@@ -57,7 +57,7 @@ type Client interface {
 	RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error
 	Link(ctx context.Context, req fsmeta.LinkRequest) error
 	Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
-	Remove(ctx context.Context, req fsmeta.RemoveRequest) error
+	Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error)
 	RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirectoryRequest) error
 	OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
 	HeartbeatWriteSession(ctx context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
@@ -389,16 +389,16 @@ func (c *GRPCClient) Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
 	return nil
 }
 
-func (c *GRPCClient) Remove(ctx context.Context, req fsmeta.RemoveRequest) error {
+func (c *GRPCClient) Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
 	if err := c.requireRPC(); err != nil {
-		return err
+		return fsmeta.RemoveResult{}, err
 	}
-	_, err := c.rpc.Remove(ctx, removeRequestToProto(req))
+	resp, err := c.rpc.Remove(ctx, removeRequestToProto(req))
 	if err != nil {
-		return translateRPCError(err)
+		return fsmeta.RemoveResult{}, translateRPCError(err)
 	}
 	c.lookup.Invalidate(req.Mount, req.Parent, req.Name)
-	return nil
+	return removeResultFromProto(resp), nil
 }
 
 func (c *GRPCClient) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirectoryRequest) error {

@@ -32,7 +32,7 @@ type Executor interface {
 	RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error
 	Link(ctx context.Context, req fsmeta.LinkRequest) error
 	Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
-	Remove(ctx context.Context, req fsmeta.RemoveRequest) error
+	Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error)
 	RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirectoryRequest) error
 	OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
 	HeartbeatWriteSession(ctx context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
@@ -395,10 +395,11 @@ func (s *Service) Remove(ctx context.Context, req *fsmetapb.RemoveRequest) (*fsm
 	if req == nil {
 		return nil, rpcInvalidArgument("fsmeta remove request is required")
 	}
-	if err := s.executor.Remove(ctx, removeRequestFromProto(req)); err != nil {
+	result, err := s.executor.Remove(ctx, removeRequestFromProto(req))
+	if err != nil {
 		return nil, rpcError(err)
 	}
-	return &fsmetapb.RemoveResponse{}, nil
+	return removeResponseToProto(result), nil
 }
 
 func (s *Service) RemoveDirectory(ctx context.Context, req *fsmetapb.RemoveDirectoryRequest) (*fsmetapb.RemoveDirectoryResponse, error) {

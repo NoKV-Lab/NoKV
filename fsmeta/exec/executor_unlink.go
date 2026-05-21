@@ -16,34 +16,34 @@ type removeDentryRequest struct {
 	Name   string
 }
 
-func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.CompiledOp, mount fsmeta.MountIdentity, req removeDentryRequest) (bool, error) {
+func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.CompiledOp, mount fsmeta.MountIdentity, req removeDentryRequest) (fsmeta.RemoveResult, bool, error) {
 	delta := compiled.Delta
 	plan := delta.Plan
 	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
-		return false, nil
+		return fsmeta.RemoveResult{}, false, nil
 	}
 	view := e.newVisibleReadView(ctx)
 	record, err := view.readDentry(plan.PrimaryKey)
 	if err != nil {
-		return false, err
+		return fsmeta.RemoveResult{}, false, err
 	}
 	inode, ok, err := view.readInode(mount, record.Inode)
 	if err != nil {
-		return false, err
+		return fsmeta.RemoveResult{}, false, err
 	}
 	if !ok {
-		return false, nil
+		return fsmeta.RemoveResult{}, false, nil
 	}
 	if inode.Type == fsmeta.InodeTypeDirectory {
-		return false, fsmeta.ErrInvalidRequest
+		return fsmeta.RemoveResult{}, false, fsmeta.ErrInvalidRequest
 	}
 	parent, err := readVisibleDirectoryInode(view, mount, req.Parent)
 	if err != nil {
-		return false, err
+		return fsmeta.RemoveResult{}, false, err
 	}
 	parent, err = decrementDirectoryChildCount(parent)
 	if err != nil {
-		return false, err
+		return fsmeta.RemoveResult{}, false, err
 	}
 	quotaOK, err := e.visibleQuotaAllowsCommit(ctx, []QuotaChange{{
 		Mount:      req.Mount,
@@ -53,52 +53,62 @@ func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.
 		Inodes:     -1,
 	}})
 	if err != nil {
-		return false, err
+		return fsmeta.RemoveResult{}, false, err
 	}
 	if !quotaOK {
-		return false, nil
+		return fsmeta.RemoveResult{}, false, nil
 	}
 	inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
 	if err != nil {
-		return false, err
+		return fsmeta.RemoveResult{}, false, err
+	}
+	result := fsmeta.RemoveResult{
+		RemovedDentry: record,
+		OldInode:      inode,
+		InodeDeleted:  inode.LinkCount <= 1,
 	}
 	effects := []compile.WriteEffect{visibleDeleteEffect(plan.MutateKeys[0])}
-	if inode.LinkCount <= 1 {
+	if result.InodeDeleted {
 		effects = append(effects, visibleDeleteEffect(inodeKey))
 	} else {
 		inode.LinkCount--
 		inodeValue, err := fsmeta.EncodeInodeValue(inode)
 		if err != nil {
-			return false, err
+			return fsmeta.RemoveResult{}, false, err
 		}
 		effects = append(effects, visiblePutEffect(inodeKey, inodeValue))
 	}
 	parentValue, err := fsmeta.EncodeInodeValue(parent)
 	if err != nil {
-		return false, err
+		return fsmeta.RemoveResult{}, false, err
 	}
 	effects = append(effects, visiblePutEffect(plan.MutateKeys[1], parentValue))
 	concrete, err := view.materializeVisibleCompiledOp(compiled, effects)
 	if err != nil {
-		return false, err
+		return fsmeta.RemoveResult{}, false, err
 	}
-	return e.tryVisibleCommitAfterRead(ctx, view, concrete)
+	committed, err := e.tryVisibleCommitAfterRead(ctx, view, concrete)
+	if err != nil || !committed {
+		return fsmeta.RemoveResult{}, committed, err
+	}
+	return result, true, nil
 }
 
-func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity, compiled compile.CompiledOp, req removeDentryRequest) error {
+func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity, compiled compile.CompiledOp, req removeDentryRequest) (fsmeta.RemoveResult, error) {
 	delta := compiled.Delta
 	plan := delta.Plan
 	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
-		return err
+		return fsmeta.RemoveResult{}, err
 	}
-	if committed, err := e.tryVisibleRemoveDentry(ctx, compiled, mount, req); committed || err != nil {
+	if result, committed, err := e.tryVisibleRemoveDentry(ctx, compiled, mount, req); committed || err != nil {
 		if err != nil {
-			return err
+			return fsmeta.RemoveResult{}, err
 		}
 		e.invalidateNegative(plan.MutateKeys[0])
 		e.invalidateDirPages(req.Mount, req.Parent)
-		return nil
+		return result, nil
 	}
+	var result fsmeta.RemoveResult
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
 		record, err := e.readDentry(ctx, plan.PrimaryKey, startVersion)
 		if err != nil {
@@ -112,6 +122,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity,
 			Op:  kvrpcpb.Mutation_Delete,
 			Key: cloneBytes(plan.MutateKeys[0]),
 		}}
+		attemptResult := fsmeta.RemoveResult{RemovedDentry: record}
 		predicates := []*kvrpcpb.AtomicPredicate{atomicValueEquals(plan.PrimaryKey, dentryValue)}
 		parent, err := e.readDirectoryInode(ctx, mount, req.Parent, startVersion)
 		if err != nil {
@@ -129,6 +140,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity,
 		if inode, ok, err := e.readInode(ctx, mount, record.Inode, startVersion); err != nil {
 			return err
 		} else if ok {
+			attemptResult.OldInode = inode
 			inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
 			if err != nil {
 				return err
@@ -142,6 +154,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity,
 			}
 			predicates = append(predicates, atomicValueEquals(inodeKey, oldInodeValue))
 			if inode.LinkCount <= 1 {
+				attemptResult.InodeDeleted = true
 				mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Delete, Key: inodeKey})
 			} else {
 				inode.LinkCount--
@@ -163,19 +176,20 @@ func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity,
 			}
 			mutations = append(mutations, quotaMutations...)
 		}
+		result = attemptResult
 		mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[1]), Value: parentValue})
 		if len(mutations) == len(predicates) {
 			return e.mutateWithAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, predicates, mutations, startVersion, commitVersion)
 		}
 		return e.mutateWithoutAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, mutations, startVersion, commitVersion)
 	}, delta.Authority); err != nil {
-		return err
+		return fsmeta.RemoveResult{}, err
 	}
 	// Removing the dentry must invalidate both point misses and any
 	// materialized directory page under its parent.
 	e.invalidateNegative(plan.MutateKeys[0])
 	e.invalidateDirPages(req.Mount, req.Parent)
-	return nil
+	return result, nil
 }
 
 // Unlink removes one non-directory dentry, decrements its inode link count,
@@ -190,7 +204,8 @@ func (e *Executor) Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error {
 	if err != nil {
 		return err
 	}
-	return e.removeDentry(ctx, mount, program.Compiled, removeDentryRequest(req))
+	_, err = e.removeDentry(ctx, mount, program.Compiled, removeDentryRequest(req))
+	return err
 }
 
 // RemoveDirectory removes one empty directory dentry and its directory inode.
@@ -361,15 +376,15 @@ func (e *Executor) tryVisibleRemoveDirectory(ctx context.Context, compiled compi
 // Remove is the product-facing primitive for removing one non-directory
 // namespace entry. Directory removal needs a separate directory-emptiness
 // contract, so v1 keeps directory targets invalid instead of orphaning children.
-func (e *Executor) Remove(ctx context.Context, req fsmeta.RemoveRequest) error {
+func (e *Executor) Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return err
+		return fsmeta.RemoveResult{}, err
 	}
 	mount := mountRecord.Identity()
 	program, err := compile.CompileRemoveProgram(req, mount, compile.WithQuotaMode(e.visibleQuotaMode()))
 	if err != nil {
-		return err
+		return fsmeta.RemoveResult{}, err
 	}
 	return e.removeDentry(ctx, mount, program.Compiled, removeDentryRequest(req))
 }

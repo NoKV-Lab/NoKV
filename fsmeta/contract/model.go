@@ -76,6 +76,7 @@ type Result struct {
 	Token         fsmeta.SnapshotSubtreeToken
 	Inode         fsmeta.InodeRecord
 	RenameReplace fsmeta.RenameReplaceResult
+	Remove        fsmeta.RemoveResult
 	Session       fsmeta.SessionRecord
 	Expired       uint64
 }
@@ -159,7 +160,7 @@ func (m *Model) Apply(op Operation) Result {
 	case OpUnlink:
 		return m.unlink(op)
 	case OpRemove:
-		return m.unlink(op)
+		return m.remove(op)
 	case OpOpenWriteSession:
 		return m.openWriteSession(op)
 	case OpHeartbeatSession:
@@ -446,20 +447,33 @@ func (m *Model) link(op Operation) Result {
 }
 
 func (m *Model) unlink(op Operation) Result {
+	_, err := m.removeDentry(op)
+	return Result{Err: err}
+}
+
+func (m *Model) remove(op Operation) Result {
+	result, err := m.removeDentry(op)
+	return Result{Err: err, Remove: result}
+}
+
+func (m *Model) removeDentry(op Operation) (fsmeta.RemoveResult, error) {
 	key := dentryKey{parent: op.Parent, name: op.Name}
 	record, ok := m.dentries[key]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return fsmeta.RemoveResult{}, fsmeta.ErrNotFound
 	}
 	if record.Type == fsmeta.InodeTypeDirectory {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
 	}
+	result := fsmeta.RemoveResult{RemovedDentry: record}
 	if inode, ok := m.inodes[record.Inode]; ok {
 		if inode.Type == fsmeta.InodeTypeDirectory {
-			return Result{Err: fsmeta.ErrInvalidRequest}
+			return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
 		}
+		result.OldInode = inode
 		delete(m.dentries, key)
 		if inode.LinkCount <= 1 {
+			result.InodeDeleted = true
 			delete(m.inodes, inode.Inode)
 		} else {
 			inode.LinkCount--
@@ -468,7 +482,7 @@ func (m *Model) unlink(op Operation) Result {
 	} else {
 		delete(m.dentries, key)
 	}
-	return Result{}
+	return result, nil
 }
 
 func (m *Model) openWriteSession(op Operation) Result {

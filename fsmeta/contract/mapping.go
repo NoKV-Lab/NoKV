@@ -171,9 +171,15 @@ func (m *inodeMappingExecutor) Unlink(ctx context.Context, req fsmeta.UnlinkRequ
 	return m.base.Unlink(ctx, req)
 }
 
-func (m *inodeMappingExecutor) Remove(ctx context.Context, req fsmeta.RemoveRequest) error {
+func (m *inodeMappingExecutor) Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
 	req.Parent = m.actualInode(req.Parent)
-	return m.base.Remove(ctx, req)
+	result, err := m.base.Remove(ctx, req)
+	if err != nil {
+		return fsmeta.RemoveResult{}, err
+	}
+	result.RemovedDentry = m.translateDentryRecord(result.RemovedDentry)
+	result.OldInode = m.translateInodeRecord(result.OldInode)
+	return result, nil
 }
 
 func (m *inodeMappingExecutor) OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {

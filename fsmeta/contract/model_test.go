@@ -233,6 +233,33 @@ func TestModelLinkRenameUnlinkMaintainsLinkCounts(t *testing.T) {
 	require.NoError(t, model.CheckInvariants())
 }
 
+func TestModelRemoveReturnsDeletedEntryAndInode(t *testing.T) {
+	model := NewModel("vol")
+	require.NoError(t, model.Apply(Operation{
+		Kind:   OpCreate,
+		Mount:  "vol",
+		Parent: model.Root,
+		Name:   "file",
+		Inode:  10,
+		Type:   fsmeta.InodeTypeFile,
+		Mode:   0o600,
+	}).Err)
+
+	result := model.Apply(Operation{
+		Kind:   OpRemove,
+		Mount:  "vol",
+		Parent: model.Root,
+		Name:   "file",
+	})
+
+	require.NoError(t, result.Err)
+	require.Equal(t, fsmeta.DentryRecord{Parent: model.Root, Name: "file", Inode: 10, Type: fsmeta.InodeTypeFile}, result.Remove.RemovedDentry)
+	require.Equal(t, fsmeta.InodeID(10), result.Remove.OldInode.Inode)
+	require.True(t, result.Remove.InodeDeleted)
+	require.NotContains(t, model.inodes, fsmeta.InodeID(10))
+	require.NoError(t, model.CheckInvariants())
+}
+
 func TestModelRenameReplaceMaintainsReplacedLinkCounts(t *testing.T) {
 	model := NewModel("vol")
 	require.NoError(t, model.Apply(Operation{

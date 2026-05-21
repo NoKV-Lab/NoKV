@@ -283,7 +283,11 @@ message RemoveRequest {
   string name = 3;
 }
 
-message RemoveResponse {}
+message RemoveResponse {
+  DentryRecord removed_dentry = 1;
+  InodeRecord old_inode = 2;
+  bool inode_deleted = 3;
+}
 
 message RemoveDirectoryRequest {
   string mount = 1;

@@ -61,12 +61,15 @@ func TestExecutorRemoveRemovesDentry(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.Remove(context.Background(), fsmeta.RemoveRequest{
+	result, err := executor.Remove(context.Background(), fsmeta.RemoveRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Name:   "file",
 	})
 	require.NoError(t, err)
+	require.Equal(t, fsmeta.DentryRecord{Parent: 7, Name: "file", Inode: 22, Type: fsmeta.InodeTypeFile}, result.RemovedDentry)
+	require.Equal(t, fsmeta.InodeID(22), result.OldInode.Inode)
+	require.True(t, result.InodeDeleted)
 
 	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{
 		Mount:  "vol",
@@ -212,7 +215,7 @@ func TestExecutorRemoveRejectsDirectoryOnTxnPath(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.Remove(context.Background(), fsmeta.RemoveRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	_, err = executor.Remove(context.Background(), fsmeta.RemoveRequest{Mount: "vol", Parent: 7, Name: "dir"})
 	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
 
 	require.Empty(t, runner.mutations)

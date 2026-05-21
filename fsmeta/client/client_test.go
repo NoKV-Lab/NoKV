@@ -237,8 +237,15 @@ func (e *fakeExecutor) Unlink(context.Context, fsmeta.UnlinkRequest) error {
 	return e.err
 }
 
-func (e *fakeExecutor) Remove(context.Context, fsmeta.RemoveRequest) error {
-	return e.err
+func (e *fakeExecutor) Remove(_ context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+	if e.err != nil {
+		return fsmeta.RemoveResult{}, e.err
+	}
+	return fsmeta.RemoveResult{
+		RemovedDentry: fsmeta.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: 61, Type: fsmeta.InodeTypeFile},
+		OldInode:      fsmeta.InodeRecord{Inode: 61, Type: fsmeta.InodeTypeFile, LinkCount: 1},
+		InodeDeleted:  true,
+	}, nil
 }
 
 func (e *fakeExecutor) RemoveDirectory(context.Context, fsmeta.RemoveDirectoryRequest) error {
@@ -386,11 +393,15 @@ func TestTypedClientMutationRPCs(t *testing.T) {
 		Parent: 2,
 		Name:   "alias",
 	}))
-	require.NoError(t, cli.Remove(context.Background(), fsmeta.RemoveRequest{
+	removed, err := cli.Remove(context.Background(), fsmeta.RemoveRequest{
 		Mount:  "vol",
 		Parent: 2,
 		Name:   "old-file",
-	}))
+	})
+	require.NoError(t, err)
+	require.Equal(t, fsmeta.InodeID(61), removed.RemovedDentry.Inode)
+	require.Equal(t, fsmeta.InodeID(61), removed.OldInode.Inode)
+	require.True(t, removed.InodeDeleted)
 	require.NoError(t, cli.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{
 		Mount:  "vol",
 		Parent: 2,

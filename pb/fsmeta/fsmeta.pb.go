@@ -2823,6 +2823,9 @@ func (x *RemoveRequest) GetName() string {
 
 type RemoveResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	RemovedDentry *DentryRecord          `protobuf:"bytes,1,opt,name=removed_dentry,json=removedDentry,proto3" json:"removed_dentry,omitempty"`
+	OldInode      *InodeRecord           `protobuf:"bytes,2,opt,name=old_inode,json=oldInode,proto3" json:"old_inode,omitempty"`
+	InodeDeleted  bool                   `protobuf:"varint,3,opt,name=inode_deleted,json=inodeDeleted,proto3" json:"inode_deleted,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2855,6 +2858,27 @@ func (x *RemoveResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use RemoveResponse.ProtoReflect.Descriptor instead.
 func (*RemoveResponse) Descriptor() ([]byte, []int) {
 	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *RemoveResponse) GetRemovedDentry() *DentryRecord {
+	if x != nil {
+		return x.RemovedDentry
+	}
+	return nil
+}
+
+func (x *RemoveResponse) GetOldInode() *InodeRecord {
+	if x != nil {
+		return x.OldInode
+	}
+	return nil
+}
+
+func (x *RemoveResponse) GetInodeDeleted() bool {
+	if x != nil {
+		return x.InodeDeleted
+	}
+	return false
 }
 
 type RemoveDirectoryRequest struct {
@@ -3569,8 +3593,11 @@ const file_fsmeta_fsmeta_proto_rawDesc = "" +
 	"\rRemoveRequest\x12\x14\n" +
 	"\x05mount\x18\x01 \x01(\tR\x05mount\x12\x16\n" +
 	"\x06parent\x18\x02 \x01(\x04R\x06parent\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04name\"\x10\n" +
-	"\x0eRemoveResponse\"Z\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\"\xb4\x01\n" +
+	"\x0eRemoveResponse\x12C\n" +
+	"\x0eremoved_dentry\x18\x01 \x01(\v2\x1c.nokv.fsmeta.v1.DentryRecordR\rremovedDentry\x128\n" +
+	"\told_inode\x18\x02 \x01(\v2\x1b.nokv.fsmeta.v1.InodeRecordR\boldInode\x12#\n" +
+	"\rinode_deleted\x18\x03 \x01(\bR\finodeDeleted\"Z\n" +
 	"\x16RemoveDirectoryRequest\x12\x14\n" +
 	"\x05mount\x18\x01 \x01(\tR\x05mount\x12\x16\n" +
 	"\x06parent\x18\x02 \x01(\x04R\x06parent\x12\x12\n" +
@@ -3738,57 +3765,59 @@ var file_fsmeta_fsmeta_proto_depIdxs = []int32{
 	29, // 26: nokv.fsmeta.v1.RetireSnapshotSubtreeRequest.runtime_evidence:type_name -> nokv.fsmeta.v1.SnapshotEvidenceRef
 	4,  // 27: nokv.fsmeta.v1.RenameReplaceResponse.old_dentry:type_name -> nokv.fsmeta.v1.DentryRecord
 	2,  // 28: nokv.fsmeta.v1.RenameReplaceResponse.old_inode:type_name -> nokv.fsmeta.v1.InodeRecord
-	3,  // 29: nokv.fsmeta.v1.OpenWriteSessionResponse.session:type_name -> nokv.fsmeta.v1.SessionRecord
-	3,  // 30: nokv.fsmeta.v1.HeartbeatWriteSessionResponse.session:type_name -> nokv.fsmeta.v1.SessionRecord
-	7,  // 31: nokv.fsmeta.v1.FSMetadata.Create:input_type -> nokv.fsmeta.v1.CreateRequest
-	9,  // 32: nokv.fsmeta.v1.FSMetadata.UpdateInode:input_type -> nokv.fsmeta.v1.UpdateInodeRequest
-	11, // 33: nokv.fsmeta.v1.FSMetadata.Lookup:input_type -> nokv.fsmeta.v1.LookupRequest
-	11, // 34: nokv.fsmeta.v1.FSMetadata.LookupPlus:input_type -> nokv.fsmeta.v1.LookupRequest
-	14, // 35: nokv.fsmeta.v1.FSMetadata.ReadDir:input_type -> nokv.fsmeta.v1.ReadDirRequest
-	14, // 36: nokv.fsmeta.v1.FSMetadata.ReadDirPlus:input_type -> nokv.fsmeta.v1.ReadDirRequest
-	25, // 37: nokv.fsmeta.v1.FSMetadata.WatchSubtree:input_type -> nokv.fsmeta.v1.WatchAckOrSubscribe
-	26, // 38: nokv.fsmeta.v1.FSMetadata.GetReadVersion:input_type -> nokv.fsmeta.v1.GetReadVersionRequest
-	28, // 39: nokv.fsmeta.v1.FSMetadata.SnapshotSubtree:input_type -> nokv.fsmeta.v1.SnapshotSubtreeRequest
-	31, // 40: nokv.fsmeta.v1.FSMetadata.RetireSnapshotSubtree:input_type -> nokv.fsmeta.v1.RetireSnapshotSubtreeRequest
-	33, // 41: nokv.fsmeta.v1.FSMetadata.GetQuotaUsage:input_type -> nokv.fsmeta.v1.QuotaUsageRequest
-	35, // 42: nokv.fsmeta.v1.FSMetadata.Rename:input_type -> nokv.fsmeta.v1.RenameRequest
-	37, // 43: nokv.fsmeta.v1.FSMetadata.RenameReplace:input_type -> nokv.fsmeta.v1.RenameReplaceRequest
-	39, // 44: nokv.fsmeta.v1.FSMetadata.RenameSubtree:input_type -> nokv.fsmeta.v1.RenameSubtreeRequest
-	41, // 45: nokv.fsmeta.v1.FSMetadata.Link:input_type -> nokv.fsmeta.v1.LinkRequest
-	43, // 46: nokv.fsmeta.v1.FSMetadata.Unlink:input_type -> nokv.fsmeta.v1.UnlinkRequest
-	45, // 47: nokv.fsmeta.v1.FSMetadata.Remove:input_type -> nokv.fsmeta.v1.RemoveRequest
-	47, // 48: nokv.fsmeta.v1.FSMetadata.RemoveDirectory:input_type -> nokv.fsmeta.v1.RemoveDirectoryRequest
-	49, // 49: nokv.fsmeta.v1.FSMetadata.OpenWriteSession:input_type -> nokv.fsmeta.v1.OpenWriteSessionRequest
-	51, // 50: nokv.fsmeta.v1.FSMetadata.HeartbeatWriteSession:input_type -> nokv.fsmeta.v1.HeartbeatWriteSessionRequest
-	53, // 51: nokv.fsmeta.v1.FSMetadata.CloseWriteSession:input_type -> nokv.fsmeta.v1.CloseWriteSessionRequest
-	55, // 52: nokv.fsmeta.v1.FSMetadata.ExpireWriteSessions:input_type -> nokv.fsmeta.v1.ExpireWriteSessionsRequest
-	8,  // 53: nokv.fsmeta.v1.FSMetadata.Create:output_type -> nokv.fsmeta.v1.CreateResponse
-	10, // 54: nokv.fsmeta.v1.FSMetadata.UpdateInode:output_type -> nokv.fsmeta.v1.UpdateInodeResponse
-	12, // 55: nokv.fsmeta.v1.FSMetadata.Lookup:output_type -> nokv.fsmeta.v1.LookupResponse
-	13, // 56: nokv.fsmeta.v1.FSMetadata.LookupPlus:output_type -> nokv.fsmeta.v1.LookupPlusResponse
-	15, // 57: nokv.fsmeta.v1.FSMetadata.ReadDir:output_type -> nokv.fsmeta.v1.ReadDirResponse
-	16, // 58: nokv.fsmeta.v1.FSMetadata.ReadDirPlus:output_type -> nokv.fsmeta.v1.ReadDirPlusResponse
-	24, // 59: nokv.fsmeta.v1.FSMetadata.WatchSubtree:output_type -> nokv.fsmeta.v1.WatchSubtreeResponse
-	27, // 60: nokv.fsmeta.v1.FSMetadata.GetReadVersion:output_type -> nokv.fsmeta.v1.GetReadVersionResponse
-	30, // 61: nokv.fsmeta.v1.FSMetadata.SnapshotSubtree:output_type -> nokv.fsmeta.v1.SnapshotSubtreeResponse
-	32, // 62: nokv.fsmeta.v1.FSMetadata.RetireSnapshotSubtree:output_type -> nokv.fsmeta.v1.RetireSnapshotSubtreeResponse
-	34, // 63: nokv.fsmeta.v1.FSMetadata.GetQuotaUsage:output_type -> nokv.fsmeta.v1.QuotaUsageResponse
-	36, // 64: nokv.fsmeta.v1.FSMetadata.Rename:output_type -> nokv.fsmeta.v1.RenameResponse
-	38, // 65: nokv.fsmeta.v1.FSMetadata.RenameReplace:output_type -> nokv.fsmeta.v1.RenameReplaceResponse
-	40, // 66: nokv.fsmeta.v1.FSMetadata.RenameSubtree:output_type -> nokv.fsmeta.v1.RenameSubtreeResponse
-	42, // 67: nokv.fsmeta.v1.FSMetadata.Link:output_type -> nokv.fsmeta.v1.LinkResponse
-	44, // 68: nokv.fsmeta.v1.FSMetadata.Unlink:output_type -> nokv.fsmeta.v1.UnlinkResponse
-	46, // 69: nokv.fsmeta.v1.FSMetadata.Remove:output_type -> nokv.fsmeta.v1.RemoveResponse
-	48, // 70: nokv.fsmeta.v1.FSMetadata.RemoveDirectory:output_type -> nokv.fsmeta.v1.RemoveDirectoryResponse
-	50, // 71: nokv.fsmeta.v1.FSMetadata.OpenWriteSession:output_type -> nokv.fsmeta.v1.OpenWriteSessionResponse
-	52, // 72: nokv.fsmeta.v1.FSMetadata.HeartbeatWriteSession:output_type -> nokv.fsmeta.v1.HeartbeatWriteSessionResponse
-	54, // 73: nokv.fsmeta.v1.FSMetadata.CloseWriteSession:output_type -> nokv.fsmeta.v1.CloseWriteSessionResponse
-	56, // 74: nokv.fsmeta.v1.FSMetadata.ExpireWriteSessions:output_type -> nokv.fsmeta.v1.ExpireWriteSessionsResponse
-	53, // [53:75] is the sub-list for method output_type
-	31, // [31:53] is the sub-list for method input_type
-	31, // [31:31] is the sub-list for extension type_name
-	31, // [31:31] is the sub-list for extension extendee
-	0,  // [0:31] is the sub-list for field type_name
+	4,  // 29: nokv.fsmeta.v1.RemoveResponse.removed_dentry:type_name -> nokv.fsmeta.v1.DentryRecord
+	2,  // 30: nokv.fsmeta.v1.RemoveResponse.old_inode:type_name -> nokv.fsmeta.v1.InodeRecord
+	3,  // 31: nokv.fsmeta.v1.OpenWriteSessionResponse.session:type_name -> nokv.fsmeta.v1.SessionRecord
+	3,  // 32: nokv.fsmeta.v1.HeartbeatWriteSessionResponse.session:type_name -> nokv.fsmeta.v1.SessionRecord
+	7,  // 33: nokv.fsmeta.v1.FSMetadata.Create:input_type -> nokv.fsmeta.v1.CreateRequest
+	9,  // 34: nokv.fsmeta.v1.FSMetadata.UpdateInode:input_type -> nokv.fsmeta.v1.UpdateInodeRequest
+	11, // 35: nokv.fsmeta.v1.FSMetadata.Lookup:input_type -> nokv.fsmeta.v1.LookupRequest
+	11, // 36: nokv.fsmeta.v1.FSMetadata.LookupPlus:input_type -> nokv.fsmeta.v1.LookupRequest
+	14, // 37: nokv.fsmeta.v1.FSMetadata.ReadDir:input_type -> nokv.fsmeta.v1.ReadDirRequest
+	14, // 38: nokv.fsmeta.v1.FSMetadata.ReadDirPlus:input_type -> nokv.fsmeta.v1.ReadDirRequest
+	25, // 39: nokv.fsmeta.v1.FSMetadata.WatchSubtree:input_type -> nokv.fsmeta.v1.WatchAckOrSubscribe
+	26, // 40: nokv.fsmeta.v1.FSMetadata.GetReadVersion:input_type -> nokv.fsmeta.v1.GetReadVersionRequest
+	28, // 41: nokv.fsmeta.v1.FSMetadata.SnapshotSubtree:input_type -> nokv.fsmeta.v1.SnapshotSubtreeRequest
+	31, // 42: nokv.fsmeta.v1.FSMetadata.RetireSnapshotSubtree:input_type -> nokv.fsmeta.v1.RetireSnapshotSubtreeRequest
+	33, // 43: nokv.fsmeta.v1.FSMetadata.GetQuotaUsage:input_type -> nokv.fsmeta.v1.QuotaUsageRequest
+	35, // 44: nokv.fsmeta.v1.FSMetadata.Rename:input_type -> nokv.fsmeta.v1.RenameRequest
+	37, // 45: nokv.fsmeta.v1.FSMetadata.RenameReplace:input_type -> nokv.fsmeta.v1.RenameReplaceRequest
+	39, // 46: nokv.fsmeta.v1.FSMetadata.RenameSubtree:input_type -> nokv.fsmeta.v1.RenameSubtreeRequest
+	41, // 47: nokv.fsmeta.v1.FSMetadata.Link:input_type -> nokv.fsmeta.v1.LinkRequest
+	43, // 48: nokv.fsmeta.v1.FSMetadata.Unlink:input_type -> nokv.fsmeta.v1.UnlinkRequest
+	45, // 49: nokv.fsmeta.v1.FSMetadata.Remove:input_type -> nokv.fsmeta.v1.RemoveRequest
+	47, // 50: nokv.fsmeta.v1.FSMetadata.RemoveDirectory:input_type -> nokv.fsmeta.v1.RemoveDirectoryRequest
+	49, // 51: nokv.fsmeta.v1.FSMetadata.OpenWriteSession:input_type -> nokv.fsmeta.v1.OpenWriteSessionRequest
+	51, // 52: nokv.fsmeta.v1.FSMetadata.HeartbeatWriteSession:input_type -> nokv.fsmeta.v1.HeartbeatWriteSessionRequest
+	53, // 53: nokv.fsmeta.v1.FSMetadata.CloseWriteSession:input_type -> nokv.fsmeta.v1.CloseWriteSessionRequest
+	55, // 54: nokv.fsmeta.v1.FSMetadata.ExpireWriteSessions:input_type -> nokv.fsmeta.v1.ExpireWriteSessionsRequest
+	8,  // 55: nokv.fsmeta.v1.FSMetadata.Create:output_type -> nokv.fsmeta.v1.CreateResponse
+	10, // 56: nokv.fsmeta.v1.FSMetadata.UpdateInode:output_type -> nokv.fsmeta.v1.UpdateInodeResponse
+	12, // 57: nokv.fsmeta.v1.FSMetadata.Lookup:output_type -> nokv.fsmeta.v1.LookupResponse
+	13, // 58: nokv.fsmeta.v1.FSMetadata.LookupPlus:output_type -> nokv.fsmeta.v1.LookupPlusResponse
+	15, // 59: nokv.fsmeta.v1.FSMetadata.ReadDir:output_type -> nokv.fsmeta.v1.ReadDirResponse
+	16, // 60: nokv.fsmeta.v1.FSMetadata.ReadDirPlus:output_type -> nokv.fsmeta.v1.ReadDirPlusResponse
+	24, // 61: nokv.fsmeta.v1.FSMetadata.WatchSubtree:output_type -> nokv.fsmeta.v1.WatchSubtreeResponse
+	27, // 62: nokv.fsmeta.v1.FSMetadata.GetReadVersion:output_type -> nokv.fsmeta.v1.GetReadVersionResponse
+	30, // 63: nokv.fsmeta.v1.FSMetadata.SnapshotSubtree:output_type -> nokv.fsmeta.v1.SnapshotSubtreeResponse
+	32, // 64: nokv.fsmeta.v1.FSMetadata.RetireSnapshotSubtree:output_type -> nokv.fsmeta.v1.RetireSnapshotSubtreeResponse
+	34, // 65: nokv.fsmeta.v1.FSMetadata.GetQuotaUsage:output_type -> nokv.fsmeta.v1.QuotaUsageResponse
+	36, // 66: nokv.fsmeta.v1.FSMetadata.Rename:output_type -> nokv.fsmeta.v1.RenameResponse
+	38, // 67: nokv.fsmeta.v1.FSMetadata.RenameReplace:output_type -> nokv.fsmeta.v1.RenameReplaceResponse
+	40, // 68: nokv.fsmeta.v1.FSMetadata.RenameSubtree:output_type -> nokv.fsmeta.v1.RenameSubtreeResponse
+	42, // 69: nokv.fsmeta.v1.FSMetadata.Link:output_type -> nokv.fsmeta.v1.LinkResponse
+	44, // 70: nokv.fsmeta.v1.FSMetadata.Unlink:output_type -> nokv.fsmeta.v1.UnlinkResponse
+	46, // 71: nokv.fsmeta.v1.FSMetadata.Remove:output_type -> nokv.fsmeta.v1.RemoveResponse
+	48, // 72: nokv.fsmeta.v1.FSMetadata.RemoveDirectory:output_type -> nokv.fsmeta.v1.RemoveDirectoryResponse
+	50, // 73: nokv.fsmeta.v1.FSMetadata.OpenWriteSession:output_type -> nokv.fsmeta.v1.OpenWriteSessionResponse
+	52, // 74: nokv.fsmeta.v1.FSMetadata.HeartbeatWriteSession:output_type -> nokv.fsmeta.v1.HeartbeatWriteSessionResponse
+	54, // 75: nokv.fsmeta.v1.FSMetadata.CloseWriteSession:output_type -> nokv.fsmeta.v1.CloseWriteSessionResponse
+	56, // 76: nokv.fsmeta.v1.FSMetadata.ExpireWriteSessions:output_type -> nokv.fsmeta.v1.ExpireWriteSessionsResponse
+	55, // [55:77] is the sub-list for method output_type
+	33, // [33:55] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_fsmeta_fsmeta_proto_init() }

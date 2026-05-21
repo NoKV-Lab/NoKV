@@ -129,8 +129,8 @@ func (unavailableCreateExecutor) Unlink(context.Context, fsmeta.UnlinkRequest) e
 	return fsmeta.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) Remove(context.Context, fsmeta.RemoveRequest) error {
-	return fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) Remove(context.Context, fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+	return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
 }
 
 func (unavailableCreateExecutor) OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {

@@ -157,6 +157,15 @@ type RemoveRequest struct {
 	Name   string
 }
 
+// RemoveResult reports the namespace entry detached by Remove. OldInode is the
+// inode record observed before link-count decrement or deletion; InodeDeleted
+// tells callers whether the inode record itself was removed.
+type RemoveResult struct {
+	RemovedDentry DentryRecord
+	OldInode      InodeRecord
+	InodeDeleted  bool
+}
+
 type RemoveDirectoryRequest struct {
 	Mount  MountID
 	Parent InodeID

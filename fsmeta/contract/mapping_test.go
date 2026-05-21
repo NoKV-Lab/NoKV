@@ -53,6 +53,33 @@ func TestInodeMappingExecutorRecoversCommittedCreate(t *testing.T) {
 	}
 }
 
+func TestInodeMappingExecutorTranslatesRemoveResult(t *testing.T) {
+	base := newFakeExternalExecutor()
+	exec, err := NewInodeMappingExecutor(base)
+	if err != nil {
+		t.Fatalf("NewInodeMappingExecutor: %v", err)
+	}
+	_, err = exec.Create(withPlannedCreateInode(context.Background(), 10), fsmeta.CreateRequest{
+		Mount:  "vol",
+		Parent: fsmeta.RootInode,
+		Name:   "alpha",
+		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	result, err := exec.Remove(context.Background(), fsmeta.RemoveRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "alpha"})
+	if err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if result.RemovedDentry.Inode != 10 || result.OldInode.Inode != 10 {
+		t.Fatalf("remove result was not translated to planned inode: %+v", result)
+	}
+	if !result.InodeDeleted {
+		t.Fatalf("Remove result did not report deleted inode: %+v", result)
+	}
+}
+
 func TestInodeMappingExecutorDoesNotRecoverSemanticCreateError(t *testing.T) {
 	base := newFakeExternalExecutor()
 	_, err := base.Create(context.Background(), fsmeta.CreateRequest{
@@ -340,8 +367,36 @@ func (f *fakeExternalExecutor) Unlink(context.Context, fsmeta.UnlinkRequest) err
 	return nil
 }
 
-func (f *fakeExternalExecutor) Remove(context.Context, fsmeta.RemoveRequest) error {
-	return nil
+func (f *fakeExternalExecutor) Remove(_ context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := [2]any{req.Parent, req.Name}
+	dentry, ok := f.dentries[key]
+	if !ok {
+		return fsmeta.RemoveResult{}, fsmeta.ErrNotFound
+	}
+	if dentry.Type == fsmeta.InodeTypeDirectory {
+		return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
+	}
+	result := fsmeta.RemoveResult{RemovedDentry: dentry}
+	inode, ok := f.inodes[dentry.Inode]
+	if !ok {
+		delete(f.dentries, key)
+		return result, nil
+	}
+	if inode.Type == fsmeta.InodeTypeDirectory {
+		return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
+	}
+	result.OldInode = inode
+	delete(f.dentries, key)
+	if inode.LinkCount <= 1 {
+		result.InodeDeleted = true
+		delete(f.inodes, inode.Inode)
+	} else {
+		inode.LinkCount--
+		f.inodes[inode.Inode] = inode
+	}
+	return result, nil
 }
 
 func (f *fakeExternalExecutor) OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {

@@ -25,7 +25,7 @@ type Executor interface {
 	RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error
 	Link(context.Context, fsmeta.LinkRequest) error
 	Unlink(context.Context, fsmeta.UnlinkRequest) error
-	Remove(context.Context, fsmeta.RemoveRequest) error
+	Remove(context.Context, fsmeta.RemoveRequest) (fsmeta.RemoveResult, error)
 	OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
 	HeartbeatWriteSession(context.Context, fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
 	CloseWriteSession(context.Context, fsmeta.CloseWriteSessionRequest) error
@@ -178,12 +178,12 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 		})
 		return Result{Err: err}
 	case OpRemove:
-		err := exec.Remove(ctx, fsmeta.RemoveRequest{
+		result, err := exec.Remove(ctx, fsmeta.RemoveRequest{
 			Mount:  op.Mount,
 			Parent: op.Parent,
 			Name:   op.Name,
 		})
-		return Result{Err: err}
+		return Result{Err: err, Remove: result}
 	case OpOpenWriteSession:
 		session, err := exec.OpenWriteSession(ctx, fsmeta.OpenWriteSessionRequest{
 			Mount:   op.Mount,
@@ -242,6 +242,9 @@ func compareResult(got, want Result) error {
 	if !reflect.DeepEqual(got.RenameReplace, want.RenameReplace) {
 		return fmt.Errorf("rename replace mismatch: got %+v want %+v", got.RenameReplace, want.RenameReplace)
 	}
+	if !reflect.DeepEqual(got.Remove, want.Remove) {
+		return fmt.Errorf("remove mismatch: got %+v want %+v", got.Remove, want.Remove)
+	}
 	if got.Session != want.Session {
 		return fmt.Errorf("session mismatch: got %+v want %+v", got.Session, want.Session)
 	}
@@ -273,6 +276,9 @@ func summarize(result Result) string {
 	}
 	if result.RenameReplace.Replaced {
 		return fmt.Sprintf("rename_replace old=%s:%d deleted=%t", result.RenameReplace.OldDentry.Name, result.RenameReplace.OldDentry.Inode, result.RenameReplace.OldInodeDeleted)
+	}
+	if result.Remove.RemovedDentry.Name != "" {
+		return fmt.Sprintf("remove old=%s:%d deleted=%t", result.Remove.RemovedDentry.Name, result.Remove.RemovedDentry.Inode, result.Remove.InodeDeleted)
 	}
 	if result.Session.Session != "" {
 		return fmt.Sprintf("session=%s inode=%d expires=%d", result.Session.Session, result.Session.Inode, result.Session.ExpiresUnixNs)

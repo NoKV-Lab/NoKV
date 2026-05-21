@@ -213,6 +213,17 @@ func removeRequestToProto(req fsmeta.RemoveRequest) *fsmetapb.RemoveRequest {
 	}
 }
 
+func removeResultFromProto(resp *fsmetapb.RemoveResponse) fsmeta.RemoveResult {
+	if resp == nil {
+		return fsmeta.RemoveResult{}
+	}
+	return fsmeta.RemoveResult{
+		RemovedDentry: dentryFromProto(resp.GetRemovedDentry()),
+		OldInode:      inodeFromProto(resp.GetOldInode()),
+		InodeDeleted:  resp.GetInodeDeleted(),
+	}
+}
+
 func removeDirectoryRequestToProto(req fsmeta.RemoveDirectoryRequest) *fsmetapb.RemoveDirectoryRequest {
 	return &fsmetapb.RemoveDirectoryRequest{
 		Mount:  string(req.Mount),
