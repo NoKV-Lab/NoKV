@@ -741,11 +741,13 @@ func BenchmarkExecutorCheckpointStormVisibleSegment100(b *testing.B) {
 }
 
 func BenchmarkExecutorCheckpointStormVisibleCommit100(b *testing.B) {
+	runner := newFakeRunner()
+	committer := newTestVisibleCommitter(b, runner)
 	executor, err := newTestExecutor(
-		newFakeRunner(),
+		runner,
 		WithInodeAllocator(&fakeInodeAllocator{next: 22}),
 		WithVisibleAuthorityAdmitter(ownedVisibleAdmitter{}),
-		WithVisibleCommitter(noopVisibleCommitter{}),
+		WithVisibleCommitter(committer),
 	)
 	if err != nil {
 		b.Fatal(err)

@@ -1298,6 +1298,7 @@ func benchmarkExecutorOpenWriteSession(b *testing.B, runner *fakeRunner, executo
 
 func benchmarkExecutorLink(b *testing.B, runner *fakeRunner, executor *Executor) {
 	ctx := context.Background()
+	benchmarkSeedDirectory(b, runner, 8)
 	b.ReportAllocs()
 	for i := 0; b.Loop(); i++ {
 		inode := fsmeta.InodeID(i + 1000)
@@ -1352,6 +1353,16 @@ func benchmarkSeedDentry(b *testing.B, runner *fakeRunner, parent fsmeta.InodeID
 		b.Fatal(err)
 	}
 	runner.data[string(key)] = value
+}
+
+func benchmarkSeedDirectory(b *testing.B, runner *fakeRunner, inode fsmeta.InodeID) {
+	b.Helper()
+	benchmarkSeedInodeRecord(b, runner, fsmeta.InodeRecord{
+		Inode:     inode,
+		Type:      fsmeta.InodeTypeDirectory,
+		Mode:      0o755,
+		LinkCount: 1,
+	})
 }
 
 func benchmarkIncrementSeedParentChildCount(b *testing.B, runner *fakeRunner, parent fsmeta.InodeID) {

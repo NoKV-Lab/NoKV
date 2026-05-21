@@ -224,6 +224,15 @@ func (r *Runner) InstallMutationsAtCommit(ctx context.Context, primary []byte, m
 	return effective, nil
 }
 
+// AtomicMutatePreservesReadOrder reports that TryAtomicMutate validates the
+// caller's read predicates under the same local latch used for the write group.
+// fsmeta uses this for read-modify-write namespace counters such as directory
+// ChildCount; falling back to blind direct MVCC writes can lose concurrent
+// increments when a later timestamp reads before an earlier write is applied.
+func (r *Runner) AtomicMutatePreservesReadOrder() bool {
+	return r != nil
+}
+
 // chunkInstallMutations splits mutations into batches that fit under the
 // local DB's per-write batch count and byte budgets. Chunks preserve the
 // original ordering (each chunk is a prefix slice) so callers that rely on

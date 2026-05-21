@@ -5,6 +5,8 @@ package local
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,6 +101,56 @@ func TestOpenUsesDirectMVCC(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, created.Dentry, got)
+}
+
+func TestLocalRuntimeConcurrentDirectoryChildCount(t *testing.T) {
+	ctx := context.Background()
+	rt, err := Open(ctx, Options{
+		WorkDir: t.TempDir(),
+		Mount:   testMount(),
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rt.Close()) }()
+
+	dir, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+		Mount:  "vol",
+		Parent: fsmeta.RootInode,
+		Name:   "hot-dir",
+		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+	})
+	require.NoError(t, err)
+
+	const files = 32
+	runConcurrentFSOps(t, files, func(i int) error {
+		_, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+			Mount:  "vol",
+			Parent: dir.Inode.Inode,
+			Name:   fmt.Sprintf("file-%03d", i),
+			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		})
+		return err
+	})
+
+	rows, err := rt.Executor.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+		Mount:  "vol",
+		Parent: dir.Inode.Inode,
+		Limit:  files,
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, files)
+
+	runConcurrentFSOps(t, files, func(i int) error {
+		return rt.Executor.Unlink(ctx, fsmeta.UnlinkRequest{
+			Mount:  "vol",
+			Parent: dir.Inode.Inode,
+			Name:   fmt.Sprintf("file-%03d", i),
+		})
+	})
+	require.NoError(t, rt.Executor.RemoveDirectory(ctx, fsmeta.RemoveDirectoryRequest{
+		Mount:  "vol",
+		Parent: fsmeta.RootInode,
+		Name:   "hot-dir",
+	}))
 }
 
 func TestLocalRuntimePassesFSMetaContract(t *testing.T) {
@@ -316,6 +368,29 @@ func TestLocalRuntimeReadDirPlusSeesCreateAfterEmptyRead(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pairs, 1)
 	require.Equal(t, "after-empty-read", pairs[0].Dentry.Name)
+}
+
+func runConcurrentFSOps(t *testing.T, count int, fn func(int) error) {
+	t.Helper()
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan error, count)
+	for i := range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := fn(i); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 }
 
 func requireWatchEvent(t *testing.T, sub fsmeta.WatchSubscription) fsmeta.WatchEvent {
