@@ -228,37 +228,72 @@ func (s *Store) List(ctx context.Context, artifactPath string) ([]ArtifactInfo, 
 	return out, nil
 }
 
-// Delete removes one file artifact from fsmeta and then best-effort removes its
-// external body. Directories are rejected until fsmeta provides a directory
-// removal primitive.
+// Delete removes an artifact path from fsmeta. Directories are removed
+// recursively, bottom-up. The root path deletes its children but leaves the root
+// inode intact.
 func (s *Store) Delete(ctx context.Context, artifactPath string) error {
 	ctx = normalizeContext(ctx)
-	parts, err := splitArtifactPath(artifactPath, false)
+	parts, err := splitArtifactPath(artifactPath, true)
 	if err != nil {
 		return err
+	}
+	if len(parts) == 0 {
+		return s.deleteDirectoryChildren(ctx, s.root)
 	}
 	pair, err := s.resolvePath(ctx, parts)
 	if err != nil {
 		return err
 	}
 	if pair.Inode.Type == fsmeta.InodeTypeDirectory {
-		return ErrArtifactIsDirectory
+		if err := s.deleteDirectoryChildren(ctx, pair.Inode.Inode); err != nil {
+			return err
+		}
+		return s.namespace.RemoveDirectory(ctx, fsmeta.RemoveDirectoryRequest{
+			Mount:  s.mount,
+			Parent: pair.Dentry.Parent,
+			Name:   pair.Dentry.Name,
+		})
 	}
-	info, err := infoFromPair(normalizeArtifactPath(parts), pair)
+	return s.deleteFileDentry(ctx, pair)
+}
+
+func (s *Store) deleteDirectoryChildren(ctx context.Context, parent fsmeta.InodeID) error {
+	pairs, err := fsmetaclient.ReadDirPlusAll(ctx, s.namespace, fsmeta.ReadDirRequest{
+		Mount:  s.mount,
+		Parent: parent,
+		Limit:  fsmeta.DefaultReadDirLimit,
+	})
 	if err != nil {
 		return err
 	}
-	if err := s.namespace.Unlink(ctx, fsmeta.UnlinkRequest{
+	for _, pair := range pairs {
+		if pair.Inode.Type == fsmeta.InodeTypeDirectory {
+			if err := s.deleteDirectoryChildren(ctx, pair.Inode.Inode); err != nil {
+				return err
+			}
+			if err := s.namespace.RemoveDirectory(ctx, fsmeta.RemoveDirectoryRequest{
+				Mount:  s.mount,
+				Parent: pair.Dentry.Parent,
+				Name:   pair.Dentry.Name,
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := s.deleteFileDentry(ctx, pair); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) deleteFileDentry(ctx context.Context, pair fsmeta.DentryAttrPair) error {
+	_, err := s.namespace.Remove(ctx, fsmeta.RemoveRequest{
 		Mount:  s.mount,
 		Parent: pair.Dentry.Parent,
 		Name:   pair.Dentry.Name,
-	}); err != nil {
-		return err
-	}
-	if err := s.bodies.Delete(ctx, info.Body); err != nil {
-		return fmt.Errorf("delete artifact body: %w", err)
-	}
-	return nil
+	})
+	return err
 }
 
 func (s *Store) ensureParentDirectories(ctx context.Context, parts []string) (fsmeta.InodeID, error) {

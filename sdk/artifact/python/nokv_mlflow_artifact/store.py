@@ -44,6 +44,9 @@ class ArtifactStore(Protocol):
     def delete_file(self, artifact_path: str) -> None:
         ...
 
+    def delete_directory(self, artifact_path: str) -> None:
+        ...
+
     def stat(self, artifact_path: str) -> ArtifactInfo:
         ...
 
@@ -104,6 +107,15 @@ class LocalArtifactStore:
         if target.is_dir():
             raise ArtifactIsDirectory(f"artifact is a directory: {normalized}")
         target.unlink()
+
+    def delete_directory(self, artifact_path: str) -> None:
+        normalized = normalize_artifact_path(artifact_path, allow_empty=False)
+        target = self._resolve(normalized)
+        if not target.exists():
+            raise ArtifactNotFound(f"artifact does not exist: {normalized}")
+        if not target.is_dir():
+            raise ValueError(f"artifact is not a directory: {normalized}")
+        target.rmdir()
 
     def stat(self, artifact_path: str) -> ArtifactInfo:
         normalized = normalize_artifact_path(artifact_path, allow_empty=True)

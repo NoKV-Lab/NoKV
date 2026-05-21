@@ -105,16 +105,73 @@ func TestStoreRejectsUnsafeArtifactPaths(t *testing.T) {
 	}
 }
 
-func TestStoreDeleteRejectsDirectoryUntilFSMetaProvidesDirectoryRemoval(t *testing.T) {
+func TestStoreDeleteRecursivelyRemovesDirectory(t *testing.T) {
 	ctx := context.Background()
 	store := openLocalTestStore(t)
-	source := writeTestFile(t, []byte("payload"))
+	first := writeTestFile(t, []byte("first"))
+	second := writeTestFile(t, []byte("second"))
 
-	_, err := store.PutFile(ctx, source, "dir/file.txt")
+	_, err := store.PutFile(ctx, first, "dir/file.txt")
+	require.NoError(t, err)
+	_, err = store.PutFile(ctx, second, "dir/nested/child.txt")
 	require.NoError(t, err)
 
 	err = store.Delete(ctx, "dir")
-	require.ErrorIs(t, err, ErrArtifactIsDirectory)
+	require.NoError(t, err)
+	_, err = store.Stat(ctx, "dir")
+	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+
+	root, err := store.List(ctx, "")
+	require.NoError(t, err)
+	require.Empty(t, root)
+}
+
+func TestStoreDeleteRootRemovesChildrenButKeepsRootUsable(t *testing.T) {
+	ctx := context.Background()
+	store := openLocalTestStore(t)
+	first := writeTestFile(t, []byte("first"))
+	second := writeTestFile(t, []byte("second"))
+
+	_, err := store.PutFile(ctx, first, "a.txt")
+	require.NoError(t, err)
+	_, err = store.PutFile(ctx, second, "dir/b.txt")
+	require.NoError(t, err)
+
+	err = store.Delete(ctx, "")
+	require.NoError(t, err)
+	root, err := store.List(ctx, "")
+	require.NoError(t, err)
+	require.Empty(t, root)
+
+	next := writeTestFile(t, []byte("next"))
+	_, err = store.PutFile(ctx, next, "next.txt")
+	require.NoError(t, err)
+	root, err = store.List(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, root, 1)
+	require.Equal(t, "next.txt", root[0].Path)
+}
+
+func TestStoreDeleteDoesNotEagerlyDeleteSharedContentAddressedBody(t *testing.T) {
+	ctx := context.Background()
+	store := openLocalTestStore(t)
+	source := writeTestFile(t, []byte("shared"))
+
+	first, err := store.PutFile(ctx, source, "first.txt")
+	require.NoError(t, err)
+	second, err := store.PutFile(ctx, source, "second.txt")
+	require.NoError(t, err)
+	require.Equal(t, first.Body, second.Body)
+
+	err = store.Delete(ctx, "first.txt")
+	require.NoError(t, err)
+
+	download := filepath.Join(t.TempDir(), "second.txt")
+	_, err = store.GetFile(ctx, "second.txt", download)
+	require.NoError(t, err)
+	got, err := os.ReadFile(download)
+	require.NoError(t, err)
+	require.Equal(t, []byte("shared"), got)
 }
 
 func TestStoreGetRejectsDirectory(t *testing.T) {
@@ -205,6 +262,10 @@ func (fakeNamespace) RenameReplace(context.Context, fsmeta.RenameReplaceRequest)
 	return fsmeta.RenameReplaceResult{}, errors.New("not implemented")
 }
 
-func (fakeNamespace) Unlink(context.Context, fsmeta.UnlinkRequest) error {
+func (fakeNamespace) Remove(context.Context, fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+	return fsmeta.RemoveResult{}, errors.New("not implemented")
+}
+
+func (fakeNamespace) RemoveDirectory(context.Context, fsmeta.RemoveDirectoryRequest) error {
 	return errors.New("not implemented")
 }

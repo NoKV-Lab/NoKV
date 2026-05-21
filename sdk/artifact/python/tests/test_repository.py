@@ -92,7 +92,7 @@ class NoKVArtifactRepositoryTest(unittest.TestCase):
             self.assertEqual((downloaded / "root.txt").read_text(encoding="utf-8"), "root")
             self.assertEqual((downloaded / "nested" / "child.txt").read_text(encoding="utf-8"), "child")
 
-    def test_delete_directory_is_unsupported_until_fsmeta_rmdir_exists(self) -> None:
+    def test_delete_directory_recursively_removes_children(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             workspace_path = Path(workspace)
             repo = NoKVArtifactRepository(
@@ -102,15 +102,32 @@ class NoKVArtifactRepositoryTest(unittest.TestCase):
             local_file = workspace_path / "model.bin"
             local_file.write_bytes(b"weights")
             repo.log_artifact(str(local_file), "models/latest")
+            nested_file = workspace_path / "metadata.txt"
+            nested_file.write_text("metadata", encoding="utf-8")
+            repo.log_artifact(str(nested_file), "models/latest/nested")
 
-            with self.assertRaises(MlflowException) as raised:
-                repo.delete_artifacts("models/latest")
+            repo.delete_artifacts("models/latest")
 
-            self.assertIn("rmdir primitive", str(raised.exception))
-            self.assertEqual(
-                [(entry.path, entry.is_dir) for entry in repo.list_artifacts("models/latest")],
-                [("models/latest/model.bin", False)],
+            self.assertEqual(repo.list_artifacts("models/latest"), [])
+            self.assertEqual(repo.list_artifacts("models"), [])
+
+    def test_delete_root_clears_children(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            workspace_path = Path(workspace)
+            repo = NoKVArtifactRepository(
+                "nokv://tenant/run",
+                store=LocalArtifactStore(workspace_path / "store"),
             )
+            first = workspace_path / "first.txt"
+            first.write_text("first", encoding="utf-8")
+            second = workspace_path / "second.txt"
+            second.write_text("second", encoding="utf-8")
+            repo.log_artifact(str(first), "root")
+            repo.log_artifact(str(second), "root/nested")
+
+            repo.delete_artifacts()
+
+            self.assertEqual(repo.list_artifacts(), [])
 
     def test_nokv_file_uri_uses_local_development_store(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

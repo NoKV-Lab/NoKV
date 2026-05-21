@@ -114,20 +114,34 @@ class NoKVArtifactRepository(ArtifactRepository):
     def delete_artifacts(self, artifact_path: str | None = None) -> None:
         normalized = _normalize_for_mlflow(artifact_path, allow_empty=True)
         if normalized == "":
-            if self.list_artifacts(None):
-                raise _directory_delete_unsupported(normalized)
+            for entry in self.list_artifacts(None):
+                self.delete_artifacts(entry.path)
             return
 
         listing = self.list_artifacts(normalized)
         if listing:
-            raise _directory_delete_unsupported(normalized)
+            for entry in listing:
+                self.delete_artifacts(entry.path)
+            try:
+                self._store.delete_directory(normalized)
+            except ArtifactNotFound:
+                return
+            except ValueError as exc:
+                raise _invalid_parameter(str(exc)) from exc
+            return
 
         try:
             self._store.delete_file(normalized)
-        except ArtifactNotFound as exc:
-            raise _not_found(normalized) from exc
+        except ArtifactNotFound:
+            return
         except ArtifactIsDirectory as exc:
-            raise _directory_delete_unsupported(normalized) from exc
+            try:
+                self._store.delete_directory(normalized)
+            except ArtifactNotFound:
+                return
+            except ValueError as directory_exc:
+                raise _invalid_parameter(str(directory_exc)) from directory_exc
+            return
         except ValueError as exc:
             raise _invalid_parameter(str(exc)) from exc
 
@@ -226,15 +240,6 @@ def _not_found(path: str) -> MlflowException:
 
 def _invalid_parameter(message: str) -> MlflowException:
     return MlflowException(message, error_code=INVALID_PARAMETER_VALUE)
-
-
-def _directory_delete_unsupported(path: str) -> MlflowException:
-    display_path = path or "<root>"
-    return MlflowException(
-        f"NoKV artifact directory delete is not supported yet: '{display_path}'. "
-        "The fsmeta rmdir primitive is required for recursive MLflow deletes.",
-        error_code=INVALID_PARAMETER_VALUE,
-    )
 
 
 def _unlink_if_exists(path: str) -> None:

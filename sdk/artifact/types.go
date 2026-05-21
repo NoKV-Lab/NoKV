@@ -19,7 +19,8 @@ type NamespaceClient interface {
 	ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
 	Rename(context.Context, fsmeta.RenameRequest) error
 	RenameReplace(context.Context, fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error)
-	Unlink(context.Context, fsmeta.UnlinkRequest) error
+	Remove(context.Context, fsmeta.RemoveRequest) (fsmeta.RemoveResult, error)
+	RemoveDirectory(context.Context, fsmeta.RemoveDirectoryRequest) error
 }
 
 // BodyStore owns artifact bytes outside fsmeta. Implementations should return a

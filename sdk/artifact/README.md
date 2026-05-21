@@ -15,7 +15,7 @@ The SDK owns artifact namespace behavior:
 - `Get` or download a file artifact by path.
 - `List` direct children under a logical artifact directory.
 - `Stat` artifact metadata.
-- `Delete` a file artifact.
+- `Delete` a file artifact, a directory subtree, or all root children.
 
 The SDK does not embed artifact bytes in `fsmeta`. `fsmeta` stores namespace
 metadata and a compact opaque body reference. The artifact body itself belongs
@@ -38,8 +38,10 @@ The artifact SDK currently depends on this fsmeta namespace surface:
   does not exist.
 - `RenameReplace`: atomically publishes a staged file dentry at the final path,
   replacing an existing non-directory target when present.
-- `Unlink`: removes one non-directory dentry and deletes or decrements its inode
-  record according to link count.
+- `Remove`: removes one non-directory dentry and returns the removed dentry,
+  the old inode metadata, and whether that inode record was deleted.
+- `RemoveDirectory`: removes one empty directory after fsmeta verifies its
+  directory child count is zero.
 
 `RenameReplace` is the native primitive added for artifact overwrite semantics.
 It commits the namespace replacement in one KV transaction:
@@ -68,7 +70,8 @@ type NamespaceClient interface {
     ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
     Rename(context.Context, fsmeta.RenameRequest) error
     RenameReplace(context.Context, fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error)
-    Unlink(context.Context, fsmeta.UnlinkRequest) error
+    Remove(context.Context, fsmeta.RemoveRequest) (fsmeta.RemoveResult, error)
+    RemoveDirectory(context.Context, fsmeta.RemoveDirectoryRequest) error
 }
 
 type BodyStore interface {
@@ -94,9 +97,8 @@ cloud object-store strategy.
 - `LocalArtifactStore` is a local development and adapter-test store. It is not
   the production NoKV namespace client.
 - The adapter implements file upload, recursive upload, direct-child listing,
-  inherited MLflow recursive download, exact file download, and file deletion.
-- Directory delete returns a clear MLflow error until the fsmeta `rmdir`
-  primitive is available.
+  inherited MLflow recursive download, exact file download, file deletion, root
+  child deletion, and recursive directory deletion.
 
 The package registers these MLflow artifact URI schemes:
 
@@ -134,14 +136,13 @@ to the NoKV-backed `ArtifactRepository` implementation.
 
 Known gaps at the bottom of the stack:
 
-- Recursive directory delete is not available in this SDK path yet. `rmdir` is
-  being developed separately. Until then, `delete_artifacts` can safely support
-  file deletion only, or return a clear unsupported error for directories.
 - Body garbage collection is not complete. `RenameReplace` returns
   `OldInodeDeleted`, `OldDentry`, and `OldInode`, which is enough to identify
-  when an overwritten artifact body may be eligible for cleanup. The SDK should
-  not eagerly delete old body data until the body store has a safe ownership or
-  reference-counting rule.
+  when an overwritten artifact body may be eligible for cleanup. `Remove`
+  returns `RemovedDentry`, `OldInode`, and `InodeDeleted`, which is enough to
+  identify when a deleted artifact inode no longer references a body. The SDK
+  should not eagerly delete old body data until the body store has a safe
+  ownership or reference-counting rule.
 - The production Python `ArtifactStore` binding is still missing. The adapter
   is now in place, but the default `nokv` scheme must be wired to a real Python
   NoKV/fsmeta client before it can serve production traffic without injection.
@@ -168,7 +169,10 @@ fsmeta runtime. Required coverage includes:
 - hard-link destination replacement decrements the old inode link count instead
   of deleting the shared inode;
 - MLflow-compatible list behavior for files and directories;
-- local download writes through a temporary file before final rename.
+- local download writes through a temporary file before final rename;
+- recursive directory delete through `Remove` plus bottom-up `RemoveDirectory`;
+- no eager body deletion when two artifacts share the same content-addressed
+  body.
 
 The fsmeta primitive tests live under `fsmeta/runtime/local`. SDK behavior tests
 live under `sdk/artifact`. The Python MLflow adapter tests live under
