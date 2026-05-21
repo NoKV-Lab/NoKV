@@ -376,14 +376,12 @@ func runConcurrentFSOps(t *testing.T, count int, fn func(int) error) {
 	start := make(chan struct{})
 	errs := make(chan error, count)
 	for i := range count {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			if err := fn(i); err != nil {
 				errs <- err
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
