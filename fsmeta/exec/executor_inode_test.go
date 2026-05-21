@@ -68,8 +68,9 @@ func TestExecutorUpdateInodeSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 
 func TestExecutorUpdateInodeVisibleCommitReadsCreateOverlay(t *testing.T) {
 	runner := newFakeRunner()
+	seedDirectory(t, runner, "vol", 7)
 	committer := newTestVisibleCommitter(t, runner)
-	inode := testInodeForParentBucket(t, 7)
+	inode := testInodeForParentBucket(t, 7, 7)
 	executor, err := newTestExecutor(
 		runner,
 		WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{inode}}),

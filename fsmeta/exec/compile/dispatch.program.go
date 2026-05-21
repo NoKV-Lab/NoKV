@@ -27,6 +27,10 @@ func compileAOTDelta(delta SemanticDelta) (CompiledOp, error) {
 		return compileLinkCompiledOp(delta)
 	case fsmeta.OperationUnlink:
 		return compileUnlinkCompiledOp(delta)
+	case fsmeta.OperationRemove:
+		return compileRemoveCompiledOp(delta)
+	case fsmeta.OperationRemoveDirectory:
+		return compileRemoveDirectoryCompiledOp(delta)
 	case fsmeta.OperationOpenWriteSession:
 		return compileOpenWriteSessionCompiledOp(delta)
 	case fsmeta.OperationHeartbeatSession:

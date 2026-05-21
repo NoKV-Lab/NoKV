@@ -95,10 +95,32 @@ func (e versionedTxnError) KeyErrors() []*kvrpcpb.KeyError {
 }
 
 func newVersionedRunner() *versionedRunner {
-	return &versionedRunner{
+	runner := &versionedRunner{
 		nextTS: 1,
 		data:   make(map[string][]versionedValue),
 	}
+	seedVersionedInode(runner, fsmeta.InodeRecord{
+		Inode:     fsmeta.RootInode,
+		Type:      fsmeta.InodeTypeDirectory,
+		Mode:      0o755,
+		LinkCount: 1,
+	}, 0)
+	return runner
+}
+
+func seedVersionedInode(runner *versionedRunner, record fsmeta.InodeRecord, version uint64) {
+	key, err := fsmeta.EncodeInodeKey(contractMountIdentity, record.Inode)
+	if err != nil {
+		panic(err)
+	}
+	value, err := fsmeta.EncodeInodeValue(record)
+	if err != nil {
+		panic(err)
+	}
+	runner.data[string(key)] = append(runner.data[string(key)], versionedValue{
+		version: version,
+		value:   value,
+	})
 }
 
 func (r *versionedRunner) ReserveTimestamp(_ context.Context, count uint64) (uint64, error) {

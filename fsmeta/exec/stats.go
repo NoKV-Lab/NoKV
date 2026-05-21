@@ -258,6 +258,7 @@ var atomicOnePhaseKinds = [...]fsmeta.OperationKind{
 	fsmeta.OperationRename,
 	fsmeta.OperationLink,
 	fsmeta.OperationUnlink,
+	fsmeta.OperationRemove,
 	fsmeta.OperationOpenWriteSession,
 	fsmeta.OperationHeartbeatSession,
 	fsmeta.OperationCloseSession,

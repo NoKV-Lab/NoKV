@@ -11,15 +11,15 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta"
 )
 
-type UnlinkProgram struct {
+type RemoveProgram struct {
 	Compiled CompiledOp
 }
 
-func CompileUnlinkProgram(req fsmeta.UnlinkRequest, mount fsmeta.MountIdentity, opts ...Option) (UnlinkProgram, error) {
+func CompileRemoveProgram(req fsmeta.RemoveRequest, mount fsmeta.MountIdentity, opts ...Option) (RemoveProgram, error) {
 	options := collectOptions(opts...)
-	plan, err := fsmeta.PlanUnlink(req, mount)
+	plan, err := fsmeta.PlanRemove(req, mount)
 	if err != nil {
-		return UnlinkProgram{}, err
+		return RemoveProgram{}, err
 	}
 	plan = canonicalPlan(plan)
 	predicates := []Predicate{
@@ -33,18 +33,18 @@ func CompileUnlinkProgram(req fsmeta.UnlinkRequest, mount fsmeta.MountIdentity, 
 	}
 	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.Parent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	delta = applyQuotaPolicy(delta, options, GuardQuotaCredit)
-	if !validateUnlinkSemanticDelta(delta) {
-		return UnlinkProgram{}, fsmeta.ErrInvalidRequest
+	if !validateRemoveSemanticDelta(delta) {
+		return RemoveProgram{}, fsmeta.ErrInvalidRequest
 	}
-	compiled, err := compileUnlinkCompiledOp(delta)
+	compiled, err := compileRemoveCompiledOp(delta)
 	if err != nil {
-		return UnlinkProgram{}, err
+		return RemoveProgram{}, err
 	}
-	return UnlinkProgram{Compiled: compiled}, nil
+	return RemoveProgram{Compiled: compiled}, nil
 }
 
-func validateUnlinkSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationUnlink {
+func validateRemoveSemanticDelta(delta SemanticDelta) bool {
+	if delta.Kind != fsmeta.OperationRemove {
 		return false
 	}
 	switch {
@@ -120,8 +120,8 @@ func validateUnlinkSemanticDelta(delta SemanticDelta) bool {
 	return true
 }
 
-func compileUnlinkCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationUnlink || len(delta.WriteEffects) != 3 {
+func compileRemoveCompiledOp(delta SemanticDelta) (CompiledOp, error) {
+	if delta.Kind != fsmeta.OperationRemove || len(delta.WriteEffects) != 3 {
 		return CompiledOp{}, fsmeta.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)

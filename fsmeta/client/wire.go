@@ -183,6 +183,22 @@ func unlinkRequestToProto(req fsmeta.UnlinkRequest) *fsmetapb.UnlinkRequest {
 	}
 }
 
+func removeRequestToProto(req fsmeta.RemoveRequest) *fsmetapb.RemoveRequest {
+	return &fsmetapb.RemoveRequest{
+		Mount:  string(req.Mount),
+		Parent: uint64(req.Parent),
+		Name:   req.Name,
+	}
+}
+
+func removeDirectoryRequestToProto(req fsmeta.RemoveDirectoryRequest) *fsmetapb.RemoveDirectoryRequest {
+	return &fsmetapb.RemoveDirectoryRequest{
+		Mount:  string(req.Mount),
+		Parent: uint64(req.Parent),
+		Name:   req.Name,
+	}
+}
+
 func openWriteSessionRequestToProto(req fsmeta.OpenWriteSessionRequest) *fsmetapb.OpenWriteSessionRequest {
 	return &fsmetapb.OpenWriteSessionRequest{
 		Mount:   string(req.Mount),
@@ -238,6 +254,7 @@ func inodeFromProto(pb *fsmetapb.InodeRecord) fsmeta.InodeRecord {
 		Size:          pb.GetSize(),
 		Mode:          pb.GetMode(),
 		LinkCount:     pb.GetLinkCount(),
+		ChildCount:    pb.GetChildCount(),
 		CreatedUnixNs: pb.GetCreatedUnixNs(),
 		UpdatedUnixNs: pb.GetUpdatedUnixNs(),
 		OpaqueAttrs:   append([]byte(nil), pb.GetOpaqueAttrs()...),

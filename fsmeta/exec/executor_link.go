@@ -46,6 +46,14 @@ func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgr
 	if inode.LinkCount == 0 {
 		inode.LinkCount = 1
 	}
+	parent, err := readVisibleDirectoryInode(view, mount, req.ToParent)
+	if err != nil {
+		return false, err
+	}
+	parent, err = incrementDirectoryChildCount(parent)
+	if err != nil {
+		return false, err
+	}
 	quotaOK, err := e.visibleQuotaAllowsCommit(ctx, []QuotaChange{{
 		Mount:      req.Mount,
 		MountKeyID: mount.MountKeyID,
@@ -77,9 +85,14 @@ func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgr
 	if err != nil {
 		return false, err
 	}
+	parentValue, err := fsmeta.EncodeInodeValue(parent)
+	if err != nil {
+		return false, err
+	}
 	concrete, err := view.materializeVisibleCompiledOp(compiled, []compile.WriteEffect{
 		visiblePutEffect(plan.ReadKeys[1], dentryValue),
 		visiblePutEffect(inodeKey, inodeValue),
+		visiblePutEffect(plan.MutateKeys[1], parentValue),
 	})
 	if err != nil {
 		return false, err
@@ -146,6 +159,18 @@ func (e *Executor) Link(ctx context.Context, req fsmeta.LinkRequest) error {
 		if inode.LinkCount == 0 {
 			inode.LinkCount = 1
 		}
+		parent, err := e.readDirectoryInode(ctx, mount, req.ToParent, startVersion)
+		if err != nil {
+			return err
+		}
+		nextParent, err := incrementDirectoryChildCount(parent.record)
+		if err != nil {
+			return err
+		}
+		parentValue, err := fsmeta.EncodeInodeValue(nextParent)
+		if err != nil {
+			return err
+		}
 		oldInodeValue, err := fsmeta.EncodeInodeValue(inode)
 		if err != nil {
 			return err
@@ -181,6 +206,11 @@ func (e *Executor) Link(ctx context.Context, req fsmeta.LinkRequest) error {
 				Key:   inodeKey,
 				Value: inodeValue,
 			},
+			{
+				Op:    kvrpcpb.Mutation_Put,
+				Key:   cloneBytes(plan.MutateKeys[1]),
+				Value: parentValue,
+			},
 		}
 		quotaMutations, err := e.reserveQuota(ctx, []QuotaChange{{
 			Mount:      req.Mount,
@@ -202,6 +232,7 @@ func (e *Executor) Link(ctx context.Context, req fsmeta.LinkRequest) error {
 				atomicValueEquals(plan.ReadKeys[0], sourceDentryValue),
 				atomicNotExists(plan.ReadKeys[1]),
 				atomicValueEquals(inodeKey, oldInodeValue),
+				atomicValueEquals(parent.key, parent.value),
 			}
 			return e.mutateWithAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, predicates, mutations, startVersion, commitVersion)
 		}

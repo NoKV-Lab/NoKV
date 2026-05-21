@@ -34,6 +34,8 @@ type fakeExecutor struct {
 	renameSubtreeReq fsmeta.RenameSubtreeRequest
 	linkReq          fsmeta.LinkRequest
 	unlinkReq        fsmeta.UnlinkRequest
+	removeReq        fsmeta.RemoveRequest
+	removeDirReq     fsmeta.RemoveDirectoryRequest
 	openReq          fsmeta.OpenWriteSessionRequest
 	heartbeatReq     fsmeta.HeartbeatWriteSessionRequest
 	closeReq         fsmeta.CloseWriteSessionRequest
@@ -190,6 +192,16 @@ func (e *fakeExecutor) Link(_ context.Context, req fsmeta.LinkRequest) error {
 
 func (e *fakeExecutor) Unlink(_ context.Context, req fsmeta.UnlinkRequest) error {
 	e.unlinkReq = req
+	return e.err
+}
+
+func (e *fakeExecutor) Remove(_ context.Context, req fsmeta.RemoveRequest) error {
+	e.removeReq = req
+	return e.err
+}
+
+func (e *fakeExecutor) RemoveDirectory(_ context.Context, req fsmeta.RemoveDirectoryRequest) error {
+	e.removeDirReq = req
 	return e.err
 }
 
@@ -369,6 +381,18 @@ func TestGRPCServiceReadDirAndMutationRPCs(t *testing.T) {
 		Parent: 2,
 		Name:   "alias",
 	}, executor.unlinkReq)
+
+	_, err = client.Remove(context.Background(), &fsmetapb.RemoveRequest{
+		Mount:  "vol",
+		Parent: 2,
+		Name:   "alias",
+	})
+	require.NoError(t, err)
+	require.Equal(t, fsmeta.RemoveRequest{
+		Mount:  "vol",
+		Parent: 2,
+		Name:   "alias",
+	}, executor.removeReq)
 
 	updateResp, err := client.UpdateInode(context.Background(), &fsmetapb.UpdateInodeRequest{
 		Mount:            "vol",

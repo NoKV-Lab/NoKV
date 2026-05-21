@@ -38,6 +38,8 @@ The current v1 API is defined by `pb/fsmeta/fsmeta.proto`. `fsmeta/server` expos
 | `RenameSubtree` | Atomically move the root dentry of a subtree; descendants follow naturally via inode references. |
 | `Link` | Create a second dentry for an existing non-directory inode and increment link count in the same transaction. |
 | `Unlink` | Delete a dentry; decrement link count and delete the inode record when the last link is removed. |
+| `Remove` | Product-facing remove primitive for one non-directory namespace entry; it shares `Unlink`'s link-count semantics. |
+| `RemoveDirectory` | Delete one empty directory dentry; atomically checks the target inode is a directory and has no children. |
 | `OpenWriteSession` / `HeartbeatWriteSession` / `CloseWriteSession` / `ExpireWriteSessions` | Maintain exclusive writer leases for file inodes with a session-id key plus an inode-owner key. Expiry cleanup uses server time and is bounded/repeatable. |
 
 Expired writer sessions are reclaimed by a bounded background pass. Set the
@@ -169,7 +171,7 @@ retry without losing prepared external state. NoKV still does not parse or write
 the object body; callers can store compact body references in
 `InodeRecord.opaque_attrs`.
 
-### Link / Unlink
+### Link / Unlink / Remove / RemoveDirectory
 
 `Link` is allowed only for non-directory inodes. It creates a new dentry and increments `InodeRecord.LinkCount` in the same transaction.
 
@@ -178,7 +180,17 @@ the object body; callers can store compact body references in
 - link count > 1: decrement and write back the inode;
 - link count ≤ 1: delete the inode record.
 
-Hard links to directories remain illegal.
+`Remove` exposes the same single-entry delete semantics under the product-facing
+name used by workspace clients. It is deliberately non-directory.
+
+`RemoveDirectory` is the directory counterpart for empty directories. It removes
+the directory dentry only when the target inode is a directory and its
+`ChildCount` is zero in the same transaction. This is intentionally narrower
+than recursive subtree deletion: callers can safely implement recursive cleanup
+above it today, while a future `DeleteSubtree` can return removed body refs for
+GC without weakening the empty-directory contract.
+
+Hard links and removes of directories remain illegal.
 
 `UpdateInode` is deliberately narrower than POSIX `setattr`. It does not change
 inode identity, type, creation time, or link count. Because v1 has no reverse

@@ -44,12 +44,12 @@ func TestAdmissionLatchesSerializeOverlappingKeys(t *testing.T) {
 
 func TestAdmissionLatchesAllowDisjointKeys(t *testing.T) {
 	latches := NewAdmissionLatches()
-	release := latches.Lock(opWithValueWrites("dentry/a", "inode=7"))
+	release := latches.Lock(testGeneratedCreateOpForInodes(t, 9, 20, "a"))
 	defer release()
 
 	done := make(chan struct{})
 	go func() {
-		unlock := latches.Lock(opWithValueWrites("dentry/b", "inode=8"))
+		unlock := latches.Lock(testGeneratedCreateOpForInodes(t, 10, 21, "b"))
 		unlock()
 		close(done)
 	}()

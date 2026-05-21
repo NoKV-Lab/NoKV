@@ -17,6 +17,7 @@ const (
 	RuleGuardSingleLinkInode     RuleID = "guard.single_link_inode"
 	RuleGuardSameAuthority       RuleID = "guard.same_authority"
 	RuleGuardNonDirectoryInode   RuleID = "guard.non_directory_inode"
+	RuleGuardEmptyDirectory      RuleID = "guard.empty_directory"
 	RuleGuardLiveSession         RuleID = "guard.live_session"
 	RuleGuardExpiredSessionOwner RuleID = "guard.expired_session_owner"
 	RuleGuardQuotaCredit         RuleID = "guard.quota_credit"

@@ -167,11 +167,12 @@ func TestExecutorCreateVisibleCommitRequiresAuthorityAdmission(t *testing.T) {
 
 	stats := executor.Stats()
 	requireVisibleCommitStatUint(t, stats, "attempt_total", 0)
-	requireVisibleCommitStatUint(t, stats, "skip_no_authority_total", 1)
+	requireVisibleCommitStatUint(t, stats, "skip_no_authority_total", 0)
 }
 
 func TestExecutorCreateVisibleCommitSkipsSharedQuota(t *testing.T) {
 	runner := newFakeRunner()
+	seedDirectory(t, runner, "vol", 7)
 	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
 	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
@@ -196,7 +197,7 @@ func TestExecutorCreateVisibleCommitSkipsSharedQuota(t *testing.T) {
 	require.Zero(t, committer.calls, "shared quota must remain on the transaction runner until quota credits exist")
 	require.Equal(t, [][]QuotaChange{{{Mount: "vol", MountKeyID: 1, Scope: 7, Bytes: 4096, Inodes: 1}}}, quota.changes)
 	require.Len(t, runner.mutations, 1)
-	require.Len(t, runner.mutations[0], 3)
+	require.Len(t, runner.mutations[0], 4)
 
 	stats := executor.Stats()
 	requireVisibleCommitStatUint(t, stats, "attempt_total", 0)
@@ -205,9 +206,10 @@ func TestExecutorCreateVisibleCommitSkipsSharedQuota(t *testing.T) {
 
 func TestExecutorCreateVisibleCommitAllowsQuotaResolverWithoutFence(t *testing.T) {
 	runner := newFakeRunner()
+	seedDirectory(t, runner, "vol", 7)
 	quota := &fakeQuotaResolver{allowVisibleCommit: true}
 	committer := &fakeVisibleCommitter{}
-	inode := testInodeForParentBucket(t, 7)
+	inode := testInodeForParentBucket(t, 7, 7)
 	executor, err := newTestExecutor(
 		runner,
 		WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{inode}}),
@@ -415,14 +417,16 @@ func TestExecutorCreateUsesAtomicMutateOnePhaseWhenHandled(t *testing.T) {
 	require.Equal(t, plan.PrimaryKey, call.primary)
 	require.Equal(t, uint64(1), call.startVersion)
 	require.Equal(t, uint64(2), call.commitVersion)
-	require.Len(t, call.predicates, 2)
-	require.Equal(t, plan.MutateKeys[0], call.predicates[0].GetKey())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS, call.predicates[0].GetKind())
+	require.Len(t, call.predicates, 3)
+	require.Equal(t, plan.ReadKeys[0], call.predicates[0].GetKey())
+	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, call.predicates[0].GetKind())
 	require.Equal(t, plan.MutateKeys[1], call.predicates[1].GetKey())
 	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS, call.predicates[1].GetKind())
-	require.Len(t, call.mutations, 2)
-	require.True(t, call.mutations[0].GetAssertionNotExist())
+	require.Equal(t, plan.MutateKeys[2], call.predicates[2].GetKey())
+	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS, call.predicates[2].GetKind())
+	require.Len(t, call.mutations, 3)
 	require.True(t, call.mutations[1].GetAssertionNotExist())
+	require.True(t, call.mutations[2].GetAssertionNotExist())
 	require.Empty(t, base.mutations)
 
 	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{
@@ -479,7 +483,7 @@ func TestExecutorCreateFallsBackWhenAtomicMutateNotHandled(t *testing.T) {
 	requireAtomicStatUint(t, stats, fsmeta.OperationCreate, "skip_total", 0)
 	requireAtomicStatUint(t, stats, fsmeta.OperationCreate, "runner_unsupported_total", 0)
 	require.Len(t, base.mutations, 1)
-	require.Len(t, base.mutations[0], 2)
+	require.Len(t, base.mutations[0], 3)
 }
 
 func TestExecutorCreateRecordsUnsupportedAtomicRunner(t *testing.T) {
@@ -507,6 +511,7 @@ func TestExecutorCreateRecordsUnsupportedAtomicRunner(t *testing.T) {
 
 func TestExecutorCreateSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	base := newFakeRunner()
+	seedDirectory(t, base, "vol", 7)
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 0)
 	require.NoError(t, err)
@@ -522,7 +527,7 @@ func TestExecutorCreateSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Quota reservation adds a third key, so Create must use the full 2PC
+	// Quota reservation adds an extra key, so Create must use the full 2PC
 	// path until AtomicMutate can prove all fsmeta and quota keys share one
 	// atomic local apply group.
 	stats := executor.Stats()
@@ -534,8 +539,8 @@ func TestExecutorCreateSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	requireAtomicStatUint(t, stats, fsmeta.OperationCreate, "runner_unsupported_total", 0)
 	require.Empty(t, runner.atomicCalls)
 	require.Len(t, base.mutations, 1)
-	require.Len(t, base.mutations[0], 3)
-	require.Equal(t, quotaKey, base.mutations[0][2].GetKey())
+	require.Len(t, base.mutations[0], 4)
+	require.Equal(t, quotaKey, base.mutations[0][3].GetKey())
 }
 
 func TestExecutorCreateRejectsExistingDentry(t *testing.T) {
@@ -550,7 +555,7 @@ func TestExecutorCreateRejectsExistingDentry(t *testing.T) {
 	_, err = executor.Create(context.Background(), req)
 	require.ErrorIs(t, err, fsmeta.ErrExists)
 	require.Len(t, runner.mutations, 1)
-	require.Zero(t, runner.getCalls)
+	require.Equal(t, 2, runner.getCalls)
 }
 
 func TestExecutorCreateRequiresActiveMountWhenResolverConfigured(t *testing.T) {
@@ -612,6 +617,7 @@ func TestExecutorCreateRequiresActiveMountWhenResolverConfigured(t *testing.T) {
 
 func TestExecutorCreateReservesQuotaInsideMutation(t *testing.T) {
 	runner := newFakeRunner()
+	seedDirectory(t, runner, "vol", 7)
 	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 0)
 	require.NoError(t, err)
 	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
@@ -627,11 +633,12 @@ func TestExecutorCreateReservesQuotaInsideMutation(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, [][]QuotaChange{{{Mount: "vol", MountKeyID: 1, Scope: 7, Bytes: 4096, Inodes: 1}}}, quota.changes)
 	require.Len(t, runner.mutations, 1)
-	require.Equal(t, quotaKey, runner.mutations[0][2].GetKey())
+	require.Equal(t, quotaKey, runner.mutations[0][3].GetKey())
 }
 
 func TestExecutorCreateRejectsQuotaExceededBeforeMutation(t *testing.T) {
 	runner := newFakeRunner()
+	seedDirectory(t, runner, "vol", 7)
 	quota := &fakeQuotaResolver{err: fsmeta.ErrQuotaExceeded}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{22}}), WithQuotaResolver(quota))
 	require.NoError(t, err)
@@ -662,7 +669,7 @@ func TestExecutorCreateTranslatesAlreadyExistsConflict(t *testing.T) {
 		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
 	})
 	require.ErrorIs(t, err, fsmeta.ErrExists)
-	require.Zero(t, runner.getCalls)
+	require.Equal(t, 1, runner.getCalls)
 }
 
 func TestExecutorNegativeCacheInvalidatedByCreate(t *testing.T) {

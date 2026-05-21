@@ -14,6 +14,7 @@ import (
 func TestExecutorLinkCreatesDentryAndIncrementsLinkCount(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "file", 22)
+	seedDirectory(t, runner, "vol", 8)
 	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 1})
 	quota := &fakeQuotaResolver{}
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
@@ -40,8 +41,9 @@ func TestExecutorLinkCreatesDentryAndIncrementsLinkCount(t *testing.T) {
 
 func TestExecutorLinkVisibleCommitServesOverlay(t *testing.T) {
 	runner := newFakeRunner()
-	inode := testInodeForParentBucket(t, 8)
+	inode := testInodeForParentBucket(t, 8, 8)
 	seedDentry(t, runner, "vol", 7, "file", inode)
+	seedDirectory(t, runner, "vol", 8)
 	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 1})
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
@@ -75,6 +77,7 @@ func TestExecutorLinkUsesAtomicMutateWithValuePredicates(t *testing.T) {
 	base := newFakeRunner()
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedDentry(t, runner.fakeRunner, "vol", 7, "file", 22)
+	seedDirectory(t, runner.fakeRunner, "vol", 8)
 	seedInode(t, runner.fakeRunner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
@@ -103,6 +106,7 @@ func TestExecutorLinkUsesAtomicMutateWithValuePredicates(t *testing.T) {
 func TestExecutorLinkRejectsDirectory(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentryType(t, runner, "vol", 7, "dir", 22, fsmeta.InodeTypeDirectory)
+	seedDirectory(t, runner, "vol", 8)
 	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeDirectory, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)

@@ -137,6 +137,7 @@ type InodeRecord struct {
 	CreatedUnixNs int64                  `protobuf:"varint,6,opt,name=created_unix_ns,json=createdUnixNs,proto3" json:"created_unix_ns,omitempty"`
 	UpdatedUnixNs int64                  `protobuf:"varint,7,opt,name=updated_unix_ns,json=updatedUnixNs,proto3" json:"updated_unix_ns,omitempty"`
 	OpaqueAttrs   []byte                 `protobuf:"bytes,8,opt,name=opaque_attrs,json=opaqueAttrs,proto3" json:"opaque_attrs,omitempty"`
+	ChildCount    uint64                 `protobuf:"varint,9,opt,name=child_count,json=childCount,proto3" json:"child_count,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -225,6 +226,13 @@ func (x *InodeRecord) GetOpaqueAttrs() []byte {
 		return x.OpaqueAttrs
 	}
 	return nil
+}
+
+func (x *InodeRecord) GetChildCount() uint64 {
+	if x != nil {
+		return x.ChildCount
+	}
+	return 0
 }
 
 type SessionRecord struct {
@@ -2609,6 +2617,198 @@ func (*UnlinkResponse) Descriptor() ([]byte, []int) {
 	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{40}
 }
 
+type RemoveRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Mount         string                 `protobuf:"bytes,1,opt,name=mount,proto3" json:"mount,omitempty"`
+	Parent        uint64                 `protobuf:"varint,2,opt,name=parent,proto3" json:"parent,omitempty"`
+	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveRequest) Reset() {
+	*x = RemoveRequest{}
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveRequest) ProtoMessage() {}
+
+func (x *RemoveRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveRequest.ProtoReflect.Descriptor instead.
+func (*RemoveRequest) Descriptor() ([]byte, []int) {
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *RemoveRequest) GetMount() string {
+	if x != nil {
+		return x.Mount
+	}
+	return ""
+}
+
+func (x *RemoveRequest) GetParent() uint64 {
+	if x != nil {
+		return x.Parent
+	}
+	return 0
+}
+
+func (x *RemoveRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+type RemoveResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveResponse) Reset() {
+	*x = RemoveResponse{}
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveResponse) ProtoMessage() {}
+
+func (x *RemoveResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveResponse.ProtoReflect.Descriptor instead.
+func (*RemoveResponse) Descriptor() ([]byte, []int) {
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{42}
+}
+
+type RemoveDirectoryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Mount         string                 `protobuf:"bytes,1,opt,name=mount,proto3" json:"mount,omitempty"`
+	Parent        uint64                 `protobuf:"varint,2,opt,name=parent,proto3" json:"parent,omitempty"`
+	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveDirectoryRequest) Reset() {
+	*x = RemoveDirectoryRequest{}
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveDirectoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveDirectoryRequest) ProtoMessage() {}
+
+func (x *RemoveDirectoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveDirectoryRequest.ProtoReflect.Descriptor instead.
+func (*RemoveDirectoryRequest) Descriptor() ([]byte, []int) {
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{43}
+}
+
+func (x *RemoveDirectoryRequest) GetMount() string {
+	if x != nil {
+		return x.Mount
+	}
+	return ""
+}
+
+func (x *RemoveDirectoryRequest) GetParent() uint64 {
+	if x != nil {
+		return x.Parent
+	}
+	return 0
+}
+
+func (x *RemoveDirectoryRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+type RemoveDirectoryResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveDirectoryResponse) Reset() {
+	*x = RemoveDirectoryResponse{}
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveDirectoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveDirectoryResponse) ProtoMessage() {}
+
+func (x *RemoveDirectoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveDirectoryResponse.ProtoReflect.Descriptor instead.
+func (*RemoveDirectoryResponse) Descriptor() ([]byte, []int) {
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{44}
+}
+
 type OpenWriteSessionRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Mount   string                 `protobuf:"bytes,1,opt,name=mount,proto3" json:"mount,omitempty"`
@@ -2623,7 +2823,7 @@ type OpenWriteSessionRequest struct {
 
 func (x *OpenWriteSessionRequest) Reset() {
 	*x = OpenWriteSessionRequest{}
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[41]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2635,7 +2835,7 @@ func (x *OpenWriteSessionRequest) String() string {
 func (*OpenWriteSessionRequest) ProtoMessage() {}
 
 func (x *OpenWriteSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[41]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2648,7 +2848,7 @@ func (x *OpenWriteSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OpenWriteSessionRequest.ProtoReflect.Descriptor instead.
 func (*OpenWriteSessionRequest) Descriptor() ([]byte, []int) {
-	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{41}
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *OpenWriteSessionRequest) GetMount() string {
@@ -2688,7 +2888,7 @@ type OpenWriteSessionResponse struct {
 
 func (x *OpenWriteSessionResponse) Reset() {
 	*x = OpenWriteSessionResponse{}
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[42]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2700,7 +2900,7 @@ func (x *OpenWriteSessionResponse) String() string {
 func (*OpenWriteSessionResponse) ProtoMessage() {}
 
 func (x *OpenWriteSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[42]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2713,7 +2913,7 @@ func (x *OpenWriteSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OpenWriteSessionResponse.ProtoReflect.Descriptor instead.
 func (*OpenWriteSessionResponse) Descriptor() ([]byte, []int) {
-	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{42}
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *OpenWriteSessionResponse) GetSession() *SessionRecord {
@@ -2737,7 +2937,7 @@ type HeartbeatWriteSessionRequest struct {
 
 func (x *HeartbeatWriteSessionRequest) Reset() {
 	*x = HeartbeatWriteSessionRequest{}
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[43]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2749,7 +2949,7 @@ func (x *HeartbeatWriteSessionRequest) String() string {
 func (*HeartbeatWriteSessionRequest) ProtoMessage() {}
 
 func (x *HeartbeatWriteSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[43]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2762,7 +2962,7 @@ func (x *HeartbeatWriteSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatWriteSessionRequest.ProtoReflect.Descriptor instead.
 func (*HeartbeatWriteSessionRequest) Descriptor() ([]byte, []int) {
-	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{43}
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *HeartbeatWriteSessionRequest) GetMount() string {
@@ -2802,7 +3002,7 @@ type HeartbeatWriteSessionResponse struct {
 
 func (x *HeartbeatWriteSessionResponse) Reset() {
 	*x = HeartbeatWriteSessionResponse{}
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[44]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2814,7 +3014,7 @@ func (x *HeartbeatWriteSessionResponse) String() string {
 func (*HeartbeatWriteSessionResponse) ProtoMessage() {}
 
 func (x *HeartbeatWriteSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[44]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2827,7 +3027,7 @@ func (x *HeartbeatWriteSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatWriteSessionResponse.ProtoReflect.Descriptor instead.
 func (*HeartbeatWriteSessionResponse) Descriptor() ([]byte, []int) {
-	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{44}
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *HeartbeatWriteSessionResponse) GetSession() *SessionRecord {
@@ -2848,7 +3048,7 @@ type CloseWriteSessionRequest struct {
 
 func (x *CloseWriteSessionRequest) Reset() {
 	*x = CloseWriteSessionRequest{}
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[45]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2860,7 +3060,7 @@ func (x *CloseWriteSessionRequest) String() string {
 func (*CloseWriteSessionRequest) ProtoMessage() {}
 
 func (x *CloseWriteSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[45]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2873,7 +3073,7 @@ func (x *CloseWriteSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseWriteSessionRequest.ProtoReflect.Descriptor instead.
 func (*CloseWriteSessionRequest) Descriptor() ([]byte, []int) {
-	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{45}
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *CloseWriteSessionRequest) GetMount() string {
@@ -2905,7 +3105,7 @@ type CloseWriteSessionResponse struct {
 
 func (x *CloseWriteSessionResponse) Reset() {
 	*x = CloseWriteSessionResponse{}
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[46]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2917,7 +3117,7 @@ func (x *CloseWriteSessionResponse) String() string {
 func (*CloseWriteSessionResponse) ProtoMessage() {}
 
 func (x *CloseWriteSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[46]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2930,7 +3130,7 @@ func (x *CloseWriteSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseWriteSessionResponse.ProtoReflect.Descriptor instead.
 func (*CloseWriteSessionResponse) Descriptor() ([]byte, []int) {
-	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{46}
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{50}
 }
 
 type ExpireWriteSessionsRequest struct {
@@ -2943,7 +3143,7 @@ type ExpireWriteSessionsRequest struct {
 
 func (x *ExpireWriteSessionsRequest) Reset() {
 	*x = ExpireWriteSessionsRequest{}
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[47]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2955,7 +3155,7 @@ func (x *ExpireWriteSessionsRequest) String() string {
 func (*ExpireWriteSessionsRequest) ProtoMessage() {}
 
 func (x *ExpireWriteSessionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[47]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2968,7 +3168,7 @@ func (x *ExpireWriteSessionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExpireWriteSessionsRequest.ProtoReflect.Descriptor instead.
 func (*ExpireWriteSessionsRequest) Descriptor() ([]byte, []int) {
-	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{47}
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *ExpireWriteSessionsRequest) GetMount() string {
@@ -2994,7 +3194,7 @@ type ExpireWriteSessionsResponse struct {
 
 func (x *ExpireWriteSessionsResponse) Reset() {
 	*x = ExpireWriteSessionsResponse{}
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[48]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3006,7 +3206,7 @@ func (x *ExpireWriteSessionsResponse) String() string {
 func (*ExpireWriteSessionsResponse) ProtoMessage() {}
 
 func (x *ExpireWriteSessionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_fsmeta_fsmeta_proto_msgTypes[48]
+	mi := &file_fsmeta_fsmeta_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3019,7 +3219,7 @@ func (x *ExpireWriteSessionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExpireWriteSessionsResponse.ProtoReflect.Descriptor instead.
 func (*ExpireWriteSessionsResponse) Descriptor() ([]byte, []int) {
-	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{48}
+	return file_fsmeta_fsmeta_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *ExpireWriteSessionsResponse) GetExpired() uint64 {
@@ -3033,7 +3233,7 @@ var File_fsmeta_fsmeta_proto protoreflect.FileDescriptor
 
 const file_fsmeta_fsmeta_proto_rawDesc = "" +
 	"\n" +
-	"\x13fsmeta/fsmeta.proto\x12\x0enokv.fsmeta.v1\"\x8c\x02\n" +
+	"\x13fsmeta/fsmeta.proto\x12\x0enokv.fsmeta.v1\"\xad\x02\n" +
 	"\vInodeRecord\x12\x14\n" +
 	"\x05inode\x18\x01 \x01(\x04R\x05inode\x12-\n" +
 	"\x04type\x18\x02 \x01(\x0e2\x19.nokv.fsmeta.v1.InodeTypeR\x04type\x12\x12\n" +
@@ -3043,7 +3243,9 @@ const file_fsmeta_fsmeta_proto_rawDesc = "" +
 	"link_count\x18\x05 \x01(\rR\tlinkCount\x12&\n" +
 	"\x0fcreated_unix_ns\x18\x06 \x01(\x03R\rcreatedUnixNs\x12&\n" +
 	"\x0fupdated_unix_ns\x18\a \x01(\x03R\rupdatedUnixNs\x12!\n" +
-	"\fopaque_attrs\x18\b \x01(\fR\vopaqueAttrs\"g\n" +
+	"\fopaque_attrs\x18\b \x01(\fR\vopaqueAttrs\x12\x1f\n" +
+	"\vchild_count\x18\t \x01(\x04R\n" +
+	"childCount\"g\n" +
 	"\rSessionRecord\x12\x18\n" +
 	"\asession\x18\x01 \x01(\tR\asession\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12&\n" +
@@ -3206,7 +3408,17 @@ const file_fsmeta_fsmeta_proto_rawDesc = "" +
 	"\x05mount\x18\x01 \x01(\tR\x05mount\x12\x16\n" +
 	"\x06parent\x18\x02 \x01(\x04R\x06parent\x12\x12\n" +
 	"\x04name\x18\x03 \x01(\tR\x04name\"\x10\n" +
-	"\x0eUnlinkResponse\"v\n" +
+	"\x0eUnlinkResponse\"Q\n" +
+	"\rRemoveRequest\x12\x14\n" +
+	"\x05mount\x18\x01 \x01(\tR\x05mount\x12\x16\n" +
+	"\x06parent\x18\x02 \x01(\x04R\x06parent\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\"\x10\n" +
+	"\x0eRemoveResponse\"Z\n" +
+	"\x16RemoveDirectoryRequest\x12\x14\n" +
+	"\x05mount\x18\x01 \x01(\tR\x05mount\x12\x16\n" +
+	"\x06parent\x18\x02 \x01(\x04R\x06parent\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\"\x19\n" +
+	"\x17RemoveDirectoryResponse\"v\n" +
 	"\x17OpenWriteSessionRequest\x12\x14\n" +
 	"\x05mount\x18\x01 \x01(\tR\x05mount\x12\x14\n" +
 	"\x05inode\x18\x02 \x01(\x04R\x05inode\x12\x18\n" +
@@ -3239,7 +3451,7 @@ const file_fsmeta_fsmeta_proto_rawDesc = "" +
 	"\x1eWATCH_EVENT_SOURCE_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19WATCH_EVENT_SOURCE_COMMIT\x10\x01\x12#\n" +
 	"\x1fWATCH_EVENT_SOURCE_RESOLVE_LOCK\x10\x02\x12&\n" +
-	"\"WATCH_EVENT_SOURCE_RUNTIME_VISIBLE\x10\x032\xc3\r\n" +
+	"\"WATCH_EVENT_SOURCE_RUNTIME_VISIBLE\x10\x032\xf0\x0e\n" +
 	"\n" +
 	"FSMetadata\x12G\n" +
 	"\x06Create\x12\x1d.nokv.fsmeta.v1.CreateRequest\x1a\x1e.nokv.fsmeta.v1.CreateResponse\x12V\n" +
@@ -3257,7 +3469,9 @@ const file_fsmeta_fsmeta_proto_rawDesc = "" +
 	"\x06Rename\x12\x1d.nokv.fsmeta.v1.RenameRequest\x1a\x1e.nokv.fsmeta.v1.RenameResponse\x12\\\n" +
 	"\rRenameSubtree\x12$.nokv.fsmeta.v1.RenameSubtreeRequest\x1a%.nokv.fsmeta.v1.RenameSubtreeResponse\x12A\n" +
 	"\x04Link\x12\x1b.nokv.fsmeta.v1.LinkRequest\x1a\x1c.nokv.fsmeta.v1.LinkResponse\x12G\n" +
-	"\x06Unlink\x12\x1d.nokv.fsmeta.v1.UnlinkRequest\x1a\x1e.nokv.fsmeta.v1.UnlinkResponse\x12e\n" +
+	"\x06Unlink\x12\x1d.nokv.fsmeta.v1.UnlinkRequest\x1a\x1e.nokv.fsmeta.v1.UnlinkResponse\x12G\n" +
+	"\x06Remove\x12\x1d.nokv.fsmeta.v1.RemoveRequest\x1a\x1e.nokv.fsmeta.v1.RemoveResponse\x12b\n" +
+	"\x0fRemoveDirectory\x12&.nokv.fsmeta.v1.RemoveDirectoryRequest\x1a'.nokv.fsmeta.v1.RemoveDirectoryResponse\x12e\n" +
 	"\x10OpenWriteSession\x12'.nokv.fsmeta.v1.OpenWriteSessionRequest\x1a(.nokv.fsmeta.v1.OpenWriteSessionResponse\x12t\n" +
 	"\x15HeartbeatWriteSession\x12,.nokv.fsmeta.v1.HeartbeatWriteSessionRequest\x1a-.nokv.fsmeta.v1.HeartbeatWriteSessionResponse\x12h\n" +
 	"\x11CloseWriteSession\x12(.nokv.fsmeta.v1.CloseWriteSessionRequest\x1a).nokv.fsmeta.v1.CloseWriteSessionResponse\x12n\n" +
@@ -3276,7 +3490,7 @@ func file_fsmeta_fsmeta_proto_rawDescGZIP() []byte {
 }
 
 var file_fsmeta_fsmeta_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_fsmeta_fsmeta_proto_msgTypes = make([]protoimpl.MessageInfo, 49)
+var file_fsmeta_fsmeta_proto_msgTypes = make([]protoimpl.MessageInfo, 53)
 var file_fsmeta_fsmeta_proto_goTypes = []any{
 	(InodeType)(0),                        // 0: nokv.fsmeta.v1.InodeType
 	(WatchEventSource)(0),                 // 1: nokv.fsmeta.v1.WatchEventSource
@@ -3321,14 +3535,18 @@ var file_fsmeta_fsmeta_proto_goTypes = []any{
 	(*LinkResponse)(nil),                  // 40: nokv.fsmeta.v1.LinkResponse
 	(*UnlinkRequest)(nil),                 // 41: nokv.fsmeta.v1.UnlinkRequest
 	(*UnlinkResponse)(nil),                // 42: nokv.fsmeta.v1.UnlinkResponse
-	(*OpenWriteSessionRequest)(nil),       // 43: nokv.fsmeta.v1.OpenWriteSessionRequest
-	(*OpenWriteSessionResponse)(nil),      // 44: nokv.fsmeta.v1.OpenWriteSessionResponse
-	(*HeartbeatWriteSessionRequest)(nil),  // 45: nokv.fsmeta.v1.HeartbeatWriteSessionRequest
-	(*HeartbeatWriteSessionResponse)(nil), // 46: nokv.fsmeta.v1.HeartbeatWriteSessionResponse
-	(*CloseWriteSessionRequest)(nil),      // 47: nokv.fsmeta.v1.CloseWriteSessionRequest
-	(*CloseWriteSessionResponse)(nil),     // 48: nokv.fsmeta.v1.CloseWriteSessionResponse
-	(*ExpireWriteSessionsRequest)(nil),    // 49: nokv.fsmeta.v1.ExpireWriteSessionsRequest
-	(*ExpireWriteSessionsResponse)(nil),   // 50: nokv.fsmeta.v1.ExpireWriteSessionsResponse
+	(*RemoveRequest)(nil),                 // 43: nokv.fsmeta.v1.RemoveRequest
+	(*RemoveResponse)(nil),                // 44: nokv.fsmeta.v1.RemoveResponse
+	(*RemoveDirectoryRequest)(nil),        // 45: nokv.fsmeta.v1.RemoveDirectoryRequest
+	(*RemoveDirectoryResponse)(nil),       // 46: nokv.fsmeta.v1.RemoveDirectoryResponse
+	(*OpenWriteSessionRequest)(nil),       // 47: nokv.fsmeta.v1.OpenWriteSessionRequest
+	(*OpenWriteSessionResponse)(nil),      // 48: nokv.fsmeta.v1.OpenWriteSessionResponse
+	(*HeartbeatWriteSessionRequest)(nil),  // 49: nokv.fsmeta.v1.HeartbeatWriteSessionRequest
+	(*HeartbeatWriteSessionResponse)(nil), // 50: nokv.fsmeta.v1.HeartbeatWriteSessionResponse
+	(*CloseWriteSessionRequest)(nil),      // 51: nokv.fsmeta.v1.CloseWriteSessionRequest
+	(*CloseWriteSessionResponse)(nil),     // 52: nokv.fsmeta.v1.CloseWriteSessionResponse
+	(*ExpireWriteSessionsRequest)(nil),    // 53: nokv.fsmeta.v1.ExpireWriteSessionsRequest
+	(*ExpireWriteSessionsResponse)(nil),   // 54: nokv.fsmeta.v1.ExpireWriteSessionsResponse
 }
 var file_fsmeta_fsmeta_proto_depIdxs = []int32{
 	0,  // 0: nokv.fsmeta.v1.InodeRecord.type:type_name -> nokv.fsmeta.v1.InodeType
@@ -3375,31 +3593,35 @@ var file_fsmeta_fsmeta_proto_depIdxs = []int32{
 	37, // 41: nokv.fsmeta.v1.FSMetadata.RenameSubtree:input_type -> nokv.fsmeta.v1.RenameSubtreeRequest
 	39, // 42: nokv.fsmeta.v1.FSMetadata.Link:input_type -> nokv.fsmeta.v1.LinkRequest
 	41, // 43: nokv.fsmeta.v1.FSMetadata.Unlink:input_type -> nokv.fsmeta.v1.UnlinkRequest
-	43, // 44: nokv.fsmeta.v1.FSMetadata.OpenWriteSession:input_type -> nokv.fsmeta.v1.OpenWriteSessionRequest
-	45, // 45: nokv.fsmeta.v1.FSMetadata.HeartbeatWriteSession:input_type -> nokv.fsmeta.v1.HeartbeatWriteSessionRequest
-	47, // 46: nokv.fsmeta.v1.FSMetadata.CloseWriteSession:input_type -> nokv.fsmeta.v1.CloseWriteSessionRequest
-	49, // 47: nokv.fsmeta.v1.FSMetadata.ExpireWriteSessions:input_type -> nokv.fsmeta.v1.ExpireWriteSessionsRequest
-	8,  // 48: nokv.fsmeta.v1.FSMetadata.Create:output_type -> nokv.fsmeta.v1.CreateResponse
-	10, // 49: nokv.fsmeta.v1.FSMetadata.UpdateInode:output_type -> nokv.fsmeta.v1.UpdateInodeResponse
-	12, // 50: nokv.fsmeta.v1.FSMetadata.Lookup:output_type -> nokv.fsmeta.v1.LookupResponse
-	13, // 51: nokv.fsmeta.v1.FSMetadata.LookupPlus:output_type -> nokv.fsmeta.v1.LookupPlusResponse
-	15, // 52: nokv.fsmeta.v1.FSMetadata.ReadDir:output_type -> nokv.fsmeta.v1.ReadDirResponse
-	16, // 53: nokv.fsmeta.v1.FSMetadata.ReadDirPlus:output_type -> nokv.fsmeta.v1.ReadDirPlusResponse
-	24, // 54: nokv.fsmeta.v1.FSMetadata.WatchSubtree:output_type -> nokv.fsmeta.v1.WatchSubtreeResponse
-	27, // 55: nokv.fsmeta.v1.FSMetadata.GetReadVersion:output_type -> nokv.fsmeta.v1.GetReadVersionResponse
-	30, // 56: nokv.fsmeta.v1.FSMetadata.SnapshotSubtree:output_type -> nokv.fsmeta.v1.SnapshotSubtreeResponse
-	32, // 57: nokv.fsmeta.v1.FSMetadata.RetireSnapshotSubtree:output_type -> nokv.fsmeta.v1.RetireSnapshotSubtreeResponse
-	34, // 58: nokv.fsmeta.v1.FSMetadata.GetQuotaUsage:output_type -> nokv.fsmeta.v1.QuotaUsageResponse
-	36, // 59: nokv.fsmeta.v1.FSMetadata.Rename:output_type -> nokv.fsmeta.v1.RenameResponse
-	38, // 60: nokv.fsmeta.v1.FSMetadata.RenameSubtree:output_type -> nokv.fsmeta.v1.RenameSubtreeResponse
-	40, // 61: nokv.fsmeta.v1.FSMetadata.Link:output_type -> nokv.fsmeta.v1.LinkResponse
-	42, // 62: nokv.fsmeta.v1.FSMetadata.Unlink:output_type -> nokv.fsmeta.v1.UnlinkResponse
-	44, // 63: nokv.fsmeta.v1.FSMetadata.OpenWriteSession:output_type -> nokv.fsmeta.v1.OpenWriteSessionResponse
-	46, // 64: nokv.fsmeta.v1.FSMetadata.HeartbeatWriteSession:output_type -> nokv.fsmeta.v1.HeartbeatWriteSessionResponse
-	48, // 65: nokv.fsmeta.v1.FSMetadata.CloseWriteSession:output_type -> nokv.fsmeta.v1.CloseWriteSessionResponse
-	50, // 66: nokv.fsmeta.v1.FSMetadata.ExpireWriteSessions:output_type -> nokv.fsmeta.v1.ExpireWriteSessionsResponse
-	48, // [48:67] is the sub-list for method output_type
-	29, // [29:48] is the sub-list for method input_type
+	43, // 44: nokv.fsmeta.v1.FSMetadata.Remove:input_type -> nokv.fsmeta.v1.RemoveRequest
+	45, // 45: nokv.fsmeta.v1.FSMetadata.RemoveDirectory:input_type -> nokv.fsmeta.v1.RemoveDirectoryRequest
+	47, // 46: nokv.fsmeta.v1.FSMetadata.OpenWriteSession:input_type -> nokv.fsmeta.v1.OpenWriteSessionRequest
+	49, // 47: nokv.fsmeta.v1.FSMetadata.HeartbeatWriteSession:input_type -> nokv.fsmeta.v1.HeartbeatWriteSessionRequest
+	51, // 48: nokv.fsmeta.v1.FSMetadata.CloseWriteSession:input_type -> nokv.fsmeta.v1.CloseWriteSessionRequest
+	53, // 49: nokv.fsmeta.v1.FSMetadata.ExpireWriteSessions:input_type -> nokv.fsmeta.v1.ExpireWriteSessionsRequest
+	8,  // 50: nokv.fsmeta.v1.FSMetadata.Create:output_type -> nokv.fsmeta.v1.CreateResponse
+	10, // 51: nokv.fsmeta.v1.FSMetadata.UpdateInode:output_type -> nokv.fsmeta.v1.UpdateInodeResponse
+	12, // 52: nokv.fsmeta.v1.FSMetadata.Lookup:output_type -> nokv.fsmeta.v1.LookupResponse
+	13, // 53: nokv.fsmeta.v1.FSMetadata.LookupPlus:output_type -> nokv.fsmeta.v1.LookupPlusResponse
+	15, // 54: nokv.fsmeta.v1.FSMetadata.ReadDir:output_type -> nokv.fsmeta.v1.ReadDirResponse
+	16, // 55: nokv.fsmeta.v1.FSMetadata.ReadDirPlus:output_type -> nokv.fsmeta.v1.ReadDirPlusResponse
+	24, // 56: nokv.fsmeta.v1.FSMetadata.WatchSubtree:output_type -> nokv.fsmeta.v1.WatchSubtreeResponse
+	27, // 57: nokv.fsmeta.v1.FSMetadata.GetReadVersion:output_type -> nokv.fsmeta.v1.GetReadVersionResponse
+	30, // 58: nokv.fsmeta.v1.FSMetadata.SnapshotSubtree:output_type -> nokv.fsmeta.v1.SnapshotSubtreeResponse
+	32, // 59: nokv.fsmeta.v1.FSMetadata.RetireSnapshotSubtree:output_type -> nokv.fsmeta.v1.RetireSnapshotSubtreeResponse
+	34, // 60: nokv.fsmeta.v1.FSMetadata.GetQuotaUsage:output_type -> nokv.fsmeta.v1.QuotaUsageResponse
+	36, // 61: nokv.fsmeta.v1.FSMetadata.Rename:output_type -> nokv.fsmeta.v1.RenameResponse
+	38, // 62: nokv.fsmeta.v1.FSMetadata.RenameSubtree:output_type -> nokv.fsmeta.v1.RenameSubtreeResponse
+	40, // 63: nokv.fsmeta.v1.FSMetadata.Link:output_type -> nokv.fsmeta.v1.LinkResponse
+	42, // 64: nokv.fsmeta.v1.FSMetadata.Unlink:output_type -> nokv.fsmeta.v1.UnlinkResponse
+	44, // 65: nokv.fsmeta.v1.FSMetadata.Remove:output_type -> nokv.fsmeta.v1.RemoveResponse
+	46, // 66: nokv.fsmeta.v1.FSMetadata.RemoveDirectory:output_type -> nokv.fsmeta.v1.RemoveDirectoryResponse
+	48, // 67: nokv.fsmeta.v1.FSMetadata.OpenWriteSession:output_type -> nokv.fsmeta.v1.OpenWriteSessionResponse
+	50, // 68: nokv.fsmeta.v1.FSMetadata.HeartbeatWriteSession:output_type -> nokv.fsmeta.v1.HeartbeatWriteSessionResponse
+	52, // 69: nokv.fsmeta.v1.FSMetadata.CloseWriteSession:output_type -> nokv.fsmeta.v1.CloseWriteSessionResponse
+	54, // 70: nokv.fsmeta.v1.FSMetadata.ExpireWriteSessions:output_type -> nokv.fsmeta.v1.ExpireWriteSessionsResponse
+	50, // [50:71] is the sub-list for method output_type
+	29, // [29:50] is the sub-list for method input_type
 	29, // [29:29] is the sub-list for extension type_name
 	29, // [29:29] is the sub-list for extension extendee
 	0,  // [0:29] is the sub-list for field type_name
@@ -3426,7 +3648,7 @@ func file_fsmeta_fsmeta_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fsmeta_fsmeta_proto_rawDesc), len(file_fsmeta_fsmeta_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   49,
+			NumMessages:   53,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -78,10 +78,10 @@ func RememberOperationFacts(known map[string]bool, emptyDirs map[string]struct{}
 		rememberDirectoryFactMutation(emptyDirs, delta.Authority, effect)
 		rememberSessionFactMutation(emptySessions, delta.Authority, effect)
 	}
-	if delta.Kind != fsmeta.OperationCreate || len(delta.Plan.MutateKeys) < 2 {
+	if delta.Kind != fsmeta.OperationCreate || len(delta.Plan.MutateKeys) < 3 {
 		return nil
 	}
-	inodeKey := delta.Plan.MutateKeys[1]
+	inodeKey := delta.Plan.MutateKeys[2]
 	for _, effect := range op.Effects {
 		if effect.Kind != compile.EffectPut || !bytes.Equal(effect.Key, inodeKey) {
 			continue

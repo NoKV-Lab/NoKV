@@ -14,32 +14,36 @@ func TestOverlayViewGetScanFactsAndRemove(t *testing.T) {
 	view := NewOverlayView()
 	dentryKey, err := fsmeta.EncodeDentryKey(testMount, 9, "a")
 	require.NoError(t, err)
+	parentKey, err := fsmeta.EncodeInodeKey(testMount, 9)
+	require.NoError(t, err)
 	inodeKey, err := fsmeta.EncodeInodeKey(testMount, 10)
 	require.NoError(t, err)
 	op := testGeneratedCreateOpForInodes(t, 9, 10, "a")
+	dentryValue := op.Effects[1].Value
 	opID := OperationID{ClientID: "c", Seq: 1}
 	require.NoError(t, view.Add(opID, op))
 
 	value, deleted, ok := view.Get(dentryKey)
 	require.True(t, ok)
 	require.False(t, deleted)
-	require.Equal(t, op.Effects[0].Value, value)
+	require.Equal(t, dentryValue, value)
 	value[0] ^= 0xff
 	viewValue, deleted, ok := view.GetView(dentryKey)
 	require.True(t, ok)
 	require.False(t, deleted)
-	require.Equal(t, op.Effects[0].Value, viewValue)
+	require.Equal(t, dentryValue, viewValue)
 	present, known := view.KeyState(dentryKey)
 	require.True(t, present)
 	require.True(t, known)
 	present, known = view.KeyState([]byte("missing"))
 	require.False(t, present)
 	require.False(t, known)
-	require.Len(t, view.Scan(nil, 8), 2)
+	require.Len(t, view.Scan(nil, 8), 3)
 
 	plan := ReplayPlan{Operations: []ReplayOperation{{
 		OpID: opID,
 		Mutations: []ReplayMutation{
+			{Key: parentKey},
 			{Key: dentryKey},
 			{Key: inodeKey},
 		},
@@ -101,6 +105,8 @@ func TestOverlaySnapshotDirectoryPinsGenerationWithoutCloningValues(t *testing.T
 	require.NoError(t, view.Add(OperationID{ClientID: "c", Seq: 1}, testGeneratedCreateOpForInodes(t, 9, 21, "a")))
 	prefix, err := fsmeta.EncodeDentryPrefix(testMount, 9)
 	require.NoError(t, err)
+	parentKey, err := fsmeta.EncodeInodeKey(testMount, 9)
+	require.NoError(t, err)
 	inodeKey, err := fsmeta.EncodeInodeKey(testMount, 21)
 	require.NoError(t, err)
 
@@ -109,6 +115,7 @@ func TestOverlaySnapshotDirectoryPinsGenerationWithoutCloningValues(t *testing.T
 	plan := ReplayPlan{Operations: []ReplayOperation{{
 		OpID: OperationID{ClientID: "c", Seq: 1},
 		Mutations: []ReplayMutation{
+			{Key: parentKey},
 			{Key: mustDentryKey(t, 9, "a")},
 			{Key: inodeKey},
 		},
@@ -132,11 +139,14 @@ func TestOverlayViewPrunesRetiredHistoryBeforeGeneration(t *testing.T) {
 	require.NoError(t, err)
 	snapshot := view.SnapshotDirectory(testMount, prefix)
 	require.NotNil(t, snapshot)
+	parentKey, err := fsmeta.EncodeInodeKey(testMount, 9)
+	require.NoError(t, err)
 	inodeKey, err := fsmeta.EncodeInodeKey(testMount, 21)
 	require.NoError(t, err)
 	plan := ReplayPlan{Operations: []ReplayOperation{{
 		OpID: OperationID{ClientID: "c", Seq: 1},
 		Mutations: []ReplayMutation{
+			{Key: parentKey},
 			{Key: mustDentryKey(t, 9, "a")},
 			{Key: inodeKey},
 		},

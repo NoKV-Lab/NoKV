@@ -10,6 +10,7 @@ const (
 	GuardEvidenceSingleLinkInode
 	GuardEvidenceSameAuthority
 	GuardEvidenceNonDirectoryInode
+	GuardEvidenceEmptyDirectory
 	GuardEvidenceLiveSession
 	GuardEvidenceExpiredSessionOwner
 	GuardEvidenceQuotaCredit

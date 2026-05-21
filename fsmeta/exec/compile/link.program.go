@@ -25,10 +25,12 @@ func CompileLinkProgram(req fsmeta.LinkRequest, mount fsmeta.MountIdentity, opts
 	predicates := []Predicate{
 		{Kind: PredicateObservedValue, Key: plan.ReadKeys[0]},
 		{Kind: PredicateNotExists, Key: plan.ReadKeys[1]},
+		{Kind: PredicateObservedValue, Key: plan.ReadKeys[2]},
 	}
 	effects := []WriteEffect{
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[0]},
 		{Kind: EffectDerivedPut},
+		{Kind: EffectDerivedPut, Key: plan.MutateKeys[1]},
 	}
 	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	delta.RuntimeGuards = append(delta.RuntimeGuards, GuardNonDirectoryInode, GuardSameAuthority)
@@ -71,7 +73,7 @@ func validateLinkSemanticDelta(delta SemanticDelta) bool {
 	if delta.Authority.AllowOpaqueKeys {
 		return false
 	}
-	if len(delta.ReadPredicates) != 2 {
+	if len(delta.ReadPredicates) < 3 {
 		return false
 	}
 	if delta.ReadPredicates[0].Kind != PredicateObservedValue {
@@ -86,7 +88,13 @@ func validateLinkSemanticDelta(delta SemanticDelta) bool {
 	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[1].Key, "read[1]") {
 		return false
 	}
-	if len(delta.WriteEffects) != 2 {
+	if delta.ReadPredicates[2].Kind != PredicateObservedValue {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[2].Key, "read[2]") {
+		return false
+	}
+	if len(delta.WriteEffects) != 3 {
 		return false
 	}
 	if delta.WriteEffects[0].Kind != EffectDerivedPut {
@@ -99,6 +107,12 @@ func validateLinkSemanticDelta(delta SemanticDelta) bool {
 		return false
 	}
 	if !semanticKeyBindingMatches(delta, delta.WriteEffects[1].Key, "runtime") {
+		return false
+	}
+	if delta.WriteEffects[2].Kind != EffectDerivedPut {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.WriteEffects[2].Key, "mutate[1]") {
 		return false
 	}
 	if len(delta.RuntimeGuards) < 2 || len(delta.RuntimeGuards) > 3 {
@@ -121,7 +135,7 @@ func validateLinkSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileLinkCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationLink || len(delta.WriteEffects) != 2 {
+	if delta.Kind != fsmeta.OperationLink || len(delta.WriteEffects) != 3 {
 		return CompiledOp{}, fsmeta.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)

@@ -40,6 +40,7 @@ func TestExecutorCreateVisibleCommitAcceptsCrossBucketCatalogInstall(t *testing.
 func TestExecutorRenameSubtreeMovesDentry(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "old", 22)
+	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{}
 	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
 		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
@@ -67,7 +68,7 @@ func TestExecutorRenameSubtreeMovesDentry(t *testing.T) {
 		Type:   fsmeta.InodeTypeFile,
 	}, record)
 	require.Len(t, runner.mutations, 1)
-	require.Len(t, runner.mutations[0], 2)
+	require.Len(t, runner.mutations[0], 4)
 	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][0].GetOp())
 	require.Equal(t, kvrpcpb.Mutation_Put, runner.mutations[0][1].GetOp())
 	require.True(t, runner.mutations[0][1].GetAssertionNotExist())
@@ -77,6 +78,7 @@ func TestExecutorRenameSubtreeMovesDentry(t *testing.T) {
 
 func TestExecutorRenameVisibleCommitServesOverlay(t *testing.T) {
 	runner := newFakeRunner()
+	seedDirectory(t, runner, "vol", 7)
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
@@ -116,6 +118,7 @@ func TestExecutorRenameVisibleCommitServesOverlay(t *testing.T) {
 
 func TestExecutorRenameDoesNotFallbackAfterVisibleOverlayReadAdmissionMiss(t *testing.T) {
 	runner := newFakeRunner()
+	seedDirectory(t, runner, "vol", 7)
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
@@ -180,6 +183,8 @@ func TestExecutorCrossParentSameBucketRenameUsesVisibleCommit(t *testing.T) {
 	toParent := testInodeForParentBucket(t, fromParent, fromParent)
 	require.NotEqual(t, fromParent, toParent)
 	require.Equal(t, fsmeta.BucketForInodeID(fromParent), fsmeta.BucketForInodeID(toParent))
+	seedDirectory(t, runner, "vol", fromParent)
+	seedDirectory(t, runner, "vol", toParent)
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
@@ -219,6 +224,8 @@ func TestExecutorRenameVisibleUsesEmptyDirectoryFactForDestination(t *testing.T)
 	runner := newFakeRunner()
 	fromParent := fsmeta.InodeID(7)
 	toParent := testInodeForParentBucket(t, fromParent, fromParent)
+	seedDirectory(t, runner, "vol", fromParent)
+	seedDirectory(t, runner, "vol", toParent)
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
@@ -247,7 +254,7 @@ func TestExecutorRenameVisibleUsesEmptyDirectoryFactForDestination(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	require.Equal(t, 0, runner.getCalls, "rename should use visible overlay source values and the destination directory fact without base probes")
+	require.Equal(t, 2, runner.getCalls, "rename should still prove parent child-count values while using overlay source values and the destination directory fact")
 	require.Empty(t, runner.mutations)
 }
 
@@ -258,6 +265,7 @@ func TestExecutorCrossBucketRenameUsesDurablePath(t *testing.T) {
 	require.NotEqual(t, fromParent, toParent)
 	require.NotEqual(t, fsmeta.BucketForInodeID(fromParent), fsmeta.BucketForInodeID(toParent))
 	seedDentry(t, runner, "vol", fromParent, "old", 22)
+	seedDirectory(t, runner, "vol", toParent)
 	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 1})
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(

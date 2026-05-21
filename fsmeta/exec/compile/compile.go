@@ -59,6 +59,7 @@ const (
 	GuardSingleLinkInode     RuntimeGuard = "single_link_inode"
 	GuardSameAuthority       RuntimeGuard = "same_authority"
 	GuardNonDirectoryInode   RuntimeGuard = "non_directory_inode"
+	GuardEmptyDirectory      RuntimeGuard = "empty_directory"
 	GuardLiveSession         RuntimeGuard = "live_session"
 	GuardExpiredSessionOwner RuntimeGuard = "expired_session_owner"
 	GuardQuotaCredit         RuntimeGuard = "quota_credit"

@@ -59,7 +59,9 @@ func chooseOperation(rng *rand.Rand, model *Model, names []string, sessions []fs
 		return linkOperation(rng, model, names)
 	case 41, 42, 43, 44, 45, 46, 47:
 		return unlinkOperation(rng, model, names)
-	case 48, 49, 50, 51, 52, 53:
+	case 48, 49, 50:
+		return removeOperation(rng, model, names)
+	case 51, 52, 53:
 		return updateOperation(rng, model, names)
 	case 54, 55, 56, 57, 58:
 		if len(files) == 0 {
@@ -211,6 +213,12 @@ func unlinkOperation(rng *rand.Rand, model *Model, names []string) Operation {
 		name = existing[rng.Intn(len(existing))].Name
 	}
 	return Operation{Kind: OpUnlink, Mount: model.Mount, Parent: model.Root, Name: name}
+}
+
+func removeOperation(rng *rand.Rand, model *Model, names []string) Operation {
+	op := unlinkOperation(rng, model, names)
+	op.Kind = OpRemove
+	return op
 }
 
 func updateOperation(rng *rand.Rand, model *Model, names []string) Operation {

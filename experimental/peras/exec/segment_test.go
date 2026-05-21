@@ -22,12 +22,12 @@ func TestBuildPerasSegmentBuildsSortedQueryableRuns(t *testing.T) {
 	require.Equal(t, ReplayVersionRange{First: 1000, Count: 3}, segment.Versions)
 	require.NotZero(t, segment.Root)
 	require.Len(t, segment.Dentries, 3)
-	require.Len(t, segment.Inodes, 3)
+	require.Len(t, segment.Inodes, 4)
 	require.Empty(t, segment.Tombstones)
 	header := segment.ReadHeaderView()
-	require.Equal(t, uint64(6), header.EntryCount)
+	require.Equal(t, uint64(7), header.EntryCount)
 	require.Equal(t, uint64(3), header.DentryCount)
-	require.Equal(t, uint64(3), header.InodeCount)
+	require.Equal(t, uint64(4), header.InodeCount)
 	require.NotEmpty(t, header.FirstKey)
 	require.NotEmpty(t, header.LastKey)
 
@@ -38,7 +38,7 @@ func TestBuildPerasSegmentBuildsSortedQueryableRuns(t *testing.T) {
 	require.Equal(t, firstDentry.Value, value)
 
 	entries := segment.Entries()
-	require.Len(t, entries, 6)
+	require.Len(t, entries, 7)
 	for i := 1; i < len(entries); i++ {
 		require.LessOrEqual(t, string(entries[i-1].Key), string(entries[i].Key))
 	}
@@ -105,7 +105,7 @@ func TestBuildPerasSegmentRecordsCompletionAndVersions(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, fsmeta.OperationCreate, first.Kind)
 	require.Equal(t, uint64(1000), first.Version)
-	require.Equal(t, uint32(2), first.MutationCount)
+	require.Equal(t, uint32(3), first.MutationCount)
 	require.Equal(t, plan.Operations[0].DescriptorDigest, first.DescriptorDigest)
 	require.Equal(t, plan.Operations[0].PredicateProofDigest, first.PredicateProofDigest)
 	require.Equal(t, plan.Operations[0].ExecutionPlanDigest, first.ExecutionPlanDigest)
@@ -125,7 +125,7 @@ func TestBuildPerasSegmentRootIsStableAndSensitive(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, left.Root, right.Root)
 
-	plan.Operations[0].Mutations[0].Value = []byte("changed")
+	plan.Operations[0].Mutations[1].Value = []byte("changed")
 	changed, err := BuildPerasSegmentFromReplayPlan(plan)
 	require.NoError(t, err)
 	require.NotEqual(t, left.Root, changed.Root)
@@ -328,7 +328,18 @@ func workspaceCreateReplayPlan(tb testing.TB, count int) ReplayPlan {
 			},
 		}, mount, fsmeta.InodeID(1000+i))
 		require.NoError(tb, err)
-		materialized, err := compile.MaterializeCreate(program, compile.CreateValues{})
+		parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+			Inode:      fsmeta.RootInode,
+			Type:       fsmeta.InodeTypeDirectory,
+			LinkCount:  1,
+			ChildCount: uint64(i + 1),
+		})
+		require.NoError(tb, err)
+		materialized, err := compile.MaterializeCreate(program, compile.CreateValues{
+			ParentInodeValue: parentValue,
+			DentryValue:      program.Compiled.Delta.WriteEffects[1].Value,
+			InodeValue:       program.Compiled.Delta.WriteEffects[2].Value,
+		})
 		require.NoError(tb, err)
 		materialized = sealTestMaterializedOp(materialized)
 		op, err := replayOperationFromMaterialized(OperationID{ClientID: "workspace-writer", Seq: uint64(i + 1)}, materialized)

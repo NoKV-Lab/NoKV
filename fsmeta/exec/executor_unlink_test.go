@@ -45,12 +45,41 @@ func TestExecutorUnlinkRemovesDentry(t *testing.T) {
 	})
 	require.ErrorIs(t, err, fsmeta.ErrNotFound)
 	require.Len(t, runner.mutations, 1)
-	require.Len(t, runner.mutations[0], 2)
+	require.Len(t, runner.mutations[0], 3)
 	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][0].GetOp())
 	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][1].GetOp())
 	_, ok, err := executor.readInode(context.Background(), testMountIdentity, 22, 99)
 	require.NoError(t, err)
 	require.False(t, ok)
+}
+
+func TestExecutorRemoveRemovesDentry(t *testing.T) {
+	base := newFakeRunner()
+	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
+	seedDentry(t, runner.fakeRunner, "vol", 7, "file", 22)
+	seedInode(t, runner.fakeRunner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	executor, err := newTestExecutor(runner)
+	require.NoError(t, err)
+
+	err = executor.Remove(context.Background(), fsmeta.RemoveRequest{
+		Mount:  "vol",
+		Parent: 7,
+		Name:   "file",
+	})
+	require.NoError(t, err)
+
+	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{
+		Mount:  "vol",
+		Parent: 7,
+		Name:   "file",
+	})
+	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.Empty(t, base.mutations)
+	require.Len(t, runner.atomicCalls, 1)
+	require.Len(t, runner.atomicCalls[0].mutations, 3)
+	require.Equal(t, kvrpcpb.Mutation_Delete, runner.atomicCalls[0].mutations[0].GetOp())
+	require.Equal(t, kvrpcpb.Mutation_Delete, runner.atomicCalls[0].mutations[1].GetOp())
+	requireAtomicStatUint(t, executor.Stats(), fsmeta.OperationRemove, "success_total", 1)
 }
 
 func TestExecutorUnlinkUsesAtomicMutateWithValuePredicates(t *testing.T) {
@@ -92,7 +121,7 @@ func TestExecutorUnlinkDecrementsMultiLinkInode(t *testing.T) {
 
 func TestExecutorUnlinkVisibleCommitServesOverlay(t *testing.T) {
 	runner := newFakeRunner()
-	inode := testInodeForParentBucket(t, 7)
+	inode := testInodeForParentBucket(t, 7, 7)
 	seedDentry(t, runner, "vol", 7, "file", inode)
 	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 2})
 	committer := newTestVisibleCommitter(t, runner)
@@ -118,7 +147,7 @@ func TestExecutorUnlinkVisibleCommitServesOverlay(t *testing.T) {
 
 func TestExecutorUnlinkLastReferenceVisibleCommitDeletesInode(t *testing.T) {
 	runner := newFakeRunner()
-	inode := testInodeForParentBucket(t, 7)
+	inode := testInodeForParentBucket(t, 7, 7)
 	seedDentry(t, runner, "vol", 7, "file", inode)
 	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 1})
 	committer := newTestVisibleCommitter(t, runner)
@@ -143,7 +172,7 @@ func TestExecutorUnlinkLastReferenceVisibleCommitDeletesInode(t *testing.T) {
 
 func TestExecutorUnlinkRejectsDirectoryBeforeVisibleCommit(t *testing.T) {
 	runner := newFakeRunner()
-	inode := testInodeForParentBucket(t, 7)
+	inode := testInodeForParentBucket(t, 7, 7)
 	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
 	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
 	committer := newTestVisibleCommitter(t, runner)
@@ -163,7 +192,7 @@ func TestExecutorUnlinkRejectsDirectoryBeforeVisibleCommit(t *testing.T) {
 
 func TestExecutorUnlinkRejectsDirectoryOnTxnPath(t *testing.T) {
 	runner := newFakeRunner()
-	inode := testInodeForParentBucket(t, 7)
+	inode := testInodeForParentBucket(t, 7, 7)
 	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
 	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
@@ -173,6 +202,108 @@ func TestExecutorUnlinkRejectsDirectoryOnTxnPath(t *testing.T) {
 	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
 
 	require.Empty(t, runner.mutations)
+}
+
+func TestExecutorRemoveRejectsDirectoryOnTxnPath(t *testing.T) {
+	runner := newFakeRunner()
+	inode := testInodeForParentBucket(t, 7, 7)
+	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
+	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
+	executor, err := newTestExecutor(runner)
+	require.NoError(t, err)
+
+	err = executor.Remove(context.Background(), fsmeta.RemoveRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+
+	require.Empty(t, runner.mutations)
+}
+
+func TestExecutorRemoveDirectoryRemovesEmptyDirectory(t *testing.T) {
+	runner := newFakeRunner()
+	inode := testInodeForParentBucket(t, 7, 7)
+	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
+	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+		Inode:     inode,
+		Type:      fsmeta.InodeTypeDirectory,
+		Mode:      0o755,
+		LinkCount: 1,
+	})
+	executor, err := newTestExecutor(runner)
+	require.NoError(t, err)
+
+	err = executor.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.NoError(t, err)
+
+	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	_, ok, err := executor.readInode(context.Background(), testMountIdentity, inode, 99)
+	require.NoError(t, err)
+	require.False(t, ok)
+	parent, ok, err := executor.readInode(context.Background(), testMountIdentity, 7, 99)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Zero(t, parent.ChildCount)
+	require.Len(t, runner.mutations, 1)
+	require.Len(t, runner.mutations[0], 3)
+	require.Equal(t, kvrpcpb.Mutation_Put, runner.mutations[0][0].GetOp())
+	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][1].GetOp())
+	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][2].GetOp())
+}
+
+func TestExecutorRemoveDirectoryRejectsNonEmptyDirectory(t *testing.T) {
+	runner := newFakeRunner()
+	inode := testInodeForParentBucket(t, 7, 7)
+	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
+	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+		Inode:      inode,
+		Type:       fsmeta.InodeTypeDirectory,
+		Mode:       0o755,
+		LinkCount:  1,
+		ChildCount: 1,
+	})
+	executor, err := newTestExecutor(runner)
+	require.NoError(t, err)
+
+	err = executor.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.Empty(t, runner.mutations)
+	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.NoError(t, err)
+	require.Equal(t, inode, record.Inode)
+}
+
+func TestExecutorRemoveDirectoryVisibleCommitServesOverlay(t *testing.T) {
+	runner := newFakeRunner()
+	inode := testInodeForParentBucket(t, 7, 7)
+	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
+	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+		Inode:     inode,
+		Type:      fsmeta.InodeTypeDirectory,
+		Mode:      0o755,
+		LinkCount: 1,
+	})
+	committer := newTestVisibleCommitter(t, runner)
+	executor, err := newTestExecutor(
+		runner,
+		WithVisibleAuthorityAdmitter(ownedVisibleAdmitter{}),
+		WithVisibleCommitter(committer),
+	)
+	require.NoError(t, err)
+
+	err = executor.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.NoError(t, err)
+
+	require.Empty(t, runner.mutations)
+	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	_, ok, err := executor.readInode(context.Background(), testMountIdentity, inode, 99)
+	require.NoError(t, err)
+	require.False(t, ok)
+	parent, ok, err := executor.readInode(context.Background(), testMountIdentity, 7, 99)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Zero(t, parent.ChildCount)
+	require.Equal(t, uint64(1), committer.Stats()["commit_total"])
 }
 
 func TestExecutorUnlinkMissingDentry(t *testing.T) {

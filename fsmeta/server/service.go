@@ -31,6 +31,8 @@ type Executor interface {
 	RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error
 	Link(ctx context.Context, req fsmeta.LinkRequest) error
 	Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
+	Remove(ctx context.Context, req fsmeta.RemoveRequest) error
+	RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirectoryRequest) error
 	OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
 	HeartbeatWriteSession(ctx context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
 	CloseWriteSession(ctx context.Context, req fsmeta.CloseWriteSessionRequest) error
@@ -369,6 +371,32 @@ func (s *Service) Unlink(ctx context.Context, req *fsmetapb.UnlinkRequest) (*fsm
 		return nil, rpcError(err)
 	}
 	return &fsmetapb.UnlinkResponse{}, nil
+}
+
+func (s *Service) Remove(ctx context.Context, req *fsmetapb.RemoveRequest) (*fsmetapb.RemoveResponse, error) {
+	if err := s.requireExecutor(); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, rpcInvalidArgument("fsmeta remove request is required")
+	}
+	if err := s.executor.Remove(ctx, removeRequestFromProto(req)); err != nil {
+		return nil, rpcError(err)
+	}
+	return &fsmetapb.RemoveResponse{}, nil
+}
+
+func (s *Service) RemoveDirectory(ctx context.Context, req *fsmetapb.RemoveDirectoryRequest) (*fsmetapb.RemoveDirectoryResponse, error) {
+	if err := s.requireExecutor(); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, rpcInvalidArgument("fsmeta remove directory request is required")
+	}
+	if err := s.executor.RemoveDirectory(ctx, removeDirectoryRequestFromProto(req)); err != nil {
+		return nil, rpcError(err)
+	}
+	return &fsmetapb.RemoveDirectoryResponse{}, nil
 }
 
 func (s *Service) OpenWriteSession(ctx context.Context, req *fsmetapb.OpenWriteSessionRequest) (*fsmetapb.OpenWriteSessionResponse, error) {

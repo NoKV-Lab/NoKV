@@ -293,7 +293,11 @@ func generatedCreateIntentOp(name, value string, opts ...compile.Option) (compil
 	if err != nil {
 		return compile.MaterializedOp{}, err
 	}
-	return compile.MaterializeCreate(program, compile.CreateValues{})
+	op, err := materializeGeneratedCreate(program, fsmeta.RootInode)
+	if err != nil {
+		return compile.MaterializedOp{}, err
+	}
+	return compile.WithPredicateProofs(op, testPredicateProofsForMaterializedOp(op)), nil
 }
 
 func testGeneratedCreateOpForInodes(tb testing.TB, parent, inode fsmeta.InodeID, name string) compile.MaterializedOp {
@@ -307,11 +311,28 @@ func testGeneratedCreateOpForInodes(tb testing.TB, parent, inode fsmeta.InodeID,
 	if err != nil {
 		tb.Fatal(err)
 	}
-	op, err := compile.MaterializeCreate(program, compile.CreateValues{})
+	op, err := materializeGeneratedCreate(program, parent)
 	if err != nil {
 		tb.Fatal(err)
 	}
 	return sealTestMaterializedOp(op)
+}
+
+func materializeGeneratedCreate(program compile.CreateProgram, parent fsmeta.InodeID) (compile.MaterializedOp, error) {
+	parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+		Inode:      parent,
+		Type:       fsmeta.InodeTypeDirectory,
+		LinkCount:  1,
+		ChildCount: 1,
+	})
+	if err != nil {
+		return compile.MaterializedOp{}, err
+	}
+	return compile.MaterializeCreate(program, compile.CreateValues{
+		ParentInodeValue: parentValue,
+		DentryValue:      program.Compiled.Delta.WriteEffects[1].Value,
+		InodeValue:       program.Compiled.Delta.WriteEffects[2].Value,
+	})
 }
 
 func opWithValueWrites(key, value string) compile.MaterializedOp {
@@ -336,7 +357,12 @@ func testPredicateProofsForMaterializedOp(op compile.MaterializedOp) []proof.Pre
 		return nil
 	}
 	proofs := make([]proof.PredicateProof, 0, len(op.Delta.ReadPredicates))
+	seen := make(map[string]struct{}, len(op.Delta.ReadPredicates))
 	for _, predicate := range op.Delta.ReadPredicates {
+		if _, ok := seen[string(predicate.Key)]; ok {
+			continue
+		}
+		seen[string(predicate.Key)] = struct{}{}
 		frontier := proof.ProofFrontier{EpochID: 1, Sequence: 1}
 		switch predicate.Kind {
 		case compile.PredicateExists:

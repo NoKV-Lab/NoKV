@@ -16,13 +16,18 @@ type CreateProgram struct {
 }
 
 type CreateValues struct {
-	DentryValue []byte
-	InodeValue  []byte
+	ParentInodeValue []byte
+	DentryValue      []byte
+	InodeValue       []byte
 }
 
 func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, inodeID fsmeta.InodeID, opts ...Option) (CreateProgram, error) {
 	if req.Mount != "" && req.Mount != mount.MountID {
 		return CreateProgram{}, fsmeta.ErrInvalidMountID
+	}
+	parentInodeKey, err := fsmeta.EncodeInodeKey(mount, req.Parent)
+	if err != nil {
+		return CreateProgram{}, err
 	}
 	dentryKey, err := fsmeta.EncodeDentryKey(mount, req.Parent, req.Name)
 	if err != nil {
@@ -32,14 +37,14 @@ func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, 
 	if err != nil {
 		return CreateProgram{}, err
 	}
-	planKeys := [][]byte{dentryKey, inodeKey}
+	planKeys := [][]byte{parentInodeKey, dentryKey, inodeKey}
 	plan := fsmeta.OperationPlan{
 		Kind:         fsmeta.OperationCreate,
 		Mount:        req.Mount,
 		PrimaryKey:   dentryKey,
-		ReadKeys:     planKeys[:1:1],
+		ReadKeys:     planKeys[:3:3],
 		ReadPrefixes: [][]byte{},
-		MutateKeys:   planKeys[:2:2],
+		MutateKeys:   planKeys[:3:3],
 	}
 	inode := req.Attrs.InodeRecord(inodeID)
 	dentry := fsmeta.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: inodeID, Type: inode.Type}
@@ -66,12 +71,14 @@ func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, 
 		Plan:      plan,
 		Authority: AuthorityScope{Mount: mount.MountID, MountKeyID: mount.MountKeyID, Buckets: buckets, Parents: []fsmeta.InodeID{req.Parent}, Inodes: []fsmeta.InodeID{inodeID}},
 		ReadPredicates: []Predicate{
-			{Kind: PredicateNotExists, Key: plan.MutateKeys[0]},
+			{Kind: PredicateObservedValue, Key: plan.ReadKeys[0]},
 			{Kind: PredicateNotExists, Key: plan.MutateKeys[1]},
+			{Kind: PredicateNotExists, Key: plan.MutateKeys[2]},
 		},
 		WriteEffects: []WriteEffect{
-			{Kind: EffectPut, Key: plan.MutateKeys[0], Value: dentryValue},
-			{Kind: EffectPut, Key: plan.MutateKeys[1], Value: inodeValue},
+			{Kind: EffectDerivedPut, Key: plan.MutateKeys[0]},
+			{Kind: EffectPut, Key: plan.MutateKeys[1], Value: dentryValue},
+			{Kind: EffectPut, Key: plan.MutateKeys[2], Value: inodeValue},
 		},
 		Eligibility: EligibilityVisibleCommit,
 	}
@@ -88,19 +95,21 @@ func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, 
 
 func MaterializeCreate(program CreateProgram, values CreateValues) (MaterializedOp, error) {
 	compiled := program.Compiled
-	if compiled.Delta.Kind != fsmeta.OperationCreate || len(compiled.Delta.ReadPredicates) != 2 || len(compiled.Delta.WriteEffects) != 2 {
+	if compiled.Delta.Kind != fsmeta.OperationCreate || len(compiled.Delta.ReadPredicates) != 3 || len(compiled.Delta.WriteEffects) != 3 {
 		return MaterializedOp{}, fsmeta.ErrInvalidRequest
 	}
 	delta := compiled.Delta
-	if values.DentryValue != nil || values.InodeValue != nil {
-		if values.DentryValue == nil || values.InodeValue == nil {
+	if values.ParentInodeValue != nil || values.DentryValue != nil || values.InodeValue != nil {
+		if values.ParentInodeValue == nil || values.DentryValue == nil || values.InodeValue == nil {
 			return MaterializedOp{}, fsmeta.ErrInvalidRequest
 		}
 		delta.WriteEffects = []WriteEffect{
-			{Kind: EffectPut, Key: delta.WriteEffects[0].Key, Value: values.DentryValue},
-			{Kind: EffectPut, Key: delta.WriteEffects[1].Key, Value: values.InodeValue},
+			{Kind: EffectPut, Key: delta.WriteEffects[0].Key, Value: values.ParentInodeValue},
+			{Kind: EffectPut, Key: delta.WriteEffects[1].Key, Value: values.DentryValue},
+			{Kind: EffectPut, Key: delta.WriteEffects[2].Key, Value: values.InodeValue},
 		}
 	}
+	delta.Authority = authorityScopeWithDeltaKeys(delta.Authority, delta)
 	materialized, err := compileCreateCompiledOp(delta)
 	if err != nil {
 		return MaterializedOp{}, err
@@ -138,13 +147,13 @@ func validateCreateSemanticDelta(delta SemanticDelta) bool {
 	if delta.Authority.AllowOpaqueKeys {
 		return false
 	}
-	if len(delta.ReadPredicates) != 2 {
+	if len(delta.ReadPredicates) != 3 {
 		return false
 	}
-	if delta.ReadPredicates[0].Kind != PredicateNotExists {
+	if delta.ReadPredicates[0].Kind != PredicateObservedValue {
 		return false
 	}
-	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[0].Key, "mutate[0]") {
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[0].Key, "read[0]") {
 		return false
 	}
 	if delta.ReadPredicates[1].Kind != PredicateNotExists {
@@ -153,10 +162,16 @@ func validateCreateSemanticDelta(delta SemanticDelta) bool {
 	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[1].Key, "mutate[1]") {
 		return false
 	}
-	if len(delta.WriteEffects) != 2 {
+	if delta.ReadPredicates[2].Kind != PredicateNotExists {
 		return false
 	}
-	if delta.WriteEffects[0].Kind != EffectPut {
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[2].Key, "mutate[2]") {
+		return false
+	}
+	if len(delta.WriteEffects) != 3 {
+		return false
+	}
+	if delta.WriteEffects[0].Kind != EffectDerivedPut {
 		return false
 	}
 	if !semanticKeyBindingMatches(delta, delta.WriteEffects[0].Key, "mutate[0]") {
@@ -166,6 +181,12 @@ func validateCreateSemanticDelta(delta SemanticDelta) bool {
 		return false
 	}
 	if !semanticKeyBindingMatches(delta, delta.WriteEffects[1].Key, "mutate[1]") {
+		return false
+	}
+	if delta.WriteEffects[2].Kind != EffectPut {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.WriteEffects[2].Key, "mutate[2]") {
 		return false
 	}
 	if len(delta.RuntimeGuards) > 1 {
@@ -182,7 +203,7 @@ func validateCreateSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileCreateCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationCreate || len(delta.ReadPredicates) != 2 || len(delta.WriteEffects) != 2 {
+	if delta.Kind != fsmeta.OperationCreate || len(delta.ReadPredicates) != 3 || len(delta.WriteEffects) != 3 {
 		return CompiledOp{}, fsmeta.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
@@ -194,26 +215,45 @@ func compileCreateCompiledOp(delta SemanticDelta) (CompiledOp, error) {
 	refs := []KeyRef{
 		keyRef(KeyAccessRead, delta.ReadPredicates[0].Key),
 		keyRef(KeyAccessRead, delta.ReadPredicates[1].Key),
+		keyRef(KeyAccessRead, delta.ReadPredicates[2].Key),
 		keyRef(KeyAccessWrite, delta.WriteEffects[0].Key),
 		keyRef(KeyAccessWrite, delta.WriteEffects[1].Key),
+		keyRef(KeyAccessWrite, delta.WriteEffects[2].Key),
 	}
 	footprint := KeyFootprint{
-		Reads:          refs[:2:2],
-		Writes:         refs[2:4:4],
-		ConflictKeys:   refs[:4:4],
-		EstimatedBytes: uint64(len(delta.ReadPredicates[0].Key) + len(delta.ReadPredicates[1].Key) + len(delta.WriteEffects[0].Key) + len(delta.WriteEffects[0].Value) + len(delta.WriteEffects[1].Key) + len(delta.WriteEffects[1].Value)),
+		Reads:          refs[:3:3],
+		Writes:         refs[3:6:6],
+		ConflictKeys:   refs[:6:6],
+		EstimatedBytes: uint64(len(delta.ReadPredicates[0].Key) + len(delta.ReadPredicates[1].Key) + len(delta.ReadPredicates[2].Key) + len(delta.WriteEffects[0].Key) + len(delta.WriteEffects[0].Value) + len(delta.WriteEffects[1].Key) + len(delta.WriteEffects[1].Value) + len(delta.WriteEffects[2].Key) + len(delta.WriteEffects[2].Value)),
 	}
-	footprint.HasOpaqueKeys = refs[0].Opaque || refs[1].Opaque || refs[2].Opaque || refs[3].Opaque
+	footprint.HasOpaqueKeys = refs[0].Opaque || refs[1].Opaque || refs[2].Opaque || refs[3].Opaque || refs[4].Opaque || refs[5].Opaque
+	parentPredicate := PredicateObligation{Kind: PredicateObservedValue, Key: delta.ReadPredicates[0].Key, NeedValue: true, HasExpectedValue: delta.ReadPredicates[0].HasExpectedValue}
+	if delta.ReadPredicates[0].HasExpectedValue {
+		parentPredicate.ExpectHash = sha256.Sum256(delta.ReadPredicates[0].ExpectedValue)
+	}
 	predicates := []PredicateObligation{
-		{Kind: PredicateNotExists, Key: delta.ReadPredicates[0].Key, NeedAbsent: true},
+		parentPredicate,
 		{Kind: PredicateNotExists, Key: delta.ReadPredicates[1].Key, NeedAbsent: true},
+		{Kind: PredicateNotExists, Key: delta.ReadPredicates[2].Key, NeedAbsent: true},
 	}
 	guards := compileCreateGuardObligations(delta.RuntimeGuards)
-	effects := []EffectPlan{
-		{ID: 0, Kind: EffectPut, Key: delta.WriteEffects[0].Key, Value: delta.WriteEffects[0].Value, Concrete: true, MountKeyID: dentryParts.MountKeyID, Bucket: dentryParts.Bucket, RecordKind: dentryParts.Kind, ValueHash: sha256.Sum256(delta.WriteEffects[0].Value)},
-		{ID: 1, Kind: EffectPut, Key: delta.WriteEffects[1].Key, Value: delta.WriteEffects[1].Value, Concrete: true, MountKeyID: inodeParts.MountKeyID, Bucket: inodeParts.Bucket, RecordKind: inodeParts.Kind, ValueHash: sha256.Sum256(delta.WriteEffects[1].Value)},
+	parentParts, ok := fsmeta.InspectKey(delta.WriteEffects[0].Key)
+	if !ok {
+		return CompiledOp{}, fsmeta.ErrInvalidRequest
 	}
-	atomicity := AtomicityGroup{Members: []MutationID{0, 1}, Recovery: RecoveryReplayAllOrNothing, Digest: digest}
+	parentEffect := EffectPlan{ID: 0, Kind: delta.WriteEffects[0].Kind, Key: delta.WriteEffects[0].Key, Value: delta.WriteEffects[0].Value, Concrete: len(delta.WriteEffects[0].Value) > 0, MountKeyID: parentParts.MountKeyID, Bucket: parentParts.Bucket, RecordKind: parentParts.Kind}
+	if len(delta.WriteEffects[0].Value) > 0 {
+		parentEffect.ValueHash = sha256.Sum256(delta.WriteEffects[0].Value)
+	}
+	if delta.WriteEffects[0].Kind == EffectDerivedPut {
+		parentEffect.Derivation = DerivationRuntimeValue
+	}
+	effects := []EffectPlan{
+		parentEffect,
+		{ID: 1, Kind: EffectPut, Key: delta.WriteEffects[1].Key, Value: delta.WriteEffects[1].Value, Concrete: true, MountKeyID: dentryParts.MountKeyID, Bucket: dentryParts.Bucket, RecordKind: dentryParts.Kind, ValueHash: sha256.Sum256(delta.WriteEffects[1].Value)},
+		{ID: 2, Kind: EffectPut, Key: delta.WriteEffects[2].Key, Value: delta.WriteEffects[2].Value, Concrete: true, MountKeyID: inodeParts.MountKeyID, Bucket: inodeParts.Bucket, RecordKind: inodeParts.Kind, ValueHash: sha256.Sum256(delta.WriteEffects[2].Value)},
+	}
+	atomicity := AtomicityGroup{Members: []MutationID{0, 1, 2}, Recovery: RecoveryReplayAllOrNothing, Digest: digest}
 	segment := compileCreateSegmentPlan(placement, footprint)
 	return CompiledOp{
 		Delta:            delta,
@@ -241,14 +281,14 @@ func compileCreateCompiledOp(delta SemanticDelta) (CompiledOp, error) {
 func compileCreatePlacementPlan(delta SemanticDelta, durability DurabilityClass) (PlacementPlan, fsmeta.KeyParts, fsmeta.KeyParts, error) {
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
-	if delta.WriteEffects[0].Kind != EffectPut || delta.WriteEffects[1].Kind != EffectPut || delta.WriteEffects[0].Value == nil || delta.WriteEffects[1].Value == nil {
+	if (delta.WriteEffects[0].Kind != EffectPut && delta.WriteEffects[0].Kind != EffectDerivedPut) || delta.WriteEffects[1].Kind != EffectPut || delta.WriteEffects[2].Kind != EffectPut || delta.WriteEffects[1].Value == nil || delta.WriteEffects[2].Value == nil {
 		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, fsmeta.ErrInvalidRequest
 	}
-	dentryParts, ok := fsmeta.InspectKey(delta.WriteEffects[0].Key)
+	dentryParts, ok := fsmeta.InspectKey(delta.WriteEffects[1].Key)
 	if !ok || dentryParts.Kind != fsmeta.KeyKindDentry {
 		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, fsmeta.ErrInvalidKey
 	}
-	inodeParts, ok := fsmeta.InspectKey(delta.WriteEffects[1].Key)
+	inodeParts, ok := fsmeta.InspectKey(delta.WriteEffects[2].Key)
 	if !ok || inodeParts.Kind != fsmeta.KeyKindInode {
 		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, fsmeta.ErrInvalidKey
 	}
@@ -275,7 +315,7 @@ func compileCreateGuardObligations(guards []RuntimeGuard) []GuardObligation {
 }
 
 func compileCreateSegmentPlan(placement PlacementPlan, footprint KeyFootprint) SegmentPlan {
-	segment := SegmentPlan{MergeKey: placement.MergeKey, Install: placement.Install, CanAppend: placement.CanSegment, RequiresMaterialize: placement.RequiresMaterialize, EstimatedPayloadBytes: footprint.EstimatedBytes, OperationCount: 1, MutationCount: 2}
+	segment := SegmentPlan{MergeKey: placement.MergeKey, Install: placement.Install, CanAppend: placement.CanSegment, RequiresMaterialize: placement.RequiresMaterialize, EstimatedPayloadBytes: footprint.EstimatedBytes, OperationCount: 1, MutationCount: 3}
 	switch {
 	case placement.Install == SegmentInstallCatalog && placement.SingleBucket && len(placement.Buckets) == 1:
 		segment.CanMaterialize = placement.CanSegment
@@ -297,9 +337,9 @@ func compileCreateCompletionPlan(delta SemanticDelta, digest [32]byte) Completio
 	if delta.Eligibility != EligibilityVisibleCommit {
 		return CompletionPlan{}
 	}
-	return CompletionPlan{RetainCompletion: true, Kind: CompletionVisible, MutationCount: 2, DescriptorDigest: digest}
+	return CompletionPlan{RetainCompletion: true, Kind: CompletionVisible, MutationCount: 3, DescriptorDigest: digest}
 }
 
 func compileCreateWatchProjections(delta SemanticDelta, dentryParts fsmeta.KeyParts, inodeParts fsmeta.KeyParts) []WatchProjection {
-	return []WatchProjection{{EventKind: WatchEventCreate, Key: delta.WriteEffects[0].Key, Parent: dentryParts.Parent, Name: dentryName(delta.WriteEffects[0].Key), Inode: inodeParts.Inode, EmitAt: WatchEmitVisible}}
+	return []WatchProjection{{EventKind: WatchEventCreate, Key: delta.WriteEffects[1].Key, Parent: dentryParts.Parent, Name: dentryName(delta.WriteEffects[1].Key), Inode: inodeParts.Inode, EmitAt: WatchEmitVisible}}
 }

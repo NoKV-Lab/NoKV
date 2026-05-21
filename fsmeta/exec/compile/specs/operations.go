@@ -17,18 +17,20 @@ var Create = specdsl.OpSpec{
 	OperationKind:  "fsmeta.OperationCreate",
 	Durability:     "DurabilityVisibleOnly",
 	Eligibility:    "EligibilityVisibleCommit",
-	PredicateCount: 2,
-	EffectCount:    2,
+	PredicateCount: 3,
+	EffectCount:    3,
 	Emitter:        "create",
 	Authority:      specdsl.AuthoritySpec{Parents: []string{"parent"}, Inodes: []string{"inode"}},
 	SlowFallbacks:  []string{"SlowReasonSharedQuota"},
 	Predicates: []specdsl.PredicateSpec{
-		{Name: "dentry_absent", Kind: "PredicateNotExists", Key: "mutate[0]"},
-		{Name: "inode_absent", Kind: "PredicateNotExists", Key: "mutate[1]"},
+		{Name: "parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[0]"},
+		{Name: "dentry_absent", Kind: "PredicateNotExists", Key: "mutate[1]"},
+		{Name: "inode_absent", Kind: "PredicateNotExists", Key: "mutate[2]"},
 	},
 	Effects: []specdsl.EffectSpec{
-		{Name: "dentry", Kind: "EffectPut", Key: "mutate[0]", ValueName: "DentryValue"},
-		{Name: "inode", Kind: "EffectPut", Key: "mutate[1]", ValueName: "InodeValue"},
+		{Name: "parent_inode", Kind: "EffectDerivedPut", Key: "mutate[0]", ValueName: "ParentInodeValue"},
+		{Name: "dentry", Kind: "EffectPut", Key: "mutate[1]", ValueName: "DentryValue"},
+		{Name: "inode", Kind: "EffectPut", Key: "mutate[2]", ValueName: "InodeValue"},
 	},
 	OptionalGuards: []specdsl.GuardSpec{
 		{Name: "quota_credit", Guard: "GuardQuotaCredit", Condition: "quota_escrow"},
@@ -139,17 +141,21 @@ var Rename = specdsl.OpSpec{
 	Durability:     "DurabilityVisibleOnly",
 	Eligibility:    "EligibilityVisibleCommit",
 	PredicateCount: -1,
-	EffectCount:    2,
+	EffectCount:    4,
 	Emitter:        "operation",
 	Authority:      specdsl.AuthoritySpec{Parents: []string{"from_parent", "to_parent"}},
 	SlowFallbacks:  []string{"SlowReasonCrossBucket"},
 	Predicates: []specdsl.PredicateSpec{
 		{Name: "from_dentry_exists", Kind: "PredicateExists", Key: "read[0]"},
 		{Name: "to_dentry_absent", Kind: "PredicateNotExists", Key: "read[1]"},
+		{Name: "from_parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[2]"},
+		{Name: "to_parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[3]"},
 	},
 	Effects: []specdsl.EffectSpec{
 		{Name: "from_dentry", Kind: "EffectDelete", Key: "mutate[0]"},
 		{Name: "to_dentry", Kind: "EffectDerivedPut", Key: "mutate[1]", ValueSource: "runtime"},
+		{Name: "from_parent_inode", Kind: "EffectDerivedPut", Key: "mutate[2]", ValueSource: "runtime"},
+		{Name: "to_parent_inode", Kind: "EffectDerivedPut", Key: "mutate[3]", ValueSource: "runtime"},
 	},
 }
 
@@ -166,17 +172,21 @@ var RenameSubtree = specdsl.OpSpec{
 	SlowReason:        "SlowReasonDurabilityBarrier",
 	DurabilityBarrier: true,
 	WatchAtSeal:       true,
-	PredicateCount:    2,
-	EffectCount:       2,
+	PredicateCount:    4,
+	EffectCount:       4,
 	Emitter:           "operation",
 	Authority:         specdsl.AuthoritySpec{Parents: []string{"from_parent", "to_parent"}},
 	Predicates: []specdsl.PredicateSpec{
 		{Name: "from_dentry_exists", Kind: "PredicateExists", Key: "read[0]"},
 		{Name: "to_dentry_absent", Kind: "PredicateNotExists", Key: "read[1]"},
+		{Name: "from_parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[2]"},
+		{Name: "to_parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[3]"},
 	},
 	Effects: []specdsl.EffectSpec{
 		{Name: "from_dentry", Kind: "EffectDelete", Key: "mutate[0]"},
 		{Name: "to_dentry", Kind: "EffectDerivedPut", Key: "mutate[1]", ValueSource: "runtime"},
+		{Name: "from_parent_inode", Kind: "EffectDerivedPut", Key: "mutate[2]", ValueSource: "runtime"},
+		{Name: "to_parent_inode", Kind: "EffectDerivedPut", Key: "mutate[3]", ValueSource: "runtime"},
 	},
 }
 
@@ -191,7 +201,7 @@ var Link = specdsl.OpSpec{
 	Durability:     "DurabilityVisibleOnly",
 	Eligibility:    "EligibilityVisibleCommit",
 	PredicateCount: -1,
-	EffectCount:    2,
+	EffectCount:    3,
 	HasOptions:     true,
 	Emitter:        "operation",
 	Authority:      specdsl.AuthoritySpec{Parents: []string{"from_parent", "to_parent"}},
@@ -199,10 +209,12 @@ var Link = specdsl.OpSpec{
 	Predicates: []specdsl.PredicateSpec{
 		{Name: "from_dentry_observed", Kind: "PredicateObservedValue", Key: "read[0]"},
 		{Name: "to_dentry_absent", Kind: "PredicateNotExists", Key: "read[1]"},
+		{Name: "to_parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[2]"},
 	},
 	Effects: []specdsl.EffectSpec{
 		{Name: "to_dentry", Kind: "EffectDerivedPut", Key: "mutate[0]", ValueSource: "runtime"},
 		{Name: "from_inode", Kind: "EffectDerivedPut", Key: "runtime", ValueSource: "runtime"},
+		{Name: "to_parent_inode", Kind: "EffectDerivedPut", Key: "mutate[1]", ValueSource: "runtime"},
 	},
 	Guards: []specdsl.GuardSpec{
 		{Name: "non_directory_inode", Guard: "GuardNonDirectoryInode"},
@@ -224,20 +236,80 @@ var Unlink = specdsl.OpSpec{
 	Durability:     "DurabilityVisibleOnly",
 	Eligibility:    "EligibilityVisibleCommit",
 	PredicateCount: -1,
-	EffectCount:    2,
+	EffectCount:    3,
 	HasOptions:     true,
 	Emitter:        "operation",
 	Authority:      specdsl.AuthoritySpec{Parents: []string{"parent"}},
 	SlowFallbacks:  []string{"SlowReasonSharedQuota"},
 	Predicates: []specdsl.PredicateSpec{
 		{Name: "dentry_observed", Kind: "PredicateObservedValue", Key: "primary"},
+		{Name: "parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[1]"},
 	},
 	Effects: []specdsl.EffectSpec{
 		{Name: "dentry", Kind: "EffectDelete", Key: "mutate[0]"},
 		{Name: "inode", Kind: "EffectDerivedPut", Key: "runtime", ValueSource: "runtime"},
+		{Name: "parent_inode", Kind: "EffectDerivedPut", Key: "mutate[1]", ValueSource: "runtime"},
 	},
 	OptionalGuards: []specdsl.GuardSpec{
 		{Name: "quota_credit", Guard: "GuardQuotaCredit", Condition: "quota_escrow"},
+	},
+}
+
+var Remove = specdsl.OpSpec{
+	Name:           "Remove",
+	FileName:       "remove.program.go",
+	ProgramType:    "RemoveProgram",
+	RequestType:    "fsmeta.RemoveRequest",
+	CompileName:    "CompileRemoveProgram",
+	PlanName:       "fsmeta.PlanRemove",
+	OperationKind:  "fsmeta.OperationRemove",
+	Durability:     "DurabilityVisibleOnly",
+	Eligibility:    "EligibilityVisibleCommit",
+	PredicateCount: -1,
+	EffectCount:    3,
+	HasOptions:     true,
+	Emitter:        "operation",
+	Authority:      specdsl.AuthoritySpec{Parents: []string{"parent"}},
+	SlowFallbacks:  []string{"SlowReasonSharedQuota"},
+	Predicates: []specdsl.PredicateSpec{
+		{Name: "dentry_observed", Kind: "PredicateObservedValue", Key: "primary"},
+		{Name: "parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[1]"},
+	},
+	Effects: []specdsl.EffectSpec{
+		{Name: "dentry", Kind: "EffectDelete", Key: "mutate[0]"},
+		{Name: "inode", Kind: "EffectDerivedPut", Key: "runtime", ValueSource: "runtime"},
+		{Name: "parent_inode", Kind: "EffectDerivedPut", Key: "mutate[1]", ValueSource: "runtime"},
+	},
+	OptionalGuards: []specdsl.GuardSpec{
+		{Name: "quota_credit", Guard: "GuardQuotaCredit", Condition: "quota_escrow"},
+	},
+}
+
+var RemoveDirectory = specdsl.OpSpec{
+	Name:           "RemoveDirectory",
+	FileName:       "remove_directory.program.go",
+	ProgramType:    "RemoveDirectoryProgram",
+	RequestType:    "fsmeta.RemoveDirectoryRequest",
+	CompileName:    "CompileRemoveDirectoryProgram",
+	PlanName:       "fsmeta.PlanRemoveDirectory",
+	OperationKind:  "fsmeta.OperationRemoveDirectory",
+	Durability:     "DurabilityVisibleOnly",
+	Eligibility:    "EligibilityVisibleCommit",
+	PredicateCount: -1,
+	EffectCount:    3,
+	Emitter:        "operation",
+	Authority:      specdsl.AuthoritySpec{Parents: []string{"parent"}},
+	Predicates: []specdsl.PredicateSpec{
+		{Name: "parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[0]"},
+		{Name: "dentry_observed", Kind: "PredicateObservedValue", Key: "primary"},
+	},
+	Effects: []specdsl.EffectSpec{
+		{Name: "parent_inode", Kind: "EffectDerivedPut", Key: "mutate[0]", ValueSource: "runtime"},
+		{Name: "dentry", Kind: "EffectDelete", Key: "mutate[1]"},
+		{Name: "inode", Kind: "EffectDerivedDelete", Key: "runtime", ValueSource: "runtime"},
+	},
+	Guards: []specdsl.GuardSpec{
+		{Name: "empty_directory_inode", Guard: "GuardEmptyDirectory"},
 	},
 }
 
@@ -365,6 +437,8 @@ func All() []specdsl.OpSpec {
 		RenameSubtree,
 		Link,
 		Unlink,
+		Remove,
+		RemoveDirectory,
 		OpenWriteSession,
 		HeartbeatWriteSession,
 		CloseWriteSession,

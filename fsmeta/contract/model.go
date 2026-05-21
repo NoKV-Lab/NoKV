@@ -26,6 +26,7 @@ const (
 	OpRenameSubtree    OperationKind = "rename_subtree"
 	OpLink             OperationKind = "link"
 	OpUnlink           OperationKind = "unlink"
+	OpRemove           OperationKind = "remove"
 	OpOpenWriteSession OperationKind = "open_write_session"
 	OpHeartbeatSession OperationKind = "heartbeat_write_session"
 	OpCloseSession     OperationKind = "close_write_session"
@@ -152,6 +153,8 @@ func (m *Model) Apply(op Operation) Result {
 	case OpLink:
 		return m.link(op)
 	case OpUnlink:
+		return m.unlink(op)
+	case OpRemove:
 		return m.unlink(op)
 	case OpOpenWriteSession:
 		return m.openWriteSession(op)

@@ -20,13 +20,15 @@ func TestPlanCreateTouchesDentryAndInode(t *testing.T) {
 
 	dentry, err := EncodeDentryKey(testMount, RootInode, "file")
 	require.NoError(t, err)
+	parent, err := EncodeInodeKey(testMount, RootInode)
+	require.NoError(t, err)
 	inode, err := EncodeInodeKey(testMount, 22)
 	require.NoError(t, err)
 
 	require.Equal(t, OperationCreate, plan.Kind)
 	require.Equal(t, dentry, plan.PrimaryKey)
-	require.Equal(t, [][]byte{dentry}, plan.ReadKeys)
-	require.Equal(t, [][]byte{dentry, inode}, plan.MutateKeys)
+	require.Equal(t, [][]byte{parent, dentry, inode}, plan.ReadKeys)
+	require.Equal(t, [][]byte{parent, dentry, inode}, plan.MutateKeys)
 }
 
 func TestPlanReadDirScansOnlyDirectoryPrefix(t *testing.T) {
@@ -129,11 +131,15 @@ func TestPlanRenameTouchesSourceAndDestinationDentries(t *testing.T) {
 	require.NoError(t, err)
 	to, err := EncodeDentryKey(testMount, 3, "new")
 	require.NoError(t, err)
+	fromParent, err := EncodeInodeKey(testMount, 2)
+	require.NoError(t, err)
+	toParent, err := EncodeInodeKey(testMount, 3)
+	require.NoError(t, err)
 
 	require.Equal(t, OperationRename, plan.Kind)
 	require.Equal(t, from, plan.PrimaryKey)
-	require.Equal(t, [][]byte{from, to}, plan.ReadKeys)
-	require.Equal(t, [][]byte{from, to}, plan.MutateKeys)
+	require.Equal(t, [][]byte{from, to, fromParent, toParent}, plan.ReadKeys)
+	require.Equal(t, [][]byte{from, to, fromParent, toParent}, plan.MutateKeys)
 }
 
 func TestPlanRenameRejectsNoop(t *testing.T) {
@@ -161,11 +167,15 @@ func TestPlanRenameSubtreeTouchesSourceAndDestinationDentries(t *testing.T) {
 	require.NoError(t, err)
 	to, err := EncodeDentryKey(testMount, 3, "new")
 	require.NoError(t, err)
+	fromParent, err := EncodeInodeKey(testMount, 2)
+	require.NoError(t, err)
+	toParent, err := EncodeInodeKey(testMount, 3)
+	require.NoError(t, err)
 
 	require.Equal(t, OperationRenameSubtree, plan.Kind)
 	require.Equal(t, from, plan.PrimaryKey)
-	require.Equal(t, [][]byte{from, to}, plan.ReadKeys)
-	require.Equal(t, [][]byte{from, to}, plan.MutateKeys)
+	require.Equal(t, [][]byte{from, to, fromParent, toParent}, plan.ReadKeys)
+	require.Equal(t, [][]byte{from, to, fromParent, toParent}, plan.MutateKeys)
 }
 
 func TestPlanRenameSubtreeRejectsNoop(t *testing.T) {
@@ -210,11 +220,13 @@ func TestPlanLinkTouchesSourceDestinationAndRejectsNoop(t *testing.T) {
 	require.NoError(t, err)
 	to, err := EncodeDentryKey(testMount, 3, "new")
 	require.NoError(t, err)
+	toParent, err := EncodeInodeKey(testMount, 3)
+	require.NoError(t, err)
 
 	require.Equal(t, OperationLink, plan.Kind)
 	require.Equal(t, to, plan.PrimaryKey)
-	require.Equal(t, [][]byte{from, to}, plan.ReadKeys)
-	require.Equal(t, [][]byte{to}, plan.MutateKeys)
+	require.Equal(t, [][]byte{from, to, toParent}, plan.ReadKeys)
+	require.Equal(t, [][]byte{to, toParent}, plan.MutateKeys)
 
 	_, err = PlanLink(LinkRequest{
 		Mount:      "vol",
@@ -236,10 +248,48 @@ func TestPlanUnlinkTouchesDentry(t *testing.T) {
 
 	dentry, err := EncodeDentryKey(testMount, 7, "file")
 	require.NoError(t, err)
+	parent, err := EncodeInodeKey(testMount, 7)
+	require.NoError(t, err)
 	require.Equal(t, OperationUnlink, plan.Kind)
 	require.Equal(t, dentry, plan.PrimaryKey)
-	require.Equal(t, [][]byte{dentry}, plan.ReadKeys)
-	require.Equal(t, [][]byte{dentry}, plan.MutateKeys)
+	require.Equal(t, [][]byte{dentry, parent}, plan.ReadKeys)
+	require.Equal(t, [][]byte{dentry, parent}, plan.MutateKeys)
+}
+
+func TestPlanRemoveTouchesDentry(t *testing.T) {
+	plan, err := PlanRemove(RemoveRequest{
+		Mount:  "vol",
+		Parent: 7,
+		Name:   "file",
+	}, testMount)
+	require.NoError(t, err)
+
+	dentry, err := EncodeDentryKey(testMount, 7, "file")
+	require.NoError(t, err)
+	parent, err := EncodeInodeKey(testMount, 7)
+	require.NoError(t, err)
+	require.Equal(t, OperationRemove, plan.Kind)
+	require.Equal(t, dentry, plan.PrimaryKey)
+	require.Equal(t, [][]byte{dentry, parent}, plan.ReadKeys)
+	require.Equal(t, [][]byte{dentry, parent}, plan.MutateKeys)
+}
+
+func TestPlanRemoveDirectoryTouchesParentAndDentry(t *testing.T) {
+	plan, err := PlanRemoveDirectory(RemoveDirectoryRequest{
+		Mount:  "vol",
+		Parent: 7,
+		Name:   "dir",
+	}, testMount)
+	require.NoError(t, err)
+
+	parent, err := EncodeInodeKey(testMount, 7)
+	require.NoError(t, err)
+	dentry, err := EncodeDentryKey(testMount, 7, "dir")
+	require.NoError(t, err)
+	require.Equal(t, OperationRemoveDirectory, plan.Kind)
+	require.Equal(t, dentry, plan.PrimaryKey)
+	require.Equal(t, [][]byte{parent, dentry}, plan.ReadKeys)
+	require.Equal(t, [][]byte{parent, dentry}, plan.MutateKeys)
 }
 
 func TestPlansCloneKeys(t *testing.T) {

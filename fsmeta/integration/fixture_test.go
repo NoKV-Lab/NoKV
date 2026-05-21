@@ -19,6 +19,7 @@ import (
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
+	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	metapb "github.com/feichai0017/NoKV/pb/meta"
 	"github.com/feichai0017/NoKV/raftstore/client"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
@@ -93,6 +94,7 @@ func openRealClusterRuntimeWithOptions(t *testing.T, ctx context.Context, opts .
 
 	runner, err := fsmetaraftstore.NewRunner(kv, coordRPC)
 	require.NoError(t, err)
+	seedRootInode(t, ctx, runner, fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1})
 	inodes, err := fsmetaraftstore.NewShardAffineInodeAllocator(coordRPC, 4)
 	require.NoError(t, err)
 	executorOpts := []fsmetaexec.Option{
@@ -195,6 +197,7 @@ func openSplitRealClusterExecutorWithOptions(t *testing.T, ctx context.Context, 
 
 	runner, err := fsmetaraftstore.NewRunner(kv, coordRPC)
 	require.NoError(t, err)
+	seedRootInode(t, ctx, runner, fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1})
 	inodes, err := fsmetaraftstore.NewShardAffineInodeAllocator(coordRPC, 4)
 	require.NoError(t, err)
 	executorOpts := []fsmetaexec.Option{
@@ -236,6 +239,38 @@ func registerMount(t *testing.T, ctx context.Context, coord *coordclient.GRPCCli
 	})
 	require.NoError(t, err)
 	require.True(t, resp.GetAccepted())
+}
+
+func seedRootInode(t *testing.T, ctx context.Context, runner fsmetaexec.TxnRunner, mount fsmeta.MountIdentity) {
+	t.Helper()
+	key, err := fsmeta.EncodeInodeKey(mount, fsmeta.RootInode)
+	require.NoError(t, err)
+	readVersion, err := runner.ReserveTimestamp(ctx, 1)
+	require.NoError(t, err)
+	_, ok, err := runner.Get(ctx, key, readVersion)
+	require.NoError(t, err)
+	if ok {
+		return
+	}
+	now := time.Now().UnixNano()
+	value, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+		Inode:         fsmeta.RootInode,
+		Type:          fsmeta.InodeTypeDirectory,
+		Mode:          0755,
+		LinkCount:     1,
+		CreatedUnixNs: now,
+		UpdatedUnixNs: now,
+	})
+	require.NoError(t, err)
+	startVersion, err := runner.ReserveTimestamp(ctx, 2)
+	require.NoError(t, err)
+	_, err = runner.Mutate(ctx, key, []*kvrpcpb.Mutation{{
+		Op:                kvrpcpb.Mutation_Put,
+		Key:               key,
+		Value:             value,
+		AssertionNotExist: true,
+	}}, startVersion, startVersion+1, uint64(30*time.Second/time.Millisecond))
+	require.NoError(t, err)
 }
 
 type staticRegionResolver struct {

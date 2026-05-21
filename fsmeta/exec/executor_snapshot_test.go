@@ -152,6 +152,7 @@ func TestExecutorReadDirPlusRetriesLiveLockAtSnapshotVersion(t *testing.T) {
 func TestExecutorRenameMovesDentryWithoutSubtreeHandoff(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "old", 22)
+	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{}
 	authority := &fakeAuthorityResolver{same: true}
 	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
@@ -189,6 +190,7 @@ func TestExecutorRenameUsesAtomicMutateWithoutSubtreeHandoff(t *testing.T) {
 	base := newFakeRunner()
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedDentry(t, runner.fakeRunner, "vol", 7, "old", 22)
+	seedDirectory(t, runner.fakeRunner, "vol", 8)
 	seedInode(t, runner.fakeRunner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 1})
 	publisher := &fakeSubtreePublisher{}
 	authority := &fakeAuthorityResolver{same: true}
@@ -226,6 +228,7 @@ func TestExecutorRenameSubtreePinsCommitVersionToHandoffFrontier(t *testing.T) {
 	runner := newFakeRunner()
 	runner.actualCommitVersion = 99
 	seedDentry(t, runner, "vol", 7, "old", 22)
+	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{}
 	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
 		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
@@ -249,6 +252,7 @@ func TestExecutorRenameSubtreePinsCommitVersionToHandoffFrontier(t *testing.T) {
 func TestExecutorRenameSubtreeBlocksMutationWhenStartHandoffFails(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "old", 22)
+	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{startErr: errors.New("publish failed")}
 	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
 		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
@@ -274,6 +278,7 @@ func TestExecutorRenameSubtreeBlocksMutationWhenStartHandoffFails(t *testing.T) 
 func TestExecutorRenameSubtreeReportsCompleteHandoffFailureAfterMutation(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "old", 22)
+	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{completeErr: errors.New("complete failed")}
 	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
 		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},

@@ -45,7 +45,7 @@ func TestRuntimeCommitsAndServesOverlay(t *testing.T) {
 	_, err = committer.SubmitVisible(context.Background(), fsperas.OperationID{ClientID: "client", Seq: 1}, delta, nil)
 	require.NoError(t, err)
 
-	value, deleted, ok := committer.GetPerasOverlay(delta.Effects[0].Key)
+	value, deleted, ok := committer.GetPerasOverlay(testRuntimeDentryEffect(delta).Key)
 	require.True(t, ok)
 	require.False(t, deleted)
 	require.Equal(t, []byte("dentry-value"), value)
@@ -67,7 +67,7 @@ func TestRuntimeSubmitVisibleRequiresVisibleLog(t *testing.T) {
 	_, err = committer.SubmitVisible(context.Background(), fsperas.OperationID{ClientID: "client", Seq: 1}, op, nil)
 	require.ErrorIs(t, err, fsperas.ErrVisibleLogRequired)
 
-	_, _, ok := committer.GetPerasOverlay(op.Effects[0].Key)
+	_, _, ok := committer.GetPerasOverlay(testRuntimeDentryEffect(op).Key)
 	require.False(t, ok)
 	require.Equal(t, 0, committer.Stats()["pending"])
 	require.Equal(t, uint64(0), committer.Stats()["commit_total"])
@@ -142,7 +142,7 @@ func TestRuntimeFlushesSegmentAndKeepsReadsVisible(t *testing.T) {
 	require.Equal(t, uint64(1), stats["segment_total"])
 	require.Equal(t, uint64(2), stats["segment_operations_total"])
 	require.Equal(t, 0, stats["overlay_keys"])
-	require.Equal(t, 4, stats["segment_keys"])
+	require.Equal(t, 5, stats["segment_keys"])
 	require.Equal(t, 0, stats["pending"])
 	require.Equal(t, 1, installer.calls)
 	require.True(t, ScopesOverlap(installer.scope, testRuntimePerasOp([]byte("dentry/a"), []byte("inode/a")).Delta.Authority))
@@ -374,7 +374,7 @@ func TestRuntimeCapturePerasVisibleSnapshotIncludesPendingOverlay(t *testing.T) 
 	inodeBKey, err := fsmeta.EncodeInodeKey(testRuntimeMount, 42)
 	require.NoError(t, err)
 	opB := testRuntimeCreateOp(testRuntimeMount, fsmeta.RootInode, "b", 42, nil, nil)
-	dentryBValue := opB.Effects[0].Value
+	dentryBValue := testRuntimeDentryEffect(opB).Value
 
 	installRuntimeSealedSegment(t, committer, testRuntimePerasSegmentForOverlay(keyA, []byte("sealed-a")))
 	require.NoError(t, committer.read.overlay.Add(fsperas.OperationID{ClientID: "test", Seq: 1}, opB))
@@ -463,10 +463,10 @@ func TestRuntimeAppendsVisibleLogBeforeOverlay(t *testing.T) {
 	require.Len(t, log.records, 1)
 	require.Equal(t, fsmeta.OperationCreate, log.records[0].Operation.Kind)
 	require.Equal(t, op.Delta.Authority, log.records[0].Scope)
-	value, deleted, ok := committer.GetPerasOverlay(op.Effects[0].Key)
+	value, deleted, ok := committer.GetPerasOverlay(testRuntimeDentryEffect(op).Key)
 	require.True(t, ok)
 	require.False(t, deleted)
-	require.Equal(t, op.Effects[0].Value, value)
+	require.Equal(t, testRuntimeDentryEffect(op).Value, value)
 }
 
 func TestRuntimeRecoversVisibleLogRecords(t *testing.T) {
@@ -490,10 +490,10 @@ func TestRuntimeRecoversVisibleLogRecords(t *testing.T) {
 	defer committer.Close()
 
 	require.Equal(t, 1, committer.pendingOperations())
-	value, deleted, ok := committer.GetPerasOverlay(op.Effects[0].Key)
+	value, deleted, ok := committer.GetPerasOverlay(testRuntimeDentryEffect(op).Key)
 	require.True(t, ok)
 	require.False(t, deleted)
-	require.Equal(t, op.Effects[0].Value, value)
+	require.Equal(t, testRuntimeDentryEffect(op).Value, value)
 	stats := committer.Stats()
 	require.Equal(t, uint64(1), stats["visible_log_recover_total"])
 }
@@ -688,7 +688,7 @@ func TestRuntimeVisibleLogFailureDoesNotPublishOverlay(t *testing.T) {
 	op := testRuntimePerasOp([]byte("dentry/a"), []byte("inode/a"))
 	_, err = committer.SubmitVisible(context.Background(), fsperas.OperationID{ClientID: "client", Seq: 1}, op, nil)
 	require.ErrorIs(t, err, logErr)
-	_, _, ok := committer.GetPerasOverlay(op.Effects[0].Key)
+	_, _, ok := committer.GetPerasOverlay(testRuntimeDentryEffect(op).Key)
 	require.False(t, ok)
 	require.Zero(t, committer.pendingOperations())
 }
@@ -1108,7 +1108,7 @@ func TestRuntimeReturnsPendingAckOnRetry(t *testing.T) {
 	stats := committer.Stats()
 	require.Equal(t, uint64(1), stats["commit_total"])
 	require.Equal(t, 1, stats["pending"])
-	require.Equal(t, 2, stats["overlay_keys"])
+	require.Equal(t, 3, stats["overlay_keys"])
 }
 
 func TestRuntimeShutdownFlushesPendingSegment(t *testing.T) {
@@ -1223,9 +1223,9 @@ func TestRuntimeAcceptsCrossBucketCreateForCatalogInstall(t *testing.T) {
 	require.Equal(t, uint64(0), stats["segment_operations_total"])
 	require.Equal(t, 0, installer.calls)
 	require.Equal(t, 1, stats["pending"])
-	_, _, ok := committer.GetPerasOverlay(op.Effects[0].Key)
+	_, _, ok := committer.GetPerasOverlay(testRuntimeDentryEffect(op).Key)
 	require.True(t, ok)
-	_, _, ok = committer.GetPerasOverlay(op.Effects[1].Key)
+	_, _, ok = committer.GetPerasOverlay(testRuntimeInodeEffect(op).Key)
 	require.True(t, ok)
 
 	require.NoError(t, committer.FlushDurable(ctx))
@@ -1258,10 +1258,10 @@ func TestRuntimeFlushHonorsReplayMutationBudget(t *testing.T) {
 	require.NoError(t, committer.FlushDurable(ctx))
 
 	stats := committer.Stats()
-	require.Equal(t, uint64(2), stats["flush_total"])
-	require.Equal(t, uint64(2), stats["segment_total"])
+	require.Equal(t, uint64(3), stats["flush_total"])
+	require.Equal(t, uint64(3), stats["segment_total"])
 	require.Equal(t, uint64(3), stats["segment_operations_total"])
-	require.Equal(t, 2, installer.calls)
+	require.Equal(t, 3, installer.calls)
 }
 
 func TestRuntimeRetriesRetryableSegmentInstall(t *testing.T) {
@@ -1339,7 +1339,7 @@ func TestRuntimeRecoversWitnessSegment(t *testing.T) {
 	holder, err := fsperas.NewHolder(fsperas.HolderConfig{EpochID: 1, HolderID: "holder-a"})
 	require.NoError(t, err)
 	delta := testRuntimePerasOp([]byte("dentry/recovered"), []byte("inode/recovered"))
-	recoveredKey := delta.Effects[0].Key
+	recoveredKey := testRuntimeDentryEffect(delta).Key
 	_, _, err = holder.Submit(context.Background(), fsperas.OperationID{ClientID: "client", Seq: 1}, delta)
 	require.NoError(t, err)
 	plan, scope, err := holder.BuildPendingReplayPlan(10)
@@ -1990,7 +1990,7 @@ func TestRuntimeRecoversPredecessorBeforeOpeningNewEpoch(t *testing.T) {
 		Parents:    []fsmeta.InodeID{1},
 		Inodes:     []fsmeta.InodeID{2},
 	})
-	recoveredKey := recoveredDelta.Effects[0].Key
+	recoveredKey := testRuntimeDentryEffect(recoveredDelta).Key
 	_, _, err = holder.Submit(context.Background(), fsperas.OperationID{ClientID: "client", Seq: 1}, recoveredDelta)
 	require.NoError(t, err)
 	plan, scope, err := holder.BuildPendingReplayPlan(10)
@@ -2109,17 +2109,17 @@ func TestRuntimeFlushAuthorityFlushesOnlyOverlappingPendingOps(t *testing.T) {
 	require.Equal(t, uint64(1), stats["segment_total"])
 	require.Equal(t, uint64(1), stats["segment_operations_total"])
 	require.Equal(t, 1, stats["pending"])
-	require.Equal(t, 2, stats["overlay_keys"])
-	require.Equal(t, 2, stats["segment_keys"])
+	require.Equal(t, 3, stats["overlay_keys"])
+	require.Equal(t, 3, stats["segment_keys"])
 	require.Equal(t, 1, installer.calls)
 	require.Equal(t, scopeA, installer.scope)
 	require.Equal(t, uint64(1), installer.segment.Stats().OperationCount)
 
-	value, deleted, ok := committer.GetPerasOverlay(deltaA.Effects[0].Key)
+	value, deleted, ok := committer.GetPerasOverlay(testRuntimeDentryEffect(deltaA).Key)
 	require.True(t, ok)
 	require.False(t, deleted)
 	require.Equal(t, []byte("dentry-value"), value)
-	value, deleted, ok = committer.GetPerasOverlay(deltaB.Effects[0].Key)
+	value, deleted, ok = committer.GetPerasOverlay(testRuntimeDentryEffect(deltaB).Key)
 	require.True(t, ok)
 	require.False(t, deleted)
 	require.Equal(t, []byte("dentry-value"), value)
@@ -3254,7 +3254,7 @@ func testRuntimeCommitterGrant() rootproto.VisibleAuthorityGrant {
 			MountID:    "vol",
 			MountKeyID: 1,
 			Parents:    []uint64{1},
-			Inodes:     []uint64{2},
+			Inodes:     []uint64{1, 2},
 		},
 	}
 }
@@ -3343,15 +3343,25 @@ func testRuntimeCreateOp(mount fsmeta.MountIdentity, parent fsmeta.InodeID, name
 	if err != nil {
 		panic(err)
 	}
+	parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+		Inode:      parent,
+		Type:       fsmeta.InodeTypeDirectory,
+		LinkCount:  1,
+		ChildCount: 1,
+	})
+	if err != nil {
+		panic(err)
+	}
 	if dentryValue == nil {
-		dentryValue = program.Compiled.Delta.WriteEffects[0].Value
+		dentryValue = program.Compiled.Delta.WriteEffects[1].Value
 	}
 	if _, err := fsmeta.DecodeInodeValue(inodeValue); inodeValue == nil || err != nil {
-		inodeValue = program.Compiled.Delta.WriteEffects[1].Value
+		inodeValue = program.Compiled.Delta.WriteEffects[2].Value
 	}
 	op, err := compile.MaterializeCreate(program, compile.CreateValues{
-		DentryValue: dentryValue,
-		InodeValue:  inodeValue,
+		ParentInodeValue: parentValue,
+		DentryValue:      dentryValue,
+		InodeValue:       inodeValue,
 	})
 	if err != nil {
 		panic(err)
@@ -3373,7 +3383,12 @@ func testRuntimePredicateProofsForOp(op compile.MaterializedOp) []proof.Predicat
 		return nil
 	}
 	proofs := make([]proof.PredicateProof, 0, len(op.Delta.ReadPredicates))
+	seen := make(map[string]struct{}, len(op.Delta.ReadPredicates))
 	for _, predicate := range op.Delta.ReadPredicates {
+		if _, ok := seen[string(predicate.Key)]; ok {
+			continue
+		}
+		seen[string(predicate.Key)] = struct{}{}
 		frontier := proof.ProofFrontier{EpochID: 1, Sequence: 1}
 		switch predicate.Kind {
 		case compile.PredicateExists:
@@ -3385,6 +3400,20 @@ func testRuntimePredicateProofsForOp(op compile.MaterializedOp) []proof.Predicat
 		}
 	}
 	return proofs
+}
+
+func testRuntimeDentryEffect(op compile.MaterializedOp) compile.EffectPlan {
+	if len(op.Effects) < 2 {
+		panic("test runtime create op missing dentry effect")
+	}
+	return op.Effects[1]
+}
+
+func testRuntimeInodeEffect(op compile.MaterializedOp) compile.EffectPlan {
+	if len(op.Effects) < 3 {
+		panic("test runtime create op missing inode effect")
+	}
+	return op.Effects[2]
 }
 
 func testRuntimeCreateArgs(dentryKey, inodeKey []byte) (fsmeta.MountIdentity, fsmeta.InodeID, string, fsmeta.InodeID) {
@@ -3448,7 +3477,7 @@ func testRuntimeInodeFromKey(key []byte) fsmeta.InodeID {
 }
 
 func testRuntimeDentryKeyForLabel(label string) []byte {
-	return testRuntimePerasOp([]byte("dentry/"+label), []byte("inode/"+label)).Effects[0].Key
+	return testRuntimeDentryEffect(testRuntimePerasOp([]byte("dentry/"+label), []byte("inode/"+label))).Key
 }
 
 func testRuntimeRootDentryPrefix() []byte {
@@ -3478,10 +3507,30 @@ func testRuntimeRenameDentryOp(fromName, toName string, toValue []byte) compile.
 	if err != nil {
 		panic(err)
 	}
+	parentKey, err := fsmeta.EncodeInodeKey(testRuntimeMount, fsmeta.RootInode)
+	if err != nil {
+		panic(err)
+	}
+	parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+		Inode:      fsmeta.RootInode,
+		Type:       fsmeta.InodeTypeDirectory,
+		LinkCount:  1,
+		ChildCount: 1,
+	})
+	if err != nil {
+		panic(err)
+	}
+	frontier := proof.ProofFrontier{EpochID: 1, Sequence: 1}
 	op, err := compile.MaterializeCompiledOpWithEvidence(program.Compiled, []compile.WriteEffect{
 		{Kind: compile.EffectDelete, Key: fromKey},
 		{Kind: compile.EffectPut, Key: toKey, Value: toValue},
-	}, compile.PredicateEvidence{}, nil)
+		{Kind: compile.EffectPut, Key: parentKey, Value: parentValue},
+		{Kind: compile.EffectPut, Key: parentKey, Value: parentValue},
+	}, compile.PredicateEvidence{Proofs: []proof.PredicateProof{
+		proof.NewPredicateProof(fromKey, []byte("from"), true, 0, proof.ReadSourceOverlay, frontier),
+		proof.NewPredicateProof(toKey, nil, false, 0, proof.ReadSourceOverlay, frontier),
+		proof.NewPredicateProof(parentKey, parentValue, true, 0, proof.ReadSourceOverlay, frontier),
+	}}, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -3516,7 +3565,7 @@ func testRuntimeInodeForBucketSeed(bucket fsmeta.AffinityBucket, seed []byte) fs
 }
 
 func testRuntimePerasOpWithScope(op compile.MaterializedOp, scope compile.AuthorityScope) compile.MaterializedOp {
-	mount, parent, name, inode := testRuntimeCreateArgs(op.Effects[0].Key, op.Effects[1].Key)
+	mount, parent, name, inode := testRuntimeCreateArgs(testRuntimeDentryEffect(op).Key, testRuntimeInodeEffect(op).Key)
 	if scope.Mount != "" {
 		mount.MountID = scope.Mount
 	}

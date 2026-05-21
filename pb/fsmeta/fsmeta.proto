@@ -23,6 +23,7 @@ message InodeRecord {
   int64 created_unix_ns = 6;
   int64 updated_unix_ns = 7;
   bytes opaque_attrs = 8;
+  uint64 child_count = 9;
 }
 
 message SessionRecord {
@@ -261,6 +262,22 @@ message UnlinkRequest {
 
 message UnlinkResponse {}
 
+message RemoveRequest {
+  string mount = 1;
+  uint64 parent = 2;
+  string name = 3;
+}
+
+message RemoveResponse {}
+
+message RemoveDirectoryRequest {
+  string mount = 1;
+  uint64 parent = 2;
+  string name = 3;
+}
+
+message RemoveDirectoryResponse {}
+
 message OpenWriteSessionRequest {
   string mount = 1;
   uint64 inode = 2;
@@ -320,6 +337,8 @@ service FSMetadata {
   rpc RenameSubtree(RenameSubtreeRequest) returns (RenameSubtreeResponse);
   rpc Link(LinkRequest) returns (LinkResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+  rpc RemoveDirectory(RemoveDirectoryRequest) returns (RemoveDirectoryResponse);
   rpc OpenWriteSession(OpenWriteSessionRequest) returns (OpenWriteSessionResponse);
   rpc HeartbeatWriteSession(HeartbeatWriteSessionRequest) returns (HeartbeatWriteSessionResponse);
   rpc CloseWriteSession(CloseWriteSessionRequest) returns (CloseWriteSessionResponse);

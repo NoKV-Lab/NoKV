@@ -39,6 +39,8 @@ const (
 	FSMetadata_RenameSubtree_FullMethodName         = "/nokv.fsmeta.v1.FSMetadata/RenameSubtree"
 	FSMetadata_Link_FullMethodName                  = "/nokv.fsmeta.v1.FSMetadata/Link"
 	FSMetadata_Unlink_FullMethodName                = "/nokv.fsmeta.v1.FSMetadata/Unlink"
+	FSMetadata_Remove_FullMethodName                = "/nokv.fsmeta.v1.FSMetadata/Remove"
+	FSMetadata_RemoveDirectory_FullMethodName       = "/nokv.fsmeta.v1.FSMetadata/RemoveDirectory"
 	FSMetadata_OpenWriteSession_FullMethodName      = "/nokv.fsmeta.v1.FSMetadata/OpenWriteSession"
 	FSMetadata_HeartbeatWriteSession_FullMethodName = "/nokv.fsmeta.v1.FSMetadata/HeartbeatWriteSession"
 	FSMetadata_CloseWriteSession_FullMethodName     = "/nokv.fsmeta.v1.FSMetadata/CloseWriteSession"
@@ -64,6 +66,8 @@ type FSMetadataClient interface {
 	RenameSubtree(ctx context.Context, in *RenameSubtreeRequest, opts ...grpc.CallOption) (*RenameSubtreeResponse, error)
 	Link(ctx context.Context, in *LinkRequest, opts ...grpc.CallOption) (*LinkResponse, error)
 	Unlink(ctx context.Context, in *UnlinkRequest, opts ...grpc.CallOption) (*UnlinkResponse, error)
+	Remove(ctx context.Context, in *RemoveRequest, opts ...grpc.CallOption) (*RemoveResponse, error)
+	RemoveDirectory(ctx context.Context, in *RemoveDirectoryRequest, opts ...grpc.CallOption) (*RemoveDirectoryResponse, error)
 	OpenWriteSession(ctx context.Context, in *OpenWriteSessionRequest, opts ...grpc.CallOption) (*OpenWriteSessionResponse, error)
 	HeartbeatWriteSession(ctx context.Context, in *HeartbeatWriteSessionRequest, opts ...grpc.CallOption) (*HeartbeatWriteSessionResponse, error)
 	CloseWriteSession(ctx context.Context, in *CloseWriteSessionRequest, opts ...grpc.CallOption) (*CloseWriteSessionResponse, error)
@@ -231,6 +235,26 @@ func (c *fSMetadataClient) Unlink(ctx context.Context, in *UnlinkRequest, opts .
 	return out, nil
 }
 
+func (c *fSMetadataClient) Remove(ctx context.Context, in *RemoveRequest, opts ...grpc.CallOption) (*RemoveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveResponse)
+	err := c.cc.Invoke(ctx, FSMetadata_Remove_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fSMetadataClient) RemoveDirectory(ctx context.Context, in *RemoveDirectoryRequest, opts ...grpc.CallOption) (*RemoveDirectoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveDirectoryResponse)
+	err := c.cc.Invoke(ctx, FSMetadata_RemoveDirectory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *fSMetadataClient) OpenWriteSession(ctx context.Context, in *OpenWriteSessionRequest, opts ...grpc.CallOption) (*OpenWriteSessionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(OpenWriteSessionResponse)
@@ -290,6 +314,8 @@ type FSMetadataServer interface {
 	RenameSubtree(context.Context, *RenameSubtreeRequest) (*RenameSubtreeResponse, error)
 	Link(context.Context, *LinkRequest) (*LinkResponse, error)
 	Unlink(context.Context, *UnlinkRequest) (*UnlinkResponse, error)
+	Remove(context.Context, *RemoveRequest) (*RemoveResponse, error)
+	RemoveDirectory(context.Context, *RemoveDirectoryRequest) (*RemoveDirectoryResponse, error)
 	OpenWriteSession(context.Context, *OpenWriteSessionRequest) (*OpenWriteSessionResponse, error)
 	HeartbeatWriteSession(context.Context, *HeartbeatWriteSessionRequest) (*HeartbeatWriteSessionResponse, error)
 	CloseWriteSession(context.Context, *CloseWriteSessionRequest) (*CloseWriteSessionResponse, error)
@@ -347,6 +373,12 @@ func (UnimplementedFSMetadataServer) Link(context.Context, *LinkRequest) (*LinkR
 }
 func (UnimplementedFSMetadataServer) Unlink(context.Context, *UnlinkRequest) (*UnlinkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Unlink not implemented")
+}
+func (UnimplementedFSMetadataServer) Remove(context.Context, *RemoveRequest) (*RemoveResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Remove not implemented")
+}
+func (UnimplementedFSMetadataServer) RemoveDirectory(context.Context, *RemoveDirectoryRequest) (*RemoveDirectoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveDirectory not implemented")
 }
 func (UnimplementedFSMetadataServer) OpenWriteSession(context.Context, *OpenWriteSessionRequest) (*OpenWriteSessionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method OpenWriteSession not implemented")
@@ -639,6 +671,42 @@ func _FSMetadata_Unlink_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FSMetadata_Remove_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FSMetadataServer).Remove(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FSMetadata_Remove_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FSMetadataServer).Remove(ctx, req.(*RemoveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FSMetadata_RemoveDirectory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveDirectoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FSMetadataServer).RemoveDirectory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FSMetadata_RemoveDirectory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FSMetadataServer).RemoveDirectory(ctx, req.(*RemoveDirectoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _FSMetadata_OpenWriteSession_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(OpenWriteSessionRequest)
 	if err := dec(in); err != nil {
@@ -773,6 +841,14 @@ var FSMetadata_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Unlink",
 			Handler:    _FSMetadata_Unlink_Handler,
+		},
+		{
+			MethodName: "Remove",
+			Handler:    _FSMetadata_Remove_Handler,
+		},
+		{
+			MethodName: "RemoveDirectory",
+			Handler:    _FSMetadata_RemoveDirectory_Handler,
 		},
 		{
 			MethodName: "OpenWriteSession",

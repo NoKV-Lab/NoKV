@@ -18,7 +18,8 @@ import (
 //	kind bodies:
 //	  inode   'i' : inode be64 | type byte | size be64 | mode be32 |
 //	                link_count be32 | created_unix_ns be64 |
-//	                updated_unix_ns be64 | opaque_len uvarint | opaque bytes
+//	                updated_unix_ns be64 | opaque_len uvarint | opaque bytes |
+//	                child_count uvarint
 //	  dentry  'd' : parent inode be64 | name_len uvarint | name bytes |
 //	                inode be64 | type byte
 //	  session 's' : session_len uvarint | session bytes | inode be64 |
@@ -63,6 +64,7 @@ type InodeRecord struct {
 	Size          uint64    `json:"size,omitempty"`
 	Mode          uint32    `json:"mode,omitempty"`
 	LinkCount     uint32    `json:"link_count,omitempty"`
+	ChildCount    uint64    `json:"child_count,omitempty"`
 	CreatedUnixNs int64     `json:"created_unix_ns,omitempty"`
 	UpdatedUnixNs int64     `json:"updated_unix_ns,omitempty"`
 	OpaqueAttrs   []byte    `json:"opaque_attrs,omitempty"`
@@ -134,7 +136,7 @@ func EncodeInodeValue(record InodeRecord) ([]byte, error) {
 	if len(record.OpaqueAttrs) > MaxInodeOpaqueAttrsBytes {
 		return nil, ErrInvalidValue
 	}
-	out := encodeValuePrefix(ValueKindInode, 41+binary.MaxVarintLen64+len(record.OpaqueAttrs))
+	out := encodeValuePrefix(ValueKindInode, 41+binary.MaxVarintLen64+len(record.OpaqueAttrs)+binary.MaxVarintLen64)
 	out = binary.BigEndian.AppendUint64(out, uint64(record.Inode))
 	out = append(out, typ)
 	out = binary.BigEndian.AppendUint64(out, record.Size)
@@ -144,6 +146,7 @@ func EncodeInodeValue(record InodeRecord) ([]byte, error) {
 	out = binary.BigEndian.AppendUint64(out, uint64(record.UpdatedUnixNs))
 	out = binary.AppendUvarint(out, uint64(len(record.OpaqueAttrs)))
 	out = append(out, record.OpaqueAttrs...)
+	out = binary.AppendUvarint(out, record.ChildCount)
 	return out, nil
 }
 
@@ -390,10 +393,23 @@ func decodeInodeBody(body []byte) (InodeRecord, error) {
 		return InodeRecord{}, ErrInvalidValue
 	}
 	pos += n
-	if attrsLen > MaxInodeOpaqueAttrsBytes || attrsLen != uint64(len(body)-pos) {
+	if attrsLen > MaxInodeOpaqueAttrsBytes || attrsLen > uint64(len(body)-pos) {
 		return InodeRecord{}, ErrInvalidValue
 	}
-	record.OpaqueAttrs = append([]byte(nil), body[pos:]...)
+	record.OpaqueAttrs = append([]byte(nil), body[pos:pos+int(attrsLen)]...)
+	pos += int(attrsLen)
+	if pos == len(body) {
+		return record, nil
+	}
+	childCount, n := binary.Uvarint(body[pos:])
+	if n <= 0 {
+		return InodeRecord{}, ErrInvalidValue
+	}
+	pos += n
+	if pos != len(body) {
+		return InodeRecord{}, ErrInvalidValue
+	}
+	record.ChildCount = childCount
 	return record, nil
 }
 

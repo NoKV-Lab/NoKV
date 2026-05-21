@@ -58,6 +58,10 @@ func visibleOperationClientID(kind fsmeta.OperationKind) string {
 		return "fsmeta-exec/link"
 	case fsmeta.OperationUnlink:
 		return "fsmeta-exec/unlink"
+	case fsmeta.OperationRemove:
+		return "fsmeta-exec/remove"
+	case fsmeta.OperationRemoveDirectory:
+		return "fsmeta-exec/remove_directory"
 	case fsmeta.OperationOpenWriteSession:
 		return "fsmeta-exec/open_write_session"
 	case fsmeta.OperationHeartbeatSession:

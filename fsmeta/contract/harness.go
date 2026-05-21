@@ -24,6 +24,7 @@ type Executor interface {
 	RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error
 	Link(context.Context, fsmeta.LinkRequest) error
 	Unlink(context.Context, fsmeta.UnlinkRequest) error
+	Remove(context.Context, fsmeta.RemoveRequest) error
 	OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
 	HeartbeatWriteSession(context.Context, fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
 	CloseWriteSession(context.Context, fsmeta.CloseWriteSessionRequest) error
@@ -161,6 +162,13 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 		return Result{Err: err}
 	case OpUnlink:
 		err := exec.Unlink(ctx, fsmeta.UnlinkRequest{
+			Mount:  op.Mount,
+			Parent: op.Parent,
+			Name:   op.Name,
+		})
+		return Result{Err: err}
+	case OpRemove:
+		err := exec.Remove(ctx, fsmeta.RemoveRequest{
 			Mount:  op.Mount,
 			Parent: op.Parent,
 			Name:   op.Name,

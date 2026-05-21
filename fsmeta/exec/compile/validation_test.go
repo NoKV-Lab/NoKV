@@ -13,56 +13,48 @@ import (
 )
 
 func TestMaterializedOpValidationRequiresAbsentProof(t *testing.T) {
-	program, err := CompileCreateProgram(fsmeta.CreateRequest{
-		Mount:  "vol",
-		Parent: fsmeta.RootInode,
-		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
-	}, testMount, 44)
-	require.NoError(t, err)
-	op, err := MaterializeCreate(program, CreateValues{})
-	require.NoError(t, err)
+	op := materializedCreateForValidation(t, 44)
+	var validationErr ValidationError
+	err := op.ValidateForAdmissionIntent()
+	require.ErrorAs(t, err, &validationErr)
+	require.Equal(t, ValidationPredicateProofMissing, validationErr.Kind)
+
+	parentProof := proof.NewPredicateProof(op.Delta.ReadPredicates[0].Key, op.Delta.WriteEffects[0].Value, true, 0, proof.ReadSourceOverlay, proof.ProofFrontier{EpochID: 1, Sequence: 1})
+	op = WithPredicateProofs(op, []proof.PredicateProof{parentProof})
 	require.NoError(t, op.ValidateForAdmissionIntent())
 
-	var validationErr ValidationError
 	err = op.ValidateForAdmission()
 	require.ErrorAs(t, err, &validationErr)
 	require.Equal(t, ValidationPredicateProofMissing, validationErr.Kind)
 
 	proofs := []proof.PredicateProof{
-		proof.NewPredicateProof(op.Delta.ReadPredicates[0].Key, nil, false, 0, proof.ReadSourceOverlay, proof.ProofFrontier{EpochID: 1, Sequence: 1}),
+		parentProof,
 		proof.NewPredicateProof(op.Delta.ReadPredicates[1].Key, nil, false, 0, proof.ReadSourceOverlay, proof.ProofFrontier{EpochID: 1, Sequence: 1}),
+		proof.NewPredicateProof(op.Delta.ReadPredicates[2].Key, nil, false, 0, proof.ReadSourceOverlay, proof.ProofFrontier{EpochID: 1, Sequence: 1}),
 	}
 	op = WithPredicateProofs(op, proofs)
 	require.NoError(t, op.ValidateForAdmission())
 }
 
 func TestPredicateProofCarriesAbsenceProofClass(t *testing.T) {
-	program, err := CompileCreateProgram(fsmeta.CreateRequest{
-		Mount:  "vol",
-		Parent: fsmeta.RootInode,
-		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
-	}, testMount, 44)
-	require.NoError(t, err)
-	op, err := MaterializeCreate(program, CreateValues{})
-	require.NoError(t, err)
+	op := materializedCreateForValidation(t, 44)
 
-	overlay := proof.NewPredicateProof(op.Delta.ReadPredicates[0].Key, nil, false, 0, proof.ReadSourceOverlay, proof.ProofFrontier{EpochID: 7, Sequence: 9})
+	parent := proof.NewPredicateProof(op.Delta.ReadPredicates[0].Key, op.Delta.WriteEffects[0].Value, true, 0, proof.ReadSourceOverlay, proof.ProofFrontier{EpochID: 7, Sequence: 9})
+	overlay := proof.NewPredicateProof(op.Delta.ReadPredicates[1].Key, nil, false, 0, proof.ReadSourceOverlay, proof.ProofFrontier{EpochID: 7, Sequence: 9})
 	require.Equal(t, proof.PredicateProofOverlayFrontierAbsence, overlay.ProofKind)
 	require.NotEqual(t, [32]byte{}, overlay.ScopeDigest)
 
-	base := proof.NewPredicateProof(op.Delta.ReadPredicates[1].Key, nil, false, 11, proof.ReadSourceBase, proof.ProofFrontier{})
+	base := proof.NewPredicateProof(op.Delta.ReadPredicates[2].Key, nil, false, 11, proof.ReadSourceBase, proof.ProofFrontier{})
 	require.Equal(t, proof.PredicateProofPointAbsence, base.ProofKind)
 	require.NotEqual(t, [32]byte{}, base.ScopeDigest)
 
-	op = WithPredicateProofs(op, []proof.PredicateProof{overlay, base})
+	op = WithPredicateProofs(op, []proof.PredicateProof{parent, overlay, base})
 	require.NoError(t, op.ValidateForAdmission())
 
 	base.ScopeDigest[0] ^= 0xff
-	op = WithPredicateProofs(op, []proof.PredicateProof{overlay, base})
+	op = WithPredicateProofs(op, []proof.PredicateProof{parent, overlay, base})
 	var validationErr ValidationError
-	err = op.ValidateForAdmission()
+	err := op.ValidateForAdmission()
 	require.ErrorAs(t, err, &validationErr)
 	require.Equal(t, ValidationPredicateProofMismatch, validationErr.Kind)
 }
@@ -85,18 +77,11 @@ func TestMaterializedOpValidationBindsGuardProofEvidence(t *testing.T) {
 }
 
 func TestMaterializedOpValidationRejectsReplayDigestDrift(t *testing.T) {
-	delta, err := testCreateDelta(t, fsmeta.CreateRequest{
-		Mount:  "vol",
-		Parent: fsmeta.RootInode,
-		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
-	}, testMount, 44)
-	require.NoError(t, err)
-	op := testMaterializeAOT(t, delta, nil)
+	op := materializedCreateForValidation(t, 44)
 	op.ReplayDigest[0] ^= 0xff
 
 	var validationErr ValidationError
-	err = op.ValidateForAdmission()
+	err := op.ValidateForAdmission()
 	require.ErrorAs(t, err, &validationErr)
 	require.Equal(t, ValidationCanonicalMismatch, validationErr.Kind)
 }
@@ -114,42 +99,52 @@ func TestObservedValuePredicateCompilesExactProofObligation(t *testing.T) {
 }
 
 func TestMaterializedOpValidationRejectsUncoveredWrite(t *testing.T) {
-	delta, err := testCreateDelta(t, fsmeta.CreateRequest{
-		Mount:  "vol",
-		Parent: fsmeta.RootInode,
-		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
-	}, testMount, 44)
-	require.NoError(t, err)
-	delta.Authority = AuthorityScope{
-		Mount:      testMount.MountID,
-		MountKeyID: testMount.MountKeyID,
-		Buckets:    []fsmeta.AffinityBucket{fsmeta.BucketForInodeID(55)},
-		Inodes:     []fsmeta.InodeID{55},
-	}
+	op := materializedCreateForValidation(t, 44)
+	badScope := op.Authority.Scope
+	badScope.Inodes = []fsmeta.InodeID{55}
+	op.Delta.Authority = badScope
+	op.Authority.Scope = badScope
 
 	var validationErr ValidationError
-	op := testMaterializeAOT(t, delta, nil)
-	err = op.ValidateForAdmission()
+	err := op.ValidateForAdmission()
 	require.ErrorAs(t, err, &validationErr)
 	require.Equal(t, ValidationAuthorityMismatch, validationErr.Kind)
 }
 
 func TestMaterializedOpValidationRejectsNonCanonicalDescriptor(t *testing.T) {
-	delta, err := testCreateDelta(t, fsmeta.CreateRequest{
+	op := materializedCreateForValidation(t, 44)
+	op.Placement.CanSegment = false
+
+	var validationErr ValidationError
+	err := op.ValidateForAdmission()
+	require.ErrorAs(t, err, &validationErr)
+	require.Equal(t, ValidationCanonicalMismatch, validationErr.Kind)
+}
+
+func materializedCreateForValidation(t *testing.T, inode fsmeta.InodeID) MaterializedOp {
+	t.Helper()
+	req := fsmeta.CreateRequest{
 		Mount:  "vol",
 		Parent: fsmeta.RootInode,
 		Name:   "file",
 		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
-	}, testMount, 44)
+	}
+	program, err := CompileCreateProgram(req, testMount, inode)
 	require.NoError(t, err)
-	op := testMaterializeAOT(t, delta, nil)
-	op.Placement.CanSegment = false
-
-	var validationErr ValidationError
-	err = op.ValidateForAdmission()
-	require.ErrorAs(t, err, &validationErr)
-	require.Equal(t, ValidationCanonicalMismatch, validationErr.Kind)
+	parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+		Inode:      fsmeta.RootInode,
+		Type:       fsmeta.InodeTypeDirectory,
+		LinkCount:  1,
+		ChildCount: 1,
+	})
+	require.NoError(t, err)
+	op, err := MaterializeCreate(program, CreateValues{
+		ParentInodeValue: parentValue,
+		DentryValue:      program.Compiled.Delta.WriteEffects[1].Value,
+		InodeValue:       program.Compiled.Delta.WriteEffects[2].Value,
+	})
+	require.NoError(t, err)
+	return op
 }
 
 func TestMaterializedOpValidationRequiresObservedValueProof(t *testing.T) {

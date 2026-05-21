@@ -283,6 +283,7 @@ func TestExecutorAtomicOnePhaseBacksOffAfterRepeatedFallback(t *testing.T) {
 	executor, err := newTestExecutor(runner, WithMountResolver(resolver), WithSubtreeAuthorityResolver(authority))
 	require.NoError(t, err)
 
+	seedDirectory(t, runner.fakeRunner, "vol", 8)
 	total := atomicOnePhaseBackoffAfter + 3
 	for i := range total {
 		oldName := fmt.Sprintf("old-%d", i)
@@ -315,6 +316,7 @@ func TestExecutorAtomicOnePhaseBackoffIsAffinityScoped(t *testing.T) {
 	executor, err := newTestExecutor(runner, WithMountResolver(resolver), WithSubtreeAuthorityResolver(authority))
 	require.NoError(t, err)
 
+	seedDirectory(t, runner.fakeRunner, "vol", 8)
 	for i := range atomicOnePhaseBackoffAfter {
 		oldName := fmt.Sprintf("old-%d", i)
 		newName := fmt.Sprintf("new-%d", i)
@@ -331,6 +333,7 @@ func TestExecutorAtomicOnePhaseBackoffIsAffinityScoped(t *testing.T) {
 
 	from, to := findDifferentRenameAffinity(t, 7, 8)
 	seedDentry(t, runner.fakeRunner, "vol", from, "other-old", 999)
+	seedDirectory(t, runner.fakeRunner, "vol", to)
 	err = executor.Rename(context.Background(), fsmeta.RenameRequest{
 		Mount:      "vol",
 		FromParent: from,

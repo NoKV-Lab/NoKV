@@ -28,10 +28,14 @@ func CompileRenameProgram(req fsmeta.RenameRequest, mount fsmeta.MountIdentity) 
 	predicates := []Predicate{
 		{Kind: PredicateExists, Key: plan.ReadKeys[0]},
 		{Kind: PredicateNotExists, Key: plan.ReadKeys[1]},
+		{Kind: PredicateObservedValue, Key: plan.ReadKeys[2]},
+		{Kind: PredicateObservedValue, Key: plan.ReadKeys[3]},
 	}
 	effects := []WriteEffect{
 		{Kind: EffectDelete, Key: plan.MutateKeys[0]},
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[1]},
+		{Kind: EffectDerivedPut, Key: plan.MutateKeys[2]},
+		{Kind: EffectDerivedPut, Key: plan.MutateKeys[3]},
 	}
 	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	if len(delta.Authority.Buckets) > 1 {
@@ -57,10 +61,14 @@ func CompileRenameSubtreeProgram(req fsmeta.RenameSubtreeRequest, mount fsmeta.M
 	predicates := []Predicate{
 		{Kind: PredicateExists, Key: plan.ReadKeys[0]},
 		{Kind: PredicateNotExists, Key: plan.ReadKeys[1]},
+		{Kind: PredicateObservedValue, Key: plan.ReadKeys[2]},
+		{Kind: PredicateObservedValue, Key: plan.ReadKeys[3]},
 	}
 	effects := []WriteEffect{
 		{Kind: EffectDelete, Key: plan.MutateKeys[0]},
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[1]},
+		{Kind: EffectDerivedPut, Key: plan.MutateKeys[2]},
+		{Kind: EffectDerivedPut, Key: plan.MutateKeys[3]},
 	}
 	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonDurabilityBarrier, DurabilityBarrier: true, WatchAtSeal: true}
 	if !validateRenameSubtreeSemanticDelta(delta) {
@@ -101,7 +109,7 @@ func validateRenameSemanticDelta(delta SemanticDelta) bool {
 	if delta.Authority.AllowOpaqueKeys {
 		return false
 	}
-	if len(delta.ReadPredicates) != 2 {
+	if len(delta.ReadPredicates) < 4 {
 		return false
 	}
 	if delta.ReadPredicates[0].Kind != PredicateExists {
@@ -116,7 +124,19 @@ func validateRenameSemanticDelta(delta SemanticDelta) bool {
 	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[1].Key, "read[1]") {
 		return false
 	}
-	if len(delta.WriteEffects) != 2 {
+	if delta.ReadPredicates[2].Kind != PredicateObservedValue {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[2].Key, "read[2]") {
+		return false
+	}
+	if delta.ReadPredicates[3].Kind != PredicateObservedValue {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[3].Key, "read[3]") {
+		return false
+	}
+	if len(delta.WriteEffects) != 4 {
 		return false
 	}
 	if delta.WriteEffects[0].Kind != EffectDelete {
@@ -129,6 +149,18 @@ func validateRenameSemanticDelta(delta SemanticDelta) bool {
 		return false
 	}
 	if !semanticKeyBindingMatches(delta, delta.WriteEffects[1].Key, "mutate[1]") {
+		return false
+	}
+	if delta.WriteEffects[2].Kind != EffectDerivedPut {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.WriteEffects[2].Key, "mutate[2]") {
+		return false
+	}
+	if delta.WriteEffects[3].Kind != EffectDerivedPut {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.WriteEffects[3].Key, "mutate[3]") {
 		return false
 	}
 	if len(delta.RuntimeGuards) != 0 {
@@ -164,7 +196,7 @@ func validateRenameSubtreeSemanticDelta(delta SemanticDelta) bool {
 	if delta.Authority.AllowOpaqueKeys {
 		return false
 	}
-	if len(delta.ReadPredicates) != 2 {
+	if len(delta.ReadPredicates) != 4 {
 		return false
 	}
 	if delta.ReadPredicates[0].Kind != PredicateExists {
@@ -179,7 +211,19 @@ func validateRenameSubtreeSemanticDelta(delta SemanticDelta) bool {
 	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[1].Key, "read[1]") {
 		return false
 	}
-	if len(delta.WriteEffects) != 2 {
+	if delta.ReadPredicates[2].Kind != PredicateObservedValue {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[2].Key, "read[2]") {
+		return false
+	}
+	if delta.ReadPredicates[3].Kind != PredicateObservedValue {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[3].Key, "read[3]") {
+		return false
+	}
+	if len(delta.WriteEffects) != 4 {
 		return false
 	}
 	if delta.WriteEffects[0].Kind != EffectDelete {
@@ -194,6 +238,18 @@ func validateRenameSubtreeSemanticDelta(delta SemanticDelta) bool {
 	if !semanticKeyBindingMatches(delta, delta.WriteEffects[1].Key, "mutate[1]") {
 		return false
 	}
+	if delta.WriteEffects[2].Kind != EffectDerivedPut {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.WriteEffects[2].Key, "mutate[2]") {
+		return false
+	}
+	if delta.WriteEffects[3].Kind != EffectDerivedPut {
+		return false
+	}
+	if !semanticKeyBindingMatches(delta, delta.WriteEffects[3].Key, "mutate[3]") {
+		return false
+	}
 	if len(delta.RuntimeGuards) != 0 {
 		return false
 	}
@@ -201,7 +257,7 @@ func validateRenameSubtreeSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileRenameCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationRename || len(delta.WriteEffects) != 2 {
+	if delta.Kind != fsmeta.OperationRename || len(delta.WriteEffects) != 4 {
 		return CompiledOp{}, fsmeta.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
@@ -410,7 +466,7 @@ placementDone:
 }
 
 func compileRenameSubtreeCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationRenameSubtree || len(delta.ReadPredicates) != 2 || len(delta.WriteEffects) != 2 {
+	if delta.Kind != fsmeta.OperationRenameSubtree || len(delta.ReadPredicates) != 4 || len(delta.WriteEffects) != 4 {
 		return CompiledOp{}, fsmeta.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)

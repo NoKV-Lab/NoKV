@@ -148,6 +148,15 @@ func testUnlinkDelta(tb testing.TB, req fsmeta.UnlinkRequest, mount fsmeta.Mount
 	return cloneDelta(program.Compiled.Delta), nil
 }
 
+func testRemoveDelta(tb testing.TB, req fsmeta.RemoveRequest, mount fsmeta.MountIdentity, opts ...Option) (SemanticDelta, error) {
+	tb.Helper()
+	program, err := CompileRemoveProgram(req, mount, opts...)
+	if err != nil {
+		return SemanticDelta{}, err
+	}
+	return cloneDelta(program.Compiled.Delta), nil
+}
+
 func testOpenWriteSessionDelta(tb testing.TB, req fsmeta.OpenWriteSessionRequest, mount fsmeta.MountIdentity) (SemanticDelta, error) {
 	tb.Helper()
 	program, err := CompileOpenWriteSessionProgram(req, mount)
@@ -231,6 +240,8 @@ func TestCreateCompilesVisibleCommitDelta(t *testing.T) {
 
 	dentryKey, err := fsmeta.EncodeDentryKey(testMount, fsmeta.RootInode, "file")
 	require.NoError(t, err)
+	parentKey, err := fsmeta.EncodeInodeKey(testMount, fsmeta.RootInode)
+	require.NoError(t, err)
 	inodeKey, err := fsmeta.EncodeInodeKey(testMount, 22)
 	require.NoError(t, err)
 
@@ -238,19 +249,22 @@ func TestCreateCompilesVisibleCommitDelta(t *testing.T) {
 	require.Equal(t, EligibilityVisibleCommit, delta.Eligibility)
 	require.Equal(t, SlowReasonNone, delta.SlowReason)
 	require.Equal(t, []Predicate{
+		{Kind: PredicateObservedValue, Key: parentKey},
 		{Kind: PredicateNotExists, Key: dentryKey},
 		{Kind: PredicateNotExists, Key: inodeKey},
 	}, delta.ReadPredicates)
-	require.Len(t, delta.WriteEffects, 2)
-	require.Equal(t, EffectPut, delta.WriteEffects[0].Kind)
-	require.Equal(t, dentryKey, delta.WriteEffects[0].Key)
+	require.Len(t, delta.WriteEffects, 3)
+	require.Equal(t, EffectDerivedPut, delta.WriteEffects[0].Kind)
+	require.Equal(t, parentKey, delta.WriteEffects[0].Key)
 	require.Equal(t, EffectPut, delta.WriteEffects[1].Kind)
-	require.Equal(t, inodeKey, delta.WriteEffects[1].Key)
+	require.Equal(t, dentryKey, delta.WriteEffects[1].Key)
+	require.Equal(t, EffectPut, delta.WriteEffects[2].Kind)
+	require.Equal(t, inodeKey, delta.WriteEffects[2].Key)
 
-	dentry, err := fsmeta.DecodeDentryValue(delta.WriteEffects[0].Value)
+	dentry, err := fsmeta.DecodeDentryValue(delta.WriteEffects[1].Value)
 	require.NoError(t, err)
 	require.Equal(t, fsmeta.DentryRecord{Parent: fsmeta.RootInode, Name: "file", Inode: 22, Type: fsmeta.InodeTypeFile}, dentry)
-	inode, err := fsmeta.DecodeInodeValue(delta.WriteEffects[1].Value)
+	inode, err := fsmeta.DecodeInodeValue(delta.WriteEffects[2].Value)
 	require.NoError(t, err)
 	require.Equal(t, fsmeta.InodeID(22), inode.Inode)
 	require.Equal(t, uint64(128), inode.Size)
@@ -284,21 +298,22 @@ func TestCreateCompilesSegmentInstallableOperation(t *testing.T) {
 	require.Equal(t, SegmentInstallCatalog, op.Placement.Install)
 	require.Equal(t, SegmentInstallCatalog, op.Placement.MergeKey.Install)
 	require.Equal(t, segmentFormatVersion, op.Placement.MergeKey.FormatVersion)
-	require.Equal(t, []MutationID{0, 1}, op.Atomicity.Members)
+	require.Equal(t, []MutationID{0, 1, 2}, op.Atomicity.Members)
 	require.False(t, op.Atomicity.Splittable)
 	require.Equal(t, RecoveryReplayAllOrNothing, op.Atomicity.Recovery)
 	require.Equal(t, op.DescriptorDigest, op.Atomicity.Digest)
 
-	require.Len(t, op.Predicates, 2)
-	require.True(t, op.Predicates[0].NeedAbsent)
-	require.False(t, op.Predicates[0].NeedValue)
+	require.Len(t, op.Predicates, 3)
+	require.True(t, op.Predicates[0].NeedValue)
+	require.False(t, op.Predicates[0].NeedAbsent)
 	require.True(t, op.Predicates[1].NeedAbsent)
-	require.Len(t, op.Effects, 2)
+	require.True(t, op.Predicates[2].NeedAbsent)
+	require.Len(t, op.Effects, 3)
 	require.Equal(t, MutationID(0), op.Effects[0].ID)
-	require.Equal(t, DerivationNone, op.Effects[0].Derivation)
-	require.True(t, op.Effects[0].Concrete)
+	require.Equal(t, DerivationRuntimeValue, op.Effects[0].Derivation)
+	require.False(t, op.Effects[0].Concrete)
 	require.Equal(t, testMount.MountKeyID, op.Effects[0].MountKeyID)
-	require.Equal(t, fsmeta.KeyKindDentry, op.Effects[0].RecordKind)
+	require.Equal(t, fsmeta.KeyKindInode, op.Effects[0].RecordKind)
 	require.Len(t, op.Watch, 1)
 	require.Equal(t, WatchEventCreate, op.Watch[0].EventKind)
 	require.Equal(t, WatchEmitVisible, op.Watch[0].EmitAt)
@@ -306,20 +321,20 @@ func TestCreateCompilesSegmentInstallableOperation(t *testing.T) {
 	require.Equal(t, fsmeta.RootInode, op.Watch[0].Parent)
 	require.Equal(t, "file", op.Watch[0].Name)
 	require.Equal(t, inodeID, op.Watch[0].Inode)
-	require.Len(t, op.Footprint.Reads, 2)
-	require.Len(t, op.Footprint.Writes, 2)
-	require.Len(t, op.Footprint.ConflictKeys, 4)
+	require.Len(t, op.Footprint.Reads, 3)
+	require.Len(t, op.Footprint.Writes, 3)
+	require.Len(t, op.Footprint.ConflictKeys, 6)
 	require.False(t, op.Footprint.HasPrefixRead)
 	require.False(t, op.Footprint.HasOpaqueKeys)
 	require.True(t, op.Footprint.EstimatedBytes > 0)
 	require.True(t, op.Completion.RetainCompletion)
 	require.Equal(t, CompletionVisible, op.Completion.Kind)
-	require.Equal(t, uint32(2), op.Completion.MutationCount)
+	require.Equal(t, uint32(3), op.Completion.MutationCount)
 	require.Equal(t, op.DescriptorDigest, op.Completion.DescriptorDigest)
 	require.Equal(t, op.Placement.MergeKey, op.Segment.MergeKey)
 	require.True(t, op.Segment.CanAppend)
 	require.Equal(t, uint32(1), op.Segment.OperationCount)
-	require.Equal(t, uint32(2), op.Segment.MutationCount)
+	require.Equal(t, uint32(3), op.Segment.MutationCount)
 }
 
 func TestGeneratedCreateProgramMatchesCurrentCompiler(t *testing.T) {
@@ -348,15 +363,33 @@ func TestGeneratedCreateProgramMatchesCurrentCompiler(t *testing.T) {
 
 			defaultMaterialized, err := MaterializeCreate(program, CreateValues{})
 			require.NoError(t, err)
-			require.Equal(t, testMaterializeAOT(t, delta, nil), defaultMaterialized)
+			expectedDefault, err := MaterializeCompiledOpWithEvidence(program.Compiled, nil, PredicateEvidence{}, nil)
+			require.NoError(t, err)
+			require.Equal(t, expectedDefault, defaultMaterialized)
 
+			parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+				Inode:      req.Parent,
+				Type:       fsmeta.InodeTypeDirectory,
+				LinkCount:  1,
+				ChildCount: 1,
+			})
+			require.NoError(t, err)
 			values := CreateValues{
-				DentryValue: append([]byte(nil), program.Compiled.Delta.WriteEffects[0].Value...),
-				InodeValue:  append([]byte(nil), program.Compiled.Delta.WriteEffects[1].Value...),
+				ParentInodeValue: parentValue,
+				DentryValue:      append([]byte(nil), program.Compiled.Delta.WriteEffects[1].Value...),
+				InodeValue:       append([]byte(nil), program.Compiled.Delta.WriteEffects[2].Value...),
 			}
 			valueMaterialized, err := MaterializeCreate(program, values)
 			require.NoError(t, err)
-			require.Equal(t, testMaterializeAOT(t, delta, nil), valueMaterialized)
+			expectedDelta := cloneDelta(delta)
+			expectedDelta.WriteEffects = []WriteEffect{
+				{Kind: EffectPut, Key: expectedDelta.WriteEffects[0].Key, Value: parentValue},
+				expectedDelta.WriteEffects[1],
+				expectedDelta.WriteEffects[2],
+			}
+			expected, err := MaterializeCompiledOpWithEvidence(program.Compiled, expectedDelta.WriteEffects, PredicateEvidence{}, nil)
+			require.NoError(t, err)
+			require.Equal(t, expected, valueMaterialized)
 		})
 	}
 }
@@ -373,7 +406,7 @@ func TestGeneratedCreateMaterializerRejectsMalformedProgram(t *testing.T) {
 	}
 	program, err := CompileCreateProgram(req, testMount, 22)
 	require.NoError(t, err)
-	_, err = MaterializeCreate(program, CreateValues{DentryValue: program.Compiled.Delta.WriteEffects[0].Value})
+	_, err = MaterializeCreate(program, CreateValues{DentryValue: program.Compiled.Delta.WriteEffects[1].Value})
 	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
 }
 
@@ -474,6 +507,13 @@ func TestGeneratedProgramEntriesAreCanonical(t *testing.T) {
 			name: "unlink",
 			compile: func() (CompiledOp, error) {
 				program, err := CompileUnlinkProgram(fsmeta.UnlinkRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old"}, testMount, WithQuotaMode(QuotaModeEscrow))
+				return program.Compiled, err
+			},
+		},
+		{
+			name: "remove",
+			compile: func() (CompiledOp, error) {
+				program, err := CompileRemoveProgram(fsmeta.RemoveRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old"}, testMount, WithQuotaMode(QuotaModeEscrow))
 				return program.Compiled, err
 			},
 		},
@@ -748,6 +788,8 @@ func TestRenameBucketLocalVisibleCrossBucketSlow(t *testing.T) {
 	require.Equal(t, []WriteEffect{
 		{Kind: EffectDelete, Key: sameParent.Plan.MutateKeys[0]},
 		{Kind: EffectDerivedPut, Key: sameParent.Plan.MutateKeys[1]},
+		{Kind: EffectDerivedPut, Key: sameParent.Plan.MutateKeys[2]},
+		{Kind: EffectDerivedPut, Key: sameParent.Plan.MutateKeys[3]},
 	}, sameParent.WriteEffects)
 
 	sameBucketParent := testParentInSameBucket(t, 8)
@@ -816,9 +858,10 @@ func TestLinkAndUnlinkCompileRuntimeConcreteVisibleCommitDeltas(t *testing.T) {
 	require.Equal(t, EligibilityVisibleCommit, link.Eligibility)
 	require.Empty(t, link.SlowReason)
 	require.Contains(t, link.RuntimeGuards, GuardSameAuthority)
-	require.Len(t, link.WriteEffects, 2)
+	require.Len(t, link.WriteEffects, 3)
 	require.Equal(t, EffectDerivedPut, link.WriteEffects[0].Kind)
 	require.Equal(t, EffectDerivedPut, link.WriteEffects[1].Kind)
+	require.Equal(t, EffectDerivedPut, link.WriteEffects[2].Kind)
 
 	delta, err := testUnlinkDelta(t, fsmeta.UnlinkRequest{
 		Mount:  "vol",
@@ -830,6 +873,19 @@ func TestLinkAndUnlinkCompileRuntimeConcreteVisibleCommitDeltas(t *testing.T) {
 	require.Empty(t, delta.SlowReason)
 	require.Equal(t, EffectDelete, delta.WriteEffects[0].Kind)
 	require.Equal(t, EffectDerivedPut, delta.WriteEffects[1].Kind)
+	require.Equal(t, EffectDerivedPut, delta.WriteEffects[2].Kind)
+
+	remove, err := testRemoveDelta(t, fsmeta.RemoveRequest{
+		Mount:  "vol",
+		Parent: 5,
+		Name:   "file",
+	}, testMount)
+	require.NoError(t, err)
+	require.Equal(t, EligibilityVisibleCommit, remove.Eligibility)
+	require.Empty(t, remove.SlowReason)
+	require.Equal(t, EffectDelete, remove.WriteEffects[0].Kind)
+	require.Equal(t, EffectDerivedPut, remove.WriteEffects[1].Kind)
+	require.Equal(t, EffectDerivedPut, remove.WriteEffects[2].Kind)
 }
 
 func TestSessionOperationsCompileVisibleCommitDeltas(t *testing.T) {
@@ -875,16 +931,16 @@ func TestDeltasCloneReturnedBytes(t *testing.T) {
 	}, testMount, 22)
 	require.NoError(t, err)
 	primary := append([]byte(nil), delta.Plan.PrimaryKey...)
-	predicate := append([]byte(nil), delta.ReadPredicates[0].Key...)
-	value := append([]byte(nil), delta.WriteEffects[0].Value...)
+	predicate := append([]byte(nil), delta.ReadPredicates[1].Key...)
+	value := append([]byte(nil), delta.WriteEffects[1].Value...)
 
 	delta.Plan.PrimaryKey[0] ^= 0xff
-	delta.ReadPredicates[0].Key[0] ^= 0xff
-	delta.WriteEffects[0].Value[0] ^= 0xff
+	delta.ReadPredicates[1].Key[0] ^= 0xff
+	delta.WriteEffects[1].Value[0] ^= 0xff
 
-	require.Equal(t, primary, delta.Plan.MutateKeys[0])
-	require.NotEqual(t, delta.Plan.PrimaryKey, delta.Plan.MutateKeys[0])
-	require.Equal(t, predicate, delta.Plan.MutateKeys[0])
-	require.NotEqual(t, predicate, delta.ReadPredicates[0].Key)
-	require.NotEqual(t, value, delta.WriteEffects[0].Value)
+	require.Equal(t, primary, delta.Plan.MutateKeys[1])
+	require.NotEqual(t, delta.Plan.PrimaryKey, delta.Plan.MutateKeys[1])
+	require.Equal(t, predicate, delta.Plan.MutateKeys[1])
+	require.NotEqual(t, predicate, delta.ReadPredicates[1].Key)
+	require.NotEqual(t, value, delta.WriteEffects[1].Value)
 }

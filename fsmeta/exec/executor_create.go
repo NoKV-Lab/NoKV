@@ -10,6 +10,35 @@ import (
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
+func (e *Executor) tryVisibleCreate(ctx context.Context, program compile.CreateProgram, mount fsmeta.MountIdentity, req fsmeta.CreateRequest, dentryValue, inodeValue []byte) (bool, error) {
+	delta := program.Compiled.Delta
+	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
+		return false, nil
+	}
+	view := e.newVisibleReadView(ctx)
+	parent, err := readVisibleDirectoryInode(view, mount, req.Parent)
+	if err != nil {
+		return false, err
+	}
+	parent, err = incrementDirectoryChildCount(parent)
+	if err != nil {
+		return false, err
+	}
+	parentValue, err := fsmeta.EncodeInodeValue(parent)
+	if err != nil {
+		return false, err
+	}
+	concrete, err := view.materializeVisibleCompiledOp(program.Compiled, []compile.WriteEffect{
+		visiblePutEffect(delta.Plan.MutateKeys[0], parentValue),
+		visiblePutEffect(delta.Plan.MutateKeys[1], dentryValue),
+		visiblePutEffect(delta.Plan.MutateKeys[2], inodeValue),
+	})
+	if err != nil {
+		return false, err
+	}
+	return e.tryVisibleCommitAfterRead(ctx, view, concrete)
+}
+
 // Create creates one dentry and its inode record in a single transaction.
 func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta.CreateResult, error) {
 	if e.inodes == nil {
@@ -46,8 +75,8 @@ func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta
 		Inode:  inodeID,
 		Type:   inode.Type,
 	}
-	dentryValue := delta.WriteEffects[0].Value
-	inodeValue := delta.WriteEffects[1].Value
+	dentryValue := delta.WriteEffects[1].Value
+	inodeValue := delta.WriteEffects[2].Value
 	e.createTotal.Add(1)
 	quotaChanges := []QuotaChange{{
 		Mount:      req.Mount,
@@ -65,34 +94,54 @@ func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta
 		}
 	}
 	if quotaOK {
-		materialized := compile.MaterializedOp{CompiledOp: program.Compiled}
-		if committed, err := e.tryVisibleCommit(ctx, materialized); committed || err != nil {
+		if committed, err := e.tryVisibleCreate(ctx, program, mount, req, dentryValue, inodeValue); committed || err != nil {
 			if err != nil {
 				return fsmeta.CreateResult{}, err
 			}
 			e.rememberVisibleCreate(mount, plan, inode)
 			e.forgetVisibleEmptyDirectory(mount, req.Parent)
-			e.invalidateNegative(plan.MutateKeys[0])
+			e.invalidateNegative(plan.MutateKeys[1])
 			e.invalidateDirPages(req.Mount, req.Parent)
 			return fsmeta.CreateResult{Dentry: dentry, Inode: inode}, nil
 		}
 	}
-	mutations := []*kvrpcpb.Mutation{
-		{
-			Op:                kvrpcpb.Mutation_Put,
-			Key:               cloneBytes(plan.MutateKeys[0]),
-			Value:             dentryValue,
-			AssertionNotExist: true,
-		},
-		{
-			Op:                kvrpcpb.Mutation_Put,
-			Key:               cloneBytes(plan.MutateKeys[1]),
-			Value:             inodeValue,
-			AssertionNotExist: true,
-		},
-	}
-	predicates := []*kvrpcpb.AtomicPredicate{atomicNotExists(plan.MutateKeys[0]), atomicNotExists(plan.MutateKeys[1])}
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
+		parent, err := e.readDirectoryInode(ctx, mount, req.Parent, startVersion)
+		if err != nil {
+			return err
+		}
+		nextParent, err := incrementDirectoryChildCount(parent.record)
+		if err != nil {
+			return err
+		}
+		parentValue, err := fsmeta.EncodeInodeValue(nextParent)
+		if err != nil {
+			return err
+		}
+		mutations := []*kvrpcpb.Mutation{
+			{
+				Op:    kvrpcpb.Mutation_Put,
+				Key:   cloneBytes(plan.MutateKeys[0]),
+				Value: parentValue,
+			},
+			{
+				Op:                kvrpcpb.Mutation_Put,
+				Key:               cloneBytes(plan.MutateKeys[1]),
+				Value:             dentryValue,
+				AssertionNotExist: true,
+			},
+			{
+				Op:                kvrpcpb.Mutation_Put,
+				Key:               cloneBytes(plan.MutateKeys[2]),
+				Value:             inodeValue,
+				AssertionNotExist: true,
+			},
+		}
+		predicates := []*kvrpcpb.AtomicPredicate{
+			atomicValueEquals(parent.key, parent.value),
+			atomicNotExists(plan.MutateKeys[1]),
+			atomicNotExists(plan.MutateKeys[2]),
+		}
 		quotaMutations, err := e.reserveQuota(ctx, []QuotaChange{{
 			Mount:      req.Mount,
 			MountKeyID: mount.MountKeyID,
@@ -119,7 +168,7 @@ func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta
 	// ReadDirPlus result cannot mask the new entry.
 	e.rememberVisibleCreate(mount, plan, inode)
 	e.forgetVisibleEmptyDirectory(mount, req.Parent)
-	e.invalidateNegative(plan.MutateKeys[0])
+	e.invalidateNegative(plan.MutateKeys[1])
 	e.invalidateDirPages(req.Mount, req.Parent)
 	return fsmeta.CreateResult{Dentry: dentry, Inode: inode}, nil
 }

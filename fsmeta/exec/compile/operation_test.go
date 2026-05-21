@@ -121,7 +121,7 @@ func TestSegmentMergeDecisionUsesCompilerPlans(t *testing.T) {
 
 	decision := CanAppendSegment(testCompileAOT(t, left), testCompileAOT(t, right), SegmentBudget{
 		MaxOperations:   2,
-		MaxMutations:    4,
+		MaxMutations:    6,
 		MaxPayloadBytes: 1 << 20,
 	})
 	require.Equal(t, SegmentDecisionAppend, decision.Kind)
@@ -167,12 +167,12 @@ func TestSegmentPlanAPIPreservesCompilerBoundary(t *testing.T) {
 
 	leftPlan := testCompileAOT(t, left).Segment
 	rightPlan := testCompileAOT(t, right).Segment
-	decision := CanAppendSegmentPlans(leftPlan, rightPlan, DurabilityVisibleOnly, SegmentBudget{MaxMutations: 4})
+	decision := CanAppendSegmentPlans(leftPlan, rightPlan, DurabilityVisibleOnly, SegmentBudget{MaxMutations: 6})
 	require.Equal(t, SegmentDecisionAppend, decision.Kind)
 
 	merged := MergeSegmentPlans(leftPlan, rightPlan)
 	require.Equal(t, uint32(2), merged.OperationCount)
-	require.Equal(t, uint32(4), merged.MutationCount)
+	require.Equal(t, uint32(6), merged.MutationCount)
 	require.Greater(t, merged.EstimatedPayloadBytes, leftPlan.EstimatedPayloadBytes)
 
 	installPlan, ok := SegmentPlanForInstall(leftPlan, false)

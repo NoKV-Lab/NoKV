@@ -285,6 +285,10 @@ func (f *fakeExternalExecutor) Unlink(context.Context, fsmeta.UnlinkRequest) err
 	return nil
 }
 
+func (f *fakeExternalExecutor) Remove(context.Context, fsmeta.RemoveRequest) error {
+	return nil
+}
+
 func (f *fakeExternalExecutor) OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {
 	return fsmeta.SessionRecord{}, errors.New("not implemented")
 }

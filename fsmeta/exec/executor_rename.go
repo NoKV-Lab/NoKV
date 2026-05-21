@@ -37,6 +37,25 @@ func (e *Executor) tryVisibleRename(ctx context.Context, compiled compile.Compil
 		}
 		return false, nil
 	}
+	fromParent, err := readVisibleDirectoryInode(view, move.identity, move.fromParent)
+	if err != nil {
+		return false, err
+	}
+	toParent := fromParent
+	if move.fromParent != move.toParent {
+		fromParent, err = decrementDirectoryChildCount(fromParent)
+		if err != nil {
+			return false, err
+		}
+		toParent, err = readVisibleDirectoryInode(view, move.identity, move.toParent)
+		if err != nil {
+			return false, err
+		}
+		toParent, err = incrementDirectoryChildCount(toParent)
+		if err != nil {
+			return false, err
+		}
+	}
 	if move.fromParent != move.toParent {
 		if inode, ok, err := view.readInode(move.identity, record.Inode); err != nil {
 			return false, err
@@ -59,9 +78,19 @@ func (e *Executor) tryVisibleRename(ctx context.Context, compiled compile.Compil
 	if err != nil {
 		return false, err
 	}
+	fromParentValue, err := fsmeta.EncodeInodeValue(fromParent)
+	if err != nil {
+		return false, err
+	}
+	toParentValue, err := fsmeta.EncodeInodeValue(toParent)
+	if err != nil {
+		return false, err
+	}
 	concrete, err := view.materializeVisibleCompiledOp(compiled, []compile.WriteEffect{
 		visibleDeleteEffect(plan.MutateKeys[0]),
 		visiblePutEffect(plan.MutateKeys[1], value),
+		visiblePutEffect(plan.MutateKeys[2], fromParentValue),
+		visiblePutEffect(plan.MutateKeys[3], toParentValue),
 	})
 	if err != nil {
 		return false, err
@@ -135,12 +164,11 @@ func (e *Executor) Rename(ctx context.Context, req fsmeta.RenameRequest) error {
 		return nil
 	}
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
-		mutations, err := e.prepareRenameMutations(ctx, plan, move, startVersion, &movedSize, &movedInode)
+		mutations, predicates, err := e.prepareRenameMutations(ctx, plan, move, startVersion, &movedSize, &movedInode)
 		if err != nil {
 			return err
 		}
-		if len(mutations) == 2 {
-			predicates := []*kvrpcpb.AtomicPredicate{atomicExists(plan.ReadKeys[0]), atomicNotExists(plan.ReadKeys[1])}
+		if len(mutations) == len(predicates) {
 			return e.mutateWithAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, predicates, mutations, startVersion, commitVersion)
 		}
 		return e.mutateWithoutAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, mutations, startVersion, commitVersion)
@@ -181,7 +209,7 @@ func (e *Executor) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRe
 	var handoffStarted bool
 	move := renameMoveFromRenameSubtree(req, mount)
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
-		mutations, err := e.prepareRenameMutations(ctx, plan, move, startVersion, &movedSize, &movedInode)
+		mutations, _, err := e.prepareRenameMutations(ctx, plan, move, startVersion, &movedSize, &movedInode)
 		if err != nil {
 			return err
 		}
@@ -227,29 +255,62 @@ func (e *Executor) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRe
 	return nil
 }
 
-func (e *Executor) prepareRenameMutations(ctx context.Context, plan fsmeta.OperationPlan, move renameMove, startVersion uint64, movedSize *uint64, movedInode *bool) ([]*kvrpcpb.Mutation, error) {
+func (e *Executor) prepareRenameMutations(ctx context.Context, plan fsmeta.OperationPlan, move renameMove, startVersion uint64, movedSize *uint64, movedInode *bool) ([]*kvrpcpb.Mutation, []*kvrpcpb.AtomicPredicate, error) {
 	record, err := e.readDentry(ctx, plan.ReadKeys[0], startVersion)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	sourceDentryValue, err := fsmeta.EncodeDentryValue(record)
+	if err != nil {
+		return nil, nil, err
 	}
 	if _, err := e.readDentry(ctx, plan.ReadKeys[1], startVersion); err == nil {
-		return nil, fsmeta.ErrExists
+		return nil, nil, fsmeta.ErrExists
 	} else if !errors.Is(err, fsmeta.ErrNotFound) {
-		return nil, err
+		return nil, nil, err
 	}
 	record.Parent = move.toParent
 	record.Name = move.toName
 	value, err := fsmeta.EncodeDentryValue(record)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	*movedSize = 0
 	*movedInode = false
 	if inode, ok, err := e.readInode(ctx, move.identity, record.Inode, startVersion); err != nil {
-		return nil, err
+		return nil, nil, err
 	} else if ok {
 		*movedSize = inode.Size
 		*movedInode = true
+	}
+	fromParent, err := e.readDirectoryInode(ctx, move.identity, move.fromParent, startVersion)
+	if err != nil {
+		return nil, nil, err
+	}
+	toParent := fromParent
+	if move.fromParent != move.toParent {
+		nextFrom, err := decrementDirectoryChildCount(fromParent.record)
+		if err != nil {
+			return nil, nil, err
+		}
+		fromParent.record = nextFrom
+		toParent, err = e.readDirectoryInode(ctx, move.identity, move.toParent, startVersion)
+		if err != nil {
+			return nil, nil, err
+		}
+		nextTo, err := incrementDirectoryChildCount(toParent.record)
+		if err != nil {
+			return nil, nil, err
+		}
+		toParent.record = nextTo
+	}
+	fromParentValue, err := fsmeta.EncodeInodeValue(fromParent.record)
+	if err != nil {
+		return nil, nil, err
+	}
+	toParentValue, err := fsmeta.EncodeInodeValue(toParent.record)
+	if err != nil {
+		return nil, nil, err
 	}
 	mutations := []*kvrpcpb.Mutation{
 		{
@@ -263,17 +324,33 @@ func (e *Executor) prepareRenameMutations(ctx context.Context, plan fsmeta.Opera
 			AssertionNotExist: true,
 		},
 	}
+	if move.fromParent == move.toParent {
+		mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue})
+	} else {
+		mutations = append(mutations,
+			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue},
+			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[3]), Value: toParentValue},
+		)
+	}
 	if *movedInode {
 		quotaMutations, err := e.reserveQuota(ctx, []QuotaChange{
 			{Mount: move.mount, MountKeyID: move.identity.MountKeyID, Scope: move.fromParent, Bytes: -inodeSizeDelta(*movedSize), Inodes: -1},
 			{Mount: move.mount, MountKeyID: move.identity.MountKeyID, Scope: move.toParent, Bytes: inodeSizeDelta(*movedSize), Inodes: 1},
 		}, startVersion)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		mutations = append(mutations, quotaMutations...)
 	}
-	return mutations, nil
+	predicates := []*kvrpcpb.AtomicPredicate{
+		atomicValueEquals(plan.ReadKeys[0], sourceDentryValue),
+		atomicNotExists(plan.ReadKeys[1]),
+		atomicValueEquals(fromParent.key, fromParent.value),
+	}
+	if move.fromParent != move.toParent {
+		predicates = append(predicates, atomicValueEquals(toParent.key, toParent.value))
+	}
+	return mutations, predicates, nil
 }
 
 func (e *Executor) startSubtreeHandoff(ctx context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {

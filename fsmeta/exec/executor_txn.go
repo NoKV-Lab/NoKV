@@ -418,10 +418,6 @@ func isRetryableRouteRefresh(err error) bool {
 	}
 }
 
-func atomicExists(key []byte) *kvrpcpb.AtomicPredicate {
-	return &kvrpcpb.AtomicPredicate{Key: cloneBytes(key), Kind: kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_EXISTS}
-}
-
 func atomicNotExists(key []byte) *kvrpcpb.AtomicPredicate {
 	return &kvrpcpb.AtomicPredicate{Key: cloneBytes(key), Kind: kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS}
 }

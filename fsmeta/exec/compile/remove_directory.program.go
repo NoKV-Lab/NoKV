@@ -11,45 +11,43 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta"
 )
 
-type UnlinkProgram struct {
+type RemoveDirectoryProgram struct {
 	Compiled CompiledOp
 }
 
-func CompileUnlinkProgram(req fsmeta.UnlinkRequest, mount fsmeta.MountIdentity, opts ...Option) (UnlinkProgram, error) {
-	options := collectOptions(opts...)
-	plan, err := fsmeta.PlanUnlink(req, mount)
+func CompileRemoveDirectoryProgram(req fsmeta.RemoveDirectoryRequest, mount fsmeta.MountIdentity) (RemoveDirectoryProgram, error) {
+	plan, err := fsmeta.PlanRemoveDirectory(req, mount)
 	if err != nil {
-		return UnlinkProgram{}, err
+		return RemoveDirectoryProgram{}, err
 	}
 	plan = canonicalPlan(plan)
 	predicates := []Predicate{
+		{Kind: PredicateObservedValue, Key: plan.ReadKeys[0]},
 		{Kind: PredicateObservedValue, Key: plan.PrimaryKey},
-		{Kind: PredicateObservedValue, Key: plan.ReadKeys[1]},
 	}
 	effects := []WriteEffect{
-		{Kind: EffectDelete, Key: plan.MutateKeys[0]},
-		{Kind: EffectDerivedPut},
-		{Kind: EffectDerivedPut, Key: plan.MutateKeys[1]},
+		{Kind: EffectDerivedPut, Key: plan.MutateKeys[0]},
+		{Kind: EffectDelete, Key: plan.MutateKeys[1]},
+		{Kind: EffectDerivedDelete},
 	}
 	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.Parent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
-	delta = applyQuotaPolicy(delta, options, GuardQuotaCredit)
-	if !validateUnlinkSemanticDelta(delta) {
-		return UnlinkProgram{}, fsmeta.ErrInvalidRequest
+	delta.RuntimeGuards = append(delta.RuntimeGuards, GuardEmptyDirectory)
+	if !validateRemoveDirectorySemanticDelta(delta) {
+		return RemoveDirectoryProgram{}, fsmeta.ErrInvalidRequest
 	}
-	compiled, err := compileUnlinkCompiledOp(delta)
+	compiled, err := compileRemoveDirectoryCompiledOp(delta)
 	if err != nil {
-		return UnlinkProgram{}, err
+		return RemoveDirectoryProgram{}, err
 	}
-	return UnlinkProgram{Compiled: compiled}, nil
+	return RemoveDirectoryProgram{Compiled: compiled}, nil
 }
 
-func validateUnlinkSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationUnlink {
+func validateRemoveDirectorySemanticDelta(delta SemanticDelta) bool {
+	if delta.Kind != fsmeta.OperationRemoveDirectory {
 		return false
 	}
 	switch {
 	case delta.Eligibility == EligibilityVisibleCommit && delta.SlowReason == SlowReasonNone:
-	case delta.Eligibility == EligibilitySlowPath && delta.SlowReason == SlowReasonSharedQuota:
 	default:
 		return false
 	}
@@ -77,51 +75,47 @@ func validateUnlinkSemanticDelta(delta SemanticDelta) bool {
 	if delta.ReadPredicates[0].Kind != PredicateObservedValue {
 		return false
 	}
-	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[0].Key, "primary") {
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[0].Key, "read[0]") {
 		return false
 	}
 	if delta.ReadPredicates[1].Kind != PredicateObservedValue {
 		return false
 	}
-	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[1].Key, "read[1]") {
+	if !semanticKeyBindingMatches(delta, delta.ReadPredicates[1].Key, "primary") {
 		return false
 	}
 	if len(delta.WriteEffects) != 3 {
 		return false
 	}
-	if delta.WriteEffects[0].Kind != EffectDelete {
+	if delta.WriteEffects[0].Kind != EffectDerivedPut {
 		return false
 	}
 	if !semanticKeyBindingMatches(delta, delta.WriteEffects[0].Key, "mutate[0]") {
 		return false
 	}
-	if delta.WriteEffects[1].Kind != EffectDerivedPut {
+	if delta.WriteEffects[1].Kind != EffectDelete {
 		return false
 	}
-	if !semanticKeyBindingMatches(delta, delta.WriteEffects[1].Key, "runtime") {
+	if !semanticKeyBindingMatches(delta, delta.WriteEffects[1].Key, "mutate[1]") {
 		return false
 	}
-	if delta.WriteEffects[2].Kind != EffectDerivedPut {
+	if delta.WriteEffects[2].Kind != EffectDerivedDelete {
 		return false
 	}
-	if !semanticKeyBindingMatches(delta, delta.WriteEffects[2].Key, "mutate[1]") {
+	if !semanticKeyBindingMatches(delta, delta.WriteEffects[2].Key, "runtime") {
 		return false
 	}
-	if len(delta.RuntimeGuards) > 1 {
+	if len(delta.RuntimeGuards) != 1 {
 		return false
 	}
-	for _, guard := range delta.RuntimeGuards {
-		switch guard {
-		case GuardQuotaCredit:
-		default:
-			return false
-		}
+	if delta.RuntimeGuards[0] != GuardEmptyDirectory {
+		return false
 	}
 	return true
 }
 
-func compileUnlinkCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationUnlink || len(delta.WriteEffects) != 3 {
+func compileRemoveDirectoryCompiledOp(delta SemanticDelta) (CompiledOp, error) {
+	if delta.Kind != fsmeta.OperationRemoveDirectory || len(delta.WriteEffects) != 3 {
 		return CompiledOp{}, fsmeta.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)

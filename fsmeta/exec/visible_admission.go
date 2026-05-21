@@ -107,6 +107,16 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 	}
 	frontier := admissionCtx.ProofFrontier
 	proofs := make([]proof.PredicateProof, 0, len(delta.ReadPredicates))
+	proofsByKey := make(map[string]int, len(delta.ReadPredicates))
+	appendProof := func(predicateProof proof.PredicateProof) {
+		key := string(predicateProof.Key)
+		if index, ok := proofsByKey[key]; ok {
+			proofs[index] = predicateProof
+			return
+		}
+		proofsByKey[key] = len(proofs)
+		proofs = append(proofs, predicateProof)
+	}
 	if len(delta.ReadPredicates) == 0 {
 		return e.visibleAdmissionResult(op, proofs)
 	}
@@ -140,7 +150,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 					if !present {
 						return VisibleAdmissionResult{}, false, fsmeta.ErrNotFound
 					}
-					proofs = append(proofs, proof.NewPredicateProof(predicate.Key, nil, true, 0, proof.ReadSourceOverlay, frontier))
+					appendProof(proof.NewPredicateProof(predicate.Key, nil, true, 0, proof.ReadSourceOverlay, frontier))
 					continue
 				}
 			}
@@ -151,7 +161,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 			if !ok {
 				return VisibleAdmissionResult{}, false, fsmeta.ErrNotFound
 			}
-			proofs = append(proofs, proof.NewPredicateProof(predicate.Key, value, true, proofVersion, source, proofFrontierForSource(source, frontier)))
+			appendProof(proof.NewPredicateProof(predicate.Key, value, true, proofVersion, source, proofFrontierForSource(source, frontier)))
 		case compile.PredicateNotExists:
 			if index != nil {
 				present, known := index.KeyState(predicate.Key)
@@ -159,12 +169,12 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 					if present {
 						return VisibleAdmissionResult{}, false, fsmeta.ErrExists
 					}
-					proofs = append(proofs, proof.NewPredicateProof(predicate.Key, nil, false, 0, proof.ReadSourceOverlay, frontier))
+					appendProof(proof.NewPredicateProof(predicate.Key, nil, false, 0, proof.ReadSourceOverlay, frontier))
 					continue
 				}
 				if e.visibleNotExistsKnown(delta.Authority, predicate.Key, index) ||
 					visibleNotExistsDerivedFromDelta(delta, predicate, index) {
-					proofs = append(proofs, proof.NewPredicateProof(predicate.Key, nil, false, 0, proof.ReadSourceOverlay, frontier))
+					appendProof(proof.NewPredicateProof(predicate.Key, nil, false, 0, proof.ReadSourceOverlay, frontier))
 					continue
 				}
 			}
@@ -175,7 +185,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 			if ok {
 				return VisibleAdmissionResult{}, false, fsmeta.ErrExists
 			}
-			proofs = append(proofs, proof.NewPredicateProof(predicate.Key, nil, false, proofVersion, source, proofFrontierForSource(source, frontier)))
+			appendProof(proof.NewPredicateProof(predicate.Key, nil, false, proofVersion, source, proofFrontierForSource(source, frontier)))
 		case compile.PredicateObservedValue:
 			if !predicate.HasExpectedValue {
 				return VisibleAdmissionResult{}, false, nil
@@ -184,7 +194,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 				if deleted || !bytes.Equal(value, predicate.ExpectedValue) {
 					return VisibleAdmissionResult{}, false, nil
 				}
-				proofs = append(proofs, proof.NewPredicateProof(predicate.Key, value, true, 0, proof.ReadSourceOverlay, frontier))
+				appendProof(proof.NewPredicateProof(predicate.Key, value, true, 0, proof.ReadSourceOverlay, frontier))
 				continue
 			}
 			value, ok, source, proofVersion, err := read(predicate.Key)
@@ -194,7 +204,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 			if !ok || !bytes.Equal(value, predicate.ExpectedValue) {
 				return VisibleAdmissionResult{}, false, nil
 			}
-			proofs = append(proofs, proof.NewPredicateProof(predicate.Key, value, true, proofVersion, source, proofFrontierForSource(source, frontier)))
+			appendProof(proof.NewPredicateProof(predicate.Key, value, true, proofVersion, source, proofFrontierForSource(source, frontier)))
 		case compile.PredicatePrefixScan:
 			return VisibleAdmissionResult{}, false, nil
 		default:
@@ -247,11 +257,11 @@ func (e *Executor) rememberVisibleCreate(mount fsmeta.MountIdentity, plan fsmeta
 	if index == nil {
 		return
 	}
-	if len(plan.MutateKeys) > 0 {
-		index.RememberKey(plan.MutateKeys[0], true)
-	}
 	if len(plan.MutateKeys) > 1 {
 		index.RememberKey(plan.MutateKeys[1], true)
+	}
+	if len(plan.MutateKeys) > 2 {
+		index.RememberKey(plan.MutateKeys[2], true)
 	}
 	if inode.Type == fsmeta.InodeTypeDirectory {
 		index.RememberEmptyDirectory(mount, inode.Inode)
@@ -285,19 +295,13 @@ func visibleDeltaAllowsAbsentObservedValue(delta compile.SemanticDelta) bool {
 }
 
 func visibleNotExistsDerivedFromDelta(delta compile.SemanticDelta, predicate compile.Predicate, index VisiblePredicateIndex) bool {
-	if delta.Kind != fsmeta.OperationCreate || len(delta.Plan.MutateKeys) < 2 {
+	if delta.Kind != fsmeta.OperationCreate || len(delta.Plan.MutateKeys) < 3 {
 		return false
 	}
 	if bytes.Equal(predicate.Key, delta.Plan.MutateKeys[1]) {
 		return true
 	}
-	if !bytes.Equal(predicate.Key, delta.Plan.MutateKeys[0]) || len(delta.Authority.Parents) != 1 {
-		return false
-	}
-	return index.DirectoryBaseEmpty(fsmeta.MountIdentity{
-		MountID:    delta.Authority.Mount,
-		MountKeyID: delta.Authority.MountKeyID,
-	}, delta.Authority.Parents[0])
+	return bytes.Equal(predicate.Key, delta.Plan.MutateKeys[2])
 }
 
 func (e *Executor) visibleNotExistsKnown(scope compile.AuthorityScope, key []byte, index VisiblePredicateIndex) bool {

@@ -66,6 +66,11 @@ func TestGeneratedProgramsMatchSemanticSpecs(t *testing.T) {
 			require.NoError(t, err)
 			return program.Compiled
 		}},
+		{spec: compilespecs.Remove, compile: func(t *testing.T) CompiledOp {
+			program, err := CompileRemoveProgram(fsmeta.RemoveRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old"}, testMount)
+			require.NoError(t, err)
+			return program.Compiled
+		}},
 		{spec: compilespecs.OpenWriteSession, compile: func(t *testing.T) CompiledOp {
 			program, err := CompileOpenWriteSessionProgram(fsmeta.OpenWriteSessionRequest{Mount: "vol", Inode: 44, Session: "writer-1", TTL: time.Second}, testMount)
 			require.NoError(t, err)
@@ -177,6 +182,8 @@ func operationKindSpecName(kind fsmeta.OperationKind) string {
 		return "fsmeta.OperationLink"
 	case fsmeta.OperationUnlink:
 		return "fsmeta.OperationUnlink"
+	case fsmeta.OperationRemove:
+		return "fsmeta.OperationRemove"
 	case fsmeta.OperationOpenWriteSession:
 		return "fsmeta.OperationOpenWriteSession"
 	case fsmeta.OperationHeartbeatSession:

@@ -648,7 +648,7 @@ func watchEventKind(delta SemanticDelta, effect WriteEffect) WatchEventKind {
 		return WatchEventCreate
 	case fsmeta.OperationRename, fsmeta.OperationRenameSubtree:
 		return WatchEventRename
-	case fsmeta.OperationUnlink:
+	case fsmeta.OperationUnlink, fsmeta.OperationRemove:
 		return WatchEventDelete
 	}
 	switch effect.Kind {
@@ -700,6 +700,8 @@ func ProofRuleForGuard(guard RuntimeGuard) (proof.RuleID, bool) {
 		return proof.RuleGuardSameAuthority, true
 	case GuardNonDirectoryInode:
 		return proof.RuleGuardNonDirectoryInode, true
+	case GuardEmptyDirectory:
+		return proof.RuleGuardEmptyDirectory, true
 	case GuardLiveSession:
 		return proof.RuleGuardLiveSession, true
 	case GuardExpiredSessionOwner:
@@ -719,6 +721,8 @@ func RuntimeGuardForProofRule(rule proof.RuleID) (RuntimeGuard, bool) {
 		return GuardSameAuthority, true
 	case proof.RuleGuardNonDirectoryInode:
 		return GuardNonDirectoryInode, true
+	case proof.RuleGuardEmptyDirectory:
+		return GuardEmptyDirectory, true
 	case proof.RuleGuardLiveSession:
 		return GuardLiveSession, true
 	case proof.RuleGuardExpiredSessionOwner:
@@ -823,7 +827,10 @@ func GuardEvidenceForGuard(op CompiledOp, predicateProofs []proof.PredicateProof
 		subject, subjectOK = sameAuthorityGuardSubject(op)
 	case GuardNonDirectoryInode:
 		evidence.Kind = proof.GuardEvidenceNonDirectoryInode
-		subject, subjectOK = nonDirectoryGuardSubject(predicateProofs)
+		subject, subjectOK = nonDirectoryGuardSubject(op, predicateProofs)
+	case GuardEmptyDirectory:
+		evidence.Kind = proof.GuardEvidenceEmptyDirectory
+		subject, subjectOK = emptyDirectoryGuardSubject(op, predicateProofs)
 	case GuardLiveSession:
 		evidence.Kind = proof.GuardEvidenceLiveSession
 		subject, subjectOK = liveSessionGuardSubject(predicateProofs)
@@ -892,7 +899,12 @@ func singleLinkInodeGuardSubject(proofs []proof.PredicateProof) ([32]byte, bool)
 	return [32]byte{}, false
 }
 
-func nonDirectoryGuardSubject(proofs []proof.PredicateProof) ([32]byte, bool) {
+func nonDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([32]byte, bool) {
+	for _, key := range nonDirectoryGuardCandidateKeys(op) {
+		if subject, ok := nonDirectoryGuardSubjectForKey(proofs, key); ok {
+			return subject, true
+		}
+	}
 	for _, proof := range proofs {
 		if !proof.Present {
 			continue
@@ -908,7 +920,7 @@ func nonDirectoryGuardSubject(proofs []proof.PredicateProof) ([32]byte, bool) {
 				return [32]byte{}, false
 			}
 			if inode.Type == fsmeta.InodeTypeDirectory {
-				return [32]byte{}, false
+				continue
 			}
 			return inodeGuardSubjectDigest(GuardNonDirectoryInode, proof, inode), true
 		case fsmeta.KeyKindDentry:
@@ -917,9 +929,56 @@ func nonDirectoryGuardSubject(proofs []proof.PredicateProof) ([32]byte, bool) {
 				return [32]byte{}, false
 			}
 			if dentry.Type == fsmeta.InodeTypeDirectory {
+				continue
+			}
+			return dentryGuardSubjectDigest(GuardNonDirectoryInode, proof, dentry), true
+		}
+	}
+	return [32]byte{}, false
+}
+
+func nonDirectoryGuardCandidateKeys(op CompiledOp) [][]byte {
+	plan := op.Delta.Plan
+	switch op.Delta.Kind {
+	case fsmeta.OperationLink:
+		if len(plan.ReadKeys) > 0 {
+			return [][]byte{plan.ReadKeys[0]}
+		}
+	case fsmeta.OperationOpenWriteSession:
+		if len(plan.ReadKeys) > 0 {
+			return [][]byte{plan.ReadKeys[0]}
+		}
+	}
+	return nil
+}
+
+func nonDirectoryGuardSubjectForKey(proofs []proof.PredicateProof, key []byte) ([32]byte, bool) {
+	if len(key) == 0 {
+		return [32]byte{}, false
+	}
+	for _, proof := range proofs {
+		if !proof.Present || !bytes.Equal(proof.Key, key) {
+			continue
+		}
+		parts, ok := fsmeta.InspectKey(proof.Key)
+		if !ok {
+			return [32]byte{}, false
+		}
+		switch parts.Kind {
+		case fsmeta.KeyKindInode:
+			inode, err := fsmeta.DecodeInodeValue(proof.Value)
+			if err != nil || inode.Type == fsmeta.InodeTypeDirectory {
+				return [32]byte{}, false
+			}
+			return inodeGuardSubjectDigest(GuardNonDirectoryInode, proof, inode), true
+		case fsmeta.KeyKindDentry:
+			dentry, err := fsmeta.DecodeDentryValue(proof.Value)
+			if err != nil || dentry.Type == fsmeta.InodeTypeDirectory {
 				return [32]byte{}, false
 			}
 			return dentryGuardSubjectDigest(GuardNonDirectoryInode, proof, dentry), true
+		default:
+			return [32]byte{}, false
 		}
 	}
 	return [32]byte{}, false
@@ -1004,6 +1063,65 @@ func quotaCreditGuardSubject(op CompiledOp) ([32]byte, bool) {
 	return h.sum(), true
 }
 
+func emptyDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([32]byte, bool) {
+	if op.Delta.Kind == fsmeta.OperationRemoveDirectory {
+		if subject, ok := removeDirectoryGuardSubject(op, proofs); ok {
+			return subject, true
+		}
+		return [32]byte{}, false
+	}
+	for _, proof := range proofs {
+		if !proof.Present {
+			continue
+		}
+		parts, ok := fsmeta.InspectKey(proof.Key)
+		if !ok || parts.Kind != fsmeta.KeyKindInode {
+			continue
+		}
+		inode, err := fsmeta.DecodeInodeValue(proof.Value)
+		if err != nil || inode.Type != fsmeta.InodeTypeDirectory || inode.ChildCount != 0 {
+			return [32]byte{}, false
+		}
+		return inodeGuardSubjectDigest(GuardEmptyDirectory, proof, inode), true
+	}
+	return [32]byte{}, false
+}
+
+func removeDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([32]byte, bool) {
+	var dentry fsmeta.DentryRecord
+	var haveDentry bool
+	for _, predicateProof := range proofs {
+		if !predicateProof.Present || !bytes.Equal(predicateProof.Key, op.Delta.Plan.PrimaryKey) {
+			continue
+		}
+		record, err := fsmeta.DecodeDentryValue(predicateProof.Value)
+		if err != nil || record.Type != fsmeta.InodeTypeDirectory {
+			return [32]byte{}, false
+		}
+		dentry = record
+		haveDentry = true
+		break
+	}
+	if !haveDentry {
+		return [32]byte{}, false
+	}
+	for _, predicateProof := range proofs {
+		if !predicateProof.Present {
+			continue
+		}
+		parts, ok := fsmeta.InspectKey(predicateProof.Key)
+		if !ok || parts.Kind != fsmeta.KeyKindInode || parts.Inode != dentry.Inode {
+			continue
+		}
+		inode, err := fsmeta.DecodeInodeValue(predicateProof.Value)
+		if err != nil || inode.Type != fsmeta.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == fsmeta.RootInode {
+			return [32]byte{}, false
+		}
+		return inodeGuardSubjectDigest(GuardEmptyDirectory, predicateProof, inode), true
+	}
+	return [32]byte{}, false
+}
+
 func inodeGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, inode fsmeta.InodeRecord) [32]byte {
 	h := newDigestBuilder()
 	h.writeString(string(guard))
@@ -1012,6 +1130,7 @@ func inodeGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, ino
 	h.writeUint64(uint64(inode.Inode))
 	h.writeString(string(inode.Type))
 	h.writeUint64(uint64(inode.LinkCount))
+	h.writeUint64(inode.ChildCount)
 	return h.sum()
 }
 

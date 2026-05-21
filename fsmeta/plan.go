@@ -27,6 +27,8 @@ const (
 	OperationRenameSubtree    OperationKind = "rename_subtree"
 	OperationLink             OperationKind = "link"
 	OperationUnlink           OperationKind = "unlink"
+	OperationRemove           OperationKind = "remove"
+	OperationRemoveDirectory  OperationKind = "remove_directory"
 	OperationOpenWriteSession OperationKind = "open_write_session"
 	OperationHeartbeatSession OperationKind = "heartbeat_write_session"
 	OperationCloseSession     OperationKind = "close_write_session"
@@ -133,6 +135,18 @@ type UnlinkRequest struct {
 	Name   string
 }
 
+type RemoveRequest struct {
+	Mount  MountID
+	Parent InodeID
+	Name   string
+}
+
+type RemoveDirectoryRequest struct {
+	Mount  MountID
+	Parent InodeID
+	Name   string
+}
+
 type OpenWriteSessionRequest struct {
 	Mount   MountID
 	Inode   InodeID
@@ -217,6 +231,10 @@ func PlanCreate(req CreateRequest, mount MountIdentity, inodeID InodeID) (Operat
 	if err != nil {
 		return OperationPlan{}, err
 	}
+	parentInode, err := EncodeInodeKey(mount, req.Parent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
 	inode, err := EncodeInodeKey(mount, inodeID)
 	if err != nil {
 		return OperationPlan{}, err
@@ -225,8 +243,8 @@ func PlanCreate(req CreateRequest, mount MountIdentity, inodeID InodeID) (Operat
 		Kind:       OperationCreate,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(dentry),
-		ReadKeys:   cloneKeySet(dentry),
-		MutateKeys: cloneKeySet(dentry, inode),
+		ReadKeys:   cloneKeySet(parentInode, dentry, inode),
+		MutateKeys: cloneKeySet(parentInode, dentry, inode),
 	}, nil
 }
 
@@ -345,12 +363,20 @@ func PlanRename(req RenameRequest, mount MountIdentity) (OperationPlan, error) {
 	if err != nil {
 		return OperationPlan{}, err
 	}
+	fromParent, err := EncodeInodeKey(mount, req.FromParent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	toParent, err := EncodeInodeKey(mount, req.ToParent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
 	return OperationPlan{
 		Kind:       OperationRename,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(source),
-		ReadKeys:   cloneKeySet(source, dest),
-		MutateKeys: cloneKeySet(source, dest),
+		ReadKeys:   cloneKeySet(source, dest, fromParent, toParent),
+		MutateKeys: cloneKeySet(source, dest, fromParent, toParent),
 	}, nil
 }
 
@@ -369,12 +395,20 @@ func PlanRenameSubtree(req RenameSubtreeRequest, mount MountIdentity) (Operation
 	if err != nil {
 		return OperationPlan{}, err
 	}
+	fromParent, err := EncodeInodeKey(mount, req.FromParent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	toParent, err := EncodeInodeKey(mount, req.ToParent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
 	return OperationPlan{
 		Kind:       OperationRenameSubtree,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(from),
-		ReadKeys:   cloneKeySet(from, to),
-		MutateKeys: cloneKeySet(from, to),
+		ReadKeys:   cloneKeySet(from, to, fromParent, toParent),
+		MutateKeys: cloneKeySet(from, to, fromParent, toParent),
 	}, nil
 }
 
@@ -393,12 +427,16 @@ func PlanLink(req LinkRequest, mount MountIdentity) (OperationPlan, error) {
 	if err != nil {
 		return OperationPlan{}, err
 	}
+	toParent, err := EncodeInodeKey(mount, req.ToParent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
 	return OperationPlan{
 		Kind:       OperationLink,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(to),
-		ReadKeys:   cloneKeySet(from, to),
-		MutateKeys: cloneKeySet(to),
+		ReadKeys:   cloneKeySet(from, to, toParent),
+		MutateKeys: cloneKeySet(to, toParent),
 	}, nil
 }
 
@@ -410,12 +448,58 @@ func PlanUnlink(req UnlinkRequest, mount MountIdentity) (OperationPlan, error) {
 	if err != nil {
 		return OperationPlan{}, err
 	}
+	parentInode, err := EncodeInodeKey(mount, req.Parent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
 	return OperationPlan{
 		Kind:       OperationUnlink,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(dentry),
-		ReadKeys:   cloneKeySet(dentry),
-		MutateKeys: cloneKeySet(dentry),
+		ReadKeys:   cloneKeySet(dentry, parentInode),
+		MutateKeys: cloneKeySet(dentry, parentInode),
+	}, nil
+}
+
+func PlanRemove(req RemoveRequest, mount MountIdentity) (OperationPlan, error) {
+	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+		return OperationPlan{}, err
+	}
+	dentry, err := EncodeDentryKey(mount, req.Parent, req.Name)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	parentInode, err := EncodeInodeKey(mount, req.Parent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	return OperationPlan{
+		Kind:       OperationRemove,
+		Mount:      req.Mount,
+		PrimaryKey: cloneBytes(dentry),
+		ReadKeys:   cloneKeySet(dentry, parentInode),
+		MutateKeys: cloneKeySet(dentry, parentInode),
+	}, nil
+}
+
+func PlanRemoveDirectory(req RemoveDirectoryRequest, mount MountIdentity) (OperationPlan, error) {
+	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+		return OperationPlan{}, err
+	}
+	parentInode, err := EncodeInodeKey(mount, req.Parent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	dentry, err := EncodeDentryKey(mount, req.Parent, req.Name)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	return OperationPlan{
+		Kind:       OperationRemoveDirectory,
+		Mount:      req.Mount,
+		PrimaryKey: cloneBytes(dentry),
+		ReadKeys:   cloneKeySet(parentInode, dentry),
+		MutateKeys: cloneKeySet(parentInode, dentry),
 	}, nil
 }
 
