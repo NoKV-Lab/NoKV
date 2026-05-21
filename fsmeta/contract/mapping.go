@@ -140,6 +140,20 @@ func (m *inodeMappingExecutor) Rename(ctx context.Context, req fsmeta.RenameRequ
 	return m.base.Rename(ctx, req)
 }
 
+func (m *inodeMappingExecutor) RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+	req.FromParent = m.actualInode(req.FromParent)
+	req.ToParent = m.actualInode(req.ToParent)
+	result, err := m.base.RenameReplace(ctx, req)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, err
+	}
+	if result.Replaced {
+		result.OldDentry = m.translateDentryRecord(result.OldDentry)
+		result.OldInode = m.translateInodeRecord(result.OldInode)
+	}
+	return result, nil
+}
+
 func (m *inodeMappingExecutor) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error {
 	req.FromParent = m.actualInode(req.FromParent)
 	req.ToParent = m.actualInode(req.ToParent)

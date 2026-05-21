@@ -178,6 +178,56 @@ func TestInodeMappingExecutorUpdatesCreateObservedBeforeReturn(t *testing.T) {
 	}
 }
 
+func TestInodeMappingExecutorTranslatesRenameReplaceResult(t *testing.T) {
+	base := newFakeExternalExecutor()
+	exec, err := NewInodeMappingExecutor(base)
+	if err != nil {
+		t.Fatalf("NewInodeMappingExecutor: %v", err)
+	}
+	_, err = exec.Create(withPlannedCreateInode(context.Background(), 10), fsmeta.CreateRequest{
+		Mount:  "vol",
+		Parent: fsmeta.RootInode,
+		Name:   "old",
+		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	actualDentry, err := base.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old"})
+	if err != nil {
+		t.Fatalf("base Lookup: %v", err)
+	}
+	base.renameReplaceResult = fsmeta.RenameReplaceResult{
+		Replaced: true,
+		OldDentry: fsmeta.DentryRecord{
+			Parent: fsmeta.RootInode,
+			Name:   "old",
+			Inode:  actualDentry.Inode,
+			Type:   fsmeta.InodeTypeFile,
+		},
+		OldInode: fsmeta.InodeRecord{
+			Inode:     actualDentry.Inode,
+			Type:      fsmeta.InodeTypeFile,
+			LinkCount: 1,
+		},
+		OldInodeDeleted: true,
+	}
+
+	result, err := exec.RenameReplace(context.Background(), fsmeta.RenameReplaceRequest{
+		Mount:      "vol",
+		FromParent: fsmeta.RootInode,
+		FromName:   "stage",
+		ToParent:   fsmeta.RootInode,
+		ToName:     "old",
+	})
+	if err != nil {
+		t.Fatalf("RenameReplace: %v", err)
+	}
+	if result.OldDentry.Inode != 10 || result.OldInode.Inode != 10 {
+		t.Fatalf("RenameReplace result was not translated to planned inode: %+v", result)
+	}
+}
+
 type fakeExternalExecutor struct {
 	mu                   sync.Mutex
 	next                 fsmeta.InodeID
@@ -187,6 +237,7 @@ type fakeExternalExecutor struct {
 	createErrAfterCommit error
 	createCommitted      chan struct{}
 	releaseCreate        chan struct{}
+	renameReplaceResult  fsmeta.RenameReplaceResult
 }
 
 func newFakeExternalExecutor() *fakeExternalExecutor {
@@ -271,6 +322,10 @@ func (f *fakeExternalExecutor) SnapshotSubtree(_ context.Context, req fsmeta.Sna
 
 func (f *fakeExternalExecutor) Rename(context.Context, fsmeta.RenameRequest) error {
 	return nil
+}
+
+func (f *fakeExternalExecutor) RenameReplace(context.Context, fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+	return f.renameReplaceResult, nil
 }
 
 func (f *fakeExternalExecutor) RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error {

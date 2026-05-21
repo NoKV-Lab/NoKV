@@ -155,6 +155,28 @@ func renameRequestToProto(req fsmeta.RenameRequest) *fsmetapb.RenameRequest {
 	}
 }
 
+func renameReplaceRequestToProto(req fsmeta.RenameReplaceRequest) *fsmetapb.RenameReplaceRequest {
+	return &fsmetapb.RenameReplaceRequest{
+		Mount:      string(req.Mount),
+		FromParent: uint64(req.FromParent),
+		FromName:   req.FromName,
+		ToParent:   uint64(req.ToParent),
+		ToName:     req.ToName,
+	}
+}
+
+func renameReplaceResultFromProto(resp *fsmetapb.RenameReplaceResponse) fsmeta.RenameReplaceResult {
+	if resp == nil {
+		return fsmeta.RenameReplaceResult{}
+	}
+	return fsmeta.RenameReplaceResult{
+		Replaced:        resp.GetReplaced(),
+		OldDentry:       dentryFromProto(resp.GetOldDentry()),
+		OldInode:        inodeFromProto(resp.GetOldInode()),
+		OldInodeDeleted: resp.GetOldInodeDeleted(),
+	}
+}
+
 func renameSubtreeRequestToProto(req fsmeta.RenameSubtreeRequest) *fsmetapb.RenameSubtreeRequest {
 	return &fsmetapb.RenameSubtreeRequest{
 		Mount:      string(req.Mount),

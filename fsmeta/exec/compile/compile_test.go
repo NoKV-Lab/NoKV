@@ -121,6 +121,15 @@ func testRenameDelta(tb testing.TB, req fsmeta.RenameRequest, mount fsmeta.Mount
 	return cloneDelta(program.Compiled.Delta), nil
 }
 
+func testRenameReplaceDelta(tb testing.TB, req fsmeta.RenameReplaceRequest, mount fsmeta.MountIdentity) (SemanticDelta, error) {
+	tb.Helper()
+	program, err := CompileRenameReplaceProgram(req, mount)
+	if err != nil {
+		return SemanticDelta{}, err
+	}
+	return cloneDelta(program.Compiled.Delta), nil
+}
+
 func testSnapshotSubtreeDelta(tb testing.TB, req fsmeta.SnapshotSubtreeRequest, mount fsmeta.MountIdentity) (SemanticDelta, error) {
 	tb.Helper()
 	program, err := CompileSnapshotSubtreeProgram(req, mount)
@@ -490,6 +499,13 @@ func TestGeneratedProgramEntriesAreCanonical(t *testing.T) {
 			},
 		},
 		{
+			name: "rename_replace",
+			compile: func() (CompiledOp, error) {
+				program, err := CompileRenameReplaceProgram(fsmeta.RenameReplaceRequest{Mount: "vol", FromParent: fsmeta.RootInode, FromName: "old", ToParent: renameToParent, ToName: "new"}, testMount)
+				return program.Compiled, err
+			},
+		},
+		{
 			name: "rename_subtree",
 			compile: func() (CompiledOp, error) {
 				program, err := CompileRenameSubtreeProgram(fsmeta.RenameSubtreeRequest{Mount: "vol", FromParent: fsmeta.RootInode, FromName: "old", ToParent: crossBucketParent, ToName: "new"}, testMount)
@@ -819,6 +835,39 @@ func TestRenameBucketLocalVisibleCrossBucketSlow(t *testing.T) {
 	require.Equal(t, SlowReasonCrossBucket, crossBucket.SlowReason)
 	require.Equal(t, []fsmeta.InodeID{8, differentBucketParent}, crossBucket.Authority.Parents)
 	require.Len(t, crossBucket.Authority.Buckets, 2)
+}
+
+func TestRenameReplaceCompilesSlowPathWithoutBarrier(t *testing.T) {
+	delta, err := testRenameReplaceDelta(t, fsmeta.RenameReplaceRequest{
+		Mount:      "vol",
+		FromParent: 8,
+		FromName:   ".stage-artifact",
+		ToParent:   8,
+		ToName:     "artifact",
+	}, testMount)
+	require.NoError(t, err)
+
+	require.Equal(t, fsmeta.OperationRenameReplace, delta.Kind)
+	require.Equal(t, EligibilitySlowPath, delta.Eligibility)
+	require.Equal(t, SlowReasonDynamicWriteSet, delta.SlowReason)
+	require.False(t, delta.DurabilityBarrier)
+	require.False(t, delta.WatchAtSeal)
+	require.Equal(t, []fsmeta.InodeID{8}, delta.Authority.Parents)
+	require.Len(t, delta.ReadPredicates, 4)
+	for _, predicate := range delta.ReadPredicates {
+		require.Equal(t, PredicateObservedValue, predicate.Kind)
+	}
+	require.Len(t, delta.WriteEffects, 4)
+	require.Equal(t, EffectDelete, delta.WriteEffects[0].Kind)
+	require.Equal(t, EffectDerivedPut, delta.WriteEffects[1].Kind)
+	require.Equal(t, EffectDerivedPut, delta.WriteEffects[2].Kind)
+	require.Equal(t, EffectDerivedPut, delta.WriteEffects[3].Kind)
+
+	compiled := testCompileAOT(t, delta)
+	require.Equal(t, DurabilityVisibleOnly, compiled.Durability)
+	require.False(t, compiled.Authority.Required)
+	require.Equal(t, FenceNone, compiled.Authority.Fence)
+	require.False(t, compiled.Placement.CanSegment)
 }
 
 func TestSlowPathBoundariesStayExplicit(t *testing.T) {

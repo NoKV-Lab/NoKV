@@ -51,6 +51,11 @@ func TestGeneratedProgramsMatchSemanticSpecs(t *testing.T) {
 			require.NoError(t, err)
 			return program.Compiled
 		}},
+		{spec: compilespecs.RenameReplace, compile: func(t *testing.T) CompiledOp {
+			program, err := CompileRenameReplaceProgram(fsmeta.RenameReplaceRequest{Mount: "vol", FromParent: fsmeta.RootInode, FromName: "old", ToParent: renameToParent, ToName: "new"}, testMount)
+			require.NoError(t, err)
+			return program.Compiled
+		}},
 		{spec: compilespecs.RenameSubtree, compile: func(t *testing.T) CompiledOp {
 			program, err := CompileRenameSubtreeProgram(fsmeta.RenameSubtreeRequest{Mount: "vol", FromParent: fsmeta.RootInode, FromName: "old", ToParent: crossBucketParent, ToName: "new"}, testMount)
 			require.NoError(t, err)
@@ -181,6 +186,8 @@ func operationKindSpecName(kind fsmeta.OperationKind) string {
 		return "fsmeta.OperationSnapshotSubtree"
 	case fsmeta.OperationRename:
 		return "fsmeta.OperationRename"
+	case fsmeta.OperationRenameReplace:
+		return "fsmeta.OperationRenameReplace"
 	case fsmeta.OperationRenameSubtree:
 		return "fsmeta.OperationRenameSubtree"
 	case fsmeta.OperationLink:

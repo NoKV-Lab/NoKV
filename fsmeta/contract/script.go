@@ -56,14 +56,16 @@ func chooseOperation(rng *rand.Rand, model *Model, names []string, sessions []fs
 	case 26, 27, 28, 29, 30, 31, 32, 33:
 		return renameOperation(rng, model, names)
 	case 34, 35, 36, 37, 38, 39, 40:
+		return renameReplaceOperation(rng, model, names)
+	case 41, 42, 43, 44:
 		return linkOperation(rng, model, names)
-	case 41, 42, 43, 44, 45, 46, 47:
+	case 45, 46, 47:
 		return unlinkOperation(rng, model, names)
 	case 48, 49, 50:
 		return removeOperation(rng, model, names)
 	case 51, 52, 53:
 		return updateOperation(rng, model, names)
-	case 54, 55, 56, 57, 58:
+	case 55, 56, 57, 58, 59:
 		if len(files) == 0 {
 			return createOperation(rng, model, names, nextInode)
 		}
@@ -75,7 +77,7 @@ func chooseOperation(rng *rand.Rand, model *Model, names []string, sessions []fs
 			Session:   sessions[rng.Intn(len(sessions))],
 			ExpiresNs: model.NowUnixNs + int64(1+rng.Intn(10))*int64(time.Second),
 		}
-	case 59, 60, 61, 62:
+	case 60, 61, 62, 63:
 		if len(liveSessions) == 0 {
 			return readDirPlusOperation(rng, model, names)
 		}
@@ -87,21 +89,21 @@ func chooseOperation(rng *rand.Rand, model *Model, names []string, sessions []fs
 			Session:   session.Session,
 			ExpiresNs: model.NowUnixNs + int64(10+rng.Intn(10))*int64(time.Second),
 		}
-	case 63, 64, 65:
+	case 64, 65, 66:
 		if len(liveSessions) == 0 {
 			return lookupOperation(rng, model, names)
 		}
 		session := liveSessions[rng.Intn(len(liveSessions))]
 		return Operation{Kind: OpCloseSession, Mount: model.Mount, Inode: session.Inode, Session: session.Session}
-	case 66, 67:
+	case 67, 68:
 		return Operation{
 			Kind:      OpAdvanceTime,
 			Mount:     model.Mount,
 			AdvanceNs: int64(1+rng.Intn(6)) * int64(time.Second),
 		}
-	case 68, 69:
+	case 69, 70:
 		return Operation{Kind: OpExpireSessions, Mount: model.Mount, Limit: 16}
-	case 70, 71, 72:
+	case 71, 72, 73:
 		ref := *nextSnapshotRef
 		*nextSnapshotRef++
 		return Operation{Kind: OpSnapshotSubtree, Mount: model.Mount, Parent: model.Root, SnapshotRef: ref}
@@ -176,6 +178,29 @@ func renameOperation(rng *rand.Rand, model *Model, names []string) Operation {
 	}
 	return Operation{
 		Kind:       OpRename,
+		Mount:      model.Mount,
+		FromParent: model.Root,
+		FromName:   fromName,
+		ToParent:   model.Root,
+		ToName:     toName,
+	}
+}
+
+func renameReplaceOperation(rng *rand.Rand, model *Model, names []string) Operation {
+	fromName := names[rng.Intn(len(names))]
+	if files := model.ExistingFileDentries(); len(files) > 0 && rng.Intn(100) < 85 {
+		fromName = files[rng.Intn(len(files))].Name
+	} else if existing := model.ExistingDentries(); len(existing) > 0 {
+		fromName = existing[rng.Intn(len(existing))].Name
+	}
+	toName := names[rng.Intn(len(names))]
+	if existing := model.ExistingDentries(); len(existing) > 0 && rng.Intn(100) < 70 {
+		toName = existing[rng.Intn(len(existing))].Name
+	} else if free := freeNames(model, names); len(free) > 0 {
+		toName = free[rng.Intn(len(free))]
+	}
+	return Operation{
+		Kind:       OpRenameReplace,
 		Mount:      model.Mount,
 		FromParent: model.Root,
 		FromName:   fromName,

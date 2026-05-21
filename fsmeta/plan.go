@@ -24,6 +24,7 @@ const (
 	OperationReadSession      OperationKind = "read_session"
 	OperationSnapshotSubtree  OperationKind = "snapshot_subtree"
 	OperationRename           OperationKind = "rename"
+	OperationRenameReplace    OperationKind = "rename_replace"
 	OperationRenameSubtree    OperationKind = "rename_subtree"
 	OperationLink             OperationKind = "link"
 	OperationUnlink           OperationKind = "unlink"
@@ -111,6 +112,21 @@ type RenameRequest struct {
 	FromName   string
 	ToParent   InodeID
 	ToName     string
+}
+
+type RenameReplaceRequest struct {
+	Mount      MountID
+	FromParent InodeID
+	FromName   string
+	ToParent   InodeID
+	ToName     string
+}
+
+type RenameReplaceResult struct {
+	Replaced        bool
+	OldDentry       DentryRecord
+	OldInode        InodeRecord
+	OldInodeDeleted bool
 }
 
 type RenameSubtreeRequest struct {
@@ -215,6 +231,10 @@ func ValidateRenameRequest(req RenameRequest) error {
 		return ErrInvalidRequest
 	}
 	return nil
+}
+
+func ValidateRenameReplaceRequest(req RenameReplaceRequest) error {
+	return ValidateRenameRequest(RenameRequest(req))
 }
 
 func PlanCreate(req CreateRequest, mount MountIdentity, inodeID InodeID) (OperationPlan, error) {
@@ -373,6 +393,38 @@ func PlanRename(req RenameRequest, mount MountIdentity) (OperationPlan, error) {
 	}
 	return OperationPlan{
 		Kind:       OperationRename,
+		Mount:      req.Mount,
+		PrimaryKey: cloneBytes(source),
+		ReadKeys:   cloneKeySet(source, dest, fromParent, toParent),
+		MutateKeys: cloneKeySet(source, dest, fromParent, toParent),
+	}, nil
+}
+
+func PlanRenameReplace(req RenameReplaceRequest, mount MountIdentity) (OperationPlan, error) {
+	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+		return OperationPlan{}, err
+	}
+	if req.FromParent == req.ToParent && req.FromName == req.ToName {
+		return OperationPlan{}, ErrInvalidRequest
+	}
+	source, err := EncodeDentryKey(mount, req.FromParent, req.FromName)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	dest, err := EncodeDentryKey(mount, req.ToParent, req.ToName)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	fromParent, err := EncodeInodeKey(mount, req.FromParent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	toParent, err := EncodeInodeKey(mount, req.ToParent)
+	if err != nil {
+		return OperationPlan{}, err
+	}
+	return OperationPlan{
+		Kind:       OperationRenameReplace,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(source),
 		ReadKeys:   cloneKeySet(source, dest, fromParent, toParent),

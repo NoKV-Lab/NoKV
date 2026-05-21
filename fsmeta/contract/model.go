@@ -23,6 +23,7 @@ const (
 	OpReadDirPlus      OperationKind = "readdir_plus"
 	OpSnapshotSubtree  OperationKind = "snapshot_subtree"
 	OpRename           OperationKind = "rename"
+	OpRenameReplace    OperationKind = "rename_replace"
 	OpRenameSubtree    OperationKind = "rename_subtree"
 	OpLink             OperationKind = "link"
 	OpUnlink           OperationKind = "unlink"
@@ -69,13 +70,14 @@ func (op Operation) String() string {
 // Result is the comparable response shape returned by both the reference model
 // and the system under test.
 type Result struct {
-	Err     error
-	Dentry  fsmeta.DentryRecord
-	Pairs   []fsmeta.DentryAttrPair
-	Token   fsmeta.SnapshotSubtreeToken
-	Inode   fsmeta.InodeRecord
-	Session fsmeta.SessionRecord
-	Expired uint64
+	Err           error
+	Dentry        fsmeta.DentryRecord
+	Pairs         []fsmeta.DentryAttrPair
+	Token         fsmeta.SnapshotSubtreeToken
+	Inode         fsmeta.InodeRecord
+	RenameReplace fsmeta.RenameReplaceResult
+	Session       fsmeta.SessionRecord
+	Expired       uint64
 }
 
 type dentryKey struct {
@@ -150,6 +152,8 @@ func (m *Model) Apply(op Operation) Result {
 		return m.readDirPlus(op)
 	case OpRename, OpRenameSubtree:
 		return m.renameSubtree(op)
+	case OpRenameReplace:
+		return m.renameReplace(op)
 	case OpLink:
 		return m.link(op)
 	case OpUnlink:
@@ -348,6 +352,65 @@ func (m *Model) renameSubtree(op Operation) Result {
 	record.Name = op.ToName
 	m.dentries[to] = record
 	return Result{}
+}
+
+func (m *Model) renameReplace(op Operation) Result {
+	if op.FromParent == op.ToParent && op.FromName == op.ToName {
+		return Result{Err: fsmeta.ErrInvalidRequest}
+	}
+	from := dentryKey{parent: op.FromParent, name: op.FromName}
+	to := dentryKey{parent: op.ToParent, name: op.ToName}
+	record, ok := m.dentries[from]
+	if !ok {
+		return Result{Err: fsmeta.ErrNotFound}
+	}
+	if record.Type == fsmeta.InodeTypeDirectory {
+		return Result{Err: fsmeta.ErrInvalidRequest}
+	}
+	sourceInode, ok := m.inodes[record.Inode]
+	if !ok {
+		return Result{Err: fsmeta.ErrNotFound}
+	}
+	if sourceInode.Type != record.Type {
+		return Result{Err: fsmeta.ErrInvalidValue}
+	}
+	if sourceInode.Type == fsmeta.InodeTypeDirectory {
+		return Result{Err: fsmeta.ErrInvalidRequest}
+	}
+	result := fsmeta.RenameReplaceResult{}
+	if existing, ok := m.dentries[to]; ok {
+		if existing.Type == fsmeta.InodeTypeDirectory {
+			return Result{Err: fsmeta.ErrInvalidRequest}
+		}
+		existingInode, ok := m.inodes[existing.Inode]
+		if !ok {
+			return Result{Err: fsmeta.ErrNotFound}
+		}
+		if existingInode.Type != existing.Type {
+			return Result{Err: fsmeta.ErrInvalidValue}
+		}
+		if existingInode.Type == fsmeta.InodeTypeDirectory {
+			return Result{Err: fsmeta.ErrInvalidRequest}
+		}
+		if existingInode.Inode == sourceInode.Inode && existingInode.LinkCount <= 1 {
+			return Result{Err: fsmeta.ErrInvalidValue}
+		}
+		result.Replaced = true
+		result.OldDentry = existing
+		result.OldInode = existingInode
+		if existingInode.LinkCount <= 1 {
+			result.OldInodeDeleted = true
+			delete(m.inodes, existingInode.Inode)
+		} else {
+			existingInode.LinkCount--
+			m.inodes[existingInode.Inode] = existingInode
+		}
+	}
+	delete(m.dentries, from)
+	record.Parent = op.ToParent
+	record.Name = op.ToName
+	m.dentries[to] = record
+	return Result{RenameReplace: result}
 }
 
 func (m *Model) link(op Operation) Result {

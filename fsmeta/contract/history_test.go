@@ -113,6 +113,10 @@ func (unavailableCreateExecutor) Rename(context.Context, fsmeta.RenameRequest) e
 	return fsmeta.ErrInvalidRequest
 }
 
+func (unavailableCreateExecutor) RenameReplace(context.Context, fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+	return fsmeta.RenameReplaceResult{}, fsmeta.ErrInvalidRequest
+}
+
 func (unavailableCreateExecutor) RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error {
 	return fsmeta.ErrInvalidRequest
 }

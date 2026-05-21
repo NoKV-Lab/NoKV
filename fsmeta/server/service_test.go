@@ -31,6 +31,7 @@ type fakeExecutor struct {
 	snapshotReq      fsmeta.SnapshotSubtreeRequest
 	quotaReq         fsmeta.QuotaUsageRequest
 	renameReq        fsmeta.RenameRequest
+	renameReplaceReq fsmeta.RenameReplaceRequest
 	renameSubtreeReq fsmeta.RenameSubtreeRequest
 	linkReq          fsmeta.LinkRequest
 	unlinkReq        fsmeta.UnlinkRequest
@@ -178,6 +179,19 @@ func (e *fakeExecutor) GetQuotaUsage(_ context.Context, req fsmeta.QuotaUsageReq
 func (e *fakeExecutor) Rename(_ context.Context, req fsmeta.RenameRequest) error {
 	e.renameReq = req
 	return e.err
+}
+
+func (e *fakeExecutor) RenameReplace(_ context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+	e.renameReplaceReq = req
+	if e.err != nil {
+		return fsmeta.RenameReplaceResult{}, e.err
+	}
+	return fsmeta.RenameReplaceResult{
+		Replaced:        true,
+		OldDentry:       fsmeta.DentryRecord{Parent: req.ToParent, Name: req.ToName, Inode: 41, Type: fsmeta.InodeTypeFile},
+		OldInode:        fsmeta.InodeRecord{Inode: 41, Type: fsmeta.InodeTypeFile, LinkCount: 1},
+		OldInodeDeleted: true,
+	}, nil
 }
 
 func (e *fakeExecutor) RenameSubtree(_ context.Context, req fsmeta.RenameSubtreeRequest) error {
@@ -337,6 +351,25 @@ func TestGRPCServiceReadDirAndMutationRPCs(t *testing.T) {
 		ToParent:   2,
 		ToName:     "new",
 	}, executor.renameReq)
+
+	replaceResp, err := client.RenameReplace(context.Background(), &fsmetapb.RenameReplaceRequest{
+		Mount:      "vol",
+		FromParent: 1,
+		FromName:   ".stage-new",
+		ToParent:   2,
+		ToName:     "new",
+	})
+	require.NoError(t, err)
+	require.True(t, replaceResp.GetReplaced())
+	require.True(t, replaceResp.GetOldInodeDeleted())
+	require.Equal(t, uint64(41), replaceResp.GetOldDentry().GetInode())
+	require.Equal(t, fsmeta.RenameReplaceRequest{
+		Mount:      "vol",
+		FromParent: 1,
+		FromName:   ".stage-new",
+		ToParent:   2,
+		ToName:     "new",
+	}, executor.renameReplaceReq)
 
 	_, err = client.RenameSubtree(context.Background(), &fsmetapb.RenameSubtreeRequest{
 		Mount:      "vol",

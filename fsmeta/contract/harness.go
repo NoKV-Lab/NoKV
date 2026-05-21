@@ -21,6 +21,7 @@ type Executor interface {
 	ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
 	SnapshotSubtree(context.Context, fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error)
 	Rename(context.Context, fsmeta.RenameRequest) error
+	RenameReplace(context.Context, fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error)
 	RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error
 	Link(context.Context, fsmeta.LinkRequest) error
 	Unlink(context.Context, fsmeta.UnlinkRequest) error
@@ -142,6 +143,15 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 			ToName:     op.ToName,
 		})
 		return Result{Err: err}
+	case OpRenameReplace:
+		result, err := exec.RenameReplace(ctx, fsmeta.RenameReplaceRequest{
+			Mount:      op.Mount,
+			FromParent: op.FromParent,
+			FromName:   op.FromName,
+			ToParent:   op.ToParent,
+			ToName:     op.ToName,
+		})
+		return Result{Err: err, RenameReplace: result}
 	case OpRenameSubtree:
 		err := exec.RenameSubtree(ctx, fsmeta.RenameSubtreeRequest{
 			Mount:      op.Mount,
@@ -229,6 +239,9 @@ func compareResult(got, want Result) error {
 	if !reflect.DeepEqual(got.Inode, want.Inode) {
 		return fmt.Errorf("inode mismatch: got %+v want %+v", got.Inode, want.Inode)
 	}
+	if !reflect.DeepEqual(got.RenameReplace, want.RenameReplace) {
+		return fmt.Errorf("rename replace mismatch: got %+v want %+v", got.RenameReplace, want.RenameReplace)
+	}
 	if got.Session != want.Session {
 		return fmt.Errorf("session mismatch: got %+v want %+v", got.Session, want.Session)
 	}
@@ -257,6 +270,9 @@ func summarize(result Result) string {
 	}
 	if result.Inode.Inode != 0 {
 		return fmt.Sprintf("inode=%d size=%d links=%d", result.Inode.Inode, result.Inode.Size, result.Inode.LinkCount)
+	}
+	if result.RenameReplace.Replaced {
+		return fmt.Sprintf("rename_replace old=%s:%d deleted=%t", result.RenameReplace.OldDentry.Name, result.RenameReplace.OldDentry.Inode, result.RenameReplace.OldInodeDeleted)
 	}
 	if result.Session.Session != "" {
 		return fmt.Sprintf("session=%s inode=%d expires=%d", result.Session.Session, result.Session.Inode, result.Session.ExpiresUnixNs)

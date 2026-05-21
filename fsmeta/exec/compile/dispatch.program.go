@@ -21,6 +21,8 @@ func compileAOTDelta(delta SemanticDelta) (CompiledOp, error) {
 		return compileSnapshotSubtreeCompiledOp(delta)
 	case fsmeta.OperationRename:
 		return compileRenameCompiledOp(delta)
+	case fsmeta.OperationRenameReplace:
+		return compileRenameReplaceCompiledOp(delta)
 	case fsmeta.OperationRenameSubtree:
 		return compileRenameSubtreeCompiledOp(delta)
 	case fsmeta.OperationLink:

@@ -53,6 +53,7 @@ type Client interface {
 	RetireSnapshotSubtree(ctx context.Context, token fsmeta.SnapshotSubtreeToken) error
 	GetQuotaUsage(ctx context.Context, req fsmeta.QuotaUsageRequest) (fsmeta.UsageRecord, error)
 	Rename(ctx context.Context, req fsmeta.RenameRequest) error
+	RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error)
 	RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error
 	Link(ctx context.Context, req fsmeta.LinkRequest) error
 	Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
@@ -320,6 +321,27 @@ func (c *GRPCClient) Rename(ctx context.Context, req fsmeta.RenameRequest) error
 		c.lookup.Put(req.Mount, record)
 	}
 	return nil
+}
+
+func (c *GRPCClient) RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+	if err := c.requireRPC(); err != nil {
+		return fsmeta.RenameReplaceResult{}, err
+	}
+	from := lookupCacheKey{mount: req.Mount, parent: req.FromParent, name: req.FromName}
+	to := lookupCacheKey{mount: req.Mount, parent: req.ToParent, name: req.ToName}
+	record, hadSource := c.lookup.peek(from)
+	resp, err := c.rpc.RenameReplace(ctx, renameReplaceRequestToProto(req))
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, translateRPCError(err)
+	}
+	c.lookup.invalidate(from)
+	c.lookup.invalidate(to)
+	if hadSource {
+		record.Parent = req.ToParent
+		record.Name = req.ToName
+		c.lookup.Put(req.Mount, record)
+	}
+	return renameReplaceResultFromProto(resp), nil
 }
 
 func (c *GRPCClient) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error {

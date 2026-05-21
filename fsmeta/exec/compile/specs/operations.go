@@ -159,6 +159,35 @@ var Rename = specdsl.OpSpec{
 	},
 }
 
+var RenameReplace = specdsl.OpSpec{
+	Name:           "RenameReplace",
+	FileName:       "rename.program.go",
+	ProgramType:    "RenameReplaceProgram",
+	RequestType:    "fsmeta.RenameReplaceRequest",
+	CompileName:    "CompileRenameReplaceProgram",
+	PlanName:       "fsmeta.PlanRenameReplace",
+	OperationKind:  "fsmeta.OperationRenameReplace",
+	Durability:     "DurabilityVisibleOnly",
+	Eligibility:    "EligibilitySlowPath",
+	SlowReason:     "SlowReasonDynamicWriteSet",
+	PredicateCount: -1,
+	EffectCount:    4,
+	Emitter:        "operation",
+	Authority:      specdsl.AuthoritySpec{Parents: []string{"from_parent", "to_parent"}},
+	Predicates: []specdsl.PredicateSpec{
+		{Name: "from_dentry_observed", Kind: "PredicateObservedValue", Key: "read[0]"},
+		{Name: "to_dentry_observed", Kind: "PredicateObservedValue", Key: "read[1]"},
+		{Name: "from_parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[2]"},
+		{Name: "to_parent_inode_observed", Kind: "PredicateObservedValue", Key: "read[3]"},
+	},
+	Effects: []specdsl.EffectSpec{
+		{Name: "from_dentry", Kind: "EffectDelete", Key: "mutate[0]"},
+		{Name: "to_dentry", Kind: "EffectDerivedPut", Key: "mutate[1]", ValueSource: "runtime"},
+		{Name: "from_parent_inode", Kind: "EffectDerivedPut", Key: "mutate[2]", ValueSource: "runtime"},
+		{Name: "to_parent_inode", Kind: "EffectDerivedPut", Key: "mutate[3]", ValueSource: "runtime"},
+	},
+}
+
 var RenameSubtree = specdsl.OpSpec{
 	Name:              "RenameSubtree",
 	FileName:          "rename.program.go",
@@ -434,6 +463,7 @@ func All() []specdsl.OpSpec {
 		ReadDir,
 		SnapshotSubtree,
 		Rename,
+		RenameReplace,
 		RenameSubtree,
 		Link,
 		Unlink,

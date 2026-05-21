@@ -213,6 +213,18 @@ func (e *fakeExecutor) Rename(context.Context, fsmeta.RenameRequest) error {
 	return e.err
 }
 
+func (e *fakeExecutor) RenameReplace(_ context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+	if e.err != nil {
+		return fsmeta.RenameReplaceResult{}, e.err
+	}
+	return fsmeta.RenameReplaceResult{
+		Replaced:        true,
+		OldDentry:       fsmeta.DentryRecord{Parent: req.ToParent, Name: req.ToName, Inode: 41, Type: fsmeta.InodeTypeFile},
+		OldInode:        fsmeta.InodeRecord{Inode: 41, Type: fsmeta.InodeTypeFile, LinkCount: 1},
+		OldInodeDeleted: true,
+	}, nil
+}
+
 func (e *fakeExecutor) RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error {
 	return e.err
 }
@@ -351,6 +363,17 @@ func TestTypedClientMutationRPCs(t *testing.T) {
 		ToParent:   2,
 		ToName:     "new",
 	}))
+	replaced, err := cli.RenameReplace(context.Background(), fsmeta.RenameReplaceRequest{
+		Mount:      "vol",
+		FromParent: 1,
+		FromName:   ".stage-new",
+		ToParent:   2,
+		ToName:     "new",
+	})
+	require.NoError(t, err)
+	require.True(t, replaced.Replaced)
+	require.True(t, replaced.OldInodeDeleted)
+	require.Equal(t, fsmeta.InodeID(41), replaced.OldDentry.Inode)
 	require.NoError(t, cli.Link(context.Background(), fsmeta.LinkRequest{
 		Mount:      "vol",
 		FromParent: 1,

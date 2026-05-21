@@ -234,6 +234,21 @@ message RenameRequest {
 
 message RenameResponse {}
 
+message RenameReplaceRequest {
+  string mount = 1;
+  uint64 from_parent = 2;
+  string from_name = 3;
+  uint64 to_parent = 4;
+  string to_name = 5;
+}
+
+message RenameReplaceResponse {
+  bool replaced = 1;
+  DentryRecord old_dentry = 2;
+  InodeRecord old_inode = 3;
+  bool old_inode_deleted = 4;
+}
+
 message RenameSubtreeRequest {
   string mount = 1;
   uint64 from_parent = 2;
@@ -334,6 +349,7 @@ service FSMetadata {
   rpc RetireSnapshotSubtree(RetireSnapshotSubtreeRequest) returns (RetireSnapshotSubtreeResponse);
   rpc GetQuotaUsage(QuotaUsageRequest) returns (QuotaUsageResponse);
   rpc Rename(RenameRequest) returns (RenameResponse);
+  rpc RenameReplace(RenameReplaceRequest) returns (RenameReplaceResponse);
   rpc RenameSubtree(RenameSubtreeRequest) returns (RenameSubtreeResponse);
   rpc Link(LinkRequest) returns (LinkResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);

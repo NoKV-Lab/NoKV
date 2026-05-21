@@ -28,6 +28,7 @@ type Executor interface {
 	ResolveSnapshotSubtreeToken(ctx context.Context, token fsmeta.SnapshotSubtreeToken) (fsmeta.SnapshotSubtreeToken, error)
 	GetQuotaUsage(ctx context.Context, req fsmeta.QuotaUsageRequest) (fsmeta.UsageRecord, error)
 	Rename(ctx context.Context, req fsmeta.RenameRequest) error
+	RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error)
 	RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error
 	Link(ctx context.Context, req fsmeta.LinkRequest) error
 	Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
@@ -332,6 +333,20 @@ func (s *Service) Rename(ctx context.Context, req *fsmetapb.RenameRequest) (*fsm
 		return nil, rpcError(err)
 	}
 	return &fsmetapb.RenameResponse{}, nil
+}
+
+func (s *Service) RenameReplace(ctx context.Context, req *fsmetapb.RenameReplaceRequest) (*fsmetapb.RenameReplaceResponse, error) {
+	if err := s.requireExecutor(); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, rpcInvalidArgument("fsmeta rename replace request is required")
+	}
+	result, err := s.executor.RenameReplace(ctx, renameReplaceRequestFromProto(req))
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return renameReplaceResponseToProto(result), nil
 }
 
 func (s *Service) RenameSubtree(ctx context.Context, req *fsmetapb.RenameSubtreeRequest) (*fsmetapb.RenameSubtreeResponse, error) {

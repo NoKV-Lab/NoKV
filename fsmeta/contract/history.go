@@ -370,7 +370,7 @@ func isIndeterminateHistoryError(err error) bool {
 
 func operationMayMutate(kind OperationKind) bool {
 	switch kind {
-	case OpCreate, OpUpdateInode, OpRename, OpRenameSubtree, OpLink, OpUnlink, OpOpenWriteSession, OpHeartbeatSession, OpCloseSession, OpExpireSessions:
+	case OpCreate, OpUpdateInode, OpRename, OpRenameReplace, OpRenameSubtree, OpLink, OpUnlink, OpOpenWriteSession, OpHeartbeatSession, OpCloseSession, OpExpireSessions:
 		return true
 	default:
 		return false

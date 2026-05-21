@@ -118,6 +118,17 @@ func renameMoveFromRename(req fsmeta.RenameRequest, identity fsmeta.MountIdentit
 	}
 }
 
+func renameMoveFromRenameReplace(req fsmeta.RenameReplaceRequest, identity fsmeta.MountIdentity) renameMove {
+	return renameMove{
+		mount:      req.Mount,
+		identity:   identity,
+		fromParent: req.FromParent,
+		fromName:   req.FromName,
+		toParent:   req.ToParent,
+		toName:     req.ToName,
+	}
+}
+
 func renameMoveFromRenameSubtree(req fsmeta.RenameSubtreeRequest, identity fsmeta.MountIdentity) renameMove {
 	return renameMove{
 		mount:      req.Mount,
@@ -180,6 +191,50 @@ func (e *Executor) Rename(ctx context.Context, req fsmeta.RenameRequest) error {
 	e.invalidateNegative(plan.MutateKeys...)
 	e.invalidateDirPages(req.Mount, req.FromParent, req.ToParent)
 	return nil
+}
+
+// RenameReplace atomically publishes the source dentry at the destination name,
+// replacing an existing non-directory destination dentry when present. It is the
+// artifact publish primitive: no subtree handoff or durability barrier is
+// emitted, and all namespace/index mutations commit in one KV transaction.
+func (e *Executor) RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, err
+	}
+	mount := mountRecord.Identity()
+	program, err := compile.CompileRenameReplaceProgram(req, mount)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, err
+	}
+	delta := program.Compiled.Delta
+	if err := e.requireSameAuthority(ctx, req.Mount, req.FromParent, req.ToParent); err != nil {
+		return fsmeta.RenameReplaceResult{}, err
+	}
+	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
+		return fsmeta.RenameReplaceResult{}, err
+	}
+	plan := delta.Plan
+	move := renameMoveFromRenameReplace(req, mount)
+	var result fsmeta.RenameReplaceResult
+	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
+		nextResult, mutations, err := e.prepareRenameReplaceMutations(ctx, plan, move, startVersion)
+		if err != nil {
+			return fmt.Errorf("prepare rename replace: %w", err)
+		}
+		if err := e.mutateWithoutAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, mutations, startVersion, commitVersion); err != nil {
+			return fmt.Errorf("commit rename replace: %w", err)
+		}
+		result = nextResult
+		return nil
+	}, delta.Authority); err != nil {
+		return fsmeta.RenameReplaceResult{}, err
+	}
+	e.forgetVisibleEmptyDirectory(mount, req.ToParent)
+	e.invalidateNegative(plan.ReadKeys...)
+	e.invalidateNegative(plan.MutateKeys...)
+	e.invalidateDirPages(req.Mount, req.FromParent, req.ToParent)
+	return result, nil
 }
 
 // RenameSubtree moves the subtree root dentry from source to destination.
@@ -252,6 +307,187 @@ func (e *Executor) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRe
 	e.invalidateNegative(plan.ReadKeys...)
 	e.invalidateNegative(plan.MutateKeys...)
 	e.invalidateDirPages(req.Mount, req.FromParent, req.ToParent)
+	return nil
+}
+
+func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmeta.OperationPlan, move renameMove, startVersion uint64) (fsmeta.RenameReplaceResult, []*kvrpcpb.Mutation, error) {
+	sourceDentry, err := e.readDentry(ctx, plan.ReadKeys[0], startVersion)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("source dentry: %w", err)
+	}
+	if sourceDentry.Type == fsmeta.InodeTypeDirectory {
+		return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidRequest
+	}
+	sourceInode, ok, err := e.readInode(ctx, move.identity, sourceDentry.Inode, startVersion)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("source inode: %w", err)
+	}
+	if !ok {
+		return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("%w: inode %d", fsmeta.ErrNotFound, sourceDentry.Inode)
+	}
+	if err := validateRenameReplaceDentryInode(sourceDentry, sourceInode); err != nil {
+		return fsmeta.RenameReplaceResult{}, nil, err
+	}
+	if sourceInode.Type == fsmeta.InodeTypeDirectory {
+		return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidRequest
+	}
+	fromParent, err := e.readDirectoryInode(ctx, move.identity, move.fromParent, startVersion)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("from parent inode: %w", err)
+	}
+
+	result := fsmeta.RenameReplaceResult{}
+	destinationExisted := false
+	destinationDentry, err := e.readDentry(ctx, plan.ReadKeys[1], startVersion)
+	if err == nil {
+		destinationExisted = true
+		result.Replaced = true
+		result.OldDentry = destinationDentry
+	} else if !errors.Is(err, fsmeta.ErrNotFound) {
+		return fsmeta.RenameReplaceResult{}, nil, err
+	} else {
+		err = nil
+	}
+
+	var destinationInode fsmeta.InodeRecord
+	if destinationExisted {
+		if destinationDentry.Type == fsmeta.InodeTypeDirectory {
+			return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidRequest
+		}
+		destinationInode, ok, err = e.readInode(ctx, move.identity, destinationDentry.Inode, startVersion)
+		if err != nil {
+			return fsmeta.RenameReplaceResult{}, nil, err
+		}
+		if !ok {
+			return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("%w: inode %d", fsmeta.ErrNotFound, destinationDentry.Inode)
+		}
+		if err := validateRenameReplaceDentryInode(destinationDentry, destinationInode); err != nil {
+			return fsmeta.RenameReplaceResult{}, nil, err
+		}
+		if destinationInode.Type == fsmeta.InodeTypeDirectory {
+			return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidRequest
+		}
+		result.OldInode = destinationInode
+	}
+	toParent := fromParent
+	if move.fromParent != move.toParent {
+		toParent, err = e.readDirectoryInode(ctx, move.identity, move.toParent, startVersion)
+		if err != nil {
+			return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("to parent inode: %w", err)
+		}
+	}
+	nextFromParent := fromParent.record
+	nextToParent := toParent.record
+	switch {
+	case move.fromParent == move.toParent && destinationExisted:
+		nextFromParent, err = decrementDirectoryChildCount(nextFromParent)
+	case move.fromParent != move.toParent:
+		nextFromParent, err = decrementDirectoryChildCount(nextFromParent)
+		if err == nil && !destinationExisted {
+			nextToParent, err = incrementDirectoryChildCount(nextToParent)
+		}
+	}
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, nil, err
+	}
+
+	replacementDentry := sourceDentry
+	replacementDentry.Parent = move.toParent
+	replacementDentry.Name = move.toName
+	replacementValue, err := fsmeta.EncodeDentryValue(replacementDentry)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, nil, err
+	}
+	putDestination := &kvrpcpb.Mutation{
+		Op:    kvrpcpb.Mutation_Put,
+		Key:   cloneBytes(plan.MutateKeys[1]),
+		Value: replacementValue,
+	}
+	if !destinationExisted {
+		putDestination.AssertionNotExist = true
+	}
+	fromParentValue, err := fsmeta.EncodeInodeValue(nextFromParent)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, nil, err
+	}
+	toParentValue, err := fsmeta.EncodeInodeValue(nextToParent)
+	if err != nil {
+		return fsmeta.RenameReplaceResult{}, nil, err
+	}
+	mutations := []*kvrpcpb.Mutation{
+		{
+			Op:  kvrpcpb.Mutation_Delete,
+			Key: cloneBytes(plan.MutateKeys[0]),
+		},
+		putDestination,
+	}
+	if move.fromParent == move.toParent {
+		mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue})
+	} else {
+		mutations = append(mutations,
+			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue},
+			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[3]), Value: toParentValue},
+		)
+	}
+
+	quotaChanges := make([]QuotaChange, 0, 3)
+	if move.fromParent != move.toParent {
+		quotaChanges = append(quotaChanges,
+			QuotaChange{Mount: move.mount, MountKeyID: move.identity.MountKeyID, Scope: move.fromParent, Bytes: -inodeSizeDelta(sourceInode.Size), Inodes: -1},
+			QuotaChange{Mount: move.mount, MountKeyID: move.identity.MountKeyID, Scope: move.toParent, Bytes: inodeSizeDelta(sourceInode.Size), Inodes: 1},
+		)
+	}
+	if destinationExisted {
+		destinationInodeKey, err := fsmeta.EncodeInodeKey(move.identity, destinationInode.Inode)
+		if err != nil {
+			return fsmeta.RenameReplaceResult{}, nil, err
+		}
+		if destinationInode.Inode == sourceInode.Inode && destinationInode.LinkCount <= 1 {
+			return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidValue
+		}
+		if destinationInode.LinkCount <= 1 {
+			result.OldInodeDeleted = true
+			mutations = append(mutations, &kvrpcpb.Mutation{
+				Op:  kvrpcpb.Mutation_Delete,
+				Key: cloneBytes(destinationInodeKey),
+			})
+		} else {
+			destinationInode.LinkCount--
+			destinationValue, err := fsmeta.EncodeInodeValue(destinationInode)
+			if err != nil {
+				return fsmeta.RenameReplaceResult{}, nil, err
+			}
+			mutations = append(mutations, &kvrpcpb.Mutation{
+				Op:    kvrpcpb.Mutation_Put,
+				Key:   cloneBytes(destinationInodeKey),
+				Value: destinationValue,
+			})
+		}
+		quotaChanges = append(quotaChanges, QuotaChange{
+			Mount:      move.mount,
+			MountKeyID: move.identity.MountKeyID,
+			Scope:      move.toParent,
+			Bytes:      -inodeSizeDelta(result.OldInode.Size),
+			Inodes:     -1,
+		})
+	}
+	if len(quotaChanges) > 0 {
+		quotaMutations, err := e.reserveQuota(ctx, quotaChanges, startVersion)
+		if err != nil {
+			return fsmeta.RenameReplaceResult{}, nil, err
+		}
+		mutations = append(mutations, quotaMutations...)
+	}
+	return result, mutations, nil
+}
+
+func validateRenameReplaceDentryInode(dentry fsmeta.DentryRecord, inode fsmeta.InodeRecord) error {
+	if dentry.Inode != inode.Inode {
+		return fmt.Errorf("%w: dentry inode=%d value inode=%d", fsmeta.ErrInvalidValue, dentry.Inode, inode.Inode)
+	}
+	if dentry.Type != inode.Type {
+		return fmt.Errorf("%w: dentry type=%s inode type=%s", fsmeta.ErrInvalidValue, dentry.Type, inode.Type)
+	}
 	return nil
 }
 

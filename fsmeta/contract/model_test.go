@@ -233,6 +233,97 @@ func TestModelLinkRenameUnlinkMaintainsLinkCounts(t *testing.T) {
 	require.NoError(t, model.CheckInvariants())
 }
 
+func TestModelRenameReplaceMaintainsReplacedLinkCounts(t *testing.T) {
+	model := NewModel("vol")
+	require.NoError(t, model.Apply(Operation{
+		Kind:   OpCreate,
+		Mount:  "vol",
+		Parent: model.Root,
+		Name:   "old",
+		Inode:  10,
+		Type:   fsmeta.InodeTypeFile,
+		Mode:   0o600,
+	}).Err)
+	require.NoError(t, model.Apply(Operation{
+		Kind:       OpLink,
+		Mount:      "vol",
+		FromParent: model.Root,
+		FromName:   "old",
+		ToParent:   model.Root,
+		ToName:     "old-alias",
+	}).Err)
+	require.NoError(t, model.Apply(Operation{
+		Kind:   OpCreate,
+		Mount:  "vol",
+		Parent: model.Root,
+		Name:   "stage",
+		Inode:  11,
+		Type:   fsmeta.InodeTypeFile,
+		Mode:   0o600,
+	}).Err)
+
+	result := model.Apply(Operation{
+		Kind:       OpRenameReplace,
+		Mount:      "vol",
+		FromParent: model.Root,
+		FromName:   "stage",
+		ToParent:   model.Root,
+		ToName:     "old",
+	})
+	require.NoError(t, result.Err)
+
+	require.True(t, result.RenameReplace.Replaced)
+	require.False(t, result.RenameReplace.OldInodeDeleted)
+	require.Equal(t, fsmeta.InodeID(10), result.RenameReplace.OldDentry.Inode)
+	require.Equal(t, uint32(2), result.RenameReplace.OldInode.LinkCount)
+	require.Equal(t, fsmeta.InodeID(11), model.dentries[dentryKey{parent: model.Root, name: "old"}].Inode)
+	require.Equal(t, uint32(1), model.inodes[10].LinkCount)
+	require.Contains(t, model.dentries, dentryKey{parent: model.Root, name: "old-alias"})
+	require.NotContains(t, model.dentries, dentryKey{parent: model.Root, name: "stage"})
+	require.NoError(t, model.CheckInvariants())
+}
+
+func TestModelRenameReplaceDeletesSingleLinkReplacedInode(t *testing.T) {
+	model := NewModel("vol")
+	require.NoError(t, model.Apply(Operation{
+		Kind:   OpCreate,
+		Mount:  "vol",
+		Parent: model.Root,
+		Name:   "old",
+		Inode:  10,
+		Type:   fsmeta.InodeTypeFile,
+		Mode:   0o600,
+	}).Err)
+	require.NoError(t, model.Apply(Operation{
+		Kind:   OpCreate,
+		Mount:  "vol",
+		Parent: model.Root,
+		Name:   "stage",
+		Inode:  11,
+		Type:   fsmeta.InodeTypeFile,
+		Mode:   0o600,
+	}).Err)
+
+	result := model.Apply(Operation{
+		Kind:       OpRenameReplace,
+		Mount:      "vol",
+		FromParent: model.Root,
+		FromName:   "stage",
+		ToParent:   model.Root,
+		ToName:     "old",
+	})
+	require.NoError(t, result.Err)
+
+	require.True(t, result.RenameReplace.Replaced)
+	require.True(t, result.RenameReplace.OldInodeDeleted)
+	require.Equal(t, fsmeta.InodeID(10), result.RenameReplace.OldDentry.Inode)
+	require.Equal(t, uint32(1), result.RenameReplace.OldInode.LinkCount)
+	require.Equal(t, fsmeta.InodeID(11), model.dentries[dentryKey{parent: model.Root, name: "old"}].Inode)
+	require.NotContains(t, model.inodes, fsmeta.InodeID(10))
+	require.NotContains(t, model.dentries, dentryKey{parent: model.Root, name: "stage"})
+	require.NoError(t, model.CheckInvariants())
+}
+
 func TestModelSnapshotReadDirStaysStableAcrossNamespaceMutation(t *testing.T) {
 	model := NewModel("vol")
 	require.NoError(t, model.Apply(Operation{

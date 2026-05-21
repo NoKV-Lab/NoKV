@@ -646,7 +646,7 @@ func watchEventKind(delta SemanticDelta, effect WriteEffect) WatchEventKind {
 	switch delta.Kind {
 	case fsmeta.OperationCreate:
 		return WatchEventCreate
-	case fsmeta.OperationRename, fsmeta.OperationRenameSubtree:
+	case fsmeta.OperationRename, fsmeta.OperationRenameReplace, fsmeta.OperationRenameSubtree:
 		return WatchEventRename
 	case fsmeta.OperationUnlink, fsmeta.OperationRemove:
 		return WatchEventDelete
