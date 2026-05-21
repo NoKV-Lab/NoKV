@@ -1034,9 +1034,11 @@ func seedDentry(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, parent f
 
 func seedDentryType(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, parent fsmeta.InodeID, name string, inode fsmeta.InodeID, typ fsmeta.InodeType) {
 	t.Helper()
-	incrementSeedParentChildCount(t, runner, mount, parent)
 	key, err := fsmeta.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
 	require.NoError(t, err)
+	if _, exists := runner.data[string(key)]; !exists {
+		incrementSeedParentChildCount(t, runner, mount, parent)
+	}
 	value, err := fsmeta.EncodeDentryValue(fsmeta.DentryRecord{
 		Parent: parent,
 		Name:   name,

@@ -253,6 +253,16 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirecto
 		if inode.Type != fsmeta.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == fsmeta.RootInode {
 			return fsmeta.ErrInvalidRequest
 		}
+		quotaMutations, err := e.reserveQuota(ctx, []QuotaChange{{
+			Mount:      req.Mount,
+			MountKeyID: mount.MountKeyID,
+			Scope:      req.Parent,
+			Bytes:      -inodeSizeDelta(inode.Size),
+			Inodes:     -1,
+		}}, startVersion)
+		if err != nil {
+			return err
+		}
 		inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
 		if err != nil {
 			return err
@@ -266,12 +276,16 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirecto
 			{Op: kvrpcpb.Mutation_Delete, Key: cloneBytes(plan.MutateKeys[1])},
 			{Op: kvrpcpb.Mutation_Delete, Key: inodeKey},
 		}
+		mutations = append(mutations, quotaMutations...)
 		predicates := []*kvrpcpb.AtomicPredicate{
 			atomicValueEquals(parent.key, parent.value),
 			atomicValueEquals(plan.PrimaryKey, dentryValue),
 			atomicValueEquals(inodeKey, inodeValue),
 		}
-		return e.mutateWithAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, predicates, mutations, startVersion, commitVersion)
+		if len(quotaMutations) == 0 {
+			return e.mutateWithAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, predicates, mutations, startVersion, commitVersion)
+		}
+		return e.mutateWithoutAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, mutations, startVersion, commitVersion)
 	}, delta.Authority); err != nil {
 		return err
 	}
@@ -311,6 +325,19 @@ func (e *Executor) tryVisibleRemoveDirectory(ctx context.Context, compiled compi
 	}
 	if inode.Type != fsmeta.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == fsmeta.RootInode {
 		return false, fsmeta.ErrInvalidRequest
+	}
+	quotaOK, err := e.visibleQuotaAllowsCommit(ctx, []QuotaChange{{
+		Mount:      req.Mount,
+		MountKeyID: mount.MountKeyID,
+		Scope:      req.Parent,
+		Bytes:      -inodeSizeDelta(inode.Size),
+		Inodes:     -1,
+	}})
+	if err != nil {
+		return false, err
+	}
+	if !quotaOK {
+		return false, nil
 	}
 	parentValue, err := fsmeta.EncodeInodeValue(parent)
 	if err != nil {

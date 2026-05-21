@@ -34,3 +34,14 @@ func TestGuardProofVerifierBindsExpectedEvidence(t *testing.T) {
 	evidence.SubjectDigest[0] ^= 0xff
 	require.ErrorIs(t, VerifyGuardProof(obligation, evidence, proof), ErrInvalidProof)
 }
+
+func TestGuardEvidenceKindValuesAreStable(t *testing.T) {
+	require.Equal(t, GuardEvidenceKind(0), GuardEvidenceUnknown)
+	require.Equal(t, GuardEvidenceKind(1), GuardEvidenceSingleLinkInode)
+	require.Equal(t, GuardEvidenceKind(2), GuardEvidenceSameAuthority)
+	require.Equal(t, GuardEvidenceKind(3), GuardEvidenceNonDirectoryInode)
+	require.Equal(t, GuardEvidenceKind(4), GuardEvidenceLiveSession)
+	require.Equal(t, GuardEvidenceKind(5), GuardEvidenceExpiredSessionOwner)
+	require.Equal(t, GuardEvidenceKind(6), GuardEvidenceQuotaCredit)
+	require.Equal(t, GuardEvidenceKind(7), GuardEvidenceEmptyDirectory)
+}

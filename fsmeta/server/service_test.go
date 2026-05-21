@@ -394,6 +394,18 @@ func TestGRPCServiceReadDirAndMutationRPCs(t *testing.T) {
 		Name:   "alias",
 	}, executor.removeReq)
 
+	_, err = client.RemoveDirectory(context.Background(), &fsmetapb.RemoveDirectoryRequest{
+		Mount:  "vol",
+		Parent: 2,
+		Name:   "empty-dir",
+	})
+	require.NoError(t, err)
+	require.Equal(t, fsmeta.RemoveDirectoryRequest{
+		Mount:  "vol",
+		Parent: 2,
+		Name:   "empty-dir",
+	}, executor.removeDirReq)
+
 	updateResp, err := client.UpdateInode(context.Background(), &fsmetapb.UpdateInodeRequest{
 		Mount:            "vol",
 		Parent:           2,

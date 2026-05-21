@@ -366,7 +366,12 @@ func TestTypedClientMutationRPCs(t *testing.T) {
 	require.NoError(t, cli.Remove(context.Background(), fsmeta.RemoveRequest{
 		Mount:  "vol",
 		Parent: 2,
-		Name:   "alias",
+		Name:   "old-file",
+	}))
+	require.NoError(t, cli.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{
+		Mount:  "vol",
+		Parent: 2,
+		Name:   "empty-dir",
 	}))
 
 	updated, err := cli.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{

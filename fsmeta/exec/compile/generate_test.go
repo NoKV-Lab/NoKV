@@ -71,6 +71,11 @@ func TestGeneratedProgramsMatchSemanticSpecs(t *testing.T) {
 			require.NoError(t, err)
 			return program.Compiled
 		}},
+		{spec: compilespecs.RemoveDirectory, compile: func(t *testing.T) CompiledOp {
+			program, err := CompileRemoveDirectoryProgram(fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old-dir"}, testMount)
+			require.NoError(t, err)
+			return program.Compiled
+		}},
 		{spec: compilespecs.OpenWriteSession, compile: func(t *testing.T) CompiledOp {
 			program, err := CompileOpenWriteSessionProgram(fsmeta.OpenWriteSessionRequest{Mount: "vol", Inode: 44, Session: "writer-1", TTL: time.Second}, testMount)
 			require.NoError(t, err)
@@ -184,6 +189,8 @@ func operationKindSpecName(kind fsmeta.OperationKind) string {
 		return "fsmeta.OperationUnlink"
 	case fsmeta.OperationRemove:
 		return "fsmeta.OperationRemove"
+	case fsmeta.OperationRemoveDirectory:
+		return "fsmeta.OperationRemoveDirectory"
 	case fsmeta.OperationOpenWriteSession:
 		return "fsmeta.OperationOpenWriteSession"
 	case fsmeta.OperationHeartbeatSession:
@@ -284,6 +291,8 @@ func guardSpecName(guard RuntimeGuard) string {
 		return "GuardSameAuthority"
 	case GuardNonDirectoryInode:
 		return "GuardNonDirectoryInode"
+	case GuardEmptyDirectory:
+		return "GuardEmptyDirectory"
 	case GuardLiveSession:
 		return "GuardLiveSession"
 	case GuardExpiredSessionOwner:

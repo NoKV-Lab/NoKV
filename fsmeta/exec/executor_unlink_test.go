@@ -250,6 +250,26 @@ func TestExecutorRemoveDirectoryRemovesEmptyDirectory(t *testing.T) {
 	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][2].GetOp())
 }
 
+func TestExecutorRemoveDirectoryReservesNegativeQuota(t *testing.T) {
+	runner := newFakeRunner()
+	inode := testInodeForParentBucket(t, 7, 7)
+	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
+	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+		Inode:     inode,
+		Type:      fsmeta.InodeTypeDirectory,
+		Size:      4096,
+		Mode:      0o755,
+		LinkCount: 1,
+	})
+	quota := &fakeQuotaResolver{}
+	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
+	require.NoError(t, err)
+
+	err = executor.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.NoError(t, err)
+	require.Equal(t, [][]QuotaChange{{{Mount: "vol", MountKeyID: 1, Scope: 7, Bytes: -4096, Inodes: -1}}}, quota.changes)
+}
+
 func TestExecutorRemoveDirectoryRejectsNonEmptyDirectory(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
