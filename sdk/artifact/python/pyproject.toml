@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nokv-mlflow-artifact"
+version = "0.0.0"
+description = "NoKV artifact repository adapter for MLflow"
+requires-python = ">=3.10"
+dependencies = ["mlflow"]
+
+[project.entry-points."mlflow.artifact_repository"]
+nokv = "nokv_mlflow_artifact.repository:NoKVArtifactRepository"
+"nokv+file" = "nokv_mlflow_artifact.repository:NoKVArtifactRepository"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nokv_mlflow_artifact*"]
