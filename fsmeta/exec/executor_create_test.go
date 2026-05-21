@@ -752,5 +752,5 @@ func BenchmarkExecutorCheckpointStormVisibleCommit100(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	benchmarkExecutorCheckpointStorm(b, executor, nil, 100)
+	benchmarkExecutorCheckpointStorm(b, executor, committer, 100)
 }
