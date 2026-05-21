@@ -298,10 +298,16 @@ func visibleNotExistsDerivedFromDelta(delta compile.SemanticDelta, predicate com
 	if delta.Kind != fsmeta.OperationCreate || len(delta.Plan.MutateKeys) < 3 {
 		return false
 	}
-	if bytes.Equal(predicate.Key, delta.Plan.MutateKeys[1]) {
+	if bytes.Equal(predicate.Key, delta.Plan.MutateKeys[2]) {
 		return true
 	}
-	return bytes.Equal(predicate.Key, delta.Plan.MutateKeys[2])
+	if !bytes.Equal(predicate.Key, delta.Plan.MutateKeys[1]) || len(delta.Authority.Parents) != 1 {
+		return false
+	}
+	return index.DirectoryBaseEmpty(fsmeta.MountIdentity{
+		MountID:    delta.Authority.Mount,
+		MountKeyID: delta.Authority.MountKeyID,
+	}, delta.Authority.Parents[0])
 }
 
 func (e *Executor) visibleNotExistsKnown(scope compile.AuthorityScope, key []byte, index VisiblePredicateIndex) bool {
