@@ -114,11 +114,7 @@ func createScopeWithRetry(ctx context.Context, cli fsmetaclient.Client, op fsmet
 				return fsmeta.CreateResult{Dentry: dentry, Inode: req.Attrs.InodeRecord(dentry.Inode)}, nil
 			}
 		}
-		// Compose startup can return NotFound until the fsmeta gateway observes
-		// rooted mount/root admission. The scope create is an admission barrier,
-		// so retrying here keeps startup synchronization out of the generated
-		// correctness history.
-		if !nokverrors.Retryable(err) && !nokverrors.IsKind(err, nokverrors.KindNotFound) {
+		if !retryScopeCreateError(err) {
 			return fsmeta.CreateResult{}, err
 		}
 		timer := time.NewTimer(delay)
@@ -131,6 +127,25 @@ func createScopeWithRetry(ctx context.Context, cli fsmetaclient.Client, op fsmet
 		if delay < time.Second {
 			delay *= 2
 		}
+	}
+}
+
+func retryScopeCreateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// The scope create is a startup/admission barrier, not part of the
+	// generated correctness history. Let the outer command timeout absorb
+	// transient root, coordinator, and store recovery windows.
+	if errors.Is(err, fsmeta.ErrMountNotRegistered) {
+		return true
+	}
+	switch nokverrors.KindOf(err) {
+	case nokverrors.KindNotFound,
+		nokverrors.KindRetryExhausted:
+		return true
+	default:
+		return nokverrors.Retryable(err)
 	}
 }
 

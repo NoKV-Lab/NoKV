@@ -35,7 +35,12 @@ stop_chaos() {
   fi
   chaos_pid=""
   docker compose unpause coordinator-1 coordinator-2 coordinator-3 store-1 store-2 store-3 meta-root-1 meta-root-2 meta-root-3 fsmeta >/dev/null 2>&1 || true
-  docker compose up -d coordinator-1 coordinator-2 coordinator-3 store-1 store-2 store-3 meta-root-1 meta-root-2 meta-root-3 fsmeta >/dev/null 2>&1 || true
+  docker compose up -d --no-deps coordinator-1 coordinator-2 coordinator-3 store-1 store-2 store-3 meta-root-1 meta-root-2 meta-root-3 fsmeta >/dev/null 2>&1 || true
+}
+
+recover_service() {
+  local service="$1"
+  docker compose up -d --no-deps "$service"
 }
 
 cleanup() {
@@ -76,14 +81,14 @@ inject_fault() {
       ;;
     2)
       docker compose kill -s SIGKILL store-2
-      docker compose up -d store-2
+      recover_service store-2
       ;;
     3)
       docker compose restart meta-root-3
       ;;
     4)
       docker compose kill -s SIGKILL coordinator-2
-      docker compose up -d coordinator-2
+      recover_service coordinator-2
       ;;
     5)
       docker compose restart store-3
@@ -104,7 +109,7 @@ inject_fault() {
       ;;
     9)
       docker compose kill -s SIGKILL store-1
-      docker compose up -d store-1
+      recover_service store-1
       ;;
     10)
       isolate_service store-2 2
@@ -144,7 +149,7 @@ inject_recovery_fault() {
   case $((seed % 4)) in
     0)
       docker compose kill -s SIGKILL store-1
-      docker compose up -d store-1
+      recover_service store-1
       ;;
     1)
       docker compose restart store-2

@@ -6,6 +6,7 @@ package main
 import (
 	"testing"
 
+	nokverrors "github.com/feichai0017/NoKV/errors"
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetacontract "github.com/feichai0017/NoKV/fsmeta/contract"
 )
@@ -37,6 +38,28 @@ func TestExternalHistoryOpsScopesRootOperationsAndFiltersInternalSessions(t *tes
 	requireOp(t, ops[2], fsmetacontract.OpLink, mount, scopeInode, "link", scopeInode+11)
 	if got := scopeGeneratedInode(scopeInode, 0); got != 0 {
 		t.Fatalf("zero inode remapped to %d", got)
+	}
+}
+
+func TestRetryScopeCreateErrorIncludesStartupAvailabilityWindows(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "mount not registered", err: fsmeta.ErrMountNotRegistered, want: true},
+		{name: "not found", err: nokverrors.New(nokverrors.KindNotFound, "root not admitted"), want: true},
+		{name: "inner retry exhausted", err: nokverrors.New(nokverrors.KindRetryExhausted, "client: kv get retries exhausted"), want: true},
+		{name: "unavailable", err: nokverrors.New(nokverrors.KindUnavailable, "store restarting"), want: true},
+		{name: "invalid", err: nokverrors.New(nokverrors.KindInvalidArgument, "bad request"), want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryScopeCreateError(tc.err); got != tc.want {
+				t.Fatalf("retryScopeCreateError(%v)=%v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
