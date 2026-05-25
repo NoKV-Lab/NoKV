@@ -9,7 +9,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/ristretto/v2 v2.4.0
 	github.com/golang/snappy v1.0.0
-	github.com/panjf2000/ants/v2 v2.12.0
+	github.com/panjf2000/ants/v2 v2.12.1
 	github.com/pkg/errors v0.9.1
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/raft/v3 v3.6.0
