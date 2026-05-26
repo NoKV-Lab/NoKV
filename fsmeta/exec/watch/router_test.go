@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,7 +67,7 @@ func TestRouterClosesSlowSubscriberOnOverflow(t *testing.T) {
 	router.Publish(fsmeta.WatchEvent{Cursor: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 2}, Key: []byte("k/b")})
 
 	require.Eventually(t, func() bool {
-		return errors.Is(sub.Err(), fsmeta.ErrWatchOverflow)
+		return errors.Is(sub.Err(), model.ErrWatchOverflow)
 	}, time.Second, 10*time.Millisecond)
 	require.GreaterOrEqual(t, router.Dropped(), uint64(1))
 }
@@ -157,7 +158,7 @@ func TestRouterPublishesPerasVisibleEventsLiveOnly(t *testing.T) {
 		KeyPrefix:    []byte("k/"),
 		ResumeCursor: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 1},
 	})
-	require.ErrorIs(t, err, fsmeta.ErrWatchCursorExpired)
+	require.ErrorIs(t, err, model.ErrWatchCursorExpired)
 	require.Nil(t, replay)
 }
 
@@ -253,14 +254,14 @@ func TestRouterRejectsExpiredResumeCursor(t *testing.T) {
 		KeyPrefix:    []byte("k/"),
 		ResumeCursor: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 9},
 	})
-	require.ErrorIs(t, err, fsmeta.ErrWatchCursorExpired)
+	require.ErrorIs(t, err, model.ErrWatchCursorExpired)
 }
 
 func TestRouterRetiresMountSubscriptions(t *testing.T) {
 	router := NewRouter()
-	volPrefix, err := fsmeta.EncodeDentryPrefix(fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}, fsmeta.RootInode)
+	volPrefix, err := fsmeta.EncodeDentryPrefix(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode)
 	require.NoError(t, err)
-	otherPrefix, err := fsmeta.EncodeDentryPrefix(fsmeta.MountIdentity{MountID: "other", MountKeyID: 2}, fsmeta.RootInode)
+	otherPrefix, err := fsmeta.EncodeDentryPrefix(model.MountIdentity{MountID: "other", MountKeyID: 2}, model.RootInode)
 	require.NoError(t, err)
 	volSub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
 		Mount:     "vol",
@@ -276,7 +277,7 @@ func TestRouterRetiresMountSubscriptions(t *testing.T) {
 	require.Equal(t, 1, router.RetireMount("vol"))
 	_, ok := <-volSub.Events()
 	require.False(t, ok)
-	require.ErrorIs(t, volSub.Err(), fsmeta.ErrMountRetired)
+	require.ErrorIs(t, volSub.Err(), model.ErrMountRetired)
 
 	evt := fsmeta.WatchEvent{
 		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 10},
@@ -297,8 +298,8 @@ func TestRouterRetiresMountSubscriptions(t *testing.T) {
 func TestWatchPrefixRejectsRecursiveInodeSubtree(t *testing.T) {
 	_, err := fsmeta.WatchPrefix(fsmeta.WatchRequest{
 		Mount:              "vol",
-		RootInode:          fsmeta.RootInode,
+		RootInode:          model.RootInode,
 		DescendRecursively: true,
 	})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 }

@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/benchmark/fsmeta/workload"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 func main() {
@@ -57,7 +57,7 @@ func main() {
 	result, err := run(ctx, cli, runConfig{
 		name:                    *workloadName,
 		scaleProfile:            *scaleProfile,
-		mount:                   fsmeta.MountID(*mount),
+		mount:                   model.MountID(*mount),
 		runID:                   id,
 		clients:                 *clients,
 		dirs:                    *dirs,
@@ -85,7 +85,7 @@ func main() {
 type runConfig struct {
 	name                    string
 	scaleProfile            string
-	mount                   fsmeta.MountID
+	mount                   model.MountID
 	runID                   string
 	clients                 int
 	dirs                    int

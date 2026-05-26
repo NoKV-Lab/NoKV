@@ -11,6 +11,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
 )
@@ -139,7 +140,7 @@ func TestHolderBuildPendingReplayPlanForScopeFiltersDisjointAuthority(t *testing
 	_, _, ok, err = holder.BuildPendingReplayPlanForScope(0, compile.AuthorityScope{
 		Mount:      "vol",
 		MountKeyID: 1,
-		Parents:    []fsmeta.InodeID{99},
+		Parents:    []model.InodeID{99},
 	})
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -182,7 +183,7 @@ func TestHolderRejectsIneligibleOperation(t *testing.T) {
 
 func TestHolderAcceptsCrossBucketDelta(t *testing.T) {
 	holder := newTestHolder(t)
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	parent := inodeForBucket(t, 1)
 	inode := inodeForBucket(t, 2)
 	op := testGeneratedCreateOpForInodes(t, parent, inode, "cross-bucket")
@@ -252,7 +253,7 @@ func newTestHolder(t *testing.T) *Holder {
 	return holder
 }
 
-var testMount = fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+var testMount = model.MountIdentity{MountID: "vol", MountKeyID: 1}
 
 func testGeneratedCreateOp(tb testing.TB, name, value string, opts ...compile.Option) compile.MaterializedOp {
 	tb.Helper()
@@ -276,16 +277,16 @@ func generatedCreateIntentOp(name, value string, opts ...compile.Option) (compil
 	if name == "" || name == "." || name == ".." {
 		name = "entry"
 	}
-	inodeID := fsmeta.InodeID(100)
+	inodeID := model.InodeID(100)
 	for _, ch := range name + value {
-		inodeID += fsmeta.InodeID(ch)
+		inodeID += model.InodeID(ch)
 	}
-	program, err := compile.CompileCreateProgram(fsmeta.CreateRequest{
+	program, err := compile.CompileCreateProgram(model.CreateRequest{
 		Mount:  testMount.MountID,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   name,
-		Attrs: fsmeta.CreateAttrs{
-			Type: fsmeta.InodeTypeFile,
+		Attrs: model.CreateAttrs{
+			Type: model.InodeTypeFile,
 			Size: uint64(len(value)),
 			Mode: 0o644,
 		},
@@ -293,20 +294,20 @@ func generatedCreateIntentOp(name, value string, opts ...compile.Option) (compil
 	if err != nil {
 		return compile.MaterializedOp{}, err
 	}
-	op, err := materializeGeneratedCreate(program, fsmeta.RootInode)
+	op, err := materializeGeneratedCreate(program, model.RootInode)
 	if err != nil {
 		return compile.MaterializedOp{}, err
 	}
 	return compile.WithPredicateProofs(op, testPredicateProofsForMaterializedOp(op)), nil
 }
 
-func testGeneratedCreateOpForInodes(tb testing.TB, parent, inode fsmeta.InodeID, name string) compile.MaterializedOp {
+func testGeneratedCreateOpForInodes(tb testing.TB, parent, inode model.InodeID, name string) compile.MaterializedOp {
 	tb.Helper()
-	program, err := compile.CompileCreateProgram(fsmeta.CreateRequest{
+	program, err := compile.CompileCreateProgram(model.CreateRequest{
 		Mount:  testMount.MountID,
 		Parent: parent,
 		Name:   name,
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	}, testMount, inode)
 	if err != nil {
 		tb.Fatal(err)
@@ -318,10 +319,10 @@ func testGeneratedCreateOpForInodes(tb testing.TB, parent, inode fsmeta.InodeID,
 	return sealTestMaterializedOp(op)
 }
 
-func materializeGeneratedCreate(program compile.CreateProgram, parent fsmeta.InodeID) (compile.MaterializedOp, error) {
-	parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+func materializeGeneratedCreate(program compile.CreateProgram, parent model.InodeID) (compile.MaterializedOp, error) {
+	parentValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
 		Inode:      parent,
-		Type:       fsmeta.InodeTypeDirectory,
+		Type:       model.InodeTypeDirectory,
 		LinkCount:  1,
 		ChildCount: 1,
 	})
@@ -376,9 +377,9 @@ func testPredicateProofsForMaterializedOp(op compile.MaterializedOp) []proof.Pre
 	return proofs
 }
 
-func inodeForBucket(t *testing.T, bucket fsmeta.AffinityBucket) fsmeta.InodeID {
+func inodeForBucket(t *testing.T, bucket fsmeta.AffinityBucket) model.InodeID {
 	t.Helper()
-	for inode := fsmeta.InodeID(2); inode < 100_000; inode++ {
+	for inode := model.InodeID(2); inode < 100_000; inode++ {
 		if fsmeta.BucketForInodeID(inode) == bucket {
 			return inode
 		}

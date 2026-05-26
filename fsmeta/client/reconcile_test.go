@@ -9,14 +9,15 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 type reconcileClient struct {
 	watchErrs []error
 	watches   []fsmeta.WatchRequest
-	pages     [][]fsmeta.DentryAttrPair
-	reads     []fsmeta.ReadDirRequest
+	pages     [][]model.DentryAttrPair
+	reads     []model.ReadDirRequest
 }
 
 func (c *reconcileClient) WatchSubtree(_ context.Context, req fsmeta.WatchRequest) (WatchSubscription, error) {
@@ -31,7 +32,7 @@ func (c *reconcileClient) WatchSubtree(_ context.Context, req fsmeta.WatchReques
 	return &stubWatchSubscription{ready: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: uint64(len(c.watches))}}, nil
 }
 
-func (c *reconcileClient) ReadDirPlus(_ context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error) {
+func (c *reconcileClient) ReadDirPlus(_ context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	c.reads = append(c.reads, req)
 	if len(c.pages) == 0 {
 		return nil, fmt.Errorf("unexpected ReadDirPlus")
@@ -43,18 +44,18 @@ func (c *reconcileClient) ReadDirPlus(_ context.Context, req fsmeta.ReadDirReque
 
 func TestReadDirPlusAllPaginates(t *testing.T) {
 	cli := &reconcileClient{
-		pages: [][]fsmeta.DentryAttrPair{
+		pages: [][]model.DentryAttrPair{
 			{
-				{Dentry: fsmeta.DentryRecord{Name: "a"}},
-				{Dentry: fsmeta.DentryRecord{Name: "b"}},
+				{Dentry: model.DentryRecord{Name: "a"}},
+				{Dentry: model.DentryRecord{Name: "b"}},
 			},
 			{
-				{Dentry: fsmeta.DentryRecord{Name: "c"}},
+				{Dentry: model.DentryRecord{Name: "c"}},
 			},
 		},
 	}
-	got, err := ReadDirPlusAll(context.Background(), cli, fsmeta.ReadDirRequest{
-		Mount: "vol", Parent: fsmeta.RootInode, Limit: 2,
+	got, err := ReadDirPlusAll(context.Background(), cli, model.ReadDirRequest{
+		Mount: "vol", Parent: model.RootInode, Limit: 2,
 	})
 	require.NoError(t, err)
 	require.Len(t, got, 3)
@@ -65,17 +66,17 @@ func TestReadDirPlusAllPaginates(t *testing.T) {
 
 func TestWatchDirectoryWithReconcileOnExpiredCursor(t *testing.T) {
 	cli := &reconcileClient{
-		watchErrs: []error{fmt.Errorf("%w: stale", fsmeta.ErrWatchCursorExpired), nil},
-		pages: [][]fsmeta.DentryAttrPair{
-			{{Dentry: fsmeta.DentryRecord{Name: "artifact"}}},
+		watchErrs: []error{fmt.Errorf("%w: stale", model.ErrWatchCursorExpired), nil},
+		pages: [][]model.DentryAttrPair{
+			{{Dentry: model.DentryRecord{Name: "artifact"}}},
 		},
 	}
 	watchReq := fsmeta.WatchRequest{
 		Mount:        "vol",
-		RootInode:    fsmeta.RootInode,
+		RootInode:    model.RootInode,
 		ResumeCursor: fsmeta.WatchCursor{RegionID: 7, Term: 1, Index: 100},
 	}
-	readReq := fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 100}
+	readReq := model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 100}
 
 	result, err := WatchDirectoryWithReconcile(context.Background(), cli, watchReq, readReq)
 	require.NoError(t, err)
@@ -92,24 +93,24 @@ func TestWatchDirectoryWithReconcileOnExpiredCursor(t *testing.T) {
 func TestWatchDirectoryWithReconcileRejectsMismatchedRequest(t *testing.T) {
 	_, err := WatchDirectoryWithReconcile(context.Background(), &reconcileClient{},
 		fsmeta.WatchRequest{Mount: "vol", RootInode: 10},
-		fsmeta.ReadDirRequest{Mount: "vol", Parent: 11},
+		model.ReadDirRequest{Mount: "vol", Parent: 11},
 	)
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 }
 
 func TestWatchDirectoryWithReconcileRejectsPartialBaseline(t *testing.T) {
 	cli := &reconcileClient{}
-	watchReq := fsmeta.WatchRequest{Mount: "vol", RootInode: fsmeta.RootInode}
+	watchReq := fsmeta.WatchRequest{Mount: "vol", RootInode: model.RootInode}
 
 	_, err := WatchDirectoryWithReconcile(context.Background(), cli, watchReq,
-		fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, StartAfter: "a"},
+		model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, StartAfter: "a"},
 	)
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 
 	_, err = WatchDirectoryWithReconcile(context.Background(), cli, watchReq,
-		fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, SnapshotVersion: 10},
+		model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, SnapshotVersion: 10},
 	)
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 	require.Empty(t, cli.watches)
 	require.Empty(t, cli.reads)
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	raftcmdpb "github.com/feichai0017/NoKV/pb/raft"
 	myraft "github.com/feichai0017/NoKV/raft"
@@ -135,8 +136,8 @@ func TestEventsFromCommandSkipsAtomicMutateFallback(t *testing.T) {
 }
 
 func TestEventsFromCommandExtractsPreparedMVCCWatchKeys(t *testing.T) {
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
-	dentryKey, err := fsmeta.EncodeDentryKey(mount, fsmeta.RootInode, "a")
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	dentryKey, err := fsmeta.EncodeDentryKey(mount, model.RootInode, "a")
 	require.NoError(t, err)
 	req := &raftcmdpb.RaftCmdRequest{
 		Header: &raftcmdpb.CmdHeader{RegionId: 7},

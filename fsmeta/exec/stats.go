@@ -7,8 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type visibleAdmissionCounters struct {
@@ -252,27 +252,27 @@ func visibleAdmissionSlowReasonStats(counters *visibleAdmissionCounters) map[str
 	}
 }
 
-var atomicOnePhaseKinds = [...]fsmeta.OperationKind{
-	fsmeta.OperationCreate,
-	fsmeta.OperationUpdateInode,
-	fsmeta.OperationRename,
-	fsmeta.OperationLink,
-	fsmeta.OperationUnlink,
-	fsmeta.OperationRemove,
-	fsmeta.OperationOpenWriteSession,
-	fsmeta.OperationHeartbeatSession,
-	fsmeta.OperationCloseSession,
+var atomicOnePhaseKinds = [...]model.OperationKind{
+	model.OperationCreate,
+	model.OperationUpdateInode,
+	model.OperationRename,
+	model.OperationLink,
+	model.OperationUnlink,
+	model.OperationRemove,
+	model.OperationOpenWriteSession,
+	model.OperationHeartbeatSession,
+	model.OperationCloseSession,
 }
 
-func newAtomicOnePhaseCounters() map[fsmeta.OperationKind]*atomicOnePhaseCounters {
-	out := make(map[fsmeta.OperationKind]*atomicOnePhaseCounters, len(atomicOnePhaseKinds))
+func newAtomicOnePhaseCounters() map[model.OperationKind]*atomicOnePhaseCounters {
+	out := make(map[model.OperationKind]*atomicOnePhaseCounters, len(atomicOnePhaseKinds))
 	for _, kind := range atomicOnePhaseKinds {
 		out[kind] = &atomicOnePhaseCounters{fallbacksByAffinity: make(map[string]uint64)}
 	}
 	return out
 }
 
-func atomicOnePhaseStats(counters map[fsmeta.OperationKind]*atomicOnePhaseCounters) map[string]any {
+func atomicOnePhaseStats(counters map[model.OperationKind]*atomicOnePhaseCounters) map[string]any {
 	out := make(map[string]any, len(atomicOnePhaseKinds))
 	for _, kind := range atomicOnePhaseKinds {
 		var stats *atomicOnePhaseCounters

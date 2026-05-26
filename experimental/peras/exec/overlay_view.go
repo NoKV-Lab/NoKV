@@ -12,6 +12,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 // OverlayKV is one visible Peras overlay row.
@@ -176,7 +177,7 @@ func (v *OverlayView) AddSegment(segment PerasSegment) error {
 // SnapshotDirectory returns a generation-pinned direct directory view. It does
 // not clone row values; it records only the dentry prefix and inode keys needed
 // for ReadDirPlus over that directory.
-func (v *OverlayView) SnapshotDirectory(mount fsmeta.MountIdentity, prefix []byte) *OverlaySnapshot {
+func (v *OverlayView) SnapshotDirectory(mount model.MountIdentity, prefix []byte) *OverlaySnapshot {
 	if v == nil || len(prefix) == 0 {
 		return nil
 	}
@@ -249,7 +250,7 @@ func (v *OverlayView) Clone() *OverlayView {
 // CloneForSnapshotDirectory copies the pending rows needed to serve a direct
 // directory snapshot: matching dentries plus pending inode rows referenced by
 // those dentries.
-func (v *OverlayView) CloneForSnapshotDirectory(mount fsmeta.MountIdentity, prefix []byte) *OverlayView {
+func (v *OverlayView) CloneForSnapshotDirectory(mount model.MountIdentity, prefix []byte) *OverlayView {
 	out := NewOverlayView()
 	if v == nil || len(prefix) == 0 {
 		return out
@@ -377,7 +378,7 @@ func (v *OverlayView) KeyState(key []byte) (present bool, known bool) {
 	return present, ok
 }
 
-func (v *OverlayView) DirectoryEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (v *OverlayView) DirectoryEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if v == nil {
 		return false
 	}
@@ -387,7 +388,7 @@ func (v *OverlayView) DirectoryEmpty(mount fsmeta.MountIdentity, inode fsmeta.In
 	return ok
 }
 
-func (v *OverlayView) DirectoryBaseEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (v *OverlayView) DirectoryBaseEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if v == nil {
 		return false
 	}
@@ -397,7 +398,7 @@ func (v *OverlayView) DirectoryBaseEmpty(mount fsmeta.MountIdentity, inode fsmet
 	return ok
 }
 
-func (v *OverlayView) SessionNamespaceEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (v *OverlayView) SessionNamespaceEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if v == nil {
 		return false
 	}
@@ -420,7 +421,7 @@ func (v *OverlayView) RememberKey(key []byte, present bool) {
 	v.mu.Unlock()
 }
 
-func (v *OverlayView) RememberEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (v *OverlayView) RememberEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	if v == nil {
 		return
 	}
@@ -431,7 +432,7 @@ func (v *OverlayView) RememberEmptyDirectory(mount fsmeta.MountIdentity, inode f
 	v.mu.Unlock()
 }
 
-func (v *OverlayView) ForgetEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (v *OverlayView) ForgetEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	if v == nil {
 		return
 	}
@@ -440,7 +441,7 @@ func (v *OverlayView) ForgetEmptyDirectory(mount fsmeta.MountIdentity, inode fsm
 	v.mu.Unlock()
 }
 
-func (v *OverlayView) RememberEmptySessionNamespace(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (v *OverlayView) RememberEmptySessionNamespace(mount model.MountIdentity, inode model.InodeID) {
 	if v == nil {
 		return
 	}

@@ -15,6 +15,7 @@ import (
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
@@ -94,11 +95,11 @@ func (s testStoreWitnessWatchStream) Recv() (*coordpb.WatchRootEventsResponse, e
 
 func testStoreWitnessAuthorityScope() compile.AuthorityScope {
 	return compile.AuthorityScope{
-		Mount:      fsmeta.MountID("vol"),
-		MountKeyID: fsmeta.MountKeyID(7),
+		Mount:      model.MountID("vol"),
+		MountKeyID: model.MountKeyID(7),
 		Buckets:    []fsmeta.AffinityBucket{3},
-		Parents:    []fsmeta.InodeID{11},
-		Inodes:     []fsmeta.InodeID{29},
+		Parents:    []model.InodeID{11},
+		Inodes:     []model.InodeID{29},
 	}
 }
 

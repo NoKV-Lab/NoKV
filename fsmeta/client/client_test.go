@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetaserver "github.com/feichai0017/NoKV/fsmeta/server"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 	"github.com/stretchr/testify/require"
@@ -26,27 +27,27 @@ type fakeExecutor struct {
 	err              error
 	lookupCount      int
 	readDirPlusCount int
-	snapshotRefs     []fsmeta.SnapshotEvidenceRef
+	snapshotRefs     []model.SnapshotEvidenceRef
 }
 
-func (e *fakeExecutor) Create(_ context.Context, req fsmeta.CreateRequest) (fsmeta.CreateResult, error) {
+func (e *fakeExecutor) Create(_ context.Context, req model.CreateRequest) (model.CreateResult, error) {
 	if e.err != nil {
-		return fsmeta.CreateResult{}, e.err
+		return model.CreateResult{}, e.err
 	}
 	inode := req.Attrs.InodeRecord(42)
-	return fsmeta.CreateResult{
-		Dentry: fsmeta.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: inode.Inode, Type: inode.Type},
+	return model.CreateResult{
+		Dentry: model.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: inode.Inode, Type: inode.Type},
 		Inode:  inode,
 	}, nil
 }
 
-func (e *fakeExecutor) UpdateInode(_ context.Context, req fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error) {
+func (e *fakeExecutor) UpdateInode(_ context.Context, req model.UpdateInodeRequest) (model.InodeRecord, error) {
 	if e.err != nil {
-		return fsmeta.InodeRecord{}, e.err
+		return model.InodeRecord{}, e.err
 	}
-	return fsmeta.InodeRecord{
+	return model.InodeRecord{
 		Inode:         req.Inode,
-		Type:          fsmeta.InodeTypeFile,
+		Type:          model.InodeTypeFile,
 		Size:          req.Size,
 		Mode:          req.Mode,
 		LinkCount:     1,
@@ -55,22 +56,22 @@ func (e *fakeExecutor) UpdateInode(_ context.Context, req fsmeta.UpdateInodeRequ
 	}, nil
 }
 
-func (e *fakeExecutor) Lookup(context.Context, fsmeta.LookupRequest) (fsmeta.DentryRecord, error) {
+func (e *fakeExecutor) Lookup(context.Context, model.LookupRequest) (model.DentryRecord, error) {
 	e.lookupCount++
 	if e.err != nil {
-		return fsmeta.DentryRecord{}, e.err
+		return model.DentryRecord{}, e.err
 	}
-	return fsmeta.DentryRecord{Parent: fsmeta.RootInode, Name: "checkpoint", Inode: 42, Type: fsmeta.InodeTypeFile}, nil
+	return model.DentryRecord{Parent: model.RootInode, Name: "checkpoint", Inode: 42, Type: model.InodeTypeFile}, nil
 }
 
-func (e *fakeExecutor) LookupPlus(ctx context.Context, req fsmeta.LookupRequest) (fsmeta.DentryAttrPair, error) {
+func (e *fakeExecutor) LookupPlus(ctx context.Context, req model.LookupRequest) (model.DentryAttrPair, error) {
 	dentry, err := e.Lookup(ctx, req)
 	if err != nil {
-		return fsmeta.DentryAttrPair{}, err
+		return model.DentryAttrPair{}, err
 	}
-	return fsmeta.DentryAttrPair{
+	return model.DentryAttrPair{
 		Dentry: dentry,
-		Inode: fsmeta.InodeRecord{
+		Inode: model.InodeRecord{
 			Inode:     dentry.Inode,
 			Type:      dentry.Type,
 			Size:      4096,
@@ -80,23 +81,23 @@ func (e *fakeExecutor) LookupPlus(ctx context.Context, req fsmeta.LookupRequest)
 	}, nil
 }
 
-func (e *fakeExecutor) ReadDir(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryRecord, error) {
+func (e *fakeExecutor) ReadDir(context.Context, model.ReadDirRequest) ([]model.DentryRecord, error) {
 	if e.err != nil {
 		return nil, e.err
 	}
-	return []fsmeta.DentryRecord{{Parent: fsmeta.RootInode, Name: "checkpoint", Inode: 42, Type: fsmeta.InodeTypeFile}}, nil
+	return []model.DentryRecord{{Parent: model.RootInode, Name: "checkpoint", Inode: 42, Type: model.InodeTypeFile}}, nil
 }
 
-func (e *fakeExecutor) ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error) {
+func (e *fakeExecutor) ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	e.readDirPlusCount++
 	if e.err != nil {
 		return nil, e.err
 	}
-	return []fsmeta.DentryAttrPair{{
-		Dentry: fsmeta.DentryRecord{Parent: fsmeta.RootInode, Name: "checkpoint", Inode: 42, Type: fsmeta.InodeTypeFile},
-		Inode: fsmeta.InodeRecord{
+	return []model.DentryAttrPair{{
+		Dentry: model.DentryRecord{Parent: model.RootInode, Name: "checkpoint", Inode: 42, Type: model.InodeTypeFile},
+		Inode: model.InodeRecord{
 			Inode:       42,
-			Type:        fsmeta.InodeTypeFile,
+			Type:        model.InodeTypeFile,
 			Size:        4096,
 			Mode:        0o644,
 			LinkCount:   1,
@@ -110,7 +111,7 @@ func TestTypedClientDefaultLookupCacheHit(t *testing.T) {
 	cli, cleanup := openBufconnClient(t, exec)
 	defer cleanup()
 
-	req := fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "checkpoint"}
+	req := model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "checkpoint"}
 	first, err := cli.Lookup(context.Background(), req)
 	require.NoError(t, err)
 	second, err := cli.Lookup(context.Background(), req)
@@ -126,7 +127,7 @@ func TestTypedClientCanDisableLookupCache(t *testing.T) {
 	cli, cleanup := openBufconnClientWithConfig(t, exec, ClientConfig{DisableLookupCache: true})
 	defer cleanup()
 
-	req := fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "checkpoint"}
+	req := model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "checkpoint"}
 	_, err := cli.Lookup(context.Background(), req)
 	require.NoError(t, err)
 	_, err = cli.Lookup(context.Background(), req)
@@ -141,12 +142,12 @@ func TestTypedClientPopulatesLookupCacheFromReadDirPlus(t *testing.T) {
 	cli, cleanup := openBufconnClient(t, exec)
 	defer cleanup()
 
-	_, err := cli.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode})
+	_, err := cli.ReadDirPlus(context.Background(), model.ReadDirRequest{Mount: "vol", Parent: model.RootInode})
 	require.NoError(t, err)
-	record, err := cli.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "checkpoint"})
+	record, err := cli.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "checkpoint"})
 	require.NoError(t, err)
 
-	require.Equal(t, fsmeta.InodeID(42), record.Inode)
+	require.Equal(t, model.InodeID(42), record.Inode)
 	require.Equal(t, 0, exec.lookupCount)
 	require.Equal(t, 1, exec.readDirPlusCount)
 	require.Equal(t, uint64(1), cli.LookupCacheStats().Hits)
@@ -157,190 +158,190 @@ func TestTypedClientMovesLookupCacheAfterRename(t *testing.T) {
 	cli, cleanup := openBufconnClient(t, exec)
 	defer cleanup()
 
-	_, err := cli.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "checkpoint"})
+	_, err := cli.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "checkpoint"})
 	require.NoError(t, err)
-	require.NoError(t, cli.Rename(context.Background(), fsmeta.RenameRequest{
+	require.NoError(t, cli.Rename(context.Background(), model.RenameRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   "checkpoint",
 		ToParent:   8,
 		ToName:     "published",
 	}))
-	record, err := cli.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 8, Name: "published"})
+	record, err := cli.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 8, Name: "published"})
 	require.NoError(t, err)
 
-	require.Equal(t, fsmeta.InodeID(42), record.Inode)
+	require.Equal(t, model.InodeID(42), record.Inode)
 	require.Equal(t, 1, exec.lookupCount)
 	require.Equal(t, uint64(1), cli.LookupCacheStats().Hits)
 }
 
-func (e *fakeExecutor) GetReadVersion(context.Context, fsmeta.ReadVersionRequest) (uint64, error) {
+func (e *fakeExecutor) GetReadVersion(context.Context, model.ReadVersionRequest) (uint64, error) {
 	if e.err != nil {
 		return 0, e.err
 	}
 	return 5678, nil
 }
 
-func (e *fakeExecutor) SnapshotSubtree(_ context.Context, req fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error) {
+func (e *fakeExecutor) SnapshotSubtree(_ context.Context, req model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error) {
 	if e.err != nil {
-		return fsmeta.SnapshotSubtreeToken{}, e.err
+		return model.SnapshotSubtreeToken{}, e.err
 	}
-	return fsmeta.SnapshotSubtreeToken{
+	return model.SnapshotSubtreeToken{
 		Mount:           req.Mount,
 		MountKeyID:      1,
 		RootInode:       req.RootInode,
 		ReadVersion:     5678,
-		RuntimeEvidence: append([]fsmeta.SnapshotEvidenceRef(nil), e.snapshotRefs...),
+		RuntimeEvidence: append([]model.SnapshotEvidenceRef(nil), e.snapshotRefs...),
 	}, nil
 }
 
-func (e *fakeExecutor) ResolveSnapshotSubtreeToken(_ context.Context, token fsmeta.SnapshotSubtreeToken) (fsmeta.SnapshotSubtreeToken, error) {
+func (e *fakeExecutor) ResolveSnapshotSubtreeToken(_ context.Context, token model.SnapshotSubtreeToken) (model.SnapshotSubtreeToken, error) {
 	if e.err != nil {
-		return fsmeta.SnapshotSubtreeToken{}, e.err
+		return model.SnapshotSubtreeToken{}, e.err
 	}
 	token.MountKeyID = 1
 	return token, nil
 }
 
-func (e *fakeExecutor) GetQuotaUsage(context.Context, fsmeta.QuotaUsageRequest) (fsmeta.UsageRecord, error) {
+func (e *fakeExecutor) GetQuotaUsage(context.Context, model.QuotaUsageRequest) (model.UsageRecord, error) {
 	if e.err != nil {
-		return fsmeta.UsageRecord{}, e.err
+		return model.UsageRecord{}, e.err
 	}
-	return fsmeta.UsageRecord{Bytes: 4096, Inodes: 2}, nil
+	return model.UsageRecord{Bytes: 4096, Inodes: 2}, nil
 }
 
-func (e *fakeExecutor) Rename(context.Context, fsmeta.RenameRequest) error {
+func (e *fakeExecutor) Rename(context.Context, model.RenameRequest) error {
 	return e.err
 }
 
-func (e *fakeExecutor) RenameReplace(_ context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+func (e *fakeExecutor) RenameReplace(_ context.Context, req model.RenameReplaceRequest) (model.RenameReplaceResult, error) {
 	if e.err != nil {
-		return fsmeta.RenameReplaceResult{}, e.err
+		return model.RenameReplaceResult{}, e.err
 	}
-	return fsmeta.RenameReplaceResult{
+	return model.RenameReplaceResult{
 		Replaced:        true,
-		OldDentry:       fsmeta.DentryRecord{Parent: req.ToParent, Name: req.ToName, Inode: 41, Type: fsmeta.InodeTypeFile},
-		OldInode:        fsmeta.InodeRecord{Inode: 41, Type: fsmeta.InodeTypeFile, LinkCount: 1},
+		OldDentry:       model.DentryRecord{Parent: req.ToParent, Name: req.ToName, Inode: 41, Type: model.InodeTypeFile},
+		OldInode:        model.InodeRecord{Inode: 41, Type: model.InodeTypeFile, LinkCount: 1},
 		OldInodeDeleted: true,
 	}, nil
 }
 
-func (e *fakeExecutor) RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error {
+func (e *fakeExecutor) RenameSubtree(context.Context, model.RenameSubtreeRequest) error {
 	return e.err
 }
 
-func (e *fakeExecutor) Link(context.Context, fsmeta.LinkRequest) error {
+func (e *fakeExecutor) Link(context.Context, model.LinkRequest) error {
 	return e.err
 }
 
-func (e *fakeExecutor) Unlink(context.Context, fsmeta.UnlinkRequest) error {
+func (e *fakeExecutor) Unlink(context.Context, model.UnlinkRequest) error {
 	return e.err
 }
 
-func (e *fakeExecutor) Remove(_ context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+func (e *fakeExecutor) Remove(_ context.Context, req model.RemoveRequest) (model.RemoveResult, error) {
 	if e.err != nil {
-		return fsmeta.RemoveResult{}, e.err
+		return model.RemoveResult{}, e.err
 	}
-	return fsmeta.RemoveResult{
-		RemovedDentry: fsmeta.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: 61, Type: fsmeta.InodeTypeFile},
-		OldInode:      fsmeta.InodeRecord{Inode: 61, Type: fsmeta.InodeTypeFile, LinkCount: 1},
+	return model.RemoveResult{
+		RemovedDentry: model.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: 61, Type: model.InodeTypeFile},
+		OldInode:      model.InodeRecord{Inode: 61, Type: model.InodeTypeFile, LinkCount: 1},
 		InodeDeleted:  true,
 	}, nil
 }
 
-func (e *fakeExecutor) RemoveDirectory(context.Context, fsmeta.RemoveDirectoryRequest) error {
+func (e *fakeExecutor) RemoveDirectory(context.Context, model.RemoveDirectoryRequest) error {
 	return e.err
 }
 
-func (e *fakeExecutor) OpenWriteSession(_ context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (e *fakeExecutor) OpenWriteSession(_ context.Context, req model.OpenWriteSessionRequest) (model.SessionRecord, error) {
 	if e.err != nil {
-		return fsmeta.SessionRecord{}, e.err
+		return model.SessionRecord{}, e.err
 	}
-	return fsmeta.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: int64(req.TTL)}, nil
+	return model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: int64(req.TTL)}, nil
 }
 
-func (e *fakeExecutor) HeartbeatWriteSession(_ context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (e *fakeExecutor) HeartbeatWriteSession(_ context.Context, req model.HeartbeatWriteSessionRequest) (model.SessionRecord, error) {
 	if e.err != nil {
-		return fsmeta.SessionRecord{}, e.err
+		return model.SessionRecord{}, e.err
 	}
-	return fsmeta.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: int64(req.TTL)}, nil
+	return model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: int64(req.TTL)}, nil
 }
 
-func (e *fakeExecutor) CloseWriteSession(context.Context, fsmeta.CloseWriteSessionRequest) error {
+func (e *fakeExecutor) CloseWriteSession(context.Context, model.CloseWriteSessionRequest) error {
 	return e.err
 }
 
-func (e *fakeExecutor) ExpireWriteSessions(context.Context, fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error) {
+func (e *fakeExecutor) ExpireWriteSessions(context.Context, model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error) {
 	if e.err != nil {
-		return fsmeta.ExpireWriteSessionsResult{}, e.err
+		return model.ExpireWriteSessionsResult{}, e.err
 	}
-	return fsmeta.ExpireWriteSessionsResult{Expired: 2}, nil
+	return model.ExpireWriteSessionsResult{Expired: 2}, nil
 }
 
 func TestTypedClientRoundTrip(t *testing.T) {
 	cli, cleanup := openBufconnClient(t, &fakeExecutor{})
 	defer cleanup()
 
-	record, err := cli.Lookup(context.Background(), fsmeta.LookupRequest{
+	record, err := cli.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "checkpoint",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryRecord{
-		Parent: fsmeta.RootInode,
+	require.Equal(t, model.DentryRecord{
+		Parent: model.RootInode,
 		Name:   "checkpoint",
 		Inode:  42,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}, record)
 
-	pair, err := cli.LookupPlus(context.Background(), fsmeta.LookupRequest{
+	pair, err := cli.LookupPlus(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "checkpoint",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryAttrPair{
-		Dentry: fsmeta.DentryRecord{
-			Parent: fsmeta.RootInode,
+	require.Equal(t, model.DentryAttrPair{
+		Dentry: model.DentryRecord{
+			Parent: model.RootInode,
 			Name:   "checkpoint",
 			Inode:  42,
-			Type:   fsmeta.InodeTypeFile,
+			Type:   model.InodeTypeFile,
 		},
-		Inode: fsmeta.InodeRecord{
+		Inode: model.InodeRecord{
 			Inode:     42,
-			Type:      fsmeta.InodeTypeFile,
+			Type:      model.InodeTypeFile,
 			Size:      4096,
 			Mode:      0o644,
 			LinkCount: 1,
 		},
 	}, pair)
 
-	records, err := cli.ReadDir(context.Background(), fsmeta.ReadDirRequest{
+	records, err := cli.ReadDir(context.Background(), model.ReadDirRequest{
 		Mount:      "vol",
-		Parent:     fsmeta.RootInode,
+		Parent:     model.RootInode,
 		StartAfter: "batch-0001",
 		Limit:      16,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryRecord{{
-		Parent: fsmeta.RootInode,
+	require.Equal(t, []model.DentryRecord{{
+		Parent: model.RootInode,
 		Name:   "checkpoint",
 		Inode:  42,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}}, records)
 
-	pairs, err := cli.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pairs, err := cli.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{{
-		Dentry: fsmeta.DentryRecord{Parent: fsmeta.RootInode, Name: "checkpoint", Inode: 42, Type: fsmeta.InodeTypeFile},
-		Inode: fsmeta.InodeRecord{
+	require.Equal(t, []model.DentryAttrPair{{
+		Dentry: model.DentryRecord{Parent: model.RootInode, Name: "checkpoint", Inode: 42, Type: model.InodeTypeFile},
+		Inode: model.InodeRecord{
 			Inode:       42,
-			Type:        fsmeta.InodeTypeFile,
+			Type:        model.InodeTypeFile,
 			Size:        4096,
 			Mode:        0o644,
 			LinkCount:   1,
@@ -353,24 +354,24 @@ func TestTypedClientMutationRPCs(t *testing.T) {
 	cli, cleanup := openBufconnClient(t, &fakeExecutor{})
 	defer cleanup()
 
-	created, err := cli.Create(context.Background(), fsmeta.CreateRequest{
+	created, err := cli.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "created",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(42), created.Inode.Inode)
+	require.Equal(t, model.InodeID(42), created.Inode.Inode)
 	require.Equal(t, "created", created.Dentry.Name)
 
-	require.NoError(t, cli.RenameSubtree(context.Background(), fsmeta.RenameSubtreeRequest{
+	require.NoError(t, cli.RenameSubtree(context.Background(), model.RenameSubtreeRequest{
 		Mount:      "vol",
 		FromParent: 1,
 		FromName:   "old",
 		ToParent:   2,
 		ToName:     "new",
 	}))
-	replaced, err := cli.RenameReplace(context.Background(), fsmeta.RenameReplaceRequest{
+	replaced, err := cli.RenameReplace(context.Background(), model.RenameReplaceRequest{
 		Mount:      "vol",
 		FromParent: 1,
 		FromName:   ".stage-new",
@@ -380,35 +381,35 @@ func TestTypedClientMutationRPCs(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, replaced.Replaced)
 	require.True(t, replaced.OldInodeDeleted)
-	require.Equal(t, fsmeta.InodeID(41), replaced.OldDentry.Inode)
-	require.NoError(t, cli.Link(context.Background(), fsmeta.LinkRequest{
+	require.Equal(t, model.InodeID(41), replaced.OldDentry.Inode)
+	require.NoError(t, cli.Link(context.Background(), model.LinkRequest{
 		Mount:      "vol",
 		FromParent: 1,
 		FromName:   "file",
 		ToParent:   2,
 		ToName:     "alias",
 	}))
-	require.NoError(t, cli.Unlink(context.Background(), fsmeta.UnlinkRequest{
+	require.NoError(t, cli.Unlink(context.Background(), model.UnlinkRequest{
 		Mount:  "vol",
 		Parent: 2,
 		Name:   "alias",
 	}))
-	removed, err := cli.Remove(context.Background(), fsmeta.RemoveRequest{
+	removed, err := cli.Remove(context.Background(), model.RemoveRequest{
 		Mount:  "vol",
 		Parent: 2,
 		Name:   "old-file",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(61), removed.RemovedDentry.Inode)
-	require.Equal(t, fsmeta.InodeID(61), removed.OldInode.Inode)
+	require.Equal(t, model.InodeID(61), removed.RemovedDentry.Inode)
+	require.Equal(t, model.InodeID(61), removed.OldInode.Inode)
 	require.True(t, removed.InodeDeleted)
-	require.NoError(t, cli.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{
+	require.NoError(t, cli.RemoveDirectory(context.Background(), model.RemoveDirectoryRequest{
 		Mount:  "vol",
 		Parent: 2,
 		Name:   "empty-dir",
 	}))
 
-	updated, err := cli.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	updated, err := cli.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:            "vol",
 		Parent:           2,
 		Inode:            42,
@@ -423,9 +424,9 @@ func TestTypedClientMutationRPCs(t *testing.T) {
 		OpaqueAttrs:      []byte("body=cas://2"),
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeRecord{
+	require.Equal(t, model.InodeRecord{
 		Inode:         42,
-		Type:          fsmeta.InodeTypeFile,
+		Type:          model.InodeTypeFile,
 		Size:          8192,
 		Mode:          0o600,
 		LinkCount:     1,
@@ -433,16 +434,16 @@ func TestTypedClientMutationRPCs(t *testing.T) {
 		OpaqueAttrs:   []byte("body=cas://2"),
 	}, updated)
 
-	session, err := cli.OpenWriteSession(context.Background(), fsmeta.OpenWriteSessionRequest{
+	session, err := cli.OpenWriteSession(context.Background(), model.OpenWriteSessionRequest{
 		Mount:   "vol",
 		Inode:   42,
 		Session: "writer-1",
 		TTL:     time.Microsecond,
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.SessionRecord{Session: "writer-1", Inode: 42, ExpiresUnixNs: 1000}, session)
+	require.Equal(t, model.SessionRecord{Session: "writer-1", Inode: 42, ExpiresUnixNs: 1000}, session)
 
-	session, err = cli.HeartbeatWriteSession(context.Background(), fsmeta.HeartbeatWriteSessionRequest{
+	session, err = cli.HeartbeatWriteSession(context.Background(), model.HeartbeatWriteSessionRequest{
 		Mount:   "vol",
 		Inode:   42,
 		Session: "writer-1",
@@ -450,74 +451,74 @@ func TestTypedClientMutationRPCs(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, int64(2000), session.ExpiresUnixNs)
-	require.NoError(t, cli.CloseWriteSession(context.Background(), fsmeta.CloseWriteSessionRequest{Mount: "vol", Inode: 42, Session: "writer-1"}))
-	expired, err := cli.ExpireWriteSessions(context.Background(), fsmeta.ExpireWriteSessionsRequest{Mount: "vol", Limit: 64})
+	require.NoError(t, cli.CloseWriteSession(context.Background(), model.CloseWriteSessionRequest{Mount: "vol", Inode: 42, Session: "writer-1"}))
+	expired, err := cli.ExpireWriteSessions(context.Background(), model.ExpireWriteSessionsRequest{Mount: "vol", Limit: 64})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.ExpireWriteSessionsResult{Expired: 2}, expired)
+	require.Equal(t, model.ExpireWriteSessionsResult{Expired: 2}, expired)
 }
 
 func TestTypedClientErrorTranslation(t *testing.T) {
-	cli, cleanup := openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrExists})
+	cli, cleanup := openBufconnClient(t, &fakeExecutor{err: model.ErrExists})
 	defer cleanup()
 
-	_, err := cli.Create(context.Background(), fsmeta.CreateRequest{
+	_, err := cli.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "checkpoint",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
-	require.ErrorIs(t, err, fsmeta.ErrExists)
+	require.ErrorIs(t, err, model.ErrExists)
 
-	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrNotFound})
+	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: model.ErrNotFound})
 	defer cleanup()
-	_, err = cli.Lookup(context.Background(), fsmeta.LookupRequest{
+	_, err = cli.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "missing",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 
-	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrMountNotRegistered})
+	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: model.ErrMountNotRegistered})
 	defer cleanup()
-	_, err = cli.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "missing", Parent: fsmeta.RootInode, Name: "x"})
-	require.ErrorIs(t, err, fsmeta.ErrMountNotRegistered)
+	_, err = cli.Lookup(context.Background(), model.LookupRequest{Mount: "missing", Parent: model.RootInode, Name: "x"})
+	require.ErrorIs(t, err, model.ErrMountNotRegistered)
 
-	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrMountRetired})
+	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: model.ErrMountRetired})
 	defer cleanup()
-	_, err = cli.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "retired", Parent: fsmeta.RootInode, Name: "x"})
-	require.ErrorIs(t, err, fsmeta.ErrMountRetired)
+	_, err = cli.Lookup(context.Background(), model.LookupRequest{Mount: "retired", Parent: model.RootInode, Name: "x"})
+	require.ErrorIs(t, err, model.ErrMountRetired)
 
-	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrCrossAuthorityRename})
+	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: model.ErrCrossAuthorityRename})
 	defer cleanup()
-	err = cli.Rename(context.Background(), fsmeta.RenameRequest{Mount: "vol", FromParent: 1, FromName: "a", ToParent: 2, ToName: "b"})
-	require.ErrorIs(t, err, fsmeta.ErrCrossAuthorityRename)
+	err = cli.Rename(context.Background(), model.RenameRequest{Mount: "vol", FromParent: 1, FromName: "a", ToParent: 2, ToName: "b"})
+	require.ErrorIs(t, err, model.ErrCrossAuthorityRename)
 
-	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrInvalidRequest})
+	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: model.ErrInvalidRequest})
 	defer cleanup()
-	err = cli.RenameSubtree(context.Background(), fsmeta.RenameSubtreeRequest{Mount: "vol", FromParent: 1, FromName: "a", ToParent: 1, ToName: "a"})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	err = cli.RenameSubtree(context.Background(), model.RenameSubtreeRequest{Mount: "vol", FromParent: 1, FromName: "a", ToParent: 1, ToName: "a"})
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 
-	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrInvalidName})
+	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: model.ErrInvalidName})
 	defer cleanup()
-	_, err = cli.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: ""})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidName)
+	_, err = cli.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: ""})
+	require.ErrorIs(t, err, model.ErrInvalidName)
 
-	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrQuotaExceeded})
+	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: model.ErrQuotaExceeded})
 	defer cleanup()
-	_, err = cli.GetQuotaUsage(context.Background(), fsmeta.QuotaUsageRequest{Mount: "vol"})
-	require.ErrorIs(t, err, fsmeta.ErrQuotaExceeded)
+	_, err = cli.GetQuotaUsage(context.Background(), model.QuotaUsageRequest{Mount: "vol"})
+	require.ErrorIs(t, err, model.ErrQuotaExceeded)
 
-	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: fsmeta.ErrWatchOverflow})
+	cli, cleanup = openBufconnClient(t, &fakeExecutor{err: model.ErrWatchOverflow})
 	defer cleanup()
-	_, err = cli.ReadDir(context.Background(), fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode})
-	require.ErrorIs(t, err, fsmeta.ErrWatchOverflow)
+	_, err = cli.ReadDir(context.Background(), model.ReadDirRequest{Mount: "vol", Parent: model.RootInode})
+	require.ErrorIs(t, err, model.ErrWatchOverflow)
 }
 
 func TestTypedClientPreservesUnknownStatus(t *testing.T) {
 	errClient := New(fsmetapb.NewFSMetadataClient(&failingConn{}))
-	_, err := errClient.Lookup(context.Background(), fsmeta.LookupRequest{})
+	_, err := errClient.Lookup(context.Background(), model.LookupRequest{})
 	require.Error(t, err)
-	require.False(t, errors.Is(err, fsmeta.ErrNotFound))
+	require.False(t, errors.Is(err, model.ErrNotFound))
 	require.Equal(t, codes.Internal, status.Code(err))
 }
 
@@ -591,30 +592,30 @@ func TestWatchSessionHelpers(t *testing.T) {
 func TestTypedClientSnapshotSubtree(t *testing.T) {
 	publisher := &fakeSnapshotPublisher{}
 	ref := testClientSnapshotEvidenceRef(4, 0x10)
-	cli, cleanup := openBufconnClient(t, &fakeExecutor{snapshotRefs: []fsmeta.SnapshotEvidenceRef{ref}}, fsmetaserver.WithSnapshotPublisher(publisher))
+	cli, cleanup := openBufconnClient(t, &fakeExecutor{snapshotRefs: []model.SnapshotEvidenceRef{ref}}, fsmetaserver.WithSnapshotPublisher(publisher))
 	defer cleanup()
 
-	token, err := cli.SnapshotSubtree(context.Background(), fsmeta.SnapshotSubtreeRequest{
+	token, err := cli.SnapshotSubtree(context.Background(), model.SnapshotSubtreeRequest{
 		Mount:     "vol",
 		RootInode: 42,
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.SnapshotSubtreeToken{Mount: "vol", RootInode: 42, ReadVersion: 5678, RuntimeEvidence: []fsmeta.SnapshotEvidenceRef{ref}}, token)
+	require.Equal(t, model.SnapshotSubtreeToken{Mount: "vol", RootInode: 42, ReadVersion: 5678, RuntimeEvidence: []model.SnapshotEvidenceRef{ref}}, token)
 	require.NoError(t, cli.RetireSnapshotSubtree(context.Background(), token))
 	require.Equal(t, token.Mount, publisher.retired.Mount)
-	require.Equal(t, fsmeta.MountKeyID(1), publisher.retired.MountKeyID)
+	require.Equal(t, model.MountKeyID(1), publisher.retired.MountKeyID)
 	require.Equal(t, token.RootInode, publisher.retired.RootInode)
 	require.Equal(t, token.ReadVersion, publisher.retired.ReadVersion)
-	require.Equal(t, []fsmeta.SnapshotEvidenceRef{ref}, publisher.retired.RuntimeEvidence)
+	require.Equal(t, []model.SnapshotEvidenceRef{ref}, publisher.retired.RuntimeEvidence)
 }
 
 func TestClientSnapshotEvidenceFromProtoSkipsNil(t *testing.T) {
 	ref := testClientSnapshotEvidenceRef(4, 0x10)
 	got := snapshotEvidenceRefsFromProto([]*fsmetapb.SnapshotEvidenceRef{
 		nil,
-		snapshotEvidenceRefsToProto([]fsmeta.SnapshotEvidenceRef{ref})[0],
+		snapshotEvidenceRefsToProto([]model.SnapshotEvidenceRef{ref})[0],
 	})
-	require.Equal(t, []fsmeta.SnapshotEvidenceRef{ref}, got)
+	require.Equal(t, []model.SnapshotEvidenceRef{ref}, got)
 	require.Nil(t, snapshotEvidenceRefsFromProto([]*fsmetapb.SnapshotEvidenceRef{nil}))
 }
 
@@ -622,7 +623,7 @@ func TestTypedClientGetReadVersion(t *testing.T) {
 	cli, cleanup := openBufconnClient(t, &fakeExecutor{})
 	defer cleanup()
 
-	version, err := cli.GetReadVersion(context.Background(), fsmeta.ReadVersionRequest{Mount: "vol"})
+	version, err := cli.GetReadVersion(context.Background(), model.ReadVersionRequest{Mount: "vol"})
 	require.NoError(t, err)
 	require.Equal(t, uint64(5678), version)
 }
@@ -631,30 +632,30 @@ func TestTypedClientGetQuotaUsage(t *testing.T) {
 	cli, cleanup := openBufconnClient(t, &fakeExecutor{})
 	defer cleanup()
 
-	usage, err := cli.GetQuotaUsage(context.Background(), fsmeta.QuotaUsageRequest{Mount: "vol", Scope: 7})
+	usage, err := cli.GetQuotaUsage(context.Background(), model.QuotaUsageRequest{Mount: "vol", Scope: 7})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.UsageRecord{Bytes: 4096, Inodes: 2}, usage)
+	require.Equal(t, model.UsageRecord{Bytes: 4096, Inodes: 2}, usage)
 }
 
 type fakeSnapshotPublisher struct {
-	retired fsmeta.SnapshotSubtreeToken
+	retired model.SnapshotSubtreeToken
 }
 
-func (p *fakeSnapshotPublisher) PublishSnapshotSubtree(context.Context, fsmeta.SnapshotSubtreeToken) error {
+func (p *fakeSnapshotPublisher) PublishSnapshotSubtree(context.Context, model.SnapshotSubtreeToken) error {
 	return nil
 }
 
-func (p *fakeSnapshotPublisher) RetireSnapshotSubtree(_ context.Context, token fsmeta.SnapshotSubtreeToken) error {
+func (p *fakeSnapshotPublisher) RetireSnapshotSubtree(_ context.Context, token model.SnapshotSubtreeToken) error {
 	p.retired = token
 	return nil
 }
 
-func testClientSnapshotEvidenceRef(epoch uint64, seed byte) fsmeta.SnapshotEvidenceRef {
+func testClientSnapshotEvidenceRef(epoch uint64, seed byte) model.SnapshotEvidenceRef {
 	var root [32]byte
 	var digest [32]byte
 	root[0] = seed
 	digest[0] = seed + 1
-	return fsmeta.SnapshotEvidenceRef{EpochID: epoch, EvidenceRoot: root, PayloadDigest: digest}
+	return model.SnapshotEvidenceRef{EpochID: epoch, EvidenceRoot: root, PayloadDigest: digest}
 }
 
 type fakeWatcher struct {

@@ -13,6 +13,7 @@ import (
 	"github.com/feichai0017/NoKV/engine/lsm"
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	raftcmdpb "github.com/feichai0017/NoKV/pb/raft"
@@ -281,7 +282,7 @@ func TestNewApplierRejectsFencedVisibleAuthorityWrites(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	key, err := fsmeta.EncodeDentryKey(mount, 42, "artifact")
 	require.NoError(t, err)
 
@@ -310,7 +311,7 @@ func TestNewApplierRejectsFsmetaWritesWhenVisibleAuthorityViewIsStale(t *testing
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	key, err := fsmeta.EncodeDentryKey(mount, 42, "artifact")
 	require.NoError(t, err)
 
@@ -340,7 +341,7 @@ func TestNewBatchApplierSplitsAroundFencedVisibleAuthorityWrite(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	fencedKey, err := fsmeta.EncodeDentryKey(mount, 42, "artifact")
 	require.NoError(t, err)
 
@@ -668,7 +669,7 @@ func keysWithDifferentDefaultShardsForApplyTest(t *testing.T, shardCount int, ve
 	return nil, nil
 }
 
-func perasFenceTableForApplyTest(t *testing.T, mount fsmeta.MountIdentity) *runtimeperas.ActiveAuthorities {
+func perasFenceTableForApplyTest(t *testing.T, mount model.MountIdentity) *runtimeperas.ActiveAuthorities {
 	t.Helper()
 	table := runtimeperas.NewActiveAuthorities()
 	require.NoError(t, table.Replace([]rootproto.VisibleAuthorityGrant{{

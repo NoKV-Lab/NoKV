@@ -6,62 +6,64 @@ package exec
 import (
 	"bytes"
 	"context"
-	"github.com/feichai0017/NoKV/fsmeta"
-	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"slices"
 	"sort"
 	"time"
+
+	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
+	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
-func (e *Executor) tryVisibleOpenWriteSession(ctx context.Context, program compile.OpenWriteSessionProgram, mount fsmeta.MountIdentity, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, bool, error) {
+func (e *Executor) tryVisibleOpenWriteSession(ctx context.Context, program compile.OpenWriteSessionProgram, mount model.MountIdentity, req model.OpenWriteSessionRequest) (model.SessionRecord, bool, error) {
 	delta := program.Compiled.Delta
 	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
 	plan := delta.Plan
 	view := e.newVisibleReadView(ctx)
 	inode, ok, err := view.readInode(mount, req.Inode)
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	if !ok {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
-	if inode.Type != fsmeta.InodeTypeFile {
-		return fsmeta.SessionRecord{}, false, nil
+	if inode.Type != model.InodeTypeFile {
+		return model.SessionRecord{}, false, nil
 	}
 	nowTime := e.clock()
 	expiresUnixNs, ok := sessionExpiryUnixNs(nowTime, req.TTL)
 	if !ok {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
 	now := nowTime.UnixNano()
 	if existing, ok, err := view.readSession(mount, plan.ReadKeys[1]); err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	} else if ok {
 		if sessionLive(existing, now) {
-			return fsmeta.SessionRecord{}, false, nil
+			return model.SessionRecord{}, false, nil
 		}
 		// Stale cleanup is value-sensitive and may touch an old session-id key
 		// outside this request's concrete write-set. Keep it on the transaction
 		// runner.
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
 	if index := e.visiblePredicateIndex(); !e.visibleNotExistsKnown(delta.Authority, plan.ReadKeys[2], index) {
 		if owner, ok, err := view.readSession(mount, plan.ReadKeys[2]); err != nil {
-			return fsmeta.SessionRecord{}, false, err
+			return model.SessionRecord{}, false, err
 		} else if ok {
 			if sessionLive(owner, now) {
-				return fsmeta.SessionRecord{}, false, nil
+				return model.SessionRecord{}, false, nil
 			}
-			return fsmeta.SessionRecord{}, false, nil
+			return model.SessionRecord{}, false, nil
 		}
 	}
-	record := fsmeta.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
+	record := model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
 	value, err := fsmeta.EncodeSessionValue(record)
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	evidence := view.predicateEvidenceForDelta(delta)
 	concrete, err := compile.MaterializeOpenWriteSession(program, compile.OpenWriteSessionValues{
@@ -69,49 +71,49 @@ func (e *Executor) tryVisibleOpenWriteSession(ctx context.Context, program compi
 		PredicateProofs: evidence.Proofs,
 	})
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	committed, err := e.tryVisibleCommitAfterRead(ctx, view, concrete)
 	if err != nil {
-		return fsmeta.SessionRecord{}, committed, err
+		return model.SessionRecord{}, committed, err
 	}
 	if !committed {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
 	return record, true, nil
 }
 
-func (e *Executor) tryVisibleHeartbeatWriteSession(ctx context.Context, program compile.HeartbeatWriteSessionProgram, mount fsmeta.MountIdentity, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, bool, error) {
+func (e *Executor) tryVisibleHeartbeatWriteSession(ctx context.Context, program compile.HeartbeatWriteSessionProgram, mount model.MountIdentity, req model.HeartbeatWriteSessionRequest) (model.SessionRecord, bool, error) {
 	delta := program.Compiled.Delta
 	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
 	plan := delta.Plan
 	view := e.newVisibleReadView(ctx)
 	nowTime := e.clock()
 	expiresUnixNs, ok := sessionExpiryUnixNs(nowTime, req.TTL)
 	if !ok {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
 	now := nowTime.UnixNano()
 	session, ok, err := view.readSession(mount, plan.ReadKeys[0])
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	if !ok || !sessionLive(session, now) || session.Inode != req.Inode {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
 	owner, ok, err := view.readSession(mount, plan.ReadKeys[1])
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	if !ok || !sessionLive(owner, now) || owner.Session != req.Session || owner.Inode != req.Inode {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
-	record := fsmeta.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
+	record := model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
 	value, err := fsmeta.EncodeSessionValue(record)
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	evidence := view.predicateEvidenceForDelta(delta)
 	concrete, err := compile.MaterializeHeartbeatWriteSession(program, compile.HeartbeatWriteSessionValues{
@@ -119,19 +121,19 @@ func (e *Executor) tryVisibleHeartbeatWriteSession(ctx context.Context, program 
 		PredicateProofs: evidence.Proofs,
 	})
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	committed, err := e.tryVisibleCommitAfterRead(ctx, view, concrete)
 	if err != nil {
-		return fsmeta.SessionRecord{}, committed, err
+		return model.SessionRecord{}, committed, err
 	}
 	if !committed {
-		return fsmeta.SessionRecord{}, false, nil
+		return model.SessionRecord{}, false, nil
 	}
 	return record, true, nil
 }
 
-func (e *Executor) tryVisibleCloseWriteSession(ctx context.Context, program compile.CloseWriteSessionProgram, mount fsmeta.MountIdentity, req fsmeta.CloseWriteSessionRequest) (bool, error) {
+func (e *Executor) tryVisibleCloseWriteSession(ctx context.Context, program compile.CloseWriteSessionProgram, mount model.MountIdentity, req model.CloseWriteSessionRequest) (bool, error) {
 	delta := program.Compiled.Delta
 	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
 		return false, nil
@@ -166,8 +168,8 @@ func (e *Executor) tryVisibleCloseWriteSession(ctx context.Context, program comp
 	return e.tryVisibleCommitAfterRead(ctx, view, concrete)
 }
 
-func (e *Executor) tryVisibleExpireWriteSession(ctx context.Context, mount fsmeta.MountIdentity, record fsmeta.SessionRecord) (bool, error) {
-	program, err := compile.CompileCloseWriteSessionProgram(fsmeta.CloseWriteSessionRequest{
+func (e *Executor) tryVisibleExpireWriteSession(ctx context.Context, mount model.MountIdentity, record model.SessionRecord) (bool, error) {
+	program, err := compile.CompileCloseWriteSessionProgram(model.CloseWriteSessionRequest{
 		Mount:   mount.MountID,
 		Inode:   record.Inode,
 		Session: record.Session,
@@ -175,21 +177,21 @@ func (e *Executor) tryVisibleExpireWriteSession(ctx context.Context, mount fsmet
 	if err != nil {
 		return false, err
 	}
-	return e.tryVisibleCloseWriteSession(ctx, program, mount, fsmeta.CloseWriteSessionRequest{
+	return e.tryVisibleCloseWriteSession(ctx, program, mount, model.CloseWriteSessionRequest{
 		Mount:   mount.MountID,
 		Inode:   record.Inode,
 		Session: record.Session,
 	})
 }
 
-func sessionDrainScopeForInodes(mount fsmeta.MountIdentity, inodes map[fsmeta.InodeID]struct{}) compile.AuthorityScope {
+func sessionDrainScopeForInodes(mount model.MountIdentity, inodes map[model.InodeID]struct{}) compile.AuthorityScope {
 	if mount.MountKeyID == 0 || len(inodes) == 0 {
 		return compile.AuthorityScope{}
 	}
 	out := compile.AuthorityScope{
 		Mount:      mount.MountID,
 		MountKeyID: mount.MountKeyID,
-		Inodes:     make([]fsmeta.InodeID, 0, len(inodes)),
+		Inodes:     make([]model.InodeID, 0, len(inodes)),
 	}
 	seenBuckets := make(map[fsmeta.AffinityBucket]struct{}, len(inodes))
 	for inode := range inodes {
@@ -208,41 +210,41 @@ func sessionDrainScopeForInodes(mount fsmeta.MountIdentity, inodes map[fsmeta.In
 // OpenWriteSession records one exclusive writer lease for an inode. It writes
 // both a session-id key and an inode-owner key so concurrent opens for the same
 // inode conflict on one Percolator key.
-func (e *Executor) OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSessionRequest) (model.SessionRecord, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	mount := mountRecord.Identity()
 	program, err := compile.CompileOpenWriteSessionProgram(req, mount)
 	if err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	delta := program.Compiled.Delta
 	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	plan := delta.Plan
 	if req.TTL <= 0 {
-		return fsmeta.SessionRecord{}, fsmeta.ErrInvalidRequest
+		return model.SessionRecord{}, model.ErrInvalidRequest
 	}
 	if record, committed, err := e.tryVisibleOpenWriteSession(ctx, program, mount, req); committed || err != nil {
 		if err != nil {
-			return fsmeta.SessionRecord{}, err
+			return model.SessionRecord{}, err
 		}
 		return record, nil
 	}
-	var record fsmeta.SessionRecord
+	var record model.SessionRecord
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
 		inode, ok, err := e.readInode(ctx, mount, req.Inode, startVersion)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return fsmeta.ErrNotFound
+			return model.ErrNotFound
 		}
-		if inode.Type != fsmeta.InodeTypeFile {
-			return fsmeta.ErrInvalidRequest
+		if inode.Type != model.InodeTypeFile {
+			return model.ErrInvalidRequest
 		}
 		inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
 		if err != nil {
@@ -255,15 +257,15 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSes
 		nowTime := e.clock()
 		expiresUnixNs, ok := sessionExpiryUnixNs(nowTime, req.TTL)
 		if !ok {
-			return fsmeta.ErrInvalidRequest
+			return model.ErrInvalidRequest
 		}
-		candidate := fsmeta.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
+		candidate := model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
 		now := nowTime.UnixNano()
 		predicates := make([]*kvrpcpb.AtomicPredicate, 0, 4)
 		if existing, ok, err := e.readSessionByKey(ctx, mount, plan.ReadKeys[1], startVersion); err != nil {
 			return err
 		} else if ok && sessionLive(existing, now) {
-			return fsmeta.ErrExists
+			return model.ErrExists
 		} else if ok {
 			existingValue, err := fsmeta.EncodeSessionValue(existing)
 			if err != nil {
@@ -278,7 +280,7 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSes
 			return err
 		} else if ok {
 			if sessionLive(owner, now) {
-				return fsmeta.ErrExists
+				return model.ErrExists
 			}
 			ownerValue, err := fsmeta.EncodeSessionValue(owner)
 			if err != nil {
@@ -319,52 +321,52 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSes
 		record = candidate
 		return nil
 	}, delta.Authority); err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	return record, nil
 }
 
 // HeartbeatWriteSession extends a live writer lease. Both session records must
 // agree, otherwise the session is considered lost and the caller must reopen.
-func (e *Executor) HeartbeatWriteSession(ctx context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (e *Executor) HeartbeatWriteSession(ctx context.Context, req model.HeartbeatWriteSessionRequest) (model.SessionRecord, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	mount := mountRecord.Identity()
 	program, err := compile.CompileHeartbeatWriteSessionProgram(req, mount)
 	if err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	delta := program.Compiled.Delta
 	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	plan := delta.Plan
 	if req.TTL <= 0 {
-		return fsmeta.SessionRecord{}, fsmeta.ErrInvalidRequest
+		return model.SessionRecord{}, model.ErrInvalidRequest
 	}
 	if record, committed, err := e.tryVisibleHeartbeatWriteSession(ctx, program, mount, req); committed || err != nil {
 		if err != nil {
-			return fsmeta.SessionRecord{}, err
+			return model.SessionRecord{}, err
 		}
 		return record, nil
 	}
-	var record fsmeta.SessionRecord
+	var record model.SessionRecord
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
 		nowTime := e.clock()
 		expiresUnixNs, ok := sessionExpiryUnixNs(nowTime, req.TTL)
 		if !ok {
-			return fsmeta.ErrInvalidRequest
+			return model.ErrInvalidRequest
 		}
-		candidate := fsmeta.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
+		candidate := model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
 		now := nowTime.UnixNano()
 		session, ok, err := e.readSessionByKey(ctx, mount, plan.ReadKeys[0], startVersion)
 		if err != nil {
 			return err
 		}
 		if !ok || !sessionLive(session, now) || session.Inode != req.Inode {
-			return fsmeta.ErrNotFound
+			return model.ErrNotFound
 		}
 		sessionValue, err := fsmeta.EncodeSessionValue(session)
 		if err != nil {
@@ -375,7 +377,7 @@ func (e *Executor) HeartbeatWriteSession(ctx context.Context, req fsmeta.Heartbe
 			return err
 		}
 		if !ok || !sessionLive(owner, now) || owner.Session != req.Session || owner.Inode != req.Inode {
-			return fsmeta.ErrNotFound
+			return model.ErrNotFound
 		}
 		ownerValue, err := fsmeta.EncodeSessionValue(owner)
 		if err != nil {
@@ -399,14 +401,14 @@ func (e *Executor) HeartbeatWriteSession(ctx context.Context, req fsmeta.Heartbe
 		record = candidate
 		return nil
 	}, delta.Authority); err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	return record, nil
 }
 
 // CloseWriteSession releases one writer lease. It deletes the owner key only
 // when it still points at the closing session.
-func (e *Executor) CloseWriteSession(ctx context.Context, req fsmeta.CloseWriteSessionRequest) error {
+func (e *Executor) CloseWriteSession(ctx context.Context, req model.CloseWriteSessionRequest) error {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
 		return err
@@ -430,10 +432,10 @@ func (e *Executor) CloseWriteSession(ctx context.Context, req fsmeta.CloseWriteS
 			return err
 		}
 		if !ok {
-			return fsmeta.ErrNotFound
+			return model.ErrNotFound
 		}
 		if session.Inode != req.Inode {
-			return fsmeta.ErrNotFound
+			return model.ErrNotFound
 		}
 		sessionValue, err := fsmeta.EncodeSessionValue(session)
 		if err != nil {
@@ -465,19 +467,19 @@ func (e *Executor) CloseWriteSession(ctx context.Context, req fsmeta.CloseWriteS
 // ExpireWriteSessions removes stale session-id and inode-owner records for one
 // mount. It is a bounded maintenance primitive; callers should repeat until
 // Expired is zero when draining a large backlog.
-func (e *Executor) ExpireWriteSessions(ctx context.Context, req fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error) {
+func (e *Executor) ExpireWriteSessions(ctx context.Context, req model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return fsmeta.ExpireWriteSessionsResult{}, err
+		return model.ExpireWriteSessionsResult{}, err
 	}
 	mount := mountRecord.Identity()
 	program, err := compile.CompileExpireWriteSessionsProgram(req, mount)
 	if err != nil {
-		return fsmeta.ExpireWriteSessionsResult{}, err
+		return model.ExpireWriteSessionsResult{}, err
 	}
 	delta := program.Compiled.Delta
 	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
-		return fsmeta.ExpireWriteSessionsResult{}, err
+		return model.ExpireWriteSessionsResult{}, err
 	}
 	plan := delta.Plan
 	now := e.clock().UnixNano()
@@ -486,11 +488,11 @@ func (e *Executor) ExpireWriteSessions(ctx context.Context, req fsmeta.ExpireWri
 	if err := e.withTxnRetryNoVisibleFlush(ctx, func(startVersion, commitVersion uint64) error {
 		deletes := make(map[string][]byte)
 		type expiredSessionKey struct {
-			inode   fsmeta.InodeID
-			session fsmeta.SessionID
+			inode   model.InodeID
+			session model.SessionID
 		}
 		expiredSessions := make(map[expiredSessionKey]struct{})
-		fallbackInodes := make(map[fsmeta.InodeID]struct{})
+		fallbackInodes := make(map[model.InodeID]struct{})
 		remaining := plan.Limit
 		for _, scanPrefix := range scanPrefixes {
 			if remaining == 0 {
@@ -585,9 +587,9 @@ func (e *Executor) ExpireWriteSessions(ctx context.Context, req fsmeta.ExpireWri
 		expired = uint64(len(expiredSessions))
 		return nil
 	}); err != nil {
-		return fsmeta.ExpireWriteSessionsResult{}, err
+		return model.ExpireWriteSessionsResult{}, err
 	}
-	return fsmeta.ExpireWriteSessionsResult{Expired: expired}, nil
+	return model.ExpireWriteSessionsResult{Expired: expired}, nil
 }
 
 func sessionExpiryUnixNs(now time.Time, ttl time.Duration) (int64, bool) {
@@ -610,6 +612,6 @@ func (e *Executor) clock() time.Time {
 	return time.Now()
 }
 
-func sessionLive(record fsmeta.SessionRecord, nowUnixNs int64) bool {
+func sessionLive(record model.SessionRecord, nowUnixNs int64) bool {
 	return record.ExpiresUnixNs > nowUnixNs
 }

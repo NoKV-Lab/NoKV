@@ -7,13 +7,13 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRootPublisherRequiresCoordinatorClient(t *testing.T) {
 	publisher := rootPublisher{}
-	token := fsmeta.SnapshotSubtreeToken{Mount: "vol", RootInode: 1, ReadVersion: 10}
+	token := model.SnapshotSubtreeToken{Mount: "vol", RootInode: 1, ReadVersion: 10}
 
 	require.ErrorContains(t, publisher.PublishSnapshotSubtree(context.Background(), token), "not configured")
 	require.ErrorContains(t, publisher.RetireSnapshotSubtree(context.Background(), token), "not configured")

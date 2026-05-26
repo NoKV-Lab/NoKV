@@ -6,8 +6,8 @@ package peras
 import (
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 func BenchmarkEncodeVisibleOperationRecord(b *testing.B) {
@@ -51,7 +51,7 @@ func benchmarkVisibleRecord() VisibleOperationRecord {
 		Scope: compile.AuthorityScope{
 			Mount:      "m",
 			MountKeyID: 1,
-			Parents:    []fsmeta.InodeID{2},
+			Parents:    []model.InodeID{2},
 		},
 		Operation:         testVisibleReplayOperation(OperationID{ClientID: "client", Seq: 9}, []byte("a")),
 		TimestampUnixNano: 1234,

@@ -9,13 +9,14 @@ import (
 	"crypto/sha256"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type ReadDirProgram struct {
 	Compiled CompiledOp
 }
 
-func CompileReadDirProgram(req fsmeta.ReadDirRequest, mount fsmeta.MountIdentity) (ReadDirProgram, error) {
+func CompileReadDirProgram(req model.ReadDirRequest, mount model.MountIdentity) (ReadDirProgram, error) {
 	plan, err := fsmeta.PlanReadDir(req, mount)
 	if err != nil {
 		return ReadDirProgram{}, err
@@ -25,9 +26,9 @@ func CompileReadDirProgram(req fsmeta.ReadDirRequest, mount fsmeta.MountIdentity
 		{Kind: PredicatePrefixScan, Key: plan.ReadPrefixes[0]},
 	}
 	effects := []WriteEffect(nil)
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.Parent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonRangeRead}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []model.InodeID{req.Parent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonRangeRead}
 	if !validateReadDirSemanticDelta(delta) {
-		return ReadDirProgram{}, fsmeta.ErrInvalidRequest
+		return ReadDirProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileReadDirCompiledOp(delta)
 	if err != nil {
@@ -37,7 +38,7 @@ func CompileReadDirProgram(req fsmeta.ReadDirRequest, mount fsmeta.MountIdentity
 }
 
 func validateReadDirSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationReadDir {
+	if delta.Kind != model.OperationReadDir {
 		return false
 	}
 	switch {
@@ -82,15 +83,15 @@ func validateReadDirSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileReadDirCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationReadDir || len(delta.ReadPredicates) != 1 || len(delta.WriteEffects) != 0 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationReadDir || len(delta.ReadPredicates) != 1 || len(delta.WriteEffects) != 0 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))

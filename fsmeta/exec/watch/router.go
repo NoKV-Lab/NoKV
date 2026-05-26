@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 const defaultWindow uint32 = 256
@@ -39,7 +40,7 @@ func NewRouter() *Router {
 // Subscribe registers one prefix watch.
 func (r *Router) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta.WatchSubscription, error) {
 	if r == nil {
-		return nil, fsmeta.ErrInvalidRequest
+		return nil, model.ErrInvalidRequest
 	}
 	var prefix []byte
 	var err error
@@ -77,7 +78,7 @@ func (r *Router) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta
 			r.overflow.Add(1)
 			r.dropped.Add(1)
 			r.mu.Unlock()
-			return nil, fsmeta.ErrWatchOverflow
+			return nil, model.ErrWatchOverflow
 		}
 	}
 	sub.ready = ready
@@ -210,7 +211,7 @@ func (r *Router) replayLocked(cursor fsmeta.WatchCursor, prefix []byte) ([]fsmet
 	}
 	history := r.regions[cursor.RegionID]
 	if history == nil || history.len == 0 {
-		return nil, fsmeta.WatchCursor{}, fsmeta.ErrWatchCursorExpired
+		return nil, fsmeta.WatchCursor{}, model.ErrWatchCursorExpired
 	}
 	entries := history.ordered()
 	latest := entries[len(entries)-1].event.Cursor
@@ -225,7 +226,7 @@ func (r *Router) replayLocked(cursor fsmeta.WatchCursor, prefix []byte) ([]fsmet
 		if compareCursor(cursor, latest) > 0 {
 			return nil, latest, nil
 		}
-		return nil, latest, fsmeta.ErrWatchCursorExpired
+		return nil, latest, model.ErrWatchCursorExpired
 	}
 	replay := make([]fsmeta.WatchEvent, 0, len(entries))
 	for _, entry := range entries {
@@ -237,7 +238,7 @@ func (r *Router) replayLocked(cursor fsmeta.WatchCursor, prefix []byte) ([]fsmet
 }
 
 // RetireMount closes all subscriptions attached to a retired mount.
-func (r *Router) RetireMount(mount fsmeta.MountID) int {
+func (r *Router) RetireMount(mount model.MountID) int {
 	if r == nil || mount == "" {
 		return 0
 	}
@@ -251,7 +252,7 @@ func (r *Router) RetireMount(mount fsmeta.MountID) int {
 	}
 	r.mu.Unlock()
 	for _, sub := range retired {
-		sub.closeWith(fsmeta.ErrMountRetired)
+		sub.closeWith(model.ErrMountRetired)
 	}
 	return len(retired)
 }
@@ -268,7 +269,7 @@ func (r *Router) unregister(id uint64, sub *Subscription) {
 type Subscription struct {
 	router *Router
 	id     uint64
-	mount  fsmeta.MountID
+	mount  model.MountID
 	prefix []byte
 	events chan fsmeta.WatchEvent
 	window uint32
@@ -344,7 +345,7 @@ func (s *Subscription) enqueue(evt fsmeta.WatchEvent) {
 		return
 	}
 	if s.outstanding >= s.window {
-		s.markClosedLocked(fsmeta.ErrWatchOverflow)
+		s.markClosedLocked(model.ErrWatchOverflow)
 		id := s.id
 		router := s.router
 		s.mu.Unlock()
@@ -367,7 +368,7 @@ func (s *Subscription) enqueue(evt fsmeta.WatchEvent) {
 			s.router.delivered.Add(1)
 		}
 	default:
-		s.closeWith(fsmeta.ErrWatchOverflow)
+		s.closeWith(model.ErrWatchOverflow)
 		if s.router != nil {
 			s.router.dropped.Add(1)
 			s.router.overflow.Add(1)
@@ -392,7 +393,7 @@ func (s *Subscription) enqueueLive(evt fsmeta.WatchEvent) {
 			s.router.delivered.Add(1)
 		}
 	default:
-		s.closeWith(fsmeta.ErrWatchOverflow)
+		s.closeWith(model.ErrWatchOverflow)
 		if s.router != nil {
 			s.router.dropped.Add(1)
 			s.router.overflow.Add(1)
@@ -410,7 +411,7 @@ func (s *Subscription) enqueueReplayLocked(evt fsmeta.WatchEvent) bool {
 		return false
 	}
 	if s.outstanding >= s.window {
-		s.markClosedLocked(fsmeta.ErrWatchOverflow)
+		s.markClosedLocked(model.ErrWatchOverflow)
 		return false
 	}
 	s.outstanding++
@@ -422,7 +423,7 @@ func (s *Subscription) enqueueReplayLocked(evt fsmeta.WatchEvent) bool {
 		}
 		return true
 	default:
-		s.markClosedLocked(fsmeta.ErrWatchOverflow)
+		s.markClosedLocked(model.ErrWatchOverflow)
 		return false
 	}
 }

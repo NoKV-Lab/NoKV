@@ -12,6 +12,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/contract"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	storemvcc "github.com/feichai0017/NoKV/raftstore/mvcc"
 	"github.com/stretchr/testify/require"
 )
@@ -22,11 +23,11 @@ func TestOpenCreateLookupSurvivesRestart(t *testing.T) {
 	rt, err := Open(ctx, Options{WorkDir: dir, Mount: testMount()})
 	require.NoError(t, err)
 
-	created, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	created, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "agent-state",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	})
 	require.NoError(t, err)
 	require.NoError(t, rt.Close())
@@ -35,19 +36,19 @@ func TestOpenCreateLookupSurvivesRestart(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	got, err := rt.Executor.Lookup(ctx, fsmeta.LookupRequest{
+	got, err := rt.Executor.Lookup(ctx, model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "agent-state",
 	})
 	require.NoError(t, err)
 	require.Equal(t, created.Dentry, got)
 
-	next, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	next, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "next",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	require.Greater(t, next.Inode.Inode, created.Inode.Inode)
@@ -68,11 +69,11 @@ func TestLocalInodeAllocatorChoosesWorkspaceShard(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	created, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	created, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "workspace-a",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 	})
 	require.NoError(t, err)
 	require.Equal(t, fsmeta.ChooseWorkspaceBucket(testMount(), "workspace-a"), fsmeta.BucketForInodeID(created.Inode.Inode))
@@ -87,16 +88,16 @@ func TestOpenUsesDirectMVCC(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	created, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	created, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "direct",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
-	got, err := rt.Executor.Lookup(ctx, fsmeta.LookupRequest{
+	got, err := rt.Executor.Lookup(ctx, model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "direct",
 	})
 	require.NoError(t, err)
@@ -112,26 +113,26 @@ func TestLocalRuntimeConcurrentDirectoryChildCount(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	dir, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	dir, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "hot-dir",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 	})
 	require.NoError(t, err)
 
 	const files = 32
 	runConcurrentFSOps(t, files, func(i int) error {
-		_, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+		_, err := rt.Executor.Create(ctx, model.CreateRequest{
 			Mount:  "vol",
 			Parent: dir.Inode.Inode,
 			Name:   fmt.Sprintf("file-%03d", i),
-			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+			Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 		})
 		return err
 	})
 
-	rows, err := rt.Executor.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	rows, err := rt.Executor.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: dir.Inode.Inode,
 		Limit:  files,
@@ -140,15 +141,15 @@ func TestLocalRuntimeConcurrentDirectoryChildCount(t *testing.T) {
 	require.Len(t, rows, files)
 
 	runConcurrentFSOps(t, files, func(i int) error {
-		return rt.Executor.Unlink(ctx, fsmeta.UnlinkRequest{
+		return rt.Executor.Unlink(ctx, model.UnlinkRequest{
 			Mount:  "vol",
 			Parent: dir.Inode.Inode,
 			Name:   fmt.Sprintf("file-%03d", i),
 		})
 	})
-	require.NoError(t, rt.Executor.RemoveDirectory(ctx, fsmeta.RemoveDirectoryRequest{
+	require.NoError(t, rt.Executor.RemoveDirectory(ctx, model.RemoveDirectoryRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "hot-dir",
 	}))
 }
@@ -180,21 +181,21 @@ func TestLocalRuntimePublishesWatchEvents(t *testing.T) {
 
 	sub, err := rt.Watcher.Subscribe(ctx, fsmeta.WatchRequest{
 		Mount:              "vol",
-		RootInode:          fsmeta.RootInode,
+		RootInode:          model.RootInode,
 		BackPressureWindow: 4,
 	})
 	require.NoError(t, err)
 	defer sub.Close()
 
-	_, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	_, err = rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "watched",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
-	wantKey, err := fsmeta.EncodeDentryKey(testMount(), fsmeta.RootInode, "watched")
+	wantKey, err := fsmeta.EncodeDentryKey(testMount(), model.RootInode, "watched")
 	require.NoError(t, err)
 	evt := requireWatchEvent(t, sub)
 	require.Equal(t, wantKey, evt.Key)
@@ -218,36 +219,36 @@ func TestLocalRuntimeWatchReplaysAfterResumeCursor(t *testing.T) {
 
 	firstSub, err := rt.Watcher.Subscribe(ctx, fsmeta.WatchRequest{
 		Mount:     "vol",
-		RootInode: fsmeta.RootInode,
+		RootInode: model.RootInode,
 	})
 	require.NoError(t, err)
-	_, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	_, err = rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "first",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	first := requireWatchEvent(t, firstSub)
 	firstSub.Close()
 
-	_, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	_, err = rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "second",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
 	resumed, err := rt.Watcher.Subscribe(ctx, fsmeta.WatchRequest{
 		Mount:        "vol",
-		RootInode:    fsmeta.RootInode,
+		RootInode:    model.RootInode,
 		ResumeCursor: first.Cursor,
 	})
 	require.NoError(t, err)
 	defer resumed.Close()
 
-	wantKey, err := fsmeta.EncodeDentryKey(testMount(), fsmeta.RootInode, "second")
+	wantKey, err := fsmeta.EncodeDentryKey(testMount(), model.RootInode, "second")
 	require.NoError(t, err)
 	replayed := requireWatchEvent(t, resumed)
 	require.Equal(t, wantKey, replayed.Key)
@@ -260,9 +261,9 @@ func TestLocalRuntimePublishesAndRetiresSnapshots(t *testing.T) {
 	rt, err := Open(ctx, Options{WorkDir: dir, Mount: testMount()})
 	require.NoError(t, err)
 
-	token, err := rt.Executor.SnapshotSubtree(ctx, fsmeta.SnapshotSubtreeRequest{
+	token, err := rt.Executor.SnapshotSubtree(ctx, model.SnapshotSubtreeRequest{
 		Mount:     "vol",
-		RootInode: fsmeta.RootInode,
+		RootInode: model.RootInode,
 	})
 	require.NoError(t, err)
 	require.NoError(t, rt.Snapshots.PublishSnapshotSubtree(ctx, token))
@@ -274,7 +275,7 @@ func TestLocalRuntimePublishesAndRetiresSnapshots(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, token.ReadVersion, floor)
 
-	gcKey, err := fsmeta.EncodeDentryKey(testMount(), fsmeta.RootInode, "pinned")
+	gcKey, err := fsmeta.EncodeDentryKey(testMount(), model.RootInode, "pinned")
 	require.NoError(t, err)
 	policy := storemvcc.SafePointPolicy{
 		RequestedSafePoint: token.ReadVersion + 100,
@@ -312,25 +313,25 @@ func TestLocalRuntimeMaintainsQuotaUsage(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	_, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	_, err = rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "quota-file",
-		Attrs: fsmeta.CreateAttrs{
-			Type: fsmeta.InodeTypeFile,
+		Attrs: model.CreateAttrs{
+			Type: model.InodeTypeFile,
 			Size: 4096,
 		},
 	})
 	require.NoError(t, err)
 
-	rootUsage, err := rt.Executor.GetQuotaUsage(ctx, fsmeta.QuotaUsageRequest{
+	rootUsage, err := rt.Executor.GetQuotaUsage(ctx, model.QuotaUsageRequest{
 		Mount: "vol",
-		Scope: fsmeta.RootInode,
+		Scope: model.RootInode,
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.UsageRecord{Bytes: 4096, Inodes: 1}, rootUsage)
+	require.Equal(t, model.UsageRecord{Bytes: 4096, Inodes: 1}, rootUsage)
 
-	mountUsage, err := rt.Executor.GetQuotaUsage(ctx, fsmeta.QuotaUsageRequest{Mount: "vol"})
+	mountUsage, err := rt.Executor.GetQuotaUsage(ctx, model.QuotaUsageRequest{Mount: "vol"})
 	require.NoError(t, err)
 	require.Equal(t, rootUsage, mountUsage)
 }
@@ -344,25 +345,25 @@ func TestLocalRuntimeReadDirPlusSeesCreateAfterEmptyRead(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	pairs, err := rt.Executor.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	pairs, err := rt.Executor.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)
 	require.Empty(t, pairs)
 
-	_, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	_, err = rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "after-empty-read",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
-	pairs, err = rt.Executor.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	pairs, err = rt.Executor.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)

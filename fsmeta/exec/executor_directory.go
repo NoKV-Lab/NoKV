@@ -7,15 +7,16 @@ import (
 	"context"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type directoryInodeSnapshot struct {
 	key    []byte
-	record fsmeta.InodeRecord
+	record model.InodeRecord
 	value  []byte
 }
 
-func (e *Executor) readDirectoryInode(ctx context.Context, mount fsmeta.MountIdentity, inode fsmeta.InodeID, version uint64) (directoryInodeSnapshot, error) {
+func (e *Executor) readDirectoryInode(ctx context.Context, mount model.MountIdentity, inode model.InodeID, version uint64) (directoryInodeSnapshot, error) {
 	key, err := fsmeta.EncodeInodeKey(mount, inode)
 	if err != nil {
 		return directoryInodeSnapshot{}, err
@@ -25,14 +26,14 @@ func (e *Executor) readDirectoryInode(ctx context.Context, mount fsmeta.MountIde
 		return directoryInodeSnapshot{}, err
 	}
 	if !ok {
-		return directoryInodeSnapshot{}, fsmeta.ErrNotFound
+		return directoryInodeSnapshot{}, model.ErrNotFound
 	}
 	record, err := fsmeta.DecodeInodeValue(value)
 	if err != nil {
 		return directoryInodeSnapshot{}, err
 	}
-	if record.Type != fsmeta.InodeTypeDirectory {
-		return directoryInodeSnapshot{}, fsmeta.ErrInvalidRequest
+	if record.Type != model.InodeTypeDirectory {
+		return directoryInodeSnapshot{}, model.ErrInvalidRequest
 	}
 	return directoryInodeSnapshot{
 		key:    key,
@@ -41,31 +42,31 @@ func (e *Executor) readDirectoryInode(ctx context.Context, mount fsmeta.MountIde
 	}, nil
 }
 
-func readVisibleDirectoryInode(view *visibleReadView, mount fsmeta.MountIdentity, inode fsmeta.InodeID) (fsmeta.InodeRecord, error) {
+func readVisibleDirectoryInode(view *visibleReadView, mount model.MountIdentity, inode model.InodeID) (model.InodeRecord, error) {
 	record, ok, err := view.readInode(mount, inode)
 	if err != nil {
-		return fsmeta.InodeRecord{}, err
+		return model.InodeRecord{}, err
 	}
 	if !ok {
-		return fsmeta.InodeRecord{}, fsmeta.ErrNotFound
+		return model.InodeRecord{}, model.ErrNotFound
 	}
-	if record.Type != fsmeta.InodeTypeDirectory {
-		return fsmeta.InodeRecord{}, fsmeta.ErrInvalidRequest
+	if record.Type != model.InodeTypeDirectory {
+		return model.InodeRecord{}, model.ErrInvalidRequest
 	}
 	return record, nil
 }
 
-func incrementDirectoryChildCount(record fsmeta.InodeRecord) (fsmeta.InodeRecord, error) {
-	if record.Type != fsmeta.InodeTypeDirectory || record.ChildCount == ^uint64(0) {
-		return fsmeta.InodeRecord{}, fsmeta.ErrInvalidRequest
+func incrementDirectoryChildCount(record model.InodeRecord) (model.InodeRecord, error) {
+	if record.Type != model.InodeTypeDirectory || record.ChildCount == ^uint64(0) {
+		return model.InodeRecord{}, model.ErrInvalidRequest
 	}
 	record.ChildCount++
 	return record, nil
 }
 
-func decrementDirectoryChildCount(record fsmeta.InodeRecord) (fsmeta.InodeRecord, error) {
-	if record.Type != fsmeta.InodeTypeDirectory || record.ChildCount == 0 {
-		return fsmeta.InodeRecord{}, fsmeta.ErrInvalidRequest
+func decrementDirectoryChildCount(record model.InodeRecord) (model.InodeRecord, error) {
+	if record.Type != model.InodeTypeDirectory || record.ChildCount == 0 {
+		return model.InodeRecord{}, model.ErrInvalidRequest
 	}
 	record.ChildCount--
 	return record, nil

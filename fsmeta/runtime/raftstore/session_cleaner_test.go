@@ -8,7 +8,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	"github.com/stretchr/testify/require"
 )
@@ -26,22 +26,22 @@ func (l fakeSessionMountLister) ListMounts(context.Context, *coordpb.ListMountsR
 }
 
 type fakeSessionCleanupExecutor struct {
-	results map[fsmeta.MountID]fsmeta.ExpireWriteSessionsResult
-	errs    map[fsmeta.MountID]error
-	calls   []fsmeta.ExpireWriteSessionsRequest
+	results map[model.MountID]model.ExpireWriteSessionsResult
+	errs    map[model.MountID]error
+	calls   []model.ExpireWriteSessionsRequest
 }
 
-func (e *fakeSessionCleanupExecutor) ExpireWriteSessions(_ context.Context, req fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error) {
+func (e *fakeSessionCleanupExecutor) ExpireWriteSessions(_ context.Context, req model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error) {
 	e.calls = append(e.calls, req)
 	if err := e.errs[req.Mount]; err != nil {
-		return fsmeta.ExpireWriteSessionsResult{}, err
+		return model.ExpireWriteSessionsResult{}, err
 	}
 	return e.results[req.Mount], nil
 }
 
 func TestSessionCleanerExpiresActiveMounts(t *testing.T) {
 	exec := &fakeSessionCleanupExecutor{
-		results: map[fsmeta.MountID]fsmeta.ExpireWriteSessionsResult{
+		results: map[model.MountID]model.ExpireWriteSessionsResult{
 			"vol-a": {Expired: 2},
 			"vol-b": {Expired: 3},
 		},
@@ -61,7 +61,7 @@ func TestSessionCleanerExpiresActiveMounts(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), mounts)
 	require.Equal(t, uint64(5), expired)
-	require.Equal(t, []fsmeta.ExpireWriteSessionsRequest{
+	require.Equal(t, []model.ExpireWriteSessionsRequest{
 		{Mount: "vol-a", Limit: 7},
 		{Mount: "vol-b", Limit: 7},
 	}, exec.calls)
@@ -69,10 +69,10 @@ func TestSessionCleanerExpiresActiveMounts(t *testing.T) {
 
 func TestSessionCleanerContinuesAfterMountError(t *testing.T) {
 	exec := &fakeSessionCleanupExecutor{
-		results: map[fsmeta.MountID]fsmeta.ExpireWriteSessionsResult{
+		results: map[model.MountID]model.ExpireWriteSessionsResult{
 			"vol-b": {Expired: 4},
 		},
-		errs: map[fsmeta.MountID]error{
+		errs: map[model.MountID]error{
 			"vol-a": errors.New("boom"),
 		},
 	}
@@ -97,7 +97,7 @@ func TestSessionCleanerRecordsStats(t *testing.T) {
 			{MountId: "vol", State: coordpb.MountState_MOUNT_STATE_ACTIVE},
 		}},
 		exec: &fakeSessionCleanupExecutor{
-			results: map[fsmeta.MountID]fsmeta.ExpireWriteSessionsResult{"vol": {Expired: 1}},
+			results: map[model.MountID]model.ExpireWriteSessionsResult{"vol": {Expired: 1}},
 		},
 		stats: sessionCleanerStats{Enabled: true},
 	}

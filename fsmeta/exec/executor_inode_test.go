@@ -5,21 +5,23 @@ package exec
 
 import (
 	"context"
+	"testing"
+
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestExecutorUpdateInodeUsesAtomicMutateWithValuePredicates(t *testing.T) {
 	base := newFakeRunner()
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedDentry(t, runner.fakeRunner, "vol", 7, "file", 22)
-	seedInode(t, runner.fakeRunner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, Mode: 0o644, LinkCount: 1})
+	seedInode(t, runner.fakeRunner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, Mode: 0o644, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	updated, err := executor.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	updated, err := executor.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:   "vol",
 		Parent:  7,
 		Inode:   22,
@@ -31,7 +33,7 @@ func TestExecutorUpdateInodeUsesAtomicMutateWithValuePredicates(t *testing.T) {
 	require.Equal(t, uint32(0o600), updated.Mode)
 	require.Len(t, runner.atomicCalls, 1)
 	require.Empty(t, base.mutations)
-	requireAtomicStatUint(t, executor.Stats(), fsmeta.OperationUpdateInode, "success_total", 1)
+	requireAtomicStatUint(t, executor.Stats(), model.OperationUpdateInode, "success_total", 1)
 	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[0].GetKind())
 	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[1].GetKind())
 
@@ -45,14 +47,14 @@ func TestExecutorUpdateInodeSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	base := newFakeRunner()
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedDentry(t, runner.fakeRunner, "vol", 7, "file", 22)
-	seedInode(t, runner.fakeRunner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, Size: 1024, LinkCount: 1})
+	seedInode(t, runner.fakeRunner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, Size: 1024, LinkCount: 1})
 	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
 	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
 	require.NoError(t, err)
 
-	_, err = executor.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	_, err = executor.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:   "vol",
 		Parent:  7,
 		Inode:   22,
@@ -63,7 +65,7 @@ func TestExecutorUpdateInodeSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, runner.atomicCalls)
 	require.Len(t, base.mutations, 1)
-	requireAtomicStatUint(t, executor.Stats(), fsmeta.OperationUpdateInode, "skip_total", 1)
+	requireAtomicStatUint(t, executor.Stats(), model.OperationUpdateInode, "skip_total", 1)
 }
 
 func TestExecutorUpdateInodeVisibleCommitReadsCreateOverlay(t *testing.T) {
@@ -73,21 +75,21 @@ func TestExecutorUpdateInodeVisibleCommitReadsCreateOverlay(t *testing.T) {
 	inode := testInodeForParentBucket(t, 7, 7)
 	executor, err := newTestExecutor(
 		runner,
-		WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{inode}}),
+		WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{inode}}),
 		WithVisibleAuthorityAdmitter(ownedVisibleAdmitter{}),
 		WithVisibleCommitter(committer),
 	)
 	require.NoError(t, err)
 
-	created, err := executor.Create(context.Background(), fsmeta.CreateRequest{
+	created, err := executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	})
 	require.NoError(t, err)
 
-	updated, err := executor.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	updated, err := executor.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:            "vol",
 		Parent:           7,
 		Inode:            created.Inode.Inode,
@@ -118,9 +120,9 @@ func TestExecutorUpdateInodeVisibleCommitReadsCreateOverlay(t *testing.T) {
 func TestExecutorUpdateInodeVisibleRechecksObservedValue(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "file", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     22,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 		Size:      1024,
 	})
@@ -131,9 +133,9 @@ func TestExecutorUpdateInodeVisibleRechecksObservedValue(t *testing.T) {
 				return
 			}
 			changed = true
-			seedInode(t, runner, "vol", fsmeta.InodeRecord{
+			seedInode(t, runner, "vol", model.InodeRecord{
 				Inode:     22,
-				Type:      fsmeta.InodeTypeFile,
+				Type:      model.InodeTypeFile,
 				LinkCount: 1,
 				Size:      4096,
 			})
@@ -146,7 +148,7 @@ func TestExecutorUpdateInodeVisibleRechecksObservedValue(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	updated, err := executor.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	updated, err := executor.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:   "vol",
 		Parent:  7,
 		Inode:   22,
@@ -165,9 +167,9 @@ func TestExecutorUpdateInodeVisibleRechecksObservedValue(t *testing.T) {
 func TestExecutorUpdateInodeUpdatesMutableFieldsAndQuota(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "file", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:         22,
-		Type:          fsmeta.InodeTypeFile,
+		Type:          model.InodeTypeFile,
 		Size:          4096,
 		Mode:          0o644,
 		LinkCount:     1,
@@ -180,7 +182,7 @@ func TestExecutorUpdateInodeUpdatesMutableFieldsAndQuota(t *testing.T) {
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
 	require.NoError(t, err)
 
-	updated, err := executor.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	updated, err := executor.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:            "vol",
 		Parent:           7,
 		Inode:            22,
@@ -213,11 +215,11 @@ func TestExecutorUpdateInodeUpdatesMutableFieldsAndQuota(t *testing.T) {
 func TestExecutorUpdateInodeRejectsHardLinkedInode(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "file", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 2})
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, Size: 4096, LinkCount: 2})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	_, err = executor.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	_, err = executor.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:   "vol",
 		Parent:  7,
 		Inode:   22,
@@ -225,18 +227,18 @@ func TestExecutorUpdateInodeRejectsHardLinkedInode(t *testing.T) {
 		SetSize: true,
 		Size:    8192,
 	})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 	require.Empty(t, runner.mutations)
 }
 
 func TestExecutorUpdateInodeRejectsDentryTypeMismatch(t *testing.T) {
 	runner := newFakeRunner()
-	seedDentryType(t, runner, "vol", 7, "file", 22, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 1})
+	seedDentryType(t, runner, "vol", 7, "file", 22, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, Size: 4096, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	_, err = executor.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	_, err = executor.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:   "vol",
 		Parent:  7,
 		Inode:   22,
@@ -244,7 +246,7 @@ func TestExecutorUpdateInodeRejectsDentryTypeMismatch(t *testing.T) {
 		SetMode: true,
 		Mode:    0o600,
 	})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidValue)
+	require.ErrorIs(t, err, model.ErrInvalidValue)
 	require.Empty(t, runner.mutations)
 }
 

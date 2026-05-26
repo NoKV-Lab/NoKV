@@ -12,6 +12,7 @@ import (
 	"github.com/feichai0017/NoKV/engine/index"
 	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootstate "github.com/feichai0017/NoKV/meta/root/state"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -23,7 +24,7 @@ type SnapshotRegistry struct {
 	mu     sync.Mutex
 	active map[localSnapshotKey]struct{}
 	runner *Runner
-	mount  fsmeta.MountIdentity
+	mount  model.MountIdentity
 
 	publishTotal   atomic.Uint64
 	retireTotal    atomic.Uint64
@@ -31,9 +32,9 @@ type SnapshotRegistry struct {
 }
 
 type localSnapshotKey struct {
-	mount       fsmeta.MountID
-	mountKeyID  fsmeta.MountKeyID
-	rootInode   fsmeta.InodeID
+	mount       model.MountID
+	mountKeyID  model.MountKeyID
+	rootInode   model.InodeID
 	readVersion uint64
 }
 
@@ -44,7 +45,7 @@ func NewSnapshotRegistry() *SnapshotRegistry {
 
 // OpenSnapshotRegistry loads the persisted local snapshot-retention records
 // for one mount.
-func OpenSnapshotRegistry(ctx context.Context, runner *Runner, mount fsmeta.MountIdentity) (*SnapshotRegistry, error) {
+func OpenSnapshotRegistry(ctx context.Context, runner *Runner, mount model.MountIdentity) (*SnapshotRegistry, error) {
 	if runner == nil {
 		return nil, errDBRequired
 	}
@@ -63,7 +64,7 @@ func OpenSnapshotRegistry(ctx context.Context, runner *Runner, mount fsmeta.Moun
 }
 
 // PublishSnapshotSubtree records a local snapshot token.
-func (r *SnapshotRegistry) PublishSnapshotSubtree(ctx context.Context, token fsmeta.SnapshotSubtreeToken) error {
+func (r *SnapshotRegistry) PublishSnapshotSubtree(ctx context.Context, token model.SnapshotSubtreeToken) error {
 	if err := validateSnapshotToken(token); err != nil {
 		return err
 	}
@@ -106,7 +107,7 @@ func (r *SnapshotRegistry) PublishSnapshotSubtree(ctx context.Context, token fsm
 }
 
 // RetireSnapshotSubtree removes a local snapshot token when it is still known.
-func (r *SnapshotRegistry) RetireSnapshotSubtree(ctx context.Context, token fsmeta.SnapshotSubtreeToken) error {
+func (r *SnapshotRegistry) RetireSnapshotSubtree(ctx context.Context, token model.SnapshotSubtreeToken) error {
 	if err := validateSnapshotToken(token); err != nil {
 		return err
 	}
@@ -255,24 +256,24 @@ func (r *SnapshotRegistry) load(ctx context.Context) error {
 	return nil
 }
 
-func (r *SnapshotRegistry) readSnapshotRecord(key []byte) (fsmeta.SnapshotSubtreeToken, bool, error) {
+func (r *SnapshotRegistry) readSnapshotRecord(key []byte) (model.SnapshotSubtreeToken, bool, error) {
 	parts, ok := fsmeta.InspectKey(key)
 	if !ok || parts.Kind != fsmeta.KeyKindSnapshot {
-		return fsmeta.SnapshotSubtreeToken{}, false, fsmeta.ErrInvalidKey
+		return model.SnapshotSubtreeToken{}, false, fsmeta.ErrInvalidKey
 	}
 	value, ok, err := r.runner.readValue(key, kv.MaxVersion)
 	if err != nil || !ok {
-		return fsmeta.SnapshotSubtreeToken{}, ok, err
+		return model.SnapshotSubtreeToken{}, ok, err
 	}
 	token, err := fsmeta.DecodeSnapshotValue(value)
 	if err != nil {
-		return fsmeta.SnapshotSubtreeToken{}, false, err
+		return model.SnapshotSubtreeToken{}, false, err
 	}
 	if err := r.validateRegistryMount(token); err != nil {
-		return fsmeta.SnapshotSubtreeToken{}, false, err
+		return model.SnapshotSubtreeToken{}, false, err
 	}
 	if token.RootInode != parts.SnapshotRoot || token.ReadVersion != parts.SnapshotReadVersion {
-		return fsmeta.SnapshotSubtreeToken{}, false, fsmeta.ErrInvalidValue
+		return model.SnapshotSubtreeToken{}, false, model.ErrInvalidValue
 	}
 	return token, true, nil
 }
@@ -286,12 +287,12 @@ func (r *SnapshotRegistry) applySnapshotMutation(ctx context.Context, primary []
 	return err
 }
 
-func (r *SnapshotRegistry) validateRegistryMount(token fsmeta.SnapshotSubtreeToken) error {
+func (r *SnapshotRegistry) validateRegistryMount(token model.SnapshotSubtreeToken) error {
 	if r == nil || r.runner == nil {
 		return nil
 	}
 	if token.Mount != r.mount.MountID || token.MountKeyID != r.mount.MountKeyID {
-		return fsmeta.ErrInvalidRequest
+		return model.ErrInvalidRequest
 	}
 	return nil
 }
@@ -316,19 +317,19 @@ func (r *SnapshotRegistry) snapshotRetentionFloorLocked() (uint64, bool) {
 	return floor, floor != 0
 }
 
-func validateSnapshotToken(token fsmeta.SnapshotSubtreeToken) error {
+func validateSnapshotToken(token model.SnapshotSubtreeToken) error {
 	if token.Mount == "" || token.MountKeyID == 0 || token.RootInode == 0 || token.ReadVersion == 0 {
-		return fsmeta.ErrInvalidRequest
+		return model.ErrInvalidRequest
 	}
 	for _, ref := range token.RuntimeEvidence {
 		if !ref.Valid() {
-			return fsmeta.ErrInvalidRequest
+			return model.ErrInvalidRequest
 		}
 	}
 	return nil
 }
 
-func localSnapshotKeyFromToken(token fsmeta.SnapshotSubtreeToken) localSnapshotKey {
+func localSnapshotKeyFromToken(token model.SnapshotSubtreeToken) localSnapshotKey {
 	return localSnapshotKey{
 		mount:       token.Mount,
 		mountKeyID:  token.MountKeyID,

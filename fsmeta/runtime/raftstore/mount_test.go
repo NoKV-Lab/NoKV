@@ -10,6 +10,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	"github.com/stretchr/testify/require"
 )
@@ -42,14 +43,14 @@ func TestMountCacheReturnsActiveMount(t *testing.T) {
 		now:   func() time.Time { return now },
 	}
 
-	first, err := cache.ResolveMount(context.Background(), fsmeta.MountID("vol"))
+	first, err := cache.ResolveMount(context.Background(), model.MountID("vol"))
 	require.NoError(t, err)
-	second, err := cache.ResolveMount(context.Background(), fsmeta.MountID("vol"))
+	second, err := cache.ResolveMount(context.Background(), model.MountID("vol"))
 	require.NoError(t, err)
 
 	require.Equal(t, 1, lookup.calls)
 	require.Equal(t, first, second)
-	require.Equal(t, fsmeta.MountID("vol"), first.MountID)
+	require.Equal(t, model.MountID("vol"), first.MountID)
 	require.False(t, first.Retired)
 }
 
@@ -70,9 +71,9 @@ func TestMountCacheRefreshesAfterTTL(t *testing.T) {
 		now:   func() time.Time { return now },
 	}
 
-	first, err := cache.ResolveMount(context.Background(), fsmeta.MountID("vol"))
+	first, err := cache.ResolveMount(context.Background(), model.MountID("vol"))
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(1), first.RootInode)
+	require.Equal(t, model.InodeID(1), first.RootInode)
 
 	now = now.Add(2 * time.Second)
 	lookup.resp = &coordpb.GetMountResponse{Mount: &coordpb.MountInfo{
@@ -82,11 +83,11 @@ func TestMountCacheRefreshesAfterTTL(t *testing.T) {
 		SchemaVersion: 2,
 		State:         coordpb.MountState_MOUNT_STATE_RETIRED,
 	}}
-	second, err := cache.ResolveMount(context.Background(), fsmeta.MountID("vol"))
+	second, err := cache.ResolveMount(context.Background(), model.MountID("vol"))
 	require.NoError(t, err)
 
 	require.Equal(t, 2, lookup.calls)
-	require.Equal(t, fsmeta.InodeID(9), second.RootInode)
+	require.Equal(t, model.InodeID(9), second.RootInode)
 	require.True(t, second.Retired)
 }
 
@@ -99,10 +100,10 @@ func TestMountCacheDoesNotCacheNotFound(t *testing.T) {
 		now:   func() time.Time { return now },
 	}
 
-	_, err := cache.ResolveMount(context.Background(), fsmeta.MountID("missing"))
-	require.ErrorIs(t, err, fsmeta.ErrMountNotRegistered)
-	_, err = cache.ResolveMount(context.Background(), fsmeta.MountID("missing"))
-	require.ErrorIs(t, err, fsmeta.ErrMountNotRegistered)
+	_, err := cache.ResolveMount(context.Background(), model.MountID("missing"))
+	require.ErrorIs(t, err, model.ErrMountNotRegistered)
+	_, err = cache.ResolveMount(context.Background(), model.MountID("missing"))
+	require.ErrorIs(t, err, model.ErrMountNotRegistered)
 	require.Equal(t, 2, lookup.calls)
 	require.Equal(t, map[string]any{
 		"cache_hits_total":        uint64(0),
@@ -126,9 +127,9 @@ func TestWatcherRejectsRetiredMount(t *testing.T) {
 
 	_, err := w.Subscribe(context.Background(), fsmeta.WatchRequest{
 		Mount:     "vol",
-		RootInode: fsmeta.RootInode,
+		RootInode: model.RootInode,
 	})
-	require.ErrorIs(t, err, fsmeta.ErrMountRetired)
+	require.ErrorIs(t, err, model.ErrMountRetired)
 	require.Equal(t, 1, lookup.calls)
 }
 

@@ -11,6 +11,7 @@ import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
@@ -314,8 +315,8 @@ func testRuntimePerasScope(bucket fsmeta.AffinityBucket) compile.AuthorityScope 
 		Mount:      "vol",
 		MountKeyID: 7,
 		Buckets:    []fsmeta.AffinityBucket{bucket},
-		Parents:    []fsmeta.InodeID{99},
-		Inodes:     []fsmeta.InodeID{100},
+		Parents:    []model.InodeID{99},
+		Inodes:     []model.InodeID{100},
 	}
 }
 
@@ -349,7 +350,7 @@ func testRuntimeVisibleSeal(id, holder string, scope compile.AuthorityScope, sea
 
 func testRuntimePerasSegment(t *testing.T) fsperas.PerasSegment {
 	t.Helper()
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 7}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 7}
 	dentry, err := fsmeta.EncodeDentryKey(mount, 99, "a")
 	require.NoError(t, err)
 	inode, err := fsmeta.EncodeInodeKey(mount, 100)

@@ -5,17 +5,19 @@ package exec
 
 import (
 	"context"
+	"testing"
+
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestExecutorVisiblePredicateReadsOverlayBeforeTimestamp(t *testing.T) {
 	runner := newFakeRunner()
-	key := dentryKeyForTest(t, "vol", fsmeta.RootInode, "file")
-	value := dentryValueForTest(t, fsmeta.RootInode, "file", 21, fsmeta.InodeTypeFile)
+	key := dentryKeyForTest(t, "vol", model.RootInode, "file")
+	value := dentryValueForTest(t, model.RootInode, "file", 21, model.InodeTypeFile)
 	committer := scanOverlayCommitter{
 		values: overlayMapForTest(overlayValueForTest(key, value)),
 	}
@@ -37,9 +39,9 @@ func TestExecutorVisiblePredicateReadsOverlayBeforeTimestamp(t *testing.T) {
 
 func TestExecutorVisibleObservedPredicateRechecksExpectedValue(t *testing.T) {
 	runner := newFakeRunner()
-	key := dentryKeyForTest(t, "vol", fsmeta.RootInode, "file")
-	oldValue := dentryValueForTest(t, fsmeta.RootInode, "file", 21, fsmeta.InodeTypeFile)
-	newValue := dentryValueForTest(t, fsmeta.RootInode, "file", 22, fsmeta.InodeTypeFile)
+	key := dentryKeyForTest(t, "vol", model.RootInode, "file")
+	oldValue := dentryValueForTest(t, model.RootInode, "file", 21, model.InodeTypeFile)
+	newValue := dentryValueForTest(t, model.RootInode, "file", 22, model.InodeTypeFile)
 	runner.data[string(key)] = newValue
 	committer := newTestVisibleCommitter(t, runner)
 	committer.RememberKey(key, true)
@@ -63,16 +65,16 @@ func TestExecutorVisibleObservedPredicateRechecksExpectedValue(t *testing.T) {
 func TestExecutorVisibleNotExistsKnownUsesCurrentDirectoryEmptiness(t *testing.T) {
 	runner := newFakeRunner()
 	committer := newTestVisibleCommitter(t, runner)
-	committer.RememberEmptyDirectory(testMountIdentity, fsmeta.RootInode)
-	committer.ForgetEmptyDirectory(testMountIdentity, fsmeta.RootInode)
+	committer.RememberEmptyDirectory(testMountIdentity, model.RootInode)
+	committer.ForgetEmptyDirectory(testMountIdentity, model.RootInode)
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(committer))
 	require.NoError(t, err)
-	key := dentryKeyForTest(t, "vol", fsmeta.RootInode, "eta")
+	key := dentryKeyForTest(t, "vol", model.RootInode, "eta")
 
 	knownAbsent := executor.visibleNotExistsKnown(compile.AuthorityScope{
 		Mount:      testMountIdentity.MountID,
 		MountKeyID: testMountIdentity.MountKeyID,
-		Parents:    []fsmeta.InodeID{fsmeta.RootInode},
+		Parents:    []model.InodeID{model.RootInode},
 	}, key, committer)
 
 	require.False(t, knownAbsent, "base-empty directory facts are not enough once visible writes made the current directory non-empty")
@@ -80,8 +82,8 @@ func TestExecutorVisibleNotExistsKnownUsesCurrentDirectoryEmptiness(t *testing.T
 
 func TestExecutorVisiblePredicateRejectsCorruptProof(t *testing.T) {
 	runner := newFakeRunner()
-	key := dentryKeyForTest(t, "vol", fsmeta.RootInode, "file")
-	value := dentryValueForTest(t, fsmeta.RootInode, "file", 21, fsmeta.InodeTypeFile)
+	key := dentryKeyForTest(t, "vol", model.RootInode, "file")
+	value := dentryValueForTest(t, model.RootInode, "file", 21, model.InodeTypeFile)
 	runner.data[string(key)] = value
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(newTestVisibleCommitter(t, runner)))
 	require.NoError(t, err)
@@ -133,8 +135,8 @@ func TestExecutorVisibleOperationIDIsExecutorScoped(t *testing.T) {
 	second, err := New(newFakeRunner())
 	require.NoError(t, err)
 
-	firstID := first.nextVisibleOperationID(fsmeta.OperationCreate)
-	secondID := second.nextVisibleOperationID(fsmeta.OperationCreate)
+	firstID := first.nextVisibleOperationID(model.OperationCreate)
+	secondID := second.nextVisibleOperationID(model.OperationCreate)
 
 	require.Equal(t, uint64(1), firstID.Seq)
 	require.Equal(t, uint64(1), secondID.Seq)
@@ -153,9 +155,9 @@ func BenchmarkExecutorAdmitVisibleAuthorityOwned(b *testing.B) {
 		Authority: compile.AuthorityScope{
 			Mount:      "vol",
 			MountKeyID: 1,
-			Buckets:    []fsmeta.AffinityBucket{fsmeta.BucketForInodeID(fsmeta.RootInode)},
-			Parents:    []fsmeta.InodeID{fsmeta.RootInode},
-			Inodes:     []fsmeta.InodeID{22},
+			Buckets:    []fsmeta.AffinityBucket{fsmeta.BucketForInodeID(model.RootInode)},
+			Parents:    []model.InodeID{model.RootInode},
+			Inodes:     []model.InodeID{22},
 		},
 	}
 	ctx := context.Background()

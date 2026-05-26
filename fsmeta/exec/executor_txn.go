@@ -7,16 +7,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
-	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"sort"
 	"sync/atomic"
 	"time"
+
+	nokverrors "github.com/feichai0017/NoKV/errors"
+	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
+	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
-func (e *Executor) mutateWithAtomicOnePhase(ctx context.Context, kind fsmeta.OperationKind, primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) error {
+func (e *Executor) mutateWithAtomicOnePhase(ctx context.Context, kind model.OperationKind, primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) error {
 	stats := e.atomicOnePhaseCounters(kind)
 	onePhase, ok := e.runner.(ReadOrderedAtomicMutateOnePhase)
 	if !ok || !onePhase.AtomicMutatePreservesReadOrder() {
@@ -101,7 +103,7 @@ func atomicOnePhaseAffinity(primary []byte, mutations []*kvrpcpb.Mutation) strin
 	return string(out)
 }
 
-func (e *Executor) mutateWithoutAtomicOnePhase(ctx context.Context, kind fsmeta.OperationKind, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) error {
+func (e *Executor) mutateWithoutAtomicOnePhase(ctx context.Context, kind model.OperationKind, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) error {
 	if stats := e.atomicOnePhaseCounters(kind); stats != nil {
 		stats.skipTotal.Add(1)
 	}
@@ -109,7 +111,7 @@ func (e *Executor) mutateWithoutAtomicOnePhase(ctx context.Context, kind fsmeta.
 	return err
 }
 
-func (e *Executor) atomicOnePhaseCounters(kind fsmeta.OperationKind) *atomicOnePhaseCounters {
+func (e *Executor) atomicOnePhaseCounters(kind model.OperationKind) *atomicOnePhaseCounters {
 	if e == nil {
 		return nil
 	}
@@ -119,9 +121,9 @@ func (e *Executor) atomicOnePhaseCounters(kind fsmeta.OperationKind) *atomicOneP
 // GetReadVersion returns an ephemeral MVCC read version. It is intentionally
 // cheaper than SnapshotSubtree: no root event is published and no GC-retention
 // promise is made.
-func (e *Executor) GetReadVersion(ctx context.Context, req fsmeta.ReadVersionRequest) (uint64, error) {
+func (e *Executor) GetReadVersion(ctx context.Context, req model.ReadVersionRequest) (uint64, error) {
 	if req.Mount == "" {
-		return 0, fsmeta.ErrInvalidMountID
+		return 0, model.ErrInvalidMountID
 	}
 	if err := e.requireActiveMount(ctx, req.Mount); err != nil {
 		return 0, err
@@ -386,11 +388,11 @@ func translateMutateError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, fsmeta.ErrExists) {
+	if errors.Is(err, model.ErrExists) {
 		return err
 	}
 	if nokverrors.HasKeyErrorKind(err, nokverrors.KindAlreadyExists) {
-		return fmt.Errorf("%w: %v", fsmeta.ErrExists, err)
+		return fmt.Errorf("%w: %v", model.ErrExists, err)
 	}
 	return err
 }

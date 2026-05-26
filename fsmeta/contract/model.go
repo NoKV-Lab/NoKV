@@ -10,6 +10,7 @@ import (
 	"sort"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 // OperationKind identifies one fsmeta contract operation used by the seeded
@@ -35,7 +36,7 @@ const (
 	OpAdvanceTime      OperationKind = "advance_time"
 )
 
-const contractMountKeyID fsmeta.MountKeyID = 1
+const contractMountKeyID model.MountKeyID = 1
 
 // Operation is one generated fsmeta request. Unused fields are ignored by the
 // selected Kind. For OpCreate, Inode is the model-assigned server-side inode
@@ -43,18 +44,18 @@ const contractMountKeyID fsmeta.MountKeyID = 1
 // CreateRequest field.
 type Operation struct {
 	Kind        OperationKind
-	Mount       fsmeta.MountID
-	Parent      fsmeta.InodeID
+	Mount       model.MountID
+	Parent      model.InodeID
 	Name        string
-	Inode       fsmeta.InodeID
-	Type        fsmeta.InodeType
+	Inode       model.InodeID
+	Type        model.InodeType
 	Size        uint64
 	Mode        uint32
-	FromParent  fsmeta.InodeID
+	FromParent  model.InodeID
 	FromName    string
-	ToParent    fsmeta.InodeID
+	ToParent    model.InodeID
 	ToName      string
-	Session     fsmeta.SessionID
+	Session     model.SessionID
 	ExpiresNs   int64
 	AdvanceNs   int64
 	StartAfter  string
@@ -71,68 +72,68 @@ func (op Operation) String() string {
 // and the system under test.
 type Result struct {
 	Err           error
-	Dentry        fsmeta.DentryRecord
-	Pairs         []fsmeta.DentryAttrPair
-	Token         fsmeta.SnapshotSubtreeToken
-	Inode         fsmeta.InodeRecord
-	RenameReplace fsmeta.RenameReplaceResult
-	Remove        fsmeta.RemoveResult
-	Session       fsmeta.SessionRecord
+	Dentry        model.DentryRecord
+	Pairs         []model.DentryAttrPair
+	Token         model.SnapshotSubtreeToken
+	Inode         model.InodeRecord
+	RenameReplace model.RenameReplaceResult
+	Remove        model.RemoveResult
+	Session       model.SessionRecord
 	Expired       uint64
 }
 
 type dentryKey struct {
-	parent fsmeta.InodeID
+	parent model.InodeID
 	name   string
 }
 
 type snapshotState struct {
-	dentries map[dentryKey]fsmeta.DentryRecord
-	inodes   map[fsmeta.InodeID]fsmeta.InodeRecord
+	dentries map[dentryKey]model.DentryRecord
+	inodes   map[model.InodeID]model.InodeRecord
 }
 
 type sessionIndexEntry struct {
 	key     string
-	record  fsmeta.SessionRecord
+	record  model.SessionRecord
 	session bool
 }
 
 type sessionKey struct {
-	inode   fsmeta.InodeID
-	session fsmeta.SessionID
+	inode   model.InodeID
+	session model.SessionID
 }
 
 // Model is a sequential oracle for fsmeta namespace semantics. It does not
 // model raftstore, routing, or Percolator internals; it models the user-visible
 // metadata contract those layers must preserve.
 type Model struct {
-	Mount       fsmeta.MountID
-	Root        fsmeta.InodeID
+	Mount       model.MountID
+	Root        model.InodeID
 	NowUnixNs   int64
-	dentries    map[dentryKey]fsmeta.DentryRecord
-	inodes      map[fsmeta.InodeID]fsmeta.InodeRecord
-	sessions    map[sessionKey]fsmeta.SessionRecord
-	owners      map[fsmeta.InodeID]fsmeta.SessionRecord
+	dentries    map[dentryKey]model.DentryRecord
+	inodes      map[model.InodeID]model.InodeRecord
+	sessions    map[sessionKey]model.SessionRecord
+	owners      map[model.InodeID]model.SessionRecord
 	snapshots   map[uint64]snapshotState
 	snapshotRef map[int]uint64
 }
 
 // NewModel returns a model with one mounted namespace and a root directory.
-func NewModel(mount fsmeta.MountID) *Model {
+func NewModel(mount model.MountID) *Model {
 	m := &Model{
 		Mount:       mount,
-		Root:        fsmeta.RootInode,
+		Root:        model.RootInode,
 		NowUnixNs:   1_000_000_000,
-		dentries:    make(map[dentryKey]fsmeta.DentryRecord),
-		inodes:      make(map[fsmeta.InodeID]fsmeta.InodeRecord),
-		sessions:    make(map[sessionKey]fsmeta.SessionRecord),
-		owners:      make(map[fsmeta.InodeID]fsmeta.SessionRecord),
+		dentries:    make(map[dentryKey]model.DentryRecord),
+		inodes:      make(map[model.InodeID]model.InodeRecord),
+		sessions:    make(map[sessionKey]model.SessionRecord),
+		owners:      make(map[model.InodeID]model.SessionRecord),
 		snapshots:   make(map[uint64]snapshotState),
 		snapshotRef: make(map[int]uint64),
 	}
-	m.inodes[m.Root] = fsmeta.InodeRecord{
+	m.inodes[m.Root] = model.InodeRecord{
 		Inode:     m.Root,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	}
@@ -172,18 +173,18 @@ func (m *Model) Apply(op Operation) Result {
 	case OpAdvanceTime:
 		return m.advanceTime(op)
 	default:
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 }
 
 // ApplySnapshot records the model view protected by an externally allocated
 // snapshot token.
-func (m *Model) ApplySnapshot(op Operation, token fsmeta.SnapshotSubtreeToken) Result {
+func (m *Model) ApplySnapshot(op Operation, token model.SnapshotSubtreeToken) Result {
 	if op.Mount == "" || op.Mount != m.Mount || op.Parent == 0 || token.ReadVersion == 0 {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	if token.Mount != op.Mount || token.RootInode != op.Parent {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	m.snapshots[token.ReadVersion] = snapshotState{
 		dentries: cloneDentries(m.dentries),
@@ -202,8 +203,8 @@ func (m *Model) SnapshotVersion(ref int) uint64 {
 	return m.snapshotRef[ref]
 }
 
-func (m *Model) ExistingDentries() []fsmeta.DentryRecord {
-	out := make([]fsmeta.DentryRecord, 0, len(m.dentries))
+func (m *Model) ExistingDentries() []model.DentryRecord {
+	out := make([]model.DentryRecord, 0, len(m.dentries))
 	for _, record := range m.dentries {
 		out = append(out, record)
 	}
@@ -216,19 +217,19 @@ func (m *Model) ExistingDentries() []fsmeta.DentryRecord {
 	return out
 }
 
-func (m *Model) ExistingFileDentries() []fsmeta.DentryRecord {
+func (m *Model) ExistingFileDentries() []model.DentryRecord {
 	all := m.ExistingDentries()
 	out := all[:0]
 	for _, record := range all {
-		if record.Type == fsmeta.InodeTypeFile {
+		if record.Type == model.InodeTypeFile {
 			out = append(out, record)
 		}
 	}
 	return out
 }
 
-func (m *Model) ExistingSessions() []fsmeta.SessionRecord {
-	out := make([]fsmeta.SessionRecord, 0, len(m.sessions))
+func (m *Model) ExistingSessions() []model.SessionRecord {
+	out := make([]model.SessionRecord, 0, len(m.sessions))
 	for _, record := range m.sessions {
 		out = append(out, record)
 	}
@@ -248,20 +249,20 @@ func (m *Model) KnownSnapshotRefs() []int {
 func (m *Model) create(op Operation) Result {
 	key := dentryKey{parent: op.Parent, name: op.Name}
 	if _, ok := m.dentries[key]; ok {
-		return Result{Err: fsmeta.ErrExists}
+		return Result{Err: model.ErrExists}
 	}
 	if _, ok := m.inodes[op.Inode]; ok {
-		return Result{Err: fsmeta.ErrExists}
+		return Result{Err: model.ErrExists}
 	}
 	linkCount := uint32(1)
-	inode := fsmeta.InodeRecord{
+	inode := model.InodeRecord{
 		Inode:     op.Inode,
 		Type:      op.Type,
 		Size:      op.Size,
 		Mode:      op.Mode,
 		LinkCount: linkCount,
 	}
-	dentry := fsmeta.DentryRecord{Parent: op.Parent, Name: op.Name, Inode: op.Inode, Type: op.Type}
+	dentry := model.DentryRecord{Parent: op.Parent, Name: op.Name, Inode: op.Inode, Type: op.Type}
 	m.inodes[op.Inode] = inode
 	m.dentries[key] = dentry
 	return Result{Dentry: dentry, Inode: inode}
@@ -271,20 +272,20 @@ func (m *Model) updateInode(op Operation) Result {
 	key := dentryKey{parent: op.Parent, name: op.Name}
 	dentry, ok := m.dentries[key]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
 	if dentry.Inode != op.Inode {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	inode, ok := m.inodes[op.Inode]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
 	if dentry.Type != inode.Type {
-		return Result{Err: fsmeta.ErrInvalidValue}
+		return Result{Err: model.ErrInvalidValue}
 	}
 	if inode.LinkCount != 1 {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	inode.Size = op.Size
 	inode.Mode = op.Mode
@@ -295,7 +296,7 @@ func (m *Model) updateInode(op Operation) Result {
 func (m *Model) lookup(op Operation) Result {
 	record, ok := m.dentries[dentryKey{parent: op.Parent, name: op.Name}]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
 	return Result{Dentry: record}
 }
@@ -305,13 +306,13 @@ func (m *Model) readDirPlus(op Operation) Result {
 	if version := m.SnapshotVersion(op.SnapshotRef); version != 0 {
 		snapshot, ok := m.snapshots[version]
 		if !ok {
-			return Result{Err: fsmeta.ErrInvalidRequest}
+			return Result{Err: model.ErrInvalidRequest}
 		}
 		state = snapshot
 	}
 	limit := op.Limit
 	if limit == 0 {
-		limit = fsmeta.DefaultReadDirLimit
+		limit = model.DefaultReadDirLimit
 	}
 	names := make([]string, 0)
 	for key := range state.dentries {
@@ -323,30 +324,30 @@ func (m *Model) readDirPlus(op Operation) Result {
 	if uint32(len(names)) > limit {
 		names = names[:limit]
 	}
-	pairs := make([]fsmeta.DentryAttrPair, 0, len(names))
+	pairs := make([]model.DentryAttrPair, 0, len(names))
 	for _, name := range names {
 		dentry := state.dentries[dentryKey{parent: op.Parent, name: name}]
 		inode, ok := state.inodes[dentry.Inode]
 		if !ok {
-			return Result{Err: fsmeta.ErrNotFound}
+			return Result{Err: model.ErrNotFound}
 		}
-		pairs = append(pairs, fsmeta.DentryAttrPair{Dentry: dentry, Inode: inode})
+		pairs = append(pairs, model.DentryAttrPair{Dentry: dentry, Inode: inode})
 	}
 	return Result{Pairs: pairs}
 }
 
 func (m *Model) renameSubtree(op Operation) Result {
 	if op.FromParent == op.ToParent && op.FromName == op.ToName {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	from := dentryKey{parent: op.FromParent, name: op.FromName}
 	to := dentryKey{parent: op.ToParent, name: op.ToName}
 	record, ok := m.dentries[from]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
 	if _, ok := m.dentries[to]; ok {
-		return Result{Err: fsmeta.ErrExists}
+		return Result{Err: model.ErrExists}
 	}
 	delete(m.dentries, from)
 	record.Parent = op.ToParent
@@ -357,44 +358,44 @@ func (m *Model) renameSubtree(op Operation) Result {
 
 func (m *Model) renameReplace(op Operation) Result {
 	if op.FromParent == op.ToParent && op.FromName == op.ToName {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	from := dentryKey{parent: op.FromParent, name: op.FromName}
 	to := dentryKey{parent: op.ToParent, name: op.ToName}
 	record, ok := m.dentries[from]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
-	if record.Type == fsmeta.InodeTypeDirectory {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+	if record.Type == model.InodeTypeDirectory {
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	sourceInode, ok := m.inodes[record.Inode]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
 	if sourceInode.Type != record.Type {
-		return Result{Err: fsmeta.ErrInvalidValue}
+		return Result{Err: model.ErrInvalidValue}
 	}
-	if sourceInode.Type == fsmeta.InodeTypeDirectory {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+	if sourceInode.Type == model.InodeTypeDirectory {
+		return Result{Err: model.ErrInvalidRequest}
 	}
-	result := fsmeta.RenameReplaceResult{}
+	result := model.RenameReplaceResult{}
 	if existing, ok := m.dentries[to]; ok {
-		if existing.Type == fsmeta.InodeTypeDirectory {
-			return Result{Err: fsmeta.ErrInvalidRequest}
+		if existing.Type == model.InodeTypeDirectory {
+			return Result{Err: model.ErrInvalidRequest}
 		}
 		existingInode, ok := m.inodes[existing.Inode]
 		if !ok {
-			return Result{Err: fsmeta.ErrNotFound}
+			return Result{Err: model.ErrNotFound}
 		}
 		if existingInode.Type != existing.Type {
-			return Result{Err: fsmeta.ErrInvalidValue}
+			return Result{Err: model.ErrInvalidValue}
 		}
-		if existingInode.Type == fsmeta.InodeTypeDirectory {
-			return Result{Err: fsmeta.ErrInvalidRequest}
+		if existingInode.Type == model.InodeTypeDirectory {
+			return Result{Err: model.ErrInvalidRequest}
 		}
 		if existingInode.Inode == sourceInode.Inode && existingInode.LinkCount <= 1 {
-			return Result{Err: fsmeta.ErrInvalidValue}
+			return Result{Err: model.ErrInvalidValue}
 		}
 		result.Replaced = true
 		result.OldDentry = existing
@@ -416,33 +417,33 @@ func (m *Model) renameReplace(op Operation) Result {
 
 func (m *Model) link(op Operation) Result {
 	if op.FromParent == op.ToParent && op.FromName == op.ToName {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	from := dentryKey{parent: op.FromParent, name: op.FromName}
 	to := dentryKey{parent: op.ToParent, name: op.ToName}
 	record, ok := m.dentries[from]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
-	if record.Type == fsmeta.InodeTypeDirectory {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+	if record.Type == model.InodeTypeDirectory {
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	if _, ok := m.dentries[to]; ok {
-		return Result{Err: fsmeta.ErrExists}
+		return Result{Err: model.ErrExists}
 	}
 	inode, ok := m.inodes[record.Inode]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
-	if inode.Type == fsmeta.InodeTypeDirectory || inode.LinkCount == ^uint32(0) {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+	if inode.Type == model.InodeTypeDirectory || inode.LinkCount == ^uint32(0) {
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	if inode.LinkCount == 0 {
 		inode.LinkCount = 1
 	}
 	inode.LinkCount++
 	m.inodes[inode.Inode] = inode
-	m.dentries[to] = fsmeta.DentryRecord{Parent: op.ToParent, Name: op.ToName, Inode: record.Inode, Type: record.Type}
+	m.dentries[to] = model.DentryRecord{Parent: op.ToParent, Name: op.ToName, Inode: record.Inode, Type: record.Type}
 	return Result{}
 }
 
@@ -456,19 +457,19 @@ func (m *Model) remove(op Operation) Result {
 	return Result{Err: err, Remove: result}
 }
 
-func (m *Model) removeDentry(op Operation) (fsmeta.RemoveResult, error) {
+func (m *Model) removeDentry(op Operation) (model.RemoveResult, error) {
 	key := dentryKey{parent: op.Parent, name: op.Name}
 	record, ok := m.dentries[key]
 	if !ok {
-		return fsmeta.RemoveResult{}, fsmeta.ErrNotFound
+		return model.RemoveResult{}, model.ErrNotFound
 	}
-	if record.Type == fsmeta.InodeTypeDirectory {
-		return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
+	if record.Type == model.InodeTypeDirectory {
+		return model.RemoveResult{}, model.ErrInvalidRequest
 	}
-	result := fsmeta.RemoveResult{RemovedDentry: record}
+	result := model.RemoveResult{RemovedDentry: record}
 	if inode, ok := m.inodes[record.Inode]; ok {
-		if inode.Type == fsmeta.InodeTypeDirectory {
-			return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
+		if inode.Type == model.InodeTypeDirectory {
+			return model.RemoveResult{}, model.ErrInvalidRequest
 		}
 		result.OldInode = inode
 		delete(m.dentries, key)
@@ -487,29 +488,29 @@ func (m *Model) removeDentry(op Operation) (fsmeta.RemoveResult, error) {
 
 func (m *Model) openWriteSession(op Operation) Result {
 	if op.ExpiresNs <= m.NowUnixNs {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	inode, ok := m.inodes[op.Inode]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
-	if inode.Type != fsmeta.InodeTypeFile {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+	if inode.Type != model.InodeTypeFile {
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	key := sessionKey{inode: op.Inode, session: op.Session}
 	if existing, ok := m.sessions[key]; ok && sessionLive(existing, m.NowUnixNs) {
-		return Result{Err: fsmeta.ErrExists}
+		return Result{Err: model.ErrExists}
 	}
 	if owner, ok := m.owners[op.Inode]; ok {
 		if sessionLive(owner, m.NowUnixNs) {
-			return Result{Err: fsmeta.ErrExists}
+			return Result{Err: model.ErrExists}
 		}
 		ownerKey := sessionKey{inode: owner.Inode, session: owner.Session}
 		if current, ok := m.sessions[ownerKey]; ok && current == owner {
 			delete(m.sessions, ownerKey)
 		}
 	}
-	record := fsmeta.SessionRecord{Session: op.Session, Inode: op.Inode, ExpiresUnixNs: op.ExpiresNs}
+	record := model.SessionRecord{Session: op.Session, Inode: op.Inode, ExpiresUnixNs: op.ExpiresNs}
 	m.sessions[key] = record
 	m.owners[op.Inode] = record
 	return Result{Session: record}
@@ -517,18 +518,18 @@ func (m *Model) openWriteSession(op Operation) Result {
 
 func (m *Model) heartbeatSession(op Operation) Result {
 	if op.ExpiresNs <= m.NowUnixNs {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	key := sessionKey{inode: op.Inode, session: op.Session}
 	session, ok := m.sessions[key]
 	if !ok || !sessionLive(session, m.NowUnixNs) || session.Inode != op.Inode {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
 	owner, ok := m.owners[op.Inode]
 	if !ok || !sessionLive(owner, m.NowUnixNs) || owner.Session != op.Session || owner.Inode != op.Inode {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
-	record := fsmeta.SessionRecord{Session: op.Session, Inode: op.Inode, ExpiresUnixNs: op.ExpiresNs}
+	record := model.SessionRecord{Session: op.Session, Inode: op.Inode, ExpiresUnixNs: op.ExpiresNs}
 	m.sessions[key] = record
 	m.owners[op.Inode] = record
 	return Result{Session: record}
@@ -538,10 +539,10 @@ func (m *Model) closeSession(op Operation) Result {
 	key := sessionKey{inode: op.Inode, session: op.Session}
 	session, ok := m.sessions[key]
 	if !ok {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
 	if session.Inode != op.Inode {
-		return Result{Err: fsmeta.ErrNotFound}
+		return Result{Err: model.ErrNotFound}
 	}
 	delete(m.sessions, key)
 	if owner, ok := m.owners[session.Inode]; ok && owner.Session == op.Session && owner.Inode == session.Inode {
@@ -553,9 +554,9 @@ func (m *Model) closeSession(op Operation) Result {
 func (m *Model) expireSessions(op Operation) Result {
 	limit := op.Limit
 	if limit == 0 {
-		limit = fsmeta.DefaultSessionExpireLimit
+		limit = model.DefaultSessionExpireLimit
 	}
-	identity := fsmeta.MountIdentity{MountID: m.Mount, MountKeyID: contractMountKeyID}
+	identity := model.MountIdentity{MountID: m.Mount, MountKeyID: contractMountKeyID}
 	entries := make([]sessionIndexEntry, 0, len(m.sessions)+len(m.owners))
 	for _, record := range m.sessions {
 		key, err := fsmeta.EncodeSessionKey(identity, record.Inode, record.Session)
@@ -573,7 +574,7 @@ func (m *Model) expireSessions(op Operation) Result {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
 	deleteSessions := make(map[sessionKey]struct{})
-	deleteOwners := make(map[fsmeta.InodeID]struct{})
+	deleteOwners := make(map[model.InodeID]struct{})
 	expiredSessions := make(map[sessionKey]struct{})
 	visited := uint32(0)
 	for _, entry := range entries {
@@ -609,13 +610,13 @@ func (m *Model) expireSessions(op Operation) Result {
 
 func (m *Model) advanceTime(op Operation) Result {
 	if op.AdvanceNs <= 0 {
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 	m.NowUnixNs += op.AdvanceNs
 	return Result{}
 }
 
-func sessionLive(record fsmeta.SessionRecord, nowUnixNs int64) bool {
+func sessionLive(record model.SessionRecord, nowUnixNs int64) bool {
 	return record.ExpiresUnixNs > nowUnixNs
 }
 
@@ -623,7 +624,7 @@ func sessionLive(record fsmeta.SessionRecord, nowUnixNs int64) bool {
 // operation. It catches model bugs and expected-state corruption before the
 // model is used as an oracle for later steps.
 func (m *Model) CheckInvariants() error {
-	refs := make(map[fsmeta.InodeID]uint32)
+	refs := make(map[model.InodeID]uint32)
 	for key, dentry := range m.dentries {
 		if key.parent == 0 || key.name == "" {
 			return fmt.Errorf("invalid dentry key: %+v", key)
@@ -633,13 +634,13 @@ func (m *Model) CheckInvariants() error {
 		}
 		inode, ok := m.inodes[dentry.Inode]
 		if !ok {
-			return fmt.Errorf("%w: dentry %s points to inode %d", fsmeta.ErrNotFound, dentry.Name, dentry.Inode)
+			return fmt.Errorf("%w: dentry %s points to inode %d", model.ErrNotFound, dentry.Name, dentry.Inode)
 		}
 		if inode.Inode != dentry.Inode {
 			return fmt.Errorf("inode key/value mismatch key=%d record=%+v", dentry.Inode, inode)
 		}
 		if inode.Type != dentry.Type {
-			return fmt.Errorf("%w: dentry type=%s inode type=%s", fsmeta.ErrInvalidValue, dentry.Type, inode.Type)
+			return fmt.Errorf("%w: dentry type=%s inode type=%s", model.ErrInvalidValue, dentry.Type, inode.Type)
 		}
 		refs[dentry.Inode]++
 	}
@@ -686,21 +687,21 @@ func EquivalentError(got, want error) bool {
 		return got == nil && want == nil
 	}
 	for _, sentinel := range []error{
-		fsmeta.ErrInvalidMountID,
-		fsmeta.ErrInvalidInodeID,
-		fsmeta.ErrInvalidName,
-		fsmeta.ErrInvalidSession,
-		fsmeta.ErrInvalidRequest,
+		model.ErrInvalidMountID,
+		model.ErrInvalidInodeID,
+		model.ErrInvalidName,
+		model.ErrInvalidSession,
+		model.ErrInvalidRequest,
 		fsmeta.ErrInvalidKey,
 		fsmeta.ErrInvalidKeyKind,
-		fsmeta.ErrInvalidValue,
+		model.ErrInvalidValue,
 		fsmeta.ErrInvalidValueKind,
-		fsmeta.ErrInvalidPageSize,
-		fsmeta.ErrExists,
-		fsmeta.ErrNotFound,
-		fsmeta.ErrMountNotRegistered,
-		fsmeta.ErrMountRetired,
-		fsmeta.ErrQuotaExceeded,
+		model.ErrInvalidPageSize,
+		model.ErrExists,
+		model.ErrNotFound,
+		model.ErrMountNotRegistered,
+		model.ErrMountRetired,
+		model.ErrQuotaExceeded,
 	} {
 		if errors.Is(got, sentinel) || errors.Is(want, sentinel) {
 			return errors.Is(got, sentinel) && errors.Is(want, sentinel)
@@ -714,14 +715,14 @@ func EquivalentError(got, want error) bool {
 	return gotMessage == wantMessage
 }
 
-func cloneDentries(in map[dentryKey]fsmeta.DentryRecord) map[dentryKey]fsmeta.DentryRecord {
-	out := make(map[dentryKey]fsmeta.DentryRecord, len(in))
+func cloneDentries(in map[dentryKey]model.DentryRecord) map[dentryKey]model.DentryRecord {
+	out := make(map[dentryKey]model.DentryRecord, len(in))
 	maps.Copy(out, in)
 	return out
 }
 
-func cloneInodes(in map[fsmeta.InodeID]fsmeta.InodeRecord) map[fsmeta.InodeID]fsmeta.InodeRecord {
-	out := make(map[fsmeta.InodeID]fsmeta.InodeRecord, len(in))
+func cloneInodes(in map[model.InodeID]model.InodeRecord) map[model.InodeID]model.InodeRecord {
+	out := make(map[model.InodeID]model.InodeRecord, len(in))
 	for key, value := range in {
 		value.OpaqueAttrs = append([]byte(nil), value.OpaqueAttrs...)
 		out[key] = value

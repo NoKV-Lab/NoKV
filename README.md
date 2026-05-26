@@ -304,7 +304,7 @@ package main
 import (
     "context"
 
-    "github.com/feichai0017/NoKV/fsmeta"
+    "github.com/feichai0017/NoKV/fsmeta/model"
     fsmetalocal "github.com/feichai0017/NoKV/fsmeta/runtime/local"
 )
 
@@ -312,26 +312,26 @@ func main() {
     ctx := context.Background()
     rt, err := fsmetalocal.Open(ctx, fsmetalocal.Options{
         WorkDir: "./nokv-fsmeta-local",
-        Mount:   fsmeta.MountIdentity{MountID: "default", MountKeyID: 1},
+        Mount:   model.MountIdentity{MountID: "default", MountKeyID: 1},
     })
     if err != nil {
         panic(err)
     }
     defer rt.Close()
 
-    _, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+    _, err = rt.Executor.Create(ctx, model.CreateRequest{
         Mount:  "default",
-        Parent: fsmeta.RootInode,
+        Parent: model.RootInode,
         Name:   "hello.txt",
-        Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 13},
+        Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 13},
     })
     if err != nil {
         panic(err)
     }
 
-    page, _ := rt.Executor.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+    page, _ := rt.Executor.ReadDirPlus(ctx, model.ReadDirRequest{
         Mount:  "default",
-        Parent: fsmeta.RootInode,
+        Parent: model.RootInode,
         Limit:  100,
     })
     for _, entry := range page {

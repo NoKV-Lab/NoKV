@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
 	"github.com/feichai0017/NoKV/utils"
 )
@@ -64,15 +65,15 @@ const (
 )
 
 type KeyParts struct {
-	MountKeyID          MountKeyID
+	MountKeyID          model.MountKeyID
 	Bucket              AffinityBucket
 	Kind                KeyKind
-	Parent              InodeID
-	Inode               InodeID
-	UsageScope          InodeID
+	Parent              model.InodeID
+	Inode               model.InodeID
+	UsageScope          model.InodeID
 	SegmentRecord       byte
 	SegmentRoot         [32]byte
-	SnapshotRoot        InodeID
+	SnapshotRoot        model.InodeID
 	SnapshotReadVersion uint64
 }
 
@@ -100,19 +101,19 @@ func (k KeyKind) String() string {
 }
 
 // EncodeMountKey returns the mount-level metadata record key.
-func EncodeMountKey(mount MountIdentity) ([]byte, error) {
+func EncodeMountKey(mount model.MountIdentity) ([]byte, error) {
 	return encodeKey(mount, RootAffinityBucket, KeyKindMount, nil)
 }
 
 // EncodeMountPrefix returns the common key prefix for one mount. All fsmeta
 // records under the mount share this prefix regardless of key kind.
-func EncodeMountPrefix(mount MountIdentity) ([]byte, error) {
+func EncodeMountPrefix(mount model.MountIdentity) ([]byte, error) {
 	return encodeMountPrefix(mount, 0)
 }
 
 // EncodeMountKeyRange returns the half-open key range covering all fsmeta
 // records under one mount.
-func EncodeMountKeyRange(mount MountIdentity) (start, end []byte, err error) {
+func EncodeMountKeyRange(mount model.MountIdentity) (start, end []byte, err error) {
 	start, err = EncodeMountPrefix(mount)
 	if err != nil {
 		return nil, nil, err
@@ -123,7 +124,7 @@ func EncodeMountKeyRange(mount MountIdentity) (start, end []byte, err error) {
 // EncodeBucketPrefix returns the key prefix for one mount-local affinity
 // bucket. Coordinator placement can split these byte ranges without learning
 // fsmeta's record families.
-func EncodeBucketPrefix(mount MountIdentity, bucket AffinityBucket) ([]byte, error) {
+func EncodeBucketPrefix(mount model.MountIdentity, bucket AffinityBucket) ([]byte, error) {
 	prefix, err := encodeMountPrefix(mount, encodedBucketBytes)
 	if err != nil {
 		return nil, err
@@ -131,7 +132,7 @@ func EncodeBucketPrefix(mount MountIdentity, bucket AffinityBucket) ([]byte, err
 	return appendBucket(prefix, bucket), nil
 }
 
-func EncodeBucketRange(mount MountIdentity, bucket AffinityBucket) (start, end []byte, err error) {
+func EncodeBucketRange(mount model.MountIdentity, bucket AffinityBucket) (start, end []byte, err error) {
 	start, err = EncodeBucketPrefix(mount, bucket)
 	if err != nil {
 		return nil, nil, err
@@ -140,11 +141,11 @@ func EncodeBucketRange(mount MountIdentity, bucket AffinityBucket) (start, end [
 }
 
 // EncodeInodeKey returns the inode attribute record key.
-func EncodeInodeKey(mount MountIdentity, inode InodeID) ([]byte, error) {
-	if err := validateInodeID(inode); err != nil {
+func EncodeInodeKey(mount model.MountIdentity, inode model.InodeID) ([]byte, error) {
+	if err := model.ValidateInodeID(inode); err != nil {
 		return nil, err
 	}
-	if err := validateMountIdentity(mount); err != nil {
+	if err := model.ValidateMountIdentity(mount); err != nil {
 		return nil, err
 	}
 	out := encodeKeyPrefixForMountKeyID(mount.MountKeyID, BucketForInodeID(inode), KeyKindInode, 8)
@@ -152,8 +153,8 @@ func EncodeInodeKey(mount MountIdentity, inode InodeID) ([]byte, error) {
 }
 
 // EncodeDentryPrefix returns the scan prefix for entries directly under parent.
-func EncodeDentryPrefix(mount MountIdentity, parent InodeID) ([]byte, error) {
-	if err := validateInodeID(parent); err != nil {
+func EncodeDentryPrefix(mount model.MountIdentity, parent model.InodeID) ([]byte, error) {
+	if err := model.ValidateInodeID(parent); err != nil {
 		return nil, err
 	}
 	var body [8]byte
@@ -162,14 +163,14 @@ func EncodeDentryPrefix(mount MountIdentity, parent InodeID) ([]byte, error) {
 }
 
 // EncodeDentryKey returns the dentry record key for parent/name.
-func EncodeDentryKey(mount MountIdentity, parent InodeID, name string) ([]byte, error) {
-	if err := validateName(name); err != nil {
+func EncodeDentryKey(mount model.MountIdentity, parent model.InodeID, name string) ([]byte, error) {
+	if err := model.ValidateName(name); err != nil {
 		return nil, err
 	}
-	if err := validateInodeID(parent); err != nil {
+	if err := model.ValidateInodeID(parent); err != nil {
 		return nil, err
 	}
-	if err := validateMountIdentity(mount); err != nil {
+	if err := model.ValidateMountIdentity(mount); err != nil {
 		return nil, err
 	}
 	out := encodeKeyPrefixForMountKeyID(mount.MountKeyID, BucketForInodeID(parent), KeyKindDentry, 8+len(name))
@@ -178,8 +179,8 @@ func EncodeDentryKey(mount MountIdentity, parent InodeID, name string) ([]byte, 
 }
 
 // EncodeChunkKey returns the chunk mapping record key for inode/chunk.
-func EncodeChunkKey(mount MountIdentity, inode InodeID, chunk ChunkIndex) ([]byte, error) {
-	if err := validateInodeID(inode); err != nil {
+func EncodeChunkKey(mount model.MountIdentity, inode model.InodeID, chunk model.ChunkIndex) ([]byte, error) {
+	if err := model.ValidateInodeID(inode); err != nil {
 		return nil, err
 	}
 	var body [16]byte
@@ -189,11 +190,11 @@ func EncodeChunkKey(mount MountIdentity, inode InodeID, chunk ChunkIndex) ([]byt
 }
 
 // EncodeSessionKey returns the client/session state key.
-func EncodeSessionKey(mount MountIdentity, inode InodeID, session SessionID) ([]byte, error) {
-	if err := validateInodeID(inode); err != nil {
+func EncodeSessionKey(mount model.MountIdentity, inode model.InodeID, session model.SessionID) ([]byte, error) {
+	if err := model.ValidateInodeID(inode); err != nil {
 		return nil, err
 	}
-	if err := validateSessionID(session); err != nil {
+	if err := model.ValidateSessionID(session); err != nil {
 		return nil, err
 	}
 	body := make([]byte, 9, 9+len(session))
@@ -207,13 +208,13 @@ func EncodeSessionKey(mount MountIdentity, inode InodeID, session SessionID) ([]
 // mount-local affinity bucket. Maintenance scanners use this bucket-local
 // prefix instead of the mount prefix so routed scans stay inside real fsmeta
 // data ranges.
-func EncodeSessionBucketPrefix(mount MountIdentity, bucket AffinityBucket) ([]byte, error) {
+func EncodeSessionBucketPrefix(mount model.MountIdentity, bucket AffinityBucket) ([]byte, error) {
 	return encodeKey(mount, bucket, KeyKindSession, nil)
 }
 
 // EncodeInodeSessionKey returns the exclusive writer-owner key for one inode.
-func EncodeInodeSessionKey(mount MountIdentity, inode InodeID) ([]byte, error) {
-	if err := validateInodeID(inode); err != nil {
+func EncodeInodeSessionKey(mount model.MountIdentity, inode model.InodeID) ([]byte, error) {
+	if err := model.ValidateInodeID(inode); err != nil {
 		return nil, err
 	}
 	var body [9]byte
@@ -224,7 +225,7 @@ func EncodeInodeSessionKey(mount MountIdentity, inode InodeID) ([]byte, error) {
 
 // EncodeUsageKey returns a quota usage/counter key. Scope 0 is mount-wide;
 // non-zero scopes are direct quota accounting roots.
-func EncodeUsageKey(mount MountIdentity, scope InodeID) ([]byte, error) {
+func EncodeUsageKey(mount model.MountIdentity, scope model.InodeID) ([]byte, error) {
 	var body [8]byte
 	binary.BigEndian.PutUint64(body[:], uint64(scope))
 	return encodeKey(mount, BucketForInodeID(scope), KeyKindUsage, body[:])
@@ -234,12 +235,12 @@ func EncodeUsageKey(mount MountIdentity, scope InodeID) ([]byte, error) {
 // Snapshot records intentionally live in the root affinity bucket so one local
 // runtime can recover all active snapshot tokens without scanning every fsmeta
 // affinity bucket.
-func EncodeSnapshotKey(mount MountIdentity, root InodeID, readVersion uint64) ([]byte, error) {
-	if err := validateInodeID(root); err != nil {
+func EncodeSnapshotKey(mount model.MountIdentity, root model.InodeID, readVersion uint64) ([]byte, error) {
+	if err := model.ValidateInodeID(root); err != nil {
 		return nil, err
 	}
 	if readVersion == 0 {
-		return nil, ErrInvalidRequest
+		return nil, model.ErrInvalidRequest
 	}
 	var body [16]byte
 	binary.BigEndian.PutUint64(body[:8], uint64(root))
@@ -248,7 +249,7 @@ func EncodeSnapshotKey(mount MountIdentity, root InodeID, readVersion uint64) ([
 }
 
 // EncodeSnapshotPrefix returns the hidden local snapshot-retention key prefix.
-func EncodeSnapshotPrefix(mount MountIdentity) ([]byte, error) {
+func EncodeSnapshotPrefix(mount model.MountIdentity) ([]byte, error) {
 	return encodeKey(mount, RootAffinityBucket, KeyKindSnapshot, nil)
 }
 
@@ -256,19 +257,19 @@ func EncodeSnapshotPrefix(mount MountIdentity) ([]byte, error) {
 // points reads at one durable segment object. It deliberately takes the rooted
 // mount key id rather than a human mount name because recovery reconstructs it
 // from already-encoded fsmeta keys.
-func EncodeSegmentCatalogIndexKey(mountKeyID MountKeyID, bucket AffinityBucket, root [32]byte) ([]byte, error) {
+func EncodeSegmentCatalogIndexKey(mountKeyID model.MountKeyID, bucket AffinityBucket, root [32]byte) ([]byte, error) {
 	return encodeSegmentKey(mountKeyID, bucket, SegmentRecordIndex, root)
 }
 
 // EncodeSegmentObjectKey returns the hidden segment-object key that stores
 // one copy of a sealed segment payload. Per-bucket catalog keys point at this
 // object so multi-bucket segments do not duplicate payload bytes.
-func EncodeSegmentObjectKey(mountKeyID MountKeyID, bucket AffinityBucket, root [32]byte) ([]byte, error) {
+func EncodeSegmentObjectKey(mountKeyID model.MountKeyID, bucket AffinityBucket, root [32]byte) ([]byte, error) {
 	return encodeSegmentKey(mountKeyID, bucket, SegmentRecordObject, root)
 }
 
-func encodeSegmentKey(mountKeyID MountKeyID, bucket AffinityBucket, record byte, root [32]byte) ([]byte, error) {
-	if err := validateMountKeyID(mountKeyID); err != nil {
+func encodeSegmentKey(mountKeyID model.MountKeyID, bucket AffinityBucket, record byte, root [32]byte) ([]byte, error) {
+	if err := model.ValidateMountKeyID(mountKeyID); err != nil {
 		return nil, err
 	}
 	if root == ([32]byte{}) {
@@ -287,8 +288,8 @@ func encodeSegmentKey(mountKeyID MountKeyID, bucket AffinityBucket, record byte,
 
 // EncodeSegmentCatalogIndexPrefix returns the hidden catalog scan prefix for
 // durable segment indexes in one mount-local affinity bucket.
-func EncodeSegmentCatalogIndexPrefix(mountKeyID MountKeyID, bucket AffinityBucket) ([]byte, error) {
-	if err := validateMountKeyID(mountKeyID); err != nil {
+func EncodeSegmentCatalogIndexPrefix(mountKeyID model.MountKeyID, bucket AffinityBucket) ([]byte, error) {
+	if err := model.ValidateMountKeyID(mountKeyID); err != nil {
 		return nil, err
 	}
 	return encodeKeyForMountKeyID(mountKeyID, bucket, KeyKindSegment, []byte{SegmentRecordIndex}), nil
@@ -340,7 +341,7 @@ func DentryNameBytesOfKey(key []byte) ([]byte, bool) {
 
 // MountKeyIDOfKey returns the rooted storage mount identity encoded in a full
 // fsmeta key.
-func MountKeyIDOfKey(key []byte) (MountKeyID, bool) {
+func MountKeyIDOfKey(key []byte) (model.MountKeyID, bool) {
 	mount, _, err := decodeHeaderParts(key)
 	if err != nil {
 		return 0, false
@@ -376,31 +377,31 @@ func InspectKey(key []byte) (KeyParts, bool) {
 		if len(body) <= 8 {
 			return KeyParts{}, false
 		}
-		parts.Parent = InodeID(binary.BigEndian.Uint64(body[:8]))
+		parts.Parent = model.InodeID(binary.BigEndian.Uint64(body[:8]))
 		return parts, true
 	case KeyKindInode:
 		if len(body) != 8 {
 			return KeyParts{}, false
 		}
-		parts.Inode = InodeID(binary.BigEndian.Uint64(body[:8]))
+		parts.Inode = model.InodeID(binary.BigEndian.Uint64(body[:8]))
 		return parts, true
 	case KeyKindChunk:
 		if len(body) != 16 {
 			return KeyParts{}, false
 		}
-		parts.Inode = InodeID(binary.BigEndian.Uint64(body[:8]))
+		parts.Inode = model.InodeID(binary.BigEndian.Uint64(body[:8]))
 		return parts, true
 	case KeyKindSession:
 		if len(body) < 9 {
 			return KeyParts{}, false
 		}
-		parts.Inode = InodeID(binary.BigEndian.Uint64(body[:8]))
+		parts.Inode = model.InodeID(binary.BigEndian.Uint64(body[:8]))
 		return parts, true
 	case KeyKindUsage:
 		if len(body) != 8 {
 			return KeyParts{}, false
 		}
-		parts.UsageScope = InodeID(binary.BigEndian.Uint64(body[:8]))
+		parts.UsageScope = model.InodeID(binary.BigEndian.Uint64(body[:8]))
 		return parts, true
 	case KeyKindSegment:
 		if len(body) != 1+len(parts.SegmentRoot) {
@@ -418,7 +419,7 @@ func InspectKey(key []byte) (KeyParts, bool) {
 		if len(body) != 16 {
 			return KeyParts{}, false
 		}
-		parts.SnapshotRoot = InodeID(binary.BigEndian.Uint64(body[:8]))
+		parts.SnapshotRoot = model.InodeID(binary.BigEndian.Uint64(body[:8]))
 		parts.SnapshotReadVersion = binary.BigEndian.Uint64(body[8:])
 		return parts, parts.SnapshotRoot != 0 && parts.SnapshotReadVersion != 0
 	default:
@@ -457,10 +458,10 @@ func UserKeyShape(key []byte) localdb.UserKeyShape {
 		if len(key) < bodyPos+8 {
 			return localdb.UserKeyShape{}
 		}
-		parent := InodeID(binary.BigEndian.Uint64(key[bodyPos : bodyPos+8]))
-		if parent == RootInode {
+		parent := model.InodeID(binary.BigEndian.Uint64(key[bodyPos : bodyPos+8]))
+		if parent == model.RootInode {
 			name := key[bodyPos+8:]
-			bucket := ChooseWorkspaceBucket(MountIdentity{MountKeyID: mountKeyID}, string(name))
+			bucket := ChooseWorkspaceBucket(model.MountIdentity{MountKeyID: mountKeyID}, string(name))
 			shape.ShardKey = encodeKeyPrefixForMountKeyID(mountKeyID, bucket, KeyKindDentry, 0)[:kindPos]
 		}
 		shape.BloomPrefix = key[:bodyPos+8]
@@ -506,7 +507,7 @@ func MountAtomicUserKeyShape(key []byte) localdb.UserKeyShape {
 	return shape
 }
 
-func segmentShardKey(mountKeyID MountKeyID, root []byte) []byte {
+func segmentShardKey(mountKeyID model.MountKeyID, root []byte) []byte {
 	out := make([]byte, 0, len(keyMagic)+1+encodedMountKeyBytes+1+len(root))
 	out = append(out, keyMagic...)
 	out = append(out, keySchemaVersion)
@@ -533,8 +534,8 @@ func ShardForUserKey(key []byte, shardCount int) int {
 	return utils.ShardForUserKey(key, shardCount)
 }
 
-func BucketForInodeID(inode InodeID) AffinityBucket {
-	if inode == RootInode {
+func BucketForInodeID(inode model.InodeID) AffinityBucket {
+	if inode == model.RootInode {
 		return RootAffinityBucket
 	}
 	var body [8]byte
@@ -542,7 +543,7 @@ func BucketForInodeID(inode InodeID) AffinityBucket {
 	return AffinityBucket(utils.ShardForUserKey(body[:], DefaultAffinityBucketCount))
 }
 
-func ChooseWorkspaceBucket(mount MountIdentity, name string) AffinityBucket {
+func ChooseWorkspaceBucket(mount model.MountIdentity, name string) AffinityBucket {
 	var mountBuf [8]byte
 	binary.BigEndian.PutUint64(mountBuf[:], uint64(mount.MountKeyID))
 	key := make([]byte, 0, len(mountBuf)+1+len(name))
@@ -552,20 +553,20 @@ func ChooseWorkspaceBucket(mount MountIdentity, name string) AffinityBucket {
 	return AffinityBucket(utils.ShardForUserKey(key, DefaultAffinityBucketCount))
 }
 
-func encodeKey(mount MountIdentity, bucket AffinityBucket, kind KeyKind, body []byte) ([]byte, error) {
-	if err := validateMountIdentity(mount); err != nil {
+func encodeKey(mount model.MountIdentity, bucket AffinityBucket, kind KeyKind, body []byte) ([]byte, error) {
+	if err := model.ValidateMountIdentity(mount); err != nil {
 		return nil, err
 	}
 	return encodeKeyForMountKeyID(mount.MountKeyID, bucket, kind, body), nil
 }
 
-func encodeKeyForMountKeyID(mountKeyID MountKeyID, bucket AffinityBucket, kind KeyKind, body []byte) []byte {
+func encodeKeyForMountKeyID(mountKeyID model.MountKeyID, bucket AffinityBucket, kind KeyKind, body []byte) []byte {
 	out := encodeKeyPrefixForMountKeyID(mountKeyID, bucket, kind, len(body))
 	out = append(out, body...)
 	return out
 }
 
-func encodeKeyPrefixForMountKeyID(mountKeyID MountKeyID, bucket AffinityBucket, kind KeyKind, bodyLen int) []byte {
+func encodeKeyPrefixForMountKeyID(mountKeyID model.MountKeyID, bucket AffinityBucket, kind KeyKind, bodyLen int) []byte {
 	out := make([]byte, 0, len(keyMagic)+1+encodedMountKeyBytes+encodedBucketBytes+1+bodyLen)
 	out = append(out, keyMagic...)
 	out = append(out, keySchemaVersion)
@@ -577,8 +578,8 @@ func encodeKeyPrefixForMountKeyID(mountKeyID MountKeyID, bucket AffinityBucket, 
 	return out
 }
 
-func encodeMountPrefix(mount MountIdentity, suffixLen int) ([]byte, error) {
-	if err := validateMountIdentity(mount); err != nil {
+func encodeMountPrefix(mount model.MountIdentity, suffixLen int) ([]byte, error) {
+	if err := model.ValidateMountIdentity(mount); err != nil {
 		return nil, err
 	}
 	out := make([]byte, 0, len(keyMagic)+1+encodedMountKeyBytes+suffixLen)
@@ -607,7 +608,7 @@ func prefixUpperBound(prefix []byte) []byte {
 	return nil
 }
 
-func decodeHeaderParts(key []byte) (MountKeyID, int, error) {
+func decodeHeaderParts(key []byte) (model.MountKeyID, int, error) {
 	mount, pos, err := decodeMountPrefix(key)
 	if err != nil {
 		return 0, 0, err
@@ -618,7 +619,7 @@ func decodeHeaderParts(key []byte) (MountKeyID, int, error) {
 	return mount, pos + encodedBucketBytes, nil
 }
 
-func decodeMountPrefix(key []byte) (MountKeyID, int, error) {
+func decodeMountPrefix(key []byte) (model.MountKeyID, int, error) {
 	if len(key) < len(keyMagic)+1+encodedMountKeyBytes {
 		return 0, 0, ErrInvalidKey
 	}
@@ -635,7 +636,7 @@ func decodeMountPrefix(key []byte) (MountKeyID, int, error) {
 	if len(key)-pos < encodedMountKeyBytes {
 		return 0, 0, ErrInvalidKey
 	}
-	mount := MountKeyID(binary.BigEndian.Uint64(key[pos : pos+encodedMountKeyBytes]))
+	mount := model.MountKeyID(binary.BigEndian.Uint64(key[pos : pos+encodedMountKeyBytes]))
 	if mount == 0 {
 		return 0, 0, ErrInvalidKey
 	}

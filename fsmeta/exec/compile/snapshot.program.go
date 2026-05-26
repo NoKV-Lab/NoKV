@@ -9,13 +9,14 @@ import (
 	"crypto/sha256"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type SnapshotSubtreeProgram struct {
 	Compiled CompiledOp
 }
 
-func CompileSnapshotSubtreeProgram(req fsmeta.SnapshotSubtreeRequest, mount fsmeta.MountIdentity) (SnapshotSubtreeProgram, error) {
+func CompileSnapshotSubtreeProgram(req model.SnapshotSubtreeRequest, mount model.MountIdentity) (SnapshotSubtreeProgram, error) {
 	plan, err := fsmeta.PlanSnapshotSubtree(req, mount)
 	if err != nil {
 		return SnapshotSubtreeProgram{}, err
@@ -25,9 +26,9 @@ func CompileSnapshotSubtreeProgram(req fsmeta.SnapshotSubtreeRequest, mount fsme
 		{Kind: PredicatePrefixScan, Key: plan.ReadPrefixes[0]},
 	}
 	effects := []WriteEffect(nil)
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.RootInode}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonDurabilityBarrier, DurabilityBarrier: true}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []model.InodeID{req.RootInode}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonDurabilityBarrier, DurabilityBarrier: true}
 	if !validateSnapshotSubtreeSemanticDelta(delta) {
-		return SnapshotSubtreeProgram{}, fsmeta.ErrInvalidRequest
+		return SnapshotSubtreeProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileSnapshotSubtreeCompiledOp(delta)
 	if err != nil {
@@ -37,7 +38,7 @@ func CompileSnapshotSubtreeProgram(req fsmeta.SnapshotSubtreeRequest, mount fsme
 }
 
 func validateSnapshotSubtreeSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationSnapshotSubtree {
+	if delta.Kind != model.OperationSnapshotSubtree {
 		return false
 	}
 	switch {
@@ -82,15 +83,15 @@ func validateSnapshotSubtreeSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileSnapshotSubtreeCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationSnapshotSubtree || len(delta.ReadPredicates) != 1 || len(delta.WriteEffects) != 0 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationSnapshotSubtree || len(delta.ReadPredicates) != 1 || len(delta.WriteEffects) != 0 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityNeedsPublishCheckpoint
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))

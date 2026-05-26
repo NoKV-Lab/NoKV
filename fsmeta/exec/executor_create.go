@@ -5,12 +5,14 @@ package exec
 
 import (
 	"context"
+
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
-func (e *Executor) tryVisibleCreate(ctx context.Context, program compile.CreateProgram, mount fsmeta.MountIdentity, req fsmeta.CreateRequest, dentryValue, inodeValue []byte) (bool, error) {
+func (e *Executor) tryVisibleCreate(ctx context.Context, program compile.CreateProgram, mount model.MountIdentity, req model.CreateRequest, dentryValue, inodeValue []byte) (bool, error) {
 	delta := program.Compiled.Delta
 	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
 		return false, nil
@@ -40,16 +42,16 @@ func (e *Executor) tryVisibleCreate(ctx context.Context, program compile.CreateP
 }
 
 // Create creates one dentry and its inode record in a single transaction.
-func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta.CreateResult, error) {
+func (e *Executor) Create(ctx context.Context, req model.CreateRequest) (model.CreateResult, error) {
 	if e.inodes == nil {
-		return fsmeta.CreateResult{}, errInodeAllocatorRequired
+		return model.CreateResult{}, errInodeAllocatorRequired
 	}
-	if _, err := fsmeta.EncodeInodeValue(req.Attrs.InodeRecord(fsmeta.RootInode)); err != nil {
-		return fsmeta.CreateResult{}, err
+	if _, err := fsmeta.EncodeInodeValue(req.Attrs.InodeRecord(model.RootInode)); err != nil {
+		return model.CreateResult{}, err
 	}
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return fsmeta.CreateResult{}, err
+		return model.CreateResult{}, err
 	}
 	mount := mountRecord.Identity()
 	// Allocate after cheap semantic validation and mount admission. Transaction
@@ -57,19 +59,19 @@ func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta
 	// ID gaps, but they cannot publish a different inode on retry.
 	inodeID, err := e.inodes.AllocateCreateInode(ctx, mount, req.Parent, req.Name)
 	if err != nil {
-		return fsmeta.CreateResult{}, err
+		return model.CreateResult{}, err
 	}
 	program, err := compile.CompileCreateProgram(req, mount, inodeID, compile.WithQuotaMode(e.visibleQuotaMode()))
 	if err != nil {
-		return fsmeta.CreateResult{}, err
+		return model.CreateResult{}, err
 	}
 	delta := program.Compiled.Delta
 	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
-		return fsmeta.CreateResult{}, err
+		return model.CreateResult{}, err
 	}
 	plan := delta.Plan
 	inode := req.Attrs.InodeRecord(inodeID)
-	dentry := fsmeta.DentryRecord{
+	dentry := model.DentryRecord{
 		Parent: req.Parent,
 		Name:   req.Name,
 		Inode:  inodeID,
@@ -90,19 +92,19 @@ func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta
 		var err error
 		quotaOK, err = e.visibleQuotaAllowsCommit(ctx, quotaChanges)
 		if err != nil {
-			return fsmeta.CreateResult{}, err
+			return model.CreateResult{}, err
 		}
 	}
 	if quotaOK {
 		if committed, err := e.tryVisibleCreate(ctx, program, mount, req, dentryValue, inodeValue); committed || err != nil {
 			if err != nil {
-				return fsmeta.CreateResult{}, err
+				return model.CreateResult{}, err
 			}
 			e.rememberVisibleCreate(mount, plan, inode)
 			e.forgetVisibleEmptyDirectory(mount, req.Parent)
 			e.invalidateNegative(plan.MutateKeys[1])
 			e.invalidateDirPages(req.Mount, req.Parent)
-			return fsmeta.CreateResult{Dentry: dentry, Inode: inode}, nil
+			return model.CreateResult{Dentry: dentry, Inode: inode}, nil
 		}
 	}
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
@@ -160,7 +162,7 @@ func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta
 		}
 		return e.mutateWithoutAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, all, startVersion, commitVersion)
 	}, delta.Authority); err != nil {
-		return fsmeta.CreateResult{}, err
+		return model.CreateResult{}, err
 	}
 	// The new dentry replaces a previously-missing key; drop any negative
 	// memo a prior Lookup may have planted, forget any visible-derived empty
@@ -170,5 +172,5 @@ func (e *Executor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta
 	e.forgetVisibleEmptyDirectory(mount, req.Parent)
 	e.invalidateNegative(plan.MutateKeys[1])
 	e.invalidateDirPages(req.Mount, req.Parent)
-	return fsmeta.CreateResult{Dentry: dentry, Inode: inode}, nil
+	return model.CreateResult{Dentry: dentry, Inode: inode}, nil
 }

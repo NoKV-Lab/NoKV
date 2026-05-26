@@ -7,11 +7,12 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestPlanBucketPlacementReturnsContinuousRanges(t *testing.T) {
-	ranges, err := PlanBucketPlacement([]MountIdentity{
+	ranges, err := PlanBucketPlacement([]model.MountIdentity{
 		{MountID: "default", MountKeyID: 1},
 		{MountID: "fsmeta-bench", MountKeyID: 2},
 	}, DefaultAffinityBucketCount)
@@ -29,7 +30,7 @@ func TestPlanBucketPlacementReturnsContinuousRanges(t *testing.T) {
 }
 
 func TestPlanBucketPlacementKeepsBucketKeysInsideBucketRange(t *testing.T) {
-	ranges, err := PlanBucketPlacement([]MountIdentity{testMount}, DefaultAffinityBucketCount)
+	ranges, err := PlanBucketPlacement([]model.MountIdentity{testMount}, DefaultAffinityBucketCount)
 	require.NoError(t, err)
 
 	var bucketRange PlacementRange
@@ -49,15 +50,15 @@ func TestPlanBucketPlacementKeepsBucketKeysInsideBucketRange(t *testing.T) {
 }
 
 func TestPlanBucketPlacementRejectsInvalidInput(t *testing.T) {
-	_, err := PlanBucketPlacement([]MountIdentity{testMount}, 0)
-	require.ErrorIs(t, err, ErrInvalidRequest)
+	_, err := PlanBucketPlacement([]model.MountIdentity{testMount}, 0)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 
-	_, err = PlanBucketPlacement([]MountIdentity{testMount, testMount}, DefaultAffinityBucketCount)
-	require.ErrorIs(t, err, ErrInvalidRequest)
+	_, err = PlanBucketPlacement([]model.MountIdentity{testMount, testMount}, DefaultAffinityBucketCount)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 }
 
 func TestBucketSplitBoundariesUseBucketEdges(t *testing.T) {
-	boundaries, err := BucketSplitBoundaries([]MountIdentity{testMount}, 4)
+	boundaries, err := BucketSplitBoundaries([]model.MountIdentity{testMount}, 4)
 	require.NoError(t, err)
 	require.Len(t, boundaries, 5)
 

@@ -8,408 +8,408 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestModelUnlinkKeepsSessionIndexesUntilSessionLifecycleRuns(t *testing.T) {
-	model := NewModel("vol")
-	require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "file",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpOpenWriteSession,
 		Mount:     "vol",
 		Inode:     10,
 		Session:   "writer-1",
-		ExpiresNs: model.NowUnixNs + int64(time.Minute),
+		ExpiresNs: state.NowUnixNs + int64(time.Minute),
 	}).Err)
 
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpUnlink,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "file",
 	}).Err)
 
-	require.NoError(t, model.CheckInvariants())
-	require.NotContains(t, model.inodes, fsmeta.InodeID(10))
-	require.Contains(t, model.sessions, sessionKey{inode: 10, session: "writer-1"})
-	require.Contains(t, model.owners, fsmeta.InodeID(10))
+	require.NoError(t, state.CheckInvariants())
+	require.NotContains(t, state.inodes, model.InodeID(10))
+	require.Contains(t, state.sessions, sessionKey{inode: 10, session: "writer-1"})
+	require.Contains(t, state.owners, model.InodeID(10))
 
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:    OpCloseSession,
 		Mount:   "vol",
 		Inode:   10,
 		Session: "writer-1",
 	}).Err)
-	require.NoError(t, model.CheckInvariants())
-	require.Empty(t, model.sessions)
-	require.Empty(t, model.owners)
+	require.NoError(t, state.CheckInvariants())
+	require.Empty(t, state.sessions)
+	require.Empty(t, state.owners)
 }
 
 func TestModelExpiresSessionsAfterTimeAdvance(t *testing.T) {
-	model := NewModel("vol")
-	require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "file",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpOpenWriteSession,
 		Mount:     "vol",
 		Inode:     10,
 		Session:   "writer-1",
-		ExpiresNs: model.NowUnixNs + int64(time.Second),
+		ExpiresNs: state.NowUnixNs + int64(time.Second),
 	}).Err)
 
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpAdvanceTime,
 		Mount:     "vol",
 		AdvanceNs: int64(2 * time.Second),
 	}).Err)
-	result := model.Apply(Operation{Kind: OpExpireSessions, Mount: "vol", Limit: 16})
+	result := state.Apply(Operation{Kind: OpExpireSessions, Mount: "vol", Limit: 16})
 
 	require.NoError(t, result.Err)
 	require.Equal(t, uint64(1), result.Expired)
-	require.Empty(t, model.sessions)
-	require.Empty(t, model.owners)
-	require.NoError(t, model.CheckInvariants())
+	require.Empty(t, state.sessions)
+	require.Empty(t, state.owners)
+	require.NoError(t, state.CheckInvariants())
 }
 
 func TestModelExpireStaleOwnerDoesNotRemoveReusedLiveSession(t *testing.T) {
-	model := NewModel("vol")
-	for _, inode := range []fsmeta.InodeID{10, 11} {
-		require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	for _, inode := range []model.InodeID{10, 11} {
+		require.NoError(t, state.Apply(Operation{
 			Kind:   OpCreate,
 			Mount:  "vol",
-			Parent: model.Root,
+			Parent: state.Root,
 			Name:   fmt.Sprintf("file-%d", inode),
 			Inode:  inode,
-			Type:   fsmeta.InodeTypeFile,
+			Type:   model.InodeTypeFile,
 			Mode:   0o600,
 		}).Err)
 	}
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpOpenWriteSession,
 		Mount:     "vol",
 		Inode:     10,
 		Session:   "writer-1",
-		ExpiresNs: model.NowUnixNs + int64(time.Second),
+		ExpiresNs: state.NowUnixNs + int64(time.Second),
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpAdvanceTime,
 		Mount:     "vol",
 		AdvanceNs: int64(2 * time.Second),
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpOpenWriteSession,
 		Mount:     "vol",
 		Inode:     11,
 		Session:   "writer-1",
-		ExpiresNs: model.NowUnixNs + int64(time.Minute),
+		ExpiresNs: state.NowUnixNs + int64(time.Minute),
 	}).Err)
 
-	result := model.Apply(Operation{Kind: OpExpireSessions, Mount: "vol", Limit: 16})
+	result := state.Apply(Operation{Kind: OpExpireSessions, Mount: "vol", Limit: 16})
 
 	require.NoError(t, result.Err)
 	require.Equal(t, uint64(1), result.Expired)
-	require.Equal(t, fsmeta.InodeID(11), model.sessions[sessionKey{inode: 11, session: "writer-1"}].Inode)
-	require.NotContains(t, model.owners, fsmeta.InodeID(10))
-	require.Contains(t, model.owners, fsmeta.InodeID(11))
-	require.NoError(t, model.CheckInvariants())
+	require.Equal(t, model.InodeID(11), state.sessions[sessionKey{inode: 11, session: "writer-1"}].Inode)
+	require.NotContains(t, state.owners, model.InodeID(10))
+	require.Contains(t, state.owners, model.InodeID(11))
+	require.NoError(t, state.CheckInvariants())
 }
 
 func TestModelOpenWithStaleOwnerDoesNotRemoveReusedLiveSession(t *testing.T) {
-	model := NewModel("vol")
-	for _, inode := range []fsmeta.InodeID{10, 11} {
-		require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	for _, inode := range []model.InodeID{10, 11} {
+		require.NoError(t, state.Apply(Operation{
 			Kind:   OpCreate,
 			Mount:  "vol",
-			Parent: model.Root,
+			Parent: state.Root,
 			Name:   fmt.Sprintf("file-%d", inode),
 			Inode:  inode,
-			Type:   fsmeta.InodeTypeFile,
+			Type:   model.InodeTypeFile,
 			Mode:   0o600,
 		}).Err)
 	}
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpOpenWriteSession,
 		Mount:     "vol",
 		Inode:     10,
 		Session:   "writer-1",
-		ExpiresNs: model.NowUnixNs + int64(time.Second),
+		ExpiresNs: state.NowUnixNs + int64(time.Second),
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpAdvanceTime,
 		Mount:     "vol",
 		AdvanceNs: int64(2 * time.Second),
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpOpenWriteSession,
 		Mount:     "vol",
 		Inode:     11,
 		Session:   "writer-1",
-		ExpiresNs: model.NowUnixNs + int64(time.Minute),
+		ExpiresNs: state.NowUnixNs + int64(time.Minute),
 	}).Err)
 
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:      OpOpenWriteSession,
 		Mount:     "vol",
 		Inode:     10,
 		Session:   "writer-2",
-		ExpiresNs: model.NowUnixNs + int64(time.Minute),
+		ExpiresNs: state.NowUnixNs + int64(time.Minute),
 	}).Err)
 
-	require.Equal(t, fsmeta.InodeID(11), model.sessions[sessionKey{inode: 11, session: "writer-1"}].Inode)
-	require.Equal(t, fsmeta.InodeID(10), model.sessions[sessionKey{inode: 10, session: "writer-2"}].Inode)
-	require.Equal(t, fsmeta.SessionID("writer-1"), model.owners[11].Session)
-	require.Equal(t, fsmeta.SessionID("writer-2"), model.owners[10].Session)
-	require.NoError(t, model.CheckInvariants())
+	require.Equal(t, model.InodeID(11), state.sessions[sessionKey{inode: 11, session: "writer-1"}].Inode)
+	require.Equal(t, model.InodeID(10), state.sessions[sessionKey{inode: 10, session: "writer-2"}].Inode)
+	require.Equal(t, model.SessionID("writer-1"), state.owners[11].Session)
+	require.Equal(t, model.SessionID("writer-2"), state.owners[10].Session)
+	require.NoError(t, state.CheckInvariants())
 }
 
 func TestModelLinkRenameUnlinkMaintainsLinkCounts(t *testing.T) {
-	model := NewModel("vol")
-	require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "file",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:       OpLink,
 		Mount:      "vol",
-		FromParent: model.Root,
+		FromParent: state.Root,
 		FromName:   "file",
-		ToParent:   model.Root,
+		ToParent:   state.Root,
 		ToName:     "alias",
 	}).Err)
-	require.Equal(t, uint32(2), model.inodes[10].LinkCount)
-	require.NoError(t, model.CheckInvariants())
+	require.Equal(t, uint32(2), state.inodes[10].LinkCount)
+	require.NoError(t, state.CheckInvariants())
 
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:       OpRenameSubtree,
 		Mount:      "vol",
-		FromParent: model.Root,
+		FromParent: state.Root,
 		FromName:   "alias",
-		ToParent:   model.Root,
+		ToParent:   state.Root,
 		ToName:     "moved",
 	}).Err)
-	require.Equal(t, uint32(2), model.inodes[10].LinkCount)
-	require.NotContains(t, model.dentries, dentryKey{parent: model.Root, name: "alias"})
-	require.Contains(t, model.dentries, dentryKey{parent: model.Root, name: "moved"})
-	require.NoError(t, model.CheckInvariants())
+	require.Equal(t, uint32(2), state.inodes[10].LinkCount)
+	require.NotContains(t, state.dentries, dentryKey{parent: state.Root, name: "alias"})
+	require.Contains(t, state.dentries, dentryKey{parent: state.Root, name: "moved"})
+	require.NoError(t, state.CheckInvariants())
 
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpUnlink,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "file",
 	}).Err)
-	require.Equal(t, uint32(1), model.inodes[10].LinkCount)
-	require.Contains(t, model.dentries, dentryKey{parent: model.Root, name: "moved"})
-	require.NoError(t, model.CheckInvariants())
+	require.Equal(t, uint32(1), state.inodes[10].LinkCount)
+	require.Contains(t, state.dentries, dentryKey{parent: state.Root, name: "moved"})
+	require.NoError(t, state.CheckInvariants())
 
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpUnlink,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "moved",
 	}).Err)
-	require.NotContains(t, model.inodes, fsmeta.InodeID(10))
-	require.NoError(t, model.CheckInvariants())
+	require.NotContains(t, state.inodes, model.InodeID(10))
+	require.NoError(t, state.CheckInvariants())
 }
 
 func TestModelRemoveReturnsDeletedEntryAndInode(t *testing.T) {
-	model := NewModel("vol")
-	require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "file",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
 
-	result := model.Apply(Operation{
+	result := state.Apply(Operation{
 		Kind:   OpRemove,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "file",
 	})
 
 	require.NoError(t, result.Err)
-	require.Equal(t, fsmeta.DentryRecord{Parent: model.Root, Name: "file", Inode: 10, Type: fsmeta.InodeTypeFile}, result.Remove.RemovedDentry)
-	require.Equal(t, fsmeta.InodeID(10), result.Remove.OldInode.Inode)
+	require.Equal(t, model.DentryRecord{Parent: state.Root, Name: "file", Inode: 10, Type: model.InodeTypeFile}, result.Remove.RemovedDentry)
+	require.Equal(t, model.InodeID(10), result.Remove.OldInode.Inode)
 	require.True(t, result.Remove.InodeDeleted)
-	require.NotContains(t, model.inodes, fsmeta.InodeID(10))
-	require.NoError(t, model.CheckInvariants())
+	require.NotContains(t, state.inodes, model.InodeID(10))
+	require.NoError(t, state.CheckInvariants())
 }
 
 func TestModelRenameReplaceMaintainsReplacedLinkCounts(t *testing.T) {
-	model := NewModel("vol")
-	require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "old",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:       OpLink,
 		Mount:      "vol",
-		FromParent: model.Root,
+		FromParent: state.Root,
 		FromName:   "old",
-		ToParent:   model.Root,
+		ToParent:   state.Root,
 		ToName:     "old-alias",
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "stage",
 		Inode:  11,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
 
-	result := model.Apply(Operation{
+	result := state.Apply(Operation{
 		Kind:       OpRenameReplace,
 		Mount:      "vol",
-		FromParent: model.Root,
+		FromParent: state.Root,
 		FromName:   "stage",
-		ToParent:   model.Root,
+		ToParent:   state.Root,
 		ToName:     "old",
 	})
 	require.NoError(t, result.Err)
 
 	require.True(t, result.RenameReplace.Replaced)
 	require.False(t, result.RenameReplace.OldInodeDeleted)
-	require.Equal(t, fsmeta.InodeID(10), result.RenameReplace.OldDentry.Inode)
+	require.Equal(t, model.InodeID(10), result.RenameReplace.OldDentry.Inode)
 	require.Equal(t, uint32(2), result.RenameReplace.OldInode.LinkCount)
-	require.Equal(t, fsmeta.InodeID(11), model.dentries[dentryKey{parent: model.Root, name: "old"}].Inode)
-	require.Equal(t, uint32(1), model.inodes[10].LinkCount)
-	require.Contains(t, model.dentries, dentryKey{parent: model.Root, name: "old-alias"})
-	require.NotContains(t, model.dentries, dentryKey{parent: model.Root, name: "stage"})
-	require.NoError(t, model.CheckInvariants())
+	require.Equal(t, model.InodeID(11), state.dentries[dentryKey{parent: state.Root, name: "old"}].Inode)
+	require.Equal(t, uint32(1), state.inodes[10].LinkCount)
+	require.Contains(t, state.dentries, dentryKey{parent: state.Root, name: "old-alias"})
+	require.NotContains(t, state.dentries, dentryKey{parent: state.Root, name: "stage"})
+	require.NoError(t, state.CheckInvariants())
 }
 
 func TestModelRenameReplaceDeletesSingleLinkReplacedInode(t *testing.T) {
-	model := NewModel("vol")
-	require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "old",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "stage",
 		Inode:  11,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
 
-	result := model.Apply(Operation{
+	result := state.Apply(Operation{
 		Kind:       OpRenameReplace,
 		Mount:      "vol",
-		FromParent: model.Root,
+		FromParent: state.Root,
 		FromName:   "stage",
-		ToParent:   model.Root,
+		ToParent:   state.Root,
 		ToName:     "old",
 	})
 	require.NoError(t, result.Err)
 
 	require.True(t, result.RenameReplace.Replaced)
 	require.True(t, result.RenameReplace.OldInodeDeleted)
-	require.Equal(t, fsmeta.InodeID(10), result.RenameReplace.OldDentry.Inode)
+	require.Equal(t, model.InodeID(10), result.RenameReplace.OldDentry.Inode)
 	require.Equal(t, uint32(1), result.RenameReplace.OldInode.LinkCount)
-	require.Equal(t, fsmeta.InodeID(11), model.dentries[dentryKey{parent: model.Root, name: "old"}].Inode)
-	require.NotContains(t, model.inodes, fsmeta.InodeID(10))
-	require.NotContains(t, model.dentries, dentryKey{parent: model.Root, name: "stage"})
-	require.NoError(t, model.CheckInvariants())
+	require.Equal(t, model.InodeID(11), state.dentries[dentryKey{parent: state.Root, name: "old"}].Inode)
+	require.NotContains(t, state.inodes, model.InodeID(10))
+	require.NotContains(t, state.dentries, dentryKey{parent: state.Root, name: "stage"})
+	require.NoError(t, state.CheckInvariants())
 }
 
 func TestModelSnapshotReadDirStaysStableAcrossNamespaceMutation(t *testing.T) {
-	model := NewModel("vol")
-	require.NoError(t, model.Apply(Operation{
+	state := NewModel("vol")
+	require.NoError(t, state.Apply(Operation{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: model.Root,
+		Parent: state.Root,
 		Name:   "alpha",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 		Mode:   0o600,
 	}).Err)
-	require.NoError(t, model.ApplySnapshot(Operation{
+	require.NoError(t, state.ApplySnapshot(Operation{
 		Kind:        OpSnapshotSubtree,
 		Mount:       "vol",
-		Parent:      model.Root,
+		Parent:      state.Root,
 		SnapshotRef: 0,
-	}, fsmeta.SnapshotSubtreeToken{
+	}, model.SnapshotSubtreeToken{
 		Mount:       "vol",
-		RootInode:   model.Root,
+		RootInode:   state.Root,
 		ReadVersion: 100,
 	}).Err)
 
-	require.NoError(t, model.Apply(Operation{
+	require.NoError(t, state.Apply(Operation{
 		Kind:       OpRenameSubtree,
 		Mount:      "vol",
-		FromParent: model.Root,
+		FromParent: state.Root,
 		FromName:   "alpha",
-		ToParent:   model.Root,
+		ToParent:   state.Root,
 		ToName:     "beta",
 	}).Err)
 
-	snapshot := model.Apply(Operation{
+	snapshot := state.Apply(Operation{
 		Kind:        OpReadDirPlus,
 		Mount:       "vol",
-		Parent:      model.Root,
+		Parent:      state.Root,
 		Limit:       10,
 		SnapshotRef: 0,
 	})
 	require.NoError(t, snapshot.Err)
 	requireDentryNames(t, snapshot.Pairs, "alpha")
 
-	latest := model.Apply(Operation{
+	latest := state.Apply(Operation{
 		Kind:        OpReadDirPlus,
 		Mount:       "vol",
-		Parent:      model.Root,
+		Parent:      state.Root,
 		Limit:       10,
 		SnapshotRef: -1,
 	})
 	require.NoError(t, latest.Err)
 	requireDentryNames(t, latest.Pairs, "beta")
-	require.NoError(t, model.CheckInvariants())
+	require.NoError(t, state.CheckInvariants())
 }
 
 func TestEquivalentErrorMatchesWrappedSentinel(t *testing.T) {
-	require.True(t, EquivalentError(fmt.Errorf("wrapped: %w", fsmeta.ErrNotFound), fsmeta.ErrNotFound))
-	require.False(t, EquivalentError(fmt.Errorf("wrapped: %w", fsmeta.ErrNotFound), fsmeta.ErrExists))
+	require.True(t, EquivalentError(fmt.Errorf("wrapped: %w", model.ErrNotFound), model.ErrNotFound))
+	require.False(t, EquivalentError(fmt.Errorf("wrapped: %w", model.ErrNotFound), model.ErrExists))
 }
 
-func requireDentryNames(t *testing.T, pairs []fsmeta.DentryAttrPair, names ...string) {
+func requireDentryNames(t *testing.T, pairs []model.DentryAttrPair, names ...string) {
 	t.Helper()
 	got := make([]string, 0, len(pairs))
 	for _, pair := range pairs {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/feichai0017/NoKV/config"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	metaregion "github.com/feichai0017/NoKV/meta/region"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
@@ -187,11 +188,11 @@ func effectiveRegions(cfg *config.File) ([]config.Region, error) {
 
 func expandFSMetaBootstrapRegions(cfg *config.File) ([]config.Region, error) {
 	layout := cfg.FSMetaRegionBootstrap
-	mounts := make([]fsmeta.MountIdentity, 0, len(layout.Mounts))
+	mounts := make([]model.MountIdentity, 0, len(layout.Mounts))
 	for _, mount := range layout.Mounts {
-		mounts = append(mounts, fsmeta.MountIdentity{
-			MountID:    fsmeta.MountID(mount.MountID),
-			MountKeyID: fsmeta.MountKeyID(mount.MountKeyID),
+		mounts = append(mounts, model.MountIdentity{
+			MountID:    model.MountID(mount.MountID),
+			MountKeyID: model.MountKeyID(mount.MountKeyID),
 		})
 	}
 	ranges, err := fsmeta.PlanBucketPlacement(mounts, layout.BucketCount)

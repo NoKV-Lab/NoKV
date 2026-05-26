@@ -9,18 +9,19 @@ import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSplitReplayPlanByCompilerBudgetRequiresStoredSegmentPlan(t *testing.T) {
-	key, err := fsmeta.EncodeInodeKey(fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}, 8)
+	key, err := fsmeta.EncodeInodeKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, 8)
 	require.NoError(t, err)
 
 	_, err = splitReplayPlanByCompilerBudget(fsperas.ReplayPlan{
 		EpochID: 1,
 		Operations: []fsperas.ReplayOperation{{
 			OpID:      fsperas.OperationID{ClientID: "client", Seq: 1},
-			Kind:      fsmeta.OperationUpdateInode,
+			Kind:      model.OperationUpdateInode,
 			Mutations: []fsperas.ReplayMutation{{Key: key, Value: []byte("inode")}},
 		}},
 	}, false, compile.SegmentBudget{MaxMutations: 16}, 0)
@@ -28,7 +29,7 @@ func TestSplitReplayPlanByCompilerBudgetRequiresStoredSegmentPlan(t *testing.T) 
 }
 
 func TestSplitReplayPlanByCompilerBudgetUsesStoredSegmentPlan(t *testing.T) {
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	leftKey := fsmetaKeyForBucket(t, mount, 1)
 	rightKey := fsmetaKeyForBucket(t, mount, 2)
 	plan := compile.SegmentPlan{
@@ -58,7 +59,7 @@ func TestSplitReplayPlanByCompilerBudgetUsesStoredSegmentPlan(t *testing.T) {
 }
 
 func TestSplitReplayPlanByCompilerBudgetCutsByCatalogRouteBudget(t *testing.T) {
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	leftKey := fsmetaKeyForBucket(t, mount, 1)
 	rightKey := fsmetaKeyForBucket(t, mount, 2)
 	plan := compile.SegmentPlan{
@@ -89,7 +90,7 @@ func TestSplitReplayPlanByCompilerBudgetCutsByCatalogRouteBudget(t *testing.T) {
 }
 
 func TestSplitReplayPlanByCompilerBudgetCutsByPayload(t *testing.T) {
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	key := fsmetaKeyForBucket(t, mount, 1)
 	plan := compile.SegmentPlan{
 		MergeKey: compile.SegmentMergeKey{
@@ -119,7 +120,7 @@ func TestSplitReplayPlanByCompilerBudgetCutsByPayload(t *testing.T) {
 }
 
 func TestSplitReplayPlanByCompilerBudgetRejectsNonMaterializablePlan(t *testing.T) {
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	key := fsmetaKeyForBucket(t, mount, 1)
 	plan := compile.SegmentPlan{
 		MergeKey: compile.SegmentMergeKey{
@@ -145,7 +146,7 @@ func TestSplitReplayPlanByCompilerBudgetRejectsNonMaterializablePlan(t *testing.
 func replayOperationWithSegmentPlan(client string, seq uint64, key []byte, segment compile.SegmentPlan) fsperas.ReplayOperation {
 	return fsperas.ReplayOperation{
 		OpID:       fsperas.OperationID{ClientID: client, Seq: seq},
-		Kind:       fsmeta.OperationUpdateInode,
+		Kind:       model.OperationUpdateInode,
 		Segment:    segment,
 		Durability: compile.DurabilityVisibleOnly,
 		Atomicity: compile.AtomicityGroup{
@@ -156,9 +157,9 @@ func replayOperationWithSegmentPlan(client string, seq uint64, key []byte, segme
 	}
 }
 
-func fsmetaKeyForBucket(t *testing.T, mount fsmeta.MountIdentity, bucket fsmeta.AffinityBucket) []byte {
+func fsmetaKeyForBucket(t *testing.T, mount model.MountIdentity, bucket fsmeta.AffinityBucket) []byte {
 	t.Helper()
-	for inode := fsmeta.InodeID(2); inode < 100_000; inode++ {
+	for inode := model.InodeID(2); inode < 100_000; inode++ {
 		if fsmeta.BucketForInodeID(inode) != bucket {
 			continue
 		}

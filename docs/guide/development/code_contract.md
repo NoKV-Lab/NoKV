@@ -52,7 +52,8 @@ Package boundaries follow ownership of truth, not convenience.
 | `raftstore/` | Region Raft execution and data-plane apply. | Interpret fsmeta namespace semantics. |
 | `meta/root/` | Rooted truth for authority, topology, grants, seals, and lifecycle facts. | Import coordinator service/client packages. |
 | `coordinator/` | Rebuildable control-plane view, routing, and service orchestration. | Become the source of truth for rooted facts. |
-| `fsmeta/` | Metadata API, key/value encoding, and domain errors. | Import runtime-specific packages from the domain model. |
+| `fsmeta/model/` | Storage-engine-neutral namespace model: inode/dentry records, operation request/result shapes, and model validation. | Import key/value layout, protobuf, raftstore, coordinator, root, Peras, or concrete backend packages. |
+| `fsmeta/` | Key/value encoding, layout planning, watch-key translation, placement policy, and ordered-storage glue. | Re-own storage-engine-neutral model types or add forwarding aliases for `fsmeta/model`. |
 | `fsmeta/exec/` | Semantic execution, compiler, and holder logic. | Import `raftstore`, `coordinator`, or `meta/root`. |
 | `fsmeta/runtime/` | Runtime adapters that bind fsmeta execution to storage backends. | Reinterpret compiler semantics without going through the compiler contract. |
 | `cmd/` | Binary assembly, flags, env, and config wiring. | Contain core protocol or storage logic. |
@@ -84,7 +85,10 @@ The current responsibility map is:
   and internal install commands.
 - `meta/root/*`: rooted truth for cluster and metadata authority facts.
 - `coordinator/*`: rebuildable serving layer over root facts.
-- `fsmeta/*`: namespace API, key layout, values, and domain errors.
+- `fsmeta/model/*`: storage-engine-neutral inode/dentry/session/quota/snapshot
+  model objects, operation request/result types, and model validation.
+- `fsmeta/*`: namespace key layout, values, placement planning,
+  watch-key translation, and ordered-storage glue.
 - `fsmeta/exec/*`: semantic compiler, executor, and runtime-neutral holder
   logic.
 - `fsmeta/runtime/*`: concrete runtime bindings from fsmeta execution to

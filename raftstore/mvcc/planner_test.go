@@ -11,6 +11,7 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	local "github.com/feichai0017/NoKV/local"
 	rootstate "github.com/feichai0017/NoKV/meta/root/state"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
@@ -207,9 +208,9 @@ func TestMVCCGCPlannerHonorsSnapshotRetentionAndTxnFloor(t *testing.T) {
 	})
 	defer planner.Close()
 
-	volKey, err := fsmeta.EncodeInodeKey(fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}, 10)
+	volKey, err := fsmeta.EncodeInodeKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, 10)
 	require.NoError(t, err)
-	otherKey, err := fsmeta.EncodeInodeKey(fsmeta.MountIdentity{MountID: "other", MountKeyID: 2}, 10)
+	otherKey, err := fsmeta.EncodeInodeKey(model.MountIdentity{MountID: "other", MountKeyID: 2}, 10)
 	require.NoError(t, err)
 	for _, key := range [][]byte{volKey, otherKey} {
 		applyMVCCGCPlannerWrite(t, db, key, 150, 140)

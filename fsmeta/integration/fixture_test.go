@@ -13,6 +13,7 @@ import (
 	"github.com/feichai0017/NoKV/coordinator/storecontrol"
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetaraftstore "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
 	metaregion "github.com/feichai0017/NoKV/meta/region"
@@ -38,7 +39,7 @@ func openRealClusterExecutor(t *testing.T, ctx context.Context) *fsmetaexec.Exec
 type realClusterRuntime struct {
 	executor      *fsmetaexec.Executor
 	node          *testcluster.Node
-	mountIdentity fsmeta.MountIdentity
+	mountIdentity model.MountIdentity
 }
 
 func openRealClusterRuntime(t *testing.T, ctx context.Context) *realClusterRuntime {
@@ -94,7 +95,7 @@ func openRealClusterRuntimeWithOptions(t *testing.T, ctx context.Context, opts .
 
 	runner, err := fsmetaraftstore.NewRunner(kv, coordRPC)
 	require.NoError(t, err)
-	seedRootInode(t, ctx, runner, fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1})
+	seedRootInode(t, ctx, runner, model.MountIdentity{MountID: "vol", MountKeyID: 1})
 	inodes, err := fsmetaraftstore.NewShardAffineInodeAllocator(coordRPC, 4)
 	require.NoError(t, err)
 	executorOpts := []fsmetaexec.Option{
@@ -107,7 +108,7 @@ func openRealClusterRuntimeWithOptions(t *testing.T, ctx context.Context, opts .
 	return &realClusterRuntime{
 		executor:      executor,
 		node:          node,
-		mountIdentity: fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1},
+		mountIdentity: model.MountIdentity{MountID: "vol", MountKeyID: 1},
 	}
 }
 
@@ -153,7 +154,7 @@ func openSplitRealClusterExecutorWithOptions(t *testing.T, ctx context.Context, 
 	testcluster.WaitForLeaderPeer(t, ctx, node.Addr(), parentRegionID, parentPeerID)
 	testcluster.WaitForSchedulerMode(t, node, storecontrol.ModeHealthy, false)
 
-	splitKey, err := fsmeta.EncodeDentryKey(fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}, fsmeta.RootInode, "m")
+	splitKey, err := fsmeta.EncodeDentryKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode, "m")
 	require.NoError(t, err)
 	childMeta := localmeta.RegionMeta{
 		ID:       childRegionID,
@@ -197,7 +198,7 @@ func openSplitRealClusterExecutorWithOptions(t *testing.T, ctx context.Context, 
 
 	runner, err := fsmetaraftstore.NewRunner(kv, coordRPC)
 	require.NoError(t, err)
-	seedRootInode(t, ctx, runner, fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1})
+	seedRootInode(t, ctx, runner, model.MountIdentity{MountID: "vol", MountKeyID: 1})
 	inodes, err := fsmetaraftstore.NewShardAffineInodeAllocator(coordRPC, 4)
 	require.NoError(t, err)
 	executorOpts := []fsmetaexec.Option{
@@ -214,36 +215,36 @@ type testMountResolver struct {
 	coord *coordclient.GRPCClient
 }
 
-func (r testMountResolver) ResolveMount(ctx context.Context, mount fsmeta.MountID) (fsmetaexec.MountAdmission, error) {
+func (r testMountResolver) ResolveMount(ctx context.Context, mount model.MountID) (fsmetaexec.MountAdmission, error) {
 	resp, err := r.coord.GetMount(ctx, &coordpb.GetMountRequest{MountId: string(mount)})
 	if err != nil {
 		return fsmetaexec.MountAdmission{}, err
 	}
 	if resp == nil || resp.GetNotFound() || resp.GetMount() == nil {
-		return fsmetaexec.MountAdmission{}, fsmeta.ErrMountNotRegistered
+		return fsmetaexec.MountAdmission{}, model.ErrMountNotRegistered
 	}
 	info := resp.GetMount()
 	return fsmetaexec.MountAdmission{
-		MountID:       fsmeta.MountID(info.GetMountId()),
-		MountKeyID:    fsmeta.MountKeyID(info.GetMountKeyId()),
-		RootInode:     fsmeta.InodeID(info.GetRootInode()),
+		MountID:       model.MountID(info.GetMountId()),
+		MountKeyID:    model.MountKeyID(info.GetMountKeyId()),
+		RootInode:     model.InodeID(info.GetRootInode()),
 		SchemaVersion: info.GetSchemaVersion(),
 		Retired:       info.GetState() == coordpb.MountState_MOUNT_STATE_RETIRED,
 	}, nil
 }
 
-func registerMount(t *testing.T, ctx context.Context, coord *coordclient.GRPCClient, mount fsmeta.MountID) {
+func registerMount(t *testing.T, ctx context.Context, coord *coordclient.GRPCClient, mount model.MountID) {
 	t.Helper()
 	resp, err := coord.PublishRootEvent(ctx, &coordpb.PublishRootEventRequest{
-		Event: metawire.RootEventToProto(rootevent.MountRegistered(string(mount), 1, uint64(fsmeta.RootInode), 1)),
+		Event: metawire.RootEventToProto(rootevent.MountRegistered(string(mount), 1, uint64(model.RootInode), 1)),
 	})
 	require.NoError(t, err)
 	require.True(t, resp.GetAccepted())
 }
 
-func seedRootInode(t *testing.T, ctx context.Context, runner fsmetaexec.TxnRunner, mount fsmeta.MountIdentity) {
+func seedRootInode(t *testing.T, ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity) {
 	t.Helper()
-	key, err := fsmeta.EncodeInodeKey(mount, fsmeta.RootInode)
+	key, err := fsmeta.EncodeInodeKey(mount, model.RootInode)
 	require.NoError(t, err)
 	readVersion, err := runner.ReserveTimestamp(ctx, 1)
 	require.NoError(t, err)
@@ -253,9 +254,9 @@ func seedRootInode(t *testing.T, ctx context.Context, runner fsmetaexec.TxnRunne
 		return
 	}
 	now := time.Now().UnixNano()
-	value, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
-		Inode:         fsmeta.RootInode,
-		Type:          fsmeta.InodeTypeDirectory,
+	value, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+		Inode:         model.RootInode,
+		Type:          model.InodeTypeDirectory,
 		Mode:          0755,
 		LinkCount:     1,
 		CreatedUnixNs: now,

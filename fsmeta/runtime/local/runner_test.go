@@ -12,7 +12,7 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/kv"
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
@@ -474,6 +474,6 @@ func testDBOptions(dir string, shards int) *localdb.Options {
 	return opts
 }
 
-func testMount() fsmeta.MountIdentity {
-	return fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+func testMount() model.MountIdentity {
+	return model.MountIdentity{MountID: "vol", MountKeyID: 1}
 }

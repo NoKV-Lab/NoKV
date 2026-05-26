@@ -10,6 +10,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -177,7 +178,7 @@ func (e *Executor) newVisibleReadView(ctx context.Context) *visibleReadView {
 
 func (v *visibleReadView) get(key []byte) ([]byte, bool, error) {
 	if v == nil || v.executor == nil {
-		return nil, false, fsmeta.ErrInvalidRequest
+		return nil, false, model.ErrInvalidRequest
 	}
 	if value, deleted, ok := v.executor.visibleOverlayGet(key); ok {
 		v.observedVisible = true
@@ -293,52 +294,52 @@ func (v *visibleReadView) predicateEvidenceForDelta(delta compile.SemanticDelta)
 	}
 }
 
-func (v *visibleReadView) readDentry(key []byte) (fsmeta.DentryRecord, error) {
+func (v *visibleReadView) readDentry(key []byte) (model.DentryRecord, error) {
 	value, ok, err := v.get(key)
 	if err != nil {
-		return fsmeta.DentryRecord{}, err
+		return model.DentryRecord{}, err
 	}
 	if !ok {
-		return fsmeta.DentryRecord{}, fsmeta.ErrNotFound
+		return model.DentryRecord{}, model.ErrNotFound
 	}
 	return fsmeta.DecodeDentryValue(value)
 }
 
-func (v *visibleReadView) readInode(mount fsmeta.MountIdentity, inodeID fsmeta.InodeID) (fsmeta.InodeRecord, bool, error) {
+func (v *visibleReadView) readInode(mount model.MountIdentity, inodeID model.InodeID) (model.InodeRecord, bool, error) {
 	program, err := compile.CompileGetAttrReadProgram(mount, inodeID)
 	if err != nil {
-		return fsmeta.InodeRecord{}, false, err
+		return model.InodeRecord{}, false, err
 	}
 	value, ok, err := v.get(program.Key)
 	if err != nil || !ok {
-		return fsmeta.InodeRecord{}, ok, err
+		return model.InodeRecord{}, ok, err
 	}
 	inode, err := fsmeta.DecodeInodeValue(value)
 	if err != nil {
-		return fsmeta.InodeRecord{}, false, err
+		return model.InodeRecord{}, false, err
 	}
 	return inode, true, nil
 }
 
-func (v *visibleReadView) readSession(mount fsmeta.MountIdentity, key []byte) (fsmeta.SessionRecord, bool, error) {
+func (v *visibleReadView) readSession(mount model.MountIdentity, key []byte) (model.SessionRecord, bool, error) {
 	parts, ok := fsmeta.InspectKey(key)
 	if !ok || parts.Kind != fsmeta.KeyKindSession {
-		return fsmeta.SessionRecord{}, false, fsmeta.ErrInvalidKey
+		return model.SessionRecord{}, false, fsmeta.ErrInvalidKey
 	}
 	if parts.MountKeyID != mount.MountKeyID {
-		return fsmeta.SessionRecord{}, false, fsmeta.ErrInvalidRequest
+		return model.SessionRecord{}, false, model.ErrInvalidRequest
 	}
 	program, err := compile.CompileReadSessionKeyProgram(mount, key)
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	value, ok, err := v.get(program.Key)
 	if err != nil || !ok {
-		return fsmeta.SessionRecord{}, ok, err
+		return model.SessionRecord{}, ok, err
 	}
 	session, err := fsmeta.DecodeSessionValue(value)
 	if err != nil {
-		return fsmeta.SessionRecord{}, false, err
+		return model.SessionRecord{}, false, err
 	}
 	return session, true, nil
 }

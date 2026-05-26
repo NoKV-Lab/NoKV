@@ -10,6 +10,7 @@ import (
 	"io"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 	"google.golang.org/grpc"
 )
@@ -17,27 +18,27 @@ import (
 // Executor is the fsmeta operation surface exported by the gRPC service.
 // fsmeta/exec.Executor satisfies this interface.
 type Executor interface {
-	Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta.CreateResult, error)
-	UpdateInode(ctx context.Context, req fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error)
-	Lookup(ctx context.Context, req fsmeta.LookupRequest) (fsmeta.DentryRecord, error)
-	LookupPlus(ctx context.Context, req fsmeta.LookupRequest) (fsmeta.DentryAttrPair, error)
-	ReadDir(ctx context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryRecord, error)
-	ReadDirPlus(ctx context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
-	GetReadVersion(ctx context.Context, req fsmeta.ReadVersionRequest) (uint64, error)
-	SnapshotSubtree(ctx context.Context, req fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error)
-	ResolveSnapshotSubtreeToken(ctx context.Context, token fsmeta.SnapshotSubtreeToken) (fsmeta.SnapshotSubtreeToken, error)
-	GetQuotaUsage(ctx context.Context, req fsmeta.QuotaUsageRequest) (fsmeta.UsageRecord, error)
-	Rename(ctx context.Context, req fsmeta.RenameRequest) error
-	RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error)
-	RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error
-	Link(ctx context.Context, req fsmeta.LinkRequest) error
-	Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
-	Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error)
-	RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirectoryRequest) error
-	OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
-	HeartbeatWriteSession(ctx context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
-	CloseWriteSession(ctx context.Context, req fsmeta.CloseWriteSessionRequest) error
-	ExpireWriteSessions(ctx context.Context, req fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error)
+	Create(ctx context.Context, req model.CreateRequest) (model.CreateResult, error)
+	UpdateInode(ctx context.Context, req model.UpdateInodeRequest) (model.InodeRecord, error)
+	Lookup(ctx context.Context, req model.LookupRequest) (model.DentryRecord, error)
+	LookupPlus(ctx context.Context, req model.LookupRequest) (model.DentryAttrPair, error)
+	ReadDir(ctx context.Context, req model.ReadDirRequest) ([]model.DentryRecord, error)
+	ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error)
+	GetReadVersion(ctx context.Context, req model.ReadVersionRequest) (uint64, error)
+	SnapshotSubtree(ctx context.Context, req model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error)
+	ResolveSnapshotSubtreeToken(ctx context.Context, token model.SnapshotSubtreeToken) (model.SnapshotSubtreeToken, error)
+	GetQuotaUsage(ctx context.Context, req model.QuotaUsageRequest) (model.UsageRecord, error)
+	Rename(ctx context.Context, req model.RenameRequest) error
+	RenameReplace(ctx context.Context, req model.RenameReplaceRequest) (model.RenameReplaceResult, error)
+	RenameSubtree(ctx context.Context, req model.RenameSubtreeRequest) error
+	Link(ctx context.Context, req model.LinkRequest) error
+	Unlink(ctx context.Context, req model.UnlinkRequest) error
+	Remove(ctx context.Context, req model.RemoveRequest) (model.RemoveResult, error)
+	RemoveDirectory(ctx context.Context, req model.RemoveDirectoryRequest) error
+	OpenWriteSession(ctx context.Context, req model.OpenWriteSessionRequest) (model.SessionRecord, error)
+	HeartbeatWriteSession(ctx context.Context, req model.HeartbeatWriteSessionRequest) (model.SessionRecord, error)
+	CloseWriteSession(ctx context.Context, req model.CloseWriteSessionRequest) error
+	ExpireWriteSessions(ctx context.Context, req model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error)
 }
 
 type visibleSnapshotRetirer interface {

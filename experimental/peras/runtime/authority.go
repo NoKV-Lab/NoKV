@@ -11,6 +11,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 )
@@ -220,9 +221,9 @@ func grantCoversKey(grant rootproto.VisibleAuthorityGrant, parts fsmeta.KeyParts
 	case fsmeta.KeyKindMount:
 		return true
 	case fsmeta.KeyKindDentry:
-		return grantCoversInodes(grant.Scope.Parents, []fsmeta.InodeID{parts.Parent}, false)
+		return grantCoversInodes(grant.Scope.Parents, []model.InodeID{parts.Parent}, false)
 	case fsmeta.KeyKindInode, fsmeta.KeyKindChunk, fsmeta.KeyKindSession:
-		return grantCoversInodes(grant.Scope.Inodes, []fsmeta.InodeID{parts.Inode}, false)
+		return grantCoversInodes(grant.Scope.Inodes, []model.InodeID{parts.Inode}, false)
 	case fsmeta.KeyKindUsage:
 		if len(grant.Scope.Parents) == 0 && len(grant.Scope.Inodes) == 0 {
 			return true
@@ -235,7 +236,7 @@ func grantCoversKey(grant rootproto.VisibleAuthorityGrant, parts fsmeta.KeyParts
 	}
 }
 
-func grantCoversInodes(grant []uint64, requested []fsmeta.InodeID, emptyRequestCovered bool) bool {
+func grantCoversInodes(grant []uint64, requested []model.InodeID, emptyRequestCovered bool) bool {
 	if len(grant) == 0 {
 		return true
 	}
@@ -293,8 +294,8 @@ func ScopeFromSeal(seal rootproto.VisibleAuthoritySeal) compile.AuthorityScope {
 
 func scopeFromRootAuthority(rootScope rootproto.VisibleAuthorityScope) compile.AuthorityScope {
 	scope := compile.AuthorityScope{
-		Mount:      fsmeta.MountID(rootScope.MountID),
-		MountKeyID: fsmeta.MountKeyID(rootScope.MountKeyID),
+		Mount:      model.MountID(rootScope.MountID),
+		MountKeyID: model.MountKeyID(rootScope.MountKeyID),
 		Parents:    fsmetaInodesFromRoot(rootScope.Parents),
 		Inodes:     fsmetaInodesFromRoot(rootScope.Inodes),
 	}
@@ -319,7 +320,7 @@ func perasBucketsFromDelta(buckets []fsmeta.AffinityBucket) []uint16 {
 	return out
 }
 
-func perasInodesFromDelta(inodes []fsmeta.InodeID) []uint64 {
+func perasInodesFromDelta(inodes []model.InodeID) []uint64 {
 	out := make([]uint64, len(inodes))
 	for i, inode := range inodes {
 		out[i] = uint64(inode)
@@ -327,10 +328,10 @@ func perasInodesFromDelta(inodes []fsmeta.InodeID) []uint64 {
 	return out
 }
 
-func fsmetaInodesFromRoot(inodes []uint64) []fsmeta.InodeID {
-	out := make([]fsmeta.InodeID, len(inodes))
+func fsmetaInodesFromRoot(inodes []uint64) []model.InodeID {
+	out := make([]model.InodeID, len(inodes))
 	for i, inode := range inodes {
-		out[i] = fsmeta.InodeID(inode)
+		out[i] = model.InodeID(inode)
 	}
 	return out
 }

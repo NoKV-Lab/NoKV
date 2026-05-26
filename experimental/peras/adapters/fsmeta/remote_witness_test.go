@@ -13,6 +13,7 @@ import (
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
 	fsmetamodel "github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -59,11 +60,11 @@ func (s *remoteSegmentWitnessStub) ProbeSegment(_ context.Context, ref fsperas.W
 
 func TestRemoteSegmentWitnessSingleRecordBatchRoundTrip(t *testing.T) {
 	scope := compile.AuthorityScope{
-		Mount:      fsmetamodel.MountID("m1"),
+		Mount:      model.MountID("m1"),
 		MountKeyID: 8,
 		Buckets:    []fsmetamodel.AffinityBucket{2},
-		Parents:    []fsmetamodel.InodeID{100},
-		Inodes:     []fsmetamodel.InodeID{200},
+		Parents:    []model.InodeID{100},
+		Inodes:     []model.InodeID{200},
 	}
 	record := remotePerasSegmentRecord()
 
@@ -84,11 +85,11 @@ func TestRemoteSegmentWitnessSingleRecordBatchRoundTrip(t *testing.T) {
 
 func TestRemoteSegmentWitnessBatchRoundTrip(t *testing.T) {
 	scope := compile.AuthorityScope{
-		Mount:      fsmetamodel.MountID("m1"),
+		Mount:      model.MountID("m1"),
 		MountKeyID: 8,
 		Buckets:    []fsmetamodel.AffinityBucket{2},
-		Parents:    []fsmetamodel.InodeID{100},
-		Inodes:     []fsmetamodel.InodeID{200},
+		Parents:    []model.InodeID{100},
+		Inodes:     []model.InodeID{200},
 	}
 	first := remotePerasSegmentRecordWithRoot(5)
 	second := remotePerasSegmentRecordWithRoot(7)
@@ -149,11 +150,11 @@ func TestRemoteProbeSegmentWitnessReadsPages(t *testing.T) {
 
 func BenchmarkRemoteSegmentWitnessAppendSegmentsSingleRecord(b *testing.B) {
 	scope := compile.AuthorityScope{
-		Mount:      fsmetamodel.MountID("m1"),
+		Mount:      model.MountID("m1"),
 		MountKeyID: 8,
 		Buckets:    []fsmetamodel.AffinityBucket{2},
-		Parents:    []fsmetamodel.InodeID{100},
-		Inodes:     []fsmetamodel.InodeID{200},
+		Parents:    []model.InodeID{100},
+		Inodes:     []model.InodeID{200},
 	}
 	record := remotePerasSegmentRecord()
 	stub := &remoteSegmentWitnessStub{}

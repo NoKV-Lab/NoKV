@@ -4,8 +4,8 @@
 package peras
 
 import (
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -17,7 +17,7 @@ type ReplayMutation struct {
 
 type ReplayOperation struct {
 	OpID                 OperationID
-	Kind                 fsmeta.OperationKind
+	Kind                 model.OperationKind
 	DescriptorDigest     [32]byte
 	PredicateProofDigest [32]byte
 	ExecutionPlanDigest  [32]byte

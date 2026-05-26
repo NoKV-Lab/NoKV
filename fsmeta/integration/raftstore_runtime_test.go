@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -19,57 +19,57 @@ func TestRaftstoreRuntimeExecutorContractOnRealCluster(t *testing.T) {
 
 	executor := openRealClusterExecutor(t, ctx)
 
-	req := fsmeta.CreateRequest{
+	req := model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "checkpoint-0001",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 4096, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 4096, Mode: 0o644},
 	}
 	created, err := executor.Create(ctx, req)
 	require.NoError(t, err)
 
-	record, err := executor.Lookup(ctx, fsmeta.LookupRequest{
+	record, err := executor.Lookup(ctx, model.LookupRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Name:   req.Name,
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryRecord{
+	require.Equal(t, model.DentryRecord{
 		Parent: req.Parent,
 		Name:   req.Name,
 		Inode:  created.Inode.Inode,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}, record)
 
-	entries, err := executor.ReadDir(ctx, fsmeta.ReadDirRequest{
+	entries, err := executor.ReadDir(ctx, model.ReadDirRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Limit:  8,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryRecord{{
+	require.Equal(t, []model.DentryRecord{{
 		Parent: req.Parent,
 		Name:   req.Name,
 		Inode:  created.Inode.Inode,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}}, entries)
 
-	pairs, err := executor.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	pairs, err := executor.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Limit:  8,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{{
-		Dentry: fsmeta.DentryRecord{
+	require.Equal(t, []model.DentryAttrPair{{
+		Dentry: model.DentryRecord{
 			Parent: req.Parent,
 			Name:   req.Name,
 			Inode:  created.Inode.Inode,
-			Type:   fsmeta.InodeTypeFile,
+			Type:   model.InodeTypeFile,
 		},
-		Inode: fsmeta.InodeRecord{
+		Inode: model.InodeRecord{
 			Inode:     created.Inode.Inode,
-			Type:      fsmeta.InodeTypeFile,
+			Type:      model.InodeTypeFile,
 			Size:      4096,
 			Mode:      0o644,
 			LinkCount: 1,
@@ -77,7 +77,7 @@ func TestRaftstoreRuntimeExecutorContractOnRealCluster(t *testing.T) {
 	}}, pairs)
 
 	_, err = executor.Create(ctx, req)
-	require.True(t, errors.Is(err, fsmeta.ErrExists), "duplicate create error = %v", err)
+	require.True(t, errors.Is(err, model.ErrExists), "duplicate create error = %v", err)
 }
 
 func TestRaftstoreRuntimeRenameAcrossRegionsOnRealCluster(t *testing.T) {
@@ -86,52 +86,52 @@ func TestRaftstoreRuntimeRenameAcrossRegionsOnRealCluster(t *testing.T) {
 
 	executor := openSplitRealClusterExecutor(t, ctx)
 
-	created, err := executor.Create(ctx, fsmeta.CreateRequest{
+	created, err := executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
-	err = executor.RenameSubtree(ctx, fsmeta.RenameSubtreeRequest{
+	err = executor.RenameSubtree(ctx, model.RenameSubtreeRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   "alpha",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "zulu",
 	})
 	require.NoError(t, err)
 
-	_, err = executor.Lookup(ctx, fsmeta.LookupRequest{
+	_, err = executor.Lookup(ctx, model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 
-	record, err := executor.Lookup(ctx, fsmeta.LookupRequest{
+	record, err := executor.Lookup(ctx, model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "zulu",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryRecord{
-		Parent: fsmeta.RootInode,
+	require.Equal(t, model.DentryRecord{
+		Parent: model.RootInode,
 		Name:   "zulu",
 		Inode:  created.Inode.Inode,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}, record)
 
-	require.NoError(t, executor.Unlink(ctx, fsmeta.UnlinkRequest{
+	require.NoError(t, executor.Unlink(ctx, model.UnlinkRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "zulu",
 	}))
-	_, err = executor.Lookup(ctx, fsmeta.LookupRequest{
+	_, err = executor.Lookup(ctx, model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "zulu",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 }

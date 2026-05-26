@@ -20,6 +20,7 @@ import (
 	"github.com/feichai0017/NoKV/engine/wal"
 	perasfsmeta "github.com/feichai0017/NoKV/experimental/peras/adapters/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetalocal "github.com/feichai0017/NoKV/fsmeta/runtime/local"
 	fsmetaraftstore "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
 	fsmetaserver "github.com/feichai0017/NoKV/fsmeta/server"
@@ -76,7 +77,7 @@ func main() {
 		localWorkDir                    = flag.String("local-work-dir", "", "embedded DB work directory when --backend=local")
 		localMountID                    = flag.String("local-mount-id", "default", "single mount id admitted by --backend=local")
 		localMountKeyID                 = flag.Uint64("local-mount-key-id", 1, "single mount key id admitted by --backend=local")
-		localRootInode                  = flag.Uint64("local-root-inode", uint64(fsmeta.RootInode), "root inode for --backend=local")
+		localRootInode                  = flag.Uint64("local-root-inode", uint64(model.RootInode), "root inode for --backend=local")
 		localNegCache                   = flag.Bool("local-negative-cache", true, "enable the slab-backed negative dentry cache when --backend=local; use --local-negative-cache=false to disable")
 		localDirPageCache               = flag.Bool("local-dirpage-cache", true, "enable the slab-backed ReadDirPlus page cache when --backend=local; use --local-dirpage-cache=false to disable")
 		negCacheDir                     = flag.String("negative-cache-dir", "", "optional slab directory for persistent negative dentry cache")
@@ -114,8 +115,8 @@ func main() {
 		fatalf("lock-ttl must be non-negative")
 		return
 	}
-	if *sessionCleanupLimit > uint(fsmeta.MaxSessionExpireLimit) {
-		fatalf("session-cleanup-limit exceeds maximum %d", fsmeta.MaxSessionExpireLimit)
+	if *sessionCleanupLimit > uint(model.MaxSessionExpireLimit) {
+		fatalf("session-cleanup-limit exceeds maximum %d", model.MaxSessionExpireLimit)
 		return
 	}
 	if *visibleAuthorityTTL < 0 || *perasSegmentWitnessRetryBackoff < 0 || *perasSegmentWitnessRetries < 0 || *segmentWitnessQuorum < 0 ||
@@ -134,7 +135,7 @@ func main() {
 		fatalf("parse peras-visible-log-policy: %v", err)
 		return
 	}
-	var localMount fsmeta.MountIdentity
+	var localMount model.MountIdentity
 	if backend == fsmetaBackendLocal {
 		localMount, err = localMountIdentity(*localMountID, *localMountKeyID)
 		if err != nil {
@@ -188,7 +189,7 @@ func main() {
 		Local: fsmetalocal.Options{
 			WorkDir:           *localWorkDir,
 			Mount:             localMount,
-			RootInode:         fsmeta.InodeID(*localRootInode),
+			RootInode:         model.InodeID(*localRootInode),
 			LockTTL:           *lockTTL,
 			NegativeCacheMode: localCacheMode(*localNegCache),
 			NegativeCacheDir:  *negCacheDir,
@@ -369,15 +370,15 @@ func parseFSMetaBackend(value string) (fsmetaBackend, error) {
 	}
 }
 
-func localMountIdentity(mountID string, mountKeyID uint64) (fsmeta.MountIdentity, error) {
-	id := fsmeta.MountID(strings.TrimSpace(mountID))
+func localMountIdentity(mountID string, mountKeyID uint64) (model.MountIdentity, error) {
+	id := model.MountID(strings.TrimSpace(mountID))
 	if id == "" {
-		return fsmeta.MountIdentity{}, fsmeta.ErrInvalidMountID
+		return model.MountIdentity{}, model.ErrInvalidMountID
 	}
 	if mountKeyID == 0 {
-		return fsmeta.MountIdentity{}, fsmeta.ErrInvalidMountID
+		return model.MountIdentity{}, model.ErrInvalidMountID
 	}
-	return fsmeta.MountIdentity{MountID: id, MountKeyID: fsmeta.MountKeyID(mountKeyID)}, nil
+	return model.MountIdentity{MountID: id, MountKeyID: model.MountKeyID(mountKeyID)}, nil
 }
 
 func localCacheMode(enabled bool) fsmetalocal.CacheMode {

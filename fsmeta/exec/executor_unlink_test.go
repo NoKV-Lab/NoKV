@@ -5,21 +5,22 @@ package exec
 
 import (
 	"context"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"testing"
+
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestExecutorUnlinkReservesNegativeQuotaWhenInodeExists(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "file", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 1})
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, Size: 4096, LinkCount: 1})
 	quota := &fakeQuotaResolver{}
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
 	require.NoError(t, err)
 	require.Equal(t, [][]QuotaChange{{{Mount: "vol", MountKeyID: 1, Scope: 7, Bytes: -4096, Inodes: -1}}}, quota.changes)
 }
@@ -27,23 +28,23 @@ func TestExecutorUnlinkReservesNegativeQuotaWhenInodeExists(t *testing.T) {
 func TestExecutorUnlinkRemovesDentry(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "file", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Name:   "file",
 	})
 	require.NoError(t, err)
 
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Name:   "file",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 	require.Len(t, runner.mutations, 1)
 	require.Len(t, runner.mutations[0], 3)
 	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][0].GetOp())
@@ -57,48 +58,48 @@ func TestExecutorRemoveRemovesDentry(t *testing.T) {
 	base := newFakeRunner()
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedDentry(t, runner.fakeRunner, "vol", 7, "file", 22)
-	seedInode(t, runner.fakeRunner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	seedInode(t, runner.fakeRunner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	result, err := executor.Remove(context.Background(), fsmeta.RemoveRequest{
+	result, err := executor.Remove(context.Background(), model.RemoveRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Name:   "file",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryRecord{Parent: 7, Name: "file", Inode: 22, Type: fsmeta.InodeTypeFile}, result.RemovedDentry)
-	require.Equal(t, fsmeta.InodeID(22), result.OldInode.Inode)
+	require.Equal(t, model.DentryRecord{Parent: 7, Name: "file", Inode: 22, Type: model.InodeTypeFile}, result.RemovedDentry)
+	require.Equal(t, model.InodeID(22), result.OldInode.Inode)
 	require.True(t, result.InodeDeleted)
 
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Name:   "file",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 	require.Empty(t, base.mutations)
 	require.Len(t, runner.atomicCalls, 1)
 	require.Len(t, runner.atomicCalls[0].mutations, 3)
 	require.Equal(t, kvrpcpb.Mutation_Delete, runner.atomicCalls[0].mutations[0].GetOp())
 	require.Equal(t, kvrpcpb.Mutation_Delete, runner.atomicCalls[0].mutations[1].GetOp())
-	requireAtomicStatUint(t, executor.Stats(), fsmeta.OperationRemove, "success_total", 1)
+	requireAtomicStatUint(t, executor.Stats(), model.OperationRemove, "success_total", 1)
 }
 
 func TestExecutorUnlinkUsesAtomicMutateWithValuePredicates(t *testing.T) {
 	base := newFakeRunner()
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedDentry(t, runner.fakeRunner, "vol", 7, "file", 22)
-	seedInode(t, runner.fakeRunner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	seedInode(t, runner.fakeRunner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
 	require.NoError(t, err)
 
 	require.Len(t, runner.atomicCalls, 1)
 	require.Empty(t, base.mutations)
-	requireAtomicStatUint(t, executor.Stats(), fsmeta.OperationUnlink, "success_total", 1)
+	requireAtomicStatUint(t, executor.Stats(), model.OperationUnlink, "success_total", 1)
 	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[0].GetKind())
 	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[1].GetKind())
 	_, ok, err := executor.readInode(context.Background(), testMountIdentity, 22, 99)
@@ -109,11 +110,11 @@ func TestExecutorUnlinkUsesAtomicMutateWithValuePredicates(t *testing.T) {
 func TestExecutorUnlinkDecrementsMultiLinkInode(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "file", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 2})
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 2})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
 	require.NoError(t, err)
 
 	inode, ok, err := executor.readInode(context.Background(), testMountIdentity, 22, 99)
@@ -126,7 +127,7 @@ func TestExecutorUnlinkVisibleCommitServesOverlay(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
 	seedDentry(t, runner, "vol", 7, "file", inode)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 2})
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: inode, Type: model.InodeTypeFile, Size: 4096, LinkCount: 2})
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
@@ -135,12 +136,12 @@ func TestExecutorUnlinkVisibleCommitServesOverlay(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
 	require.NoError(t, err)
 
 	require.Empty(t, runner.mutations)
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "file"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 7, Name: "file"})
+	require.ErrorIs(t, err, model.ErrNotFound)
 	stored, ok, err := executor.readInode(context.Background(), testMountIdentity, inode, 99)
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -152,7 +153,7 @@ func TestExecutorUnlinkLastReferenceVisibleCommitDeletesInode(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
 	seedDentry(t, runner, "vol", 7, "file", inode)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 1})
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: inode, Type: model.InodeTypeFile, Size: 4096, LinkCount: 1})
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
@@ -161,12 +162,12 @@ func TestExecutorUnlinkLastReferenceVisibleCommitDeletesInode(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{Mount: "vol", Parent: 7, Name: "file"})
 	require.NoError(t, err)
 
 	require.Empty(t, runner.mutations)
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "file"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 7, Name: "file"})
+	require.ErrorIs(t, err, model.ErrNotFound)
 	_, ok, err := executor.readInode(context.Background(), testMountIdentity, inode, 99)
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -176,8 +177,8 @@ func TestExecutorUnlinkLastReferenceVisibleCommitDeletesInode(t *testing.T) {
 func TestExecutorUnlinkRejectsDirectoryBeforeVisibleCommit(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
-	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
+	seedDentryType(t, runner, "vol", 7, "dir", inode, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: inode, Type: model.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
@@ -186,8 +187,8 @@ func TestExecutorUnlinkRejectsDirectoryBeforeVisibleCommit(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{Mount: "vol", Parent: 7, Name: "dir"})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 
 	require.Empty(t, runner.mutations)
 	require.Equal(t, uint64(0), committer.Stats()["commit_total"])
@@ -196,13 +197,13 @@ func TestExecutorUnlinkRejectsDirectoryBeforeVisibleCommit(t *testing.T) {
 func TestExecutorUnlinkRejectsDirectoryOnTxnPath(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
-	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
+	seedDentryType(t, runner, "vol", 7, "dir", inode, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: inode, Type: model.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{Mount: "vol", Parent: 7, Name: "dir"})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 
 	require.Empty(t, runner.mutations)
 }
@@ -210,13 +211,13 @@ func TestExecutorUnlinkRejectsDirectoryOnTxnPath(t *testing.T) {
 func TestExecutorRemoveRejectsDirectoryOnTxnPath(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
-	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
+	seedDentryType(t, runner, "vol", 7, "dir", inode, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: inode, Type: model.InodeTypeDirectory, Mode: 0o755, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	_, err = executor.Remove(context.Background(), fsmeta.RemoveRequest{Mount: "vol", Parent: 7, Name: "dir"})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	_, err = executor.Remove(context.Background(), model.RemoveRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 
 	require.Empty(t, runner.mutations)
 }
@@ -224,21 +225,21 @@ func TestExecutorRemoveRejectsDirectoryOnTxnPath(t *testing.T) {
 func TestExecutorRemoveDirectoryRemovesEmptyDirectory(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
-	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentryType(t, runner, "vol", 7, "dir", inode, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     inode,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	err = executor.RemoveDirectory(context.Background(), model.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
 	require.NoError(t, err)
 
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, model.ErrNotFound)
 	_, ok, err := executor.readInode(context.Background(), testMountIdentity, inode, 99)
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -256,10 +257,10 @@ func TestExecutorRemoveDirectoryRemovesEmptyDirectory(t *testing.T) {
 func TestExecutorRemoveDirectoryReservesNegativeQuota(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
-	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentryType(t, runner, "vol", 7, "dir", inode, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     inode,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Size:      4096,
 		Mode:      0o755,
 		LinkCount: 1,
@@ -268,7 +269,7 @@ func TestExecutorRemoveDirectoryReservesNegativeQuota(t *testing.T) {
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
 	require.NoError(t, err)
 
-	err = executor.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	err = executor.RemoveDirectory(context.Background(), model.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
 	require.NoError(t, err)
 	require.Equal(t, [][]QuotaChange{{{Mount: "vol", MountKeyID: 1, Scope: 7, Bytes: -4096, Inodes: -1}}}, quota.changes)
 }
@@ -276,10 +277,10 @@ func TestExecutorRemoveDirectoryReservesNegativeQuota(t *testing.T) {
 func TestExecutorRemoveDirectoryRejectsNonEmptyDirectory(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
-	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentryType(t, runner, "vol", 7, "dir", inode, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:      inode,
-		Type:       fsmeta.InodeTypeDirectory,
+		Type:       model.InodeTypeDirectory,
 		Mode:       0o755,
 		LinkCount:  1,
 		ChildCount: 1,
@@ -287,10 +288,10 @@ func TestExecutorRemoveDirectoryRejectsNonEmptyDirectory(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	err = executor.RemoveDirectory(context.Background(), model.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 	require.Empty(t, runner.mutations)
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
 	require.NoError(t, err)
 	require.Equal(t, inode, record.Inode)
 }
@@ -298,10 +299,10 @@ func TestExecutorRemoveDirectoryRejectsNonEmptyDirectory(t *testing.T) {
 func TestExecutorRemoveDirectoryVisibleCommitServesOverlay(t *testing.T) {
 	runner := newFakeRunner()
 	inode := testInodeForParentBucket(t, 7, 7)
-	seedDentryType(t, runner, "vol", 7, "dir", inode, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentryType(t, runner, "vol", 7, "dir", inode, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     inode,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	})
@@ -313,12 +314,12 @@ func TestExecutorRemoveDirectoryVisibleCommitServesOverlay(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = executor.RemoveDirectory(context.Background(), fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	err = executor.RemoveDirectory(context.Background(), model.RemoveDirectoryRequest{Mount: "vol", Parent: 7, Name: "dir"})
 	require.NoError(t, err)
 
 	require.Empty(t, runner.mutations)
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 7, Name: "dir"})
+	require.ErrorIs(t, err, model.ErrNotFound)
 	_, ok, err := executor.readInode(context.Background(), testMountIdentity, inode, 99)
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -334,12 +335,12 @@ func TestExecutorUnlinkMissingDentry(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	err = executor.Unlink(context.Background(), fsmeta.UnlinkRequest{
+	err = executor.Unlink(context.Background(), model.UnlinkRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Name:   "missing",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 	require.Empty(t, runner.mutations)
 }
 

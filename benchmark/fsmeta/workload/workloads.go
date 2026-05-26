@@ -10,11 +10,12 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type fileRef struct {
-	parent fsmeta.InodeID
-	inode  fsmeta.InodeID
+	parent model.InodeID
+	inode  model.InodeID
 	name   string
 }
 
@@ -53,14 +54,14 @@ func runMDTest(ctx context.Context, cli MetadataClient, cfg MDTestConfig, name s
 	runParallel(cfg.Clients, totalFiles, func(idx int) {
 		parent, fileName := mdtestFileTarget(cfg, dirs, name, shared, idx)
 		size := mdtestFileSize(shared)
-		var created fsmeta.CreateResult
+		var created model.CreateResult
 		if err := recordCall(rec, name+"_create", func() error {
 			var err error
-			created, err = cli.Create(ctx, fsmeta.CreateRequest{
+			created, err = cli.Create(ctx, model.CreateRequest{
 				Mount:  cfg.Mount,
 				Parent: parent,
 				Name:   fileName,
-				Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644, Size: size},
+				Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644, Size: size},
 			})
 			return err
 		}); err != nil {
@@ -75,16 +76,16 @@ func runMDTest(ctx context.Context, cli MetadataClient, cfg MDTestConfig, name s
 		}
 		rec.recordCall(name+"_stat", func() error {
 			if cli, ok := cli.(LookupPlusMetadataClient); ok {
-				_, err := cli.LookupPlus(ctx, fsmeta.LookupRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
+				_, err := cli.LookupPlus(ctx, model.LookupRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
 				return err
 			}
-			_, err := cli.Lookup(ctx, fsmeta.LookupRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
+			_, err := cli.Lookup(ctx, model.LookupRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
 			return err
 		})
 	})
 	runParallel(cfg.Clients, len(dirs), func(idx int) {
 		rec.recordCall(name+"_readdirplus", func() error {
-			_, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{Mount: cfg.Mount, Parent: dirs[idx], Limit: cfg.PageLimit})
+			_, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{Mount: cfg.Mount, Parent: dirs[idx], Limit: cfg.PageLimit})
 			return err
 		})
 	})
@@ -94,24 +95,24 @@ func runMDTest(ctx context.Context, cli MetadataClient, cfg MDTestConfig, name s
 			return
 		}
 		rec.recordCall(name+"_unlink", func() error {
-			return cli.Unlink(ctx, fsmeta.UnlinkRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
+			return cli.Unlink(ctx, model.UnlinkRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
 		})
 	})
 
 	return finishResult(name, cfg.RunID, started, rec.snapshot())
 }
 
-func createMDTestDirs(ctx context.Context, cli MetadataClient, cfg MDTestConfig, workloadName string, shared bool, rec *recorder) ([]fsmeta.InodeID, error) {
+func createMDTestDirs(ctx context.Context, cli MetadataClient, cfg MDTestConfig, workloadName string, shared bool, rec *recorder) ([]model.InodeID, error) {
 	if shared {
-		dir, err := createDirectory(ctx, cli, cfg.Mount, fsmeta.RootInode, fmt.Sprintf("%s-%s-shared", workloadName, cfg.RunID), workloadName+"_mkdir_shared", rec)
+		dir, err := createDirectory(ctx, cli, cfg.Mount, model.RootInode, fmt.Sprintf("%s-%s-shared", workloadName, cfg.RunID), workloadName+"_mkdir_shared", rec)
 		if err != nil {
 			return nil, err
 		}
-		return []fsmeta.InodeID{dir}, nil
+		return []model.InodeID{dir}, nil
 	}
-	dirs := make([]fsmeta.InodeID, cfg.Directories)
+	dirs := make([]model.InodeID, cfg.Directories)
 	for i := range dirs {
-		dir, err := createDirectory(ctx, cli, cfg.Mount, fsmeta.RootInode, fmt.Sprintf("%s-%s-dir-%04d", workloadName, cfg.RunID, i), workloadName+"_mkdir", rec)
+		dir, err := createDirectory(ctx, cli, cfg.Mount, model.RootInode, fmt.Sprintf("%s-%s-dir-%04d", workloadName, cfg.RunID, i), workloadName+"_mkdir", rec)
 		if err != nil {
 			return nil, err
 		}
@@ -120,7 +121,7 @@ func createMDTestDirs(ctx context.Context, cli MetadataClient, cfg MDTestConfig,
 	return dirs, nil
 }
 
-func mdtestFileTarget(cfg MDTestConfig, dirs []fsmeta.InodeID, workloadName string, shared bool, idx int) (fsmeta.InodeID, string) {
+func mdtestFileTarget(cfg MDTestConfig, dirs []model.InodeID, workloadName string, shared bool, idx int) (model.InodeID, string) {
 	if shared {
 		return dirs[0], fmt.Sprintf("%s-%s-file-%08d", workloadName, cfg.RunID, idx)
 	}
@@ -140,11 +141,11 @@ func RunFilebenchVarmail(ctx context.Context, cli MetadataClient, cfg FilebenchV
 	cfg = normalizeFilebenchVarmailConfig(cfg)
 	started := time.Now()
 	rec := newRecorder()
-	root, err := createDirectory(ctx, cli, cfg.Mount, fsmeta.RootInode, fmt.Sprintf("varmail-%s", cfg.RunID), "filebench_varmail_mkdir_root", rec)
+	root, err := createDirectory(ctx, cli, cfg.Mount, model.RootInode, fmt.Sprintf("varmail-%s", cfg.RunID), "filebench_varmail_mkdir_root", rec)
 	if err != nil {
 		return Result{}, err
 	}
-	users := make([]fsmeta.InodeID, cfg.Users)
+	users := make([]model.InodeID, cfg.Users)
 	for user := range users {
 		dir, err := createDirectory(ctx, cli, cfg.Mount, root, fmt.Sprintf("user-%04d", user), "filebench_varmail_mkdir_user", rec)
 		if err != nil {
@@ -160,7 +161,7 @@ func RunFilebenchVarmail(ctx context.Context, cli MetadataClient, cfg FilebenchV
 	})
 	runParallel(cfg.Clients, cfg.Users, func(idx int) {
 		rec.recordCall("filebench_varmail_readdirplus", func() error {
-			_, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{Mount: cfg.Mount, Parent: users[idx], Limit: cfg.PageLimit})
+			_, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{Mount: cfg.Mount, Parent: users[idx], Limit: cfg.PageLimit})
 			return err
 		})
 	})
@@ -169,22 +170,22 @@ func RunFilebenchVarmail(ctx context.Context, cli MetadataClient, cfg FilebenchV
 		message := idx / cfg.Users
 		name := varmailMessageName(user, message)
 		rec.recordCall("filebench_varmail_unlink", func() error {
-			return cli.Unlink(ctx, fsmeta.UnlinkRequest{Mount: cfg.Mount, Parent: users[user], Name: name})
+			return cli.Unlink(ctx, model.UnlinkRequest{Mount: cfg.Mount, Parent: users[user], Name: name})
 		})
 	})
 	return finishResult(FilebenchVarmail, cfg.RunID, started, rec.snapshot())
 }
 
-func runVarmailMessage(ctx context.Context, cli MetadataClient, cfg FilebenchVarmailConfig, parent fsmeta.InodeID, user, message int, rec *recorder) {
+func runVarmailMessage(ctx context.Context, cli MetadataClient, cfg FilebenchVarmailConfig, parent model.InodeID, user, message int, rec *recorder) {
 	name := varmailMessageName(user, message)
-	var created fsmeta.CreateResult
+	var created model.CreateResult
 	if err := recordCall(rec, "filebench_varmail_create", func() error {
 		var err error
-		created, err = cli.Create(ctx, fsmeta.CreateRequest{
+		created, err = cli.Create(ctx, model.CreateRequest{
 			Mount:  cfg.Mount,
 			Parent: parent,
 			Name:   name,
-			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o600, Size: uint64(4096 + message)},
+			Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o600, Size: uint64(4096 + message)},
 		})
 		return err
 	}); err != nil {
@@ -195,7 +196,7 @@ func runVarmailMessage(ctx context.Context, cli MetadataClient, cfg FilebenchVar
 		return
 	}
 	rec.recordCall("filebench_varmail_update", func() error {
-		_, err := cli.UpdateInode(ctx, fsmeta.UpdateInodeRequest{
+		_, err := cli.UpdateInode(ctx, model.UpdateInodeRequest{
 			Mount:            cfg.Mount,
 			Parent:           parent,
 			Inode:            created.Inode.Inode,
@@ -208,7 +209,7 @@ func runVarmailMessage(ctx context.Context, cli MetadataClient, cfg FilebenchVar
 		return err
 	})
 	if err := recordCall(rec, "filebench_varmail_heartbeat", func() error {
-		_, err := cli.HeartbeatWriteSession(ctx, fsmeta.HeartbeatWriteSessionRequest{
+		_, err := cli.HeartbeatWriteSession(ctx, model.HeartbeatWriteSessionRequest{
 			Mount:   cfg.Mount,
 			Inode:   created.Inode.Inode,
 			Session: session,
@@ -219,7 +220,7 @@ func runVarmailMessage(ctx context.Context, cli MetadataClient, cfg FilebenchVar
 		return
 	}
 	rec.recordCall("filebench_varmail_close_session", func() error {
-		return cli.CloseWriteSession(ctx, fsmeta.CloseWriteSessionRequest{Mount: cfg.Mount, Inode: created.Inode.Inode, Session: session})
+		return cli.CloseWriteSession(ctx, model.CloseWriteSessionRequest{Mount: cfg.Mount, Inode: created.Inode.Inode, Session: session})
 	})
 }
 
@@ -231,11 +232,11 @@ func RunMimesisNamespace(ctx context.Context, cli MetadataClient, cfg MimesisNam
 	cfg = normalizeMimesisNamespaceConfig(cfg)
 	started := time.Now()
 	rec := newRecorder()
-	root, err := createDirectory(ctx, cli, cfg.Mount, fsmeta.RootInode, fmt.Sprintf("mimesis-%s", cfg.RunID), "mimesis_mkdir_root", rec)
+	root, err := createDirectory(ctx, cli, cfg.Mount, model.RootInode, fmt.Sprintf("mimesis-%s", cfg.RunID), "mimesis_mkdir_root", rec)
 	if err != nil {
 		return Result{}, err
 	}
-	dirs := make([]fsmeta.InodeID, cfg.Directories)
+	dirs := make([]model.InodeID, cfg.Directories)
 	for i := range dirs {
 		dir, err := createDirectory(ctx, cli, cfg.Mount, root, fmt.Sprintf("dir-%04d", i), "mimesis_mkdir", rec)
 		if err != nil {
@@ -249,14 +250,14 @@ func RunMimesisNamespace(ctx context.Context, cli MetadataClient, cfg MimesisNam
 		dir := idx % cfg.Directories
 		file := idx / cfg.Directories
 		name := fmt.Sprintf("mimesis-%s-dir-%04d-file-%08d.dat", cfg.RunID, dir, file)
-		var created fsmeta.CreateResult
+		var created model.CreateResult
 		if err := recordCall(rec, "mimesis_create", func() error {
 			var err error
-			created, err = cli.Create(ctx, fsmeta.CreateRequest{
+			created, err = cli.Create(ctx, model.CreateRequest{
 				Mount:  cfg.Mount,
 				Parent: dirs[dir],
 				Name:   name,
-				Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644, Size: uint64(1024 + file)},
+				Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644, Size: uint64(1024 + file)},
 			})
 			return err
 		}); err != nil {
@@ -271,7 +272,7 @@ func RunMimesisNamespace(ctx context.Context, cli MetadataClient, cfg MimesisNam
 		}
 		renamed := file.name + ".renamed"
 		if err := recordCall(rec, "mimesis_rename", func() error {
-			return cli.Rename(ctx, fsmeta.RenameRequest{
+			return cli.Rename(ctx, model.RenameRequest{
 				Mount:      cfg.Mount,
 				FromParent: file.parent,
 				FromName:   file.name,
@@ -285,14 +286,14 @@ func RunMimesisNamespace(ctx context.Context, cli MetadataClient, cfg MimesisNam
 		files[idx] = file
 		rec.recordCall("mimesis_lookup", func() error {
 			if cli, ok := cli.(LookupPlusMetadataClient); ok {
-				_, err := cli.LookupPlus(ctx, fsmeta.LookupRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
+				_, err := cli.LookupPlus(ctx, model.LookupRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
 				return err
 			}
-			_, err := cli.Lookup(ctx, fsmeta.LookupRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
+			_, err := cli.Lookup(ctx, model.LookupRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
 			return err
 		})
 		rec.recordCall("mimesis_setattr", func() error {
-			_, err := cli.UpdateInode(ctx, fsmeta.UpdateInodeRequest{
+			_, err := cli.UpdateInode(ctx, model.UpdateInodeRequest{
 				Mount:            cfg.Mount,
 				Parent:           file.parent,
 				Inode:            file.inode,
@@ -307,7 +308,7 @@ func RunMimesisNamespace(ctx context.Context, cli MetadataClient, cfg MimesisNam
 	})
 	runParallel(cfg.Clients, len(dirs), func(idx int) {
 		rec.recordCall("mimesis_readdirplus", func() error {
-			_, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{Mount: cfg.Mount, Parent: dirs[idx], Limit: cfg.PageLimit})
+			_, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{Mount: cfg.Mount, Parent: dirs[idx], Limit: cfg.PageLimit})
 			return err
 		})
 	})
@@ -317,7 +318,7 @@ func RunMimesisNamespace(ctx context.Context, cli MetadataClient, cfg MimesisNam
 			return
 		}
 		rec.recordCall("mimesis_unlink", func() error {
-			return cli.Unlink(ctx, fsmeta.UnlinkRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
+			return cli.Unlink(ctx, model.UnlinkRequest{Mount: cfg.Mount, Parent: file.parent, Name: file.name})
 		})
 	})
 	return finishResult(MimesisNamespace, cfg.RunID, started, rec.snapshot())
@@ -327,7 +328,7 @@ func RunAICheckpointAgent(ctx context.Context, cli MetadataClient, cfg AICheckpo
 	cfg = normalizeAICheckpointAgentConfig(cfg)
 	started := time.Now()
 	rec := newRecorder()
-	root, err := createDirectory(ctx, cli, cfg.Mount, fsmeta.RootInode, fmt.Sprintf("ai-agent-%s", cfg.RunID), "ai_checkpoint_mkdir_root", rec)
+	root, err := createDirectory(ctx, cli, cfg.Mount, model.RootInode, fmt.Sprintf("ai-agent-%s", cfg.RunID), "ai_checkpoint_mkdir_root", rec)
 	if err != nil {
 		return Result{}, err
 	}
@@ -339,7 +340,7 @@ func RunAICheckpointAgent(ctx context.Context, cli MetadataClient, cfg AICheckpo
 	if err != nil {
 		return Result{}, err
 	}
-	checkpointParents := make([]fsmeta.InodeID, cfg.Workspaces)
+	checkpointParents := make([]model.InodeID, cfg.Workspaces)
 	for workspace := range checkpointParents {
 		workspaceDir, err := createDirectory(ctx, cli, cfg.Mount, workspaceRoot, fmt.Sprintf("workspace-%04d", workspace), "ai_checkpoint_mkdir_workspace", rec)
 		if err != nil {
@@ -361,11 +362,11 @@ func RunAICheckpointAgent(ctx context.Context, cli MetadataClient, cfg AICheckpo
 		return Result{}, err
 	}
 	defer func() { _ = stream.Close() }()
-	if _, err := cli.Create(ctx, fsmeta.CreateRequest{
+	if _, err := cli.Create(ctx, model.CreateRequest{
 		Mount:  cfg.Mount,
 		Parent: publishedRoot,
 		Name:   "watch-warmup",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	}); err != nil {
 		return Result{}, err
 	}
@@ -396,7 +397,7 @@ func RunAICheckpointAgent(ctx context.Context, cli MetadataClient, cfg AICheckpo
 	return finishResult(AICheckpointAgent, cfg.RunID, started, rec.snapshot())
 }
 
-func runAICheckpointTask(ctx context.Context, cli MetadataClient, cfg AICheckpointAgentConfig, workspaceParent, publishedRoot fsmeta.InodeID, task checkpointTask, starts *watchStarts, successfulPublishes *atomic.Int64, rec *recorder) {
+func runAICheckpointTask(ctx context.Context, cli MetadataClient, cfg AICheckpointAgentConfig, workspaceParent, publishedRoot model.InodeID, task checkpointTask, starts *watchStarts, successfulPublishes *atomic.Int64, rec *recorder) {
 	checkpointName := fmt.Sprintf("workspace-%04d-checkpoint-%08d", task.workspace, task.checkpoint)
 	checkpointDir, err := createDirectory(ctx, cli, cfg.Mount, workspaceParent, checkpointName, "ai_checkpoint_mkdir_checkpoint", rec)
 	if err != nil {
@@ -405,23 +406,23 @@ func runAICheckpointTask(ctx context.Context, cli MetadataClient, cfg AICheckpoi
 	for file := 0; file < cfg.FilesPerCheckpoint; file++ {
 		file := file
 		rec.recordCall("ai_checkpoint_create_artifact", func() error {
-			_, err := cli.Create(ctx, fsmeta.CreateRequest{
+			_, err := cli.Create(ctx, model.CreateRequest{
 				Mount:  cfg.Mount,
 				Parent: checkpointDir,
 				Name:   fmt.Sprintf("shard-%05d.bin", file),
-				Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644, Size: uint64(64<<20 + file)},
+				Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644, Size: uint64(64<<20 + file)},
 			})
 			return err
 		})
 	}
-	var manifest fsmeta.CreateResult
+	var manifest model.CreateResult
 	if err := recordCall(rec, "ai_checkpoint_create_manifest", func() error {
 		var err error
-		manifest, err = cli.Create(ctx, fsmeta.CreateRequest{
+		manifest, err = cli.Create(ctx, model.CreateRequest{
 			Mount:  cfg.Mount,
 			Parent: checkpointDir,
 			Name:   "manifest.tmp",
-			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644, Size: 4096},
+			Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644, Size: 4096},
 		})
 		return err
 	}); err != nil {
@@ -432,7 +433,7 @@ func runAICheckpointTask(ctx context.Context, cli MetadataClient, cfg AICheckpoi
 		return
 	}
 	rec.recordCall("ai_checkpoint_update_manifest", func() error {
-		_, err := cli.UpdateInode(ctx, fsmeta.UpdateInodeRequest{
+		_, err := cli.UpdateInode(ctx, model.UpdateInodeRequest{
 			Mount:            cfg.Mount,
 			Parent:           checkpointDir,
 			Inode:            manifest.Inode.Inode,
@@ -445,7 +446,7 @@ func runAICheckpointTask(ctx context.Context, cli MetadataClient, cfg AICheckpoi
 		return err
 	})
 	if err := recordCall(rec, "ai_checkpoint_heartbeat", func() error {
-		_, err := cli.HeartbeatWriteSession(ctx, fsmeta.HeartbeatWriteSessionRequest{
+		_, err := cli.HeartbeatWriteSession(ctx, model.HeartbeatWriteSessionRequest{
 			Mount:   cfg.Mount,
 			Inode:   manifest.Inode.Inode,
 			Session: session,
@@ -456,12 +457,12 @@ func runAICheckpointTask(ctx context.Context, cli MetadataClient, cfg AICheckpoi
 		return
 	}
 	rec.recordCall("ai_checkpoint_close_session", func() error {
-		return cli.CloseWriteSession(ctx, fsmeta.CloseWriteSessionRequest{Mount: cfg.Mount, Inode: manifest.Inode.Inode, Session: session})
+		return cli.CloseWriteSession(ctx, model.CloseWriteSessionRequest{Mount: cfg.Mount, Inode: manifest.Inode.Inode, Session: session})
 	})
 	finalName := checkpointName + ".manifest.json"
 	if err := recordCall(rec, "ai_checkpoint_publish_manifest", func() error {
 		starts.put(finalName, time.Now())
-		return cli.Rename(ctx, fsmeta.RenameRequest{
+		return cli.Rename(ctx, model.RenameRequest{
 			Mount:      cfg.Mount,
 			FromParent: checkpointDir,
 			FromName:   "manifest.tmp",
@@ -474,19 +475,19 @@ func runAICheckpointTask(ctx context.Context, cli MetadataClient, cfg AICheckpoi
 	}
 	successfulPublishes.Add(1)
 	rec.recordCall("ai_checkpoint_readdirplus", func() error {
-		_, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{Mount: cfg.Mount, Parent: checkpointDir, Limit: cfg.PageLimit})
+		_, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{Mount: cfg.Mount, Parent: checkpointDir, Limit: cfg.PageLimit})
 		return err
 	})
-	var token fsmeta.SnapshotSubtreeToken
+	var token model.SnapshotSubtreeToken
 	if err := recordCall(rec, "ai_checkpoint_snapshot", func() error {
 		var err error
-		token, err = cli.SnapshotSubtree(ctx, fsmeta.SnapshotSubtreeRequest{Mount: cfg.Mount, RootInode: checkpointDir})
+		token, err = cli.SnapshotSubtree(ctx, model.SnapshotSubtreeRequest{Mount: cfg.Mount, RootInode: checkpointDir})
 		return err
 	}); err != nil {
 		return
 	}
 	rec.recordCall("ai_checkpoint_snapshot_readdirplus", func() error {
-		_, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+		_, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{
 			Mount:           cfg.Mount,
 			Parent:          checkpointDir,
 			Limit:           cfg.PageLimit,
@@ -499,14 +500,14 @@ func runAICheckpointTask(ctx context.Context, cli MetadataClient, cfg AICheckpoi
 	})
 }
 
-func createDirectory(ctx context.Context, cli MetadataClient, mount fsmeta.MountID, parent fsmeta.InodeID, name, op string, rec *recorder) (fsmeta.InodeID, error) {
-	var inode fsmeta.InodeID
+func createDirectory(ctx context.Context, cli MetadataClient, mount model.MountID, parent model.InodeID, name, op string, rec *recorder) (model.InodeID, error) {
+	var inode model.InodeID
 	err := recordCall(rec, op, func() error {
-		result, err := cli.Create(ctx, fsmeta.CreateRequest{
+		result, err := cli.Create(ctx, model.CreateRequest{
 			Mount:  mount,
 			Parent: parent,
 			Name:   name,
-			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory, Mode: 0o755},
+			Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory, Mode: 0o755},
 		})
 		if err == nil {
 			inode = result.Inode.Inode
@@ -522,13 +523,13 @@ func createDirectory(ctx context.Context, cli MetadataClient, mount fsmeta.Mount
 	return inode, nil
 }
 
-func openSession(ctx context.Context, cli MetadataClient, mount fsmeta.MountID, inode fsmeta.InodeID, base string, ttl time.Duration, op string, rec *recorder) (fsmeta.SessionID, bool) {
-	var session fsmeta.SessionID
+func openSession(ctx context.Context, cli MetadataClient, mount model.MountID, inode model.InodeID, base string, ttl time.Duration, op string, rec *recorder) (model.SessionID, bool) {
+	var session model.SessionID
 	attempt := 0
 	err := recordCall(rec, op, func() error {
 		attempt++
-		candidate := fsmeta.SessionID(fmt.Sprintf("%s-attempt-%02d", base, attempt))
-		_, err := cli.OpenWriteSession(ctx, fsmeta.OpenWriteSessionRequest{
+		candidate := model.SessionID(fmt.Sprintf("%s-attempt-%02d", base, attempt))
+		_, err := cli.OpenWriteSession(ctx, model.OpenWriteSessionRequest{
 			Mount:   mount,
 			Inode:   inode,
 			Session: candidate,

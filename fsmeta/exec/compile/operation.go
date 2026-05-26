@@ -13,6 +13,7 @@ import (
 	"unsafe"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -84,7 +85,7 @@ const (
 )
 
 type SegmentMergeKey struct {
-	MountKeyID       fsmeta.MountKeyID
+	MountKeyID       model.MountKeyID
 	HasPrimaryBucket bool
 	PrimaryBucket    fsmeta.AffinityBucket
 	Install          SegmentInstallMode
@@ -93,7 +94,7 @@ type SegmentMergeKey struct {
 }
 
 type PlacementPlan struct {
-	MountKeyID          fsmeta.MountKeyID
+	MountKeyID          model.MountKeyID
 	Buckets             []fsmeta.AffinityBucket
 	SingleBucket        bool
 	Install             SegmentInstallMode
@@ -115,11 +116,11 @@ type KeyRef struct {
 	Mode       KeyAccessMode
 	Key        []byte
 	Opaque     bool
-	MountKeyID fsmeta.MountKeyID
+	MountKeyID model.MountKeyID
 	Bucket     fsmeta.AffinityBucket
 	Kind       fsmeta.KeyKind
-	Parent     fsmeta.InodeID
-	Inode      fsmeta.InodeID
+	Parent     model.InodeID
+	Inode      model.InodeID
 }
 
 type KeyFootprint struct {
@@ -160,7 +161,7 @@ type EffectPlan struct {
 	Value      []byte
 	Concrete   bool
 	Opaque     bool
-	MountKeyID fsmeta.MountKeyID
+	MountKeyID model.MountKeyID
 	Bucket     fsmeta.AffinityBucket
 	RecordKind fsmeta.KeyKind
 	ValueHash  [32]byte
@@ -211,9 +212,9 @@ const (
 type WatchProjection struct {
 	EventKind WatchEventKind
 	Key       []byte
-	Parent    fsmeta.InodeID
+	Parent    model.InodeID
 	Name      string
-	Inode     fsmeta.InodeID
+	Inode     model.InodeID
 	EmitAt    WatchEmitPoint
 }
 
@@ -323,7 +324,7 @@ func applyPredicateEvidence(delta SemanticDelta, evidence PredicateEvidence) (Se
 			continue
 		}
 		if len(predicate.Key) == 0 {
-			return SemanticDelta{}, fsmeta.ErrInvalidRequest
+			return SemanticDelta{}, model.ErrInvalidRequest
 		}
 		key := string(predicate.Key)
 		seen[key] = struct{}{}
@@ -367,7 +368,7 @@ func applySmallPredicateEvidence(delta SemanticDelta, proofs []proof.PredicatePr
 			continue
 		}
 		if len(predicate.Key) == 0 {
-			return SemanticDelta{}, fsmeta.ErrInvalidRequest
+			return SemanticDelta{}, model.ErrInvalidRequest
 		}
 		for proofIndex, predicateProof := range proofs {
 			if !bytes.Equal(predicateProof.Key, predicate.Key) {
@@ -447,7 +448,7 @@ func authorityScopeWithKey(scope AuthorityScope, key []byte) AuthorityScope {
 	case fsmeta.KeyKindInode, fsmeta.KeyKindChunk, fsmeta.KeyKindSession:
 		scope.Inodes = uniqueInodes(append(scope.Inodes, parts.Inode))
 	case fsmeta.KeyKindUsage:
-		scope.Parents = uniqueInodes(append(scope.Parents, fsmeta.InodeID(parts.UsageScope)))
+		scope.Parents = uniqueInodes(append(scope.Parents, model.InodeID(parts.UsageScope)))
 	}
 	return scope
 }
@@ -635,7 +636,7 @@ func semanticOwnerKey(delta SemanticDelta) ([]byte, bool) {
 	if !ok || parts.Kind != fsmeta.KeyKindSession || parts.Inode == 0 || delta.Authority.Mount == "" {
 		return nil, false
 	}
-	key, err := fsmeta.EncodeInodeSessionKey(fsmeta.MountIdentity{
+	key, err := fsmeta.EncodeInodeSessionKey(model.MountIdentity{
 		MountID:    delta.Authority.Mount,
 		MountKeyID: parts.MountKeyID,
 	}, parts.Inode)
@@ -644,11 +645,11 @@ func semanticOwnerKey(delta SemanticDelta) ([]byte, bool) {
 
 func watchEventKind(delta SemanticDelta, effect WriteEffect) WatchEventKind {
 	switch delta.Kind {
-	case fsmeta.OperationCreate:
+	case model.OperationCreate:
 		return WatchEventCreate
-	case fsmeta.OperationRename, fsmeta.OperationRenameReplace, fsmeta.OperationRenameSubtree:
+	case model.OperationRename, model.OperationRenameReplace, model.OperationRenameSubtree:
 		return WatchEventRename
-	case fsmeta.OperationUnlink, fsmeta.OperationRemove:
+	case model.OperationUnlink, model.OperationRemove:
 		return WatchEventDelete
 	}
 	switch effect.Kind {
@@ -786,7 +787,7 @@ func GuardProofsFor(op CompiledOp, predicateProofs []proof.PredicateProof, guard
 func VerifyGuardProof(op CompiledOp, predicateProofs []proof.PredicateProof, obligation GuardObligation, guardProof proof.GuardProof) error {
 	rule, ok := ProofRuleForGuard(obligation.Guard)
 	if !ok {
-		return fsmeta.ErrInvalidRequest
+		return model.ErrInvalidRequest
 	}
 	proofObligation := proof.GuardObligation{
 		Guard:  rule,
@@ -797,7 +798,7 @@ func VerifyGuardProof(op CompiledOp, predicateProofs []proof.PredicateProof, obl
 		return err
 	}
 	if err := proof.VerifyGuardProof(proofObligation, evidence, guardProof); err != nil {
-		return fsmeta.ErrInvalidRequest
+		return model.ErrInvalidRequest
 	}
 	return nil
 }
@@ -805,7 +806,7 @@ func VerifyGuardProof(op CompiledOp, predicateProofs []proof.PredicateProof, obl
 func GuardEvidenceForGuard(op CompiledOp, predicateProofs []proof.PredicateProof, guard RuntimeGuard) (proof.GuardEvidence, error) {
 	rule, ok := ProofRuleForGuard(guard)
 	if !ok {
-		return proof.GuardEvidence{}, fsmeta.ErrInvalidRequest
+		return proof.GuardEvidence{}, model.ErrInvalidRequest
 	}
 	evidence := proof.GuardEvidence{
 		SchemaVersion:        proof.Version1,
@@ -841,10 +842,10 @@ func GuardEvidenceForGuard(op CompiledOp, predicateProofs []proof.PredicateProof
 		evidence.Kind = proof.GuardEvidenceQuotaCredit
 		subject, subjectOK = quotaCreditGuardSubject(op)
 	default:
-		return proof.GuardEvidence{}, fsmeta.ErrInvalidRequest
+		return proof.GuardEvidence{}, model.ErrInvalidRequest
 	}
 	if !subjectOK {
-		return proof.GuardEvidence{}, fsmeta.ErrInvalidRequest
+		return proof.GuardEvidence{}, model.ErrInvalidRequest
 	}
 	evidence.SubjectDigest = subject
 	return evidence, nil
@@ -919,7 +920,7 @@ func nonDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([32
 			if err != nil {
 				return [32]byte{}, false
 			}
-			if inode.Type == fsmeta.InodeTypeDirectory {
+			if inode.Type == model.InodeTypeDirectory {
 				continue
 			}
 			return inodeGuardSubjectDigest(GuardNonDirectoryInode, proof, inode), true
@@ -928,7 +929,7 @@ func nonDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([32
 			if err != nil {
 				return [32]byte{}, false
 			}
-			if dentry.Type == fsmeta.InodeTypeDirectory {
+			if dentry.Type == model.InodeTypeDirectory {
 				continue
 			}
 			return dentryGuardSubjectDigest(GuardNonDirectoryInode, proof, dentry), true
@@ -940,11 +941,11 @@ func nonDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([32
 func nonDirectoryGuardCandidateKeys(op CompiledOp) [][]byte {
 	plan := op.Delta.Plan
 	switch op.Delta.Kind {
-	case fsmeta.OperationLink:
+	case model.OperationLink:
 		if len(plan.ReadKeys) > 0 {
 			return [][]byte{plan.ReadKeys[0]}
 		}
-	case fsmeta.OperationOpenWriteSession:
+	case model.OperationOpenWriteSession:
 		if len(plan.ReadKeys) > 0 {
 			return [][]byte{plan.ReadKeys[0]}
 		}
@@ -967,13 +968,13 @@ func nonDirectoryGuardSubjectForKey(proofs []proof.PredicateProof, key []byte) (
 		switch parts.Kind {
 		case fsmeta.KeyKindInode:
 			inode, err := fsmeta.DecodeInodeValue(proof.Value)
-			if err != nil || inode.Type == fsmeta.InodeTypeDirectory {
+			if err != nil || inode.Type == model.InodeTypeDirectory {
 				return [32]byte{}, false
 			}
 			return inodeGuardSubjectDigest(GuardNonDirectoryInode, proof, inode), true
 		case fsmeta.KeyKindDentry:
 			dentry, err := fsmeta.DecodeDentryValue(proof.Value)
-			if err != nil || dentry.Type == fsmeta.InodeTypeDirectory {
+			if err != nil || dentry.Type == model.InodeTypeDirectory {
 				return [32]byte{}, false
 			}
 			return dentryGuardSubjectDigest(GuardNonDirectoryInode, proof, dentry), true
@@ -1064,7 +1065,7 @@ func quotaCreditGuardSubject(op CompiledOp) ([32]byte, bool) {
 }
 
 func emptyDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([32]byte, bool) {
-	if op.Delta.Kind == fsmeta.OperationRemoveDirectory {
+	if op.Delta.Kind == model.OperationRemoveDirectory {
 		if subject, ok := removeDirectoryGuardSubject(op, proofs); ok {
 			return subject, true
 		}
@@ -1079,7 +1080,7 @@ func emptyDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([
 			continue
 		}
 		inode, err := fsmeta.DecodeInodeValue(proof.Value)
-		if err != nil || inode.Type != fsmeta.InodeTypeDirectory || inode.ChildCount != 0 {
+		if err != nil || inode.Type != model.InodeTypeDirectory || inode.ChildCount != 0 {
 			return [32]byte{}, false
 		}
 		return inodeGuardSubjectDigest(GuardEmptyDirectory, proof, inode), true
@@ -1088,14 +1089,14 @@ func emptyDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([
 }
 
 func removeDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) ([32]byte, bool) {
-	var dentry fsmeta.DentryRecord
+	var dentry model.DentryRecord
 	var haveDentry bool
 	for _, predicateProof := range proofs {
 		if !predicateProof.Present || !bytes.Equal(predicateProof.Key, op.Delta.Plan.PrimaryKey) {
 			continue
 		}
 		record, err := fsmeta.DecodeDentryValue(predicateProof.Value)
-		if err != nil || record.Type != fsmeta.InodeTypeDirectory {
+		if err != nil || record.Type != model.InodeTypeDirectory {
 			return [32]byte{}, false
 		}
 		dentry = record
@@ -1114,7 +1115,7 @@ func removeDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) (
 			continue
 		}
 		inode, err := fsmeta.DecodeInodeValue(predicateProof.Value)
-		if err != nil || inode.Type != fsmeta.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == fsmeta.RootInode {
+		if err != nil || inode.Type != model.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == model.RootInode {
 			return [32]byte{}, false
 		}
 		return inodeGuardSubjectDigest(GuardEmptyDirectory, predicateProof, inode), true
@@ -1122,7 +1123,7 @@ func removeDirectoryGuardSubject(op CompiledOp, proofs []proof.PredicateProof) (
 	return [32]byte{}, false
 }
 
-func inodeGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, inode fsmeta.InodeRecord) [32]byte {
+func inodeGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, inode model.InodeRecord) [32]byte {
 	h := newDigestBuilder()
 	h.writeString(string(guard))
 	h.writeBytes(proof.Key)
@@ -1134,7 +1135,7 @@ func inodeGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, ino
 	return h.sum()
 }
 
-func dentryGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, dentry fsmeta.DentryRecord) [32]byte {
+func dentryGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, dentry model.DentryRecord) [32]byte {
 	h := newDigestBuilder()
 	h.writeString(string(guard))
 	h.writeBytes(proof.Key)
@@ -1146,7 +1147,7 @@ func dentryGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, de
 	return h.sum()
 }
 
-func sessionGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, session fsmeta.SessionRecord) [32]byte {
+func sessionGuardSubjectDigest(guard RuntimeGuard, proof proof.PredicateProof, session model.SessionRecord) [32]byte {
 	h := newDigestBuilder()
 	h.writeString(string(guard))
 	h.writeBytes(proof.Key)

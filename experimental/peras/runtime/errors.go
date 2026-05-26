@@ -7,7 +7,7 @@ import (
 	"errors"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 var (
@@ -32,8 +32,8 @@ func IsNotHeld(err error) bool {
 }
 
 func isAdmissionTerminalError(err error) bool {
-	return errors.Is(err, fsmeta.ErrExists) ||
-		errors.Is(err, fsmeta.ErrNotFound) ||
-		errors.Is(err, fsmeta.ErrInvalidRequest) ||
-		errors.Is(err, fsmeta.ErrInvalidValue)
+	return errors.Is(err, model.ErrExists) ||
+		errors.Is(err, model.ErrNotFound) ||
+		errors.Is(err, model.ErrInvalidRequest) ||
+		errors.Is(err, model.ErrInvalidValue)
 }

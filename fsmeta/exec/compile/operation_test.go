@@ -8,12 +8,13 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
 )
 
 func TestDerivedOperationRequiresRuntimeMaterialization(t *testing.T) {
-	delta, err := testUpdateInodeDelta(t, fsmeta.UpdateInodeRequest{
+	delta, err := testUpdateInodeDelta(t, model.UpdateInodeRequest{
 		Mount:   "vol",
 		Parent:  3,
 		Inode:   44,
@@ -38,7 +39,7 @@ func TestDerivedOperationRequiresRuntimeMaterialization(t *testing.T) {
 }
 
 func TestMaterializedOpRecompilesConcreteEffectsAndCarriesProofs(t *testing.T) {
-	delta, err := testUpdateInodeDelta(t, fsmeta.UpdateInodeRequest{
+	delta, err := testUpdateInodeDelta(t, model.UpdateInodeRequest{
 		Mount:   "vol",
 		Parent:  3,
 		Inode:   44,
@@ -74,18 +75,18 @@ func TestMaterializedOpRecompilesConcreteEffectsAndCarriesProofs(t *testing.T) {
 }
 
 func TestCompiledDigestSemanticsAreStableAcrossMaterialization(t *testing.T) {
-	createDelta, err := testCreateDelta(t, fsmeta.CreateRequest{
+	createDelta, err := testCreateDelta(t, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	}, testMount, 44)
 	require.NoError(t, err)
 	create := testCompileAOT(t, createDelta)
 	require.Equal(t, create.DescriptorDigest, create.IntentDigest)
 	require.Equal(t, create.DescriptorDigest, create.ReplayDigest)
 
-	updateDelta, err := testUpdateInodeDelta(t, fsmeta.UpdateInodeRequest{
+	updateDelta, err := testUpdateInodeDelta(t, model.UpdateInodeRequest{
 		Mount:   "vol",
 		Parent:  3,
 		Inode:   44,
@@ -104,18 +105,18 @@ func TestCompiledDigestSemanticsAreStableAcrossMaterialization(t *testing.T) {
 }
 
 func TestSegmentMergeDecisionUsesCompilerPlans(t *testing.T) {
-	left, err := testCreateDelta(t, fsmeta.CreateRequest{
+	left, err := testCreateDelta(t, model.CreateRequest{
 		Mount:  "vol",
 		Parent: 8,
 		Name:   "a",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	}, testMount, testParentInSameBucket(t, 8))
 	require.NoError(t, err)
-	right, err := testCreateDelta(t, fsmeta.CreateRequest{
+	right, err := testCreateDelta(t, model.CreateRequest{
 		Mount:  "vol",
 		Parent: 8,
 		Name:   "b",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	}, testMount, testParentInDifferentBucketAfter(t, 8, 128))
 	require.NoError(t, err)
 
@@ -129,7 +130,7 @@ func TestSegmentMergeDecisionUsesCompilerPlans(t *testing.T) {
 	decision = CanAppendSegment(testCompileAOT(t, left), testCompileAOT(t, right), SegmentBudget{MaxMutations: 3})
 	require.Equal(t, SegmentDecisionCut, decision.Kind)
 
-	snapshot, err := testSnapshotSubtreeDelta(t, fsmeta.SnapshotSubtreeRequest{Mount: "vol", RootInode: 8}, testMount)
+	snapshot, err := testSnapshotSubtreeDelta(t, model.SnapshotSubtreeRequest{Mount: "vol", RootInode: 8}, testMount)
 	require.NoError(t, err)
 	decision = CanAppendSegment(testCompileAOT(t, left), testCompileAOT(t, snapshot), SegmentBudget{})
 	require.Equal(t, SegmentDecisionFlushBeforeAndAfter, decision.Kind)
@@ -150,18 +151,18 @@ func TestSegmentMergeDecisionUsesCompilerPlans(t *testing.T) {
 }
 
 func TestSegmentPlanAPIPreservesCompilerBoundary(t *testing.T) {
-	left, err := testCreateDelta(t, fsmeta.CreateRequest{
+	left, err := testCreateDelta(t, model.CreateRequest{
 		Mount:  "vol",
 		Parent: 8,
 		Name:   "a",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	}, testMount, testParentInSameBucket(t, 8))
 	require.NoError(t, err)
-	right, err := testCreateDelta(t, fsmeta.CreateRequest{
+	right, err := testCreateDelta(t, model.CreateRequest{
 		Mount:  "vol",
 		Parent: 8,
 		Name:   "b",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	}, testMount, testParentInDifferentBucketAfter(t, 8, 128))
 	require.NoError(t, err)
 
@@ -203,22 +204,22 @@ func TestSegmentMergeKeyDistinguishesBucketZeroFromNoPrimaryBucket(t *testing.T)
 	require.NotEqual(t, singleBucketZero, multiBucket)
 }
 
-func testMaterializedCloseWriteSession(t *testing.T, session fsmeta.SessionID, inode fsmeta.InodeID) MaterializedOp {
+func testMaterializedCloseWriteSession(t *testing.T, session model.SessionID, inode model.InodeID) MaterializedOp {
 	t.Helper()
-	req := fsmeta.CloseWriteSessionRequest{
+	req := model.CloseWriteSessionRequest{
 		Mount:   "vol",
 		Inode:   inode,
 		Session: session,
 	}
 	program, err := CompileCloseWriteSessionProgram(req, testMount)
 	require.NoError(t, err)
-	sessionValue, err := fsmeta.EncodeSessionValue(fsmeta.SessionRecord{
+	sessionValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{
 		Session:       session,
 		Inode:         inode,
 		ExpiresUnixNs: 100,
 	})
 	require.NoError(t, err)
-	ownerValue, err := fsmeta.EncodeSessionValue(fsmeta.SessionRecord{
+	ownerValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{
 		Session:       session,
 		Inode:         inode,
 		ExpiresUnixNs: 100,

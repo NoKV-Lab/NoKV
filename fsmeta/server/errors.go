@@ -9,6 +9,7 @@ import (
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -82,41 +83,41 @@ func rpcServiceUnavailable(message string) error {
 func fsmetaErrorMetadata(err error) map[string]string {
 	reason := ""
 	switch {
-	case errors.Is(err, fsmeta.ErrQuotaExceeded):
+	case errors.Is(err, model.ErrQuotaExceeded):
 		reason = reasonQuotaExceeded
-	case errors.Is(err, fsmeta.ErrWatchOverflow):
+	case errors.Is(err, model.ErrWatchOverflow):
 		reason = reasonWatchOverflow
-	case errors.Is(err, fsmeta.ErrWatchCursorExpired):
+	case errors.Is(err, model.ErrWatchCursorExpired):
 		reason = reasonWatchCursorExpired
-	case errors.Is(err, fsmeta.ErrMountNotRegistered):
+	case errors.Is(err, model.ErrMountNotRegistered):
 		reason = reasonMountNotRegistered
-	case errors.Is(err, fsmeta.ErrMountRetired):
+	case errors.Is(err, model.ErrMountRetired):
 		reason = reasonMountRetired
-	case errors.Is(err, fsmeta.ErrCrossAuthorityRename):
+	case errors.Is(err, model.ErrCrossAuthorityRename):
 		reason = reasonCrossAuthorityRename
-	case errors.Is(err, fsmeta.ErrExists):
+	case errors.Is(err, model.ErrExists):
 		reason = reasonNamespaceExists
-	case errors.Is(err, fsmeta.ErrNotFound):
+	case errors.Is(err, model.ErrNotFound):
 		reason = reasonNamespaceNotFound
-	case errors.Is(err, fsmeta.ErrInvalidMountID):
+	case errors.Is(err, model.ErrInvalidMountID):
 		reason = reasonInvalidMountID
-	case errors.Is(err, fsmeta.ErrInvalidInodeID):
+	case errors.Is(err, model.ErrInvalidInodeID):
 		reason = reasonInvalidInodeID
-	case errors.Is(err, fsmeta.ErrInvalidName):
+	case errors.Is(err, model.ErrInvalidName):
 		reason = reasonInvalidName
-	case errors.Is(err, fsmeta.ErrInvalidSession):
+	case errors.Is(err, model.ErrInvalidSession):
 		reason = reasonInvalidSession
-	case errors.Is(err, fsmeta.ErrInvalidRequest):
+	case errors.Is(err, model.ErrInvalidRequest):
 		reason = reasonInvalidRequest
 	case errors.Is(err, fsmeta.ErrInvalidKey):
 		reason = reasonInvalidKey
 	case errors.Is(err, fsmeta.ErrInvalidKeyKind):
 		reason = reasonInvalidKeyKind
-	case errors.Is(err, fsmeta.ErrInvalidValue):
+	case errors.Is(err, model.ErrInvalidValue):
 		reason = reasonInvalidValue
 	case errors.Is(err, fsmeta.ErrInvalidValueKind):
 		reason = reasonInvalidValueKind
-	case errors.Is(err, fsmeta.ErrInvalidPageSize):
+	case errors.Is(err, model.ErrInvalidPageSize):
 		reason = reasonInvalidPageSize
 	}
 	if reason == "" {

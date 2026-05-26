@@ -9,13 +9,14 @@ import (
 	"crypto/sha256"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type LinkProgram struct {
 	Compiled CompiledOp
 }
 
-func CompileLinkProgram(req fsmeta.LinkRequest, mount fsmeta.MountIdentity, opts ...Option) (LinkProgram, error) {
+func CompileLinkProgram(req model.LinkRequest, mount model.MountIdentity, opts ...Option) (LinkProgram, error) {
 	options := collectOptions(opts...)
 	plan, err := fsmeta.PlanLink(req, mount)
 	if err != nil {
@@ -32,11 +33,11 @@ func CompileLinkProgram(req fsmeta.LinkRequest, mount fsmeta.MountIdentity, opts
 		{Kind: EffectDerivedPut},
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[1]},
 	}
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []model.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	delta.RuntimeGuards = append(delta.RuntimeGuards, GuardNonDirectoryInode, GuardSameAuthority)
 	delta = applyQuotaPolicy(delta, options, GuardQuotaCredit)
 	if !validateLinkSemanticDelta(delta) {
-		return LinkProgram{}, fsmeta.ErrInvalidRequest
+		return LinkProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileLinkCompiledOp(delta)
 	if err != nil {
@@ -46,7 +47,7 @@ func CompileLinkProgram(req fsmeta.LinkRequest, mount fsmeta.MountIdentity, opts
 }
 
 func validateLinkSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationLink {
+	if delta.Kind != model.OperationLink {
 		return false
 	}
 	switch {
@@ -135,15 +136,15 @@ func validateLinkSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileLinkCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationLink || len(delta.WriteEffects) != 3 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationLink || len(delta.WriteEffects) != 3 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))

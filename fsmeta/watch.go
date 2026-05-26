@@ -3,7 +3,11 @@
 
 package fsmeta
 
-import "context"
+import (
+	"context"
+
+	"github.com/feichai0017/NoKV/fsmeta/model"
+)
 
 // WatchEventSource identifies the raftstore command source that made a key
 // visible to MVCC readers.
@@ -36,8 +40,8 @@ type WatchCursor struct {
 
 // WatchRequest subscribes to one fsmeta key prefix.
 type WatchRequest struct {
-	Mount              MountID
-	RootInode          InodeID
+	Mount              model.MountID
+	RootInode          model.InodeID
 	KeyPrefix          []byte
 	DescendRecursively bool
 	ResumeCursor       WatchCursor
@@ -69,21 +73,21 @@ type Watcher interface {
 // SnapshotPublisher records published subtree snapshot epochs into an authority
 // layer such as meta/root. Implementations must not store per-dentry data.
 type SnapshotPublisher interface {
-	PublishSnapshotSubtree(context.Context, SnapshotSubtreeToken) error
-	RetireSnapshotSubtree(context.Context, SnapshotSubtreeToken) error
+	PublishSnapshotSubtree(context.Context, model.SnapshotSubtreeToken) error
+	RetireSnapshotSubtree(context.Context, model.SnapshotSubtreeToken) error
 }
 
 // SnapshotPublisherFunc adapts a function into SnapshotPublisher.
-type SnapshotPublisherFunc func(context.Context, SnapshotSubtreeToken) error
+type SnapshotPublisherFunc func(context.Context, model.SnapshotSubtreeToken) error
 
-func (f SnapshotPublisherFunc) PublishSnapshotSubtree(ctx context.Context, token SnapshotSubtreeToken) error {
+func (f SnapshotPublisherFunc) PublishSnapshotSubtree(ctx context.Context, token model.SnapshotSubtreeToken) error {
 	if f == nil {
 		return nil
 	}
 	return f(ctx, token)
 }
 
-func (f SnapshotPublisherFunc) RetireSnapshotSubtree(context.Context, SnapshotSubtreeToken) error {
+func (f SnapshotPublisherFunc) RetireSnapshotSubtree(context.Context, model.SnapshotSubtreeToken) error {
 	return nil
 }
 
@@ -94,31 +98,31 @@ func (f SnapshotPublisherFunc) RetireSnapshotSubtree(context.Context, SnapshotSu
 func WatchPrefix(req WatchRequest) ([]byte, error) {
 	if len(req.KeyPrefix) > 0 {
 		if req.Mount != "" || req.RootInode != 0 {
-			return nil, ErrInvalidRequest
+			return nil, model.ErrInvalidRequest
 		}
 		return append([]byte(nil), req.KeyPrefix...), nil
 	}
-	return nil, ErrInvalidRequest
+	return nil, model.ErrInvalidRequest
 }
 
 // WatchPrefixForMount returns the dentry prefix for a resolved mount identity.
-func WatchPrefixForMount(req WatchRequest, mount MountIdentity) ([]byte, error) {
+func WatchPrefixForMount(req WatchRequest, mount model.MountIdentity) ([]byte, error) {
 	if len(req.KeyPrefix) > 0 {
 		return WatchPrefix(req)
 	}
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return nil, err
 	}
-	if err := validateMountID(req.Mount); err != nil {
+	if err := model.ValidateMountID(req.Mount); err != nil {
 		return nil, err
 	}
-	if err := validateInodeID(req.RootInode); err != nil {
+	if err := model.ValidateInodeID(req.RootInode); err != nil {
 		return nil, err
 	}
 	if req.DescendRecursively {
 		// Dentry keys are parent-inode scoped, not path-prefix scoped. Recursive
 		// subtree watch needs a directory-tree index and is deferred.
-		return nil, ErrInvalidRequest
+		return nil, model.ErrInvalidRequest
 	}
 	return EncodeDentryPrefix(mount, req.RootInode)
 }

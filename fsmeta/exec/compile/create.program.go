@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type CreateProgram struct {
@@ -21,9 +22,9 @@ type CreateValues struct {
 	InodeValue       []byte
 }
 
-func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, inodeID fsmeta.InodeID, opts ...Option) (CreateProgram, error) {
+func CompileCreateProgram(req model.CreateRequest, mount model.MountIdentity, inodeID model.InodeID, opts ...Option) (CreateProgram, error) {
 	if req.Mount != "" && req.Mount != mount.MountID {
-		return CreateProgram{}, fsmeta.ErrInvalidMountID
+		return CreateProgram{}, model.ErrInvalidMountID
 	}
 	parentInodeKey, err := fsmeta.EncodeInodeKey(mount, req.Parent)
 	if err != nil {
@@ -39,7 +40,7 @@ func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, 
 	}
 	planKeys := [][]byte{parentInodeKey, dentryKey, inodeKey}
 	plan := fsmeta.OperationPlan{
-		Kind:         fsmeta.OperationCreate,
+		Kind:         model.OperationCreate,
 		Mount:        req.Mount,
 		PrimaryKey:   dentryKey,
 		ReadKeys:     planKeys[:3:3],
@@ -47,7 +48,7 @@ func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, 
 		MutateKeys:   planKeys[:3:3],
 	}
 	inode := req.Attrs.InodeRecord(inodeID)
-	dentry := fsmeta.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: inodeID, Type: inode.Type}
+	dentry := model.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: inodeID, Type: inode.Type}
 	dentryValue, err := fsmeta.EncodeDentryValue(dentry)
 	if err != nil {
 		return CreateProgram{}, err
@@ -69,7 +70,7 @@ func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, 
 	delta := SemanticDelta{
 		Kind:      plan.Kind,
 		Plan:      plan,
-		Authority: AuthorityScope{Mount: mount.MountID, MountKeyID: mount.MountKeyID, Buckets: buckets, Parents: []fsmeta.InodeID{req.Parent}, Inodes: []fsmeta.InodeID{inodeID}},
+		Authority: AuthorityScope{Mount: mount.MountID, MountKeyID: mount.MountKeyID, Buckets: buckets, Parents: []model.InodeID{req.Parent}, Inodes: []model.InodeID{inodeID}},
 		ReadPredicates: []Predicate{
 			{Kind: PredicateObservedValue, Key: plan.ReadKeys[0]},
 			{Kind: PredicateNotExists, Key: plan.MutateKeys[1]},
@@ -84,7 +85,7 @@ func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, 
 	}
 	delta = applyQuotaPolicy(delta, collectOptions(opts...), GuardQuotaCredit)
 	if !validateCreateSemanticDelta(delta) {
-		return CreateProgram{}, fsmeta.ErrInvalidRequest
+		return CreateProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileCreateCompiledOp(delta)
 	if err != nil {
@@ -95,13 +96,13 @@ func CompileCreateProgram(req fsmeta.CreateRequest, mount fsmeta.MountIdentity, 
 
 func MaterializeCreate(program CreateProgram, values CreateValues) (MaterializedOp, error) {
 	compiled := program.Compiled
-	if compiled.Delta.Kind != fsmeta.OperationCreate || len(compiled.Delta.ReadPredicates) != 3 || len(compiled.Delta.WriteEffects) != 3 {
-		return MaterializedOp{}, fsmeta.ErrInvalidRequest
+	if compiled.Delta.Kind != model.OperationCreate || len(compiled.Delta.ReadPredicates) != 3 || len(compiled.Delta.WriteEffects) != 3 {
+		return MaterializedOp{}, model.ErrInvalidRequest
 	}
 	delta := compiled.Delta
 	if values.ParentInodeValue != nil || values.DentryValue != nil || values.InodeValue != nil {
 		if values.ParentInodeValue == nil || values.DentryValue == nil || values.InodeValue == nil {
-			return MaterializedOp{}, fsmeta.ErrInvalidRequest
+			return MaterializedOp{}, model.ErrInvalidRequest
 		}
 		delta.WriteEffects = []WriteEffect{
 			{Kind: EffectPut, Key: delta.WriteEffects[0].Key, Value: values.ParentInodeValue},
@@ -120,7 +121,7 @@ func MaterializeCreate(program CreateProgram, values CreateValues) (Materialized
 }
 
 func validateCreateSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationCreate {
+	if delta.Kind != model.OperationCreate {
 		return false
 	}
 	switch {
@@ -203,8 +204,8 @@ func validateCreateSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileCreateCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationCreate || len(delta.ReadPredicates) != 3 || len(delta.WriteEffects) != 3 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationCreate || len(delta.ReadPredicates) != 3 || len(delta.WriteEffects) != 3 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
@@ -239,7 +240,7 @@ func compileCreateCompiledOp(delta SemanticDelta) (CompiledOp, error) {
 	guards := compileCreateGuardObligations(delta.RuntimeGuards)
 	parentParts, ok := fsmeta.InspectKey(delta.WriteEffects[0].Key)
 	if !ok {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	parentEffect := EffectPlan{ID: 0, Kind: delta.WriteEffects[0].Kind, Key: delta.WriteEffects[0].Key, Value: delta.WriteEffects[0].Value, Concrete: len(delta.WriteEffects[0].Value) > 0, MountKeyID: parentParts.MountKeyID, Bucket: parentParts.Bucket, RecordKind: parentParts.Kind}
 	if len(delta.WriteEffects[0].Value) > 0 {
@@ -282,7 +283,7 @@ func compileCreatePlacementPlan(delta SemanticDelta, durability DurabilityClass)
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if (delta.WriteEffects[0].Kind != EffectPut && delta.WriteEffects[0].Kind != EffectDerivedPut) || delta.WriteEffects[1].Kind != EffectPut || delta.WriteEffects[2].Kind != EffectPut || delta.WriteEffects[1].Value == nil || delta.WriteEffects[2].Value == nil {
-		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, fsmeta.ErrInvalidRequest
+		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, model.ErrInvalidRequest
 	}
 	dentryParts, ok := fsmeta.InspectKey(delta.WriteEffects[1].Key)
 	if !ok || dentryParts.Kind != fsmeta.KeyKindDentry {
@@ -293,7 +294,7 @@ func compileCreatePlacementPlan(delta SemanticDelta, durability DurabilityClass)
 		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, fsmeta.ErrInvalidKey
 	}
 	if dentryParts.MountKeyID != inodeParts.MountKeyID {
-		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, fsmeta.ErrInvalidRequest
+		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, model.ErrInvalidRequest
 	}
 	if delta.Eligibility != EligibilityVisibleCommit || delta.DurabilityBarrier {
 		return placement, dentryParts, inodeParts, nil

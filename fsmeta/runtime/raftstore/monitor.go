@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	rootstorage "github.com/feichai0017/NoKV/meta/root/storage"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
@@ -28,7 +28,7 @@ type lifecycleSource interface {
 }
 
 type retireRouter interface {
-	RetireMount(fsmeta.MountID) int
+	RetireMount(model.MountID) int
 }
 
 // monitor bootstraps lifecycle state once, then follows coordinator rooted
@@ -95,7 +95,7 @@ func (m *monitor) bootstrap(ctx context.Context) error {
 		if mount.GetMountId() == "" || mount.GetState() != coordpb.MountState_MOUNT_STATE_RETIRED {
 			continue
 		}
-		id := fsmeta.MountID(mount.GetMountId())
+		id := model.MountID(mount.GetMountId())
 		if m.cache != nil {
 			m.cache.markRetired(id)
 		}
@@ -125,7 +125,7 @@ func (m *monitor) bootstrap(ctx context.Context) error {
 			if subtree.GetMountId() == "" || subtree.GetRootInode() == 0 || subtree.GetPredecessorFrontier() == 0 {
 				continue
 			}
-			if err := m.subtrees.CompleteSubtreeHandoff(ctx, fsmeta.MountID(subtree.GetMountId()), fsmeta.InodeID(subtree.GetRootInode()), subtree.GetPredecessorFrontier()); err != nil {
+			if err := m.subtrees.CompleteSubtreeHandoff(ctx, model.MountID(subtree.GetMountId()), model.InodeID(subtree.GetRootInode()), subtree.GetPredecessorFrontier()); err != nil {
 				log.Printf("fsmeta monitor: complete pending subtree handoff mount=%s root=%d frontier=%d: %v",
 					subtree.GetMountId(), subtree.GetRootInode(), subtree.GetPredecessorFrontier(), err)
 			}
@@ -174,7 +174,7 @@ func (m *monitor) applyRootEvent(ctx context.Context, event rootevent.Event) {
 		if event.Mount == nil || event.Mount.MountID == "" {
 			return
 		}
-		m.retireMount(fsmeta.MountID(event.Mount.MountID))
+		m.retireMount(model.MountID(event.Mount.MountID))
 	case rootevent.KindQuotaFenceUpdated:
 		if m.quotas == nil || event.QuotaFence == nil {
 			return
@@ -197,7 +197,7 @@ func (m *monitor) applyRootEvent(ctx context.Context, event rootevent.Event) {
 	}
 }
 
-func (m *monitor) retireMount(id fsmeta.MountID) {
+func (m *monitor) retireMount(id model.MountID) {
 	if id == "" {
 		return
 	}
@@ -216,7 +216,7 @@ func (m *monitor) completePendingSubtreeHandoff(ctx context.Context, mount strin
 	if m.subtrees == nil || mount == "" || rootInode == 0 || frontier == 0 {
 		return
 	}
-	if err := m.subtrees.CompleteSubtreeHandoff(ctx, fsmeta.MountID(mount), fsmeta.InodeID(rootInode), frontier); err != nil {
+	if err := m.subtrees.CompleteSubtreeHandoff(ctx, model.MountID(mount), model.InodeID(rootInode), frontier); err != nil {
 		log.Printf("fsmeta monitor: complete pending subtree handoff mount=%s root=%d frontier=%d: %v",
 			mount, rootInode, frontier, err)
 	}

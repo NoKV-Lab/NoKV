@@ -10,6 +10,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 const (
@@ -34,26 +35,26 @@ const (
 // MetadataClient is the native fsmeta service surface exercised by the
 // official-aligned metadata workload suite.
 type MetadataClient interface {
-	Create(context.Context, fsmeta.CreateRequest) (fsmeta.CreateResult, error)
-	UpdateInode(context.Context, fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error)
-	Lookup(context.Context, fsmeta.LookupRequest) (fsmeta.DentryRecord, error)
-	ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
+	Create(context.Context, model.CreateRequest) (model.CreateResult, error)
+	UpdateInode(context.Context, model.UpdateInodeRequest) (model.InodeRecord, error)
+	Lookup(context.Context, model.LookupRequest) (model.DentryRecord, error)
+	ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error)
 	WatchSubtree(context.Context, fsmeta.WatchRequest) (fsmetaclient.WatchSubscription, error)
-	SnapshotSubtree(context.Context, fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error)
-	RetireSnapshotSubtree(context.Context, fsmeta.SnapshotSubtreeToken) error
-	Rename(context.Context, fsmeta.RenameRequest) error
-	Unlink(context.Context, fsmeta.UnlinkRequest) error
-	OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
-	HeartbeatWriteSession(context.Context, fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
-	CloseWriteSession(context.Context, fsmeta.CloseWriteSessionRequest) error
+	SnapshotSubtree(context.Context, model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error)
+	RetireSnapshotSubtree(context.Context, model.SnapshotSubtreeToken) error
+	Rename(context.Context, model.RenameRequest) error
+	Unlink(context.Context, model.UnlinkRequest) error
+	OpenWriteSession(context.Context, model.OpenWriteSessionRequest) (model.SessionRecord, error)
+	HeartbeatWriteSession(context.Context, model.HeartbeatWriteSessionRequest) (model.SessionRecord, error)
+	CloseWriteSession(context.Context, model.CloseWriteSessionRequest) error
 }
 
 type LookupPlusMetadataClient interface {
-	LookupPlus(context.Context, fsmeta.LookupRequest) (fsmeta.DentryAttrPair, error)
+	LookupPlus(context.Context, model.LookupRequest) (model.DentryAttrPair, error)
 }
 
 type MDTestConfig struct {
-	Mount             fsmeta.MountID
+	Mount             model.MountID
 	RunID             string
 	Clients           int
 	Directories       int
@@ -62,7 +63,7 @@ type MDTestConfig struct {
 }
 
 type FilebenchVarmailConfig struct {
-	Mount           fsmeta.MountID
+	Mount           model.MountID
 	RunID           string
 	Clients         int
 	Users           int
@@ -72,7 +73,7 @@ type FilebenchVarmailConfig struct {
 }
 
 type MimesisNamespaceConfig struct {
-	Mount             fsmeta.MountID
+	Mount             model.MountID
 	RunID             string
 	Clients           int
 	Directories       int
@@ -81,7 +82,7 @@ type MimesisNamespaceConfig struct {
 }
 
 type AICheckpointAgentConfig struct {
-	Mount                   fsmeta.MountID
+	Mount                   model.MountID
 	RunID                   string
 	Clients                 int
 	Workspaces              int

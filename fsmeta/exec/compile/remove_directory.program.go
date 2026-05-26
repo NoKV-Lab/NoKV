@@ -9,13 +9,14 @@ import (
 	"crypto/sha256"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type RemoveDirectoryProgram struct {
 	Compiled CompiledOp
 }
 
-func CompileRemoveDirectoryProgram(req fsmeta.RemoveDirectoryRequest, mount fsmeta.MountIdentity) (RemoveDirectoryProgram, error) {
+func CompileRemoveDirectoryProgram(req model.RemoveDirectoryRequest, mount model.MountIdentity) (RemoveDirectoryProgram, error) {
 	plan, err := fsmeta.PlanRemoveDirectory(req, mount)
 	if err != nil {
 		return RemoveDirectoryProgram{}, err
@@ -30,10 +31,10 @@ func CompileRemoveDirectoryProgram(req fsmeta.RemoveDirectoryRequest, mount fsme
 		{Kind: EffectDelete, Key: plan.MutateKeys[1]},
 		{Kind: EffectDerivedDelete},
 	}
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.Parent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []model.InodeID{req.Parent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	delta.RuntimeGuards = append(delta.RuntimeGuards, GuardEmptyDirectory)
 	if !validateRemoveDirectorySemanticDelta(delta) {
-		return RemoveDirectoryProgram{}, fsmeta.ErrInvalidRequest
+		return RemoveDirectoryProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileRemoveDirectoryCompiledOp(delta)
 	if err != nil {
@@ -43,7 +44,7 @@ func CompileRemoveDirectoryProgram(req fsmeta.RemoveDirectoryRequest, mount fsme
 }
 
 func validateRemoveDirectorySemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationRemoveDirectory {
+	if delta.Kind != model.OperationRemoveDirectory {
 		return false
 	}
 	switch {
@@ -115,15 +116,15 @@ func validateRemoveDirectorySemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileRemoveDirectoryCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationRemoveDirectory || len(delta.WriteEffects) != 3 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationRemoveDirectory || len(delta.WriteEffects) != 3 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))

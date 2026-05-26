@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -26,8 +28,8 @@ func (e *Executor) tryVisibleRename(ctx context.Context, compiled compile.Compil
 	sourceFromVisible := view.observedKeyFromVisibleOverlay(plan.ReadKeys[0])
 	if !e.visibleNotExistsKnown(delta.Authority, plan.ReadKeys[1], e.visiblePredicateIndex()) {
 		if _, err := view.readDentry(plan.ReadKeys[1]); err == nil {
-			return false, fsmeta.ErrExists
-		} else if !errors.Is(err, fsmeta.ErrNotFound) {
+			return false, model.ErrExists
+		} else if !errors.Is(err, model.ErrNotFound) {
 			return false, err
 		}
 	}
@@ -99,15 +101,15 @@ func (e *Executor) tryVisibleRename(ctx context.Context, compiled compile.Compil
 }
 
 type renameMove struct {
-	mount      fsmeta.MountID
-	identity   fsmeta.MountIdentity
-	fromParent fsmeta.InodeID
+	mount      model.MountID
+	identity   model.MountIdentity
+	fromParent model.InodeID
 	fromName   string
-	toParent   fsmeta.InodeID
+	toParent   model.InodeID
 	toName     string
 }
 
-func renameMoveFromRename(req fsmeta.RenameRequest, identity fsmeta.MountIdentity) renameMove {
+func renameMoveFromRename(req model.RenameRequest, identity model.MountIdentity) renameMove {
 	return renameMove{
 		mount:      req.Mount,
 		identity:   identity,
@@ -118,7 +120,7 @@ func renameMoveFromRename(req fsmeta.RenameRequest, identity fsmeta.MountIdentit
 	}
 }
 
-func renameMoveFromRenameReplace(req fsmeta.RenameReplaceRequest, identity fsmeta.MountIdentity) renameMove {
+func renameMoveFromRenameReplace(req model.RenameReplaceRequest, identity model.MountIdentity) renameMove {
 	return renameMove{
 		mount:      req.Mount,
 		identity:   identity,
@@ -129,7 +131,7 @@ func renameMoveFromRenameReplace(req fsmeta.RenameReplaceRequest, identity fsmet
 	}
 }
 
-func renameMoveFromRenameSubtree(req fsmeta.RenameSubtreeRequest, identity fsmeta.MountIdentity) renameMove {
+func renameMoveFromRenameSubtree(req model.RenameSubtreeRequest, identity model.MountIdentity) renameMove {
 	return renameMove{
 		mount:      req.Mount,
 		identity:   identity,
@@ -143,7 +145,7 @@ func renameMoveFromRenameSubtree(req fsmeta.RenameSubtreeRequest, identity fsmet
 // Rename moves one dentry inside the same subtree authority. It is deliberately
 // a data-plane transaction: no rooted handoff is published, so common staged
 // publish paths do not serialize through the control plane.
-func (e *Executor) Rename(ctx context.Context, req fsmeta.RenameRequest) error {
+func (e *Executor) Rename(ctx context.Context, req model.RenameRequest) error {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
 		return err
@@ -197,26 +199,26 @@ func (e *Executor) Rename(ctx context.Context, req fsmeta.RenameRequest) error {
 // replacing an existing non-directory destination dentry when present. It is the
 // artifact publish primitive: no subtree handoff or durability barrier is
 // emitted, and all namespace/index mutations commit in one KV transaction.
-func (e *Executor) RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+func (e *Executor) RenameReplace(ctx context.Context, req model.RenameReplaceRequest) (model.RenameReplaceResult, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, err
+		return model.RenameReplaceResult{}, err
 	}
 	mount := mountRecord.Identity()
 	program, err := compile.CompileRenameReplaceProgram(req, mount)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, err
+		return model.RenameReplaceResult{}, err
 	}
 	delta := program.Compiled.Delta
 	if err := e.requireSameAuthority(ctx, req.Mount, req.FromParent, req.ToParent); err != nil {
-		return fsmeta.RenameReplaceResult{}, err
+		return model.RenameReplaceResult{}, err
 	}
 	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
-		return fsmeta.RenameReplaceResult{}, err
+		return model.RenameReplaceResult{}, err
 	}
 	plan := delta.Plan
 	move := renameMoveFromRenameReplace(req, mount)
-	var result fsmeta.RenameReplaceResult
+	var result model.RenameReplaceResult
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
 		nextResult, mutations, err := e.prepareRenameReplaceMutations(ctx, plan, move, startVersion)
 		if err != nil {
@@ -228,7 +230,7 @@ func (e *Executor) RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRe
 		result = nextResult
 		return nil
 	}, delta.Authority); err != nil {
-		return fsmeta.RenameReplaceResult{}, err
+		return model.RenameReplaceResult{}, err
 	}
 	e.forgetVisibleEmptyDirectory(mount, req.ToParent)
 	e.invalidateNegative(plan.ReadKeys...)
@@ -239,7 +241,7 @@ func (e *Executor) RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRe
 
 // RenameSubtree moves the subtree root dentry from source to destination.
 // Descendants follow through inode parent links rather than key rewrites.
-func (e *Executor) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error {
+func (e *Executor) RenameSubtree(ctx context.Context, req model.RenameSubtreeRequest) error {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
 		return err
@@ -256,7 +258,7 @@ func (e *Executor) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRe
 	plan := delta.Plan
 	authorityRoot := mountRecord.RootInode
 	if e.subtrees != nil && authorityRoot == 0 {
-		return fsmeta.ErrInvalidInodeID
+		return model.ErrInvalidInodeID
 	}
 	var movedSize uint64
 	var movedInode bool
@@ -310,62 +312,62 @@ func (e *Executor) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRe
 	return nil
 }
 
-func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmeta.OperationPlan, move renameMove, startVersion uint64) (fsmeta.RenameReplaceResult, []*kvrpcpb.Mutation, error) {
+func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmeta.OperationPlan, move renameMove, startVersion uint64) (model.RenameReplaceResult, []*kvrpcpb.Mutation, error) {
 	sourceDentry, err := e.readDentry(ctx, plan.ReadKeys[0], startVersion)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("source dentry: %w", err)
+		return model.RenameReplaceResult{}, nil, fmt.Errorf("source dentry: %w", err)
 	}
-	if sourceDentry.Type == fsmeta.InodeTypeDirectory {
-		return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidRequest
+	if sourceDentry.Type == model.InodeTypeDirectory {
+		return model.RenameReplaceResult{}, nil, model.ErrInvalidRequest
 	}
 	sourceInode, ok, err := e.readInode(ctx, move.identity, sourceDentry.Inode, startVersion)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("source inode: %w", err)
+		return model.RenameReplaceResult{}, nil, fmt.Errorf("source inode: %w", err)
 	}
 	if !ok {
-		return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("%w: inode %d", fsmeta.ErrNotFound, sourceDentry.Inode)
+		return model.RenameReplaceResult{}, nil, fmt.Errorf("%w: inode %d", model.ErrNotFound, sourceDentry.Inode)
 	}
 	if err := validateRenameReplaceDentryInode(sourceDentry, sourceInode); err != nil {
-		return fsmeta.RenameReplaceResult{}, nil, err
+		return model.RenameReplaceResult{}, nil, err
 	}
-	if sourceInode.Type == fsmeta.InodeTypeDirectory {
-		return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidRequest
+	if sourceInode.Type == model.InodeTypeDirectory {
+		return model.RenameReplaceResult{}, nil, model.ErrInvalidRequest
 	}
 	fromParent, err := e.readDirectoryInode(ctx, move.identity, move.fromParent, startVersion)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("from parent inode: %w", err)
+		return model.RenameReplaceResult{}, nil, fmt.Errorf("from parent inode: %w", err)
 	}
 
-	result := fsmeta.RenameReplaceResult{}
+	result := model.RenameReplaceResult{}
 	destinationExisted := false
 	destinationDentry, err := e.readDentry(ctx, plan.ReadKeys[1], startVersion)
 	if err == nil {
 		destinationExisted = true
 		result.Replaced = true
 		result.OldDentry = destinationDentry
-	} else if !errors.Is(err, fsmeta.ErrNotFound) {
-		return fsmeta.RenameReplaceResult{}, nil, err
+	} else if !errors.Is(err, model.ErrNotFound) {
+		return model.RenameReplaceResult{}, nil, err
 	} else {
 		err = nil
 	}
 
-	var destinationInode fsmeta.InodeRecord
+	var destinationInode model.InodeRecord
 	if destinationExisted {
-		if destinationDentry.Type == fsmeta.InodeTypeDirectory {
-			return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidRequest
+		if destinationDentry.Type == model.InodeTypeDirectory {
+			return model.RenameReplaceResult{}, nil, model.ErrInvalidRequest
 		}
 		destinationInode, ok, err = e.readInode(ctx, move.identity, destinationDentry.Inode, startVersion)
 		if err != nil {
-			return fsmeta.RenameReplaceResult{}, nil, err
+			return model.RenameReplaceResult{}, nil, err
 		}
 		if !ok {
-			return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("%w: inode %d", fsmeta.ErrNotFound, destinationDentry.Inode)
+			return model.RenameReplaceResult{}, nil, fmt.Errorf("%w: inode %d", model.ErrNotFound, destinationDentry.Inode)
 		}
 		if err := validateRenameReplaceDentryInode(destinationDentry, destinationInode); err != nil {
-			return fsmeta.RenameReplaceResult{}, nil, err
+			return model.RenameReplaceResult{}, nil, err
 		}
-		if destinationInode.Type == fsmeta.InodeTypeDirectory {
-			return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidRequest
+		if destinationInode.Type == model.InodeTypeDirectory {
+			return model.RenameReplaceResult{}, nil, model.ErrInvalidRequest
 		}
 		result.OldInode = destinationInode
 	}
@@ -373,7 +375,7 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 	if move.fromParent != move.toParent {
 		toParent, err = e.readDirectoryInode(ctx, move.identity, move.toParent, startVersion)
 		if err != nil {
-			return fsmeta.RenameReplaceResult{}, nil, fmt.Errorf("to parent inode: %w", err)
+			return model.RenameReplaceResult{}, nil, fmt.Errorf("to parent inode: %w", err)
 		}
 	}
 	nextFromParent := fromParent.record
@@ -388,7 +390,7 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 		}
 	}
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, nil, err
+		return model.RenameReplaceResult{}, nil, err
 	}
 
 	replacementDentry := sourceDentry
@@ -396,7 +398,7 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 	replacementDentry.Name = move.toName
 	replacementValue, err := fsmeta.EncodeDentryValue(replacementDentry)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, nil, err
+		return model.RenameReplaceResult{}, nil, err
 	}
 	putDestination := &kvrpcpb.Mutation{
 		Op:    kvrpcpb.Mutation_Put,
@@ -408,11 +410,11 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 	}
 	fromParentValue, err := fsmeta.EncodeInodeValue(nextFromParent)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, nil, err
+		return model.RenameReplaceResult{}, nil, err
 	}
 	toParentValue, err := fsmeta.EncodeInodeValue(nextToParent)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, nil, err
+		return model.RenameReplaceResult{}, nil, err
 	}
 	mutations := []*kvrpcpb.Mutation{
 		{
@@ -440,10 +442,10 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 	if destinationExisted {
 		destinationInodeKey, err := fsmeta.EncodeInodeKey(move.identity, destinationInode.Inode)
 		if err != nil {
-			return fsmeta.RenameReplaceResult{}, nil, err
+			return model.RenameReplaceResult{}, nil, err
 		}
 		if destinationInode.Inode == sourceInode.Inode && destinationInode.LinkCount <= 1 {
-			return fsmeta.RenameReplaceResult{}, nil, fsmeta.ErrInvalidValue
+			return model.RenameReplaceResult{}, nil, model.ErrInvalidValue
 		}
 		if destinationInode.LinkCount <= 1 {
 			result.OldInodeDeleted = true
@@ -455,7 +457,7 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 			destinationInode.LinkCount--
 			destinationValue, err := fsmeta.EncodeInodeValue(destinationInode)
 			if err != nil {
-				return fsmeta.RenameReplaceResult{}, nil, err
+				return model.RenameReplaceResult{}, nil, err
 			}
 			mutations = append(mutations, &kvrpcpb.Mutation{
 				Op:    kvrpcpb.Mutation_Put,
@@ -474,19 +476,19 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 	if len(quotaChanges) > 0 {
 		quotaMutations, err := e.reserveQuota(ctx, quotaChanges, startVersion)
 		if err != nil {
-			return fsmeta.RenameReplaceResult{}, nil, err
+			return model.RenameReplaceResult{}, nil, err
 		}
 		mutations = append(mutations, quotaMutations...)
 	}
 	return result, mutations, nil
 }
 
-func validateRenameReplaceDentryInode(dentry fsmeta.DentryRecord, inode fsmeta.InodeRecord) error {
+func validateRenameReplaceDentryInode(dentry model.DentryRecord, inode model.InodeRecord) error {
 	if dentry.Inode != inode.Inode {
-		return fmt.Errorf("%w: dentry inode=%d value inode=%d", fsmeta.ErrInvalidValue, dentry.Inode, inode.Inode)
+		return fmt.Errorf("%w: dentry inode=%d value inode=%d", model.ErrInvalidValue, dentry.Inode, inode.Inode)
 	}
 	if dentry.Type != inode.Type {
-		return fmt.Errorf("%w: dentry type=%s inode type=%s", fsmeta.ErrInvalidValue, dentry.Type, inode.Type)
+		return fmt.Errorf("%w: dentry type=%s inode type=%s", model.ErrInvalidValue, dentry.Type, inode.Type)
 	}
 	return nil
 }
@@ -501,8 +503,8 @@ func (e *Executor) prepareRenameMutations(ctx context.Context, plan fsmeta.Opera
 		return nil, nil, err
 	}
 	if _, err := e.readDentry(ctx, plan.ReadKeys[1], startVersion); err == nil {
-		return nil, nil, fsmeta.ErrExists
-	} else if !errors.Is(err, fsmeta.ErrNotFound) {
+		return nil, nil, model.ErrExists
+	} else if !errors.Is(err, model.ErrNotFound) {
 		return nil, nil, err
 	}
 	record.Parent = move.toParent
@@ -589,21 +591,21 @@ func (e *Executor) prepareRenameMutations(ctx context.Context, plan fsmeta.Opera
 	return mutations, predicates, nil
 }
 
-func (e *Executor) startSubtreeHandoff(ctx context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {
+func (e *Executor) startSubtreeHandoff(ctx context.Context, mount model.MountID, root model.InodeID, frontier uint64) error {
 	if e == nil || e.subtrees == nil || mount == "" || root == 0 || frontier == 0 {
 		return nil
 	}
 	return e.subtrees.StartSubtreeHandoff(ctx, mount, root, frontier)
 }
 
-func (e *Executor) completeSubtreeHandoff(ctx context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {
+func (e *Executor) completeSubtreeHandoff(ctx context.Context, mount model.MountID, root model.InodeID, frontier uint64) error {
 	if e == nil || e.subtrees == nil || mount == "" || root == 0 || frontier == 0 {
 		return nil
 	}
 	return e.subtrees.CompleteSubtreeHandoff(ctx, mount, root, frontier)
 }
 
-func (e *Executor) requireSameAuthority(ctx context.Context, mount fsmeta.MountID, fromParent, toParent fsmeta.InodeID) error {
+func (e *Executor) requireSameAuthority(ctx context.Context, mount model.MountID, fromParent, toParent model.InodeID) error {
 	if e == nil || e.authorities == nil {
 		return nil
 	}
@@ -612,7 +614,7 @@ func (e *Executor) requireSameAuthority(ctx context.Context, mount fsmeta.MountI
 		return err
 	}
 	if !same {
-		return fsmeta.ErrCrossAuthorityRename
+		return model.ErrCrossAuthorityRename
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -39,20 +40,20 @@ func ScopeFromProto(in *kvrpcpb.VisibleAuthorityScope) (compile.AuthorityScope, 
 		return compile.AuthorityScope{}, fmt.Errorf("peras wire: authority scope missing")
 	}
 	out := compile.AuthorityScope{
-		Mount:      fsmeta.MountID(in.GetMount()),
-		MountKeyID: fsmeta.MountKeyID(in.GetMountKeyId()),
+		Mount:      model.MountID(in.GetMount()),
+		MountKeyID: model.MountKeyID(in.GetMountKeyId()),
 		Buckets:    make([]fsmeta.AffinityBucket, 0, len(in.GetBuckets())),
-		Parents:    make([]fsmeta.InodeID, 0, len(in.GetParents())),
-		Inodes:     make([]fsmeta.InodeID, 0, len(in.GetInodes())),
+		Parents:    make([]model.InodeID, 0, len(in.GetParents())),
+		Inodes:     make([]model.InodeID, 0, len(in.GetInodes())),
 	}
 	for _, bucket := range in.GetBuckets() {
 		out.Buckets = append(out.Buckets, fsmeta.AffinityBucket(bucket))
 	}
 	for _, parent := range in.GetParents() {
-		out.Parents = append(out.Parents, fsmeta.InodeID(parent))
+		out.Parents = append(out.Parents, model.InodeID(parent))
 	}
 	for _, inode := range in.GetInodes() {
-		out.Inodes = append(out.Inodes, fsmeta.InodeID(inode))
+		out.Inodes = append(out.Inodes, model.InodeID(inode))
 	}
 	return out, nil
 }

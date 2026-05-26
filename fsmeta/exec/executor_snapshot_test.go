@@ -6,26 +6,27 @@ package exec
 import (
 	"context"
 	"errors"
-	"github.com/feichai0017/NoKV/fsmeta"
-	"github.com/stretchr/testify/require"
 	"testing"
+
+	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExecutorSnapshotSubtreeTokenDrivesReadVersion(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "a", 21)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 21, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: 21, Type: model.InodeTypeFile, LinkCount: 1})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	token, err := executor.SnapshotSubtree(context.Background(), fsmeta.SnapshotSubtreeRequest{
+	token, err := executor.SnapshotSubtree(context.Background(), model.SnapshotSubtreeRequest{
 		Mount:     "vol",
 		RootInode: 7,
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.SnapshotSubtreeToken{Mount: "vol", MountKeyID: 1, RootInode: 7, ReadVersion: 1}, token)
+	require.Equal(t, model.SnapshotSubtreeToken{Mount: "vol", MountKeyID: 1, RootInode: 7, ReadVersion: 1}, token)
 
-	_, err = executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	_, err = executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:           "vol",
 		Parent:          7,
 		Limit:           8,
@@ -45,7 +46,7 @@ func TestExecutorSnapshotSubtreeFlushesVisibleAuthorityBeforeToken(t *testing.T)
 	)
 	require.NoError(t, err)
 
-	token, err := executor.SnapshotSubtree(context.Background(), fsmeta.SnapshotSubtreeRequest{
+	token, err := executor.SnapshotSubtree(context.Background(), model.SnapshotSubtreeRequest{
 		Mount:     "vol",
 		RootInode: 7,
 	})
@@ -53,22 +54,22 @@ func TestExecutorSnapshotSubtreeFlushesVisibleAuthorityBeforeToken(t *testing.T)
 	require.Equal(t, uint64(1), token.ReadVersion)
 	require.Equal(t, 1, flusher.flushCalls)
 	require.Len(t, flusher.flushScopes, 1)
-	require.Equal(t, fsmeta.MountID("vol"), flusher.flushScopes[0].Mount)
-	require.Equal(t, fsmeta.MountKeyID(1), flusher.flushScopes[0].MountKeyID)
-	require.Equal(t, []fsmeta.InodeID{7}, flusher.flushScopes[0].Parents)
+	require.Equal(t, model.MountID("vol"), flusher.flushScopes[0].Mount)
+	require.Equal(t, model.MountKeyID(1), flusher.flushScopes[0].MountKeyID)
+	require.Equal(t, []model.InodeID{7}, flusher.flushScopes[0].Parents)
 }
 
 func TestExecutorSnapshotSubtreeUsesVisibleCaptureWhenAvailable(t *testing.T) {
 	runner := newFakeRunner()
 	ref := testSnapshotEvidenceRef(3, 0xaa)
-	capturer := &fakeVisibleSnapshotCapturer{capture: true, segmentRefs: []fsmeta.SnapshotEvidenceRef{ref}}
+	capturer := &fakeVisibleSnapshotCapturer{capture: true, segmentRefs: []model.SnapshotEvidenceRef{ref}}
 	executor, err := newTestExecutor(runner,
 		WithVisibleCommitter(capturer),
 		WithVisibleAuthorityAdmitter(&fakeVisibleAdmitter{owned: true}),
 	)
 	require.NoError(t, err)
 
-	token, err := executor.SnapshotSubtree(context.Background(), fsmeta.SnapshotSubtreeRequest{
+	token, err := executor.SnapshotSubtree(context.Background(), model.SnapshotSubtreeRequest{
 		Mount:     "vol",
 		RootInode: 7,
 	})
@@ -76,26 +77,26 @@ func TestExecutorSnapshotSubtreeUsesVisibleCaptureWhenAvailable(t *testing.T) {
 	require.Equal(t, uint64(1), token.ReadVersion)
 	require.Equal(t, []uint64{1}, capturer.captureVersions)
 	require.Len(t, capturer.captureScopes, 1)
-	require.Equal(t, []fsmeta.InodeID{7}, capturer.captureScopes[0].Parents)
-	require.Equal(t, []fsmeta.SnapshotEvidenceRef{ref}, token.RuntimeEvidence)
+	require.Equal(t, []model.InodeID{7}, capturer.captureScopes[0].Parents)
+	require.Equal(t, []model.SnapshotEvidenceRef{ref}, token.RuntimeEvidence)
 	require.Equal(t, 0, capturer.flushCalls)
 }
 
 func TestExecutorResolveSnapshotSubtreeTokenAllowsRetiredMount(t *testing.T) {
 	runner := newFakeRunner()
-	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
-		"vol": {MountID: "vol", MountKeyID: 9, RootInode: fsmeta.RootInode, SchemaVersion: 1, Retired: true},
+	resolver := &fakeMountResolver{records: map[model.MountID]MountAdmission{
+		"vol": {MountID: "vol", MountKeyID: 9, RootInode: model.RootInode, SchemaVersion: 1, Retired: true},
 	}}
 	executor, err := newTestExecutor(runner, WithMountResolver(resolver))
 	require.NoError(t, err)
 
-	token, err := executor.ResolveSnapshotSubtreeToken(context.Background(), fsmeta.SnapshotSubtreeToken{
+	token, err := executor.ResolveSnapshotSubtreeToken(context.Background(), model.SnapshotSubtreeToken{
 		Mount:       "vol",
 		RootInode:   7,
 		ReadVersion: 42,
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.SnapshotSubtreeToken{Mount: "vol", MountKeyID: 9, RootInode: 7, ReadVersion: 42}, token)
+	require.Equal(t, model.SnapshotSubtreeToken{Mount: "vol", MountKeyID: 9, RootInode: 7, ReadVersion: 42}, token)
 }
 
 func TestExecutorResolveSnapshotSubtreeTokenRejectsInvalidVisibleRef(t *testing.T) {
@@ -103,21 +104,21 @@ func TestExecutorResolveSnapshotSubtreeTokenRejectsInvalidVisibleRef(t *testing.
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	_, err = executor.ResolveSnapshotSubtreeToken(context.Background(), fsmeta.SnapshotSubtreeToken{
+	_, err = executor.ResolveSnapshotSubtreeToken(context.Background(), model.SnapshotSubtreeToken{
 		Mount:           "vol",
 		RootInode:       7,
 		ReadVersion:     42,
-		RuntimeEvidence: []fsmeta.SnapshotEvidenceRef{{EpochID: 1}},
+		RuntimeEvidence: []model.SnapshotEvidenceRef{{EpochID: 1}},
 	})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 }
 
-func testSnapshotEvidenceRef(epoch uint64, seed byte) fsmeta.SnapshotEvidenceRef {
+func testSnapshotEvidenceRef(epoch uint64, seed byte) model.SnapshotEvidenceRef {
 	var root [32]byte
 	var digest [32]byte
 	root[0] = seed
 	digest[0] = seed + 1
-	return fsmeta.SnapshotEvidenceRef{
+	return model.SnapshotEvidenceRef{
 		EpochID:       epoch,
 		EvidenceRoot:  root,
 		PayloadDigest: digest,
@@ -128,15 +129,15 @@ func TestExecutorReadDirPlusRetriesLiveLockAtSnapshotVersion(t *testing.T) {
 	runner := newFakeRunner()
 	runner.scanErrs = []error{txnLockedError("vol", 7, "a")}
 	seedDentry(t, runner, "vol", 7, "a", 21)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     21,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	pairs, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pairs, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:           "vol",
 		Parent:          7,
 		Limit:           8,
@@ -155,8 +156,8 @@ func TestExecutorRenameMovesDentryWithoutSubtreeHandoff(t *testing.T) {
 	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{}
 	authority := &fakeAuthorityResolver{same: true}
-	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
-		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
+	resolver := &fakeMountResolver{records: map[model.MountID]MountAdmission{
+		"vol": {MountID: "vol", MountKeyID: 1, RootInode: model.RootInode, SchemaVersion: 1},
 	}}
 	executor, err := newTestExecutor(
 		runner,
@@ -166,7 +167,7 @@ func TestExecutorRenameMovesDentryWithoutSubtreeHandoff(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = executor.Rename(context.Background(), fsmeta.RenameRequest{
+	err = executor.Rename(context.Background(), model.RenameRequest{
 		Mount:      "vol",
 		FromParent: 7,
 		FromName:   "old",
@@ -175,11 +176,11 @@ func TestExecutorRenameMovesDentryWithoutSubtreeHandoff(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "old"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 8, Name: "new"})
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 7, Name: "old"})
+	require.ErrorIs(t, err, model.ErrNotFound)
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 8, Name: "new"})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(22), record.Inode)
+	require.Equal(t, model.InodeID(22), record.Inode)
 	require.Len(t, runner.mutations, 1)
 	require.Empty(t, publisher.starts)
 	require.Empty(t, publisher.completes)
@@ -191,11 +192,11 @@ func TestExecutorRenameUsesAtomicMutateWithoutSubtreeHandoff(t *testing.T) {
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedDentry(t, runner.fakeRunner, "vol", 7, "old", 22)
 	seedDirectory(t, runner.fakeRunner, "vol", 8)
-	seedInode(t, runner.fakeRunner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	seedInode(t, runner.fakeRunner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1})
 	publisher := &fakeSubtreePublisher{}
 	authority := &fakeAuthorityResolver{same: true}
-	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
-		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
+	resolver := &fakeMountResolver{records: map[model.MountID]MountAdmission{
+		"vol": {MountID: "vol", MountKeyID: 1, RootInode: model.RootInode, SchemaVersion: 1},
 	}}
 	executor, err := newTestExecutor(
 		runner,
@@ -205,7 +206,7 @@ func TestExecutorRenameUsesAtomicMutateWithoutSubtreeHandoff(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = executor.Rename(context.Background(), fsmeta.RenameRequest{
+	err = executor.Rename(context.Background(), model.RenameRequest{
 		Mount:      "vol",
 		FromParent: 7,
 		FromName:   "old",
@@ -218,10 +219,10 @@ func TestExecutorRenameUsesAtomicMutateWithoutSubtreeHandoff(t *testing.T) {
 	require.Empty(t, base.mutations)
 	require.Empty(t, publisher.starts)
 	require.Empty(t, publisher.completes)
-	requireAtomicStatUint(t, executor.Stats(), fsmeta.OperationRename, "success_total", 1)
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 8, Name: "new"})
+	requireAtomicStatUint(t, executor.Stats(), model.OperationRename, "success_total", 1)
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 8, Name: "new"})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(22), record.Inode)
+	require.Equal(t, model.InodeID(22), record.Inode)
 }
 
 func TestExecutorRenameSubtreePinsCommitVersionToHandoffFrontier(t *testing.T) {
@@ -230,13 +231,13 @@ func TestExecutorRenameSubtreePinsCommitVersionToHandoffFrontier(t *testing.T) {
 	seedDentry(t, runner, "vol", 7, "old", 22)
 	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{}
-	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
-		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
+	resolver := &fakeMountResolver{records: map[model.MountID]MountAdmission{
+		"vol": {MountID: "vol", MountKeyID: 1, RootInode: model.RootInode, SchemaVersion: 1},
 	}}
 	executor, err := newTestExecutor(runner, WithMountResolver(resolver), WithSubtreeHandoffPublisher(publisher))
 	require.NoError(t, err)
 
-	err = executor.RenameSubtree(context.Background(), fsmeta.RenameSubtreeRequest{
+	err = executor.RenameSubtree(context.Background(), model.RenameSubtreeRequest{
 		Mount:      "vol",
 		FromParent: 7,
 		FromName:   "old",
@@ -245,8 +246,8 @@ func TestExecutorRenameSubtreePinsCommitVersionToHandoffFrontier(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.Equal(t, []subtreePublishCall{{mount: "vol", root: fsmeta.RootInode, frontier: 2}}, publisher.starts)
-	require.Equal(t, []subtreePublishCall{{mount: "vol", root: fsmeta.RootInode, frontier: 2}}, publisher.completes)
+	require.Equal(t, []subtreePublishCall{{mount: "vol", root: model.RootInode, frontier: 2}}, publisher.starts)
+	require.Equal(t, []subtreePublishCall{{mount: "vol", root: model.RootInode, frontier: 2}}, publisher.completes)
 }
 
 func TestExecutorRenameSubtreeBlocksMutationWhenStartHandoffFails(t *testing.T) {
@@ -254,13 +255,13 @@ func TestExecutorRenameSubtreeBlocksMutationWhenStartHandoffFails(t *testing.T) 
 	seedDentry(t, runner, "vol", 7, "old", 22)
 	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{startErr: errors.New("publish failed")}
-	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
-		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
+	resolver := &fakeMountResolver{records: map[model.MountID]MountAdmission{
+		"vol": {MountID: "vol", MountKeyID: 1, RootInode: model.RootInode, SchemaVersion: 1},
 	}}
 	executor, err := newTestExecutor(runner, WithMountResolver(resolver), WithSubtreeHandoffPublisher(publisher))
 	require.NoError(t, err)
 
-	err = executor.RenameSubtree(context.Background(), fsmeta.RenameSubtreeRequest{
+	err = executor.RenameSubtree(context.Background(), model.RenameSubtreeRequest{
 		Mount:      "vol",
 		FromParent: 7,
 		FromName:   "old",
@@ -270,9 +271,9 @@ func TestExecutorRenameSubtreeBlocksMutationWhenStartHandoffFails(t *testing.T) 
 	require.ErrorContains(t, err, "publish failed")
 	require.Empty(t, runner.mutations)
 
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "old"})
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 7, Name: "old"})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(22), record.Inode)
+	require.Equal(t, model.InodeID(22), record.Inode)
 }
 
 func TestExecutorRenameSubtreeReportsCompleteHandoffFailureAfterMutation(t *testing.T) {
@@ -280,13 +281,13 @@ func TestExecutorRenameSubtreeReportsCompleteHandoffFailureAfterMutation(t *test
 	seedDentry(t, runner, "vol", 7, "old", 22)
 	seedDirectory(t, runner, "vol", 8)
 	publisher := &fakeSubtreePublisher{completeErr: errors.New("complete failed")}
-	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
-		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
+	resolver := &fakeMountResolver{records: map[model.MountID]MountAdmission{
+		"vol": {MountID: "vol", MountKeyID: 1, RootInode: model.RootInode, SchemaVersion: 1},
 	}}
 	executor, err := newTestExecutor(runner, WithMountResolver(resolver), WithSubtreeHandoffPublisher(publisher))
 	require.NoError(t, err)
 
-	err = executor.RenameSubtree(context.Background(), fsmeta.RenameSubtreeRequest{
+	err = executor.RenameSubtree(context.Background(), model.RenameSubtreeRequest{
 		Mount:      "vol",
 		FromParent: 7,
 		FromName:   "old",
@@ -295,11 +296,11 @@ func TestExecutorRenameSubtreeReportsCompleteHandoffFailureAfterMutation(t *test
 	})
 	require.ErrorContains(t, err, "complete failed")
 	require.Len(t, runner.mutations, 1)
-	require.Equal(t, []subtreePublishCall{{mount: "vol", root: fsmeta.RootInode, frontier: 2}}, publisher.starts)
+	require.Equal(t, []subtreePublishCall{{mount: "vol", root: model.RootInode, frontier: 2}}, publisher.starts)
 
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 7, Name: "old"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: 8, Name: "new"})
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 7, Name: "old"})
+	require.ErrorIs(t, err, model.ErrNotFound)
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: 8, Name: "new"})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(22), record.Inode)
+	require.Equal(t, model.InodeID(22), record.Inode)
 }

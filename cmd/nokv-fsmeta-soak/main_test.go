@@ -7,20 +7,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetacontract "github.com/feichai0017/NoKV/fsmeta/contract"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 func TestSoakHistoryOpsScopesExternalNamespaceOperations(t *testing.T) {
 	const (
-		mount      = fsmeta.MountID("prod")
-		scopeInode = fsmeta.InodeID(8001)
+		mount      = model.MountID("prod")
+		scopeInode = model.InodeID(8001)
 	)
 	ops := soakHistoryOps([]fsmetacontract.Operation{
 		{Kind: fsmetacontract.OpHeartbeatSession, Mount: "vol", Session: "writer-a"},
-		{Kind: fsmetacontract.OpLookup, Mount: "vol", Parent: fsmeta.RootInode, Name: "alpha"},
-		{Kind: fsmetacontract.OpReadDirPlus, Mount: "vol", Parent: fsmeta.RootInode, StartAfter: "a", Limit: 10},
-		{Kind: fsmetacontract.OpUnlink, Mount: "vol", Parent: fsmeta.RootInode, Name: "alpha"},
+		{Kind: fsmetacontract.OpLookup, Mount: "vol", Parent: model.RootInode, Name: "alpha"},
+		{Kind: fsmetacontract.OpReadDirPlus, Mount: "vol", Parent: model.RootInode, StartAfter: "a", Limit: 10},
+		{Kind: fsmetacontract.OpUnlink, Mount: "vol", Parent: model.RootInode, Name: "alpha"},
 		{Kind: fsmetacontract.OpExpireSessions, Mount: "vol", Limit: 1},
 	}, mount, scopeInode)
 

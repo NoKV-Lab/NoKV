@@ -9,9 +9,9 @@ import (
 
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
-	fsmetadomain "github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type executorAdapter struct {
@@ -147,9 +147,9 @@ func (a executorAdapter) CaptureInstalledVisibleSnapshot(version uint64) error {
 	return a.runtime.CapturePerasSnapshot(version)
 }
 
-func (a executorAdapter) CaptureVisibleSnapshot(ctx context.Context, version uint64, scope compile.AuthorityScope) (fsmetadomain.VisibleSnapshotCapture, bool, error) {
+func (a executorAdapter) CaptureVisibleSnapshot(ctx context.Context, version uint64, scope compile.AuthorityScope) (model.VisibleSnapshotCapture, bool, error) {
 	if a.runtime == nil {
-		return fsmetadomain.VisibleSnapshotCapture{}, false, runtimeperas.ErrRuntimeInvalid
+		return model.VisibleSnapshotCapture{}, false, runtimeperas.ErrRuntimeInvalid
 	}
 	return a.runtime.CapturePerasVisibleSnapshot(ctx, version, scope)
 }
@@ -185,15 +185,15 @@ func (a executorAdapter) KeyState(key []byte) (bool, bool) {
 	return a.runtime.KeyState(key)
 }
 
-func (a executorAdapter) DirectoryEmpty(mount fsmetadomain.MountIdentity, inode fsmetadomain.InodeID) bool {
+func (a executorAdapter) DirectoryEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	return a.runtime != nil && a.runtime.DirectoryEmpty(mount, inode)
 }
 
-func (a executorAdapter) DirectoryBaseEmpty(mount fsmetadomain.MountIdentity, inode fsmetadomain.InodeID) bool {
+func (a executorAdapter) DirectoryBaseEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	return a.runtime != nil && a.runtime.DirectoryBaseEmpty(mount, inode)
 }
 
-func (a executorAdapter) SessionNamespaceEmpty(mount fsmetadomain.MountIdentity, inode fsmetadomain.InodeID) bool {
+func (a executorAdapter) SessionNamespaceEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	return a.runtime != nil && a.runtime.SessionNamespaceEmpty(mount, inode)
 }
 
@@ -203,19 +203,19 @@ func (a executorAdapter) RememberKey(key []byte, present bool) {
 	}
 }
 
-func (a executorAdapter) RememberEmptyDirectory(mount fsmetadomain.MountIdentity, inode fsmetadomain.InodeID) {
+func (a executorAdapter) RememberEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	if a.runtime != nil {
 		a.runtime.RememberEmptyDirectory(mount, inode)
 	}
 }
 
-func (a executorAdapter) RememberEmptySessionNamespace(mount fsmetadomain.MountIdentity, inode fsmetadomain.InodeID) {
+func (a executorAdapter) RememberEmptySessionNamespace(mount model.MountIdentity, inode model.InodeID) {
 	if a.runtime != nil {
 		a.runtime.RememberEmptySessionNamespace(mount, inode)
 	}
 }
 
-func (a executorAdapter) ForgetEmptyDirectory(mount fsmetadomain.MountIdentity, inode fsmetadomain.InodeID) {
+func (a executorAdapter) ForgetEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	if a.runtime != nil {
 		a.runtime.ForgetEmptyDirectory(mount, inode)
 	}

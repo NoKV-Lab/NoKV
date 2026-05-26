@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -44,17 +44,17 @@ func (c *fakeMountList) WatchRootEvents(context.Context, *coordpb.WatchRootEvent
 }
 
 type fakeRetireRouter struct {
-	retired []fsmeta.MountID
+	retired []model.MountID
 }
 
-func (r *fakeRetireRouter) RetireMount(m fsmeta.MountID) int {
+func (r *fakeRetireRouter) RetireMount(m model.MountID) int {
 	r.retired = append(r.retired, m)
 	return 1
 }
 
 type subtreePublishCall struct {
-	mount    fsmeta.MountID
-	root     fsmeta.InodeID
+	mount    model.MountID
+	root     model.InodeID
 	frontier uint64
 }
 
@@ -63,12 +63,12 @@ type fakeSubtreePublisher struct {
 	completes []subtreePublishCall
 }
 
-func (p *fakeSubtreePublisher) StartSubtreeHandoff(_ context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {
+func (p *fakeSubtreePublisher) StartSubtreeHandoff(_ context.Context, mount model.MountID, root model.InodeID, frontier uint64) error {
 	p.starts = append(p.starts, subtreePublishCall{mount: mount, root: root, frontier: frontier})
 	return nil
 }
 
-func (p *fakeSubtreePublisher) CompleteSubtreeHandoff(_ context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {
+func (p *fakeSubtreePublisher) CompleteSubtreeHandoff(_ context.Context, mount model.MountID, root model.InodeID, frontier uint64) error {
 	p.completes = append(p.completes, subtreePublishCall{mount: mount, root: root, frontier: frontier})
 	return nil
 }
@@ -92,7 +92,7 @@ func TestMonitorRetiresWatchersAndCache(t *testing.T) {
 	require.Equal(t, 1, list.mountCalls)
 	require.Equal(t, 1, list.quotaCalls)
 	require.Equal(t, 1, list.subtreeCalls)
-	require.Equal(t, []fsmeta.MountID{"vol"}, router.retired)
+	require.Equal(t, []model.MountID{"vol"}, router.retired)
 
 	entry, ok := cache.entries["vol"]
 	require.True(t, ok)

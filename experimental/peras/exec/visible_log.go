@@ -9,6 +9,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 var visibleRecordMagic = [4]byte{'N', 'P', 'V', 3}
@@ -379,11 +380,11 @@ func readAuthorityScope(r *witnessReader) (compile.AuthorityScope, error) {
 		return compile.AuthorityScope{}, err
 	}
 	scope := compile.AuthorityScope{
-		Mount:           fsmeta.MountID(mount),
-		MountKeyID:      fsmeta.MountKeyID(mountKeyID),
+		Mount:           model.MountID(mount),
+		MountKeyID:      model.MountKeyID(mountKeyID),
 		Buckets:         make([]fsmeta.AffinityBucket, len(buckets)),
-		Parents:         make([]fsmeta.InodeID, len(parents)),
-		Inodes:          make([]fsmeta.InodeID, len(inodes)),
+		Parents:         make([]model.InodeID, len(parents)),
+		Inodes:          make([]model.InodeID, len(inodes)),
 		Broad:           broad,
 		AllowOpaqueKeys: allowOpaque,
 	}
@@ -391,10 +392,10 @@ func readAuthorityScope(r *witnessReader) (compile.AuthorityScope, error) {
 		scope.Buckets[i] = fsmeta.AffinityBucket(bucket)
 	}
 	for i, parent := range parents {
-		scope.Parents[i] = fsmeta.InodeID(parent)
+		scope.Parents[i] = model.InodeID(parent)
 	}
 	for i, inode := range inodes {
-		scope.Inodes[i] = fsmeta.InodeID(inode)
+		scope.Inodes[i] = model.InodeID(inode)
 	}
 	return scope, nil
 }
@@ -518,7 +519,7 @@ func readSegmentMergeKey(r *witnessReader) (compile.SegmentMergeKey, error) {
 		return compile.SegmentMergeKey{}, err
 	}
 	return compile.SegmentMergeKey{
-		MountKeyID:       fsmeta.MountKeyID(mountKeyID),
+		MountKeyID:       model.MountKeyID(mountKeyID),
 		HasPrimaryBucket: hasPrimaryBucket,
 		PrimaryBucket:    fsmeta.AffinityBucket(primaryBucket),
 		Install:          compile.SegmentInstallMode(install),
@@ -673,7 +674,7 @@ func readVisibleReplayOperation(r *witnessReader) (ReplayOperation, error) {
 	}
 	op := ReplayOperation{
 		OpID:                 opID,
-		Kind:                 fsmeta.OperationKind(kind),
+		Kind:                 model.OperationKind(kind),
 		DescriptorDigest:     descriptorDigest,
 		PredicateProofDigest: predicateProofDigest,
 		ExecutionPlanDigest:  executionPlanDigest,

@@ -11,6 +11,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -56,7 +57,7 @@ type SegmentKV struct {
 
 type SegmentCompletion struct {
 	OpID                 OperationID
-	Kind                 fsmeta.OperationKind
+	Kind                 model.OperationKind
 	Version              uint64
 	MutationCount        uint32
 	DescriptorDigest     [32]byte
@@ -572,7 +573,7 @@ func readSegmentCompletion(r *witnessReader) (SegmentCompletion, error) {
 	}
 	return SegmentCompletion{
 		OpID:                 opID,
-		Kind:                 fsmeta.OperationKind(kind),
+		Kind:                 model.OperationKind(kind),
 		Version:              version,
 		MutationCount:        uint32(mutationCount),
 		DescriptorDigest:     descriptorDigest,

@@ -6,12 +6,13 @@ package exec
 import (
 	"context"
 	"fmt"
-	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
-	"github.com/stretchr/testify/require"
 	"testing"
 	"time"
+
+	nokverrors "github.com/feichai0017/NoKV/errors"
+	"github.com/feichai0017/NoKV/fsmeta/model"
+	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExecutorGetReadVersionReservesEphemeralTimestamp(t *testing.T) {
@@ -19,7 +20,7 @@ func TestExecutorGetReadVersionReservesEphemeralTimestamp(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	version, err := executor.GetReadVersion(context.Background(), fsmeta.ReadVersionRequest{Mount: "vol"})
+	version, err := executor.GetReadVersion(context.Background(), model.ReadVersionRequest{Mount: "vol"})
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), version)
 	require.Equal(t, uint64(2), runner.nextTS)
@@ -28,14 +29,14 @@ func TestExecutorGetReadVersionReservesEphemeralTimestamp(t *testing.T) {
 func TestExecutorRetriesTimestampAuthorityRefreshBeforeMutate(t *testing.T) {
 	runner := newFakeRunner()
 	runner.timestampErrs = []error{nokverrors.New(nokverrors.KindStaleEpoch, "coordinator client: stale witness era")}
-	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{22}}))
+	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{22}}))
 	require.NoError(t, err)
 
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 
 	require.NoError(t, err)
@@ -50,7 +51,7 @@ func TestExecutorRetriesReadTimestampAuthorityRefresh(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	version, err := executor.GetReadVersion(context.Background(), fsmeta.ReadVersionRequest{Mount: "vol"})
+	version, err := executor.GetReadVersion(context.Background(), model.ReadVersionRequest{Mount: "vol"})
 
 	require.NoError(t, err)
 	require.NotZero(t, version)
@@ -66,15 +67,15 @@ func TestExecutorRetriesLostTxnLock(t *testing.T) {
 		}}},
 		nil,
 	}
-	allocator := &fakeInodeAllocator{ids: []fsmeta.InodeID{22}}
+	allocator := &fakeInodeAllocator{ids: []model.InodeID{22}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(allocator))
 	require.NoError(t, err)
 
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	require.Len(t, runner.mutations, 1)
@@ -95,15 +96,15 @@ func TestExecutorRetriesCommitTsExpired(t *testing.T) {
 		}}},
 		nil,
 	}
-	allocator := &fakeInodeAllocator{ids: []fsmeta.InodeID{22}}
+	allocator := &fakeInodeAllocator{ids: []model.InodeID{22}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(allocator))
 	require.NoError(t, err)
 
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	require.Len(t, runner.mutations, 1)
@@ -119,15 +120,15 @@ func TestExecutorRetriesRouteUnavailable(t *testing.T) {
 		nokverrors.New(nokverrors.KindRouteUnavailable, "route lookup refreshing"),
 		nil,
 	}
-	allocator := &fakeInodeAllocator{ids: []fsmeta.InodeID{22}}
+	allocator := &fakeInodeAllocator{ids: []model.InodeID{22}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(allocator))
 	require.NoError(t, err)
 
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	require.Len(t, runner.mutations, 1)
@@ -149,15 +150,15 @@ func TestExecutorRetriesWriteConflict(t *testing.T) {
 		}}},
 		nil,
 	}
-	allocator := &fakeInodeAllocator{ids: []fsmeta.InodeID{22}}
+	allocator := &fakeInodeAllocator{ids: []model.InodeID{22}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(allocator))
 	require.NoError(t, err)
 
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	require.Len(t, runner.mutations, 1)
@@ -179,15 +180,15 @@ func TestExecutorRetriesLockedTxnContention(t *testing.T) {
 		}}},
 		nil,
 	}
-	allocator := &fakeInodeAllocator{ids: []fsmeta.InodeID{22}}
+	allocator := &fakeInodeAllocator{ids: []model.InodeID{22}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(allocator))
 	require.NoError(t, err)
 
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	require.Len(t, runner.mutations, 1)
@@ -210,15 +211,15 @@ func TestExecutorRetriesSustainedLiveTxnContention(t *testing.T) {
 		}}})
 	}
 	runner.mutateErrs = append(runner.mutateErrs, nil)
-	allocator := &fakeInodeAllocator{ids: []fsmeta.InodeID{22}}
+	allocator := &fakeInodeAllocator{ids: []model.InodeID{22}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(allocator))
 	require.NoError(t, err)
 
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	require.Len(t, runner.mutations, 1)
@@ -277,8 +278,8 @@ func TestExecutorAtomicOnePhaseBacksOffAfterRepeatedFallback(t *testing.T) {
 	base := newFakeRunner()
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: false}
 	authority := &fakeAuthorityResolver{same: true}
-	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
-		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
+	resolver := &fakeMountResolver{records: map[model.MountID]MountAdmission{
+		"vol": {MountID: "vol", MountKeyID: 1, RootInode: model.RootInode, SchemaVersion: 1},
 	}}
 	executor, err := newTestExecutor(runner, WithMountResolver(resolver), WithSubtreeAuthorityResolver(authority))
 	require.NoError(t, err)
@@ -288,8 +289,8 @@ func TestExecutorAtomicOnePhaseBacksOffAfterRepeatedFallback(t *testing.T) {
 	for i := range total {
 		oldName := fmt.Sprintf("old-%d", i)
 		newName := fmt.Sprintf("new-%d", i)
-		seedDentry(t, runner.fakeRunner, "vol", 7, oldName, fsmeta.InodeID(100+i))
-		err := executor.Rename(context.Background(), fsmeta.RenameRequest{
+		seedDentry(t, runner.fakeRunner, "vol", 7, oldName, model.InodeID(100+i))
+		err := executor.Rename(context.Background(), model.RenameRequest{
 			Mount:      "vol",
 			FromParent: 7,
 			FromName:   oldName,
@@ -301,17 +302,17 @@ func TestExecutorAtomicOnePhaseBacksOffAfterRepeatedFallback(t *testing.T) {
 
 	require.Len(t, runner.atomicCalls, atomicOnePhaseBackoffAfter)
 	stats := executor.Stats()
-	requireAtomicStatUint(t, stats, fsmeta.OperationRename, "fallback_total", atomicOnePhaseBackoffAfter)
-	requireAtomicStatUint(t, stats, fsmeta.OperationRename, "skip_total", 3)
-	requireAtomicStatUint(t, stats, fsmeta.OperationRename, "backoff_skip_total", 3)
+	requireAtomicStatUint(t, stats, model.OperationRename, "fallback_total", atomicOnePhaseBackoffAfter)
+	requireAtomicStatUint(t, stats, model.OperationRename, "skip_total", 3)
+	requireAtomicStatUint(t, stats, model.OperationRename, "backoff_skip_total", 3)
 }
 
 func TestExecutorAtomicOnePhaseBackoffIsAffinityScoped(t *testing.T) {
 	base := newFakeRunner()
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: false}
 	authority := &fakeAuthorityResolver{same: true}
-	resolver := &fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
-		"vol": {MountID: "vol", MountKeyID: 1, RootInode: fsmeta.RootInode, SchemaVersion: 1},
+	resolver := &fakeMountResolver{records: map[model.MountID]MountAdmission{
+		"vol": {MountID: "vol", MountKeyID: 1, RootInode: model.RootInode, SchemaVersion: 1},
 	}}
 	executor, err := newTestExecutor(runner, WithMountResolver(resolver), WithSubtreeAuthorityResolver(authority))
 	require.NoError(t, err)
@@ -320,8 +321,8 @@ func TestExecutorAtomicOnePhaseBackoffIsAffinityScoped(t *testing.T) {
 	for i := range atomicOnePhaseBackoffAfter {
 		oldName := fmt.Sprintf("old-%d", i)
 		newName := fmt.Sprintf("new-%d", i)
-		seedDentry(t, runner.fakeRunner, "vol", 7, oldName, fsmeta.InodeID(100+i))
-		err := executor.Rename(context.Background(), fsmeta.RenameRequest{
+		seedDentry(t, runner.fakeRunner, "vol", 7, oldName, model.InodeID(100+i))
+		err := executor.Rename(context.Background(), model.RenameRequest{
 			Mount:      "vol",
 			FromParent: 7,
 			FromName:   oldName,
@@ -334,7 +335,7 @@ func TestExecutorAtomicOnePhaseBackoffIsAffinityScoped(t *testing.T) {
 	from, to := findDifferentRenameAffinity(t, 7, 8)
 	seedDentry(t, runner.fakeRunner, "vol", from, "other-old", 999)
 	seedDirectory(t, runner.fakeRunner, "vol", to)
-	err = executor.Rename(context.Background(), fsmeta.RenameRequest{
+	err = executor.Rename(context.Background(), model.RenameRequest{
 		Mount:      "vol",
 		FromParent: from,
 		FromName:   "other-old",
@@ -344,5 +345,5 @@ func TestExecutorAtomicOnePhaseBackoffIsAffinityScoped(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, runner.atomicCalls, atomicOnePhaseBackoffAfter+1)
-	requireAtomicStatUint(t, executor.Stats(), fsmeta.OperationRename, "skip_total", 0)
+	requireAtomicStatUint(t, executor.Stats(), model.OperationRename, "skip_total", 0)
 }

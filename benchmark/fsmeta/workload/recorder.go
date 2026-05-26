@@ -19,6 +19,7 @@ import (
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -392,7 +393,7 @@ func hasRecordedErrors(samples []Sample) bool {
 	return false
 }
 
-func defaultMount(mount fsmeta.MountID) fsmeta.MountID {
+func defaultMount(mount model.MountID) model.MountID {
 	if mount == "" {
 		return "fsmeta-workload"
 	}
@@ -431,10 +432,10 @@ func clampReadDirLimit(limit uint32, fallback int) uint32 {
 		limit = uint32(fallback)
 	}
 	if limit == 0 {
-		limit = fsmeta.DefaultReadDirLimit
+		limit = model.DefaultReadDirLimit
 	}
-	if limit > fsmeta.MaxReadDirLimit {
-		return fsmeta.MaxReadDirLimit
+	if limit > model.MaxReadDirLimit {
+		return model.MaxReadDirLimit
 	}
 	return limit
 }

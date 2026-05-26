@@ -14,34 +14,35 @@ import (
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	"github.com/feichai0017/NoKV/engine/slab/negativecache"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestExecutorCreateAndLookup(t *testing.T) {
 	runner := newFakeRunner()
-	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{22}}))
+	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{22}}))
 	require.NoError(t, err)
 
-	result, err := executor.Create(context.Background(), fsmeta.CreateRequest{
+	result, err := executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(22), result.Inode.Inode)
+	require.Equal(t, model.InodeID(22), result.Inode.Inode)
 
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryRecord{
-		Parent: fsmeta.RootInode,
+	require.Equal(t, model.DentryRecord{
+		Parent: model.RootInode,
 		Name:   "file",
 		Inode:  22,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}, record)
 
 	require.Len(t, runner.mutations, 1)
@@ -53,27 +54,27 @@ func TestExecutorCreateAndLookup(t *testing.T) {
 func TestExecutorCreateVisibleCommitServesLookupOverlay(t *testing.T) {
 	runner := newFakeRunner()
 	committer := newTestVisibleCommitter(t, runner)
-	inode := testInodeForParentBucket(t, fsmeta.RootInode)
+	inode := testInodeForParentBucket(t, model.RootInode)
 	executor, err := newTestExecutor(
 		runner,
-		WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{inode}}),
+		WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{inode}}),
 		WithVisibleAuthorityAdmitter(ownedVisibleAdmitter{}),
 		WithVisibleCommitter(committer),
 	)
 	require.NoError(t, err)
 
-	created, err := executor.Create(context.Background(), fsmeta.CreateRequest{
+	created, err := executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	require.Empty(t, runner.mutations)
 
-	lookedUp, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{
+	lookedUp, err := executor.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
 	})
 	require.NoError(t, err)
@@ -85,27 +86,27 @@ func TestExecutorCreateVisibleCommitServesReadDirPlusOverlay(t *testing.T) {
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
-		WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{22}}),
+		WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{22}}),
 		WithVisibleAuthorityAdmitter(ownedVisibleAdmitter{}),
 		WithVisibleCommitter(committer),
 	)
 	require.NoError(t, err)
 
-	created, err := executor.Create(context.Background(), fsmeta.CreateRequest{
+	created, err := executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
-	pairs, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pairs, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  16,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{{
+	require.Equal(t, []model.DentryAttrPair{{
 		Dentry: created.Dentry,
 		Inode:  created.Inode,
 	}}, pairs)
@@ -119,25 +120,25 @@ func TestExecutorReadDirPlusOverlayOnlyPathBypassesDirPageCache(t *testing.T) {
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
-		WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{22}}),
+		WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{22}}),
 		WithVisibleAuthorityAdmitter(ownedVisibleAdmitter{}),
 		WithVisibleCommitter(committer),
 		WithDirPageCache(cache),
 	)
 	require.NoError(t, err)
 
-	created, err := executor.Create(context.Background(), fsmeta.CreateRequest{
+	created, err := executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
-	req := fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 16}
+	req := model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 16}
 
 	first, err := executor.ReadDirPlus(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{{Dentry: created.Dentry, Inode: created.Inode}}, first)
+	require.Equal(t, []model.DentryAttrPair{{Dentry: created.Dentry, Inode: created.Inode}}, first)
 	require.Equal(t, uint64(0), cache.Stats().StoreOK)
 
 	second, err := executor.ReadDirPlus(context.Background(), req)
@@ -150,10 +151,10 @@ func TestExecutorReadDirPlusOverlayOnlyPathBypassesDirPageCache(t *testing.T) {
 
 func TestExecutorReadDirPlusVisibleOverlayPathBypassesDirPageCache(t *testing.T) {
 	runner := newFakeRunner()
-	seedDentry(t, runner, "vol", fsmeta.RootInode, "base", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentry(t, runner, "vol", model.RootInode, "base", 22)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     22,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
 	cache, err := dirpage.Open(dirpage.Config{Dir: t.TempDir()})
@@ -165,13 +166,13 @@ func TestExecutorReadDirPlusVisibleOverlayPathBypassesDirPageCache(t *testing.T)
 		WithDirPageCache(cache),
 	)
 	require.NoError(t, err)
-	req := fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 16}
+	req := model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 16}
 
 	first, err := executor.ReadDirPlus(context.Background(), req)
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{{
-		Dentry: fsmeta.DentryRecord{Parent: fsmeta.RootInode, Name: "base", Inode: 22, Type: fsmeta.InodeTypeFile},
-		Inode:  fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 1},
+	require.Equal(t, []model.DentryAttrPair{{
+		Dentry: model.DentryRecord{Parent: model.RootInode, Name: "base", Inode: 22, Type: model.InodeTypeFile},
+		Inode:  model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1},
 	}}, first)
 	require.Equal(t, uint64(0), cache.Stats().StoreOK)
 
@@ -186,29 +187,29 @@ func TestExecutorReadDirPlusVisibleOverlayPathBypassesDirPageCache(t *testing.T)
 
 func TestExecutorReadDirPlusPinsVisibleOverlayAcrossDentryAndInodeReads(t *testing.T) {
 	runner := newFakeRunner()
-	parent := fsmeta.InodeID(7)
+	parent := model.InodeID(7)
 	seedDentry(t, runner, "vol", parent, "eta", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{Inode: 22, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1})
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
-		WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{23}}),
+		WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{23}}),
 		WithVisibleAuthorityAdmitter(ownedVisibleAdmitter{}),
 		WithVisibleCommitter(committer),
 	)
 	require.NoError(t, err)
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
 		Parent: parent,
 		Name:   "omega",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
 	var once sync.Once
 	runner.beforeBatchGet = func() {
 		once.Do(func() {
-			require.NoError(t, executor.Link(context.Background(), fsmeta.LinkRequest{
+			require.NoError(t, executor.Link(context.Background(), model.LinkRequest{
 				Mount:      "vol",
 				FromParent: parent,
 				FromName:   "eta",
@@ -218,7 +219,7 @@ func TestExecutorReadDirPlusPinsVisibleOverlayAcrossDentryAndInodeReads(t *testi
 		})
 	}
 
-	pairs, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pairs, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: parent,
 		Limit:  1,
@@ -228,24 +229,24 @@ func TestExecutorReadDirPlusPinsVisibleOverlayAcrossDentryAndInodeReads(t *testi
 	require.Equal(t, "eta", pairs[0].Dentry.Name)
 	require.Equal(t, uint32(1), pairs[0].Inode.LinkCount, "ReadDirPlus must not combine a pre-link dentry page with a post-link inode overlay")
 
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: parent, Name: "zeta"})
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: parent, Name: "zeta"})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(22), record.Inode)
+	require.Equal(t, model.InodeID(22), record.Inode)
 }
 
 func TestExecutorReadDirPlusCachesSealedVisibleDirectory(t *testing.T) {
 	runner := newFakeRunner()
-	seedDentry(t, runner, "vol", fsmeta.RootInode, "base", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentry(t, runner, "vol", model.RootInode, "base", 22)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     22,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
-	sealedDentryKey := dentryKeyForTest(t, "vol", fsmeta.RootInode, "sealed")
+	sealedDentryKey := dentryKeyForTest(t, "vol", model.RootInode, "sealed")
 	sealedInodeKey := inodeKeyForTest(t, "vol", 33)
 	sealedRows := []VisibleOverlayKV{
-		overlayValueForTest(sealedDentryKey, dentryValueForTest(t, fsmeta.RootInode, "sealed", 33, fsmeta.InodeTypeFile)),
-		overlayValueForTest(sealedInodeKey, inodeValueForTest(t, fsmeta.InodeRecord{Inode: 33, Type: fsmeta.InodeTypeFile, LinkCount: 1})),
+		overlayValueForTest(sealedDentryKey, dentryValueForTest(t, model.RootInode, "sealed", 33, model.InodeTypeFile)),
+		overlayValueForTest(sealedInodeKey, inodeValueForTest(t, model.InodeRecord{Inode: 33, Type: model.InodeTypeFile, LinkCount: 1})),
 	}
 	cache, err := dirpage.Open(dirpage.Config{Dir: t.TempDir()})
 	require.NoError(t, err)
@@ -260,7 +261,7 @@ func TestExecutorReadDirPlusCachesSealedVisibleDirectory(t *testing.T) {
 		WithDirPageCache(cache),
 	)
 	require.NoError(t, err)
-	req := fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 16}
+	req := model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 16}
 
 	first, err := executor.ReadDirPlus(context.Background(), req)
 	require.NoError(t, err)
@@ -279,17 +280,17 @@ func TestExecutorReadDirPlusCachesSealedVisibleDirectory(t *testing.T) {
 
 func TestExecutorReadDirPlusInvalidatesCacheWhenSealedVisibleFrontierChanges(t *testing.T) {
 	runner := newFakeRunner()
-	seedDentry(t, runner, "vol", fsmeta.RootInode, "base", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentry(t, runner, "vol", model.RootInode, "base", 22)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     22,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
-	sealedDentryKey := dentryKeyForTest(t, "vol", fsmeta.RootInode, "sealed")
+	sealedDentryKey := dentryKeyForTest(t, "vol", model.RootInode, "sealed")
 	sealedInodeKey := inodeKeyForTest(t, "vol", 33)
 	sealedRows := []VisibleOverlayKV{
-		overlayValueForTest(sealedDentryKey, dentryValueForTest(t, fsmeta.RootInode, "sealed", 33, fsmeta.InodeTypeFile)),
-		overlayValueForTest(sealedInodeKey, inodeValueForTest(t, fsmeta.InodeRecord{Inode: 33, Type: fsmeta.InodeTypeFile, LinkCount: 1})),
+		overlayValueForTest(sealedDentryKey, dentryValueForTest(t, model.RootInode, "sealed", 33, model.InodeTypeFile)),
+		overlayValueForTest(sealedInodeKey, inodeValueForTest(t, model.InodeRecord{Inode: 33, Type: model.InodeTypeFile, LinkCount: 1})),
 	}
 	cache, err := dirpage.Open(dirpage.Config{Dir: t.TempDir()})
 	require.NoError(t, err)
@@ -301,7 +302,7 @@ func TestExecutorReadDirPlusInvalidatesCacheWhenSealedVisibleFrontierChanges(t *
 	}
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(committer), WithDirPageCache(cache))
 	require.NoError(t, err)
-	req := fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 16}
+	req := model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 16}
 
 	first, err := executor.ReadDirPlus(context.Background(), req)
 	require.NoError(t, err)
@@ -311,11 +312,11 @@ func TestExecutorReadDirPlusInvalidatesCacheWhenSealedVisibleFrontierChanges(t *
 	}, time.Second, 10*time.Millisecond)
 	scansAfterFirst := len(runner.scanVersions)
 
-	newDentryKey := dentryKeyForTest(t, "vol", fsmeta.RootInode, "sealed-new")
+	newDentryKey := dentryKeyForTest(t, "vol", model.RootInode, "sealed-new")
 	newInodeKey := inodeKeyForTest(t, "vol", 44)
 	newRows := []VisibleOverlayKV{
-		overlayValueForTest(newDentryKey, dentryValueForTest(t, fsmeta.RootInode, "sealed-new", 44, fsmeta.InodeTypeFile)),
-		overlayValueForTest(newInodeKey, inodeValueForTest(t, fsmeta.InodeRecord{Inode: 44, Type: fsmeta.InodeTypeFile, LinkCount: 1})),
+		overlayValueForTest(newDentryKey, dentryValueForTest(t, model.RootInode, "sealed-new", 44, model.InodeTypeFile)),
+		overlayValueForTest(newInodeKey, inodeValueForTest(t, model.InodeRecord{Inode: 44, Type: model.InodeTypeFile, LinkCount: 1})),
 	}
 	committer.rows = append(committer.rows, newRows...)
 	committer.values = overlayMapForTest(committer.rows...)
@@ -329,10 +330,10 @@ func TestExecutorReadDirPlusInvalidatesCacheWhenSealedVisibleFrontierChanges(t *
 
 func TestExecutorReadDirPlusUsesDirPageCacheWhenVisibleHasNoDirectoryOverlay(t *testing.T) {
 	runner := newFakeRunner()
-	seedDentry(t, runner, "vol", fsmeta.RootInode, "base", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentry(t, runner, "vol", model.RootInode, "base", 22)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     22,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
 	cache, err := dirpage.Open(dirpage.Config{Dir: t.TempDir()})
@@ -345,7 +346,7 @@ func TestExecutorReadDirPlusUsesDirPageCacheWhenVisibleHasNoDirectoryOverlay(t *
 		WithDirPageCache(cache),
 	)
 	require.NoError(t, err)
-	req := fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 16}
+	req := model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 16}
 
 	first, err := executor.ReadDirPlus(context.Background(), req)
 	require.NoError(t, err)
@@ -363,15 +364,15 @@ func TestExecutorReadDirPlusUsesDirPageCacheWhenVisibleHasNoDirectoryOverlay(t *
 
 func TestExecutorReadDirPlusUsesDirPageCacheWhenOverlayRowsAreInAnotherDirectory(t *testing.T) {
 	runner := newFakeRunner()
-	seedDentry(t, runner, "vol", fsmeta.RootInode, "base", 22)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentry(t, runner, "vol", model.RootInode, "base", 22)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     22,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     33,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		LinkCount: 1,
 	})
 	cache, err := dirpage.Open(dirpage.Config{Dir: t.TempDir()})
@@ -386,15 +387,15 @@ func TestExecutorReadDirPlusUsesDirPageCacheWhenOverlayRowsAreInAnotherDirectory
 		WithDirPageCache(cache),
 	)
 	require.NoError(t, err)
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
+	_, err = executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
 		Parent: 33,
 		Name:   "overlay",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
-	req := fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 16}
+	req := model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 16}
 	first, err := executor.ReadDirPlus(context.Background(), req)
 	require.NoError(t, err)
 	require.Len(t, first, 1)
@@ -411,50 +412,50 @@ func TestExecutorReadDirPlusUsesDirPageCacheWhenOverlayRowsAreInAnotherDirectory
 
 func TestExecutorReadDirVisibleCreatedDirectorySkipsBaseScan(t *testing.T) {
 	runner := newFakeRunner()
-	dirInode := testInodeForParentBucket(t, fsmeta.RootInode)
+	dirInode := testInodeForParentBucket(t, model.RootInode)
 	childInode := testInodeForParentBucket(t, dirInode, dirInode)
 	committer := newTestVisibleCommitter(t, runner)
 	executor, err := newTestExecutor(
 		runner,
-		WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{dirInode, childInode}}),
+		WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{dirInode, childInode}}),
 		WithVisibleAuthorityAdmitter(ownedVisibleAdmitter{}),
 		WithVisibleCommitter(committer),
 	)
 	require.NoError(t, err)
 
-	dir, err := executor.Create(context.Background(), fsmeta.CreateRequest{
+	dir, err := executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "run",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 	})
 	require.NoError(t, err)
-	file, err := executor.Create(context.Background(), fsmeta.CreateRequest{
+	file, err := executor.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
 		Parent: dir.Inode.Inode,
 		Name:   "artifact",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 	runner.scanVersions = nil
 	runner.batchVersions = nil
 
-	records, err := executor.ReadDir(context.Background(), fsmeta.ReadDirRequest{
+	records, err := executor.ReadDir(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: dir.Inode.Inode,
 		Limit:  16,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryRecord{file.Dentry}, records)
+	require.Equal(t, []model.DentryRecord{file.Dentry}, records)
 	require.Empty(t, runner.scanVersions, "Visible-created directory has a covered base namespace")
 
-	pairs, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pairs, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: dir.Inode.Inode,
 		Limit:  16,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{{Dentry: file.Dentry, Inode: file.Inode}}, pairs)
+	require.Equal(t, []model.DentryAttrPair{{Dentry: file.Dentry, Inode: file.Inode}}, pairs)
 	require.Empty(t, runner.scanVersions)
 	require.Empty(t, runner.batchVersions)
 }
@@ -463,12 +464,12 @@ func TestExecutorLookupReturnsNotFound(t *testing.T) {
 	executor, err := newTestExecutor(newFakeRunner())
 	require.NoError(t, err)
 
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "missing",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 }
 
 func TestExecutorReadDirConsumesPlanCursorAndLimit(t *testing.T) {
@@ -481,18 +482,18 @@ func TestExecutorReadDirConsumesPlanCursorAndLimit(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	records, err := executor.ReadDir(context.Background(), fsmeta.ReadDirRequest{
+	records, err := executor.ReadDir(context.Background(), model.ReadDirRequest{
 		Mount:      "vol",
 		Parent:     7,
 		StartAfter: "a",
 		Limit:      1,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryRecord{{
+	require.Equal(t, []model.DentryRecord{{
 		Parent: 7,
 		Name:   "b",
 		Inode:  22,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}}, records)
 }
 
@@ -503,7 +504,7 @@ func TestExecutorReadDirRetriesLiveLock(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	records, err := executor.ReadDir(context.Background(), fsmeta.ReadDirRequest{
+	records, err := executor.ReadDir(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Limit:  8,
@@ -524,7 +525,7 @@ func TestExecutorReadDirExhaustsRetriesOnLiveLock(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	_, err = executor.ReadDir(context.Background(), fsmeta.ReadDirRequest{
+	_, err = executor.ReadDir(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Limit:  8,
@@ -542,17 +543,17 @@ func TestExecutorReadDirExhaustsRetriesOnLiveLock(t *testing.T) {
 func TestExecutorReadDirPlusReturnsDentriesAndAttrs(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "a", 21)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     21,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		Size:      4096,
 		Mode:      0o644,
 		LinkCount: 1,
 	})
-	seedDentryType(t, runner, "vol", 7, "b", 22, fsmeta.InodeTypeDirectory)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedDentryType(t, runner, "vol", 7, "b", 22, model.InodeTypeDirectory)
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     22,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 2,
 	})
@@ -560,28 +561,28 @@ func TestExecutorReadDirPlusReturnsDentriesAndAttrs(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	pairs, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pairs, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Limit:  8,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{
+	require.Equal(t, []model.DentryAttrPair{
 		{
-			Dentry: fsmeta.DentryRecord{Parent: 7, Name: "a", Inode: 21, Type: fsmeta.InodeTypeFile},
-			Inode: fsmeta.InodeRecord{
+			Dentry: model.DentryRecord{Parent: 7, Name: "a", Inode: 21, Type: model.InodeTypeFile},
+			Inode: model.InodeRecord{
 				Inode:     21,
-				Type:      fsmeta.InodeTypeFile,
+				Type:      model.InodeTypeFile,
 				Size:      4096,
 				Mode:      0o644,
 				LinkCount: 1,
 			},
 		},
 		{
-			Dentry: fsmeta.DentryRecord{Parent: 7, Name: "b", Inode: 22, Type: fsmeta.InodeTypeDirectory},
-			Inode: fsmeta.InodeRecord{
+			Dentry: model.DentryRecord{Parent: 7, Name: "b", Inode: 22, Type: model.InodeTypeDirectory},
+			Inode: model.InodeRecord{
 				Inode:     22,
-				Type:      fsmeta.InodeTypeDirectory,
+				Type:      model.InodeTypeDirectory,
 				Mode:      0o755,
 				LinkCount: 2,
 			},
@@ -592,9 +593,9 @@ func TestExecutorReadDirPlusReturnsDentriesAndAttrs(t *testing.T) {
 func TestExecutorLookupPlusReturnsDentryAndAttrs(t *testing.T) {
 	runner := newFakeRunner()
 	seedDentry(t, runner, "vol", 7, "a", 21)
-	seedInode(t, runner, "vol", fsmeta.InodeRecord{
+	seedInode(t, runner, "vol", model.InodeRecord{
 		Inode:     21,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		Size:      4096,
 		Mode:      0o644,
 		LinkCount: 1,
@@ -602,17 +603,17 @@ func TestExecutorLookupPlusReturnsDentryAndAttrs(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	pair, err := executor.LookupPlus(context.Background(), fsmeta.LookupRequest{
+	pair, err := executor.LookupPlus(context.Background(), model.LookupRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Name:   "a",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryAttrPair{
-		Dentry: fsmeta.DentryRecord{Parent: 7, Name: "a", Inode: 21, Type: fsmeta.InodeTypeFile},
-		Inode: fsmeta.InodeRecord{
+	require.Equal(t, model.DentryAttrPair{
+		Dentry: model.DentryRecord{Parent: 7, Name: "a", Inode: 21, Type: model.InodeTypeFile},
+		Inode: model.InodeRecord{
 			Inode:     21,
-			Type:      fsmeta.InodeTypeFile,
+			Type:      model.InodeTypeFile,
 			Size:      4096,
 			Mode:      0o644,
 			LinkCount: 1,
@@ -626,44 +627,44 @@ func TestExecutorReadDirPlusMissingInodeReturnsNotFound(t *testing.T) {
 	executor, err := newTestExecutor(runner)
 	require.NoError(t, err)
 
-	_, err = executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	_, err = executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Limit:  8,
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 }
 
 func TestExecutorLookupUsesVisibleOverlayWithoutTimestamp(t *testing.T) {
 	runner := newFakeRunner()
-	key := dentryKeyForTest(t, "vol", fsmeta.RootInode, "visible")
-	value := dentryValueForTest(t, fsmeta.RootInode, "visible", 22, fsmeta.InodeTypeFile)
+	key := dentryKeyForTest(t, "vol", model.RootInode, "visible")
+	value := dentryValueForTest(t, model.RootInode, "visible", 22, model.InodeTypeFile)
 	committer := scanOverlayCommitter{
 		values: overlayMapForTest(overlayValueForTest(key, value)),
 	}
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(committer))
 	require.NoError(t, err)
 
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "visible",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(22), record.Inode)
+	require.Equal(t, model.InodeID(22), record.Inode)
 	require.Zero(t, runner.getCalls)
 	require.Equal(t, uint64(1), runner.nextTS, "overlay lookup must not reserve a read timestamp")
 }
 
 func TestExecutorLookupUsesMergedDirectoryWhenVisibleTombstoneHidesBase(t *testing.T) {
 	runner := newFakeRunner()
-	parent := fsmeta.InodeID(7)
+	parent := model.InodeID(7)
 	seedDentry(t, runner, "vol", parent, "alpha", 22)
 	alphaKey := dentryKeyForTest(t, "vol", parent, "alpha")
 	etaKey := dentryKeyForTest(t, "vol", parent, "eta")
 	rows := []VisibleOverlayKV{
 		overlayDeleteForTest(alphaKey),
-		overlayValueForTest(etaKey, dentryValueForTest(t, parent, "eta", 22, fsmeta.InodeTypeFile)),
+		overlayValueForTest(etaKey, dentryValueForTest(t, parent, "eta", 22, model.InodeTypeFile)),
 	}
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(scanOverlayCommitter{
 		rows:   rows,
@@ -671,28 +672,28 @@ func TestExecutorLookupUsesMergedDirectoryWhenVisibleTombstoneHidesBase(t *testi
 	}))
 	require.NoError(t, err)
 
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: parent, Name: "alpha"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: parent, Name: "eta"})
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: parent, Name: "alpha"})
+	require.ErrorIs(t, err, model.ErrNotFound)
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: parent, Name: "eta"})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryRecord{Parent: parent, Name: "eta", Inode: 22, Type: fsmeta.InodeTypeFile}, record)
+	require.Equal(t, model.DentryRecord{Parent: parent, Name: "eta", Inode: 22, Type: model.InodeTypeFile}, record)
 }
 
 func TestExecutorLookupUsesVisibleOverlayDeleteWithoutRunner(t *testing.T) {
 	runner := newFakeRunner()
-	key := dentryKeyForTest(t, "vol", fsmeta.RootInode, "deleted")
+	key := dentryKeyForTest(t, "vol", model.RootInode, "deleted")
 	committer := scanOverlayCommitter{
 		values: overlayMapForTest(overlayDeleteForTest(key)),
 	}
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(committer))
 	require.NoError(t, err)
 
-	_, err = executor.Lookup(context.Background(), fsmeta.LookupRequest{
+	_, err = executor.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "deleted",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 	require.Zero(t, runner.getCalls)
 	require.Equal(t, uint64(1), runner.nextTS, "overlay tombstone lookup must not reserve a read timestamp")
 }
@@ -702,8 +703,8 @@ func TestExecutorLookupChecksVisibleOverlayBeforeNegativeCache(t *testing.T) {
 	cache := negativecache.New(negativecache.Config{
 		GroupKeyFn: func(k []byte) []byte { return k },
 	})
-	key := dentryKeyForTest(t, "vol", fsmeta.RootInode, "visible")
-	value := dentryValueForTest(t, fsmeta.RootInode, "visible", 22, fsmeta.InodeTypeFile)
+	key := dentryKeyForTest(t, "vol", model.RootInode, "visible")
+	value := dentryValueForTest(t, model.RootInode, "visible", 22, model.InodeTypeFile)
 	committer := scanOverlayCommitter{
 		values: overlayMapForTest(overlayValueForTest(key, value)),
 	}
@@ -711,13 +712,13 @@ func TestExecutorLookupChecksVisibleOverlayBeforeNegativeCache(t *testing.T) {
 	require.NoError(t, err)
 	cache.Remember(key)
 
-	record, err := executor.Lookup(context.Background(), fsmeta.LookupRequest{
+	record, err := executor.Lookup(context.Background(), model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "visible",
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.InodeID(22), record.Inode)
+	require.Equal(t, model.InodeID(22), record.Inode)
 	require.Zero(t, runner.getCalls)
 	require.False(t, cache.Has(key), "overlay hit must invalidate stale negative memo")
 }
@@ -727,7 +728,7 @@ func TestExecutorClearsNegativeCacheWhenVisibleOverlayIsEnabled(t *testing.T) {
 	cache := negativecache.New(negativecache.Config{
 		GroupKeyFn: func(k []byte) []byte { return k },
 	})
-	key := dentryKeyForTest(t, "vol", fsmeta.RootInode, "stale")
+	key := dentryKeyForTest(t, "vol", model.RootInode, "stale")
 	cache.Remember(key)
 
 	_, err := newTestExecutor(runner, WithNegativeCache(cache), WithVisibleCommitter(scanOverlayCommitter{}))
@@ -747,15 +748,15 @@ func TestExecutorReadDirRefillsBaseAfterOverlayTombstone(t *testing.T) {
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(committer))
 	require.NoError(t, err)
 
-	records, err := executor.ReadDir(context.Background(), fsmeta.ReadDirRequest{
+	records, err := executor.ReadDir(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Limit:  2,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryRecord{
-		{Parent: 7, Name: "b", Inode: 22, Type: fsmeta.InodeTypeFile},
-		{Parent: 7, Name: "c", Inode: 23, Type: fsmeta.InodeTypeFile},
+	require.Equal(t, []model.DentryRecord{
+		{Parent: 7, Name: "b", Inode: 22, Type: model.InodeTypeFile},
+		{Parent: 7, Name: "c", Inode: 23, Type: model.InodeTypeFile},
 	}, records)
 	require.Len(t, runner.scanVersions, 2, "base scan must refill after overlay tombstone removes a row")
 }
@@ -777,15 +778,15 @@ func TestExecutorReadDirRefillsOverlayTombstonesBeforeBaseRows(t *testing.T) {
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(committer))
 	require.NoError(t, err)
 
-	records, err := executor.ReadDir(context.Background(), fsmeta.ReadDirRequest{
+	records, err := executor.ReadDir(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
 		Parent: 7,
 		Limit:  2,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryRecord{
-		{Parent: 7, Name: "d", Inode: 24, Type: fsmeta.InodeTypeFile},
-		{Parent: 7, Name: "e", Inode: 25, Type: fsmeta.InodeTypeFile},
+	require.Equal(t, []model.DentryRecord{
+		{Parent: 7, Name: "d", Inode: 24, Type: model.InodeTypeFile},
+		{Parent: 7, Name: "e", Inode: 25, Type: model.InodeTypeFile},
 	}, records)
 }
 
@@ -798,11 +799,11 @@ func TestExecutorReadDirOverlayOnlyRefillsOverlayAfterTombstone(t *testing.T) {
 			overlayDeleteForTest(dentryKeyForTest(t, "vol", 7, "b")),
 			overlayValueForTest(
 				dentryKeyForTest(t, "vol", 7, "c"),
-				dentryValueForTest(t, 7, "c", 23, fsmeta.InodeTypeFile),
+				dentryValueForTest(t, 7, "c", 23, model.InodeTypeFile),
 			),
 			overlayValueForTest(
 				dentryKeyForTest(t, "vol", 7, "d"),
-				dentryValueForTest(t, 7, "d", 24, fsmeta.InodeTypeFile),
+				dentryValueForTest(t, 7, "d", 24, model.InodeTypeFile),
 			),
 		},
 	}
@@ -821,11 +822,11 @@ func TestExecutorReadDirOverlayOnlyRefillsOverlayAfterTombstone(t *testing.T) {
 
 func TestExecutorReadDirPlusUsesVisibleOverlayInodesWithoutBatchGet(t *testing.T) {
 	runner := newFakeRunner()
-	seedDentry(t, runner, "vol", fsmeta.RootInode, "visible", 22)
+	seedDentry(t, runner, "vol", model.RootInode, "visible", 22)
 	inodeKey := inodeKeyForTest(t, "vol", 22)
-	inodeValue := inodeValueForTest(t, fsmeta.InodeRecord{
+	inodeValue := inodeValueForTest(t, model.InodeRecord{
 		Inode:     22,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
 	committer := scanOverlayCommitter{
@@ -835,15 +836,15 @@ func TestExecutorReadDirPlusUsesVisibleOverlayInodesWithoutBatchGet(t *testing.T
 	executor, err := newTestExecutor(runner, WithVisibleCommitter(committer))
 	require.NoError(t, err)
 
-	pairs, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pairs, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)
 	require.Len(t, pairs, 1)
 	require.Equal(t, "visible", pairs[0].Dentry.Name)
-	require.Equal(t, fsmeta.InodeID(22), pairs[0].Inode.Inode)
+	require.Equal(t, model.InodeID(22), pairs[0].Inode.Inode)
 	require.NotEmpty(t, runner.scanVersions)
 	require.Empty(t, runner.batchVersions, "inode attributes supplied by overlay should skip runner.BatchGet")
 }
@@ -853,19 +854,19 @@ func TestExecutorNegativeCacheLookupShortCircuit(t *testing.T) {
 	cache := negativecache.New(negativecache.Config{
 		GroupKeyFn: func(k []byte) []byte { return k },
 	})
-	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{100}}), WithNegativeCache(cache))
+	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{100}}), WithNegativeCache(cache))
 	require.NoError(t, err)
 
-	req := fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "missing"}
+	req := model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "missing"}
 
 	// First lookup: real LSM probe (runner.Get), records the miss.
 	_, err = executor.Lookup(context.Background(), req)
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 	firstGetCalls := runner.getCalls
 
 	// Second lookup: served by cache, no runner round-trip.
 	_, err = executor.Lookup(context.Background(), req)
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 	require.Equal(t, firstGetCalls, runner.getCalls,
 		"runner.Get must not be called when negative cache memo is fresh")
 }
@@ -875,19 +876,19 @@ func TestExecutorDirPageReadDirPlusCacheHit(t *testing.T) {
 	cache, err := dirpage.Open(dirpage.Config{Dir: t.TempDir()})
 	require.NoError(t, err)
 	defer func() { _ = cache.Close() }()
-	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{10, 11, 12}}), WithDirPageCache(cache))
+	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{10, 11, 12}}), WithDirPageCache(cache))
 	require.NoError(t, err)
 
-	mount := fsmeta.MountID("vol")
-	parent := fsmeta.RootInode
+	mount := model.MountID("vol")
+	parent := model.RootInode
 	for _, name := range []string{"a", "b", "c"} {
-		_, err := executor.Create(context.Background(), fsmeta.CreateRequest{
-			Mount: mount, Parent: parent, Name: name, Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		_, err := executor.Create(context.Background(), model.CreateRequest{
+			Mount: mount, Parent: parent, Name: name, Attrs: model.CreateAttrs{Type: model.InodeTypeFile},
 		})
 		require.NoError(t, err)
 	}
 
-	req := fsmeta.ReadDirRequest{Mount: mount, Parent: parent, Limit: 100}
+	req := model.ReadDirRequest{Mount: mount, Parent: parent, Limit: 100}
 
 	// First call: runner Scan + BatchGet, then async materialize.
 	first, err := executor.ReadDirPlus(context.Background(), req)
@@ -908,27 +909,27 @@ func TestExecutorDirPageReadDirPlusCacheKeysPagination(t *testing.T) {
 	cache, err := dirpage.Open(dirpage.Config{Dir: t.TempDir()})
 	require.NoError(t, err)
 	defer func() { _ = cache.Close() }()
-	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{10, 11, 12}}), WithDirPageCache(cache))
+	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{10, 11, 12}}), WithDirPageCache(cache))
 	require.NoError(t, err)
 
-	mount := fsmeta.MountID("vol")
-	parent := fsmeta.RootInode
+	mount := model.MountID("vol")
+	parent := model.RootInode
 	for _, name := range []string{"a", "b", "c"} {
-		_, err := executor.Create(context.Background(), fsmeta.CreateRequest{
-			Mount: mount, Parent: parent, Name: name, Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		_, err := executor.Create(context.Background(), model.CreateRequest{
+			Mount: mount, Parent: parent, Name: name, Attrs: model.CreateAttrs{Type: model.InodeTypeFile},
 		})
 		require.NoError(t, err)
 	}
 
 	// Materialize a non-leading page first. A later first-page request must not
 	// reuse it just because both requests target the same parent directory.
-	pageAfterA, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pageAfterA, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount: mount, Parent: parent, StartAfter: "a", Limit: 1,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "b", pageAfterA[0].Dentry.Name)
 
-	firstPage, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	firstPage, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount: mount, Parent: parent, Limit: 1,
 	})
 	require.NoError(t, err)
@@ -939,17 +940,17 @@ func TestExecutorDirPageReadDirPlusCacheKeysPagination(t *testing.T) {
 func TestExecutorDirPageDecodeFailureFallsBackToRunner(t *testing.T) {
 	runner := newFakeRunner()
 	cache := &corruptDirPageCache{}
-	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{10}}), WithDirPageCache(cache))
+	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{10}}), WithDirPageCache(cache))
 	require.NoError(t, err)
 
-	mount := fsmeta.MountID("vol")
-	parent := fsmeta.RootInode
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
-		Mount: mount, Parent: parent, Name: "a", Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+	mount := model.MountID("vol")
+	parent := model.RootInode
+	_, err = executor.Create(context.Background(), model.CreateRequest{
+		Mount: mount, Parent: parent, Name: "a", Attrs: model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
-	out, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	out, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount: mount, Parent: parent, Limit: 1,
 	})
 	require.NoError(t, err)
@@ -959,12 +960,12 @@ func TestExecutorDirPageDecodeFailureFallsBackToRunner(t *testing.T) {
 }
 
 func TestEncodeDirPageEntriesRejectsPartialMaterialization(t *testing.T) {
-	_, err := encodeDirPageEntries([]fsmeta.DentryAttrPair{{
-		Dentry: fsmeta.DentryRecord{Parent: 1, Name: "bad", Inode: 10, Type: fsmeta.InodeTypeFile},
-		Inode: fsmeta.InodeRecord{
+	_, err := encodeDirPageEntries([]model.DentryAttrPair{{
+		Dentry: model.DentryRecord{Parent: 1, Name: "bad", Inode: 10, Type: model.InodeTypeFile},
+		Inode: model.InodeRecord{
 			Inode:       10,
-			Type:        fsmeta.InodeTypeFile,
-			OpaqueAttrs: make([]byte, fsmeta.MaxInodeOpaqueAttrsBytes+1),
+			Type:        model.InodeTypeFile,
+			OpaqueAttrs: make([]byte, model.MaxInodeOpaqueAttrsBytes+1),
 		},
 	}})
 	require.Error(t, err)
@@ -975,27 +976,27 @@ func TestExecutorDirPageInvalidatedByCreate(t *testing.T) {
 	cache, err := dirpage.Open(dirpage.Config{Dir: t.TempDir()})
 	require.NoError(t, err)
 	defer func() { _ = cache.Close() }()
-	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []fsmeta.InodeID{99}}), WithDirPageCache(cache))
+	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{99}}), WithDirPageCache(cache))
 	require.NoError(t, err)
 
-	mount := fsmeta.MountID("vol")
-	parent := fsmeta.RootInode
+	mount := model.MountID("vol")
+	parent := model.RootInode
 
 	// Materialize an initial empty page set under frontier 0.
-	_, err = executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	_, err = executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount: mount, Parent: parent, Limit: 10,
 	})
 	require.NoError(t, err)
 
 	// Create a dentry; this must bump the dirpage epoch.
-	_, err = executor.Create(context.Background(), fsmeta.CreateRequest{
-		Mount: mount, Parent: parent, Name: "fresh", Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+	_, err = executor.Create(context.Background(), model.CreateRequest{
+		Mount: mount, Parent: parent, Name: "fresh", Attrs: model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
 	// Next ReadDirPlus must miss the cache (epoch advanced) and re-scan.
 	scansBefore := len(runner.scanVersions)
-	out, err := executor.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	out, err := executor.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount: mount, Parent: parent, Limit: 10,
 	})
 	require.NoError(t, err)
@@ -1007,21 +1008,21 @@ func TestExecutorDirPageInvalidatedByCreate(t *testing.T) {
 func BenchmarkExecutorReadDirPlusFromVisibleView100(b *testing.B) {
 	const entries = 100
 	mount := testMountIdentityFor("vol")
-	dentries := make([]fsmeta.DentryRecord, entries)
+	dentries := make([]model.DentryRecord, entries)
 	overlayRows := make([]VisibleOverlayKV, 0, entries)
 	for i := range entries {
-		inode := fsmeta.InodeID(1_000 + i)
-		dentries[i] = fsmeta.DentryRecord{
-			Parent: fsmeta.RootInode,
+		inode := model.InodeID(1_000 + i)
+		dentries[i] = model.DentryRecord{
+			Parent: model.RootInode,
 			Name:   "file-" + strconv.Itoa(i),
 			Inode:  inode,
-			Type:   fsmeta.InodeTypeFile,
+			Type:   model.InodeTypeFile,
 		}
 		key, err := fsmeta.EncodeInodeKey(mount, inode)
 		require.NoError(b, err)
-		value, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+		value, err := fsmeta.EncodeInodeValue(model.InodeRecord{
 			Inode:     inode,
-			Type:      fsmeta.InodeTypeFile,
+			Type:      model.InodeTypeFile,
 			LinkCount: 1,
 		})
 		require.NoError(b, err)

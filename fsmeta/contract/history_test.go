@@ -11,14 +11,14 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 type scriptInodeAllocator struct {
 	mu   sync.Mutex
-	next fsmeta.InodeID
+	next model.InodeID
 }
 
 func newScriptInodeAllocator(ops []Operation) *scriptInodeAllocator {
@@ -34,7 +34,7 @@ func newScriptInodeAllocator(ops []Operation) *scriptInodeAllocator {
 	return alloc
 }
 
-func (a *scriptInodeAllocator) AllocateCreateInode(ctx context.Context, _ fsmeta.MountIdentity, _ fsmeta.InodeID, _ string) (fsmeta.InodeID, error) {
+func (a *scriptInodeAllocator) AllocateCreateInode(ctx context.Context, _ model.MountIdentity, _ model.InodeID, _ string) (model.InodeID, error) {
 	if inode, ok := plannedCreateInode(ctx); ok {
 		return inode, nil
 	}
@@ -51,33 +51,33 @@ func TestFSMetaExecutorConcurrentHistoryContract(t *testing.T) {
 	batchSize := envInt("NOKV_CONTRACT_HISTORY_BATCH", 3)
 	for seed := int64(1); seed <= int64(seeds); seed++ {
 		t.Run(fmt.Sprintf("seed_%03d", seed), func(t *testing.T) {
-			model := NewModel("vol")
+			state := NewModel("vol")
 			runner := newVersionedRunner()
 			ops := GenerateScript(seed, steps)
 			executor, err := fsmetaexec.New(runner,
 				fsmetaexec.WithMountResolver(contractMountResolver{}),
 				fsmetaexec.WithInodeAllocator(newScriptInodeAllocator(ops)),
 				fsmetaexec.WithClock(func() time.Time {
-					return time.Unix(0, model.NowUnixNs)
+					return time.Unix(0, state.NowUnixNs)
 				}),
 			)
 			require.NoError(t, err)
 
-			err = RunConcurrentBatches(context.Background(), executor, model, ops, batchSize, HistoryOptions{})
+			err = RunConcurrentBatches(context.Background(), executor, state, ops, batchSize, HistoryOptions{})
 			require.NoError(t, err, "seed=%d steps=%d batch=%d", seed, steps, batchSize)
 		})
 	}
 }
 
 func TestRunConcurrentBatchesHonorsIndeterminateErrorsWithBatchOne(t *testing.T) {
-	model := NewModel("vol")
-	err := RunConcurrentBatches(context.Background(), unavailableCreateExecutor{}, model, []Operation{{
+	state := NewModel("vol")
+	err := RunConcurrentBatches(context.Background(), unavailableCreateExecutor{}, state, []Operation{{
 		Kind:   OpCreate,
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}}, 1, HistoryOptions{AllowIndeterminateErrors: true})
 	require.NoError(t, err)
 }
@@ -89,62 +89,62 @@ func TestIndeterminateHistoryErrorExcludesAborted(t *testing.T) {
 
 type unavailableCreateExecutor struct{}
 
-func (unavailableCreateExecutor) Create(context.Context, fsmeta.CreateRequest) (fsmeta.CreateResult, error) {
-	return fsmeta.CreateResult{}, nokverrors.New(nokverrors.KindRetryExhausted, "store unavailable after retry")
+func (unavailableCreateExecutor) Create(context.Context, model.CreateRequest) (model.CreateResult, error) {
+	return model.CreateResult{}, nokverrors.New(nokverrors.KindRetryExhausted, "store unavailable after retry")
 }
 
-func (unavailableCreateExecutor) UpdateInode(context.Context, fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error) {
-	return fsmeta.InodeRecord{}, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) UpdateInode(context.Context, model.UpdateInodeRequest) (model.InodeRecord, error) {
+	return model.InodeRecord{}, model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) Lookup(context.Context, fsmeta.LookupRequest) (fsmeta.DentryRecord, error) {
-	return fsmeta.DentryRecord{}, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) Lookup(context.Context, model.LookupRequest) (model.DentryRecord, error) {
+	return model.DentryRecord{}, model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error) {
-	return nil, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error) {
+	return nil, model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) SnapshotSubtree(context.Context, fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error) {
-	return fsmeta.SnapshotSubtreeToken{}, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) SnapshotSubtree(context.Context, model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error) {
+	return model.SnapshotSubtreeToken{}, model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) Rename(context.Context, fsmeta.RenameRequest) error {
-	return fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) Rename(context.Context, model.RenameRequest) error {
+	return model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) RenameReplace(context.Context, fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
-	return fsmeta.RenameReplaceResult{}, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) RenameReplace(context.Context, model.RenameReplaceRequest) (model.RenameReplaceResult, error) {
+	return model.RenameReplaceResult{}, model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error {
-	return fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) RenameSubtree(context.Context, model.RenameSubtreeRequest) error {
+	return model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) Link(context.Context, fsmeta.LinkRequest) error {
-	return fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) Link(context.Context, model.LinkRequest) error {
+	return model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) Unlink(context.Context, fsmeta.UnlinkRequest) error {
-	return fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) Unlink(context.Context, model.UnlinkRequest) error {
+	return model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) Remove(context.Context, fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
-	return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) Remove(context.Context, model.RemoveRequest) (model.RemoveResult, error) {
+	return model.RemoveResult{}, model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {
-	return fsmeta.SessionRecord{}, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) OpenWriteSession(context.Context, model.OpenWriteSessionRequest) (model.SessionRecord, error) {
+	return model.SessionRecord{}, model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) HeartbeatWriteSession(context.Context, fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error) {
-	return fsmeta.SessionRecord{}, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) HeartbeatWriteSession(context.Context, model.HeartbeatWriteSessionRequest) (model.SessionRecord, error) {
+	return model.SessionRecord{}, model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) CloseWriteSession(context.Context, fsmeta.CloseWriteSessionRequest) error {
-	return fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) CloseWriteSession(context.Context, model.CloseWriteSessionRequest) error {
+	return model.ErrInvalidRequest
 }
 
-func (unavailableCreateExecutor) ExpireWriteSessions(context.Context, fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error) {
-	return fsmeta.ExpireWriteSessionsResult{}, fsmeta.ErrInvalidRequest
+func (unavailableCreateExecutor) ExpireWriteSessions(context.Context, model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error) {
+	return model.ExpireWriteSessionsResult{}, model.ErrInvalidRequest
 }

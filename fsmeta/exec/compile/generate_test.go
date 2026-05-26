@@ -8,96 +8,96 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile/specdsl"
 	compilespecs "github.com/feichai0017/NoKV/fsmeta/exec/compile/specs"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestGeneratedProgramsMatchSemanticSpecs(t *testing.T) {
-	renameToParent := testParentInSameBucket(t, fsmeta.RootInode)
-	crossBucketParent := testParentInDifferentBucket(t, fsmeta.RootInode)
+	renameToParent := testParentInSameBucket(t, model.RootInode)
+	crossBucketParent := testParentInDifferentBucket(t, model.RootInode)
 	for _, tc := range []struct {
 		spec    specdsl.OpSpec
 		compile func(*testing.T) CompiledOp
 	}{
 		{spec: compilespecs.Create, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileCreateProgram(fsmeta.CreateRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "file", Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile}}, testMount, 44)
+			program, err := CompileCreateProgram(model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "file", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}, testMount, 44)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.UpdateInode, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileUpdateInodeProgram(fsmeta.UpdateInodeRequest{Mount: "vol", Parent: fsmeta.RootInode, Inode: 44, Name: "file", SetMode: true, Mode: 0o600}, testMount)
+			program, err := CompileUpdateInodeProgram(model.UpdateInodeRequest{Mount: "vol", Parent: model.RootInode, Inode: 44, Name: "file", SetMode: true, Mode: 0o600}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.Lookup, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileLookupProgram(fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "file"}, testMount)
+			program, err := CompileLookupProgram(model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "file"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.ReadDir, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileReadDirProgram(fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 32}, testMount)
+			program, err := CompileReadDirProgram(model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 32}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.SnapshotSubtree, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileSnapshotSubtreeProgram(fsmeta.SnapshotSubtreeRequest{Mount: "vol", RootInode: fsmeta.RootInode}, testMount)
+			program, err := CompileSnapshotSubtreeProgram(model.SnapshotSubtreeRequest{Mount: "vol", RootInode: model.RootInode}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.Rename, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileRenameProgram(fsmeta.RenameRequest{Mount: "vol", FromParent: fsmeta.RootInode, FromName: "old", ToParent: renameToParent, ToName: "new"}, testMount)
+			program, err := CompileRenameProgram(model.RenameRequest{Mount: "vol", FromParent: model.RootInode, FromName: "old", ToParent: renameToParent, ToName: "new"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.RenameReplace, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileRenameReplaceProgram(fsmeta.RenameReplaceRequest{Mount: "vol", FromParent: fsmeta.RootInode, FromName: "old", ToParent: renameToParent, ToName: "new"}, testMount)
+			program, err := CompileRenameReplaceProgram(model.RenameReplaceRequest{Mount: "vol", FromParent: model.RootInode, FromName: "old", ToParent: renameToParent, ToName: "new"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.RenameSubtree, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileRenameSubtreeProgram(fsmeta.RenameSubtreeRequest{Mount: "vol", FromParent: fsmeta.RootInode, FromName: "old", ToParent: crossBucketParent, ToName: "new"}, testMount)
+			program, err := CompileRenameSubtreeProgram(model.RenameSubtreeRequest{Mount: "vol", FromParent: model.RootInode, FromName: "old", ToParent: crossBucketParent, ToName: "new"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.Link, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileLinkProgram(fsmeta.LinkRequest{Mount: "vol", FromParent: fsmeta.RootInode, FromName: "old", ToParent: renameToParent, ToName: "new"}, testMount)
+			program, err := CompileLinkProgram(model.LinkRequest{Mount: "vol", FromParent: model.RootInode, FromName: "old", ToParent: renameToParent, ToName: "new"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.Unlink, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileUnlinkProgram(fsmeta.UnlinkRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old"}, testMount)
+			program, err := CompileUnlinkProgram(model.UnlinkRequest{Mount: "vol", Parent: model.RootInode, Name: "old"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.Remove, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileRemoveProgram(fsmeta.RemoveRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old"}, testMount)
+			program, err := CompileRemoveProgram(model.RemoveRequest{Mount: "vol", Parent: model.RootInode, Name: "old"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.RemoveDirectory, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileRemoveDirectoryProgram(fsmeta.RemoveDirectoryRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old-dir"}, testMount)
+			program, err := CompileRemoveDirectoryProgram(model.RemoveDirectoryRequest{Mount: "vol", Parent: model.RootInode, Name: "old-dir"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.OpenWriteSession, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileOpenWriteSessionProgram(fsmeta.OpenWriteSessionRequest{Mount: "vol", Inode: 44, Session: "writer-1", TTL: time.Second}, testMount)
+			program, err := CompileOpenWriteSessionProgram(model.OpenWriteSessionRequest{Mount: "vol", Inode: 44, Session: "writer-1", TTL: time.Second}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.HeartbeatWriteSession, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileHeartbeatWriteSessionProgram(fsmeta.HeartbeatWriteSessionRequest{Mount: "vol", Inode: 44, Session: "writer-1", TTL: time.Second}, testMount)
+			program, err := CompileHeartbeatWriteSessionProgram(model.HeartbeatWriteSessionRequest{Mount: "vol", Inode: 44, Session: "writer-1", TTL: time.Second}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.CloseWriteSession, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileCloseWriteSessionProgram(fsmeta.CloseWriteSessionRequest{Mount: "vol", Inode: 44, Session: "writer-1"}, testMount)
+			program, err := CompileCloseWriteSessionProgram(model.CloseWriteSessionRequest{Mount: "vol", Inode: 44, Session: "writer-1"}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
 		{spec: compilespecs.ExpireWriteSessions, compile: func(t *testing.T) CompiledOp {
-			program, err := CompileExpireWriteSessionsProgram(fsmeta.ExpireWriteSessionsRequest{Mount: "vol", Limit: 16}, testMount)
+			program, err := CompileExpireWriteSessionsProgram(model.ExpireWriteSessionsRequest{Mount: "vol", Limit: 16}, testMount)
 			require.NoError(t, err)
 			return program.Compiled
 		}},
@@ -172,40 +172,40 @@ func repeatableSpecBindingFamily(binding string) string {
 	return binding
 }
 
-func operationKindSpecName(kind fsmeta.OperationKind) string {
+func operationKindSpecName(kind model.OperationKind) string {
 	switch kind {
-	case fsmeta.OperationCreate:
-		return "fsmeta.OperationCreate"
-	case fsmeta.OperationUpdateInode:
-		return "fsmeta.OperationUpdateInode"
-	case fsmeta.OperationLookup:
-		return "fsmeta.OperationLookup"
-	case fsmeta.OperationReadDir:
-		return "fsmeta.OperationReadDir"
-	case fsmeta.OperationSnapshotSubtree:
-		return "fsmeta.OperationSnapshotSubtree"
-	case fsmeta.OperationRename:
-		return "fsmeta.OperationRename"
-	case fsmeta.OperationRenameReplace:
-		return "fsmeta.OperationRenameReplace"
-	case fsmeta.OperationRenameSubtree:
-		return "fsmeta.OperationRenameSubtree"
-	case fsmeta.OperationLink:
-		return "fsmeta.OperationLink"
-	case fsmeta.OperationUnlink:
-		return "fsmeta.OperationUnlink"
-	case fsmeta.OperationRemove:
-		return "fsmeta.OperationRemove"
-	case fsmeta.OperationRemoveDirectory:
-		return "fsmeta.OperationRemoveDirectory"
-	case fsmeta.OperationOpenWriteSession:
-		return "fsmeta.OperationOpenWriteSession"
-	case fsmeta.OperationHeartbeatSession:
-		return "fsmeta.OperationHeartbeatSession"
-	case fsmeta.OperationCloseSession:
-		return "fsmeta.OperationCloseSession"
-	case fsmeta.OperationExpireSessions:
-		return "fsmeta.OperationExpireSessions"
+	case model.OperationCreate:
+		return "model.OperationCreate"
+	case model.OperationUpdateInode:
+		return "model.OperationUpdateInode"
+	case model.OperationLookup:
+		return "model.OperationLookup"
+	case model.OperationReadDir:
+		return "model.OperationReadDir"
+	case model.OperationSnapshotSubtree:
+		return "model.OperationSnapshotSubtree"
+	case model.OperationRename:
+		return "model.OperationRename"
+	case model.OperationRenameReplace:
+		return "model.OperationRenameReplace"
+	case model.OperationRenameSubtree:
+		return "model.OperationRenameSubtree"
+	case model.OperationLink:
+		return "model.OperationLink"
+	case model.OperationUnlink:
+		return "model.OperationUnlink"
+	case model.OperationRemove:
+		return "model.OperationRemove"
+	case model.OperationRemoveDirectory:
+		return "model.OperationRemoveDirectory"
+	case model.OperationOpenWriteSession:
+		return "model.OperationOpenWriteSession"
+	case model.OperationHeartbeatSession:
+		return "model.OperationHeartbeatSession"
+	case model.OperationCloseSession:
+		return "model.OperationCloseSession"
+	case model.OperationExpireSessions:
+		return "model.OperationExpireSessions"
 	default:
 		return ""
 	}

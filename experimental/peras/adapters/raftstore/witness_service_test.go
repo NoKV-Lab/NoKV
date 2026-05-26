@@ -11,6 +11,7 @@ import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -61,11 +62,11 @@ func (s *segmentWitnessStub) ProbeSegment(_ context.Context, ref fsperas.Witness
 
 func TestServiceAppendSegmentWitnessSingleRecordProbe(t *testing.T) {
 	scope := compile.AuthorityScope{
-		Mount:      fsmeta.MountID("m1"),
+		Mount:      model.MountID("m1"),
 		MountKeyID: 2,
 		Buckets:    []fsmeta.AffinityBucket{4},
-		Parents:    []fsmeta.InodeID{10},
-		Inodes:     []fsmeta.InodeID{20},
+		Parents:    []model.InodeID{10},
+		Inodes:     []model.InodeID{20},
 	}
 	record := serviceTestSegmentRecord()
 	witness := &segmentWitnessStub{
@@ -91,11 +92,11 @@ func TestServiceAppendSegmentWitnessSingleRecordProbe(t *testing.T) {
 
 func TestServiceAppendSegmentWitness(t *testing.T) {
 	scope := compile.AuthorityScope{
-		Mount:      fsmeta.MountID("m1"),
+		Mount:      model.MountID("m1"),
 		MountKeyID: 2,
 		Buckets:    []fsmeta.AffinityBucket{4},
-		Parents:    []fsmeta.InodeID{10},
-		Inodes:     []fsmeta.InodeID{20},
+		Parents:    []model.InodeID{10},
+		Inodes:     []model.InodeID{20},
 	}
 	first := serviceTestSegmentRecordWithRoot(3)
 	second := serviceTestSegmentRecordWithRoot(4)

@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 const stagedPublishCleanupTimeout = 5 * time.Second
@@ -17,9 +17,9 @@ const stagedPublishCleanupTimeout = 5 * time.Second
 // StagedPublishClient is the narrow namespace surface needed for staged
 // publish. GRPCClient satisfies it.
 type StagedPublishClient interface {
-	Create(context.Context, fsmeta.CreateRequest) (fsmeta.CreateResult, error)
-	Rename(context.Context, fsmeta.RenameRequest) error
-	Unlink(context.Context, fsmeta.UnlinkRequest) error
+	Create(context.Context, model.CreateRequest) (model.CreateResult, error)
+	Rename(context.Context, model.RenameRequest) error
+	Unlink(context.Context, model.UnlinkRequest) error
 }
 
 // StagedPublishRequest describes one namespace-only stage -> commit publish.
@@ -29,18 +29,18 @@ type StagedPublishClient interface {
 // (FinalParent, FinalName). NoKV does not write or validate the body itself;
 // callers typically store body references inside Inode.OpaqueAttrs.
 type StagedPublishRequest struct {
-	Mount       fsmeta.MountID
-	StageParent fsmeta.InodeID
+	Mount       model.MountID
+	StageParent model.InodeID
 	StageName   string
-	FinalParent fsmeta.InodeID
+	FinalParent model.InodeID
 	FinalName   string
-	Attrs       fsmeta.CreateAttrs
+	Attrs       model.CreateAttrs
 }
 
 // PrepareStagedFunc is called after the staged namespace entry is created and
 // before the final rename. The callback is where a caller writes external body
 // data, uploads an object, or validates a content-addressed reference.
-type PrepareStagedFunc func(context.Context, fsmeta.CreateResult) error
+type PrepareStagedFunc func(context.Context, model.CreateResult) error
 
 // PublishStagedNamespaceEntry implements the stage -> commit namespace pattern.
 //
@@ -55,11 +55,11 @@ func PublishStagedNamespaceEntry(ctx context.Context, cli StagedPublishClient, r
 		return errStagedPublishClientRequired
 	}
 	create := req.createRequest()
-	if err := fsmeta.ValidateCreateRequest(create); err != nil {
+	if err := model.ValidateCreateRequest(create); err != nil {
 		return err
 	}
 	rename := req.renameRequest()
-	if err := fsmeta.ValidateRenameRequest(rename); err != nil {
+	if err := model.ValidateRenameRequest(rename); err != nil {
 		return err
 	}
 
@@ -71,7 +71,7 @@ func PublishStagedNamespaceEntry(ctx context.Context, cli StagedPublishClient, r
 		if err := prepare(ctx, result); err != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stagedPublishCleanupTimeout)
 			defer cancel()
-			if cleanupErr := cli.Unlink(cleanupCtx, fsmeta.UnlinkRequest{
+			if cleanupErr := cli.Unlink(cleanupCtx, model.UnlinkRequest{
 				Mount:  req.Mount,
 				Parent: req.StageParent,
 				Name:   req.StageName,
@@ -84,8 +84,8 @@ func PublishStagedNamespaceEntry(ctx context.Context, cli StagedPublishClient, r
 	return cli.Rename(ctx, rename)
 }
 
-func (r StagedPublishRequest) createRequest() fsmeta.CreateRequest {
-	return fsmeta.CreateRequest{
+func (r StagedPublishRequest) createRequest() model.CreateRequest {
+	return model.CreateRequest{
 		Mount:  r.Mount,
 		Parent: r.StageParent,
 		Name:   r.StageName,
@@ -93,8 +93,8 @@ func (r StagedPublishRequest) createRequest() fsmeta.CreateRequest {
 	}
 }
 
-func (r StagedPublishRequest) renameRequest() fsmeta.RenameRequest {
-	return fsmeta.RenameRequest{
+func (r StagedPublishRequest) renameRequest() model.RenameRequest {
+	return model.RenameRequest{
 		Mount:      r.Mount,
 		FromParent: r.StageParent,
 		FromName:   r.StageName,

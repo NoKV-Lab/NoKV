@@ -1,30 +1,7 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package fsmeta is NoKV's workspace namespace metadata plane.
-//
-// fsmeta sits on top of NoKV as a consumer. It exposes filesystem-shaped
-// metadata semantics for AI agent workspaces: inodes, dentries, xattrs, atomic
-// cross-directory rename, multi-mount namespace routing, snapshots, and watch
-// streams. The same contract can also serve distributed filesystems that need a
-// standalone metadata service.
-//
-// Scope boundary:
-//
-//   - fsmeta is not a filesystem. It is the namespace metadata kernel that an
-//     agent workspace layer, a DFS, or a FUSE frontend consumes. NoKV's pitch is
-//     "workspace metadata engine", not "another distributed filesystem".
-//
-//   - fsmeta does not live under meta/. meta/root is NoKV's own rooted cluster
-//     truth: region descriptors, authority grants, and allocator fences.
-//     User-facing filesystem metadata is application data: a consumer of NoKV,
-//     not part of NoKV's internal truth.
-//
-//   - fsmeta uses runtime adapters for local and distributed storage. It may
-//     reuse meta/root's rooted-event substrate only for namespace-level
-//     authority where Eunomia semantics apply. Per-inode and per-dentry
-//     mutations are data-plane writes, never rooted events.
-package fsmeta
+package model
 
 // MountID identifies one filesystem namespace hosted inside fsmeta.
 type MountID string
@@ -50,6 +27,48 @@ type ChunkIndex uint64
 
 // SessionID identifies one client/session lease record.
 type SessionID string
+
+// InodeType describes the user-visible inode kind tracked by fsmeta.
+type InodeType string
+
+const (
+	InodeTypeFile      InodeType = "file"
+	InodeTypeDirectory InodeType = "directory"
+)
+
+// InodeRecord is the value stored under an inode key.
+type InodeRecord struct {
+	Inode         InodeID   `json:"inode"`
+	Type          InodeType `json:"type,omitempty"`
+	Size          uint64    `json:"size,omitempty"`
+	Mode          uint32    `json:"mode,omitempty"`
+	LinkCount     uint32    `json:"link_count,omitempty"`
+	ChildCount    uint64    `json:"child_count,omitempty"`
+	CreatedUnixNs int64     `json:"created_unix_ns,omitempty"`
+	UpdatedUnixNs int64     `json:"updated_unix_ns,omitempty"`
+	OpaqueAttrs   []byte    `json:"opaque_attrs,omitempty"`
+}
+
+// DentryRecord is the value stored under a parent/name dentry key.
+type DentryRecord struct {
+	Parent InodeID   `json:"parent"`
+	Name   string    `json:"name"`
+	Inode  InodeID   `json:"inode"`
+	Type   InodeType `json:"type,omitempty"`
+}
+
+// SessionRecord is the value stored under a writer/session key.
+type SessionRecord struct {
+	Session       SessionID `json:"session"`
+	Inode         InodeID   `json:"inode"`
+	ExpiresUnixNs int64     `json:"expires_unix_ns,omitempty"`
+}
+
+// UsageRecord is the value stored under quota usage counter keys.
+type UsageRecord struct {
+	Bytes  uint64 `json:"bytes,omitempty"`
+	Inodes uint64 `json:"inodes,omitempty"`
+}
 
 // DentryAttrPair is the fused result returned by ReadDirPlus-style operations.
 type DentryAttrPair struct {
@@ -80,15 +99,6 @@ func (r SnapshotEvidenceRef) Valid() bool {
 		r.PayloadDigest != ([32]byte{})
 }
 
-func cloneSnapshotEvidenceRefs(refs []SnapshotEvidenceRef) []SnapshotEvidenceRef {
-	if len(refs) == 0 {
-		return nil
-	}
-	out := make([]SnapshotEvidenceRef, len(refs))
-	copy(out, refs)
-	return out
-}
-
 // ReadVersionRequest asks for an ephemeral MVCC read version. It provides a
 // consistent read timestamp only; it does not publish a snapshot epoch or pin
 // GC state.
@@ -111,6 +121,15 @@ type SnapshotSubtreeToken struct {
 func (t SnapshotSubtreeToken) Clone() SnapshotSubtreeToken {
 	t.RuntimeEvidence = cloneSnapshotEvidenceRefs(t.RuntimeEvidence)
 	return t
+}
+
+func cloneSnapshotEvidenceRefs(refs []SnapshotEvidenceRef) []SnapshotEvidenceRef {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]SnapshotEvidenceRef, len(refs))
+	copy(out, refs)
+	return out
 }
 
 // QuotaUsageRequest addresses one usage counter. Scope 0 is mount-wide;
@@ -143,86 +162,3 @@ const (
 	// MaxSessionExpireLimit keeps one session cleanup pass bounded.
 	MaxSessionExpireLimit uint32 = 16 * 1024
 )
-
-func validateMountID(id MountID) error {
-	if id == "" {
-		return ErrInvalidMountID
-	}
-	return nil
-}
-
-func validateMountKeyID(id MountKeyID) error {
-	if id == 0 {
-		return ErrInvalidMountID
-	}
-	return nil
-}
-
-func validateMountIdentity(identity MountIdentity) error {
-	if err := validateMountID(identity.MountID); err != nil {
-		return err
-	}
-	return validateMountKeyID(identity.MountKeyID)
-}
-
-func validateMountIdentityForRequest(identity MountIdentity, mount MountID) error {
-	if err := validateMountIdentity(identity); err != nil {
-		return err
-	}
-	if mount != "" && mount != identity.MountID {
-		return ErrInvalidMountID
-	}
-	return nil
-}
-
-func validateInodeID(id InodeID) error {
-	if id == 0 {
-		return ErrInvalidInodeID
-	}
-	return nil
-}
-
-func validateName(name string) error {
-	if name == "" || name == "." || name == ".." {
-		return ErrInvalidName
-	}
-	for i := 0; i < len(name); i++ {
-		switch name[i] {
-		case '/', 0:
-			return ErrInvalidName
-		}
-	}
-	return nil
-}
-
-func validateSessionID(id SessionID) error {
-	if id == "" {
-		return ErrInvalidSession
-	}
-	for i := 0; i < len(id); i++ {
-		if id[i] == 0 {
-			return ErrInvalidSession
-		}
-	}
-	return nil
-}
-
-func normalizeReadDirLimit(limit uint32) (uint32, error) {
-	if limit == 0 {
-		return DefaultReadDirLimit, nil
-	}
-	if limit > MaxReadDirLimit {
-		return 0, ErrInvalidPageSize
-	}
-	return limit, nil
-}
-
-func normalizeSessionExpireLimit(limit uint32) (uint32, error) {
-	if limit == 0 {
-		return DefaultSessionExpireLimit, nil
-	}
-	if limit > MaxSessionExpireLimit {
-		return 0, ErrInvalidPageSize
-	}
-	return limit, nil
-}

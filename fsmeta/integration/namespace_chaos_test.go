@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -25,33 +25,33 @@ func TestFSMetadataNamespaceChaosSurvivesGatewayRestartAndMixedMutations(t *test
 		}
 	}()
 
-	mount := fsmeta.MountID("vol")
-	_, err := cli.Create(ctx, fsmeta.CreateRequest{
+	mount := model.MountID("vol")
+	_, err := cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 64, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 64, Mode: 0o644},
 	})
 	require.NoError(t, err)
-	_, err = cli.Create(ctx, fsmeta.CreateRequest{
+	_, err = cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "beta",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 128, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 128, Mode: 0o644},
 	})
 	require.NoError(t, err)
-	require.NoError(t, cli.Link(ctx, fsmeta.LinkRequest{
+	require.NoError(t, cli.Link(ctx, model.LinkRequest{
 		Mount:      mount,
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   "alpha",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "alpha-link",
 	}))
-	require.NoError(t, cli.Rename(ctx, fsmeta.RenameRequest{
+	require.NoError(t, cli.Rename(ctx, model.RenameRequest{
 		Mount:      mount,
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   "beta",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "zeta",
 	}))
 
@@ -62,22 +62,22 @@ func TestFSMetadataNamespaceChaosSurvivesGatewayRestartAndMixedMutations(t *test
 	cleanup = nil
 	cli, cleanup = openFSMetadataClient(t, ctx, runtime.executor)
 
-	require.NoError(t, cli.Unlink(ctx, fsmeta.UnlinkRequest{
+	require.NoError(t, cli.Unlink(ctx, model.UnlinkRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
 	}))
-	_, err = cli.Create(ctx, fsmeta.CreateRequest{
+	_, err = cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "gamma",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 256, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 256, Mode: 0o644},
 	})
 	require.NoError(t, err)
 
-	pairs, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	pairs, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  16,
 	})
 	require.NoError(t, err)
@@ -94,37 +94,37 @@ func TestFSMetadataRenameSubtreePublishesSingleHandoffOnRealCluster(t *testing.T
 	cli, cleanup := openFSMetadataClient(t, ctx, runtime.executor)
 	defer cleanup()
 
-	mount := fsmeta.MountID("vol")
-	_, err := cli.Create(ctx, fsmeta.CreateRequest{
+	mount := model.MountID("vol")
+	_, err := cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "source",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 512, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 512, Mode: 0o644},
 	})
 	require.NoError(t, err)
-	require.NoError(t, cli.RenameSubtree(ctx, fsmeta.RenameSubtreeRequest{
+	require.NoError(t, cli.RenameSubtree(ctx, model.RenameSubtreeRequest{
 		Mount:      mount,
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   "source",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "target",
 	}))
 
 	require.Equal(t, 1, publisher.starts)
 	require.Equal(t, 1, publisher.completes)
 	require.Equal(t, mount, publisher.mount)
-	require.Equal(t, fsmeta.RootInode, publisher.root)
+	require.Equal(t, model.RootInode, publisher.root)
 	require.NotZero(t, publisher.startFrontier)
 	// Real raftstore 2PC may allocate commit_ts after handoff start. The
 	// successor frontier must cover the predecessor frontier and may be later.
 	require.GreaterOrEqual(t, publisher.completeFrontier, publisher.startFrontier)
 }
 
-func assertNamespaceInvariants(t *testing.T, pairs []fsmeta.DentryAttrPair) {
+func assertNamespaceInvariants(t *testing.T, pairs []model.DentryAttrPair) {
 	t.Helper()
 	seenNames := make(map[string]struct{}, len(pairs))
-	linkRefs := make(map[fsmeta.InodeID]uint32)
-	linkCounts := make(map[fsmeta.InodeID]uint32)
+	linkRefs := make(map[model.InodeID]uint32)
+	linkCounts := make(map[model.InodeID]uint32)
 	for _, pair := range pairs {
 		require.NotEmpty(t, pair.Dentry.Name)
 		if _, ok := seenNames[pair.Dentry.Name]; ok {
@@ -144,13 +144,13 @@ func assertNamespaceInvariants(t *testing.T, pairs []fsmeta.DentryAttrPair) {
 type recordingSubtreeHandoffPublisher struct {
 	starts           int
 	completes        int
-	mount            fsmeta.MountID
-	root             fsmeta.InodeID
+	mount            model.MountID
+	root             model.InodeID
 	startFrontier    uint64
 	completeFrontier uint64
 }
 
-func (p *recordingSubtreeHandoffPublisher) StartSubtreeHandoff(_ context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {
+func (p *recordingSubtreeHandoffPublisher) StartSubtreeHandoff(_ context.Context, mount model.MountID, root model.InodeID, frontier uint64) error {
 	p.starts++
 	p.mount = mount
 	p.root = root
@@ -158,7 +158,7 @@ func (p *recordingSubtreeHandoffPublisher) StartSubtreeHandoff(_ context.Context
 	return nil
 }
 
-func (p *recordingSubtreeHandoffPublisher) CompleteSubtreeHandoff(_ context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {
+func (p *recordingSubtreeHandoffPublisher) CompleteSubtreeHandoff(_ context.Context, mount model.MountID, root model.InodeID, frontier uint64) error {
 	p.completes++
 	p.mount = mount
 	p.root = root

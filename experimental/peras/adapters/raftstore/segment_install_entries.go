@@ -9,6 +9,7 @@ import (
 	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
 )
@@ -227,7 +228,7 @@ func dedupeInternalEntries(entries []*entrykv.Entry) []*entrykv.Entry {
 }
 
 type perasSegmentCatalogBucket struct {
-	mount  fsmeta.MountKeyID
+	mount  model.MountKeyID
 	bucket fsmeta.AffinityBucket
 }
 

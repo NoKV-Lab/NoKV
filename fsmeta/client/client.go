@@ -9,6 +9,7 @@ import (
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -41,28 +42,28 @@ const (
 
 // Client is the typed fsmeta client surface consumed by demos and benchmarks.
 type Client interface {
-	Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta.CreateResult, error)
-	UpdateInode(ctx context.Context, req fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error)
-	Lookup(ctx context.Context, req fsmeta.LookupRequest) (fsmeta.DentryRecord, error)
-	LookupPlus(ctx context.Context, req fsmeta.LookupRequest) (fsmeta.DentryAttrPair, error)
-	ReadDir(ctx context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryRecord, error)
-	ReadDirPlus(ctx context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
+	Create(ctx context.Context, req model.CreateRequest) (model.CreateResult, error)
+	UpdateInode(ctx context.Context, req model.UpdateInodeRequest) (model.InodeRecord, error)
+	Lookup(ctx context.Context, req model.LookupRequest) (model.DentryRecord, error)
+	LookupPlus(ctx context.Context, req model.LookupRequest) (model.DentryAttrPair, error)
+	ReadDir(ctx context.Context, req model.ReadDirRequest) ([]model.DentryRecord, error)
+	ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error)
 	WatchSubtree(ctx context.Context, req fsmeta.WatchRequest) (WatchSubscription, error)
-	GetReadVersion(ctx context.Context, req fsmeta.ReadVersionRequest) (uint64, error)
-	SnapshotSubtree(ctx context.Context, req fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error)
-	RetireSnapshotSubtree(ctx context.Context, token fsmeta.SnapshotSubtreeToken) error
-	GetQuotaUsage(ctx context.Context, req fsmeta.QuotaUsageRequest) (fsmeta.UsageRecord, error)
-	Rename(ctx context.Context, req fsmeta.RenameRequest) error
-	RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error)
-	RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error
-	Link(ctx context.Context, req fsmeta.LinkRequest) error
-	Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
-	Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error)
-	RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirectoryRequest) error
-	OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
-	HeartbeatWriteSession(ctx context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
-	CloseWriteSession(ctx context.Context, req fsmeta.CloseWriteSessionRequest) error
-	ExpireWriteSessions(ctx context.Context, req fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error)
+	GetReadVersion(ctx context.Context, req model.ReadVersionRequest) (uint64, error)
+	SnapshotSubtree(ctx context.Context, req model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error)
+	RetireSnapshotSubtree(ctx context.Context, token model.SnapshotSubtreeToken) error
+	GetQuotaUsage(ctx context.Context, req model.QuotaUsageRequest) (model.UsageRecord, error)
+	Rename(ctx context.Context, req model.RenameRequest) error
+	RenameReplace(ctx context.Context, req model.RenameReplaceRequest) (model.RenameReplaceResult, error)
+	RenameSubtree(ctx context.Context, req model.RenameSubtreeRequest) error
+	Link(ctx context.Context, req model.LinkRequest) error
+	Unlink(ctx context.Context, req model.UnlinkRequest) error
+	Remove(ctx context.Context, req model.RemoveRequest) (model.RemoveResult, error)
+	RemoveDirectory(ctx context.Context, req model.RemoveDirectoryRequest) error
+	OpenWriteSession(ctx context.Context, req model.OpenWriteSessionRequest) (model.SessionRecord, error)
+	HeartbeatWriteSession(ctx context.Context, req model.HeartbeatWriteSessionRequest) (model.SessionRecord, error)
+	CloseWriteSession(ctx context.Context, req model.CloseWriteSessionRequest) error
+	ExpireWriteSessions(ctx context.Context, req model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error)
 	Close() error
 }
 
@@ -143,15 +144,15 @@ func (c *GRPCClient) LookupCacheStats() LookupCacheStats {
 	return c.lookup.Stats()
 }
 
-func (c *GRPCClient) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta.CreateResult, error) {
+func (c *GRPCClient) Create(ctx context.Context, req model.CreateRequest) (model.CreateResult, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.CreateResult{}, err
+		return model.CreateResult{}, err
 	}
 	resp, err := c.rpc.Create(ctx, createRequestToProto(req))
 	if err != nil {
-		return fsmeta.CreateResult{}, translateRPCError(err)
+		return model.CreateResult{}, translateRPCError(err)
 	}
-	result := fsmeta.CreateResult{
+	result := model.CreateResult{
 		Dentry: dentryFromProto(resp.GetDentry()),
 		Inode:  inodeFromProto(resp.GetInode()),
 	}
@@ -159,47 +160,47 @@ func (c *GRPCClient) Create(ctx context.Context, req fsmeta.CreateRequest) (fsme
 	return result, nil
 }
 
-func (c *GRPCClient) UpdateInode(ctx context.Context, req fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error) {
+func (c *GRPCClient) UpdateInode(ctx context.Context, req model.UpdateInodeRequest) (model.InodeRecord, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.InodeRecord{}, err
+		return model.InodeRecord{}, err
 	}
 	resp, err := c.rpc.UpdateInode(ctx, updateInodeRequestToProto(req))
 	if err != nil {
-		return fsmeta.InodeRecord{}, translateRPCError(err)
+		return model.InodeRecord{}, translateRPCError(err)
 	}
 	return inodeFromProto(resp.GetInode()), nil
 }
 
-func (c *GRPCClient) Lookup(ctx context.Context, req fsmeta.LookupRequest) (fsmeta.DentryRecord, error) {
+func (c *GRPCClient) Lookup(ctx context.Context, req model.LookupRequest) (model.DentryRecord, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.DentryRecord{}, err
+		return model.DentryRecord{}, err
 	}
 	if record, ok := c.lookup.Get(req.Mount, req.Parent, req.Name); ok {
 		return record, nil
 	}
 	resp, err := c.rpc.Lookup(ctx, lookupRequestToProto(req))
 	if err != nil {
-		return fsmeta.DentryRecord{}, translateRPCError(err)
+		return model.DentryRecord{}, translateRPCError(err)
 	}
 	record := dentryFromProto(resp.GetDentry())
 	c.lookup.Put(req.Mount, record)
 	return record, nil
 }
 
-func (c *GRPCClient) LookupPlus(ctx context.Context, req fsmeta.LookupRequest) (fsmeta.DentryAttrPair, error) {
+func (c *GRPCClient) LookupPlus(ctx context.Context, req model.LookupRequest) (model.DentryAttrPair, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.DentryAttrPair{}, err
+		return model.DentryAttrPair{}, err
 	}
 	resp, err := c.rpc.LookupPlus(ctx, lookupRequestToProto(req))
 	if err != nil {
-		return fsmeta.DentryAttrPair{}, translateRPCError(err)
+		return model.DentryAttrPair{}, translateRPCError(err)
 	}
 	pair := pairFromProto(resp.GetEntry())
 	c.lookup.Put(req.Mount, pair.Dentry)
 	return pair, nil
 }
 
-func (c *GRPCClient) ReadDir(ctx context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryRecord, error) {
+func (c *GRPCClient) ReadDir(ctx context.Context, req model.ReadDirRequest) ([]model.DentryRecord, error) {
 	if err := c.requireRPC(); err != nil {
 		return nil, err
 	}
@@ -207,7 +208,7 @@ func (c *GRPCClient) ReadDir(ctx context.Context, req fsmeta.ReadDirRequest) ([]
 	if err != nil {
 		return nil, translateRPCError(err)
 	}
-	out := make([]fsmeta.DentryRecord, 0, len(resp.GetEntries()))
+	out := make([]model.DentryRecord, 0, len(resp.GetEntries()))
 	for _, entry := range resp.GetEntries() {
 		out = append(out, dentryFromProto(entry))
 	}
@@ -217,7 +218,7 @@ func (c *GRPCClient) ReadDir(ctx context.Context, req fsmeta.ReadDirRequest) ([]
 	return out, nil
 }
 
-func (c *GRPCClient) ReadDirPlus(ctx context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error) {
+func (c *GRPCClient) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	if err := c.requireRPC(); err != nil {
 		return nil, err
 	}
@@ -225,7 +226,7 @@ func (c *GRPCClient) ReadDirPlus(ctx context.Context, req fsmeta.ReadDirRequest)
 	if err != nil {
 		return nil, translateRPCError(err)
 	}
-	out := make([]fsmeta.DentryAttrPair, 0, len(resp.GetEntries()))
+	out := make([]model.DentryAttrPair, 0, len(resp.GetEntries()))
 	for _, entry := range resp.GetEntries() {
 		out = append(out, pairFromProto(entry))
 	}
@@ -261,7 +262,7 @@ func (c *GRPCClient) WatchSubtree(ctx context.Context, req fsmeta.WatchRequest) 
 	return &WatchStream{stream: stream, ready: ready}, nil
 }
 
-func (c *GRPCClient) GetReadVersion(ctx context.Context, req fsmeta.ReadVersionRequest) (uint64, error) {
+func (c *GRPCClient) GetReadVersion(ctx context.Context, req model.ReadVersionRequest) (uint64, error) {
 	if err := c.requireRPC(); err != nil {
 		return 0, err
 	}
@@ -272,18 +273,18 @@ func (c *GRPCClient) GetReadVersion(ctx context.Context, req fsmeta.ReadVersionR
 	return resp.GetReadVersion(), nil
 }
 
-func (c *GRPCClient) SnapshotSubtree(ctx context.Context, req fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error) {
+func (c *GRPCClient) SnapshotSubtree(ctx context.Context, req model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.SnapshotSubtreeToken{}, err
+		return model.SnapshotSubtreeToken{}, err
 	}
 	resp, err := c.rpc.SnapshotSubtree(ctx, snapshotSubtreeRequestToProto(req))
 	if err != nil {
-		return fsmeta.SnapshotSubtreeToken{}, translateRPCError(err)
+		return model.SnapshotSubtreeToken{}, translateRPCError(err)
 	}
 	return snapshotSubtreeTokenFromProto(resp), nil
 }
 
-func (c *GRPCClient) RetireSnapshotSubtree(ctx context.Context, token fsmeta.SnapshotSubtreeToken) error {
+func (c *GRPCClient) RetireSnapshotSubtree(ctx context.Context, token model.SnapshotSubtreeToken) error {
 	if err := c.requireRPC(); err != nil {
 		return err
 	}
@@ -291,18 +292,18 @@ func (c *GRPCClient) RetireSnapshotSubtree(ctx context.Context, token fsmeta.Sna
 	return translateRPCError(err)
 }
 
-func (c *GRPCClient) GetQuotaUsage(ctx context.Context, req fsmeta.QuotaUsageRequest) (fsmeta.UsageRecord, error) {
+func (c *GRPCClient) GetQuotaUsage(ctx context.Context, req model.QuotaUsageRequest) (model.UsageRecord, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.UsageRecord{}, err
+		return model.UsageRecord{}, err
 	}
 	resp, err := c.rpc.GetQuotaUsage(ctx, quotaUsageRequestToProto(req))
 	if err != nil {
-		return fsmeta.UsageRecord{}, translateRPCError(err)
+		return model.UsageRecord{}, translateRPCError(err)
 	}
 	return quotaUsageFromProto(resp), nil
 }
 
-func (c *GRPCClient) Rename(ctx context.Context, req fsmeta.RenameRequest) error {
+func (c *GRPCClient) Rename(ctx context.Context, req model.RenameRequest) error {
 	if err := c.requireRPC(); err != nil {
 		return err
 	}
@@ -323,16 +324,16 @@ func (c *GRPCClient) Rename(ctx context.Context, req fsmeta.RenameRequest) error
 	return nil
 }
 
-func (c *GRPCClient) RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+func (c *GRPCClient) RenameReplace(ctx context.Context, req model.RenameReplaceRequest) (model.RenameReplaceResult, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.RenameReplaceResult{}, err
+		return model.RenameReplaceResult{}, err
 	}
 	from := lookupCacheKey{mount: req.Mount, parent: req.FromParent, name: req.FromName}
 	to := lookupCacheKey{mount: req.Mount, parent: req.ToParent, name: req.ToName}
 	record, hadSource := c.lookup.peek(from)
 	resp, err := c.rpc.RenameReplace(ctx, renameReplaceRequestToProto(req))
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, translateRPCError(err)
+		return model.RenameReplaceResult{}, translateRPCError(err)
 	}
 	c.lookup.invalidate(from)
 	c.lookup.invalidate(to)
@@ -344,7 +345,7 @@ func (c *GRPCClient) RenameReplace(ctx context.Context, req fsmeta.RenameReplace
 	return renameReplaceResultFromProto(resp), nil
 }
 
-func (c *GRPCClient) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error {
+func (c *GRPCClient) RenameSubtree(ctx context.Context, req model.RenameSubtreeRequest) error {
 	if err := c.requireRPC(); err != nil {
 		return err
 	}
@@ -365,7 +366,7 @@ func (c *GRPCClient) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtree
 	return nil
 }
 
-func (c *GRPCClient) Link(ctx context.Context, req fsmeta.LinkRequest) error {
+func (c *GRPCClient) Link(ctx context.Context, req model.LinkRequest) error {
 	if err := c.requireRPC(); err != nil {
 		return err
 	}
@@ -377,7 +378,7 @@ func (c *GRPCClient) Link(ctx context.Context, req fsmeta.LinkRequest) error {
 	return nil
 }
 
-func (c *GRPCClient) Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error {
+func (c *GRPCClient) Unlink(ctx context.Context, req model.UnlinkRequest) error {
 	if err := c.requireRPC(); err != nil {
 		return err
 	}
@@ -389,19 +390,19 @@ func (c *GRPCClient) Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error
 	return nil
 }
 
-func (c *GRPCClient) Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+func (c *GRPCClient) Remove(ctx context.Context, req model.RemoveRequest) (model.RemoveResult, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.RemoveResult{}, err
+		return model.RemoveResult{}, err
 	}
 	resp, err := c.rpc.Remove(ctx, removeRequestToProto(req))
 	if err != nil {
-		return fsmeta.RemoveResult{}, translateRPCError(err)
+		return model.RemoveResult{}, translateRPCError(err)
 	}
 	c.lookup.Invalidate(req.Mount, req.Parent, req.Name)
 	return removeResultFromProto(resp), nil
 }
 
-func (c *GRPCClient) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirectoryRequest) error {
+func (c *GRPCClient) RemoveDirectory(ctx context.Context, req model.RemoveDirectoryRequest) error {
 	if err := c.requireRPC(); err != nil {
 		return err
 	}
@@ -413,29 +414,29 @@ func (c *GRPCClient) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirec
 	return nil
 }
 
-func (c *GRPCClient) OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (c *GRPCClient) OpenWriteSession(ctx context.Context, req model.OpenWriteSessionRequest) (model.SessionRecord, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	resp, err := c.rpc.OpenWriteSession(ctx, openWriteSessionRequestToProto(req))
 	if err != nil {
-		return fsmeta.SessionRecord{}, translateRPCError(err)
+		return model.SessionRecord{}, translateRPCError(err)
 	}
 	return sessionFromProto(resp.GetSession()), nil
 }
 
-func (c *GRPCClient) HeartbeatWriteSession(ctx context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (c *GRPCClient) HeartbeatWriteSession(ctx context.Context, req model.HeartbeatWriteSessionRequest) (model.SessionRecord, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	resp, err := c.rpc.HeartbeatWriteSession(ctx, heartbeatWriteSessionRequestToProto(req))
 	if err != nil {
-		return fsmeta.SessionRecord{}, translateRPCError(err)
+		return model.SessionRecord{}, translateRPCError(err)
 	}
 	return sessionFromProto(resp.GetSession()), nil
 }
 
-func (c *GRPCClient) CloseWriteSession(ctx context.Context, req fsmeta.CloseWriteSessionRequest) error {
+func (c *GRPCClient) CloseWriteSession(ctx context.Context, req model.CloseWriteSessionRequest) error {
 	if err := c.requireRPC(); err != nil {
 		return err
 	}
@@ -443,15 +444,15 @@ func (c *GRPCClient) CloseWriteSession(ctx context.Context, req fsmeta.CloseWrit
 	return translateRPCError(err)
 }
 
-func (c *GRPCClient) ExpireWriteSessions(ctx context.Context, req fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error) {
+func (c *GRPCClient) ExpireWriteSessions(ctx context.Context, req model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error) {
 	if err := c.requireRPC(); err != nil {
-		return fsmeta.ExpireWriteSessionsResult{}, err
+		return model.ExpireWriteSessionsResult{}, err
 	}
 	resp, err := c.rpc.ExpireWriteSessions(ctx, expireWriteSessionsRequestToProto(req))
 	if err != nil {
-		return fsmeta.ExpireWriteSessionsResult{}, translateRPCError(err)
+		return model.ExpireWriteSessionsResult{}, translateRPCError(err)
 	}
-	return fsmeta.ExpireWriteSessionsResult{Expired: resp.GetExpired()}, nil
+	return model.ExpireWriteSessionsResult{Expired: resp.GetExpired()}, nil
 }
 
 // WatchSubscription is one typed WatchSubtree client stream.
@@ -482,7 +483,7 @@ func (s *WatchStream) Recv() (fsmeta.WatchEvent, error) {
 			return watchEventFromProto(event), nil
 		}
 		if throttle := resp.GetThrottle(); throttle != nil {
-			return fsmeta.WatchEvent{}, fmt.Errorf("%w: %s", fsmeta.ErrWatchOverflow, throttle.GetReason())
+			return fsmeta.WatchEvent{}, fmt.Errorf("%w: %s", model.ErrWatchOverflow, throttle.GetReason())
 		}
 		// Ready and catch-up markers are stream-control frames, not user events.
 	}
@@ -498,7 +499,7 @@ func waitForWatchReady(stream fsmetapb.FSMetadata_WatchSubtreeClient) (fsmeta.Wa
 			return watchCursorFromProto(ready.GetCursor()), nil
 		}
 		if throttle := resp.GetThrottle(); throttle != nil {
-			return fsmeta.WatchCursor{}, fmt.Errorf("%w: %s", fsmeta.ErrWatchOverflow, throttle.GetReason())
+			return fsmeta.WatchCursor{}, fmt.Errorf("%w: %s", model.ErrWatchOverflow, throttle.GetReason())
 		}
 		if resp.GetEvent() != nil {
 			return fsmeta.WatchCursor{}, errWatchEventBeforeReady
@@ -567,31 +568,31 @@ func translateRPCError(err error) error {
 		}
 		return err
 	case codes.AlreadyExists:
-		return fmt.Errorf("%w: %v", fsmeta.ErrExists, err)
+		return fmt.Errorf("%w: %v", model.ErrExists, err)
 	case codes.NotFound:
 		if fsmetaReason(err) == reasonMountNotRegistered {
-			return fmt.Errorf("%w: %v", fsmeta.ErrMountNotRegistered, err)
+			return fmt.Errorf("%w: %v", model.ErrMountNotRegistered, err)
 		}
-		return fmt.Errorf("%w: %v", fsmeta.ErrNotFound, err)
+		return fmt.Errorf("%w: %v", model.ErrNotFound, err)
 	case codes.OutOfRange:
 		if fsmetaReason(err) == reasonWatchCursorExpired {
-			return fmt.Errorf("%w: %v", fsmeta.ErrWatchCursorExpired, err)
+			return fmt.Errorf("%w: %v", model.ErrWatchCursorExpired, err)
 		}
 		return err
 	case codes.FailedPrecondition:
 		switch fsmetaReason(err) {
 		case reasonMountRetired:
-			return fmt.Errorf("%w: %v", fsmeta.ErrMountRetired, err)
+			return fmt.Errorf("%w: %v", model.ErrMountRetired, err)
 		case reasonCrossAuthorityRename:
-			return fmt.Errorf("%w: %v", fsmeta.ErrCrossAuthorityRename, err)
+			return fmt.Errorf("%w: %v", model.ErrCrossAuthorityRename, err)
 		}
 		return err
 	case codes.ResourceExhausted:
 		switch fsmetaReason(err) {
 		case reasonQuotaExceeded:
-			return fmt.Errorf("%w: %v", fsmeta.ErrQuotaExceeded, err)
+			return fmt.Errorf("%w: %v", model.ErrQuotaExceeded, err)
 		case reasonWatchOverflow:
-			return fmt.Errorf("%w: %v", fsmeta.ErrWatchOverflow, err)
+			return fmt.Errorf("%w: %v", model.ErrWatchOverflow, err)
 		}
 		return err
 	default:
@@ -602,25 +603,25 @@ func translateRPCError(err error) error {
 func invalidReasonSentinel(reason string) error {
 	switch reason {
 	case reasonInvalidMountID:
-		return fsmeta.ErrInvalidMountID
+		return model.ErrInvalidMountID
 	case reasonInvalidInodeID:
-		return fsmeta.ErrInvalidInodeID
+		return model.ErrInvalidInodeID
 	case reasonInvalidName:
-		return fsmeta.ErrInvalidName
+		return model.ErrInvalidName
 	case reasonInvalidSession:
-		return fsmeta.ErrInvalidSession
+		return model.ErrInvalidSession
 	case reasonInvalidRequest, reasonInvalidFSMetaInput:
-		return fsmeta.ErrInvalidRequest
+		return model.ErrInvalidRequest
 	case reasonInvalidKey:
 		return fsmeta.ErrInvalidKey
 	case reasonInvalidKeyKind:
 		return fsmeta.ErrInvalidKeyKind
 	case reasonInvalidValue:
-		return fsmeta.ErrInvalidValue
+		return model.ErrInvalidValue
 	case reasonInvalidValueKind:
 		return fsmeta.ErrInvalidValueKind
 	case reasonInvalidPageSize:
-		return fsmeta.ErrInvalidPageSize
+		return model.ErrInvalidPageSize
 	default:
 		return nil
 	}

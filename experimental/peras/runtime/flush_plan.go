@@ -7,6 +7,7 @@ import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -205,7 +206,7 @@ func splitReplayPlanByCompilerBudget(plan fsperas.ReplayPlan, materialize bool, 
 }
 
 type catalogRouteBucket struct {
-	mount  fsmeta.MountKeyID
+	mount  model.MountKeyID
 	bucket fsmeta.AffinityBucket
 }
 

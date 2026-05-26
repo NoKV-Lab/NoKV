@@ -17,19 +17,20 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 )
 
-var contractMountIdentity = fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+var contractMountIdentity = model.MountIdentity{MountID: "vol", MountKeyID: 1}
 
 type contractMountResolver struct{}
 
-func (contractMountResolver) ResolveMount(context.Context, fsmeta.MountID) (fsmetaexec.MountAdmission, error) {
+func (contractMountResolver) ResolveMount(context.Context, model.MountID) (fsmetaexec.MountAdmission, error) {
 	return fsmetaexec.MountAdmission{
 		MountID:       contractMountIdentity.MountID,
 		MountKeyID:    contractMountIdentity.MountKeyID,
-		RootInode:     fsmeta.RootInode,
+		RootInode:     model.RootInode,
 		SchemaVersion: 1,
 	}, nil
 }
@@ -39,19 +40,19 @@ func TestFSMetaExecutorModelContract(t *testing.T) {
 	steps := envInt("NOKV_CONTRACT_STEPS", 80)
 	for seed := int64(1); seed <= int64(seeds); seed++ {
 		t.Run(fmt.Sprintf("seed_%03d", seed), func(t *testing.T) {
-			model := NewModel("vol")
+			state := NewModel("vol")
 			runner := newVersionedRunner()
 			ops := GenerateScript(seed, steps)
 			executor, err := fsmetaexec.New(runner,
 				fsmetaexec.WithMountResolver(contractMountResolver{}),
 				fsmetaexec.WithInodeAllocator(newScriptInodeAllocator(ops)),
 				fsmetaexec.WithClock(func() time.Time {
-					return time.Unix(0, model.NowUnixNs)
+					return time.Unix(0, state.NowUnixNs)
 				}),
 			)
 			require.NoError(t, err)
 
-			err = Run(context.Background(), executor, model, ops)
+			err = Run(context.Background(), executor, state, ops)
 			require.NoError(t, err, "seed=%d steps=%d", seed, steps)
 		})
 	}
@@ -99,16 +100,16 @@ func newVersionedRunner() *versionedRunner {
 		nextTS: 1,
 		data:   make(map[string][]versionedValue),
 	}
-	seedVersionedInode(runner, fsmeta.InodeRecord{
-		Inode:     fsmeta.RootInode,
-		Type:      fsmeta.InodeTypeDirectory,
+	seedVersionedInode(runner, model.InodeRecord{
+		Inode:     model.RootInode,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	}, 0)
 	return runner
 }
 
-func seedVersionedInode(runner *versionedRunner, record fsmeta.InodeRecord, version uint64) {
+func seedVersionedInode(runner *versionedRunner, record model.InodeRecord, version uint64) {
 	key, err := fsmeta.EncodeInodeKey(contractMountIdentity, record.Inode)
 	if err != nil {
 		panic(err)
@@ -218,15 +219,15 @@ func (r *versionedRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mu
 		}
 		if mut.GetAssertionNotExist() {
 			if _, ok := r.visibleLocked(mut.GetKey(), startVersion); ok {
-				return 0, fsmeta.ErrExists
+				return 0, model.ErrExists
 			}
 			if _, ok := r.visibleLatestLocked(mut.GetKey()); ok {
-				return 0, fsmeta.ErrExists
+				return 0, model.ErrExists
 			}
 		}
 		if bytes.Equal(mut.GetKey(), primary) && mut.GetOp() == kvrpcpb.Mutation_Delete {
 			if _, ok := r.visibleLatestLocked(mut.GetKey()); !ok {
-				return 0, fsmeta.ErrNotFound
+				return 0, model.ErrNotFound
 			}
 		}
 	}
@@ -244,7 +245,7 @@ func (r *versionedRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mu
 				deleted: true,
 			})
 		default:
-			return 0, fsmeta.ErrInvalidRequest
+			return 0, model.ErrInvalidRequest
 		}
 	}
 	return effectiveCommitVersion, nil
@@ -254,35 +255,35 @@ func TestVersionedRunnerDelaysPreallocatedCommitPastConcurrentRead(t *testing.T)
 	ctx := context.Background()
 	runner := newVersionedRunner()
 
-	epsilonKey, err := fsmeta.EncodeDentryKey(contractMountIdentity, fsmeta.RootInode, "epsilon")
+	epsilonKey, err := fsmeta.EncodeDentryKey(contractMountIdentity, model.RootInode, "epsilon")
 	require.NoError(t, err)
-	etaKey, err := fsmeta.EncodeDentryKey(contractMountIdentity, fsmeta.RootInode, "eta")
+	etaKey, err := fsmeta.EncodeDentryKey(contractMountIdentity, model.RootInode, "eta")
 	require.NoError(t, err)
 	inodeKey, err := fsmeta.EncodeInodeKey(contractMountIdentity, 10)
 	require.NoError(t, err)
-	epsilonValue, err := fsmeta.EncodeDentryValue(fsmeta.DentryRecord{
-		Parent: fsmeta.RootInode,
+	epsilonValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+		Parent: model.RootInode,
 		Name:   "epsilon",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	})
 	require.NoError(t, err)
-	etaValue, err := fsmeta.EncodeDentryValue(fsmeta.DentryRecord{
-		Parent: fsmeta.RootInode,
+	etaValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+		Parent: model.RootInode,
 		Name:   "eta",
 		Inode:  10,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	})
 	require.NoError(t, err)
-	inodeValueOneLink, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+	inodeValueOneLink, err := fsmeta.EncodeInodeValue(model.InodeRecord{
 		Inode:     10,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
 	require.NoError(t, err)
-	inodeValueTwoLinks, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+	inodeValueTwoLinks, err := fsmeta.EncodeInodeValue(model.InodeRecord{
 		Inode:     10,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 2,
 	})
 	require.NoError(t, err)

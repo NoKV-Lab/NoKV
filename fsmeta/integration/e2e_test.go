@@ -13,6 +13,7 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
 	fswatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetaraftstore "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
 	fsmetaserver "github.com/feichai0017/NoKV/fsmeta/server"
 	"github.com/stretchr/testify/require"
@@ -21,7 +22,7 @@ import (
 
 type staticMountWatcher struct {
 	router   *fswatch.Router
-	identity fsmeta.MountIdentity
+	identity model.MountIdentity
 }
 
 func (w staticMountWatcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta.WatchSubscription, error) {
@@ -43,12 +44,12 @@ func TestFSMetadataClientServerOnRealCluster(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, executor)
 	defer cleanup()
 
-	req := fsmeta.CreateRequest{
+	req := model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "checkpoint-0001",
-		Attrs: fsmeta.CreateAttrs{
-			Type:        fsmeta.InodeTypeFile,
+		Attrs: model.CreateAttrs{
+			Type:        model.InodeTypeFile,
 			Size:        4096,
 			Mode:        0o644,
 			OpaqueAttrs: []byte(`{"body_ref":"cas://checkpoint-0001","sha256":"abc"}`),
@@ -57,35 +58,35 @@ func TestFSMetadataClientServerOnRealCluster(t *testing.T) {
 	created, err := cli.Create(ctx, req)
 	require.NoError(t, err)
 
-	record, err := cli.Lookup(ctx, fsmeta.LookupRequest{
+	record, err := cli.Lookup(ctx, model.LookupRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Name:   req.Name,
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryRecord{
+	require.Equal(t, model.DentryRecord{
 		Parent: req.Parent,
 		Name:   req.Name,
 		Inode:  created.Inode.Inode,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}, record)
 
-	pairs, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	pairs, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Limit:  8,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{{
-		Dentry: fsmeta.DentryRecord{
+	require.Equal(t, []model.DentryAttrPair{{
+		Dentry: model.DentryRecord{
 			Parent: req.Parent,
 			Name:   req.Name,
 			Inode:  created.Inode.Inode,
-			Type:   fsmeta.InodeTypeFile,
+			Type:   model.InodeTypeFile,
 		},
-		Inode: fsmeta.InodeRecord{
+		Inode: model.InodeRecord{
 			Inode:       created.Inode.Inode,
-			Type:        fsmeta.InodeTypeFile,
+			Type:        model.InodeTypeFile,
 			Size:        4096,
 			Mode:        0o644,
 			LinkCount:   1,
@@ -94,33 +95,33 @@ func TestFSMetadataClientServerOnRealCluster(t *testing.T) {
 	}}, pairs)
 
 	_, err = cli.Create(ctx, req)
-	require.True(t, errors.Is(err, fsmeta.ErrExists), "duplicate create error = %v", err)
+	require.True(t, errors.Is(err, model.ErrExists), "duplicate create error = %v", err)
 
-	require.NoError(t, cli.Rename(ctx, fsmeta.RenameRequest{
+	require.NoError(t, cli.Rename(ctx, model.RenameRequest{
 		Mount:      req.Mount,
 		FromParent: req.Parent,
 		FromName:   req.Name,
 		ToParent:   req.Parent,
 		ToName:     "checkpoint-0002",
 	}))
-	_, err = cli.Lookup(ctx, fsmeta.LookupRequest{
+	_, err = cli.Lookup(ctx, model.LookupRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Name:   req.Name,
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 
-	require.NoError(t, cli.Unlink(ctx, fsmeta.UnlinkRequest{
+	require.NoError(t, cli.Unlink(ctx, model.UnlinkRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Name:   "checkpoint-0002",
 	}))
-	_, err = cli.Lookup(ctx, fsmeta.LookupRequest{
+	_, err = cli.Lookup(ctx, model.LookupRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Name:   "checkpoint-0002",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 }
 
 func TestFSMetadataHardLinkLifecycleOnRealCluster(t *testing.T) {
@@ -131,26 +132,26 @@ func TestFSMetadataHardLinkLifecycleOnRealCluster(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, executor)
 	defer cleanup()
 
-	mount := fsmeta.MountID("vol")
-	_, err := cli.Create(ctx, fsmeta.CreateRequest{
+	mount := model.MountID("vol")
+	_, err := cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "original",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 8192, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 8192, Mode: 0o644},
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, cli.Link(ctx, fsmeta.LinkRequest{
+	require.NoError(t, cli.Link(ctx, model.LinkRequest{
 		Mount:      mount,
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   "original",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "alias",
 	}))
 
-	linked, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	linked, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)
@@ -158,28 +159,28 @@ func TestFSMetadataHardLinkLifecycleOnRealCluster(t *testing.T) {
 	require.Equal(t, uint32(2), inodeLinkCount(t, linked, "alias"))
 	require.Equal(t, uint32(2), inodeLinkCount(t, linked, "original"))
 
-	require.NoError(t, cli.Unlink(ctx, fsmeta.UnlinkRequest{
+	require.NoError(t, cli.Unlink(ctx, model.UnlinkRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "original",
 	}))
-	afterFirstUnlink, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	afterFirstUnlink, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"alias"}, dentryNames(afterFirstUnlink))
 	require.Equal(t, uint32(1), inodeLinkCount(t, afterFirstUnlink, "alias"))
 
-	require.NoError(t, cli.Unlink(ctx, fsmeta.UnlinkRequest{
+	require.NoError(t, cli.Unlink(ctx, model.UnlinkRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alias",
 	}))
-	afterLastUnlink, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	afterLastUnlink, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)
@@ -199,7 +200,7 @@ func TestFSMetadataWatchSubtreeOnRealCluster(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, runtime.executor, fsmetaserver.WithWatcher(staticMountWatcher{router: router, identity: runtime.mountIdentity}))
 	defer cleanup()
 
-	prefix, err := fsmeta.EncodeDentryPrefix(runtime.mountIdentity, fsmeta.RootInode)
+	prefix, err := fsmeta.EncodeDentryPrefix(runtime.mountIdentity, model.RootInode)
 	require.NoError(t, err)
 	stream, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
 		KeyPrefix:          prefix,
@@ -208,11 +209,11 @@ func TestFSMetadataWatchSubtreeOnRealCluster(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = stream.Close() }()
 
-	req := fsmeta.CreateRequest{
+	req := model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "watched-checkpoint",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 1, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 1, Mode: 0o644},
 	}
 	_, err = cli.Create(ctx, req)
 	require.NoError(t, err)
@@ -247,7 +248,7 @@ func TestFSMetadataWatchSubtreeReplaysAfterResumeCursor(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, runtime.executor, fsmetaserver.WithWatcher(staticMountWatcher{router: router, identity: runtime.mountIdentity}))
 	defer cleanup()
 
-	prefix, err := fsmeta.EncodeDentryPrefix(runtime.mountIdentity, fsmeta.RootInode)
+	prefix, err := fsmeta.EncodeDentryPrefix(runtime.mountIdentity, model.RootInode)
 	require.NoError(t, err)
 	stream, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
 		KeyPrefix:          prefix,
@@ -255,7 +256,7 @@ func TestFSMetadataWatchSubtreeReplaysAfterResumeCursor(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	first := fsmeta.CreateRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "catchup-0001", Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile}}
+	first := model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "catchup-0001", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}
 	_, err = cli.Create(ctx, first)
 	require.NoError(t, err)
 	firstKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, first.Parent, first.Name)
@@ -264,8 +265,8 @@ func TestFSMetadataWatchSubtreeReplaysAfterResumeCursor(t *testing.T) {
 	require.NoError(t, stream.Ack(firstEvent.Cursor))
 	require.NoError(t, stream.Close())
 
-	second := fsmeta.CreateRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "catchup-0002", Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile}}
-	third := fsmeta.CreateRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "catchup-0003", Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile}}
+	second := model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "catchup-0002", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}
+	third := model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "catchup-0003", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}
 	_, err = cli.Create(ctx, second)
 	require.NoError(t, err)
 	_, err = cli.Create(ctx, third)
@@ -311,12 +312,12 @@ func TestFSMetadataWatchSubtreeReconcilesAfterExpiredCursor(t *testing.T) {
 
 	warmup, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
 		Mount:              "vol",
-		RootInode:          fsmeta.RootInode,
+		RootInode:          model.RootInode,
 		BackPressureWindow: 8,
 	})
 	require.NoError(t, err)
 
-	baseline := fsmeta.CreateRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "baseline-artifact", Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile}}
+	baseline := model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "baseline-artifact", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}
 	_, err = cli.Create(ctx, baseline)
 	require.NoError(t, err)
 	baselineKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, baseline.Parent, baseline.Name)
@@ -333,18 +334,18 @@ func TestFSMetadataWatchSubtreeReconcilesAfterExpiredCursor(t *testing.T) {
 	result, err := fsmetaclient.WatchDirectoryWithReconcile(ctx, cli,
 		fsmeta.WatchRequest{
 			Mount:              "vol",
-			RootInode:          fsmeta.RootInode,
+			RootInode:          model.RootInode,
 			ResumeCursor:       expired,
 			BackPressureWindow: 8,
 		},
-		fsmeta.ReadDirRequest{Mount: "vol", Parent: fsmeta.RootInode, Limit: 8},
+		model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 8},
 	)
 	require.NoError(t, err)
 	defer func() { _ = result.Subscription.Close() }()
 	require.True(t, result.Reconciled)
 	require.Equal(t, []string{"baseline-artifact"}, dentryNames(result.Snapshot))
 
-	live := fsmeta.CreateRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "live-after-reconcile", Attrs: fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile}}
+	live := model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "live-after-reconcile", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}
 	_, err = cli.Create(ctx, live)
 	require.NoError(t, err)
 	liveKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, live.Parent, live.Name)
@@ -362,48 +363,48 @@ func TestFSMetadataSnapshotSubtreeOnRealCluster(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, executor, fsmetaserver.WithSnapshotPublisher(publisher))
 	defer cleanup()
 
-	mount := fsmeta.MountID("vol")
-	_, err := cli.Create(ctx, fsmeta.CreateRequest{
+	mount := model.MountID("vol")
+	_, err := cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "a",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
-	token, err := cli.SnapshotSubtree(ctx, fsmeta.SnapshotSubtreeRequest{
+	token, err := cli.SnapshotSubtree(ctx, model.SnapshotSubtreeRequest{
 		Mount:     mount,
-		RootInode: fsmeta.RootInode,
+		RootInode: model.RootInode,
 	})
 	require.NoError(t, err)
 	require.Equal(t, mount, token.Mount)
-	require.Equal(t, fsmeta.RootInode, token.RootInode)
+	require.Equal(t, model.RootInode, token.RootInode)
 	require.NotZero(t, token.ReadVersion)
 	require.Equal(t, token.Mount, publisher.token.Mount)
-	require.Equal(t, fsmeta.MountKeyID(1), publisher.token.MountKeyID)
+	require.Equal(t, model.MountKeyID(1), publisher.token.MountKeyID)
 	require.Equal(t, token.RootInode, publisher.token.RootInode)
 	require.Equal(t, token.ReadVersion, publisher.token.ReadVersion)
 
-	_, err = cli.Create(ctx, fsmeta.CreateRequest{
+	_, err = cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "b",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
 
-	snapshotPage, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	snapshotPage, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:           mount,
-		Parent:          fsmeta.RootInode,
+		Parent:          model.RootInode,
 		Limit:           8,
 		SnapshotVersion: token.ReadVersion,
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"a"}, dentryNames(snapshotPage))
 
-	latestPage, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	latestPage, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)
@@ -411,7 +412,7 @@ func TestFSMetadataSnapshotSubtreeOnRealCluster(t *testing.T) {
 
 	require.NoError(t, cli.RetireSnapshotSubtree(ctx, token))
 	require.Equal(t, token.Mount, publisher.retired.Mount)
-	require.Equal(t, fsmeta.MountKeyID(1), publisher.retired.MountKeyID)
+	require.Equal(t, model.MountKeyID(1), publisher.retired.MountKeyID)
 	require.Equal(t, token.RootInode, publisher.retired.RootInode)
 	require.Equal(t, token.ReadVersion, publisher.retired.ReadVersion)
 }
@@ -424,71 +425,71 @@ func TestFSMetadataStageCommitArtifactPublishOnRealCluster(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, executor)
 	defer cleanup()
 
-	mount := fsmeta.MountID("vol")
-	staging, err := cli.Create(ctx, fsmeta.CreateRequest{
+	mount := model.MountID("vol")
+	staging, err := cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   ".staging",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 	})
 	require.NoError(t, err)
 	stagingInode := staging.Inode.Inode
-	run, err := cli.Create(ctx, fsmeta.CreateRequest{
+	run, err := cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
 		Parent: stagingInode,
 		Name:   "run-tmp",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 	})
 	require.NoError(t, err)
 	runInode := run.Inode.Inode
-	_, err = cli.Create(ctx, fsmeta.CreateRequest{
+	_, err = cli.Create(ctx, model.CreateRequest{
 		Mount:  mount,
 		Parent: runInode,
 		Name:   "manifest.json",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 128},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 128},
 	})
 	require.NoError(t, err)
 
-	_, err = cli.Lookup(ctx, fsmeta.LookupRequest{Mount: mount, Parent: fsmeta.RootInode, Name: "run-001"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
-	staged, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{Mount: mount, Parent: runInode, Limit: 8})
+	_, err = cli.Lookup(ctx, model.LookupRequest{Mount: mount, Parent: model.RootInode, Name: "run-001"})
+	require.ErrorIs(t, err, model.ErrNotFound)
+	staged, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{Mount: mount, Parent: runInode, Limit: 8})
 	require.NoError(t, err)
 	require.Equal(t, []string{"manifest.json"}, dentryNames(staged))
 
-	require.NoError(t, cli.Rename(ctx, fsmeta.RenameRequest{
+	require.NoError(t, cli.Rename(ctx, model.RenameRequest{
 		Mount:      mount,
 		FromParent: stagingInode,
 		FromName:   "run-tmp",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "run-001",
 	}))
 
-	_, err = cli.Lookup(ctx, fsmeta.LookupRequest{Mount: mount, Parent: stagingInode, Name: "run-tmp"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
-	published, err := cli.Lookup(ctx, fsmeta.LookupRequest{Mount: mount, Parent: fsmeta.RootInode, Name: "run-001"})
+	_, err = cli.Lookup(ctx, model.LookupRequest{Mount: mount, Parent: stagingInode, Name: "run-tmp"})
+	require.ErrorIs(t, err, model.ErrNotFound)
+	published, err := cli.Lookup(ctx, model.LookupRequest{Mount: mount, Parent: model.RootInode, Name: "run-001"})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.DentryRecord{
-		Parent: fsmeta.RootInode,
+	require.Equal(t, model.DentryRecord{
+		Parent: model.RootInode,
 		Name:   "run-001",
 		Inode:  runInode,
-		Type:   fsmeta.InodeTypeDirectory,
+		Type:   model.InodeTypeDirectory,
 	}, published)
-	children, err := cli.ReadDirPlus(ctx, fsmeta.ReadDirRequest{Mount: mount, Parent: runInode, Limit: 8})
+	children, err := cli.ReadDirPlus(ctx, model.ReadDirRequest{Mount: mount, Parent: runInode, Limit: 8})
 	require.NoError(t, err)
 	require.Equal(t, []string{"manifest.json"}, dentryNames(children))
 }
 
 type snapshotRecorder struct {
-	token   fsmeta.SnapshotSubtreeToken
-	retired fsmeta.SnapshotSubtreeToken
+	token   model.SnapshotSubtreeToken
+	retired model.SnapshotSubtreeToken
 }
 
-func (r *snapshotRecorder) PublishSnapshotSubtree(_ context.Context, token fsmeta.SnapshotSubtreeToken) error {
+func (r *snapshotRecorder) PublishSnapshotSubtree(_ context.Context, token model.SnapshotSubtreeToken) error {
 	r.token = token
 	return nil
 }
 
-func (r *snapshotRecorder) RetireSnapshotSubtree(_ context.Context, token fsmeta.SnapshotSubtreeToken) error {
+func (r *snapshotRecorder) RetireSnapshotSubtree(_ context.Context, token model.SnapshotSubtreeToken) error {
 	r.retired = token
 	return nil
 }
@@ -507,7 +508,7 @@ func recvWatchKey(t *testing.T, stream fsmetaclient.WatchSubscription, key []byt
 	return got
 }
 
-func dentryNames(entries []fsmeta.DentryAttrPair) []string {
+func dentryNames(entries []model.DentryAttrPair) []string {
 	out := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		out = append(out, entry.Dentry.Name)
@@ -515,7 +516,7 @@ func dentryNames(entries []fsmeta.DentryAttrPair) []string {
 	return out
 }
 
-func inodeLinkCount(t *testing.T, entries []fsmeta.DentryAttrPair, name string) uint32 {
+func inodeLinkCount(t *testing.T, entries []model.DentryAttrPair, name string) uint32 {
 	t.Helper()
 	for _, entry := range entries {
 		if entry.Dentry.Name == name {

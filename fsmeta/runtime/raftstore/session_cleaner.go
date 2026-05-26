@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	"github.com/feichai0017/NoKV/utils"
 )
@@ -22,7 +22,7 @@ type sessionMountLister interface {
 }
 
 type sessionCleanupExecutor interface {
-	ExpireWriteSessions(context.Context, fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error)
+	ExpireWriteSessions(context.Context, model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error)
 }
 
 // sessionCleaner periodically removes expired writer-session records for every
@@ -98,12 +98,12 @@ func (c *sessionCleaner) expire(ctx context.Context) (uint64, uint64, error) {
 		errs    []error
 	)
 	for _, mount := range resp.GetMounts() {
-		id := fsmeta.MountID(mount.GetMountId())
+		id := model.MountID(mount.GetMountId())
 		if id == "" || mount.GetState() != coordpb.MountState_MOUNT_STATE_ACTIVE {
 			continue
 		}
 		visited++
-		result, err := c.exec.ExpireWriteSessions(ctx, fsmeta.ExpireWriteSessionsRequest{
+		result, err := c.exec.ExpireWriteSessions(ctx, model.ExpireWriteSessionsRequest{
 			Mount: id,
 			Limit: c.limit,
 		})

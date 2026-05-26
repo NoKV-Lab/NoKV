@@ -9,16 +9,17 @@ import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestPerasWireRoundTrip(t *testing.T) {
 	scope := compile.AuthorityScope{
-		Mount:      fsmeta.MountID("m1"),
-		MountKeyID: fsmeta.MountKeyID(9),
+		Mount:      model.MountID("m1"),
+		MountKeyID: model.MountKeyID(9),
 		Buckets:    []fsmeta.AffinityBucket{1, 3},
-		Parents:    []fsmeta.InodeID{11, 12},
-		Inodes:     []fsmeta.InodeID{21},
+		Parents:    []model.InodeID{11, 12},
+		Inodes:     []model.InodeID{21},
 	}
 	decodedScope, err := ScopeFromProto(ScopeToProto(scope))
 	require.NoError(t, err)

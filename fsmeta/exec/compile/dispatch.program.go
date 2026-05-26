@@ -5,43 +5,43 @@
 
 package compile
 
-import "github.com/feichai0017/NoKV/fsmeta"
+import "github.com/feichai0017/NoKV/fsmeta/model"
 
 func compileAOTDelta(delta SemanticDelta) (CompiledOp, error) {
 	switch delta.Kind {
-	case fsmeta.OperationCreate:
+	case model.OperationCreate:
 		return compileCreateCompiledOp(delta)
-	case fsmeta.OperationUpdateInode:
+	case model.OperationUpdateInode:
 		return compileUpdateInodeCompiledOp(delta)
-	case fsmeta.OperationLookup:
+	case model.OperationLookup:
 		return compileLookupCompiledOp(delta)
-	case fsmeta.OperationReadDir:
+	case model.OperationReadDir:
 		return compileReadDirCompiledOp(delta)
-	case fsmeta.OperationSnapshotSubtree:
+	case model.OperationSnapshotSubtree:
 		return compileSnapshotSubtreeCompiledOp(delta)
-	case fsmeta.OperationRename:
+	case model.OperationRename:
 		return compileRenameCompiledOp(delta)
-	case fsmeta.OperationRenameReplace:
+	case model.OperationRenameReplace:
 		return compileRenameReplaceCompiledOp(delta)
-	case fsmeta.OperationRenameSubtree:
+	case model.OperationRenameSubtree:
 		return compileRenameSubtreeCompiledOp(delta)
-	case fsmeta.OperationLink:
+	case model.OperationLink:
 		return compileLinkCompiledOp(delta)
-	case fsmeta.OperationUnlink:
+	case model.OperationUnlink:
 		return compileUnlinkCompiledOp(delta)
-	case fsmeta.OperationRemove:
+	case model.OperationRemove:
 		return compileRemoveCompiledOp(delta)
-	case fsmeta.OperationRemoveDirectory:
+	case model.OperationRemoveDirectory:
 		return compileRemoveDirectoryCompiledOp(delta)
-	case fsmeta.OperationOpenWriteSession:
+	case model.OperationOpenWriteSession:
 		return compileOpenWriteSessionCompiledOp(delta)
-	case fsmeta.OperationHeartbeatSession:
+	case model.OperationHeartbeatSession:
 		return compileHeartbeatWriteSessionCompiledOp(delta)
-	case fsmeta.OperationCloseSession:
+	case model.OperationCloseSession:
 		return compileCloseWriteSessionCompiledOp(delta)
-	case fsmeta.OperationExpireSessions:
+	case model.OperationExpireSessions:
 		return compileExpireWriteSessionsCompiledOp(delta)
 	default:
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 }

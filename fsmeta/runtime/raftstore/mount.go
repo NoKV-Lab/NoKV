@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 )
 
@@ -29,7 +29,7 @@ type mountCache struct {
 	now   func() time.Time
 
 	mu      sync.Mutex
-	entries map[fsmeta.MountID]mountEntry
+	entries map[model.MountID]mountEntry
 
 	cacheHitsTotal        atomic.Uint64
 	cacheMissesTotal      atomic.Uint64
@@ -42,7 +42,7 @@ type mountEntry struct {
 	expiresAt time.Time
 }
 
-func (c *mountCache) ResolveMount(ctx context.Context, mount fsmeta.MountID) (fsmetaexec.MountAdmission, error) {
+func (c *mountCache) ResolveMount(ctx context.Context, mount model.MountID) (fsmetaexec.MountAdmission, error) {
 	if c.coord == nil {
 		return fsmetaexec.MountAdmission{}, errMountCacheNotConfigured
 	}
@@ -69,9 +69,9 @@ func (c *mountCache) ResolveMount(ctx context.Context, mount fsmeta.MountID) (fs
 // mount owns one rooted namespace authority. The executor calls this before
 // ordinary Rename so a future nested-authority resolver can reject
 // cross-authority moves without changing the data-plane rename path.
-func (c *mountCache) SameAuthority(ctx context.Context, mount fsmeta.MountID, fromParent, toParent fsmeta.InodeID) (bool, error) {
+func (c *mountCache) SameAuthority(ctx context.Context, mount model.MountID, fromParent, toParent model.InodeID) (bool, error) {
 	if fromParent == 0 || toParent == 0 {
-		return false, fsmeta.ErrInvalidInodeID
+		return false, model.ErrInvalidInodeID
 	}
 	if _, err := c.ResolveMount(ctx, mount); err != nil {
 		return false, err
@@ -82,7 +82,7 @@ func (c *mountCache) SameAuthority(ctx context.Context, mount fsmeta.MountID, fr
 // markRetired forces the cached view of mount to retired. The monitor calls
 // this when it observes a rooted MountRetired event so admission flips before
 // the cached TTL expires.
-func (c *mountCache) markRetired(mount fsmeta.MountID) {
+func (c *mountCache) markRetired(mount model.MountID) {
 	if mount == "" {
 		return
 	}
@@ -96,7 +96,7 @@ func (c *mountCache) clock() time.Time {
 	return time.Now()
 }
 
-func (c *mountCache) lookup(mount fsmeta.MountID, now time.Time) (fsmetaexec.MountAdmission, error, bool) {
+func (c *mountCache) lookup(mount model.MountID, now time.Time) (fsmetaexec.MountAdmission, error, bool) {
 	if c.ttl <= 0 {
 		return fsmetaexec.MountAdmission{}, nil, false
 	}
@@ -109,14 +109,14 @@ func (c *mountCache) lookup(mount fsmeta.MountID, now time.Time) (fsmetaexec.Mou
 	return entry.record, entry.err, true
 }
 
-func (c *mountCache) put(mount fsmeta.MountID, now time.Time, record fsmetaexec.MountAdmission, err error) {
+func (c *mountCache) put(mount model.MountID, now time.Time, record fsmetaexec.MountAdmission, err error) {
 	if c.ttl <= 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
-		c.entries = make(map[fsmeta.MountID]mountEntry)
+		c.entries = make(map[model.MountID]mountEntry)
 	}
 	c.entries[mount] = mountEntry{record: record, err: err, expiresAt: now.Add(c.ttl)}
 }
@@ -144,19 +144,19 @@ func (c *mountCache) Stats() map[string]any {
 
 func mountFromProto(resp *coordpb.GetMountResponse) (fsmetaexec.MountAdmission, error) {
 	if resp == nil || resp.GetNotFound() {
-		return fsmetaexec.MountAdmission{}, fsmeta.ErrMountNotRegistered
+		return fsmetaexec.MountAdmission{}, model.ErrMountNotRegistered
 	}
 	info := resp.GetMount()
 	if info == nil {
-		return fsmetaexec.MountAdmission{}, fsmeta.ErrMountNotRegistered
+		return fsmetaexec.MountAdmission{}, model.ErrMountNotRegistered
 	}
 	if info.GetMountKeyId() == 0 {
-		return fsmetaexec.MountAdmission{}, fsmeta.ErrMountNotRegistered
+		return fsmetaexec.MountAdmission{}, model.ErrMountNotRegistered
 	}
 	return fsmetaexec.MountAdmission{
-		MountID:       fsmeta.MountID(info.GetMountId()),
-		MountKeyID:    fsmeta.MountKeyID(info.GetMountKeyId()),
-		RootInode:     fsmeta.InodeID(info.GetRootInode()),
+		MountID:       model.MountID(info.GetMountId()),
+		MountKeyID:    model.MountKeyID(info.GetMountKeyId()),
+		RootInode:     model.InodeID(info.GetRootInode()),
 		SchemaVersion: info.GetSchemaVersion(),
 		Retired:       info.GetState() == coordpb.MountState_MOUNT_STATE_RETIRED,
 	}, nil

@@ -5,23 +5,25 @@ package exec
 
 import (
 	"context"
+
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 // GetQuotaUsage returns the current persisted usage counter for one quota
 // subject. Missing usage keys represent zero usage.
-func (e *Executor) GetQuotaUsage(ctx context.Context, req fsmeta.QuotaUsageRequest) (fsmeta.UsageRecord, error) {
+func (e *Executor) GetQuotaUsage(ctx context.Context, req model.QuotaUsageRequest) (model.UsageRecord, error) {
 	if req.Mount == "" {
-		return fsmeta.UsageRecord{}, fsmeta.ErrInvalidMountID
+		return model.UsageRecord{}, model.ErrInvalidMountID
 	}
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return fsmeta.UsageRecord{}, err
+		return model.UsageRecord{}, err
 	}
 	version, err := e.reserveReadVersion(ctx)
 	if err != nil {
-		return fsmeta.UsageRecord{}, err
+		return model.UsageRecord{}, err
 	}
 	if reader, ok := e.quotas.(QuotaUsageResolver); ok {
 		usage, handled, err := reader.ReadQuotaUsage(ctx, e.runner, mountRecord.Identity(), req.Scope, version)
@@ -31,14 +33,14 @@ func (e *Executor) GetQuotaUsage(ctx context.Context, req fsmeta.QuotaUsageReque
 	}
 	key, err := fsmeta.EncodeUsageKey(mountRecord.Identity(), req.Scope)
 	if err != nil {
-		return fsmeta.UsageRecord{}, err
+		return model.UsageRecord{}, err
 	}
 	value, ok, err := e.runner.Get(ctx, key, version)
 	if err != nil {
-		return fsmeta.UsageRecord{}, err
+		return model.UsageRecord{}, err
 	}
 	if !ok {
-		return fsmeta.UsageRecord{}, nil
+		return model.UsageRecord{}, nil
 	}
 	return fsmeta.DecodeUsageValue(value)
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -37,7 +38,7 @@ func NewWatcher(mounts fsmetaexec.MountResolver) *Watcher {
 // Subscribe implements fsmeta.Watcher with local mount admission.
 func (w *Watcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta.WatchSubscription, error) {
 	if w == nil || w.Router == nil {
-		return nil, fsmeta.ErrInvalidRequest
+		return nil, model.ErrInvalidRequest
 	}
 	if req.Mount != "" && w.mounts != nil {
 		record, err := w.mounts.ResolveMount(ctx, req.Mount)
@@ -45,10 +46,10 @@ func (w *Watcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmet
 			return nil, err
 		}
 		if record.MountID == "" {
-			return nil, fsmeta.ErrMountNotRegistered
+			return nil, model.ErrMountNotRegistered
 		}
 		if record.Retired {
-			return nil, fsmeta.ErrMountRetired
+			return nil, model.ErrMountRetired
 		}
 		prefix, err := fsmeta.WatchPrefixForMount(req, record.Identity())
 		if err != nil {

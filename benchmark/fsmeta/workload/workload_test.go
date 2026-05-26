@@ -10,7 +10,7 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 )
@@ -210,10 +210,10 @@ func TestTimeCallDoesNotRetryPermanentOrCanceledError(t *testing.T) {
 	attempts := 0
 	_, err := timeCall(func() error {
 		attempts++
-		return fsmeta.ErrNotFound
+		return model.ErrNotFound
 	})
 
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
+	require.ErrorIs(t, err, model.ErrNotFound)
 	require.Equal(t, 1, attempts)
 
 	attempts = 0
@@ -228,11 +228,11 @@ func TestTimeCallDoesNotRetryPermanentOrCanceledError(t *testing.T) {
 
 func TestOpenSessionUsesFreshLeaseIDAcrossRetry(t *testing.T) {
 	base := newFakeMetadataClient()
-	created, err := base.Create(context.Background(), fsmeta.CreateRequest{
+	created, err := base.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
 		Parent: 1,
 		Name:   "state.bin",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	})
 	require.NoError(t, err)
 	cli := &retryOpenClient{fakeMetadataClient: base}
@@ -250,15 +250,15 @@ func TestOpenSessionUsesFreshLeaseIDAcrossRetry(t *testing.T) {
 type retryOpenClient struct {
 	*fakeMetadataClient
 	attempts      int
-	firstSession  fsmeta.SessionID
-	secondSession fsmeta.SessionID
+	firstSession  model.SessionID
+	secondSession model.SessionID
 }
 
-func (c *retryOpenClient) OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (c *retryOpenClient) OpenWriteSession(ctx context.Context, req model.OpenWriteSessionRequest) (model.SessionRecord, error) {
 	c.attempts++
 	if c.attempts == 1 {
 		c.firstSession = req.Session
-		return fsmeta.SessionRecord{}, nokverrors.RPCStatusError(nokverrors.KindLockConflict, codes.Aborted, "live lock", nil)
+		return model.SessionRecord{}, nokverrors.RPCStatusError(nokverrors.KindLockConflict, codes.Aborted, "live lock", nil)
 	}
 	c.secondSession = req.Session
 	return c.fakeMetadataClient.OpenWriteSession(ctx, req)

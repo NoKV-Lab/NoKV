@@ -13,9 +13,9 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
 	fsmetacontract "github.com/feichai0017/NoKV/fsmeta/contract"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 func main() {
@@ -47,12 +47,12 @@ func main() {
 	}
 	defer func() { _ = cli.Close() }()
 
-	mountID := fsmeta.MountID(*mount)
+	mountID := model.MountID(*mount)
 	for seed := *start; seed < *start+int64(*seeds); seed++ {
-		model := fsmetacontract.NewModel(mountID)
+		state := fsmetacontract.NewModel(mountID)
 		unique := time.Now().UnixNano()
 		scopeName := fmt.Sprintf("%s-%06d-%d", *scope, seed, unique)
-		scopeInode := fsmeta.InodeID(9_000_000_000 + seed*1_000_000 + unique%1_000_000)
+		scopeInode := model.InodeID(9_000_000_000 + seed*1_000_000 + unique%1_000_000)
 		scopeOp := scopeCreateOperation(mountID, scopeName, scopeInode)
 		scopeResult, err := createScopeWithRetry(ctx, cli, scopeOp)
 		if err != nil {
@@ -60,7 +60,7 @@ func main() {
 		}
 		scopeOp.Inode = scopeResult.Inode.Inode
 		scopeInode = scopeResult.Inode.Inode
-		if got := model.Apply(scopeOp); got.Err != nil {
+		if got := state.Apply(scopeOp); got.Err != nil {
 			log.Fatalf("apply history scope seed=%d: %v", seed, got.Err)
 		}
 		ops := externalHistoryOps(fsmetacontract.GenerateScript(seed, *steps), mountID, scopeInode, scopeInode)
@@ -72,7 +72,7 @@ func main() {
 			log.Fatalf("open history inode mapper: %v", err)
 		}
 		opts := fsmetacontract.HistoryOptions{AllowIndeterminateErrors: *allowIndeterminate}
-		if err := fsmetacontract.RunConcurrentBatches(ctx, historyExec, model, ops, *batch, opts); err != nil {
+		if err := fsmetacontract.RunConcurrentBatches(ctx, historyExec, state, ops, *batch, opts); err != nil {
 			fmt.Fprintf(os.Stderr, "fsmeta history failed seed=%d steps=%d filtered_ops=%d\n", seed, *steps, len(ops))
 			log.Fatal(err)
 		}
@@ -80,48 +80,48 @@ func main() {
 	}
 }
 
-func scopeCreateOperation(mount fsmeta.MountID, scopeName string, scopeInode fsmeta.InodeID) fsmetacontract.Operation {
+func scopeCreateOperation(mount model.MountID, scopeName string, scopeInode model.InodeID) fsmetacontract.Operation {
 	return fsmetacontract.Operation{
 		Kind:   fsmetacontract.OpCreate,
 		Mount:  mount,
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   scopeName,
 		Inode:  scopeInode,
-		Type:   fsmeta.InodeTypeDirectory,
+		Type:   model.InodeTypeDirectory,
 		Mode:   0o755,
 	}
 }
 
-func createScopeWithRetry(ctx context.Context, cli fsmetaclient.Client, op fsmetacontract.Operation) (fsmeta.CreateResult, error) {
+func createScopeWithRetry(ctx context.Context, cli fsmetaclient.Client, op fsmetacontract.Operation) (model.CreateResult, error) {
 	delay := 100 * time.Millisecond
 	for {
-		req := fsmeta.CreateRequest{
+		req := model.CreateRequest{
 			Mount:  op.Mount,
 			Parent: op.Parent,
 			Name:   op.Name,
-			Attrs: fsmeta.CreateAttrs{
+			Attrs: model.CreateAttrs{
 				Type: op.Type,
 				Mode: op.Mode,
 			},
 		}
 		result, err := cli.Create(ctx, req)
-		if err == nil || errors.Is(err, fsmeta.ErrExists) {
+		if err == nil || errors.Is(err, model.ErrExists) {
 			if err == nil {
 				return result, nil
 			}
-			dentry, lookupErr := cli.Lookup(ctx, fsmeta.LookupRequest{Mount: op.Mount, Parent: op.Parent, Name: op.Name})
+			dentry, lookupErr := cli.Lookup(ctx, model.LookupRequest{Mount: op.Mount, Parent: op.Parent, Name: op.Name})
 			if lookupErr == nil {
-				return fsmeta.CreateResult{Dentry: dentry, Inode: req.Attrs.InodeRecord(dentry.Inode)}, nil
+				return model.CreateResult{Dentry: dentry, Inode: req.Attrs.InodeRecord(dentry.Inode)}, nil
 			}
 		}
 		if !retryScopeCreateError(err) {
-			return fsmeta.CreateResult{}, err
+			return model.CreateResult{}, err
 		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return fsmeta.CreateResult{}, ctx.Err()
+			return model.CreateResult{}, ctx.Err()
 		case <-timer.C:
 		}
 		if delay < time.Second {
@@ -137,7 +137,7 @@ func retryScopeCreateError(err error) bool {
 	// The scope create is a startup/admission barrier, not part of the
 	// generated correctness history. Let the outer command timeout absorb
 	// transient root, coordinator, and store recovery windows.
-	if errors.Is(err, fsmeta.ErrMountNotRegistered) {
+	if errors.Is(err, model.ErrMountNotRegistered) {
 		return true
 	}
 	switch nokverrors.KindOf(err) {
@@ -149,7 +149,7 @@ func retryScopeCreateError(err error) bool {
 	}
 }
 
-func externalHistoryOps(in []fsmetacontract.Operation, mount fsmeta.MountID, scopeInode, inodeBase fsmeta.InodeID) []fsmetacontract.Operation {
+func externalHistoryOps(in []fsmetacontract.Operation, mount model.MountID, scopeInode, inodeBase model.InodeID) []fsmetacontract.Operation {
 	out := make([]fsmetacontract.Operation, 0, len(in))
 	for _, op := range in {
 		switch op.Kind {
@@ -166,17 +166,17 @@ func externalHistoryOps(in []fsmetacontract.Operation, mount fsmeta.MountID, sco
 			// so external histories must shift inode ids into the per-seed scope
 			// to avoid cross-seed namespace pollution.
 			op.Inode = scopeGeneratedInode(inodeBase, op.Inode)
-			if op.Parent == fsmeta.RootInode {
+			if op.Parent == model.RootInode {
 				op.Parent = scopeInode
 			} else {
 				op.Parent = scopeGeneratedInode(inodeBase, op.Parent)
 			}
-			if op.FromParent == fsmeta.RootInode {
+			if op.FromParent == model.RootInode {
 				op.FromParent = scopeInode
 			} else {
 				op.FromParent = scopeGeneratedInode(inodeBase, op.FromParent)
 			}
-			if op.ToParent == fsmeta.RootInode {
+			if op.ToParent == model.RootInode {
 				op.ToParent = scopeInode
 			} else {
 				op.ToParent = scopeGeneratedInode(inodeBase, op.ToParent)
@@ -187,7 +187,7 @@ func externalHistoryOps(in []fsmetacontract.Operation, mount fsmeta.MountID, sco
 	return out
 }
 
-func scopeGeneratedInode(base, inode fsmeta.InodeID) fsmeta.InodeID {
+func scopeGeneratedInode(base, inode model.InodeID) model.InodeID {
 	if inode == 0 {
 		return 0
 	}

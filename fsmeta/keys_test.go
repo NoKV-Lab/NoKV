@@ -8,13 +8,14 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/utils"
 	"github.com/stretchr/testify/require"
 )
 
 var (
-	testMount      = MountIdentity{MountID: "vol", MountKeyID: 1}
-	testOtherMount = MountIdentity{MountID: "volume", MountKeyID: 2}
+	testMount      = model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	testOtherMount = model.MountIdentity{MountID: "volume", MountKeyID: 2}
 )
 
 func TestKeyLayoutStable(t *testing.T) {
@@ -81,7 +82,7 @@ func TestSegmentCatalogIndexPrefixCoversCatalogKeys(t *testing.T) {
 }
 
 func TestSnapshotKeyRoundTrip(t *testing.T) {
-	key, err := EncodeSnapshotKey(testMount, RootInode, 42)
+	key, err := EncodeSnapshotKey(testMount, model.RootInode, 42)
 	require.NoError(t, err)
 
 	kind, err := KeyKindOf(key)
@@ -94,7 +95,7 @@ func TestSnapshotKeyRoundTrip(t *testing.T) {
 	require.Equal(t, testMount.MountKeyID, parts.MountKeyID)
 	require.Equal(t, RootAffinityBucket, parts.Bucket)
 	require.Equal(t, KeyKindSnapshot, parts.Kind)
-	require.Equal(t, RootInode, parts.SnapshotRoot)
+	require.Equal(t, model.RootInode, parts.SnapshotRoot)
 	require.Equal(t, uint64(42), parts.SnapshotReadVersion)
 
 	prefix, err := EncodeSnapshotPrefix(testMount)
@@ -124,8 +125,8 @@ func TestBucketPrefixAndRangeCoverOneAffinityBucket(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, end)
 
-	var inBucket InodeID
-	for inode := InodeID(2); inode < 10_000; inode++ {
+	var inBucket model.InodeID
+	for inode := model.InodeID(2); inode < 10_000; inode++ {
 		if BucketForInodeID(inode) == 3 {
 			inBucket = inode
 			break
@@ -164,7 +165,7 @@ func TestMountPrefixAndRangeCoverOnlyOneMount(t *testing.T) {
 
 	mountKey, ok := MountKeyIDOfKey(dentry)
 	require.True(t, ok)
-	require.Equal(t, MountKeyID(1), mountKey)
+	require.Equal(t, model.MountKeyID(1), mountKey)
 	name, ok := DentryNameOfKey(dentry)
 	require.True(t, ok)
 	require.Equal(t, "name", name)
@@ -181,35 +182,35 @@ func TestInspectKeyExtractsAuthorityParts(t *testing.T) {
 	require.Equal(t, testMount.MountKeyID, parts.MountKeyID)
 	require.Equal(t, BucketForInodeID(7), parts.Bucket)
 	require.Equal(t, KeyKindDentry, parts.Kind)
-	require.Equal(t, InodeID(7), parts.Parent)
+	require.Equal(t, model.InodeID(7), parts.Parent)
 
 	inode, err := EncodeInodeKey(testMount, 42)
 	require.NoError(t, err)
 	parts, ok = InspectKey(inode)
 	require.True(t, ok)
 	require.Equal(t, KeyKindInode, parts.Kind)
-	require.Equal(t, InodeID(42), parts.Inode)
+	require.Equal(t, model.InodeID(42), parts.Inode)
 
 	chunk, err := EncodeChunkKey(testMount, 42, 3)
 	require.NoError(t, err)
 	parts, ok = InspectKey(chunk)
 	require.True(t, ok)
 	require.Equal(t, KeyKindChunk, parts.Kind)
-	require.Equal(t, InodeID(42), parts.Inode)
+	require.Equal(t, model.InodeID(42), parts.Inode)
 
 	session, err := EncodeSessionKey(testMount, 42, "writer")
 	require.NoError(t, err)
 	parts, ok = InspectKey(session)
 	require.True(t, ok)
 	require.Equal(t, KeyKindSession, parts.Kind)
-	require.Equal(t, InodeID(42), parts.Inode)
+	require.Equal(t, model.InodeID(42), parts.Inode)
 
 	usage, err := EncodeUsageKey(testMount, 9)
 	require.NoError(t, err)
 	parts, ok = InspectKey(usage)
 	require.True(t, ok)
 	require.Equal(t, KeyKindUsage, parts.Kind)
-	require.Equal(t, InodeID(9), parts.UsageScope)
+	require.Equal(t, model.InodeID(9), parts.UsageScope)
 
 	_, ok = InspectKey([]byte("bad"))
 	require.False(t, ok)
@@ -235,7 +236,7 @@ func TestDentryPrefixGroupsDirectoryEntries(t *testing.T) {
 
 func TestShardForUserKeyKeepsWorkspaceMutationsLocal(t *testing.T) {
 	const shards = 4
-	createDentry, err := EncodeDentryKey(testMount, RootInode, "workspace-a")
+	createDentry, err := EncodeDentryKey(testMount, model.RootInode, "workspace-a")
 	require.NoError(t, err)
 	rootBucket, ok := BucketOfKey(createDentry)
 	require.True(t, ok)
@@ -273,7 +274,7 @@ func TestShardForUserKeyKeepsSegmentCatalogAtomic(t *testing.T) {
 
 func TestUserKeyShapeExtractsAffinityAndBloomPrefixes(t *testing.T) {
 	mount := testMount
-	const inode InodeID = 42
+	const inode model.InodeID = 42
 
 	bucketPrefix, err := EncodeBucketPrefix(mount, BucketForInodeID(inode))
 	require.NoError(t, err)
@@ -341,10 +342,10 @@ func TestMountAtomicUserKeyShapePinsMountToOneShard(t *testing.T) {
 	inodeKey, err := EncodeInodeKey(mount, inode)
 	require.NoError(t, err)
 	keys = append(keys, inodeKey)
-	dentryA, err := EncodeDentryKey(mount, RootInode, "alpha")
+	dentryA, err := EncodeDentryKey(mount, model.RootInode, "alpha")
 	require.NoError(t, err)
 	keys = append(keys, dentryA)
-	dentryB, err := EncodeDentryKey(mount, RootInode, "omega")
+	dentryB, err := EncodeDentryKey(mount, model.RootInode, "omega")
 	require.NoError(t, err)
 	keys = append(keys, dentryB)
 	session, err := EncodeSessionKey(mount, inode, "writer-1")
@@ -375,8 +376,8 @@ func TestShardForUserKeyKeepsSessionIndexesWithInode(t *testing.T) {
 
 func TestNameValidationRejectsUnsafePathComponents(t *testing.T) {
 	for _, name := range []string{"", ".", "..", "a/b", "a\x00b"} {
-		_, err := EncodeDentryKey(testMount, RootInode, name)
-		require.ErrorIs(t, err, ErrInvalidName)
+		_, err := EncodeDentryKey(testMount, model.RootInode, name)
+		require.ErrorIs(t, err, model.ErrInvalidName)
 	}
 }
 
@@ -390,9 +391,9 @@ func TestKeyKindOfRejectsInvalidKeys(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidKeyKind)
 }
 
-func findInodeOnBucket(t *testing.T, mount MountIdentity, bucket AffinityBucket) InodeID {
+func findInodeOnBucket(t *testing.T, mount model.MountIdentity, bucket AffinityBucket) model.InodeID {
 	t.Helper()
-	for inode := InodeID(2); inode < 10_000; inode++ {
+	for inode := model.InodeID(2); inode < 10_000; inode++ {
 		key, err := EncodeInodeKey(mount, inode)
 		require.NoError(t, err)
 		got, ok := BucketOfKey(key)

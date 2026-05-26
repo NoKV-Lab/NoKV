@@ -9,6 +9,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
 )
@@ -68,8 +69,8 @@ func TestVisibleAppliedRecordRoundTrip(t *testing.T) {
 }
 
 func TestVisibleOperationRecordAcceptsOpenSessionReplay(t *testing.T) {
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
-	req := fsmeta.OpenWriteSessionRequest{
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	req := model.OpenWriteSessionRequest{
 		Mount:   mount.MountID,
 		Inode:   44,
 		Session: "writer-1",
@@ -77,15 +78,15 @@ func TestVisibleOperationRecordAcceptsOpenSessionReplay(t *testing.T) {
 	}
 	program, err := compile.CompileOpenWriteSessionProgram(req, mount)
 	require.NoError(t, err)
-	sessionValue, err := fsmeta.EncodeSessionValue(fsmeta.SessionRecord{
+	sessionValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{
 		Session:       req.Session,
 		Inode:         req.Inode,
 		ExpiresUnixNs: time.Unix(0, 0).Add(req.TTL).UnixNano(),
 	})
 	require.NoError(t, err)
-	inodeValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
+	inodeValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
 		Inode:     req.Inode,
-		Type:      fsmeta.InodeTypeFile,
+		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
 	require.NoError(t, err)
@@ -125,15 +126,15 @@ func TestVisibleOperationRecordAcceptsOpenSessionReplay(t *testing.T) {
 }
 
 func TestVisibleOperationRecordAcceptsHeartbeatAndCloseSessionReplay(t *testing.T) {
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
-	session := fsmeta.SessionRecord{
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	session := model.SessionRecord{
 		Session:       "writer-1",
 		Inode:         44,
 		ExpiresUnixNs: time.Now().Add(time.Second).UnixNano(),
 	}
 	oldValue, err := fsmeta.EncodeSessionValue(session)
 	require.NoError(t, err)
-	newValue, err := fsmeta.EncodeSessionValue(fsmeta.SessionRecord{
+	newValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{
 		Session:       session.Session,
 		Inode:         session.Inode,
 		ExpiresUnixNs: time.Now().Add(2 * time.Second).UnixNano(),
@@ -141,7 +142,7 @@ func TestVisibleOperationRecordAcceptsHeartbeatAndCloseSessionReplay(t *testing.
 	require.NoError(t, err)
 	frontier := proof.ProofFrontier{EpochID: 7, Sequence: 2}
 
-	heartbeat, err := compile.CompileHeartbeatWriteSessionProgram(fsmeta.HeartbeatWriteSessionRequest{
+	heartbeat, err := compile.CompileHeartbeatWriteSessionProgram(model.HeartbeatWriteSessionRequest{
 		Mount:   mount.MountID,
 		Inode:   session.Inode,
 		Session: session.Session,
@@ -156,7 +157,7 @@ func TestVisibleOperationRecordAcceptsHeartbeatAndCloseSessionReplay(t *testing.
 	require.NoError(t, err)
 	requireVisibleOperationRecordEncodesMaterialized(t, heartbeatOp, heartbeatProofs, OperationID{ClientID: "session", Seq: 2})
 
-	closeProgram, err := compile.CompileCloseWriteSessionProgram(fsmeta.CloseWriteSessionRequest{
+	closeProgram, err := compile.CompileCloseWriteSessionProgram(model.CloseWriteSessionRequest{
 		Mount:   mount.MountID,
 		Inode:   session.Inode,
 		Session: session.Session,
@@ -226,7 +227,7 @@ func testVisibleReplayOperation(id OperationID, key []byte) ReplayOperation {
 	}
 	return ReplayOperation{
 		OpID:                 id,
-		Kind:                 fsmeta.OperationCreate,
+		Kind:                 model.OperationCreate,
 		DescriptorDigest:     filledDigest(1),
 		PredicateProofDigest: compile.AdmissionProofSetDigest(nil, nil),
 		ExecutionPlanDigest:  compile.ExecutionPlanDigest(segment, atomicity, compile.DurabilityVisibleOnly),
@@ -242,8 +243,8 @@ func testVisibleAuthorityScope() compile.AuthorityScope {
 		Mount:      "m",
 		MountKeyID: 1,
 		Buckets:    []fsmeta.AffinityBucket{},
-		Parents:    []fsmeta.InodeID{2},
-		Inodes:     []fsmeta.InodeID{},
+		Parents:    []model.InodeID{2},
+		Inodes:     []model.InodeID{},
 	}
 }
 

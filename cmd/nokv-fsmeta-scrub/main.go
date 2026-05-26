@@ -14,14 +14,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 const defaultPageLimit uint32 = 256
 
 type scrubClient interface {
-	ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
+	ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error)
 	Close() error
 }
 
@@ -40,19 +40,19 @@ const (
 
 type scrubIssue struct {
 	Kind   scrubIssueKind `json:"kind"`
-	Parent fsmeta.InodeID `json:"parent,omitempty"`
+	Parent model.InodeID  `json:"parent,omitempty"`
 	Name   string         `json:"name,omitempty"`
-	Inode  fsmeta.InodeID `json:"inode,omitempty"`
+	Inode  model.InodeID  `json:"inode,omitempty"`
 	Detail string         `json:"detail,omitempty"`
 }
 
 type scrubReport struct {
-	Mount       fsmeta.MountID `json:"mount"`
-	Root        fsmeta.InodeID `json:"root"`
-	Directories uint64         `json:"directories"`
-	Dentries    uint64         `json:"dentries"`
-	Inodes      uint64         `json:"inodes"`
-	Issues      []scrubIssue   `json:"issues,omitempty"`
+	Mount       model.MountID `json:"mount"`
+	Root        model.InodeID `json:"root"`
+	Directories uint64        `json:"directories"`
+	Dentries    uint64        `json:"dentries"`
+	Inodes      uint64        `json:"inodes"`
+	Issues      []scrubIssue  `json:"issues,omitempty"`
 }
 
 func (r scrubReport) OK() bool {
@@ -63,14 +63,14 @@ func main() {
 	var (
 		addr      = flag.String("addr", "127.0.0.1:8090", "FSMetadata gRPC address")
 		mount     = flag.String("mount", "default", "registered mount ID")
-		root      = flag.Uint64("root", uint64(fsmeta.RootInode), "root inode to scrub")
+		root      = flag.Uint64("root", uint64(model.RootInode), "root inode to scrub")
 		pageLimit = flag.Uint("page-limit", uint(defaultPageLimit), "ReadDirPlus page size")
 		maxIssues = flag.Int("max-issues", 32, "maximum issues to record before failing fast")
 		timeout   = flag.Duration("timeout", 60*time.Second, "overall scrub timeout")
 		jsonOut   = flag.Bool("json", false, "emit JSON report")
 	)
 	flag.Parse()
-	if *addr == "" || *mount == "" || *root == 0 || *pageLimit == 0 || *pageLimit > uint(fsmeta.MaxReadDirLimit) || *timeout <= 0 {
+	if *addr == "" || *mount == "" || *root == 0 || *pageLimit == 0 || *pageLimit > uint(model.MaxReadDirLimit) || *timeout <= 0 {
 		log.Fatalf("addr, mount, root, page-limit, and timeout must be valid")
 	}
 
@@ -83,7 +83,7 @@ func main() {
 	}
 	defer func() { _ = cli.Close() }()
 
-	report, err := scrubMount(ctx, cli, fsmeta.MountID(*mount), fsmeta.InodeID(*root), uint32(*pageLimit), *maxIssues)
+	report, err := scrubMount(ctx, cli, model.MountID(*mount), model.InodeID(*root), uint32(*pageLimit), *maxIssues)
 	if err != nil {
 		log.Fatalf("scrub failed: %v", err)
 	}
@@ -106,21 +106,21 @@ func main() {
 	}
 }
 
-func scrubMount(ctx context.Context, cli scrubClient, mount fsmeta.MountID, root fsmeta.InodeID, pageLimit uint32, maxIssues int) (scrubReport, error) {
+func scrubMount(ctx context.Context, cli scrubClient, mount model.MountID, root model.InodeID, pageLimit uint32, maxIssues int) (scrubReport, error) {
 	if cli == nil {
 		return scrubReport{}, fmt.Errorf("scrub client is required")
 	}
 	if mount == "" || root == 0 {
-		return scrubReport{}, fsmeta.ErrInvalidRequest
+		return scrubReport{}, model.ErrInvalidRequest
 	}
 	if pageLimit == 0 {
 		pageLimit = defaultPageLimit
 	}
 	report := scrubReport{Mount: mount, Root: root}
-	refs := make(map[fsmeta.InodeID]uint32)
-	inodes := make(map[fsmeta.InodeID]fsmeta.InodeRecord)
-	visitedDirs := make(map[fsmeta.InodeID]struct{})
-	queue := []fsmeta.InodeID{root}
+	refs := make(map[model.InodeID]uint32)
+	inodes := make(map[model.InodeID]model.InodeRecord)
+	visitedDirs := make(map[model.InodeID]struct{})
+	queue := []model.InodeID{root}
 
 	addIssue := func(issue scrubIssue) bool {
 		if maxIssues > 0 && len(report.Issues) >= maxIssues {
@@ -142,7 +142,7 @@ func scrubMount(ctx context.Context, cli scrubClient, mount fsmeta.MountID, root
 		}
 		visitedDirs[parent] = struct{}{}
 		report.Directories++
-		entries, err := readDirPlusAll(ctx, cli, fsmeta.ReadDirRequest{
+		entries, err := readDirPlusAll(ctx, cli, model.ReadDirRequest{
 			Mount:  mount,
 			Parent: parent,
 			Limit:  pageLimit,
@@ -175,12 +175,12 @@ func scrubMount(ctx context.Context, cli scrubClient, mount fsmeta.MountID, root
 	return report, nil
 }
 
-func readDirPlusAll(ctx context.Context, cli scrubClient, req fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error) {
+func readDirPlusAll(ctx context.Context, cli scrubClient, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	limit := req.Limit
 	if limit == 0 {
 		limit = defaultPageLimit
 	}
-	var out []fsmeta.DentryAttrPair
+	var out []model.DentryAttrPair
 	lastName := ""
 	haveLast := false
 	for {
@@ -209,11 +209,11 @@ func readDirPlusAll(ctx context.Context, cli scrubClient, req fsmeta.ReadDirRequ
 }
 
 func scrubDentryPair(
-	pair fsmeta.DentryAttrPair,
-	parent fsmeta.InodeID,
-	refs map[fsmeta.InodeID]uint32,
-	inodes map[fsmeta.InodeID]fsmeta.InodeRecord,
-	queue *[]fsmeta.InodeID,
+	pair model.DentryAttrPair,
+	parent model.InodeID,
+	refs map[model.InodeID]uint32,
+	inodes map[model.InodeID]model.InodeRecord,
+	queue *[]model.InodeID,
 	addIssue func(scrubIssue) bool,
 ) bool {
 	dentry := pair.Dentry
@@ -238,14 +238,14 @@ func scrubDentryPair(
 			return false
 		}
 	}
-	if existing, ok := inodes[inode.Inode]; ok && existing.Type == fsmeta.InodeTypeDirectory && dentry.Type == fsmeta.InodeTypeDirectory {
+	if existing, ok := inodes[inode.Inode]; ok && existing.Type == model.InodeTypeDirectory && dentry.Type == model.InodeTypeDirectory {
 		if !addIssue(scrubIssue{Kind: issueDirectoryHardlink, Parent: parent, Name: dentry.Name, Inode: inode.Inode}) {
 			return false
 		}
 	}
 	refs[inode.Inode]++
 	inodes[inode.Inode] = inode
-	if inode.Type == fsmeta.InodeTypeDirectory {
+	if inode.Type == model.InodeTypeDirectory {
 		*queue = append(*queue, inode.Inode)
 	}
 	return true

@@ -7,15 +7,16 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestDentryValueRoundTrip(t *testing.T) {
-	value, err := EncodeDentryValue(DentryRecord{
-		Parent: RootInode,
+	value, err := EncodeDentryValue(model.DentryRecord{
+		Parent: model.RootInode,
 		Name:   "file",
 		Inode:  22,
-		Type:   InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "66737600016400000000000000010466696c65000000000000001601", hex.EncodeToString(value))
@@ -26,18 +27,18 @@ func TestDentryValueRoundTrip(t *testing.T) {
 
 	record, err := DecodeDentryValue(value)
 	require.NoError(t, err)
-	require.Equal(t, DentryRecord{
-		Parent: RootInode,
+	require.Equal(t, model.DentryRecord{
+		Parent: model.RootInode,
 		Name:   "file",
 		Inode:  22,
-		Type:   InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	}, record)
 }
 
 func TestInodeValueRoundTrip(t *testing.T) {
-	value, err := EncodeInodeValue(InodeRecord{
+	value, err := EncodeInodeValue(model.InodeRecord{
 		Inode:       22,
-		Type:        InodeTypeFile,
+		Type:        model.InodeTypeFile,
 		Size:        4096,
 		LinkCount:   1,
 		OpaqueAttrs: []byte(`{"body_ref":"s3://bucket/checkpoint"}`),
@@ -47,9 +48,9 @@ func TestInodeValueRoundTrip(t *testing.T) {
 
 	record, err := DecodeInodeValue(value)
 	require.NoError(t, err)
-	require.Equal(t, InodeRecord{
+	require.Equal(t, model.InodeRecord{
 		Inode:       22,
-		Type:        InodeTypeFile,
+		Type:        model.InodeTypeFile,
 		Size:        4096,
 		LinkCount:   1,
 		OpaqueAttrs: []byte(`{"body_ref":"s3://bucket/checkpoint"}`),
@@ -57,7 +58,7 @@ func TestInodeValueRoundTrip(t *testing.T) {
 }
 
 func TestSessionValueRoundTrip(t *testing.T) {
-	value, err := EncodeSessionValue(SessionRecord{
+	value, err := EncodeSessionValue(model.SessionRecord{
 		Session:       "writer-1",
 		Inode:         22,
 		ExpiresUnixNs: 99,
@@ -66,7 +67,7 @@ func TestSessionValueRoundTrip(t *testing.T) {
 
 	record, err := DecodeSessionValue(value)
 	require.NoError(t, err)
-	require.Equal(t, SessionRecord{
+	require.Equal(t, model.SessionRecord{
 		Session:       "writer-1",
 		Inode:         22,
 		ExpiresUnixNs: 99,
@@ -74,7 +75,7 @@ func TestSessionValueRoundTrip(t *testing.T) {
 }
 
 func TestUsageValueRoundTrip(t *testing.T) {
-	value, err := EncodeUsageValue(UsageRecord{
+	value, err := EncodeUsageValue(model.UsageRecord{
 		Bytes:  4096,
 		Inodes: 12,
 	})
@@ -88,20 +89,20 @@ func TestUsageValueRoundTrip(t *testing.T) {
 
 	record, err := DecodeUsageValue(value)
 	require.NoError(t, err)
-	require.Equal(t, UsageRecord{Bytes: 4096, Inodes: 12}, record)
+	require.Equal(t, model.UsageRecord{Bytes: 4096, Inodes: 12}, record)
 }
 
 func TestSnapshotValueRoundTrip(t *testing.T) {
-	var ref SnapshotEvidenceRef
+	var ref model.SnapshotEvidenceRef
 	ref.EpochID = 7
 	ref.EvidenceRoot[0] = 1
 	ref.PayloadDigest[0] = 2
-	token := SnapshotSubtreeToken{
+	token := model.SnapshotSubtreeToken{
 		Mount:           "vol",
 		MountKeyID:      9,
-		RootInode:       RootInode,
+		RootInode:       model.RootInode,
 		ReadVersion:     42,
-		RuntimeEvidence: []SnapshotEvidenceRef{ref},
+		RuntimeEvidence: []model.SnapshotEvidenceRef{ref},
 	}
 	value, err := EncodeSnapshotValue(token)
 	require.NoError(t, err)
@@ -117,7 +118,7 @@ func TestSnapshotValueRoundTrip(t *testing.T) {
 }
 
 func TestValueDecodersRejectWrongKind(t *testing.T) {
-	value, err := EncodeDentryValue(DentryRecord{Parent: RootInode, Name: "file", Inode: 22})
+	value, err := EncodeDentryValue(model.DentryRecord{Parent: model.RootInode, Name: "file", Inode: 22})
 	require.NoError(t, err)
 
 	_, err = DecodeInodeValue(value)
@@ -126,7 +127,7 @@ func TestValueDecodersRejectWrongKind(t *testing.T) {
 
 func TestValueKindOfRejectsInvalidValues(t *testing.T) {
 	_, err := ValueKindOf([]byte("not-fsmeta-value"))
-	require.ErrorIs(t, err, ErrInvalidValue)
+	require.ErrorIs(t, err, model.ErrInvalidValue)
 
 	value := encodeValue(ValueKind('z'), []byte("body"))
 	_, err = ValueKindOf(value)
@@ -134,15 +135,15 @@ func TestValueKindOfRejectsInvalidValues(t *testing.T) {
 }
 
 func TestValueCodecsRejectInvalidType(t *testing.T) {
-	_, err := EncodeInodeValue(InodeRecord{Inode: 22, Type: InodeType("symlink")})
-	require.ErrorIs(t, err, ErrInvalidValue)
+	_, err := EncodeInodeValue(model.InodeRecord{Inode: 22, Type: model.InodeType("symlink")})
+	require.ErrorIs(t, err, model.ErrInvalidValue)
 
-	_, err = EncodeInodeValue(InodeRecord{
+	_, err = EncodeInodeValue(model.InodeRecord{
 		Inode:       22,
-		Type:        InodeTypeFile,
-		OpaqueAttrs: make([]byte, MaxInodeOpaqueAttrsBytes+1),
+		Type:        model.InodeTypeFile,
+		OpaqueAttrs: make([]byte, model.MaxInodeOpaqueAttrsBytes+1),
 	})
-	require.ErrorIs(t, err, ErrInvalidValue)
+	require.ErrorIs(t, err, model.ErrInvalidValue)
 
 	body := append([]byte{
 		0, 0, 0, 0, 0, 0, 0, 22,
@@ -151,12 +152,12 @@ func TestValueCodecsRejectInvalidType(t *testing.T) {
 	body = append(body, 0)
 	value := encodeValue(ValueKindInode, body)
 	_, err = DecodeInodeValue(value)
-	require.ErrorIs(t, err, ErrInvalidValue)
+	require.ErrorIs(t, err, model.ErrInvalidValue)
 
 	value = encodeValue(ValueKindInode, append([]byte{
 		0, 0, 0, 0, 0, 0, 0, 22,
 		1,
 	}, make([]byte, 32)...))
 	_, err = DecodeInodeValue(value)
-	require.ErrorIs(t, err, ErrInvalidValue)
+	require.ErrorIs(t, err, model.ErrInvalidValue)
 }

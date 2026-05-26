@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 func TestInodeMappingExecutorTranslatesGeneratedHistoryIDs(t *testing.T) {
@@ -18,13 +18,13 @@ func TestInodeMappingExecutorTranslatesGeneratedHistoryIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewInodeMappingExecutor: %v", err)
 	}
-	model := NewModel("vol")
+	state := NewModel("vol")
 	ops := []Operation{
-		{Kind: OpCreate, Mount: "vol", Parent: fsmeta.RootInode, Name: "alpha", Inode: 10, Type: fsmeta.InodeTypeFile, Mode: 0o644},
-		{Kind: OpUpdateInode, Mount: "vol", Parent: fsmeta.RootInode, Name: "alpha", Inode: 10, Size: 42, Mode: 0o600},
-		{Kind: OpReadDirPlus, Mount: "vol", Parent: fsmeta.RootInode, Limit: 16},
+		{Kind: OpCreate, Mount: "vol", Parent: model.RootInode, Name: "alpha", Inode: 10, Type: model.InodeTypeFile, Mode: 0o644},
+		{Kind: OpUpdateInode, Mount: "vol", Parent: model.RootInode, Name: "alpha", Inode: 10, Size: 42, Mode: 0o600},
+		{Kind: OpReadDirPlus, Mount: "vol", Parent: model.RootInode, Limit: 16},
 	}
-	if err := Run(context.Background(), exec, model, ops); err != nil {
+	if err := Run(context.Background(), exec, state, ops); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if base.lastUpdated != 1000 {
@@ -39,11 +39,11 @@ func TestInodeMappingExecutorRecoversCommittedCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewInodeMappingExecutor: %v", err)
 	}
-	result, err := exec.Create(withPlannedCreateInode(context.Background(), 10), fsmeta.CreateRequest{
+	result, err := exec.Create(withPlannedCreateInode(context.Background(), 10), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -59,16 +59,16 @@ func TestInodeMappingExecutorTranslatesRemoveResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewInodeMappingExecutor: %v", err)
 	}
-	_, err = exec.Create(withPlannedCreateInode(context.Background(), 10), fsmeta.CreateRequest{
+	_, err = exec.Create(withPlannedCreateInode(context.Background(), 10), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	result, err := exec.Remove(context.Background(), fsmeta.RemoveRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "alpha"})
+	result, err := exec.Remove(context.Background(), model.RemoveRequest{Mount: "vol", Parent: model.RootInode, Name: "alpha"})
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
@@ -82,11 +82,11 @@ func TestInodeMappingExecutorTranslatesRemoveResult(t *testing.T) {
 
 func TestInodeMappingExecutorDoesNotRecoverSemanticCreateError(t *testing.T) {
 	base := newFakeExternalExecutor()
-	_, err := base.Create(context.Background(), fsmeta.CreateRequest{
+	_, err := base.Create(context.Background(), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory, Mode: 0o755},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory, Mode: 0o755},
 	})
 	if err != nil {
 		t.Fatalf("seed Create: %v", err)
@@ -95,13 +95,13 @@ func TestInodeMappingExecutorDoesNotRecoverSemanticCreateError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewInodeMappingExecutor: %v", err)
 	}
-	_, err = exec.Create(withPlannedCreateInode(context.Background(), 10), fsmeta.CreateRequest{
+	_, err = exec.Create(withPlannedCreateInode(context.Background(), 10), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	})
-	if !errors.Is(err, fsmeta.ErrExists) {
+	if !errors.Is(err, model.ErrExists) {
 		t.Fatalf("Create error = %v, want ErrExists", err)
 	}
 }
@@ -118,24 +118,24 @@ func TestInodeMappingExecutorTranslatesCreateObservedBeforeReturn(t *testing.T) 
 	}
 
 	type createResult struct {
-		result fsmeta.CreateResult
+		result model.CreateResult
 		err    error
 	}
 	done := make(chan createResult, 1)
 	go func() {
-		result, err := exec.Create(withPlannedCreateInode(context.Background(), 10), fsmeta.CreateRequest{
+		result, err := exec.Create(withPlannedCreateInode(context.Background(), 10), model.CreateRequest{
 			Mount:  "vol",
-			Parent: fsmeta.RootInode,
+			Parent: model.RootInode,
 			Name:   "alpha",
-			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+			Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 		})
 		done <- createResult{result: result, err: err}
 	}()
 	<-createCommitted
 
-	pairs, err := exec.ReadDirPlus(context.Background(), fsmeta.ReadDirRequest{
+	pairs, err := exec.ReadDirPlus(context.Background(), model.ReadDirRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  16,
 	})
 	if err != nil {
@@ -171,19 +171,19 @@ func TestInodeMappingExecutorUpdatesCreateObservedBeforeReturn(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := exec.Create(withPlannedCreateInode(context.Background(), 10), fsmeta.CreateRequest{
+		_, err := exec.Create(withPlannedCreateInode(context.Background(), 10), model.CreateRequest{
 			Mount:  "vol",
-			Parent: fsmeta.RootInode,
+			Parent: model.RootInode,
 			Name:   "alpha",
-			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+			Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 		})
 		done <- err
 	}()
 	<-createCommitted
 
-	updated, err := exec.UpdateInode(context.Background(), fsmeta.UpdateInodeRequest{
+	updated, err := exec.UpdateInode(context.Background(), model.UpdateInodeRequest{
 		Mount:   "vol",
-		Parent:  fsmeta.RootInode,
+		Parent:  model.RootInode,
 		Name:    "alpha",
 		Inode:   10,
 		SetSize: true,
@@ -211,40 +211,40 @@ func TestInodeMappingExecutorTranslatesRenameReplaceResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewInodeMappingExecutor: %v", err)
 	}
-	_, err = exec.Create(withPlannedCreateInode(context.Background(), 10), fsmeta.CreateRequest{
+	_, err = exec.Create(withPlannedCreateInode(context.Background(), 10), model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "old",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Mode: 0o644},
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	actualDentry, err := base.Lookup(context.Background(), fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "old"})
+	actualDentry, err := base.Lookup(context.Background(), model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "old"})
 	if err != nil {
 		t.Fatalf("base Lookup: %v", err)
 	}
-	base.renameReplaceResult = fsmeta.RenameReplaceResult{
+	base.renameReplaceResult = model.RenameReplaceResult{
 		Replaced: true,
-		OldDentry: fsmeta.DentryRecord{
-			Parent: fsmeta.RootInode,
+		OldDentry: model.DentryRecord{
+			Parent: model.RootInode,
 			Name:   "old",
 			Inode:  actualDentry.Inode,
-			Type:   fsmeta.InodeTypeFile,
+			Type:   model.InodeTypeFile,
 		},
-		OldInode: fsmeta.InodeRecord{
+		OldInode: model.InodeRecord{
 			Inode:     actualDentry.Inode,
-			Type:      fsmeta.InodeTypeFile,
+			Type:      model.InodeTypeFile,
 			LinkCount: 1,
 		},
 		OldInodeDeleted: true,
 	}
 
-	result, err := exec.RenameReplace(context.Background(), fsmeta.RenameReplaceRequest{
+	result, err := exec.RenameReplace(context.Background(), model.RenameReplaceRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   "stage",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "old",
 	})
 	if err != nil {
@@ -257,36 +257,36 @@ func TestInodeMappingExecutorTranslatesRenameReplaceResult(t *testing.T) {
 
 type fakeExternalExecutor struct {
 	mu                   sync.Mutex
-	next                 fsmeta.InodeID
-	dentries             map[[2]any]fsmeta.DentryRecord
-	inodes               map[fsmeta.InodeID]fsmeta.InodeRecord
-	lastUpdated          fsmeta.InodeID
+	next                 model.InodeID
+	dentries             map[[2]any]model.DentryRecord
+	inodes               map[model.InodeID]model.InodeRecord
+	lastUpdated          model.InodeID
 	createErrAfterCommit error
 	createCommitted      chan struct{}
 	releaseCreate        chan struct{}
-	renameReplaceResult  fsmeta.RenameReplaceResult
+	renameReplaceResult  model.RenameReplaceResult
 }
 
 func newFakeExternalExecutor() *fakeExternalExecutor {
 	f := &fakeExternalExecutor{
 		next:     1000,
-		dentries: make(map[[2]any]fsmeta.DentryRecord),
-		inodes:   map[fsmeta.InodeID]fsmeta.InodeRecord{fsmeta.RootInode: {Inode: fsmeta.RootInode, Type: fsmeta.InodeTypeDirectory, LinkCount: 1}},
+		dentries: make(map[[2]any]model.DentryRecord),
+		inodes:   map[model.InodeID]model.InodeRecord{model.RootInode: {Inode: model.RootInode, Type: model.InodeTypeDirectory, LinkCount: 1}},
 	}
 	return f
 }
 
-func (f *fakeExternalExecutor) Create(_ context.Context, req fsmeta.CreateRequest) (fsmeta.CreateResult, error) {
+func (f *fakeExternalExecutor) Create(_ context.Context, req model.CreateRequest) (model.CreateResult, error) {
 	f.mu.Lock()
 	key := [2]any{req.Parent, req.Name}
 	if _, ok := f.dentries[key]; ok {
 		f.mu.Unlock()
-		return fsmeta.CreateResult{}, fsmeta.ErrExists
+		return model.CreateResult{}, model.ErrExists
 	}
 	inodeID := f.next
 	f.next++
 	inode := req.Attrs.InodeRecord(inodeID)
-	dentry := fsmeta.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: inodeID, Type: req.Attrs.Type}
+	dentry := model.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: inodeID, Type: req.Attrs.Type}
 	f.dentries[key] = dentry
 	f.inodes[inodeID] = inode
 	if f.createCommitted != nil {
@@ -300,17 +300,17 @@ func (f *fakeExternalExecutor) Create(_ context.Context, req fsmeta.CreateReques
 		<-release
 	}
 	if errAfterCommit != nil {
-		return fsmeta.CreateResult{}, errAfterCommit
+		return model.CreateResult{}, errAfterCommit
 	}
-	return fsmeta.CreateResult{Dentry: dentry, Inode: inode}, nil
+	return model.CreateResult{Dentry: dentry, Inode: inode}, nil
 }
 
-func (f *fakeExternalExecutor) UpdateInode(_ context.Context, req fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error) {
+func (f *fakeExternalExecutor) UpdateInode(_ context.Context, req model.UpdateInodeRequest) (model.InodeRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	dentry, ok := f.dentries[[2]any{req.Parent, req.Name}]
 	if !ok || dentry.Inode != req.Inode {
-		return fsmeta.InodeRecord{}, fsmeta.ErrNotFound
+		return model.InodeRecord{}, model.ErrNotFound
 	}
 	inode := f.inodes[req.Inode]
 	inode.Size = req.Size
@@ -320,72 +320,72 @@ func (f *fakeExternalExecutor) UpdateInode(_ context.Context, req fsmeta.UpdateI
 	return inode, nil
 }
 
-func (f *fakeExternalExecutor) Lookup(_ context.Context, req fsmeta.LookupRequest) (fsmeta.DentryRecord, error) {
+func (f *fakeExternalExecutor) Lookup(_ context.Context, req model.LookupRequest) (model.DentryRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	dentry, ok := f.dentries[[2]any{req.Parent, req.Name}]
 	if !ok {
-		return fsmeta.DentryRecord{}, fsmeta.ErrNotFound
+		return model.DentryRecord{}, model.ErrNotFound
 	}
 	return dentry, nil
 }
 
-func (f *fakeExternalExecutor) ReadDirPlus(_ context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error) {
+func (f *fakeExternalExecutor) ReadDirPlus(_ context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []fsmeta.DentryAttrPair
+	var out []model.DentryAttrPair
 	for key, dentry := range f.dentries {
 		if key[0] != req.Parent {
 			continue
 		}
-		out = append(out, fsmeta.DentryAttrPair{Dentry: dentry, Inode: f.inodes[dentry.Inode]})
+		out = append(out, model.DentryAttrPair{Dentry: dentry, Inode: f.inodes[dentry.Inode]})
 	}
 	return out, nil
 }
 
-func (f *fakeExternalExecutor) SnapshotSubtree(_ context.Context, req fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error) {
-	return fsmeta.SnapshotSubtreeToken{Mount: req.Mount, RootInode: req.RootInode, ReadVersion: 1}, nil
+func (f *fakeExternalExecutor) SnapshotSubtree(_ context.Context, req model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error) {
+	return model.SnapshotSubtreeToken{Mount: req.Mount, RootInode: req.RootInode, ReadVersion: 1}, nil
 }
 
-func (f *fakeExternalExecutor) Rename(context.Context, fsmeta.RenameRequest) error {
+func (f *fakeExternalExecutor) Rename(context.Context, model.RenameRequest) error {
 	return nil
 }
 
-func (f *fakeExternalExecutor) RenameReplace(context.Context, fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+func (f *fakeExternalExecutor) RenameReplace(context.Context, model.RenameReplaceRequest) (model.RenameReplaceResult, error) {
 	return f.renameReplaceResult, nil
 }
 
-func (f *fakeExternalExecutor) RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error {
+func (f *fakeExternalExecutor) RenameSubtree(context.Context, model.RenameSubtreeRequest) error {
 	return nil
 }
 
-func (f *fakeExternalExecutor) Link(context.Context, fsmeta.LinkRequest) error {
+func (f *fakeExternalExecutor) Link(context.Context, model.LinkRequest) error {
 	return nil
 }
 
-func (f *fakeExternalExecutor) Unlink(context.Context, fsmeta.UnlinkRequest) error {
+func (f *fakeExternalExecutor) Unlink(context.Context, model.UnlinkRequest) error {
 	return nil
 }
 
-func (f *fakeExternalExecutor) Remove(_ context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+func (f *fakeExternalExecutor) Remove(_ context.Context, req model.RemoveRequest) (model.RemoveResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	key := [2]any{req.Parent, req.Name}
 	dentry, ok := f.dentries[key]
 	if !ok {
-		return fsmeta.RemoveResult{}, fsmeta.ErrNotFound
+		return model.RemoveResult{}, model.ErrNotFound
 	}
-	if dentry.Type == fsmeta.InodeTypeDirectory {
-		return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
+	if dentry.Type == model.InodeTypeDirectory {
+		return model.RemoveResult{}, model.ErrInvalidRequest
 	}
-	result := fsmeta.RemoveResult{RemovedDentry: dentry}
+	result := model.RemoveResult{RemovedDentry: dentry}
 	inode, ok := f.inodes[dentry.Inode]
 	if !ok {
 		delete(f.dentries, key)
 		return result, nil
 	}
-	if inode.Type == fsmeta.InodeTypeDirectory {
-		return fsmeta.RemoveResult{}, fsmeta.ErrInvalidRequest
+	if inode.Type == model.InodeTypeDirectory {
+		return model.RemoveResult{}, model.ErrInvalidRequest
 	}
 	result.OldInode = inode
 	delete(f.dentries, key)
@@ -399,18 +399,18 @@ func (f *fakeExternalExecutor) Remove(_ context.Context, req fsmeta.RemoveReques
 	return result, nil
 }
 
-func (f *fakeExternalExecutor) OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {
-	return fsmeta.SessionRecord{}, errors.New("not implemented")
+func (f *fakeExternalExecutor) OpenWriteSession(context.Context, model.OpenWriteSessionRequest) (model.SessionRecord, error) {
+	return model.SessionRecord{}, errors.New("not implemented")
 }
 
-func (f *fakeExternalExecutor) HeartbeatWriteSession(context.Context, fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error) {
-	return fsmeta.SessionRecord{}, errors.New("not implemented")
+func (f *fakeExternalExecutor) HeartbeatWriteSession(context.Context, model.HeartbeatWriteSessionRequest) (model.SessionRecord, error) {
+	return model.SessionRecord{}, errors.New("not implemented")
 }
 
-func (f *fakeExternalExecutor) CloseWriteSession(context.Context, fsmeta.CloseWriteSessionRequest) error {
+func (f *fakeExternalExecutor) CloseWriteSession(context.Context, model.CloseWriteSessionRequest) error {
 	return errors.New("not implemented")
 }
 
-func (f *fakeExternalExecutor) ExpireWriteSessions(context.Context, fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error) {
-	return fsmeta.ExpireWriteSessionsResult{}, nil
+func (f *fakeExternalExecutor) ExpireWriteSessions(context.Context, model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error) {
+	return model.ExpireWriteSessionsResult{}, nil
 }

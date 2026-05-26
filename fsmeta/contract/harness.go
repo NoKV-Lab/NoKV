@@ -10,90 +10,90 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 // Executor is the fsmeta API surface exercised by the contract harness.
 type Executor interface {
-	Create(context.Context, fsmeta.CreateRequest) (fsmeta.CreateResult, error)
-	UpdateInode(context.Context, fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error)
-	Lookup(context.Context, fsmeta.LookupRequest) (fsmeta.DentryRecord, error)
-	ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
-	SnapshotSubtree(context.Context, fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error)
-	Rename(context.Context, fsmeta.RenameRequest) error
-	RenameReplace(context.Context, fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error)
-	RenameSubtree(context.Context, fsmeta.RenameSubtreeRequest) error
-	Link(context.Context, fsmeta.LinkRequest) error
-	Unlink(context.Context, fsmeta.UnlinkRequest) error
-	Remove(context.Context, fsmeta.RemoveRequest) (fsmeta.RemoveResult, error)
-	OpenWriteSession(context.Context, fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error)
-	HeartbeatWriteSession(context.Context, fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error)
-	CloseWriteSession(context.Context, fsmeta.CloseWriteSessionRequest) error
-	ExpireWriteSessions(context.Context, fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error)
+	Create(context.Context, model.CreateRequest) (model.CreateResult, error)
+	UpdateInode(context.Context, model.UpdateInodeRequest) (model.InodeRecord, error)
+	Lookup(context.Context, model.LookupRequest) (model.DentryRecord, error)
+	ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error)
+	SnapshotSubtree(context.Context, model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error)
+	Rename(context.Context, model.RenameRequest) error
+	RenameReplace(context.Context, model.RenameReplaceRequest) (model.RenameReplaceResult, error)
+	RenameSubtree(context.Context, model.RenameSubtreeRequest) error
+	Link(context.Context, model.LinkRequest) error
+	Unlink(context.Context, model.UnlinkRequest) error
+	Remove(context.Context, model.RemoveRequest) (model.RemoveResult, error)
+	OpenWriteSession(context.Context, model.OpenWriteSessionRequest) (model.SessionRecord, error)
+	HeartbeatWriteSession(context.Context, model.HeartbeatWriteSessionRequest) (model.SessionRecord, error)
+	CloseWriteSession(context.Context, model.CloseWriteSessionRequest) error
+	ExpireWriteSessions(context.Context, model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error)
 }
 
 type plannedCreateInodeContextKey struct{}
 
-func withPlannedCreateInode(ctx context.Context, inode fsmeta.InodeID) context.Context {
+func withPlannedCreateInode(ctx context.Context, inode model.InodeID) context.Context {
 	if inode == 0 {
 		return ctx
 	}
 	return context.WithValue(ctx, plannedCreateInodeContextKey{}, inode)
 }
 
-func plannedCreateInode(ctx context.Context) (fsmeta.InodeID, bool) {
-	inode, ok := ctx.Value(plannedCreateInodeContextKey{}).(fsmeta.InodeID)
+func plannedCreateInode(ctx context.Context) (model.InodeID, bool) {
+	inode, ok := ctx.Value(plannedCreateInodeContextKey{}).(model.InodeID)
 	return inode, ok && inode != 0
 }
 
 // Run executes operations against the system under test and the reference
 // model, comparing every externally visible result.
-func Run(ctx context.Context, exec Executor, model *Model, ops []Operation) error {
+func Run(ctx context.Context, exec Executor, state *Model, ops []Operation) error {
 	if exec == nil {
 		return errExecutorRequired
 	}
-	if model == nil {
+	if state == nil {
 		return errModelRequired
 	}
 	history := make([]string, 0, len(ops))
 	for i, op := range ops {
-		got := execute(ctx, exec, model, op)
+		got := execute(ctx, exec, state, op)
 		if op.Kind == OpCreate && got.Err == nil {
 			op.Inode = got.Inode.Inode
 		}
 		var want Result
 		if op.Kind == OpSnapshotSubtree {
 			if got.Err == nil {
-				want = model.ApplySnapshot(op, got.Token)
+				want = state.ApplySnapshot(op, got.Token)
 			} else {
-				want = model.Apply(op)
+				want = state.Apply(op)
 			}
 		} else {
-			want = model.Apply(op)
+			want = state.Apply(op)
 		}
 		history = append(history, fmt.Sprintf("%03d %s -> got=%s want=%s", i, op, summarize(got), summarize(want)))
 		if err := compareResult(got, want); err != nil {
 			return fmt.Errorf("step %d failed: %w\nhistory:\n%s", i, err, strings.Join(history, "\n"))
 		}
-		if err := model.CheckInvariants(); err != nil {
+		if err := state.CheckInvariants(); err != nil {
 			return fmt.Errorf("step %d corrupted model invariants: %w\nhistory:\n%s", i, err, strings.Join(history, "\n"))
 		}
 	}
 	return nil
 }
 
-func execute(ctx context.Context, exec Executor, model *Model, op Operation) Result {
+func execute(ctx context.Context, exec Executor, state *Model, op Operation) Result {
 	switch op.Kind {
 	case OpCreate:
 		// The real API allocates Create inode IDs server-side. The contract
 		// harness still pins a model inode per generated operation so future
 		// Update/Link/Session operations can target a stable object even when
 		// concurrent duplicate-name creates race.
-		result, err := exec.Create(withPlannedCreateInode(ctx, op.Inode), fsmeta.CreateRequest{
+		result, err := exec.Create(withPlannedCreateInode(ctx, op.Inode), model.CreateRequest{
 			Mount:  op.Mount,
 			Parent: op.Parent,
 			Name:   op.Name,
-			Attrs: fsmeta.CreateAttrs{
+			Attrs: model.CreateAttrs{
 				Type: op.Type,
 				Size: op.Size,
 				Mode: op.Mode,
@@ -101,7 +101,7 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 		})
 		return Result{Err: err, Dentry: result.Dentry, Inode: result.Inode}
 	case OpUpdateInode:
-		inode, err := exec.UpdateInode(ctx, fsmeta.UpdateInodeRequest{
+		inode, err := exec.UpdateInode(ctx, model.UpdateInodeRequest{
 			Mount:   op.Mount,
 			Parent:  op.Parent,
 			Inode:   op.Inode,
@@ -113,29 +113,29 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 		})
 		return Result{Err: err, Inode: inode}
 	case OpLookup:
-		dentry, err := exec.Lookup(ctx, fsmeta.LookupRequest{
+		dentry, err := exec.Lookup(ctx, model.LookupRequest{
 			Mount:  op.Mount,
 			Parent: op.Parent,
 			Name:   op.Name,
 		})
 		return Result{Err: err, Dentry: dentry}
 	case OpReadDirPlus:
-		pairs, err := exec.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+		pairs, err := exec.ReadDirPlus(ctx, model.ReadDirRequest{
 			Mount:           op.Mount,
 			Parent:          op.Parent,
 			StartAfter:      op.StartAfter,
 			Limit:           op.Limit,
-			SnapshotVersion: model.SnapshotVersion(op.SnapshotRef),
+			SnapshotVersion: state.SnapshotVersion(op.SnapshotRef),
 		})
 		return Result{Err: err, Pairs: pairs}
 	case OpSnapshotSubtree:
-		token, err := exec.SnapshotSubtree(ctx, fsmeta.SnapshotSubtreeRequest{
+		token, err := exec.SnapshotSubtree(ctx, model.SnapshotSubtreeRequest{
 			Mount:     op.Mount,
 			RootInode: op.Parent,
 		})
 		return Result{Err: err, Token: token}
 	case OpRename:
-		err := exec.Rename(ctx, fsmeta.RenameRequest{
+		err := exec.Rename(ctx, model.RenameRequest{
 			Mount:      op.Mount,
 			FromParent: op.FromParent,
 			FromName:   op.FromName,
@@ -144,7 +144,7 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 		})
 		return Result{Err: err}
 	case OpRenameReplace:
-		result, err := exec.RenameReplace(ctx, fsmeta.RenameReplaceRequest{
+		result, err := exec.RenameReplace(ctx, model.RenameReplaceRequest{
 			Mount:      op.Mount,
 			FromParent: op.FromParent,
 			FromName:   op.FromName,
@@ -153,7 +153,7 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 		})
 		return Result{Err: err, RenameReplace: result}
 	case OpRenameSubtree:
-		err := exec.RenameSubtree(ctx, fsmeta.RenameSubtreeRequest{
+		err := exec.RenameSubtree(ctx, model.RenameSubtreeRequest{
 			Mount:      op.Mount,
 			FromParent: op.FromParent,
 			FromName:   op.FromName,
@@ -162,7 +162,7 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 		})
 		return Result{Err: err}
 	case OpLink:
-		err := exec.Link(ctx, fsmeta.LinkRequest{
+		err := exec.Link(ctx, model.LinkRequest{
 			Mount:      op.Mount,
 			FromParent: op.FromParent,
 			FromName:   op.FromName,
@@ -171,44 +171,44 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 		})
 		return Result{Err: err}
 	case OpUnlink:
-		err := exec.Unlink(ctx, fsmeta.UnlinkRequest{
+		err := exec.Unlink(ctx, model.UnlinkRequest{
 			Mount:  op.Mount,
 			Parent: op.Parent,
 			Name:   op.Name,
 		})
 		return Result{Err: err}
 	case OpRemove:
-		result, err := exec.Remove(ctx, fsmeta.RemoveRequest{
+		result, err := exec.Remove(ctx, model.RemoveRequest{
 			Mount:  op.Mount,
 			Parent: op.Parent,
 			Name:   op.Name,
 		})
 		return Result{Err: err, Remove: result}
 	case OpOpenWriteSession:
-		session, err := exec.OpenWriteSession(ctx, fsmeta.OpenWriteSessionRequest{
+		session, err := exec.OpenWriteSession(ctx, model.OpenWriteSessionRequest{
 			Mount:   op.Mount,
 			Inode:   op.Inode,
 			Session: op.Session,
-			TTL:     time.Duration(op.ExpiresNs - model.NowUnixNs),
+			TTL:     time.Duration(op.ExpiresNs - state.NowUnixNs),
 		})
 		return Result{Err: err, Session: session}
 	case OpHeartbeatSession:
-		session, err := exec.HeartbeatWriteSession(ctx, fsmeta.HeartbeatWriteSessionRequest{
+		session, err := exec.HeartbeatWriteSession(ctx, model.HeartbeatWriteSessionRequest{
 			Mount:   op.Mount,
 			Inode:   op.Inode,
 			Session: op.Session,
-			TTL:     time.Duration(op.ExpiresNs - model.NowUnixNs),
+			TTL:     time.Duration(op.ExpiresNs - state.NowUnixNs),
 		})
 		return Result{Err: err, Session: session}
 	case OpCloseSession:
-		err := exec.CloseWriteSession(ctx, fsmeta.CloseWriteSessionRequest{
+		err := exec.CloseWriteSession(ctx, model.CloseWriteSessionRequest{
 			Mount:   op.Mount,
 			Inode:   op.Inode,
 			Session: op.Session,
 		})
 		return Result{Err: err}
 	case OpExpireSessions:
-		result, err := exec.ExpireWriteSessions(ctx, fsmeta.ExpireWriteSessionsRequest{
+		result, err := exec.ExpireWriteSessions(ctx, model.ExpireWriteSessionsRequest{
 			Mount: op.Mount,
 			Limit: op.Limit,
 		})
@@ -216,7 +216,7 @@ func execute(ctx context.Context, exec Executor, model *Model, op Operation) Res
 	case OpAdvanceTime:
 		return Result{}
 	default:
-		return Result{Err: fsmeta.ErrInvalidRequest}
+		return Result{Err: model.ErrInvalidRequest}
 	}
 }
 

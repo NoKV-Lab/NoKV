@@ -11,6 +11,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -21,9 +22,9 @@ type QuotaLedger struct {
 }
 
 type quotaSubject struct {
-	mount      fsmeta.MountID
-	mountKeyID fsmeta.MountKeyID
-	scope      fsmeta.InodeID
+	mount      model.MountID
+	mountKeyID model.MountKeyID
+	scope      model.InodeID
 }
 
 type quotaDelta struct {
@@ -58,15 +59,15 @@ func (q *QuotaLedger) AllowVisibleQuota(context.Context, []fsmetaexec.QuotaChang
 
 // ReadQuotaUsage derives local unlimited-quota diagnostics from visible dentries
 // instead of forcing every metadata write to update a mount-wide counter key.
-func (q *QuotaLedger) ReadQuotaUsage(ctx context.Context, runner fsmetaexec.TxnRunner, mount fsmeta.MountIdentity, scope fsmeta.InodeID, version uint64) (fsmeta.UsageRecord, bool, error) {
+func (q *QuotaLedger) ReadQuotaUsage(ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity, scope model.InodeID, version uint64) (model.UsageRecord, bool, error) {
 	if q == nil || runner == nil {
-		return fsmeta.UsageRecord{}, false, nil
+		return model.UsageRecord{}, false, nil
 	}
 	if version == 0 {
 		var err error
 		version, err = runner.ReserveTimestamp(ctx, 1)
 		if err != nil {
-			return fsmeta.UsageRecord{}, true, err
+			return model.UsageRecord{}, true, err
 		}
 	}
 	var (
@@ -79,7 +80,7 @@ func (q *QuotaLedger) ReadQuotaUsage(ctx context.Context, runner fsmetaexec.TxnR
 		prefix, err = fsmeta.EncodeDentryPrefix(mount, scope)
 	}
 	if err != nil {
-		return fsmeta.UsageRecord{}, true, err
+		return model.UsageRecord{}, true, err
 	}
 	usage, err := q.deriveQuotaUsageFromDentries(ctx, runner, mount, prefix, version)
 	return usage, true, err
@@ -101,13 +102,13 @@ func (q *QuotaLedger) Stats() map[string]any {
 	}
 }
 
-func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner fsmetaexec.TxnRunner, mount fsmeta.MountIdentity, prefix []byte, version uint64) (fsmeta.UsageRecord, error) {
-	var usage fsmeta.UsageRecord
+func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity, prefix []byte, version uint64) (model.UsageRecord, error) {
+	var usage model.UsageRecord
 	start := append([]byte(nil), prefix...)
 	for {
 		rows, err := runner.Scan(ctx, start, 256, version)
 		if err != nil {
-			return fsmeta.UsageRecord{}, err
+			return model.UsageRecord{}, err
 		}
 		if len(rows) == 0 {
 			return usage, nil
@@ -122,11 +123,11 @@ func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner f
 			}
 			dentry, err := fsmeta.DecodeDentryValue(row.Value)
 			if err != nil {
-				return fsmeta.UsageRecord{}, err
+				return model.UsageRecord{}, err
 			}
 			inode, ok, err := q.readQuotaInode(ctx, runner, mount, dentry.Inode, version)
 			if err != nil {
-				return fsmeta.UsageRecord{}, err
+				return model.UsageRecord{}, err
 			}
 			if !ok {
 				continue
@@ -138,18 +139,18 @@ func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner f
 	}
 }
 
-func (q *QuotaLedger) readQuotaInode(ctx context.Context, runner fsmetaexec.TxnRunner, mount fsmeta.MountIdentity, inodeID fsmeta.InodeID, version uint64) (fsmeta.InodeRecord, bool, error) {
+func (q *QuotaLedger) readQuotaInode(ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity, inodeID model.InodeID, version uint64) (model.InodeRecord, bool, error) {
 	key, err := fsmeta.EncodeInodeKey(mount, inodeID)
 	if err != nil {
-		return fsmeta.InodeRecord{}, false, err
+		return model.InodeRecord{}, false, err
 	}
 	value, ok, err := runner.Get(ctx, key, version)
 	if err != nil || !ok {
-		return fsmeta.InodeRecord{}, ok, err
+		return model.InodeRecord{}, ok, err
 	}
 	inode, err := fsmeta.DecodeInodeValue(value)
 	if err != nil {
-		return fsmeta.InodeRecord{}, false, err
+		return model.InodeRecord{}, false, err
 	}
 	return inode, true, nil
 }
@@ -164,7 +165,7 @@ func aggregateQuotaChanges(changes []fsmetaexec.QuotaChange) (map[quotaSubject]q
 	out := make(map[quotaSubject]quotaDelta)
 	for _, change := range changes {
 		if change.Mount == "" || change.MountKeyID == 0 {
-			return nil, fsmeta.ErrInvalidMountID
+			return nil, model.ErrInvalidMountID
 		}
 		addQuotaDelta(out, quotaSubject{mount: change.Mount, mountKeyID: change.MountKeyID}, change.Bytes, change.Inodes)
 		if change.Scope != 0 {

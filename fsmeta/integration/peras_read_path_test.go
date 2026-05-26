@@ -19,6 +19,7 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	"github.com/stretchr/testify/require"
 )
@@ -56,58 +57,58 @@ func TestPerasVisibleReadPathBypassesPersistentCachesOnRealCluster(t *testing.T)
 	)
 	executor := runtime.executor
 
-	created, err := executor.Create(ctx, fsmeta.CreateRequest{
+	created, err := executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "visible",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 4096, Mode: 0o644},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 4096, Mode: 0o644},
 	})
 	require.NoError(t, err)
 
-	key, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, fsmeta.RootInode, "visible")
+	key, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, model.RootInode, "visible")
 	require.NoError(t, err)
 	negatives.Remember(key)
-	lookedUp, err := executor.Lookup(ctx, fsmeta.LookupRequest{
+	lookedUp, err := executor.Lookup(ctx, model.LookupRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "visible",
 	})
 	require.NoError(t, err)
 	require.Equal(t, created.Dentry, lookedUp)
 	require.False(t, negatives.Has(key), "visible overlay hit must evict stale negative memo")
 
-	session, err := executor.OpenWriteSession(ctx, fsmeta.OpenWriteSessionRequest{
+	session, err := executor.OpenWriteSession(ctx, model.OpenWriteSessionRequest{
 		Mount:   "vol",
 		Inode:   created.Inode.Inode,
 		Session: "visible-writer",
 		TTL:     time.Minute,
 	})
 	require.NoError(t, err)
-	_, err = executor.HeartbeatWriteSession(ctx, fsmeta.HeartbeatWriteSessionRequest{
+	_, err = executor.HeartbeatWriteSession(ctx, model.HeartbeatWriteSessionRequest{
 		Mount:   "vol",
 		Inode:   created.Inode.Inode,
 		Session: session.Session,
 		TTL:     time.Minute,
 	})
 	require.NoError(t, err)
-	require.NoError(t, executor.CloseWriteSession(ctx, fsmeta.CloseWriteSessionRequest{
+	require.NoError(t, executor.CloseWriteSession(ctx, model.CloseWriteSessionRequest{
 		Mount:   "vol",
 		Inode:   created.Inode.Inode,
 		Session: session.Session,
 	}))
 
-	first, err := executor.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	first, err := executor.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []fsmeta.DentryAttrPair{{Dentry: created.Dentry, Inode: created.Inode}}, first)
+	require.Equal(t, []model.DentryAttrPair{{Dentry: created.Dentry, Inode: created.Inode}}, first)
 	require.Equal(t, uint64(0), dirPages.Stats().StoreOK)
 
-	second, err := executor.ReadDirPlus(ctx, fsmeta.ReadDirRequest{
+	second, err := executor.ReadDirPlus(ctx, model.ReadDirRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Limit:  8,
 	})
 	require.NoError(t, err)

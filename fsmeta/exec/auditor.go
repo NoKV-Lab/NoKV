@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 const defaultAuditBatchSize uint32 = 256
@@ -34,8 +35,8 @@ const (
 type AuditIssue struct {
 	Kind   AuditIssueKind
 	Key    []byte
-	Inode  fsmeta.InodeID
-	Parent fsmeta.InodeID
+	Inode  model.InodeID
+	Parent model.InodeID
 	Name   string
 	Detail string
 }
@@ -43,8 +44,8 @@ type AuditIssue struct {
 // AuditOptions bounds one online fsmeta scrub pass.
 type AuditOptions struct {
 	// RootInode is skipped when checking "inode must have a dentry reference".
-	// Zero uses fsmeta.RootInode.
-	RootInode fsmeta.InodeID
+	// Zero uses model.RootInode.
+	RootInode model.InodeID
 	// BatchSize is the number of KVs requested per scan. Zero uses the default.
 	BatchSize uint32
 	// MaxIssues stops recording after this many issues. Zero means unlimited.
@@ -53,7 +54,7 @@ type AuditOptions struct {
 
 // AuditReport summarizes one read-only namespace scrub pass.
 type AuditReport struct {
-	Mount       fsmeta.MountID
+	Mount       model.MountID
 	ReadVersion uint64
 	Inodes      uint64
 	Dentries    uint64
@@ -66,7 +67,7 @@ func (r AuditReport) OK() bool {
 
 // AuditMount scans one mount at a stable read version and checks namespace
 // invariants that must hold after every committed fsmeta mutation.
-func (e *Executor) AuditMount(ctx context.Context, mount fsmeta.MountID, readVersion uint64, opt AuditOptions) (AuditReport, error) {
+func (e *Executor) AuditMount(ctx context.Context, mount model.MountID, readVersion uint64, opt AuditOptions) (AuditReport, error) {
 	if e == nil || e.runner == nil {
 		return AuditReport{}, errAuditorRunnerRequired
 	}
@@ -82,7 +83,7 @@ func (e *Executor) AuditMount(ctx context.Context, mount fsmeta.MountID, readVer
 	}
 	rootInode := opt.RootInode
 	if rootInode == 0 {
-		rootInode = fsmeta.RootInode
+		rootInode = model.RootInode
 	}
 	batchSize := opt.BatchSize
 	if batchSize == 0 {
@@ -99,9 +100,9 @@ func (e *Executor) AuditMount(ctx context.Context, mount fsmeta.MountID, readVer
 	}
 
 	report := AuditReport{Mount: mount, ReadVersion: readVersion}
-	inodes := make(map[fsmeta.InodeID]fsmeta.InodeRecord)
-	dentries := make([]fsmeta.DentryRecord, 0)
-	refs := make(map[fsmeta.InodeID]uint32)
+	inodes := make(map[model.InodeID]model.InodeRecord)
+	dentries := make([]model.DentryRecord, 0)
+	refs := make(map[model.InodeID]uint32)
 	addIssue := func(issue AuditIssue) bool {
 		if opt.MaxIssues > 0 && len(report.Issues) >= opt.MaxIssues {
 			report.Issues = append(report.Issues, AuditIssue{Kind: AuditIssueLimitExhausted, Detail: "issue limit reached"})
@@ -183,7 +184,7 @@ func (e *Executor) AuditMount(ctx context.Context, mount fsmeta.MountID, readVer
 	return report, nil
 }
 
-func finishAuditReport(inodes map[fsmeta.InodeID]fsmeta.InodeRecord, dentries []fsmeta.DentryRecord, refs map[fsmeta.InodeID]uint32, rootInode fsmeta.InodeID, addIssue func(AuditIssue) bool) {
+func finishAuditReport(inodes map[model.InodeID]model.InodeRecord, dentries []model.DentryRecord, refs map[model.InodeID]uint32, rootInode model.InodeID, addIssue func(AuditIssue) bool) {
 	if _, ok := inodes[rootInode]; !ok {
 		if !addIssue(AuditIssue{Kind: AuditRootMissing, Inode: rootInode}) {
 			return

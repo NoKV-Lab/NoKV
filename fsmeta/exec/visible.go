@@ -6,8 +6,8 @@ package exec
 import (
 	"context"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -112,7 +112,7 @@ type InstalledVisibleSnapshotCapturer interface {
 // an authority flush. Runtimes return captured=false when the snapshot cannot be
 // made durable at the visible boundary.
 type VisibleSnapshotCapturer interface {
-	CaptureVisibleSnapshot(context.Context, uint64, compile.AuthorityScope) (fsmeta.VisibleSnapshotCapture, bool, error)
+	CaptureVisibleSnapshot(context.Context, uint64, compile.AuthorityScope) (model.VisibleSnapshotCapture, bool, error)
 }
 
 // VisibleSnapshotOverlayReader serves a captured runtime overlay for a snapshot
@@ -141,10 +141,10 @@ type VisibleAuthorityDrainer interface {
 
 type VisiblePredicateIndex interface {
 	KeyState(key []byte) (present bool, known bool)
-	DirectoryEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool
-	DirectoryBaseEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool
-	SessionNamespaceEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool
+	DirectoryEmpty(mount model.MountIdentity, inode model.InodeID) bool
+	DirectoryBaseEmpty(mount model.MountIdentity, inode model.InodeID) bool
+	SessionNamespaceEmpty(mount model.MountIdentity, inode model.InodeID) bool
 	RememberKey(key []byte, present bool)
-	RememberEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID)
-	RememberEmptySessionNamespace(mount fsmeta.MountIdentity, inode fsmeta.InodeID)
+	RememberEmptyDirectory(mount model.MountIdentity, inode model.InodeID)
+	RememberEmptySessionNamespace(mount model.MountIdentity, inode model.InodeID)
 }

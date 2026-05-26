@@ -5,10 +5,11 @@ package client
 
 import (
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 )
 
-func createRequestToProto(req fsmeta.CreateRequest) *fsmetapb.CreateRequest {
+func createRequestToProto(req model.CreateRequest) *fsmetapb.CreateRequest {
 	return &fsmetapb.CreateRequest{
 		Mount:  string(req.Mount),
 		Parent: uint64(req.Parent),
@@ -17,7 +18,7 @@ func createRequestToProto(req fsmeta.CreateRequest) *fsmetapb.CreateRequest {
 	}
 }
 
-func createAttrsToProto(attrs fsmeta.CreateAttrs) *fsmetapb.CreateInodeAttrs {
+func createAttrsToProto(attrs model.CreateAttrs) *fsmetapb.CreateInodeAttrs {
 	return &fsmetapb.CreateInodeAttrs{
 		Type:          inodeTypeToProto(attrs.Type),
 		Size:          attrs.Size,
@@ -28,7 +29,7 @@ func createAttrsToProto(attrs fsmeta.CreateAttrs) *fsmetapb.CreateInodeAttrs {
 	}
 }
 
-func updateInodeRequestToProto(req fsmeta.UpdateInodeRequest) *fsmetapb.UpdateInodeRequest {
+func updateInodeRequestToProto(req model.UpdateInodeRequest) *fsmetapb.UpdateInodeRequest {
 	return &fsmetapb.UpdateInodeRequest{
 		Mount:            string(req.Mount),
 		Parent:           uint64(req.Parent),
@@ -45,7 +46,7 @@ func updateInodeRequestToProto(req fsmeta.UpdateInodeRequest) *fsmetapb.UpdateIn
 	}
 }
 
-func lookupRequestToProto(req fsmeta.LookupRequest) *fsmetapb.LookupRequest {
+func lookupRequestToProto(req model.LookupRequest) *fsmetapb.LookupRequest {
 	return &fsmetapb.LookupRequest{
 		Mount:  string(req.Mount),
 		Parent: uint64(req.Parent),
@@ -53,7 +54,7 @@ func lookupRequestToProto(req fsmeta.LookupRequest) *fsmetapb.LookupRequest {
 	}
 }
 
-func readDirRequestToProto(req fsmeta.ReadDirRequest) *fsmetapb.ReadDirRequest {
+func readDirRequestToProto(req model.ReadDirRequest) *fsmetapb.ReadDirRequest {
 	return &fsmetapb.ReadDirRequest{
 		Mount:           string(req.Mount),
 		Parent:          uint64(req.Parent),
@@ -63,30 +64,30 @@ func readDirRequestToProto(req fsmeta.ReadDirRequest) *fsmetapb.ReadDirRequest {
 	}
 }
 
-func getReadVersionRequestToProto(req fsmeta.ReadVersionRequest) *fsmetapb.GetReadVersionRequest {
+func getReadVersionRequestToProto(req model.ReadVersionRequest) *fsmetapb.GetReadVersionRequest {
 	return &fsmetapb.GetReadVersionRequest{Mount: string(req.Mount)}
 }
 
-func snapshotSubtreeRequestToProto(req fsmeta.SnapshotSubtreeRequest) *fsmetapb.SnapshotSubtreeRequest {
+func snapshotSubtreeRequestToProto(req model.SnapshotSubtreeRequest) *fsmetapb.SnapshotSubtreeRequest {
 	return &fsmetapb.SnapshotSubtreeRequest{
 		Mount:     string(req.Mount),
 		RootInode: uint64(req.RootInode),
 	}
 }
 
-func snapshotSubtreeTokenFromProto(resp *fsmetapb.SnapshotSubtreeResponse) fsmeta.SnapshotSubtreeToken {
+func snapshotSubtreeTokenFromProto(resp *fsmetapb.SnapshotSubtreeResponse) model.SnapshotSubtreeToken {
 	if resp == nil {
-		return fsmeta.SnapshotSubtreeToken{}
+		return model.SnapshotSubtreeToken{}
 	}
-	return fsmeta.SnapshotSubtreeToken{
-		Mount:           fsmeta.MountID(resp.GetMount()),
-		RootInode:       fsmeta.InodeID(resp.GetRootInode()),
+	return model.SnapshotSubtreeToken{
+		Mount:           model.MountID(resp.GetMount()),
+		RootInode:       model.InodeID(resp.GetRootInode()),
 		ReadVersion:     resp.GetReadVersion(),
 		RuntimeEvidence: snapshotEvidenceRefsFromProto(resp.GetRuntimeEvidence()),
 	}
 }
 
-func retireSnapshotSubtreeRequestToProto(token fsmeta.SnapshotSubtreeToken) *fsmetapb.RetireSnapshotSubtreeRequest {
+func retireSnapshotSubtreeRequestToProto(token model.SnapshotSubtreeToken) *fsmetapb.RetireSnapshotSubtreeRequest {
 	return &fsmetapb.RetireSnapshotSubtreeRequest{
 		Mount:           string(token.Mount),
 		RootInode:       uint64(token.RootInode),
@@ -95,7 +96,7 @@ func retireSnapshotSubtreeRequestToProto(token fsmeta.SnapshotSubtreeToken) *fsm
 	}
 }
 
-func snapshotEvidenceRefsToProto(refs []fsmeta.SnapshotEvidenceRef) []*fsmetapb.SnapshotEvidenceRef {
+func snapshotEvidenceRefsToProto(refs []model.SnapshotEvidenceRef) []*fsmetapb.SnapshotEvidenceRef {
 	if len(refs) == 0 {
 		return nil
 	}
@@ -110,16 +111,16 @@ func snapshotEvidenceRefsToProto(refs []fsmeta.SnapshotEvidenceRef) []*fsmetapb.
 	return out
 }
 
-func snapshotEvidenceRefsFromProto(refs []*fsmetapb.SnapshotEvidenceRef) []fsmeta.SnapshotEvidenceRef {
+func snapshotEvidenceRefsFromProto(refs []*fsmetapb.SnapshotEvidenceRef) []model.SnapshotEvidenceRef {
 	if len(refs) == 0 {
 		return nil
 	}
-	out := make([]fsmeta.SnapshotEvidenceRef, 0, len(refs))
+	out := make([]model.SnapshotEvidenceRef, 0, len(refs))
 	for _, ref := range refs {
 		if ref == nil {
 			continue
 		}
-		var parsed fsmeta.SnapshotEvidenceRef
+		var parsed model.SnapshotEvidenceRef
 		parsed.EpochID = ref.GetEpochId()
 		copy(parsed.EvidenceRoot[:], ref.GetEvidenceRoot())
 		copy(parsed.PayloadDigest[:], ref.GetPayloadDigest())
@@ -131,21 +132,21 @@ func snapshotEvidenceRefsFromProto(refs []*fsmetapb.SnapshotEvidenceRef) []fsmet
 	return out
 }
 
-func quotaUsageRequestToProto(req fsmeta.QuotaUsageRequest) *fsmetapb.QuotaUsageRequest {
+func quotaUsageRequestToProto(req model.QuotaUsageRequest) *fsmetapb.QuotaUsageRequest {
 	return &fsmetapb.QuotaUsageRequest{
 		Mount: string(req.Mount),
 		Scope: uint64(req.Scope),
 	}
 }
 
-func quotaUsageFromProto(resp *fsmetapb.QuotaUsageResponse) fsmeta.UsageRecord {
+func quotaUsageFromProto(resp *fsmetapb.QuotaUsageResponse) model.UsageRecord {
 	if resp == nil {
-		return fsmeta.UsageRecord{}
+		return model.UsageRecord{}
 	}
-	return fsmeta.UsageRecord{Bytes: resp.GetBytes(), Inodes: resp.GetInodes()}
+	return model.UsageRecord{Bytes: resp.GetBytes(), Inodes: resp.GetInodes()}
 }
 
-func renameRequestToProto(req fsmeta.RenameRequest) *fsmetapb.RenameRequest {
+func renameRequestToProto(req model.RenameRequest) *fsmetapb.RenameRequest {
 	return &fsmetapb.RenameRequest{
 		Mount:      string(req.Mount),
 		FromParent: uint64(req.FromParent),
@@ -155,7 +156,7 @@ func renameRequestToProto(req fsmeta.RenameRequest) *fsmetapb.RenameRequest {
 	}
 }
 
-func renameReplaceRequestToProto(req fsmeta.RenameReplaceRequest) *fsmetapb.RenameReplaceRequest {
+func renameReplaceRequestToProto(req model.RenameReplaceRequest) *fsmetapb.RenameReplaceRequest {
 	return &fsmetapb.RenameReplaceRequest{
 		Mount:      string(req.Mount),
 		FromParent: uint64(req.FromParent),
@@ -165,11 +166,11 @@ func renameReplaceRequestToProto(req fsmeta.RenameReplaceRequest) *fsmetapb.Rena
 	}
 }
 
-func renameReplaceResultFromProto(resp *fsmetapb.RenameReplaceResponse) fsmeta.RenameReplaceResult {
+func renameReplaceResultFromProto(resp *fsmetapb.RenameReplaceResponse) model.RenameReplaceResult {
 	if resp == nil {
-		return fsmeta.RenameReplaceResult{}
+		return model.RenameReplaceResult{}
 	}
-	return fsmeta.RenameReplaceResult{
+	return model.RenameReplaceResult{
 		Replaced:        resp.GetReplaced(),
 		OldDentry:       dentryFromProto(resp.GetOldDentry()),
 		OldInode:        inodeFromProto(resp.GetOldInode()),
@@ -177,7 +178,7 @@ func renameReplaceResultFromProto(resp *fsmetapb.RenameReplaceResponse) fsmeta.R
 	}
 }
 
-func renameSubtreeRequestToProto(req fsmeta.RenameSubtreeRequest) *fsmetapb.RenameSubtreeRequest {
+func renameSubtreeRequestToProto(req model.RenameSubtreeRequest) *fsmetapb.RenameSubtreeRequest {
 	return &fsmetapb.RenameSubtreeRequest{
 		Mount:      string(req.Mount),
 		FromParent: uint64(req.FromParent),
@@ -187,7 +188,7 @@ func renameSubtreeRequestToProto(req fsmeta.RenameSubtreeRequest) *fsmetapb.Rena
 	}
 }
 
-func linkRequestToProto(req fsmeta.LinkRequest) *fsmetapb.LinkRequest {
+func linkRequestToProto(req model.LinkRequest) *fsmetapb.LinkRequest {
 	return &fsmetapb.LinkRequest{
 		Mount:      string(req.Mount),
 		FromParent: uint64(req.FromParent),
@@ -197,7 +198,7 @@ func linkRequestToProto(req fsmeta.LinkRequest) *fsmetapb.LinkRequest {
 	}
 }
 
-func unlinkRequestToProto(req fsmeta.UnlinkRequest) *fsmetapb.UnlinkRequest {
+func unlinkRequestToProto(req model.UnlinkRequest) *fsmetapb.UnlinkRequest {
 	return &fsmetapb.UnlinkRequest{
 		Mount:  string(req.Mount),
 		Parent: uint64(req.Parent),
@@ -205,7 +206,7 @@ func unlinkRequestToProto(req fsmeta.UnlinkRequest) *fsmetapb.UnlinkRequest {
 	}
 }
 
-func removeRequestToProto(req fsmeta.RemoveRequest) *fsmetapb.RemoveRequest {
+func removeRequestToProto(req model.RemoveRequest) *fsmetapb.RemoveRequest {
 	return &fsmetapb.RemoveRequest{
 		Mount:  string(req.Mount),
 		Parent: uint64(req.Parent),
@@ -213,18 +214,18 @@ func removeRequestToProto(req fsmeta.RemoveRequest) *fsmetapb.RemoveRequest {
 	}
 }
 
-func removeResultFromProto(resp *fsmetapb.RemoveResponse) fsmeta.RemoveResult {
+func removeResultFromProto(resp *fsmetapb.RemoveResponse) model.RemoveResult {
 	if resp == nil {
-		return fsmeta.RemoveResult{}
+		return model.RemoveResult{}
 	}
-	return fsmeta.RemoveResult{
+	return model.RemoveResult{
 		RemovedDentry: dentryFromProto(resp.GetRemovedDentry()),
 		OldInode:      inodeFromProto(resp.GetOldInode()),
 		InodeDeleted:  resp.GetInodeDeleted(),
 	}
 }
 
-func removeDirectoryRequestToProto(req fsmeta.RemoveDirectoryRequest) *fsmetapb.RemoveDirectoryRequest {
+func removeDirectoryRequestToProto(req model.RemoveDirectoryRequest) *fsmetapb.RemoveDirectoryRequest {
 	return &fsmetapb.RemoveDirectoryRequest{
 		Mount:  string(req.Mount),
 		Parent: uint64(req.Parent),
@@ -232,7 +233,7 @@ func removeDirectoryRequestToProto(req fsmeta.RemoveDirectoryRequest) *fsmetapb.
 	}
 }
 
-func openWriteSessionRequestToProto(req fsmeta.OpenWriteSessionRequest) *fsmetapb.OpenWriteSessionRequest {
+func openWriteSessionRequestToProto(req model.OpenWriteSessionRequest) *fsmetapb.OpenWriteSessionRequest {
 	return &fsmetapb.OpenWriteSessionRequest{
 		Mount:   string(req.Mount),
 		Inode:   uint64(req.Inode),
@@ -241,7 +242,7 @@ func openWriteSessionRequestToProto(req fsmeta.OpenWriteSessionRequest) *fsmetap
 	}
 }
 
-func heartbeatWriteSessionRequestToProto(req fsmeta.HeartbeatWriteSessionRequest) *fsmetapb.HeartbeatWriteSessionRequest {
+func heartbeatWriteSessionRequestToProto(req model.HeartbeatWriteSessionRequest) *fsmetapb.HeartbeatWriteSessionRequest {
 	return &fsmetapb.HeartbeatWriteSessionRequest{
 		Mount:   string(req.Mount),
 		Inode:   uint64(req.Inode),
@@ -250,7 +251,7 @@ func heartbeatWriteSessionRequestToProto(req fsmeta.HeartbeatWriteSessionRequest
 	}
 }
 
-func closeWriteSessionRequestToProto(req fsmeta.CloseWriteSessionRequest) *fsmetapb.CloseWriteSessionRequest {
+func closeWriteSessionRequestToProto(req model.CloseWriteSessionRequest) *fsmetapb.CloseWriteSessionRequest {
 	return &fsmetapb.CloseWriteSessionRequest{
 		Mount:   string(req.Mount),
 		Session: string(req.Session),
@@ -258,31 +259,31 @@ func closeWriteSessionRequestToProto(req fsmeta.CloseWriteSessionRequest) *fsmet
 	}
 }
 
-func expireWriteSessionsRequestToProto(req fsmeta.ExpireWriteSessionsRequest) *fsmetapb.ExpireWriteSessionsRequest {
+func expireWriteSessionsRequestToProto(req model.ExpireWriteSessionsRequest) *fsmetapb.ExpireWriteSessionsRequest {
 	return &fsmetapb.ExpireWriteSessionsRequest{
 		Mount: string(req.Mount),
 		Limit: req.Limit,
 	}
 }
 
-func dentryFromProto(pb *fsmetapb.DentryRecord) fsmeta.DentryRecord {
+func dentryFromProto(pb *fsmetapb.DentryRecord) model.DentryRecord {
 	if pb == nil {
-		return fsmeta.DentryRecord{}
+		return model.DentryRecord{}
 	}
-	return fsmeta.DentryRecord{
-		Parent: fsmeta.InodeID(pb.GetParent()),
+	return model.DentryRecord{
+		Parent: model.InodeID(pb.GetParent()),
 		Name:   pb.GetName(),
-		Inode:  fsmeta.InodeID(pb.GetInode()),
+		Inode:  model.InodeID(pb.GetInode()),
 		Type:   inodeTypeFromProto(pb.GetType()),
 	}
 }
 
-func inodeFromProto(pb *fsmetapb.InodeRecord) fsmeta.InodeRecord {
+func inodeFromProto(pb *fsmetapb.InodeRecord) model.InodeRecord {
 	if pb == nil {
-		return fsmeta.InodeRecord{}
+		return model.InodeRecord{}
 	}
-	return fsmeta.InodeRecord{
-		Inode:         fsmeta.InodeID(pb.GetInode()),
+	return model.InodeRecord{
+		Inode:         model.InodeID(pb.GetInode()),
 		Type:          inodeTypeFromProto(pb.GetType()),
 		Size:          pb.GetSize(),
 		Mode:          pb.GetMode(),
@@ -294,22 +295,22 @@ func inodeFromProto(pb *fsmetapb.InodeRecord) fsmeta.InodeRecord {
 	}
 }
 
-func sessionFromProto(pb *fsmetapb.SessionRecord) fsmeta.SessionRecord {
+func sessionFromProto(pb *fsmetapb.SessionRecord) model.SessionRecord {
 	if pb == nil {
-		return fsmeta.SessionRecord{}
+		return model.SessionRecord{}
 	}
-	return fsmeta.SessionRecord{
-		Session:       fsmeta.SessionID(pb.GetSession()),
-		Inode:         fsmeta.InodeID(pb.GetInode()),
+	return model.SessionRecord{
+		Session:       model.SessionID(pb.GetSession()),
+		Inode:         model.InodeID(pb.GetInode()),
 		ExpiresUnixNs: pb.GetExpiresUnixNs(),
 	}
 }
 
-func pairFromProto(pb *fsmetapb.DentryAttrPair) fsmeta.DentryAttrPair {
+func pairFromProto(pb *fsmetapb.DentryAttrPair) model.DentryAttrPair {
 	if pb == nil {
-		return fsmeta.DentryAttrPair{}
+		return model.DentryAttrPair{}
 	}
-	return fsmeta.DentryAttrPair{
+	return model.DentryAttrPair{
 		Dentry: dentryFromProto(pb.GetDentry()),
 		Inode:  inodeFromProto(pb.GetInode()),
 	}
@@ -370,22 +371,22 @@ func watchEventSourceFromProto(source fsmetapb.WatchEventSource) fsmeta.WatchEve
 	}
 }
 
-func inodeTypeFromProto(typ fsmetapb.InodeType) fsmeta.InodeType {
+func inodeTypeFromProto(typ fsmetapb.InodeType) model.InodeType {
 	switch typ {
 	case fsmetapb.InodeType_INODE_TYPE_FILE:
-		return fsmeta.InodeTypeFile
+		return model.InodeTypeFile
 	case fsmetapb.InodeType_INODE_TYPE_DIRECTORY:
-		return fsmeta.InodeTypeDirectory
+		return model.InodeTypeDirectory
 	default:
 		return ""
 	}
 }
 
-func inodeTypeToProto(typ fsmeta.InodeType) fsmetapb.InodeType {
+func inodeTypeToProto(typ model.InodeType) fsmetapb.InodeType {
 	switch typ {
-	case fsmeta.InodeTypeFile:
+	case model.InodeTypeFile:
 		return fsmetapb.InodeType_INODE_TYPE_FILE
-	case fsmeta.InodeTypeDirectory:
+	case model.InodeTypeDirectory:
 		return fsmetapb.InodeType_INODE_TYPE_DIRECTORY
 	default:
 		return fsmetapb.InodeType_INODE_TYPE_UNSPECIFIED

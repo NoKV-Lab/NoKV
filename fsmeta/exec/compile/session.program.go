@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -43,9 +44,9 @@ type CloseWriteSessionValues struct {
 	PredicateProofs []proof.PredicateProof
 }
 
-func CompileOpenWriteSessionProgram(req fsmeta.OpenWriteSessionRequest, mount fsmeta.MountIdentity) (OpenWriteSessionProgram, error) {
+func CompileOpenWriteSessionProgram(req model.OpenWriteSessionRequest, mount model.MountIdentity) (OpenWriteSessionProgram, error) {
 	if req.TTL <= 0 {
-		return OpenWriteSessionProgram{}, fsmeta.ErrInvalidRequest
+		return OpenWriteSessionProgram{}, model.ErrInvalidRequest
 	}
 	plan, err := fsmeta.PlanOpenWriteSession(req, mount)
 	if err != nil {
@@ -61,10 +62,10 @@ func CompileOpenWriteSessionProgram(req fsmeta.OpenWriteSessionRequest, mount fs
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[0]},
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[1]},
 	}
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, nil, []fsmeta.InodeID{req.Inode}), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, nil, []model.InodeID{req.Inode}), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	delta.RuntimeGuards = append(delta.RuntimeGuards, GuardNonDirectoryInode, GuardExpiredSessionOwner)
 	if !validateOpenWriteSessionSemanticDelta(delta) {
-		return OpenWriteSessionProgram{}, fsmeta.ErrInvalidRequest
+		return OpenWriteSessionProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileOpenWriteSessionCompiledOp(delta)
 	if err != nil {
@@ -73,9 +74,9 @@ func CompileOpenWriteSessionProgram(req fsmeta.OpenWriteSessionRequest, mount fs
 	return OpenWriteSessionProgram{Compiled: compiled}, nil
 }
 
-func CompileHeartbeatWriteSessionProgram(req fsmeta.HeartbeatWriteSessionRequest, mount fsmeta.MountIdentity) (HeartbeatWriteSessionProgram, error) {
+func CompileHeartbeatWriteSessionProgram(req model.HeartbeatWriteSessionRequest, mount model.MountIdentity) (HeartbeatWriteSessionProgram, error) {
 	if req.TTL <= 0 {
-		return HeartbeatWriteSessionProgram{}, fsmeta.ErrInvalidRequest
+		return HeartbeatWriteSessionProgram{}, model.ErrInvalidRequest
 	}
 	plan, err := fsmeta.PlanHeartbeatWriteSession(req, mount)
 	if err != nil {
@@ -90,10 +91,10 @@ func CompileHeartbeatWriteSessionProgram(req fsmeta.HeartbeatWriteSessionRequest
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[0]},
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[1]},
 	}
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, nil, []fsmeta.InodeID{req.Inode}), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, nil, []model.InodeID{req.Inode}), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	delta.RuntimeGuards = append(delta.RuntimeGuards, GuardLiveSession)
 	if !validateHeartbeatWriteSessionSemanticDelta(delta) {
-		return HeartbeatWriteSessionProgram{}, fsmeta.ErrInvalidRequest
+		return HeartbeatWriteSessionProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileHeartbeatWriteSessionCompiledOp(delta)
 	if err != nil {
@@ -102,7 +103,7 @@ func CompileHeartbeatWriteSessionProgram(req fsmeta.HeartbeatWriteSessionRequest
 	return HeartbeatWriteSessionProgram{Compiled: compiled}, nil
 }
 
-func CompileCloseWriteSessionProgram(req fsmeta.CloseWriteSessionRequest, mount fsmeta.MountIdentity) (CloseWriteSessionProgram, error) {
+func CompileCloseWriteSessionProgram(req model.CloseWriteSessionRequest, mount model.MountIdentity) (CloseWriteSessionProgram, error) {
 	plan, err := fsmeta.PlanCloseWriteSession(req, mount)
 	if err != nil {
 		return CloseWriteSessionProgram{}, err
@@ -120,10 +121,10 @@ func CompileCloseWriteSessionProgram(req fsmeta.CloseWriteSessionRequest, mount 
 		{Kind: EffectDelete, Key: plan.MutateKeys[0]},
 		{Kind: EffectDerivedDelete, Key: ownerKey},
 	}
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, nil, []fsmeta.InodeID{req.Inode}), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, nil, []model.InodeID{req.Inode}), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	delta.RuntimeGuards = append(delta.RuntimeGuards, GuardLiveSession)
 	if !validateCloseWriteSessionSemanticDelta(delta) {
-		return CloseWriteSessionProgram{}, fsmeta.ErrInvalidRequest
+		return CloseWriteSessionProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileCloseWriteSessionCompiledOp(delta)
 	if err != nil {
@@ -132,7 +133,7 @@ func CompileCloseWriteSessionProgram(req fsmeta.CloseWriteSessionRequest, mount 
 	return CloseWriteSessionProgram{Compiled: compiled}, nil
 }
 
-func CompileExpireWriteSessionsProgram(req fsmeta.ExpireWriteSessionsRequest, mount fsmeta.MountIdentity) (ExpireWriteSessionsProgram, error) {
+func CompileExpireWriteSessionsProgram(req model.ExpireWriteSessionsRequest, mount model.MountIdentity) (ExpireWriteSessionsProgram, error) {
 	plan, err := fsmeta.PlanExpireWriteSessions(req, mount)
 	if err != nil {
 		return ExpireWriteSessionsProgram{}, err
@@ -145,7 +146,7 @@ func CompileExpireWriteSessionsProgram(req fsmeta.ExpireWriteSessionsRequest, mo
 	effects := []WriteEffect(nil)
 	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, nil, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonMaintenanceScan}
 	if !validateExpireWriteSessionsSemanticDelta(delta) {
-		return ExpireWriteSessionsProgram{}, fsmeta.ErrInvalidRequest
+		return ExpireWriteSessionsProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileExpireWriteSessionsCompiledOp(delta)
 	if err != nil {
@@ -155,7 +156,7 @@ func CompileExpireWriteSessionsProgram(req fsmeta.ExpireWriteSessionsRequest, mo
 }
 
 func validateOpenWriteSessionSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationOpenWriteSession {
+	if delta.Kind != model.OperationOpenWriteSession {
 		return false
 	}
 	switch {
@@ -230,7 +231,7 @@ func validateOpenWriteSessionSemanticDelta(delta SemanticDelta) bool {
 }
 
 func validateHeartbeatWriteSessionSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationHeartbeatSession {
+	if delta.Kind != model.OperationHeartbeatSession {
 		return false
 	}
 	switch {
@@ -296,7 +297,7 @@ func validateHeartbeatWriteSessionSemanticDelta(delta SemanticDelta) bool {
 }
 
 func validateCloseWriteSessionSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationCloseSession {
+	if delta.Kind != model.OperationCloseSession {
 		return false
 	}
 	switch {
@@ -362,7 +363,7 @@ func validateCloseWriteSessionSemanticDelta(delta SemanticDelta) bool {
 }
 
 func validateExpireWriteSessionsSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationExpireSessions {
+	if delta.Kind != model.OperationExpireSessions {
 		return false
 	}
 	switch {
@@ -409,15 +410,15 @@ func validateExpireWriteSessionsSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileOpenWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationOpenWriteSession || len(delta.ReadPredicates) != 3 || len(delta.WriteEffects) != 2 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationOpenWriteSession || len(delta.ReadPredicates) != 3 || len(delta.WriteEffects) != 2 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
@@ -618,15 +619,15 @@ placementDone:
 }
 
 func compileHeartbeatWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationHeartbeatSession || len(delta.ReadPredicates) != 2 || len(delta.WriteEffects) != 2 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationHeartbeatSession || len(delta.ReadPredicates) != 2 || len(delta.WriteEffects) != 2 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
@@ -827,15 +828,15 @@ placementDone:
 }
 
 func compileCloseWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationCloseSession || len(delta.ReadPredicates) != 2 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationCloseSession || len(delta.ReadPredicates) != 2 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityNeedsCloseSession
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
@@ -1036,15 +1037,15 @@ placementDone:
 }
 
 func compileExpireWriteSessionsCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationExpireSessions || len(delta.WriteEffects) != 0 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationExpireSessions || len(delta.WriteEffects) != 0 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
@@ -1246,8 +1247,8 @@ placementDone:
 
 func MaterializeOpenWriteSession(program OpenWriteSessionProgram, values OpenWriteSessionValues) (MaterializedOp, error) {
 	compiled := program.Compiled
-	if compiled.Delta.Kind != fsmeta.OperationOpenWriteSession || len(compiled.Delta.WriteEffects) != 2 || values.SessionValue == nil {
-		return MaterializedOp{}, fsmeta.ErrInvalidRequest
+	if compiled.Delta.Kind != model.OperationOpenWriteSession || len(compiled.Delta.WriteEffects) != 2 || values.SessionValue == nil {
+		return MaterializedOp{}, model.ErrInvalidRequest
 	}
 	effects := []WriteEffect{
 		{Kind: EffectPut, Key: compiled.Delta.WriteEffects[0].Key, Value: values.SessionValue},
@@ -1260,8 +1261,8 @@ func MaterializeOpenWriteSession(program OpenWriteSessionProgram, values OpenWri
 
 func MaterializeHeartbeatWriteSession(program HeartbeatWriteSessionProgram, values HeartbeatWriteSessionValues) (MaterializedOp, error) {
 	compiled := program.Compiled
-	if compiled.Delta.Kind != fsmeta.OperationHeartbeatSession || len(compiled.Delta.WriteEffects) != 2 || values.SessionValue == nil {
-		return MaterializedOp{}, fsmeta.ErrInvalidRequest
+	if compiled.Delta.Kind != model.OperationHeartbeatSession || len(compiled.Delta.WriteEffects) != 2 || values.SessionValue == nil {
+		return MaterializedOp{}, model.ErrInvalidRequest
 	}
 	effects := []WriteEffect{
 		{Kind: EffectPut, Key: compiled.Delta.WriteEffects[0].Key, Value: values.SessionValue},
@@ -1274,8 +1275,8 @@ func MaterializeHeartbeatWriteSession(program HeartbeatWriteSessionProgram, valu
 
 func MaterializeCloseWriteSession(program CloseWriteSessionProgram, values CloseWriteSessionValues) (MaterializedOp, error) {
 	compiled := program.Compiled
-	if compiled.Delta.Kind != fsmeta.OperationCloseSession || len(compiled.Delta.WriteEffects) != 2 {
-		return MaterializedOp{}, fsmeta.ErrInvalidRequest
+	if compiled.Delta.Kind != model.OperationCloseSession || len(compiled.Delta.WriteEffects) != 2 {
+		return MaterializedOp{}, model.ErrInvalidRequest
 	}
 	effects := []WriteEffect{{Kind: EffectDelete, Key: compiled.Delta.WriteEffects[0].Key}}
 	if values.DeleteOwner {

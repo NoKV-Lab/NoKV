@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 var visibleClientIDFallbackSeq atomic.Uint64
@@ -26,7 +26,7 @@ func visibleDeleteEffect(key []byte) compile.WriteEffect {
 	return compile.WriteEffect{Kind: compile.EffectDelete, Key: cloneBytes(key)}
 }
 
-func (e *Executor) nextVisibleOperationID(kind fsmeta.OperationKind) VisibleOperationID {
+func (e *Executor) nextVisibleOperationID(kind model.OperationKind) VisibleOperationID {
 	seq := uint64(1)
 	if e != nil {
 		seq = e.visibleSeq.Add(1)
@@ -46,27 +46,27 @@ func newVisibleClientID() string {
 	return fmt.Sprintf("%x-%x-%x", os.Getpid(), time.Now().UnixNano(), visibleClientIDFallbackSeq.Add(1))
 }
 
-func visibleOperationClientID(kind fsmeta.OperationKind) string {
+func visibleOperationClientID(kind model.OperationKind) string {
 	switch kind {
-	case fsmeta.OperationCreate:
+	case model.OperationCreate:
 		return "fsmeta-exec/create"
-	case fsmeta.OperationUpdateInode:
+	case model.OperationUpdateInode:
 		return "fsmeta-exec/update_inode"
-	case fsmeta.OperationRename:
+	case model.OperationRename:
 		return "fsmeta-exec/rename"
-	case fsmeta.OperationLink:
+	case model.OperationLink:
 		return "fsmeta-exec/link"
-	case fsmeta.OperationUnlink:
+	case model.OperationUnlink:
 		return "fsmeta-exec/unlink"
-	case fsmeta.OperationRemove:
+	case model.OperationRemove:
 		return "fsmeta-exec/remove"
-	case fsmeta.OperationRemoveDirectory:
+	case model.OperationRemoveDirectory:
 		return "fsmeta-exec/remove_directory"
-	case fsmeta.OperationOpenWriteSession:
+	case model.OperationOpenWriteSession:
 		return "fsmeta-exec/open_write_session"
-	case fsmeta.OperationHeartbeatSession:
+	case model.OperationHeartbeatSession:
 		return "fsmeta-exec/heartbeat_write_session"
-	case fsmeta.OperationCloseSession:
+	case model.OperationCloseSession:
 		return "fsmeta-exec/close_write_session"
 	default:
 		return "fsmeta-exec/" + string(kind)

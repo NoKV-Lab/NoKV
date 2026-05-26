@@ -3,7 +3,7 @@
 
 package fsmeta
 
-import "time"
+import "github.com/feichai0017/NoKV/fsmeta/model"
 
 // fsmeta operation plans define semantic key boundaries only. The executor
 // owns value interpretation, conflict handling, and operation-specific checks;
@@ -12,37 +12,13 @@ import "time"
 // RenameSubtree moves only the subtree-root dentry. Descendants reference
 // parent inode IDs, so they remain reachable without descendant key rewrites.
 
-// OperationKind identifies one metadata operation contract.
-type OperationKind string
-
-const (
-	OperationCreate           OperationKind = "create"
-	OperationUpdateInode      OperationKind = "update_inode"
-	OperationLookup           OperationKind = "lookup"
-	OperationGetAttr          OperationKind = "getattr"
-	OperationReadDir          OperationKind = "readdir"
-	OperationReadSession      OperationKind = "read_session"
-	OperationSnapshotSubtree  OperationKind = "snapshot_subtree"
-	OperationRename           OperationKind = "rename"
-	OperationRenameReplace    OperationKind = "rename_replace"
-	OperationRenameSubtree    OperationKind = "rename_subtree"
-	OperationLink             OperationKind = "link"
-	OperationUnlink           OperationKind = "unlink"
-	OperationRemove           OperationKind = "remove"
-	OperationRemoveDirectory  OperationKind = "remove_directory"
-	OperationOpenWriteSession OperationKind = "open_write_session"
-	OperationHeartbeatSession OperationKind = "heartbeat_write_session"
-	OperationCloseSession     OperationKind = "close_write_session"
-	OperationExpireSessions   OperationKind = "expire_write_sessions"
-)
-
 // OperationPlan describes the key set one metadata operation will touch.
 //
 // It is intentionally value-only. The transaction runner decides timestamps,
 // retries, and mutation encoding; fsmeta only defines the semantic key boundary.
 type OperationPlan struct {
-	Kind         OperationKind
-	Mount        MountID
+	Kind         model.OperationKind
+	Mount        model.MountID
 	PrimaryKey   []byte
 	StartKey     []byte
 	Limit        uint32
@@ -51,209 +27,14 @@ type OperationPlan struct {
 	MutateKeys   [][]byte
 }
 
-type CreateRequest struct {
-	Mount  MountID
-	Parent InodeID
-	Name   string
-	Attrs  CreateAttrs
-}
-
-type CreateAttrs struct {
-	Type          InodeType
-	Size          uint64
-	Mode          uint32
-	CreatedUnixNs int64
-	UpdatedUnixNs int64
-	OpaqueAttrs   []byte
-}
-
-type CreateResult struct {
-	Dentry DentryRecord
-	Inode  InodeRecord
-}
-
-type UpdateInodeRequest struct {
-	Mount            MountID
-	Parent           InodeID
-	Inode            InodeID
-	Name             string
-	SetSize          bool
-	Size             uint64
-	SetMode          bool
-	Mode             uint32
-	SetUpdatedUnixNs bool
-	UpdatedUnixNs    int64
-	SetOpaqueAttrs   bool
-	OpaqueAttrs      []byte
-}
-
-type LookupRequest struct {
-	Mount  MountID
-	Parent InodeID
-	Name   string
-}
-
-type ReadDirRequest struct {
-	Mount           MountID
-	Parent          InodeID
-	StartAfter      string
-	Limit           uint32
-	SnapshotVersion uint64
-}
-
-type SnapshotSubtreeRequest struct {
-	Mount     MountID
-	RootInode InodeID
-}
-
-type RenameRequest struct {
-	Mount      MountID
-	FromParent InodeID
-	FromName   string
-	ToParent   InodeID
-	ToName     string
-}
-
-type RenameReplaceRequest struct {
-	Mount      MountID
-	FromParent InodeID
-	FromName   string
-	ToParent   InodeID
-	ToName     string
-}
-
-type RenameReplaceResult struct {
-	Replaced        bool
-	OldDentry       DentryRecord
-	OldInode        InodeRecord
-	OldInodeDeleted bool
-}
-
-type RenameSubtreeRequest struct {
-	Mount      MountID
-	FromParent InodeID
-	FromName   string
-	ToParent   InodeID
-	ToName     string
-}
-
-type LinkRequest struct {
-	Mount      MountID
-	FromParent InodeID
-	FromName   string
-	ToParent   InodeID
-	ToName     string
-}
-
-type UnlinkRequest struct {
-	Mount  MountID
-	Parent InodeID
-	Name   string
-}
-
-type RemoveRequest struct {
-	Mount  MountID
-	Parent InodeID
-	Name   string
-}
-
-// RemoveResult reports the namespace entry detached by Remove. OldInode is the
-// inode record observed before link-count decrement or deletion; InodeDeleted
-// tells callers whether the inode record itself was removed.
-type RemoveResult struct {
-	RemovedDentry DentryRecord
-	OldInode      InodeRecord
-	InodeDeleted  bool
-}
-
-type RemoveDirectoryRequest struct {
-	Mount  MountID
-	Parent InodeID
-	Name   string
-}
-
-type OpenWriteSessionRequest struct {
-	Mount   MountID
-	Inode   InodeID
-	Session SessionID
-	// TTL is a requested lease duration. The executor derives the persisted
-	// absolute expiry from its own clock inside the successful transaction
-	// attempt, so caller clock skew and queueing delay cannot shorten a lease.
-	TTL time.Duration
-}
-
-type HeartbeatWriteSessionRequest struct {
-	Mount   MountID
-	Inode   InodeID
-	Session SessionID
-	// TTL is a requested extension duration; SessionRecord.ExpiresUnixNs is the
-	// server-issued absolute expiry returned after commit.
-	TTL time.Duration
-}
-
-type CloseWriteSessionRequest struct {
-	Mount   MountID
-	Inode   InodeID
-	Session SessionID
-}
-
-type ExpireWriteSessionsRequest struct {
-	Mount MountID
-	Limit uint32
-}
-
-type ExpireWriteSessionsResult struct {
-	Expired uint64
-}
-
-func ValidateCreateRequest(req CreateRequest) error {
-	if err := validateMountID(req.Mount); err != nil {
-		return err
-	}
-	if err := validateInodeID(req.Parent); err != nil {
-		return err
-	}
-	if err := validateName(req.Name); err != nil {
-		return err
-	}
-	_, err := EncodeInodeValue(req.Attrs.InodeRecord(RootInode))
-	return err
-}
-
-func ValidateRenameRequest(req RenameRequest) error {
-	if err := validateMountID(req.Mount); err != nil {
-		return err
-	}
-	if err := validateInodeID(req.FromParent); err != nil {
-		return err
-	}
-	if err := validateInodeID(req.ToParent); err != nil {
-		return err
-	}
-	if err := validateName(req.FromName); err != nil {
-		return err
-	}
-	if err := validateName(req.ToName); err != nil {
-		return err
-	}
-	if req.FromParent == req.ToParent && req.FromName == req.ToName {
-		return ErrInvalidRequest
-	}
-	return nil
-}
-
-func ValidateRenameReplaceRequest(req RenameReplaceRequest) error {
-	return ValidateRenameRequest(RenameRequest(req))
-}
-
-func PlanCreate(req CreateRequest, mount MountIdentity, inodeID InodeID) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanCreate(req model.CreateRequest, mount model.MountIdentity, inodeID model.InodeID) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
-	if err := validateInodeID(req.Parent); err != nil {
+	if err := model.ValidateInodeID(req.Parent); err != nil {
 		return OperationPlan{}, err
 	}
-	if err := validateInodeID(inodeID); err != nil {
+	if err := model.ValidateInodeID(inodeID); err != nil {
 		return OperationPlan{}, err
 	}
 	dentry, err := EncodeDentryKey(mount, req.Parent, req.Name)
@@ -269,7 +50,7 @@ func PlanCreate(req CreateRequest, mount MountIdentity, inodeID InodeID) (Operat
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationCreate,
+		Kind:       model.OperationCreate,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(dentry),
 		ReadKeys:   cloneKeySet(parentInode, dentry, inode),
@@ -277,11 +58,11 @@ func PlanCreate(req CreateRequest, mount MountIdentity, inodeID InodeID) (Operat
 	}, nil
 }
 
-func PlanUpdateInode(req UpdateInodeRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanUpdateInode(req model.UpdateInodeRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
-	if err := validateInodeID(req.Parent); err != nil {
+	if err := model.ValidateInodeID(req.Parent); err != nil {
 		return OperationPlan{}, err
 	}
 	dentry, err := EncodeDentryKey(mount, req.Parent, req.Name)
@@ -293,7 +74,7 @@ func PlanUpdateInode(req UpdateInodeRequest, mount MountIdentity) (OperationPlan
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationUpdateInode,
+		Kind:       model.OperationUpdateInode,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(inode),
 		ReadKeys:   cloneKeySet(dentry, inode),
@@ -301,8 +82,8 @@ func PlanUpdateInode(req UpdateInodeRequest, mount MountIdentity) (OperationPlan
 	}, nil
 }
 
-func PlanLookup(req LookupRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanLookup(req model.LookupRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	dentry, err := EncodeDentryKey(mount, req.Parent, req.Name)
@@ -310,18 +91,18 @@ func PlanLookup(req LookupRequest, mount MountIdentity) (OperationPlan, error) {
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationLookup,
+		Kind:       model.OperationLookup,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(dentry),
 		ReadKeys:   cloneKeySet(dentry),
 	}, nil
 }
 
-func PlanReadDir(req ReadDirRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanReadDir(req model.ReadDirRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
-	limit, err := normalizeReadDirLimit(req.Limit)
+	limit, err := model.NormalizeReadDirLimit(req.Limit)
 	if err != nil {
 		return OperationPlan{}, err
 	}
@@ -333,7 +114,7 @@ func PlanReadDir(req ReadDirRequest, mount MountIdentity) (OperationPlan, error)
 		}
 		startKey = prefix
 	} else {
-		if err := validateName(req.StartAfter); err != nil {
+		if err := model.ValidateName(req.StartAfter); err != nil {
 			return OperationPlan{}, err
 		}
 		cursor, err := EncodeDentryKey(mount, req.Parent, req.StartAfter)
@@ -349,7 +130,7 @@ func PlanReadDir(req ReadDirRequest, mount MountIdentity) (OperationPlan, error)
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:         OperationReadDir,
+		Kind:         model.OperationReadDir,
 		Mount:        req.Mount,
 		PrimaryKey:   cloneBytes(prefix),
 		StartKey:     cloneBytes(startKey),
@@ -358,11 +139,11 @@ func PlanReadDir(req ReadDirRequest, mount MountIdentity) (OperationPlan, error)
 	}, nil
 }
 
-func PlanSnapshotSubtree(req SnapshotSubtreeRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanSnapshotSubtree(req model.SnapshotSubtreeRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
-	if err := validateInodeID(req.RootInode); err != nil {
+	if err := model.ValidateInodeID(req.RootInode); err != nil {
 		return OperationPlan{}, err
 	}
 	prefix, err := EncodeDentryPrefix(mount, req.RootInode)
@@ -370,19 +151,19 @@ func PlanSnapshotSubtree(req SnapshotSubtreeRequest, mount MountIdentity) (Opera
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:         OperationSnapshotSubtree,
+		Kind:         model.OperationSnapshotSubtree,
 		Mount:        req.Mount,
 		PrimaryKey:   cloneBytes(prefix),
 		ReadPrefixes: cloneKeySet(prefix),
 	}, nil
 }
 
-func PlanRename(req RenameRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanRename(req model.RenameRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	if req.FromParent == req.ToParent && req.FromName == req.ToName {
-		return OperationPlan{}, ErrInvalidRequest
+		return OperationPlan{}, model.ErrInvalidRequest
 	}
 	source, err := EncodeDentryKey(mount, req.FromParent, req.FromName)
 	if err != nil {
@@ -401,7 +182,7 @@ func PlanRename(req RenameRequest, mount MountIdentity) (OperationPlan, error) {
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationRename,
+		Kind:       model.OperationRename,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(source),
 		ReadKeys:   cloneKeySet(source, dest, fromParent, toParent),
@@ -409,12 +190,12 @@ func PlanRename(req RenameRequest, mount MountIdentity) (OperationPlan, error) {
 	}, nil
 }
 
-func PlanRenameReplace(req RenameReplaceRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanRenameReplace(req model.RenameReplaceRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	if req.FromParent == req.ToParent && req.FromName == req.ToName {
-		return OperationPlan{}, ErrInvalidRequest
+		return OperationPlan{}, model.ErrInvalidRequest
 	}
 	source, err := EncodeDentryKey(mount, req.FromParent, req.FromName)
 	if err != nil {
@@ -433,7 +214,7 @@ func PlanRenameReplace(req RenameReplaceRequest, mount MountIdentity) (Operation
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationRenameReplace,
+		Kind:       model.OperationRenameReplace,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(source),
 		ReadKeys:   cloneKeySet(source, dest, fromParent, toParent),
@@ -441,12 +222,12 @@ func PlanRenameReplace(req RenameReplaceRequest, mount MountIdentity) (Operation
 	}, nil
 }
 
-func PlanRenameSubtree(req RenameSubtreeRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanRenameSubtree(req model.RenameSubtreeRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	if req.FromParent == req.ToParent && req.FromName == req.ToName {
-		return OperationPlan{}, ErrInvalidRequest
+		return OperationPlan{}, model.ErrInvalidRequest
 	}
 	from, err := EncodeDentryKey(mount, req.FromParent, req.FromName)
 	if err != nil {
@@ -465,7 +246,7 @@ func PlanRenameSubtree(req RenameSubtreeRequest, mount MountIdentity) (Operation
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationRenameSubtree,
+		Kind:       model.OperationRenameSubtree,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(from),
 		ReadKeys:   cloneKeySet(from, to, fromParent, toParent),
@@ -473,12 +254,12 @@ func PlanRenameSubtree(req RenameSubtreeRequest, mount MountIdentity) (Operation
 	}, nil
 }
 
-func PlanLink(req LinkRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanLink(req model.LinkRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	if req.FromParent == req.ToParent && req.FromName == req.ToName {
-		return OperationPlan{}, ErrInvalidRequest
+		return OperationPlan{}, model.ErrInvalidRequest
 	}
 	from, err := EncodeDentryKey(mount, req.FromParent, req.FromName)
 	if err != nil {
@@ -493,7 +274,7 @@ func PlanLink(req LinkRequest, mount MountIdentity) (OperationPlan, error) {
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationLink,
+		Kind:       model.OperationLink,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(to),
 		ReadKeys:   cloneKeySet(from, to, toParent),
@@ -501,8 +282,8 @@ func PlanLink(req LinkRequest, mount MountIdentity) (OperationPlan, error) {
 	}, nil
 }
 
-func PlanUnlink(req UnlinkRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanUnlink(req model.UnlinkRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	dentry, err := EncodeDentryKey(mount, req.Parent, req.Name)
@@ -514,7 +295,7 @@ func PlanUnlink(req UnlinkRequest, mount MountIdentity) (OperationPlan, error) {
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationUnlink,
+		Kind:       model.OperationUnlink,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(dentry),
 		ReadKeys:   cloneKeySet(dentry, parentInode),
@@ -522,8 +303,8 @@ func PlanUnlink(req UnlinkRequest, mount MountIdentity) (OperationPlan, error) {
 	}, nil
 }
 
-func PlanRemove(req RemoveRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanRemove(req model.RemoveRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	dentry, err := EncodeDentryKey(mount, req.Parent, req.Name)
@@ -535,7 +316,7 @@ func PlanRemove(req RemoveRequest, mount MountIdentity) (OperationPlan, error) {
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationRemove,
+		Kind:       model.OperationRemove,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(dentry),
 		ReadKeys:   cloneKeySet(dentry, parentInode),
@@ -543,8 +324,8 @@ func PlanRemove(req RemoveRequest, mount MountIdentity) (OperationPlan, error) {
 	}, nil
 }
 
-func PlanRemoveDirectory(req RemoveDirectoryRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanRemoveDirectory(req model.RemoveDirectoryRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	parentInode, err := EncodeInodeKey(mount, req.Parent)
@@ -556,7 +337,7 @@ func PlanRemoveDirectory(req RemoveDirectoryRequest, mount MountIdentity) (Opera
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationRemoveDirectory,
+		Kind:       model.OperationRemoveDirectory,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(dentry),
 		ReadKeys:   cloneKeySet(parentInode, dentry),
@@ -564,8 +345,8 @@ func PlanRemoveDirectory(req RemoveDirectoryRequest, mount MountIdentity) (Opera
 	}, nil
 }
 
-func PlanOpenWriteSession(req OpenWriteSessionRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanOpenWriteSession(req model.OpenWriteSessionRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	inode, err := EncodeInodeKey(mount, req.Inode)
@@ -581,7 +362,7 @@ func PlanOpenWriteSession(req OpenWriteSessionRequest, mount MountIdentity) (Ope
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationOpenWriteSession,
+		Kind:       model.OperationOpenWriteSession,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(session),
 		ReadKeys:   cloneKeySet(inode, session, owner),
@@ -589,8 +370,8 @@ func PlanOpenWriteSession(req OpenWriteSessionRequest, mount MountIdentity) (Ope
 	}, nil
 }
 
-func PlanHeartbeatWriteSession(req HeartbeatWriteSessionRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanHeartbeatWriteSession(req model.HeartbeatWriteSessionRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	session, err := EncodeSessionKey(mount, req.Inode, req.Session)
@@ -602,7 +383,7 @@ func PlanHeartbeatWriteSession(req HeartbeatWriteSessionRequest, mount MountIden
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationHeartbeatSession,
+		Kind:       model.OperationHeartbeatSession,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(session),
 		ReadKeys:   cloneKeySet(session, owner),
@@ -610,8 +391,8 @@ func PlanHeartbeatWriteSession(req HeartbeatWriteSessionRequest, mount MountIden
 	}, nil
 }
 
-func PlanCloseWriteSession(req CloseWriteSessionRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanCloseWriteSession(req model.CloseWriteSessionRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
 	session, err := EncodeSessionKey(mount, req.Inode, req.Session)
@@ -619,7 +400,7 @@ func PlanCloseWriteSession(req CloseWriteSessionRequest, mount MountIdentity) (O
 		return OperationPlan{}, err
 	}
 	return OperationPlan{
-		Kind:       OperationCloseSession,
+		Kind:       model.OperationCloseSession,
 		Mount:      req.Mount,
 		PrimaryKey: cloneBytes(session),
 		ReadKeys:   cloneKeySet(session),
@@ -627,11 +408,11 @@ func PlanCloseWriteSession(req CloseWriteSessionRequest, mount MountIdentity) (O
 	}, nil
 }
 
-func PlanExpireWriteSessions(req ExpireWriteSessionsRequest, mount MountIdentity) (OperationPlan, error) {
-	if err := validateMountIdentityForRequest(mount, req.Mount); err != nil {
+func PlanExpireWriteSessions(req model.ExpireWriteSessionsRequest, mount model.MountIdentity) (OperationPlan, error) {
+	if err := model.ValidateMountIdentityForRequest(mount, req.Mount); err != nil {
 		return OperationPlan{}, err
 	}
-	limit, err := normalizeSessionExpireLimit(req.Limit)
+	limit, err := model.NormalizeSessionExpireLimit(req.Limit)
 	if err != nil {
 		return OperationPlan{}, err
 	}
@@ -644,7 +425,7 @@ func PlanExpireWriteSessions(req ExpireWriteSessionsRequest, mount MountIdentity
 		prefixes = append(prefixes, prefix)
 	}
 	return OperationPlan{
-		Kind:         OperationExpireSessions,
+		Kind:         model.OperationExpireSessions,
 		Mount:        req.Mount,
 		PrimaryKey:   cloneBytes(prefixes[0]),
 		StartKey:     cloneBytes(prefixes[0]),

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,34 +18,34 @@ func TestLocalRuntimeRenameReplaceOverwritesFileAtomically(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	oldFinal, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	oldFinal, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "artifact",
-		Attrs: fsmeta.CreateAttrs{
-			Type:        fsmeta.InodeTypeFile,
+		Attrs: model.CreateAttrs{
+			Type:        model.InodeTypeFile,
 			Size:        3,
 			OpaqueAttrs: []byte("old-body"),
 		},
 	})
 	require.NoError(t, err)
-	staged, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	staged, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   ".stage-artifact",
-		Attrs: fsmeta.CreateAttrs{
-			Type:        fsmeta.InodeTypeFile,
+		Attrs: model.CreateAttrs{
+			Type:        model.InodeTypeFile,
 			Size:        7,
 			OpaqueAttrs: []byte("new-body"),
 		},
 	})
 	require.NoError(t, err)
 
-	result, err := rt.Executor.RenameReplace(ctx, fsmeta.RenameReplaceRequest{
+	result, err := rt.Executor.RenameReplace(ctx, model.RenameReplaceRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   ".stage-artifact",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "artifact",
 	})
 	require.NoError(t, err)
@@ -53,14 +54,14 @@ func TestLocalRuntimeRenameReplaceOverwritesFileAtomically(t *testing.T) {
 	require.Equal(t, oldFinal.Inode, result.OldInode)
 	require.True(t, result.OldInodeDeleted)
 
-	_, err = rt.Executor.Lookup(ctx, fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: ".stage-artifact"})
-	require.ErrorIs(t, err, fsmeta.ErrNotFound)
-	final, err := rt.Executor.LookupPlus(ctx, fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "artifact"})
+	_, err = rt.Executor.Lookup(ctx, model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: ".stage-artifact"})
+	require.ErrorIs(t, err, model.ErrNotFound)
+	final, err := rt.Executor.LookupPlus(ctx, model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "artifact"})
 	require.NoError(t, err)
 	require.Equal(t, staged.Inode.Inode, final.Inode.Inode)
-	require.Equal(t, fsmeta.InodeRecord{
+	require.Equal(t, model.InodeRecord{
 		Inode:       staged.Inode.Inode,
-		Type:        fsmeta.InodeTypeFile,
+		Type:        model.InodeTypeFile,
 		Size:        7,
 		LinkCount:   1,
 		OpaqueAttrs: []byte("new-body"),
@@ -81,34 +82,34 @@ func TestLocalRuntimeRenameReplacePreservesRemainingHardLinks(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	oldFinal, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	oldFinal, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "artifact",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 3},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 3},
 	})
 	require.NoError(t, err)
-	err = rt.Executor.Link(ctx, fsmeta.LinkRequest{
+	err = rt.Executor.Link(ctx, model.LinkRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   "artifact",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "artifact-link",
 	})
 	require.NoError(t, err)
-	staged, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	staged, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   ".stage-artifact",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 7},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 7},
 	})
 	require.NoError(t, err)
 
-	result, err := rt.Executor.RenameReplace(ctx, fsmeta.RenameReplaceRequest{
+	result, err := rt.Executor.RenameReplace(ctx, model.RenameReplaceRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   ".stage-artifact",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "artifact",
 	})
 	require.NoError(t, err)
@@ -117,10 +118,10 @@ func TestLocalRuntimeRenameReplacePreservesRemainingHardLinks(t *testing.T) {
 	require.Equal(t, uint32(2), result.OldInode.LinkCount)
 	require.False(t, result.OldInodeDeleted)
 
-	final, err := rt.Executor.LookupPlus(ctx, fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "artifact"})
+	final, err := rt.Executor.LookupPlus(ctx, model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "artifact"})
 	require.NoError(t, err)
 	require.Equal(t, staged.Inode.Inode, final.Inode.Inode)
-	remaining, err := rt.Executor.LookupPlus(ctx, fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "artifact-link"})
+	remaining, err := rt.Executor.LookupPlus(ctx, model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "artifact-link"})
 	require.NoError(t, err)
 	require.Equal(t, oldFinal.Inode.Inode, remaining.Inode.Inode)
 	require.Equal(t, uint32(1), remaining.Inode.LinkCount)
@@ -132,25 +133,25 @@ func TestLocalRuntimeRenameReplaceMissingTargetActsLikeRename(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	staged, err := rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	staged, err := rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   ".stage-artifact",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile, Size: 11},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile, Size: 11},
 	})
 	require.NoError(t, err)
 
-	result, err := rt.Executor.RenameReplace(ctx, fsmeta.RenameReplaceRequest{
+	result, err := rt.Executor.RenameReplace(ctx, model.RenameReplaceRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   ".stage-artifact",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "artifact",
 	})
 	require.NoError(t, err)
 	require.False(t, result.Replaced)
 
-	final, err := rt.Executor.LookupPlus(ctx, fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "artifact"})
+	final, err := rt.Executor.LookupPlus(ctx, model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "artifact"})
 	require.NoError(t, err)
 	require.Equal(t, staged.Inode.Inode, final.Inode.Inode)
 }
@@ -161,22 +162,22 @@ func TestLocalRuntimeRenameReplaceRejectsDirectorySources(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	_, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	_, err = rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   ".stage-artifact",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 	})
 	require.NoError(t, err)
 
-	_, err = rt.Executor.RenameReplace(ctx, fsmeta.RenameReplaceRequest{
+	_, err = rt.Executor.RenameReplace(ctx, model.RenameReplaceRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   ".stage-artifact",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "artifact",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 }
 
 func TestLocalRuntimeRenameReplaceRejectsDirectoryTargets(t *testing.T) {
@@ -185,27 +186,27 @@ func TestLocalRuntimeRenameReplaceRejectsDirectoryTargets(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	_, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	_, err = rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   ".stage-artifact",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	require.NoError(t, err)
-	_, err = rt.Executor.Create(ctx, fsmeta.CreateRequest{
+	_, err = rt.Executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "artifact",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 	})
 	require.NoError(t, err)
 
-	_, err = rt.Executor.RenameReplace(ctx, fsmeta.RenameReplaceRequest{
+	_, err = rt.Executor.RenameReplace(ctx, model.RenameReplaceRequest{
 		Mount:      "vol",
-		FromParent: fsmeta.RootInode,
+		FromParent: model.RootInode,
 		FromName:   ".stage-artifact",
-		ToParent:   fsmeta.RootInode,
+		ToParent:   model.RootInode,
 		ToName:     "artifact",
 	})
-	require.ErrorIs(t, err, fsmeta.ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 }

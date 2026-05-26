@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 const (
@@ -58,15 +58,15 @@ type historyCandidate struct {
 // linearization oracle. It is deliberately factorial and bounded: the point is
 // to catch non-serializable metadata histories in nightly runs without turning
 // the regular PR path into a large model checker.
-func RunConcurrentBatches(ctx context.Context, exec Executor, model *Model, ops []Operation, batchSize int, opts HistoryOptions) error {
+func RunConcurrentBatches(ctx context.Context, exec Executor, state *Model, ops []Operation, batchSize int, opts HistoryOptions) error {
 	if exec == nil {
 		return errExecutorRequired
 	}
-	if model == nil {
+	if state == nil {
 		return errModelRequired
 	}
 	if batchSize <= 1 && !opts.AllowIndeterminateErrors {
-		return Run(ctx, exec, model, ops)
+		return Run(ctx, exec, state, ops)
 	}
 	if batchSize > maxConcurrentHistoryBatch {
 		return fmt.Errorf("fsmeta/contract: concurrent batch size %d exceeds max %d", batchSize, maxConcurrentHistoryBatch)
@@ -77,7 +77,7 @@ func RunConcurrentBatches(ctx context.Context, exec Executor, model *Model, ops 
 	}
 
 	history := make([]string, 0, len(ops))
-	candidates := []*Model{cloneModel(model)}
+	candidates := []*Model{cloneModel(state)}
 	batch := make([]scheduledOperation, 0, batchSize)
 	batchID := 0
 	flush := func() error {
@@ -97,8 +97,8 @@ func RunConcurrentBatches(ctx context.Context, exec Executor, model *Model, ops 
 		candidates = next
 		history = append(history, fmt.Sprintf("batch %03d candidates=%d first_linearized_as=%s",
 			batchID, len(candidates), describeOrder(observed, orders[0])))
-		replaceModel(model, candidates[0])
-		if err := model.CheckInvariants(); err != nil {
+		replaceModel(state, candidates[0])
+		if err := state.CheckInvariants(); err != nil {
 			return fmt.Errorf("batch %d corrupted model invariants: %w\nhistory:\n%s", batchID, err, strings.Join(history, "\n"))
 		}
 		batch = batch[:0]
@@ -116,7 +116,7 @@ func RunConcurrentBatches(ctx context.Context, exec Executor, model *Model, ops 
 				return err
 			}
 			candidates = next
-			replaceModel(model, candidates[0])
+			replaceModel(state, candidates[0])
 			continue
 		}
 		batch = append(batch, scheduledOperation{index: i, op: op})
@@ -280,17 +280,17 @@ func respectsRealTime(candidate int, used []bool, observed []observedOperation) 
 	return true
 }
 
-func applyObserved(model *Model, op Operation, got Result) Result {
+func applyObserved(state *Model, op Operation, got Result) Result {
 	if op.Kind == OpCreate && got.Err == nil {
 		op.Inode = got.Inode.Inode
 	}
 	if op.Kind == OpSnapshotSubtree {
 		if got.Err == nil {
-			return model.ApplySnapshot(op, got.Token)
+			return state.ApplySnapshot(op, got.Token)
 		}
-		return model.Apply(op)
+		return state.Apply(op)
 	}
-	return model.Apply(op)
+	return state.Apply(op)
 }
 
 func advanceCandidates(base []*Model, op Operation, got Result, opts HistoryOptions, maxCandidates int) ([]*Model, error) {
@@ -387,8 +387,8 @@ func cloneModel(in *Model) *Model {
 		NowUnixNs:   in.NowUnixNs,
 		dentries:    cloneDentries(in.dentries),
 		inodes:      cloneInodes(in.inodes),
-		sessions:    make(map[sessionKey]fsmeta.SessionRecord, len(in.sessions)),
-		owners:      make(map[fsmeta.InodeID]fsmeta.SessionRecord, len(in.owners)),
+		sessions:    make(map[sessionKey]model.SessionRecord, len(in.sessions)),
+		owners:      make(map[model.InodeID]model.SessionRecord, len(in.owners)),
 		snapshots:   make(map[uint64]snapshotState, len(in.snapshots)),
 		snapshotRef: make(map[int]uint64, len(in.snapshotRef)),
 	}
@@ -457,7 +457,7 @@ func modelFingerprint(m *Model) string {
 		dentry := m.dentries[key]
 		fmt.Fprintf(&b, "d:%d/%s=%d/%s;", key.parent, key.name, dentry.Inode, dentry.Type)
 	}
-	inodeIDs := make([]fsmeta.InodeID, 0, len(m.inodes))
+	inodeIDs := make([]model.InodeID, 0, len(m.inodes))
 	for inode := range m.inodes {
 		inodeIDs = append(inodeIDs, inode)
 	}
@@ -480,7 +480,7 @@ func modelFingerprint(m *Model) string {
 		session := m.sessions[key]
 		fmt.Fprintf(&b, "s:%d/%s=%d;", key.inode, key.session, session.ExpiresUnixNs)
 	}
-	ownerIDs := make([]fsmeta.InodeID, 0, len(m.owners))
+	ownerIDs := make([]model.InodeID, 0, len(m.owners))
 	for id := range m.owners {
 		ownerIDs = append(ownerIDs, id)
 	}
@@ -519,7 +519,7 @@ func modelFingerprint(m *Model) string {
 			dentry := snapshot.dentries[key]
 			fmt.Fprintf(&b, "d:%d/%s=%d/%s;", key.parent, key.name, dentry.Inode, dentry.Type)
 		}
-		snapshotInodeIDs := make([]fsmeta.InodeID, 0, len(snapshot.inodes))
+		snapshotInodeIDs := make([]model.InodeID, 0, len(snapshot.inodes))
 		for inode := range snapshot.inodes {
 			snapshotInodeIDs = append(snapshotInodeIDs, inode)
 		}

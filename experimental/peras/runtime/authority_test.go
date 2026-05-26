@@ -10,6 +10,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	"github.com/stretchr/testify/require"
@@ -17,7 +18,7 @@ import (
 
 var (
 	testNow   = time.Unix(100, 0)
-	testMount = fsmeta.MountIdentity{MountID: "vol", MountKeyID: 7}
+	testMount = model.MountIdentity{MountID: "vol", MountKeyID: 7}
 )
 
 func TestActiveAuthoritiesFindsCoveringGrant(t *testing.T) {
@@ -26,13 +27,13 @@ func TestActiveAuthoritiesFindsCoveringGrant(t *testing.T) {
 		Mount:      testMount.MountID,
 		MountKeyID: testMount.MountKeyID,
 		Buckets:    []fsmeta.AffinityBucket{2},
-		Parents:    []fsmeta.InodeID{10},
+		Parents:    []model.InodeID{10},
 	}
 	grant := testGrant("g1", "holder-a", compile.AuthorityScope{
 		Mount:      testMount.MountID,
 		MountKeyID: testMount.MountKeyID,
 		Buckets:    []fsmeta.AffinityBucket{1, 2},
-		Parents:    []fsmeta.InodeID{10},
+		Parents:    []model.InodeID{10},
 	})
 	require.NoError(t, table.Replace([]rootproto.VisibleAuthorityGrant{grant}))
 
@@ -94,8 +95,8 @@ func TestActiveAuthoritiesTreatsEmptyGrantDimensionsAsWildcard(t *testing.T) {
 		Mount:      testMount.MountID,
 		MountKeyID: testMount.MountKeyID,
 		Buckets:    []fsmeta.AffinityBucket{15},
-		Parents:    []fsmeta.InodeID{100},
-		Inodes:     []fsmeta.InodeID{200},
+		Parents:    []model.InodeID{100},
+		Inodes:     []model.InodeID{200},
 	}, testNow)
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -238,7 +239,7 @@ func TestActiveAuthoritiesFencesMountWideFsmetaKeys(t *testing.T) {
 
 func TestActiveAuthoritiesFencesFsmetaKeysFailClosedBeforeSnapshot(t *testing.T) {
 	table := NewActiveAuthorities()
-	key, err := fsmeta.EncodeDentryKey(testMount, fsmeta.RootInode, "artifact")
+	key, err := fsmeta.EncodeDentryKey(testMount, model.RootInode, "artifact")
 	require.NoError(t, err)
 
 	_, _, err = table.FencesKey(key, testNow)
@@ -251,13 +252,13 @@ func TestActiveAuthoritiesFencesFsmetaKeysFailClosedBeforeSnapshot(t *testing.T)
 
 func TestActiveAuthoritiesFencesSpecificParentAndBucket(t *testing.T) {
 	table := NewActiveAuthorities()
-	parent := fsmeta.InodeID(10)
+	parent := model.InodeID(10)
 	require.NoError(t, table.Replace([]rootproto.VisibleAuthorityGrant{
 		testGrant("g1", "holder-a", compile.AuthorityScope{
 			Mount:      testMount.MountID,
 			MountKeyID: testMount.MountKeyID,
 			Buckets:    []fsmeta.AffinityBucket{fsmeta.BucketForInodeID(parent)},
-			Parents:    []fsmeta.InodeID{parent},
+			Parents:    []model.InodeID{parent},
 		}),
 	}))
 
@@ -273,7 +274,7 @@ func TestActiveAuthoritiesFencesSpecificParentAndBucket(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 
-	otherMount, err := fsmeta.EncodeDentryKey(fsmeta.MountIdentity{MountID: "other", MountKeyID: 9}, parent, "name")
+	otherMount, err := fsmeta.EncodeDentryKey(model.MountIdentity{MountID: "other", MountKeyID: 9}, parent, "name")
 	require.NoError(t, err)
 	_, ok, err = table.FencesKey(otherMount, testNow)
 	require.NoError(t, err)
@@ -290,7 +291,7 @@ func TestActiveAuthoritiesFencesUsageOnlyWhenScopeMatches(t *testing.T) {
 		testGrant("g1", "holder-a", compile.AuthorityScope{
 			Mount:      testMount.MountID,
 			MountKeyID: testMount.MountKeyID,
-			Inodes:     []fsmeta.InodeID{20},
+			Inodes:     []model.InodeID{20},
 		}),
 	}))
 
@@ -396,8 +397,8 @@ func TestAuthorityScopeFromDeltaConvertsRootTypes(t *testing.T) {
 		Mount:      testMount.MountID,
 		MountKeyID: testMount.MountKeyID,
 		Buckets:    []fsmeta.AffinityBucket{1, 2},
-		Parents:    []fsmeta.InodeID{10},
-		Inodes:     []fsmeta.InodeID{20},
+		Parents:    []model.InodeID{10},
+		Inodes:     []model.InodeID{20},
 	})
 
 	require.Equal(t, "vol", scope.MountID)

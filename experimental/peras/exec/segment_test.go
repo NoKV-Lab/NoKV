@@ -9,6 +9,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,21 +59,21 @@ func TestBuildPerasSegmentCoalescesLatestValueAndDelete(t *testing.T) {
 		Operations: []ReplayOperation{
 			{
 				OpID: OperationID{ClientID: "client-a", Seq: 1},
-				Kind: fsmeta.OperationCreate,
+				Kind: model.OperationCreate,
 				Mutations: []ReplayMutation{
 					{Key: key, Value: []byte("v1")},
 				},
 			},
 			{
 				OpID: OperationID{ClientID: "client-a", Seq: 2},
-				Kind: fsmeta.OperationUpdateInode,
+				Kind: model.OperationUpdateInode,
 				Mutations: []ReplayMutation{
 					{Key: key, Value: []byte("v2")},
 				},
 			},
 			{
 				OpID: OperationID{ClientID: "client-a", Seq: 3},
-				Kind: fsmeta.OperationUnlink,
+				Kind: model.OperationUnlink,
 				Mutations: []ReplayMutation{
 					{Key: key, Delete: true},
 				},
@@ -103,7 +104,7 @@ func TestBuildPerasSegmentRecordsCompletionAndVersions(t *testing.T) {
 
 	first, ok := segment.Completion(OperationID{ClientID: "workspace-writer", Seq: 1})
 	require.True(t, ok)
-	require.Equal(t, fsmeta.OperationCreate, first.Kind)
+	require.Equal(t, model.OperationCreate, first.Kind)
 	require.Equal(t, uint64(1000), first.Version)
 	require.Equal(t, uint32(3), first.MutationCount)
 	require.Equal(t, plan.Operations[0].DescriptorDigest, first.DescriptorDigest)
@@ -186,7 +187,7 @@ func TestBuildPerasSegmentRejectsInvalidPlans(t *testing.T) {
 		EpochID:  1,
 		Versions: ReplayVersionRange{First: 1, Count: 2},
 		Operations: []ReplayOperation{
-			{OpID: OperationID{ClientID: "c", Seq: 1}, Kind: fsmeta.OperationCreate, Mutations: []ReplayMutation{{Key: []byte("k"), Value: []byte("v")}}},
+			{OpID: OperationID{ClientID: "c", Seq: 1}, Kind: model.OperationCreate, Mutations: []ReplayMutation{{Key: []byte("k"), Value: []byte("v")}}},
 		},
 	})
 	require.ErrorIs(t, err, ErrReplayVersionRequired)
@@ -194,7 +195,7 @@ func TestBuildPerasSegmentRejectsInvalidPlans(t *testing.T) {
 	_, err = BuildPerasSegmentFromReplayPlan(ReplayPlan{
 		EpochID: 1,
 		Operations: []ReplayOperation{
-			{OpID: OperationID{ClientID: "c", Seq: 1}, Kind: fsmeta.OperationCreate, Mutations: []ReplayMutation{{Key: []byte("k")}}},
+			{OpID: OperationID{ClientID: "c", Seq: 1}, Kind: model.OperationCreate, Mutations: []ReplayMutation{{Key: []byte("k")}}},
 		},
 	})
 	require.ErrorIs(t, err, ErrInvalidPerasSegment)
@@ -311,26 +312,26 @@ func BenchmarkSegmentEntriesView(b *testing.B) {
 
 func workspaceCreateReplayPlan(tb testing.TB, count int) ReplayPlan {
 	tb.Helper()
-	mount := fsmeta.MountIdentity{MountID: "workspace", MountKeyID: 42}
+	mount := model.MountIdentity{MountID: "workspace", MountKeyID: 42}
 	ops := make([]ReplayOperation, 0, count)
 	for i := range count {
 		name := fmt.Sprintf("checkpoint-%06d", i)
-		program, err := compile.CompileCreateProgram(fsmeta.CreateRequest{
+		program, err := compile.CompileCreateProgram(model.CreateRequest{
 			Mount:  mount.MountID,
-			Parent: fsmeta.RootInode,
+			Parent: model.RootInode,
 			Name:   name,
-			Attrs: fsmeta.CreateAttrs{
-				Type:          fsmeta.InodeTypeFile,
+			Attrs: model.CreateAttrs{
+				Type:          model.InodeTypeFile,
 				Size:          uint64(i),
 				Mode:          0o644,
 				CreatedUnixNs: int64(i + 1),
 				UpdatedUnixNs: int64(i + 1),
 			},
-		}, mount, fsmeta.InodeID(1000+i))
+		}, mount, model.InodeID(1000+i))
 		require.NoError(tb, err)
-		parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
-			Inode:      fsmeta.RootInode,
-			Type:       fsmeta.InodeTypeDirectory,
+		parentValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+			Inode:      model.RootInode,
+			Type:       model.InodeTypeDirectory,
 			LinkCount:  1,
 			ChildCount: uint64(i + 1),
 		})

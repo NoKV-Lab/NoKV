@@ -9,6 +9,7 @@ import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 )
 
@@ -85,8 +86,8 @@ func ScopesEqual(left, right compile.AuthorityScope) bool {
 
 func CloneScope(scope compile.AuthorityScope) compile.AuthorityScope {
 	scope.Buckets = append([]fsmeta.AffinityBucket(nil), scope.Buckets...)
-	scope.Parents = append([]fsmeta.InodeID(nil), scope.Parents...)
-	scope.Inodes = append([]fsmeta.InodeID(nil), scope.Inodes...)
+	scope.Parents = append([]model.InodeID(nil), scope.Parents...)
+	scope.Inodes = append([]model.InodeID(nil), scope.Inodes...)
 	return scope
 }
 

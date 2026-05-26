@@ -12,6 +12,7 @@ import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type perasSnapshotView struct {
@@ -199,19 +200,19 @@ func (c *Runtime) CapturePerasSnapshot(version uint64) error {
 }
 
 // CapturePerasVisibleSnapshot records a visible snapshot when configured.
-func (c *Runtime) CapturePerasVisibleSnapshot(ctx context.Context, version uint64, scope compile.AuthorityScope) (fsmeta.VisibleSnapshotCapture, bool, error) {
+func (c *Runtime) CapturePerasVisibleSnapshot(ctx context.Context, version uint64, scope compile.AuthorityScope) (model.VisibleSnapshotCapture, bool, error) {
 	if c == nil || c.read == nil || version == 0 {
-		return fsmeta.VisibleSnapshotCapture{}, false, ErrRuntimeInvalid
+		return model.VisibleSnapshotCapture{}, false, ErrRuntimeInvalid
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if !c.visibleSnapshots && !c.quorumVisibleSnapshots {
-		return fsmeta.VisibleSnapshotCapture{}, false, nil
+		return model.VisibleSnapshotCapture{}, false, nil
 	}
 	mount, prefix, ok := visibleSnapshotDirectory(scope)
 	if !ok {
-		return fsmeta.VisibleSnapshotCapture{}, false, nil
+		return model.VisibleSnapshotCapture{}, false, nil
 	}
 	if c.quorumVisibleSnapshots && c.usesSegmentWitness() {
 		return c.captureQuorumVisibleSnapshot(ctx, version, scope, mount, prefix)
@@ -219,17 +220,17 @@ func (c *Runtime) CapturePerasVisibleSnapshot(ctx context.Context, version uint6
 	c.commitMu.Lock()
 	c.captureVisibleSnapshotLocked(version, mount, prefix)
 	c.commitMu.Unlock()
-	return fsmeta.VisibleSnapshotCapture{}, true, nil
+	return model.VisibleSnapshotCapture{}, true, nil
 }
 
-func (c *Runtime) captureQuorumVisibleSnapshot(ctx context.Context, version uint64, scope compile.AuthorityScope, mount fsmeta.MountIdentity, prefix []byte) (fsmeta.VisibleSnapshotCapture, bool, error) {
+func (c *Runtime) captureQuorumVisibleSnapshot(ctx context.Context, version uint64, scope compile.AuthorityScope, mount model.MountIdentity, prefix []byte) (model.VisibleSnapshotCapture, bool, error) {
 	c.flushMu.Lock()
 	c.commitMu.Lock()
 	plans, err := c.freezeReplayPlansLocked(&scope, 0)
 	if err != nil {
 		c.commitMu.Unlock()
 		c.flushMu.Unlock()
-		return fsmeta.VisibleSnapshotCapture{}, false, err
+		return model.VisibleSnapshotCapture{}, false, err
 	}
 	c.captureVisibleSnapshotLocked(version, mount, prefix)
 	c.commitMu.Unlock()
@@ -237,22 +238,22 @@ func (c *Runtime) captureQuorumVisibleSnapshot(ctx context.Context, version uint
 	if err != nil {
 		c.retirePerasSnapshot(version)
 		c.flushMu.Unlock()
-		return fsmeta.VisibleSnapshotCapture{}, false, err
+		return model.VisibleSnapshotCapture{}, false, err
 	}
 	pipeline := flushPipeline{runtime: c, level: fsperas.SegmentPersistenceDurable, materialize: c.materialize}
 	for _, batch := range batches {
 		if err := pipeline.renewBatchAuthority(ctx, batch); err != nil {
 			c.retirePerasSnapshot(version)
 			c.flushMu.Unlock()
-			return fsmeta.VisibleSnapshotCapture{}, false, err
+			return model.VisibleSnapshotCapture{}, false, err
 		}
 		if err := pipeline.witnessBatch(ctx, batch); err != nil {
 			c.retirePerasSnapshot(version)
 			c.flushMu.Unlock()
-			return fsmeta.VisibleSnapshotCapture{}, false, err
+			return model.VisibleSnapshotCapture{}, false, err
 		}
 	}
-	capture := fsmeta.VisibleSnapshotCapture{
+	capture := model.VisibleSnapshotCapture{
 		Evidence: snapshotEvidenceRefsFromBatches(batches),
 	}
 	c.flushMu.Unlock()
@@ -267,7 +268,7 @@ func (c *Runtime) triggerSnapshotFlush() {
 	c.triggerBackgroundFlush()
 }
 
-func (c *Runtime) captureVisibleSnapshotLocked(version uint64, mount fsmeta.MountIdentity, prefix []byte) {
+func (c *Runtime) captureVisibleSnapshotLocked(version uint64, mount model.MountIdentity, prefix []byte) {
 	c.read.mu.Lock()
 	if c.read.snapshots == nil {
 		c.read.snapshots = make(map[uint64]perasSnapshotView)
@@ -279,14 +280,14 @@ func (c *Runtime) captureVisibleSnapshotLocked(version uint64, mount fsmeta.Moun
 	c.read.mu.Unlock()
 }
 
-func snapshotEvidenceRefsFromBatches(batches []perasFlushBatch) []fsmeta.SnapshotEvidenceRef {
+func snapshotEvidenceRefsFromBatches(batches []perasFlushBatch) []model.SnapshotEvidenceRef {
 	if len(batches) == 0 {
 		return nil
 	}
-	refs := make([]fsmeta.SnapshotEvidenceRef, 0)
+	refs := make([]model.SnapshotEvidenceRef, 0)
 	for _, batch := range batches {
 		for _, job := range batch.jobs {
-			refs = append(refs, fsmeta.SnapshotEvidenceRef{
+			refs = append(refs, model.SnapshotEvidenceRef{
 				EpochID:       job.segment.EpochID,
 				EvidenceRoot:  job.segment.Root,
 				PayloadDigest: job.digest,
@@ -485,14 +486,14 @@ func prefixUpperBound(prefix []byte) []byte {
 	return nil
 }
 
-func visibleSnapshotDirectory(scope compile.AuthorityScope) (fsmeta.MountIdentity, []byte, bool) {
+func visibleSnapshotDirectory(scope compile.AuthorityScope) (model.MountIdentity, []byte, bool) {
 	if scope.Mount == "" || scope.MountKeyID == 0 || len(scope.Parents) != 1 || len(scope.Inodes) != 0 || scope.Broad {
-		return fsmeta.MountIdentity{}, nil, false
+		return model.MountIdentity{}, nil, false
 	}
-	mount := fsmeta.MountIdentity{MountID: scope.Mount, MountKeyID: scope.MountKeyID}
+	mount := model.MountIdentity{MountID: scope.Mount, MountKeyID: scope.MountKeyID}
 	prefix, err := fsmeta.EncodeDentryPrefix(mount, scope.Parents[0])
 	if err != nil {
-		return fsmeta.MountIdentity{}, nil, false
+		return model.MountIdentity{}, nil, false
 	}
 	return mount, prefix, true
 }
@@ -510,21 +511,21 @@ func (c *Runtime) KeyState(key []byte) (present bool, known bool) {
 	return c.read.overlay.KeyState(key)
 }
 
-func (c *Runtime) DirectoryEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (c *Runtime) DirectoryEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if c == nil || c.read == nil {
 		return false
 	}
 	return c.read.overlay.DirectoryEmpty(mount, inode) && !c.sealedDirectoryHasRows(mount, inode)
 }
 
-func (c *Runtime) DirectoryBaseEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (c *Runtime) DirectoryBaseEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if c == nil || c.read == nil {
 		return false
 	}
 	return c.read.overlay.DirectoryBaseEmpty(mount, inode) && !c.sealedDirectoryHasRows(mount, inode)
 }
 
-func (c *Runtime) SessionNamespaceEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (c *Runtime) SessionNamespaceEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if c == nil || c.read == nil {
 		return false
 	}
@@ -538,28 +539,28 @@ func (c *Runtime) RememberKey(key []byte, present bool) {
 	c.read.overlay.RememberKey(key, present)
 }
 
-func (c *Runtime) RememberEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (c *Runtime) RememberEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	if c == nil || c.read == nil {
 		return
 	}
 	c.read.overlay.RememberEmptyDirectory(mount, inode)
 }
 
-func (c *Runtime) ForgetEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (c *Runtime) ForgetEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	if c == nil || c.read == nil {
 		return
 	}
 	c.read.overlay.ForgetEmptyDirectory(mount, inode)
 }
 
-func (c *Runtime) RememberEmptySessionNamespace(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (c *Runtime) RememberEmptySessionNamespace(mount model.MountIdentity, inode model.InodeID) {
 	if c == nil || c.read == nil {
 		return
 	}
 	c.read.overlay.RememberEmptySessionNamespace(mount, inode)
 }
 
-func (c *Runtime) sealedDirectoryHasRows(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (c *Runtime) sealedDirectoryHasRows(mount model.MountIdentity, inode model.InodeID) bool {
 	if c == nil || c.read == nil || c.read.sealed == nil {
 		return false
 	}

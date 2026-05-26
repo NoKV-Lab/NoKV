@@ -21,6 +21,7 @@ import (
 	coordclient "github.com/feichai0017/NoKV/coordinator/client"
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
@@ -137,7 +138,7 @@ func ensureBenchmarkMount(t *testing.T, ctx context.Context) {
 	}
 	mountKeyID := alloc.GetFirstId()
 	publishResp, err := coordRPC.PublishRootEvent(ctx, &coordpb.PublishRootEventRequest{
-		Event: metawire.RootEventToProto(rootevent.MountRegistered(strings.TrimSpace(*fsmetaMount), mountKeyID, uint64(fsmeta.RootInode), 1)),
+		Event: metawire.RootEventToProto(rootevent.MountRegistered(strings.TrimSpace(*fsmetaMount), mountKeyID, uint64(model.RootInode), 1)),
 	})
 	if err != nil {
 		t.Fatalf("register benchmark mount: %v", err)
@@ -177,8 +178,8 @@ func waitForFSMetaMount(t *testing.T, ctx context.Context, cli workload.Metadata
 	var lastErr error
 	for {
 		stream, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
-			Mount:     fsmeta.MountID(*fsmetaMount),
-			RootInode: fsmeta.RootInode,
+			Mount:     model.MountID(*fsmetaMount),
+			RootInode: model.RootInode,
 		})
 		if err == nil {
 			_ = stream.Close()
@@ -200,7 +201,7 @@ func waitForFSMetaMount(t *testing.T, ctx context.Context, cli workload.Metadata
 }
 
 func isMountVisibilityPending(err error) bool {
-	return errors.Is(err, fsmeta.ErrMountNotRegistered)
+	return errors.Is(err, model.ErrMountNotRegistered)
 }
 
 func runBenchmarkWorkload(ctx context.Context, cli workload.MetadataClient, workloadName, runID string) (workload.Result, error) {
@@ -212,7 +213,7 @@ func runBenchmarkWorkload(ctx context.Context, cli workload.MetadataClient, work
 	case workload.MDTestEasy:
 		scale := resolvedScale(workloadName)
 		result, err = workload.RunMDTestEasy(ctx, cli, workload.MDTestConfig{
-			Mount:             fsmeta.MountID(*fsmetaMount),
+			Mount:             model.MountID(*fsmetaMount),
 			RunID:             runID,
 			Clients:           scale.Clients,
 			Directories:       scale.Directories,
@@ -222,7 +223,7 @@ func runBenchmarkWorkload(ctx context.Context, cli workload.MetadataClient, work
 	case workload.MDTestHard:
 		scale := resolvedScale(workloadName)
 		result, err = workload.RunMDTestHard(ctx, cli, workload.MDTestConfig{
-			Mount:             fsmeta.MountID(*fsmetaMount),
+			Mount:             model.MountID(*fsmetaMount),
 			RunID:             runID,
 			Clients:           scale.Clients,
 			Directories:       scale.Directories,
@@ -232,7 +233,7 @@ func runBenchmarkWorkload(ctx context.Context, cli workload.MetadataClient, work
 	case workload.FilebenchVarmail:
 		scale := resolvedScale(workloadName)
 		result, err = workload.RunFilebenchVarmail(ctx, cli, workload.FilebenchVarmailConfig{
-			Mount:           fsmeta.MountID(*fsmetaMount),
+			Mount:           model.MountID(*fsmetaMount),
 			RunID:           runID,
 			Clients:         scale.Clients,
 			Users:           scale.Users,
@@ -243,7 +244,7 @@ func runBenchmarkWorkload(ctx context.Context, cli workload.MetadataClient, work
 	case workload.MimesisNamespace:
 		scale := resolvedScale(workloadName)
 		result, err = workload.RunMimesisNamespace(ctx, cli, workload.MimesisNamespaceConfig{
-			Mount:             fsmeta.MountID(*fsmetaMount),
+			Mount:             model.MountID(*fsmetaMount),
 			RunID:             runID,
 			Clients:           scale.Clients,
 			Directories:       scale.Directories,
@@ -253,7 +254,7 @@ func runBenchmarkWorkload(ctx context.Context, cli workload.MetadataClient, work
 	case workload.AICheckpointAgent:
 		scale := resolvedScale(workloadName)
 		result, err = workload.RunAICheckpointAgent(ctx, cli, workload.AICheckpointAgentConfig{
-			Mount:                   fsmeta.MountID(*fsmetaMount),
+			Mount:                   model.MountID(*fsmetaMount),
 			RunID:                   runID,
 			Clients:                 scale.Clients,
 			Workspaces:              scale.Workspaces,

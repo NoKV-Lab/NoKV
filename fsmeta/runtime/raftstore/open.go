@@ -15,6 +15,7 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/raftstore/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -49,7 +50,7 @@ type Options struct {
 	SessionCleanupInterval time.Duration
 
 	// SessionCleanupLimit bounds one stale-session cleanup pass per mount. Zero
-	// uses fsmeta.DefaultSessionExpireLimit.
+	// uses model.DefaultSessionExpireLimit.
 	SessionCleanupLimit uint32
 
 	// LockTTL bounds Percolator primary-lock liveness for fsmeta mutations.
@@ -113,7 +114,7 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.CoordinatorAddr == "" {
 		return nil, errCoordinatorAddrRequired
 	}
-	if opts.SessionCleanupLimit > fsmeta.MaxSessionExpireLimit {
+	if opts.SessionCleanupLimit > model.MaxSessionExpireLimit {
 		return nil, errSessionCleanupLimitExceeded
 	}
 	if opts.LockTTL < 0 {

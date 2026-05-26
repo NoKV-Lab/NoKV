@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
+
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 // PlacementRange describes one bootstrap byte range. Bucket ranges are fsmeta
@@ -15,30 +17,30 @@ import (
 type PlacementRange struct {
 	StartKey []byte
 	EndKey   []byte
-	Mount    MountID
-	MountKey MountKeyID
+	Mount    model.MountID
+	MountKey model.MountKeyID
 	Bucket   AffinityBucket
 	Bucketed bool
 }
 
 // PlanBucketPlacement returns continuous byte ranges that isolate each
 // mount-local affinity bucket while preserving full keyspace coverage.
-func PlanBucketPlacement(mounts []MountIdentity, bucketCount int) ([]PlacementRange, error) {
+func PlanBucketPlacement(mounts []model.MountIdentity, bucketCount int) ([]PlacementRange, error) {
 	if bucketCount <= 0 || bucketCount > 1<<16 {
-		return nil, fmt.Errorf("%w: affinity bucket count out of range", ErrInvalidRequest)
+		return nil, fmt.Errorf("%w: affinity bucket count out of range", model.ErrInvalidRequest)
 	}
 	buckets := make([]PlacementRange, 0, len(mounts)*bucketCount)
-	seenMount := make(map[MountID]struct{}, len(mounts))
-	seenKey := make(map[MountKeyID]struct{}, len(mounts))
+	seenMount := make(map[model.MountID]struct{}, len(mounts))
+	seenKey := make(map[model.MountKeyID]struct{}, len(mounts))
 	for _, mount := range mounts {
-		if err := validateMountIdentity(mount); err != nil {
+		if err := model.ValidateMountIdentity(mount); err != nil {
 			return nil, err
 		}
 		if _, ok := seenMount[mount.MountID]; ok {
-			return nil, fmt.Errorf("%w: duplicate mount %q", ErrInvalidRequest, mount.MountID)
+			return nil, fmt.Errorf("%w: duplicate mount %q", model.ErrInvalidRequest, mount.MountID)
 		}
 		if _, ok := seenKey[mount.MountKeyID]; ok {
-			return nil, fmt.Errorf("%w: duplicate mount_key_id %d", ErrInvalidRequest, mount.MountKeyID)
+			return nil, fmt.Errorf("%w: duplicate mount_key_id %d", model.ErrInvalidRequest, mount.MountKeyID)
 		}
 		seenMount[mount.MountID] = struct{}{}
 		seenKey[mount.MountKeyID] = struct{}{}
@@ -74,7 +76,7 @@ func PlanBucketPlacement(mounts []MountIdentity, bucketCount int) ([]PlacementRa
 		} else {
 			cmp := bytes.Compare(cursor, bucket.StartKey)
 			if cmp > 0 {
-				return nil, fmt.Errorf("%w: overlapping fsmeta bucket ranges", ErrInvalidRequest)
+				return nil, fmt.Errorf("%w: overlapping fsmeta bucket ranges", model.ErrInvalidRequest)
 			}
 			if cmp < 0 {
 				out = append(out, PlacementRange{
@@ -95,7 +97,7 @@ func PlanBucketPlacement(mounts []MountIdentity, bucketCount int) ([]PlacementRa
 
 // BucketSplitBoundaries returns byte boundaries that can split fsmeta bootstrap
 // ranges without cutting through one affinity bucket.
-func BucketSplitBoundaries(mounts []MountIdentity, bucketCount int) ([][]byte, error) {
+func BucketSplitBoundaries(mounts []model.MountIdentity, bucketCount int) ([][]byte, error) {
 	ranges, err := PlanBucketPlacement(mounts, bucketCount)
 	if err != nil {
 		return nil, err

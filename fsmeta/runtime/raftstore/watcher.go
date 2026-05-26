@@ -9,6 +9,7 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 // watcher wraps the in-process router with mount admission and pulls watch
@@ -27,10 +28,10 @@ func (w watcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta
 			return nil, err
 		}
 		if record.MountID == "" {
-			return nil, fsmeta.ErrMountNotRegistered
+			return nil, model.ErrMountNotRegistered
 		}
 		if record.Retired {
-			return nil, fsmeta.ErrMountRetired
+			return nil, model.ErrMountRetired
 		}
 		prefix, err := fsmeta.WatchPrefixForMount(req, record.Identity())
 		if err != nil {
@@ -39,7 +40,7 @@ func (w watcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta
 		req.KeyPrefix = prefix
 	}
 	if w.Router == nil {
-		return nil, fsmeta.ErrInvalidRequest
+		return nil, model.ErrInvalidRequest
 	}
 	return w.Router.Subscribe(ctx, req)
 }

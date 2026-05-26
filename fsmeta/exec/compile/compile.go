@@ -14,6 +14,7 @@ import (
 	"slices"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 // Eligibility describes whether a request can enter the visible optimized write
@@ -107,11 +108,11 @@ type WriteEffect struct {
 // AuthorityScope is the mount-local scope a holder grant must cover. It is a
 // runtime contract, not persisted root truth.
 type AuthorityScope struct {
-	Mount           fsmeta.MountID
-	MountKeyID      fsmeta.MountKeyID
+	Mount           model.MountID
+	MountKeyID      model.MountKeyID
 	Buckets         []fsmeta.AffinityBucket
-	Parents         []fsmeta.InodeID
-	Inodes          []fsmeta.InodeID
+	Parents         []model.InodeID
+	Inodes          []model.InodeID
 	Broad           bool
 	AllowOpaqueKeys bool
 }
@@ -122,7 +123,7 @@ type AuthorityScope struct {
 // attached. Runtime code must materialize it into MaterializedOp before holder
 // admission.
 type SemanticDelta struct {
-	Kind              fsmeta.OperationKind
+	Kind              model.OperationKind
 	Plan              fsmeta.OperationPlan
 	Authority         AuthorityScope
 	ReadPredicates    []Predicate
@@ -191,7 +192,7 @@ func collectOptions(opts ...Option) Options {
 	return out
 }
 
-func scopeFor(mount fsmeta.MountIdentity, parents, inodes []fsmeta.InodeID) AuthorityScope {
+func scopeFor(mount model.MountIdentity, parents, inodes []model.InodeID) AuthorityScope {
 	scope := AuthorityScope{
 		Mount:      mount.MountID,
 		MountKeyID: mount.MountKeyID,
@@ -209,7 +210,7 @@ func scopeFor(mount fsmeta.MountIdentity, parents, inodes []fsmeta.InodeID) Auth
 	return scope
 }
 
-func uniqueInodes(in []fsmeta.InodeID) []fsmeta.InodeID {
+func uniqueInodes(in []model.InodeID) []model.InodeID {
 	switch len(in) {
 	case 0:
 		return nil
@@ -217,24 +218,24 @@ func uniqueInodes(in []fsmeta.InodeID) []fsmeta.InodeID {
 		if in[0] == 0 {
 			return nil
 		}
-		return []fsmeta.InodeID{in[0]}
+		return []model.InodeID{in[0]}
 	case 2:
 		left, right := in[0], in[1]
 		switch {
 		case left == 0 && right == 0:
 			return nil
 		case left == 0:
-			return []fsmeta.InodeID{right}
+			return []model.InodeID{right}
 		case right == 0 || left == right:
-			return []fsmeta.InodeID{left}
+			return []model.InodeID{left}
 		case left < right:
-			return []fsmeta.InodeID{left, right}
+			return []model.InodeID{left, right}
 		default:
-			return []fsmeta.InodeID{right, left}
+			return []model.InodeID{right, left}
 		}
 	}
-	out := make([]fsmeta.InodeID, 0, len(in))
-	seen := make(map[fsmeta.InodeID]struct{}, len(in))
+	out := make([]model.InodeID, 0, len(in))
+	seen := make(map[model.InodeID]struct{}, len(in))
 	for _, id := range in {
 		if id == 0 {
 			continue
@@ -297,8 +298,8 @@ func cloneScope(scope AuthorityScope) AuthorityScope {
 		Mount:           scope.Mount,
 		MountKeyID:      scope.MountKeyID,
 		Buckets:         append([]fsmeta.AffinityBucket(nil), scope.Buckets...),
-		Parents:         append([]fsmeta.InodeID(nil), scope.Parents...),
-		Inodes:          append([]fsmeta.InodeID(nil), scope.Inodes...),
+		Parents:         append([]model.InodeID(nil), scope.Parents...),
+		Inodes:          append([]model.InodeID(nil), scope.Inodes...),
 		Broad:           scope.Broad,
 		AllowOpaqueKeys: scope.AllowOpaqueKeys,
 	}

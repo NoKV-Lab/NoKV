@@ -13,6 +13,7 @@ import (
 
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -41,9 +42,9 @@ type quotaCache struct {
 }
 
 type quotaSubject struct {
-	mount      fsmeta.MountID
-	mountKeyID fsmeta.MountKeyID
-	scope      fsmeta.InodeID
+	mount      model.MountID
+	mountKeyID model.MountKeyID
+	scope      model.InodeID
 }
 
 type quotaEntry struct {
@@ -93,7 +94,7 @@ func (c *quotaCache) AllowVisibleQuota(ctx context.Context, changes []fsmetaexec
 	}
 	for _, change := range changes {
 		if change.Mount == "" || change.MountKeyID == 0 {
-			return false, fsmeta.ErrInvalidMountID
+			return false, model.ErrInvalidMountID
 		}
 		if change.Bytes == 0 && change.Inodes == 0 {
 			continue
@@ -124,7 +125,7 @@ func (c *quotaCache) aggregate(changes []fsmetaexec.QuotaChange) (map[quotaSubje
 	out := make(map[quotaSubject]quotaDelta)
 	for _, change := range changes {
 		if change.Mount == "" || change.MountKeyID == 0 {
-			return nil, fsmeta.ErrInvalidMountID
+			return nil, model.ErrInvalidMountID
 		}
 		addDelta(out, quotaSubject{mount: change.Mount, mountKeyID: change.MountKeyID}, change.Bytes, change.Inodes)
 		if change.Scope != 0 {
@@ -155,7 +156,7 @@ func (c *quotaCache) reserveSubject(ctx context.Context, runner fsmetaexec.TxnRu
 	if !ok {
 		return nil, nil
 	}
-	key, err := fsmeta.EncodeUsageKey(fsmeta.MountIdentity{MountID: subject.mount, MountKeyID: subject.mountKeyID}, subject.scope)
+	key, err := fsmeta.EncodeUsageKey(model.MountIdentity{MountID: subject.mount, MountKeyID: subject.mountKeyID}, subject.scope)
 	if err != nil {
 		return nil, err
 	}
@@ -167,12 +168,12 @@ func (c *quotaCache) reserveSubject(ctx context.Context, runner fsmetaexec.TxnRu
 	if delta.bytes > 0 && fence.limitBytes > 0 && next.Bytes > fence.limitBytes {
 		c.rejectsTotal.Add(1)
 		return nil, fmt.Errorf("%w: mount=%s scope=%d bytes=%d add=%d limit=%d era=%d",
-			fsmeta.ErrQuotaExceeded, subject.mount, subject.scope, current.Bytes, delta.bytes, fence.limitBytes, fence.era)
+			model.ErrQuotaExceeded, subject.mount, subject.scope, current.Bytes, delta.bytes, fence.limitBytes, fence.era)
 	}
 	if delta.inodes > 0 && fence.limitInodes > 0 && next.Inodes > fence.limitInodes {
 		c.rejectsTotal.Add(1)
 		return nil, fmt.Errorf("%w: mount=%s scope=%d inodes=%d add=%d limit=%d era=%d",
-			fsmeta.ErrQuotaExceeded, subject.mount, subject.scope, current.Inodes, delta.inodes, fence.limitInodes, fence.era)
+			model.ErrQuotaExceeded, subject.mount, subject.scope, current.Inodes, delta.inodes, fence.limitInodes, fence.era)
 	}
 	c.usageMutationsTotal.Add(1)
 	if next.Bytes == 0 && next.Inodes == 0 {
@@ -185,19 +186,19 @@ func (c *quotaCache) reserveSubject(ctx context.Context, runner fsmetaexec.TxnRu
 	return &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: key, Value: value}, nil
 }
 
-func readUsage(ctx context.Context, runner fsmetaexec.TxnRunner, key []byte, version uint64) (fsmeta.UsageRecord, error) {
+func readUsage(ctx context.Context, runner fsmetaexec.TxnRunner, key []byte, version uint64) (model.UsageRecord, error) {
 	value, ok, err := runner.Get(ctx, key, version)
 	if err != nil {
-		return fsmeta.UsageRecord{}, err
+		return model.UsageRecord{}, err
 	}
 	if !ok {
-		return fsmeta.UsageRecord{}, nil
+		return model.UsageRecord{}, nil
 	}
 	return fsmeta.DecodeUsageValue(value)
 }
 
-func applyUsageDelta(current fsmeta.UsageRecord, delta quotaDelta) fsmeta.UsageRecord {
-	return fsmeta.UsageRecord{
+func applyUsageDelta(current model.UsageRecord, delta quotaDelta) model.UsageRecord {
+	return model.UsageRecord{
 		Bytes:  applyDelta(current.Bytes, delta.bytes),
 		Inodes: applyDelta(current.Inodes, delta.inodes),
 	}
@@ -252,7 +253,7 @@ func (c *quotaCache) markFenceUpdated(info *coordpb.QuotaFenceInfo) {
 	// would create an entry that no reserve path can safely hit.
 }
 
-func (c *quotaCache) purgeMount(mount fsmeta.MountID) {
+func (c *quotaCache) purgeMount(mount model.MountID) {
 	if c == nil || mount == "" {
 		return
 	}

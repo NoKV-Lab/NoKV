@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 // NewInodeMappingExecutor adapts an external fsmeta service to the contract
@@ -24,11 +24,11 @@ func NewInodeMappingExecutor(base Executor) (Executor, error) {
 	}
 	m := &inodeMappingExecutor{
 		base:            base,
-		plannedToActual: make(map[fsmeta.InodeID]fsmeta.InodeID),
-		actualToPlanned: make(map[fsmeta.InodeID]fsmeta.InodeID),
-		pendingCreates:  make(map[dentryKey]fsmeta.InodeID),
+		plannedToActual: make(map[model.InodeID]model.InodeID),
+		actualToPlanned: make(map[model.InodeID]model.InodeID),
+		pendingCreates:  make(map[dentryKey]model.InodeID),
 	}
-	m.rememberLocked(fsmeta.RootInode, fsmeta.RootInode)
+	m.rememberLocked(model.RootInode, model.RootInode)
 	return m, nil
 }
 
@@ -36,12 +36,12 @@ type inodeMappingExecutor struct {
 	base Executor
 
 	mu              sync.RWMutex
-	plannedToActual map[fsmeta.InodeID]fsmeta.InodeID
-	actualToPlanned map[fsmeta.InodeID]fsmeta.InodeID
-	pendingCreates  map[dentryKey]fsmeta.InodeID
+	plannedToActual map[model.InodeID]model.InodeID
+	actualToPlanned map[model.InodeID]model.InodeID
+	pendingCreates  map[dentryKey]model.InodeID
 }
 
-func (m *inodeMappingExecutor) Create(ctx context.Context, req fsmeta.CreateRequest) (fsmeta.CreateResult, error) {
+func (m *inodeMappingExecutor) Create(ctx context.Context, req model.CreateRequest) (model.CreateResult, error) {
 	planned, hasPlanned := plannedCreateInode(ctx)
 	req.Parent = m.actualInode(req.Parent)
 	pendingKey := dentryKey{parent: req.Parent, name: req.Name}
@@ -59,7 +59,7 @@ func (m *inodeMappingExecutor) Create(ctx context.Context, req fsmeta.CreateRequ
 		if hasPlanned {
 			m.clearPendingCreate(planned)
 		}
-		return fsmeta.CreateResult{}, err
+		return model.CreateResult{}, err
 	}
 	if !hasPlanned {
 		planned = result.Inode.Inode
@@ -75,7 +75,7 @@ func createOutcomeAmbiguous(err error) bool {
 	return nokverrors.Retryable(err)
 }
 
-func (m *inodeMappingExecutor) UpdateInode(ctx context.Context, req fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error) {
+func (m *inodeMappingExecutor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest) (model.InodeRecord, error) {
 	planned := req.Inode
 	req.Parent = m.actualInode(req.Parent)
 	if actual, ok := m.resolvePendingCreateActual(ctx, req.Mount, req.Parent, req.Name, planned); ok {
@@ -85,7 +85,7 @@ func (m *inodeMappingExecutor) UpdateInode(ctx context.Context, req fsmeta.Updat
 	}
 	record, err := m.base.UpdateInode(ctx, req)
 	if err != nil {
-		if (errors.Is(err, fsmeta.ErrInvalidRequest) || errors.Is(err, fsmeta.ErrNotFound)) && planned != 0 {
+		if (errors.Is(err, model.ErrInvalidRequest) || errors.Is(err, model.ErrNotFound)) && planned != 0 {
 			if actual, ok := m.resolvePendingCreateActual(ctx, req.Mount, req.Parent, req.Name, planned); ok && actual != req.Inode {
 				req.Inode = actual
 				record, err = m.base.UpdateInode(ctx, req)
@@ -94,29 +94,29 @@ func (m *inodeMappingExecutor) UpdateInode(ctx context.Context, req fsmeta.Updat
 				}
 			}
 		}
-		return fsmeta.InodeRecord{}, err
+		return model.InodeRecord{}, err
 	}
 	return m.translateInodeRecord(record), nil
 }
 
-func (m *inodeMappingExecutor) Lookup(ctx context.Context, req fsmeta.LookupRequest) (fsmeta.DentryRecord, error) {
+func (m *inodeMappingExecutor) Lookup(ctx context.Context, req model.LookupRequest) (model.DentryRecord, error) {
 	req.Parent = m.actualInode(req.Parent)
 	record, err := m.base.Lookup(ctx, req)
 	if err != nil {
-		return fsmeta.DentryRecord{}, err
+		return model.DentryRecord{}, err
 	}
 	return m.translateDentryRecord(record), nil
 }
 
-func (m *inodeMappingExecutor) ReadDirPlus(ctx context.Context, req fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error) {
+func (m *inodeMappingExecutor) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	req.Parent = m.actualInode(req.Parent)
 	pairs, err := m.base.ReadDirPlus(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]fsmeta.DentryAttrPair, len(pairs))
+	out := make([]model.DentryAttrPair, len(pairs))
 	for i, pair := range pairs {
-		out[i] = fsmeta.DentryAttrPair{
+		out[i] = model.DentryAttrPair{
 			Dentry: m.translateDentryRecord(pair.Dentry),
 			Inode:  m.translateInodeRecord(pair.Inode),
 		}
@@ -124,28 +124,28 @@ func (m *inodeMappingExecutor) ReadDirPlus(ctx context.Context, req fsmeta.ReadD
 	return out, nil
 }
 
-func (m *inodeMappingExecutor) SnapshotSubtree(ctx context.Context, req fsmeta.SnapshotSubtreeRequest) (fsmeta.SnapshotSubtreeToken, error) {
+func (m *inodeMappingExecutor) SnapshotSubtree(ctx context.Context, req model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error) {
 	req.RootInode = m.actualInode(req.RootInode)
 	token, err := m.base.SnapshotSubtree(ctx, req)
 	if err != nil {
-		return fsmeta.SnapshotSubtreeToken{}, err
+		return model.SnapshotSubtreeToken{}, err
 	}
 	token.RootInode = m.plannedInode(token.RootInode)
 	return token, nil
 }
 
-func (m *inodeMappingExecutor) Rename(ctx context.Context, req fsmeta.RenameRequest) error {
+func (m *inodeMappingExecutor) Rename(ctx context.Context, req model.RenameRequest) error {
 	req.FromParent = m.actualInode(req.FromParent)
 	req.ToParent = m.actualInode(req.ToParent)
 	return m.base.Rename(ctx, req)
 }
 
-func (m *inodeMappingExecutor) RenameReplace(ctx context.Context, req fsmeta.RenameReplaceRequest) (fsmeta.RenameReplaceResult, error) {
+func (m *inodeMappingExecutor) RenameReplace(ctx context.Context, req model.RenameReplaceRequest) (model.RenameReplaceResult, error) {
 	req.FromParent = m.actualInode(req.FromParent)
 	req.ToParent = m.actualInode(req.ToParent)
 	result, err := m.base.RenameReplace(ctx, req)
 	if err != nil {
-		return fsmeta.RenameReplaceResult{}, err
+		return model.RenameReplaceResult{}, err
 	}
 	if result.Replaced {
 		result.OldDentry = m.translateDentryRecord(result.OldDentry)
@@ -154,103 +154,106 @@ func (m *inodeMappingExecutor) RenameReplace(ctx context.Context, req fsmeta.Ren
 	return result, nil
 }
 
-func (m *inodeMappingExecutor) RenameSubtree(ctx context.Context, req fsmeta.RenameSubtreeRequest) error {
+func (m *inodeMappingExecutor) RenameSubtree(ctx context.Context, req model.RenameSubtreeRequest) error {
 	req.FromParent = m.actualInode(req.FromParent)
 	req.ToParent = m.actualInode(req.ToParent)
 	return m.base.RenameSubtree(ctx, req)
 }
 
-func (m *inodeMappingExecutor) Link(ctx context.Context, req fsmeta.LinkRequest) error {
+func (m *inodeMappingExecutor) Link(ctx context.Context, req model.LinkRequest) error {
 	req.FromParent = m.actualInode(req.FromParent)
 	req.ToParent = m.actualInode(req.ToParent)
 	return m.base.Link(ctx, req)
 }
 
-func (m *inodeMappingExecutor) Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error {
+func (m *inodeMappingExecutor) Unlink(ctx context.Context, req model.UnlinkRequest) error {
 	req.Parent = m.actualInode(req.Parent)
 	return m.base.Unlink(ctx, req)
 }
 
-func (m *inodeMappingExecutor) Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+func (m *inodeMappingExecutor) Remove(ctx context.Context, req model.RemoveRequest) (model.RemoveResult, error) {
 	req.Parent = m.actualInode(req.Parent)
 	result, err := m.base.Remove(ctx, req)
 	if err != nil {
-		return fsmeta.RemoveResult{}, err
+		return model.RemoveResult{}, err
 	}
 	result.RemovedDentry = m.translateDentryRecord(result.RemovedDentry)
 	result.OldInode = m.translateInodeRecord(result.OldInode)
 	return result, nil
 }
 
-func (m *inodeMappingExecutor) OpenWriteSession(ctx context.Context, req fsmeta.OpenWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (m *inodeMappingExecutor) OpenWriteSession(ctx context.Context, req model.OpenWriteSessionRequest) (model.SessionRecord, error) {
 	req.Inode = m.actualInode(req.Inode)
 	record, err := m.base.OpenWriteSession(ctx, req)
 	if err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	return m.translateSessionRecord(record), nil
 }
 
-func (m *inodeMappingExecutor) HeartbeatWriteSession(ctx context.Context, req fsmeta.HeartbeatWriteSessionRequest) (fsmeta.SessionRecord, error) {
+func (m *inodeMappingExecutor) HeartbeatWriteSession(ctx context.Context, req model.HeartbeatWriteSessionRequest) (model.SessionRecord, error) {
 	req.Inode = m.actualInode(req.Inode)
 	record, err := m.base.HeartbeatWriteSession(ctx, req)
 	if err != nil {
-		return fsmeta.SessionRecord{}, err
+		return model.SessionRecord{}, err
 	}
 	return m.translateSessionRecord(record), nil
 }
 
-func (m *inodeMappingExecutor) CloseWriteSession(ctx context.Context, req fsmeta.CloseWriteSessionRequest) error {
+func (m *inodeMappingExecutor) CloseWriteSession(ctx context.Context, req model.CloseWriteSessionRequest) error {
 	req.Inode = m.actualInode(req.Inode)
 	return m.base.CloseWriteSession(ctx, req)
 }
 
-// forwarding-ok: inode-remap adapter passes ExpireWriteSessions through unchanged (no inode rewrite needed).
-func (m *inodeMappingExecutor) ExpireWriteSessions(ctx context.Context, req fsmeta.ExpireWriteSessionsRequest) (fsmeta.ExpireWriteSessionsResult, error) {
-	return m.base.ExpireWriteSessions(ctx, req)
+func (m *inodeMappingExecutor) ExpireWriteSessions(ctx context.Context, req model.ExpireWriteSessionsRequest) (model.ExpireWriteSessionsResult, error) {
+	result, err := m.base.ExpireWriteSessions(ctx, req)
+	if err != nil {
+		return model.ExpireWriteSessionsResult{}, err
+	}
+	return result, nil
 }
 
-func (m *inodeMappingExecutor) recoverCreate(ctx context.Context, req fsmeta.CreateRequest, planned fsmeta.InodeID) (fsmeta.CreateResult, bool) {
-	dentry, err := m.base.Lookup(ctx, fsmeta.LookupRequest{
+func (m *inodeMappingExecutor) recoverCreate(ctx context.Context, req model.CreateRequest, planned model.InodeID) (model.CreateResult, bool) {
+	dentry, err := m.base.Lookup(ctx, model.LookupRequest{
 		Mount:  req.Mount,
 		Parent: req.Parent,
 		Name:   req.Name,
 	})
 	if err != nil {
-		return fsmeta.CreateResult{}, false
+		return model.CreateResult{}, false
 	}
 	m.remember(planned, dentry.Inode)
-	return m.translateCreateResult(fsmeta.CreateResult{
+	return m.translateCreateResult(model.CreateResult{
 		Dentry: dentry,
 		Inode:  req.Attrs.InodeRecord(dentry.Inode),
 	}), true
 }
 
-func (m *inodeMappingExecutor) translateCreateResult(result fsmeta.CreateResult) fsmeta.CreateResult {
-	return fsmeta.CreateResult{
+func (m *inodeMappingExecutor) translateCreateResult(result model.CreateResult) model.CreateResult {
+	return model.CreateResult{
 		Dentry: m.translateDentryRecord(result.Dentry),
 		Inode:  m.translateInodeRecord(result.Inode),
 	}
 }
 
-func (m *inodeMappingExecutor) translateDentryRecord(record fsmeta.DentryRecord) fsmeta.DentryRecord {
+func (m *inodeMappingExecutor) translateDentryRecord(record model.DentryRecord) model.DentryRecord {
 	actualParent := record.Parent
 	record.Parent = m.plannedInode(actualParent)
 	record.Inode = m.plannedInodeForDentry(actualParent, record.Name, record.Inode)
 	return record
 }
 
-func (m *inodeMappingExecutor) translateInodeRecord(record fsmeta.InodeRecord) fsmeta.InodeRecord {
+func (m *inodeMappingExecutor) translateInodeRecord(record model.InodeRecord) model.InodeRecord {
 	record.Inode = m.plannedInode(record.Inode)
 	return record
 }
 
-func (m *inodeMappingExecutor) translateSessionRecord(record fsmeta.SessionRecord) fsmeta.SessionRecord {
+func (m *inodeMappingExecutor) translateSessionRecord(record model.SessionRecord) model.SessionRecord {
 	record.Inode = m.plannedInode(record.Inode)
 	return record
 }
 
-func (m *inodeMappingExecutor) actualInode(planned fsmeta.InodeID) fsmeta.InodeID {
+func (m *inodeMappingExecutor) actualInode(planned model.InodeID) model.InodeID {
 	if planned == 0 {
 		return 0
 	}
@@ -263,7 +266,7 @@ func (m *inodeMappingExecutor) actualInode(planned fsmeta.InodeID) fsmeta.InodeI
 	return planned
 }
 
-func (m *inodeMappingExecutor) resolvePendingCreateActual(ctx context.Context, mount fsmeta.MountID, parent fsmeta.InodeID, name string, planned fsmeta.InodeID) (fsmeta.InodeID, bool) {
+func (m *inodeMappingExecutor) resolvePendingCreateActual(ctx context.Context, mount model.MountID, parent model.InodeID, name string, planned model.InodeID) (model.InodeID, bool) {
 	if planned == 0 || name == "" {
 		return 0, false
 	}
@@ -274,7 +277,7 @@ func (m *inodeMappingExecutor) resolvePendingCreateActual(ctx context.Context, m
 	if !m.pendingCreateMatches(key, planned) {
 		return 0, false
 	}
-	dentry, err := m.base.Lookup(ctx, fsmeta.LookupRequest{
+	dentry, err := m.base.Lookup(ctx, model.LookupRequest{
 		Mount:  mount,
 		Parent: parent,
 		Name:   name,
@@ -286,7 +289,7 @@ func (m *inodeMappingExecutor) resolvePendingCreateActual(ctx context.Context, m
 	return dentry.Inode, true
 }
 
-func (m *inodeMappingExecutor) actualInodeIfKnown(planned fsmeta.InodeID) (fsmeta.InodeID, bool) {
+func (m *inodeMappingExecutor) actualInodeIfKnown(planned model.InodeID) (model.InodeID, bool) {
 	if planned == 0 {
 		return 0, false
 	}
@@ -296,7 +299,7 @@ func (m *inodeMappingExecutor) actualInodeIfKnown(planned fsmeta.InodeID) (fsmet
 	return actual, ok
 }
 
-func (m *inodeMappingExecutor) pendingCreateMatches(key dentryKey, planned fsmeta.InodeID) bool {
+func (m *inodeMappingExecutor) pendingCreateMatches(key dentryKey, planned model.InodeID) bool {
 	if planned == 0 {
 		return false
 	}
@@ -306,7 +309,7 @@ func (m *inodeMappingExecutor) pendingCreateMatches(key dentryKey, planned fsmet
 	return ok && pending == planned
 }
 
-func (m *inodeMappingExecutor) plannedInode(actual fsmeta.InodeID) fsmeta.InodeID {
+func (m *inodeMappingExecutor) plannedInode(actual model.InodeID) model.InodeID {
 	if actual == 0 {
 		return 0
 	}
@@ -319,7 +322,7 @@ func (m *inodeMappingExecutor) plannedInode(actual fsmeta.InodeID) fsmeta.InodeI
 	return actual
 }
 
-func (m *inodeMappingExecutor) plannedInodeForDentry(parent fsmeta.InodeID, name string, actual fsmeta.InodeID) fsmeta.InodeID {
+func (m *inodeMappingExecutor) plannedInodeForDentry(parent model.InodeID, name string, actual model.InodeID) model.InodeID {
 	if actual == 0 {
 		return 0
 	}
@@ -335,7 +338,7 @@ func (m *inodeMappingExecutor) plannedInodeForDentry(parent fsmeta.InodeID, name
 	return actual
 }
 
-func (m *inodeMappingExecutor) remember(planned, actual fsmeta.InodeID) {
+func (m *inodeMappingExecutor) remember(planned, actual model.InodeID) {
 	if planned == 0 || actual == 0 {
 		return
 	}
@@ -344,12 +347,12 @@ func (m *inodeMappingExecutor) remember(planned, actual fsmeta.InodeID) {
 	m.rememberLocked(planned, actual)
 }
 
-func (m *inodeMappingExecutor) rememberLocked(planned, actual fsmeta.InodeID) {
+func (m *inodeMappingExecutor) rememberLocked(planned, actual model.InodeID) {
 	m.plannedToActual[planned] = actual
 	m.actualToPlanned[actual] = planned
 }
 
-func (m *inodeMappingExecutor) rememberPendingCreate(key dentryKey, planned fsmeta.InodeID) {
+func (m *inodeMappingExecutor) rememberPendingCreate(key dentryKey, planned model.InodeID) {
 	if planned == 0 {
 		return
 	}
@@ -358,7 +361,7 @@ func (m *inodeMappingExecutor) rememberPendingCreate(key dentryKey, planned fsme
 	m.pendingCreates[key] = planned
 }
 
-func (m *inodeMappingExecutor) clearPendingCreate(planned fsmeta.InodeID) {
+func (m *inodeMappingExecutor) clearPendingCreate(planned model.InodeID) {
 	if planned == 0 {
 		return
 	}

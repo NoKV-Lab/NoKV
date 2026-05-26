@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -75,7 +75,7 @@ type ReadOrderedAtomicMutateOnePhase interface {
 // transaction retry so a retry cannot publish a different inode for the same
 // logical Create after a conflict or ambiguous transport error.
 type InodeAllocator interface {
-	AllocateCreateInode(ctx context.Context, mount fsmeta.MountIdentity, parent fsmeta.InodeID, name string) (fsmeta.InodeID, error)
+	AllocateCreateInode(ctx context.Context, mount model.MountIdentity, parent model.InodeID, name string) (model.InodeID, error)
 }
 
 // statsProvider is implemented by lower fsmeta runtime layers that can expose
@@ -86,34 +86,34 @@ type statsProvider interface {
 
 // MountAdmission is the executor's mount-admission view.
 type MountAdmission struct {
-	MountID       fsmeta.MountID
-	MountKeyID    fsmeta.MountKeyID
-	RootInode     fsmeta.InodeID
+	MountID       model.MountID
+	MountKeyID    model.MountKeyID
+	RootInode     model.InodeID
 	SchemaVersion uint32
 	Retired       bool
 }
 
-func (m MountAdmission) Identity() fsmeta.MountIdentity {
-	return fsmeta.MountIdentity{MountID: m.MountID, MountKeyID: m.MountKeyID}
+func (m MountAdmission) Identity() model.MountIdentity {
+	return model.MountIdentity{MountID: m.MountID, MountKeyID: m.MountKeyID}
 }
 
 // MountResolver checks rooted mount lifecycle before mutating fsmeta data.
 type MountResolver interface {
-	ResolveMount(context.Context, fsmeta.MountID) (MountAdmission, error)
+	ResolveMount(context.Context, model.MountID) (MountAdmission, error)
 }
 
 // SubtreeHandoffPublisher publishes rooted subtree authority handoff events for
 // successful authority-aware namespace mutations.
 type SubtreeHandoffPublisher interface {
-	StartSubtreeHandoff(context.Context, fsmeta.MountID, fsmeta.InodeID, uint64) error
-	CompleteSubtreeHandoff(context.Context, fsmeta.MountID, fsmeta.InodeID, uint64) error
+	StartSubtreeHandoff(context.Context, model.MountID, model.InodeID, uint64) error
+	CompleteSubtreeHandoff(context.Context, model.MountID, model.InodeID, uint64) error
 }
 
 // SubtreeAuthorityResolver decides whether an ordinary data-plane rename stays
 // inside one rooted authority. Cross-authority moves must use RenameSubtree so
 // root can advance authority eras explicitly.
 type SubtreeAuthorityResolver interface {
-	SameAuthority(context.Context, fsmeta.MountID, fsmeta.InodeID, fsmeta.InodeID) (bool, error)
+	SameAuthority(context.Context, model.MountID, model.InodeID, model.InodeID) (bool, error)
 }
 
 type VisibleQuotaAdmitter interface {
@@ -166,7 +166,7 @@ type Executor struct {
 	visibleCommit           visibleCommitCounters
 	visibleDirectoryRead    visibleDirectoryReadCounters
 	visibleSeq              atomic.Uint64
-	atomicOnePhase          map[fsmeta.OperationKind]*atomicOnePhaseCounters
+	atomicOnePhase          map[model.OperationKind]*atomicOnePhaseCounters
 }
 
 // Option configures an Executor.

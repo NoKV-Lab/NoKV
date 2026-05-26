@@ -24,6 +24,7 @@ import (
 	coordserver "github.com/feichai0017/NoKV/coordinator/server"
 	"github.com/feichai0017/NoKV/coordinator/tso"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	rootstorage "github.com/feichai0017/NoKV/meta/root/storage"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
@@ -294,11 +295,11 @@ func fsmetaBootstrapSplitBoundaries(layout *config.FSMetaRegionBootstrap) ([][]b
 	if layout == nil {
 		return nil, nil
 	}
-	mounts := make([]fsmeta.MountIdentity, 0, len(layout.Mounts))
+	mounts := make([]model.MountIdentity, 0, len(layout.Mounts))
 	for _, mount := range layout.Mounts {
-		mounts = append(mounts, fsmeta.MountIdentity{
-			MountID:    fsmeta.MountID(mount.MountID),
-			MountKeyID: fsmeta.MountKeyID(mount.MountKeyID),
+		mounts = append(mounts, model.MountIdentity{
+			MountID:    model.MountID(mount.MountID),
+			MountKeyID: model.MountKeyID(mount.MountKeyID),
 		})
 	}
 	boundaries, err := fsmeta.BucketSplitBoundaries(mounts, layout.BucketCount)

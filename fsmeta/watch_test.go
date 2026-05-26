@@ -7,13 +7,14 @@ import (
 	"context"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSnapshotPublisherFunc(t *testing.T) {
-	token := SnapshotSubtreeToken{Mount: "vol", RootInode: 1, ReadVersion: 10}
-	var seen SnapshotSubtreeToken
-	publisher := SnapshotPublisherFunc(func(_ context.Context, t SnapshotSubtreeToken) error {
+	token := model.SnapshotSubtreeToken{Mount: "vol", RootInode: 1, ReadVersion: 10}
+	var seen model.SnapshotSubtreeToken
+	publisher := SnapshotPublisherFunc(func(_ context.Context, t model.SnapshotSubtreeToken) error {
 		seen = t
 		return nil
 	})
@@ -42,7 +43,7 @@ func TestWatchPrefix(t *testing.T) {
 	require.Equal(t, want, dentryPrefix)
 
 	_, err = WatchPrefix(WatchRequest{Mount: "vol", KeyPrefix: []byte("fsm/custom")})
-	require.ErrorIs(t, err, ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 	_, err = WatchPrefixForMount(WatchRequest{Mount: "vol", RootInode: 7, DescendRecursively: true}, testMount)
-	require.ErrorIs(t, err, ErrInvalidRequest)
+	require.ErrorIs(t, err, model.ErrInvalidRequest)
 }

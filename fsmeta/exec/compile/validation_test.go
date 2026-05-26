@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
 )
@@ -87,7 +88,7 @@ func TestMaterializedOpValidationRejectsReplayDigestDrift(t *testing.T) {
 }
 
 func TestObservedValuePredicateCompilesExactProofObligation(t *testing.T) {
-	expected, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{Inode: 44, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	expected, err := fsmeta.EncodeInodeValue(model.InodeRecord{Inode: 44, Type: model.InodeTypeFile, LinkCount: 1})
 	require.NoError(t, err)
 	delta, _ := testConcreteUpdateInodeDelta(t, expected)
 
@@ -101,7 +102,7 @@ func TestObservedValuePredicateCompilesExactProofObligation(t *testing.T) {
 func TestMaterializedOpValidationRejectsUncoveredWrite(t *testing.T) {
 	op := materializedCreateForValidation(t, 44)
 	badScope := op.Authority.Scope
-	badScope.Inodes = []fsmeta.InodeID{55}
+	badScope.Inodes = []model.InodeID{55}
 	op.Delta.Authority = badScope
 	op.Authority.Scope = badScope
 
@@ -121,19 +122,19 @@ func TestMaterializedOpValidationRejectsNonCanonicalDescriptor(t *testing.T) {
 	require.Equal(t, ValidationCanonicalMismatch, validationErr.Kind)
 }
 
-func materializedCreateForValidation(t *testing.T, inode fsmeta.InodeID) MaterializedOp {
+func materializedCreateForValidation(t *testing.T, inode model.InodeID) MaterializedOp {
 	t.Helper()
-	req := fsmeta.CreateRequest{
+	req := model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "file",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	}
 	program, err := CompileCreateProgram(req, testMount, inode)
 	require.NoError(t, err)
-	parentValue, err := fsmeta.EncodeInodeValue(fsmeta.InodeRecord{
-		Inode:      fsmeta.RootInode,
-		Type:       fsmeta.InodeTypeDirectory,
+	parentValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+		Inode:      model.RootInode,
+		Type:       model.InodeTypeDirectory,
 		LinkCount:  1,
 		ChildCount: 1,
 	})

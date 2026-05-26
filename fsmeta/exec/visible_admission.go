@@ -13,6 +13,7 @@ import (
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -148,7 +149,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 				present, known := index.KeyState(predicate.Key)
 				if known {
 					if !present {
-						return VisibleAdmissionResult{}, false, fsmeta.ErrNotFound
+						return VisibleAdmissionResult{}, false, model.ErrNotFound
 					}
 					appendProof(proof.NewPredicateProof(predicate.Key, nil, true, 0, proof.ReadSourceOverlay, frontier))
 					continue
@@ -159,7 +160,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 				return VisibleAdmissionResult{}, false, err
 			}
 			if !ok {
-				return VisibleAdmissionResult{}, false, fsmeta.ErrNotFound
+				return VisibleAdmissionResult{}, false, model.ErrNotFound
 			}
 			appendProof(proof.NewPredicateProof(predicate.Key, value, true, proofVersion, source, proofFrontierForSource(source, frontier)))
 		case compile.PredicateNotExists:
@@ -167,7 +168,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 				present, known := index.KeyState(predicate.Key)
 				if known {
 					if present {
-						return VisibleAdmissionResult{}, false, fsmeta.ErrExists
+						return VisibleAdmissionResult{}, false, model.ErrExists
 					}
 					appendProof(proof.NewPredicateProof(predicate.Key, nil, false, 0, proof.ReadSourceOverlay, frontier))
 					continue
@@ -183,7 +184,7 @@ func (e *Executor) visiblePredicatesHold(ctx context.Context, op compile.Materia
 				return VisibleAdmissionResult{}, false, err
 			}
 			if ok {
-				return VisibleAdmissionResult{}, false, fsmeta.ErrExists
+				return VisibleAdmissionResult{}, false, model.ErrExists
 			}
 			appendProof(proof.NewPredicateProof(predicate.Key, nil, false, proofVersion, source, proofFrontierForSource(source, frontier)))
 		case compile.PredicateObservedValue:
@@ -252,7 +253,7 @@ func (e *Executor) visiblePredicateIndex() VisiblePredicateIndex {
 	return index
 }
 
-func (e *Executor) rememberVisibleCreate(mount fsmeta.MountIdentity, plan fsmeta.OperationPlan, inode fsmeta.InodeRecord) {
+func (e *Executor) rememberVisibleCreate(mount model.MountIdentity, plan fsmeta.OperationPlan, inode model.InodeRecord) {
 	index := e.visiblePredicateIndex()
 	if index == nil {
 		return
@@ -263,7 +264,7 @@ func (e *Executor) rememberVisibleCreate(mount fsmeta.MountIdentity, plan fsmeta
 	if len(plan.MutateKeys) > 2 {
 		index.RememberKey(plan.MutateKeys[2], true)
 	}
-	if inode.Type == fsmeta.InodeTypeDirectory {
+	if inode.Type == model.InodeTypeDirectory {
 		index.RememberEmptyDirectory(mount, inode.Inode)
 		return
 	}
@@ -275,10 +276,10 @@ func (e *Executor) rememberVisibleCreate(mount fsmeta.MountIdentity, plan fsmeta
 }
 
 type visibleEmptyDirectoryForgetter interface {
-	ForgetEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID)
+	ForgetEmptyDirectory(mount model.MountIdentity, inode model.InodeID)
 }
 
-func (e *Executor) forgetVisibleEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (e *Executor) forgetVisibleEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	index := e.visiblePredicateIndex()
 	if index == nil {
 		return
@@ -295,7 +296,7 @@ func visibleDeltaAllowsAbsentObservedValue(delta compile.SemanticDelta) bool {
 }
 
 func visibleNotExistsDerivedFromDelta(delta compile.SemanticDelta, predicate compile.Predicate, index VisiblePredicateIndex) bool {
-	if delta.Kind != fsmeta.OperationCreate || len(delta.Plan.MutateKeys) < 3 {
+	if delta.Kind != model.OperationCreate || len(delta.Plan.MutateKeys) < 3 {
 		return false
 	}
 	if bytes.Equal(predicate.Key, delta.Plan.MutateKeys[2]) {
@@ -304,7 +305,7 @@ func visibleNotExistsDerivedFromDelta(delta compile.SemanticDelta, predicate com
 	if !bytes.Equal(predicate.Key, delta.Plan.MutateKeys[1]) || len(delta.Authority.Parents) != 1 {
 		return false
 	}
-	return index.DirectoryBaseEmpty(fsmeta.MountIdentity{
+	return index.DirectoryBaseEmpty(model.MountIdentity{
 		MountID:    delta.Authority.Mount,
 		MountKeyID: delta.Authority.MountKeyID,
 	}, delta.Authority.Parents[0])
@@ -323,7 +324,7 @@ func (e *Executor) visibleNotExistsKnown(scope compile.AuthorityScope, key []byt
 		return false
 	}
 	if parts.Kind == fsmeta.KeyKindSession {
-		return index.SessionNamespaceEmpty(fsmeta.MountIdentity{
+		return index.SessionNamespaceEmpty(model.MountIdentity{
 			MountID:    scope.Mount,
 			MountKeyID: scope.MountKeyID,
 		}, parts.Inode)
@@ -331,15 +332,15 @@ func (e *Executor) visibleNotExistsKnown(scope compile.AuthorityScope, key []byt
 	if parts.Kind != fsmeta.KeyKindDentry {
 		return false
 	}
-	return index.DirectoryEmpty(fsmeta.MountIdentity{
+	return index.DirectoryEmpty(model.MountIdentity{
 		MountID:    scope.Mount,
 		MountKeyID: scope.MountKeyID,
 	}, parts.Parent)
 }
 
 func isVisibleAdmissionTerminalError(err error) bool {
-	return errors.Is(err, fsmeta.ErrExists) ||
-		errors.Is(err, fsmeta.ErrNotFound) ||
-		errors.Is(err, fsmeta.ErrInvalidRequest) ||
-		errors.Is(err, fsmeta.ErrInvalidValue)
+	return errors.Is(err, model.ErrExists) ||
+		errors.Is(err, model.ErrNotFound) ||
+		errors.Is(err, model.ErrInvalidRequest) ||
+		errors.Is(err, model.ErrInvalidValue)
 }

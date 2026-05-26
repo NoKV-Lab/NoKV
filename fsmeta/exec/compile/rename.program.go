@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 type RenameProgram struct {
@@ -23,7 +24,7 @@ type RenameSubtreeProgram struct {
 	Compiled CompiledOp
 }
 
-func CompileRenameProgram(req fsmeta.RenameRequest, mount fsmeta.MountIdentity) (RenameProgram, error) {
+func CompileRenameProgram(req model.RenameRequest, mount model.MountIdentity) (RenameProgram, error) {
 	plan, err := fsmeta.PlanRename(req, mount)
 	if err != nil {
 		return RenameProgram{}, err
@@ -41,13 +42,13 @@ func CompileRenameProgram(req fsmeta.RenameRequest, mount fsmeta.MountIdentity) 
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[2]},
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[3]},
 	}
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []model.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilityVisibleCommit}
 	if len(delta.Authority.Buckets) > 1 {
 		delta.Eligibility = EligibilitySlowPath
 		delta.SlowReason = SlowReasonCrossBucket
 	}
 	if !validateRenameSemanticDelta(delta) {
-		return RenameProgram{}, fsmeta.ErrInvalidRequest
+		return RenameProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileRenameCompiledOp(delta)
 	if err != nil {
@@ -56,7 +57,7 @@ func CompileRenameProgram(req fsmeta.RenameRequest, mount fsmeta.MountIdentity) 
 	return RenameProgram{Compiled: compiled}, nil
 }
 
-func CompileRenameReplaceProgram(req fsmeta.RenameReplaceRequest, mount fsmeta.MountIdentity) (RenameReplaceProgram, error) {
+func CompileRenameReplaceProgram(req model.RenameReplaceRequest, mount model.MountIdentity) (RenameReplaceProgram, error) {
 	plan, err := fsmeta.PlanRenameReplace(req, mount)
 	if err != nil {
 		return RenameReplaceProgram{}, err
@@ -74,9 +75,9 @@ func CompileRenameReplaceProgram(req fsmeta.RenameReplaceRequest, mount fsmeta.M
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[2]},
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[3]},
 	}
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonDynamicWriteSet}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []model.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonDynamicWriteSet}
 	if !validateRenameReplaceSemanticDelta(delta) {
-		return RenameReplaceProgram{}, fsmeta.ErrInvalidRequest
+		return RenameReplaceProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileRenameReplaceCompiledOp(delta)
 	if err != nil {
@@ -85,7 +86,7 @@ func CompileRenameReplaceProgram(req fsmeta.RenameReplaceRequest, mount fsmeta.M
 	return RenameReplaceProgram{Compiled: compiled}, nil
 }
 
-func CompileRenameSubtreeProgram(req fsmeta.RenameSubtreeRequest, mount fsmeta.MountIdentity) (RenameSubtreeProgram, error) {
+func CompileRenameSubtreeProgram(req model.RenameSubtreeRequest, mount model.MountIdentity) (RenameSubtreeProgram, error) {
 	plan, err := fsmeta.PlanRenameSubtree(req, mount)
 	if err != nil {
 		return RenameSubtreeProgram{}, err
@@ -103,9 +104,9 @@ func CompileRenameSubtreeProgram(req fsmeta.RenameSubtreeRequest, mount fsmeta.M
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[2]},
 		{Kind: EffectDerivedPut, Key: plan.MutateKeys[3]},
 	}
-	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []fsmeta.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonDurabilityBarrier, DurabilityBarrier: true, WatchAtSeal: true}
+	delta := SemanticDelta{Kind: plan.Kind, Plan: plan, Authority: scopeFor(mount, []model.InodeID{req.FromParent, req.ToParent}, nil), ReadPredicates: predicates, WriteEffects: effects, Eligibility: EligibilitySlowPath, SlowReason: SlowReasonDurabilityBarrier, DurabilityBarrier: true, WatchAtSeal: true}
 	if !validateRenameSubtreeSemanticDelta(delta) {
-		return RenameSubtreeProgram{}, fsmeta.ErrInvalidRequest
+		return RenameSubtreeProgram{}, model.ErrInvalidRequest
 	}
 	compiled, err := compileRenameSubtreeCompiledOp(delta)
 	if err != nil {
@@ -115,7 +116,7 @@ func CompileRenameSubtreeProgram(req fsmeta.RenameSubtreeRequest, mount fsmeta.M
 }
 
 func validateRenameSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationRename {
+	if delta.Kind != model.OperationRename {
 		return false
 	}
 	switch {
@@ -203,7 +204,7 @@ func validateRenameSemanticDelta(delta SemanticDelta) bool {
 }
 
 func validateRenameReplaceSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationRenameReplace {
+	if delta.Kind != model.OperationRenameReplace {
 		return false
 	}
 	switch {
@@ -290,7 +291,7 @@ func validateRenameReplaceSemanticDelta(delta SemanticDelta) bool {
 }
 
 func validateRenameSubtreeSemanticDelta(delta SemanticDelta) bool {
-	if delta.Kind != fsmeta.OperationRenameSubtree {
+	if delta.Kind != model.OperationRenameSubtree {
 		return false
 	}
 	switch {
@@ -377,15 +378,15 @@ func validateRenameSubtreeSemanticDelta(delta SemanticDelta) bool {
 }
 
 func compileRenameCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationRename || len(delta.WriteEffects) != 4 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationRename || len(delta.WriteEffects) != 4 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
@@ -586,15 +587,15 @@ placementDone:
 }
 
 func compileRenameReplaceCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationRenameReplace || len(delta.WriteEffects) != 4 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationRenameReplace || len(delta.WriteEffects) != 4 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityVisibleOnly
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
@@ -795,15 +796,15 @@ placementDone:
 }
 
 func compileRenameSubtreeCompiledOp(delta SemanticDelta) (CompiledOp, error) {
-	if delta.Kind != fsmeta.OperationRenameSubtree || len(delta.ReadPredicates) != 4 || len(delta.WriteEffects) != 4 {
-		return CompiledOp{}, fsmeta.ErrInvalidRequest
+	if delta.Kind != model.OperationRenameSubtree || len(delta.ReadPredicates) != 4 || len(delta.WriteEffects) != 4 {
+		return CompiledOp{}, model.ErrInvalidRequest
 	}
 	digest := descriptorDigest(delta)
 	durability := DurabilityNeedsPublishCheckpoint
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if delta.Eligibility == EligibilityVisibleCommit && !delta.DurabilityBarrier && len(delta.WriteEffects) > 0 {
-		var mount fsmeta.MountKeyID
+		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
 		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))

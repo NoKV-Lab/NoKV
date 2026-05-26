@@ -17,6 +17,7 @@ import (
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
 	fsmetamodel "github.com/feichai0017/NoKV/fsmeta"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	stable "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
@@ -47,8 +48,8 @@ func TestValidatePreparedSegmentInstallResponseChecksVersionAndAppliedCount(t *t
 }
 
 func TestRaftstoreSegmentInstallerUsesLocalInstallVersion(t *testing.T) {
-	mount := fsmetamodel.MountIdentity{MountID: "vol", MountKeyID: 1}
-	dentryKey, err := fsmetamodel.EncodeDentryKey(mount, fsmetamodel.RootInode, "a")
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	dentryKey, err := fsmetamodel.EncodeDentryKey(mount, model.RootInode, "a")
 	require.NoError(t, err)
 	inodeKey, err := fsmetamodel.EncodeInodeKey(mount, 10)
 	require.NoError(t, err)
@@ -82,8 +83,8 @@ func TestRaftstoreSegmentInstallerUsesLocalInstallVersion(t *testing.T) {
 }
 
 func TestRaftstoreSegmentInstallerPublishesInstalledDentries(t *testing.T) {
-	mount := fsmetamodel.MountIdentity{MountID: "vol", MountKeyID: 1}
-	dentryKey, err := fsmetamodel.EncodeDentryKey(mount, fsmetamodel.RootInode, "a")
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	dentryKey, err := fsmetamodel.EncodeDentryKey(mount, model.RootInode, "a")
 	require.NoError(t, err)
 	inodeKey, err := fsmetamodel.EncodeInodeKey(mount, 10)
 	require.NoError(t, err)
@@ -128,12 +129,12 @@ func TestRaftstoreSegmentInstallerInstallsCatalogRoutesInParallel(t *testing.T) 
 	oldProcs := runtime.GOMAXPROCS(2)
 	defer runtime.GOMAXPROCS(oldProcs)
 
-	mount := fsmetamodel.MountIdentity{MountID: "vol", MountKeyID: 1}
-	rootKey, err := fsmetamodel.EncodeInodeKey(mount, fsmetamodel.RootInode)
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	rootKey, err := fsmetamodel.EncodeInodeKey(mount, model.RootInode)
 	require.NoError(t, err)
 	var otherKey []byte
-	for inode := fsmetamodel.InodeID(2); inode < 100_000; inode++ {
-		if fsmetamodel.BucketForInodeID(inode) == fsmetamodel.BucketForInodeID(fsmetamodel.RootInode) {
+	for inode := model.InodeID(2); inode < 100_000; inode++ {
+		if fsmetamodel.BucketForInodeID(inode) == fsmetamodel.BucketForInodeID(model.RootInode) {
 			continue
 		}
 		otherKey, err = fsmetamodel.EncodeInodeKey(mount, inode)
@@ -277,8 +278,8 @@ func TestRaftstoreSegmentInstallerReturnsWhenRouteErrorsExceedWorkers(t *testing
 }
 
 func TestRaftstoreSegmentInstallerMarksInstallRetryExhaustedRoutingRetryable(t *testing.T) {
-	mount := fsmetamodel.MountIdentity{MountID: "vol", MountKeyID: 1}
-	dentryKey, err := fsmetamodel.EncodeDentryKey(mount, fsmetamodel.RootInode, "a")
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	dentryKey, err := fsmetamodel.EncodeDentryKey(mount, model.RootInode, "a")
 	require.NoError(t, err)
 	inodeKey, err := fsmetamodel.EncodeInodeKey(mount, 10)
 	require.NoError(t, err)
@@ -317,7 +318,7 @@ func testRaftstoreInstallSegment(t *testing.T, keys [][]byte) fsperas.PerasSegme
 		EpochID: 1,
 		Operations: []fsperas.ReplayOperation{{
 			OpID:      fsperas.OperationID{ClientID: "client", Seq: 1},
-			Kind:      fsmetamodel.OperationCreate,
+			Kind:      model.OperationCreate,
 			Mutations: mutations,
 		}},
 	})
@@ -327,10 +328,10 @@ func testRaftstoreInstallSegment(t *testing.T, keys [][]byte) fsperas.PerasSegme
 
 func testRaftstoreInstallKeysAcrossBuckets(t *testing.T, count int) [][]byte {
 	t.Helper()
-	mount := fsmetamodel.MountIdentity{MountID: "vol", MountKeyID: 1}
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
 	seen := make(map[fsmetamodel.AffinityBucket]struct{}, count)
 	keys := make([][]byte, 0, count)
-	for inode := fsmetamodel.InodeID(1); len(keys) < count && inode < 1_000_000; inode++ {
+	for inode := model.InodeID(1); len(keys) < count && inode < 1_000_000; inode++ {
 		bucket := fsmetamodel.BucketForInodeID(inode)
 		if _, ok := seen[bucket]; ok {
 			continue

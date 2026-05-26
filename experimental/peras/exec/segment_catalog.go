@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 var (
@@ -117,7 +118,7 @@ func PerasSegmentCatalogObjectKeys(segment PerasSegment) ([][]byte, error) {
 }
 
 type perasSegmentCatalogBucket struct {
-	mount  fsmeta.MountKeyID
+	mount  model.MountKeyID
 	bucket fsmeta.AffinityBucket
 }
 

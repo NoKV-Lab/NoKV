@@ -16,6 +16,7 @@ import (
 	"github.com/feichai0017/NoKV/engine/wal"
 	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetalocal "github.com/feichai0017/NoKV/fsmeta/runtime/local"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -90,13 +91,13 @@ func TestLocalMountIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("local mount identity: %v", err)
 	}
-	if got != (fsmeta.MountIdentity{MountID: "vol", MountKeyID: 7}) {
+	if got != (model.MountIdentity{MountID: "vol", MountKeyID: 7}) {
 		t.Fatalf("got %+v", got)
 	}
-	if _, err := localMountIdentity("", 1); !errors.Is(err, fsmeta.ErrInvalidMountID) {
+	if _, err := localMountIdentity("", 1); !errors.Is(err, model.ErrInvalidMountID) {
 		t.Fatalf("empty mount err=%v", err)
 	}
-	if _, err := localMountIdentity("vol", 0); !errors.Is(err, fsmeta.ErrInvalidMountID) {
+	if _, err := localMountIdentity("vol", 0); !errors.Is(err, model.ErrInvalidMountID) {
 		t.Fatalf("zero mount key err=%v", err)
 	}
 }
@@ -107,7 +108,7 @@ func TestOpenConfiguredRuntimeLocal(t *testing.T) {
 		Backend: fsmetaBackendLocal,
 		Local: fsmetalocal.Options{
 			WorkDir: t.TempDir(),
-			Mount:   fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1},
+			Mount:   model.MountIdentity{MountID: "vol", MountKeyID: 1},
 		},
 	})
 	if err != nil {
@@ -130,16 +131,16 @@ func TestOpenConfiguredRuntimeLocal(t *testing.T) {
 	if !strings.Contains(rt.startupSummary, "fsmeta backend: local") || strings.Contains(rt.startupSummary, "peras=") {
 		t.Fatalf("local runtime summary should stay direct-only: %s", rt.startupSummary)
 	}
-	result, err := rt.executor.Create(ctx, fsmeta.CreateRequest{
+	result, err := rt.executor.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "alpha",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	if err != nil {
 		t.Fatalf("create through local runtime: %v", err)
 	}
-	got, err := rt.executor.Lookup(ctx, fsmeta.LookupRequest{Mount: "vol", Parent: fsmeta.RootInode, Name: "alpha"})
+	got, err := rt.executor.Lookup(ctx, model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "alpha"})
 	if err != nil {
 		t.Fatalf("lookup through local runtime: %v", err)
 	}
@@ -154,7 +155,7 @@ func TestOpenConfiguredRuntimeLocalCommitContract(t *testing.T) {
 		Backend: fsmetaBackendLocal,
 		Local: fsmetalocal.Options{
 			WorkDir: t.TempDir(),
-			Mount:   fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1},
+			Mount:   model.MountIdentity{MountID: "vol", MountKeyID: 1},
 		},
 	})
 	if err != nil {
@@ -183,7 +184,7 @@ func TestLocalRuntimeRegistersWatchAndSnapshot(t *testing.T) {
 		Backend: fsmetaBackendLocal,
 		Local: fsmetalocal.Options{
 			WorkDir: t.TempDir(),
-			Mount:   fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1},
+			Mount:   model.MountIdentity{MountID: "vol", MountKeyID: 1},
 		},
 	})
 	if err != nil {
@@ -200,24 +201,24 @@ func TestLocalRuntimeRegistersWatchAndSnapshot(t *testing.T) {
 
 	watch, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
 		Mount:     "vol",
-		RootInode: fsmeta.RootInode,
+		RootInode: model.RootInode,
 	})
 	if err != nil {
 		t.Fatalf("watch local runtime: %v", err)
 	}
 	defer func() { _ = watch.Close() }()
 
-	_, err = cli.Create(ctx, fsmeta.CreateRequest{
+	_, err = cli.Create(ctx, model.CreateRequest{
 		Mount:  "vol",
-		Parent: fsmeta.RootInode,
+		Parent: model.RootInode,
 		Name:   "over-grpc",
-		Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	})
 	if err != nil {
 		t.Fatalf("create over local grpc: %v", err)
 	}
 	evt := recvClientWatchEvent(t, watch)
-	wantKey, err := fsmeta.EncodeDentryKey(fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}, fsmeta.RootInode, "over-grpc")
+	wantKey, err := fsmeta.EncodeDentryKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode, "over-grpc")
 	if err != nil {
 		t.Fatalf("encode dentry key: %v", err)
 	}
@@ -227,9 +228,9 @@ func TestLocalRuntimeRegistersWatchAndSnapshot(t *testing.T) {
 	if err := watch.Ack(evt.Cursor); err != nil {
 		t.Fatalf("ack watch event: %v", err)
 	}
-	usage, err := cli.GetQuotaUsage(ctx, fsmeta.QuotaUsageRequest{
+	usage, err := cli.GetQuotaUsage(ctx, model.QuotaUsageRequest{
 		Mount: "vol",
-		Scope: fsmeta.RootInode,
+		Scope: model.RootInode,
 	})
 	if err != nil {
 		t.Fatalf("get local quota usage: %v", err)
@@ -238,14 +239,14 @@ func TestLocalRuntimeRegistersWatchAndSnapshot(t *testing.T) {
 		t.Fatalf("quota usage got %+v", usage)
 	}
 
-	token, err := cli.SnapshotSubtree(ctx, fsmeta.SnapshotSubtreeRequest{
+	token, err := cli.SnapshotSubtree(ctx, model.SnapshotSubtreeRequest{
 		Mount:     "vol",
-		RootInode: fsmeta.RootInode,
+		RootInode: model.RootInode,
 	})
 	if err != nil {
 		t.Fatalf("snapshot over local grpc: %v", err)
 	}
-	if token.Mount != "vol" || token.RootInode != fsmeta.RootInode || token.ReadVersion == 0 {
+	if token.Mount != "vol" || token.RootInode != model.RootInode || token.ReadVersion == 0 {
 		t.Fatalf("bad snapshot token: %+v", token)
 	}
 	if err := cli.RetireSnapshotSubtree(ctx, token); err != nil {

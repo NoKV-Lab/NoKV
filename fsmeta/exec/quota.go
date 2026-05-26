@@ -7,7 +7,7 @@ import (
 	"context"
 	"math"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -15,9 +15,9 @@ import (
 // affects the mount-wide subject; non-zero scopes also affect that direct
 // accounting scope.
 type QuotaChange struct {
-	Mount      fsmeta.MountID
-	MountKeyID fsmeta.MountKeyID
-	Scope      fsmeta.InodeID
+	Mount      model.MountID
+	MountKeyID model.MountKeyID
+	Scope      model.InodeID
 	Bytes      int64
 	Inodes     int64
 }
@@ -32,7 +32,7 @@ type QuotaResolver interface {
 // keys in the write transaction. Runtimes that do not implement it keep the
 // persisted counter-key behavior in GetQuotaUsage.
 type QuotaUsageResolver interface {
-	ReadQuotaUsage(context.Context, TxnRunner, fsmeta.MountIdentity, fsmeta.InodeID, uint64) (fsmeta.UsageRecord, bool, error)
+	ReadQuotaUsage(context.Context, TxnRunner, model.MountIdentity, model.InodeID, uint64) (model.UsageRecord, bool, error)
 }
 
 func inodeSizeDelta(size uint64) int64 {

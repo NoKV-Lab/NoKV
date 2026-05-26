@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 const (
@@ -74,14 +74,14 @@ func normalizeLookupCacheConfig(cfg LookupCacheConfig) (LookupCacheConfig, error
 }
 
 type lookupCacheKey struct {
-	mount  fsmeta.MountID
-	parent fsmeta.InodeID
+	mount  model.MountID
+	parent model.InodeID
 	name   string
 }
 
 type lookupCacheEntry struct {
 	key       lookupCacheKey
-	record    fsmeta.DentryRecord
+	record    model.DentryRecord
 	expiresAt time.Time
 }
 
@@ -105,54 +105,54 @@ func (c *LookupCache) Stats() LookupCacheStats {
 }
 
 // Get returns a fresh cached dentry for mount/parent/name when present.
-func (c *LookupCache) Get(mount fsmeta.MountID, parent fsmeta.InodeID, name string) (fsmeta.DentryRecord, bool) {
+func (c *LookupCache) Get(mount model.MountID, parent model.InodeID, name string) (model.DentryRecord, bool) {
 	return c.get(lookupCacheKey{mount: mount, parent: parent, name: name})
 }
 
-func (c *LookupCache) get(key lookupCacheKey) (fsmeta.DentryRecord, bool) {
+func (c *LookupCache) get(key lookupCacheKey) (model.DentryRecord, bool) {
 	if c == nil {
-		return fsmeta.DentryRecord{}, false
+		return model.DentryRecord{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	elem := c.items[key]
 	if elem == nil {
 		c.stats.Misses++
-		return fsmeta.DentryRecord{}, false
+		return model.DentryRecord{}, false
 	}
 	entry := elem.Value.(*lookupCacheEntry)
 	if !entry.expiresAt.After(c.now()) {
 		c.removeElement(elem)
 		c.stats.Expired++
 		c.stats.Misses++
-		return fsmeta.DentryRecord{}, false
+		return model.DentryRecord{}, false
 	}
 	c.lru.MoveToFront(elem)
 	c.stats.Hits++
 	return entry.record, true
 }
 
-func (c *LookupCache) peek(key lookupCacheKey) (fsmeta.DentryRecord, bool) {
+func (c *LookupCache) peek(key lookupCacheKey) (model.DentryRecord, bool) {
 	if c == nil {
-		return fsmeta.DentryRecord{}, false
+		return model.DentryRecord{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	elem := c.items[key]
 	if elem == nil {
-		return fsmeta.DentryRecord{}, false
+		return model.DentryRecord{}, false
 	}
 	entry := elem.Value.(*lookupCacheEntry)
 	if !entry.expiresAt.After(c.now()) {
 		c.removeElement(elem)
 		c.stats.Expired++
-		return fsmeta.DentryRecord{}, false
+		return model.DentryRecord{}, false
 	}
 	return entry.record, true
 }
 
 // Put stores one dentry record using the supplied mount identity.
-func (c *LookupCache) Put(mount fsmeta.MountID, record fsmeta.DentryRecord) {
+func (c *LookupCache) Put(mount model.MountID, record model.DentryRecord) {
 	if c == nil || c.maxEntries == 0 {
 		return
 	}
@@ -163,14 +163,14 @@ func (c *LookupCache) Put(mount fsmeta.MountID, record fsmeta.DentryRecord) {
 }
 
 // PutMany stores a batch of dentry records for the same mount.
-func (c *LookupCache) PutMany(mount fsmeta.MountID, records []fsmeta.DentryRecord) {
+func (c *LookupCache) PutMany(mount model.MountID, records []model.DentryRecord) {
 	for _, record := range records {
 		c.Put(mount, record)
 	}
 }
 
 // Invalidate drops the exact mount/parent/name cache entry.
-func (c *LookupCache) Invalidate(mount fsmeta.MountID, parent fsmeta.InodeID, name string) {
+func (c *LookupCache) Invalidate(mount model.MountID, parent model.InodeID, name string) {
 	c.invalidate(lookupCacheKey{mount: mount, parent: parent, name: name})
 }
 
@@ -197,7 +197,7 @@ func (c *LookupCache) Clear() {
 	c.lru.Init()
 }
 
-func (c *LookupCache) putLocked(key lookupCacheKey, record fsmeta.DentryRecord) {
+func (c *LookupCache) putLocked(key lookupCacheKey, record model.DentryRecord) {
 	if elem := c.items[key]; elem != nil {
 		entry := elem.Value.(*lookupCacheEntry)
 		entry.record = record

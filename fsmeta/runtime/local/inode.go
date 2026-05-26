@@ -11,12 +11,13 @@ import (
 	"github.com/feichai0017/NoKV/engine/index"
 	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
 )
 
 // InodeAllocator assigns monotonically increasing local inode IDs.
 type InodeAllocator struct {
-	mount fsmeta.MountIdentity
+	mount model.MountIdentity
 
 	mu   sync.Mutex
 	next uint64
@@ -28,13 +29,13 @@ type InodeAllocator struct {
 
 // NewInodeAllocator initializes allocation above every inode key already
 // present for mount.
-func NewInodeAllocator(db *localdb.DB, mount fsmeta.MountIdentity) (*InodeAllocator, error) {
+func NewInodeAllocator(db *localdb.DB, mount model.MountIdentity) (*InodeAllocator, error) {
 	maxInode, err := maxInodeInStore(db, mount)
 	if err != nil {
 		return nil, err
 	}
-	if maxInode < fsmeta.RootInode {
-		maxInode = fsmeta.RootInode
+	if maxInode < model.RootInode {
+		maxInode = model.RootInode
 	}
 	alloc := &InodeAllocator{mount: mount}
 	alloc.next = uint64(maxInode) + 1
@@ -42,12 +43,12 @@ func NewInodeAllocator(db *localdb.DB, mount fsmeta.MountIdentity) (*InodeAlloca
 }
 
 // AllocateCreateInode implements fsmetaexec.InodeAllocator.
-func (a *InodeAllocator) AllocateCreateInode(_ context.Context, mount fsmeta.MountIdentity, parent fsmeta.InodeID, name string) (fsmeta.InodeID, error) {
+func (a *InodeAllocator) AllocateCreateInode(_ context.Context, mount model.MountIdentity, parent model.InodeID, name string) (model.InodeID, error) {
 	if a == nil {
 		return 0, errMountRequired
 	}
 	if mount != a.mount {
-		return 0, fsmeta.ErrMountNotRegistered
+		return 0, model.ErrMountNotRegistered
 	}
 	target, err := localCreateDentryBucket(mount, parent, name)
 	if err != nil {
@@ -56,9 +57,9 @@ func (a *InodeAllocator) AllocateCreateInode(_ context.Context, mount fsmeta.Mou
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for {
-		id := fsmeta.InodeID(a.next)
+		id := model.InodeID(a.next)
 		a.next++
-		if id <= fsmeta.RootInode {
+		if id <= model.RootInode {
 			continue
 		}
 		a.affineProbe.Add(1)
@@ -92,8 +93,8 @@ func (a *InodeAllocator) Stats() map[string]any {
 	}
 }
 
-func localCreateDentryBucket(mount fsmeta.MountIdentity, parent fsmeta.InodeID, name string) (fsmeta.AffinityBucket, error) {
-	if parent == fsmeta.RootInode {
+func localCreateDentryBucket(mount model.MountIdentity, parent model.InodeID, name string) (fsmeta.AffinityBucket, error) {
+	if parent == model.RootInode {
 		return fsmeta.ChooseWorkspaceBucket(mount, name), nil
 	}
 	key, err := fsmeta.EncodeDentryKey(mount, parent, name)
@@ -107,7 +108,7 @@ func localCreateDentryBucket(mount fsmeta.MountIdentity, parent fsmeta.InodeID, 
 	return bucket, nil
 }
 
-func maxInodeInStore(db *localdb.DB, mount fsmeta.MountIdentity) (fsmeta.InodeID, error) {
+func maxInodeInStore(db *localdb.DB, mount model.MountIdentity) (model.InodeID, error) {
 	if db == nil {
 		return 0, nil
 	}
@@ -116,7 +117,7 @@ func maxInodeInStore(db *localdb.DB, mount fsmeta.MountIdentity) (fsmeta.InodeID
 		return 0, nil
 	}
 	defer func() { _ = iter.Close() }()
-	var maxInode fsmeta.InodeID
+	var maxInode model.InodeID
 	iter.Seek(kv.InternalKey(kv.CFWrite, nil, kv.MaxVersion))
 	for iter.Valid() {
 		item := iter.Item()

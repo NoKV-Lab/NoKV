@@ -10,11 +10,12 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	"github.com/stretchr/testify/require"
 )
 
-var allocatorTestMount = fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+var allocatorTestMount = model.MountIdentity{MountID: "vol", MountKeyID: 1}
 
 type fakeAllocIDClient struct {
 	mu      sync.Mutex
@@ -58,9 +59,9 @@ func TestShardAffineInodeAllocatorSkipsRootInode(t *testing.T) {
 	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, 1, 4)
 	require.NoError(t, err)
 
-	inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, fsmeta.RootInode, "file")
+	inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, model.RootInode, "file")
 	require.NoError(t, err)
-	require.Greater(t, inode, fsmeta.RootInode)
+	require.Greater(t, inode, model.RootInode)
 	require.Equal(t, []uint64{4}, client.counts)
 	require.Equal(t, uint64(3), alloc.Stats()["inode_alloc_reserved_total"])
 }
@@ -70,9 +71,9 @@ func TestShardAffineInodeAllocatorChoosesWorkspaceBucket(t *testing.T) {
 	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, fsmeta.DefaultAffinityBucketCount, 64)
 	require.NoError(t, err)
 
-	inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, fsmeta.RootInode, "aligned")
+	inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, model.RootInode, "aligned")
 	require.NoError(t, err)
-	want, err := createDentryBucket(allocatorTestMount, fsmeta.RootInode, "aligned")
+	want, err := createDentryBucket(allocatorTestMount, model.RootInode, "aligned")
 	require.NoError(t, err)
 	got, err := createInodeBucket(allocatorTestMount, inode)
 	require.NoError(t, err)
@@ -87,12 +88,12 @@ func TestShardAffineInodeAllocatorReturnsUniqueConcurrentIDs(t *testing.T) {
 	require.NoError(t, err)
 
 	const workers = 64
-	ids := make(chan fsmeta.InodeID, workers)
+	ids := make(chan model.InodeID, workers)
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Go(func() {
-			inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, fsmeta.RootInode, "hot")
+			inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, model.RootInode, "hot")
 			errs <- err
 			ids <- inode
 		})
@@ -104,7 +105,7 @@ func TestShardAffineInodeAllocatorReturnsUniqueConcurrentIDs(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	seen := make(map[fsmeta.InodeID]struct{}, workers)
+	seen := make(map[model.InodeID]struct{}, workers)
 	for id := range ids {
 		require.NotContains(t, seen, id)
 		seen[id] = struct{}{}
@@ -117,15 +118,15 @@ func TestShardAffineInodeAllocatorPropagatesAllocIDError(t *testing.T) {
 	alloc, err := NewShardAffineInodeAllocatorWithBatch(&fakeAllocIDClient{err: want}, fsmeta.DefaultAffinityBucketCount, 8)
 	require.NoError(t, err)
 
-	_, err = alloc.AllocateCreateInode(context.Background(), allocatorTestMount, fsmeta.RootInode, "file")
+	_, err = alloc.AllocateCreateInode(context.Background(), allocatorTestMount, model.RootInode, "file")
 	require.ErrorIs(t, err, want)
 }
 
 func TestShardAffineInodeAllocatorMissStillReturnsUsableID(t *testing.T) {
-	target, err := createDentryBucket(allocatorTestMount, fsmeta.RootInode, "file")
+	target, err := createDentryBucket(allocatorTestMount, model.RootInode, "file")
 	require.NoError(t, err)
-	var candidate fsmeta.InodeID
-	for id := fsmeta.InodeID(2); id < 10_000; id++ {
+	var candidate model.InodeID
+	for id := model.InodeID(2); id < 10_000; id++ {
 		bucket, err := createInodeBucket(allocatorTestMount, id)
 		require.NoError(t, err)
 		if bucket != target {
@@ -138,7 +139,7 @@ func TestShardAffineInodeAllocatorMissStillReturnsUsableID(t *testing.T) {
 	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, fsmeta.DefaultAffinityBucketCount, 1)
 	require.NoError(t, err)
 
-	inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, fsmeta.RootInode, "file")
+	inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, model.RootInode, "file")
 	require.NoError(t, err)
 	require.Equal(t, candidate, inode)
 	require.Equal(t, uint64(0), alloc.Stats()["inode_alloc_affinity_hit_total"])

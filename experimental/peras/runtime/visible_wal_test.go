@@ -11,8 +11,8 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/wal"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -254,7 +254,7 @@ func testVisibleRecord(id fsperas.OperationID, key []byte) fsperas.VisibleOperat
 		Scope: compile.AuthorityScope{
 			Mount:      "m",
 			MountKeyID: 1,
-			Parents:    []fsmeta.InodeID{2},
+			Parents:    []model.InodeID{2},
 		},
 		Operation:         testVisibleReplayOperation(id, key),
 		TimestampUnixNano: 1234,
@@ -287,7 +287,7 @@ func testVisibleReplayOperation(id fsperas.OperationID, key []byte) fsperas.Repl
 	}
 	return fsperas.ReplayOperation{
 		OpID:                 id,
-		Kind:                 fsmeta.OperationCreate,
+		Kind:                 model.OperationCreate,
 		DescriptorDigest:     testVisibleDigest(1),
 		PredicateProofDigest: compile.AdmissionProofSetDigest(nil, nil),
 		ExecutionPlanDigest:  compile.ExecutionPlanDigest(segment, atomicity, compile.DurabilityVisibleOnly),

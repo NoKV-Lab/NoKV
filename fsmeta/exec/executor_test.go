@@ -8,19 +8,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/feichai0017/NoKV/engine/slab/dirpage"
-	nokverrors "github.com/feichai0017/NoKV/errors"
-	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
-	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
-	"github.com/feichai0017/NoKV/fsmeta/proof"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
-	"github.com/stretchr/testify/require"
 	"sort"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/feichai0017/NoKV/engine/slab/dirpage"
+	nokverrors "github.com/feichai0017/NoKV/errors"
+	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
+	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/proof"
+	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
+	"github.com/stretchr/testify/require"
 )
 
 type fakeRunner struct {
@@ -59,26 +61,26 @@ type fakeSpeculativeAtomicRunner struct {
 	atomicCalls []atomicMutateCall
 }
 
-var testMountIdentity = fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
+var testMountIdentity = model.MountIdentity{MountID: "vol", MountKeyID: 1}
 
-func testMountIdentityFor(mount fsmeta.MountID) fsmeta.MountIdentity {
+func testMountIdentityFor(mount model.MountID) model.MountIdentity {
 	if mount == testMountIdentity.MountID {
 		return testMountIdentity
 	}
-	return fsmeta.MountIdentity{MountID: mount, MountKeyID: 2}
+	return model.MountIdentity{MountID: mount, MountKeyID: 2}
 }
 
 func testMountAdmission() MountAdmission {
 	return MountAdmission{
 		MountID:       testMountIdentity.MountID,
 		MountKeyID:    testMountIdentity.MountKeyID,
-		RootInode:     fsmeta.RootInode,
+		RootInode:     model.RootInode,
 		SchemaVersion: 1,
 	}
 }
 
 func newTestExecutor(runner TxnRunner, opts ...Option) (*Executor, error) {
-	defaults := []Option{WithMountResolver(&fakeMountResolver{records: map[fsmeta.MountID]MountAdmission{
+	defaults := []Option{WithMountResolver(&fakeMountResolver{records: map[model.MountID]MountAdmission{
 		testMountIdentity.MountID: testMountAdmission(),
 	}})}
 	return New(runner, append(defaults, opts...)...)
@@ -93,7 +95,7 @@ func requireStatUint(t *testing.T, stats map[string]any, key string, want uint64
 	require.Equal(t, want, got)
 }
 
-func requireAtomicStatUint(t *testing.T, stats map[string]any, kind fsmeta.OperationKind, key string, want uint64) {
+func requireAtomicStatUint(t *testing.T, stats map[string]any, kind model.OperationKind, key string, want uint64) {
 	t.Helper()
 	raw, ok := stats["atomic_one_phase"]
 	require.True(t, ok, "missing atomic_one_phase stats")
@@ -163,7 +165,7 @@ func requireVisibleCommitStatBool(t *testing.T, stats map[string]any, key string
 	require.Equal(t, want, got)
 }
 
-func txnLockedError(mount fsmeta.MountID, parent fsmeta.InodeID, name string) error {
+func txnLockedError(mount model.MountID, parent model.InodeID, name string) error {
 	key, err := fsmeta.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
 	if err != nil {
 		panic(err)
@@ -179,7 +181,7 @@ func txnLockedError(mount fsmeta.MountID, parent fsmeta.InodeID, name string) er
 }
 
 type fakeMountResolver struct {
-	records map[fsmeta.MountID]MountAdmission
+	records map[model.MountID]MountAdmission
 	err     error
 	calls   int
 }
@@ -228,7 +230,7 @@ type fakeVisibleAuthorityFlusher struct {
 type fakeVisibleSnapshotCapturer struct {
 	fakeVisibleAuthorityFlusher
 	capture         bool
-	segmentRefs     []fsmeta.SnapshotEvidenceRef
+	segmentRefs     []model.SnapshotEvidenceRef
 	err             error
 	captureVersions []uint64
 	captureScopes   []compile.AuthorityScope
@@ -264,20 +266,20 @@ type fakeQuotaResolver struct {
 }
 
 type fakeInodeAllocator struct {
-	next  fsmeta.InodeID
-	ids   []fsmeta.InodeID
+	next  model.InodeID
+	ids   []model.InodeID
 	err   error
 	calls int
 }
 
-func testInodeForParentBucket(t *testing.T, parent fsmeta.InodeID, exclude ...fsmeta.InodeID) fsmeta.InodeID {
+func testInodeForParentBucket(t *testing.T, parent model.InodeID, exclude ...model.InodeID) model.InodeID {
 	t.Helper()
 	target := fsmeta.BucketForInodeID(parent)
-	excluded := make(map[fsmeta.InodeID]struct{}, len(exclude))
+	excluded := make(map[model.InodeID]struct{}, len(exclude))
 	for _, id := range exclude {
 		excluded[id] = struct{}{}
 	}
-	for id := fsmeta.InodeID(2); id < 1_000_000; id++ {
+	for id := model.InodeID(2); id < 1_000_000; id++ {
 		if _, ok := excluded[id]; ok {
 			continue
 		}
@@ -289,14 +291,14 @@ func testInodeForParentBucket(t *testing.T, parent fsmeta.InodeID, exclude ...fs
 	return 0
 }
 
-func testInodeForDifferentBucket(t *testing.T, parent fsmeta.InodeID, exclude ...fsmeta.InodeID) fsmeta.InodeID {
+func testInodeForDifferentBucket(t *testing.T, parent model.InodeID, exclude ...model.InodeID) model.InodeID {
 	t.Helper()
 	target := fsmeta.BucketForInodeID(parent)
-	excluded := make(map[fsmeta.InodeID]struct{}, len(exclude))
+	excluded := make(map[model.InodeID]struct{}, len(exclude))
 	for _, id := range exclude {
 		excluded[id] = struct{}{}
 	}
-	for id := fsmeta.InodeID(2); id < 1_000_000; id++ {
+	for id := model.InodeID(2); id < 1_000_000; id++ {
 		if _, ok := excluded[id]; ok {
 			continue
 		}
@@ -308,7 +310,7 @@ func testInodeForDifferentBucket(t *testing.T, parent fsmeta.InodeID, exclude ..
 	return 0
 }
 
-func (a *fakeInodeAllocator) AllocateCreateInode(context.Context, fsmeta.MountIdentity, fsmeta.InodeID, string) (fsmeta.InodeID, error) {
+func (a *fakeInodeAllocator) AllocateCreateInode(context.Context, model.MountIdentity, model.InodeID, string) (model.InodeID, error) {
 	a.calls++
 	if a.err != nil {
 		return 0, a.err
@@ -327,8 +329,8 @@ func (a *fakeInodeAllocator) AllocateCreateInode(context.Context, fsmeta.MountId
 }
 
 type subtreePublishCall struct {
-	mount    fsmeta.MountID
-	root     fsmeta.InodeID
+	mount    model.MountID
+	root     model.InodeID
 	frontier uint64
 }
 
@@ -351,7 +353,7 @@ func (q *fakeQuotaResolver) AllowVisibleQuota(_ context.Context, changes []Quota
 	return q.allowVisibleCommit, nil
 }
 
-func (p *fakeSubtreePublisher) StartSubtreeHandoff(_ context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {
+func (p *fakeSubtreePublisher) StartSubtreeHandoff(_ context.Context, mount model.MountID, root model.InodeID, frontier uint64) error {
 	if p.startErr != nil {
 		return p.startErr
 	}
@@ -362,7 +364,7 @@ func (p *fakeSubtreePublisher) StartSubtreeHandoff(_ context.Context, mount fsme
 	return nil
 }
 
-func (p *fakeSubtreePublisher) CompleteSubtreeHandoff(_ context.Context, mount fsmeta.MountID, root fsmeta.InodeID, frontier uint64) error {
+func (p *fakeSubtreePublisher) CompleteSubtreeHandoff(_ context.Context, mount model.MountID, root model.InodeID, frontier uint64) error {
 	if p.completeErr != nil {
 		return p.completeErr
 	}
@@ -373,19 +375,19 @@ func (p *fakeSubtreePublisher) CompleteSubtreeHandoff(_ context.Context, mount f
 	return nil
 }
 
-func (r *fakeMountResolver) ResolveMount(_ context.Context, mount fsmeta.MountID) (MountAdmission, error) {
+func (r *fakeMountResolver) ResolveMount(_ context.Context, mount model.MountID) (MountAdmission, error) {
 	r.calls++
 	if r.err != nil {
 		return MountAdmission{}, r.err
 	}
 	record, ok := r.records[mount]
 	if !ok {
-		return MountAdmission{}, fsmeta.ErrMountNotRegistered
+		return MountAdmission{}, model.ErrMountNotRegistered
 	}
 	return record, nil
 }
 
-func (r *fakeAuthorityResolver) SameAuthority(context.Context, fsmeta.MountID, fsmeta.InodeID, fsmeta.InodeID) (bool, error) {
+func (r *fakeAuthorityResolver) SameAuthority(context.Context, model.MountID, model.InodeID, model.InodeID) (bool, error) {
 	r.calls++
 	if r.err != nil {
 		return false, r.err
@@ -399,8 +401,8 @@ func (a *fakeVisibleAdmitter) AcquireVisibleAuthority(_ context.Context, scope c
 		Mount:      scope.Mount,
 		MountKeyID: scope.MountKeyID,
 		Buckets:    append([]fsmeta.AffinityBucket(nil), scope.Buckets...),
-		Parents:    append([]fsmeta.InodeID(nil), scope.Parents...),
-		Inodes:     append([]fsmeta.InodeID(nil), scope.Inodes...),
+		Parents:    append([]model.InodeID(nil), scope.Parents...),
+		Inodes:     append([]model.InodeID(nil), scope.Inodes...),
 	})
 	if a.err != nil {
 		return false, a.err
@@ -543,21 +545,21 @@ func (c *testVisibleCommitter) KeyState(key []byte) (bool, bool) {
 	return c.view.KeyState(key)
 }
 
-func (c *testVisibleCommitter) DirectoryEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (c *testVisibleCommitter) DirectoryEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if c == nil || c.view == nil {
 		return false
 	}
 	return c.view.DirectoryEmpty(mount, inode)
 }
 
-func (c *testVisibleCommitter) DirectoryBaseEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (c *testVisibleCommitter) DirectoryBaseEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if c == nil || c.view == nil {
 		return false
 	}
 	return c.view.DirectoryBaseEmpty(mount, inode)
 }
 
-func (c *testVisibleCommitter) SessionNamespaceEmpty(mount fsmeta.MountIdentity, inode fsmeta.InodeID) bool {
+func (c *testVisibleCommitter) SessionNamespaceEmpty(mount model.MountIdentity, inode model.InodeID) bool {
 	if c == nil || c.view == nil {
 		return false
 	}
@@ -571,21 +573,21 @@ func (c *testVisibleCommitter) RememberKey(key []byte, present bool) {
 	c.view.RememberKey(key, present)
 }
 
-func (c *testVisibleCommitter) RememberEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (c *testVisibleCommitter) RememberEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	if c == nil || c.view == nil {
 		return
 	}
 	c.view.RememberEmptyDirectory(mount, inode)
 }
 
-func (c *testVisibleCommitter) ForgetEmptyDirectory(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (c *testVisibleCommitter) ForgetEmptyDirectory(mount model.MountIdentity, inode model.InodeID) {
 	if c == nil || c.view == nil {
 		return
 	}
 	c.view.ForgetEmptyDirectory(mount, inode)
 }
 
-func (c *testVisibleCommitter) RememberEmptySessionNamespace(mount fsmeta.MountIdentity, inode fsmeta.InodeID) {
+func (c *testVisibleCommitter) RememberEmptySessionNamespace(mount model.MountIdentity, inode model.InodeID) {
 	if c == nil || c.view == nil {
 		return
 	}
@@ -607,26 +609,26 @@ func (f *fakeVisibleAuthorityFlusher) FlushAuthority(_ context.Context, scope co
 		Mount:      scope.Mount,
 		MountKeyID: scope.MountKeyID,
 		Buckets:    append([]fsmeta.AffinityBucket(nil), scope.Buckets...),
-		Parents:    append([]fsmeta.InodeID(nil), scope.Parents...),
-		Inodes:     append([]fsmeta.InodeID(nil), scope.Inodes...),
+		Parents:    append([]model.InodeID(nil), scope.Parents...),
+		Inodes:     append([]model.InodeID(nil), scope.Inodes...),
 	})
 	return nil
 }
 
-func (f *fakeVisibleSnapshotCapturer) CaptureVisibleSnapshot(_ context.Context, version uint64, scope compile.AuthorityScope) (fsmeta.VisibleSnapshotCapture, bool, error) {
+func (f *fakeVisibleSnapshotCapturer) CaptureVisibleSnapshot(_ context.Context, version uint64, scope compile.AuthorityScope) (model.VisibleSnapshotCapture, bool, error) {
 	f.captureVersions = append(f.captureVersions, version)
 	f.captureScopes = append(f.captureScopes, cloneTestAuthorityScope(scope))
 	if f.err != nil {
-		return fsmeta.VisibleSnapshotCapture{}, false, f.err
+		return model.VisibleSnapshotCapture{}, false, f.err
 	}
-	return fsmeta.VisibleSnapshotCapture{Evidence: append([]fsmeta.SnapshotEvidenceRef(nil), f.segmentRefs...)}, f.capture, nil
+	return model.VisibleSnapshotCapture{Evidence: append([]model.SnapshotEvidenceRef(nil), f.segmentRefs...)}, f.capture, nil
 }
 
 func cloneTestAuthorityScope(scope compile.AuthorityScope) compile.AuthorityScope {
 	out := scope
 	out.Buckets = append([]fsmeta.AffinityBucket(nil), scope.Buckets...)
-	out.Parents = append([]fsmeta.InodeID(nil), scope.Parents...)
-	out.Inodes = append([]fsmeta.InodeID(nil), scope.Inodes...)
+	out.Parents = append([]model.InodeID(nil), scope.Parents...)
+	out.Inodes = append([]model.InodeID(nil), scope.Inodes...)
 	return out
 }
 
@@ -675,9 +677,9 @@ func overlayMapForTest(rows ...VisibleOverlayKV) map[string]VisibleOverlayKV {
 	return out
 }
 
-func dentryValueForTest(t *testing.T, parent fsmeta.InodeID, name string, inode fsmeta.InodeID, typ fsmeta.InodeType) []byte {
+func dentryValueForTest(t *testing.T, parent model.InodeID, name string, inode model.InodeID, typ model.InodeType) []byte {
 	t.Helper()
-	value, err := fsmeta.EncodeDentryValue(fsmeta.DentryRecord{
+	value, err := fsmeta.EncodeDentryValue(model.DentryRecord{
 		Parent: parent,
 		Name:   name,
 		Inode:  inode,
@@ -687,21 +689,21 @@ func dentryValueForTest(t *testing.T, parent fsmeta.InodeID, name string, inode 
 	return value
 }
 
-func inodeValueForTest(t *testing.T, record fsmeta.InodeRecord) []byte {
+func inodeValueForTest(t *testing.T, record model.InodeRecord) []byte {
 	t.Helper()
 	value, err := fsmeta.EncodeInodeValue(record)
 	require.NoError(t, err)
 	return value
 }
 
-func dentryKeyForTest(t *testing.T, mount fsmeta.MountID, parent fsmeta.InodeID, name string) []byte {
+func dentryKeyForTest(t *testing.T, mount model.MountID, parent model.InodeID, name string) []byte {
 	t.Helper()
 	key, err := fsmeta.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
 	require.NoError(t, err)
 	return key
 }
 
-func inodeKeyForTest(t *testing.T, mount fsmeta.MountID, inode fsmeta.InodeID) []byte {
+func inodeKeyForTest(t *testing.T, mount model.MountID, inode model.InodeID) []byte {
 	t.Helper()
 	key, err := fsmeta.EncodeInodeKey(testMountIdentityFor(mount), inode)
 	require.NoError(t, err)
@@ -817,9 +819,9 @@ func newFakeRunner() *fakeRunner {
 		nextTS: 1,
 		data:   make(map[string][]byte),
 	}
-	seedInodeValue(runner, testMountIdentity.MountID, fsmeta.InodeRecord{
-		Inode:     fsmeta.RootInode,
-		Type:      fsmeta.InodeTypeDirectory,
+	seedInodeValue(runner, testMountIdentity.MountID, model.InodeRecord{
+		Inode:     model.RootInode,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	})
@@ -927,7 +929,7 @@ func (r *fakeRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mutatio
 	for _, mut := range mutations {
 		if mut.GetAssertionNotExist() {
 			if _, ok := r.data[string(mut.GetKey())]; ok {
-				return 0, fsmeta.ErrExists
+				return 0, model.ErrExists
 			}
 		}
 		if bytes.Equal(mut.GetKey(), primary) {
@@ -975,18 +977,18 @@ func (r *fakeAtomicRunner) TryAtomicMutate(_ context.Context, primary []byte, pr
 		switch pred.GetKind() {
 		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS:
 			if exists {
-				return true, fsmeta.ErrExists
+				return true, model.ErrExists
 			}
 		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_EXISTS:
 			if !exists {
-				return true, fsmeta.ErrNotFound
+				return true, model.ErrNotFound
 			}
 		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS:
 			if !exists || !bytes.Equal(r.data[string(pred.GetKey())], pred.GetExpectedValue()) {
-				return true, fsmeta.ErrInvalidValue
+				return true, model.ErrInvalidValue
 			}
 		default:
-			return true, fsmeta.ErrInvalidRequest
+			return true, model.ErrInvalidRequest
 		}
 	}
 	cloned := make([]*kvrpcpb.Mutation, 0, len(mutations))
@@ -996,7 +998,7 @@ func (r *fakeAtomicRunner) TryAtomicMutate(_ context.Context, primary []byte, pr
 		}
 		if mut.GetAssertionNotExist() {
 			if _, exists := r.data[string(mut.GetKey())]; exists {
-				return true, fsmeta.ErrExists
+				return true, model.ErrExists
 			}
 		}
 		cloned = append(cloned, cloneMutation(mut))
@@ -1027,19 +1029,19 @@ func (r *fakeSpeculativeAtomicRunner) TryAtomicMutate(_ context.Context, primary
 	return true, nil
 }
 
-func seedDentry(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, parent fsmeta.InodeID, name string, inode fsmeta.InodeID) {
+func seedDentry(t *testing.T, runner *fakeRunner, mount model.MountID, parent model.InodeID, name string, inode model.InodeID) {
 	t.Helper()
-	seedDentryType(t, runner, mount, parent, name, inode, fsmeta.InodeTypeFile)
+	seedDentryType(t, runner, mount, parent, name, inode, model.InodeTypeFile)
 }
 
-func seedDentryType(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, parent fsmeta.InodeID, name string, inode fsmeta.InodeID, typ fsmeta.InodeType) {
+func seedDentryType(t *testing.T, runner *fakeRunner, mount model.MountID, parent model.InodeID, name string, inode model.InodeID, typ model.InodeType) {
 	t.Helper()
 	key, err := fsmeta.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
 	require.NoError(t, err)
 	if _, exists := runner.data[string(key)]; !exists {
 		incrementSeedParentChildCount(t, runner, mount, parent)
 	}
-	value, err := fsmeta.EncodeDentryValue(fsmeta.DentryRecord{
+	value, err := fsmeta.EncodeDentryValue(model.DentryRecord{
 		Parent: parent,
 		Name:   name,
 		Inode:  inode,
@@ -1049,22 +1051,22 @@ func seedDentryType(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, pare
 	runner.data[string(key)] = value
 }
 
-func seedInode(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, record fsmeta.InodeRecord) {
+func seedInode(t *testing.T, runner *fakeRunner, mount model.MountID, record model.InodeRecord) {
 	t.Helper()
 	seedInodeValue(runner, mount, record)
 }
 
-func seedDirectory(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, inode fsmeta.InodeID) {
+func seedDirectory(t *testing.T, runner *fakeRunner, mount model.MountID, inode model.InodeID) {
 	t.Helper()
-	seedInodeValue(runner, mount, fsmeta.InodeRecord{
+	seedInodeValue(runner, mount, model.InodeRecord{
 		Inode:     inode,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	})
 }
 
-func seedInodeValue(runner *fakeRunner, mount fsmeta.MountID, record fsmeta.InodeRecord) {
+func seedInodeValue(runner *fakeRunner, mount model.MountID, record model.InodeRecord) {
 	key, err := fsmeta.EncodeInodeKey(testMountIdentityFor(mount), record.Inode)
 	if err != nil {
 		panic(err)
@@ -1076,20 +1078,20 @@ func seedInodeValue(runner *fakeRunner, mount fsmeta.MountID, record fsmeta.Inod
 	runner.data[string(key)] = value
 }
 
-func incrementSeedParentChildCount(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, parent fsmeta.InodeID) {
+func incrementSeedParentChildCount(t *testing.T, runner *fakeRunner, mount model.MountID, parent model.InodeID) {
 	t.Helper()
 	key, err := fsmeta.EncodeInodeKey(testMountIdentityFor(mount), parent)
 	require.NoError(t, err)
-	record := fsmeta.InodeRecord{
+	record := model.InodeRecord{
 		Inode:     parent,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	}
 	if value, ok := runner.data[string(key)]; ok {
 		record, err = fsmeta.DecodeInodeValue(value)
 		require.NoError(t, err)
-		require.Equal(t, fsmeta.InodeTypeDirectory, record.Type)
+		require.Equal(t, model.InodeTypeDirectory, record.Type)
 	}
 	record.ChildCount++
 	value, err := fsmeta.EncodeInodeValue(record)
@@ -1097,11 +1099,11 @@ func incrementSeedParentChildCount(t *testing.T, runner *fakeRunner, mount fsmet
 	runner.data[string(key)] = value
 }
 
-func findDifferentRenameAffinity(t *testing.T, baseFrom, baseTo fsmeta.InodeID) (fsmeta.InodeID, fsmeta.InodeID) {
+func findDifferentRenameAffinity(t *testing.T, baseFrom, baseTo model.InodeID) (model.InodeID, model.InodeID) {
 	t.Helper()
 	base := renameAffinity(t, baseFrom, baseTo)
-	for from := fsmeta.InodeID(9); from < 256; from++ {
-		for to := fsmeta.InodeID(9); to < 256; to++ {
+	for from := model.InodeID(9); from < 256; from++ {
+		for to := model.InodeID(9); to < 256; to++ {
 			if from == to {
 				continue
 			}
@@ -1114,7 +1116,7 @@ func findDifferentRenameAffinity(t *testing.T, baseFrom, baseTo fsmeta.InodeID) 
 	return 0, 0
 }
 
-func renameAffinity(t *testing.T, from, to fsmeta.InodeID) string {
+func renameAffinity(t *testing.T, from, to model.InodeID) string {
 	t.Helper()
 	source, err := fsmeta.EncodeDentryKey(testMountIdentity, from, "old")
 	require.NoError(t, err)
@@ -1126,7 +1128,7 @@ func renameAffinity(t *testing.T, from, to fsmeta.InodeID) string {
 	})
 }
 
-func seedSession(t *testing.T, runner *fakeRunner, mount fsmeta.MountID, record fsmeta.SessionRecord) {
+func seedSession(t *testing.T, runner *fakeRunner, mount model.MountID, record model.SessionRecord) {
 	t.Helper()
 	value, err := fsmeta.EncodeSessionValue(record)
 	require.NoError(t, err)
@@ -1184,11 +1186,11 @@ func benchmarkExecutorCreate(b *testing.B, executor *Executor) {
 	for b.Loop() {
 		name := "file-" + strconv.FormatUint(seq, 10)
 		seq++
-		if _, err := executor.Create(ctx, fsmeta.CreateRequest{
+		if _, err := executor.Create(ctx, model.CreateRequest{
 			Mount:  "vol",
-			Parent: fsmeta.RootInode,
+			Parent: model.RootInode,
 			Name:   name,
-			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+			Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 		}); err != nil {
 			b.Fatal(err)
 		}
@@ -1203,21 +1205,21 @@ func benchmarkExecutorCheckpointStorm(b *testing.B, executor *Executor, flusher 
 	for b.Loop() {
 		prefix := "ckpt-" + strconv.FormatUint(batch, 10) + "-"
 		batch++
-		dir, err := executor.Create(ctx, fsmeta.CreateRequest{
+		dir, err := executor.Create(ctx, model.CreateRequest{
 			Mount:  "vol",
-			Parent: fsmeta.RootInode,
+			Parent: model.RootInode,
 			Name:   prefix + "dir",
-			Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeDirectory},
+			Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 		})
 		if err != nil {
 			b.Fatal(err)
 		}
 		for i := range files {
-			if _, err := executor.Create(ctx, fsmeta.CreateRequest{
+			if _, err := executor.Create(ctx, model.CreateRequest{
 				Mount:  "vol",
 				Parent: dir.Inode.Inode,
 				Name:   prefix + strconv.Itoa(i),
-				Attrs:  fsmeta.CreateAttrs{Type: fsmeta.InodeTypeFile},
+				Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 			}); err != nil {
 				b.Fatal(err)
 			}
@@ -1240,11 +1242,11 @@ func benchmarkExecutorUpdateInode(b *testing.B, runner *fakeRunner, executor *Ex
 	ctx := context.Background()
 	b.ReportAllocs()
 	for i := 0; b.Loop(); i++ {
-		inode := fsmeta.InodeID(i + 1000)
+		inode := model.InodeID(i + 1000)
 		name := "file-" + strconv.Itoa(i)
 		benchmarkSeedDentry(b, runner, 7, name, inode)
 		benchmarkSeedInode(b, runner, inode)
-		if _, err := executor.UpdateInode(ctx, fsmeta.UpdateInodeRequest{
+		if _, err := executor.UpdateInode(ctx, model.UpdateInodeRequest{
 			Mount:            "vol",
 			Parent:           7,
 			Inode:            inode,
@@ -1265,11 +1267,11 @@ func benchmarkExecutorRename(b *testing.B, runner *fakeRunner, executor *Executo
 	ctx := context.Background()
 	b.ReportAllocs()
 	for i := 0; b.Loop(); i++ {
-		inode := fsmeta.InodeID(i + 1000)
+		inode := model.InodeID(i + 1000)
 		oldName := "old-" + strconv.Itoa(i)
 		newName := "new-" + strconv.Itoa(i)
 		benchmarkSeedDentry(b, runner, 7, oldName, inode)
-		if err := executor.Rename(ctx, fsmeta.RenameRequest{
+		if err := executor.Rename(ctx, model.RenameRequest{
 			Mount:      "vol",
 			FromParent: 7,
 			FromName:   oldName,
@@ -1285,12 +1287,12 @@ func benchmarkExecutorOpenWriteSession(b *testing.B, runner *fakeRunner, executo
 	ctx := context.Background()
 	b.ReportAllocs()
 	for i := 0; b.Loop(); i++ {
-		inode := fsmeta.InodeID(i + 1000)
+		inode := model.InodeID(i + 1000)
 		benchmarkSeedInode(b, runner, inode)
-		if _, err := executor.OpenWriteSession(ctx, fsmeta.OpenWriteSessionRequest{
+		if _, err := executor.OpenWriteSession(ctx, model.OpenWriteSessionRequest{
 			Mount:   "vol",
 			Inode:   inode,
-			Session: fsmeta.SessionID("writer-" + strconv.Itoa(i)),
+			Session: model.SessionID("writer-" + strconv.Itoa(i)),
 			TTL:     100 * time.Nanosecond,
 		}); err != nil {
 			b.Fatal(err)
@@ -1303,12 +1305,12 @@ func benchmarkExecutorLink(b *testing.B, runner *fakeRunner, executor *Executor)
 	benchmarkSeedDirectory(b, runner, 8)
 	b.ReportAllocs()
 	for i := 0; b.Loop(); i++ {
-		inode := fsmeta.InodeID(i + 1000)
+		inode := model.InodeID(i + 1000)
 		fromName := "file-" + strconv.Itoa(i)
 		toName := "alias-" + strconv.Itoa(i)
 		benchmarkSeedDentry(b, runner, 7, fromName, inode)
 		benchmarkSeedInode(b, runner, inode)
-		if err := executor.Link(ctx, fsmeta.LinkRequest{
+		if err := executor.Link(ctx, model.LinkRequest{
 			Mount:      "vol",
 			FromParent: 7,
 			FromName:   fromName,
@@ -1324,11 +1326,11 @@ func benchmarkExecutorUnlink(b *testing.B, runner *fakeRunner, executor *Executo
 	ctx := context.Background()
 	b.ReportAllocs()
 	for i := 0; b.Loop(); i++ {
-		inode := fsmeta.InodeID(i + 1000)
+		inode := model.InodeID(i + 1000)
 		name := "file-" + strconv.Itoa(i)
 		benchmarkSeedDentry(b, runner, 7, name, inode)
-		benchmarkSeedInodeRecord(b, runner, fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeFile, Size: 4096, LinkCount: 2})
-		if err := executor.Unlink(ctx, fsmeta.UnlinkRequest{
+		benchmarkSeedInodeRecord(b, runner, model.InodeRecord{Inode: inode, Type: model.InodeTypeFile, Size: 4096, LinkCount: 2})
+		if err := executor.Unlink(ctx, model.UnlinkRequest{
 			Mount:  "vol",
 			Parent: 7,
 			Name:   name,
@@ -1338,18 +1340,18 @@ func benchmarkExecutorUnlink(b *testing.B, runner *fakeRunner, executor *Executo
 	}
 }
 
-func benchmarkSeedDentry(b *testing.B, runner *fakeRunner, parent fsmeta.InodeID, name string, inode fsmeta.InodeID) {
+func benchmarkSeedDentry(b *testing.B, runner *fakeRunner, parent model.InodeID, name string, inode model.InodeID) {
 	b.Helper()
 	benchmarkIncrementSeedParentChildCount(b, runner, parent)
 	key, err := fsmeta.EncodeDentryKey(testMountIdentity, parent, name)
 	if err != nil {
 		b.Fatal(err)
 	}
-	value, err := fsmeta.EncodeDentryValue(fsmeta.DentryRecord{
+	value, err := fsmeta.EncodeDentryValue(model.DentryRecord{
 		Parent: parent,
 		Name:   name,
 		Inode:  inode,
-		Type:   fsmeta.InodeTypeFile,
+		Type:   model.InodeTypeFile,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -1357,25 +1359,25 @@ func benchmarkSeedDentry(b *testing.B, runner *fakeRunner, parent fsmeta.InodeID
 	runner.data[string(key)] = value
 }
 
-func benchmarkSeedDirectory(b *testing.B, runner *fakeRunner, inode fsmeta.InodeID) {
+func benchmarkSeedDirectory(b *testing.B, runner *fakeRunner, inode model.InodeID) {
 	b.Helper()
-	benchmarkSeedInodeRecord(b, runner, fsmeta.InodeRecord{
+	benchmarkSeedInodeRecord(b, runner, model.InodeRecord{
 		Inode:     inode,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	})
 }
 
-func benchmarkIncrementSeedParentChildCount(b *testing.B, runner *fakeRunner, parent fsmeta.InodeID) {
+func benchmarkIncrementSeedParentChildCount(b *testing.B, runner *fakeRunner, parent model.InodeID) {
 	b.Helper()
 	key, err := fsmeta.EncodeInodeKey(testMountIdentity, parent)
 	if err != nil {
 		b.Fatal(err)
 	}
-	record := fsmeta.InodeRecord{
+	record := model.InodeRecord{
 		Inode:     parent,
-		Type:      fsmeta.InodeTypeDirectory,
+		Type:      model.InodeTypeDirectory,
 		Mode:      0o755,
 		LinkCount: 1,
 	}
@@ -1384,7 +1386,7 @@ func benchmarkIncrementSeedParentChildCount(b *testing.B, runner *fakeRunner, pa
 		if err != nil {
 			b.Fatal(err)
 		}
-		if record.Type != fsmeta.InodeTypeDirectory {
+		if record.Type != model.InodeTypeDirectory {
 			b.Fatalf("seed parent %d is %s", parent, record.Type)
 		}
 	}
@@ -1396,12 +1398,12 @@ func benchmarkIncrementSeedParentChildCount(b *testing.B, runner *fakeRunner, pa
 	runner.data[string(key)] = value
 }
 
-func benchmarkSeedInode(b *testing.B, runner *fakeRunner, inode fsmeta.InodeID) {
+func benchmarkSeedInode(b *testing.B, runner *fakeRunner, inode model.InodeID) {
 	b.Helper()
-	benchmarkSeedInodeRecord(b, runner, fsmeta.InodeRecord{Inode: inode, Type: fsmeta.InodeTypeFile, LinkCount: 1})
+	benchmarkSeedInodeRecord(b, runner, model.InodeRecord{Inode: inode, Type: model.InodeTypeFile, LinkCount: 1})
 }
 
-func benchmarkSeedInodeRecord(b *testing.B, runner *fakeRunner, record fsmeta.InodeRecord) {
+func benchmarkSeedInodeRecord(b *testing.B, runner *fakeRunner, record model.InodeRecord) {
 	b.Helper()
 	key, err := fsmeta.EncodeInodeKey(testMountIdentity, record.Inode)
 	if err != nil {

@@ -9,12 +9,13 @@ import (
 	"fmt"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 // DirectoryWatchClient is the narrow client surface needed for directory
 // watch recovery. GRPCClient satisfies it.
 type DirectoryWatchClient interface {
-	ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
+	ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error)
 	WatchSubtree(context.Context, fsmeta.WatchRequest) (WatchSubscription, error)
 }
 
@@ -23,7 +24,7 @@ type WatchReconcileResult struct {
 	Subscription WatchSubscription
 	// Snapshot is populated only when the server rejected ResumeCursor and
 	// the helper had to re-baseline the directory.
-	Snapshot []fsmeta.DentryAttrPair
+	Snapshot []model.DentryAttrPair
 	// Reconciled reports whether Snapshot contains a fresh full directory
 	// view. Live events may overlap that view and must be applied
 	// idempotently by callers.
@@ -32,20 +33,20 @@ type WatchReconcileResult struct {
 
 // ReadDirPlusAll scans one directory through ReadDirPlus pagination.
 func ReadDirPlusAll(ctx context.Context, cli interface {
-	ReadDirPlus(context.Context, fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error)
-}, req fsmeta.ReadDirRequest) ([]fsmeta.DentryAttrPair, error) {
+	ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error)
+}, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	if cli == nil {
 		return nil, errDirectoryReaderRequired
 	}
 	limit := req.Limit
 	if limit == 0 {
-		limit = fsmeta.DefaultReadDirLimit
+		limit = model.DefaultReadDirLimit
 	}
-	if limit > fsmeta.MaxReadDirLimit {
-		limit = fsmeta.MaxReadDirLimit
+	if limit > model.MaxReadDirLimit {
+		limit = model.MaxReadDirLimit
 	}
 	req.Limit = limit
-	var out []fsmeta.DentryAttrPair
+	var out []model.DentryAttrPair
 	for {
 		page, err := cli.ReadDirPlus(ctx, req)
 		if err != nil {
@@ -67,21 +68,21 @@ func ReadDirPlusAll(ctx context.Context, cli interface {
 // read. Events that race with the baseline can therefore be duplicated, but
 // they are not silently lost; callers should treat the returned Snapshot as
 // the new base state and apply subsequent events idempotently.
-func WatchDirectoryWithReconcile(ctx context.Context, cli DirectoryWatchClient, watchReq fsmeta.WatchRequest, readReq fsmeta.ReadDirRequest) (WatchReconcileResult, error) {
+func WatchDirectoryWithReconcile(ctx context.Context, cli DirectoryWatchClient, watchReq fsmeta.WatchRequest, readReq model.ReadDirRequest) (WatchReconcileResult, error) {
 	if cli == nil {
 		return WatchReconcileResult{}, errWatchClientRequired
 	}
 	if len(watchReq.KeyPrefix) != 0 || watchReq.DescendRecursively || watchReq.Mount != readReq.Mount || watchReq.RootInode != readReq.Parent {
-		return WatchReconcileResult{}, fmt.Errorf("%w: watch/read directory mismatch", fsmeta.ErrInvalidRequest)
+		return WatchReconcileResult{}, fmt.Errorf("%w: watch/read directory mismatch", model.ErrInvalidRequest)
 	}
 	if readReq.StartAfter != "" || readReq.SnapshotVersion != 0 {
-		return WatchReconcileResult{}, fmt.Errorf("%w: watch reconcile requires a fresh full-directory read", fsmeta.ErrInvalidRequest)
+		return WatchReconcileResult{}, fmt.Errorf("%w: watch reconcile requires a fresh full-directory read", model.ErrInvalidRequest)
 	}
 	sub, err := cli.WatchSubtree(ctx, watchReq)
 	if err == nil {
 		return WatchReconcileResult{Subscription: sub}, nil
 	}
-	if !errors.Is(err, fsmeta.ErrWatchCursorExpired) {
+	if !errors.Is(err, model.ErrWatchCursorExpired) {
 		return WatchReconcileResult{}, err
 	}
 

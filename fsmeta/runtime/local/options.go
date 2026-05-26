@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
 )
 
@@ -36,10 +37,10 @@ type Options struct {
 	WorkDir string
 
 	// Mount is the single local fsmeta mount admitted by this runtime.
-	Mount fsmeta.MountIdentity
+	Mount model.MountIdentity
 
-	// RootInode is the mount root inode. Zero uses fsmeta.RootInode.
-	RootInode fsmeta.InodeID
+	// RootInode is the mount root inode. Zero uses model.RootInode.
+	RootInode model.InodeID
 
 	// LockTTL overrides fsmeta/exec's lock TTL, in the same units expected by
 	// fsmeta/exec.WithLockTTL. Local MVCC commits are one-phase, but keeping the
@@ -64,11 +65,11 @@ type Options struct {
 	DirPageCacheDir string
 }
 
-func (opts Options) rootInode() fsmeta.InodeID {
+func (opts Options) rootInode() model.InodeID {
 	if opts.RootInode != 0 {
 		return opts.RootInode
 	}
-	return fsmeta.RootInode
+	return model.RootInode
 }
 
 func (opts Options) validate() error {

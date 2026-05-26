@@ -5,45 +5,47 @@ package exec
 
 import (
 	"context"
+
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 type removeDentryRequest struct {
-	Mount  fsmeta.MountID
-	Parent fsmeta.InodeID
+	Mount  model.MountID
+	Parent model.InodeID
 	Name   string
 }
 
-func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.CompiledOp, mount fsmeta.MountIdentity, req removeDentryRequest) (fsmeta.RemoveResult, bool, error) {
+func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.CompiledOp, mount model.MountIdentity, req removeDentryRequest) (model.RemoveResult, bool, error) {
 	delta := compiled.Delta
 	plan := delta.Plan
 	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
-		return fsmeta.RemoveResult{}, false, nil
+		return model.RemoveResult{}, false, nil
 	}
 	view := e.newVisibleReadView(ctx)
 	record, err := view.readDentry(plan.PrimaryKey)
 	if err != nil {
-		return fsmeta.RemoveResult{}, false, err
+		return model.RemoveResult{}, false, err
 	}
 	inode, ok, err := view.readInode(mount, record.Inode)
 	if err != nil {
-		return fsmeta.RemoveResult{}, false, err
+		return model.RemoveResult{}, false, err
 	}
 	if !ok {
-		return fsmeta.RemoveResult{}, false, nil
+		return model.RemoveResult{}, false, nil
 	}
-	if inode.Type == fsmeta.InodeTypeDirectory {
-		return fsmeta.RemoveResult{}, false, fsmeta.ErrInvalidRequest
+	if inode.Type == model.InodeTypeDirectory {
+		return model.RemoveResult{}, false, model.ErrInvalidRequest
 	}
 	parent, err := readVisibleDirectoryInode(view, mount, req.Parent)
 	if err != nil {
-		return fsmeta.RemoveResult{}, false, err
+		return model.RemoveResult{}, false, err
 	}
 	parent, err = decrementDirectoryChildCount(parent)
 	if err != nil {
-		return fsmeta.RemoveResult{}, false, err
+		return model.RemoveResult{}, false, err
 	}
 	quotaOK, err := e.visibleQuotaAllowsCommit(ctx, []QuotaChange{{
 		Mount:      req.Mount,
@@ -53,16 +55,16 @@ func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.
 		Inodes:     -1,
 	}})
 	if err != nil {
-		return fsmeta.RemoveResult{}, false, err
+		return model.RemoveResult{}, false, err
 	}
 	if !quotaOK {
-		return fsmeta.RemoveResult{}, false, nil
+		return model.RemoveResult{}, false, nil
 	}
 	inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
 	if err != nil {
-		return fsmeta.RemoveResult{}, false, err
+		return model.RemoveResult{}, false, err
 	}
-	result := fsmeta.RemoveResult{
+	result := model.RemoveResult{
 		RemovedDentry: record,
 		OldInode:      inode,
 		InodeDeleted:  inode.LinkCount <= 1,
@@ -74,41 +76,41 @@ func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.
 		inode.LinkCount--
 		inodeValue, err := fsmeta.EncodeInodeValue(inode)
 		if err != nil {
-			return fsmeta.RemoveResult{}, false, err
+			return model.RemoveResult{}, false, err
 		}
 		effects = append(effects, visiblePutEffect(inodeKey, inodeValue))
 	}
 	parentValue, err := fsmeta.EncodeInodeValue(parent)
 	if err != nil {
-		return fsmeta.RemoveResult{}, false, err
+		return model.RemoveResult{}, false, err
 	}
 	effects = append(effects, visiblePutEffect(plan.MutateKeys[1], parentValue))
 	concrete, err := view.materializeVisibleCompiledOp(compiled, effects)
 	if err != nil {
-		return fsmeta.RemoveResult{}, false, err
+		return model.RemoveResult{}, false, err
 	}
 	committed, err := e.tryVisibleCommitAfterRead(ctx, view, concrete)
 	if err != nil || !committed {
-		return fsmeta.RemoveResult{}, committed, err
+		return model.RemoveResult{}, committed, err
 	}
 	return result, true, nil
 }
 
-func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity, compiled compile.CompiledOp, req removeDentryRequest) (fsmeta.RemoveResult, error) {
+func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, compiled compile.CompiledOp, req removeDentryRequest) (model.RemoveResult, error) {
 	delta := compiled.Delta
 	plan := delta.Plan
 	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
-		return fsmeta.RemoveResult{}, err
+		return model.RemoveResult{}, err
 	}
 	if result, committed, err := e.tryVisibleRemoveDentry(ctx, compiled, mount, req); committed || err != nil {
 		if err != nil {
-			return fsmeta.RemoveResult{}, err
+			return model.RemoveResult{}, err
 		}
 		e.invalidateNegative(plan.MutateKeys[0])
 		e.invalidateDirPages(req.Mount, req.Parent)
 		return result, nil
 	}
-	var result fsmeta.RemoveResult
+	var result model.RemoveResult
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
 		record, err := e.readDentry(ctx, plan.PrimaryKey, startVersion)
 		if err != nil {
@@ -122,7 +124,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity,
 			Op:  kvrpcpb.Mutation_Delete,
 			Key: cloneBytes(plan.MutateKeys[0]),
 		}}
-		attemptResult := fsmeta.RemoveResult{RemovedDentry: record}
+		attemptResult := model.RemoveResult{RemovedDentry: record}
 		predicates := []*kvrpcpb.AtomicPredicate{atomicValueEquals(plan.PrimaryKey, dentryValue)}
 		parent, err := e.readDirectoryInode(ctx, mount, req.Parent, startVersion)
 		if err != nil {
@@ -145,8 +147,8 @@ func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity,
 			if err != nil {
 				return err
 			}
-			if inode.Type == fsmeta.InodeTypeDirectory {
-				return fsmeta.ErrInvalidRequest
+			if inode.Type == model.InodeTypeDirectory {
+				return model.ErrInvalidRequest
 			}
 			oldInodeValue, err := fsmeta.EncodeInodeValue(inode)
 			if err != nil {
@@ -183,7 +185,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity,
 		}
 		return e.mutateWithoutAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, mutations, startVersion, commitVersion)
 	}, delta.Authority); err != nil {
-		return fsmeta.RemoveResult{}, err
+		return model.RemoveResult{}, err
 	}
 	// Removing the dentry must invalidate both point misses and any
 	// materialized directory page under its parent.
@@ -194,7 +196,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount fsmeta.MountIdentity,
 
 // Unlink removes one non-directory dentry, decrements its inode link count,
 // and deletes the inode record when the last dentry goes away.
-func (e *Executor) Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error {
+func (e *Executor) Unlink(ctx context.Context, req model.UnlinkRequest) error {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
 		return err
@@ -211,7 +213,7 @@ func (e *Executor) Unlink(ctx context.Context, req fsmeta.UnlinkRequest) error {
 // RemoveDirectory removes one empty directory dentry and its directory inode.
 // Empty is checked through the directory inode ChildCount, which every child
 // membership mutation updates in the same metadata transaction.
-func (e *Executor) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirectoryRequest) error {
+func (e *Executor) RemoveDirectory(ctx context.Context, req model.RemoveDirectoryRequest) error {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
 		return err
@@ -251,8 +253,8 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirecto
 		if err != nil {
 			return err
 		}
-		if record.Type != fsmeta.InodeTypeDirectory {
-			return fsmeta.ErrInvalidRequest
+		if record.Type != model.InodeTypeDirectory {
+			return model.ErrInvalidRequest
 		}
 		dentryValue, err := fsmeta.EncodeDentryValue(record)
 		if err != nil {
@@ -263,10 +265,10 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirecto
 			return err
 		}
 		if !ok {
-			return fsmeta.ErrNotFound
+			return model.ErrNotFound
 		}
-		if inode.Type != fsmeta.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == fsmeta.RootInode {
-			return fsmeta.ErrInvalidRequest
+		if inode.Type != model.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == model.RootInode {
+			return model.ErrInvalidRequest
 		}
 		quotaMutations, err := e.reserveQuota(ctx, []QuotaChange{{
 			Mount:      req.Mount,
@@ -309,7 +311,7 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req fsmeta.RemoveDirecto
 	return nil
 }
 
-func (e *Executor) tryVisibleRemoveDirectory(ctx context.Context, compiled compile.CompiledOp, mount fsmeta.MountIdentity, req fsmeta.RemoveDirectoryRequest) (bool, error) {
+func (e *Executor) tryVisibleRemoveDirectory(ctx context.Context, compiled compile.CompiledOp, mount model.MountIdentity, req model.RemoveDirectoryRequest) (bool, error) {
 	delta := compiled.Delta
 	plan := delta.Plan
 	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
@@ -328,18 +330,18 @@ func (e *Executor) tryVisibleRemoveDirectory(ctx context.Context, compiled compi
 	if err != nil {
 		return false, err
 	}
-	if record.Type != fsmeta.InodeTypeDirectory {
-		return false, fsmeta.ErrInvalidRequest
+	if record.Type != model.InodeTypeDirectory {
+		return false, model.ErrInvalidRequest
 	}
 	inode, ok, err := view.readInode(mount, record.Inode)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
-		return false, fsmeta.ErrNotFound
+		return false, model.ErrNotFound
 	}
-	if inode.Type != fsmeta.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == fsmeta.RootInode {
-		return false, fsmeta.ErrInvalidRequest
+	if inode.Type != model.InodeTypeDirectory || inode.ChildCount != 0 || inode.Inode == model.RootInode {
+		return false, model.ErrInvalidRequest
 	}
 	quotaOK, err := e.visibleQuotaAllowsCommit(ctx, []QuotaChange{{
 		Mount:      req.Mount,
@@ -376,15 +378,15 @@ func (e *Executor) tryVisibleRemoveDirectory(ctx context.Context, compiled compi
 // Remove is the product-facing primitive for removing one non-directory
 // namespace entry. Directory removal needs a separate directory-emptiness
 // contract, so v1 keeps directory targets invalid instead of orphaning children.
-func (e *Executor) Remove(ctx context.Context, req fsmeta.RemoveRequest) (fsmeta.RemoveResult, error) {
+func (e *Executor) Remove(ctx context.Context, req model.RemoveRequest) (model.RemoveResult, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return fsmeta.RemoveResult{}, err
+		return model.RemoveResult{}, err
 	}
 	mount := mountRecord.Identity()
 	program, err := compile.CompileRemoveProgram(req, mount, compile.WithQuotaMode(e.visibleQuotaMode()))
 	if err != nil {
-		return fsmeta.RemoveResult{}, err
+		return model.RemoveResult{}, err
 	}
 	return e.removeDentry(ctx, mount, program.Compiled, removeDentryRequest(req))
 }

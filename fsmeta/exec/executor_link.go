@@ -6,12 +6,14 @@ package exec
 import (
 	"context"
 	"errors"
+
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
-func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgram, mount fsmeta.MountIdentity, req fsmeta.LinkRequest) (bool, error) {
+func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgram, mount model.MountIdentity, req model.LinkRequest) (bool, error) {
 	compiled := program.Compiled
 	delta := compiled.Delta
 	plan := delta.Plan
@@ -23,13 +25,13 @@ func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgr
 	if err != nil {
 		return false, err
 	}
-	if record.Type == fsmeta.InodeTypeDirectory {
-		return false, fsmeta.ErrInvalidRequest
+	if record.Type == model.InodeTypeDirectory {
+		return false, model.ErrInvalidRequest
 	}
 	if !e.visibleNotExistsKnown(delta.Authority, plan.ReadKeys[1], e.visiblePredicateIndex()) {
 		if _, err := view.readDentry(plan.ReadKeys[1]); err == nil {
-			return false, fsmeta.ErrExists
-		} else if !errors.Is(err, fsmeta.ErrNotFound) {
+			return false, model.ErrExists
+		} else if !errors.Is(err, model.ErrNotFound) {
 			return false, err
 		}
 	}
@@ -38,10 +40,10 @@ func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgr
 		return false, err
 	}
 	if !ok {
-		return false, fsmeta.ErrNotFound
+		return false, model.ErrNotFound
 	}
-	if inode.Type == fsmeta.InodeTypeDirectory || inode.LinkCount == ^uint32(0) {
-		return false, fsmeta.ErrInvalidRequest
+	if inode.Type == model.InodeTypeDirectory || inode.LinkCount == ^uint32(0) {
+		return false, model.ErrInvalidRequest
 	}
 	if inode.LinkCount == 0 {
 		inode.LinkCount = 1
@@ -68,7 +70,7 @@ func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgr
 		return false, nil
 	}
 	inode.LinkCount++
-	dentryValue, err := fsmeta.EncodeDentryValue(fsmeta.DentryRecord{
+	dentryValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
 		Parent: req.ToParent,
 		Name:   req.ToName,
 		Inode:  record.Inode,
@@ -102,7 +104,7 @@ func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgr
 
 // Link creates a second dentry for an existing non-directory inode and bumps
 // the inode link count in the same transaction.
-func (e *Executor) Link(ctx context.Context, req fsmeta.LinkRequest) error {
+func (e *Executor) Link(ctx context.Context, req model.LinkRequest) error {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
 		return err
@@ -135,12 +137,12 @@ func (e *Executor) Link(ctx context.Context, req fsmeta.LinkRequest) error {
 		if err != nil {
 			return err
 		}
-		if record.Type == fsmeta.InodeTypeDirectory {
-			return fsmeta.ErrInvalidRequest
+		if record.Type == model.InodeTypeDirectory {
+			return model.ErrInvalidRequest
 		}
 		if _, err := e.readDentry(ctx, plan.ReadKeys[1], startVersion); err == nil {
-			return fsmeta.ErrExists
-		} else if !errors.Is(err, fsmeta.ErrNotFound) {
+			return model.ErrExists
+		} else if !errors.Is(err, model.ErrNotFound) {
 			return err
 		}
 		inode, ok, err := e.readInode(ctx, mount, record.Inode, startVersion)
@@ -148,13 +150,13 @@ func (e *Executor) Link(ctx context.Context, req fsmeta.LinkRequest) error {
 			return err
 		}
 		if !ok {
-			return fsmeta.ErrNotFound
+			return model.ErrNotFound
 		}
-		if inode.Type == fsmeta.InodeTypeDirectory {
-			return fsmeta.ErrInvalidRequest
+		if inode.Type == model.InodeTypeDirectory {
+			return model.ErrInvalidRequest
 		}
 		if inode.LinkCount == ^uint32(0) {
-			return fsmeta.ErrInvalidRequest
+			return model.ErrInvalidRequest
 		}
 		if inode.LinkCount == 0 {
 			inode.LinkCount = 1
@@ -177,7 +179,7 @@ func (e *Executor) Link(ctx context.Context, req fsmeta.LinkRequest) error {
 		}
 		inode.LinkCount++
 
-		dentryValue, err := fsmeta.EncodeDentryValue(fsmeta.DentryRecord{
+		dentryValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
 			Parent: req.ToParent,
 			Name:   req.ToName,
 			Inode:  record.Inode,

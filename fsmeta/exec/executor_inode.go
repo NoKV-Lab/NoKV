@@ -5,37 +5,39 @@ package exec
 
 import (
 	"context"
+
 	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
-func (e *Executor) tryVisibleUpdateInode(ctx context.Context, program compile.UpdateInodeProgram, mount fsmeta.MountIdentity, req fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, bool, error) {
+func (e *Executor) tryVisibleUpdateInode(ctx context.Context, program compile.UpdateInodeProgram, mount model.MountIdentity, req model.UpdateInodeRequest) (model.InodeRecord, bool, error) {
 	delta := program.Compiled.Delta
 	if e == nil || e.visibleCommitter == nil || e.visibleAuthority == nil || delta.Eligibility != compile.EligibilityVisibleCommit {
-		return fsmeta.InodeRecord{}, false, nil
+		return model.InodeRecord{}, false, nil
 	}
 	plan := delta.Plan
 	view := e.newVisibleReadView(ctx)
 	dentry, err := view.readDentry(plan.ReadKeys[0])
 	if err != nil {
-		return fsmeta.InodeRecord{}, false, err
+		return model.InodeRecord{}, false, err
 	}
 	if dentry.Inode != req.Inode {
-		return fsmeta.InodeRecord{}, false, fsmeta.ErrInvalidRequest
+		return model.InodeRecord{}, false, model.ErrInvalidRequest
 	}
 	inode, ok, err := view.readInode(mount, req.Inode)
 	if err != nil {
-		return fsmeta.InodeRecord{}, false, err
+		return model.InodeRecord{}, false, err
 	}
 	if !ok {
-		return fsmeta.InodeRecord{}, false, fsmeta.ErrNotFound
+		return model.InodeRecord{}, false, model.ErrNotFound
 	}
 	if dentry.Type != inode.Type {
-		return fsmeta.InodeRecord{}, false, fsmeta.ErrInvalidValue
+		return model.InodeRecord{}, false, model.ErrInvalidValue
 	}
 	if inode.LinkCount != 1 {
-		return fsmeta.InodeRecord{}, false, fsmeta.ErrInvalidRequest
+		return model.InodeRecord{}, false, model.ErrInvalidRequest
 	}
 	sizeDelta := int64(0)
 	if req.SetSize {
@@ -48,10 +50,10 @@ func (e *Executor) tryVisibleUpdateInode(ctx context.Context, program compile.Up
 				Bytes:      sizeDelta,
 			}})
 			if err != nil {
-				return fsmeta.InodeRecord{}, false, err
+				return model.InodeRecord{}, false, err
 			}
 			if !quotaOK {
-				return fsmeta.InodeRecord{}, false, nil
+				return model.InodeRecord{}, false, nil
 			}
 		}
 	}
@@ -69,18 +71,18 @@ func (e *Executor) tryVisibleUpdateInode(ctx context.Context, program compile.Up
 	}
 	value, err := fsmeta.EncodeInodeValue(inode)
 	if err != nil {
-		return fsmeta.InodeRecord{}, false, err
+		return model.InodeRecord{}, false, err
 	}
 	concrete, err := view.materializeVisibleCompiledOp(program.Compiled, []compile.WriteEffect{visiblePutEffect(plan.MutateKeys[0], value)})
 	if err != nil {
-		return fsmeta.InodeRecord{}, false, err
+		return model.InodeRecord{}, false, err
 	}
 	committed, err := e.tryVisibleCommitAfterRead(ctx, view, concrete)
 	if err != nil {
-		return fsmeta.InodeRecord{}, committed, err
+		return model.InodeRecord{}, committed, err
 	}
 	if !committed {
-		return fsmeta.InodeRecord{}, false, nil
+		return model.InodeRecord{}, false, nil
 	}
 	return inode, true, nil
 }
@@ -88,32 +90,32 @@ func (e *Executor) tryVisibleUpdateInode(ctx context.Context, program compile.Up
 // UpdateInode updates mutable inode attributes and applies the size quota delta
 // in the same transaction. The parent field is required because quota and
 // DirPage invalidation are directory-scoped by parent inode and page token.
-func (e *Executor) UpdateInode(ctx context.Context, req fsmeta.UpdateInodeRequest) (fsmeta.InodeRecord, error) {
+func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest) (model.InodeRecord, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
-		return fsmeta.InodeRecord{}, err
+		return model.InodeRecord{}, err
 	}
 	mount := mountRecord.Identity()
 	program, err := compile.CompileUpdateInodeProgram(req, mount, compile.WithQuotaMode(e.visibleQuotaMode()))
 	if err != nil {
-		return fsmeta.InodeRecord{}, err
+		return model.InodeRecord{}, err
 	}
 	delta := program.Compiled.Delta
 	if err := e.admitVisibleAuthority(ctx, delta); err != nil {
-		return fsmeta.InodeRecord{}, err
+		return model.InodeRecord{}, err
 	}
 	plan := delta.Plan
 	if !req.SetSize && !req.SetMode && !req.SetUpdatedUnixNs && !req.SetOpaqueAttrs {
-		return fsmeta.InodeRecord{}, fsmeta.ErrInvalidRequest
+		return model.InodeRecord{}, model.ErrInvalidRequest
 	}
 	if updated, committed, err := e.tryVisibleUpdateInode(ctx, program, mount, req); committed || err != nil {
 		if err != nil {
-			return fsmeta.InodeRecord{}, err
+			return model.InodeRecord{}, err
 		}
 		e.invalidateDirPages(req.Mount, req.Parent)
 		return updated, nil
 	}
-	var updated fsmeta.InodeRecord
+	var updated model.InodeRecord
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
 		dentry, err := e.readDentry(ctx, plan.ReadKeys[0], startVersion)
 		if err != nil {
@@ -124,23 +126,23 @@ func (e *Executor) UpdateInode(ctx context.Context, req fsmeta.UpdateInodeReques
 			return err
 		}
 		if dentry.Inode != req.Inode {
-			return fsmeta.ErrInvalidRequest
+			return model.ErrInvalidRequest
 		}
 		inode, ok, err := e.readInode(ctx, mount, req.Inode, startVersion)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return fsmeta.ErrNotFound
+			return model.ErrNotFound
 		}
 		if dentry.Type != inode.Type {
-			return fsmeta.ErrInvalidValue
+			return model.ErrInvalidValue
 		}
 		// fsmeta does not maintain an inode->parents reverse index. Updating a
 		// hard-linked inode would require invalidating and quota-adjusting every
 		// parent, so reject it rather than silently corrupting accounting.
 		if inode.LinkCount != 1 {
-			return fsmeta.ErrInvalidRequest
+			return model.ErrInvalidRequest
 		}
 		oldInodeValue, err := fsmeta.EncodeInodeValue(inode)
 		if err != nil {
@@ -195,7 +197,7 @@ func (e *Executor) UpdateInode(ctx context.Context, req fsmeta.UpdateInodeReques
 		updated = inode
 		return nil
 	}, delta.Authority); err != nil {
-		return fsmeta.InodeRecord{}, err
+		return model.InodeRecord{}, err
 	}
 	e.invalidateDirPages(req.Mount, req.Parent)
 	return updated, nil

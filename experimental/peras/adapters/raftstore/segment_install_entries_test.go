@@ -12,6 +12,7 @@ import (
 	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/local"
 	"github.com/stretchr/testify/require"
 )
@@ -335,10 +336,10 @@ func openPerasReplayDB(t *testing.T) *local.DB {
 
 func fsmetaSegmentForTest(t *testing.T) fsperas.PerasSegment {
 	t.Helper()
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
-	dentryA, err := fsmeta.EncodeDentryKey(mount, fsmeta.RootInode, "a")
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	dentryA, err := fsmeta.EncodeDentryKey(mount, model.RootInode, "a")
 	require.NoError(t, err)
-	dentryB, err := fsmeta.EncodeDentryKey(mount, fsmeta.RootInode, "b")
+	dentryB, err := fsmeta.EncodeDentryKey(mount, model.RootInode, "b")
 	require.NoError(t, err)
 	inodeA, err := fsmeta.EncodeInodeKey(mount, 7)
 	require.NoError(t, err)
@@ -347,7 +348,7 @@ func fsmetaSegmentForTest(t *testing.T) fsperas.PerasSegment {
 		Operations: []fsperas.ReplayOperation{
 			{
 				OpID: testPerasInstallOpID("client-a", 1),
-				Kind: fsmeta.OperationCreate,
+				Kind: model.OperationCreate,
 				Mutations: []fsperas.ReplayMutation{
 					{Key: dentryA, Value: []byte("inode=7")},
 					{Key: inodeA, Value: []byte("attrs")},
@@ -355,7 +356,7 @@ func fsmetaSegmentForTest(t *testing.T) fsperas.PerasSegment {
 			},
 			{
 				OpID: testPerasInstallOpID("client-b", 1),
-				Kind: fsmeta.OperationCreate,
+				Kind: model.OperationCreate,
 				Mutations: []fsperas.ReplayMutation{
 					{Key: dentryB, Value: []byte("inode=8")},
 				},
@@ -368,16 +369,16 @@ func fsmetaSegmentForTest(t *testing.T) fsperas.PerasSegment {
 
 func fsmetaMultiBucketSegmentForTest(t *testing.T) fsperas.PerasSegment {
 	t.Helper()
-	mount := fsmeta.MountIdentity{MountID: "vol", MountKeyID: 1}
-	var inode fsmeta.InodeID
-	for candidate := fsmeta.InodeID(2); candidate < 1_000_000; candidate++ {
+	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
+	var inode model.InodeID
+	for candidate := model.InodeID(2); candidate < 1_000_000; candidate++ {
 		if fsmeta.BucketForInodeID(candidate) != fsmeta.RootAffinityBucket {
 			inode = candidate
 			break
 		}
 	}
 	require.NotZero(t, inode)
-	dentry, err := fsmeta.EncodeDentryKey(mount, fsmeta.RootInode, "artifact")
+	dentry, err := fsmeta.EncodeDentryKey(mount, model.RootInode, "artifact")
 	require.NoError(t, err)
 	inodeKey, err := fsmeta.EncodeInodeKey(mount, inode)
 	require.NoError(t, err)
@@ -385,7 +386,7 @@ func fsmetaMultiBucketSegmentForTest(t *testing.T) fsperas.PerasSegment {
 		EpochID: 1,
 		Operations: []fsperas.ReplayOperation{{
 			OpID: testPerasInstallOpID("client-a", 1),
-			Kind: fsmeta.OperationCreate,
+			Kind: model.OperationCreate,
 			Mutations: []fsperas.ReplayMutation{
 				{Key: dentry, Value: []byte("inode")},
 				{Key: inodeKey, Value: []byte("attrs")},
@@ -436,17 +437,17 @@ func testPerasInstallOpID(client string, seq uint64) fsperas.OperationID {
 
 func workspaceInstallReplayPlan(tb testing.TB, count int) fsperas.ReplayPlan {
 	tb.Helper()
-	mount := fsmeta.MountIdentity{MountID: "workspace", MountKeyID: 42}
+	mount := model.MountIdentity{MountID: "workspace", MountKeyID: 42}
 	ops := make([]fsperas.ReplayOperation, 0, count)
 	for i := range count {
 		name := fmt.Sprintf("checkpoint-%06d", i)
-		dentry, err := fsmeta.EncodeDentryKey(mount, fsmeta.RootInode, name)
+		dentry, err := fsmeta.EncodeDentryKey(mount, model.RootInode, name)
 		require.NoError(tb, err)
-		inodeKey, err := fsmeta.EncodeInodeKey(mount, fsmeta.InodeID(1000+i))
+		inodeKey, err := fsmeta.EncodeInodeKey(mount, model.InodeID(1000+i))
 		require.NoError(tb, err)
 		ops = append(ops, fsperas.ReplayOperation{
 			OpID: testPerasInstallOpID("workspace-writer", uint64(i+1)),
-			Kind: fsmeta.OperationCreate,
+			Kind: model.OperationCreate,
 			Mutations: []fsperas.ReplayMutation{
 				{Key: dentry, Value: []byte("inode")},
 				{Key: inodeKey, Value: []byte("attrs")},

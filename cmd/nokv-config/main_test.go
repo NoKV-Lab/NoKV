@@ -6,12 +6,14 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	metaregion "github.com/feichai0017/NoKV/meta/region"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/feichai0017/NoKV/fsmeta/model"
+	metaregion "github.com/feichai0017/NoKV/meta/region"
 
 	"github.com/feichai0017/NoKV/config"
 	"github.com/feichai0017/NoKV/fsmeta"
@@ -101,7 +103,7 @@ func TestRunRegionsExpandsFSMetaBootstrapLayout(t *testing.T) {
 	require.Len(t, regions[1].Peers, 3)
 	require.Equal(t, uint64(10_003), regions[1].Peers[0].PeerID)
 
-	start, end, err := fsmeta.EncodeBucketRange(fsmeta.MountIdentity{MountID: "fsmeta-bench", MountKeyID: 2}, 0)
+	start, end, err := fsmeta.EncodeBucketRange(model.MountIdentity{MountID: "fsmeta-bench", MountKeyID: 2}, 0)
 	require.NoError(t, err)
 	require.Equal(t, start, []byte(regions[1].StartKey))
 	require.Equal(t, end, []byte(regions[1].EndKey))

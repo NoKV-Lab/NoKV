@@ -8,14 +8,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestOpenRejectsInvalidSessionCleanupLimit(t *testing.T) {
 	_, err := Open(context.Background(), Options{
 		CoordinatorAddr:     "127.0.0.1:1",
-		SessionCleanupLimit: fsmeta.MaxSessionExpireLimit + 1,
+		SessionCleanupLimit: model.MaxSessionExpireLimit + 1,
 	})
 	require.ErrorContains(t, err, "session cleanup limit exceeds maximum")
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,7 +67,7 @@ func TestOverlayViewScanReusesSortedIndexAcrossReads(t *testing.T) {
 		{name: "a", seq: 2},
 		{name: "b", seq: 3},
 	} {
-		op := testGeneratedCreateOpForInodes(t, 9, fsmeta.InodeID(20+item.seq), item.name)
+		op := testGeneratedCreateOpForInodes(t, 9, model.InodeID(20+item.seq), item.name)
 		require.NoError(t, view.Add(OperationID{ClientID: "c", Seq: item.seq}, op))
 	}
 	prefix, err := fsmeta.EncodeDentryPrefix(testMount, 9)
@@ -174,7 +175,7 @@ func TestOverlayViewDirectoryBaseEmptySurvivesCurrentEmptyForget(t *testing.T) {
 	require.True(t, view.Clone().DirectoryBaseEmpty(testMount, 9))
 }
 
-func mustDentryKey(t *testing.T, parent fsmeta.InodeID, name string) []byte {
+func mustDentryKey(t *testing.T, parent model.InodeID, name string) []byte {
 	t.Helper()
 	key, err := fsmeta.EncodeDentryKey(testMount, parent, name)
 	require.NoError(t, err)
