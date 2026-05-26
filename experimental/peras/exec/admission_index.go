@@ -7,8 +7,8 @@ import (
 	"bytes"
 	"strconv"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -87,7 +87,7 @@ func RememberOperationFacts(known map[string]bool, emptyDirs map[string]struct{}
 		if effect.Kind != compile.EffectPut || !bytes.Equal(effect.Key, inodeKey) {
 			continue
 		}
-		inode, err := fsmeta.DecodeInodeValue(effect.Value)
+		inode, err := layout.DecodeInodeValue(effect.Value)
 		if err != nil {
 			return err
 		}
@@ -145,8 +145,8 @@ func ForgetEmptySessionNamespaceFact(emptySessions map[string]struct{}, mount mo
 }
 
 func SessionNamespaceEmptyForKey(emptySessions map[string]struct{}, key []byte) bool {
-	parts, ok := fsmeta.InspectKey(key)
-	if !ok || parts.Kind != fsmeta.KeyKindSession {
+	parts, ok := layout.InspectKey(key)
+	if !ok || parts.Kind != layout.KeyKindSession {
 		return false
 	}
 	_, ok = emptySessions[SessionNamespaceFactKey(model.MountIdentity{
@@ -156,8 +156,8 @@ func SessionNamespaceEmptyForKey(emptySessions map[string]struct{}, key []byte) 
 }
 
 func ForgetEmptySessionNamespaceForKey(emptySessions map[string]struct{}, key []byte) {
-	parts, ok := fsmeta.InspectKey(key)
-	if !ok || parts.Kind != fsmeta.KeyKindSession {
+	parts, ok := layout.InspectKey(key)
+	if !ok || parts.Kind != layout.KeyKindSession {
 		return
 	}
 	delete(emptySessions, SessionNamespaceFactKey(model.MountIdentity{MountKeyID: parts.MountKeyID}, parts.Inode))
@@ -167,8 +167,8 @@ func rememberDirectoryFactMutation(emptyDirs map[string]struct{}, scope compile.
 	if effect.Kind != compile.EffectPut || emptyDirs == nil {
 		return
 	}
-	parts, ok := fsmeta.InspectKey(effect.Key)
-	if !ok || parts.Kind != fsmeta.KeyKindDentry || parts.MountKeyID != scope.MountKeyID {
+	parts, ok := layout.InspectKey(effect.Key)
+	if !ok || parts.Kind != layout.KeyKindDentry || parts.MountKeyID != scope.MountKeyID {
 		return
 	}
 	ForgetEmptyDirectoryFact(emptyDirs, model.MountIdentity{
@@ -181,8 +181,8 @@ func rememberSessionFactMutation(emptySessions map[string]struct{}, scope compil
 	if effect.Kind != compile.EffectPut || emptySessions == nil {
 		return
 	}
-	parts, ok := fsmeta.InspectKey(effect.Key)
-	if !ok || parts.Kind != fsmeta.KeyKindSession || parts.MountKeyID != scope.MountKeyID {
+	parts, ok := layout.InspectKey(effect.Key)
+	if !ok || parts.Kind != layout.KeyKindSession || parts.MountKeyID != scope.MountKeyID {
 		return
 	}
 	ForgetEmptySessionNamespaceFact(emptySessions, model.MountIdentity{

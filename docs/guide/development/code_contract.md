@@ -53,7 +53,9 @@ Package boundaries follow ownership of truth, not convenience.
 | `meta/root/` | Rooted truth for authority, topology, grants, seals, and lifecycle facts. | Import coordinator service/client packages. |
 | `coordinator/` | Rebuildable control-plane view, routing, and service orchestration. | Become the source of truth for rooted facts. |
 | `fsmeta/model/` | Storage-engine-neutral namespace model: inode/dentry records, operation request/result shapes, and model validation. | Import key/value layout, protobuf, raftstore, coordinator, root, Peras, or concrete backend packages. |
-| `fsmeta/` | Key/value encoding, layout planning, watch-key translation, placement policy, and ordered-storage glue. | Re-own storage-engine-neutral model types or add forwarding aliases for `fsmeta/model`. |
+| `fsmeta/layout/` | Ordered-key backend layout: key/value codecs, key-family kinds, affinity buckets, placement ranges, and operation key plans. | Own namespace semantics, protobuf, raftstore, coordinator, root, Peras, or concrete backend clients. |
+| `fsmeta/observe/` | Runtime-neutral watch and snapshot observation surfaces: requests, cursors, events, subscriptions, apply notifications, and snapshot publication hooks. | Own namespace model objects, storage runtimes, protobuf conversion, raftstore, coordinator, root, Peras, or backend clients. |
+| `fsmeta/` | Package-level architecture anchor. | Re-own model/layout/observe types or add forwarding aliases for `fsmeta/model`, `fsmeta/layout`, or `fsmeta/observe`. |
 | `fsmeta/exec/` | Semantic execution, compiler, and holder logic. | Import `raftstore`, `coordinator`, or `meta/root`. |
 | `fsmeta/runtime/` | Runtime adapters that bind fsmeta execution to storage backends. | Reinterpret compiler semantics without going through the compiler contract. |
 | `cmd/` | Binary assembly, flags, env, and config wiring. | Contain core protocol or storage logic. |
@@ -87,8 +89,10 @@ The current responsibility map is:
 - `coordinator/*`: rebuildable serving layer over root facts.
 - `fsmeta/model/*`: storage-engine-neutral inode/dentry/session/quota/snapshot
   model objects, operation request/result types, and model validation.
-- `fsmeta/*`: namespace key layout, values, placement planning,
-  watch-key translation, and ordered-storage glue.
+- `fsmeta/layout/*`: namespace key layout, value codecs, placement planning,
+  and operation key plans for ordered storage backends.
+- `fsmeta/observe/*`: runtime-neutral watch and snapshot observation surfaces.
+- `fsmeta/*`: package-level architecture anchor only.
 - `fsmeta/exec/*`: semantic compiler, executor, and runtime-neutral holder
   logic.
 - `fsmeta/runtime/*`: concrete runtime bindings from fsmeta execution to

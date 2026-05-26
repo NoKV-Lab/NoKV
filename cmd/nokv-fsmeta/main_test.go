@@ -14,9 +14,10 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/engine/wal"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetalocal "github.com/feichai0017/NoKV/fsmeta/runtime/local"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -199,7 +200,7 @@ func TestLocalRuntimeRegistersWatchAndSnapshot(t *testing.T) {
 	cli, cleanup := openLocalBufconnClient(t, rt)
 	defer cleanup()
 
-	watch, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
+	watch, err := cli.WatchSubtree(ctx, observe.WatchRequest{
 		Mount:     "vol",
 		RootInode: model.RootInode,
 	})
@@ -218,7 +219,7 @@ func TestLocalRuntimeRegistersWatchAndSnapshot(t *testing.T) {
 		t.Fatalf("create over local grpc: %v", err)
 	}
 	evt := recvClientWatchEvent(t, watch)
-	wantKey, err := fsmeta.EncodeDentryKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode, "over-grpc")
+	wantKey, err := layout.EncodeDentryKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode, "over-grpc")
 	if err != nil {
 		t.Fatalf("encode dentry key: %v", err)
 	}
@@ -280,10 +281,10 @@ func openLocalBufconnClient(t *testing.T, rt *fsmetaServerRuntime) (*fsmetaclien
 	}
 }
 
-func recvClientWatchEvent(t *testing.T, watch fsmetaclient.WatchSubscription) fsmeta.WatchEvent {
+func recvClientWatchEvent(t *testing.T, watch fsmetaclient.WatchSubscription) observe.WatchEvent {
 	t.Helper()
 	type result struct {
-		evt fsmeta.WatchEvent
+		evt observe.WatchEvent
 		err error
 	}
 	ch := make(chan result, 1)
@@ -299,6 +300,6 @@ func recvClientWatchEvent(t *testing.T, watch fsmetaclient.WatchSubscription) fs
 		return got.evt
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for local watch event")
-		return fsmeta.WatchEvent{}
+		return observe.WatchEvent{}
 	}
 }

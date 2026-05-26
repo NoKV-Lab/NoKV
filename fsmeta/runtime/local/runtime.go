@@ -12,8 +12,8 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	"github.com/feichai0017/NoKV/engine/slab/negativecache"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
@@ -198,7 +198,7 @@ func (r *Runtime) Close() error {
 }
 
 func bootstrapRootInode(ctx context.Context, runner *Runner, mount fsmetaexec.MountAdmission, now func() time.Time) error {
-	key, err := fsmeta.EncodeInodeKey(mount.Identity(), mount.RootInode)
+	key, err := layout.EncodeInodeKey(mount.Identity(), mount.RootInode)
 	if err != nil {
 		return err
 	}
@@ -213,7 +213,7 @@ func bootstrapRootInode(ctx context.Context, runner *Runner, mount fsmetaexec.Mo
 	if now != nil {
 		ts = now()
 	}
-	value, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+	value, err := layout.EncodeInodeValue(model.InodeRecord{
 		Inode:         mount.RootInode,
 		Type:          model.InodeTypeDirectory,
 		LinkCount:     1,

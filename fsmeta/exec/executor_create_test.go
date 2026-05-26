@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/engine/slab/negativecache"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
@@ -175,7 +175,7 @@ func TestExecutorCreateVisibleCommitRequiresAuthorityAdmission(t *testing.T) {
 func TestExecutorCreateVisibleCommitSkipsSharedQuota(t *testing.T) {
 	runner := newFakeRunner()
 	seedDirectory(t, runner, "vol", 7)
-	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 7)
+	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
 	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
 	committer := &fakeVisibleCommitter{}
@@ -405,7 +405,7 @@ func TestExecutorCreateUsesAtomicMutateOnePhaseWhenHandled(t *testing.T) {
 	_, err = executor.Create(context.Background(), req)
 	require.NoError(t, err)
 
-	plan, err := fsmeta.PlanCreate(req, testMountIdentity, 22)
+	plan, err := layout.PlanCreate(req, testMountIdentity, 22)
 	require.NoError(t, err)
 	stats := executor.Stats()
 	requireStatUint(t, stats, "create_total", 1)
@@ -515,7 +515,7 @@ func TestExecutorCreateSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	base := newFakeRunner()
 	seedDirectory(t, base, "vol", 7)
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
-	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 0)
+	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 0)
 	require.NoError(t, err)
 	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{22}}), WithQuotaResolver(quota))
@@ -620,7 +620,7 @@ func TestExecutorCreateRequiresActiveMountWhenResolverConfigured(t *testing.T) {
 func TestExecutorCreateReservesQuotaInsideMutation(t *testing.T) {
 	runner := newFakeRunner()
 	seedDirectory(t, runner, "vol", 7)
-	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 0)
+	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 0)
 	require.NoError(t, err)
 	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{22}}), WithQuotaResolver(quota))

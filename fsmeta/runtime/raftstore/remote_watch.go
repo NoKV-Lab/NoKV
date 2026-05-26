@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"google.golang.org/grpc"
@@ -294,9 +294,9 @@ func publishApplyWatchEvent(router *fsmetawatch.Router, evt *kvrpcpb.ApplyWatchE
 	}
 }
 
-func newWatchEvent(evt *kvrpcpb.ApplyWatchEvent, source fsmeta.WatchEventSource, key []byte) fsmeta.WatchEvent {
-	return fsmeta.WatchEvent{
-		Cursor: fsmeta.WatchCursor{
+func newWatchEvent(evt *kvrpcpb.ApplyWatchEvent, source observe.WatchEventSource, key []byte) observe.WatchEvent {
+	return observe.WatchEvent{
+		Cursor: observe.WatchCursor{
 			RegionID: evt.GetRegionId(),
 			Term:     evt.GetTerm(),
 			Index:    evt.GetIndex(),
@@ -335,12 +335,12 @@ func nextBackoff(delay time.Duration) time.Duration {
 	return delay
 }
 
-func applyWatchSourceFromProto(source kvrpcpb.ApplyWatchEventSource) fsmeta.WatchEventSource {
+func applyWatchSourceFromProto(source kvrpcpb.ApplyWatchEventSource) observe.WatchEventSource {
 	switch source {
 	case kvrpcpb.ApplyWatchEventSource_APPLY_WATCH_EVENT_SOURCE_COMMIT:
-		return fsmeta.WatchEventSourceCommit
+		return observe.WatchEventSourceCommit
 	case kvrpcpb.ApplyWatchEventSource_APPLY_WATCH_EVENT_SOURCE_RESOLVE_LOCK:
-		return fsmeta.WatchEventSourceResolveLock
+		return observe.WatchEventSourceResolveLock
 	default:
 		return 0
 	}

@@ -4,8 +4,8 @@
 package raftstore
 
 import (
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	storepkg "github.com/feichai0017/NoKV/raftstore/store"
 )
 
@@ -23,16 +23,16 @@ func (o *ApplyObserver) OnApply(evt storepkg.ApplyEvent) {
 	if o == nil || o.router == nil {
 		return
 	}
-	source := fsmeta.WatchEventSource(0)
+	source := observe.WatchEventSource(0)
 	switch evt.Source {
 	case storepkg.ApplyEventSourceCommit:
-		source = fsmeta.WatchEventSourceCommit
+		source = observe.WatchEventSourceCommit
 	case storepkg.ApplyEventSourceResolveLock:
-		source = fsmeta.WatchEventSourceResolveLock
+		source = observe.WatchEventSourceResolveLock
 	default:
 		return
 	}
-	o.router.OnApply(fsmeta.ApplyEvent{
+	o.router.OnApply(observe.ApplyEvent{
 		RegionID:      evt.RegionID,
 		Term:          evt.Term,
 		Index:         evt.Index,

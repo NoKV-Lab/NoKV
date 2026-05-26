@@ -6,8 +6,8 @@ package exec
 import (
 	"context"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -69,7 +69,7 @@ func (e *Executor) tryVisibleUpdateInode(ctx context.Context, program compile.Up
 	if req.SetOpaqueAttrs {
 		inode.OpaqueAttrs = append([]byte(nil), req.OpaqueAttrs...)
 	}
-	value, err := fsmeta.EncodeInodeValue(inode)
+	value, err := layout.EncodeInodeValue(inode)
 	if err != nil {
 		return model.InodeRecord{}, false, err
 	}
@@ -121,7 +121,7 @@ func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest
 		if err != nil {
 			return err
 		}
-		dentryValue, err := fsmeta.EncodeDentryValue(dentry)
+		dentryValue, err := layout.EncodeDentryValue(dentry)
 		if err != nil {
 			return err
 		}
@@ -144,7 +144,7 @@ func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest
 		if inode.LinkCount != 1 {
 			return model.ErrInvalidRequest
 		}
-		oldInodeValue, err := fsmeta.EncodeInodeValue(inode)
+		oldInodeValue, err := layout.EncodeInodeValue(inode)
 		if err != nil {
 			return err
 		}
@@ -162,7 +162,7 @@ func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest
 		if req.SetOpaqueAttrs {
 			inode.OpaqueAttrs = append([]byte(nil), req.OpaqueAttrs...)
 		}
-		value, err := fsmeta.EncodeInodeValue(inode)
+		value, err := layout.EncodeInodeValue(inode)
 		if err != nil {
 			return err
 		}

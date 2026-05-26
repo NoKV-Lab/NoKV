@@ -8,7 +8,7 @@ import (
 
 	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -198,8 +198,8 @@ func dentryKeysFromHeader(keys [][]byte) [][]byte {
 	}
 	out := make([][]byte, 0, len(keys))
 	for _, key := range keys {
-		parts, ok := fsmeta.InspectKey(key)
-		if !ok || parts.Kind != fsmeta.KeyKindDentry {
+		parts, ok := layout.InspectKey(key)
+		if !ok || parts.Kind != layout.KeyKindDentry {
 			continue
 		}
 		out = append(out, cloneInstallBytes(key))

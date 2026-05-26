@@ -6,10 +6,10 @@ package raftstore
 import (
 	"context"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 )
 
 // watcher wraps the in-process router with mount admission and pulls watch
@@ -21,7 +21,7 @@ type watcher struct {
 	mounts fsmetaexec.MountResolver
 }
 
-func (w watcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta.WatchSubscription, error) {
+func (w watcher) Subscribe(ctx context.Context, req observe.WatchRequest) (observe.WatchSubscription, error) {
 	if req.Mount != "" && w.mounts != nil {
 		record, err := w.mounts.ResolveMount(ctx, req.Mount)
 		if err != nil {
@@ -33,7 +33,7 @@ func (w watcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta
 		if record.Retired {
 			return nil, model.ErrMountRetired
 		}
-		prefix, err := fsmeta.WatchPrefixForMount(req, record.Identity())
+		prefix, err := observe.WatchPrefixForMount(req, record.Identity())
 		if err != nil {
 			return nil, err
 		}

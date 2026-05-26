@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 	"google.golang.org/grpc"
 )
@@ -52,22 +52,22 @@ type Service struct {
 	fsmetapb.UnimplementedFSMetadataServer
 
 	executor Executor
-	watcher  fsmeta.Watcher
-	snapshot fsmeta.SnapshotPublisher
+	watcher  observe.Watcher
+	snapshot observe.SnapshotPublisher
 }
 
 // Option configures an FSMetadata service.
 type Option func(*Service)
 
 // WithWatcher enables WatchSubtree streams for the service.
-func WithWatcher(watcher fsmeta.Watcher) Option {
+func WithWatcher(watcher observe.Watcher) Option {
 	return func(s *Service) {
 		s.watcher = watcher
 	}
 }
 
 // WithSnapshotPublisher records SnapshotSubtree epochs in rooted truth.
-func WithSnapshotPublisher(publisher fsmeta.SnapshotPublisher) Option {
+func WithSnapshotPublisher(publisher observe.SnapshotPublisher) Option {
 	return func(s *Service) {
 		s.snapshot = publisher
 	}

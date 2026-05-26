@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
 )
@@ -149,6 +149,19 @@ func localDBOptions(opts Options) *localdb.Options {
 	if opts.WorkDir != "" {
 		cfg.WorkDir = opts.WorkDir
 	}
-	cfg.UserKeyShapeExtractor = fsmeta.MountAtomicUserKeyShape
+	cfg.UserKeyShapeExtractor = mountAtomicUserKeyShape
 	return cfg
+}
+
+func mountAtomicUserKeyShape(key []byte) localdb.UserKeyShape {
+	return localUserKeyShape(layout.MountAtomicUserKeyShape(key))
+}
+
+func localUserKeyShape(shape layout.KeyShape) localdb.UserKeyShape {
+	return localdb.UserKeyShape{
+		LocalityPrefix: shape.LocalityPrefix,
+		BloomPrefix:    shape.BloomPrefix,
+		ShardKey:       shape.ShardKey,
+		Family:         shape.Family,
+	}
 }

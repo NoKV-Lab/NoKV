@@ -1,14 +1,13 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-package fsmeta
+package layout
 
 import (
 	"encoding/binary"
 	"fmt"
 
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	localdb "github.com/feichai0017/NoKV/local"
 	"github.com/feichai0017/NoKV/utils"
 )
 
@@ -75,6 +74,16 @@ type KeyParts struct {
 	SegmentRoot         [32]byte
 	SnapshotRoot        model.InodeID
 	SnapshotReadVersion uint64
+}
+
+// KeyShape describes runtime-derived structure for one encoded fsmeta key.
+// Runtime adapters may use it for local shard routing and prefix filters
+// without making layout depend on a concrete storage engine.
+type KeyShape struct {
+	LocalityPrefix []byte
+	BloomPrefix    []byte
+	ShardKey       []byte
+	Family         byte
 }
 
 func (k KeyKind) String() string {
@@ -438,15 +447,15 @@ func MountKeyResolver(key []byte) (uint64, bool) {
 // engine import fsmeta. The shape keeps all keys in one mount-local affinity
 // bucket on the same local shard and gives prefix bloom filters record-family
 // prefixes that match the current key layout.
-func UserKeyShape(key []byte) localdb.UserKeyShape {
+func UserKeyShape(key []byte) KeyShape {
 	mountKeyID, bucketPos, err := decodeMountPrefix(key)
 	if err != nil || len(key)-bucketPos < encodedBucketBytes+1 {
-		return localdb.UserKeyShape{}
+		return KeyShape{}
 	}
 	kindPos := bucketPos + encodedBucketBytes
 	kind := KeyKind(key[kindPos])
 	bodyPos := kindPos + 1
-	shape := localdb.UserKeyShape{
+	shape := KeyShape{
 		LocalityPrefix: key[:kindPos],
 		ShardKey:       key[:kindPos],
 		Family:         byte(kind),
@@ -456,7 +465,7 @@ func UserKeyShape(key []byte) localdb.UserKeyShape {
 		shape.BloomPrefix = key[:bodyPos]
 	case KeyKindDentry:
 		if len(key) < bodyPos+8 {
-			return localdb.UserKeyShape{}
+			return KeyShape{}
 		}
 		parent := model.InodeID(binary.BigEndian.Uint64(key[bodyPos : bodyPos+8]))
 		if parent == model.RootInode {
@@ -467,22 +476,22 @@ func UserKeyShape(key []byte) localdb.UserKeyShape {
 		shape.BloomPrefix = key[:bodyPos+8]
 	case KeyKindInode, KeyKindChunk, KeyKindSession, KeyKindUsage:
 		if len(key) < bodyPos+8 {
-			return localdb.UserKeyShape{}
+			return KeyShape{}
 		}
 		shape.BloomPrefix = key[:bodyPos+8]
 	case KeyKindSnapshot:
 		if len(key) < bodyPos+16 {
-			return localdb.UserKeyShape{}
+			return KeyShape{}
 		}
 		shape.BloomPrefix = key[:bodyPos+8]
 	case KeyKindSegment:
 		if len(key) < bodyPos+33 {
-			return localdb.UserKeyShape{}
+			return KeyShape{}
 		}
 		shape.ShardKey = segmentShardKey(mountKeyID, key[bodyPos+1:bodyPos+33])
 		shape.BloomPrefix = key[:bodyPos+33]
 	default:
-		return localdb.UserKeyShape{}
+		return KeyShape{}
 	}
 	return shape
 }
@@ -492,14 +501,14 @@ func UserKeyShape(key []byte) localdb.UserKeyShape {
 // direct-MVCC runtime uses this stricter shape so multi-key namespace
 // operations remain one local WAL/apply group even when the storage engine has
 // multiple LSM shards.
-func MountAtomicUserKeyShape(key []byte) localdb.UserKeyShape {
+func MountAtomicUserKeyShape(key []byte) KeyShape {
 	_, bucketPos, err := decodeMountPrefix(key)
 	if err != nil || bucketPos <= 0 {
-		return localdb.UserKeyShape{}
+		return KeyShape{}
 	}
 	shape := UserKeyShape(key)
 	if len(shape.BloomPrefix) == 0 && shape.Family == 0 {
-		return localdb.UserKeyShape{}
+		return KeyShape{}
 	}
 	mountPrefix := key[:bucketPos]
 	shape.LocalityPrefix = mountPrefix

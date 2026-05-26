@@ -6,7 +6,7 @@ package exec
 import (
 	"context"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -31,7 +31,7 @@ func (e *Executor) GetQuotaUsage(ctx context.Context, req model.QuotaUsageReques
 			return usage, err
 		}
 	}
-	key, err := fsmeta.EncodeUsageKey(mountRecord.Identity(), req.Scope)
+	key, err := layout.EncodeUsageKey(mountRecord.Identity(), req.Scope)
 	if err != nil {
 		return model.UsageRecord{}, err
 	}
@@ -42,7 +42,7 @@ func (e *Executor) GetQuotaUsage(ctx context.Context, req model.QuotaUsageReques
 	if !ok {
 		return model.UsageRecord{}, nil
 	}
-	return fsmeta.DecodeUsageValue(value)
+	return layout.DecodeUsageValue(value)
 }
 
 func (e *Executor) reserveQuota(ctx context.Context, changes []QuotaChange, startVersion uint64) ([]*kvrpcpb.Mutation, error) {

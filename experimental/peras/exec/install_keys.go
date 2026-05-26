@@ -6,8 +6,8 @@ package peras
 import (
 	"bytes"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 )
 
 // PerasSegmentInstallKeys returns the exact metadata keys written by a segment
@@ -46,11 +46,11 @@ func PerasSegmentCatalogRouteInstallKeys(root [32]byte, routingKey []byte) ([][]
 	if root == ([32]byte{}) || len(routingKey) == 0 {
 		return nil, ErrInvalidPerasSegment
 	}
-	parts, ok := fsmeta.InspectKey(routingKey)
-	if !ok || parts.Kind != fsmeta.KeyKindSegment || parts.SegmentRecord != fsmeta.SegmentRecordObject || parts.SegmentRoot != root {
+	parts, ok := layout.InspectKey(routingKey)
+	if !ok || parts.Kind != layout.KeyKindSegment || parts.SegmentRecord != layout.SegmentRecordObject || parts.SegmentRoot != root {
 		return nil, ErrInvalidPerasSegment
 	}
-	indexKey, err := fsmeta.EncodeSegmentCatalogIndexKey(parts.MountKeyID, parts.Bucket, root)
+	indexKey, err := layout.EncodeSegmentCatalogIndexKey(parts.MountKeyID, parts.Bucket, root)
 	if err != nil {
 		return nil, err
 	}
@@ -168,11 +168,11 @@ func perasSegmentCatalogInstallKeys(segment PerasSegment, routingKey []byte) ([]
 	if err != nil {
 		return nil, err
 	}
-	parts, ok := fsmeta.InspectKey(routingKey)
-	if !ok || parts.Kind != fsmeta.KeyKindSegment || parts.SegmentRecord != fsmeta.SegmentRecordObject || parts.SegmentRoot != segment.Root {
+	parts, ok := layout.InspectKey(routingKey)
+	if !ok || parts.Kind != layout.KeyKindSegment || parts.SegmentRecord != layout.SegmentRecordObject || parts.SegmentRoot != segment.Root {
 		return nil, ErrInvalidPerasSegment
 	}
-	indexKey, err := fsmeta.EncodeSegmentCatalogIndexKey(parts.MountKeyID, parts.Bucket, segment.Root)
+	indexKey, err := layout.EncodeSegmentCatalogIndexKey(parts.MountKeyID, parts.Bucket, segment.Root)
 	if err != nil {
 		return nil, err
 	}

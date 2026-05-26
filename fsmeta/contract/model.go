@@ -9,7 +9,7 @@ import (
 	"maps"
 	"sort"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -559,14 +559,14 @@ func (m *Model) expireSessions(op Operation) Result {
 	identity := model.MountIdentity{MountID: m.Mount, MountKeyID: contractMountKeyID}
 	entries := make([]sessionIndexEntry, 0, len(m.sessions)+len(m.owners))
 	for _, record := range m.sessions {
-		key, err := fsmeta.EncodeSessionKey(identity, record.Inode, record.Session)
+		key, err := layout.EncodeSessionKey(identity, record.Inode, record.Session)
 		if err != nil {
 			return Result{Err: err}
 		}
 		entries = append(entries, sessionIndexEntry{key: string(key), record: record, session: true})
 	}
 	for _, record := range m.owners {
-		key, err := fsmeta.EncodeInodeSessionKey(identity, record.Inode)
+		key, err := layout.EncodeInodeSessionKey(identity, record.Inode)
 		if err != nil {
 			return Result{Err: err}
 		}
@@ -692,10 +692,10 @@ func EquivalentError(got, want error) bool {
 		model.ErrInvalidName,
 		model.ErrInvalidSession,
 		model.ErrInvalidRequest,
-		fsmeta.ErrInvalidKey,
-		fsmeta.ErrInvalidKeyKind,
+		layout.ErrInvalidKey,
+		layout.ErrInvalidKeyKind,
 		model.ErrInvalidValue,
-		fsmeta.ErrInvalidValueKind,
+		layout.ErrInvalidValueKind,
 		model.ErrInvalidPageSize,
 		model.ErrExists,
 		model.ErrNotFound,

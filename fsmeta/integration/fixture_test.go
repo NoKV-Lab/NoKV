@@ -11,8 +11,8 @@ import (
 
 	coordclient "github.com/feichai0017/NoKV/coordinator/client"
 	"github.com/feichai0017/NoKV/coordinator/storecontrol"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	fsmetaraftstore "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
@@ -154,7 +154,7 @@ func openSplitRealClusterExecutorWithOptions(t *testing.T, ctx context.Context, 
 	testcluster.WaitForLeaderPeer(t, ctx, node.Addr(), parentRegionID, parentPeerID)
 	testcluster.WaitForSchedulerMode(t, node, storecontrol.ModeHealthy, false)
 
-	splitKey, err := fsmeta.EncodeDentryKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode, "m")
+	splitKey, err := layout.EncodeDentryKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode, "m")
 	require.NoError(t, err)
 	childMeta := localmeta.RegionMeta{
 		ID:       childRegionID,
@@ -244,7 +244,7 @@ func registerMount(t *testing.T, ctx context.Context, coord *coordclient.GRPCCli
 
 func seedRootInode(t *testing.T, ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity) {
 	t.Helper()
-	key, err := fsmeta.EncodeInodeKey(mount, model.RootInode)
+	key, err := layout.EncodeInodeKey(mount, model.RootInode)
 	require.NoError(t, err)
 	readVersion, err := runner.ReserveTimestamp(ctx, 1)
 	require.NoError(t, err)
@@ -254,7 +254,7 @@ func seedRootInode(t *testing.T, ctx context.Context, runner fsmetaexec.TxnRunne
 		return
 	}
 	now := time.Now().UnixNano()
-	value, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+	value, err := layout.EncodeInodeValue(model.InodeRecord{
 		Inode:         model.RootInode,
 		Type:          model.InodeTypeDirectory,
 		Mode:          0755,

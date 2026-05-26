@@ -10,8 +10,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -61,7 +61,7 @@ func (e *Executor) tryVisibleOpenWriteSession(ctx context.Context, program compi
 		}
 	}
 	record := model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
-	value, err := fsmeta.EncodeSessionValue(record)
+	value, err := layout.EncodeSessionValue(record)
 	if err != nil {
 		return model.SessionRecord{}, false, err
 	}
@@ -111,7 +111,7 @@ func (e *Executor) tryVisibleHeartbeatWriteSession(ctx context.Context, program 
 		return model.SessionRecord{}, false, nil
 	}
 	record := model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
-	value, err := fsmeta.EncodeSessionValue(record)
+	value, err := layout.EncodeSessionValue(record)
 	if err != nil {
 		return model.SessionRecord{}, false, err
 	}
@@ -148,7 +148,7 @@ func (e *Executor) tryVisibleCloseWriteSession(ctx context.Context, program comp
 		return false, nil
 	}
 	deleteOwner := false
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(mount, session.Inode)
+	ownerKey, err := layout.EncodeInodeSessionKey(mount, session.Inode)
 	if err != nil {
 		return false, err
 	}
@@ -193,10 +193,10 @@ func sessionDrainScopeForInodes(mount model.MountIdentity, inodes map[model.Inod
 		MountKeyID: mount.MountKeyID,
 		Inodes:     make([]model.InodeID, 0, len(inodes)),
 	}
-	seenBuckets := make(map[fsmeta.AffinityBucket]struct{}, len(inodes))
+	seenBuckets := make(map[layout.AffinityBucket]struct{}, len(inodes))
 	for inode := range inodes {
 		out.Inodes = append(out.Inodes, inode)
-		bucket := fsmeta.BucketForInodeID(inode)
+		bucket := layout.BucketForInodeID(inode)
 		if _, ok := seenBuckets[bucket]; !ok {
 			seenBuckets[bucket] = struct{}{}
 			out.Buckets = append(out.Buckets, bucket)
@@ -246,11 +246,11 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSess
 		if inode.Type != model.InodeTypeFile {
 			return model.ErrInvalidRequest
 		}
-		inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
+		inodeKey, err := layout.EncodeInodeKey(mount, inode.Inode)
 		if err != nil {
 			return err
 		}
-		inodeValue, err := fsmeta.EncodeInodeValue(inode)
+		inodeValue, err := layout.EncodeInodeValue(inode)
 		if err != nil {
 			return err
 		}
@@ -267,7 +267,7 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSess
 		} else if ok && sessionLive(existing, now) {
 			return model.ErrExists
 		} else if ok {
-			existingValue, err := fsmeta.EncodeSessionValue(existing)
+			existingValue, err := layout.EncodeSessionValue(existing)
 			if err != nil {
 				return err
 			}
@@ -282,12 +282,12 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSess
 			if sessionLive(owner, now) {
 				return model.ErrExists
 			}
-			ownerValue, err := fsmeta.EncodeSessionValue(owner)
+			ownerValue, err := layout.EncodeSessionValue(owner)
 			if err != nil {
 				return err
 			}
 			predicates = append(predicates, atomicValueEquals(plan.ReadKeys[2], ownerValue))
-			staleSessionKey, err := fsmeta.EncodeSessionKey(mount, owner.Inode, owner.Session)
+			staleSessionKey, err := layout.EncodeSessionKey(mount, owner.Inode, owner.Session)
 			if err != nil {
 				return err
 			}
@@ -302,7 +302,7 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSess
 		} else {
 			predicates = append(predicates, atomicNotExists(plan.ReadKeys[2]))
 		}
-		value, err := fsmeta.EncodeSessionValue(candidate)
+		value, err := layout.EncodeSessionValue(candidate)
 		if err != nil {
 			return err
 		}
@@ -368,7 +368,7 @@ func (e *Executor) HeartbeatWriteSession(ctx context.Context, req model.Heartbea
 		if !ok || !sessionLive(session, now) || session.Inode != req.Inode {
 			return model.ErrNotFound
 		}
-		sessionValue, err := fsmeta.EncodeSessionValue(session)
+		sessionValue, err := layout.EncodeSessionValue(session)
 		if err != nil {
 			return err
 		}
@@ -379,11 +379,11 @@ func (e *Executor) HeartbeatWriteSession(ctx context.Context, req model.Heartbea
 		if !ok || !sessionLive(owner, now) || owner.Session != req.Session || owner.Inode != req.Inode {
 			return model.ErrNotFound
 		}
-		ownerValue, err := fsmeta.EncodeSessionValue(owner)
+		ownerValue, err := layout.EncodeSessionValue(owner)
 		if err != nil {
 			return err
 		}
-		value, err := fsmeta.EncodeSessionValue(candidate)
+		value, err := layout.EncodeSessionValue(candidate)
 		if err != nil {
 			return err
 		}
@@ -437,20 +437,20 @@ func (e *Executor) CloseWriteSession(ctx context.Context, req model.CloseWriteSe
 		if session.Inode != req.Inode {
 			return model.ErrNotFound
 		}
-		sessionValue, err := fsmeta.EncodeSessionValue(session)
+		sessionValue, err := layout.EncodeSessionValue(session)
 		if err != nil {
 			return err
 		}
 		mutations := []*kvrpcpb.Mutation{{Op: kvrpcpb.Mutation_Delete, Key: cloneBytes(plan.MutateKeys[0])}}
 		predicates := []*kvrpcpb.AtomicPredicate{atomicValueEquals(plan.ReadKeys[0], sessionValue)}
-		ownerKey, err := fsmeta.EncodeInodeSessionKey(mount, session.Inode)
+		ownerKey, err := layout.EncodeInodeSessionKey(mount, session.Inode)
 		if err != nil {
 			return err
 		}
 		if owner, ok, err := e.readSessionByKey(ctx, mount, ownerKey, startVersion); err != nil {
 			return err
 		} else if ok && owner.Session == req.Session && owner.Inode == session.Inode {
-			ownerValue, err := fsmeta.EncodeSessionValue(owner)
+			ownerValue, err := layout.EncodeSessionValue(owner)
 			if err != nil {
 				return err
 			}
@@ -509,14 +509,14 @@ func (e *Executor) ExpireWriteSessions(ctx context.Context, req model.ExpireWrit
 					break
 				}
 				matched++
-				kind, err := fsmeta.KeyKindOf(kv.Key)
+				kind, err := layout.KeyKindOf(kv.Key)
 				if err != nil {
 					return err
 				}
-				if kind != fsmeta.KeyKindSession {
+				if kind != layout.KeyKindSession {
 					continue
 				}
-				record, err := fsmeta.DecodeSessionValue(kv.Value)
+				record, err := layout.DecodeSessionValue(kv.Value)
 				if err != nil {
 					return err
 				}
@@ -534,11 +534,11 @@ func (e *Executor) ExpireWriteSessions(ctx context.Context, req model.ExpireWrit
 					continue
 				}
 				deletes[string(kv.Key)] = cloneBytes(kv.Key)
-				sessionKey, err := fsmeta.EncodeSessionKey(mount, record.Inode, record.Session)
+				sessionKey, err := layout.EncodeSessionKey(mount, record.Inode, record.Session)
 				if err != nil {
 					return err
 				}
-				ownerKey, err := fsmeta.EncodeInodeSessionKey(mount, record.Inode)
+				ownerKey, err := layout.EncodeInodeSessionKey(mount, record.Inode)
 				if err != nil {
 					return err
 				}

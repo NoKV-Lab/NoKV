@@ -8,7 +8,7 @@ import (
 	"crypto/sha256"
 	"slices"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
 
@@ -333,20 +333,20 @@ func authorityScopeCoversKey(scope AuthorityScope, ref KeyRef) bool {
 		return false
 	}
 	switch ref.Kind {
-	case fsmeta.KeyKindMount:
+	case layout.KeyKindMount:
 		return true
-	case fsmeta.KeyKindDentry:
+	case layout.KeyKindDentry:
 		return scope.Broad || slices.Contains(scope.Parents, ref.Parent)
-	case fsmeta.KeyKindInode, fsmeta.KeyKindChunk, fsmeta.KeyKindSession:
+	case layout.KeyKindInode, layout.KeyKindChunk, layout.KeyKindSession:
 		return scope.Broad || slices.Contains(scope.Inodes, ref.Inode)
-	case fsmeta.KeyKindUsage:
+	case layout.KeyKindUsage:
 		return true
 	default:
 		return false
 	}
 }
 
-func authorityScopeCoversBuckets(scope AuthorityScope, buckets []fsmeta.AffinityBucket) bool {
+func authorityScopeCoversBuckets(scope AuthorityScope, buckets []layout.AffinityBucket) bool {
 	if len(buckets) == 0 {
 		return true
 	}

@@ -8,15 +8,15 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	"github.com/feichai0017/NoKV/utils"
 )
 
 const (
-	defaultInodeAllocBatchSize  = fsmeta.DefaultAffinityBucketCount * 256
-	defaultInodeAffinityBuckets = fsmeta.DefaultAffinityBucketCount
+	defaultInodeAllocBatchSize  = layout.DefaultAffinityBucketCount * 256
+	defaultInodeAffinityBuckets = layout.DefaultAffinityBucketCount
 )
 
 // IDAllocatorClient is the rooted coordinator ID surface used by fsmeta. The
@@ -56,7 +56,7 @@ func NewShardAffineInodeAllocatorWithBatch(client IDAllocatorClient, shardCount 
 	if batchSize == 0 {
 		return nil, errInodeAllocBatchRequired
 	}
-	buckets := max(utils.NormalizeShardCount(shardCount), fsmeta.DefaultAffinityBucketCount)
+	buckets := max(utils.NormalizeShardCount(shardCount), layout.DefaultAffinityBucketCount)
 	return &ShardAffineInodeAllocator{
 		client:    client,
 		buckets:   buckets,
@@ -153,7 +153,7 @@ func (a *ShardAffineInodeAllocator) ensurePoolsLocked(mount model.MountIdentity)
 	return pool
 }
 
-func (a *ShardAffineInodeAllocator) popBucketLocked(mount model.MountIdentity, bucket fsmeta.AffinityBucket) (model.InodeID, bool) {
+func (a *ShardAffineInodeAllocator) popBucketLocked(mount model.MountIdentity, bucket layout.AffinityBucket) (model.InodeID, bool) {
 	pool := a.ensurePoolsLocked(mount)
 	idx := int(bucket)
 	if idx < 0 || idx >= len(pool) || len(pool[idx]) == 0 {
@@ -168,36 +168,36 @@ func (a *ShardAffineInodeAllocator) popBucketLocked(mount model.MountIdentity, b
 func (a *ShardAffineInodeAllocator) popAnyLocked(mount model.MountIdentity) (model.InodeID, bool) {
 	pool := a.ensurePoolsLocked(mount)
 	for bucket := range pool {
-		if inode, ok := a.popBucketLocked(mount, fsmeta.AffinityBucket(bucket)); ok {
+		if inode, ok := a.popBucketLocked(mount, layout.AffinityBucket(bucket)); ok {
 			return inode, true
 		}
 	}
 	return 0, false
 }
 
-func createDentryBucket(mount model.MountIdentity, parent model.InodeID, name string) (fsmeta.AffinityBucket, error) {
+func createDentryBucket(mount model.MountIdentity, parent model.InodeID, name string) (layout.AffinityBucket, error) {
 	if parent == model.RootInode {
-		return fsmeta.ChooseWorkspaceBucket(mount, name), nil
+		return layout.ChooseWorkspaceBucket(mount, name), nil
 	}
-	key, err := fsmeta.EncodeDentryKey(mount, parent, name)
+	key, err := layout.EncodeDentryKey(mount, parent, name)
 	if err != nil {
 		return 0, err
 	}
-	bucket, ok := fsmeta.BucketOfKey(key)
+	bucket, ok := layout.BucketOfKey(key)
 	if !ok {
-		return 0, fsmeta.ErrInvalidKey
+		return 0, layout.ErrInvalidKey
 	}
 	return bucket, nil
 }
 
-func createInodeBucket(mount model.MountIdentity, inode model.InodeID) (fsmeta.AffinityBucket, error) {
-	key, err := fsmeta.EncodeInodeKey(mount, inode)
+func createInodeBucket(mount model.MountIdentity, inode model.InodeID) (layout.AffinityBucket, error) {
+	key, err := layout.EncodeInodeKey(mount, inode)
 	if err != nil {
 		return 0, err
 	}
-	bucket, ok := fsmeta.BucketOfKey(key)
+	bucket, ok := layout.BucketOfKey(key)
 	if !ok {
-		return 0, fsmeta.ErrInvalidKey
+		return 0, layout.ErrInvalidKey
 	}
 	return bucket, nil
 }

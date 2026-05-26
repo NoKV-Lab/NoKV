@@ -19,8 +19,9 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/wal"
 	perasfsmeta "github.com/feichai0017/NoKV/experimental/peras/adapters/fsmeta"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetalocal "github.com/feichai0017/NoKV/fsmeta/runtime/local"
 	fsmetaraftstore "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
 	fsmetaserver "github.com/feichai0017/NoKV/fsmeta/server"
@@ -45,8 +46,8 @@ const (
 
 type fsmetaServerRuntime struct {
 	executor       fsmetaserver.Executor
-	watcher        fsmeta.Watcher
-	snapshot       fsmeta.SnapshotPublisher
+	watcher        observe.Watcher
+	snapshot       observe.SnapshotPublisher
 	close          func() error
 	publishStats   func()
 	contractLog    string
@@ -82,7 +83,7 @@ func main() {
 		localDirPageCache               = flag.Bool("local-dirpage-cache", true, "enable the slab-backed ReadDirPlus page cache when --backend=local; use --local-dirpage-cache=false to disable")
 		negCacheDir                     = flag.String("negative-cache-dir", "", "optional slab directory for persistent negative dentry cache")
 		dirPageDir                      = flag.String("dirpage-cache-dir", "", "optional slab directory for ReadDirPlus page cache")
-		affinityBuckets                 = flag.Int("affinity-buckets", fsmeta.DefaultAffinityBucketCount, "fsmeta placement bucket count used to choose Create inode IDs")
+		affinityBuckets                 = flag.Int("affinity-buckets", layout.DefaultAffinityBucketCount, "fsmeta placement bucket count used to choose Create inode IDs")
 		lockTTL                         = flag.Duration("lock-ttl", 0, "Percolator primary-lock TTL for fsmeta mutations; zero uses the fsmeta default")
 		sessionCleanupInterval          = flag.Duration("session-cleanup-interval", 30*time.Second, "interval for expired write-session cleanup; choose about half the smallest expected session TTL; negative disables")
 		sessionCleanupLimit             = flag.Uint("session-cleanup-limit", 0, "maximum session records scanned per mount per cleanup pass; zero uses fsmeta default")

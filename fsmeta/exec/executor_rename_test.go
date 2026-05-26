@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
@@ -184,7 +184,7 @@ func TestExecutorCrossParentSameBucketRenameUsesVisibleCommit(t *testing.T) {
 	fromParent := model.InodeID(7)
 	toParent := testInodeForParentBucket(t, fromParent, fromParent)
 	require.NotEqual(t, fromParent, toParent)
-	require.Equal(t, fsmeta.BucketForInodeID(fromParent), fsmeta.BucketForInodeID(toParent))
+	require.Equal(t, layout.BucketForInodeID(fromParent), layout.BucketForInodeID(toParent))
 	seedDirectory(t, runner, "vol", fromParent)
 	seedDirectory(t, runner, "vol", toParent)
 	committer := newTestVisibleCommitter(t, runner)
@@ -265,7 +265,7 @@ func TestExecutorCrossBucketRenameUsesDurablePath(t *testing.T) {
 	fromParent := model.InodeID(7)
 	toParent := testInodeForDifferentBucket(t, fromParent, fromParent)
 	require.NotEqual(t, fromParent, toParent)
-	require.NotEqual(t, fsmeta.BucketForInodeID(fromParent), fsmeta.BucketForInodeID(toParent))
+	require.NotEqual(t, layout.BucketForInodeID(fromParent), layout.BucketForInodeID(toParent))
 	seedDentry(t, runner, "vol", fromParent, "old", 22)
 	seedDirectory(t, runner, "vol", toParent)
 	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, Size: 4096, LinkCount: 1})

@@ -6,18 +6,18 @@ package peras
 import (
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestOverlayViewGetScanFactsAndRemove(t *testing.T) {
 	view := NewOverlayView()
-	dentryKey, err := fsmeta.EncodeDentryKey(testMount, 9, "a")
+	dentryKey, err := layout.EncodeDentryKey(testMount, 9, "a")
 	require.NoError(t, err)
-	parentKey, err := fsmeta.EncodeInodeKey(testMount, 9)
+	parentKey, err := layout.EncodeInodeKey(testMount, 9)
 	require.NoError(t, err)
-	inodeKey, err := fsmeta.EncodeInodeKey(testMount, 10)
+	inodeKey, err := layout.EncodeInodeKey(testMount, 10)
 	require.NoError(t, err)
 	op := testGeneratedCreateOpForInodes(t, 9, 10, "a")
 	dentryValue := op.Effects[1].Value
@@ -70,7 +70,7 @@ func TestOverlayViewScanReusesSortedIndexAcrossReads(t *testing.T) {
 		op := testGeneratedCreateOpForInodes(t, 9, model.InodeID(20+item.seq), item.name)
 		require.NoError(t, view.Add(OperationID{ClientID: "c", Seq: item.seq}, op))
 	}
-	prefix, err := fsmeta.EncodeDentryPrefix(testMount, 9)
+	prefix, err := layout.EncodeDentryPrefix(testMount, 9)
 	require.NoError(t, err)
 
 	first := view.Scan(prefix, 3)
@@ -86,7 +86,7 @@ func TestOverlayViewScanDirectoryUsesDirectoryIndex(t *testing.T) {
 	require.NoError(t, view.Add(OperationID{ClientID: "c", Seq: 1}, testGeneratedCreateOpForInodes(t, 9, 21, "b")))
 	require.NoError(t, view.Add(OperationID{ClientID: "c", Seq: 2}, testGeneratedCreateOpForInodes(t, 10, 22, "a")))
 	require.NoError(t, view.Add(OperationID{ClientID: "c", Seq: 3}, testGeneratedCreateOpForInodes(t, 9, 23, "a")))
-	prefix, err := fsmeta.EncodeDentryPrefix(testMount, 9)
+	prefix, err := layout.EncodeDentryPrefix(testMount, 9)
 	require.NoError(t, err)
 
 	first := view.ScanDirectory(prefix, prefix, 8)
@@ -104,11 +104,11 @@ func TestOverlayViewScanDirectoryUsesDirectoryIndex(t *testing.T) {
 func TestOverlaySnapshotDirectoryPinsGenerationWithoutCloningValues(t *testing.T) {
 	view := NewOverlayView()
 	require.NoError(t, view.Add(OperationID{ClientID: "c", Seq: 1}, testGeneratedCreateOpForInodes(t, 9, 21, "a")))
-	prefix, err := fsmeta.EncodeDentryPrefix(testMount, 9)
+	prefix, err := layout.EncodeDentryPrefix(testMount, 9)
 	require.NoError(t, err)
-	parentKey, err := fsmeta.EncodeInodeKey(testMount, 9)
+	parentKey, err := layout.EncodeInodeKey(testMount, 9)
 	require.NoError(t, err)
-	inodeKey, err := fsmeta.EncodeInodeKey(testMount, 21)
+	inodeKey, err := layout.EncodeInodeKey(testMount, 21)
 	require.NoError(t, err)
 
 	snapshot := view.SnapshotDirectory(testMount, prefix)
@@ -136,13 +136,13 @@ func TestOverlaySnapshotDirectoryPinsGenerationWithoutCloningValues(t *testing.T
 func TestOverlayViewPrunesRetiredHistoryBeforeGeneration(t *testing.T) {
 	view := NewOverlayView()
 	require.NoError(t, view.Add(OperationID{ClientID: "c", Seq: 1}, testGeneratedCreateOpForInodes(t, 9, 21, "a")))
-	prefix, err := fsmeta.EncodeDentryPrefix(testMount, 9)
+	prefix, err := layout.EncodeDentryPrefix(testMount, 9)
 	require.NoError(t, err)
 	snapshot := view.SnapshotDirectory(testMount, prefix)
 	require.NotNil(t, snapshot)
-	parentKey, err := fsmeta.EncodeInodeKey(testMount, 9)
+	parentKey, err := layout.EncodeInodeKey(testMount, 9)
 	require.NoError(t, err)
-	inodeKey, err := fsmeta.EncodeInodeKey(testMount, 21)
+	inodeKey, err := layout.EncodeInodeKey(testMount, 21)
 	require.NoError(t, err)
 	plan := ReplayPlan{Operations: []ReplayOperation{{
 		OpID: OperationID{ClientID: "c", Seq: 1},
@@ -177,14 +177,14 @@ func TestOverlayViewDirectoryBaseEmptySurvivesCurrentEmptyForget(t *testing.T) {
 
 func mustDentryKey(t *testing.T, parent model.InodeID, name string) []byte {
 	t.Helper()
-	key, err := fsmeta.EncodeDentryKey(testMount, parent, name)
+	key, err := layout.EncodeDentryKey(testMount, parent, name)
 	require.NoError(t, err)
 	return key
 }
 
 func mustDentryName(t *testing.T, key []byte) string {
 	t.Helper()
-	name, ok := fsmeta.DentryNameOfKey(key)
+	name, ok := layout.DentryNameOfKey(key)
 	require.True(t, ok)
 	return name
 }

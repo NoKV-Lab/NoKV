@@ -9,8 +9,8 @@ import (
 	"time"
 
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
@@ -310,11 +310,11 @@ func BenchmarkManagerAcquireLocalHeld(b *testing.B) {
 	}
 }
 
-func testRuntimePerasScope(bucket fsmeta.AffinityBucket) compile.AuthorityScope {
+func testRuntimePerasScope(bucket layout.AffinityBucket) compile.AuthorityScope {
 	return compile.AuthorityScope{
 		Mount:      "vol",
 		MountKeyID: 7,
-		Buckets:    []fsmeta.AffinityBucket{bucket},
+		Buckets:    []layout.AffinityBucket{bucket},
 		Parents:    []model.InodeID{99},
 		Inodes:     []model.InodeID{100},
 	}
@@ -351,9 +351,9 @@ func testRuntimeVisibleSeal(id, holder string, scope compile.AuthorityScope, sea
 func testRuntimePerasSegment(t *testing.T) fsperas.PerasSegment {
 	t.Helper()
 	mount := model.MountIdentity{MountID: "vol", MountKeyID: 7}
-	dentry, err := fsmeta.EncodeDentryKey(mount, 99, "a")
+	dentry, err := layout.EncodeDentryKey(mount, 99, "a")
 	require.NoError(t, err)
-	inode, err := fsmeta.EncodeInodeKey(mount, 100)
+	inode, err := layout.EncodeInodeKey(mount, 100)
 	require.NoError(t, err)
 	segment, err := fsperas.BuildPerasSegmentFromReplayPlan(fsperas.ReplayPlan{
 		EpochID: 1,

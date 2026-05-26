@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
@@ -48,7 +48,7 @@ func TestExecutorUpdateInodeSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedDentry(t, runner.fakeRunner, "vol", 7, "file", 22)
 	seedInode(t, runner.fakeRunner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, Size: 1024, LinkCount: 1})
-	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 7)
+	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
 	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
@@ -176,7 +176,7 @@ func TestExecutorUpdateInodeUpdatesMutableFieldsAndQuota(t *testing.T) {
 		CreatedUnixNs: 10,
 		UpdatedUnixNs: 20,
 	})
-	quotaKey, err := fsmeta.EncodeUsageKey(testMountIdentity, 7)
+	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
 	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))

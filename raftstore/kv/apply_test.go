@@ -12,7 +12,7 @@ import (
 	"github.com/feichai0017/NoKV/engine/index"
 	"github.com/feichai0017/NoKV/engine/lsm"
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
@@ -283,7 +283,7 @@ func TestNewApplierRejectsFencedVisibleAuthorityWrites(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
-	key, err := fsmeta.EncodeDentryKey(mount, 42, "artifact")
+	key, err := layout.EncodeDentryKey(mount, 42, "artifact")
 	require.NoError(t, err)
 
 	applier := NewApplier(db, nil, WithWriteFence(perasFenceForApplyTest{perasFenceTableForApplyTest(t, mount)}))
@@ -312,7 +312,7 @@ func TestNewApplierRejectsFsmetaWritesWhenVisibleAuthorityViewIsStale(t *testing
 	t.Cleanup(func() { _ = db.Close() })
 
 	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
-	key, err := fsmeta.EncodeDentryKey(mount, 42, "artifact")
+	key, err := layout.EncodeDentryKey(mount, 42, "artifact")
 	require.NoError(t, err)
 
 	applier := NewApplier(db, nil, WithWriteFence(perasFenceForApplyTest{runtimeperas.NewActiveAuthorities()}))
@@ -342,7 +342,7 @@ func TestNewBatchApplierSplitsAroundFencedVisibleAuthorityWrite(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	mount := model.MountIdentity{MountID: "vol", MountKeyID: 1}
-	fencedKey, err := fsmeta.EncodeDentryKey(mount, 42, "artifact")
+	fencedKey, err := layout.EncodeDentryKey(mount, 42, "artifact")
 	require.NoError(t, err)
 
 	applier := NewBatchApplier(db, nil, WithWriteFence(perasFenceForApplyTest{perasFenceTableForApplyTest(t, mount)}))

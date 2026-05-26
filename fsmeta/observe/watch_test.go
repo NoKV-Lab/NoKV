@@ -1,15 +1,18 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-package fsmeta
+package observe
 
 import (
 	"context"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
+
+var watchTestMount = model.MountIdentity{MountID: "vol", MountKeyID: 1}
 
 func TestSnapshotPublisherFunc(t *testing.T) {
 	token := model.SnapshotSubtreeToken{Mount: "vol", RootInode: 1, ReadVersion: 10}
@@ -36,14 +39,14 @@ func TestWatchPrefix(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, byte('f'), prefixAgain[0])
 
-	dentryPrefix, err := WatchPrefixForMount(WatchRequest{Mount: "vol", RootInode: 7}, testMount)
+	dentryPrefix, err := WatchPrefixForMount(WatchRequest{Mount: "vol", RootInode: 7}, watchTestMount)
 	require.NoError(t, err)
-	want, err := EncodeDentryPrefix(testMount, 7)
+	want, err := layout.EncodeDentryPrefix(watchTestMount, 7)
 	require.NoError(t, err)
 	require.Equal(t, want, dentryPrefix)
 
 	_, err = WatchPrefix(WatchRequest{Mount: "vol", KeyPrefix: []byte("fsm/custom")})
 	require.ErrorIs(t, err, model.ErrInvalidRequest)
-	_, err = WatchPrefixForMount(WatchRequest{Mount: "vol", RootInode: 7, DescendRecursively: true}, testMount)
+	_, err = WatchPrefixForMount(WatchRequest{Mount: "vol", RootInode: 7, DescendRecursively: true}, watchTestMount)
 	require.ErrorIs(t, err, model.ErrInvalidRequest)
 }

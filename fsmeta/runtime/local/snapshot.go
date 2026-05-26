@@ -11,7 +11,7 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/index"
 	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootstate "github.com/feichai0017/NoKV/meta/root/state"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
@@ -49,7 +49,7 @@ func OpenSnapshotRegistry(ctx context.Context, runner *Runner, mount model.Mount
 	if runner == nil {
 		return nil, errDBRequired
 	}
-	if _, err := fsmeta.EncodeSnapshotPrefix(mount); err != nil {
+	if _, err := layout.EncodeSnapshotPrefix(mount); err != nil {
 		return nil, err
 	}
 	r := &SnapshotRegistry{
@@ -80,11 +80,11 @@ func (r *SnapshotRegistry) PublishSnapshotSubtree(ctx context.Context, token mod
 		return err
 	}
 	if r.runner != nil {
-		storageKey, err := fsmeta.EncodeSnapshotKey(r.mount, token.RootInode, token.ReadVersion)
+		storageKey, err := layout.EncodeSnapshotKey(r.mount, token.RootInode, token.ReadVersion)
 		if err != nil {
 			return err
 		}
-		value, err := fsmeta.EncodeSnapshotValue(token)
+		value, err := layout.EncodeSnapshotValue(token)
 		if err != nil {
 			return err
 		}
@@ -123,7 +123,7 @@ func (r *SnapshotRegistry) RetireSnapshotSubtree(ctx context.Context, token mode
 		return err
 	}
 	if r.runner != nil {
-		storageKey, err := fsmeta.EncodeSnapshotKey(r.mount, token.RootInode, token.ReadVersion)
+		storageKey, err := layout.EncodeSnapshotKey(r.mount, token.RootInode, token.ReadVersion)
 		if err != nil {
 			return err
 		}
@@ -207,7 +207,7 @@ func (r *SnapshotRegistry) Stats() map[string]any {
 }
 
 func (r *SnapshotRegistry) load(ctx context.Context) error {
-	prefix, err := fsmeta.EncodeSnapshotPrefix(r.mount)
+	prefix, err := layout.EncodeSnapshotPrefix(r.mount)
 	if err != nil {
 		return err
 	}
@@ -257,15 +257,15 @@ func (r *SnapshotRegistry) load(ctx context.Context) error {
 }
 
 func (r *SnapshotRegistry) readSnapshotRecord(key []byte) (model.SnapshotSubtreeToken, bool, error) {
-	parts, ok := fsmeta.InspectKey(key)
-	if !ok || parts.Kind != fsmeta.KeyKindSnapshot {
-		return model.SnapshotSubtreeToken{}, false, fsmeta.ErrInvalidKey
+	parts, ok := layout.InspectKey(key)
+	if !ok || parts.Kind != layout.KeyKindSnapshot {
+		return model.SnapshotSubtreeToken{}, false, layout.ErrInvalidKey
 	}
 	value, ok, err := r.runner.readValue(key, kv.MaxVersion)
 	if err != nil || !ok {
 		return model.SnapshotSubtreeToken{}, ok, err
 	}
-	token, err := fsmeta.DecodeSnapshotValue(value)
+	token, err := layout.DecodeSnapshotValue(value)
 	if err != nil {
 		return model.SnapshotSubtreeToken{}, false, err
 	}

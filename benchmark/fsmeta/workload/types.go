@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 )
 
 const (
@@ -39,7 +39,7 @@ type MetadataClient interface {
 	UpdateInode(context.Context, model.UpdateInodeRequest) (model.InodeRecord, error)
 	Lookup(context.Context, model.LookupRequest) (model.DentryRecord, error)
 	ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error)
-	WatchSubtree(context.Context, fsmeta.WatchRequest) (fsmetaclient.WatchSubscription, error)
+	WatchSubtree(context.Context, observe.WatchRequest) (fsmetaclient.WatchSubscription, error)
 	SnapshotSubtree(context.Context, model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error)
 	RetireSnapshotSubtree(context.Context, model.SnapshotSubtreeToken) error
 	Rename(context.Context, model.RenameRequest) error

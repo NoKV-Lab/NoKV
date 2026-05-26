@@ -8,7 +8,7 @@ package compile
 import (
 	"crypto/sha256"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -26,20 +26,20 @@ func CompileCreateProgram(req model.CreateRequest, mount model.MountIdentity, in
 	if req.Mount != "" && req.Mount != mount.MountID {
 		return CreateProgram{}, model.ErrInvalidMountID
 	}
-	parentInodeKey, err := fsmeta.EncodeInodeKey(mount, req.Parent)
+	parentInodeKey, err := layout.EncodeInodeKey(mount, req.Parent)
 	if err != nil {
 		return CreateProgram{}, err
 	}
-	dentryKey, err := fsmeta.EncodeDentryKey(mount, req.Parent, req.Name)
+	dentryKey, err := layout.EncodeDentryKey(mount, req.Parent, req.Name)
 	if err != nil {
 		return CreateProgram{}, err
 	}
-	inodeKey, err := fsmeta.EncodeInodeKey(mount, inodeID)
+	inodeKey, err := layout.EncodeInodeKey(mount, inodeID)
 	if err != nil {
 		return CreateProgram{}, err
 	}
 	planKeys := [][]byte{parentInodeKey, dentryKey, inodeKey}
-	plan := fsmeta.OperationPlan{
+	plan := layout.OperationPlan{
 		Kind:         model.OperationCreate,
 		Mount:        req.Mount,
 		PrimaryKey:   dentryKey,
@@ -49,22 +49,22 @@ func CompileCreateProgram(req model.CreateRequest, mount model.MountIdentity, in
 	}
 	inode := req.Attrs.InodeRecord(inodeID)
 	dentry := model.DentryRecord{Parent: req.Parent, Name: req.Name, Inode: inodeID, Type: inode.Type}
-	dentryValue, err := fsmeta.EncodeDentryValue(dentry)
+	dentryValue, err := layout.EncodeDentryValue(dentry)
 	if err != nil {
 		return CreateProgram{}, err
 	}
-	inodeValue, err := fsmeta.EncodeInodeValue(inode)
+	inodeValue, err := layout.EncodeInodeValue(inode)
 	if err != nil {
 		return CreateProgram{}, err
 	}
-	parentBucket := fsmeta.BucketForInodeID(req.Parent)
-	inodeBucket := fsmeta.BucketForInodeID(inodeID)
-	buckets := []fsmeta.AffinityBucket{parentBucket}
+	parentBucket := layout.BucketForInodeID(req.Parent)
+	inodeBucket := layout.BucketForInodeID(inodeID)
+	buckets := []layout.AffinityBucket{parentBucket}
 	if inodeBucket != parentBucket {
 		if inodeBucket < parentBucket {
-			buckets = []fsmeta.AffinityBucket{inodeBucket, parentBucket}
+			buckets = []layout.AffinityBucket{inodeBucket, parentBucket}
 		} else {
-			buckets = []fsmeta.AffinityBucket{parentBucket, inodeBucket}
+			buckets = []layout.AffinityBucket{parentBucket, inodeBucket}
 		}
 	}
 	delta := SemanticDelta{
@@ -238,7 +238,7 @@ func compileCreateCompiledOp(delta SemanticDelta) (CompiledOp, error) {
 		{Kind: PredicateNotExists, Key: delta.ReadPredicates[2].Key, NeedAbsent: true},
 	}
 	guards := compileCreateGuardObligations(delta.RuntimeGuards)
-	parentParts, ok := fsmeta.InspectKey(delta.WriteEffects[0].Key)
+	parentParts, ok := layout.InspectKey(delta.WriteEffects[0].Key)
 	if !ok {
 		return CompiledOp{}, model.ErrInvalidRequest
 	}
@@ -279,22 +279,22 @@ func compileCreateCompiledOp(delta SemanticDelta) (CompiledOp, error) {
 	}, nil
 }
 
-func compileCreatePlacementPlan(delta SemanticDelta, durability DurabilityClass) (PlacementPlan, fsmeta.KeyParts, fsmeta.KeyParts, error) {
+func compileCreatePlacementPlan(delta SemanticDelta, durability DurabilityClass) (PlacementPlan, layout.KeyParts, layout.KeyParts, error) {
 	placement := PlacementPlan{MountKeyID: delta.Authority.MountKeyID, Buckets: delta.Authority.Buckets, SlowReason: delta.SlowReason}
 	placement.SingleBucket = len(placement.Buckets) == 1
 	if (delta.WriteEffects[0].Kind != EffectPut && delta.WriteEffects[0].Kind != EffectDerivedPut) || delta.WriteEffects[1].Kind != EffectPut || delta.WriteEffects[2].Kind != EffectPut || delta.WriteEffects[1].Value == nil || delta.WriteEffects[2].Value == nil {
-		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, model.ErrInvalidRequest
+		return PlacementPlan{}, layout.KeyParts{}, layout.KeyParts{}, model.ErrInvalidRequest
 	}
-	dentryParts, ok := fsmeta.InspectKey(delta.WriteEffects[1].Key)
-	if !ok || dentryParts.Kind != fsmeta.KeyKindDentry {
-		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, fsmeta.ErrInvalidKey
+	dentryParts, ok := layout.InspectKey(delta.WriteEffects[1].Key)
+	if !ok || dentryParts.Kind != layout.KeyKindDentry {
+		return PlacementPlan{}, layout.KeyParts{}, layout.KeyParts{}, layout.ErrInvalidKey
 	}
-	inodeParts, ok := fsmeta.InspectKey(delta.WriteEffects[2].Key)
-	if !ok || inodeParts.Kind != fsmeta.KeyKindInode {
-		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, fsmeta.ErrInvalidKey
+	inodeParts, ok := layout.InspectKey(delta.WriteEffects[2].Key)
+	if !ok || inodeParts.Kind != layout.KeyKindInode {
+		return PlacementPlan{}, layout.KeyParts{}, layout.KeyParts{}, layout.ErrInvalidKey
 	}
 	if dentryParts.MountKeyID != inodeParts.MountKeyID {
-		return PlacementPlan{}, fsmeta.KeyParts{}, fsmeta.KeyParts{}, model.ErrInvalidRequest
+		return PlacementPlan{}, layout.KeyParts{}, layout.KeyParts{}, model.ErrInvalidRequest
 	}
 	if delta.Eligibility != EligibilityVisibleCommit || delta.DurabilityBarrier {
 		return placement, dentryParts, inodeParts, nil
@@ -341,6 +341,6 @@ func compileCreateCompletionPlan(delta SemanticDelta, digest [32]byte) Completio
 	return CompletionPlan{RetainCompletion: true, Kind: CompletionVisible, MutationCount: 3, DescriptorDigest: digest}
 }
 
-func compileCreateWatchProjections(delta SemanticDelta, dentryParts fsmeta.KeyParts, inodeParts fsmeta.KeyParts) []WatchProjection {
+func compileCreateWatchProjections(delta SemanticDelta, dentryParts layout.KeyParts, inodeParts layout.KeyParts) []WatchProjection {
 	return []WatchProjection{{EventKind: WatchEventCreate, Key: delta.WriteEffects[1].Key, Parent: dentryParts.Parent, Name: dentryName(delta.WriteEffects[1].Key), Inode: inodeParts.Inode, EmitAt: WatchEmitVisible}}
 }

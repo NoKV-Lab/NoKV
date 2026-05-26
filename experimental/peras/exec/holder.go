@@ -10,8 +10,8 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
@@ -290,7 +290,7 @@ func (h *Holder) HolderID() string {
 
 func cloneAuthorityScope(scope compile.AuthorityScope) compile.AuthorityScope {
 	out := scope
-	out.Buckets = append([]fsmeta.AffinityBucket(nil), scope.Buckets...)
+	out.Buckets = append([]layout.AffinityBucket(nil), scope.Buckets...)
 	out.Parents = append([]model.InodeID(nil), scope.Parents...)
 	out.Inodes = append([]model.InodeID(nil), scope.Inodes...)
 	return out
@@ -322,7 +322,7 @@ func AuthorityScopesOverlap(left, right compile.AuthorityScope) bool {
 	return authorityScopesOverlap(left, right)
 }
 
-func bucketsOverlap(left, right []fsmeta.AffinityBucket) bool {
+func bucketsOverlap(left, right []layout.AffinityBucket) bool {
 	if len(left) == 0 || len(right) == 0 {
 		return true
 	}
@@ -346,8 +346,8 @@ func inodesOverlap(left, right []model.InodeID) bool {
 	return false
 }
 
-func unionBuckets(left, right []fsmeta.AffinityBucket) []fsmeta.AffinityBucket {
-	out := append([]fsmeta.AffinityBucket(nil), left...)
+func unionBuckets(left, right []layout.AffinityBucket) []layout.AffinityBucket {
+	out := append([]layout.AffinityBucket(nil), left...)
 	for _, candidate := range right {
 		seen := slices.Contains(out, candidate)
 		if !seen {

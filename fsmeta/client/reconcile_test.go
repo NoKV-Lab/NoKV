@@ -8,19 +8,19 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	"github.com/stretchr/testify/require"
 )
 
 type reconcileClient struct {
 	watchErrs []error
-	watches   []fsmeta.WatchRequest
+	watches   []observe.WatchRequest
 	pages     [][]model.DentryAttrPair
 	reads     []model.ReadDirRequest
 }
 
-func (c *reconcileClient) WatchSubtree(_ context.Context, req fsmeta.WatchRequest) (WatchSubscription, error) {
+func (c *reconcileClient) WatchSubtree(_ context.Context, req observe.WatchRequest) (WatchSubscription, error) {
 	c.watches = append(c.watches, req)
 	if len(c.watchErrs) > 0 {
 		err := c.watchErrs[0]
@@ -29,7 +29,7 @@ func (c *reconcileClient) WatchSubtree(_ context.Context, req fsmeta.WatchReques
 			return nil, err
 		}
 	}
-	return &stubWatchSubscription{ready: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: uint64(len(c.watches))}}, nil
+	return &stubWatchSubscription{ready: observe.WatchCursor{RegionID: 1, Term: 1, Index: uint64(len(c.watches))}}, nil
 }
 
 func (c *reconcileClient) ReadDirPlus(_ context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
@@ -71,10 +71,10 @@ func TestWatchDirectoryWithReconcileOnExpiredCursor(t *testing.T) {
 			{{Dentry: model.DentryRecord{Name: "artifact"}}},
 		},
 	}
-	watchReq := fsmeta.WatchRequest{
+	watchReq := observe.WatchRequest{
 		Mount:        "vol",
 		RootInode:    model.RootInode,
-		ResumeCursor: fsmeta.WatchCursor{RegionID: 7, Term: 1, Index: 100},
+		ResumeCursor: observe.WatchCursor{RegionID: 7, Term: 1, Index: 100},
 	}
 	readReq := model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, Limit: 100}
 
@@ -85,14 +85,14 @@ func TestWatchDirectoryWithReconcileOnExpiredCursor(t *testing.T) {
 	require.NotNil(t, result.Subscription)
 	require.Len(t, cli.watches, 2)
 	require.Equal(t, watchReq.ResumeCursor, cli.watches[0].ResumeCursor)
-	require.Equal(t, fsmeta.WatchCursor{}, cli.watches[1].ResumeCursor,
+	require.Equal(t, observe.WatchCursor{}, cli.watches[1].ResumeCursor,
 		"fresh watch must drop the expired cursor before full-state reconcile")
 	require.Len(t, cli.reads, 1)
 }
 
 func TestWatchDirectoryWithReconcileRejectsMismatchedRequest(t *testing.T) {
 	_, err := WatchDirectoryWithReconcile(context.Background(), &reconcileClient{},
-		fsmeta.WatchRequest{Mount: "vol", RootInode: 10},
+		observe.WatchRequest{Mount: "vol", RootInode: 10},
 		model.ReadDirRequest{Mount: "vol", Parent: 11},
 	)
 	require.ErrorIs(t, err, model.ErrInvalidRequest)
@@ -100,7 +100,7 @@ func TestWatchDirectoryWithReconcileRejectsMismatchedRequest(t *testing.T) {
 
 func TestWatchDirectoryWithReconcileRejectsPartialBaseline(t *testing.T) {
 	cli := &reconcileClient{}
-	watchReq := fsmeta.WatchRequest{Mount: "vol", RootInode: model.RootInode}
+	watchReq := observe.WatchRequest{Mount: "vol", RootInode: model.RootInode}
 
 	_, err := WatchDirectoryWithReconcile(context.Background(), cli, watchReq,
 		model.ReadDirRequest{Mount: "vol", Parent: model.RootInode, StartAfter: "a"},

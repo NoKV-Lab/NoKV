@@ -8,7 +8,7 @@ package compile
 import (
 	"crypto/sha256"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
@@ -48,7 +48,7 @@ func CompileOpenWriteSessionProgram(req model.OpenWriteSessionRequest, mount mod
 	if req.TTL <= 0 {
 		return OpenWriteSessionProgram{}, model.ErrInvalidRequest
 	}
-	plan, err := fsmeta.PlanOpenWriteSession(req, mount)
+	plan, err := layout.PlanOpenWriteSession(req, mount)
 	if err != nil {
 		return OpenWriteSessionProgram{}, err
 	}
@@ -78,7 +78,7 @@ func CompileHeartbeatWriteSessionProgram(req model.HeartbeatWriteSessionRequest,
 	if req.TTL <= 0 {
 		return HeartbeatWriteSessionProgram{}, model.ErrInvalidRequest
 	}
-	plan, err := fsmeta.PlanHeartbeatWriteSession(req, mount)
+	plan, err := layout.PlanHeartbeatWriteSession(req, mount)
 	if err != nil {
 		return HeartbeatWriteSessionProgram{}, err
 	}
@@ -104,12 +104,12 @@ func CompileHeartbeatWriteSessionProgram(req model.HeartbeatWriteSessionRequest,
 }
 
 func CompileCloseWriteSessionProgram(req model.CloseWriteSessionRequest, mount model.MountIdentity) (CloseWriteSessionProgram, error) {
-	plan, err := fsmeta.PlanCloseWriteSession(req, mount)
+	plan, err := layout.PlanCloseWriteSession(req, mount)
 	if err != nil {
 		return CloseWriteSessionProgram{}, err
 	}
 	plan = canonicalPlan(plan)
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(mount, req.Inode)
+	ownerKey, err := layout.EncodeInodeSessionKey(mount, req.Inode)
 	if err != nil {
 		return CloseWriteSessionProgram{}, err
 	}
@@ -134,7 +134,7 @@ func CompileCloseWriteSessionProgram(req model.CloseWriteSessionRequest, mount m
 }
 
 func CompileExpireWriteSessionsProgram(req model.ExpireWriteSessionsRequest, mount model.MountIdentity) (ExpireWriteSessionsProgram, error) {
-	plan, err := fsmeta.PlanExpireWriteSessions(req, mount)
+	plan, err := layout.PlanExpireWriteSessions(req, mount)
 	if err != nil {
 		return ExpireWriteSessionsProgram{}, err
 	}
@@ -421,7 +421,7 @@ func compileOpenWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, error) 
 		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
-		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
+		buckets := make([]layout.AffinityBucket, 0, len(delta.WriteEffects))
 		for _, effect := range delta.WriteEffects {
 			switch effect.Kind {
 			case EffectPut:
@@ -441,7 +441,7 @@ func compileOpenWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, error) 
 				placement.SlowReason = SlowReasonDynamicWriteSet
 				goto placementDone
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
+			parts, ok := layout.InspectKey(effect.Key)
 			if !ok {
 				if fsmetaKeys {
 					placement.SlowReason = SlowReasonDynamicWriteSet
@@ -527,7 +527,7 @@ placementDone:
 		if len(effect.Value) > 0 {
 			plan.ValueHash = sha256.Sum256(effect.Value)
 		}
-		if parts, ok := fsmeta.InspectKey(effect.Key); ok {
+		if parts, ok := layout.InspectKey(effect.Key); ok {
 			plan.MountKeyID = parts.MountKeyID
 			plan.Bucket = parts.Bucket
 			plan.RecordKind = parts.Kind
@@ -586,13 +586,13 @@ placementDone:
 			if len(effect.Key) == 0 {
 				continue
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
-			if !ok || parts.Kind != fsmeta.KeyKindDentry {
+			parts, ok := layout.InspectKey(effect.Key)
+			if !ok || parts.Kind != layout.KeyKindDentry {
 				continue
 			}
 			projection := WatchProjection{EventKind: watchEventKind(delta, effect), Key: effect.Key, Parent: parts.Parent, Name: dentryName(effect.Key), EmitAt: emitAt}
 			if len(effect.Value) > 0 {
-				if dentry, err := fsmeta.DecodeDentryValue(effect.Value); err == nil {
+				if dentry, err := layout.DecodeDentryValue(effect.Value); err == nil {
 					projection.Inode = dentry.Inode
 				}
 			}
@@ -630,7 +630,7 @@ func compileHeartbeatWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, er
 		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
-		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
+		buckets := make([]layout.AffinityBucket, 0, len(delta.WriteEffects))
 		for _, effect := range delta.WriteEffects {
 			switch effect.Kind {
 			case EffectPut:
@@ -650,7 +650,7 @@ func compileHeartbeatWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, er
 				placement.SlowReason = SlowReasonDynamicWriteSet
 				goto placementDone
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
+			parts, ok := layout.InspectKey(effect.Key)
 			if !ok {
 				if fsmetaKeys {
 					placement.SlowReason = SlowReasonDynamicWriteSet
@@ -736,7 +736,7 @@ placementDone:
 		if len(effect.Value) > 0 {
 			plan.ValueHash = sha256.Sum256(effect.Value)
 		}
-		if parts, ok := fsmeta.InspectKey(effect.Key); ok {
+		if parts, ok := layout.InspectKey(effect.Key); ok {
 			plan.MountKeyID = parts.MountKeyID
 			plan.Bucket = parts.Bucket
 			plan.RecordKind = parts.Kind
@@ -795,13 +795,13 @@ placementDone:
 			if len(effect.Key) == 0 {
 				continue
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
-			if !ok || parts.Kind != fsmeta.KeyKindDentry {
+			parts, ok := layout.InspectKey(effect.Key)
+			if !ok || parts.Kind != layout.KeyKindDentry {
 				continue
 			}
 			projection := WatchProjection{EventKind: watchEventKind(delta, effect), Key: effect.Key, Parent: parts.Parent, Name: dentryName(effect.Key), EmitAt: emitAt}
 			if len(effect.Value) > 0 {
-				if dentry, err := fsmeta.DecodeDentryValue(effect.Value); err == nil {
+				if dentry, err := layout.DecodeDentryValue(effect.Value); err == nil {
 					projection.Inode = dentry.Inode
 				}
 			}
@@ -839,7 +839,7 @@ func compileCloseWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, error)
 		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
-		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
+		buckets := make([]layout.AffinityBucket, 0, len(delta.WriteEffects))
 		for _, effect := range delta.WriteEffects {
 			switch effect.Kind {
 			case EffectPut:
@@ -859,7 +859,7 @@ func compileCloseWriteSessionCompiledOp(delta SemanticDelta) (CompiledOp, error)
 				placement.SlowReason = SlowReasonDynamicWriteSet
 				goto placementDone
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
+			parts, ok := layout.InspectKey(effect.Key)
 			if !ok {
 				if fsmetaKeys {
 					placement.SlowReason = SlowReasonDynamicWriteSet
@@ -945,7 +945,7 @@ placementDone:
 		if len(effect.Value) > 0 {
 			plan.ValueHash = sha256.Sum256(effect.Value)
 		}
-		if parts, ok := fsmeta.InspectKey(effect.Key); ok {
+		if parts, ok := layout.InspectKey(effect.Key); ok {
 			plan.MountKeyID = parts.MountKeyID
 			plan.Bucket = parts.Bucket
 			plan.RecordKind = parts.Kind
@@ -1004,13 +1004,13 @@ placementDone:
 			if len(effect.Key) == 0 {
 				continue
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
-			if !ok || parts.Kind != fsmeta.KeyKindDentry {
+			parts, ok := layout.InspectKey(effect.Key)
+			if !ok || parts.Kind != layout.KeyKindDentry {
 				continue
 			}
 			projection := WatchProjection{EventKind: watchEventKind(delta, effect), Key: effect.Key, Parent: parts.Parent, Name: dentryName(effect.Key), EmitAt: emitAt}
 			if len(effect.Value) > 0 {
-				if dentry, err := fsmeta.DecodeDentryValue(effect.Value); err == nil {
+				if dentry, err := layout.DecodeDentryValue(effect.Value); err == nil {
 					projection.Inode = dentry.Inode
 				}
 			}
@@ -1048,7 +1048,7 @@ func compileExpireWriteSessionsCompiledOp(delta SemanticDelta) (CompiledOp, erro
 		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
-		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
+		buckets := make([]layout.AffinityBucket, 0, len(delta.WriteEffects))
 		for _, effect := range delta.WriteEffects {
 			switch effect.Kind {
 			case EffectPut:
@@ -1068,7 +1068,7 @@ func compileExpireWriteSessionsCompiledOp(delta SemanticDelta) (CompiledOp, erro
 				placement.SlowReason = SlowReasonDynamicWriteSet
 				goto placementDone
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
+			parts, ok := layout.InspectKey(effect.Key)
 			if !ok {
 				if fsmetaKeys {
 					placement.SlowReason = SlowReasonDynamicWriteSet
@@ -1154,7 +1154,7 @@ placementDone:
 		if len(effect.Value) > 0 {
 			plan.ValueHash = sha256.Sum256(effect.Value)
 		}
-		if parts, ok := fsmeta.InspectKey(effect.Key); ok {
+		if parts, ok := layout.InspectKey(effect.Key); ok {
 			plan.MountKeyID = parts.MountKeyID
 			plan.Bucket = parts.Bucket
 			plan.RecordKind = parts.Kind
@@ -1213,13 +1213,13 @@ placementDone:
 			if len(effect.Key) == 0 {
 				continue
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
-			if !ok || parts.Kind != fsmeta.KeyKindDentry {
+			parts, ok := layout.InspectKey(effect.Key)
+			if !ok || parts.Kind != layout.KeyKindDentry {
 				continue
 			}
 			projection := WatchProjection{EventKind: watchEventKind(delta, effect), Key: effect.Key, Parent: parts.Parent, Name: dentryName(effect.Key), EmitAt: emitAt}
 			if len(effect.Value) > 0 {
-				if dentry, err := fsmeta.DecodeDentryValue(effect.Value); err == nil {
+				if dentry, err := layout.DecodeDentryValue(effect.Value); err == nil {
 					projection.Inode = dentry.Inode
 				}
 			}

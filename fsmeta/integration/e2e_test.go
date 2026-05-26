@@ -10,10 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
 	fswatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetaraftstore "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
 	fsmetaserver "github.com/feichai0017/NoKV/fsmeta/server"
 	"github.com/stretchr/testify/require"
@@ -25,9 +26,9 @@ type staticMountWatcher struct {
 	identity model.MountIdentity
 }
 
-func (w staticMountWatcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta.WatchSubscription, error) {
+func (w staticMountWatcher) Subscribe(ctx context.Context, req observe.WatchRequest) (observe.WatchSubscription, error) {
 	if req.Mount != "" {
-		prefix, err := fsmeta.WatchPrefixForMount(req, w.identity)
+		prefix, err := observe.WatchPrefixForMount(req, w.identity)
 		if err != nil {
 			return nil, err
 		}
@@ -200,9 +201,9 @@ func TestFSMetadataWatchSubtreeOnRealCluster(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, runtime.executor, fsmetaserver.WithWatcher(staticMountWatcher{router: router, identity: runtime.mountIdentity}))
 	defer cleanup()
 
-	prefix, err := fsmeta.EncodeDentryPrefix(runtime.mountIdentity, model.RootInode)
+	prefix, err := layout.EncodeDentryPrefix(runtime.mountIdentity, model.RootInode)
 	require.NoError(t, err)
-	stream, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
+	stream, err := cli.WatchSubtree(ctx, observe.WatchRequest{
 		KeyPrefix:          prefix,
 		BackPressureWindow: 8,
 	})
@@ -217,10 +218,10 @@ func TestFSMetadataWatchSubtreeOnRealCluster(t *testing.T) {
 	}
 	_, err = cli.Create(ctx, req)
 	require.NoError(t, err)
-	wantKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, req.Parent, req.Name)
+	wantKey, err := layout.EncodeDentryKey(runtime.mountIdentity, req.Parent, req.Name)
 	require.NoError(t, err)
 
-	var got fsmeta.WatchEvent
+	var got observe.WatchEvent
 	require.Eventually(t, func() bool {
 		evt, err := stream.Recv()
 		if err != nil {
@@ -229,7 +230,7 @@ func TestFSMetadataWatchSubtreeOnRealCluster(t *testing.T) {
 		got = evt
 		return string(evt.Key) == string(wantKey)
 	}, 5*time.Second, 20*time.Millisecond)
-	require.Equal(t, fsmeta.WatchEventSourceCommit, got.Source)
+	require.Equal(t, observe.WatchEventSourceCommit, got.Source)
 	require.NotZero(t, got.CommitVersion)
 	require.NotZero(t, got.Cursor.Index)
 	require.NoError(t, stream.Ack(got.Cursor))
@@ -248,9 +249,9 @@ func TestFSMetadataWatchSubtreeReplaysAfterResumeCursor(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, runtime.executor, fsmetaserver.WithWatcher(staticMountWatcher{router: router, identity: runtime.mountIdentity}))
 	defer cleanup()
 
-	prefix, err := fsmeta.EncodeDentryPrefix(runtime.mountIdentity, model.RootInode)
+	prefix, err := layout.EncodeDentryPrefix(runtime.mountIdentity, model.RootInode)
 	require.NoError(t, err)
-	stream, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
+	stream, err := cli.WatchSubtree(ctx, observe.WatchRequest{
 		KeyPrefix:          prefix,
 		BackPressureWindow: 8,
 	})
@@ -259,7 +260,7 @@ func TestFSMetadataWatchSubtreeReplaysAfterResumeCursor(t *testing.T) {
 	first := model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "catchup-0001", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}
 	_, err = cli.Create(ctx, first)
 	require.NoError(t, err)
-	firstKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, first.Parent, first.Name)
+	firstKey, err := layout.EncodeDentryKey(runtime.mountIdentity, first.Parent, first.Name)
 	require.NoError(t, err)
 	firstEvent := recvWatchKey(t, stream, firstKey)
 	require.NoError(t, stream.Ack(firstEvent.Cursor))
@@ -271,12 +272,12 @@ func TestFSMetadataWatchSubtreeReplaysAfterResumeCursor(t *testing.T) {
 	require.NoError(t, err)
 	_, err = cli.Create(ctx, third)
 	require.NoError(t, err)
-	secondKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, second.Parent, second.Name)
+	secondKey, err := layout.EncodeDentryKey(runtime.mountIdentity, second.Parent, second.Name)
 	require.NoError(t, err)
-	thirdKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, third.Parent, third.Name)
+	thirdKey, err := layout.EncodeDentryKey(runtime.mountIdentity, third.Parent, third.Name)
 	require.NoError(t, err)
 
-	resumed, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
+	resumed, err := cli.WatchSubtree(ctx, observe.WatchRequest{
 		KeyPrefix:          prefix,
 		ResumeCursor:       firstEvent.Cursor,
 		BackPressureWindow: 8,
@@ -310,7 +311,7 @@ func TestFSMetadataWatchSubtreeReconcilesAfterExpiredCursor(t *testing.T) {
 	cli, cleanup := openFSMetadataClient(t, ctx, runtime.executor, fsmetaserver.WithWatcher(staticMountWatcher{router: router, identity: runtime.mountIdentity}))
 	defer cleanup()
 
-	warmup, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
+	warmup, err := cli.WatchSubtree(ctx, observe.WatchRequest{
 		Mount:              "vol",
 		RootInode:          model.RootInode,
 		BackPressureWindow: 8,
@@ -320,7 +321,7 @@ func TestFSMetadataWatchSubtreeReconcilesAfterExpiredCursor(t *testing.T) {
 	baseline := model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "baseline-artifact", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}
 	_, err = cli.Create(ctx, baseline)
 	require.NoError(t, err)
-	baselineKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, baseline.Parent, baseline.Name)
+	baselineKey, err := layout.EncodeDentryKey(runtime.mountIdentity, baseline.Parent, baseline.Name)
 	require.NoError(t, err)
 	baselineEvent := recvWatchKey(t, warmup, baselineKey)
 	require.NotZero(t, baselineEvent.Cursor.RegionID)
@@ -332,7 +333,7 @@ func TestFSMetadataWatchSubtreeReconcilesAfterExpiredCursor(t *testing.T) {
 	expired.Index = 0
 
 	result, err := fsmetaclient.WatchDirectoryWithReconcile(ctx, cli,
-		fsmeta.WatchRequest{
+		observe.WatchRequest{
 			Mount:              "vol",
 			RootInode:          model.RootInode,
 			ResumeCursor:       expired,
@@ -348,7 +349,7 @@ func TestFSMetadataWatchSubtreeReconcilesAfterExpiredCursor(t *testing.T) {
 	live := model.CreateRequest{Mount: "vol", Parent: model.RootInode, Name: "live-after-reconcile", Attrs: model.CreateAttrs{Type: model.InodeTypeFile}}
 	_, err = cli.Create(ctx, live)
 	require.NoError(t, err)
-	liveKey, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, live.Parent, live.Name)
+	liveKey, err := layout.EncodeDentryKey(runtime.mountIdentity, live.Parent, live.Name)
 	require.NoError(t, err)
 	got := recvWatchKey(t, result.Subscription, liveKey)
 	require.NoError(t, result.Subscription.Ack(got.Cursor))
@@ -494,9 +495,9 @@ func (r *snapshotRecorder) RetireSnapshotSubtree(_ context.Context, token model.
 	return nil
 }
 
-func recvWatchKey(t *testing.T, stream fsmetaclient.WatchSubscription, key []byte) fsmeta.WatchEvent {
+func recvWatchKey(t *testing.T, stream fsmetaclient.WatchSubscription, key []byte) observe.WatchEvent {
 	t.Helper()
-	var got fsmeta.WatchEvent
+	var got observe.WatchEvent
 	require.Eventually(t, func() bool {
 		evt, err := stream.Recv()
 		if err != nil {

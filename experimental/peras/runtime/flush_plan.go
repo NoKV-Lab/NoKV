@@ -5,8 +5,8 @@ package peras
 
 import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
@@ -207,7 +207,7 @@ func splitReplayPlanByCompilerBudget(plan fsperas.ReplayPlan, materialize bool, 
 
 type catalogRouteBucket struct {
 	mount  model.MountKeyID
-	bucket fsmeta.AffinityBucket
+	bucket layout.AffinityBucket
 }
 
 func replayOperationCatalogRouteBuckets(op fsperas.ReplayOperation, materialize bool, plan compile.SegmentPlan) ([]catalogRouteBucket, bool, error) {
@@ -217,7 +217,7 @@ func replayOperationCatalogRouteBuckets(op fsperas.ReplayOperation, materialize 
 	seen := make(map[catalogRouteBucket]struct{})
 	out := make([]catalogRouteBucket, 0, len(op.Mutations))
 	for _, mutation := range op.Mutations {
-		parts, ok := fsmeta.InspectKey(mutation.Key)
+		parts, ok := layout.InspectKey(mutation.Key)
 		if !ok {
 			return nil, false, fsperas.ErrInvalidPerasSegment
 		}

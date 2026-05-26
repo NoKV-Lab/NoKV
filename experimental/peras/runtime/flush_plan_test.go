@@ -7,14 +7,14 @@ import (
 	"testing"
 
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSplitReplayPlanByCompilerBudgetRequiresStoredSegmentPlan(t *testing.T) {
-	key, err := fsmeta.EncodeInodeKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, 8)
+	key, err := layout.EncodeInodeKey(model.MountIdentity{MountID: "vol", MountKeyID: 1}, 8)
 	require.NoError(t, err)
 
 	_, err = splitReplayPlanByCompilerBudget(fsperas.ReplayPlan{
@@ -157,13 +157,13 @@ func replayOperationWithSegmentPlan(client string, seq uint64, key []byte, segme
 	}
 }
 
-func fsmetaKeyForBucket(t *testing.T, mount model.MountIdentity, bucket fsmeta.AffinityBucket) []byte {
+func fsmetaKeyForBucket(t *testing.T, mount model.MountIdentity, bucket layout.AffinityBucket) []byte {
 	t.Helper()
 	for inode := model.InodeID(2); inode < 100_000; inode++ {
-		if fsmeta.BucketForInodeID(inode) != bucket {
+		if layout.BucketForInodeID(inode) != bucket {
 			continue
 		}
-		key, err := fsmeta.EncodeInodeKey(mount, inode)
+		key, err := layout.EncodeInodeKey(mount, inode)
 		require.NoError(t, err)
 		return key
 	}

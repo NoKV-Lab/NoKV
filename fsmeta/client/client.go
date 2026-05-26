@@ -8,8 +8,9 @@ import (
 	"fmt"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -48,7 +49,7 @@ type Client interface {
 	LookupPlus(ctx context.Context, req model.LookupRequest) (model.DentryAttrPair, error)
 	ReadDir(ctx context.Context, req model.ReadDirRequest) ([]model.DentryRecord, error)
 	ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error)
-	WatchSubtree(ctx context.Context, req fsmeta.WatchRequest) (WatchSubscription, error)
+	WatchSubtree(ctx context.Context, req observe.WatchRequest) (WatchSubscription, error)
 	GetReadVersion(ctx context.Context, req model.ReadVersionRequest) (uint64, error)
 	SnapshotSubtree(ctx context.Context, req model.SnapshotSubtreeRequest) (model.SnapshotSubtreeToken, error)
 	RetireSnapshotSubtree(ctx context.Context, token model.SnapshotSubtreeToken) error
@@ -241,7 +242,7 @@ func (c *GRPCClient) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) 
 // WatchSubtree opens a prefix watch stream. When ResumeCursor is set, the
 // server replays retained events after that cursor before switching to live
 // delivery.
-func (c *GRPCClient) WatchSubtree(ctx context.Context, req fsmeta.WatchRequest) (WatchSubscription, error) {
+func (c *GRPCClient) WatchSubtree(ctx context.Context, req observe.WatchRequest) (WatchSubscription, error) {
 	if err := c.requireRPC(); err != nil {
 		return nil, err
 	}
@@ -457,67 +458,67 @@ func (c *GRPCClient) ExpireWriteSessions(ctx context.Context, req model.ExpireWr
 
 // WatchSubscription is one typed WatchSubtree client stream.
 type WatchSubscription interface {
-	Recv() (fsmeta.WatchEvent, error)
-	ReadyCursor() fsmeta.WatchCursor
-	Ack(fsmeta.WatchCursor) error
+	Recv() (observe.WatchEvent, error)
+	ReadyCursor() observe.WatchCursor
+	Ack(observe.WatchCursor) error
 	Close() error
 }
 
 // WatchStream is the gRPC-backed WatchSubtree stream implementation.
 type WatchStream struct {
 	stream fsmetapb.FSMetadata_WatchSubtreeClient
-	ready  fsmeta.WatchCursor
+	ready  observe.WatchCursor
 }
 
 // Recv blocks until the next watch event arrives.
-func (s *WatchStream) Recv() (fsmeta.WatchEvent, error) {
+func (s *WatchStream) Recv() (observe.WatchEvent, error) {
 	if s == nil || s.stream == nil {
-		return fsmeta.WatchEvent{}, errWatchStreamNotConfigured
+		return observe.WatchEvent{}, errWatchStreamNotConfigured
 	}
 	for {
 		resp, err := s.stream.Recv()
 		if err != nil {
-			return fsmeta.WatchEvent{}, translateRPCError(err)
+			return observe.WatchEvent{}, translateRPCError(err)
 		}
 		if event := resp.GetEvent(); event != nil {
 			return watchEventFromProto(event), nil
 		}
 		if throttle := resp.GetThrottle(); throttle != nil {
-			return fsmeta.WatchEvent{}, fmt.Errorf("%w: %s", model.ErrWatchOverflow, throttle.GetReason())
+			return observe.WatchEvent{}, fmt.Errorf("%w: %s", model.ErrWatchOverflow, throttle.GetReason())
 		}
 		// Ready and catch-up markers are stream-control frames, not user events.
 	}
 }
 
-func waitForWatchReady(stream fsmetapb.FSMetadata_WatchSubtreeClient) (fsmeta.WatchCursor, error) {
+func waitForWatchReady(stream fsmetapb.FSMetadata_WatchSubtreeClient) (observe.WatchCursor, error) {
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
-			return fsmeta.WatchCursor{}, translateRPCError(err)
+			return observe.WatchCursor{}, translateRPCError(err)
 		}
 		if ready := resp.GetReady(); ready != nil {
 			return watchCursorFromProto(ready.GetCursor()), nil
 		}
 		if throttle := resp.GetThrottle(); throttle != nil {
-			return fsmeta.WatchCursor{}, fmt.Errorf("%w: %s", model.ErrWatchOverflow, throttle.GetReason())
+			return observe.WatchCursor{}, fmt.Errorf("%w: %s", model.ErrWatchOverflow, throttle.GetReason())
 		}
 		if resp.GetEvent() != nil {
-			return fsmeta.WatchCursor{}, errWatchEventBeforeReady
+			return observe.WatchCursor{}, errWatchEventBeforeReady
 		}
 	}
 }
 
 // ReadyCursor returns the server frontier after the subscription's initial
 // catch-up replay was queued.
-func (s *WatchStream) ReadyCursor() fsmeta.WatchCursor {
+func (s *WatchStream) ReadyCursor() observe.WatchCursor {
 	if s == nil {
-		return fsmeta.WatchCursor{}
+		return observe.WatchCursor{}
 	}
 	return s.ready
 }
 
 // Ack releases back-pressure budget for a received event.
-func (s *WatchStream) Ack(cursor fsmeta.WatchCursor) error {
+func (s *WatchStream) Ack(cursor observe.WatchCursor) error {
 	if s == nil || s.stream == nil {
 		return errWatchStreamNotConfigured
 	}
@@ -527,7 +528,7 @@ func (s *WatchStream) Ack(cursor fsmeta.WatchCursor) error {
 }
 
 // AckEvent releases back-pressure budget for a received event.
-func (s *WatchStream) AckEvent(evt fsmeta.WatchEvent) error {
+func (s *WatchStream) AckEvent(evt observe.WatchEvent) error {
 	return s.Ack(evt.Cursor)
 }
 
@@ -613,13 +614,13 @@ func invalidReasonSentinel(reason string) error {
 	case reasonInvalidRequest, reasonInvalidFSMetaInput:
 		return model.ErrInvalidRequest
 	case reasonInvalidKey:
-		return fsmeta.ErrInvalidKey
+		return layout.ErrInvalidKey
 	case reasonInvalidKeyKind:
-		return fsmeta.ErrInvalidKeyKind
+		return layout.ErrInvalidKeyKind
 	case reasonInvalidValue:
 		return model.ErrInvalidValue
 	case reasonInvalidValueKind:
-		return fsmeta.ErrInvalidValueKind
+		return layout.ErrInvalidValueKind
 	case reasonInvalidPageSize:
 		return model.ErrInvalidPageSize
 	default:
@@ -646,15 +647,15 @@ func NewWatchSession(sub WatchSubscription) *WatchSession {
 }
 
 // Recv receives the next watch event.
-func (s *WatchSession) Recv() (fsmeta.WatchEvent, error) {
+func (s *WatchSession) Recv() (observe.WatchEvent, error) {
 	if s == nil || s.sub == nil {
-		return fsmeta.WatchEvent{}, errWatchSessionNotConfigured
+		return observe.WatchEvent{}, errWatchSessionNotConfigured
 	}
 	return s.sub.Recv()
 }
 
 // Ack acknowledges the cursor carried by event.
-func (s *WatchSession) Ack(event fsmeta.WatchEvent) error {
+func (s *WatchSession) Ack(event observe.WatchEvent) error {
 	if s == nil || s.sub == nil {
 		return errWatchSessionNotConfigured
 	}
@@ -662,9 +663,9 @@ func (s *WatchSession) Ack(event fsmeta.WatchEvent) error {
 }
 
 // ReadyCursor returns the server frontier after initial replay.
-func (s *WatchSession) ReadyCursor() fsmeta.WatchCursor {
+func (s *WatchSession) ReadyCursor() observe.WatchCursor {
 	if s == nil || s.sub == nil {
-		return fsmeta.WatchCursor{}
+		return observe.WatchCursor{}
 	}
 	return s.sub.ReadyCursor()
 }

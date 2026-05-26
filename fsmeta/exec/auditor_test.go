@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
@@ -47,7 +47,7 @@ func TestAuditMountReportsDentryMissingInode(t *testing.T) {
 
 func TestAuditMountReportsMissingRootInode(t *testing.T) {
 	runner := newFakeRunner()
-	rootKey, err := fsmeta.EncodeInodeKey(testMountIdentity, model.RootInode)
+	rootKey, err := layout.EncodeInodeKey(testMountIdentity, model.RootInode)
 	require.NoError(t, err)
 	delete(runner.data, string(rootKey))
 	executor, err := newTestExecutor(runner)

@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
@@ -329,7 +329,7 @@ func workspaceCreateReplayPlan(tb testing.TB, count int) ReplayPlan {
 			},
 		}, mount, model.InodeID(1000+i))
 		require.NoError(tb, err)
-		parentValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+		parentValue, err := layout.EncodeInodeValue(model.InodeRecord{
 			Inode:      model.RootInode,
 			Type:       model.InodeTypeDirectory,
 			LinkCount:  1,

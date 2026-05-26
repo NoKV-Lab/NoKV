@@ -73,7 +73,7 @@ func (k PageKey) Directory() DirectoryKey {
 
 // Entry is one materialized directory entry. AttrBlob is the consumer-
 // chosen serialization of the inode attributes (e.g. fsmeta/model.InodeRecord
-// encoded via fsmeta.EncodeInodeValue); dirpage never inspects it.
+// encoded via layout.EncodeInodeValue); dirpage never inspects it.
 type Entry struct {
 	Name     []byte
 	Inode    uint64

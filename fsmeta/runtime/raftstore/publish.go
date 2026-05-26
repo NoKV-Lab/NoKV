@@ -14,7 +14,7 @@ import (
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 )
 
-// rootPublisher implements both fsmeta.SnapshotPublisher and the
+// rootPublisher implements both observe.SnapshotPublisher and the
 // SubtreeHandoffPublisher interface using the coordinator PublishRootEvent RPC.
 type rootPublisher struct {
 	coord *coordclient.GRPCClient

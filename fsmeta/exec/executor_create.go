@@ -6,8 +6,8 @@ package exec
 import (
 	"context"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -26,7 +26,7 @@ func (e *Executor) tryVisibleCreate(ctx context.Context, program compile.CreateP
 	if err != nil {
 		return false, err
 	}
-	parentValue, err := fsmeta.EncodeInodeValue(parent)
+	parentValue, err := layout.EncodeInodeValue(parent)
 	if err != nil {
 		return false, err
 	}
@@ -46,7 +46,7 @@ func (e *Executor) Create(ctx context.Context, req model.CreateRequest) (model.C
 	if e.inodes == nil {
 		return model.CreateResult{}, errInodeAllocatorRequired
 	}
-	if _, err := fsmeta.EncodeInodeValue(req.Attrs.InodeRecord(model.RootInode)); err != nil {
+	if _, err := layout.EncodeInodeValue(req.Attrs.InodeRecord(model.RootInode)); err != nil {
 		return model.CreateResult{}, err
 	}
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
@@ -116,7 +116,7 @@ func (e *Executor) Create(ctx context.Context, req model.CreateRequest) (model.C
 		if err != nil {
 			return err
 		}
-		parentValue, err := fsmeta.EncodeInodeValue(nextParent)
+		parentValue, err := layout.EncodeInodeValue(nextParent)
 		if err != nil {
 			return err
 		}

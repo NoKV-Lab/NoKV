@@ -10,8 +10,8 @@ import (
 	"sync"
 
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -491,7 +491,7 @@ func visibleSnapshotDirectory(scope compile.AuthorityScope) (model.MountIdentity
 		return model.MountIdentity{}, nil, false
 	}
 	mount := model.MountIdentity{MountID: scope.Mount, MountKeyID: scope.MountKeyID}
-	prefix, err := fsmeta.EncodeDentryPrefix(mount, scope.Parents[0])
+	prefix, err := layout.EncodeDentryPrefix(mount, scope.Parents[0])
 	if err != nil {
 		return model.MountIdentity{}, nil, false
 	}
@@ -564,7 +564,7 @@ func (c *Runtime) sealedDirectoryHasRows(mount model.MountIdentity, inode model.
 	if c == nil || c.read == nil || c.read.sealed == nil {
 		return false
 	}
-	prefix, err := fsmeta.EncodeDentryPrefix(mount, inode)
+	prefix, err := layout.EncodeDentryPrefix(mount, inode)
 	if err != nil {
 		return false
 	}

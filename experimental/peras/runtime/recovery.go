@@ -12,8 +12,8 @@ import (
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 )
 
@@ -311,7 +311,7 @@ func (c *Runtime) scanInstalledSegmentCatalogs(ctx context.Context, scope compil
 	records := make([]fsperas.SegmentCatalogRecord, 0)
 	seen := make(map[[32]byte]struct{})
 	for _, bucket := range buckets {
-		prefix, err := fsmeta.EncodeSegmentCatalogIndexPrefix(scope.MountKeyID, bucket)
+		prefix, err := layout.EncodeSegmentCatalogIndexPrefix(scope.MountKeyID, bucket)
 		if err != nil {
 			return nil, err
 		}
@@ -334,8 +334,8 @@ func (c *Runtime) scanInstalledSegmentCatalogs(ctx context.Context, scope compil
 				if err != nil {
 					return nil, err
 				}
-				parts, ok := fsmeta.InspectKey(kv.Key)
-				if !ok || parts.Kind != fsmeta.KeyKindSegment || parts.SegmentRecord != fsmeta.SegmentRecordIndex || parts.SegmentRoot != index.Root {
+				parts, ok := layout.InspectKey(kv.Key)
+				if !ok || parts.Kind != layout.KeyKindSegment || parts.SegmentRecord != layout.SegmentRecordIndex || parts.SegmentRoot != index.Root {
 					return nil, fsperas.ErrInvalidPerasSegment
 				}
 				if _, ok := seen[index.Root]; ok {

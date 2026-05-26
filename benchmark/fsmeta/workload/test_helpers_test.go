@@ -12,9 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 )
 
 type fakeMetadataClient struct {
@@ -158,10 +159,10 @@ func (c *fakeMetadataClient) readDirLocked(req model.ReadDirRequest) []model.Den
 	return out
 }
 
-func (c *fakeMetadataClient) WatchSubtree(_ context.Context, req fsmeta.WatchRequest) (fsmetaclient.WatchSubscription, error) {
+func (c *fakeMetadataClient) WatchSubtree(_ context.Context, req observe.WatchRequest) (fsmetaclient.WatchSubscription, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	prefix, err := fsmeta.WatchPrefixForMount(req, testMountIdentity(req.Mount))
+	prefix, err := observe.WatchPrefixForMount(req, testMountIdentity(req.Mount))
 	if err != nil {
 		return nil, err
 	}
@@ -300,15 +301,15 @@ func (c *fakeMetadataClient) emitDentryEventLocked(mount model.MountID, entry mo
 	if len(c.streams) == 0 {
 		return
 	}
-	key, err := fsmeta.EncodeDentryKey(testMountIdentity(mount), entry.Parent, entry.Name)
+	key, err := layout.EncodeDentryKey(testMountIdentity(mount), entry.Parent, entry.Name)
 	if err != nil {
 		return
 	}
 	c.version++
-	evt := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: c.version},
+	evt := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: c.version},
 		CommitVersion: c.version,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           key,
 	}
 	for _, stream := range c.streams {
@@ -323,27 +324,27 @@ func (c *fakeMetadataClient) emitDentryEventLocked(mount model.MountID, entry mo
 type fakeWatchStream struct {
 	mu     sync.Mutex
 	prefix []byte
-	events chan fsmeta.WatchEvent
+	events chan observe.WatchEvent
 	closed bool
 }
 
 func newFakeWatchStream(size int) *fakeWatchStream {
-	return &fakeWatchStream{events: make(chan fsmeta.WatchEvent, size)}
+	return &fakeWatchStream{events: make(chan observe.WatchEvent, size)}
 }
 
-func (s *fakeWatchStream) Recv() (fsmeta.WatchEvent, error) {
+func (s *fakeWatchStream) Recv() (observe.WatchEvent, error) {
 	evt, ok := <-s.events
 	if !ok {
-		return fsmeta.WatchEvent{}, io.EOF
+		return observe.WatchEvent{}, io.EOF
 	}
 	return evt, nil
 }
 
-func (s *fakeWatchStream) ReadyCursor() fsmeta.WatchCursor {
-	return fsmeta.WatchCursor{}
+func (s *fakeWatchStream) ReadyCursor() observe.WatchCursor {
+	return observe.WatchCursor{}
 }
 
-func (s *fakeWatchStream) Ack(fsmeta.WatchCursor) error {
+func (s *fakeWatchStream) Ack(observe.WatchCursor) error {
 	return nil
 }
 

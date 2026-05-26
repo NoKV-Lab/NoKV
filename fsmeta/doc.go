@@ -21,8 +21,9 @@
 //     not part of NoKV's internal truth.
 //
 //   - fsmeta/model owns the storage-engine-neutral namespace model and public
-//     operation shapes. This package owns key/value layout, placement planning,
-//     watch-key translation, and ordered-storage glue.
+//     operation shapes. fsmeta/layout owns ordered-key encodings and placement
+//     plans. fsmeta/observe owns watch and snapshot observation surfaces. This
+//     root package is only the package-level architecture anchor.
 //
 //   - fsmeta uses runtime adapters for local and distributed storage. It may
 //     reuse meta/root's rooted-event substrate only for namespace-level

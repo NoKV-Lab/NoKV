@@ -11,8 +11,8 @@ import (
 	perasraftstore "github.com/feichai0017/NoKV/experimental/peras/adapters/raftstore"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
-	fsmetamodel "github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
@@ -62,7 +62,7 @@ func TestRemoteSegmentWitnessSingleRecordBatchRoundTrip(t *testing.T) {
 	scope := compile.AuthorityScope{
 		Mount:      model.MountID("m1"),
 		MountKeyID: 8,
-		Buckets:    []fsmetamodel.AffinityBucket{2},
+		Buckets:    []layout.AffinityBucket{2},
 		Parents:    []model.InodeID{100},
 		Inodes:     []model.InodeID{200},
 	}
@@ -87,7 +87,7 @@ func TestRemoteSegmentWitnessBatchRoundTrip(t *testing.T) {
 	scope := compile.AuthorityScope{
 		Mount:      model.MountID("m1"),
 		MountKeyID: 8,
-		Buckets:    []fsmetamodel.AffinityBucket{2},
+		Buckets:    []layout.AffinityBucket{2},
 		Parents:    []model.InodeID{100},
 		Inodes:     []model.InodeID{200},
 	}
@@ -152,7 +152,7 @@ func BenchmarkRemoteSegmentWitnessAppendSegmentsSingleRecord(b *testing.B) {
 	scope := compile.AuthorityScope{
 		Mount:      model.MountID("m1"),
 		MountKeyID: 8,
-		Buckets:    []fsmetamodel.AffinityBucket{2},
+		Buckets:    []layout.AffinityBucket{2},
 		Parents:    []model.InodeID{100},
 		Inodes:     []model.InodeID{200},
 	}

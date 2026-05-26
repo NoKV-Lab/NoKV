@@ -10,7 +10,7 @@ import (
 	"github.com/feichai0017/NoKV/engine/index"
 	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 )
 
 type SegmentCatalogStore interface {
@@ -39,8 +39,8 @@ func LoadPerasSegmentCatalogs(store SegmentCatalogStore) ([]fsperas.SegmentCatal
 			it.Next()
 			continue
 		}
-		parts, ok := fsmeta.InspectKey(userKey)
-		if !ok || parts.Kind != fsmeta.KeyKindSegment || parts.SegmentRecord != fsmeta.SegmentRecordObject {
+		parts, ok := layout.InspectKey(userKey)
+		if !ok || parts.Kind != layout.KeyKindSegment || parts.SegmentRecord != layout.SegmentRecordObject {
 			it.Next()
 			continue
 		}
@@ -91,7 +91,7 @@ func LoadPerasSegmentCatalogInstallForObjectKey(store SegmentCatalogStore, segme
 	if err != nil {
 		return false, err
 	}
-	indexKey, err := fsmeta.EncodeSegmentCatalogIndexKey(bucket.mount, bucket.bucket, segment.Root)
+	indexKey, err := layout.EncodeSegmentCatalogIndexKey(bucket.mount, bucket.bucket, segment.Root)
 	if err != nil {
 		return false, err
 	}
@@ -135,7 +135,7 @@ func LoadPerasSegmentCatalogIndexInstall(store SegmentCatalogStore, root [32]byt
 	if _, err := inspectPerasSegmentObjectKey(root, canonicalObjectKey); err != nil {
 		return false, fsperas.ErrInvalidPerasSegment
 	}
-	indexKey, err := fsmeta.EncodeSegmentCatalogIndexKey(route.mount, route.bucket, root)
+	indexKey, err := layout.EncodeSegmentCatalogIndexKey(route.mount, route.bucket, root)
 	if err != nil {
 		return false, err
 	}

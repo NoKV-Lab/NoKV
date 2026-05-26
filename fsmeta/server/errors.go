@@ -8,7 +8,7 @@ import (
 	"errors"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -109,13 +109,13 @@ func fsmetaErrorMetadata(err error) map[string]string {
 		reason = reasonInvalidSession
 	case errors.Is(err, model.ErrInvalidRequest):
 		reason = reasonInvalidRequest
-	case errors.Is(err, fsmeta.ErrInvalidKey):
+	case errors.Is(err, layout.ErrInvalidKey):
 		reason = reasonInvalidKey
-	case errors.Is(err, fsmeta.ErrInvalidKeyKind):
+	case errors.Is(err, layout.ErrInvalidKeyKind):
 		reason = reasonInvalidKeyKind
 	case errors.Is(err, model.ErrInvalidValue):
 		reason = reasonInvalidValue
-	case errors.Is(err, fsmeta.ErrInvalidValueKind):
+	case errors.Is(err, layout.ErrInvalidValueKind):
 		reason = reasonInvalidValueKind
 	case errors.Is(err, model.ErrInvalidPageSize):
 		reason = reasonInvalidPageSize

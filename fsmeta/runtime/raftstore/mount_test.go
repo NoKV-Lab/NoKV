@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	"github.com/stretchr/testify/require"
 )
@@ -125,7 +125,7 @@ func TestWatcherRejectsRetiredMount(t *testing.T) {
 	cache := &mountCache{coord: lookup, ttl: time.Minute}
 	w := watcher{Router: fsmetawatch.NewRouter(), mounts: cache}
 
-	_, err := w.Subscribe(context.Background(), fsmeta.WatchRequest{
+	_, err := w.Subscribe(context.Background(), observe.WatchRequest{
 		Mount:     "vol",
 		RootInode: model.RootInode,
 	})

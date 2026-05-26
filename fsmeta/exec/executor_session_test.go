@@ -9,8 +9,8 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
@@ -44,7 +44,7 @@ func TestExecutorOpenWriteSessionVisibleCommitBypassesRaftCommit(t *testing.T) {
 		require.Equal(t, compile.EffectPut, effect.Kind)
 		require.NotEmpty(t, effect.Key)
 		require.NotEmpty(t, effect.Value)
-		decoded, err := fsmeta.DecodeSessionValue(effect.Value)
+		decoded, err := layout.DecodeSessionValue(effect.Value)
 		require.NoError(t, err)
 		require.Equal(t, record, decoded)
 	}
@@ -122,9 +122,9 @@ func TestExecutorWriteSessionLifecycleVisibleCommitServesOverlay(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(300), heartbeat.ExpiresUnixNs)
 
-	sessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, 22, "writer-1")
+	sessionKey, err := layout.EncodeSessionKey(testMountIdentity, 22, "writer-1")
 	require.NoError(t, err)
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, 22)
+	ownerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, 22)
 	require.NoError(t, err)
 	owner, ok, err := executor.readSessionByKey(context.Background(), testMountIdentity, ownerKey, 99)
 	require.NoError(t, err)
@@ -167,9 +167,9 @@ func TestExecutorWriteSessionLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, model.SessionRecord{Session: "writer-1", Inode: 22, ExpiresUnixNs: 200}, opened)
 
-	sessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, 22, "writer-1")
+	sessionKey, err := layout.EncodeSessionKey(testMountIdentity, 22, "writer-1")
 	require.NoError(t, err)
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, 22)
+	ownerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, 22)
 	require.NoError(t, err)
 	require.Contains(t, runner.data, string(sessionKey))
 	require.Contains(t, runner.data, string(ownerKey))
@@ -241,11 +241,11 @@ func TestExecutorOpenWriteSessionUsesAtomicMutateForStaleSessionCleanup(t *testi
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	seedInode(t, runner.fakeRunner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1})
 	oldRecord := model.SessionRecord{Session: "writer-old", Inode: 22, ExpiresUnixNs: 50}
-	oldValue, err := fsmeta.EncodeSessionValue(oldRecord)
+	oldValue, err := layout.EncodeSessionValue(oldRecord)
 	require.NoError(t, err)
-	oldSessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, 22, "writer-old")
+	oldSessionKey, err := layout.EncodeSessionKey(testMountIdentity, 22, "writer-old")
 	require.NoError(t, err)
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, 22)
+	ownerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, 22)
 	require.NoError(t, err)
 	runner.data[string(oldSessionKey)] = oldValue
 	runner.data[string(ownerKey)] = oldValue
@@ -294,7 +294,7 @@ func TestExecutorWriteSessionRejectsNonPositiveTTL(t *testing.T) {
 func TestExecutorOpenWriteSessionComputesExpiryInsideRetryAttempt(t *testing.T) {
 	runner := newFakeRunner()
 	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1})
-	sessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, 22, "writer-1")
+	sessionKey, err := layout.EncodeSessionKey(testMountIdentity, 22, "writer-1")
 	require.NoError(t, err)
 	runner.mutateErrs = []error{
 		nokverrors.NewTxnKeyError(&kvrpcpb.KeyError{
@@ -334,11 +334,11 @@ func TestExecutorOpenWriteSessionReclaimsExpiredOwner(t *testing.T) {
 	runner := newFakeRunner()
 	seedInode(t, runner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, LinkCount: 1})
 	oldRecord := model.SessionRecord{Session: "writer-old", Inode: 22, ExpiresUnixNs: 50}
-	oldValue, err := fsmeta.EncodeSessionValue(oldRecord)
+	oldValue, err := layout.EncodeSessionValue(oldRecord)
 	require.NoError(t, err)
-	oldSessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, 22, "writer-old")
+	oldSessionKey, err := layout.EncodeSessionKey(testMountIdentity, 22, "writer-old")
 	require.NoError(t, err)
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, 22)
+	ownerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, 22)
 	require.NoError(t, err)
 	runner.data[string(oldSessionKey)] = oldValue
 	runner.data[string(ownerKey)] = oldValue
@@ -353,7 +353,7 @@ func TestExecutorOpenWriteSessionReclaimsExpiredOwner(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotContains(t, runner.data, string(oldSessionKey))
-	newSessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, 22, "writer-new")
+	newSessionKey, err := layout.EncodeSessionKey(testMountIdentity, 22, "writer-new")
 	require.NoError(t, err)
 	require.Contains(t, runner.data, string(newSessionKey))
 	require.Contains(t, runner.data, string(ownerKey))
@@ -366,14 +366,14 @@ func TestExecutorOpenWriteSessionDoesNotDeleteReusedLiveSession(t *testing.T) {
 	live := model.SessionRecord{Session: "writer-reused", Inode: 23, ExpiresUnixNs: 500}
 	seedSession(t, runner, "vol", live)
 	expired := model.SessionRecord{Session: "writer-reused", Inode: 22, ExpiresUnixNs: 50}
-	expiredValue, err := fsmeta.EncodeSessionValue(expired)
+	expiredValue, err := layout.EncodeSessionValue(expired)
 	require.NoError(t, err)
-	expiredOwnerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, expired.Inode)
+	expiredOwnerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, expired.Inode)
 	require.NoError(t, err)
 	runner.data[string(expiredOwnerKey)] = expiredValue
-	liveSessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, live.Inode, live.Session)
+	liveSessionKey, err := layout.EncodeSessionKey(testMountIdentity, live.Inode, live.Session)
 	require.NoError(t, err)
-	liveOwnerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, live.Inode)
+	liveOwnerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, live.Inode)
 	require.NoError(t, err)
 	executor, err := newTestExecutor(runner, WithClock(func() time.Time { return time.Unix(0, 100) }))
 	require.NoError(t, err)
@@ -423,13 +423,13 @@ func TestExecutorExpireWriteSessionsDeletesBothIndexes(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, model.ExpireWriteSessionsResult{Expired: 1}, result)
 
-	expiredSessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, expired.Inode, expired.Session)
+	expiredSessionKey, err := layout.EncodeSessionKey(testMountIdentity, expired.Inode, expired.Session)
 	require.NoError(t, err)
-	expiredOwnerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, expired.Inode)
+	expiredOwnerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, expired.Inode)
 	require.NoError(t, err)
-	liveSessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, live.Inode, live.Session)
+	liveSessionKey, err := layout.EncodeSessionKey(testMountIdentity, live.Inode, live.Session)
 	require.NoError(t, err)
-	liveOwnerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, live.Inode)
+	liveOwnerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, live.Inode)
 	require.NoError(t, err)
 	require.NotContains(t, runner.data, string(expiredSessionKey))
 	require.NotContains(t, runner.data, string(expiredOwnerKey))
@@ -455,15 +455,15 @@ func TestExecutorExpireWriteSessionsDoesNotDeleteReusedLiveSession(t *testing.T)
 	runner := newFakeRunner()
 	expired := model.SessionRecord{Session: "writer-reused", Inode: 22, ExpiresUnixNs: 50}
 	live := model.SessionRecord{Session: "writer-reused", Inode: 23, ExpiresUnixNs: 500}
-	expiredValue, err := fsmeta.EncodeSessionValue(expired)
+	expiredValue, err := layout.EncodeSessionValue(expired)
 	require.NoError(t, err)
-	liveValue, err := fsmeta.EncodeSessionValue(live)
+	liveValue, err := layout.EncodeSessionValue(live)
 	require.NoError(t, err)
-	sessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, live.Inode, live.Session)
+	sessionKey, err := layout.EncodeSessionKey(testMountIdentity, live.Inode, live.Session)
 	require.NoError(t, err)
-	expiredOwnerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, expired.Inode)
+	expiredOwnerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, expired.Inode)
 	require.NoError(t, err)
-	liveOwnerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, live.Inode)
+	liveOwnerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, live.Inode)
 	require.NoError(t, err)
 	runner.data[string(expiredOwnerKey)] = expiredValue
 	runner.data[string(sessionKey)] = liveValue
@@ -517,12 +517,12 @@ func TestExecutorExpireWriteSessionsUsesVisibleCommitDelete(t *testing.T) {
 	require.Equal(t, model.ExpireWriteSessionsResult{Expired: 1}, result)
 	require.Empty(t, runner.mutations)
 
-	sessionKey, err := fsmeta.EncodeSessionKey(testMountIdentity, expired.Inode, expired.Session)
+	sessionKey, err := layout.EncodeSessionKey(testMountIdentity, expired.Inode, expired.Session)
 	require.NoError(t, err)
 	_, deleted, ok := committer.GetVisibleOverlay(sessionKey)
 	require.True(t, ok)
 	require.True(t, deleted)
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentity, expired.Inode)
+	ownerKey, err := layout.EncodeInodeSessionKey(testMountIdentity, expired.Inode)
 	require.NoError(t, err)
 	_, deleted, ok = committer.GetVisibleOverlay(ownerKey)
 	require.True(t, ok)

@@ -8,15 +8,15 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 )
 
 // DirectoryWatchClient is the narrow client surface needed for directory
 // watch recovery. GRPCClient satisfies it.
 type DirectoryWatchClient interface {
 	ReadDirPlus(context.Context, model.ReadDirRequest) ([]model.DentryAttrPair, error)
-	WatchSubtree(context.Context, fsmeta.WatchRequest) (WatchSubscription, error)
+	WatchSubtree(context.Context, observe.WatchRequest) (WatchSubscription, error)
 }
 
 // WatchReconcileResult is returned by WatchDirectoryWithReconcile.
@@ -68,7 +68,7 @@ func ReadDirPlusAll(ctx context.Context, cli interface {
 // read. Events that race with the baseline can therefore be duplicated, but
 // they are not silently lost; callers should treat the returned Snapshot as
 // the new base state and apply subsequent events idempotently.
-func WatchDirectoryWithReconcile(ctx context.Context, cli DirectoryWatchClient, watchReq fsmeta.WatchRequest, readReq model.ReadDirRequest) (WatchReconcileResult, error) {
+func WatchDirectoryWithReconcile(ctx context.Context, cli DirectoryWatchClient, watchReq observe.WatchRequest, readReq model.ReadDirRequest) (WatchReconcileResult, error) {
 	if cli == nil {
 		return WatchReconcileResult{}, errWatchClientRequired
 	}
@@ -87,7 +87,7 @@ func WatchDirectoryWithReconcile(ctx context.Context, cli DirectoryWatchClient, 
 	}
 
 	freshReq := watchReq
-	freshReq.ResumeCursor = fsmeta.WatchCursor{}
+	freshReq.ResumeCursor = observe.WatchCursor{}
 	sub, err = cli.WatchSubtree(ctx, freshReq)
 	if err != nil {
 		return WatchReconcileResult{}, err

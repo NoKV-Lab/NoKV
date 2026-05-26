@@ -1,7 +1,7 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-package fsmeta
+package layout
 
 import nokverrors "github.com/feichai0017/NoKV/errors"
 

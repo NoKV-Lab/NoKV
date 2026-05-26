@@ -13,7 +13,7 @@ package compile
 import (
 	"slices"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -110,7 +110,7 @@ type WriteEffect struct {
 type AuthorityScope struct {
 	Mount           model.MountID
 	MountKeyID      model.MountKeyID
-	Buckets         []fsmeta.AffinityBucket
+	Buckets         []layout.AffinityBucket
 	Parents         []model.InodeID
 	Inodes          []model.InodeID
 	Broad           bool
@@ -124,7 +124,7 @@ type AuthorityScope struct {
 // admission.
 type SemanticDelta struct {
 	Kind              model.OperationKind
-	Plan              fsmeta.OperationPlan
+	Plan              layout.OperationPlan
 	Authority         AuthorityScope
 	ReadPredicates    []Predicate
 	WriteEffects      []WriteEffect
@@ -158,7 +158,7 @@ func WithQuotaMode(mode QuotaMode) Option {
 	return Option{quotaMode: mode, setQuotaMode: true}
 }
 
-func canonicalPlan(plan fsmeta.OperationPlan) fsmeta.OperationPlan {
+func canonicalPlan(plan layout.OperationPlan) layout.OperationPlan {
 	if plan.ReadKeys == nil {
 		plan.ReadKeys = emptyKeySet
 	}
@@ -199,12 +199,12 @@ func scopeFor(mount model.MountIdentity, parents, inodes []model.InodeID) Author
 		Parents:    uniqueInodes(parents),
 		Inodes:     uniqueInodes(inodes),
 	}
-	buckets := make([]fsmeta.AffinityBucket, 0, len(scope.Parents)+len(scope.Inodes))
+	buckets := make([]layout.AffinityBucket, 0, len(scope.Parents)+len(scope.Inodes))
 	for _, parent := range scope.Parents {
-		buckets = append(buckets, fsmeta.BucketForInodeID(parent))
+		buckets = append(buckets, layout.BucketForInodeID(parent))
 	}
 	for _, inode := range scope.Inodes {
-		buckets = append(buckets, fsmeta.BucketForInodeID(inode))
+		buckets = append(buckets, layout.BucketForInodeID(inode))
 	}
 	scope.Buckets = uniqueBuckets(buckets)
 	return scope
@@ -250,25 +250,25 @@ func uniqueInodes(in []model.InodeID) []model.InodeID {
 	return out
 }
 
-func uniqueBuckets(in []fsmeta.AffinityBucket) []fsmeta.AffinityBucket {
+func uniqueBuckets(in []layout.AffinityBucket) []layout.AffinityBucket {
 	switch len(in) {
 	case 0:
 		return nil
 	case 1:
-		return []fsmeta.AffinityBucket{in[0]}
+		return []layout.AffinityBucket{in[0]}
 	case 2:
 		left, right := in[0], in[1]
 		switch {
 		case left == right:
-			return []fsmeta.AffinityBucket{left}
+			return []layout.AffinityBucket{left}
 		case left < right:
-			return []fsmeta.AffinityBucket{left, right}
+			return []layout.AffinityBucket{left, right}
 		default:
-			return []fsmeta.AffinityBucket{right, left}
+			return []layout.AffinityBucket{right, left}
 		}
 	}
-	out := make([]fsmeta.AffinityBucket, 0, len(in))
-	seen := make(map[fsmeta.AffinityBucket]struct{}, len(in))
+	out := make([]layout.AffinityBucket, 0, len(in))
+	seen := make(map[layout.AffinityBucket]struct{}, len(in))
 	for _, bucket := range in {
 		if _, ok := seen[bucket]; ok {
 			continue
@@ -280,8 +280,8 @@ func uniqueBuckets(in []fsmeta.AffinityBucket) []fsmeta.AffinityBucket {
 	return out
 }
 
-func clonePlan(plan fsmeta.OperationPlan) fsmeta.OperationPlan {
-	return fsmeta.OperationPlan{
+func clonePlan(plan layout.OperationPlan) layout.OperationPlan {
+	return layout.OperationPlan{
 		Kind:         plan.Kind,
 		Mount:        plan.Mount,
 		PrimaryKey:   cloneBytes(plan.PrimaryKey),
@@ -297,7 +297,7 @@ func cloneScope(scope AuthorityScope) AuthorityScope {
 	return AuthorityScope{
 		Mount:           scope.Mount,
 		MountKeyID:      scope.MountKeyID,
-		Buckets:         append([]fsmeta.AffinityBucket(nil), scope.Buckets...),
+		Buckets:         append([]layout.AffinityBucket(nil), scope.Buckets...),
 		Parents:         append([]model.InodeID(nil), scope.Parents...),
 		Inodes:          append([]model.InodeID(nil), scope.Inodes...),
 		Broad:           scope.Broad,

@@ -6,7 +6,7 @@ package compile
 import (
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
@@ -24,33 +24,33 @@ func TestGeneratedReadProgramsCarryPointPlans(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ReadProgramGetAttr, attr.Kind)
 	require.Equal(t, model.OperationGetAttr, attr.Plan.Kind)
-	require.Equal(t, fsmeta.KeyKindInode, attr.Footprint.Reads[0].Kind)
+	require.Equal(t, layout.KeyKindInode, attr.Footprint.Reads[0].Kind)
 	require.Equal(t, []model.InodeID{44}, attr.Authority.Scope.Inodes)
 
 	session, err := CompileReadSessionProgram(testMount, 44, "writer-1")
 	require.NoError(t, err)
 	require.Equal(t, ReadProgramReadSession, session.Kind)
 	require.Equal(t, model.OperationReadSession, session.Plan.Kind)
-	require.Equal(t, fsmeta.KeyKindSession, session.Footprint.Reads[0].Kind)
+	require.Equal(t, layout.KeyKindSession, session.Footprint.Reads[0].Kind)
 	require.Equal(t, []model.InodeID{44}, session.Authority.Scope.Inodes)
 
 	owner, err := CompileReadSessionOwnerProgram(testMount, 44)
 	require.NoError(t, err)
 	require.Equal(t, ReadProgramReadSession, owner.Kind)
 	require.Equal(t, model.OperationReadSession, owner.Plan.Kind)
-	require.Equal(t, fsmeta.KeyKindSession, owner.Footprint.Reads[0].Kind)
+	require.Equal(t, layout.KeyKindSession, owner.Footprint.Reads[0].Kind)
 	require.Equal(t, []model.InodeID{44}, owner.Authority.Scope.Inodes)
 }
 
 func TestGeneratedReadSessionKeyProgramValidatesMountAndKeyShape(t *testing.T) {
-	key, err := fsmeta.EncodeSessionKey(testMount, 44, "writer-1")
+	key, err := layout.EncodeSessionKey(testMount, 44, "writer-1")
 	require.NoError(t, err)
 
 	program, err := CompileReadSessionKeyProgram(testMount, key)
 	require.NoError(t, err)
 	require.Equal(t, ReadProgramReadSession, program.Kind)
 	require.Equal(t, model.OperationReadSession, program.Plan.Kind)
-	require.Equal(t, fsmeta.KeyKindSession, program.Footprint.Reads[0].Kind)
+	require.Equal(t, layout.KeyKindSession, program.Footprint.Reads[0].Kind)
 	require.Equal(t, testMount.MountID, program.Authority.Scope.Mount)
 	require.Equal(t, testMount.MountID, program.Plan.Mount)
 	require.Equal(t, []model.InodeID{44}, program.Authority.Scope.Inodes)
@@ -60,7 +60,7 @@ func TestGeneratedReadSessionKeyProgramValidatesMountAndKeyShape(t *testing.T) {
 	_, err = CompileReadSessionKeyProgram(wrongMount, key)
 	require.ErrorIs(t, err, model.ErrInvalidRequest)
 
-	dentryKey, err := fsmeta.EncodeDentryKey(testMount, 7, "file")
+	dentryKey, err := layout.EncodeDentryKey(testMount, 7, "file")
 	require.NoError(t, err)
 	_, err = CompileReadSessionKeyProgram(testMount, dentryKey)
 	require.ErrorIs(t, err, model.ErrInvalidRequest)
@@ -76,9 +76,9 @@ func TestGeneratedReadDirPlusInodeKeysPreserveDentryOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, keys, len(dentries))
 
-	first, err := fsmeta.EncodeInodeKey(testMount, 44)
+	first, err := layout.EncodeInodeKey(testMount, 44)
 	require.NoError(t, err)
-	second, err := fsmeta.EncodeInodeKey(testMount, 42)
+	second, err := layout.EncodeInodeKey(testMount, 42)
 	require.NoError(t, err)
 	require.Equal(t, first, keys[0])
 	require.Equal(t, second, keys[1])

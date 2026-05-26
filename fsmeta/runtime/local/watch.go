@@ -8,10 +8,10 @@ import (
 	"maps"
 	"sync/atomic"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -35,8 +35,8 @@ func NewWatcher(mounts fsmetaexec.MountResolver) *Watcher {
 	}
 }
 
-// Subscribe implements fsmeta.Watcher with local mount admission.
-func (w *Watcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmeta.WatchSubscription, error) {
+// Subscribe implements observe.Watcher with local mount admission.
+func (w *Watcher) Subscribe(ctx context.Context, req observe.WatchRequest) (observe.WatchSubscription, error) {
 	if w == nil || w.Router == nil {
 		return nil, model.ErrInvalidRequest
 	}
@@ -51,7 +51,7 @@ func (w *Watcher) Subscribe(ctx context.Context, req fsmeta.WatchRequest) (fsmet
 		if record.Retired {
 			return nil, model.ErrMountRetired
 		}
-		prefix, err := fsmeta.WatchPrefixForMount(req, record.Identity())
+		prefix, err := observe.WatchPrefixForMount(req, record.Identity())
 		if err != nil {
 			return nil, err
 		}
@@ -70,16 +70,16 @@ func (w *Watcher) ObserveMutation(commitVersion uint64, mutations []*kvrpcpb.Mut
 	if len(keys) == 0 {
 		return
 	}
-	cursor := fsmeta.WatchCursor{
+	cursor := observe.WatchCursor{
 		RegionID: localWatchRegionID,
 		Term:     localWatchTerm,
 		Index:    w.next.Add(1),
 	}
 	for _, key := range keys {
-		w.Publish(fsmeta.WatchEvent{
+		w.Publish(observe.WatchEvent{
 			Cursor:        cursor,
 			CommitVersion: commitVersion,
-			Source:        fsmeta.WatchEventSourceCommit,
+			Source:        observe.WatchEventSourceCommit,
 			Key:           key,
 		})
 	}

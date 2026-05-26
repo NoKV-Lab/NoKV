@@ -21,7 +21,7 @@ import (
 	"github.com/feichai0017/NoKV/coordinator/storecontrol"
 	"github.com/feichai0017/NoKV/engine/wal"
 	perasraftstore "github.com/feichai0017/NoKV/experimental/peras/adapters/raftstore"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	local "github.com/feichai0017/NoKV/local"
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
 	rootstate "github.com/feichai0017/NoKV/meta/root/state"
@@ -40,6 +40,16 @@ import (
 )
 
 var notifyContext = signal.NotifyContext
+
+func fsmetaLocalUserKeyShape(key []byte) local.UserKeyShape {
+	shape := layout.UserKeyShape(key)
+	return local.UserKeyShape{
+		LocalityPrefix: shape.LocalityPrefix,
+		BloomPrefix:    shape.BloomPrefix,
+		ShardKey:       shape.ShardKey,
+		Family:         shape.Family,
+	}
+}
 
 func runServeCmd(w io.Writer, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -227,7 +237,7 @@ func runServeCmd(w io.Writer, args []string) error {
 		opt.MaxBatchSize = *storageMaxBatchSize
 	}
 	opt.ControlLogPointerSnapshot = raftstorestats.ControlLogPointers(localMeta.DurableRaftPointerSnapshot)
-	opt.UserKeyShapeExtractor = fsmeta.UserKeyShape
+	opt.UserKeyShapeExtractor = fsmetaLocalUserKeyShape
 	opt.AllowedModes = []workdirmode.Mode{
 		workdirmode.ModeStandalone,
 		workdirmode.ModeSeeded,
@@ -308,7 +318,7 @@ func runServeCmd(w io.Writer, args []string) error {
 				}
 				return retentionSource.Retention()
 			},
-			Mount: fsmeta.MountKeyResolver,
+			Mount: layout.MountKeyResolver,
 			Apply: storemvcc.ApplyOptions{
 				BatchEntries: *mvccGCBatchEntries,
 				MaxKeys:      *mvccGCMaxKeys,
@@ -337,7 +347,7 @@ func runServeCmd(w io.Writer, args []string) error {
 				}
 				return retentionSource.Retention()
 			},
-			Mount: fsmeta.MountKeyResolver,
+			Mount: layout.MountKeyResolver,
 		},
 		TransportAddr: *listenAddr,
 		WriteFence:    writeFence,

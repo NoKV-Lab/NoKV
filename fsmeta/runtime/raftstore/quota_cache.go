@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
@@ -156,7 +156,7 @@ func (c *quotaCache) reserveSubject(ctx context.Context, runner fsmetaexec.TxnRu
 	if !ok {
 		return nil, nil
 	}
-	key, err := fsmeta.EncodeUsageKey(model.MountIdentity{MountID: subject.mount, MountKeyID: subject.mountKeyID}, subject.scope)
+	key, err := layout.EncodeUsageKey(model.MountIdentity{MountID: subject.mount, MountKeyID: subject.mountKeyID}, subject.scope)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +179,7 @@ func (c *quotaCache) reserveSubject(ctx context.Context, runner fsmetaexec.TxnRu
 	if next.Bytes == 0 && next.Inodes == 0 {
 		return &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Delete, Key: key}, nil
 	}
-	value, err := fsmeta.EncodeUsageValue(next)
+	value, err := layout.EncodeUsageValue(next)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +194,7 @@ func readUsage(ctx context.Context, runner fsmetaexec.TxnRunner, key []byte, ver
 	if !ok {
 		return model.UsageRecord{}, nil
 	}
-	return fsmeta.DecodeUsageValue(value)
+	return layout.DecodeUsageValue(value)
 }
 
 func applyUsageDelta(current model.UsageRecord, delta quotaDelta) model.UsageRecord {

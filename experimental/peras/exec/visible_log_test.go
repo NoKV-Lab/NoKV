@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
@@ -78,13 +78,13 @@ func TestVisibleOperationRecordAcceptsOpenSessionReplay(t *testing.T) {
 	}
 	program, err := compile.CompileOpenWriteSessionProgram(req, mount)
 	require.NoError(t, err)
-	sessionValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{
+	sessionValue, err := layout.EncodeSessionValue(model.SessionRecord{
 		Session:       req.Session,
 		Inode:         req.Inode,
 		ExpiresUnixNs: time.Unix(0, 0).Add(req.TTL).UnixNano(),
 	})
 	require.NoError(t, err)
-	inodeValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+	inodeValue, err := layout.EncodeInodeValue(model.InodeRecord{
 		Inode:     req.Inode,
 		Type:      model.InodeTypeFile,
 		LinkCount: 1,
@@ -132,9 +132,9 @@ func TestVisibleOperationRecordAcceptsHeartbeatAndCloseSessionReplay(t *testing.
 		Inode:         44,
 		ExpiresUnixNs: time.Now().Add(time.Second).UnixNano(),
 	}
-	oldValue, err := fsmeta.EncodeSessionValue(session)
+	oldValue, err := layout.EncodeSessionValue(session)
 	require.NoError(t, err)
-	newValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{
+	newValue, err := layout.EncodeSessionValue(model.SessionRecord{
 		Session:       session.Session,
 		Inode:         session.Inode,
 		ExpiresUnixNs: time.Now().Add(2 * time.Second).UnixNano(),
@@ -242,7 +242,7 @@ func testVisibleAuthorityScope() compile.AuthorityScope {
 	return compile.AuthorityScope{
 		Mount:      "m",
 		MountKeyID: 1,
-		Buckets:    []fsmeta.AffinityBucket{},
+		Buckets:    []layout.AffinityBucket{},
 		Parents:    []model.InodeID{2},
 		Inodes:     []model.InodeID{},
 	}

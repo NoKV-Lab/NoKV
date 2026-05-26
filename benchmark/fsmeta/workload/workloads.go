@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 )
 
 type fileRef struct {
@@ -353,7 +353,7 @@ func RunAICheckpointAgent(ctx context.Context, cli MetadataClient, cfg AICheckpo
 		checkpointParents[workspace] = parent
 	}
 
-	stream, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
+	stream, err := cli.WatchSubtree(ctx, observe.WatchRequest{
 		Mount:              cfg.Mount,
 		RootInode:          publishedRoot,
 		BackPressureWindow: cfg.WatchWindow,

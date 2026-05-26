@@ -11,8 +11,8 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
@@ -253,7 +253,7 @@ func (e *Executor) visiblePredicateIndex() VisiblePredicateIndex {
 	return index
 }
 
-func (e *Executor) rememberVisibleCreate(mount model.MountIdentity, plan fsmeta.OperationPlan, inode model.InodeRecord) {
+func (e *Executor) rememberVisibleCreate(mount model.MountIdentity, plan layout.OperationPlan, inode model.InodeRecord) {
 	index := e.visiblePredicateIndex()
 	if index == nil {
 		return
@@ -268,7 +268,7 @@ func (e *Executor) rememberVisibleCreate(mount model.MountIdentity, plan fsmeta.
 		index.RememberEmptyDirectory(mount, inode.Inode)
 		return
 	}
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(mount, inode.Inode)
+	ownerKey, err := layout.EncodeInodeSessionKey(mount, inode.Inode)
 	if err == nil {
 		index.RememberKey(ownerKey, false)
 	}
@@ -319,17 +319,17 @@ func (e *Executor) visibleNotExistsKnown(scope compile.AuthorityScope, key []byt
 	if known {
 		return !present
 	}
-	parts, ok := fsmeta.InspectKey(key)
+	parts, ok := layout.InspectKey(key)
 	if !ok || parts.MountKeyID != scope.MountKeyID {
 		return false
 	}
-	if parts.Kind == fsmeta.KeyKindSession {
+	if parts.Kind == layout.KeyKindSession {
 		return index.SessionNamespaceEmpty(model.MountIdentity{
 			MountID:    scope.Mount,
 			MountKeyID: scope.MountKeyID,
 		}, parts.Inode)
 	}
-	if parts.Kind != fsmeta.KeyKindDentry {
+	if parts.Kind != layout.KeyKindDentry {
 		return false
 	}
 	return index.DirectoryEmpty(model.MountIdentity{

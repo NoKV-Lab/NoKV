@@ -6,8 +6,8 @@ package exec
 import (
 	"context"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -60,7 +60,7 @@ func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.
 	if !quotaOK {
 		return model.RemoveResult{}, false, nil
 	}
-	inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
+	inodeKey, err := layout.EncodeInodeKey(mount, inode.Inode)
 	if err != nil {
 		return model.RemoveResult{}, false, err
 	}
@@ -74,13 +74,13 @@ func (e *Executor) tryVisibleRemoveDentry(ctx context.Context, compiled compile.
 		effects = append(effects, visibleDeleteEffect(inodeKey))
 	} else {
 		inode.LinkCount--
-		inodeValue, err := fsmeta.EncodeInodeValue(inode)
+		inodeValue, err := layout.EncodeInodeValue(inode)
 		if err != nil {
 			return model.RemoveResult{}, false, err
 		}
 		effects = append(effects, visiblePutEffect(inodeKey, inodeValue))
 	}
-	parentValue, err := fsmeta.EncodeInodeValue(parent)
+	parentValue, err := layout.EncodeInodeValue(parent)
 	if err != nil {
 		return model.RemoveResult{}, false, err
 	}
@@ -116,7 +116,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 		if err != nil {
 			return err
 		}
-		dentryValue, err := fsmeta.EncodeDentryValue(record)
+		dentryValue, err := layout.EncodeDentryValue(record)
 		if err != nil {
 			return err
 		}
@@ -134,7 +134,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 		if err != nil {
 			return err
 		}
-		parentValue, err := fsmeta.EncodeInodeValue(nextParent)
+		parentValue, err := layout.EncodeInodeValue(nextParent)
 		if err != nil {
 			return err
 		}
@@ -143,14 +143,14 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 			return err
 		} else if ok {
 			attemptResult.OldInode = inode
-			inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
+			inodeKey, err := layout.EncodeInodeKey(mount, inode.Inode)
 			if err != nil {
 				return err
 			}
 			if inode.Type == model.InodeTypeDirectory {
 				return model.ErrInvalidRequest
 			}
-			oldInodeValue, err := fsmeta.EncodeInodeValue(inode)
+			oldInodeValue, err := layout.EncodeInodeValue(inode)
 			if err != nil {
 				return err
 			}
@@ -160,7 +160,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 				mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Delete, Key: inodeKey})
 			} else {
 				inode.LinkCount--
-				inodeValue, err := fsmeta.EncodeInodeValue(inode)
+				inodeValue, err := layout.EncodeInodeValue(inode)
 				if err != nil {
 					return err
 				}
@@ -245,7 +245,7 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req model.RemoveDirector
 		if err != nil {
 			return err
 		}
-		parentValue, err := fsmeta.EncodeInodeValue(nextParent)
+		parentValue, err := layout.EncodeInodeValue(nextParent)
 		if err != nil {
 			return err
 		}
@@ -256,7 +256,7 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req model.RemoveDirector
 		if record.Type != model.InodeTypeDirectory {
 			return model.ErrInvalidRequest
 		}
-		dentryValue, err := fsmeta.EncodeDentryValue(record)
+		dentryValue, err := layout.EncodeDentryValue(record)
 		if err != nil {
 			return err
 		}
@@ -280,11 +280,11 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req model.RemoveDirector
 		if err != nil {
 			return err
 		}
-		inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
+		inodeKey, err := layout.EncodeInodeKey(mount, inode.Inode)
 		if err != nil {
 			return err
 		}
-		inodeValue, err := fsmeta.EncodeInodeValue(inode)
+		inodeValue, err := layout.EncodeInodeValue(inode)
 		if err != nil {
 			return err
 		}
@@ -356,11 +356,11 @@ func (e *Executor) tryVisibleRemoveDirectory(ctx context.Context, compiled compi
 	if !quotaOK {
 		return false, nil
 	}
-	parentValue, err := fsmeta.EncodeInodeValue(parent)
+	parentValue, err := layout.EncodeInodeValue(parent)
 	if err != nil {
 		return false, err
 	}
-	inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
+	inodeKey, err := layout.EncodeInodeKey(mount, inode.Inode)
 	if err != nil {
 		return false, err
 	}

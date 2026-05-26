@@ -9,8 +9,8 @@ import (
 	"io"
 	"slices"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
@@ -919,20 +919,20 @@ func compareSegmentKV(left, right SegmentKV) int {
 }
 
 func classifySegmentKey(key []byte) SegmentRecordClass {
-	kind, err := fsmeta.KeyKindOf(key)
+	kind, err := layout.KeyKindOf(key)
 	if err != nil {
 		return SegmentRecordOther
 	}
 	switch kind {
-	case fsmeta.KeyKindDentry:
+	case layout.KeyKindDentry:
 		return SegmentRecordDentry
-	case fsmeta.KeyKindInode:
+	case layout.KeyKindInode:
 		return SegmentRecordInode
-	case fsmeta.KeyKindChunk:
+	case layout.KeyKindChunk:
 		return SegmentRecordChunk
-	case fsmeta.KeyKindSession:
+	case layout.KeyKindSession:
 		return SegmentRecordSession
-	case fsmeta.KeyKindUsage:
+	case layout.KeyKindUsage:
 		return SegmentRecordUsage
 	default:
 		return SegmentRecordOther

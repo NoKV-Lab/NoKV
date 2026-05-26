@@ -19,9 +19,9 @@ import (
 
 	"github.com/feichai0017/NoKV/benchmark/fsmeta/workload"
 	coordclient "github.com/feichai0017/NoKV/coordinator/client"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
@@ -177,7 +177,7 @@ func waitForFSMetaMount(t *testing.T, ctx context.Context, cli workload.Metadata
 	deadline := time.Now().Add(*fsmetaMountWait)
 	var lastErr error
 	for {
-		stream, err := cli.WatchSubtree(ctx, fsmeta.WatchRequest{
+		stream, err := cli.WatchSubtree(ctx, observe.WatchRequest{
 			Mount:     model.MountID(*fsmetaMount),
 			RootInode: model.RootInode,
 		})

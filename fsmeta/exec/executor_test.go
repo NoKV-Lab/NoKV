@@ -17,8 +17,8 @@ import (
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
@@ -166,7 +166,7 @@ func requireVisibleCommitStatBool(t *testing.T, stats map[string]any, key string
 }
 
 func txnLockedError(mount model.MountID, parent model.InodeID, name string) error {
-	key, err := fsmeta.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
+	key, err := layout.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
 	if err != nil {
 		panic(err)
 	}
@@ -274,7 +274,7 @@ type fakeInodeAllocator struct {
 
 func testInodeForParentBucket(t *testing.T, parent model.InodeID, exclude ...model.InodeID) model.InodeID {
 	t.Helper()
-	target := fsmeta.BucketForInodeID(parent)
+	target := layout.BucketForInodeID(parent)
 	excluded := make(map[model.InodeID]struct{}, len(exclude))
 	for _, id := range exclude {
 		excluded[id] = struct{}{}
@@ -283,7 +283,7 @@ func testInodeForParentBucket(t *testing.T, parent model.InodeID, exclude ...mod
 		if _, ok := excluded[id]; ok {
 			continue
 		}
-		if fsmeta.BucketForInodeID(id) == target {
+		if layout.BucketForInodeID(id) == target {
 			return id
 		}
 	}
@@ -293,7 +293,7 @@ func testInodeForParentBucket(t *testing.T, parent model.InodeID, exclude ...mod
 
 func testInodeForDifferentBucket(t *testing.T, parent model.InodeID, exclude ...model.InodeID) model.InodeID {
 	t.Helper()
-	target := fsmeta.BucketForInodeID(parent)
+	target := layout.BucketForInodeID(parent)
 	excluded := make(map[model.InodeID]struct{}, len(exclude))
 	for _, id := range exclude {
 		excluded[id] = struct{}{}
@@ -302,7 +302,7 @@ func testInodeForDifferentBucket(t *testing.T, parent model.InodeID, exclude ...
 		if _, ok := excluded[id]; ok {
 			continue
 		}
-		if fsmeta.BucketForInodeID(id) != target {
+		if layout.BucketForInodeID(id) != target {
 			return id
 		}
 	}
@@ -400,7 +400,7 @@ func (a *fakeVisibleAdmitter) AcquireVisibleAuthority(_ context.Context, scope c
 	a.scopes = append(a.scopes, compile.AuthorityScope{
 		Mount:      scope.Mount,
 		MountKeyID: scope.MountKeyID,
-		Buckets:    append([]fsmeta.AffinityBucket(nil), scope.Buckets...),
+		Buckets:    append([]layout.AffinityBucket(nil), scope.Buckets...),
 		Parents:    append([]model.InodeID(nil), scope.Parents...),
 		Inodes:     append([]model.InodeID(nil), scope.Inodes...),
 	})
@@ -608,7 +608,7 @@ func (f *fakeVisibleAuthorityFlusher) FlushAuthority(_ context.Context, scope co
 	f.flushScopes = append(f.flushScopes, compile.AuthorityScope{
 		Mount:      scope.Mount,
 		MountKeyID: scope.MountKeyID,
-		Buckets:    append([]fsmeta.AffinityBucket(nil), scope.Buckets...),
+		Buckets:    append([]layout.AffinityBucket(nil), scope.Buckets...),
 		Parents:    append([]model.InodeID(nil), scope.Parents...),
 		Inodes:     append([]model.InodeID(nil), scope.Inodes...),
 	})
@@ -626,7 +626,7 @@ func (f *fakeVisibleSnapshotCapturer) CaptureVisibleSnapshot(_ context.Context, 
 
 func cloneTestAuthorityScope(scope compile.AuthorityScope) compile.AuthorityScope {
 	out := scope
-	out.Buckets = append([]fsmeta.AffinityBucket(nil), scope.Buckets...)
+	out.Buckets = append([]layout.AffinityBucket(nil), scope.Buckets...)
 	out.Parents = append([]model.InodeID(nil), scope.Parents...)
 	out.Inodes = append([]model.InodeID(nil), scope.Inodes...)
 	return out
@@ -679,7 +679,7 @@ func overlayMapForTest(rows ...VisibleOverlayKV) map[string]VisibleOverlayKV {
 
 func dentryValueForTest(t *testing.T, parent model.InodeID, name string, inode model.InodeID, typ model.InodeType) []byte {
 	t.Helper()
-	value, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+	value, err := layout.EncodeDentryValue(model.DentryRecord{
 		Parent: parent,
 		Name:   name,
 		Inode:  inode,
@@ -691,21 +691,21 @@ func dentryValueForTest(t *testing.T, parent model.InodeID, name string, inode m
 
 func inodeValueForTest(t *testing.T, record model.InodeRecord) []byte {
 	t.Helper()
-	value, err := fsmeta.EncodeInodeValue(record)
+	value, err := layout.EncodeInodeValue(record)
 	require.NoError(t, err)
 	return value
 }
 
 func dentryKeyForTest(t *testing.T, mount model.MountID, parent model.InodeID, name string) []byte {
 	t.Helper()
-	key, err := fsmeta.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
+	key, err := layout.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
 	require.NoError(t, err)
 	return key
 }
 
 func inodeKeyForTest(t *testing.T, mount model.MountID, inode model.InodeID) []byte {
 	t.Helper()
-	key, err := fsmeta.EncodeInodeKey(testMountIdentityFor(mount), inode)
+	key, err := layout.EncodeInodeKey(testMountIdentityFor(mount), inode)
 	require.NoError(t, err)
 	return key
 }
@@ -1036,12 +1036,12 @@ func seedDentry(t *testing.T, runner *fakeRunner, mount model.MountID, parent mo
 
 func seedDentryType(t *testing.T, runner *fakeRunner, mount model.MountID, parent model.InodeID, name string, inode model.InodeID, typ model.InodeType) {
 	t.Helper()
-	key, err := fsmeta.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
+	key, err := layout.EncodeDentryKey(testMountIdentityFor(mount), parent, name)
 	require.NoError(t, err)
 	if _, exists := runner.data[string(key)]; !exists {
 		incrementSeedParentChildCount(t, runner, mount, parent)
 	}
-	value, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+	value, err := layout.EncodeDentryValue(model.DentryRecord{
 		Parent: parent,
 		Name:   name,
 		Inode:  inode,
@@ -1067,11 +1067,11 @@ func seedDirectory(t *testing.T, runner *fakeRunner, mount model.MountID, inode 
 }
 
 func seedInodeValue(runner *fakeRunner, mount model.MountID, record model.InodeRecord) {
-	key, err := fsmeta.EncodeInodeKey(testMountIdentityFor(mount), record.Inode)
+	key, err := layout.EncodeInodeKey(testMountIdentityFor(mount), record.Inode)
 	if err != nil {
 		panic(err)
 	}
-	value, err := fsmeta.EncodeInodeValue(record)
+	value, err := layout.EncodeInodeValue(record)
 	if err != nil {
 		panic(err)
 	}
@@ -1080,7 +1080,7 @@ func seedInodeValue(runner *fakeRunner, mount model.MountID, record model.InodeR
 
 func incrementSeedParentChildCount(t *testing.T, runner *fakeRunner, mount model.MountID, parent model.InodeID) {
 	t.Helper()
-	key, err := fsmeta.EncodeInodeKey(testMountIdentityFor(mount), parent)
+	key, err := layout.EncodeInodeKey(testMountIdentityFor(mount), parent)
 	require.NoError(t, err)
 	record := model.InodeRecord{
 		Inode:     parent,
@@ -1089,12 +1089,12 @@ func incrementSeedParentChildCount(t *testing.T, runner *fakeRunner, mount model
 		LinkCount: 1,
 	}
 	if value, ok := runner.data[string(key)]; ok {
-		record, err = fsmeta.DecodeInodeValue(value)
+		record, err = layout.DecodeInodeValue(value)
 		require.NoError(t, err)
 		require.Equal(t, model.InodeTypeDirectory, record.Type)
 	}
 	record.ChildCount++
-	value, err := fsmeta.EncodeInodeValue(record)
+	value, err := layout.EncodeInodeValue(record)
 	require.NoError(t, err)
 	runner.data[string(key)] = value
 }
@@ -1118,9 +1118,9 @@ func findDifferentRenameAffinity(t *testing.T, baseFrom, baseTo model.InodeID) (
 
 func renameAffinity(t *testing.T, from, to model.InodeID) string {
 	t.Helper()
-	source, err := fsmeta.EncodeDentryKey(testMountIdentity, from, "old")
+	source, err := layout.EncodeDentryKey(testMountIdentity, from, "old")
 	require.NoError(t, err)
-	destination, err := fsmeta.EncodeDentryKey(testMountIdentity, to, "new")
+	destination, err := layout.EncodeDentryKey(testMountIdentity, to, "new")
 	require.NoError(t, err)
 	return atomicOnePhaseAffinity(source, []*kvrpcpb.Mutation{
 		{Op: kvrpcpb.Mutation_Delete, Key: source},
@@ -1130,11 +1130,11 @@ func renameAffinity(t *testing.T, from, to model.InodeID) string {
 
 func seedSession(t *testing.T, runner *fakeRunner, mount model.MountID, record model.SessionRecord) {
 	t.Helper()
-	value, err := fsmeta.EncodeSessionValue(record)
+	value, err := layout.EncodeSessionValue(record)
 	require.NoError(t, err)
-	sessionKey, err := fsmeta.EncodeSessionKey(testMountIdentityFor(mount), record.Inode, record.Session)
+	sessionKey, err := layout.EncodeSessionKey(testMountIdentityFor(mount), record.Inode, record.Session)
 	require.NoError(t, err)
-	ownerKey, err := fsmeta.EncodeInodeSessionKey(testMountIdentityFor(mount), record.Inode)
+	ownerKey, err := layout.EncodeInodeSessionKey(testMountIdentityFor(mount), record.Inode)
 	require.NoError(t, err)
 	runner.data[string(sessionKey)] = value
 	runner.data[string(ownerKey)] = value
@@ -1343,11 +1343,11 @@ func benchmarkExecutorUnlink(b *testing.B, runner *fakeRunner, executor *Executo
 func benchmarkSeedDentry(b *testing.B, runner *fakeRunner, parent model.InodeID, name string, inode model.InodeID) {
 	b.Helper()
 	benchmarkIncrementSeedParentChildCount(b, runner, parent)
-	key, err := fsmeta.EncodeDentryKey(testMountIdentity, parent, name)
+	key, err := layout.EncodeDentryKey(testMountIdentity, parent, name)
 	if err != nil {
 		b.Fatal(err)
 	}
-	value, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+	value, err := layout.EncodeDentryValue(model.DentryRecord{
 		Parent: parent,
 		Name:   name,
 		Inode:  inode,
@@ -1371,7 +1371,7 @@ func benchmarkSeedDirectory(b *testing.B, runner *fakeRunner, inode model.InodeI
 
 func benchmarkIncrementSeedParentChildCount(b *testing.B, runner *fakeRunner, parent model.InodeID) {
 	b.Helper()
-	key, err := fsmeta.EncodeInodeKey(testMountIdentity, parent)
+	key, err := layout.EncodeInodeKey(testMountIdentity, parent)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1382,7 +1382,7 @@ func benchmarkIncrementSeedParentChildCount(b *testing.B, runner *fakeRunner, pa
 		LinkCount: 1,
 	}
 	if value, ok := runner.data[string(key)]; ok {
-		record, err = fsmeta.DecodeInodeValue(value)
+		record, err = layout.DecodeInodeValue(value)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1391,7 +1391,7 @@ func benchmarkIncrementSeedParentChildCount(b *testing.B, runner *fakeRunner, pa
 		}
 	}
 	record.ChildCount++
-	value, err := fsmeta.EncodeInodeValue(record)
+	value, err := layout.EncodeInodeValue(record)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1405,11 +1405,11 @@ func benchmarkSeedInode(b *testing.B, runner *fakeRunner, inode model.InodeID) {
 
 func benchmarkSeedInodeRecord(b *testing.B, runner *fakeRunner, record model.InodeRecord) {
 	b.Helper()
-	key, err := fsmeta.EncodeInodeKey(testMountIdentity, record.Inode)
+	key, err := layout.EncodeInodeKey(testMountIdentity, record.Inode)
 	if err != nil {
 		b.Fatal(err)
 	}
-	value, err := fsmeta.EncodeInodeValue(record)
+	value, err := layout.EncodeInodeValue(record)
 	if err != nil {
 		b.Fatal(err)
 	}

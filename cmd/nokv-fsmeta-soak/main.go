@@ -12,10 +12,11 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
 	fsmetacontract "github.com/feichai0017/NoKV/fsmeta/contract"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 )
 
 const minSoakRoundBudget = 15 * time.Second
@@ -266,7 +267,7 @@ func runSnapshotProbe(ctx context.Context, cli *fsmetaclient.GRPCClient, mount m
 func runWatchProbe(ctx context.Context, cli *fsmetaclient.GRPCClient, mount model.MountID, seed int64) error {
 	watchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	stream, err := cli.WatchSubtree(watchCtx, fsmeta.WatchRequest{
+	stream, err := cli.WatchSubtree(watchCtx, observe.WatchRequest{
 		Mount:              mount,
 		RootInode:          model.RootInode,
 		BackPressureWindow: 8,
@@ -295,7 +296,7 @@ func runWatchProbe(ctx context.Context, cli *fsmetaclient.GRPCClient, mount mode
 		if err != nil {
 			return err
 		}
-		if got, ok := fsmeta.DentryNameOfKey(evt.Key); !ok || got != name {
+		if got, ok := layout.DentryNameOfKey(evt.Key); !ok || got != name {
 			_ = stream.Ack(evt.Cursor)
 			continue
 		}

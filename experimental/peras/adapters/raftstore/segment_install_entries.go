@@ -8,7 +8,7 @@ import (
 
 	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
@@ -116,7 +116,7 @@ func buildMVCCSegmentCatalogInstallEntriesWithVerifiedPayloadForObjectKey(segmen
 	if err != nil {
 		return nil, err
 	}
-	canonicalObjectKey, err := fsmeta.EncodeSegmentObjectKey(canonicalBucket.mount, canonicalBucket.bucket, segment.Root)
+	canonicalObjectKey, err := layout.EncodeSegmentObjectKey(canonicalBucket.mount, canonicalBucket.bucket, segment.Root)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +124,7 @@ func buildMVCCSegmentCatalogInstallEntriesWithVerifiedPayloadForObjectKey(segmen
 	if err != nil {
 		return nil, err
 	}
-	indexKey, err := fsmeta.EncodeSegmentCatalogIndexKey(routeBucket.mount, routeBucket.bucket, segment.Root)
+	indexKey, err := layout.EncodeSegmentCatalogIndexKey(routeBucket.mount, routeBucket.bucket, segment.Root)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +173,7 @@ func buildMVCCSegmentCatalogIndexInstallEntries(root, digest [32]byte, epochID, 
 	if err != nil {
 		return nil, err
 	}
-	indexKey, err := fsmeta.EncodeSegmentCatalogIndexKey(route.mount, route.bucket, root)
+	indexKey, err := layout.EncodeSegmentCatalogIndexKey(route.mount, route.bucket, root)
 	if err != nil {
 		return nil, err
 	}
@@ -229,12 +229,12 @@ func dedupeInternalEntries(entries []*entrykv.Entry) []*entrykv.Entry {
 
 type perasSegmentCatalogBucket struct {
 	mount  model.MountKeyID
-	bucket fsmeta.AffinityBucket
+	bucket layout.AffinityBucket
 }
 
 func inspectPerasSegmentObjectKey(root [32]byte, key []byte) (perasSegmentCatalogBucket, error) {
-	parts, ok := fsmeta.InspectKey(key)
-	if !ok || parts.Kind != fsmeta.KeyKindSegment || parts.SegmentRecord != fsmeta.SegmentRecordObject || parts.SegmentRoot != root {
+	parts, ok := layout.InspectKey(key)
+	if !ok || parts.Kind != layout.KeyKindSegment || parts.SegmentRecord != layout.SegmentRecordObject || parts.SegmentRoot != root {
 		return perasSegmentCatalogBucket{}, fsperas.ErrInvalidPerasSegment
 	}
 	return perasSegmentCatalogBucket{mount: parts.MountKeyID, bucket: parts.Bucket}, nil
@@ -248,7 +248,7 @@ func perasSegmentObjectBuckets(segment fsperas.PerasSegment, objectKey []byte) (
 	var canonical perasSegmentCatalogBucket
 	seenRoute := false
 	err = segment.ForEachEntry(func(entry fsperas.SegmentKV) error {
-		entryParts, ok := fsmeta.InspectKey(entry.Key)
+		entryParts, ok := layout.InspectKey(entry.Key)
 		if !ok {
 			return fsperas.ErrInvalidPerasSegment
 		}

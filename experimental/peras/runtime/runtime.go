@@ -13,8 +13,8 @@ import (
 	"time"
 
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	"github.com/feichai0017/NoKV/utils"
@@ -133,7 +133,7 @@ type Runtime struct {
 	closed     atomic.Bool
 	closer     *utils.Closer
 	flushTask  *utils.PeriodicTask
-	watchQueue *utils.MPSCQueue[fsmeta.WatchEvent]
+	watchQueue *utils.MPSCQueue[observe.WatchEvent]
 	installQ   *perasInstallLane
 	sealQ      *visibleSealLane
 
@@ -402,7 +402,7 @@ func NewRuntime(cfg Config) (*Runtime, error) {
 		return nil, err
 	}
 	if c.watch != nil {
-		c.watchQueue = utils.NewMPSCQueue[fsmeta.WatchEvent](defaultPerasVisibleWatchQueue)
+		c.watchQueue = utils.NewMPSCQueue[observe.WatchEvent](defaultPerasVisibleWatchQueue)
 		c.closer.Add(1)
 		go c.visibleWatchLoop()
 	}

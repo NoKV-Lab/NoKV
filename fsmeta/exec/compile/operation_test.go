@@ -7,7 +7,7 @@ import (
 	"crypto/sha256"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
@@ -213,13 +213,13 @@ func testMaterializedCloseWriteSession(t *testing.T, session model.SessionID, in
 	}
 	program, err := CompileCloseWriteSessionProgram(req, testMount)
 	require.NoError(t, err)
-	sessionValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{
+	sessionValue, err := layout.EncodeSessionValue(model.SessionRecord{
 		Session:       session,
 		Inode:         inode,
 		ExpiresUnixNs: 100,
 	})
 	require.NoError(t, err)
-	ownerValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{
+	ownerValue, err := layout.EncodeSessionValue(model.SessionRecord{
 		Session:       session,
 		Inode:         inode,
 		ExpiresUnixNs: 100,

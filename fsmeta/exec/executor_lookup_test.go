@@ -13,7 +13,7 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	"github.com/feichai0017/NoKV/engine/slab/negativecache"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
@@ -791,7 +791,7 @@ func TestExecutorReadDirRefillsOverlayTombstonesBeforeBaseRows(t *testing.T) {
 }
 
 func TestExecutorReadDirOverlayOnlyRefillsOverlayAfterTombstone(t *testing.T) {
-	prefix, err := fsmeta.EncodeDentryPrefix(testMountIdentityFor("vol"), 7)
+	prefix, err := layout.EncodeDentryPrefix(testMountIdentityFor("vol"), 7)
 	require.NoError(t, err)
 	committer := scanOverlayCommitter{
 		rows: []VisibleOverlayKV{
@@ -812,9 +812,9 @@ func TestExecutorReadDirOverlayOnlyRefillsOverlayAfterTombstone(t *testing.T) {
 	kvs, rows, _ := executor.mergeVisibleDirectoryOverlayScan(nil, prefix, prefix, 2)
 	require.Equal(t, uint32(4), rows)
 	require.Len(t, kvs, 2)
-	first, err := fsmeta.DecodeDentryValue(kvs[0].Value)
+	first, err := layout.DecodeDentryValue(kvs[0].Value)
 	require.NoError(t, err)
-	second, err := fsmeta.DecodeDentryValue(kvs[1].Value)
+	second, err := layout.DecodeDentryValue(kvs[1].Value)
 	require.NoError(t, err)
 	require.Equal(t, "c", first.Name)
 	require.Equal(t, "d", second.Name)
@@ -1018,9 +1018,9 @@ func BenchmarkExecutorReadDirPlusFromVisibleView100(b *testing.B) {
 			Inode:  inode,
 			Type:   model.InodeTypeFile,
 		}
-		key, err := fsmeta.EncodeInodeKey(mount, inode)
+		key, err := layout.EncodeInodeKey(mount, inode)
 		require.NoError(b, err)
-		value, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+		value, err := layout.EncodeInodeValue(model.InodeRecord{
 			Inode:     inode,
 			Type:      model.InodeTypeFile,
 			LinkCount: 1,

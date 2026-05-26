@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"slices"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -56,7 +56,7 @@ func PerasSegmentCatalogIndexKeys(segment PerasSegment) ([][]byte, error) {
 	}
 	keys := make([][]byte, 0, len(buckets))
 	for _, bucket := range buckets {
-		key, err := fsmeta.EncodeSegmentCatalogIndexKey(bucket.mount, bucket.bucket, segment.Root)
+		key, err := layout.EncodeSegmentCatalogIndexKey(bucket.mount, bucket.bucket, segment.Root)
 		if err != nil {
 			return nil, err
 		}
@@ -70,7 +70,7 @@ func PerasSegmentObjectKey(segment PerasSegment) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fsmeta.EncodeSegmentObjectKey(bucket.mount, bucket.bucket, segment.Root)
+	return layout.EncodeSegmentObjectKey(bucket.mount, bucket.bucket, segment.Root)
 }
 
 func perasSegmentCanonicalCatalogBucket(segment PerasSegment) (perasSegmentCatalogBucket, error) {
@@ -82,7 +82,7 @@ func perasSegmentCanonicalCatalogBucket(segment PerasSegment) (perasSegmentCatal
 	}
 	var out perasSegmentCatalogBucket
 	for idx, entry := range segment.entries {
-		parts, ok := fsmeta.InspectKey(entry.Key)
+		parts, ok := layout.InspectKey(entry.Key)
 		if !ok {
 			return perasSegmentCatalogBucket{}, ErrInvalidPerasSegment
 		}
@@ -108,7 +108,7 @@ func PerasSegmentCatalogObjectKeys(segment PerasSegment) ([][]byte, error) {
 	}
 	keys := make([][]byte, 0, len(buckets))
 	for _, bucket := range buckets {
-		key, err := fsmeta.EncodeSegmentObjectKey(bucket.mount, bucket.bucket, segment.Root)
+		key, err := layout.EncodeSegmentObjectKey(bucket.mount, bucket.bucket, segment.Root)
 		if err != nil {
 			return nil, err
 		}
@@ -119,7 +119,7 @@ func PerasSegmentCatalogObjectKeys(segment PerasSegment) ([][]byte, error) {
 
 type perasSegmentCatalogBucket struct {
 	mount  model.MountKeyID
-	bucket fsmeta.AffinityBucket
+	bucket layout.AffinityBucket
 }
 
 func perasSegmentCatalogBuckets(segment PerasSegment) ([]perasSegmentCatalogBucket, error) {
@@ -132,7 +132,7 @@ func perasSegmentCatalogBuckets(segment PerasSegment) ([]perasSegmentCatalogBuck
 	seen := make(map[perasSegmentCatalogBucket]struct{})
 	out := make([]perasSegmentCatalogBucket, 0)
 	for _, entry := range segment.entries {
-		parts, ok := fsmeta.InspectKey(entry.Key)
+		parts, ok := layout.InspectKey(entry.Key)
 		if !ok {
 			return nil, ErrInvalidPerasSegment
 		}
@@ -237,8 +237,8 @@ func encodePerasSegmentCatalogIndexRecord(epochID, installVersion uint64, root, 
 	if epochID == 0 || installVersion == 0 || root == ([32]byte{}) || digest == ([32]byte{}) || payloadSize == 0 || len(objectKey) == 0 {
 		return nil, ErrInvalidPerasSegment
 	}
-	parts, ok := fsmeta.InspectKey(objectKey)
-	if !ok || parts.Kind != fsmeta.KeyKindSegment || parts.SegmentRecord != fsmeta.SegmentRecordObject || parts.SegmentRoot != root {
+	parts, ok := layout.InspectKey(objectKey)
+	if !ok || parts.Kind != layout.KeyKindSegment || parts.SegmentRecord != layout.SegmentRecordObject || parts.SegmentRoot != root {
 		return nil, ErrInvalidPerasSegment
 	}
 	var out bytes.Buffer
@@ -285,8 +285,8 @@ func DecodePerasSegmentCatalogIndexRecord(payload []byte) (SegmentCatalogIndexRe
 	if !r.done() || epochID == 0 || root == ([32]byte{}) || payloadDigest == ([32]byte{}) {
 		return SegmentCatalogIndexRecord{}, ErrInvalidPerasSegment
 	}
-	parts, ok := fsmeta.InspectKey(objectKey)
-	if !ok || parts.Kind != fsmeta.KeyKindSegment || parts.SegmentRecord != fsmeta.SegmentRecordObject || parts.SegmentRoot != root {
+	parts, ok := layout.InspectKey(objectKey)
+	if !ok || parts.Kind != layout.KeyKindSegment || parts.SegmentRecord != layout.SegmentRecordObject || parts.SegmentRoot != root {
 		return SegmentCatalogIndexRecord{}, ErrInvalidPerasSegment
 	}
 	return SegmentCatalogIndexRecord{

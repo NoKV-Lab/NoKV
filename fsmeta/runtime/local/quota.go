@@ -9,8 +9,8 @@ import (
 	"math"
 	"sync/atomic"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -75,9 +75,9 @@ func (q *QuotaLedger) ReadQuotaUsage(ctx context.Context, runner fsmetaexec.TxnR
 		err    error
 	)
 	if scope == 0 {
-		prefix, err = fsmeta.EncodeMountPrefix(mount)
+		prefix, err = layout.EncodeMountPrefix(mount)
 	} else {
-		prefix, err = fsmeta.EncodeDentryPrefix(mount, scope)
+		prefix, err = layout.EncodeDentryPrefix(mount, scope)
 	}
 	if err != nil {
 		return model.UsageRecord{}, true, err
@@ -117,11 +117,11 @@ func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner f
 			if !bytes.HasPrefix(row.Key, prefix) {
 				return usage, nil
 			}
-			parts, ok := fsmeta.InspectKey(row.Key)
-			if !ok || parts.Kind != fsmeta.KeyKindDentry {
+			parts, ok := layout.InspectKey(row.Key)
+			if !ok || parts.Kind != layout.KeyKindDentry {
 				continue
 			}
-			dentry, err := fsmeta.DecodeDentryValue(row.Value)
+			dentry, err := layout.DecodeDentryValue(row.Value)
 			if err != nil {
 				return model.UsageRecord{}, err
 			}
@@ -140,7 +140,7 @@ func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner f
 }
 
 func (q *QuotaLedger) readQuotaInode(ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity, inodeID model.InodeID, version uint64) (model.InodeRecord, bool, error) {
-	key, err := fsmeta.EncodeInodeKey(mount, inodeID)
+	key, err := layout.EncodeInodeKey(mount, inodeID)
 	if err != nil {
 		return model.InodeRecord{}, false, err
 	}
@@ -148,7 +148,7 @@ func (q *QuotaLedger) readQuotaInode(ctx context.Context, runner fsmetaexec.TxnR
 	if err != nil || !ok {
 		return model.InodeRecord{}, ok, err
 	}
-	inode, err := fsmeta.DecodeInodeValue(value)
+	inode, err := layout.DecodeInodeValue(value)
 	if err != nil {
 		return model.InodeRecord{}, false, err
 	}

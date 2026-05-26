@@ -7,7 +7,7 @@ import (
 	"crypto/sha256"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
@@ -88,7 +88,7 @@ func TestMaterializedOpValidationRejectsReplayDigestDrift(t *testing.T) {
 }
 
 func TestObservedValuePredicateCompilesExactProofObligation(t *testing.T) {
-	expected, err := fsmeta.EncodeInodeValue(model.InodeRecord{Inode: 44, Type: model.InodeTypeFile, LinkCount: 1})
+	expected, err := layout.EncodeInodeValue(model.InodeRecord{Inode: 44, Type: model.InodeTypeFile, LinkCount: 1})
 	require.NoError(t, err)
 	delta, _ := testConcreteUpdateInodeDelta(t, expected)
 
@@ -132,7 +132,7 @@ func materializedCreateForValidation(t *testing.T, inode model.InodeID) Material
 	}
 	program, err := CompileCreateProgram(req, testMount, inode)
 	require.NoError(t, err)
-	parentValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+	parentValue, err := layout.EncodeInodeValue(model.InodeRecord{
 		Inode:      model.RootInode,
 		Type:       model.InodeTypeDirectory,
 		LinkCount:  1,

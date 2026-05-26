@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	"github.com/stretchr/testify/require"
@@ -68,7 +68,7 @@ func TestShardAffineInodeAllocatorSkipsRootInode(t *testing.T) {
 
 func TestShardAffineInodeAllocatorChoosesWorkspaceBucket(t *testing.T) {
 	client := &fakeAllocIDClient{next: 2}
-	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, fsmeta.DefaultAffinityBucketCount, 64)
+	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, layout.DefaultAffinityBucketCount, 64)
 	require.NoError(t, err)
 
 	inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, model.RootInode, "aligned")
@@ -84,7 +84,7 @@ func TestShardAffineInodeAllocatorChoosesWorkspaceBucket(t *testing.T) {
 
 func TestShardAffineInodeAllocatorReturnsUniqueConcurrentIDs(t *testing.T) {
 	client := &fakeAllocIDClient{next: 2}
-	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, fsmeta.DefaultAffinityBucketCount, 16)
+	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, layout.DefaultAffinityBucketCount, 16)
 	require.NoError(t, err)
 
 	const workers = 64
@@ -115,7 +115,7 @@ func TestShardAffineInodeAllocatorReturnsUniqueConcurrentIDs(t *testing.T) {
 
 func TestShardAffineInodeAllocatorPropagatesAllocIDError(t *testing.T) {
 	want := errors.New("root unavailable")
-	alloc, err := NewShardAffineInodeAllocatorWithBatch(&fakeAllocIDClient{err: want}, fsmeta.DefaultAffinityBucketCount, 8)
+	alloc, err := NewShardAffineInodeAllocatorWithBatch(&fakeAllocIDClient{err: want}, layout.DefaultAffinityBucketCount, 8)
 	require.NoError(t, err)
 
 	_, err = alloc.AllocateCreateInode(context.Background(), allocatorTestMount, model.RootInode, "file")
@@ -136,7 +136,7 @@ func TestShardAffineInodeAllocatorMissStillReturnsUsableID(t *testing.T) {
 	}
 	require.NotZero(t, candidate)
 	client := &fakeAllocIDClient{fixed: []*coordpb.AllocIDResponse{{FirstId: uint64(candidate), Count: 1}}}
-	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, fsmeta.DefaultAffinityBucketCount, 1)
+	alloc, err := NewShardAffineInodeAllocatorWithBatch(client, layout.DefaultAffinityBucketCount, 1)
 	require.NoError(t, err)
 
 	inode, err := alloc.AllocateCreateInode(context.Background(), allocatorTestMount, model.RootInode, "file")

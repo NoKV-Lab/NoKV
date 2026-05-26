@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	"github.com/feichai0017/NoKV/meta/wire"
@@ -31,7 +31,7 @@ func TestRootAuthorityFeedPollsGrantSnapshotsWhileWatchIsQuiet(t *testing.T) {
 	scope := compile.AuthorityScope{
 		Mount:      testMount.MountID,
 		MountKeyID: testMount.MountKeyID,
-		Buckets:    []fsmeta.AffinityBucket{7},
+		Buckets:    []layout.AffinityBucket{7},
 	}
 	source.replace(testGrant("g1", "holder-a", scope))
 
@@ -49,7 +49,7 @@ func TestRootAuthorityFeedAppliesGrantEvents(t *testing.T) {
 	scope := compile.AuthorityScope{
 		Mount:      testMount.MountID,
 		MountKeyID: testMount.MountKeyID,
-		Buckets:    []fsmeta.AffinityBucket{11},
+		Buckets:    []layout.AffinityBucket{11},
 	}
 	grant := testGrant("g-event", "holder-event", scope)
 

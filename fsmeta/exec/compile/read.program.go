@@ -6,12 +6,12 @@
 package compile
 
 import (
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
 func CompileLookupReadProgram(req model.LookupRequest, mount model.MountIdentity) (ReadProgram, error) {
-	plan, err := fsmeta.PlanLookup(req, mount)
+	plan, err := layout.PlanLookup(req, mount)
 	if err != nil {
 		return ReadProgram{}, err
 	}
@@ -20,18 +20,18 @@ func CompileLookupReadProgram(req model.LookupRequest, mount model.MountIdentity
 }
 
 func CompileGetAttrReadProgram(mount model.MountIdentity, inode model.InodeID) (ReadProgram, error) {
-	key, err := fsmeta.EncodeInodeKey(mount, inode)
+	key, err := layout.EncodeInodeKey(mount, inode)
 	if err != nil {
 		return ReadProgram{}, err
 	}
 	ref := keyRef(KeyAccessRead, key)
-	return ReadProgram{Kind: ReadProgramGetAttr, Plan: fsmeta.OperationPlan{Kind: model.OperationGetAttr, Mount: mount.MountID, PrimaryKey: cloneBytes(key), ReadKeys: [][]byte{cloneBytes(key)}, ReadPrefixes: emptyKeySet, MutateKeys: emptyKeySet}, Authority: AuthorityPlan{Scope: scopeFor(mount, nil, []model.InodeID{inode}), Required: true, Fence: FenceActiveAuthority}, Footprint: KeyFootprint{Reads: []KeyRef{ref}, ConflictKeys: []KeyRef{ref}, EstimatedBytes: uint64(len(key))}, Key: cloneBytes(key)}, nil
+	return ReadProgram{Kind: ReadProgramGetAttr, Plan: layout.OperationPlan{Kind: model.OperationGetAttr, Mount: mount.MountID, PrimaryKey: cloneBytes(key), ReadKeys: [][]byte{cloneBytes(key)}, ReadPrefixes: emptyKeySet, MutateKeys: emptyKeySet}, Authority: AuthorityPlan{Scope: scopeFor(mount, nil, []model.InodeID{inode}), Required: true, Fence: FenceActiveAuthority}, Footprint: KeyFootprint{Reads: []KeyRef{ref}, ConflictKeys: []KeyRef{ref}, EstimatedBytes: uint64(len(key))}, Key: cloneBytes(key)}, nil
 }
 
 func CompileReadDirPlusInodeKeys(mount model.MountIdentity, dentries []model.DentryRecord) ([][]byte, error) {
 	keys := make([][]byte, len(dentries))
 	for i, dentry := range dentries {
-		key, err := fsmeta.EncodeInodeKey(mount, dentry.Inode)
+		key, err := layout.EncodeInodeKey(mount, dentry.Inode)
 		if err != nil {
 			return nil, err
 		}
@@ -41,34 +41,34 @@ func CompileReadDirPlusInodeKeys(mount model.MountIdentity, dentries []model.Den
 }
 
 func CompileReadSessionProgram(mount model.MountIdentity, inode model.InodeID, session model.SessionID) (ReadProgram, error) {
-	key, err := fsmeta.EncodeSessionKey(mount, inode, session)
+	key, err := layout.EncodeSessionKey(mount, inode, session)
 	if err != nil {
 		return ReadProgram{}, err
 	}
 	ref := keyRef(KeyAccessRead, key)
-	return ReadProgram{Kind: ReadProgramReadSession, Plan: fsmeta.OperationPlan{Kind: model.OperationReadSession, Mount: mount.MountID, PrimaryKey: cloneBytes(key), ReadKeys: [][]byte{cloneBytes(key)}, ReadPrefixes: emptyKeySet, MutateKeys: emptyKeySet}, Authority: AuthorityPlan{Scope: scopeFor(mount, nil, []model.InodeID{inode}), Required: true, Fence: FenceActiveAuthority}, Footprint: KeyFootprint{Reads: []KeyRef{ref}, ConflictKeys: []KeyRef{ref}, EstimatedBytes: uint64(len(key))}, Key: cloneBytes(key)}, nil
+	return ReadProgram{Kind: ReadProgramReadSession, Plan: layout.OperationPlan{Kind: model.OperationReadSession, Mount: mount.MountID, PrimaryKey: cloneBytes(key), ReadKeys: [][]byte{cloneBytes(key)}, ReadPrefixes: emptyKeySet, MutateKeys: emptyKeySet}, Authority: AuthorityPlan{Scope: scopeFor(mount, nil, []model.InodeID{inode}), Required: true, Fence: FenceActiveAuthority}, Footprint: KeyFootprint{Reads: []KeyRef{ref}, ConflictKeys: []KeyRef{ref}, EstimatedBytes: uint64(len(key))}, Key: cloneBytes(key)}, nil
 }
 
 func CompileReadSessionOwnerProgram(mount model.MountIdentity, inode model.InodeID) (ReadProgram, error) {
-	key, err := fsmeta.EncodeInodeSessionKey(mount, inode)
+	key, err := layout.EncodeInodeSessionKey(mount, inode)
 	if err != nil {
 		return ReadProgram{}, err
 	}
 	ref := keyRef(KeyAccessRead, key)
-	return ReadProgram{Kind: ReadProgramReadSession, Plan: fsmeta.OperationPlan{Kind: model.OperationReadSession, Mount: mount.MountID, PrimaryKey: cloneBytes(key), ReadKeys: [][]byte{cloneBytes(key)}, ReadPrefixes: emptyKeySet, MutateKeys: emptyKeySet}, Authority: AuthorityPlan{Scope: scopeFor(mount, nil, []model.InodeID{inode}), Required: true, Fence: FenceActiveAuthority}, Footprint: KeyFootprint{Reads: []KeyRef{ref}, ConflictKeys: []KeyRef{ref}, EstimatedBytes: uint64(len(key))}, Key: cloneBytes(key)}, nil
+	return ReadProgram{Kind: ReadProgramReadSession, Plan: layout.OperationPlan{Kind: model.OperationReadSession, Mount: mount.MountID, PrimaryKey: cloneBytes(key), ReadKeys: [][]byte{cloneBytes(key)}, ReadPrefixes: emptyKeySet, MutateKeys: emptyKeySet}, Authority: AuthorityPlan{Scope: scopeFor(mount, nil, []model.InodeID{inode}), Required: true, Fence: FenceActiveAuthority}, Footprint: KeyFootprint{Reads: []KeyRef{ref}, ConflictKeys: []KeyRef{ref}, EstimatedBytes: uint64(len(key))}, Key: cloneBytes(key)}, nil
 }
 
 func CompileReadSessionKeyProgram(mount model.MountIdentity, key []byte) (ReadProgram, error) {
-	parts, ok := fsmeta.InspectKey(key)
-	if !ok || parts.Kind != fsmeta.KeyKindSession || parts.MountKeyID != mount.MountKeyID || parts.Inode == 0 {
+	parts, ok := layout.InspectKey(key)
+	if !ok || parts.Kind != layout.KeyKindSession || parts.MountKeyID != mount.MountKeyID || parts.Inode == 0 {
 		return ReadProgram{}, model.ErrInvalidRequest
 	}
 	ref := keyRef(KeyAccessRead, key)
-	return ReadProgram{Kind: ReadProgramReadSession, Plan: fsmeta.OperationPlan{Kind: model.OperationReadSession, Mount: mount.MountID, PrimaryKey: cloneBytes(key), ReadKeys: [][]byte{cloneBytes(key)}, ReadPrefixes: emptyKeySet, MutateKeys: emptyKeySet}, Authority: AuthorityPlan{Scope: scopeFor(mount, nil, []model.InodeID{parts.Inode}), Required: true, Fence: FenceActiveAuthority}, Footprint: KeyFootprint{Reads: []KeyRef{ref}, ConflictKeys: []KeyRef{ref}, EstimatedBytes: uint64(len(key))}, Key: cloneBytes(key)}, nil
+	return ReadProgram{Kind: ReadProgramReadSession, Plan: layout.OperationPlan{Kind: model.OperationReadSession, Mount: mount.MountID, PrimaryKey: cloneBytes(key), ReadKeys: [][]byte{cloneBytes(key)}, ReadPrefixes: emptyKeySet, MutateKeys: emptyKeySet}, Authority: AuthorityPlan{Scope: scopeFor(mount, nil, []model.InodeID{parts.Inode}), Required: true, Fence: FenceActiveAuthority}, Footprint: KeyFootprint{Reads: []KeyRef{ref}, ConflictKeys: []KeyRef{ref}, EstimatedBytes: uint64(len(key))}, Key: cloneBytes(key)}, nil
 }
 
 func CompileDirectoryReadPlan(req model.ReadDirRequest, mount model.MountIdentity, includeOverlay, overlayOnly bool) (DirectoryReadPlan, error) {
-	plan, err := fsmeta.PlanReadDir(req, mount)
+	plan, err := layout.PlanReadDir(req, mount)
 	if err != nil {
 		return DirectoryReadPlan{}, err
 	}

@@ -7,8 +7,8 @@ import (
 	"slices"
 
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 )
@@ -24,7 +24,7 @@ func SegmentWithinScope(segment fsperas.PerasSegment, scope compile.AuthoritySco
 	}
 	checked := false
 	for _, entry := range segment.EntriesView() {
-		parts, ok := fsmeta.InspectKey(entry.Key)
+		parts, ok := layout.InspectKey(entry.Key)
 		if !ok {
 			if checked {
 				return false
@@ -39,18 +39,18 @@ func SegmentWithinScope(segment fsperas.PerasSegment, scope compile.AuthoritySco
 	return true
 }
 
-func CatalogBuckets(scope compile.AuthorityScope) []fsmeta.AffinityBucket {
+func CatalogBuckets(scope compile.AuthorityScope) []layout.AffinityBucket {
 	if scope.MountKeyID == 0 {
 		return nil
 	}
 	if len(scope.Buckets) > 0 {
-		buckets := append([]fsmeta.AffinityBucket(nil), scope.Buckets...)
+		buckets := append([]layout.AffinityBucket(nil), scope.Buckets...)
 		slices.Sort(buckets)
 		return slices.Compact(buckets)
 	}
-	buckets := make([]fsmeta.AffinityBucket, fsmeta.DefaultAffinityBucketCount)
+	buckets := make([]layout.AffinityBucket, layout.DefaultAffinityBucketCount)
 	for idx := range buckets {
-		buckets[idx] = fsmeta.AffinityBucket(idx)
+		buckets[idx] = layout.AffinityBucket(idx)
 	}
 	return buckets
 }
@@ -85,7 +85,7 @@ func ScopesEqual(left, right compile.AuthorityScope) bool {
 }
 
 func CloneScope(scope compile.AuthorityScope) compile.AuthorityScope {
-	scope.Buckets = append([]fsmeta.AffinityBucket(nil), scope.Buckets...)
+	scope.Buckets = append([]layout.AffinityBucket(nil), scope.Buckets...)
 	scope.Parents = append([]model.InodeID(nil), scope.Parents...)
 	scope.Inodes = append([]model.InodeID(nil), scope.Inodes...)
 	return scope
@@ -99,7 +99,7 @@ func CloneScopes(scopes []compile.AuthorityScope) []compile.AuthorityScope {
 	return out
 }
 
-func scopeCoversKeyParts(scope compile.AuthorityScope, parts fsmeta.KeyParts) bool {
+func scopeCoversKeyParts(scope compile.AuthorityScope, parts layout.KeyParts) bool {
 	if scope.MountKeyID == 0 || parts.MountKeyID != scope.MountKeyID {
 		return false
 	}
@@ -107,11 +107,11 @@ func scopeCoversKeyParts(scope compile.AuthorityScope, parts fsmeta.KeyParts) bo
 		return false
 	}
 	switch parts.Kind {
-	case fsmeta.KeyKindDentry:
+	case layout.KeyKindDentry:
 		return len(scope.Parents) == 0 || slices.Contains(scope.Parents, parts.Parent)
-	case fsmeta.KeyKindInode, fsmeta.KeyKindChunk, fsmeta.KeyKindSession:
+	case layout.KeyKindInode, layout.KeyKindChunk, layout.KeyKindSession:
 		return len(scope.Inodes) == 0 || slices.Contains(scope.Inodes, parts.Inode)
-	case fsmeta.KeyKindUsage:
+	case layout.KeyKindUsage:
 		return len(scope.Parents) == 0 || slices.Contains(scope.Parents, parts.UsageScope)
 	default:
 		return true

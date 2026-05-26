@@ -23,7 +23,7 @@ import (
 	"github.com/feichai0017/NoKV/coordinator/rootview"
 	coordserver "github.com/feichai0017/NoKV/coordinator/server"
 	"github.com/feichai0017/NoKV/coordinator/tso"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	rootstorage "github.com/feichai0017/NoKV/meta/root/storage"
@@ -291,18 +291,18 @@ func dutyNames(duties []rootproto.DutyID) []string {
 	return out
 }
 
-func fsmetaBootstrapSplitBoundaries(layout *config.FSMetaRegionBootstrap) ([][]byte, error) {
-	if layout == nil {
+func fsmetaBootstrapSplitBoundaries(bootstrap *config.FSMetaRegionBootstrap) ([][]byte, error) {
+	if bootstrap == nil {
 		return nil, nil
 	}
-	mounts := make([]model.MountIdentity, 0, len(layout.Mounts))
-	for _, mount := range layout.Mounts {
+	mounts := make([]model.MountIdentity, 0, len(bootstrap.Mounts))
+	for _, mount := range bootstrap.Mounts {
 		mounts = append(mounts, model.MountIdentity{
 			MountID:    model.MountID(mount.MountID),
 			MountKeyID: model.MountKeyID(mount.MountKeyID),
 		})
 	}
-	boundaries, err := fsmeta.BucketSplitBoundaries(mounts, layout.BucketCount)
+	boundaries, err := layout.BucketSplitBoundaries(mounts, bootstrap.BucketCount)
 	if err != nil {
 		return nil, fmt.Errorf("coordinator build fsmeta split boundaries: %w", err)
 	}

@@ -7,8 +7,8 @@ import (
 	"fmt"
 
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -42,12 +42,12 @@ func ScopeFromProto(in *kvrpcpb.VisibleAuthorityScope) (compile.AuthorityScope, 
 	out := compile.AuthorityScope{
 		Mount:      model.MountID(in.GetMount()),
 		MountKeyID: model.MountKeyID(in.GetMountKeyId()),
-		Buckets:    make([]fsmeta.AffinityBucket, 0, len(in.GetBuckets())),
+		Buckets:    make([]layout.AffinityBucket, 0, len(in.GetBuckets())),
 		Parents:    make([]model.InodeID, 0, len(in.GetParents())),
 		Inodes:     make([]model.InodeID, 0, len(in.GetInodes())),
 	}
 	for _, bucket := range in.GetBuckets() {
-		out.Buckets = append(out.Buckets, fsmeta.AffinityBucket(bucket))
+		out.Buckets = append(out.Buckets, layout.AffinityBucket(bucket))
 	}
 	for _, parent := range in.GetParents() {
 		out.Parents = append(out.Parents, model.InodeID(parent))

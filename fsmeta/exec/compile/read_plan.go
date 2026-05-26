@@ -3,9 +3,7 @@
 
 package compile
 
-import (
-	"github.com/feichai0017/NoKV/fsmeta"
-)
+import "github.com/feichai0017/NoKV/fsmeta/layout"
 
 type ReadProgramKind uint8
 
@@ -17,7 +15,7 @@ const (
 
 type ReadProgram struct {
 	Kind      ReadProgramKind
-	Plan      fsmeta.OperationPlan
+	Plan      layout.OperationPlan
 	Authority AuthorityPlan
 	Footprint KeyFootprint
 	Key       []byte
@@ -40,7 +38,7 @@ type DirectoryReadStats struct {
 }
 
 type DirectoryReadPlan struct {
-	Plan           fsmeta.OperationPlan
+	Plan           layout.OperationPlan
 	Authority      AuthorityPlan
 	Footprint      KeyFootprint
 	Prefix         []byte

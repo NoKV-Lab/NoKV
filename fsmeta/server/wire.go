@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 )
 
@@ -337,11 +337,11 @@ func pairToProto(pair model.DentryAttrPair) *fsmetapb.DentryAttrPair {
 	}
 }
 
-func watchRequestFromProto(req *fsmetapb.WatchSubtreeRequest) fsmeta.WatchRequest {
+func watchRequestFromProto(req *fsmetapb.WatchSubtreeRequest) observe.WatchRequest {
 	if req == nil {
-		return fsmeta.WatchRequest{}
+		return observe.WatchRequest{}
 	}
-	return fsmeta.WatchRequest{
+	return observe.WatchRequest{
 		Mount:              model.MountID(req.GetMount()),
 		RootInode:          model.InodeID(req.GetRootInode()),
 		KeyPrefix:          append([]byte(nil), req.GetKeyPrefix()...),
@@ -351,18 +351,18 @@ func watchRequestFromProto(req *fsmetapb.WatchSubtreeRequest) fsmeta.WatchReques
 	}
 }
 
-func watchCursorFromProto(cursor *fsmetapb.WatchCursor) fsmeta.WatchCursor {
+func watchCursorFromProto(cursor *fsmetapb.WatchCursor) observe.WatchCursor {
 	if cursor == nil {
-		return fsmeta.WatchCursor{}
+		return observe.WatchCursor{}
 	}
-	return fsmeta.WatchCursor{
+	return observe.WatchCursor{
 		RegionID: cursor.GetRegionId(),
 		Term:     cursor.GetTerm(),
 		Index:    cursor.GetIndex(),
 	}
 }
 
-func watchCursorToProto(cursor fsmeta.WatchCursor) *fsmetapb.WatchCursor {
+func watchCursorToProto(cursor observe.WatchCursor) *fsmetapb.WatchCursor {
 	return &fsmetapb.WatchCursor{
 		RegionId: cursor.RegionID,
 		Term:     cursor.Term,
@@ -370,7 +370,7 @@ func watchCursorToProto(cursor fsmeta.WatchCursor) *fsmetapb.WatchCursor {
 	}
 }
 
-func watchEventToProto(evt fsmeta.WatchEvent) *fsmetapb.WatchEvent {
+func watchEventToProto(evt observe.WatchEvent) *fsmetapb.WatchEvent {
 	return &fsmetapb.WatchEvent{
 		RaftCursor:    watchCursorToProto(evt.Cursor),
 		CommitVersion: evt.CommitVersion,
@@ -379,13 +379,13 @@ func watchEventToProto(evt fsmeta.WatchEvent) *fsmetapb.WatchEvent {
 	}
 }
 
-func watchEventSourceToProto(source fsmeta.WatchEventSource) fsmetapb.WatchEventSource {
+func watchEventSourceToProto(source observe.WatchEventSource) fsmetapb.WatchEventSource {
 	switch source {
-	case fsmeta.WatchEventSourceCommit:
+	case observe.WatchEventSourceCommit:
 		return fsmetapb.WatchEventSource_WATCH_EVENT_SOURCE_COMMIT
-	case fsmeta.WatchEventSourceResolveLock:
+	case observe.WatchEventSourceResolveLock:
 		return fsmetapb.WatchEventSource_WATCH_EVENT_SOURCE_RESOLVE_LOCK
-	case fsmeta.WatchEventSourceRuntimeVisible:
+	case observe.WatchEventSourceRuntimeVisible:
 		return fsmetapb.WatchEventSource_WATCH_EVENT_SOURCE_RUNTIME_VISIBLE
 	default:
 		return fsmetapb.WatchEventSource_WATCH_EVENT_SOURCE_UNSPECIFIED

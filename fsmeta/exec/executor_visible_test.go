@@ -7,8 +7,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
@@ -155,7 +155,7 @@ func BenchmarkExecutorAdmitVisibleAuthorityOwned(b *testing.B) {
 		Authority: compile.AuthorityScope{
 			Mount:      "vol",
 			MountKeyID: 1,
-			Buckets:    []fsmeta.AffinityBucket{fsmeta.BucketForInodeID(model.RootInode)},
+			Buckets:    []layout.AffinityBucket{layout.BucketForInodeID(model.RootInode)},
 			Parents:    []model.InodeID{model.RootInode},
 			Inodes:     []model.InodeID{22},
 		},

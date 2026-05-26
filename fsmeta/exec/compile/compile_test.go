@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
@@ -19,9 +19,9 @@ var benchmarkCompiledOp CompiledOp
 
 func testParentInSameBucket(t *testing.T, base model.InodeID) model.InodeID {
 	t.Helper()
-	want := fsmeta.BucketForInodeID(base)
+	want := layout.BucketForInodeID(base)
 	for candidate := base + 1; candidate < base+4096; candidate++ {
-		if fsmeta.BucketForInodeID(candidate) == want {
+		if layout.BucketForInodeID(candidate) == want {
 			return candidate
 		}
 	}
@@ -31,9 +31,9 @@ func testParentInSameBucket(t *testing.T, base model.InodeID) model.InodeID {
 
 func testParentInDifferentBucket(t *testing.T, base model.InodeID) model.InodeID {
 	t.Helper()
-	want := fsmeta.BucketForInodeID(base)
+	want := layout.BucketForInodeID(base)
 	for candidate := base + 1; candidate < base+4096; candidate++ {
-		if fsmeta.BucketForInodeID(candidate) != want {
+		if layout.BucketForInodeID(candidate) != want {
 			return candidate
 		}
 	}
@@ -43,9 +43,9 @@ func testParentInDifferentBucket(t *testing.T, base model.InodeID) model.InodeID
 
 func testParentInDifferentBucketAfter(t *testing.T, base, start model.InodeID) model.InodeID {
 	t.Helper()
-	want := fsmeta.BucketForInodeID(base)
+	want := layout.BucketForInodeID(base)
 	for candidate := start; candidate < start+4096; candidate++ {
-		if fsmeta.BucketForInodeID(candidate) != want {
+		if layout.BucketForInodeID(candidate) != want {
 			return candidate
 		}
 	}
@@ -55,7 +55,7 @@ func testParentInDifferentBucketAfter(t *testing.T, base, start model.InodeID) m
 
 func mustInodeKey(t *testing.T, inode model.InodeID) []byte {
 	t.Helper()
-	key, err := fsmeta.EncodeInodeKey(testMount, inode)
+	key, err := layout.EncodeInodeKey(testMount, inode)
 	require.NoError(t, err)
 	return key
 }
@@ -214,7 +214,7 @@ func testConcreteUpdateInodeDelta(tb testing.TB, expected []byte) (SemanticDelta
 		Mode:    0o600,
 	}, testMount)
 	require.NoError(tb, err)
-	dentryValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+	dentryValue, err := layout.EncodeDentryValue(model.DentryRecord{
 		Parent: 3,
 		Name:   "file",
 		Inode:  44,
@@ -224,7 +224,7 @@ func testConcreteUpdateInodeDelta(tb testing.TB, expected []byte) (SemanticDelta
 	dentryKey := delta.ReadPredicates[0].Key
 	inodeKey := delta.ReadPredicates[1].Key
 	if expected == nil {
-		expected, err = fsmeta.EncodeInodeValue(model.InodeRecord{Inode: 44, Type: model.InodeTypeFile, LinkCount: 1})
+		expected, err = layout.EncodeInodeValue(model.InodeRecord{Inode: 44, Type: model.InodeTypeFile, LinkCount: 1})
 		require.NoError(tb, err)
 	}
 	delta.ReadPredicates = []Predicate{
@@ -248,11 +248,11 @@ func TestCreateCompilesVisibleCommitDelta(t *testing.T) {
 	delta, err := testCreateDelta(t, req, testMount, 22)
 	require.NoError(t, err)
 
-	dentryKey, err := fsmeta.EncodeDentryKey(testMount, model.RootInode, "file")
+	dentryKey, err := layout.EncodeDentryKey(testMount, model.RootInode, "file")
 	require.NoError(t, err)
-	parentKey, err := fsmeta.EncodeInodeKey(testMount, model.RootInode)
+	parentKey, err := layout.EncodeInodeKey(testMount, model.RootInode)
 	require.NoError(t, err)
-	inodeKey, err := fsmeta.EncodeInodeKey(testMount, 22)
+	inodeKey, err := layout.EncodeInodeKey(testMount, 22)
 	require.NoError(t, err)
 
 	require.Equal(t, model.OperationCreate, delta.Kind)
@@ -271,18 +271,18 @@ func TestCreateCompilesVisibleCommitDelta(t *testing.T) {
 	require.Equal(t, EffectPut, delta.WriteEffects[2].Kind)
 	require.Equal(t, inodeKey, delta.WriteEffects[2].Key)
 
-	dentry, err := fsmeta.DecodeDentryValue(delta.WriteEffects[1].Value)
+	dentry, err := layout.DecodeDentryValue(delta.WriteEffects[1].Value)
 	require.NoError(t, err)
 	require.Equal(t, model.DentryRecord{Parent: model.RootInode, Name: "file", Inode: 22, Type: model.InodeTypeFile}, dentry)
-	inode, err := fsmeta.DecodeInodeValue(delta.WriteEffects[2].Value)
+	inode, err := layout.DecodeInodeValue(delta.WriteEffects[2].Value)
 	require.NoError(t, err)
 	require.Equal(t, model.InodeID(22), inode.Inode)
 	require.Equal(t, uint64(128), inode.Size)
 
 	require.Equal(t, []model.InodeID{model.RootInode}, delta.Authority.Parents)
 	require.Equal(t, []model.InodeID{22}, delta.Authority.Inodes)
-	require.True(t, slices.Contains(delta.Authority.Buckets, fsmeta.BucketForInodeID(model.RootInode)))
-	require.True(t, slices.Contains(delta.Authority.Buckets, fsmeta.BucketForInodeID(22)))
+	require.True(t, slices.Contains(delta.Authority.Buckets, layout.BucketForInodeID(model.RootInode)))
+	require.True(t, slices.Contains(delta.Authority.Buckets, layout.BucketForInodeID(22)))
 }
 
 func TestCreateCompilesSegmentInstallableOperation(t *testing.T) {
@@ -294,7 +294,7 @@ func TestCreateCompilesSegmentInstallableOperation(t *testing.T) {
 		Attrs:  model.CreateAttrs{Type: model.InodeTypeFile},
 	}, testMount, inodeID)
 	require.NoError(t, err)
-	dentryKey, err := fsmeta.EncodeDentryKey(testMount, model.RootInode, "file")
+	dentryKey, err := layout.EncodeDentryKey(testMount, model.RootInode, "file")
 	require.NoError(t, err)
 
 	op := testCompileAOT(t, delta)
@@ -323,7 +323,7 @@ func TestCreateCompilesSegmentInstallableOperation(t *testing.T) {
 	require.Equal(t, DerivationRuntimeValue, op.Effects[0].Derivation)
 	require.False(t, op.Effects[0].Concrete)
 	require.Equal(t, testMount.MountKeyID, op.Effects[0].MountKeyID)
-	require.Equal(t, fsmeta.KeyKindInode, op.Effects[0].RecordKind)
+	require.Equal(t, layout.KeyKindInode, op.Effects[0].RecordKind)
 	require.Len(t, op.Watch, 1)
 	require.Equal(t, WatchEventCreate, op.Watch[0].EventKind)
 	require.Equal(t, WatchEmitVisible, op.Watch[0].EmitAt)
@@ -377,7 +377,7 @@ func TestGeneratedCreateProgramMatchesCurrentCompiler(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, expectedDefault, defaultMaterialized)
 
-			parentValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+			parentValue, err := layout.EncodeInodeValue(model.InodeRecord{
 				Inode:      req.Parent,
 				Type:       model.InodeTypeDirectory,
 				LinkCount:  1,
@@ -596,9 +596,9 @@ func TestOpenWriteSessionMaterializerMatchesGenericMaterialization(t *testing.T)
 	}
 	program, err := CompileOpenWriteSessionProgram(req, testMount)
 	require.NoError(t, err)
-	sessionValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: 200})
+	sessionValue, err := layout.EncodeSessionValue(model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: 200})
 	require.NoError(t, err)
-	inodeValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{Inode: req.Inode, Type: model.InodeTypeFile})
+	inodeValue, err := layout.EncodeInodeValue(model.InodeRecord{Inode: req.Inode, Type: model.InodeTypeFile})
 	require.NoError(t, err)
 	inodeKey := program.Compiled.Delta.ReadPredicates[0].Key
 	sessionKey := program.Compiled.Delta.ReadPredicates[1].Key
@@ -639,9 +639,9 @@ func TestHeartbeatWriteSessionMaterializerMatchesGenericMaterialization(t *testi
 	}
 	program, err := CompileHeartbeatWriteSessionProgram(req, testMount)
 	require.NoError(t, err)
-	oldValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: 100})
+	oldValue, err := layout.EncodeSessionValue(model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: 100})
 	require.NoError(t, err)
-	newValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: 200})
+	newValue, err := layout.EncodeSessionValue(model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: 200})
 	require.NoError(t, err)
 	sessionKey := program.Compiled.Delta.ReadPredicates[0].Key
 	ownerKey := program.Compiled.Delta.ReadPredicates[1].Key
@@ -678,9 +678,9 @@ func TestCloseWriteSessionMaterializerMatchesGenericMaterialization(t *testing.T
 	}
 	program, err := CompileCloseWriteSessionProgram(req, testMount)
 	require.NoError(t, err)
-	sessionValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: 100})
+	sessionValue, err := layout.EncodeSessionValue(model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: 100})
 	require.NoError(t, err)
-	ownerValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{Session: "other", Inode: req.Inode, ExpiresUnixNs: 100})
+	ownerValue, err := layout.EncodeSessionValue(model.SessionRecord{Session: "other", Inode: req.Inode, ExpiresUnixNs: 100})
 	require.NoError(t, err)
 	sessionKey := program.Compiled.Delta.ReadPredicates[0].Key
 	ownerKey := program.Compiled.Delta.ReadPredicates[1].Key
@@ -725,7 +725,7 @@ func TestSessionMaterializersRejectMalformedInput(t *testing.T) {
 	_, err = MaterializeOpenWriteSession(openProgram, OpenWriteSessionValues{})
 	require.ErrorIs(t, err, model.ErrInvalidRequest)
 
-	sessionValue, err := fsmeta.EncodeSessionValue(model.SessionRecord{Session: openReq.Session, Inode: openReq.Inode, ExpiresUnixNs: 100})
+	sessionValue, err := layout.EncodeSessionValue(model.SessionRecord{Session: openReq.Session, Inode: openReq.Inode, ExpiresUnixNs: 100})
 	require.NoError(t, err)
 	badProof := proof.PredicateProof{Key: openProgram.Compiled.Delta.ReadPredicates[0].Key, Present: true, Value: []byte("bad"), Version: 1, Source: proof.ReadSourceBase}
 	_, err = MaterializeOpenWriteSession(openProgram, OpenWriteSessionValues{
@@ -893,7 +893,7 @@ func TestSlowPathBoundariesStayExplicit(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, EligibilitySlowPath, expire.Eligibility)
 	require.Equal(t, SlowReasonMaintenanceScan, expire.SlowReason)
-	require.Len(t, expire.ReadPredicates, fsmeta.DefaultAffinityBucketCount)
+	require.Len(t, expire.ReadPredicates, layout.DefaultAffinityBucketCount)
 }
 
 func TestLinkAndUnlinkCompileRuntimeConcreteVisibleCommitDeltas(t *testing.T) {

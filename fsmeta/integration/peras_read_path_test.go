@@ -16,9 +16,9 @@ import (
 	perasfsmeta "github.com/feichai0017/NoKV/experimental/peras/adapters/fsmeta"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
 	"github.com/stretchr/testify/require"
@@ -65,7 +65,7 @@ func TestPerasVisibleReadPathBypassesPersistentCachesOnRealCluster(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	key, err := fsmeta.EncodeDentryKey(runtime.mountIdentity, model.RootInode, "visible")
+	key, err := layout.EncodeDentryKey(runtime.mountIdentity, model.RootInode, "visible")
 	require.NoError(t, err)
 	negatives.Remember(key)
 	lookedUp, err := executor.Lookup(ctx, model.LookupRequest{

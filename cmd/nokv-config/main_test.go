@@ -12,11 +12,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	metaregion "github.com/feichai0017/NoKV/meta/region"
 
 	"github.com/feichai0017/NoKV/config"
-	"github.com/feichai0017/NoKV/fsmeta"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/stretchr/testify/require"
 )
@@ -78,7 +78,7 @@ func TestRunRegionsExpandsFSMetaBootstrapLayout(t *testing.T) {
 		},
 		FSMetaRegionBootstrap: &config.FSMetaRegionBootstrap{
 			Mounts:         []config.FSMetaRegionBootstrapMount{{MountID: "fsmeta-bench", MountKeyID: 2}},
-			BucketCount:    fsmeta.DefaultAffinityBucketCount,
+			BucketCount:    layout.DefaultAffinityBucketCount,
 			RegionIDBase:   1000,
 			PeerIDBase:     10_000,
 			LeaderStoreIDs: []uint64{1, 2, 3},
@@ -96,14 +96,14 @@ func TestRunRegionsExpandsFSMetaBootstrapLayout(t *testing.T) {
 	require.NoError(t, err)
 	var regions []config.Region
 	require.NoError(t, json.Unmarshal([]byte(output), &regions))
-	require.Len(t, regions, fsmeta.DefaultAffinityBucketCount+2)
+	require.Len(t, regions, layout.DefaultAffinityBucketCount+2)
 	require.Equal(t, uint64(1000), regions[0].ID)
 	require.Equal(t, uint64(1), regions[0].LeaderStoreID)
 	require.Equal(t, uint64(2), regions[1].LeaderStoreID)
 	require.Len(t, regions[1].Peers, 3)
 	require.Equal(t, uint64(10_003), regions[1].Peers[0].PeerID)
 
-	start, end, err := fsmeta.EncodeBucketRange(model.MountIdentity{MountID: "fsmeta-bench", MountKeyID: 2}, 0)
+	start, end, err := layout.EncodeBucketRange(model.MountIdentity{MountID: "fsmeta-bench", MountKeyID: 2}, 0)
 	require.NoError(t, err)
 	require.Equal(t, start, []byte(regions[1].StartKey))
 	require.Equal(t, end, []byte(regions[1].EndKey))

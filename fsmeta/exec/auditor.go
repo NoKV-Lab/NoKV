@@ -8,7 +8,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -94,7 +94,7 @@ func (e *Executor) AuditMount(ctx context.Context, mount model.MountID, readVers
 		return AuditReport{}, err
 	}
 	identity := record.Identity()
-	start, end, err := fsmeta.EncodeMountKeyRange(identity)
+	start, end, err := layout.EncodeMountKeyRange(identity)
 	if err != nil {
 		return AuditReport{}, err
 	}
@@ -131,7 +131,7 @@ func (e *Executor) AuditMount(ctx context.Context, mount model.MountID, readVers
 				finishAuditReport(inodes, dentries, refs, rootInode, addIssue)
 				return report, nil
 			}
-			kind, err := fsmeta.KeyKindOf(row.Key)
+			kind, err := layout.KeyKindOf(row.Key)
 			if err != nil {
 				if !addIssue(AuditIssue{Kind: AuditInvalidKey, Key: row.Key, Detail: err.Error()}) {
 					return report, nil
@@ -139,8 +139,8 @@ func (e *Executor) AuditMount(ctx context.Context, mount model.MountID, readVers
 				continue
 			}
 			switch kind {
-			case fsmeta.KeyKindInode:
-				record, err := fsmeta.DecodeInodeValue(row.Value)
+			case layout.KeyKindInode:
+				record, err := layout.DecodeInodeValue(row.Value)
 				if err != nil {
 					if !addIssue(AuditIssue{Kind: AuditInvalidValue, Key: row.Key, Detail: err.Error()}) {
 						return report, nil
@@ -149,14 +149,14 @@ func (e *Executor) AuditMount(ctx context.Context, mount model.MountID, readVers
 				}
 				report.Inodes++
 				inodes[record.Inode] = record
-				expected, err := fsmeta.EncodeInodeKey(identity, record.Inode)
+				expected, err := layout.EncodeInodeKey(identity, record.Inode)
 				if err != nil || !bytes.Equal(expected, row.Key) {
 					if !addIssue(AuditIssue{Kind: AuditInodeKeyMismatch, Key: row.Key, Inode: record.Inode}) {
 						return report, nil
 					}
 				}
-			case fsmeta.KeyKindDentry:
-				record, err := fsmeta.DecodeDentryValue(row.Value)
+			case layout.KeyKindDentry:
+				record, err := layout.DecodeDentryValue(row.Value)
 				if err != nil {
 					if !addIssue(AuditIssue{Kind: AuditInvalidValue, Key: row.Key, Detail: err.Error()}) {
 						return report, nil
@@ -166,7 +166,7 @@ func (e *Executor) AuditMount(ctx context.Context, mount model.MountID, readVers
 				report.Dentries++
 				dentries = append(dentries, record)
 				refs[record.Inode]++
-				expected, err := fsmeta.EncodeDentryKey(identity, record.Parent, record.Name)
+				expected, err := layout.EncodeDentryKey(identity, record.Parent, record.Name)
 				if err != nil || !bytes.Equal(expected, row.Key) {
 					if !addIssue(AuditIssue{Kind: AuditDentryKeyMismatch, Key: row.Key, Parent: record.Parent, Name: record.Name, Inode: record.Inode}) {
 						return report, nil

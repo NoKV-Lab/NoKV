@@ -8,8 +8,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -76,15 +76,15 @@ func (e *Executor) tryVisibleRename(ctx context.Context, compiled compile.Compil
 	}
 	record.Parent = move.toParent
 	record.Name = move.toName
-	value, err := fsmeta.EncodeDentryValue(record)
+	value, err := layout.EncodeDentryValue(record)
 	if err != nil {
 		return false, err
 	}
-	fromParentValue, err := fsmeta.EncodeInodeValue(fromParent)
+	fromParentValue, err := layout.EncodeInodeValue(fromParent)
 	if err != nil {
 		return false, err
 	}
-	toParentValue, err := fsmeta.EncodeInodeValue(toParent)
+	toParentValue, err := layout.EncodeInodeValue(toParent)
 	if err != nil {
 		return false, err
 	}
@@ -312,7 +312,7 @@ func (e *Executor) RenameSubtree(ctx context.Context, req model.RenameSubtreeReq
 	return nil
 }
 
-func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmeta.OperationPlan, move renameMove, startVersion uint64) (model.RenameReplaceResult, []*kvrpcpb.Mutation, error) {
+func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan layout.OperationPlan, move renameMove, startVersion uint64) (model.RenameReplaceResult, []*kvrpcpb.Mutation, error) {
 	sourceDentry, err := e.readDentry(ctx, plan.ReadKeys[0], startVersion)
 	if err != nil {
 		return model.RenameReplaceResult{}, nil, fmt.Errorf("source dentry: %w", err)
@@ -396,7 +396,7 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 	replacementDentry := sourceDentry
 	replacementDentry.Parent = move.toParent
 	replacementDentry.Name = move.toName
-	replacementValue, err := fsmeta.EncodeDentryValue(replacementDentry)
+	replacementValue, err := layout.EncodeDentryValue(replacementDentry)
 	if err != nil {
 		return model.RenameReplaceResult{}, nil, err
 	}
@@ -408,11 +408,11 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 	if !destinationExisted {
 		putDestination.AssertionNotExist = true
 	}
-	fromParentValue, err := fsmeta.EncodeInodeValue(nextFromParent)
+	fromParentValue, err := layout.EncodeInodeValue(nextFromParent)
 	if err != nil {
 		return model.RenameReplaceResult{}, nil, err
 	}
-	toParentValue, err := fsmeta.EncodeInodeValue(nextToParent)
+	toParentValue, err := layout.EncodeInodeValue(nextToParent)
 	if err != nil {
 		return model.RenameReplaceResult{}, nil, err
 	}
@@ -440,7 +440,7 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 		)
 	}
 	if destinationExisted {
-		destinationInodeKey, err := fsmeta.EncodeInodeKey(move.identity, destinationInode.Inode)
+		destinationInodeKey, err := layout.EncodeInodeKey(move.identity, destinationInode.Inode)
 		if err != nil {
 			return model.RenameReplaceResult{}, nil, err
 		}
@@ -455,7 +455,7 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan fsmet
 			})
 		} else {
 			destinationInode.LinkCount--
-			destinationValue, err := fsmeta.EncodeInodeValue(destinationInode)
+			destinationValue, err := layout.EncodeInodeValue(destinationInode)
 			if err != nil {
 				return model.RenameReplaceResult{}, nil, err
 			}
@@ -493,12 +493,12 @@ func validateRenameReplaceDentryInode(dentry model.DentryRecord, inode model.Ino
 	return nil
 }
 
-func (e *Executor) prepareRenameMutations(ctx context.Context, plan fsmeta.OperationPlan, move renameMove, startVersion uint64, movedSize *uint64, movedInode *bool) ([]*kvrpcpb.Mutation, []*kvrpcpb.AtomicPredicate, error) {
+func (e *Executor) prepareRenameMutations(ctx context.Context, plan layout.OperationPlan, move renameMove, startVersion uint64, movedSize *uint64, movedInode *bool) ([]*kvrpcpb.Mutation, []*kvrpcpb.AtomicPredicate, error) {
 	record, err := e.readDentry(ctx, plan.ReadKeys[0], startVersion)
 	if err != nil {
 		return nil, nil, err
 	}
-	sourceDentryValue, err := fsmeta.EncodeDentryValue(record)
+	sourceDentryValue, err := layout.EncodeDentryValue(record)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -509,7 +509,7 @@ func (e *Executor) prepareRenameMutations(ctx context.Context, plan fsmeta.Opera
 	}
 	record.Parent = move.toParent
 	record.Name = move.toName
-	value, err := fsmeta.EncodeDentryValue(record)
+	value, err := layout.EncodeDentryValue(record)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -542,11 +542,11 @@ func (e *Executor) prepareRenameMutations(ctx context.Context, plan fsmeta.Opera
 		}
 		toParent.record = nextTo
 	}
-	fromParentValue, err := fsmeta.EncodeInodeValue(fromParent.record)
+	fromParentValue, err := layout.EncodeInodeValue(fromParent.record)
 	if err != nil {
 		return nil, nil, err
 	}
-	toParentValue, err := fsmeta.EncodeInodeValue(toParent.record)
+	toParentValue, err := layout.EncodeInodeValue(toParent.record)
 	if err != nil {
 		return nil, nil, err
 	}

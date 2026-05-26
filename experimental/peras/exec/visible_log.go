@@ -7,8 +7,8 @@ import (
 	"bytes"
 	"context"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -382,14 +382,14 @@ func readAuthorityScope(r *witnessReader) (compile.AuthorityScope, error) {
 	scope := compile.AuthorityScope{
 		Mount:           model.MountID(mount),
 		MountKeyID:      model.MountKeyID(mountKeyID),
-		Buckets:         make([]fsmeta.AffinityBucket, len(buckets)),
+		Buckets:         make([]layout.AffinityBucket, len(buckets)),
 		Parents:         make([]model.InodeID, len(parents)),
 		Inodes:          make([]model.InodeID, len(inodes)),
 		Broad:           broad,
 		AllowOpaqueKeys: allowOpaque,
 	}
 	for i, bucket := range buckets {
-		scope.Buckets[i] = fsmeta.AffinityBucket(bucket)
+		scope.Buckets[i] = layout.AffinityBucket(bucket)
 	}
 	for i, parent := range parents {
 		scope.Parents[i] = model.InodeID(parent)
@@ -521,7 +521,7 @@ func readSegmentMergeKey(r *witnessReader) (compile.SegmentMergeKey, error) {
 	return compile.SegmentMergeKey{
 		MountKeyID:       model.MountKeyID(mountKeyID),
 		HasPrimaryBucket: hasPrimaryBucket,
-		PrimaryBucket:    fsmeta.AffinityBucket(primaryBucket),
+		PrimaryBucket:    layout.AffinityBucket(primaryBucket),
 		Install:          compile.SegmentInstallMode(install),
 		Durability:       compile.DurabilityClass(durability),
 		FormatVersion:    uint16(formatVersion),

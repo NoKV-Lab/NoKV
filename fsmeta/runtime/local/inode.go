@@ -10,7 +10,7 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/index"
 	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
 )
@@ -63,7 +63,7 @@ func (a *InodeAllocator) AllocateCreateInode(_ context.Context, mount model.Moun
 			continue
 		}
 		a.affineProbe.Add(1)
-		if fsmeta.BucketForInodeID(id) != target {
+		if layout.BucketForInodeID(id) != target {
 			continue
 		}
 		a.total.Add(1)
@@ -93,17 +93,17 @@ func (a *InodeAllocator) Stats() map[string]any {
 	}
 }
 
-func localCreateDentryBucket(mount model.MountIdentity, parent model.InodeID, name string) (fsmeta.AffinityBucket, error) {
+func localCreateDentryBucket(mount model.MountIdentity, parent model.InodeID, name string) (layout.AffinityBucket, error) {
 	if parent == model.RootInode {
-		return fsmeta.ChooseWorkspaceBucket(mount, name), nil
+		return layout.ChooseWorkspaceBucket(mount, name), nil
 	}
-	key, err := fsmeta.EncodeDentryKey(mount, parent, name)
+	key, err := layout.EncodeDentryKey(mount, parent, name)
 	if err != nil {
 		return 0, err
 	}
-	bucket, ok := fsmeta.BucketOfKey(key)
+	bucket, ok := layout.BucketOfKey(key)
 	if !ok {
-		return 0, fsmeta.ErrInvalidKey
+		return 0, layout.ErrInvalidKey
 	}
 	return bucket, nil
 }
@@ -132,8 +132,8 @@ func maxInodeInStore(db *localdb.DB, mount model.MountIdentity) (model.InodeID, 
 		if cf != kv.CFWrite {
 			break
 		}
-		parts, ok := fsmeta.InspectKey(userKey)
-		if ok && parts.MountKeyID == mount.MountKeyID && parts.Kind == fsmeta.KeyKindInode && parts.Inode > maxInode {
+		parts, ok := layout.InspectKey(userKey)
+		if ok && parts.MountKeyID == mount.MountKeyID && parts.Kind == layout.KeyKindInode && parts.Inode > maxInode {
 			maxInode = parts.Inode
 		}
 		iter.Next()

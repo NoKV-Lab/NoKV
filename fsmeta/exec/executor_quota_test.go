@@ -7,16 +7,16 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
 
 func TestExecutorGetQuotaUsage(t *testing.T) {
 	runner := newFakeRunner()
-	key, err := fsmeta.EncodeUsageKey(testMountIdentity, 7)
+	key, err := layout.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
-	value, err := fsmeta.EncodeUsageValue(model.UsageRecord{Bytes: 4096, Inodes: 2})
+	value, err := layout.EncodeUsageValue(model.UsageRecord{Bytes: 4096, Inodes: 2})
 	require.NoError(t, err)
 	runner.data[string(key)] = value
 	executor, err := newTestExecutor(runner)

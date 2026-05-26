@@ -5,12 +5,12 @@ package peras
 
 import (
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 )
 
 type perasWatchPublisher interface {
-	Publish(fsmeta.WatchEvent)
+	Publish(observe.WatchEvent)
 }
 
 func (c *Runtime) publishVisibleWatch(op compile.MaterializedOp, ack fsperas.VisibleAck) {
@@ -20,7 +20,7 @@ func (c *Runtime) publishVisibleWatch(op compile.MaterializedOp, ack fsperas.Vis
 	if len(op.Watch) == 0 {
 		return
 	}
-	cursor := fsmeta.WatchCursor{
+	cursor := observe.WatchCursor{
 		Term:  ack.EpochID,
 		Index: c.visibleSeq.Add(1),
 	}
@@ -34,9 +34,9 @@ func (c *Runtime) publishVisibleWatch(op compile.MaterializedOp, ack fsperas.Vis
 			continue
 		}
 		seen[keyID] = struct{}{}
-		evt := fsmeta.WatchEvent{
+		evt := observe.WatchEvent{
 			Cursor: cursor,
-			Source: fsmeta.WatchEventSourceRuntimeVisible,
+			Source: observe.WatchEventSourceRuntimeVisible,
 			Key:    cloneBytes(projection.Key),
 		}
 		if c.watchQueue != nil && c.watchQueue.TryPush(evt) {

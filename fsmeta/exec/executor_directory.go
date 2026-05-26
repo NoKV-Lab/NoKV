@@ -6,7 +6,7 @@ package exec
 import (
 	"context"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -17,7 +17,7 @@ type directoryInodeSnapshot struct {
 }
 
 func (e *Executor) readDirectoryInode(ctx context.Context, mount model.MountIdentity, inode model.InodeID, version uint64) (directoryInodeSnapshot, error) {
-	key, err := fsmeta.EncodeInodeKey(mount, inode)
+	key, err := layout.EncodeInodeKey(mount, inode)
 	if err != nil {
 		return directoryInodeSnapshot{}, err
 	}
@@ -28,7 +28,7 @@ func (e *Executor) readDirectoryInode(ctx context.Context, mount model.MountIden
 	if !ok {
 		return directoryInodeSnapshot{}, model.ErrNotFound
 	}
-	record, err := fsmeta.DecodeInodeValue(value)
+	record, err := layout.DecodeInodeValue(value)
 	if err != nil {
 		return directoryInodeSnapshot{}, err
 	}

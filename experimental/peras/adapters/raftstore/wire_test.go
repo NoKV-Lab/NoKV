@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
@@ -17,7 +17,7 @@ func TestPerasWireRoundTrip(t *testing.T) {
 	scope := compile.AuthorityScope{
 		Mount:      model.MountID("m1"),
 		MountKeyID: model.MountKeyID(9),
-		Buckets:    []fsmeta.AffinityBucket{1, 3},
+		Buckets:    []layout.AffinityBucket{1, 3},
 		Parents:    []model.InodeID{11, 12},
 		Inodes:     []model.InodeID{21},
 	}

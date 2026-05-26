@@ -9,8 +9,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	"github.com/stretchr/testify/require"
@@ -320,7 +320,7 @@ func testGeneratedCreateOpForInodes(tb testing.TB, parent, inode model.InodeID, 
 }
 
 func materializeGeneratedCreate(program compile.CreateProgram, parent model.InodeID) (compile.MaterializedOp, error) {
-	parentValue, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+	parentValue, err := layout.EncodeInodeValue(model.InodeRecord{
 		Inode:      parent,
 		Type:       model.InodeTypeDirectory,
 		LinkCount:  1,
@@ -377,10 +377,10 @@ func testPredicateProofsForMaterializedOp(op compile.MaterializedOp) []proof.Pre
 	return proofs
 }
 
-func inodeForBucket(t *testing.T, bucket fsmeta.AffinityBucket) model.InodeID {
+func inodeForBucket(t *testing.T, bucket layout.AffinityBucket) model.InodeID {
 	t.Helper()
 	for inode := model.InodeID(2); inode < 100_000; inode++ {
-		if fsmeta.BucketForInodeID(inode) == bucket {
+		if layout.BucketForInodeID(inode) == bucket {
 			return inode
 		}
 	}

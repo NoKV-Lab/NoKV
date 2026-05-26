@@ -8,8 +8,8 @@ import (
 	"context"
 	"sort"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 )
@@ -302,7 +302,7 @@ func (v *visibleReadView) readDentry(key []byte) (model.DentryRecord, error) {
 	if !ok {
 		return model.DentryRecord{}, model.ErrNotFound
 	}
-	return fsmeta.DecodeDentryValue(value)
+	return layout.DecodeDentryValue(value)
 }
 
 func (v *visibleReadView) readInode(mount model.MountIdentity, inodeID model.InodeID) (model.InodeRecord, bool, error) {
@@ -314,7 +314,7 @@ func (v *visibleReadView) readInode(mount model.MountIdentity, inodeID model.Ino
 	if err != nil || !ok {
 		return model.InodeRecord{}, ok, err
 	}
-	inode, err := fsmeta.DecodeInodeValue(value)
+	inode, err := layout.DecodeInodeValue(value)
 	if err != nil {
 		return model.InodeRecord{}, false, err
 	}
@@ -322,9 +322,9 @@ func (v *visibleReadView) readInode(mount model.MountIdentity, inodeID model.Ino
 }
 
 func (v *visibleReadView) readSession(mount model.MountIdentity, key []byte) (model.SessionRecord, bool, error) {
-	parts, ok := fsmeta.InspectKey(key)
-	if !ok || parts.Kind != fsmeta.KeyKindSession {
-		return model.SessionRecord{}, false, fsmeta.ErrInvalidKey
+	parts, ok := layout.InspectKey(key)
+	if !ok || parts.Kind != layout.KeyKindSession {
+		return model.SessionRecord{}, false, layout.ErrInvalidKey
 	}
 	if parts.MountKeyID != mount.MountKeyID {
 		return model.SessionRecord{}, false, model.ErrInvalidRequest
@@ -337,7 +337,7 @@ func (v *visibleReadView) readSession(mount model.MountIdentity, key []byte) (mo
 	if err != nil || !ok {
 		return model.SessionRecord{}, ok, err
 	}
-	session, err := fsmeta.DecodeSessionValue(value)
+	session, err := layout.DecodeSessionValue(value)
 	if err != nil {
 		return model.SessionRecord{}, false, err
 	}

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
@@ -83,7 +83,7 @@ func TestQuotaReserveWritesUsageCountersInTransaction(t *testing.T) {
 
 	for _, mut := range mutations {
 		require.Equal(t, kvrpcpb.Mutation_Put, mut.GetOp())
-		usage, err := fsmeta.DecodeUsageValue(mut.GetValue())
+		usage, err := layout.DecodeUsageValue(mut.GetValue())
 		require.NoError(t, err)
 		require.Equal(t, model.UsageRecord{Bytes: 1024, Inodes: 1}, usage)
 	}
@@ -91,9 +91,9 @@ func TestQuotaReserveWritesUsageCountersInTransaction(t *testing.T) {
 
 func TestQuotaReserveRejectsClusterWideLimit(t *testing.T) {
 	runner := newFakeTxnRunner()
-	key, err := fsmeta.EncodeUsageKey(quotaTestMount, 0)
+	key, err := layout.EncodeUsageKey(quotaTestMount, 0)
 	require.NoError(t, err)
-	value, err := fsmeta.EncodeUsageValue(model.UsageRecord{Bytes: 900, Inodes: 1})
+	value, err := layout.EncodeUsageValue(model.UsageRecord{Bytes: 900, Inodes: 1})
 	require.NoError(t, err)
 	runner.data[string(key)] = value
 	lookup := &fakeQuotaLookup{fences: map[quotaSubject]*coordpb.QuotaFenceInfo{

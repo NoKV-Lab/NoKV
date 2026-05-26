@@ -12,8 +12,8 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -572,10 +572,10 @@ func TestGRPCServiceWatchSubtree(t *testing.T) {
 	require.NotNil(t, ready.GetReady())
 	require.Equal(t, uint64(3), ready.GetReady().GetCursor().GetIndex())
 
-	evt := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 2, Index: 3},
+	evt := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 2, Index: 3},
 		CommitVersion: 44,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("fsm/a"),
 	}
 	watcher.sub.events <- evt
@@ -734,12 +734,12 @@ func testServerSnapshotEvidenceRef(epoch uint64, seed byte) model.SnapshotEviden
 
 type fakeWatcher struct {
 	mu  sync.Mutex
-	req fsmeta.WatchRequest
+	req observe.WatchRequest
 	sub *fakeWatchSub
 	err error
 }
 
-func (w *fakeWatcher) Subscribe(_ context.Context, req fsmeta.WatchRequest) (fsmeta.WatchSubscription, error) {
+func (w *fakeWatcher) Subscribe(_ context.Context, req observe.WatchRequest) (observe.WatchSubscription, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.req = req
@@ -749,7 +749,7 @@ func (w *fakeWatcher) Subscribe(_ context.Context, req fsmeta.WatchRequest) (fsm
 	return w.sub, nil
 }
 
-func (w *fakeWatcher) request() fsmeta.WatchRequest {
+func (w *fakeWatcher) request() observe.WatchRequest {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.req
@@ -757,37 +757,37 @@ func (w *fakeWatcher) request() fsmeta.WatchRequest {
 
 type fakeWatchSub struct {
 	mu     sync.Mutex
-	events chan fsmeta.WatchEvent
-	acks   []fsmeta.WatchCursor
+	events chan observe.WatchEvent
+	acks   []observe.WatchCursor
 	err    error
-	ready  fsmeta.WatchCursor
+	ready  observe.WatchCursor
 }
 
 func newFakeWatchSub(buffer int) *fakeWatchSub {
 	return &fakeWatchSub{
-		events: make(chan fsmeta.WatchEvent, buffer),
-		ready:  fsmeta.WatchCursor{RegionID: 1, Term: 2, Index: 3},
+		events: make(chan observe.WatchEvent, buffer),
+		ready:  observe.WatchCursor{RegionID: 1, Term: 2, Index: 3},
 	}
 }
 
-func (s *fakeWatchSub) Events() <-chan fsmeta.WatchEvent {
+func (s *fakeWatchSub) Events() <-chan observe.WatchEvent {
 	return s.events
 }
 
-func (s *fakeWatchSub) ReadyCursor() fsmeta.WatchCursor {
+func (s *fakeWatchSub) ReadyCursor() observe.WatchCursor {
 	return s.ready
 }
 
-func (s *fakeWatchSub) Ack(cursor fsmeta.WatchCursor) {
+func (s *fakeWatchSub) Ack(cursor observe.WatchCursor) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.acks = append(s.acks, cursor)
 }
 
-func (s *fakeWatchSub) acked() []fsmeta.WatchCursor {
+func (s *fakeWatchSub) acked() []observe.WatchCursor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]fsmeta.WatchCursor(nil), s.acks...)
+	return append([]observe.WatchCursor(nil), s.acks...)
 }
 
 func (s *fakeWatchSub) Close() {

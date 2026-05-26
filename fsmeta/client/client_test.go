@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetaserver "github.com/feichai0017/NoKV/fsmeta/server"
 	fsmetapb "github.com/feichai0017/NoKV/pb/fsmeta"
 	"github.com/stretchr/testify/require"
@@ -527,7 +527,7 @@ func TestTypedClientWatchSubtree(t *testing.T) {
 	cli, cleanup := openBufconnClient(t, &fakeExecutor{}, fsmetaserver.WithWatcher(watcher))
 	defer cleanup()
 
-	stream, err := cli.WatchSubtree(context.Background(), fsmeta.WatchRequest{
+	stream, err := cli.WatchSubtree(context.Background(), observe.WatchRequest{
 		KeyPrefix:          []byte("fsm/"),
 		BackPressureWindow: 4,
 	})
@@ -538,10 +538,10 @@ func TestTypedClientWatchSubtree(t *testing.T) {
 		req := watcher.request()
 		return string(req.KeyPrefix) == "fsm/" && req.BackPressureWindow == 4
 	}, time.Second, 10*time.Millisecond)
-	evt := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 8, Term: 1, Index: 2},
+	evt := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 8, Term: 1, Index: 2},
 		CommitVersion: 90,
-		Source:        fsmeta.WatchEventSourceResolveLock,
+		Source:        observe.WatchEventSourceResolveLock,
 		Key:           []byte("fsm/checkpoint"),
 	}
 	watcher.sub.events <- evt
@@ -561,11 +561,11 @@ func TestTypedClientWatchSubtree(t *testing.T) {
 
 func TestWatchSessionHelpers(t *testing.T) {
 	sub := &stubWatchSubscription{
-		ready: fsmeta.WatchCursor{RegionID: 1, Term: 2, Index: 3},
-		events: []fsmeta.WatchEvent{{
-			Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 2, Index: 4},
+		ready: observe.WatchCursor{RegionID: 1, Term: 2, Index: 3},
+		events: []observe.WatchEvent{{
+			Cursor:        observe.WatchCursor{RegionID: 1, Term: 2, Index: 4},
 			CommitVersion: 99,
-			Source:        fsmeta.WatchEventSourceCommit,
+			Source:        observe.WatchEventSourceCommit,
 			Key:           []byte("fsm/key"),
 		}},
 	}
@@ -577,7 +577,7 @@ func TestWatchSessionHelpers(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want, evt)
 	require.NoError(t, session.Ack(evt))
-	require.Equal(t, []fsmeta.WatchCursor{evt.Cursor}, sub.acks)
+	require.Equal(t, []observe.WatchCursor{evt.Cursor}, sub.acks)
 	require.NoError(t, session.Close())
 	require.True(t, sub.closed)
 
@@ -585,7 +585,7 @@ func TestWatchSessionHelpers(t *testing.T) {
 	_, err = nilSession.Recv()
 	require.Error(t, err)
 	require.Error(t, nilSession.Ack(evt))
-	require.Equal(t, fsmeta.WatchCursor{}, nilSession.ReadyCursor())
+	require.Equal(t, observe.WatchCursor{}, nilSession.ReadyCursor())
 	require.NoError(t, nilSession.Close())
 }
 
@@ -660,18 +660,18 @@ func testClientSnapshotEvidenceRef(epoch uint64, seed byte) model.SnapshotEviden
 
 type fakeWatcher struct {
 	mu  sync.Mutex
-	req fsmeta.WatchRequest
+	req observe.WatchRequest
 	sub *fakeWatchSub
 }
 
-func (w *fakeWatcher) Subscribe(_ context.Context, req fsmeta.WatchRequest) (fsmeta.WatchSubscription, error) {
+func (w *fakeWatcher) Subscribe(_ context.Context, req observe.WatchRequest) (observe.WatchSubscription, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.req = req
 	return w.sub, nil
 }
 
-func (w *fakeWatcher) request() fsmeta.WatchRequest {
+func (w *fakeWatcher) request() observe.WatchRequest {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.req
@@ -679,36 +679,36 @@ func (w *fakeWatcher) request() fsmeta.WatchRequest {
 
 type fakeWatchSub struct {
 	mu     sync.Mutex
-	events chan fsmeta.WatchEvent
-	acks   []fsmeta.WatchCursor
-	ready  fsmeta.WatchCursor
+	events chan observe.WatchEvent
+	acks   []observe.WatchCursor
+	ready  observe.WatchCursor
 }
 
 func newFakeWatchSub(buffer int) *fakeWatchSub {
 	return &fakeWatchSub{
-		events: make(chan fsmeta.WatchEvent, buffer),
-		ready:  fsmeta.WatchCursor{RegionID: 8, Term: 1, Index: 1},
+		events: make(chan observe.WatchEvent, buffer),
+		ready:  observe.WatchCursor{RegionID: 8, Term: 1, Index: 1},
 	}
 }
 
-func (s *fakeWatchSub) Events() <-chan fsmeta.WatchEvent {
+func (s *fakeWatchSub) Events() <-chan observe.WatchEvent {
 	return s.events
 }
 
-func (s *fakeWatchSub) ReadyCursor() fsmeta.WatchCursor {
+func (s *fakeWatchSub) ReadyCursor() observe.WatchCursor {
 	return s.ready
 }
 
-func (s *fakeWatchSub) Ack(cursor fsmeta.WatchCursor) {
+func (s *fakeWatchSub) Ack(cursor observe.WatchCursor) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.acks = append(s.acks, cursor)
 }
 
-func (s *fakeWatchSub) acked() []fsmeta.WatchCursor {
+func (s *fakeWatchSub) acked() []observe.WatchCursor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]fsmeta.WatchCursor(nil), s.acks...)
+	return append([]observe.WatchCursor(nil), s.acks...)
 }
 
 func (s *fakeWatchSub) Close() {
@@ -720,26 +720,26 @@ func (s *fakeWatchSub) Err() error {
 }
 
 type stubWatchSubscription struct {
-	events []fsmeta.WatchEvent
-	acks   []fsmeta.WatchCursor
-	ready  fsmeta.WatchCursor
+	events []observe.WatchEvent
+	acks   []observe.WatchCursor
+	ready  observe.WatchCursor
 	closed bool
 }
 
-func (s *stubWatchSubscription) Recv() (fsmeta.WatchEvent, error) {
+func (s *stubWatchSubscription) Recv() (observe.WatchEvent, error) {
 	if len(s.events) == 0 {
-		return fsmeta.WatchEvent{}, errors.New("empty")
+		return observe.WatchEvent{}, errors.New("empty")
 	}
 	evt := s.events[0]
 	s.events = s.events[1:]
 	return evt, nil
 }
 
-func (s *stubWatchSubscription) ReadyCursor() fsmeta.WatchCursor {
+func (s *stubWatchSubscription) ReadyCursor() observe.WatchCursor {
 	return s.ready
 }
 
-func (s *stubWatchSubscription) Ack(cursor fsmeta.WatchCursor) error {
+func (s *stubWatchSubscription) Ack(cursor observe.WatchCursor) error {
 	s.acks = append(s.acks, cursor)
 	return nil
 }

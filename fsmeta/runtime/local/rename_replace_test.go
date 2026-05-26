@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"
 )
@@ -67,7 +67,7 @@ func TestLocalRuntimeRenameReplaceOverwritesFileAtomically(t *testing.T) {
 		OpaqueAttrs: []byte("new-body"),
 	}, final.Inode)
 
-	oldInodeKey, err := fsmeta.EncodeInodeKey(testMount(), oldFinal.Inode.Inode)
+	oldInodeKey, err := layout.EncodeInodeKey(testMount(), oldFinal.Inode.Inode)
 	require.NoError(t, err)
 	readVersion, err := rt.Runner.ReserveTimestamp(ctx, 1)
 	require.NoError(t, err)

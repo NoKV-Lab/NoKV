@@ -8,7 +8,7 @@ package compile
 import (
 	"crypto/sha256"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -21,7 +21,7 @@ func CompileUpdateInodeProgram(req model.UpdateInodeRequest, mount model.MountId
 	if !req.SetSize && !req.SetMode && !req.SetUpdatedUnixNs && !req.SetOpaqueAttrs {
 		return UpdateInodeProgram{}, model.ErrInvalidRequest
 	}
-	plan, err := fsmeta.PlanUpdateInode(req, mount)
+	plan, err := layout.PlanUpdateInode(req, mount)
 	if err != nil {
 		return UpdateInodeProgram{}, err
 	}
@@ -126,7 +126,7 @@ func compileUpdateInodeCompiledOp(delta SemanticDelta) (CompiledOp, error) {
 		var mount model.MountKeyID
 		var fsmetaKeys bool
 		var opaqueKeys bool
-		buckets := make([]fsmeta.AffinityBucket, 0, len(delta.WriteEffects))
+		buckets := make([]layout.AffinityBucket, 0, len(delta.WriteEffects))
 		for _, effect := range delta.WriteEffects {
 			switch effect.Kind {
 			case EffectPut:
@@ -146,7 +146,7 @@ func compileUpdateInodeCompiledOp(delta SemanticDelta) (CompiledOp, error) {
 				placement.SlowReason = SlowReasonDynamicWriteSet
 				goto placementDone
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
+			parts, ok := layout.InspectKey(effect.Key)
 			if !ok {
 				if fsmetaKeys {
 					placement.SlowReason = SlowReasonDynamicWriteSet
@@ -232,7 +232,7 @@ placementDone:
 		if len(effect.Value) > 0 {
 			plan.ValueHash = sha256.Sum256(effect.Value)
 		}
-		if parts, ok := fsmeta.InspectKey(effect.Key); ok {
+		if parts, ok := layout.InspectKey(effect.Key); ok {
 			plan.MountKeyID = parts.MountKeyID
 			plan.Bucket = parts.Bucket
 			plan.RecordKind = parts.Kind
@@ -291,13 +291,13 @@ placementDone:
 			if len(effect.Key) == 0 {
 				continue
 			}
-			parts, ok := fsmeta.InspectKey(effect.Key)
-			if !ok || parts.Kind != fsmeta.KeyKindDentry {
+			parts, ok := layout.InspectKey(effect.Key)
+			if !ok || parts.Kind != layout.KeyKindDentry {
 				continue
 			}
 			projection := WatchProjection{EventKind: watchEventKind(delta, effect), Key: effect.Key, Parent: parts.Parent, Name: dentryName(effect.Key), EmitAt: emitAt}
 			if len(effect.Value) > 0 {
-				if dentry, err := fsmeta.DecodeDentryValue(effect.Value); err == nil {
+				if dentry, err := layout.DecodeDentryValue(effect.Value); err == nil {
 					projection.Inode = dentry.Inode
 				}
 			}

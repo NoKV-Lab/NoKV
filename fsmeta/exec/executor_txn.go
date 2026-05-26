@@ -12,8 +12,8 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -81,13 +81,13 @@ func atomicOnePhaseAffinity(primary []byte, mutations []*kvrpcpb.Mutation) strin
 	const virtualShards = 64
 	shards := make([]int, 0, 1+len(mutations))
 	if len(primary) > 0 {
-		shards = append(shards, fsmeta.ShardForUserKey(primary, virtualShards))
+		shards = append(shards, layout.ShardForUserKey(primary, virtualShards))
 	}
 	for _, mutation := range mutations {
 		if mutation == nil || len(mutation.GetKey()) == 0 {
 			continue
 		}
-		shards = append(shards, fsmeta.ShardForUserKey(mutation.GetKey(), virtualShards))
+		shards = append(shards, layout.ShardForUserKey(mutation.GetKey(), virtualShards))
 	}
 	if len(shards) == 0 {
 		return "empty"

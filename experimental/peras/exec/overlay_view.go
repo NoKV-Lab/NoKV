@@ -10,8 +10,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -197,11 +197,11 @@ func (v *OverlayView) SnapshotDirectory(mount model.MountIdentity, prefix []byte
 		if row.Delete {
 			continue
 		}
-		dentry, err := fsmeta.DecodeDentryValue(row.Value)
+		dentry, err := layout.DecodeDentryValue(row.Value)
 		if err != nil {
 			continue
 		}
-		inodeKey, err := fsmeta.EncodeInodeKey(mount, dentry.Inode)
+		inodeKey, err := layout.EncodeInodeKey(mount, dentry.Inode)
 		if err != nil {
 			continue
 		}
@@ -268,11 +268,11 @@ func (v *OverlayView) CloneForSnapshotDirectory(mount model.MountIdentity, prefi
 		if entry.delete {
 			continue
 		}
-		dentry, err := fsmeta.DecodeDentryValue(entry.value)
+		dentry, err := layout.DecodeDentryValue(entry.value)
 		if err != nil {
 			continue
 		}
-		inodeKey, err := fsmeta.EncodeInodeKey(mount, dentry.Inode)
+		inodeKey, err := layout.EncodeInodeKey(mount, dentry.Inode)
 		if err != nil {
 			continue
 		}
@@ -857,7 +857,7 @@ func (v *OverlayView) removeDirectoryKeyLocked(key []byte, generation uint64) {
 }
 
 func dentryDirectoryPrefix(key []byte) (string, bool) {
-	name, ok := fsmeta.DentryNameBytesOfKey(key)
+	name, ok := layout.DentryNameBytesOfKey(key)
 	if !ok || len(name) == 0 || len(name) > len(key) {
 		return "", false
 	}

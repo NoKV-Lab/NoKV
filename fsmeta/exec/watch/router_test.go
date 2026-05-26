@@ -9,25 +9,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRouterFiltersByPrefixAndAcksBudget(t *testing.T) {
 	router := NewRouter()
 	prefix := []byte("fsm\x00prefix/")
-	sub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	sub, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix:          prefix,
 		BackPressureWindow: 1,
 	})
 	require.NoError(t, err)
 	defer sub.Close()
 
-	router.Publish(fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 2, Index: 3},
+	router.Publish(observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 2, Index: 3},
 		CommitVersion: 10,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("other/key"),
 	})
 	select {
@@ -36,10 +37,10 @@ func TestRouterFiltersByPrefixAndAcksBudget(t *testing.T) {
 	default:
 	}
 
-	want := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 2, Index: 4},
+	want := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 2, Index: 4},
 		CommitVersion: 11,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("fsm\x00prefix/a"),
 	}
 	router.Publish(want)
@@ -57,14 +58,14 @@ func TestRouterFiltersByPrefixAndAcksBudget(t *testing.T) {
 
 func TestRouterClosesSlowSubscriberOnOverflow(t *testing.T) {
 	router := NewRouter()
-	sub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	sub, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix:          []byte("k/"),
 		BackPressureWindow: 1,
 	})
 	require.NoError(t, err)
 
-	router.Publish(fsmeta.WatchEvent{Cursor: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 1}, Key: []byte("k/a")})
-	router.Publish(fsmeta.WatchEvent{Cursor: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 2}, Key: []byte("k/b")})
+	router.Publish(observe.WatchEvent{Cursor: observe.WatchCursor{RegionID: 1, Term: 1, Index: 1}, Key: []byte("k/a")})
+	router.Publish(observe.WatchEvent{Cursor: observe.WatchCursor{RegionID: 1, Term: 1, Index: 2}, Key: []byte("k/b")})
 
 	require.Eventually(t, func() bool {
 		return errors.Is(sub.Err(), model.ErrWatchOverflow)
@@ -74,42 +75,42 @@ func TestRouterClosesSlowSubscriberOnOverflow(t *testing.T) {
 
 func TestRouterConsumesApplyEvents(t *testing.T) {
 	router := NewRouter()
-	sub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	sub, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix: []byte("dentry/"),
 	})
 	require.NoError(t, err)
 	defer sub.Close()
 
-	router.OnApply(fsmeta.ApplyEvent{
+	router.OnApply(observe.ApplyEvent{
 		RegionID:      7,
 		Term:          3,
 		Index:         9,
-		Source:        fsmeta.WatchEventSourceResolveLock,
+		Source:        observe.WatchEventSourceResolveLock,
 		CommitVersion: 44,
 		Keys:          [][]byte{[]byte("dentry/a"), []byte("inode/1")},
 	})
 
 	got := <-sub.Events()
-	require.Equal(t, fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 7, Term: 3, Index: 9},
+	require.Equal(t, observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 7, Term: 3, Index: 9},
 		CommitVersion: 44,
-		Source:        fsmeta.WatchEventSourceResolveLock,
+		Source:        observe.WatchEventSourceResolveLock,
 		Key:           []byte("dentry/a"),
 	}, got)
 }
 
 func TestRouterDeduplicatesReplicatedApplyEvents(t *testing.T) {
 	router := NewRouter()
-	sub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	sub, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix: []byte("k/"),
 	})
 	require.NoError(t, err)
 	defer sub.Close()
 
-	evt := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 2, Index: 3},
+	evt := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 2, Index: 3},
 		CommitVersion: 4,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("k/a"),
 	}
 	router.Publish(evt)
@@ -125,19 +126,19 @@ func TestRouterDeduplicatesReplicatedApplyEvents(t *testing.T) {
 
 func TestRouterPublishesPerasVisibleEventsLiveOnly(t *testing.T) {
 	router := NewRouter()
-	sub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	sub, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix:          []byte("k/"),
 		BackPressureWindow: 1,
 	})
 	require.NoError(t, err)
 	defer sub.Close()
 
-	visible := fsmeta.WatchEvent{
-		Cursor: fsmeta.WatchCursor{
+	visible := observe.WatchEvent{
+		Cursor: observe.WatchCursor{
 			Term:  9,
 			Index: 1,
 		},
-		Source: fsmeta.WatchEventSourceRuntimeVisible,
+		Source: observe.WatchEventSourceRuntimeVisible,
 		Key:    []byte("k/a"),
 	}
 	router.Publish(visible)
@@ -154,9 +155,9 @@ func TestRouterPublishesPerasVisibleEventsLiveOnly(t *testing.T) {
 	require.Equal(t, 0, stats["regions"])
 	require.Equal(t, 0, stats["recent_events"])
 
-	replay, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	replay, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix:    []byte("k/"),
-		ResumeCursor: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 1},
+		ResumeCursor: observe.WatchCursor{RegionID: 1, Term: 1, Index: 1},
 	})
 	require.ErrorIs(t, err, model.ErrWatchCursorExpired)
 	require.Nil(t, replay)
@@ -174,13 +175,13 @@ func TestRouterStatsTracksPublishedAndSubscribers(t *testing.T) {
 		"overflow_total":  uint64(0),
 	}, router.Stats())
 
-	sub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{KeyPrefix: []byte("k/")})
+	sub, err := router.Subscribe(context.Background(), observe.WatchRequest{KeyPrefix: []byte("k/")})
 	require.NoError(t, err)
 	defer sub.Close()
-	router.Publish(fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 1},
+	router.Publish(observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: 1},
 		CommitVersion: 10,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("k/a"),
 	})
 
@@ -195,29 +196,29 @@ func TestRouterStatsTracksPublishedAndSubscribers(t *testing.T) {
 func TestRouterReplaysEventsAfterResumeCursor(t *testing.T) {
 	router := NewRouter()
 	prefix := []byte("k/")
-	first := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 1},
+	first := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: 1},
 		CommitVersion: 10,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("k/a"),
 	}
-	second := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 2},
+	second := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: 2},
 		CommitVersion: 11,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("k/b"),
 	}
-	thirdOtherPrefix := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 3},
+	thirdOtherPrefix := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: 3},
 		CommitVersion: 12,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("other/c"),
 	}
 	router.Publish(first)
 	router.Publish(second)
 	router.Publish(thirdOtherPrefix)
 
-	sub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	sub, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix:    prefix,
 		ResumeCursor: first.Cursor,
 	})
@@ -231,10 +232,10 @@ func TestRouterReplaysEventsAfterResumeCursor(t *testing.T) {
 	default:
 	}
 
-	live := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 4},
+	live := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: 4},
 		CommitVersion: 13,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("k/d"),
 	}
 	router.Publish(live)
@@ -243,32 +244,32 @@ func TestRouterReplaysEventsAfterResumeCursor(t *testing.T) {
 
 func TestRouterRejectsExpiredResumeCursor(t *testing.T) {
 	router := NewRouter()
-	router.Publish(fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 10},
+	router.Publish(observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: 10},
 		CommitVersion: 20,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("k/current"),
 	})
 
-	_, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	_, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix:    []byte("k/"),
-		ResumeCursor: fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 9},
+		ResumeCursor: observe.WatchCursor{RegionID: 1, Term: 1, Index: 9},
 	})
 	require.ErrorIs(t, err, model.ErrWatchCursorExpired)
 }
 
 func TestRouterRetiresMountSubscriptions(t *testing.T) {
 	router := NewRouter()
-	volPrefix, err := fsmeta.EncodeDentryPrefix(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode)
+	volPrefix, err := layout.EncodeDentryPrefix(model.MountIdentity{MountID: "vol", MountKeyID: 1}, model.RootInode)
 	require.NoError(t, err)
-	otherPrefix, err := fsmeta.EncodeDentryPrefix(model.MountIdentity{MountID: "other", MountKeyID: 2}, model.RootInode)
+	otherPrefix, err := layout.EncodeDentryPrefix(model.MountIdentity{MountID: "other", MountKeyID: 2}, model.RootInode)
 	require.NoError(t, err)
-	volSub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	volSub, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		Mount:     "vol",
 		KeyPrefix: volPrefix,
 	})
 	require.NoError(t, err)
-	otherSub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{
+	otherSub, err := router.Subscribe(context.Background(), observe.WatchRequest{
 		KeyPrefix: otherPrefix,
 	})
 	require.NoError(t, err)
@@ -279,16 +280,16 @@ func TestRouterRetiresMountSubscriptions(t *testing.T) {
 	require.False(t, ok)
 	require.ErrorIs(t, volSub.Err(), model.ErrMountRetired)
 
-	evt := fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 10},
+	evt := observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: 10},
 		CommitVersion: 20,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           append(otherPrefix, []byte("entry")...),
 	}
-	router.Publish(fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 1, Term: 1, Index: 9},
+	router.Publish(observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 1, Term: 1, Index: 9},
 		CommitVersion: 19,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           append(volPrefix, []byte("entry")...),
 	})
 	router.Publish(evt)
@@ -296,7 +297,7 @@ func TestRouterRetiresMountSubscriptions(t *testing.T) {
 }
 
 func TestWatchPrefixRejectsRecursiveInodeSubtree(t *testing.T) {
-	_, err := fsmeta.WatchPrefix(fsmeta.WatchRequest{
+	_, err := observe.WatchPrefix(observe.WatchRequest{
 		Mount:              "vol",
 		RootInode:          model.RootInode,
 		DescendRecursively: true,

@@ -1,11 +1,12 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-package fsmeta
+package observe
 
 import (
 	"context"
 
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -124,5 +125,5 @@ func WatchPrefixForMount(req WatchRequest, mount model.MountIdentity) ([]byte, e
 		// subtree watch needs a directory-tree index and is deferred.
 		return nil, model.ErrInvalidRequest
 	}
-	return EncodeDentryPrefix(mount, req.RootInode)
+	return layout.EncodeDentryPrefix(mount, req.RootInode)
 }

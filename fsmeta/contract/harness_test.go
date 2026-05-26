@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
@@ -110,11 +110,11 @@ func newVersionedRunner() *versionedRunner {
 }
 
 func seedVersionedInode(runner *versionedRunner, record model.InodeRecord, version uint64) {
-	key, err := fsmeta.EncodeInodeKey(contractMountIdentity, record.Inode)
+	key, err := layout.EncodeInodeKey(contractMountIdentity, record.Inode)
 	if err != nil {
 		panic(err)
 	}
-	value, err := fsmeta.EncodeInodeValue(record)
+	value, err := layout.EncodeInodeValue(record)
 	if err != nil {
 		panic(err)
 	}
@@ -255,33 +255,33 @@ func TestVersionedRunnerDelaysPreallocatedCommitPastConcurrentRead(t *testing.T)
 	ctx := context.Background()
 	runner := newVersionedRunner()
 
-	epsilonKey, err := fsmeta.EncodeDentryKey(contractMountIdentity, model.RootInode, "epsilon")
+	epsilonKey, err := layout.EncodeDentryKey(contractMountIdentity, model.RootInode, "epsilon")
 	require.NoError(t, err)
-	etaKey, err := fsmeta.EncodeDentryKey(contractMountIdentity, model.RootInode, "eta")
+	etaKey, err := layout.EncodeDentryKey(contractMountIdentity, model.RootInode, "eta")
 	require.NoError(t, err)
-	inodeKey, err := fsmeta.EncodeInodeKey(contractMountIdentity, 10)
+	inodeKey, err := layout.EncodeInodeKey(contractMountIdentity, 10)
 	require.NoError(t, err)
-	epsilonValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+	epsilonValue, err := layout.EncodeDentryValue(model.DentryRecord{
 		Parent: model.RootInode,
 		Name:   "epsilon",
 		Inode:  10,
 		Type:   model.InodeTypeFile,
 	})
 	require.NoError(t, err)
-	etaValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+	etaValue, err := layout.EncodeDentryValue(model.DentryRecord{
 		Parent: model.RootInode,
 		Name:   "eta",
 		Inode:  10,
 		Type:   model.InodeTypeFile,
 	})
 	require.NoError(t, err)
-	inodeValueOneLink, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+	inodeValueOneLink, err := layout.EncodeInodeValue(model.InodeRecord{
 		Inode:     10,
 		Type:      model.InodeTypeFile,
 		LinkCount: 1,
 	})
 	require.NoError(t, err)
-	inodeValueTwoLinks, err := fsmeta.EncodeInodeValue(model.InodeRecord{
+	inodeValueTwoLinks, err := layout.EncodeInodeValue(model.InodeRecord{
 		Inode:     10,
 		Type:      model.InodeTypeFile,
 		LinkCount: 2,
@@ -311,7 +311,7 @@ func TestVersionedRunnerDelaysPreallocatedCommitPastConcurrentRead(t *testing.T)
 	require.False(t, ok)
 	values, err := runner.BatchGet(ctx, [][]byte{inodeKey}, readVersion)
 	require.NoError(t, err)
-	inode, err := fsmeta.DecodeInodeValue(values[string(inodeKey)])
+	inode, err := layout.DecodeInodeValue(values[string(inodeKey)])
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), inode.LinkCount)
 
@@ -322,7 +322,7 @@ func TestVersionedRunnerDelaysPreallocatedCommitPastConcurrentRead(t *testing.T)
 	require.True(t, ok)
 	values, err = runner.BatchGet(ctx, [][]byte{inodeKey}, afterVersion)
 	require.NoError(t, err)
-	inode, err = fsmeta.DecodeInodeValue(values[string(inodeKey)])
+	inode, err = layout.DecodeInodeValue(values[string(inodeKey)])
 	require.NoError(t, err)
 	require.Equal(t, uint32(2), inode.LinkCount)
 }

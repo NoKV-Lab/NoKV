@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
@@ -151,7 +151,7 @@ func (a *ActiveAuthorities) FencesKey(key []byte, now time.Time) (rootproto.Visi
 	if a == nil {
 		return rootproto.VisibleAuthorityGrant{}, false, nil
 	}
-	parts, ok := fsmeta.InspectKey(key)
+	parts, ok := layout.InspectKey(key)
 	if !ok {
 		return rootproto.VisibleAuthorityGrant{}, false, nil
 	}
@@ -192,7 +192,7 @@ func GrantCoversDelta(grant rootproto.VisibleAuthorityGrant, scope compile.Autho
 	return grantCoversInodes(grant.Scope.Inodes, scope.Inodes, true)
 }
 
-func grantCoversBuckets(grant []uint16, requested []fsmeta.AffinityBucket, emptyRequestCovered bool) bool {
+func grantCoversBuckets(grant []uint16, requested []layout.AffinityBucket, emptyRequestCovered bool) bool {
 	if len(grant) == 0 {
 		return true
 	}
@@ -207,24 +207,24 @@ func grantCoversBuckets(grant []uint16, requested []fsmeta.AffinityBucket, empty
 	return true
 }
 
-func grantCoversKey(grant rootproto.VisibleAuthorityGrant, parts fsmeta.KeyParts, now time.Time) bool {
+func grantCoversKey(grant rootproto.VisibleAuthorityGrant, parts layout.KeyParts, now time.Time) bool {
 	if !grant.Valid() || !grant.ActiveAt(now.UnixNano()) {
 		return false
 	}
 	if grant.Scope.MountKeyID != uint64(parts.MountKeyID) {
 		return false
 	}
-	if !grantCoversBuckets(grant.Scope.Buckets, []fsmeta.AffinityBucket{parts.Bucket}, false) {
+	if !grantCoversBuckets(grant.Scope.Buckets, []layout.AffinityBucket{parts.Bucket}, false) {
 		return false
 	}
 	switch parts.Kind {
-	case fsmeta.KeyKindMount:
+	case layout.KeyKindMount:
 		return true
-	case fsmeta.KeyKindDentry:
+	case layout.KeyKindDentry:
 		return grantCoversInodes(grant.Scope.Parents, []model.InodeID{parts.Parent}, false)
-	case fsmeta.KeyKindInode, fsmeta.KeyKindChunk, fsmeta.KeyKindSession:
+	case layout.KeyKindInode, layout.KeyKindChunk, layout.KeyKindSession:
 		return grantCoversInodes(grant.Scope.Inodes, []model.InodeID{parts.Inode}, false)
-	case fsmeta.KeyKindUsage:
+	case layout.KeyKindUsage:
 		if len(grant.Scope.Parents) == 0 && len(grant.Scope.Inodes) == 0 {
 			return true
 		}
@@ -300,9 +300,9 @@ func scopeFromRootAuthority(rootScope rootproto.VisibleAuthorityScope) compile.A
 		Inodes:     fsmetaInodesFromRoot(rootScope.Inodes),
 	}
 	if len(rootScope.Buckets) > 0 {
-		scope.Buckets = make([]fsmeta.AffinityBucket, len(rootScope.Buckets))
+		scope.Buckets = make([]layout.AffinityBucket, len(rootScope.Buckets))
 		for i, bucket := range rootScope.Buckets {
-			scope.Buckets[i] = fsmeta.AffinityBucket(bucket)
+			scope.Buckets[i] = layout.AffinityBucket(bucket)
 		}
 	}
 	return scope
@@ -312,7 +312,7 @@ func ScopeEmpty(scope compile.AuthorityScope) bool {
 	return scope.Mount == "" || scope.MountKeyID == 0
 }
 
-func perasBucketsFromDelta(buckets []fsmeta.AffinityBucket) []uint16 {
+func perasBucketsFromDelta(buckets []layout.AffinityBucket) []uint16 {
 	out := make([]uint16, len(buckets))
 	for i, bucket := range buckets {
 		out[i] = uint16(bucket)

@@ -10,8 +10,8 @@ import (
 
 	xxhash "github.com/cespare/xxhash/v2"
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -50,7 +50,7 @@ func (e *Executor) Lookup(ctx context.Context, req model.LookupRequest) (model.D
 		if deleted {
 			return model.DentryRecord{}, model.ErrNotFound
 		}
-		return fsmeta.DecodeDentryValue(value)
+		return layout.DecodeDentryValue(value)
 	}
 	if e.negCache != nil && e.negCache.Has(plan.PrimaryKey) {
 		return model.DentryRecord{}, model.ErrNotFound
@@ -69,11 +69,11 @@ func (e *Executor) Lookup(ctx context.Context, req model.LookupRequest) (model.D
 		}
 		return model.DentryRecord{}, model.ErrNotFound
 	}
-	return fsmeta.DecodeDentryValue(value)
+	return layout.DecodeDentryValue(value)
 }
 
 func (e *Executor) lookupMergedDentry(ctx context.Context, mount model.MountIdentity, parent model.InodeID, key []byte) (model.DentryRecord, bool, error) {
-	prefix, err := fsmeta.EncodeDentryPrefix(mount, parent)
+	prefix, err := layout.EncodeDentryPrefix(mount, parent)
 	if err != nil {
 		return model.DentryRecord{}, false, err
 	}
@@ -95,7 +95,7 @@ func (e *Executor) lookupMergedDentry(ctx context.Context, mount model.MountIden
 			found = false
 			return nil
 		}
-		decoded, err := fsmeta.DecodeDentryValue(kvs[0].Value)
+		decoded, err := layout.DecodeDentryValue(kvs[0].Value)
 		if err != nil {
 			return err
 		}
@@ -127,7 +127,7 @@ func (e *Executor) LookupPlus(ctx context.Context, req model.LookupRequest) (mod
 		if deleted {
 			return model.DentryAttrPair{}, model.ErrNotFound
 		}
-		dentry, err := fsmeta.DecodeDentryValue(value)
+		dentry, err := layout.DecodeDentryValue(value)
 		if err != nil {
 			return model.DentryAttrPair{}, err
 		}
@@ -150,7 +150,7 @@ func (e *Executor) LookupPlus(ctx context.Context, req model.LookupRequest) (mod
 		}
 		return model.DentryAttrPair{}, model.ErrNotFound
 	}
-	dentry, err := fsmeta.DecodeDentryValue(value)
+	dentry, err := layout.DecodeDentryValue(value)
 	if err != nil {
 		return model.DentryAttrPair{}, err
 	}
@@ -166,7 +166,7 @@ func (e *Executor) readLookupPlusInode(ctx context.Context, mount model.MountIde
 		if deleted {
 			return model.DentryAttrPair{}, fmt.Errorf("%w: inode %d", model.ErrNotFound, dentry.Inode)
 		}
-		inode, err := fsmeta.DecodeInodeValue(value)
+		inode, err := layout.DecodeInodeValue(value)
 		if err != nil {
 			return model.DentryAttrPair{}, err
 		}
@@ -188,7 +188,7 @@ func (e *Executor) readLookupPlusInode(ctx context.Context, mount model.MountIde
 	if !ok {
 		return model.DentryAttrPair{}, fmt.Errorf("%w: inode %d", model.ErrNotFound, dentry.Inode)
 	}
-	inode, err := fsmeta.DecodeInodeValue(value)
+	inode, err := layout.DecodeInodeValue(value)
 	if err != nil {
 		return model.DentryAttrPair{}, err
 	}
@@ -353,7 +353,7 @@ func (e *Executor) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([
 			if !inodePresent[i] {
 				return fmt.Errorf("%w: inode %d", model.ErrNotFound, dentry.Inode)
 			}
-			inode, err := fsmeta.DecodeInodeValue(inodeValues[i])
+			inode, err := layout.DecodeInodeValue(inodeValues[i])
 			if err != nil {
 				return err
 			}
@@ -432,7 +432,7 @@ func (e *Executor) readDirPlusFromVisibleViewAt(mount model.MountIdentity, dentr
 		if !ok || deleted {
 			return nil, false, nil
 		}
-		inode, err := fsmeta.DecodeInodeValue(value)
+		inode, err := layout.DecodeInodeValue(value)
 		if err != nil {
 			return nil, false, err
 		}
@@ -479,7 +479,7 @@ func (e *Executor) scanDentriesAt(ctx context.Context, plan compile.DirectoryRea
 		if !bytes.HasPrefix(kv.Key, plan.Prefix) {
 			break
 		}
-		record, err := fsmeta.DecodeDentryValue(kv.Value)
+		record, err := layout.DecodeDentryValue(kv.Value)
 		if err != nil {
 			return nil, err
 		}
@@ -507,7 +507,7 @@ func (e *Executor) visibleDirectoryHasOverlay(mount model.MountIdentity, parent 
 	if !ok {
 		return true
 	}
-	prefix, err := fsmeta.EncodeDentryPrefix(mount, parent)
+	prefix, err := layout.EncodeDentryPrefix(mount, parent)
 	if err != nil {
 		return true
 	}
@@ -523,7 +523,7 @@ func (e *Executor) visibleDirectoryHasVisibleOverlay(mount model.MountIdentity, 
 	if !ok {
 		return e.visibleDirectoryHasOverlay(mount, parent)
 	}
-	prefix, err := fsmeta.EncodeDentryPrefix(mount, parent)
+	prefix, err := layout.EncodeDentryPrefix(mount, parent)
 	if err != nil {
 		return true
 	}
@@ -535,7 +535,7 @@ func (e *Executor) visibleSnapshotDirectoryHasOverlay(version uint64, mount mode
 	if reader == nil {
 		return false
 	}
-	prefix, err := fsmeta.EncodeDentryPrefix(mount, parent)
+	prefix, err := layout.EncodeDentryPrefix(mount, parent)
 	if err != nil {
 		return true
 	}
@@ -556,7 +556,7 @@ func (e *Executor) visibleDirectoryCacheFrontier(mount model.MountIdentity, pare
 	if !ok {
 		return 0
 	}
-	prefix, err := fsmeta.EncodeDentryPrefix(mount, parent)
+	prefix, err := layout.EncodeDentryPrefix(mount, parent)
 	if err != nil {
 		return 0
 	}
@@ -593,7 +593,7 @@ func (e *Executor) readDentry(ctx context.Context, key []byte, version uint64) (
 	if !ok {
 		return model.DentryRecord{}, model.ErrNotFound
 	}
-	return fsmeta.DecodeDentryValue(value)
+	return layout.DecodeDentryValue(value)
 }
 
 func (e *Executor) readInode(ctx context.Context, mount model.MountIdentity, inodeID model.InodeID, version uint64) (model.InodeRecord, bool, error) {
@@ -605,7 +605,7 @@ func (e *Executor) readInode(ctx context.Context, mount model.MountIdentity, ino
 	if err != nil || !ok {
 		return model.InodeRecord{}, ok, err
 	}
-	inode, err := fsmeta.DecodeInodeValue(value)
+	inode, err := layout.DecodeInodeValue(value)
 	if err != nil {
 		return model.InodeRecord{}, false, err
 	}
@@ -613,9 +613,9 @@ func (e *Executor) readInode(ctx context.Context, mount model.MountIdentity, ino
 }
 
 func (e *Executor) readSessionByKey(ctx context.Context, mount model.MountIdentity, key []byte, version uint64) (model.SessionRecord, bool, error) {
-	parts, ok := fsmeta.InspectKey(key)
-	if !ok || parts.Kind != fsmeta.KeyKindSession {
-		return model.SessionRecord{}, false, fsmeta.ErrInvalidKey
+	parts, ok := layout.InspectKey(key)
+	if !ok || parts.Kind != layout.KeyKindSession {
+		return model.SessionRecord{}, false, layout.ErrInvalidKey
 	}
 	if parts.MountKeyID != mount.MountKeyID {
 		return model.SessionRecord{}, false, model.ErrInvalidRequest
@@ -628,7 +628,7 @@ func (e *Executor) readSessionByKey(ctx context.Context, mount model.MountIdenti
 	if err != nil || !ok {
 		return model.SessionRecord{}, ok, err
 	}
-	record, err := fsmeta.DecodeSessionValue(value)
+	record, err := layout.DecodeSessionValue(value)
 	if err != nil {
 		return model.SessionRecord{}, false, err
 	}
@@ -664,7 +664,7 @@ func dirPageKey(mount model.MountID, parent model.InodeID, startAfter string, li
 func encodeDirPageEntries(pairs []model.DentryAttrPair) ([]dirpage.Entry, error) {
 	out := make([]dirpage.Entry, 0, len(pairs))
 	for _, p := range pairs {
-		blob, err := fsmeta.EncodeInodeValue(p.Inode)
+		blob, err := layout.EncodeInodeValue(p.Inode)
 		if err != nil {
 			return nil, err
 		}
@@ -683,7 +683,7 @@ func encodeDirPageEntries(pairs []model.DentryAttrPair) ([]dirpage.Entry, error)
 func decodeDirPageEntries(key dirpage.PageKey, entries []dirpage.Entry) ([]model.DentryAttrPair, error) {
 	out := make([]model.DentryAttrPair, 0, len(entries))
 	for _, e := range entries {
-		inode, err := fsmeta.DecodeInodeValue(e.AttrBlob)
+		inode, err := layout.DecodeInodeValue(e.AttrBlob)
 		if err != nil {
 			return nil, err
 		}

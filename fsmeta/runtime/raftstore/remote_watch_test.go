@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -19,8 +19,8 @@ import (
 )
 
 func TestRemoteSourceHelpers(t *testing.T) {
-	require.Equal(t, fsmeta.WatchEventSourceCommit, applyWatchSourceFromProto(kvrpcpb.ApplyWatchEventSource_APPLY_WATCH_EVENT_SOURCE_COMMIT))
-	require.Equal(t, fsmeta.WatchEventSourceResolveLock, applyWatchSourceFromProto(kvrpcpb.ApplyWatchEventSource_APPLY_WATCH_EVENT_SOURCE_RESOLVE_LOCK))
+	require.Equal(t, observe.WatchEventSourceCommit, applyWatchSourceFromProto(kvrpcpb.ApplyWatchEventSource_APPLY_WATCH_EVENT_SOURCE_COMMIT))
+	require.Equal(t, observe.WatchEventSourceResolveLock, applyWatchSourceFromProto(kvrpcpb.ApplyWatchEventSource_APPLY_WATCH_EVENT_SOURCE_RESOLVE_LOCK))
 	require.Zero(t, applyWatchSourceFromProto(kvrpcpb.ApplyWatchEventSource_APPLY_WATCH_EVENT_SOURCE_UNSPECIFIED))
 
 	require.True(t, isPermanentWatchError(status.Error(codes.FailedPrecondition, "retired")))
@@ -36,7 +36,7 @@ func TestRemoteSourceHelpers(t *testing.T) {
 
 func TestPublishApplyWatchEvent(t *testing.T) {
 	router := fsmetawatch.NewRouter()
-	sub, err := router.Subscribe(context.Background(), fsmeta.WatchRequest{KeyPrefix: []byte("k/")})
+	sub, err := router.Subscribe(context.Background(), observe.WatchRequest{KeyPrefix: []byte("k/")})
 	require.NoError(t, err)
 	defer sub.Close()
 
@@ -49,10 +49,10 @@ func TestPublishApplyWatchEvent(t *testing.T) {
 		Keys:          [][]byte{[]byte("k/a"), []byte("other")},
 	})
 
-	require.Equal(t, fsmeta.WatchEvent{
-		Cursor:        fsmeta.WatchCursor{RegionID: 7, Term: 2, Index: 3},
+	require.Equal(t, observe.WatchEvent{
+		Cursor:        observe.WatchCursor{RegionID: 7, Term: 2, Index: 3},
 		CommitVersion: 99,
-		Source:        fsmeta.WatchEventSourceCommit,
+		Source:        observe.WatchEventSourceCommit,
 		Key:           []byte("k/a"),
 	}, <-sub.Events())
 

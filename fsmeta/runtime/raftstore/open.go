@@ -12,10 +12,10 @@ import (
 	coordclient "github.com/feichai0017/NoKV/coordinator/client"
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	"github.com/feichai0017/NoKV/engine/slab/negativecache"
-	"github.com/feichai0017/NoKV/fsmeta"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	"github.com/feichai0017/NoKV/raftstore/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -83,8 +83,8 @@ type Options struct {
 // every client and goroutine it creates; Close releases all of them.
 type Runtime struct {
 	Executor          *fsmetaexec.Executor
-	Watcher           fsmeta.Watcher
-	SnapshotPublisher fsmeta.SnapshotPublisher
+	Watcher           observe.Watcher
+	SnapshotPublisher observe.SnapshotPublisher
 	MountResolver     fsmetaexec.MountResolver
 	QuotaResolver     fsmetaexec.QuotaResolver
 	SessionCleaner    interface{ Stats() map[string]any }

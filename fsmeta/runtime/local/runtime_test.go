@@ -10,9 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/contract"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/fsmeta/observe"
 	storemvcc "github.com/feichai0017/NoKV/raftstore/mvcc"
 	"github.com/stretchr/testify/require"
 )
@@ -76,7 +77,7 @@ func TestLocalInodeAllocatorChoosesWorkspaceShard(t *testing.T) {
 		Attrs:  model.CreateAttrs{Type: model.InodeTypeDirectory},
 	})
 	require.NoError(t, err)
-	require.Equal(t, fsmeta.ChooseWorkspaceBucket(testMount(), "workspace-a"), fsmeta.BucketForInodeID(created.Inode.Inode))
+	require.Equal(t, layout.ChooseWorkspaceBucket(testMount(), "workspace-a"), layout.BucketForInodeID(created.Inode.Inode))
 }
 
 func TestOpenUsesDirectMVCC(t *testing.T) {
@@ -179,7 +180,7 @@ func TestLocalRuntimePublishesWatchEvents(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	sub, err := rt.Watcher.Subscribe(ctx, fsmeta.WatchRequest{
+	sub, err := rt.Watcher.Subscribe(ctx, observe.WatchRequest{
 		Mount:              "vol",
 		RootInode:          model.RootInode,
 		BackPressureWindow: 4,
@@ -195,11 +196,11 @@ func TestLocalRuntimePublishesWatchEvents(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	wantKey, err := fsmeta.EncodeDentryKey(testMount(), model.RootInode, "watched")
+	wantKey, err := layout.EncodeDentryKey(testMount(), model.RootInode, "watched")
 	require.NoError(t, err)
 	evt := requireWatchEvent(t, sub)
 	require.Equal(t, wantKey, evt.Key)
-	require.Equal(t, fsmeta.WatchEventSourceCommit, evt.Source)
+	require.Equal(t, observe.WatchEventSourceCommit, evt.Source)
 	require.Equal(t, localWatchTerm, evt.Cursor.Term)
 	require.NotZero(t, evt.Cursor.Index)
 
@@ -217,7 +218,7 @@ func TestLocalRuntimeWatchReplaysAfterResumeCursor(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	firstSub, err := rt.Watcher.Subscribe(ctx, fsmeta.WatchRequest{
+	firstSub, err := rt.Watcher.Subscribe(ctx, observe.WatchRequest{
 		Mount:     "vol",
 		RootInode: model.RootInode,
 	})
@@ -240,7 +241,7 @@ func TestLocalRuntimeWatchReplaysAfterResumeCursor(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	resumed, err := rt.Watcher.Subscribe(ctx, fsmeta.WatchRequest{
+	resumed, err := rt.Watcher.Subscribe(ctx, observe.WatchRequest{
 		Mount:        "vol",
 		RootInode:    model.RootInode,
 		ResumeCursor: first.Cursor,
@@ -248,7 +249,7 @@ func TestLocalRuntimeWatchReplaysAfterResumeCursor(t *testing.T) {
 	require.NoError(t, err)
 	defer resumed.Close()
 
-	wantKey, err := fsmeta.EncodeDentryKey(testMount(), model.RootInode, "second")
+	wantKey, err := layout.EncodeDentryKey(testMount(), model.RootInode, "second")
 	require.NoError(t, err)
 	replayed := requireWatchEvent(t, resumed)
 	require.Equal(t, wantKey, replayed.Key)
@@ -275,12 +276,12 @@ func TestLocalRuntimePublishesAndRetiresSnapshots(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, token.ReadVersion, floor)
 
-	gcKey, err := fsmeta.EncodeDentryKey(testMount(), model.RootInode, "pinned")
+	gcKey, err := layout.EncodeDentryKey(testMount(), model.RootInode, "pinned")
 	require.NoError(t, err)
 	policy := storemvcc.SafePointPolicy{
 		RequestedSafePoint: token.ReadVersion + 100,
 		SnapshotRetention:  rt.Snapshots.SnapshotRetentionIndex(),
-		Mount:              fsmeta.MountKeyResolver,
+		Mount:              layout.MountKeyResolver,
 	}
 	require.Equal(t, token.ReadVersion, policy.EffectiveForKey(gcKey))
 
@@ -392,7 +393,7 @@ func runConcurrentFSOps(t *testing.T, count int, fn func(int) error) {
 	}
 }
 
-func requireWatchEvent(t *testing.T, sub fsmeta.WatchSubscription) fsmeta.WatchEvent {
+func requireWatchEvent(t *testing.T, sub observe.WatchSubscription) observe.WatchEvent {
 	t.Helper()
 	select {
 	case evt, ok := <-sub.Events():
@@ -400,6 +401,6 @@ func requireWatchEvent(t *testing.T, sub fsmeta.WatchSubscription) fsmeta.WatchE
 		return evt
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for watch event")
-		return fsmeta.WatchEvent{}
+		return observe.WatchEvent{}
 	}
 }

@@ -7,8 +7,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/feichai0017/NoKV/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
+	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
@@ -70,7 +70,7 @@ func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgr
 		return false, nil
 	}
 	inode.LinkCount++
-	dentryValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+	dentryValue, err := layout.EncodeDentryValue(model.DentryRecord{
 		Parent: req.ToParent,
 		Name:   req.ToName,
 		Inode:  record.Inode,
@@ -79,15 +79,15 @@ func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgr
 	if err != nil {
 		return false, err
 	}
-	inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
+	inodeKey, err := layout.EncodeInodeKey(mount, inode.Inode)
 	if err != nil {
 		return false, err
 	}
-	inodeValue, err := fsmeta.EncodeInodeValue(inode)
+	inodeValue, err := layout.EncodeInodeValue(inode)
 	if err != nil {
 		return false, err
 	}
-	parentValue, err := fsmeta.EncodeInodeValue(parent)
+	parentValue, err := layout.EncodeInodeValue(parent)
 	if err != nil {
 		return false, err
 	}
@@ -133,7 +133,7 @@ func (e *Executor) Link(ctx context.Context, req model.LinkRequest) error {
 		if err != nil {
 			return err
 		}
-		sourceDentryValue, err := fsmeta.EncodeDentryValue(record)
+		sourceDentryValue, err := layout.EncodeDentryValue(record)
 		if err != nil {
 			return err
 		}
@@ -169,17 +169,17 @@ func (e *Executor) Link(ctx context.Context, req model.LinkRequest) error {
 		if err != nil {
 			return err
 		}
-		parentValue, err := fsmeta.EncodeInodeValue(nextParent)
+		parentValue, err := layout.EncodeInodeValue(nextParent)
 		if err != nil {
 			return err
 		}
-		oldInodeValue, err := fsmeta.EncodeInodeValue(inode)
+		oldInodeValue, err := layout.EncodeInodeValue(inode)
 		if err != nil {
 			return err
 		}
 		inode.LinkCount++
 
-		dentryValue, err := fsmeta.EncodeDentryValue(model.DentryRecord{
+		dentryValue, err := layout.EncodeDentryValue(model.DentryRecord{
 			Parent: req.ToParent,
 			Name:   req.ToName,
 			Inode:  record.Inode,
@@ -188,11 +188,11 @@ func (e *Executor) Link(ctx context.Context, req model.LinkRequest) error {
 		if err != nil {
 			return err
 		}
-		inodeKey, err := fsmeta.EncodeInodeKey(mount, inode.Inode)
+		inodeKey, err := layout.EncodeInodeKey(mount, inode.Inode)
 		if err != nil {
 			return err
 		}
-		inodeValue, err := fsmeta.EncodeInodeValue(inode)
+		inodeValue, err := layout.EncodeInodeValue(inode)
 		if err != nil {
 			return err
 		}
