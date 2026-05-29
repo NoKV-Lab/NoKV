@@ -34,7 +34,6 @@ type Runner struct {
 
 	atomicMutateTotal            atomic.Uint64
 	atomicPredicateRejectedTotal atomic.Uint64
-	atomicRejectedTotal          atomic.Uint64
 	mutateTotal                  atomic.Uint64
 }
 
@@ -175,20 +174,16 @@ func (r *Runner) MutateAtCommit(ctx context.Context, primary []byte, mutations [
 }
 
 // InstallMutationsAtCommit applies a segment-install mutation group at
-// commitVersion without the cross-shard atomicity guard that MutateAtCommit
-// enforces. Large groups are chunked under the local DB's per-batch size /
+// commitVersion. Large groups are chunked under the local DB's per-batch size /
 // count limit so a single segment can carry many more mutations than a
 // percolator commit ever could; every chunk shares the same commitVersion
 // so the resulting set is observationally one install.
 //
 // Contract for callers: every mutation is a versioned MVCC write whose effect
-// is idempotent on retry. The local DB still routes mutations to their
-// affinity-correct commit shard internally, so each shard's group is
-// atomically fsynced; the relaxation is only at the cross-shard and cross-chunk
-// boundary. The caller is responsible for not exposing the install as
-// complete until the function returns nil — partial completion on crash is
-// recovered by visibleLog replay re-running the same install with the same
-// commitVersion (the duplicate writes are no-ops because they share the
+// is idempotent on retry. The caller is responsible for not exposing the
+// install as complete until the function returns nil — partial completion on
+// crash is recovered by visibleLog replay re-running the same install with the
+// same commitVersion (the duplicate writes are no-ops because they share the
 // internal-key version).
 //
 // This path is only safe for callers that have committed to "no lock/intent
@@ -281,9 +276,10 @@ func (r *Runner) chunkInstallMutations(mutations []*backend.Mutation) ([][]*back
 	return chunks, nil
 }
 
-// TryAtomicMutate applies predicate-checked mutations through the same local
-// atomic apply group used by Mutate. handled=false means the caller-owned DB is
-// sharded in a way that cannot preserve group atomicity for this key set.
+// TryAtomicMutate applies predicate-checked mutations through the same backend
+// atomic batch boundary used by Mutate. handled=false means this runner cannot
+// serve the one-phase fast path for the request and the caller should use the
+// regular transaction protocol.
 func (r *Runner) TryAtomicMutate(ctx context.Context, primary []byte, predicates []*backend.Predicate, mutations []*backend.Mutation, startVersion, commitVersion uint64) (bool, error) {
 	if err := ctxErr(ctx); err != nil {
 		return true, err
@@ -305,12 +301,11 @@ func (r *Runner) TryAtomicMutate(ctx context.Context, primary []byte, predicates
 func (r *Runner) Stats() map[string]any {
 	if r == nil {
 		return map[string]any{
-			"next_timestamp":                    uint64(0),
-			"latest_observed":                   uint64(0),
-			"mutate_total":                      uint64(0),
-			"atomic_mutate_total":               uint64(0),
-			"atomic_predicate_rejected_total":   uint64(0),
-			"atomic_apply_group_rejected_total": uint64(0),
+			"next_timestamp":                  uint64(0),
+			"latest_observed":                 uint64(0),
+			"mutate_total":                    uint64(0),
+			"atomic_mutate_total":             uint64(0),
+			"atomic_predicate_rejected_total": uint64(0),
 		}
 	}
 	r.mu.Lock()
@@ -318,12 +313,11 @@ func (r *Runner) Stats() map[string]any {
 	observed := r.latestObservedTS
 	r.mu.Unlock()
 	return map[string]any{
-		"next_timestamp":                    next,
-		"latest_observed":                   observed,
-		"mutate_total":                      r.mutateTotal.Load(),
-		"atomic_mutate_total":               r.atomicMutateTotal.Load(),
-		"atomic_predicate_rejected_total":   r.atomicPredicateRejectedTotal.Load(),
-		"atomic_apply_group_rejected_total": r.atomicRejectedTotal.Load(),
+		"next_timestamp":                  next,
+		"latest_observed":                 observed,
+		"mutate_total":                    r.mutateTotal.Load(),
+		"atomic_mutate_total":             r.atomicMutateTotal.Load(),
+		"atomic_predicate_rejected_total": r.atomicPredicateRejectedTotal.Load(),
 	}
 }
 
@@ -356,23 +350,17 @@ func (r *Runner) applyMutationGroup(primary []byte, mutations []*backend.Mutatio
 		return 0, nil, err
 	}
 	defer releaseEntries(entries)
-	if !r.db.CanApplyInternalEntriesAtomically(entries) {
-		r.atomicRejectedTotal.Add(1)
-		return 0, nil, errNonAtomicApplyGroup
-	}
 	if err := r.db.ApplyInternalEntries(entries); err != nil {
 		return 0, nil, err
 	}
 	return effectiveCommitVersion, r.completeMutationApply(effectiveCommitVersion, false), nil
 }
 
-// applyInstallMutationGroup is the cross-shard-safe sibling of
-// applyMutationGroup used by segment install. It performs install-specific
-// validation, latch acquire, and entry build, but routes through
-// db.ApplyInternalEntries without the CanApplyInternalEntriesAtomically
-// guard because install entries are versioned MVCC writes that are
-// idempotent on visibleLog replay. See InstallMutationsAtCommit for the
-// full contract.
+// applyInstallMutationGroup is the segment-install sibling of
+// applyMutationGroup. It performs install-specific validation, latch acquire,
+// and entry build. Install entries are versioned MVCC writes that are
+// idempotent on visibleLog replay. See InstallMutationsAtCommit for the full
+// contract.
 func (r *Runner) applyInstallMutationGroup(primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64) (uint64, mutationObserver, error) {
 	guard := r.latches.Acquire(mutationLatchKeys(primary, nil, mutations))
 	defer guard.Release()
@@ -385,9 +373,6 @@ func (r *Runner) applyInstallMutationGroup(primary []byte, mutations []*backend.
 		return 0, nil, err
 	}
 	defer releaseEntries(entries)
-	// Intentionally skip CanApplyInternalEntriesAtomically — see method doc.
-	// db.ApplyInternalEntries still routes per shard via the key-affinity
-	// router so each shard's writes are atomically fsynced.
 	if err := r.db.ApplyInternalEntries(entries); err != nil {
 		return 0, nil, err
 	}
@@ -415,10 +400,6 @@ func (r *Runner) applyAtomicMutationGroup(primary []byte, predicates []*backend.
 		return 0, nil, true, err
 	}
 	defer releaseEntries(entries)
-	if !r.db.CanApplyInternalEntriesAtomically(entries) {
-		r.atomicRejectedTotal.Add(1)
-		return 0, nil, false, nil
-	}
 	if err := r.db.ApplyInternalEntries(entries); err != nil {
 		return 0, nil, true, err
 	}

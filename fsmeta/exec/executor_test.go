@@ -1100,35 +1100,6 @@ func incrementSeedParentChildCount(t *testing.T, runner *fakeRunner, mount model
 	runner.data[string(key)] = value
 }
 
-func findDifferentRenameAffinity(t *testing.T, baseFrom, baseTo model.InodeID) (model.InodeID, model.InodeID) {
-	t.Helper()
-	base := renameAffinity(t, baseFrom, baseTo)
-	for from := model.InodeID(9); from < 256; from++ {
-		for to := model.InodeID(9); to < 256; to++ {
-			if from == to {
-				continue
-			}
-			if renameAffinity(t, from, to) != base {
-				return from, to
-			}
-		}
-	}
-	t.Fatalf("no distinct rename affinity found")
-	return 0, 0
-}
-
-func renameAffinity(t *testing.T, from, to model.InodeID) string {
-	t.Helper()
-	source, err := layout.EncodeDentryKey(testMountIdentity, from, "old")
-	require.NoError(t, err)
-	destination, err := layout.EncodeDentryKey(testMountIdentity, to, "new")
-	require.NoError(t, err)
-	return atomicOnePhaseAffinity(source, []*backend.Mutation{
-		{Op: backend.MutationDelete, Key: source},
-		{Op: backend.MutationPut, Key: destination},
-	})
-}
-
 func seedSession(t *testing.T, runner *fakeRunner, mount model.MountID, record model.SessionRecord) {
 	t.Helper()
 	value, err := layout.EncodeSessionValue(record)

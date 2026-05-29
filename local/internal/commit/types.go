@@ -120,8 +120,7 @@ func (cq *CommitQueue) AddPending(entries int64, bytes int64) {
 }
 
 // CommitBatch is the temporary grouping drained by one commit-worker pass.
-// ShardID is set by the dispatcher and pins the batch to one local apply shard
-// end-to-end.
+// ShardID is set by the dispatcher and selects the local processor lane.
 type CommitBatch struct {
 	Reqs       []*CommitRequest
 	Pool       *[]*CommitRequest

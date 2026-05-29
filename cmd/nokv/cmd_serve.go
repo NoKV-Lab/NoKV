@@ -41,15 +41,6 @@ import (
 
 var notifyContext = signal.NotifyContext
 
-func fsmetaLocalUserKeyShape(key []byte) local.UserKeyShape {
-	shape := layout.UserKeyShape(key)
-	return local.UserKeyShape{
-		LocalityPrefix: shape.LocalityPrefix,
-		ShardKey:       shape.ShardKey,
-		Family:         shape.Family,
-	}
-}
-
 func runServeCmd(w io.Writer, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	workDir := fs.String("workdir", "", "database work directory")
@@ -235,7 +226,6 @@ func runServeCmd(w io.Writer, args []string) error {
 		opt.MaxBatchSize = *storageMaxBatchSize
 	}
 	opt.ControlLogPointerSnapshot = raftstorestats.ControlLogPointers(localMeta.DurableRaftPointerSnapshot)
-	opt.UserKeyShapeExtractor = fsmetaLocalUserKeyShape
 	opt.AllowedModes = []workdirmode.Mode{
 		workdirmode.ModeStandalone,
 		workdirmode.ModeSeeded,

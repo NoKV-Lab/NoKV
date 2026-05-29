@@ -49,20 +49,15 @@ func (s *visibleAdmissionCounters) recordSlow(reason compile.SlowReason) {
 	}
 }
 
-// recordFallback bumps the per-affinity fallback counter and updates the
-// monotonic consecutive-fallback gauge.
-func (s *atomicOnePhaseCounters) recordFallback(affinity string) {
-	s.mu.Lock()
-	next := s.fallbacksByAffinity[affinity] + 1
-	s.fallbacksByAffinity[affinity] = next
-	s.mu.Unlock()
-	s.consecutiveFallbacks.Store(next)
+// recordFallback records one unsupported one-phase attempt. The fallback streak
+// is global for this operation kind because physical batch atomicity belongs to
+// the backend, not to a filesystem key-placement proof.
+func (s *atomicOnePhaseCounters) recordFallback() {
+	s.consecutiveFallbacks.Add(1)
 }
 
-// recordSuccess clears the per-affinity fallback streak.
-func (s *atomicOnePhaseCounters) recordSuccess(affinity string) {
-	s.mu.Lock()
-	delete(s.fallbacksByAffinity, affinity)
-	s.mu.Unlock()
+// recordSuccess clears the fallback streak after the backend accepts a
+// one-phase mutation for this operation kind.
+func (s *atomicOnePhaseCounters) recordSuccess() {
 	s.consecutiveFallbacks.Store(0)
 }

@@ -42,5 +42,5 @@ func TestInstallStorePercolatorExpvarPublishesAtomicCounters(t *testing.T) {
 	var snapshot map[string]any
 	require.NoError(t, json.Unmarshal([]byte(metricsVar.String()), &snapshot))
 	require.Contains(t, snapshot, "atomic_apply_called_total")
-	require.Contains(t, snapshot, "atomic_local_fallback_total")
+	require.Contains(t, snapshot, "atomic_fused_apply_requests_total")
 }

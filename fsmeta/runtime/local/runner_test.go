@@ -55,7 +55,6 @@ func TestRunnerMutateHandlesCrossShardPebbleBatch(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
 	opts.WriteShardCount = 4
-	opts.UserKeyShapeExtractor = nil
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
@@ -76,7 +75,6 @@ func TestRunnerInstallMutationsAtCommitAcceptsCrossShard(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
 	opts.WriteShardCount = 4
-	opts.UserKeyShapeExtractor = nil
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
@@ -129,7 +127,6 @@ func TestRunnerInstallMutationsAtCommitChunksLargeGroups(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
 	opts.WriteShardCount = 1
-	opts.UserKeyShapeExtractor = nil
 	// Squeeze the per-batch budget so the install path is forced to chunk.
 	opts.MaxBatchCount = 8
 	opts.MaxBatchSize = 64 << 10
@@ -167,7 +164,6 @@ func TestRunnerInstallMutationsAtCommitRespectsSmallMaxBatchSize(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
 	opts.WriteShardCount = 1
-	opts.UserKeyShapeExtractor = nil
 	opts.MaxBatchCount = 10_000
 	opts.MaxBatchSize = 64
 	db := openTestDB(t, opts)
@@ -199,7 +195,6 @@ func TestRunnerInstallMutationsAtCommitChunksDeleteGroupsBelowStrictLimit(t *tes
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
 	opts.WriteShardCount = 1
-	opts.UserKeyShapeExtractor = nil
 	opts.MaxBatchCount = 8
 	opts.MaxBatchSize = 64 << 10
 	db := openTestDB(t, opts)
@@ -333,7 +328,6 @@ func TestRunnerTryAtomicMutateHandlesCrossShardPebbleBatch(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
 	opts.WriteShardCount = 4
-	opts.UserKeyShapeExtractor = nil
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
@@ -348,7 +342,6 @@ func TestRunnerTryAtomicMutateHandlesCrossShardPebbleBatch(t *testing.T) {
 	}, start, start+1)
 	require.NoError(t, err)
 	require.True(t, handled)
-	require.Equal(t, uint64(0), runner.Stats()["atomic_apply_group_rejected_total"])
 }
 
 func TestRunnerTryAtomicMutateSerializesConcurrentSameKey(t *testing.T) {
@@ -382,7 +375,7 @@ func TestRunnerTryAtomicMutateSerializesConcurrentSameKey(t *testing.T) {
 				Value: []byte{byte(i)},
 			}}, ts, ts+1)
 			if !handled {
-				errCh <- errNonAtomicApplyGroup
+				errCh <- errInvalidAtomicMutate
 				return
 			}
 			if mutateErr == nil {

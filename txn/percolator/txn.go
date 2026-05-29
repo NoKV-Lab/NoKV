@@ -245,7 +245,6 @@ type AtomicMutateResult struct {
 
 type statsRegistry struct {
 	applyCalledTotal        atomic.Uint64
-	localFallbackTotal      atomic.Uint64
 	fusedApplyBatchesTotal  atomic.Uint64
 	fusedApplyRequestsTotal atomic.Uint64
 	fusedApplyEntriesTotal  atomic.Uint64
@@ -265,7 +264,6 @@ var percolatorStats statsRegistry
 func Stats() map[string]any {
 	return map[string]any{
 		"atomic_apply_called_total":         percolatorStats.applyCalledTotal.Load(),
-		"atomic_local_fallback_total":       percolatorStats.localFallbackTotal.Load(),
 		"atomic_fused_apply_batches_total":  percolatorStats.fusedApplyBatchesTotal.Load(),
 		"atomic_fused_apply_requests_total": percolatorStats.fusedApplyRequestsTotal.Load(),
 		"atomic_fused_apply_entries_total":  percolatorStats.fusedApplyEntriesTotal.Load(),
@@ -279,9 +277,8 @@ func Stats() map[string]any {
 }
 
 // ApplyAtomicMutate tries to materialize a region-local MVCC mutation without
-// exposing Percolator locks. It is only allowed to write when the DB can prove
-// the resulting internal entries share one atomic local apply group; otherwise
-// callers must fall back to the regular 2PC protocol.
+// exposing Percolator locks. The selected storage backend owns the physical
+// atomicity of the internal entry batch.
 func ApplyAtomicMutate(db txnstore.Store, latches *latch.Manager, req *kvrpcpb.TryAtomicMutateRequest) AtomicMutateResult {
 	if req == nil {
 		return AtomicMutateResult{}
@@ -294,8 +291,8 @@ func ApplyAtomicMutate(db txnstore.Store, latches *latch.Manager, req *kvrpcpb.T
 }
 
 // ApplyAtomicMutateBatch applies a raft-entry batch of independent 1PC
-// attempts. It preserves per-request responses and only fuses requests when
-// their combined MVCC entries remain one local atomic apply group.
+// attempts. It preserves per-request responses and fuses non-overlapping
+// requests into one storage-backed atomic apply group.
 func ApplyAtomicMutateBatch(db txnstore.Store, latches *latch.Manager, reqs []*kvrpcpb.TryAtomicMutateRequest) []AtomicMutateResult {
 	results := make([]AtomicMutateResult, len(reqs))
 	if len(reqs) == 0 {
@@ -322,7 +319,6 @@ func ApplyAtomicMutateBatch(db txnstore.Store, latches *latch.Manager, reqs []*k
 	guard := latches.Acquire(allKeys)
 	defer guard.Release()
 
-	planner, hasPlanner := db.(txnstore.AtomicInternalApplyPlanner)
 	group := atomicMutateApplyGroup{}
 	for i, item := range prepared {
 		if !item.eligible {
@@ -341,18 +337,6 @@ func ApplyAtomicMutateBatch(db txnstore.Store, latches *latch.Manager, reqs []*k
 		if len(plan.entries) == 0 {
 			results[i] = AtomicMutateResult{AppliedKeys: plan.appliedKeys}
 			continue
-		}
-		if !hasPlanner || !planner.CanApplyInternalEntriesAtomically(plan.entries) {
-			percolatorStats.localFallbackTotal.Add(1)
-			releaseEntries(plan.entries)
-			results[i] = AtomicMutateResult{Fallback: true}
-			continue
-		}
-		// A request can be locally atomic by itself while belonging to a
-		// different local apply shard than the current group. Split the group
-		// instead of turning a valid 1PC request into a 2PC fallback.
-		if !group.empty() && !planner.CanApplyInternalEntriesAtomically(group.entriesWith(plan.entries)) {
-			group.flush(db, results)
 		}
 		group.add(i, plan)
 	}
@@ -460,10 +444,6 @@ type atomicMutateGroupRequest struct {
 	appliedKeys uint64
 }
 
-func (g *atomicMutateApplyGroup) empty() bool {
-	return g == nil || len(g.requests) == 0
-}
-
 func (g *atomicMutateApplyGroup) conflicts(keys [][]byte) bool {
 	if g == nil || len(g.keys) == 0 {
 		return false
@@ -474,13 +454,6 @@ func (g *atomicMutateApplyGroup) conflicts(keys [][]byte) bool {
 		}
 	}
 	return false
-}
-
-func (g *atomicMutateApplyGroup) entriesWith(entries []*txnstore.Entry) []*txnstore.Entry {
-	out := make([]*txnstore.Entry, 0, len(g.entries)+len(entries))
-	out = append(out, g.entries...)
-	out = append(out, entries...)
-	return out
 }
 
 func (g *atomicMutateApplyGroup) add(index int, plan atomicMutatePlan) {

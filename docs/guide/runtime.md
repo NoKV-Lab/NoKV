@@ -83,13 +83,14 @@ interpret fsmeta, MVCC, raftstore, or protobuf semantics.
 
 - `Get`, `Put`, `Delete`, `DeleteRange`;
 - ordered forward/reverse iterators with bounds;
-- atomic batch apply;
+- atomic batch apply through `ApplyBatch`;
 - point-in-time snapshots;
 - `Sync`, `Close`, and backend-neutral stats.
 
-Pebble implements this today. Holt should implement the same interface, either
-as one raw ordered tree or as a multi-tree adapter hidden behind the same Go
-contract.
+Pebble implements this today. Holt is pinned under `third_party/holt`; the
+future Go adapter should live under `storage/holt` and implement the same
+interface, either as one raw ordered tree or as a multi-tree adapter hidden
+behind the same Go contract.
 
 ## 5. Entry Ownership
 

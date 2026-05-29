@@ -9,11 +9,11 @@
 // (commit-store batch apply and Sync) and for read-only state
 // signals (block/slow-write throttle, hot-key tracking, write metrics).
 //
-// The hot path is fan-out by per-shard channel: the dispatcher pulls
-// each batch off the MPSC queue and routes it to one shard's processor
-// using key-affinity hashing. The processor coalesces a burst of batches
-// arriving on its channel into one commit-store SetBatchGroup + optional Sync,
-// then acks each originating batch with the per-batch failedAt fanned back out.
+// The hot path is fan-out by per-shard channel: the dispatcher pulls each
+// batch off the MPSC queue and routes it to one shard's processor using the
+// first user key. The processor coalesces a burst of batches arriving on its
+// channel into one commit-store SetBatchGroup + optional Sync, then acks each
+// originating batch with the per-batch failedAt fanned back out.
 package commit
 
 import (
@@ -37,7 +37,6 @@ type Config struct {
 	WriteBatchMaxCount int
 	WriteBatchMaxSize  int64
 	WriteBatchWait     time.Duration
-	UserKeyShardKey    func(userKey []byte) []byte
 }
 
 // CommitStore is the narrow commit-store surface the pipeline writes through.
@@ -300,19 +299,18 @@ func (p *Pipeline) dispatcher() {
 			closeAll()
 			return
 		}
-		shardID := shardForBatch(batch, n, &rrFallback, p.cfg.UserKeyShardKey)
+		shardID := shardForBatch(batch, n, &rrFallback)
 		batch.ShardID = shardID
 		p.dispatch[shardID] <- batch
 	}
 }
 
-// shardForBatch picks the destination shard for a commit batch using the
-// configured semantic shard key. The default router hashes the whole user key;
-// runtimes can expose a stable locality key so related records reach one local
-// apply group without the commit package knowing their higher-level schema.
+// shardForBatch picks the destination worker for a commit batch using the first
+// valid user key in the batch. Atomicity is not derived from this placement:
+// storage/kv.ApplyBatch is the physical atomicity boundary.
 //
 // Empty batches (no key to hash) round-robin via *rr to keep load even.
-func shardForBatch(batch *CommitBatch, n int, rr *int, shardKey func([]byte) []byte) int {
+func shardForBatch(batch *CommitBatch, n int, rr *int) int {
 	if n <= 1 {
 		return 0
 	}
@@ -329,7 +327,7 @@ func shardForBatch(batch *CommitBatch, n int, rr *int, shardKey func([]byte) []b
 				if !ok || len(userKey) == 0 {
 					continue
 				}
-				return routeUserKeyToShard(userKey, n, shardKey)
+				return utils.ShardForUserKey(userKey, n)
 			}
 		}
 	}
@@ -339,15 +337,6 @@ func shardForBatch(batch *CommitBatch, n int, rr *int, shardKey func([]byte) []b
 		*rr = 0
 	}
 	return id
-}
-
-func routeUserKeyToShard(userKey []byte, shardCount int, shardKey func([]byte) []byte) int {
-	if shardKey != nil {
-		if key := shardKey(userKey); len(key) > 0 {
-			return utils.ShardForUserKey(key, shardCount)
-		}
-	}
-	return utils.ShardForUserKey(userKey, shardCount)
 }
 
 // processor runs the per-batch CPU pipeline (collect -> applyRequests -> ack)

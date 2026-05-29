@@ -626,7 +626,7 @@ func (c *Client) TryAtomicMutate(ctx context.Context, primary []byte, predicates
 			continue
 		}
 		if resp.GetFallbackToTwoPhaseCommit() {
-			c.atomicLocalFallbackTotal.Add(1)
+			c.atomicBackendFallbackTotal.Add(1)
 			return false, nil
 		}
 		if err := txnKeyError(resp.GetError()); err != nil {

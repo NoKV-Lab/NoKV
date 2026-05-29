@@ -50,8 +50,8 @@ flowchart TD
   D -. "same contract" .-> F["storage/holt target"]
 ```
 
-Durability and ordering guarantees come from the selected raw backend plus
-NoKV's MVCC/transaction protocol above it. The backend owns its own WAL,
+Durability, ordering, and raw batch atomicity come from the selected backend
+plus NoKV's MVCC/transaction protocol above it. The backend owns its own WAL,
 memtable, flush, and compaction internals.
 
 ## Read Path

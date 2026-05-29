@@ -27,7 +27,7 @@ application / SDK
   -> fsmeta/runtime/local or fsmeta/runtime/raftstore
   -> txn MVCC / Percolator
   -> storage/kv raw ordered engine
-  -> storage/pebble today, future adapters such as Holt
+  -> storage/pebble today, future storage/holt adapter over third_party/holt
 ```
 
 The main package boundaries are:
@@ -46,6 +46,7 @@ The main package boundaries are:
 | `txn` | MVCC storage keys, read/write planning, latches, and Percolator-style 2PC. |
 | `storage/kv` | Raw ordered key/value engine interface. |
 | `storage/pebble` | Default Pebble-backed raw storage implementation. |
+| `third_party/holt` | Pinned Holt source checkout for the future Rust-backed adapter. |
 | `local` | Embedded DB facade over NoKV MVCC encoding and raw storage. |
 | `experimental` | Research mechanisms such as Peras and Thermos. |
 

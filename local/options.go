@@ -83,16 +83,13 @@ type Options struct {
 	// WAL fsync from the commit pipeline. When false (the default), the commit
 	// worker performs fsync inline. Only effective when SyncWrites is true.
 	SyncPipeline bool
-	// WriteShardCount is the number of local commit-pipeline processors. The
-	// shard router uses `& (N-1)` for placement so the value must be a power of
-	// two. Zero falls back to the constructor default; non-power-of-two values
-	// are rounded DOWN to the nearest power of two during Open (e.g. 6 -> 4,
-	// 12 -> 8).
+	// WriteShardCount is the number of local commit-pipeline processors. It is
+	// a CPU/admission coalescing knob only; raw storage batch atomicity is owned
+	// by the selected storage/kv backend. The shard router uses `& (N-1)` for
+	// placement so the value must be a power of two. Zero falls back to the
+	// constructor default; non-power-of-two values are rounded DOWN to the
+	// nearest power of two during Open (e.g. 6 -> 4, 12 -> 8).
 	WriteShardCount int
-	// UserKeyShapeExtractor optionally exposes runtime-derived key structure to
-	// local storage. Nil keeps generic full-key hashing and disables semantic
-	// affinity routing.
-	UserKeyShapeExtractor UserKeyShapeExtractor
 	// WriteHotKeyLimit caps how many consecutive writes a single key can issue
 	// before the DB returns utils.ErrHotKeyWriteThrottle. Zero disables write-path
 	// throttling.

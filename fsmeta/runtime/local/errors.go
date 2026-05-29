@@ -19,7 +19,6 @@ var (
 	errCommitVersion        = nokverrors.New(nokverrors.KindInvalidArgument, "fsmeta/runtime/local: commit version must be greater than start version")
 	errEmptyMutationKey     = nokverrors.New(nokverrors.KindInvalidArgument, "fsmeta/runtime/local: empty mutation key")
 	errUnsupportedMutation  = nokverrors.New(nokverrors.KindInvalidArgument, "fsmeta/runtime/local: unsupported mutation op")
-	errNonAtomicApplyGroup  = nokverrors.New(nokverrors.KindProtocolViolation, "fsmeta/runtime/local: local DB cannot atomically apply fsmeta mutation group")
 	errInvalidInternalEntry = nokverrors.New(nokverrors.KindProtocolViolation, "fsmeta/runtime/local: invalid MVCC internal entry")
 	errInvalidAtomicMutate  = nokverrors.New(nokverrors.KindInvalidArgument, "fsmeta/runtime/local: invalid atomic mutate")
 	errAtomicPredicate      = nokverrors.New(nokverrors.KindRetryable, "fsmeta/runtime/local: atomic predicate mismatch")

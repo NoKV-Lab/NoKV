@@ -76,15 +76,6 @@ type KeyParts struct {
 	SnapshotReadVersion uint64
 }
 
-// KeyShape describes runtime-derived structure for one encoded fsmeta key.
-// Runtime adapters may use it for local shard routing without making layout
-// depend on a concrete storage engine.
-type KeyShape struct {
-	LocalityPrefix []byte
-	ShardKey       []byte
-	Family         byte
-}
-
 func (k KeyKind) String() string {
 	switch k {
 	case KeyKindMount:
@@ -442,95 +433,13 @@ func MountKeyResolver(key []byte) (uint64, bool) {
 	return uint64(mount), ok
 }
 
-// UserKeyShape exposes fsmeta key shape to the local engine without making the
-// engine import fsmeta. The shape keeps all keys in one mount-local affinity
-// bucket on the same local shard.
-func UserKeyShape(key []byte) KeyShape {
-	mountKeyID, bucketPos, err := decodeMountPrefix(key)
-	if err != nil || len(key)-bucketPos < encodedBucketBytes+1 {
-		return KeyShape{}
-	}
-	kindPos := bucketPos + encodedBucketBytes
-	kind := KeyKind(key[kindPos])
-	bodyPos := kindPos + 1
-	shape := KeyShape{
-		LocalityPrefix: key[:kindPos],
-		ShardKey:       key[:kindPos],
-		Family:         byte(kind),
-	}
-	switch kind {
-	case KeyKindMount:
-	case KeyKindDentry:
-		if len(key) < bodyPos+8 {
-			return KeyShape{}
-		}
-		parent := model.InodeID(binary.BigEndian.Uint64(key[bodyPos : bodyPos+8]))
-		if parent == model.RootInode {
-			name := key[bodyPos+8:]
-			bucket := ChooseWorkspaceBucket(model.MountIdentity{MountKeyID: mountKeyID}, string(name))
-			shape.ShardKey = encodeKeyPrefixForMountKeyID(mountKeyID, bucket, KeyKindDentry, 0)[:kindPos]
-		}
-	case KeyKindInode, KeyKindChunk, KeyKindSession, KeyKindUsage:
-		if len(key) < bodyPos+8 {
-			return KeyShape{}
-		}
-	case KeyKindSnapshot:
-		if len(key) < bodyPos+16 {
-			return KeyShape{}
-		}
-	case KeyKindSegment:
-		if len(key) < bodyPos+33 {
-			return KeyShape{}
-		}
-		shape.ShardKey = segmentShardKey(mountKeyID, key[bodyPos+1:bodyPos+33])
-	default:
-		return KeyShape{}
-	}
-	return shape
-}
-
-// MountAtomicUserKeyShape keeps all records for one mount on one local apply
-// shard. The embedded fsmeta direct-MVCC runtime uses this stricter shape so multi-key namespace
-// operations remain one local WAL/apply group even when the storage engine has
-// multiple commit shards.
-func MountAtomicUserKeyShape(key []byte) KeyShape {
-	_, bucketPos, err := decodeMountPrefix(key)
-	if err != nil || bucketPos <= 0 {
-		return KeyShape{}
-	}
-	shape := UserKeyShape(key)
-	if len(shape.LocalityPrefix) == 0 && shape.Family == 0 {
-		return KeyShape{}
-	}
-	mountPrefix := key[:bucketPos]
-	shape.LocalityPrefix = mountPrefix
-	shape.ShardKey = mountPrefix
-	return shape
-}
-
-func segmentShardKey(mountKeyID model.MountKeyID, root []byte) []byte {
-	out := make([]byte, 0, len(keyMagic)+1+encodedMountKeyBytes+1+len(root))
-	out = append(out, keyMagic...)
-	out = append(out, keySchemaVersion)
-	out = binary.BigEndian.AppendUint64(out, uint64(mountKeyID))
-	out = append(out, byte(KeyKindSegment))
-	return append(out, root...)
-}
-
-// ShardForUserKey is the fsmeta physical placement policy used by local DB
-// runtimes. It keeps semantically-related metadata keys on one local shard
-// without teaching the local engine fsmeta's key families.
+// ShardForUserKey returns the generic hash shard for one encoded fsmeta key.
+// It is used for diagnostics and synthetic placement tests only; physical
+// atomicity is owned by storage/kv.ApplyBatch.
 func ShardForUserKey(key []byte, shardCount int) int {
 	shardCount = utils.NormalizeShardCount(shardCount)
 	if shardCount <= 1 {
 		return 0
-	}
-	shape := UserKeyShape(key)
-	if len(shape.ShardKey) > 0 {
-		return utils.ShardForUserKey(shape.ShardKey, shardCount)
-	}
-	if len(shape.LocalityPrefix) > 0 {
-		return utils.ShardForUserKey(shape.LocalityPrefix, shardCount)
 	}
 	return utils.ShardForUserKey(key, shardCount)
 }

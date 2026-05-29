@@ -46,7 +46,7 @@ Package boundaries follow ownership of truth, not convenience.
 
 | Package | Owns | Must Not Do |
 | --- | --- | --- |
-| `storage/kv/` | Raw ordered key/value backend contract. | Expose MVCC, fsmeta, raftstore, migration, SST, or protobuf semantics. |
+| `storage/kv/` | Raw ordered key/value backend contract, including atomic raw batch apply. | Expose MVCC, fsmeta, raftstore, migration, SST, or protobuf semantics. |
 | `storage/pebble/`, `storage/holt/`, `storage/memory/` | Concrete raw ordered KV backends. | Own MVCC timestamps, column families, transactions, fsmeta layout, raftstore routing, or migration policy. |
 | `storage/wal/`, `storage/file/`, `storage/vfs/` | Low-level file, WAL, and VFS support for concrete runtime internals. | Become public fsmeta, txn, raftstore, or migration contracts. |
 | `local/` | Embedded DB facade and local runtime assembly. | Know fsmeta, coordinator, root, or raftstore semantics. |
@@ -66,6 +66,7 @@ Package boundaries follow ownership of truth, not convenience.
 | `cmd/` | Binary assembly, flags, env, and config wiring. | Contain core protocol or storage logic. |
 | `pb/`, `*/wire/` | Proto definitions and conversion glue. | Leak protobuf structs into storage or semantic cores when a domain type exists. |
 | `utils/` | Domain-neutral helpers shared by multiple packages. | Import global error taxonomy or own storage, raft, fsmeta, coordinator, or root semantics. |
+| `third_party/holt/` | Pinned external Holt source checkout for the future Rust-backed storage adapter. | Be imported directly by Go runtime code or become a semantic storage contract. |
 
 If a lower layer needs a higher-layer operation, define a narrow interface at
 the caller boundary instead of importing the higher layer.
@@ -85,6 +86,8 @@ The current responsibility map is:
 - `storage/pebble/*`: default Pebble-backed raw KV implementation.
 - `storage/holt/*`: owned Holt backend adapter once it is wired into this repo.
 - `storage/memory/*`: test raw KV implementation.
+- `third_party/holt`: pinned external Holt submodule. Go code should depend on
+  a future `storage/holt` adapter, not on this checkout directly.
 - `storage/wal`, `storage/file`, `storage/vfs`: low-level support packages used
   by concrete runtimes. They are not fsmeta or migration contracts.
 - `fsmeta/cache/*`: derived namespace sidecar caches such as dirpage and

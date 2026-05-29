@@ -4,7 +4,6 @@
 package exec
 
 import (
-	"sync"
 	"sync/atomic"
 
 	"github.com/feichai0017/NoKV/fsmeta/backend"
@@ -59,8 +58,6 @@ type atomicOnePhaseCounters struct {
 	fallbackTotal          atomic.Uint64
 	successTotal           atomic.Uint64
 	consecutiveFallbacks   atomic.Uint64
-	mu                     sync.Mutex
-	fallbacksByAffinity    map[string]uint64
 }
 
 // Stats returns executor counters suitable for expvar export.
@@ -268,7 +265,7 @@ var atomicOnePhaseKinds = [...]model.OperationKind{
 func newAtomicOnePhaseCounters() map[model.OperationKind]*atomicOnePhaseCounters {
 	out := make(map[model.OperationKind]*atomicOnePhaseCounters, len(atomicOnePhaseKinds))
 	for _, kind := range atomicOnePhaseKinds {
-		out[kind] = &atomicOnePhaseCounters{fallbacksByAffinity: make(map[string]uint64)}
+		out[kind] = &atomicOnePhaseCounters{}
 	}
 	return out
 }

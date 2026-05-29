@@ -7,14 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"sync/atomic"
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
-	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -28,8 +26,7 @@ func (e *Executor) mutateWithAtomicOnePhase(ctx context.Context, kind model.Oper
 		_, err := e.runner.Mutate(ctx, primary, mutations, startVersion, commitVersion, e.lockTTL)
 		return err
 	}
-	affinity := atomicOnePhaseAffinity(primary, mutations)
-	if stats != nil && !stats.allowAttempt(affinity) {
+	if stats != nil && !stats.allowAttempt() {
 		stats.skipTotal.Add(1)
 		_, err := e.runner.Mutate(ctx, primary, mutations, startVersion, commitVersion, e.lockTTL)
 		return err
@@ -41,13 +38,13 @@ func (e *Executor) mutateWithAtomicOnePhase(ctx context.Context, kind model.Oper
 	if err != nil || handled {
 		if err == nil && stats != nil {
 			stats.successTotal.Add(1)
-			stats.recordSuccess(affinity)
+			stats.recordSuccess()
 		}
 		return err
 	}
 	if stats != nil {
 		stats.fallbackTotal.Add(1)
-		stats.recordFallback(affinity)
+		stats.recordFallback()
 	}
 	_, err = e.runner.Mutate(ctx, primary, mutations, startVersion, commitVersion, e.lockTTL)
 	return err
@@ -58,49 +55,16 @@ const (
 	atomicOnePhaseProbeEvery   = 128
 )
 
-func (s *atomicOnePhaseCounters) allowAttempt(affinity string) bool {
+func (s *atomicOnePhaseCounters) allowAttempt() bool {
 	if s == nil {
 		return true
 	}
-	if s.affinityFallbacks(affinity) < atomicOnePhaseBackoffAfter {
+	if s.consecutiveFallbacks.Load() < atomicOnePhaseBackoffAfter {
 		return true
 	}
-	// Some plans are only conditionally co-located. Back off after repeated
-	// admission misses for the same placement pattern, but do not let unrelated
-	// patterns force all operations of this kind back onto 2PC.
+	// Back off after repeated backend misses, but keep probing periodically so a
+	// live backend upgrade or configuration change can re-enable the fast path.
 	return s.backoffSkipTotal.Add(1)%atomicOnePhaseProbeEvery == 0
-}
-
-func (s *atomicOnePhaseCounters) affinityFallbacks(affinity string) uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.fallbacksByAffinity[affinity]
-}
-
-func atomicOnePhaseAffinity(primary []byte, mutations []*backend.Mutation) string {
-	const virtualShards = 64
-	shards := make([]int, 0, 1+len(mutations))
-	if len(primary) > 0 {
-		shards = append(shards, layout.ShardForUserKey(primary, virtualShards))
-	}
-	for _, mutation := range mutations {
-		if mutation == nil || len(mutation.Key) == 0 {
-			continue
-		}
-		shards = append(shards, layout.ShardForUserKey(mutation.Key, virtualShards))
-	}
-	if len(shards) == 0 {
-		return "empty"
-	}
-	sort.Ints(shards)
-	out := make([]byte, 0, len(shards)*3)
-	for i, shard := range shards {
-		if i > 0 {
-			out = append(out, ',')
-		}
-		out = fmt.Appendf(out, "%02d", shard)
-	}
-	return string(out)
 }
 
 func (e *Executor) mutateWithoutAtomicOnePhase(ctx context.Context, kind model.OperationKind, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64) error {

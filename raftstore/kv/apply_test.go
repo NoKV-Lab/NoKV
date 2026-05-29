@@ -636,10 +636,6 @@ func (s *countingAtomicApplyStore) ApplyInternalEntries(entries []*entrykv.Entry
 	return s.base.ApplyInternalEntries(entries)
 }
 
-func (s *countingAtomicApplyStore) CanApplyInternalEntriesAtomically(entries []*entrykv.Entry) bool {
-	return s.base.CanApplyInternalEntriesAtomically(entries)
-}
-
 func (s *countingAtomicApplyStore) GetInternalEntry(cf entrykv.ColumnFamily, key []byte, version uint64) (*entrykv.Entry, error) {
 	return s.base.GetInternalEntry(cf, key, version)
 }

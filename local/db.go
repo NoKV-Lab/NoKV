@@ -214,11 +214,9 @@ func (db *DB) scanMaxDefaultVersion() (uint64, error) {
 }
 
 func (db *DB) startWriteRuntime() {
-	// One commit processor per CommitStore data-plane shard. Each processor
-	// owns its shard's WAL Manager — no cross-shard sharing means no
-	// Manager.mu contention on the hot write path. The dispatcher fans
-	// batches out by per-key affinity so each batch lives on exactly
-	// one shard (preserving SetBatch atomicity).
+	// Commit processors are local CPU/admission lanes. The selected raw storage
+	// backend owns physical batch atomicity; shard placement only spreads commit
+	// pipeline work.
 	workers := db.opt.WriteShardCount
 	if workers <= 0 {
 		workers = 1
@@ -232,7 +230,6 @@ func (db *DB) startWriteRuntime() {
 		WriteBatchMaxCount: db.opt.WriteBatchMaxCount,
 		WriteBatchMaxSize:  db.opt.WriteBatchMaxSize,
 		WriteBatchWait:     db.opt.WriteBatchWait,
-		UserKeyShardKey:    db.userKeyShardKey,
 	}, db)
 	db.pipeline.Start()
 }
@@ -967,24 +964,6 @@ func (db *DB) batchSet(entries []*kv.Entry) error {
 
 func (db *DB) batchSetInternalEntries(entries []*kv.Entry) error {
 	return db.batchSet(entries)
-}
-
-// CanApplyInternalEntriesAtomically reports whether ApplyInternalEntries will
-// persist entries as one local Pebble write batch.
-func (db *DB) CanApplyInternalEntriesAtomically(entries []*kv.Entry) bool {
-	for _, entry := range entries {
-		if entry == nil || len(entry.Key) == 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func (db *DB) userKeyShardKey(userKey []byte) []byte {
-	if db == nil || db.opt == nil || db.opt.UserKeyShapeExtractor == nil {
-		return nil
-	}
-	return db.opt.UserKeyShapeExtractor(userKey).shardKey()
 }
 
 func (db *DB) WorkDir() string {

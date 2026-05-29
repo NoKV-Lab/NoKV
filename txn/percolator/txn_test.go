@@ -149,10 +149,6 @@ func newCountingAtomicStore(base *local.DB) *countingAtomicStore {
 	return &countingAtomicStore{countingStore: newCountingStore(base)}
 }
 
-func (s *countingAtomicStore) CanApplyInternalEntriesAtomically(entries []*kv.Entry) bool {
-	return s.base.CanApplyInternalEntriesAtomically(entries)
-}
-
 type testIterator struct {
 	items []kv.Item
 	idx   int
@@ -260,22 +256,6 @@ func TestApplyAtomicMutateMaterializesCommittedKeys(t *testing.T) {
 	require.Nil(t, result.Error)
 	require.False(t, result.Fallback)
 	require.Equal(t, uint64(2), result.AppliedKeys)
-}
-
-func TestApplyAtomicMutateStatsRecordLocalFallback(t *testing.T) {
-	db := openTestDB(t)
-	store := newCountingStore(db)
-	latches := latch.NewManager(16)
-	before := Stats()
-
-	result := ApplyAtomicMutate(store, latches, atomicPutIfAbsentRequest(20, 21, []byte("dentry"), []byte("ino=42"), []byte("inode"), []byte("attrs")))
-	require.Nil(t, result.Error)
-	require.True(t, result.Fallback)
-	require.Zero(t, store.applyCalls)
-
-	after := Stats()
-	require.Equal(t, atomicMutateStat(t, before, "atomic_apply_called_total")+1, atomicMutateStat(t, after, "atomic_apply_called_total"))
-	require.Equal(t, atomicMutateStat(t, before, "atomic_local_fallback_total")+1, atomicMutateStat(t, after, "atomic_local_fallback_total"))
 }
 
 func TestApplyAtomicMutateBatchFusesIndependentRequests(t *testing.T) {

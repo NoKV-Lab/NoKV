@@ -214,7 +214,6 @@ func TestNewDefaultOptionsExposeConcreteStorageDefaults(t *testing.T) {
 
 	require.Greater(t, opt.MemTableSize, int64(0))
 	require.Greater(t, opt.BlockCacheBytes, int64(0))
-	require.Nil(t, opt.UserKeyShapeExtractor)
 }
 
 func TestNewDefaultOptionsExposeConcreteBatchDefaults(t *testing.T) {

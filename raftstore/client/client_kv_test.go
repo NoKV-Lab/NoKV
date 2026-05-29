@@ -575,11 +575,11 @@ func TestClientTryAtomicMutateStatsRecordRouteFallback(t *testing.T) {
 	stats := cli.Stats()
 	require.Equal(t, uint64(0), stats["atomic_route_single_total"])
 	require.Equal(t, uint64(1), stats["atomic_route_multi_total"])
-	require.Equal(t, uint64(0), stats["atomic_local_fallback_total"])
+	require.Equal(t, uint64(0), stats["atomic_backend_fallback_total"])
 	require.Equal(t, uint64(0), stats["atomic_success_total"])
 }
 
-func TestClientTryAtomicMutateStatsRecordLocalFallbackAndSuccess(t *testing.T) {
+func TestClientTryAtomicMutateStatsRecordBackendFallbackAndSuccess(t *testing.T) {
 	cluster := newMockCluster(clusterRegion{
 		meta: &metapb.RegionDescriptor{
 			RegionId: 1,
@@ -631,7 +631,7 @@ func TestClientTryAtomicMutateStatsRecordLocalFallbackAndSuccess(t *testing.T) {
 	stats := cli.Stats()
 	require.Equal(t, uint64(2), stats["atomic_route_single_total"])
 	require.Equal(t, uint64(0), stats["atomic_route_multi_total"])
-	require.Equal(t, uint64(1), stats["atomic_local_fallback_total"])
+	require.Equal(t, uint64(1), stats["atomic_backend_fallback_total"])
 	require.Equal(t, uint64(1), stats["atomic_success_total"])
 }
 

@@ -46,13 +46,19 @@ raftstore/
 storage/
   kv/             # raw ordered KV contract
   pebble/         # default Pebble backend
+  holt/           # future adapter over third_party/holt
   memory/         # tests
   wal/file/vfs/   # low-level runtime support
+
+third_party/
+  holt/           # pinned external Holt source checkout
 ```
 
 `storage/holt` is the expected placement for the Holt adapter once it is wired
-into this repository. It should implement `storage/kv.Store`; it should not
-import fsmeta, raftstore, coordinator, root, protobuf, or MVCC packages.
+into this repository. The Rust source is pinned as `third_party/holt`; Go
+runtime code should only depend on the adapter package. The adapter should
+implement `storage/kv.Store`; it should not import fsmeta, raftstore,
+coordinator, root, protobuf, or MVCC packages.
 
 `engine/*`, operator-facing `raftstore/migrate`, and SST import/export are not
 mainline packages. This version does not provide online migration from old
@@ -89,7 +95,7 @@ changing fsmeta semantics or distributed transaction behavior.
 The raw backend must provide:
 
 - ordered point reads and range iteration;
-- atomic batch apply;
+- atomic batch apply through `ApplyBatch`;
 - range delete;
 - point-in-time snapshot reads;
 - explicit `Sync`, `Close`, and small backend-neutral stats.
@@ -103,7 +109,9 @@ The backend must not own:
 - migration, SST ingest/export, or product-level backup semantics.
 
 That rule is what lets Pebble and Holt be interchangeable under NoKV's metadata
-execution model.
+execution model. Higher layers do not prove whether a mutation group can be
+atomic on a particular shard; they submit one raw batch and rely on the selected
+backend to make it visible all-or-nothing.
 
 ## Local Runtime
 

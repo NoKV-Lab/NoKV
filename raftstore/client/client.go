@@ -65,22 +65,22 @@ type RouteKeyGroup struct {
 
 // Client provides Region-aware helpers for StoreKV RPCs, including 2PC.
 type Client struct {
-	mu                       sync.RWMutex
-	stores                   map[uint64]*storeConn
-	regions                  map[uint64]*regionState
-	regionIndex              []regionRange
-	regionResolver           RegionResolver
-	storeResolver            StoreResolver
-	routeDescriptorFloors    []routeDescriptorFloor
-	routeLookupTimeout       time.Duration
-	storeRevalidateIn        time.Duration
-	dialTimeout              time.Duration
-	dialOpts                 []grpc.DialOption
-	retry                    RetryPolicy
-	atomicRouteSingleTotal   atomic.Uint64
-	atomicRouteMultiTotal    atomic.Uint64
-	atomicLocalFallbackTotal atomic.Uint64
-	atomicSuccessTotal       atomic.Uint64
+	mu                         sync.RWMutex
+	stores                     map[uint64]*storeConn
+	regions                    map[uint64]*regionState
+	regionIndex                []regionRange
+	regionResolver             RegionResolver
+	storeResolver              StoreResolver
+	routeDescriptorFloors      []routeDescriptorFloor
+	routeLookupTimeout         time.Duration
+	storeRevalidateIn          time.Duration
+	dialTimeout                time.Duration
+	dialOpts                   []grpc.DialOption
+	retry                      RetryPolicy
+	atomicRouteSingleTotal     atomic.Uint64
+	atomicRouteMultiTotal      atomic.Uint64
+	atomicBackendFallbackTotal atomic.Uint64
+	atomicSuccessTotal         atomic.Uint64
 }
 
 // New constructs a Client using the provided configuration.
@@ -168,16 +168,16 @@ func (c *Client) Close() error {
 func (c *Client) Stats() map[string]any {
 	if c == nil {
 		return map[string]any{
-			"atomic_route_single_total":   uint64(0),
-			"atomic_route_multi_total":    uint64(0),
-			"atomic_local_fallback_total": uint64(0),
-			"atomic_success_total":        uint64(0),
+			"atomic_route_single_total":     uint64(0),
+			"atomic_route_multi_total":      uint64(0),
+			"atomic_backend_fallback_total": uint64(0),
+			"atomic_success_total":          uint64(0),
 		}
 	}
 	return map[string]any{
-		"atomic_route_single_total":   c.atomicRouteSingleTotal.Load(),
-		"atomic_route_multi_total":    c.atomicRouteMultiTotal.Load(),
-		"atomic_local_fallback_total": c.atomicLocalFallbackTotal.Load(),
-		"atomic_success_total":        c.atomicSuccessTotal.Load(),
+		"atomic_route_single_total":     c.atomicRouteSingleTotal.Load(),
+		"atomic_route_multi_total":      c.atomicRouteMultiTotal.Load(),
+		"atomic_backend_fallback_total": c.atomicBackendFallbackTotal.Load(),
+		"atomic_success_total":          c.atomicSuccessTotal.Load(),
 	}
 }

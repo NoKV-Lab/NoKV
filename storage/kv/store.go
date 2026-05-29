@@ -15,6 +15,9 @@ type Store interface {
 	Delete(key []byte) error
 	DeleteRange(start, end []byte) error
 	NewIterator(opts IteratorOptions) (Iterator, error)
+	// ApplyBatch persists all mutations atomically. Implementations must make
+	// every op visible together or return an error without exposing a partial
+	// batch.
 	ApplyBatch(batch Batch) error
 	Snapshot() (Snapshot, error)
 	Sync() error
