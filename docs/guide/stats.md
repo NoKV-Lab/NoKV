@@ -22,7 +22,7 @@ Current domains include:
 
 | Domain | Owner |
 | --- | --- |
-| `storage` | Raw backend summary such as size bytes and key estimate. |
+| `storage` | Storage backend summary such as size bytes and key estimate. |
 | `write` | Local commit queue and apply pipeline. |
 | `raft` | Raft group and replay state. |
 | `region` | Store-local region catalog counts. |

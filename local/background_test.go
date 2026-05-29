@@ -41,13 +41,13 @@ func TestBackgroundServicesLifecycle(t *testing.T) {
 		StartCompacter: func() {
 			compacterStarts++
 		},
-		EnableWALWatchdog: true,
+		EnableControlWALWatchdog: true,
 	})
 
 	require.Equal(t, 1, compacterStarts)
 	require.Equal(t, 1, stats.started)
 	require.Same(t, stats, services.StatsCollector())
-	require.Empty(t, services.WALWatchdogs())
+	require.Empty(t, services.ControlWALWatchdogs())
 
 	rm := metrics.NewRegionMetrics()
 	services.SetRegionMetrics(rm)
@@ -56,7 +56,7 @@ func TestBackgroundServicesLifecycle(t *testing.T) {
 	require.NoError(t, services.Close())
 	require.Equal(t, 1, stats.closed)
 	require.Nil(t, services.StatsCollector())
-	require.Empty(t, services.WALWatchdogs())
+	require.Empty(t, services.ControlWALWatchdogs())
 }
 
 func TestBackgroundServicesClosePropagatesStatsError(t *testing.T) {

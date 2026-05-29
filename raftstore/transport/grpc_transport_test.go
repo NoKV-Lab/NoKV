@@ -581,7 +581,7 @@ func openDBAt(t *testing.T, dir string) (*local.DB, *localmeta.Store) {
 	require.NoError(t, err)
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = dir
-	opt.MemTableSize = 1 << 12
+	opt.StorageWriteBufferBytes = 1 << 12
 	opt.ControlLogLagWarnSegments = 1
 	opt.ControlLogPointerSnapshot = raftstorestats.ControlLogPointers(localMeta.DurableRaftPointerSnapshot)
 	db, err := local.Open(opt)

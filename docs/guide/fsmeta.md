@@ -82,7 +82,7 @@ type Store interface {
 ```
 
 `fsmeta/backend` deliberately has no protobuf, raftstore, local DB, concrete
-raw-storage, SST, or migration types. `fsmeta/exec` produces backend-neutral
+storage backend, SST, or migration types. `fsmeta/exec` produces backend-neutral
 mutations and predicates; runtime adapters translate those into their concrete
 commit path.
 For example, `fsmeta/runtime/local` applies them through the embedded local

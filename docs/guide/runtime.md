@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Runtime Call Chains
 
-This page documents the current runtime paths after the storage-backend
+This page documents the current runtime paths after the storage backend
 refactor. NoKV no longer has a product path centered on a self-managed Go LSM.
 The physical ordered-KV backend is replaceable: Pebble is the default backend
 in this repo, and Holt is the owned backend target at the same `storage/kv`
@@ -21,7 +21,7 @@ sequenceDiagram
     participant Local as fsmeta/runtime/local
     participant DB as local.DB
     participant MVCC as txn/storage
-    participant Raw as storage/kv
+    participant KV as storage/kv
     participant Pebble as storage/pebble
     participant Holt as storage/holt target
 
@@ -30,13 +30,13 @@ sequenceDiagram
     Backend->>Local: local runtime adapter
     Local->>DB: ApplyInternalEntries
     DB->>MVCC: encode CF + user key + timestamp
-    MVCC->>Raw: raw ordered key/value batch
-    Raw->>Pebble: current default backend
-    Raw-->>Holt: same contract when adapter is wired
+    MVCC->>KV: ordered key/value batch
+    KV->>Pebble: current default backend
+    KV-->>Holt: same contract when adapter is wired
 ```
 
 The fsmeta executor sees only `fsmeta/backend.Store`. It does not know whether
-the raw backend is Pebble, Holt, memory, or a future ordered engine.
+the storage backend is Pebble, Holt, memory, or a future ordered engine.
 
 ## 2. Distributed fsmeta Write Path
 
@@ -49,7 +49,7 @@ sequenceDiagram
     participant Store as raftstore/kv
     participant Raft as raftstore peer
     participant Txn as txn/mvcc + percolator
-    participant Raw as storage/kv
+    participant KV as storage/kv
 
     App->>Exec: metadata request
     Exec->>Adapter: backend mutations
@@ -58,16 +58,16 @@ sequenceDiagram
     Store->>Raft: propose command
     Raft->>Store: apply committed command
     Store->>Txn: MVCC / Percolator operation
-    Txn->>Raw: local raw ordered storage
+    Txn->>KV: local ordered-KV storage
 ```
 
 The distributed path adds rooted routing, TSO, Raft replication, and MVCC
-transaction coordination. It still stores the final bytes through the same raw
+transaction coordination. It still stores the final bytes through the same
 storage backend contract on each store.
 
 ## 3. Internal Key Shape
 
-NoKV keeps MVCC and column-family semantics above the raw storage engine:
+NoKV keeps MVCC and column-family semantics above the storage engine:
 
 ```text
 <column-family><user-key><descending timestamp>
@@ -77,7 +77,7 @@ NoKV keeps MVCC and column-family semantics above the raw storage engine:
 They must preserve byte ordering and snapshot consistency, but they must not
 interpret fsmeta, MVCC, raftstore, or protobuf semantics.
 
-## 4. Raw Backend Requirements
+## 4. Storage Backend Requirements
 
 `storage/kv.Store` is the physical boundary:
 
@@ -89,7 +89,7 @@ interpret fsmeta, MVCC, raftstore, or protobuf semantics.
 
 Pebble implements this today. Holt is pinned under `third_party/holt`; the
 future Go adapter should live under `storage/holt` and implement the same
-interface, either as one raw ordered tree or as a multi-tree adapter hidden
+interface, either as one ordered tree or as a multi-tree adapter hidden
 behind the same Go contract.
 
 ## 5. Entry Ownership
@@ -110,4 +110,4 @@ The old mainline storage-engine path owned WAL, memtable, flush, compaction,
 manifest, range filters, and SST migration. Those concerns now belong to the
 physical backend implementation. For Pebble they live inside Pebble. For Holt
 they should live inside Holt. NoKV's mainline owns metadata semantics, MVCC
-encoding, distributed execution, and the raw backend contract.
+encoding, distributed execution, and the storage backend contract.

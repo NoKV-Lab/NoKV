@@ -20,7 +20,7 @@ var entryPool = sync.Pool{
 // layer.
 //
 // It can hold:
-//   - fully encoded internal key/value payloads destined for WAL or raw KV apply
+//   - fully encoded internal key/value payloads destined for WAL or storage backend apply
 //   - borrowed or detached results produced by iterators and table lookups
 //   - scratch entries used by tests and internal buffering
 //

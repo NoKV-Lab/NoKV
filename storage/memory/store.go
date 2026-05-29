@@ -9,11 +9,11 @@ import (
 	"sort"
 	"sync"
 
-	rawkv "github.com/feichai0017/NoKV/storage/kv"
+	storekv "github.com/feichai0017/NoKV/storage/kv"
 	"github.com/feichai0017/NoKV/utils"
 )
 
-// Store is an in-memory raw ordered KV store.
+// Store is an in-memory ordered KV store.
 type Store struct {
 	mu     sync.RWMutex
 	closed bool
@@ -39,18 +39,18 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 }
 
 func (s *Store) Put(key, value []byte) error {
-	return s.ApplyBatch(rawkv.Batch{Ops: []rawkv.Mutation{{Op: rawkv.PutOp, Key: key, Value: value}}})
+	return s.ApplyBatch(storekv.Batch{Ops: []storekv.Mutation{{Op: storekv.PutOp, Key: key, Value: value}}})
 }
 
 func (s *Store) Delete(key []byte) error {
-	return s.ApplyBatch(rawkv.Batch{Ops: []rawkv.Mutation{{Op: rawkv.DeleteOp, Key: key}}})
+	return s.ApplyBatch(storekv.Batch{Ops: []storekv.Mutation{{Op: storekv.DeleteOp, Key: key}}})
 }
 
 func (s *Store) DeleteRange(start, end []byte) error {
-	return s.ApplyBatch(rawkv.Batch{Ops: []rawkv.Mutation{{Op: rawkv.DeleteRangeOp, Key: start, End: end}}})
+	return s.ApplyBatch(storekv.Batch{Ops: []storekv.Mutation{{Op: storekv.DeleteRangeOp, Key: start, End: end}}})
 }
 
-func (s *Store) ApplyBatch(batch rawkv.Batch) error {
+func (s *Store) ApplyBatch(batch storekv.Batch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -58,11 +58,11 @@ func (s *Store) ApplyBatch(batch rawkv.Batch) error {
 	}
 	for _, op := range batch.Ops {
 		switch op.Op {
-		case rawkv.PutOp:
+		case storekv.PutOp:
 			s.data[string(op.Key)] = append([]byte(nil), op.Value...)
-		case rawkv.DeleteOp:
+		case storekv.DeleteOp:
 			delete(s.data, string(op.Key))
-		case rawkv.DeleteRangeOp:
+		case storekv.DeleteRangeOp:
 			for key := range s.data {
 				k := []byte(key)
 				if bytes.Compare(k, op.Key) >= 0 && bytes.Compare(k, op.End) < 0 {
@@ -74,13 +74,13 @@ func (s *Store) ApplyBatch(batch rawkv.Batch) error {
 	return nil
 }
 
-func (s *Store) NewIterator(opts rawkv.IteratorOptions) (rawkv.Iterator, error) {
+func (s *Store) NewIterator(opts storekv.IteratorOptions) (storekv.Iterator, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return newIterator(snapshotData(s.data), opts), nil
 }
 
-func (s *Store) Snapshot() (rawkv.Snapshot, error) {
+func (s *Store) Snapshot() (storekv.Snapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return &snapshot{data: snapshotData(s.data)}, nil
@@ -95,14 +95,14 @@ func (s *Store) Close() error {
 	return nil
 }
 
-func (s *Store) Stats() rawkv.Stats {
+func (s *Store) Stats() storekv.Stats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var size uint64
 	for k, v := range s.data {
 		size += uint64(len(k) + len(v))
 	}
-	return rawkv.Stats{KeysEstimate: uint64(len(s.data)), SizeBytes: size}
+	return storekv.Stats{KeysEstimate: uint64(len(s.data)), SizeBytes: size}
 }
 
 type snapshot struct {
@@ -117,7 +117,7 @@ func (s *snapshot) Get(key []byte) ([]byte, bool, error) {
 	return append([]byte(nil), value...), true, nil
 }
 
-func (s *snapshot) NewIterator(opts rawkv.IteratorOptions) (rawkv.Iterator, error) {
+func (s *snapshot) NewIterator(opts storekv.IteratorOptions) (storekv.Iterator, error) {
 	return newIterator(snapshotData(s.data), opts), nil
 }
 
@@ -127,10 +127,10 @@ type iterator struct {
 	keys   [][]byte
 	values [][]byte
 	idx    int
-	opts   rawkv.IteratorOptions
+	opts   storekv.IteratorOptions
 }
 
-func newIterator(data map[string][]byte, opts rawkv.IteratorOptions) *iterator {
+func newIterator(data map[string][]byte, opts storekv.IteratorOptions) *iterator {
 	keys := make([][]byte, 0, len(data))
 	for key := range data {
 		k := []byte(key)

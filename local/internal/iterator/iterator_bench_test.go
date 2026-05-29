@@ -22,7 +22,7 @@ func newBenchDB(b *testing.B, optFn func(*local.Options)) *local.DB {
 	b.Helper()
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = b.TempDir()
-	opt.EnableWALWatchdog = false
+	opt.EnableControlWALWatchdog = false
 	opt.SyncWrites = false
 	opt.WriteBatchWait = 0
 	if optFn != nil {

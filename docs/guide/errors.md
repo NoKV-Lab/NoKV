@@ -83,14 +83,14 @@ Examples:
 
 ## 5. Propagation in Hot Paths
 
-1. Embedded write path (`DB.Set*` -> commit pipeline -> selected raw backend):
+1. Embedded write path (`DB.Set*` -> commit pipeline -> selected storage backend):
    - validation returns direct sentinel (`ErrEmptyKey`, `ErrNilValue`, `ErrInvalidRequest`);
    - storage boundary errors are wrapped with context and preserved via `%w`.
 2. Distributed command path (`kv.Service` -> `Store.*Command` -> `kv.Apply`):
    - region/leader/store/range failures are mapped to `errorpb` messages in protobuf responses;
    - execution failures return Go errors to RPC layer and are translated to gRPC status.
 3. Recovery/replay path:
-   - the selected raw backend owns raw KV recovery. Pebble does this today;
+   - the selected storage backend owns storage backend recovery. Pebble does this today;
      Holt should own the same boundary inside `storage/holt` once wired.
      Raft/control WAL consumers surface partial or corrupt records through
      domain sentinels and fail startup when the owner cannot prove safe replay.
@@ -99,7 +99,7 @@ Examples:
 
 ## 6. Local Storage Boundary Map
 
-The raw storage packages (`storage/kv`, `storage/pebble`, `storage/memory`, and
+The storage backend packages (`storage/kv`, `storage/pebble`, `storage/memory`, and
 future concrete adapters such as `storage/holt`) and transaction-storage
 primitives must not import the root `errors` package. The `local/errkind`
 mapper is the explicit DB boundary where local sentinels become the stable

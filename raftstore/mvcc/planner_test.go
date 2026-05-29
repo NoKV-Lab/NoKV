@@ -30,7 +30,7 @@ func newMVCCGCPlannerTestOptions(t *testing.T) *local.Options {
 	t.Helper()
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.MemTableSize = 1 << 12
+	opt.StorageWriteBufferBytes = 1 << 12
 	return opt
 }
 

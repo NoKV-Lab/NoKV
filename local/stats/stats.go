@@ -16,7 +16,7 @@ import (
 
 	"github.com/feichai0017/NoKV/experimental/thermos"
 	"github.com/feichai0017/NoKV/metrics"
-	rawkv "github.com/feichai0017/NoKV/storage/kv"
+	storekv "github.com/feichai0017/NoKV/storage/kv"
 	"github.com/feichai0017/NoKV/storage/wal"
 	"github.com/feichai0017/NoKV/utils"
 )
@@ -27,8 +27,8 @@ type Host interface {
 	// ControlWALsLocked invokes fn while holding the host's control-WAL mutex.
 	// Stats only iterates the slice while the lock is held.
 	ControlWALsLocked(fn func(wals []*wal.Manager))
-	BackgroundWatchdogs() []*wal.Watchdog
-	StorageStats() rawkv.Stats
+	ControlWALWatchdogs() []*wal.Watchdog
+	StorageStats() storekv.Stats
 	HotWrite() *thermos.RotatingThermos
 	IteratorReused() uint64
 	WriteMetrics() *metrics.WriteMetrics
@@ -40,8 +40,8 @@ type Host interface {
 
 	// Options-snapshot accessors.
 	ControlLogLagWarnSegments() int64
-	WALTypedRecordWarnRatio() float64
-	WALTypedRecordWarnSegments() int64
+	ControlWALTypedRecordWarnRatio() float64
+	ControlWALTypedRecordWarnSegments() int64
 	ThermosTopK() int
 	ControlLogPointerSnapshot() func() map[uint64]ControlLogPointer
 	MVCCGCStatsSnapshot() MVCCGCStatsSnapshot
@@ -77,15 +77,15 @@ type ControlLogPointer struct {
 
 // StatsSnapshot captures a point-in-time view of internal backlog metrics.
 type StatsSnapshot struct {
-	Storage   StorageStatsSnapshot         `json:"storage"`
-	WAL       WALStatsSnapshot             `json:"wal"`
-	Raft      RaftStatsSnapshot            `json:"raft"`
-	Write     WriteStatsSnapshot           `json:"write"`
-	Region    RegionStatsSnapshot          `json:"region"`
-	MVCCGC    MVCCGCStatsSnapshot          `json:"mvcc_gc"`
-	Hot       HotStatsSnapshot             `json:"hot"`
-	Cache     CacheStatsSnapshot           `json:"cache"`
-	Transport metrics.GRPCTransportMetrics `json:"transport"`
+	Storage    StorageStatsSnapshot         `json:"storage"`
+	ControlWAL ControlWALStatsSnapshot      `json:"control_wal"`
+	Raft       RaftStatsSnapshot            `json:"raft"`
+	Write      WriteStatsSnapshot           `json:"write"`
+	Region     RegionStatsSnapshot          `json:"region"`
+	MVCCGC     MVCCGCStatsSnapshot          `json:"mvcc_gc"`
+	Hot        HotStatsSnapshot             `json:"hot"`
+	Cache      CacheStatsSnapshot           `json:"cache"`
+	Transport  metrics.GRPCTransportMetrics `json:"transport"`
 }
 
 // StorageStatsSnapshot is the backend-neutral local storage view. It avoids
@@ -98,8 +98,9 @@ type StorageStatsSnapshot struct {
 	Prefetch     metrics.TablePrefetchSnapshot `json:"prefetch"`
 }
 
-// WALStatsSnapshot captures WAL head position, record mix, and watchdog status.
-type WALStatsSnapshot struct {
+// ControlWALStatsSnapshot captures control-log WAL head position, record mix,
+// and watchdog status.
+type ControlWALStatsSnapshot struct {
 	ActiveSegment           int64             `json:"active_segment"`
 	SegmentCount            int64             `json:"segment_count"`
 	ActiveSize              int64             `json:"active_size"`
@@ -370,15 +371,15 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			shardStats := mgr.Metrics()
 			shardSegments := mgr.SegmentMetrics()
 			shardAnalysis := metrics.AnalyzeWALBacklog(shardStats, shardSegments)
-			snap.WAL.RecordCounts.Entries += shardAnalysis.RecordCounts.Entries
-			snap.WAL.RecordCounts.RaftEntries += shardAnalysis.RecordCounts.RaftEntries
-			snap.WAL.RecordCounts.RaftStates += shardAnalysis.RecordCounts.RaftStates
-			snap.WAL.RecordCounts.RaftSnapshots += shardAnalysis.RecordCounts.RaftSnapshots
-			snap.WAL.RecordCounts.Other += shardAnalysis.RecordCounts.Other
-			snap.WAL.SegmentsWithRaftRecords += shardAnalysis.SegmentsWithRaft
+			snap.ControlWAL.RecordCounts.Entries += shardAnalysis.RecordCounts.Entries
+			snap.ControlWAL.RecordCounts.RaftEntries += shardAnalysis.RecordCounts.RaftEntries
+			snap.ControlWAL.RecordCounts.RaftStates += shardAnalysis.RecordCounts.RaftStates
+			snap.ControlWAL.RecordCounts.RaftSnapshots += shardAnalysis.RecordCounts.RaftSnapshots
+			snap.ControlWAL.RecordCounts.Other += shardAnalysis.RecordCounts.Other
+			snap.ControlWAL.SegmentsWithRaftRecords += shardAnalysis.SegmentsWithRaft
 			if shardStats != nil {
-				snap.WAL.SegmentCount += int64(shardStats.SegmentCount)
-				snap.WAL.SegmentsRemoved += shardStats.RemovedSegments
+				snap.ControlWAL.SegmentCount += int64(shardStats.SegmentCount)
+				snap.ControlWAL.SegmentsRemoved += shardStats.RemovedSegments
 			}
 			for _, id := range shardAnalysis.RemovableSegments {
 				if shardSegments[id].RaftRecords() > 0 && shardStats != nil && id < shardStats.ActiveSegment {
@@ -387,10 +388,10 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			}
 		}
 	})
-	snap.WAL.RemovableRaftSegments = removableRaftSegments
-	if total := snap.WAL.RecordCounts.Total(); total > 0 {
-		raftRecords := snap.WAL.RecordCounts.RaftRecords()
-		snap.WAL.TypedRecordRatio = float64(raftRecords) / float64(total)
+	snap.ControlWAL.RemovableRaftSegments = removableRaftSegments
+	if total := snap.ControlWAL.RecordCounts.Total(); total > 0 {
+		raftRecords := snap.ControlWAL.RecordCounts.RaftRecords()
+		snap.ControlWAL.TypedRecordRatio = float64(raftRecords) / float64(total)
 	}
 
 	if len(ptrs) > 0 {
@@ -398,8 +399,8 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		var maxSeg uint32
 		var maxLag int64
 		lagging := 0
-		effectiveActive := snap.WAL.ActiveSegment
-		if snap.WAL.ActiveSize == 0 && effectiveActive > 0 {
+		effectiveActive := snap.ControlWAL.ActiveSegment
+		if snap.ControlWAL.ActiveSize == 0 && effectiveActive > 0 {
 			effectiveActive--
 		}
 		for _, ptr := range ptrs {
@@ -437,8 +438,8 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		snap.Raft.LagWarning = true
 	}
 
-	warning, reason := metrics.WALTypedWarning(snap.WAL.TypedRecordRatio, snap.WAL.SegmentsWithRaftRecords, s.host.WALTypedRecordWarnRatio(), s.host.WALTypedRecordWarnSegments())
-	watchdogs := s.host.BackgroundWatchdogs()
+	warning, reason := metrics.WALTypedWarning(snap.ControlWAL.TypedRecordRatio, snap.ControlWAL.SegmentsWithRaftRecords, s.host.ControlWALTypedRecordWarnRatio(), s.host.ControlWALTypedRecordWarnSegments())
+	watchdogs := s.host.ControlWALWatchdogs()
 	if len(watchdogs) > 0 {
 		var anyWarn bool
 		var warnReason string
@@ -447,10 +448,10 @@ func (s *Stats) Snapshot() StatsSnapshot {
 				continue
 			}
 			wsnap := watchdog.Snapshot()
-			snap.WAL.AutoGCRuns += wsnap.AutoRuns
-			snap.WAL.AutoGCRemoved += wsnap.SegmentsRemoved
-			if wsnap.LastAutoUnix > snap.WAL.AutoGCLastUnix {
-				snap.WAL.AutoGCLastUnix = wsnap.LastAutoUnix
+			snap.ControlWAL.AutoGCRuns += wsnap.AutoRuns
+			snap.ControlWAL.AutoGCRemoved += wsnap.SegmentsRemoved
+			if wsnap.LastAutoUnix > snap.ControlWAL.AutoGCLastUnix {
+				snap.ControlWAL.AutoGCLastUnix = wsnap.LastAutoUnix
 			}
 			if wsnap.Warning && !anyWarn {
 				anyWarn = true
@@ -458,15 +459,15 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			}
 		}
 		if anyWarn {
-			snap.WAL.TypedRecordWarning = true
-			snap.WAL.TypedRecordReason = warnReason
+			snap.ControlWAL.TypedRecordWarning = true
+			snap.ControlWAL.TypedRecordReason = warnReason
 		} else if warning {
-			snap.WAL.TypedRecordWarning = true
-			snap.WAL.TypedRecordReason = reason
+			snap.ControlWAL.TypedRecordWarning = true
+			snap.ControlWAL.TypedRecordReason = reason
 		}
 	} else if warning {
-		snap.WAL.TypedRecordWarning = true
-		snap.WAL.TypedRecordReason = reason
+		snap.ControlWAL.TypedRecordWarning = true
+		snap.ControlWAL.TypedRecordReason = reason
 	}
 
 	if hot := s.host.HotWrite(); hot != nil {

@@ -1,11 +1,11 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package kv defines the raw ordered key/value engine contract below NoKV's
+// Package kv defines the ordered key/value storage backend contract below NoKV's
 // MVCC and fsmeta execution layers.
 package kv
 
-// Store is the physical ordered KV boundary. It deliberately exposes raw
+// Store is the physical ordered KV boundary. It deliberately exposes opaque
 // byte keys and values only; MVCC timestamps, column families, raftstore
 // regions, fsmeta layout, operator data movement, and table-file details live
 // above this package.
@@ -25,12 +25,12 @@ type Store interface {
 	Stats() Stats
 }
 
-// Batch is one atomic group of raw KV mutations.
+// Batch is one atomic group of ordered-KV mutations.
 type Batch struct {
 	Ops []Mutation
 }
 
-// MutationOp identifies one raw KV batch operation.
+// MutationOp identifies one ordered-KV batch operation.
 type MutationOp uint8
 
 const (
@@ -39,7 +39,7 @@ const (
 	DeleteRangeOp
 )
 
-// Mutation is one raw KV mutation. For DeleteRangeOp, Key is the inclusive
+// Mutation is one ordered-KV mutation. For DeleteRangeOp, Key is the inclusive
 // start and End is the exclusive end.
 type Mutation struct {
 	Op    MutationOp
@@ -48,14 +48,14 @@ type Mutation struct {
 	Value []byte
 }
 
-// IteratorOptions controls raw ordered scans.
+// IteratorOptions controls ordered scans.
 type IteratorOptions struct {
 	LowerBound []byte
 	UpperBound []byte
 	Reverse    bool
 }
 
-// Iterator is a raw ordered iterator over one store or snapshot view.
+// Iterator is an ordered iterator over one store or snapshot view.
 type Iterator interface {
 	First() bool
 	Last() bool
@@ -68,7 +68,7 @@ type Iterator interface {
 	Close() error
 }
 
-// Snapshot is a read-only point-in-time raw KV view.
+// Snapshot is a read-only point-in-time ordered-KV view.
 type Snapshot interface {
 	Get(key []byte) ([]byte, bool, error)
 	NewIterator(opts IteratorOptions) (Iterator, error)

@@ -120,7 +120,7 @@ ownership rule should not change:
 - `fsmeta/model`, `fsmeta/layout`, `fsmeta/backend`, and `fsmeta/observe`
   are stable semantic boundaries for the namespace layer.
 - `local` and `raftstore` are stable runtime substrates.
-- `storage/kv` is the raw ordered-KV contract; `storage/pebble` is the default
+- `storage/kv` is the ordered-KV contract; `storage/pebble` is the default
   concrete backend, and `storage/holt` is the expected placement for the Holt
   adapter once wired.
 - `experimental/peras` may depend on stable fsmeta and raftstore interfaces.

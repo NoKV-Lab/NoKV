@@ -1162,7 +1162,7 @@ func applyVersionedOps(db txnstore.Store, ops ...versionedOp) error {
 	}
 	entries := versionedOpsToEntries(ops...)
 	// NoKV's DB regroups these internal entries by commit-pipeline shard before
-	// they reach the raw storage backend. Percolator batches at the protocol phase
+	// they reach the storage backend. Percolator batches at the protocol phase
 	// boundary; storage keeps the per-key placement invariant.
 	defer releaseEntries(entries)
 	return applyVersionedEntries(db, entries)

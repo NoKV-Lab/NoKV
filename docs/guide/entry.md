@@ -36,7 +36,7 @@ Meta | ExpiresAt | Value bytes
 ```
 
 Delete markers, range-delete markers, and expiry timestamps participate in
-visibility filtering above the raw backend. There is no product-level value-log
+visibility filtering above the storage backend. There is no product-level value-log
 pointer format in the current mainline.
 
 ## Write Path
@@ -50,7 +50,7 @@ flowchart TD
   D -. "same contract" .-> F["storage/holt target"]
 ```
 
-Durability, ordering, and raw batch atomicity come from the selected backend
+Durability, ordering, and storage batch atomicity come from the selected backend
 plus NoKV's MVCC/transaction protocol above it. The backend owns its own WAL,
 memtable, flush, and compaction internals.
 

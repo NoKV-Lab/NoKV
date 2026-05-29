@@ -108,7 +108,7 @@ var Rules = []Rule{
 		},
 	},
 	{
-		Name:          "raw storage contract stays semantics-free",
+		Name:          "storage backend contract stays semantics-free",
 		PackagePrefix: ModulePath + "/storage/kv",
 		Forbidden: []string{
 			ModulePath + "/errors",
@@ -121,7 +121,7 @@ var Rules = []Rule{
 		},
 	},
 	{
-		Name:          "raw storage engines stay below MVCC and distributed semantics",
+		Name:          "storage engines stay below MVCC and distributed semantics",
 		PackagePrefix: ModulePath + "/storage/pebble",
 		Forbidden: []string{
 			ModulePath + "/errors",
@@ -144,6 +144,26 @@ var Rules = []Rule{
 			ModulePath + "/coordinator",
 			ModulePath + "/meta/root",
 			ModulePath + "/pb",
+		},
+	},
+	{
+		Name:          "holt storage engine stays below MVCC and distributed semantics",
+		PackagePrefix: ModulePath + "/storage/holt",
+		Forbidden: []string{
+			ModulePath + "/errors",
+			ModulePath + "/fsmeta",
+			ModulePath + "/txn",
+			ModulePath + "/raftstore",
+			ModulePath + "/coordinator",
+			ModulePath + "/meta/root",
+			ModulePath + "/pb",
+		},
+	},
+	{
+		Name:          "third-party holt checkout is adapter-only",
+		PackagePrefix: ModulePath,
+		Forbidden: []string{
+			ModulePath + "/third_party/holt",
 		},
 	},
 	{

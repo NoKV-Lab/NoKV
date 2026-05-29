@@ -1,7 +1,7 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package pebble adapts CockroachDB Pebble to NoKV's raw ordered KV boundary.
+// Package pebble adapts CockroachDB Pebble to NoKV's ordered KV backend boundary.
 package pebble
 
 import (
@@ -9,10 +9,10 @@ import (
 
 	cpebble "github.com/cockroachdb/pebble"
 
-	rawkv "github.com/feichai0017/NoKV/storage/kv"
+	storekv "github.com/feichai0017/NoKV/storage/kv"
 )
 
-// Options configures a Pebble-backed raw KV store.
+// Options configures a Pebble-backed ordered KV store.
 type Options struct {
 	Dir           string
 	SyncWrites    bool
@@ -27,7 +27,7 @@ type Store struct {
 	writeOpts *cpebble.WriteOptions
 }
 
-// Open opens a Pebble-backed raw KV store.
+// Open opens a Pebble-backed ordered KV store.
 func Open(opts Options) (*Store, error) {
 	pebbleOpts := &cpebble.Options{}
 	if opts.CacheBytes > 0 {
@@ -74,7 +74,7 @@ func (s *Store) DeleteRange(start, end []byte) error {
 	return s.db.DeleteRange(start, end, s.writeOpts)
 }
 
-func (s *Store) ApplyBatch(batch rawkv.Batch) error {
+func (s *Store) ApplyBatch(batch storekv.Batch) error {
 	if len(batch.Ops) == 0 {
 		return nil
 	}
@@ -82,15 +82,15 @@ func (s *Store) ApplyBatch(batch rawkv.Batch) error {
 	defer func() { _ = b.Close() }()
 	for _, op := range batch.Ops {
 		switch op.Op {
-		case rawkv.PutOp:
+		case storekv.PutOp:
 			if err := b.Set(op.Key, op.Value, nil); err != nil {
 				return err
 			}
-		case rawkv.DeleteOp:
+		case storekv.DeleteOp:
 			if err := b.Delete(op.Key, nil); err != nil {
 				return err
 			}
-		case rawkv.DeleteRangeOp:
+		case storekv.DeleteRangeOp:
 			if err := b.DeleteRange(op.Key, op.End, nil); err != nil {
 				return err
 			}
@@ -99,7 +99,7 @@ func (s *Store) ApplyBatch(batch rawkv.Batch) error {
 	return b.Commit(s.writeOpts)
 }
 
-func (s *Store) NewIterator(opts rawkv.IteratorOptions) (rawkv.Iterator, error) {
+func (s *Store) NewIterator(opts storekv.IteratorOptions) (storekv.Iterator, error) {
 	it, err := s.db.NewIter(toPebbleIterOptions(opts))
 	if err != nil {
 		return nil, err
@@ -107,7 +107,7 @@ func (s *Store) NewIterator(opts rawkv.IteratorOptions) (rawkv.Iterator, error) 
 	return &iterator{it: it}, nil
 }
 
-func (s *Store) Snapshot() (rawkv.Snapshot, error) {
+func (s *Store) Snapshot() (storekv.Snapshot, error) {
 	return &snapshot{snap: s.db.NewSnapshot()}, nil
 }
 
@@ -128,12 +128,12 @@ func (s *Store) Close() error {
 	return err
 }
 
-func (s *Store) Stats() rawkv.Stats {
+func (s *Store) Stats() storekv.Stats {
 	if s == nil || s.db == nil {
-		return rawkv.Stats{}
+		return storekv.Stats{}
 	}
 	metrics := s.db.Metrics()
-	return rawkv.Stats{
+	return storekv.Stats{
 		SizeBytes: uint64(metrics.DiskSpaceUsage()) + metrics.MemTable.Size,
 	}
 }
@@ -154,7 +154,7 @@ func (s *snapshot) Get(key []byte) ([]byte, bool, error) {
 	return append([]byte(nil), value...), true, nil
 }
 
-func (s *snapshot) NewIterator(opts rawkv.IteratorOptions) (rawkv.Iterator, error) {
+func (s *snapshot) NewIterator(opts storekv.IteratorOptions) (storekv.Iterator, error) {
 	it, err := s.snap.NewIter(toPebbleIterOptions(opts))
 	if err != nil {
 		return nil, err
@@ -205,7 +205,7 @@ func (it *iterator) Close() error {
 	return err
 }
 
-func toPebbleIterOptions(opts rawkv.IteratorOptions) *cpebble.IterOptions {
+func toPebbleIterOptions(opts storekv.IteratorOptions) *cpebble.IterOptions {
 	return &cpebble.IterOptions{
 		LowerBound: opts.LowerBound,
 		UpperBound: opts.UpperBound,

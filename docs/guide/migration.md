@@ -10,10 +10,10 @@ from the mainline architecture.
 
 Current policy:
 
-- new local workdirs use the selected raw storage backend format
+- new local workdirs use the selected storage backend format
 - Pebble is the default backend in this repo; Holt is the owned backend target
 - NoKV keeps fsmeta inode/dentry semantics and MVCC transaction semantics above
-  the raw storage backend
+  the storage backend
 - raftstore retains internal raft snapshots for peer bootstrap and recovery
 - `nokv migrate`, `nokv manifest`, `raftstore/migrate`, and SST import/export
   are not product surfaces in this version

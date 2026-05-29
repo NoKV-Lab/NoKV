@@ -7,7 +7,7 @@ package storage
 // raftstore MVCC maintenance code.
 type Store interface {
 	// ApplyInternalEntries persists one caller-provided batch of internal
-	// entries. The selected raw storage backend must preserve the batch as one
+	// entries. The selected storage backend must preserve the batch as one
 	// atomic storage group; maintenance callers retry whole batches.
 	ApplyInternalEntries(entries []*Entry) error
 	GetInternalEntry(cf ColumnFamily, key []byte, version uint64) (*Entry, error)

@@ -56,14 +56,14 @@ func TestOpenCreateLookupSurvivesRestart(t *testing.T) {
 	require.Greater(t, next.Inode.Inode, created.Inode.Inode)
 }
 
-func TestOpenUsesPebbleLocalStoreByDefault(t *testing.T) {
+func TestOpenUsesStorageBackendDirByDefault(t *testing.T) {
 	ctx := context.Background()
 	workDir := t.TempDir()
 	rt, err := Open(ctx, Options{WorkDir: workDir, Mount: testMount()})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	require.DirExists(t, filepath.Join(workDir, "pebble"))
+	require.DirExists(t, filepath.Join(workDir, "storage"))
 }
 
 func TestLocalInodeAllocatorChoosesWorkspaceShard(t *testing.T) {

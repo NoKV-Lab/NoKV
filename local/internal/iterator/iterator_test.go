@@ -29,7 +29,7 @@ func newTestOptions(t *testing.T) *local.Options {
 	t.Helper()
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.MemTableSize = 1 << 12
+	opt.StorageWriteBufferBytes = 1 << 12
 	opt.MaxBatchCount = 10
 	opt.MaxBatchSize = 1 << 20
 	return opt

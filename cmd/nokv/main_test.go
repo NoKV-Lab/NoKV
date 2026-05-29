@@ -68,7 +68,7 @@ func TestRenderStatsWarnLine(t *testing.T) {
 	var buf bytes.Buffer
 	snap := stats.StatsSnapshot{
 		Storage: stats.StorageStatsSnapshot{KeysEstimate: 1},
-		WAL: stats.WALStatsSnapshot{
+		ControlWAL: stats.ControlWALStatsSnapshot{
 			ActiveSegment:   7,
 			SegmentCount:    3,
 			SegmentsRemoved: 1,
@@ -89,8 +89,8 @@ func TestRenderStatsWarnLine(t *testing.T) {
 	if !strings.Contains(out, "Raft.Warning") {
 		t.Fatalf("expected Raft.Warning line in output, got: %q", out)
 	}
-	if !strings.Contains(out, "WAL.ActiveSize") {
-		t.Fatalf("expected WAL.ActiveSize line in output, got: %q", out)
+	if !strings.Contains(out, "ControlWAL.ActiveSize") {
+		t.Fatalf("expected ControlWAL.ActiveSize line in output, got: %q", out)
 	}
 	if !strings.Contains(out, "Regions.Total") {
 		t.Fatalf("expected Regions.Total line in output, got: %q", out)
@@ -463,7 +463,7 @@ func TestRenderStatsFull(t *testing.T) {
 		Write: stats.WriteStatsSnapshot{
 			HotKeyLimited: 2,
 		},
-		WAL: stats.WALStatsSnapshot{
+		ControlWAL: stats.ControlWALStatsSnapshot{
 			ActiveSegment:           1,
 			SegmentCount:            2,
 			ActiveSize:              4096,

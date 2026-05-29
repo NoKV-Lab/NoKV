@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # RaftStore Deep Dive
 
 `raftstore` powers NoKV's distributed mode by layering multi-Raft replication
-on top of the selected raw ordered-KV backend. Its RPC surface is exposed as
+on top of the selected ordered-KV backend. Its RPC surface is exposed as
 the `NoKV` gRPC service, while the command model still tracks the TinyKV/TiKV
 region + MVCC design. This note explains the major packages, the boot and
 command paths, how transport and storage interact, and the supporting tooling
@@ -113,8 +113,8 @@ flowchart TD
 ### Write (via Propose)
 1. Write RPCs (Prewrite/Commit/…) call `Store.ProposeCommand`, encoding the command and routing to the leader peer.
 2. The leader appends the encoded request to raft, replicates, and once committed the command pipeline hands data to `kv.Apply`, which maps Prewrite/Commit/ResolveLock to `percolator` and `InstallPreparedMVCCEntries` to the generic prepared-entry installer. Experimental Peras install lowers segment payloads into the same prepared-entry installer.
-3. `raftstore/raftlog` persists raft entries/state snapshots and updates `raftstore/localmeta` raft pointers. This keeps raft log GC and raft truncation aligned without exposing storage-backend internals.
-4. Raft apply only accepts command-encoded payloads (`RaftCmdRequest`). Legacy raw KV payloads are rejected as unsupported.
+3. `raftstore/raftlog` persists raft entries/state snapshots and updates `raftstore/localmeta` raft pointers. This keeps raft log GC and raft truncation aligned without exposing storage backend internals.
+4. Raft apply only accepts command-encoded payloads (`RaftCmdRequest`). Legacy legacy key/value payloads are rejected as unsupported.
 
 ### Command flow diagram
 
@@ -163,7 +163,7 @@ sequenceDiagram
 - `raftstore/localmeta` persists the store-local raft replay pointer used by WAL GC and replay.
 - StoreKV state is materialized through NoKV MVCC into the selected `storage/kv`
   backend. Pebble is the default local backend; Holt should plug in below the
-  same raw storage contract.
+  same storage backend contract.
 
 ---
 

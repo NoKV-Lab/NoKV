@@ -24,14 +24,14 @@ type backgroundStatsCollector interface {
 // backgroundConfig describes the runtime hooks needed to start DB-scoped
 // background services.
 //
-// WALWatchdogConfigs supports the local data plane's per-shard WAL
-// Managers: one watchdog per Manager keeps backlog metrics and auto-GC
-// scoped to that shard's segments.
+// ControlWALWatchdogConfigs supports the replicated control-log WAL managers:
+// one watchdog per manager keeps backlog metrics and auto-GC scoped to that
+// shard's segments.
 type backgroundConfig struct {
-	StartCompacter     func()
-	EnableWALWatchdog  bool
-	WALWatchdogConfigs []wal.WatchdogConfig
-	PeriodicTasks      []utils.PeriodicTaskConfig
+	StartCompacter            func()
+	EnableControlWALWatchdog  bool
+	ControlWALWatchdogConfigs []wal.WatchdogConfig
+	PeriodicTasks             []utils.PeriodicTaskConfig
 }
 
 // backgroundServices owns DB-scoped background runtime services that
@@ -56,8 +56,8 @@ func (s *backgroundServices) Start(cfg backgroundConfig) {
 	if cfg.StartCompacter != nil {
 		cfg.StartCompacter()
 	}
-	if cfg.EnableWALWatchdog {
-		for _, wcfg := range cfg.WALWatchdogConfigs {
+	if cfg.EnableControlWALWatchdog {
+		for _, wcfg := range cfg.ControlWALWatchdogConfigs {
 			wd := wal.NewWatchdog(wcfg)
 			if wd == nil {
 				continue
@@ -127,10 +127,9 @@ func (s *backgroundServices) SetRegionMetrics(rm *metrics.RegionMetrics) {
 	s.stats.SetRegionMetrics(rm)
 }
 
-// WALWatchdogs returns every running WAL watchdog (one per local commit
-// data-plane shard). Stats collectors that surface backlog metrics
-// aggregate across the slice.
-func (s *backgroundServices) WALWatchdogs() []*wal.Watchdog {
+// ControlWALWatchdogs returns every running control-log WAL watchdog.
+// Stats collectors that surface backlog metrics aggregate across the slice.
+func (s *backgroundServices) ControlWALWatchdogs() []*wal.Watchdog {
 	if s == nil {
 		return nil
 	}

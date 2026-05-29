@@ -11,7 +11,7 @@ The interesting part is not the feature list. The interesting part is that
 **layer separation is enforced in code**: the fsmeta executor consumes a narrow
 backend contract; `fsmeta/runtime/local` is the default embedded runtime;
 `fsmeta/runtime/raftstore` owns scale-out raftstore wiring; `meta/root` keeps
-only lifecycle / authority truth; raw storage backends such as Pebble and Holt
+only lifecycle / authority truth; storage backends such as Pebble and Holt
 never learn that a namespace exists.
 
 > Looking for the landing page, headline benchmarks, and the `Why NoKV vs X?` matrix? See the [homepage](/).
@@ -63,8 +63,8 @@ All three consume the **same** rooted truth in `meta/root` and the **same** nati
 
 The physical substrate everything sits on. Pebble is the default backend
 through `storage/pebble`; Holt is the owned backend target at the same
-`storage/kv` boundary. NoKV keeps MVCC and metadata semantics above that raw
-ordered-KV boundary.
+`storage/kv` boundary. NoKV keeps MVCC and metadata semantics above that
+ordered-KV backend boundary.
 
 | Topic | Doc |
 |---|---|
@@ -114,7 +114,7 @@ Layer 2  meta/root         ← rooted authority truth
          raftstore         ← per-region Raft + apply observer
          percolator        ← 2PC + MVCC + AssertionNotExist + commit-ts retry
    │
-Layer 3  storage           ← raw ordered KV (Pebble default, Holt target) + low-level runtime support
+Layer 3  storage           ← ordered KV (Pebble default, Holt target) + low-level runtime support
 
 Experimental mechanisms such as Peras and Thermos live behind the stable
 contract and should move under `experimental/` as they are cleaned up.
@@ -122,7 +122,7 @@ contract and should move under `experimental/` as they are cleaned up.
 
 **Four boundaries enforced in code:**
 
-1. **fsmeta-first API.** Metadata operations expose filesystem / object-namespace shapes directly, instead of forcing users to assemble them from raw KV calls.
+1. **fsmeta-first API.** Metadata operations expose filesystem / object-namespace shapes directly, instead of forcing users to assemble them from ordered KV calls.
 2. **Layer separation enforced.** The fsmeta executor consumes the narrow
    `fsmeta/backend.Store` contract; runtime adapters own local or raftstore
    wiring; lower layers do not import fsmeta.

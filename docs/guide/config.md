@@ -7,13 +7,14 @@ SPDX-License-Identifier: Apache-2.0
 
 NoKV exposes two configuration surfaces:
 
-1. **Runtime options** for the embedded engine (`Options` in `options.go`).
+1. **Runtime options** for the embedded DB facade (`Options` in
+   `local/options.go`).
 2. **Cluster topology** for distributed mode (`raft_config.example.json` via
    `config.LoadFile/Validate`).
 
 ---
 
-## 1. Runtime Options (Embedded Engine)
+## 1. Runtime Options (Embedded DB)
 
 `local.NewDefaultOptions()` returns a tuned baseline. Override fields before
 calling `local.Open(opt)`, which returns `(*local.DB, error)`.
@@ -21,22 +22,23 @@ calling `local.Open(opt)`, which returns `(*local.DB, error)`.
 Key option groups (see `options.go` for the full list):
 
 - **Paths & durability**
-  - `WorkDir`, `SyncWrites`, `ManifestSync`, `ManifestRewriteThreshold`
+  - `WorkDir`, `SyncWrites`
 - **Write pipeline**
   - `WriteBatchMaxCount`, `WriteBatchMaxSize`, `WriteBatchWait`
   - `MaxBatchCount`, `MaxBatchSize`
   - `WriteThrottleMinRate`, `WriteThrottleMaxRate`
-- **Raw storage backend**
-  - `MemTableSize`
-  - `BlockCacheBytes`, `IndexCacheBytes`
+- **Storage backend backend**
+  - `StorageBackendFactory`
+  - `StorageWriteBufferBytes`
+  - `BlockCacheBytes`
 - **Hot key throttling**
   - `WriteHotKeyLimit`
   - `ThermosEnabled`, `ThermosTopK`, decay/window settings
   - `ThermosNodeCap`, `ThermosNodeSampleBits`, `ThermosRotationInterval`
-- **WAL watchdog**
-  - `EnableWALWatchdog`, `WALAutoGCInterval`
-  - `WALAutoGCMinRemovable`, `WALAutoGCMaxBatch`
-  - `WALTypedRecordWarnRatio`, `WALTypedRecordWarnSegments`
+- **Control-log WAL watchdog**
+  - `EnableControlWALWatchdog`, `ControlWALAutoGCInterval`
+  - `ControlWALAutoGCMinRemovable`, `ControlWALAutoGCMaxBatch`
+  - `ControlWALTypedRecordWarnRatio`, `ControlWALTypedRecordWarnSegments`
 - **Raft lag warnings (stats only)**
   - `ControlLogLagWarnSegments`
 
@@ -56,15 +58,15 @@ defer db.Close()
 
 Notes:
 - `NewDefaultOptions()` populates the embedded local runtime defaults up front.
-  The selected raw backend is Pebble today; Holt should plug in later behind
-  the same `storage/kv` boundary. `Open()` resolves constructor-owned defaults
-  once, then the DB and raw storage backend consume the resolved values
-  directly.
+  The selected storage backend is Pebble today; Holt should plug in later through
+  `StorageBackendFactory` and the same `storage/kv` boundary. `Open()` resolves
+  constructor-owned defaults once, then the DB and storage backend consume
+  the resolved values directly.
 - `WriteBatchMaxCount`, `WriteBatchMaxSize`, `MaxBatchCount`, `MaxBatchSize`,
-  `WriteThrottleMinRate`, `WriteThrottleMaxRate`, and `WALBufferSize` now also
-  expose concrete defaults through `NewDefaultOptions()`. If you construct
-  `Options` manually, leaving these fields at zero lets `Open()` resolve the
-  constructor defaults.
+  `WriteThrottleMinRate`, `WriteThrottleMaxRate`, `StorageWriteBufferBytes`, and
+  `ControlWALBufferSize` expose concrete defaults through
+  `NewDefaultOptions()`. If you construct `Options` manually, leaving these
+  fields at zero lets `Open()` resolve the constructor defaults.
 - Batch knobs are split by owner:
   - `WriteBatchMaxCount` / `WriteBatchMaxSize` bound commit-worker request
     coalescing.
@@ -73,41 +75,6 @@ Notes:
 - Write slowdown is bandwidth-driven: `WriteThrottleMaxRate` applies when
   slowdown first becomes active, and pressure lowers the target rate toward
   `WriteThrottleMinRate`.
-
-### Load Options From TOML
-
-For convenience, you can load engine options from a TOML file. Unspecified
-fields keep their defaults from `NewDefaultOptions`.
-
-```go
-opt, err := NoKV.LoadOptionsFile("nokv.options.toml")
-if err != nil {
-    log.Fatal(err)
-}
-db, err := local.Open(opt)
-if err != nil {
-	log.Fatalf("open failed: %v", err)
-}
-defer db.Close()
-```
-
-Example (TOML):
-
-```toml
-work_dir = "./data"
-mem_table_engine = "art"
-write_hot_key_limit = 128
-```
-
-Notes:
-- Field names are case-insensitive; `_` / `-` / `.` are ignored.
-- Durations accept Go-style strings (e.g. `"30s"`, `"200ms"`). Numeric durations
-  are interpreted as nanoseconds.
-- File extensions `.toml` and `.tml` are accepted.
-- JSON option files are rejected by design.
-- Unknown fields return an error so typos do not silently pass.
-
----
 
 ## 2. Raft Topology File
 

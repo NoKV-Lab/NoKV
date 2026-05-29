@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Thermos
 
 `experimental/thermos` is NoKV's optional internal hotspot detector. It is no
-longer part of the default read path or physical storage-backend planning.
+longer part of the default read path or physical storage backend planning.
 
 ## Current Role
 
@@ -27,7 +27,7 @@ These integrations were intentionally removed from the default engine path:
 - legacy value placement experiments
 - hot-write batch enlargement heuristics
 
-NoKV now stores values through the selected raw storage backend, so Thermos does
+NoKV now stores values through the selected storage backend, so Thermos does
 not participate in value placement.
 
 ## Data Structure

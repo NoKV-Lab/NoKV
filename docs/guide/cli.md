@@ -116,7 +116,7 @@ Restart semantics:
 ### Removed migration commands
 
 The old operator-facing `nokv migrate` and `nokv manifest` commands are no
-longer part of the mainline CLI. Current workdirs use the selected raw backend
+longer part of the mainline CLI. Current workdirs use the selected storage backend
 format: Pebble today, Holt once its adapter is wired. This version does not
 provide an online migration path from old self-managed LSM workdirs.
 

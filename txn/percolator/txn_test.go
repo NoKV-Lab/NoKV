@@ -23,7 +23,7 @@ import (
 func testOptionsForDir(dir string) *local.Options {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = dir
-	opt.MemTableSize = 1 << 12
+	opt.StorageWriteBufferBytes = 1 << 12
 	return opt
 }
 

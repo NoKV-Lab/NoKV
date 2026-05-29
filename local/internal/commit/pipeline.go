@@ -341,7 +341,7 @@ func shardForBatch(batch *CommitBatch, n int, rr *int) int {
 
 // processor runs the per-batch CPU pipeline (collect -> applyRequests -> ack)
 // for batches pinned to one CommitStore shard. The processor owns its shard
-// end-to-end: WAL append, raw KV apply, and (when sync is inline) WAL fsync all
+// end-to-end: WAL append, storage batch apply, and (when sync is inline) WAL fsync all
 // hit one Manager, so there is no Manager.mu contention across processors.
 //
 // Burst coalescing: when the dispatcher delivers small batches faster
@@ -375,7 +375,7 @@ func (p *Pipeline) processor(shardID int) {
 	}
 }
 
-// runBurst processes a burst of batches as a single WAL append + raw KV apply,
+// runBurst processes a burst of batches as a single WAL append + storage batch apply,
 // then fans the result back to each batch for ack.
 func (p *Pipeline) runBurst(shardID int, burst []*CommitBatch) {
 	if len(burst) == 0 {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/feichai0017/NoKV/local/stats"
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
+	storekv "github.com/feichai0017/NoKV/storage/kv"
 	"github.com/feichai0017/NoKV/storage/vfs"
 	"github.com/feichai0017/NoKV/storage/wal"
 )
@@ -20,10 +21,24 @@ const (
 	defaultWriteThrottleMinRate int64 = 32 << 20
 	defaultWriteThrottleMaxRate int64 = 128 << 20
 	// defaultWriteShardCount is the number of commit processors used by the
-	// local write pipeline. Pebble persists the final raw batch; this count only
-	// controls local admission and coalescing parallelism. Must be a power of two.
+	// local write pipeline. The selected storage backend persists the final batch;
+	// this count only controls local admission and coalescing parallelism.
+	// Must be a power of two.
 	defaultWriteShardCount = 4
 )
+
+// StorageBackendConfig is the local DB view of the physical ordered-KV backend.
+// It is intentionally storage-engine only; NoKV MVCC keys, fsmeta layout, and
+// raftstore semantics remain above the returned storage/kv.Store.
+type StorageBackendConfig struct {
+	Dir              string
+	SyncWrites       bool
+	CacheBytes       int64
+	WriteBufferBytes uint64
+}
+
+// StorageBackendFactory opens one physical ordered-KV store for local.DB.
+type StorageBackendFactory func(StorageBackendConfig) (storekv.Store, error)
 
 // Options holds the top-level database configuration.
 type Options struct {
@@ -36,24 +51,30 @@ type Options struct {
 	// must opt into seeded/cluster directories explicitly.
 	AllowedModes []workdirmode.Mode
 
-	WorkDir      string
-	MemTableSize int64
+	WorkDir string
+	// StorageBackendFactory overrides the physical ordered-KV backend. Nil uses
+	// the built-in Pebble adapter. Future Holt wiring should enter through this
+	// hook or a storage/holt adapter that implements the same contract.
+	StorageBackendFactory StorageBackendFactory
+	// StorageWriteBufferBytes is the write-buffer budget passed to the selected
+	// ordered-KV backend. It is not a NoKV memtable or MVCC setting.
+	StorageWriteBufferBytes int64
 	// MaxBatchCount bounds the number of entries grouped into one internal
-	// write batch. NewDefaultOptions exposes a concrete default; zero is only
-	// interpreted Open resolves the constructor default when left zero.
+	// write batch. NewDefaultOptions exposes a concrete default; Open resolves
+	// zero to the constructor default when left unset.
 	MaxBatchCount int64
 	// MaxBatchSize bounds the size in bytes of one internal write batch.
-	// NewDefaultOptions exposes a concrete default; zero is only interpreted as
-	// a Open resolves the constructor default when left zero.
+	// NewDefaultOptions exposes a concrete default; Open resolves zero to the
+	// constructor default when left unset.
 	MaxBatchSize int64
 
 	// WriteBatchMaxCount bounds how many requests the commit worker coalesces in
-	// one pass. NewDefaultOptions exposes a concrete default; zero is only
-	// interpreted Open resolves the constructor default when left zero.
+	// one pass. NewDefaultOptions exposes a concrete default; Open resolves zero
+	// to the constructor default when left unset.
 	WriteBatchMaxCount int
 	// WriteBatchMaxSize bounds the byte size the commit worker coalesces in one
-	// pass. NewDefaultOptions exposes a concrete default; zero is only
-	// interpreted Open resolves the constructor default when left zero.
+	// pass. NewDefaultOptions exposes a concrete default; Open resolves zero to
+	// the constructor default when left unset.
 	WriteBatchMaxSize int64
 
 	DetectConflicts bool
@@ -84,7 +105,7 @@ type Options struct {
 	// worker performs fsync inline. Only effective when SyncWrites is true.
 	SyncPipeline bool
 	// WriteShardCount is the number of local commit-pipeline processors. It is
-	// a CPU/admission coalescing knob only; raw storage batch atomicity is owned
+	// a CPU/admission coalescing knob only; batch atomicity is owned
 	// by the selected storage/kv backend. The shard router uses `& (N-1)` for
 	// placement so the value must be a power of two. Zero falls back to the
 	// constructor default; non-power-of-two values are rounded DOWN to the
@@ -108,7 +129,7 @@ type Options struct {
 	// default; zero lets Open resolve the constructor default.
 	WriteThrottleMaxRate int64
 
-	// BlockCacheBytes bounds the in-memory cache budget passed to the raw
+	// BlockCacheBytes bounds the in-memory cache budget passed to the selected
 	// ordered-KV backend.
 	BlockCacheBytes int64
 
@@ -117,34 +138,35 @@ type Options struct {
 	// surfaces a warning. Zero disables the alert.
 	ControlLogLagWarnSegments int64
 
-	// EnableWALWatchdog enables the background WAL backlog watchdog which
-	// surfaces typed-record warnings and optionally runs automated segment GC.
-	EnableWALWatchdog bool
-	// WALBufferSize controls the size of the in-memory write buffer used by
-	// the WAL manager. Larger buffers reduce syscall frequency at the cost of
-	// memory. NewDefaultOptions exposes a concrete default; zero is only
-	// interpreted Open resolves the constructor default when left zero.
-	WALBufferSize int
-	// WALAutoGCInterval controls how frequently the watchdog evaluates WAL
+	// EnableControlWALWatchdog enables the background WAL backlog watchdog which
+	// surfaces control-log typed-record warnings and optionally runs automated
+	// segment GC.
+	EnableControlWALWatchdog bool
+	// ControlWALBufferSize controls the size of the in-memory write buffer used by
+	// control-log WAL managers. Larger buffers reduce syscall frequency at the
+	// cost of memory. NewDefaultOptions exposes a concrete default; Open
+	// resolves zero to the constructor default when left unset.
+	ControlWALBufferSize int
+	// ControlWALAutoGCInterval controls how frequently the watchdog evaluates WAL
 	// backlog for automated garbage collection.
-	WALAutoGCInterval time.Duration
-	// WALAutoGCMinRemovable is the minimum number of removable WAL segments
+	ControlWALAutoGCInterval time.Duration
+	// ControlWALAutoGCMinRemovable is the minimum number of removable WAL segments
 	// required before an automated GC pass will run.
-	WALAutoGCMinRemovable int
-	// WALAutoGCMaxBatch bounds how many WAL segments are removed during a single
+	ControlWALAutoGCMinRemovable int
+	// ControlWALAutoGCMaxBatch bounds how many WAL segments are removed during a single
 	// automated GC pass.
-	WALAutoGCMaxBatch int
-	// WALTypedRecordWarnRatio triggers a typed-record warning when raft records
+	ControlWALAutoGCMaxBatch int
+	// ControlWALTypedRecordWarnRatio triggers a typed-record warning when raft records
 	// constitute at least this fraction of WAL writes. Zero disables ratio-based
 	// warnings.
-	WALTypedRecordWarnRatio float64
-	// WALTypedRecordWarnSegments triggers a typed-record warning when the number
+	ControlWALTypedRecordWarnRatio float64
+	// ControlWALTypedRecordWarnSegments triggers a typed-record warning when the number
 	// of WAL segments containing raft records exceeds this threshold. Zero
 	// disables segment-count warnings.
-	WALTypedRecordWarnSegments int64
+	ControlWALTypedRecordWarnSegments int64
 	// ControlLogPointerSnapshot returns durable control-log checkpoints used by
-	// WAL watchdogs, GC policy, and diagnostics. It must return a detached
-	// snapshot. Nil disables control-log backlog accounting.
+	// control-log watchdogs, GC policy, and diagnostics. It must return a
+	// detached snapshot. Nil disables control-log backlog accounting.
 	ControlLogPointerSnapshot func() map[uint64]stats.ControlLogPointer
 
 	// NegativeCachePersistent enables snapshot-on-Close + restore-on-Open for
@@ -166,7 +188,7 @@ type Options struct {
 func NewDefaultOptions() *Options {
 	opt := &Options{
 		WorkDir:                   "./work_test",
-		MemTableSize:              64 << 20,
+		StorageWriteBufferBytes:   64 << 20,
 		ThermosEnabled:            false,
 		ThermosBits:               12,
 		ThermosTopK:               defaultThermosTopK,
@@ -178,25 +200,25 @@ func NewDefaultOptions() *Options {
 		ThermosWindowSlots:        8,
 		ThermosWindowSlotDuration: 250 * time.Millisecond,
 		// Conservative defaults to avoid long batch-induced pauses.
-		WriteBatchMaxCount:         defaultWriteBatchMaxCount,
-		WriteBatchMaxSize:          defaultWriteBatchMaxSize,
-		WriteShardCount:            defaultWriteShardCount,
-		MaxBatchCount:              defaultWriteBatchMaxCount,
-		MaxBatchSize:               defaultWriteBatchMaxSize,
-		BlockCacheBytes:            defaultBlockCacheBytes,
-		SyncWrites:                 false,
-		WriteHotKeyLimit:           128,
-		WriteBatchWait:             200 * time.Microsecond,
-		WriteThrottleMinRate:       defaultWriteThrottleMinRate,
-		WriteThrottleMaxRate:       defaultWriteThrottleMaxRate,
-		ControlLogLagWarnSegments:  8,
-		EnableWALWatchdog:          true,
-		WALBufferSize:              wal.DefaultBufferSize,
-		WALAutoGCInterval:          15 * time.Second,
-		WALAutoGCMinRemovable:      1,
-		WALAutoGCMaxBatch:          4,
-		WALTypedRecordWarnRatio:    0.35,
-		WALTypedRecordWarnSegments: 6,
+		WriteBatchMaxCount:                defaultWriteBatchMaxCount,
+		WriteBatchMaxSize:                 defaultWriteBatchMaxSize,
+		WriteShardCount:                   defaultWriteShardCount,
+		MaxBatchCount:                     defaultWriteBatchMaxCount,
+		MaxBatchSize:                      defaultWriteBatchMaxSize,
+		BlockCacheBytes:                   defaultBlockCacheBytes,
+		SyncWrites:                        false,
+		WriteHotKeyLimit:                  128,
+		WriteBatchWait:                    200 * time.Microsecond,
+		WriteThrottleMinRate:              defaultWriteThrottleMinRate,
+		WriteThrottleMaxRate:              defaultWriteThrottleMaxRate,
+		ControlLogLagWarnSegments:         8,
+		EnableControlWALWatchdog:          true,
+		ControlWALBufferSize:              wal.DefaultBufferSize,
+		ControlWALAutoGCInterval:          15 * time.Second,
+		ControlWALAutoGCMinRemovable:      1,
+		ControlWALAutoGCMaxBatch:          4,
+		ControlWALTypedRecordWarnRatio:    0.35,
+		ControlWALTypedRecordWarnSegments: 6,
 	}
 	return opt
 }
@@ -227,8 +249,8 @@ func (opt *Options) resolveOpenDefaults() {
 		opt.WriteBatchWait = 0
 	}
 	opt.normalizeStorageOptions()
-	if opt.WALBufferSize <= 0 {
-		opt.WALBufferSize = wal.DefaultBufferSize
+	if opt.ControlWALBufferSize <= 0 {
+		opt.ControlWALBufferSize = wal.DefaultBufferSize
 	}
 	if opt.WriteShardCount <= 0 {
 		opt.WriteShardCount = defaultWriteShardCount

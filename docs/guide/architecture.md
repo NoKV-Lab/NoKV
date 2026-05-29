@@ -12,7 +12,7 @@ NoKV is organized as a three-layer metadata system:
 2. The distributed execution layer (`meta/root`, `coordinator`, `raftstore`,
    `txn`) owns rooted authority, routing, TSO, replicated execution, MVCC
    transactions, and recovery facts.
-3. `storage/*` owns raw ordered key/value persistence. Pebble is the default
+3. `storage/*` owns ordered key/value persistence. Pebble is the default
    implementation in this repo. Holt is the owned backend target that should
    plug in at the same `storage/kv` boundary.
 
@@ -44,7 +44,7 @@ raftstore/
   snapshot/       # internal MVCC-entry snapshot payloads for peer bootstrap
 
 storage/
-  kv/             # raw ordered KV contract
+  kv/             # ordered KV contract
   pebble/         # default Pebble backend
   holt/           # future adapter over third_party/holt
   memory/         # tests
@@ -75,16 +75,16 @@ flowchart LR
     StoreKV --> Txn["txn/mvcc + txn/percolator"]
     LocalDB --> MVCC["txn/storage internal keys"]
     Txn --> MVCC
-    MVCC --> Raw["storage/kv raw ordered bytes"]
-    Raw --> Pebble["storage/pebble"]
-    Raw -. "same contract" .-> Holt["storage/holt target"]
+    MVCC --> KV["storage/kv ordered bytes"]
+    KV --> Pebble["storage/pebble"]
+    KV -. "same contract" .-> Holt["storage/holt target"]
 ```
 
 The important boundary is between `fsmeta/backend` and `storage/kv`:
 
 - `fsmeta/backend` is an MVCC metadata contract with timestamps, predicates,
   mutations, scans, and atomic mutation semantics.
-- `storage/kv` is raw ordered bytes: get, put, delete, range delete, iterator,
+- `storage/kv` is ordered bytes: get, put, delete, range delete, iterator,
   batch, snapshot, sync, close, and small stats.
 
 Keeping both contracts separate lets NoKV swap the physical engine without
@@ -92,7 +92,7 @@ changing fsmeta semantics or distributed transaction behavior.
 
 ## Storage Backend Contract
 
-The raw backend must provide:
+The storage backend must provide:
 
 - ordered point reads and range iteration;
 - atomic batch apply through `ApplyBatch`;
@@ -110,15 +110,15 @@ The backend must not own:
 
 That rule is what lets Pebble and Holt be interchangeable under NoKV's metadata
 execution model. Higher layers do not prove whether a mutation group can be
-atomic on a particular shard; they submit one raw batch and rely on the selected
+atomic on a particular shard; they submit one storage batch and rely on the selected
 backend to make it visible all-or-nothing.
 
 ## Local Runtime
 
-`local.DB` is the embedded database facade. It opens a raw storage backend and
+`local.DB` is the embedded database facade. It opens a storage backend and
 preserves NoKV's internal-key layout:
 
-- column families are encoded into the raw key;
+- column families are encoded into the storage key;
 - MVCC timestamps keep the existing inverted ordering;
 - `local.DB` exposes internal-entry iterators for MVCC, raftlog, and raftstore
   snapshot code;
@@ -127,7 +127,7 @@ preserves NoKV's internal-key layout:
 
 The local fsmeta runtime (`fsmeta/runtime/local`) uses the same
 `fsmeta/backend` contract as the raftstore runtime. It is the default path for
-demos, local agent-workspace deployments, and storage-backend experimentation.
+demos, local agent-workspace deployments, and storage backend experimentation.
 
 ## Distributed Runtime
 

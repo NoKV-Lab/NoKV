@@ -384,7 +384,7 @@ func applyMVCCMaintenance(db txnstore.Store, req *kvrpcpb.MVCCMaintenanceRequest
 		}
 	}()
 	// ApplyInternalEntries is the raft apply batch boundary for MVCC
-	// maintenance. NoKV's DB implementation maps it to one atomic raw-KV batch.
+	// maintenance. NoKV's DB implementation maps it to one atomic storage batch.
 	// If another Store implementation reports an error after partial persistence,
 	// the caller retries the whole tombstone batch and relies on tombstones being
 	// idempotent.

@@ -11,7 +11,7 @@ recovery ownership by layer.
 
 | Layer | Recovery owner |
 | --- | --- |
-| Raw ordered KV | Concrete `storage/kv` backend: Pebble today, Holt target |
+| Ordered KV | Concrete `storage/kv` backend: Pebble today, Holt target |
 | NoKV MVCC keys and versions | `txn/storage`, `txn/mvcc`, and `local.DB` |
 | Raft logs and peer snapshots | `raftstore/raftlog` and `raftstore/snapshot` |
 | Store-local region catalog | `raftstore/localmeta` |

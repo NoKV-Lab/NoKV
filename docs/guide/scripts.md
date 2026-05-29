@@ -123,9 +123,9 @@ This split is deliberate:
 ## Removed Migration Workflow
 
 The old `scripts/ops/migrate-cluster.sh` wrapper has been removed together with
-the operator-facing `nokv migrate` CLI. Current workdirs use the selected raw
-backend format: Pebble today, Holt once its adapter is wired. This version does
-not provide online migration from old self-managed LSM workdirs.
+the operator-facing `nokv migrate` CLI. Current workdirs use the selected
+storage backend format: Pebble today, Holt once its adapter is wired. This
+version does not provide online migration from old self-managed LSM workdirs.
 
 ## Shared Shell Rules
 

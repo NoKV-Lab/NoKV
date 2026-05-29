@@ -15,7 +15,7 @@ func newBenchDB(b *testing.B, optFn func(*Options)) *DB {
 	b.Helper()
 	opt := NewDefaultOptions()
 	opt.WorkDir = b.TempDir()
-	opt.EnableWALWatchdog = false
+	opt.EnableControlWALWatchdog = false
 	opt.SyncWrites = false
 	opt.WriteBatchWait = 0
 	if optFn != nil {
@@ -167,7 +167,7 @@ func BenchmarkDBBatchSet(b *testing.B) {
 
 // BenchmarkDBCommitInlineValueSizes measures commit pipeline throughput across
 // metadata-sized and larger inline values. NoKV no longer routes user values
-// through a separate blob log, so these cases exercise the same WAL + raw-KV
+// through a separate blob log, so these cases exercise the same WAL + storage
 // apply path.
 func BenchmarkDBCommitInlineValueSizes(b *testing.B) {
 	type profile struct {

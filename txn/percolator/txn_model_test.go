@@ -107,7 +107,7 @@ func openPercolatorModelDB(t *testing.T) *local.DB {
 	t.Helper()
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = filepath.Join(t.TempDir(), "db")
-	opt.MemTableSize = 1 << 12
+	opt.StorageWriteBufferBytes = 1 << 12
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })

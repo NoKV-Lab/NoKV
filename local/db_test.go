@@ -14,6 +14,8 @@ import (
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	raftstorestats "github.com/feichai0017/NoKV/raftstore/stats"
+	storekv "github.com/feichai0017/NoKV/storage/kv"
+	"github.com/feichai0017/NoKV/storage/memory"
 	"github.com/feichai0017/NoKV/storage/wal"
 	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
@@ -189,7 +191,7 @@ func TestOpenNormalizesLegacyUnsetFieldsWithoutMutatingCaller(t *testing.T) {
 	opt.MaxBatchSize = 0
 	opt.WriteThrottleMinRate = 0
 	opt.WriteThrottleMaxRate = 0
-	opt.WALBufferSize = 0
+	opt.ControlWALBufferSize = 0
 	opt.ThermosTopK = 0
 
 	db := openTestDB(t, opt)
@@ -205,14 +207,14 @@ func TestOpenNormalizesLegacyUnsetFieldsWithoutMutatingCaller(t *testing.T) {
 	require.Greater(t, db.opt.MaxBatchSize, int64(0))
 	require.Greater(t, db.opt.WriteThrottleMinRate, int64(0))
 	require.GreaterOrEqual(t, db.opt.WriteThrottleMaxRate, db.opt.WriteThrottleMinRate)
-	require.Greater(t, db.opt.WALBufferSize, 0)
+	require.Greater(t, db.opt.ControlWALBufferSize, 0)
 	require.Greater(t, db.opt.ThermosTopK, 0)
 }
 
 func TestNewDefaultOptionsExposeConcreteStorageDefaults(t *testing.T) {
 	opt := NewDefaultOptions()
 
-	require.Greater(t, opt.MemTableSize, int64(0))
+	require.Greater(t, opt.StorageWriteBufferBytes, int64(0))
 	require.Greater(t, opt.BlockCacheBytes, int64(0))
 }
 
@@ -225,14 +227,39 @@ func TestNewDefaultOptionsExposeConcreteBatchDefaults(t *testing.T) {
 	require.Equal(t, opt.WriteBatchMaxSize, opt.MaxBatchSize)
 	require.Greater(t, opt.WriteThrottleMinRate, int64(0))
 	require.GreaterOrEqual(t, opt.WriteThrottleMaxRate, opt.WriteThrottleMinRate)
-	require.Greater(t, opt.WALBufferSize, 0)
+	require.Greater(t, opt.ControlWALBufferSize, 0)
+}
+
+func TestOpenUsesStorageBackendFactory(t *testing.T) {
+	opt := newTestOptions(t)
+	var got StorageBackendConfig
+	var called bool
+	opt.StorageBackendFactory = func(cfg StorageBackendConfig) (storekv.Store, error) {
+		called = true
+		got = cfg
+		return memory.New(), nil
+	}
+
+	db := openTestDB(t, opt)
+	defer func() { _ = db.Close() }()
+
+	require.True(t, called)
+	require.Equal(t, filepath.Join(opt.WorkDir, "storage"), got.Dir)
+	require.Equal(t, opt.SyncWrites, got.SyncWrites)
+	require.Equal(t, opt.BlockCacheBytes, got.CacheBytes)
+	require.Equal(t, uint64(opt.StorageWriteBufferBytes), got.WriteBufferBytes)
+
+	require.NoError(t, db.Set([]byte("factory-key"), []byte("factory-value")))
+	entry, err := db.Get([]byte("factory-key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("factory-value"), entry.Value)
 }
 
 func newTestOptions(t *testing.T) *Options {
 	t.Helper()
 	opt := NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.MemTableSize = 1 << 20
+	opt.StorageWriteBufferBytes = 1 << 20
 	opt.DetectConflicts = true
 	return opt
 }
@@ -667,10 +694,10 @@ func TestRequestLoadEntriesCopiesSlice(t *testing.T) {
 func TestDirectoryLockPreventsConcurrentOpen(t *testing.T) {
 	dir := t.TempDir()
 	opt := &Options{
-		WorkDir:       dir,
-		MemTableSize:  1 << 12,
-		MaxBatchCount: 16,
-		MaxBatchSize:  1 << 20,
+		WorkDir:                 dir,
+		StorageWriteBufferBytes: 1 << 12,
+		MaxBatchCount:           16,
+		MaxBatchSize:            1 << 20,
 	}
 
 	db := openTestDB(t, opt)
@@ -755,10 +782,10 @@ func logRecoveryMetric(t *testing.T, name string, payload any) {
 func TestRecoveryWALReplayRestoresData(t *testing.T) {
 	dir := t.TempDir()
 	opt := &Options{
-		WorkDir:       dir,
-		MemTableSize:  1 << 16,
-		MaxBatchCount: 100,
-		MaxBatchSize:  1 << 20,
+		WorkDir:                 dir,
+		StorageWriteBufferBytes: 1 << 16,
+		MaxBatchCount:           100,
+		MaxBatchSize:            1 << 20,
 	}
 
 	db := openTestDB(t, opt)
@@ -786,10 +813,10 @@ func TestRecoveryWALReplayRestoresData(t *testing.T) {
 func TestRecoverySlowFollowerSnapshotBacklog(t *testing.T) {
 	root := t.TempDir()
 	opt := &Options{
-		WorkDir:       root,
-		MemTableSize:  1 << 12,
-		MaxBatchCount: 32,
-		MaxBatchSize:  1 << 20,
+		WorkDir:                 root,
+		StorageWriteBufferBytes: 1 << 12,
+		MaxBatchCount:           32,
+		MaxBatchSize:            1 << 20,
 	}
 	localMeta, err := localmeta.OpenLocalStore(root, nil)
 	require.NoError(t, err)
@@ -813,9 +840,9 @@ func TestRecoverySlowFollowerSnapshotBacklog(t *testing.T) {
 	require.NoError(t, localMeta.SaveRaftPointer(localmeta.RaftLogPointer{GroupID: 9, Segment: walMgr.ActiveSegment(), AppliedIndex: 9, AppliedTerm: 1}))
 
 	snapBefore := db.Info().Snapshot()
-	logRecoveryMetric(t, "raft_wal_backlog_pre", map[string]any{
-		"wal_segments_with_raft": snapBefore.WAL.SegmentsWithRaftRecords,
-		"wal_removable_segments": snapBefore.WAL.RemovableRaftSegments,
+	logRecoveryMetric(t, "raft_control_wal_backlog_pre", map[string]any{
+		"control_wal_segments_with_raft": snapBefore.ControlWAL.SegmentsWithRaftRecords,
+		"control_wal_removable_segments": snapBefore.ControlWAL.RemovableRaftSegments,
 	})
 
 	require.NoError(t, walMgr.SwitchSegment(2, true))
@@ -843,11 +870,11 @@ func TestRecoverySlowFollowerSnapshotBacklog(t *testing.T) {
 	}))
 
 	snapAfter := db.Info().Snapshot()
-	require.Greater(t, snapAfter.WAL.SegmentsWithRaftRecords, 0, "expected raft segments to be tracked")
-	require.Greater(t, snapAfter.WAL.RemovableRaftSegments, 0, "expected removable raft backlog once followers catch up")
-	logRecoveryMetric(t, "raft_wal_backlog_post", map[string]any{
-		"wal_segments_with_raft": snapAfter.WAL.SegmentsWithRaftRecords,
-		"wal_removable_segments": snapAfter.WAL.RemovableRaftSegments,
+	require.Greater(t, snapAfter.ControlWAL.SegmentsWithRaftRecords, 0, "expected raft segments to be tracked")
+	require.Greater(t, snapAfter.ControlWAL.RemovableRaftSegments, 0, "expected removable raft backlog once followers catch up")
+	logRecoveryMetric(t, "raft_control_wal_backlog_post", map[string]any{
+		"control_wal_segments_with_raft": snapAfter.ControlWAL.SegmentsWithRaftRecords,
+		"control_wal_removable_segments": snapAfter.ControlWAL.RemovableRaftSegments,
 	})
 }
 
@@ -887,7 +914,7 @@ func TestHotWriteAndThrottle(t *testing.T) {
 func TestApplyRequestsFailureIndex(t *testing.T) {
 	local := NewDefaultOptions()
 	local.WorkDir = t.TempDir()
-	local.EnableWALWatchdog = false
+	local.EnableControlWALWatchdog = false
 	local.WriteBatchWait = 0
 
 	db := openTestDB(t, local)
@@ -920,7 +947,7 @@ func TestApplyRequestsFailureIndex(t *testing.T) {
 func TestApplyRequestsInlineRequestWithoutPtrs(t *testing.T) {
 	local := NewDefaultOptions()
 	local.WorkDir = t.TempDir()
-	local.EnableWALWatchdog = false
+	local.EnableControlWALWatchdog = false
 	local.WriteBatchWait = 0
 
 	db := openTestDB(t, local)
@@ -948,7 +975,7 @@ func TestApplyRequestsInlineRequestWithoutPtrs(t *testing.T) {
 func TestApplyRequestsCoalescesCommitBatchIntoOnePebbleBatch(t *testing.T) {
 	local := NewDefaultOptions()
 	local.WorkDir = t.TempDir()
-	local.EnableWALWatchdog = false
+	local.EnableControlWALWatchdog = false
 	local.WriteBatchWait = 0
 
 	db := openTestDB(t, local)
@@ -1286,7 +1313,7 @@ func TestDeleteRangeComplex(t *testing.T) {
 // TestDeleteRangeWithStorageRewrite tests range deletion across durable storage rewrite points.
 func TestDeleteRangeWithStorageRewrite(t *testing.T) {
 	opt := drTestOptions(t.TempDir())
-	opt.MemTableSize = 1024
+	opt.StorageWriteBufferBytes = 1024
 	db := openTestDB(t, opt)
 	defer func() { drMustClose(t, db) }()
 
@@ -1312,8 +1339,8 @@ func TestDeleteRangeWithStorageRewrite(t *testing.T) {
 	}
 }
 
-// TestDeleteRangeWALRecovery tests that range tombstones are correctly recovered from WAL.
-func TestDeleteRangeWALRecovery(t *testing.T) {
+// TestDeleteRangeRecovery tests that range tombstones survive a storage backend reopen.
+func TestDeleteRangeRecovery(t *testing.T) {
 	dir := t.TempDir()
 	opt := drTestOptions(dir)
 
@@ -1361,7 +1388,7 @@ func TestDeleteRangeVisibilityBug(t *testing.T) {
 func TestDeleteRangePersistsAfterFlushAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	opt := drTestOptions(dir)
-	opt.MemTableSize = 512
+	opt.StorageWriteBufferBytes = 512
 
 	db := openTestDB(t, opt)
 	drMustSet(t, db, []byte("b"), []byte("old"))
@@ -1480,7 +1507,7 @@ func TestDBIteratorBoundsAndOutOfRangeSeekContract(t *testing.T) {
 func TestAPIMixedOpsPersistAcrossStorageRewriteAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	opt := drTestOptions(dir)
-	opt.MemTableSize = 512
+	opt.StorageWriteBufferBytes = 512
 
 	db := openTestDB(t, opt)
 	require.NoError(t, db.SetBatch([]BatchSetItem{
@@ -1519,7 +1546,7 @@ func TestRecoveryWALReplayMixedBatchDeleteAndRangeDelete(t *testing.T) {
 	dir := t.TempDir()
 	opt := newTestOptions(t)
 	opt.WorkDir = dir
-	opt.MemTableSize = 1 << 16
+	opt.StorageWriteBufferBytes = 1 << 16
 
 	db := openTestDB(t, opt)
 	require.NoError(t, db.SetBatch([]BatchSetItem{
@@ -1550,7 +1577,7 @@ func TestRecoveryWALReplayIdempotentAcrossRepeatedReopen(t *testing.T) {
 	dir := t.TempDir()
 	opt := newTestOptions(t)
 	opt.WorkDir = dir
-	opt.MemTableSize = 1 << 16
+	opt.StorageWriteBufferBytes = 1 << 16
 
 	db := openTestDB(t, opt)
 	require.NoError(t, db.SetBatch([]BatchSetItem{
@@ -1598,7 +1625,7 @@ func TestCloseAggregatesDirLockErrors(t *testing.T) {
 
 func TestConcurrentReadWriteStorageRewriteStress(t *testing.T) {
 	opt := newTestOptions(t)
-	opt.MemTableSize = 4 << 10
+	opt.StorageWriteBufferBytes = 4 << 10
 	opt.WriteHotKeyLimit = 0
 	db := openTestDB(t, opt)
 	defer func() { _ = db.Close() }()
@@ -1745,13 +1772,13 @@ func TestDBWrapperNilAndOpenGuards(t *testing.T) {
 // opt is the shared test-fixture Options used by db_test.go fast-path tests.
 // Tests that mutate it must restore the previous value in a defer.
 var opt = &Options{
-	WorkDir:        "./work_test",
-	MemTableSize:   1 << 10,
-	MaxBatchCount:  10,
-	MaxBatchSize:   1 << 20,
-	ThermosEnabled: true,
-	ThermosBits:    8,
-	ThermosTopK:    8,
+	WorkDir:                 "./work_test",
+	StorageWriteBufferBytes: 1 << 10,
+	MaxBatchCount:           10,
+	MaxBatchSize:            1 << 20,
+	ThermosEnabled:          true,
+	ThermosBits:             8,
+	ThermosTopK:             8,
 }
 
 // clearDir wipes the shared opt.WorkDir between tests and re-points it
@@ -1787,7 +1814,7 @@ func TestDecodeWalEntryReleasesEntries(t *testing.T) {
 }
 
 // TestPipelineSyncWorkerShardErrorIsolation confirms that when the sync
-// worker's WAL.Sync fails on one shard, only requests pinned to that
+// worker's ControlWAL.Sync fails on one shard, only requests pinned to that
 // shard inherit the error — sibling shards keep returning success.
 func TestPipelineSyncWorkerShardErrorIsolation(t *testing.T) {
 	if defaultControlWALShards <= 1 {
@@ -1799,7 +1826,7 @@ func TestPipelineSyncWorkerShardErrorIsolation(t *testing.T) {
 	cfg.SyncWrites = true
 	cfg.SyncPipeline = true
 	cfg.WriteShardCount = 2
-	cfg.EnableWALWatchdog = false
+	cfg.EnableControlWALWatchdog = false
 	cfg.WriteBatchWait = 0
 
 	db := openTestDB(t, cfg)

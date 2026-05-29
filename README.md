@@ -12,7 +12,7 @@ The stable product core is `fsmeta`: a filesystem-shaped metadata model with
 inode, dentry, watch, snapshot, quota, session, atomic publish, remove, and
 subtree-move semantics. The distributed modules provide rooted authority,
 routing, TSO, Raft execution, MVCC transactions, and recovery. The bottom layer
-is a replaceable raw ordered key/value storage engine.
+is a replaceable ordered key/value storage backend.
 
 NoKV does not own object bodies, model weights, checkpoint payloads, or POSIX
 file data. Those bytes stay in object stores, local filesystems, model stores,
@@ -26,7 +26,7 @@ application / SDK
   -> fsmeta
   -> fsmeta/runtime/local or fsmeta/runtime/raftstore
   -> txn MVCC / Percolator
-  -> storage/kv raw ordered engine
+  -> storage/kv ordered backend
   -> storage/pebble today, future storage/holt adapter over third_party/holt
 ```
 
@@ -44,16 +44,16 @@ The main package boundaries are:
 | `coordinator` | Routing, TSO, store discovery, root-event publish, and serving-plane rebuild. |
 | `raftstore` | Replicated region execution, peer lifecycle, apply, and raft snapshot bootstrap. |
 | `txn` | MVCC storage keys, read/write planning, latches, and Percolator-style 2PC. |
-| `storage/kv` | Raw ordered key/value engine interface. |
-| `storage/pebble` | Default Pebble-backed raw storage implementation. |
+| `storage/kv` | Ordered key/value backend interface. |
+| `storage/pebble` | Default Pebble-backed storage backend. |
 | `third_party/holt` | Pinned Holt source checkout for the future Rust-backed adapter. |
-| `local` | Embedded DB facade over NoKV MVCC encoding and raw storage. |
+| `local` | Embedded DB facade over NoKV MVCC encoding and storage backend. |
 | `experimental` | Research mechanisms such as Peras and Thermos. |
 
 The important split is between `fsmeta/backend` and `storage/kv`.
 `fsmeta/backend` is an MVCC metadata contract with timestamps, predicates,
-mutations, scans, and optional one-phase atomic mutation. `storage/kv` is raw
-ordered bytes only. That keeps fsmeta semantics and distributed transaction
+mutations, scans, and optional one-phase atomic mutation. `storage/kv` stores
+opaque ordered bytes only. That keeps fsmeta semantics and distributed transaction
 behavior independent from the physical storage engine.
 
 ## fsmeta

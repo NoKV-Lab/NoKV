@@ -32,7 +32,7 @@ func newTestOptions(t *testing.T) *local.Options {
 	t.Helper()
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.MemTableSize = 1 << 12
+	opt.StorageWriteBufferBytes = 1 << 12
 	opt.MaxBatchCount = 10
 	opt.MaxBatchSize = 1 << 20
 	opt.DetectConflicts = true
@@ -63,9 +63,9 @@ func TestStatsCollectSnapshots(t *testing.T) {
 
 	snap := db.Info().Snapshot()
 	require.Empty(t, snap.Hot.WriteKeys)
-	require.False(t, snap.WAL.TypedRecordWarning)
-	require.Equal(t, uint64(0), snap.WAL.AutoGCRuns)
-	require.Equal(t, uint64(0), snap.WAL.AutoGCRemoved)
+	require.False(t, snap.ControlWAL.TypedRecordWarning)
+	require.Equal(t, uint64(0), snap.ControlWAL.AutoGCRuns)
+	require.Equal(t, uint64(0), snap.ControlWAL.AutoGCRemoved)
 	require.Greater(t, snap.Write.BatchesTotal, int64(0))
 	require.False(t, snap.Write.ThrottleActive)
 	require.Equal(t, db.IteratorReused(), snap.Cache.IteratorReused)
@@ -87,7 +87,7 @@ func TestStatsCollectSnapshots(t *testing.T) {
 
 	// Legacy scalar keys are intentionally removed.
 	require.Nil(t, expvar.Get("NoKV.Local.Stats.Flush.Pending"))
-	require.Nil(t, expvar.Get("NoKV.Local.Stats.WAL.ActiveSegment"))
+	require.Nil(t, expvar.Get("NoKV.Local.Stats.ControlWAL.ActiveSegment"))
 	require.Nil(t, expvar.Get("NoKV.Txns.Active"))
 	require.Nil(t, expvar.Get("NoKV.Stats"))
 	require.Nil(t, expvar.Get("NoKV.Mmap.Madvise"))

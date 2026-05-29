@@ -72,26 +72,26 @@ func renderStats(w io.Writer, snap stats.StatsSnapshot, asJSON bool) error {
 				hs.DecayInterval.String(), hs.DecayShift)
 		}
 	}
-	_, _ = fmt.Fprintf(w, "WAL.ActiveSegment      %d (segments=%d removed=%d)\n", snap.WAL.ActiveSegment, snap.WAL.SegmentCount, snap.WAL.SegmentsRemoved)
-	_, _ = fmt.Fprintf(w, "WAL.ActiveSize         %d bytes\n", snap.WAL.ActiveSize)
-	if snap.WAL.RecordCounts.Total() > 0 {
-		r := snap.WAL.RecordCounts
-		_, _ = fmt.Fprintf(w, "WAL.Records            entries=%d raft_entries=%d raft_states=%d raft_snapshots=%d other=%d\n",
+	_, _ = fmt.Fprintf(w, "ControlWAL.ActiveSegment      %d (segments=%d removed=%d)\n", snap.ControlWAL.ActiveSegment, snap.ControlWAL.SegmentCount, snap.ControlWAL.SegmentsRemoved)
+	_, _ = fmt.Fprintf(w, "ControlWAL.ActiveSize         %d bytes\n", snap.ControlWAL.ActiveSize)
+	if snap.ControlWAL.RecordCounts.Total() > 0 {
+		r := snap.ControlWAL.RecordCounts
+		_, _ = fmt.Fprintf(w, "ControlWAL.Records            entries=%d raft_entries=%d raft_states=%d raft_snapshots=%d other=%d\n",
 			r.Entries, r.RaftEntries, r.RaftStates, r.RaftSnapshots, r.Other)
 	}
-	_, _ = fmt.Fprintf(w, "WAL.RaftSegments       %d (removable=%d)\n", snap.WAL.SegmentsWithRaftRecords, snap.WAL.RemovableRaftSegments)
-	if snap.WAL.TypedRecordRatio > 0 || snap.WAL.TypedRecordWarning {
-		_, _ = fmt.Fprintf(w, "WAL.TypedRatio         %.2f\n", snap.WAL.TypedRecordRatio)
+	_, _ = fmt.Fprintf(w, "ControlWAL.RaftSegments       %d (removable=%d)\n", snap.ControlWAL.SegmentsWithRaftRecords, snap.ControlWAL.RemovableRaftSegments)
+	if snap.ControlWAL.TypedRecordRatio > 0 || snap.ControlWAL.TypedRecordWarning {
+		_, _ = fmt.Fprintf(w, "ControlWAL.TypedRatio         %.2f\n", snap.ControlWAL.TypedRecordRatio)
 	}
-	if snap.WAL.TypedRecordWarning && snap.WAL.TypedRecordReason != "" {
-		_, _ = fmt.Fprintf(w, "WAL.Warning            %s\n", snap.WAL.TypedRecordReason)
+	if snap.ControlWAL.TypedRecordWarning && snap.ControlWAL.TypedRecordReason != "" {
+		_, _ = fmt.Fprintf(w, "ControlWAL.Warning            %s\n", snap.ControlWAL.TypedRecordReason)
 	}
-	if snap.WAL.AutoGCRuns > 0 || snap.WAL.AutoGCRemoved > 0 || snap.WAL.AutoGCLastUnix > 0 {
+	if snap.ControlWAL.AutoGCRuns > 0 || snap.ControlWAL.AutoGCRemoved > 0 || snap.ControlWAL.AutoGCLastUnix > 0 {
 		last := "never"
-		if snap.WAL.AutoGCLastUnix > 0 {
-			last = time.Unix(snap.WAL.AutoGCLastUnix, 0).Format(time.RFC3339)
+		if snap.ControlWAL.AutoGCLastUnix > 0 {
+			last = time.Unix(snap.ControlWAL.AutoGCLastUnix, 0).Format(time.RFC3339)
 		}
-		_, _ = fmt.Fprintf(w, "WAL.AutoGC             runs=%d removed=%d last=%s\n", snap.WAL.AutoGCRuns, snap.WAL.AutoGCRemoved, last)
+		_, _ = fmt.Fprintf(w, "ControlWAL.AutoGC             runs=%d removed=%d last=%s\n", snap.ControlWAL.AutoGCRuns, snap.ControlWAL.AutoGCRemoved, last)
 	}
 	if snap.Raft.GroupCount > 0 {
 		_, _ = fmt.Fprintf(w, "Raft.Groups            %d lagging=%d maxLagSegments=%d\n",

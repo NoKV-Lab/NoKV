@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Legacy Flush Design
 
 The old NoKV-owned LSM flush pipeline has been removed from the mainline.
-Physical memtable flush and compaction belong to the concrete raw backend:
+Physical memtable flush and compaction belong to the concrete storage backend:
 Pebble today, Holt once its adapter is wired, or any future implementation of
 `storage/kv.Store`.
 

@@ -46,8 +46,8 @@ Package boundaries follow ownership of truth, not convenience.
 
 | Package | Owns | Must Not Do |
 | --- | --- | --- |
-| `storage/kv/` | Raw ordered key/value backend contract, including atomic raw batch apply. | Expose MVCC, fsmeta, raftstore, migration, SST, or protobuf semantics. |
-| `storage/pebble/`, `storage/holt/`, `storage/memory/` | Concrete raw ordered KV backends. | Own MVCC timestamps, column families, transactions, fsmeta layout, raftstore routing, or migration policy. |
+| `storage/kv/` | Ordered key/value backend contract, including atomic storage batch apply. | Expose MVCC, fsmeta, raftstore, migration, SST, or protobuf semantics. |
+| `storage/pebble/`, `storage/holt/`, `storage/memory/` | Concrete ordered KV backends. | Own MVCC timestamps, column families, transactions, fsmeta layout, raftstore routing, or migration policy. |
 | `storage/wal/`, `storage/file/`, `storage/vfs/` | Low-level file, WAL, and VFS support for concrete runtime internals. | Become public fsmeta, txn, raftstore, or migration contracts. |
 | `local/` | Embedded DB facade and local runtime assembly. | Know fsmeta, coordinator, root, or raftstore semantics. |
 | `txn/storage/` | MVCC internal keys, column families, timestamp encoding, entries, and transaction storage contract. | Import Percolator, raftstore, fsmeta, coordinator, root, or concrete storage backends. |
@@ -82,10 +82,10 @@ Every new package must have a clear owner and one sentence of responsibility in
 
 The current responsibility map is:
 
-- `storage/kv/*`: raw ordered KV contract only.
-- `storage/pebble/*`: default Pebble-backed raw KV implementation.
+- `storage/kv/*`: ordered KV contract only.
+- `storage/pebble/*`: default Pebble-backed ordered KV implementation.
 - `storage/holt/*`: owned Holt backend adapter once it is wired into this repo.
-- `storage/memory/*`: test raw KV implementation.
+- `storage/memory/*`: test ordered KV implementation.
 - `third_party/holt`: pinned external Holt submodule. Go code should depend on
   a future `storage/holt` adapter, not on this checkout directly.
 - `storage/wal`, `storage/file`, `storage/vfs`: low-level support packages used
@@ -93,7 +93,7 @@ The current responsibility map is:
 - `fsmeta/cache/*`: derived namespace sidecar caches such as dirpage and
   negative-cache slabs. They can be rebuilt and do not own authoritative
   namespace truth.
-- `local/*`: embedded DB assembly around the raw storage backend, NoKV MVCC key
+- `local/*`: embedded DB assembly around the storage backend, NoKV MVCC key
   encoding, local stats, workdir mode, and commit queues. It may collect local
   stats, but it does not own distributed truth.
 - `txn/mvcc`, `txn/storage`, `txn/latch`: reusable transaction building blocks.
@@ -112,7 +112,7 @@ The current responsibility map is:
   and operation key plans for ordered storage backends.
 - `fsmeta/backend/*`: minimal MVCC metadata backend contract. It contains
   backend-neutral key/value, mutation, predicate, atomic mutation, and stats
-  surfaces only. Migration, SST ingest/export, LSM diagnostics, raw storage
+  surfaces only. Migration, SST ingest/export, LSM diagnostics, storage backend
   stats, and raftstore RPC conversion remain in concrete runtime or operations
   packages.
 - `fsmeta/observe/*`: runtime-neutral watch and snapshot observation surfaces.

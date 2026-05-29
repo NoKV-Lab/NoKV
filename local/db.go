@@ -1,7 +1,7 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package local provides the embedded single-node database API and engine wiring.
+// Package local provides the embedded DB facade and local runtime wiring.
 package local
 
 import (
@@ -22,7 +22,7 @@ import (
 	"github.com/feichai0017/NoKV/local/stats"
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
 	"github.com/feichai0017/NoKV/metrics"
-	rawkv "github.com/feichai0017/NoKV/storage/kv"
+	storekv "github.com/feichai0017/NoKV/storage/kv"
 	pebblestore "github.com/feichai0017/NoKV/storage/pebble"
 	"github.com/feichai0017/NoKV/storage/vfs"
 	"github.com/feichai0017/NoKV/storage/wal"
@@ -40,9 +40,8 @@ const nonTxnMaxVersion = kv.MaxVersion
 // and per-Manager.mu contention. Must be a power of two — controlWALShard
 // uses `& (N-1)` for placement.
 //
-// Total Manager budget under the CommitStore data-plane sharding plan:
-// 4 control-log + 4 CommitStore data = 8 Managers. There is no separate control-plane
-// Manager — db.wal is dissolved into the CommitStore shards.
+// The storage backend owns its physical WAL. These managers are only for
+// replicated control-log consumers such as raftlog and experimental witnesses.
 const defaultControlWALShards = 4
 
 type (
@@ -58,13 +57,13 @@ type (
 	mvccGCStatsSnapshotSource func() stats.MVCCGCStatsSnapshot
 	transportMetricsSource    func() metrics.GRPCTransportMetrics
 
-	// DB is the global handle for the engine and owns shared resources.
+	// DB is the embedded database facade and owns shared local runtime resources.
 	DB struct {
 		sync.RWMutex
 		opt              *Options
 		fs               vfs.FS
 		dirLock          io.Closer
-		store            rawkv.Store
+		store            storekv.Store
 		controlWALMu     sync.Mutex
 		controlWALs      [defaultControlWALShards]*wal.Manager
 		controlWatchdogs [defaultControlWALShards]*wal.Watchdog
@@ -162,15 +161,19 @@ func (db *DB) checkWorkDirMode() error {
 	return fmt.Errorf("open db: workdir mode %q is not allowed for this open intent", mode)
 }
 
-func (db *DB) openEngine() error {
-	store, err := pebblestore.Open(pebblestore.Options{
-		Dir:           db.storageDir(),
-		SyncWrites:    db.opt.SyncWrites,
-		CacheBytes:    db.opt.BlockCacheBytes,
-		MemTableBytes: uint64(max(db.opt.MemTableSize, 0)),
+func (db *DB) openStorageBackend() error {
+	factory := db.opt.StorageBackendFactory
+	if factory == nil {
+		factory = openPebbleStorageBackend
+	}
+	store, err := factory(StorageBackendConfig{
+		Dir:              db.storageBackendDir(),
+		SyncWrites:       db.opt.SyncWrites,
+		CacheBytes:       db.opt.BlockCacheBytes,
+		WriteBufferBytes: uint64(max(db.opt.StorageWriteBufferBytes, 0)),
 	})
 	if err != nil {
-		return fmt.Errorf("open db: pebble init: %w", err)
+		return fmt.Errorf("open db: storage backend init: %w", err)
 	}
 	db.store = store
 	maxVersion, err := db.scanMaxDefaultVersion()
@@ -183,15 +186,24 @@ func (db *DB) openEngine() error {
 	return nil
 }
 
-func (db *DB) storageDir() string {
-	return filepath.Join(db.opt.WorkDir, "pebble")
+func openPebbleStorageBackend(cfg StorageBackendConfig) (storekv.Store, error) {
+	return pebblestore.Open(pebblestore.Options{
+		Dir:           cfg.Dir,
+		SyncWrites:    cfg.SyncWrites,
+		CacheBytes:    cfg.CacheBytes,
+		MemTableBytes: cfg.WriteBufferBytes,
+	})
+}
+
+func (db *DB) storageBackendDir() string {
+	return filepath.Join(db.opt.WorkDir, "storage")
 }
 
 func (db *DB) scanMaxDefaultVersion() (uint64, error) {
 	if db == nil || db.store == nil {
 		return 0, nil
 	}
-	iter, err := db.newRawIterator(rawkv.IteratorOptions{})
+	iter, err := db.newStorageIterator(storekv.IteratorOptions{})
 	if err != nil {
 		return 0, err
 	}
@@ -214,9 +226,9 @@ func (db *DB) scanMaxDefaultVersion() (uint64, error) {
 }
 
 func (db *DB) startWriteRuntime() {
-	// Commit processors are local CPU/admission lanes. The selected raw storage
-	// backend owns physical batch atomicity; shard placement only spreads commit
-	// pipeline work.
+	// Commit processors are local CPU/admission lanes. The selected storage
+	// backend owns physical batch atomicity; shard placement only spreads
+	// commit-pipeline work.
 	workers := db.opt.WriteShardCount
 	if workers <= 0 {
 		workers = 1
@@ -249,7 +261,7 @@ func (db *DB) controlWALFor(groupID uint64) (*wal.Manager, error) {
 	}
 	mgr, err := wal.Open(wal.Config{
 		Dir:        db.controlWALDir(shard),
-		BufferSize: db.opt.WALBufferSize,
+		BufferSize: db.opt.ControlWALBufferSize,
 		FS:         db.fs,
 	})
 	if err != nil {
@@ -263,14 +275,14 @@ func (db *DB) controlWALFor(groupID uint64) (*wal.Manager, error) {
 			return nil, err
 		}
 	}
-	if db.opt.EnableWALWatchdog {
+	if db.opt.EnableControlWALWatchdog {
 		wd := wal.NewWatchdog(wal.WatchdogConfig{
 			Manager:      mgr,
-			Interval:     db.opt.WALAutoGCInterval,
-			MinRemovable: db.opt.WALAutoGCMinRemovable,
-			MaxBatch:     db.opt.WALAutoGCMaxBatch,
-			WarnRatio:    db.opt.WALTypedRecordWarnRatio,
-			WarnSegments: db.opt.WALTypedRecordWarnSegments,
+			Interval:     db.opt.ControlWALAutoGCInterval,
+			MinRemovable: db.opt.ControlWALAutoGCMinRemovable,
+			MaxBatch:     db.opt.ControlWALAutoGCMaxBatch,
+			WarnRatio:    db.opt.ControlWALTypedRecordWarnRatio,
+			WarnSegments: db.opt.ControlWALTypedRecordWarnSegments,
 		})
 		if wd != nil {
 			wd.Start()
@@ -334,7 +346,7 @@ func Open(opt *Options) (_ *DB, err error) {
 	if err := db.openDurability(); err != nil {
 		return nil, err
 	}
-	if err := db.openEngine(); err != nil {
+	if err := db.openStorageBackend(); err != nil {
 		return nil, err
 	}
 	db.startWriteRuntime()
@@ -683,7 +695,7 @@ func (db *DB) findVisibleInternalEntry(cf kv.ColumnFamily, key []byte, readVersi
 		return nil, utils.ErrEmptyKey
 	}
 	seekKey := kv.InternalKey(cf, key, readVersion)
-	iter, err := db.newRawIterator(rawkv.IteratorOptions{})
+	iter, err := db.newStorageIterator(storekv.IteratorOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -734,7 +746,7 @@ func (db *DB) NewInternalIterator(opt *kv.Options) kv.Iterator {
 	if opt == nil {
 		opt = &kv.Options{}
 	}
-	iter, err := db.newRawIterator(rawkv.IteratorOptions{
+	iter, err := db.newStorageIterator(storekv.IteratorOptions{
 		LowerBound: internalIteratorBound(opt.LowerBound),
 		UpperBound: internalIteratorBound(opt.UpperBound),
 		Reverse:    !opt.IsAsc,
@@ -769,10 +781,21 @@ func (db *DB) Info() *stats.Stats {
 // over DB struct fields so the snapshot logic can live in local/stats without
 // importing the local DB implementation.
 
-func (db *DB) BackgroundWatchdogs() []*wal.Watchdog { return db.background.WALWatchdogs() }
-func (db *DB) StorageStats() rawkv.Stats {
+func (db *DB) ControlWALWatchdogs() []*wal.Watchdog {
+	if db == nil {
+		return nil
+	}
+	watchdogs := db.background.walWatchdogs
+	if len(watchdogs) == 0 {
+		return nil
+	}
+	out := make([]*wal.Watchdog, len(watchdogs))
+	copy(out, watchdogs)
+	return out
+}
+func (db *DB) StorageStats() storekv.Stats {
 	if db == nil || db.store == nil {
-		return rawkv.Stats{}
+		return storekv.Stats{}
 	}
 	return db.store.Stats()
 }
@@ -798,16 +821,18 @@ func (db *DB) MVCCGCStatsSnapshot() stats.MVCCGCStatsSnapshot {
 	return source()
 }
 
-func (db *DB) HotWrite() *thermos.RotatingThermos  { return db.hotWrite }
-func (db *DB) IteratorReused() uint64              { return db.iterPool.Reused() }
-func (db *DB) WriteMetrics() *metrics.WriteMetrics { return db.writeMetrics }
-func (db *DB) BlockWritesActive() bool             { return db.blockWrites.Load() == 1 }
-func (db *DB) SlowWritesActive() bool              { return db.slowWrites.Load() == 1 }
-func (db *DB) HotWriteLimited() uint64             { return db.hotWriteLimited.Load() }
-func (db *DB) ControlLogLagWarnSegments() int64    { return db.opt.ControlLogLagWarnSegments }
-func (db *DB) WALTypedRecordWarnRatio() float64    { return db.opt.WALTypedRecordWarnRatio }
-func (db *DB) WALTypedRecordWarnSegments() int64   { return db.opt.WALTypedRecordWarnSegments }
-func (db *DB) ThermosTopK() int                    { return db.opt.ThermosTopK }
+func (db *DB) HotWrite() *thermos.RotatingThermos      { return db.hotWrite }
+func (db *DB) IteratorReused() uint64                  { return db.iterPool.Reused() }
+func (db *DB) WriteMetrics() *metrics.WriteMetrics     { return db.writeMetrics }
+func (db *DB) BlockWritesActive() bool                 { return db.blockWrites.Load() == 1 }
+func (db *DB) SlowWritesActive() bool                  { return db.slowWrites.Load() == 1 }
+func (db *DB) HotWriteLimited() uint64                 { return db.hotWriteLimited.Load() }
+func (db *DB) ControlLogLagWarnSegments() int64        { return db.opt.ControlLogLagWarnSegments }
+func (db *DB) ControlWALTypedRecordWarnRatio() float64 { return db.opt.ControlWALTypedRecordWarnRatio }
+func (db *DB) ControlWALTypedRecordWarnSegments() int64 {
+	return db.opt.ControlWALTypedRecordWarnSegments
+}
+func (db *DB) ThermosTopK() int { return db.opt.ThermosTopK }
 
 // WriteBatchLimits returns the per-batch entry-count and byte-size caps the
 // commit pipeline enforces. Callers that build batched-install paths use
@@ -878,7 +903,7 @@ func (db *DB) SetRegionMetrics(rm *metrics.RegionMetrics) {
 
 // SyncWAL preserves the administrative durability hook used by transaction
 // tests. The Pebble-backed local store owns its own WAL, so this delegates to
-// the raw store sync boundary instead of exposing data-plane WAL managers.
+// the storage backend sync boundary instead of exposing data-plane WAL managers.
 func (db *DB) SyncWAL() error {
 	if db == nil || db.store == nil {
 		return fmt.Errorf("db: wal is unavailable")
@@ -978,7 +1003,7 @@ func (db *DB) SetBatchGroup(_ int, groups [][]*kv.Entry) (int, error) {
 		if len(group) == 0 {
 			continue
 		}
-		batch := rawkv.Batch{Ops: make([]rawkv.Mutation, 0, len(group))}
+		batch := storekv.Batch{Ops: make([]storekv.Mutation, 0, len(group))}
 		for _, entry := range group {
 			if entry == nil || len(entry.Key) == 0 {
 				return i, utils.ErrEmptyKey
@@ -987,8 +1012,8 @@ func (db *DB) SetBatchGroup(_ int, groups [][]*kv.Entry) (int, error) {
 			if err != nil {
 				return i, err
 			}
-			batch.Ops = append(batch.Ops, rawkv.Mutation{
-				Op:    rawkv.PutOp,
+			batch.Ops = append(batch.Ops, storekv.Mutation{
+				Op:    storekv.PutOp,
 				Key:   physicalKey,
 				Value: encodeStoredEntry(entry),
 			})
@@ -1013,7 +1038,7 @@ func (db *DB) IsKeyCoveredByRangeTombstone(cf kv.ColumnFamily, userKey []byte, v
 	if db == nil || db.store == nil {
 		return false
 	}
-	iter, err := db.newRawIterator(rawkv.IteratorOptions{})
+	iter, err := db.newStorageIterator(storekv.IteratorOptions{})
 	if err != nil {
 		return false
 	}
@@ -1069,7 +1094,7 @@ func decodeStoredEntry(internalKey []byte, encoded []byte) (*kv.Entry, error) {
 	return entry, nil
 }
 
-func (db *DB) newRawIterator(opts rawkv.IteratorOptions) (kv.Iterator, error) {
+func (db *DB) newStorageIterator(opts storekv.IteratorOptions) (kv.Iterator, error) {
 	if db == nil || db.store == nil {
 		return nil, fmt.Errorf("db: storage is unavailable")
 	}
@@ -1086,15 +1111,15 @@ func (db *DB) newRawIterator(opts rawkv.IteratorOptions) (kv.Iterator, error) {
 			return nil, err
 		}
 	}
-	raw, err := db.store.NewIterator(opts)
+	iter, err := db.store.NewIterator(opts)
 	if err != nil {
 		return nil, err
 	}
-	return &internalIterator{raw: raw, reverse: opts.Reverse}, nil
+	return &internalIterator{iter: iter, reverse: opts.Reverse}, nil
 }
 
 type internalIterator struct {
-	raw     rawkv.Iterator
+	iter    storekv.Iterator
 	reverse bool
 	entry   *kv.Entry
 	item    internalIteratorItem
@@ -1132,23 +1157,23 @@ func (item *internalIteratorItem) Entry() *kv.Entry {
 func (it *internalIterator) Next() {
 	it.releaseItem()
 	if it.reverse {
-		it.raw.Prev()
+		it.iter.Prev()
 		return
 	}
-	it.raw.Next()
+	it.iter.Next()
 }
 
 func (it *internalIterator) Valid() bool {
-	return it != nil && it.raw != nil && it.raw.Valid()
+	return it != nil && it.iter != nil && it.iter.Valid()
 }
 
 func (it *internalIterator) Rewind() {
 	it.releaseItem()
 	if it.reverse {
-		it.raw.Last()
+		it.iter.Last()
 		return
 	}
-	it.raw.First()
+	it.iter.First()
 }
 
 func (it *internalIterator) Item() kv.Item {
@@ -1156,11 +1181,11 @@ func (it *internalIterator) Item() kv.Item {
 		return nil
 	}
 	it.releaseItem()
-	logicalKey, err := decodePhysicalKey(it.raw.Key())
+	logicalKey, err := decodePhysicalKey(it.iter.Key())
 	if err != nil {
 		return nil
 	}
-	value, err := it.raw.Value()
+	value, err := it.iter.Value()
 	if err != nil {
 		return nil
 	}
@@ -1174,15 +1199,15 @@ func (it *internalIterator) Item() kv.Item {
 }
 
 func (it *internalIterator) Close() error {
-	if it == nil || it.raw == nil {
+	if it == nil || it.iter == nil {
 		return nil
 	}
 	it.releaseItem()
-	return it.raw.Close()
+	return it.iter.Close()
 }
 
 func (it *internalIterator) Seek(key []byte) {
-	if it == nil || it.raw == nil {
+	if it == nil || it.iter == nil {
 		return
 	}
 	it.releaseItem()
@@ -1191,15 +1216,15 @@ func (it *internalIterator) Seek(key []byte) {
 		return
 	}
 	if !it.reverse {
-		it.raw.Seek(physicalKey)
+		it.iter.Seek(physicalKey)
 		return
 	}
-	if !it.raw.Seek(physicalKey) {
-		it.raw.Last()
+	if !it.iter.Seek(physicalKey) {
+		it.iter.Last()
 		return
 	}
-	if bytes.Compare(it.raw.Key(), physicalKey) > 0 {
-		it.raw.Prev()
+	if bytes.Compare(it.iter.Key(), physicalKey) > 0 {
+		it.iter.Prev()
 	}
 }
 

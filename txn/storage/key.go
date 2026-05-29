@@ -123,7 +123,7 @@ func CompareUserKeys(key1, key2 []byte) int {
 }
 
 // InternalKey encodes (column family, user key, version) into the canonical
-// internal layout used above raw ordered-KV backends:
+// internal layout used above ordered-KV backends:
 //
 //	+------------+----------+----------------------+
 //	| CF marker  | User key | Timestamp (uint64 BE)|
