@@ -74,8 +74,6 @@ func (e *Executor) Stats() map[string]any {
 			"visible_commit":             visibleCommitStats(nil, false),
 			"visible_directory_read":     visibleDirectoryReadStats(nil),
 			"atomic_one_phase":           atomicOnePhaseStats(nil),
-			"negative_cache_enabled":     false,
-			"dirpage_cache_enabled":      false,
 		}
 	}
 	out := map[string]any{
@@ -89,22 +87,12 @@ func (e *Executor) Stats() map[string]any {
 		"visible_commit":             visibleCommitStats(&e.visibleCommit, e.visibleCommitter != nil),
 		"visible_directory_read":     visibleDirectoryReadStats(&e.visibleDirectoryRead),
 		"atomic_one_phase":           atomicOnePhaseStats(e.atomicOnePhase),
-		"negative_cache_enabled":     e.negCache != nil,
-		"dirpage_cache_enabled":      e.dirPages != nil,
 	}
 	if stats, ok := e.runner.(backend.StatsProvider); ok {
 		out["runner"] = stats.Stats()
 	}
 	if stats, ok := e.visibleCommitter.(backend.StatsProvider); ok {
 		out["visible_committer"] = stats.Stats()
-	}
-	if e.dirPages != nil {
-		stats := e.dirPages.Stats()
-		out["dirpage_hits"] = stats.Hits
-		out["dirpage_misses"] = stats.Misses
-		out["dirpage_stale"] = stats.Stale
-		out["dirpage_store_ok"] = stats.StoreOK
-		out["dirpage_dropped"] = stats.Dropped
 	}
 	if stats, ok := e.inodes.(backend.StatsProvider); ok {
 		out["inode_allocator"] = stats.Stats()

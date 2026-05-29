@@ -6,9 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # VFS
 
 The `storage/vfs` package provides a small filesystem abstraction used by
-NoKV-owned low-level files such as control WALs, raft metadata, slab sidecars,
-and tests. It is not the Pebble or Holt physical storage API; concrete backends
-own their own file layout below `storage/kv`.
+NoKV-owned low-level files such as control WALs, raft metadata, and tests. It
+is not the Pebble or Holt physical storage API; concrete backends own their own
+file layout below `storage/kv`.
 
 ---
 

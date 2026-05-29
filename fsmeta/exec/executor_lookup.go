@@ -8,19 +8,15 @@ import (
 	"context"
 	"fmt"
 
-	xxhash "github.com/cespare/xxhash/v2"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
-	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
-// Lookup returns the dentry record for parent/name. visible overlay is consulted
-// before the negative cache so a visible or recovered record cannot be hidden
-// by a stale miss memo. Misses observed by the runner are recorded so the next
-// Lookup can skip the authoritative probe; mutating operations invalidate the
-// affected dentry keys after a successful commit.
+// Lookup returns the dentry record for parent/name. Visible overlay is consulted
+// before the authoritative backend so visible or recovered records are observed
+// without waiting for the durable install path.
 func (e *Executor) Lookup(ctx context.Context, req model.LookupRequest) (model.DentryRecord, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
@@ -38,23 +34,15 @@ func (e *Executor) Lookup(ctx context.Context, req model.LookupRequest) (model.D
 			return model.DentryRecord{}, err
 		}
 		if !found {
-			if e.negCache != nil {
-				e.negCache.Remember(plan.PrimaryKey)
-			}
 			return model.DentryRecord{}, model.ErrNotFound
 		}
-		e.invalidateNegative(plan.PrimaryKey)
 		return record, nil
 	}
 	if value, deleted, ok := e.readVisibleProgram(program); ok {
-		e.invalidateNegative(plan.PrimaryKey)
 		if deleted {
 			return model.DentryRecord{}, model.ErrNotFound
 		}
 		return layout.DecodeDentryValue(value)
-	}
-	if e.negCache != nil && e.negCache.Has(plan.PrimaryKey) {
-		return model.DentryRecord{}, model.ErrNotFound
 	}
 	version, err := e.reserveReadVersion(ctx)
 	if err != nil {
@@ -65,9 +53,6 @@ func (e *Executor) Lookup(ctx context.Context, req model.LookupRequest) (model.D
 		return model.DentryRecord{}, err
 	}
 	if !ok {
-		if e.negCache != nil {
-			e.negCache.Remember(plan.PrimaryKey)
-		}
 		return model.DentryRecord{}, model.ErrNotFound
 	}
 	return layout.DecodeDentryValue(value)
@@ -124,7 +109,6 @@ func (e *Executor) LookupPlus(ctx context.Context, req model.LookupRequest) (mod
 	}
 	plan := program.Plan
 	if value, deleted, ok := e.readVisibleProgram(program); ok {
-		e.invalidateNegative(plan.PrimaryKey)
 		if deleted {
 			return model.DentryAttrPair{}, model.ErrNotFound
 		}
@@ -133,9 +117,6 @@ func (e *Executor) LookupPlus(ctx context.Context, req model.LookupRequest) (mod
 			return model.DentryAttrPair{}, err
 		}
 		return e.readLookupPlusInode(ctx, mount, dentry, 0)
-	}
-	if e.negCache != nil && e.negCache.Has(plan.PrimaryKey) {
-		return model.DentryAttrPair{}, model.ErrNotFound
 	}
 	version, err := e.reserveReadVersion(ctx)
 	if err != nil {
@@ -146,9 +127,6 @@ func (e *Executor) LookupPlus(ctx context.Context, req model.LookupRequest) (mod
 		return model.DentryAttrPair{}, err
 	}
 	if !ok {
-		if e.negCache != nil {
-			e.negCache.Remember(plan.PrimaryKey)
-		}
 		return model.DentryAttrPair{}, model.ErrNotFound
 	}
 	dentry, err := layout.DecodeDentryValue(value)
@@ -199,51 +177,6 @@ func (e *Executor) readLookupPlusInode(ctx context.Context, mount model.MountIde
 	return model.DentryAttrPair{Dentry: dentry, Inode: inode}, nil
 }
 
-// invalidateNegative drops cached "missing" memos for every dentry key that
-// was just mutated, so the next Lookup re-issues against the runner instead
-// of returning a stale ErrNotFound. Safe with a nil cache.
-func (e *Executor) invalidateNegative(keys ...[]byte) {
-	if e == nil || e.negCache == nil {
-		return
-	}
-	for _, k := range keys {
-		if len(k) > 0 {
-			e.negCache.Invalidate(k)
-		}
-	}
-}
-
-func (e *Executor) clearNegativeCache() {
-	if e == nil || e.negCache == nil {
-		return
-	}
-	clearer, ok := e.negCache.(negativeCacheClearer)
-	if ok {
-		clearer.Clear()
-	}
-}
-
-// invalidateDirPages bumps the dirpage cache's epoch for every parent
-// directory the just-committed mutation touched. Safe with a nil cache.
-// Caller passes (mount, parent) tuples — the helper folds duplicates so
-// rename across a single parent doesn't double-bump.
-func (e *Executor) invalidateDirPages(mount model.MountID, parents ...model.InodeID) {
-	if e == nil || e.dirPages == nil {
-		return
-	}
-	seen := make(map[model.InodeID]struct{}, len(parents))
-	for _, p := range parents {
-		if p == 0 {
-			continue
-		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		e.dirPages.Invalidate(dirPageDirectoryKey(mount, p))
-	}
-}
-
 // ReadDir returns one directory page from a dentry prefix scan.
 func (e *Executor) ReadDir(ctx context.Context, req model.ReadDirRequest) ([]model.DentryRecord, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
@@ -275,17 +208,6 @@ func (e *Executor) ReadDir(ctx context.Context, req model.ReadDirRequest) ([]mod
 // ReadDirPlus returns one directory page fused with inode attributes at the
 // same snapshot version. This is the first native fsmeta operation that avoids
 // client-side dentry scan plus N point reads.
-//
-// When a dirpage cache is wired and the request omits an explicit
-// SnapshotVersion (i.e. the caller is asking for "latest"), ReadDirPlus checks
-// the cache first against the parent's current invalidation epoch. visible-backed
-// reads bypass the persistent cache because visible overlay rows are not durable
-// until they have flushed and installed.
-//
-// Snapshot-versioned reads bypass the cache: pages are tagged with the
-// "latest" frontier and a stale snapshot-versioned read might disagree
-// with the live cache, so we keep that path on the authoritative backend
-// route.
 func (e *Executor) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
@@ -301,18 +223,6 @@ func (e *Executor) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([
 		return nil, err
 	}
 
-	useDirPage := e.dirPages != nil && req.SnapshotVersion == 0 && !hasVisibleOverlay
-	var pageKey dirpage.PageKey
-	var frontier uint64
-	if useDirPage {
-		pageKey = dirPageKey(req.Mount, req.Parent, req.StartAfter, plan.Limit)
-		frontier = e.dirPageReadFrontier(pageKey.Directory(), mount, req.Parent)
-		if entries, ok := e.dirPages.Lookup(pageKey, frontier); ok {
-			if cached, err := decodeDirPageEntries(pageKey, entries); err == nil {
-				return cached, nil
-			}
-		}
-	}
 	if overlayOnly {
 		overlayGeneration, sealedGeneration := e.captureVisibleOverlayRead(includeOverlay)
 		dentries, err := e.scanDentriesAt(ctx, plan, 0, false, overlayGeneration, sealedGeneration)
@@ -322,9 +232,6 @@ func (e *Executor) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([
 		if pairs, ok, err := e.readDirPlusFromVisibleViewAt(mount, dentries, overlayGeneration, sealedGeneration); err != nil {
 			return nil, err
 		} else if ok {
-			if useDirPage {
-				e.materializeDirPage(pageKey, frontier, pairs)
-			}
 			return pairs, nil
 		}
 	}
@@ -372,12 +279,6 @@ func (e *Executor) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([
 	if err != nil {
 		return nil, err
 	}
-	if useDirPage {
-		// Materialize is best-effort: if Invalidate fired since we read,
-		// the cache drops the write and the next call re-fetches. Encoding must
-		// be all-or-none: a partial cached page would be worse than a miss.
-		e.materializeDirPage(pageKey, frontier, out)
-	}
 	return out, nil
 }
 
@@ -390,17 +291,6 @@ func (e *Executor) captureVisibleOverlayRead(includeOverlay bool) (uint64, uint6
 		return 0, 0
 	}
 	return reader.CaptureVisibleOverlayRead()
-}
-
-func (e *Executor) materializeDirPage(pageKey dirpage.PageKey, frontier uint64, pairs []model.DentryAttrPair) {
-	if e == nil || e.dirPages == nil {
-		return
-	}
-	entries, err := encodeDirPageEntries(pairs)
-	if err != nil {
-		return
-	}
-	_ = e.dirPages.MaterializeAsync(pageKey, frontier, entries)
 }
 
 func (e *Executor) readDirPlusFromVisibleView(mount model.MountIdentity, dentries []model.DentryRecord) ([]model.DentryAttrPair, bool, error) {
@@ -543,49 +433,6 @@ func (e *Executor) visibleSnapshotDirectoryHasOverlay(version uint64, mount mode
 	return reader.HasVisibleSnapshotDirectory(version, prefix)
 }
 
-func (e *Executor) dirPageReadFrontier(directory dirpage.DirectoryKey, mount model.MountIdentity, parent model.InodeID) uint64 {
-	e.syncDirPageVisibleFrontier(directory, e.visibleDirectoryCacheFrontier(mount, parent))
-	return e.dirPages.CurrentEpoch(directory)
-}
-
-func (e *Executor) visibleDirectoryCacheFrontier(mount model.MountIdentity, parent model.InodeID) uint64 {
-	overlay := e.visibleOverlay()
-	if overlay == nil {
-		return 0
-	}
-	reporter, ok := overlay.(VisibleDirectoryCacheFrontier)
-	if !ok {
-		return 0
-	}
-	prefix, err := layout.EncodeDentryPrefix(mount, parent)
-	if err != nil {
-		return 0
-	}
-	return reporter.VisibleDirectoryCacheFrontier(prefix)
-}
-
-func (e *Executor) syncDirPageVisibleFrontier(directory dirpage.DirectoryKey, frontier uint64) {
-	if e == nil || e.dirPages == nil {
-		return
-	}
-	e.dirPageVisibleMu.Lock()
-	if e.dirPageVisibleFrontier == nil {
-		e.dirPageVisibleFrontier = make(map[dirpage.DirectoryKey]uint64)
-	}
-	previous, known := e.dirPageVisibleFrontier[directory]
-	if (!known && frontier == 0) || (known && previous == frontier) {
-		e.dirPageVisibleMu.Unlock()
-		return
-	}
-	if frontier == 0 {
-		delete(e.dirPageVisibleFrontier, directory)
-	} else {
-		e.dirPageVisibleFrontier[directory] = frontier
-	}
-	e.dirPageVisibleMu.Unlock()
-	e.dirPages.Invalidate(directory)
-}
-
 func (e *Executor) readDentry(ctx context.Context, key []byte, version uint64) (model.DentryRecord, error) {
 	value, ok, err := e.getMergedValue(ctx, key, version)
 	if err != nil {
@@ -634,69 +481,4 @@ func (e *Executor) readSessionByKey(ctx context.Context, mount model.MountIdenti
 		return model.SessionRecord{}, false, err
 	}
 	return record, true, nil
-}
-
-// dirPageDirectoryKey hashes (mount, parent) into the dirpage cache's
-// directory invalidation key. model.MountID is a string; we use xxhash.Sum64
-// to fold it into a uint64 mount slot. Collision probability across reasonable
-// mount counts (<= 10K) is ~5e-12, well below "fallback re-warm" tolerance.
-func dirPageDirectoryKey(mount model.MountID, parent model.InodeID) dirpage.DirectoryKey {
-	return dirpage.DirectoryKey{
-		Mount:  xxhash.Sum64String(string(mount)),
-		Parent: uint64(parent),
-	}
-}
-
-// dirPageKey includes the caller-visible page cursor. ReadDirPlus cache hits
-// are only valid for the exact StartAfter/Limit shape that produced them.
-func dirPageKey(mount model.MountID, parent model.InodeID, startAfter string, limit uint32) dirpage.PageKey {
-	return dirpage.PageKey{
-		Mount:      xxhash.Sum64String(string(mount)),
-		Parent:     uint64(parent),
-		StartAfter: startAfter,
-		Limit:      limit,
-	}
-}
-
-// encodeDirPageEntries converts assembled DentryAttrPairs into the
-// generic dirpage Entry shape. AttrBlob is the encoded InodeRecord; if any
-// entry cannot be encoded, the whole materialization is skipped so the cache
-// never serves a truncated page as complete.
-func encodeDirPageEntries(pairs []model.DentryAttrPair) ([]dirpage.Entry, error) {
-	out := make([]dirpage.Entry, 0, len(pairs))
-	for _, p := range pairs {
-		blob, err := layout.EncodeInodeValue(p.Inode)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, dirpage.Entry{
-			Name:     []byte(p.Dentry.Name),
-			Inode:    uint64(p.Dentry.Inode),
-			AttrBlob: blob,
-		})
-	}
-	return out, nil
-}
-
-// decodeDirPageEntries reverses encodeDirPageEntries. Decode failure on
-// any entry treats the whole page set as corrupt and forces a fallback
-// to the runner.
-func decodeDirPageEntries(key dirpage.PageKey, entries []dirpage.Entry) ([]model.DentryAttrPair, error) {
-	out := make([]model.DentryAttrPair, 0, len(entries))
-	for _, e := range entries {
-		inode, err := layout.DecodeInodeValue(e.AttrBlob)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, model.DentryAttrPair{
-			Dentry: model.DentryRecord{
-				Parent: model.InodeID(key.Parent),
-				Name:   string(e.Name),
-				Inode:  model.InodeID(e.Inode),
-				Type:   inode.Type,
-			},
-			Inode: inode,
-		})
-	}
-	return out, nil
 }

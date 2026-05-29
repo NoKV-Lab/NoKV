@@ -6,11 +6,10 @@ package percolator
 import (
 	"bytes"
 	"errors"
-	"fmt"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"path/filepath"
 	"testing"
 
+	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 
 	local "github.com/feichai0017/NoKV/local"
@@ -228,7 +227,6 @@ func TestPrewriteAndCommitPut(t *testing.T) {
 
 func TestApplyAtomicMutateMaterializesCommittedKeys(t *testing.T) {
 	opt := testOptionsForDir(filepath.Join(t.TempDir(), "db"))
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -260,7 +258,6 @@ func TestApplyAtomicMutateMaterializesCommittedKeys(t *testing.T) {
 
 func TestApplyAtomicMutateBatchFusesIndependentRequests(t *testing.T) {
 	opt := testOptionsForDir(t.TempDir())
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -296,18 +293,12 @@ func TestApplyAtomicMutateBatchFusesIndependentRequests(t *testing.T) {
 }
 
 func TestApplyAtomicMutateBatchUsesSinglePebbleApplyGroup(t *testing.T) {
-	const shardCount = 4
-
 	opt := testOptionsForDir(t.TempDir())
-	opt.WriteShardCount = shardCount
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	first, second := keysWithAscendingCommitShards(t, shardCount)
-	firstShard := testShardForInternalKey(kv.InternalKey(kv.CFDefault, first, 50), shardCount)
-	secondShard := testShardForInternalKey(kv.InternalKey(kv.CFDefault, second, 52), shardCount)
-	require.NotEqual(t, firstShard, secondShard)
+	first, second := []byte("atomic-single-apply-a"), []byte("atomic-single-apply-b")
 
 	store := newCountingAtomicStore(db)
 	results := ApplyAtomicMutateBatch(store, latch.NewManager(16), []*kvrpcpb.TryAtomicMutateRequest{
@@ -326,7 +317,6 @@ func TestApplyAtomicMutateBatchUsesSinglePebbleApplyGroup(t *testing.T) {
 
 func TestApplyAtomicMutateBatchPreservesOverlappingRequestOrder(t *testing.T) {
 	opt := testOptionsForDir(t.TempDir())
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -351,7 +341,6 @@ func TestApplyAtomicMutateBatchPreservesOverlappingRequestOrder(t *testing.T) {
 
 func TestApplyAtomicMutateBatchApplyFailureMarksWholeFusedGroup(t *testing.T) {
 	opt := testOptionsForDir(t.TempDir())
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -462,7 +451,6 @@ func TestApplyAtomicMutateValueEqualsPredicate(t *testing.T) {
 
 func TestApplyAtomicMutateRejectsLockedPredicate(t *testing.T) {
 	opt := testOptionsForDir(filepath.Join(t.TempDir(), "db"))
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -1188,16 +1176,13 @@ func TestCommitBatchAppliesAllKeysOnce(t *testing.T) {
 	require.Equal(t, []int{6}, store.appliedEntryCounts)
 }
 
-func TestCommitAfterBatchPrewritePreservesShardAffinityAcrossRestart(t *testing.T) {
-	const shardCount = 4
-
+func TestCommitAfterBatchPrewriteClearsSecondaryLockAcrossRestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "db")
 	opt := testOptionsForDir(dir)
-	opt.WriteShardCount = shardCount
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 
-	first, second := keysWithAscendingCommitShards(t, shardCount)
+	first, second := []byte("batch-prewrite-primary"), []byte("batch-prewrite-secondary")
 	latches := latch.NewManager(32)
 	errs := Prewrite(db, latches, &kvrpcpb.PrewriteRequest{
 		Mutations: []*kvrpcpb.Mutation{
@@ -1220,47 +1205,9 @@ func TestCommitAfterBatchPrewritePreservesShardAffinityAcrossRestart(t *testing.
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
-	// This reproduces the sharded-apply failure mode behind the review comment:
-	// if a batch prewrite routes every key by the first key's shard, then a
-	// later single-key commit can put the second key's lock tombstone on its
-	// real shard while the stale lock remains on the first shard. After restart
-	// shard hints are cold, so equal-version lock records are resolved by shard
-	// scan order and the stale lock can become visible again.
 	lock, err := NewReader(db).GetLock(second)
 	require.NoError(t, err)
 	require.Nil(t, lock)
-}
-
-func keysWithAscendingCommitShards(t *testing.T, shardCount int) ([]byte, []byte) {
-	t.Helper()
-	keysByShard := make([][]byte, shardCount)
-	for i := range 10000 {
-		key := fmt.Appendf(nil, "affinity-%d", i)
-		shardID := testShardForInternalKey(kv.InternalKey(kv.CFLock, key, lockColumnTs), shardCount)
-		if shardID >= 0 && shardID < shardCount && keysByShard[shardID] == nil {
-			keysByShard[shardID] = key
-		}
-	}
-	for low := range shardCount {
-		for high := low + 1; high < shardCount; high++ {
-			if keysByShard[low] != nil && keysByShard[high] != nil {
-				return keysByShard[low], keysByShard[high]
-			}
-		}
-	}
-	t.Fatalf("could not find keys on ascending shards for shardCount=%d", shardCount)
-	return nil, nil
-}
-
-func testShardForInternalKey(internalKey []byte, shardCount int) int {
-	if shardCount <= 1 {
-		return 0
-	}
-	_, userKey, _, ok := kv.SplitInternalKey(internalKey)
-	if !ok || len(userKey) == 0 {
-		return 0
-	}
-	return utils.ShardForUserKey(userKey, shardCount)
 }
 
 func TestCommitBatchCommitTsExpiredDoesNotApplyPartialCommits(t *testing.T) {
@@ -2287,7 +2234,6 @@ func TestPrewriteLargeValueKeepsDefaultCF(t *testing.T) {
 
 func TestAtomicMutateShortValueSkipsDefaultCF(t *testing.T) {
 	opt := testOptionsForDir(filepath.Join(t.TempDir(), "db"))
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })

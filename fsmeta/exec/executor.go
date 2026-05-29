@@ -5,12 +5,10 @@ package exec
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/feichai0017/NoKV/fsmeta/backend"
-	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
@@ -75,26 +73,6 @@ type VisibleQuotaAdmitter interface {
 	AllowVisibleQuota(context.Context, []QuotaChange) (bool, error)
 }
 
-// NegativeCache is the dentry-miss memo surface used by Lookup.
-type NegativeCache interface {
-	Has([]byte) bool
-	Remember([]byte)
-	Invalidate([]byte)
-}
-
-type negativeCacheClearer interface {
-	Clear()
-}
-
-// DirPageCache is the ReadDirPlus page memo surface.
-type DirPageCache interface {
-	CurrentEpoch(dirpage.DirectoryKey) uint64
-	Lookup(dirpage.PageKey, uint64) ([]dirpage.Entry, bool)
-	MaterializeAsync(dirpage.PageKey, uint64, []dirpage.Entry) error
-	Invalidate(dirpage.DirectoryKey) uint64
-	Stats() dirpage.Stats
-}
-
 // Executor interprets fsmeta operation plans against a backend.Store.
 type Executor struct {
 	runner                  backend.Store
@@ -106,10 +84,6 @@ type Executor struct {
 	visibleAuthority        VisibleAuthorityAdmitter
 	visibleCommitter        VisibleCommitter
 	visibleClientID         string
-	negCache                NegativeCache
-	dirPages                DirPageCache
-	dirPageVisibleMu        sync.Mutex
-	dirPageVisibleFrontier  map[dirpage.DirectoryKey]uint64
 	lockTTL                 uint64
 	now                     func() time.Time
 	readRetriesTotal        atomic.Uint64
@@ -168,36 +142,6 @@ func WithInodeAllocator(allocator InodeAllocator) Option {
 	}
 }
 
-// WithNegativeCache wires the visible-commit "this dentry does not exist" memo.
-// Lookup checks visible overlay first, then Has on the dentry primary key before
-// consulting the runner; misses are recorded via Remember; mutating ops call
-// Invalidate on the touched dentry keys after a successful commit.
-//
-// A nil cache disables the cache.
-func WithNegativeCache(cache NegativeCache) Option {
-	return func(e *Executor) {
-		e.negCache = cache
-	}
-}
-
-// WithDirPageCache wires the ReadDirPlus derived page cache. ReadDirPlus first asks the
-// cache for a fresh page set keyed by (mountHash, parentInode); on hit the
-// runner-side dentry scan + N inode BatchGet are skipped entirely. On miss, the
-// runner path runs as today and the assembled DentryAttrPair slice is
-// asynchronously materialized into the cache for the next call.
-//
-// Mutating ops (Create/Link/Unlink/Rename/RenameSubtree) call Invalidate
-// on the affected parent directory's PageKey after a successful commit
-// so subsequent Lookup observes the change.
-//
-// A nil cache disables the cache. The mount hash uses xxhash.Sum64
-// over the MountID string, so collision probability is negligible.
-func WithDirPageCache(cache DirPageCache) Option {
-	return func(e *Executor) {
-		e.dirPages = cache
-	}
-}
-
 // WithSubtreeHandoffPublisher enables rooted subtree authority era advancement
 // for RenameSubtree.
 func WithSubtreeHandoffPublisher(publisher SubtreeHandoffPublisher) Option {
@@ -245,9 +189,6 @@ func New(runner backend.Store, opts ...Option) (*Executor, error) {
 		if opt != nil {
 			opt(executor)
 		}
-	}
-	if executor.visibleCommitter != nil {
-		executor.clearNegativeCache()
 	}
 	return executor, nil
 }

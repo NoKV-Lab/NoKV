@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	"github.com/feichai0017/NoKV/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -234,13 +233,39 @@ func TestDentryPrefixGroupsDirectoryEntries(t *testing.T) {
 	require.False(t, bytes.HasPrefix(otherMountKey, prefix))
 }
 
-func TestShardForUserKeyUsesGenericHash(t *testing.T) {
-	const shards = 8
-	key, err := EncodeInodeKey(testMount, 42)
-	require.NoError(t, err)
+func TestHashBucketForKeyUsesStableLayoutHash(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     []byte
+		buckets int
+		want    int
+	}{
+		{name: "empty key", key: nil, buckets: 4, want: 0},
+		{name: "single bucket", key: []byte("alpha"), buckets: 1, want: 0},
+		{name: "non power of two bucket count normalizes down", key: []byte("alpha"), buckets: 6, want: 3},
+		{name: "stable hash", key: []byte("fsmeta:dentry"), buckets: 8, want: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, HashBucketForKey(tt.key, tt.buckets))
+		})
+	}
+}
 
-	require.Equal(t, utils.ShardForUserKey(key, shards), ShardForUserKey(key, shards))
-	require.Equal(t, 0, ShardForUserKey(key, 1))
+func TestNormalizeAffinityBucketCount(t *testing.T) {
+	tests := map[int]int{
+		-1: 1,
+		0:  1,
+		1:  1,
+		2:  2,
+		3:  2,
+		4:  4,
+		7:  4,
+		8:  8,
+	}
+	for input, want := range tests {
+		require.Equal(t, want, NormalizeAffinityBucketCount(input))
+	}
 }
 
 func TestNameValidationRejectsUnsafePathComponents(t *testing.T) {

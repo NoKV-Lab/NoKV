@@ -6,8 +6,6 @@ package latch
 import (
 	"sort"
 	"sync"
-
-	"github.com/feichai0017/NoKV/utils/cache"
 )
 
 // Manager provides hashed latches on keys to serialize conflicting
@@ -42,7 +40,7 @@ body:
 		if len(key) == 0 {
 			continue
 		}
-		h := cache.MemHash(key)
+		h := latchHash(key)
 		idx := int(h % uint64(len(m.stripes)))
 		// deduplicate identical indices for identical keys
 		for _, existing := range indices {
@@ -73,4 +71,17 @@ func (g *Guard) Release() {
 	}
 	g.manager = nil
 	g.slots = nil
+}
+
+func latchHash(data []byte) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	var h uint64 = offset64
+	for _, c := range data {
+		h ^= uint64(c)
+		h *= prime64
+	}
+	return h
 }

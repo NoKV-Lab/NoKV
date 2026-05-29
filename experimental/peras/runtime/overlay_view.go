@@ -614,13 +614,6 @@ func (c *Runtime) HasPerasVisibleDirectory(prefix []byte) bool {
 	return c.read.overlay.HasDirectory(prefix)
 }
 
-func (c *Runtime) PerasDirectoryCacheFrontier(prefix []byte) uint64 {
-	if c == nil || c.read == nil {
-		return 0
-	}
-	return c.read.sealed.DirectoryFrontier(prefix)
-}
-
 func (c *Runtime) addOverlay(id fsperas.OperationID, op compile.MaterializedOp) error {
 	if c == nil || c.read == nil {
 		return ErrRuntimeInvalid

@@ -97,10 +97,6 @@ type PendingVisibleDirectoryPresence interface {
 	HasPendingVisibleDirectory(prefix []byte) bool
 }
 
-type VisibleDirectoryCacheFrontier interface {
-	VisibleDirectoryCacheFrontier(prefix []byte) uint64
-}
-
 // InstalledVisibleSnapshotCapturer records the installed runtime overlay
 // visible at an MVCC snapshot token so later snapshot reads do not consult live
 // overlay state.

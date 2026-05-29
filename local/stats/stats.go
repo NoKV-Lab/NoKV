@@ -94,7 +94,6 @@ type StatsSnapshot struct {
 type StorageStatsSnapshot struct {
 	KeysEstimate uint64                        `json:"keys_estimate,omitempty"`
 	SizeBytes    uint64                        `json:"size_bytes,omitempty"`
-	Mmap         metrics.MmapAdviceSnapshot    `json:"mmap"`
 	Prefetch     metrics.TablePrefetchSnapshot `json:"prefetch"`
 }
 
@@ -308,7 +307,6 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	storageStats := s.host.StorageStats()
 	snap.Storage.KeysEstimate = storageStats.KeysEstimate
 	snap.Storage.SizeBytes = storageStats.SizeBytes
-	snap.Storage.Mmap = metrics.MmapAdviceStats()
 	snap.Storage.Prefetch = metrics.TablePrefetchStats()
 
 	if wm := s.host.WriteMetrics(); wm != nil {

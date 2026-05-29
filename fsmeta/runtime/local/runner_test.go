@@ -14,7 +14,6 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
-	"github.com/feichai0017/NoKV/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,16 +50,15 @@ func TestRunnerProvidesSnapshotReads(t *testing.T) {
 	require.Equal(t, []byte("one"), rows[0].Value)
 }
 
-func TestRunnerMutateHandlesCrossShardPebbleBatch(t *testing.T) {
+func TestRunnerMutateHandlesMultiKeyPebbleBatch(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.WriteShardCount = 4
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
 	require.NoError(t, err)
 
-	first, second := keysOnDifferentLogicalShards(t, 4)
+	first, second := []byte("multi-key-a"), []byte("multi-key-b")
 	start, err := runner.ReserveTimestamp(context.Background(), 2)
 	require.NoError(t, err)
 	commit, err := runner.Mutate(context.Background(), first, []*backend.Mutation{
@@ -71,16 +69,15 @@ func TestRunnerMutateHandlesCrossShardPebbleBatch(t *testing.T) {
 	require.GreaterOrEqual(t, commit, start+1)
 }
 
-func TestRunnerInstallMutationsAtCommitAcceptsCrossShard(t *testing.T) {
+func TestRunnerInstallMutationsAtCommitAcceptsMultiKeyGroup(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.WriteShardCount = 4
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
 	require.NoError(t, err)
 
-	first, second := keysOnDifferentLogicalShards(t, 4)
+	first, second := []byte("install-key-a"), []byte("install-key-b")
 	ctx := context.Background()
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
@@ -88,7 +85,7 @@ func TestRunnerInstallMutationsAtCommitAcceptsCrossShard(t *testing.T) {
 		{Op: backend.MutationPut, Key: first, Value: []byte("a")},
 		{Op: backend.MutationPut, Key: second, Value: []byte("b")},
 	}, start, start+1)
-	require.NoError(t, err, "install must tolerate cross-shard groups that percolator commits reject")
+	require.NoError(t, err, "install must tolerate multi-key groups")
 	require.Equal(t, start+1, commit)
 
 	got, ok, err := runner.Get(ctx, first, commit)
@@ -126,7 +123,6 @@ func TestRunnerInstallMutationsAtCommitAllowsMissingDeletePrimary(t *testing.T) 
 func TestRunnerInstallMutationsAtCommitChunksLargeGroups(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.WriteShardCount = 1
 	// Squeeze the per-batch budget so the install path is forced to chunk.
 	opts.MaxBatchCount = 8
 	opts.MaxBatchSize = 64 << 10
@@ -163,7 +159,6 @@ func TestRunnerInstallMutationsAtCommitChunksLargeGroups(t *testing.T) {
 func TestRunnerInstallMutationsAtCommitRespectsSmallMaxBatchSize(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.WriteShardCount = 1
 	opts.MaxBatchCount = 10_000
 	opts.MaxBatchSize = 64
 	db := openTestDB(t, opts)
@@ -194,7 +189,6 @@ func TestRunnerInstallMutationsAtCommitRespectsSmallMaxBatchSize(t *testing.T) {
 func TestRunnerInstallMutationsAtCommitChunksDeleteGroupsBelowStrictLimit(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.WriteShardCount = 1
 	opts.MaxBatchCount = 8
 	opts.MaxBatchSize = 64 << 10
 	db := openTestDB(t, opts)
@@ -324,16 +318,15 @@ func TestRunnerTryAtomicMutateRejectsValuePredicateMismatch(t *testing.T) {
 	require.Equal(t, uint64(1), runner.Stats()["atomic_predicate_rejected_total"])
 }
 
-func TestRunnerTryAtomicMutateHandlesCrossShardPebbleBatch(t *testing.T) {
+func TestRunnerTryAtomicMutateHandlesMultiKeyPebbleBatch(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.WriteShardCount = 4
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
 	require.NoError(t, err)
 
-	first, second := keysOnDifferentLogicalShards(t, 4)
+	first, second := []byte("atomic-key-a"), []byte("atomic-key-b")
 	start, err := runner.ReserveTimestamp(context.Background(), 2)
 	require.NoError(t, err)
 	handled, err := runner.TryAtomicMutate(context.Background(), first, nil, []*backend.Mutation{
@@ -399,29 +392,9 @@ func TestRunnerTryAtomicMutateSerializesConcurrentSameKey(t *testing.T) {
 	require.True(t, ok)
 }
 
-func keysOnDifferentLogicalShards(t *testing.T, shards int) ([]byte, []byte) {
-	t.Helper()
-	var first []byte
-	var firstShard int
-	for i := range 1024 {
-		key := []byte{byte('a' + i%26), byte(i / 26)}
-		shard := utils.ShardForUserKey(key, shards)
-		if first == nil {
-			first = append([]byte(nil), key...)
-			firstShard = shard
-			continue
-		}
-		if shard != firstShard {
-			return first, append([]byte(nil), key...)
-		}
-	}
-	t.Fatalf("failed to find keys on different local shards for shard count %d", shards)
-	return nil, nil
-}
-
 func TestRunnerRestartsAboveObservedTimestamp(t *testing.T) {
 	dir := t.TempDir()
-	db := openTestDB(t, testDBOptions(dir, 1))
+	db := openTestDB(t, testDBOptions(dir))
 	runner, err := NewRunner(db)
 	require.NoError(t, err)
 	start, err := runner.ReserveTimestamp(context.Background(), 2)
@@ -434,7 +407,7 @@ func TestRunnerRestartsAboveObservedTimestamp(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	db = openTestDB(t, testDBOptions(dir, 1))
+	db = openTestDB(t, testDBOptions(dir))
 	defer func() { require.NoError(t, db.Close()) }()
 	recovered, err := NewRunner(db)
 	require.NoError(t, err)
@@ -448,17 +421,15 @@ func openTestDB(t *testing.T, opts *localdb.Options) *localdb.DB {
 	if opts == nil {
 		opts = localdb.NewDefaultOptions()
 		opts.WorkDir = t.TempDir()
-		opts.WriteShardCount = 1
 	}
 	db, err := localdb.Open(opts)
 	require.NoError(t, err)
 	return db
 }
 
-func testDBOptions(dir string, shards int) *localdb.Options {
+func testDBOptions(dir string) *localdb.Options {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = dir
-	opts.WriteShardCount = shards
 	return opts
 }
 

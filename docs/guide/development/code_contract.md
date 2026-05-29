@@ -48,7 +48,7 @@ Package boundaries follow ownership of truth, not convenience.
 | --- | --- | --- |
 | `storage/kv/` | Ordered key/value backend contract, including atomic storage batch apply. | Expose MVCC, fsmeta, raftstore, migration, SST, or protobuf semantics. |
 | `storage/pebble/`, `storage/holt/`, `storage/memory/` | Concrete ordered KV backends. | Own MVCC timestamps, column families, transactions, fsmeta layout, raftstore routing, or migration policy. |
-| `storage/wal/`, `storage/file/`, `storage/vfs/` | Low-level file, WAL, and VFS support for concrete runtime internals. | Become public fsmeta, txn, raftstore, or migration contracts. |
+| `storage/wal/`, `storage/vfs/` | Low-level WAL and VFS support for concrete runtime internals. | Become public fsmeta, txn, raftstore, or migration contracts. |
 | `local/` | Embedded DB facade and local runtime assembly. | Know fsmeta, coordinator, root, or raftstore semantics. |
 | `txn/storage/` | MVCC internal keys, column families, timestamp encoding, entries, and transaction storage contract. | Import Percolator, raftstore, fsmeta, coordinator, root, or concrete storage backends. |
 | `txn/` | Transaction protocol layers. | Let `mvcc`, `storage`, or `latch` depend on Percolator or raftstore. |
@@ -88,11 +88,8 @@ The current responsibility map is:
 - `storage/memory/*`: test ordered KV implementation.
 - `third_party/holt`: pinned external Holt submodule. Go code should depend on
   a future `storage/holt` adapter, not on this checkout directly.
-- `storage/wal`, `storage/file`, `storage/vfs`: low-level support packages used
-  by concrete runtimes. They are not fsmeta or migration contracts.
-- `fsmeta/cache/*`: derived namespace sidecar caches such as dirpage and
-  negative-cache slabs. They can be rebuilt and do not own authoritative
-  namespace truth.
+- `storage/wal`, `storage/vfs`: low-level support packages used by concrete
+  runtimes. They are not fsmeta or migration contracts.
 - `local/*`: embedded DB assembly around the storage backend, NoKV MVCC key
   encoding, local stats, workdir mode, and commit queues. It may collect local
   stats, but it does not own distributed truth.

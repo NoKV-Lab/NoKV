@@ -102,8 +102,6 @@ func (e *Executor) Create(ctx context.Context, req model.CreateRequest) (model.C
 			}
 			e.rememberVisibleCreate(mount, plan, inode)
 			e.forgetVisibleEmptyDirectory(mount, req.Parent)
-			e.invalidateNegative(plan.MutateKeys[1])
-			e.invalidateDirPages(req.Mount, req.Parent)
 			return model.CreateResult{Dentry: dentry, Inode: inode}, nil
 		}
 	}
@@ -164,13 +162,7 @@ func (e *Executor) Create(ctx context.Context, req model.CreateRequest) (model.C
 	}, delta.Authority); err != nil {
 		return model.CreateResult{}, err
 	}
-	// The new dentry replaces a previously-missing key; drop any negative
-	// memo a prior Lookup may have planted, forget any visible-derived empty
-	// directory fact, and bump the parent's dirpage epoch so a stale
-	// ReadDirPlus result cannot mask the new entry.
 	e.rememberVisibleCreate(mount, plan, inode)
 	e.forgetVisibleEmptyDirectory(mount, req.Parent)
-	e.invalidateNegative(plan.MutateKeys[1])
-	e.invalidateDirPages(req.Mount, req.Parent)
 	return model.CreateResult{Dentry: dentry, Inode: inode}, nil
 }

@@ -27,7 +27,6 @@ Current domains include:
 | `raft` | Raft group and replay state. |
 | `region` | Store-local region catalog counts. |
 | `hot` | Optional Thermos hot-key observations. |
-| `cache` | fsmeta sidecar cache diagnostics. |
 | `transport` | gRPC/raft transport metrics. |
 
 Removed self-managed LSM domains such as flush backlog, compaction score,

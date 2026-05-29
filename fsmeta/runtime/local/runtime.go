@@ -5,14 +5,10 @@ package local
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/feichai0017/NoKV/fsmeta/backend"
-	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
-	"github.com/feichai0017/NoKV/fsmeta/cache/slab/negativecache"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -21,19 +17,16 @@ import (
 
 // Runtime is a complete fsmeta runtime backed by one embedded local.DB.
 type Runtime struct {
-	DB            *localdb.DB
-	Runner        *Runner
-	Executor      *fsmetaexec.Executor
-	Mounts        *MountCatalog
-	Quotas        *QuotaLedger
-	Watcher       *Watcher
-	Snapshots     *SnapshotRegistry
-	NegativeCache *negativecache.Cache
-	DirPageCache  *dirpage.Cache
+	DB        *localdb.DB
+	Runner    *Runner
+	Executor  *fsmetaexec.Executor
+	Mounts    *MountCatalog
+	Quotas    *QuotaLedger
+	Watcher   *Watcher
+	Snapshots *SnapshotRegistry
 
-	closeDB    bool
-	negPersist *negativecache.Persistence
-	once       sync.Once
+	closeDB bool
+	once    sync.Once
 }
 
 // Open builds a local fsmeta runtime without coordinator, root, or raftstore.
@@ -95,26 +88,6 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 		fsmetaexec.WithInodeAllocator(inodes),
 		fsmetaexec.WithQuotaResolver(quotas),
 	}
-	negCache, negPersist, err := openLocalNegativeCache(opts)
-	if err != nil {
-		if closeDB {
-			_ = db.Close()
-		}
-		return nil, err
-	}
-	if negCache != nil {
-		execOpts = append(execOpts, fsmetaexec.WithNegativeCache(negCache))
-	}
-	dirPages, err := openLocalDirPageCache(opts)
-	if err != nil {
-		if closeDB {
-			_ = db.Close()
-		}
-		return nil, err
-	}
-	if dirPages != nil {
-		execOpts = append(execOpts, fsmetaexec.WithDirPageCache(dirPages))
-	}
 	if opts.LockTTL > 0 {
 		execOpts = append(execOpts, fsmetaexec.WithLockTTL(uint64((opts.LockTTL+time.Millisecond-1)/time.Millisecond)))
 	}
@@ -123,56 +96,21 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	executor, err := fsmetaexec.New(runner, execOpts...)
 	if err != nil {
-		if dirPages != nil {
-			_ = dirPages.Close()
-		}
 		if closeDB {
 			_ = db.Close()
 		}
 		return nil, err
 	}
 	return &Runtime{
-		DB:            db,
-		Runner:        runner,
-		Executor:      executor,
-		Mounts:        mounts,
-		Quotas:        quotas,
-		Watcher:       watcher,
-		Snapshots:     snapshots,
-		NegativeCache: negCache,
-		DirPageCache:  dirPages,
-		closeDB:       closeDB,
-		negPersist:    negPersist,
+		DB:        db,
+		Runner:    runner,
+		Executor:  executor,
+		Mounts:    mounts,
+		Quotas:    quotas,
+		Watcher:   watcher,
+		Snapshots: snapshots,
+		closeDB:   closeDB,
 	}, nil
-}
-
-func openLocalNegativeCache(opts Options) (*negativecache.Cache, *negativecache.Persistence, error) {
-	dir := localNegativeCacheDir(opts)
-	if dir == "" {
-		return nil, nil, nil
-	}
-	cache, persist, err := negativecache.OpenWithPersistence(
-		negativecache.Config{
-			GroupKeyFn: func(k []byte) []byte { return k },
-		},
-		negativecache.PersistConfig{Dir: dir},
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("init local negative cache: %w", err)
-	}
-	return cache, persist, nil
-}
-
-func openLocalDirPageCache(opts Options) (*dirpage.Cache, error) {
-	dir := localDirPageCacheDir(opts)
-	if dir == "" {
-		return nil, nil
-	}
-	cache, err := dirpage.Open(dirpage.Config{Dir: dir})
-	if err != nil {
-		return nil, fmt.Errorf("init local dirpage cache: %w", err)
-	}
-	return cache, nil
 }
 
 // Close releases the runtime-owned DB. Caller-owned DB handles are left open.
@@ -182,16 +120,8 @@ func (r *Runtime) Close() error {
 	}
 	var err error
 	r.once.Do(func() {
-		if r.DirPageCache != nil {
-			err = errors.Join(err, r.DirPageCache.Close())
-		}
-		if r.negPersist != nil {
-			if _, snapErr := r.negPersist.Snapshot(); snapErr != nil {
-				err = errors.Join(err, snapErr)
-			}
-		}
 		if r.closeDB && r.DB != nil {
-			err = errors.Join(err, r.DB.Close())
+			err = r.DB.Close()
 		}
 	})
 	return err

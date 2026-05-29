@@ -26,9 +26,6 @@ capture_profiles="${NOKV_FSMETA_CAPTURE_PROFILES:-0}"
 profile_seconds="${NOKV_FSMETA_PROFILE_SECONDS:-30}"
 profile_dir="${NOKV_FSMETA_PROFILE_DIR:-$ROOT/benchmark/data/fsmeta/profiles/fsmeta_${profile}_${run_id}}"
 profile_targets="${NOKV_FSMETA_PROFILE_TARGETS:-fsmeta=127.0.0.1:9400,store1=127.0.0.1:9200,store2=127.0.0.1:9201,store3=127.0.0.1:9202,coord1=127.0.0.1:9100,coord2=127.0.0.1:9101,coord3=127.0.0.1:9102,root1=127.0.0.1:9380,root2=127.0.0.1:9381,root3=127.0.0.1:9382}"
-cache_tmp_dir=""
-plain_pid=""
-cached_pid=""
 local_pid=""
 local_tools_dir=""
 local_tmp_dir=""
@@ -600,58 +597,6 @@ run_local_benchmarks() {
 	echo "wrote isolated local fsmeta benchmark summary: $output"
 }
 
-cleanup_cache_gateways() {
-	if [[ -n "$plain_pid" ]]; then
-		kill "$plain_pid" 2>/dev/null || true
-		wait "$plain_pid" 2>/dev/null || true
-	fi
-	if [[ -n "$cached_pid" ]]; then
-		kill "$cached_pid" 2>/dev/null || true
-		wait "$cached_pid" 2>/dev/null || true
-	fi
-	if [[ -z "${NOKV_FSMETA_CACHE_TMPDIR:-}" && -n "$cache_tmp_dir" ]]; then
-		rm -rf "$cache_tmp_dir"
-	fi
-}
-
-run_derived_cache_benchmarks() {
-	local plain_addr="${NOKV_FSMETA_PLAIN_ADDR:-127.0.0.1:8090}"
-	local cached_addr="${NOKV_FSMETA_CACHED_ADDR:-127.0.0.1:8091}"
-	cache_tmp_dir="${NOKV_FSMETA_CACHE_TMPDIR:-$(mktemp -d "${TMPDIR:-/tmp}/nokv-fsmeta-cache.XXXXXX")}"
-	plain_pid=""
-	cached_pid=""
-	trap cleanup_cache_gateways EXIT
-
-	mkdir -p "$cache_tmp_dir/plain" "$cache_tmp_dir/cached" "$cache_tmp_dir/negative" "$cache_tmp_dir/dirpage"
-	echo "starting plain fsmeta gateway on $plain_addr"
-	go run ./cmd/nokv-fsmeta \
-		--addr "$plain_addr" \
-		--coordinator-addr "$coord_addr" \
-		>"$cache_tmp_dir/plain/fsmeta.log" 2>&1 &
-	plain_pid="$!"
-	wait_port "$plain_addr"
-
-	echo "starting cached fsmeta gateway on $cached_addr"
-	go run ./cmd/nokv-fsmeta \
-		--addr "$cached_addr" \
-		--coordinator-addr "$coord_addr" \
-		--negative-cache-dir "$cache_tmp_dir/negative" \
-		--dirpage-cache-dir "$cache_tmp_dir/dirpage" \
-		>"$cache_tmp_dir/cached/fsmeta.log" 2>&1 &
-	cached_pid="$!"
-	wait_port "$cached_addr"
-
-	local plain_output="$output_dir/fsmeta_derived_cache_${profile}_off_${run_id}.csv"
-	local cached_output="$output_dir/fsmeta_derived_cache_${profile}_on_${run_id}.csv"
-	run_bench "$plain_addr" "mdtest-hard,mimesis-namespace" "$plain_output"
-	print_bench_summary "$plain_output"
-	run_bench "$cached_addr" "mdtest-hard,mimesis-namespace" "$cached_output"
-	print_bench_summary "$cached_output"
-	write_benchmark_manifest "$plain_output" "mdtest-hard,mimesis-namespace"
-	write_benchmark_manifest "$cached_output" "mdtest-hard,mimesis-namespace"
-	echo "done"
-}
-
 case "$mode" in
 	compose)
 		run_compose_benchmarks
@@ -659,11 +604,8 @@ case "$mode" in
 	local)
 		run_local_benchmarks
 		;;
-	derived-cache|cache)
-		run_derived_cache_benchmarks
-		;;
 	*)
-		echo "unknown NOKV_FSMETA_BENCH_MODE=$mode; use compose, local, or derived-cache" >&2
+		echo "unknown NOKV_FSMETA_BENCH_MODE=$mode; use compose or local" >&2
 		exit 2
 		;;
 esac

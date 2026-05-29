@@ -11,7 +11,6 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
-	"github.com/feichai0017/NoKV/utils"
 )
 
 const (
@@ -26,11 +25,11 @@ type IDAllocatorClient interface {
 	AllocID(ctx context.Context, req *coordpb.AllocIDRequest) (*coordpb.AllocIDResponse, error)
 }
 
-// ShardAffineInodeAllocator prefetches coordinator IDs and returns an inode ID
+// BucketAffineInodeAllocator prefetches coordinator IDs and returns an inode ID
 // whose fsmeta affinity bucket matches the target workspace when possible. A
 // miss is still correct: Create keeps the existing 1PC safety gate and falls
 // back to Percolator 2PC when local atomicity cannot be proven.
-type ShardAffineInodeAllocator struct {
+type BucketAffineInodeAllocator struct {
 	client    IDAllocatorClient
 	buckets   int
 	batchSize uint64
@@ -45,19 +44,19 @@ type ShardAffineInodeAllocator struct {
 	reservedTotal atomic.Uint64
 }
 
-func NewShardAffineInodeAllocator(client IDAllocatorClient, shardCount int) (*ShardAffineInodeAllocator, error) {
-	return NewShardAffineInodeAllocatorWithBatch(client, shardCount, defaultInodeAllocBatchSize)
+func NewBucketAffineInodeAllocator(client IDAllocatorClient, bucketCount int) (*BucketAffineInodeAllocator, error) {
+	return NewBucketAffineInodeAllocatorWithBatch(client, bucketCount, defaultInodeAllocBatchSize)
 }
 
-func NewShardAffineInodeAllocatorWithBatch(client IDAllocatorClient, shardCount int, batchSize uint64) (*ShardAffineInodeAllocator, error) {
+func NewBucketAffineInodeAllocatorWithBatch(client IDAllocatorClient, bucketCount int, batchSize uint64) (*BucketAffineInodeAllocator, error) {
 	if client == nil {
 		return nil, errIDAllocatorClientRequired
 	}
 	if batchSize == 0 {
 		return nil, errInodeAllocBatchRequired
 	}
-	buckets := max(utils.NormalizeShardCount(shardCount), layout.DefaultAffinityBucketCount)
-	return &ShardAffineInodeAllocator{
+	buckets := max(layout.NormalizeAffinityBucketCount(bucketCount), layout.DefaultAffinityBucketCount)
+	return &BucketAffineInodeAllocator{
 		client:    client,
 		buckets:   buckets,
 		batchSize: batchSize,
@@ -65,7 +64,7 @@ func NewShardAffineInodeAllocatorWithBatch(client IDAllocatorClient, shardCount 
 	}, nil
 }
 
-func (a *ShardAffineInodeAllocator) AllocateCreateInode(ctx context.Context, mount model.MountIdentity, parent model.InodeID, name string) (model.InodeID, error) {
+func (a *BucketAffineInodeAllocator) AllocateCreateInode(ctx context.Context, mount model.MountIdentity, parent model.InodeID, name string) (model.InodeID, error) {
 	if a == nil {
 		return 0, errIDAllocatorClientRequired
 	}
@@ -96,7 +95,7 @@ func (a *ShardAffineInodeAllocator) AllocateCreateInode(ctx context.Context, mou
 	return 0, errNoUsableInodeID
 }
 
-func (a *ShardAffineInodeAllocator) Stats() map[string]any {
+func (a *BucketAffineInodeAllocator) Stats() map[string]any {
 	if a == nil {
 		return map[string]any{
 			"inode_alloc_total":               uint64(0),
@@ -115,7 +114,7 @@ func (a *ShardAffineInodeAllocator) Stats() map[string]any {
 	}
 }
 
-func (a *ShardAffineInodeAllocator) refillLocked(ctx context.Context, mount model.MountIdentity) error {
+func (a *BucketAffineInodeAllocator) refillLocked(ctx context.Context, mount model.MountIdentity) error {
 	resp, err := a.client.AllocID(ctx, &coordpb.AllocIDRequest{Count: a.batchSize})
 	if err != nil {
 		return err
@@ -144,7 +143,7 @@ func (a *ShardAffineInodeAllocator) refillLocked(ctx context.Context, mount mode
 	return nil
 }
 
-func (a *ShardAffineInodeAllocator) ensurePoolsLocked(mount model.MountIdentity) [][]model.InodeID {
+func (a *BucketAffineInodeAllocator) ensurePoolsLocked(mount model.MountIdentity) [][]model.InodeID {
 	if pool := a.pools[mount.MountKeyID]; len(pool) == a.buckets {
 		return pool
 	}
@@ -153,7 +152,7 @@ func (a *ShardAffineInodeAllocator) ensurePoolsLocked(mount model.MountIdentity)
 	return pool
 }
 
-func (a *ShardAffineInodeAllocator) popBucketLocked(mount model.MountIdentity, bucket layout.AffinityBucket) (model.InodeID, bool) {
+func (a *BucketAffineInodeAllocator) popBucketLocked(mount model.MountIdentity, bucket layout.AffinityBucket) (model.InodeID, bool) {
 	pool := a.ensurePoolsLocked(mount)
 	idx := int(bucket)
 	if idx < 0 || idx >= len(pool) || len(pool[idx]) == 0 {
@@ -165,7 +164,7 @@ func (a *ShardAffineInodeAllocator) popBucketLocked(mount model.MountIdentity, b
 	return inode, true
 }
 
-func (a *ShardAffineInodeAllocator) popAnyLocked(mount model.MountIdentity) (model.InodeID, bool) {
+func (a *BucketAffineInodeAllocator) popAnyLocked(mount model.MountIdentity) (model.InodeID, bool) {
 	pool := a.ensurePoolsLocked(mount)
 	for bucket := range pool {
 		if inode, ok := a.popBucketLocked(mount, layout.AffinityBucket(bucket)); ok {

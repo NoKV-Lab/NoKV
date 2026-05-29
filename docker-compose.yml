@@ -338,8 +338,6 @@ services:
     command:
       - "--addr=0.0.0.0:8090"
       - "--coordinator-addr=nokv-coordinator-1:2379,nokv-coordinator-2:2379,nokv-coordinator-3:2379"
-      - "--negative-cache-dir=/var/lib/nokv/negative-cache"
-      - "--dirpage-cache-dir=/var/lib/nokv/dirpage-cache"
       - "--affinity-buckets=16"
       - "--metrics-addr=0.0.0.0:9400"
       - "--peras-holder-id=${NOKV_FSMETA_PERAS_HOLDER_ID:-fsmeta-compose-holder}"
@@ -360,8 +358,6 @@ services:
       - "--peras-visible-log-dir=/var/lib/nokv/peras-visible-log"
       - "--peras-visible-log-policy=${NOKV_FSMETA_PERAS_VISIBLE_LOG_POLICY:-flushed}"
     volumes:
-      - fsmeta-negative-cache:/var/lib/nokv/negative-cache
-      - fsmeta-dirpage-cache:/var/lib/nokv/dirpage-cache
       - fsmeta-peras-visible-log:/var/lib/nokv/peras-visible-log
     ports:
       - "8090:8090"   # FSMetadata gRPC
@@ -394,6 +390,4 @@ volumes:
   store1-data:
   store2-data:
   store3-data:
-  fsmeta-negative-cache:
-  fsmeta-dirpage-cache:
   fsmeta-peras-visible-log:

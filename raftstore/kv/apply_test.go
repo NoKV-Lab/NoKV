@@ -5,7 +5,6 @@ package kv
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -334,7 +333,6 @@ func TestNewApplierRejectsFsmetaWritesWhenVisibleAuthorityViewIsStale(t *testing
 func TestNewBatchApplierSplitsAroundFencedVisibleAuthorityWrite(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -384,7 +382,6 @@ func TestNewBatchApplierSplitsAroundFencedVisibleAuthorityWrite(t *testing.T) {
 func TestApplyTryAtomicMutateCommandMaterializesBothKeys(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -424,7 +421,6 @@ func TestApplyTryAtomicMutateCommandMaterializesBothKeys(t *testing.T) {
 func TestApplyTryAtomicMutateBatchFusesLocalApply(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -458,7 +454,6 @@ func TestApplyTryAtomicMutateBatchFusesLocalApply(t *testing.T) {
 func TestApplyBatchFusesTryAtomicMutateAcrossRaftRequests(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -534,19 +529,16 @@ func TestApplyPrewriteBatchFusesLocalApply(t *testing.T) {
 	require.Equal(t, []int{2}, store.appliedEntryCounts)
 }
 
-func TestApplyTryAtomicMutateCommandAppliesCrossShardPebbleBatch(t *testing.T) {
-	const shardCount = 4
-
+func TestApplyTryAtomicMutateCommandAppliesPebbleBatch(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.WriteShardCount = shardCount
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
 	startVersion := uint64(30)
 	commitVersion := uint64(31)
-	dentryKey, inodeKey := keysWithDifferentDefaultShardsForApplyTest(t, shardCount)
+	dentryKey, inodeKey := []byte("apply-atomic-dentry"), []byte("apply-atomic-inode")
 	resp, err := Apply(db, nil, &raftcmdpb.RaftCmdRequest{
 		Requests: []*raftcmdpb.Request{{
 			CmdType: raftcmdpb.CmdType_CMD_TRY_ATOMIC_MUTATE,
@@ -642,27 +634,6 @@ func (s *countingAtomicApplyStore) GetInternalEntry(cf entrykv.ColumnFamily, key
 
 func (s *countingAtomicApplyStore) NewInternalIterator(opt *entrykv.Options) entrykv.Iterator {
 	return s.base.NewInternalIterator(opt)
-}
-
-func keysWithDifferentDefaultShardsForApplyTest(t *testing.T, shardCount int) ([]byte, []byte) {
-	t.Helper()
-	keysByShard := make([][]byte, shardCount)
-	for i := range 10000 {
-		key := fmt.Appendf(nil, "apply-atomic-%d", i)
-		shardID := utils.ShardForUserKey(key, shardCount)
-		if shardID >= 0 && shardID < shardCount && keysByShard[shardID] == nil {
-			keysByShard[shardID] = key
-		}
-	}
-	for low := range shardCount {
-		for high := low + 1; high < shardCount; high++ {
-			if keysByShard[low] != nil && keysByShard[high] != nil {
-				return keysByShard[low], keysByShard[high]
-			}
-		}
-	}
-	t.Fatalf("could not find different-shard keys for shardCount=%d", shardCount)
-	return nil, nil
 }
 
 func perasFenceTableForApplyTest(t *testing.T, mount model.MountIdentity) *runtimeperas.ActiveAuthorities {

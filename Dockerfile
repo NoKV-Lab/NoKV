@@ -42,7 +42,7 @@ RUN chmod +x /usr/local/lib/nokv-scripts/ops/serve-store.sh /usr/local/lib/nokv-
     && printf '#!/usr/bin/env bash\nexec /usr/local/lib/nokv-scripts/ops/serve-store.sh "$@"\n' > /usr/local/bin/serve-store.sh \
     && printf '#!/usr/bin/env bash\nexec /usr/local/lib/nokv-scripts/ops/bootstrap.sh "$@"\n' > /usr/local/bin/bootstrap.sh \
     && chmod +x /usr/local/bin/serve-store.sh /usr/local/bin/bootstrap.sh \
-    && mkdir -p /etc/nokv /var/lib/nokv/store /var/lib/nokv/negative-cache /var/lib/nokv/dirpage-cache /var/lib/nokv/peras-visible-log /var/lib/nokv-meta-root \
+    && mkdir -p /etc/nokv /var/lib/nokv/store /var/lib/nokv/peras-visible-log /var/lib/nokv-meta-root \
                /volumes/store-1 /volumes/store-2 /volumes/store-3 \
     && chown -R nokv:nokv /var/lib/nokv /var/lib/nokv-meta-root /volumes
 COPY raft_config.example.json /etc/nokv/raft_config.json

@@ -8,7 +8,6 @@ import (
 	"fmt"
 
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	"github.com/feichai0017/NoKV/utils"
 )
 
 // fsmeta key layout:
@@ -433,15 +432,31 @@ func MountKeyResolver(key []byte) (uint64, bool) {
 	return uint64(mount), ok
 }
 
-// ShardForUserKey returns the generic hash shard for one encoded fsmeta key.
+// HashBucketForKey returns the hash affinity bucket for one encoded fsmeta key.
 // It is used for diagnostics and synthetic placement tests only; physical
 // atomicity is owned by storage/kv.ApplyBatch.
-func ShardForUserKey(key []byte, shardCount int) int {
-	shardCount = utils.NormalizeShardCount(shardCount)
-	if shardCount <= 1 {
+func HashBucketForKey(key []byte, bucketCount int) int {
+	bucketCount = NormalizeAffinityBucketCount(bucketCount)
+	if bucketCount <= 1 {
 		return 0
 	}
-	return utils.ShardForUserKey(key, shardCount)
+	if len(key) == 0 {
+		return 0
+	}
+	return int(fnv1a32(key)) & (bucketCount - 1)
+}
+
+// NormalizeAffinityBucketCount returns a power-of-two fsmeta affinity bucket count.
+// Non-positive and single-bucket configurations collapse to 1.
+func NormalizeAffinityBucketCount(buckets int) int {
+	if buckets <= 1 {
+		return 1
+	}
+	out := 1
+	for out*2 <= buckets {
+		out *= 2
+	}
+	return out
 }
 
 func BucketForInodeID(inode model.InodeID) AffinityBucket {
@@ -450,7 +465,7 @@ func BucketForInodeID(inode model.InodeID) AffinityBucket {
 	}
 	var body [8]byte
 	binary.BigEndian.PutUint64(body[:], uint64(inode))
-	return AffinityBucket(utils.ShardForUserKey(body[:], DefaultAffinityBucketCount))
+	return AffinityBucket(HashBucketForKey(body[:], DefaultAffinityBucketCount))
 }
 
 func ChooseWorkspaceBucket(mount model.MountIdentity, name string) AffinityBucket {
@@ -460,7 +475,16 @@ func ChooseWorkspaceBucket(mount model.MountIdentity, name string) AffinityBucke
 	key = append(key, mountBuf[:]...)
 	key = append(key, 0)
 	key = append(key, name...)
-	return AffinityBucket(utils.ShardForUserKey(key, DefaultAffinityBucketCount))
+	return AffinityBucket(HashBucketForKey(key, DefaultAffinityBucketCount))
+}
+
+func fnv1a32(b []byte) uint32 {
+	var h uint32 = 2166136261
+	for _, c := range b {
+		h ^= uint32(c)
+		h *= 16777619
+	}
+	return h
 }
 
 func encodeKey(mount model.MountIdentity, bucket AffinityBucket, kind KeyKind, body []byte) ([]byte, error) {

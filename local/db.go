@@ -77,8 +77,7 @@ type (
 		throttleCh       chan struct{}
 		hotWrite         *thermos.RotatingThermos
 		writeMetrics     *metrics.WriteMetrics
-		// pipeline owns the commit queue, per-shard dispatch channels,
-		// processors, and the optional sync worker.
+		// pipeline owns the commit queue, batch coalescing, and the optional sync worker.
 		pipeline        *commit.Pipeline
 		iterPool        *iterpkg.IteratorPool
 		workdirMode     workdirmode.Mode
@@ -226,15 +225,7 @@ func (db *DB) scanMaxDefaultVersion() (uint64, error) {
 }
 
 func (db *DB) startWriteRuntime() {
-	// Commit processors are local CPU/admission lanes. The selected storage
-	// backend owns physical batch atomicity; shard placement only spreads
-	// commit-pipeline work.
-	workers := db.opt.WriteShardCount
-	if workers <= 0 {
-		workers = 1
-	}
 	db.pipeline = commit.New(commit.Config{
-		ShardCount:         workers,
 		SyncWrites:         db.opt.SyncWrites,
 		SyncPipeline:       db.opt.SyncPipeline,
 		MaxBatchCount:      db.opt.MaxBatchCount,
@@ -562,10 +553,9 @@ func (db *DB) nextNonTxnVersion() uint64 {
 // The caller must provide entries with internal keys. The entry slices must not
 // be mutated until this call returns.
 //
-// Multi-key internal batches are regrouped by the same key-affinity router used
-// by the commit pipeline before they reach the sharded CommitStore. That keeps every
-// write/delete for one user key on one shard, which is required for
-// same-version MVCC tombstones such as Percolator lock removal.
+// Multi-key internal batches keep each caller-submitted group as one physical
+// storage batch boundary. The selected storage backend owns atomic batch
+// application; the embedded DB does not add another local routing layer.
 func (db *DB) ApplyInternalEntries(entries []*kv.Entry) error {
 	if db == nil {
 		return fmt.Errorf("db is nil")
@@ -901,26 +891,6 @@ func (db *DB) SetRegionMetrics(rm *metrics.RegionMetrics) {
 	db.background.SetRegionMetrics(rm)
 }
 
-// SyncWAL preserves the administrative durability hook used by transaction
-// tests. The Pebble-backed local store owns its own WAL, so this delegates to
-// the storage backend sync boundary instead of exposing data-plane WAL managers.
-func (db *DB) SyncWAL() error {
-	if db == nil || db.store == nil {
-		return fmt.Errorf("db: wal is unavailable")
-	}
-	return db.store.Sync()
-}
-
-// ReplayWAL is intentionally empty for the Pebble-backed data path. Pebble owns
-// physical WAL recovery internally; NoKV no longer exposes data WAL replay as a
-// product API.
-func (db *DB) ReplayWAL(fn func(info wal.EntryInfo, payload []byte) error) error {
-	if db == nil || db.store == nil {
-		return fmt.Errorf("db: wal is unavailable")
-	}
-	return nil
-}
-
 // IsClosed reports whether Close has finished and the DB no longer accepts work.
 func (db *DB) IsClosed() bool {
 	return db.isClosed.Load() == 1
@@ -998,7 +968,7 @@ func (db *DB) WorkDir() string {
 	return db.opt.WorkDir
 }
 
-func (db *DB) SetBatchGroup(_ int, groups [][]*kv.Entry) (int, error) {
+func (db *DB) ApplyEntryGroups(groups [][]*kv.Entry) (int, error) {
 	for i, group := range groups {
 		if len(group) == 0 {
 			continue

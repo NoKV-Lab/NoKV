@@ -211,7 +211,6 @@ var Rules = []Rule{
 			ModulePath + "/storage/pebble",
 			ModulePath + "/storage/memory",
 			ModulePath + "/storage/wal",
-			ModulePath + "/storage/file",
 			ModulePath + "/local",
 			ModulePath + "/fsmeta",
 		},

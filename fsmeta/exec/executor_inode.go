@@ -88,8 +88,8 @@ func (e *Executor) tryVisibleUpdateInode(ctx context.Context, program compile.Up
 }
 
 // UpdateInode updates mutable inode attributes and applies the size quota delta
-// in the same transaction. The parent field is required because quota and
-// DirPage invalidation are directory-scoped by parent inode and page token.
+// in the same transaction. The parent field is required because quota is
+// directory-scoped by parent inode.
 func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest) (model.InodeRecord, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
@@ -112,7 +112,6 @@ func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest
 		if err != nil {
 			return model.InodeRecord{}, err
 		}
-		e.invalidateDirPages(req.Mount, req.Parent)
 		return updated, nil
 	}
 	var updated model.InodeRecord
@@ -199,6 +198,5 @@ func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest
 	}, delta.Authority); err != nil {
 		return model.InodeRecord{}, err
 	}
-	e.invalidateDirPages(req.Mount, req.Parent)
 	return updated, nil
 }

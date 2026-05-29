@@ -17,7 +17,6 @@ import (
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
-	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -1387,19 +1386,3 @@ func benchmarkSeedInodeRecord(b *testing.B, runner *fakeRunner, record model.Ino
 	}
 	runner.data[string(key)] = value
 }
-
-type corruptDirPageCache struct{}
-
-func (c *corruptDirPageCache) CurrentEpoch(dirpage.DirectoryKey) uint64 { return 0 }
-
-func (c *corruptDirPageCache) Lookup(dirpage.PageKey, uint64) ([]dirpage.Entry, bool) {
-	return []dirpage.Entry{{Name: []byte("stale"), Inode: 999, AttrBlob: []byte("not-an-inode")}}, true
-}
-
-func (c *corruptDirPageCache) MaterializeAsync(dirpage.PageKey, uint64, []dirpage.Entry) error {
-	return nil
-}
-
-func (c *corruptDirPageCache) Invalidate(dirpage.DirectoryKey) uint64 { return 1 }
-
-func (c *corruptDirPageCache) Stats() dirpage.Stats { return dirpage.Stats{} }

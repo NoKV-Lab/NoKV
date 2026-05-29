@@ -20,11 +20,6 @@ const (
 	defaultBlockCacheBytes      int64 = 256 << 20
 	defaultWriteThrottleMinRate int64 = 32 << 20
 	defaultWriteThrottleMaxRate int64 = 128 << 20
-	// defaultWriteShardCount is the number of commit processors used by the
-	// local write pipeline. The selected storage backend persists the final batch;
-	// this count only controls local admission and coalescing parallelism.
-	// Must be a power of two.
-	defaultWriteShardCount = 4
 )
 
 // StorageBackendConfig is the local DB view of the physical ordered-KV backend.
@@ -104,13 +99,6 @@ type Options struct {
 	// WAL fsync from the commit pipeline. When false (the default), the commit
 	// worker performs fsync inline. Only effective when SyncWrites is true.
 	SyncPipeline bool
-	// WriteShardCount is the number of local commit-pipeline processors. It is
-	// a CPU/admission coalescing knob only; batch atomicity is owned
-	// by the selected storage/kv backend. The shard router uses `& (N-1)` for
-	// placement so the value must be a power of two. Zero falls back to the
-	// constructor default; non-power-of-two values are rounded DOWN to the
-	// nearest power of two during Open (e.g. 6 -> 4, 12 -> 8).
-	WriteShardCount int
 	// WriteHotKeyLimit caps how many consecutive writes a single key can issue
 	// before the DB returns utils.ErrHotKeyWriteThrottle. Zero disables write-path
 	// throttling.
@@ -168,20 +156,6 @@ type Options struct {
 	// control-log watchdogs, GC policy, and diagnostics. It must return a
 	// detached snapshot. Nil disables control-log backlog accounting.
 	ControlLogPointerSnapshot func() map[uint64]stats.ControlLogPointer
-
-	// NegativeCachePersistent enables snapshot-on-Close + restore-on-Open for
-	// the in-memory negative cache, backed by an fsmeta/cache slab segment under
-	// WorkDir/negative-slab/. Default false. When enabled, a process restart
-	// skips the cold-start re-warm phase for previously-known not-found keys
-	// (fsmeta Lookup misses, S3 GetObject 404, HDFS path probes). The slab
-	// is best-effort (Derived consistency class): a corrupt or missing
-	// snapshot forces a re-warm but does not affect read correctness.
-	NegativeCachePersistent bool
-	// NegativeCacheSlabMaxSize bounds the on-disk snapshot size in bytes.
-	// Snapshots stop appending once the limit is hit; remaining keys re-warm
-	// normally. Zero falls back to a 64 MiB default. Ignored unless
-	// NegativeCachePersistent is true.
-	NegativeCacheSlabMaxSize int64
 }
 
 // NewDefaultOptions returns the default option set.
@@ -202,7 +176,6 @@ func NewDefaultOptions() *Options {
 		// Conservative defaults to avoid long batch-induced pauses.
 		WriteBatchMaxCount:                defaultWriteBatchMaxCount,
 		WriteBatchMaxSize:                 defaultWriteBatchMaxSize,
-		WriteShardCount:                   defaultWriteShardCount,
 		MaxBatchCount:                     defaultWriteBatchMaxCount,
 		MaxBatchSize:                      defaultWriteBatchMaxSize,
 		BlockCacheBytes:                   defaultBlockCacheBytes,
@@ -251,18 +224,6 @@ func (opt *Options) resolveOpenDefaults() {
 	opt.normalizeStorageOptions()
 	if opt.ControlWALBufferSize <= 0 {
 		opt.ControlWALBufferSize = wal.DefaultBufferSize
-	}
-	if opt.WriteShardCount <= 0 {
-		opt.WriteShardCount = defaultWriteShardCount
-	}
-	// Power-of-two so the eventual hash routing can use & (N-1).
-	if opt.WriteShardCount&(opt.WriteShardCount-1) != 0 {
-		// Round down to nearest power of two; never zero.
-		n := 1
-		for n*2 <= opt.WriteShardCount {
-			n *= 2
-		}
-		opt.WriteShardCount = n
 	}
 }
 

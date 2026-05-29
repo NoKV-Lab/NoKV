@@ -106,8 +106,6 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 		if err != nil {
 			return model.RemoveResult{}, err
 		}
-		e.invalidateNegative(plan.MutateKeys[0])
-		e.invalidateDirPages(req.Mount, req.Parent)
 		return result, nil
 	}
 	var result model.RemoveResult
@@ -187,10 +185,6 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 	}, delta.Authority); err != nil {
 		return model.RemoveResult{}, err
 	}
-	// Removing the dentry must invalidate both point misses and any
-	// materialized directory page under its parent.
-	e.invalidateNegative(plan.MutateKeys[0])
-	e.invalidateDirPages(req.Mount, req.Parent)
 	return result, nil
 }
 
@@ -232,8 +226,6 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req model.RemoveDirector
 		if err != nil {
 			return err
 		}
-		e.invalidateNegative(plan.MutateKeys[1])
-		e.invalidateDirPages(req.Mount, req.Parent)
 		return nil
 	}
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
@@ -306,8 +298,6 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req model.RemoveDirector
 	}, delta.Authority); err != nil {
 		return err
 	}
-	e.invalidateNegative(plan.MutateKeys[1])
-	e.invalidateDirPages(req.Mount, req.Parent)
 	return nil
 }
 

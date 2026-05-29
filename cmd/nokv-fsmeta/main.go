@@ -79,10 +79,6 @@ func main() {
 		localMountID                    = flag.String("local-mount-id", "default", "single mount id admitted by --backend=local")
 		localMountKeyID                 = flag.Uint64("local-mount-key-id", 1, "single mount key id admitted by --backend=local")
 		localRootInode                  = flag.Uint64("local-root-inode", uint64(model.RootInode), "root inode for --backend=local")
-		localNegCache                   = flag.Bool("local-negative-cache", true, "enable the slab-backed negative dentry cache when --backend=local; use --local-negative-cache=false to disable")
-		localDirPageCache               = flag.Bool("local-dirpage-cache", true, "enable the slab-backed ReadDirPlus page cache when --backend=local; use --local-dirpage-cache=false to disable")
-		negCacheDir                     = flag.String("negative-cache-dir", "", "optional slab directory for persistent negative dentry cache")
-		dirPageDir                      = flag.String("dirpage-cache-dir", "", "optional slab directory for ReadDirPlus page cache")
 		affinityBuckets                 = flag.Int("affinity-buckets", layout.DefaultAffinityBucketCount, "fsmeta placement bucket count used to choose Create inode IDs")
 		lockTTL                         = flag.Duration("lock-ttl", 0, "Percolator primary-lock TTL for fsmeta mutations; zero uses the fsmeta default")
 		sessionCleanupInterval          = flag.Duration("session-cleanup-interval", 30*time.Second, "interval for expired write-session cleanup; choose about half the smallest expected session TTL; negative disables")
@@ -179,8 +175,6 @@ func main() {
 		Backend: backend,
 		Raftstore: fsmetaraftstore.Options{
 			CoordinatorAddr:        *coordAddr,
-			NegativeCacheDir:       *negCacheDir,
-			DirPageCacheDir:        *dirPageDir,
 			AffinityBuckets:        *affinityBuckets,
 			LockTTL:                *lockTTL,
 			SessionCleanupInterval: *sessionCleanupInterval,
@@ -188,14 +182,10 @@ func main() {
 			Extension:              extension,
 		},
 		Local: fsmetalocal.Options{
-			WorkDir:           *localWorkDir,
-			Mount:             localMount,
-			RootInode:         model.InodeID(*localRootInode),
-			LockTTL:           *lockTTL,
-			NegativeCacheMode: localCacheMode(*localNegCache),
-			NegativeCacheDir:  *negCacheDir,
-			DirPageCacheMode:  localCacheMode(*localDirPageCache),
-			DirPageCacheDir:   *dirPageDir,
+			WorkDir:   *localWorkDir,
+			Mount:     localMount,
+			RootInode: model.InodeID(*localRootInode),
+			LockTTL:   *lockTTL,
 		},
 	})
 	if err != nil {
@@ -380,13 +370,6 @@ func localMountIdentity(mountID string, mountKeyID uint64) (model.MountIdentity,
 		return model.MountIdentity{}, model.ErrInvalidMountID
 	}
 	return model.MountIdentity{MountID: id, MountKeyID: model.MountKeyID(mountKeyID)}, nil
-}
-
-func localCacheMode(enabled bool) fsmetalocal.CacheMode {
-	if enabled {
-		return fsmetalocal.CacheModeEnabled
-	}
-	return fsmetalocal.CacheModeDisabled
 }
 
 func publishExpvarOnce(name string, value expvar.Var) {

@@ -108,13 +108,9 @@
   <text x="735" y="871" text-anchor="middle" class="small-title">Holt target</text>
   <text x="735" y="888" text-anchor="middle" class="mono">storage/holt</text>
 
-  <rect x="885" y="854" width="250" height="42" rx="11" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
-  <text x="1010" y="871" text-anchor="middle" class="small-title">Derived slab caches</text>
-  <text x="1010" y="888" text-anchor="middle" class="mono">dirpage / negative</text>
-
-  <rect x="1180" y="854" width="260" height="42" rx="11" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
-  <text x="1310" y="871" text-anchor="middle" class="small-title">VFS / file substrate</text>
-  <text x="1310" y="888" text-anchor="middle" class="mono">storage/vfs, storage/file</text>
+  <rect x="885" y="854" width="555" height="42" rx="11" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+  <text x="1162" y="871" text-anchor="middle" class="small-title">VFS substrate</text>
+  <text x="1162" y="888" text-anchor="middle" class="mono">storage/vfs</text>
 
   <path d="M 1370 238 C 1370 290, 1180 318, 1040 348" fill="none" stroke="#64748b" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
   <path d="M 800 424 L 800 460" fill="none" stroke="#64748b" stroke-width="2.2" marker-end="url(#arrow)"/>

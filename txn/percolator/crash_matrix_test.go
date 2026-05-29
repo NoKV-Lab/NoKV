@@ -60,16 +60,13 @@ func TestPercolatorCrashMatrixBatchPrewriteApplyFailureRetries(t *testing.T) {
 	}
 }
 
-func TestPercolatorCrashMatrixAtomicMutateCrossShardUsesPebbleBatch(t *testing.T) {
-	const shardCount = 4
-
+func TestPercolatorCrashMatrixAtomicMutateUsesPebbleBatch(t *testing.T) {
 	workDir := t.TempDir()
 	startTs := uint64(300)
 	commitTs := uint64(320)
-	dentryKey, inodeKey := keysWithAscendingCommitShards(t, shardCount)
+	dentryKey, inodeKey := []byte("crash-dentry-value"), []byte("crash-inode-value")
 
 	opt := testOptionsForDir(workDir)
-	opt.WriteShardCount = shardCount
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 
@@ -83,7 +80,6 @@ func TestPercolatorCrashMatrixAtomicMutateCrossShardUsesPebbleBatch(t *testing.T
 	_ = db.Close()
 
 	reopenedOpt := testOptionsForDir(workDir)
-	reopenedOpt.WriteShardCount = shardCount
 	db, err = local.Open(reopenedOpt)
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()

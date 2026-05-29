@@ -10,8 +10,6 @@ import (
 	"time"
 
 	coordclient "github.com/feichai0017/NoKV/coordinator/client"
-	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
-	"github.com/feichai0017/NoKV/fsmeta/cache/slab/negativecache"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -58,16 +56,6 @@ type Options struct {
 	// coordinator TSO window; otherwise read-side lock resolution can roll back
 	// a live transaction that is only delayed in the commit path.
 	LockTTL time.Duration
-
-	// NegativeCacheDir enables the slab-backed negative dentry cache. Empty
-	// disables it. This is a Derived cache: authoritative reads still fall
-	// back to raftstore plus txn/percolator on miss or invalidation.
-	NegativeCacheDir string
-
-	// DirPageCacheDir enables the slab-backed ReadDirPlus page cache. Empty
-	// disables it. Pages are derived from authoritative backend reads and are
-	// invalidated by fsmeta mutations.
-	DirPageCacheDir string
 
 	// AffinityBuckets is the fsmeta key-placement bucket count used when
 	// choosing Create inode IDs. The local engine receives only generic key
@@ -162,7 +150,7 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 	if buckets == 0 {
 		buckets = defaultInodeAffinityBuckets
 	}
-	inodes, err := NewShardAffineInodeAllocator(coord, buckets)
+	inodes, err := NewBucketAffineInodeAllocator(coord, buckets)
 	if err != nil {
 		_ = kv.Close()
 		_ = coord.Close()
@@ -212,43 +200,8 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 	if opts.LockTTL > 0 {
 		execOpts = append(execOpts, fsmetaexec.WithLockTTL(uint64((opts.LockTTL+time.Millisecond-1)/time.Millisecond)))
 	}
-	var negPersist *negativecache.Persistence
-	if opts.NegativeCacheDir != "" {
-		neg, persist, err := negativecache.OpenWithPersistence(
-			negativecache.Config{
-				GroupKeyFn: func(k []byte) []byte { return k },
-			},
-			negativecache.PersistConfig{
-				Dir: opts.NegativeCacheDir,
-			},
-		)
-		if err != nil {
-			_ = closeExtensionAttachments(extensionAttachments)
-			_ = kv.Close()
-			_ = coord.Close()
-			return nil, fmt.Errorf("init negative cache: %w", err)
-		}
-		negPersist = persist
-		execOpts = append(execOpts, fsmetaexec.WithNegativeCache(neg))
-	}
-	var dirPages *dirpage.Cache
-	if opts.DirPageCacheDir != "" {
-		dirPages, err = dirpage.Open(dirpage.Config{
-			Dir: opts.DirPageCacheDir,
-		})
-		if err != nil {
-			_ = closeExtensionAttachments(extensionAttachments)
-			_ = kv.Close()
-			_ = coord.Close()
-			return nil, fmt.Errorf("init dirpage cache: %w", err)
-		}
-		execOpts = append(execOpts, fsmetaexec.WithDirPageCache(dirPages))
-	}
 	exec, err := fsmetaexec.New(runner, execOpts...)
 	if err != nil {
-		if dirPages != nil {
-			_ = dirPages.Close()
-		}
 		_ = closeExtensionAttachments(extensionAttachments)
 		_ = kv.Close()
 		_ = coord.Close()
@@ -257,9 +210,6 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 
 	source, err := StartRemoteSource(ctx, coord, router, dialOpts...)
 	if err != nil {
-		if dirPages != nil {
-			_ = dirPages.Close()
-		}
 		_ = closeExtensionAttachments(extensionAttachments)
 		_ = kv.Close()
 		_ = coord.Close()
@@ -298,16 +248,6 @@ func Open(ctx context.Context, opts Options) (*Runtime, error) {
 		}
 		if err := source.Close(); err != nil && first == nil {
 			first = err
-		}
-		if negPersist != nil {
-			if _, err := negPersist.Snapshot(); err != nil && first == nil {
-				first = err
-			}
-		}
-		if dirPages != nil {
-			if err := dirPages.Close(); err != nil && first == nil {
-				first = err
-			}
 		}
 		if err := closeExtensionAttachments(extensionAttachments); err != nil && first == nil {
 			first = err

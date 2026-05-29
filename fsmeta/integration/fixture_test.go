@@ -89,7 +89,7 @@ func openRealClusterRuntimeWithOptions(t *testing.T, ctx context.Context, opts .
 	runner, err := fsmetaraftstore.NewRunner(kv, coordRPC)
 	require.NoError(t, err)
 	seedRootInode(t, ctx, runner, model.MountIdentity{MountID: "vol", MountKeyID: 1})
-	inodes, err := fsmetaraftstore.NewShardAffineInodeAllocator(coordRPC, 4)
+	inodes, err := fsmetaraftstore.NewBucketAffineInodeAllocator(coordRPC, 4)
 	require.NoError(t, err)
 	executorOpts := []fsmetaexec.Option{
 		fsmetaexec.WithInodeAllocator(inodes),
@@ -186,7 +186,7 @@ func openSplitRealClusterExecutorWithOptions(t *testing.T, ctx context.Context, 
 	runner, err := fsmetaraftstore.NewRunner(kv, coordRPC)
 	require.NoError(t, err)
 	seedRootInode(t, ctx, runner, model.MountIdentity{MountID: "vol", MountKeyID: 1})
-	inodes, err := fsmetaraftstore.NewShardAffineInodeAllocator(coordRPC, 4)
+	inodes, err := fsmetaraftstore.NewBucketAffineInodeAllocator(coordRPC, 4)
 	require.NoError(t, err)
 	executorOpts := []fsmetaexec.Option{
 		fsmetaexec.WithInodeAllocator(inodes),

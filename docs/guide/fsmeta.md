@@ -95,13 +95,6 @@ The scale-out runtime is `fsmeta/runtime/raftstore.Open`. It wires coordinator, 
 
 Peras is an experimental runtime path for visible-before-durable metadata execution. A Peras write may return at a **visible** boundary before the **durable** boundary is reached by witness quorum plus segment install into raftstore. That mechanism should not be required to understand the stable fsmeta API.
 
-`fsmeta/runtime/raftstore.Open` can also wire two derived slab caches when explicitly configured:
-
-- `NegativeCacheDir` enables a persistent negative dentry cache. It remembers recent lookup misses and invalidates on namespace mutations.
-- `DirPageCacheDir` enables a ReadDirPlus page cache. It materializes fused dentry+inode pages and invalidates by parent directory epoch.
-
-Both caches are derived state. They can be dropped or rebuilt without changing authoritative namespace truth.
-
 The layering constraints are:
 
 - `Executor` does not directly know about raft region / store routing.
@@ -248,9 +241,7 @@ go run ./cmd/nokv-fsmeta \
   --addr 127.0.0.1:8090 \
   --coordinator-addr 127.0.0.1:2390,127.0.0.1:2391,127.0.0.1:2392 \
   --metrics-addr 127.0.0.1:9400 \
-  --session-cleanup-interval 30s \
-  --negative-cache-dir ./artifacts/fsmeta/negative-cache \
-  --dirpage-cache-dir ./artifacts/fsmeta/dirpage-cache
+  --session-cleanup-interval 30s
 ```
 
 Register a mount:
@@ -285,9 +276,6 @@ nokv quota set \
 | `nokv_fsmeta_quota` | fence check/reject, cache hit/miss, fence updates, usage mutations. |
 | `nokv_fsmeta_sessions` | stale writer-session cleanup runs, expired sessions, and last error. |
 
-When the derived caches are enabled, `nokv_fsmeta_executor` also reports whether
-NegativeCache / DirPage are active and the DirPage hit/miss/store counters.
-
 ## 9. Benchmarks
 
 The fsmeta benchmark lives in `benchmark/fsmeta` and drives the native
@@ -298,8 +286,7 @@ Compose helper runs each workload in isolation:
 make fsmeta-bench
 ```
 
-The Compose gateway enables both persistent DirPage and NegativeCache directories
-by default. Workload provenance and default scales are kept in
+Workload provenance and default scales are kept in
 `benchmark/fsmeta/profiles/official/workloads.yaml`, which records the public
 IO500/mdtest, Filebench varmail, MimesisBench, and MLPerf Storage
 checkpointing source links, their official shape, and NoKV's fsmeta projection.

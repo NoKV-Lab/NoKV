@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/fsmeta/backend"
-	"github.com/feichai0017/NoKV/fsmeta/cache/slab/negativecache"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -673,30 +672,6 @@ func TestExecutorCreateTranslatesAlreadyExistsConflict(t *testing.T) {
 	})
 	require.ErrorIs(t, err, model.ErrExists)
 	require.Equal(t, 1, runner.getCalls)
-}
-
-func TestExecutorNegativeCacheInvalidatedByCreate(t *testing.T) {
-	runner := newFakeRunner()
-	cache := negativecache.New(negativecache.Config{
-		GroupKeyFn: func(k []byte) []byte { return k },
-	})
-	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{100}}), WithNegativeCache(cache))
-	require.NoError(t, err)
-
-	req := model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "novel"}
-	_, err = executor.Lookup(context.Background(), req)
-	require.ErrorIs(t, err, model.ErrNotFound)
-
-	// Create the dentry. After commit the cache must drop the memo so the
-	// next Lookup re-issues against the runner and observes the new entry.
-	_, err = executor.Create(context.Background(), model.CreateRequest{
-		Mount: "vol", Parent: model.RootInode, Name: "novel", Attrs: model.CreateAttrs{Type: model.InodeTypeFile},
-	})
-	require.NoError(t, err)
-
-	record, err := executor.Lookup(context.Background(), req)
-	require.NoError(t, err, "create must invalidate the prior negative memo")
-	require.Equal(t, model.InodeID(100), record.Inode)
 }
 
 func BenchmarkExecutorCreateDefaultPath(b *testing.B) {

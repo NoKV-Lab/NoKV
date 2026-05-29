@@ -133,13 +133,6 @@ func (a executorAdapter) HasPendingVisibleDirectory(prefix []byte) bool {
 	return a.runtime != nil && a.runtime.HasPerasVisibleDirectory(prefix)
 }
 
-func (a executorAdapter) VisibleDirectoryCacheFrontier(prefix []byte) uint64 {
-	if a.runtime == nil {
-		return 0
-	}
-	return a.runtime.PerasDirectoryCacheFrontier(prefix)
-}
-
 func (a executorAdapter) CaptureInstalledVisibleSnapshot(version uint64) error {
 	if a.runtime == nil {
 		return runtimeperas.ErrRuntimeInvalid

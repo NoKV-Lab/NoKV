@@ -171,9 +171,6 @@ func (e *Executor) Rename(ctx context.Context, req model.RenameRequest) error {
 			return err
 		}
 		e.forgetVisibleEmptyDirectory(mount, req.ToParent)
-		e.invalidateNegative(plan.ReadKeys...)
-		e.invalidateNegative(plan.MutateKeys...)
-		e.invalidateDirPages(req.Mount, req.FromParent, req.ToParent)
 		return nil
 	}
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
@@ -189,9 +186,6 @@ func (e *Executor) Rename(ctx context.Context, req model.RenameRequest) error {
 		return err
 	}
 	e.forgetVisibleEmptyDirectory(mount, req.ToParent)
-	e.invalidateNegative(plan.ReadKeys...)
-	e.invalidateNegative(plan.MutateKeys...)
-	e.invalidateDirPages(req.Mount, req.FromParent, req.ToParent)
 	return nil
 }
 
@@ -233,9 +227,6 @@ func (e *Executor) RenameReplace(ctx context.Context, req model.RenameReplaceReq
 		return model.RenameReplaceResult{}, err
 	}
 	e.forgetVisibleEmptyDirectory(mount, req.ToParent)
-	e.invalidateNegative(plan.ReadKeys...)
-	e.invalidateNegative(plan.MutateKeys...)
-	e.invalidateDirPages(req.Mount, req.FromParent, req.ToParent)
 	return result, nil
 }
 
@@ -301,14 +292,7 @@ func (e *Executor) RenameSubtree(ctx context.Context, req model.RenameSubtreeReq
 	if handoffStarted && committedAt == 0 {
 		return errSubtreeHandoffWithoutFrontier
 	}
-	// Only the subtree root dentry moves; descendants follow inode parent links.
-	// Invalidate both old and new dentry keys plus the two parent directory
-	// epochs so negative and materialized directory-page caches cannot serve the
-	// pre-rename view.
 	e.forgetVisibleEmptyDirectory(mount, req.ToParent)
-	e.invalidateNegative(plan.ReadKeys...)
-	e.invalidateNegative(plan.MutateKeys...)
-	e.invalidateDirPages(req.Mount, req.FromParent, req.ToParent)
 	return nil
 }
 

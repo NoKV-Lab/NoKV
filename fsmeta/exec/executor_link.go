@@ -124,8 +124,6 @@ func (e *Executor) Link(ctx context.Context, req model.LinkRequest) error {
 			return err
 		}
 		e.forgetVisibleEmptyDirectory(mount, req.ToParent)
-		e.invalidateNegative(plan.ReadKeys[1])
-		e.invalidateDirPages(req.Mount, req.ToParent)
 		return nil
 	}
 	if err := e.withTxnRetry(ctx, func(startVersion, commitVersion uint64) error {
@@ -242,12 +240,6 @@ func (e *Executor) Link(ctx context.Context, req model.LinkRequest) error {
 	}, delta.Authority); err != nil {
 		return err
 	}
-	// Link writes a fresh dentry at ReadKeys[1]; drop any negative memo
-	// and visible-derived empty-directory fact, then bump the destination
-	// parent's dirpage epoch so the new dentry shows up on the next
-	// ReadDirPlus.
 	e.forgetVisibleEmptyDirectory(mount, req.ToParent)
-	e.invalidateNegative(plan.ReadKeys[1])
-	e.invalidateDirPages(req.Mount, req.ToParent)
 	return nil
 }

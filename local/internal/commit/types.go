@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// CommitRequest is the queue element used by the commit Pipeline. It
-// wraps a Request with the queue-side accounting (entry count,
-// payload size) the dispatcher needs.
+// CommitRequest is the queue element used by the commit Pipeline. It wraps a
+// Request with the queue-side accounting (entry count, payload size) the commit
+// worker needs.
 type CommitRequest struct {
 	Req        *Request
 	EntryCount int
@@ -26,8 +26,8 @@ var CommitRequestPool = sync.Pool{
 	New: func() any { return &CommitRequest{} },
 }
 
-// CommitQueue is the MPSC-backed queue shared by write submitters and
-// the commit dispatcher.
+// CommitQueue is the MPSC-backed queue shared by write submitters and the
+// commit worker.
 type CommitQueue struct {
 	q              *utils.MPSCQueue[*CommitRequest]
 	pendingBytes   atomic.Int64
@@ -120,12 +120,10 @@ func (cq *CommitQueue) AddPending(entries int64, bytes int64) {
 }
 
 // CommitBatch is the temporary grouping drained by one commit-worker pass.
-// ShardID is set by the dispatcher and selects the local processor lane.
 type CommitBatch struct {
 	Reqs       []*CommitRequest
 	Pool       *[]*CommitRequest
 	Requests   []*Request
-	ShardID    int
 	BatchStart time.Time
 }
 
@@ -135,7 +133,6 @@ type SyncBatch struct {
 	Reqs      []*CommitRequest
 	Pool      *[]*CommitRequest
 	Requests  []*Request
-	ShardID   int
 	FailedAt  int
 	ApplyDone time.Time
 }

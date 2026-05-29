@@ -934,7 +934,7 @@ func TestApplyRequestsFailureIndex(t *testing.T) {
 		},
 	}
 
-	failedAt, err := db.pipeline.ApplyRequests(reqs, 0)
+	failedAt, err := db.pipeline.ApplyRequests(reqs)
 	require.Equal(t, 1, failedAt)
 	require.Error(t, err)
 
@@ -962,7 +962,7 @@ func TestApplyRequestsInlineRequestWithoutPtrs(t *testing.T) {
 		},
 	}
 
-	failedAt, err := db.pipeline.ApplyRequests(reqs, 0)
+	failedAt, err := db.pipeline.ApplyRequests(reqs)
 	require.Equal(t, -1, failedAt)
 	require.NoError(t, err)
 
@@ -991,7 +991,7 @@ func TestApplyRequestsCoalescesCommitBatchIntoOnePebbleBatch(t *testing.T) {
 		{Entries: []*kv.Entry{second}},
 	}
 
-	failedAt, err := db.pipeline.ApplyRequests(reqs, 0)
+	failedAt, err := db.pipeline.ApplyRequests(reqs)
 	require.Equal(t, -1, failedAt)
 	require.NoError(t, err)
 
@@ -1751,9 +1751,6 @@ func TestSendToWriteChReturnsBlockedWritesWhenClosedWhileThrottled(t *testing.T)
 func TestDBWrapperNilAndOpenGuards(t *testing.T) {
 	var nilDB *DB
 
-	require.ErrorContains(t, nilDB.SyncWAL(), "wal is unavailable")
-	require.ErrorContains(t, nilDB.ReplayWAL(nil), "wal is unavailable")
-
 	_, err := nilDB.MaterializeInternalEntry(nil)
 	require.EqualError(t, err, "db is nil")
 
@@ -1813,28 +1810,20 @@ func TestDecodeWalEntryReleasesEntries(t *testing.T) {
 	}
 }
 
-// TestPipelineSyncWorkerShardErrorIsolation confirms that when the sync
-// worker's ControlWAL.Sync fails on one shard, only requests pinned to that
-// shard inherit the error — sibling shards keep returning success.
-func TestPipelineSyncWorkerShardErrorIsolation(t *testing.T) {
-	if defaultControlWALShards <= 1 {
-		t.Skip("requires at least 2 CommitStore shards to exercise isolation")
-	}
+func TestPipelineSyncWorkerCommitsRequests(t *testing.T) {
 	dir := t.TempDir()
 	cfg := NewDefaultOptions()
 	cfg.WorkDir = dir
 	cfg.SyncWrites = true
 	cfg.SyncPipeline = true
-	cfg.WriteShardCount = 2
 	cfg.EnableControlWALWatchdog = false
 	cfg.WriteBatchWait = 0
 
 	db := openTestDB(t, cfg)
 	defer func() { _ = db.Close() }()
 
-	// Pick keys that hash to distinct shards.
-	keyA := []byte("shard-iso-a-key-001")
-	keyB := []byte("shard-iso-b-key-002")
+	keyA := []byte("sync-worker-a-key-001")
+	keyB := []byte("sync-worker-b-key-002")
 	require.NoError(t, db.Set(keyA, []byte("vA")))
 	require.NoError(t, db.Set(keyB, []byte("vB")))
 
@@ -1904,8 +1893,7 @@ func TestPipelineSendBlockedWritesFastFails(t *testing.T) {
 // TestPipelineSendOversizedBatchRejected confirms the batch-cap check
 // in Pipeline.Send: a batch whose entry count or estimated size
 // exceeds MaxBatchCount/MaxBatchSize must be rejected before reaching
-// the queue (so a rogue caller can't OOM the dispatcher's pending
-// accounting).
+// the queue (so a rogue caller can't OOM the worker's pending accounting).
 func TestPipelineSendOversizedBatchRejected(t *testing.T) {
 	cfg := newTestOptions(t)
 	cfg.MaxBatchCount = 4 // leave MaxBatchSize at 1<<20 for exclusive count test
