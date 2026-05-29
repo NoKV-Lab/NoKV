@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/coordinator/storecontrol"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	local "github.com/feichai0017/NoKV/local"
 	"github.com/feichai0017/NoKV/meta/topology"
 	myraft "github.com/feichai0017/NoKV/raft"
@@ -858,7 +857,7 @@ func newTestMVCCApplier(db txnstore.Store) func(*raftcmdpb.RaftCmdRequest) (*raf
 }
 
 func applyTestMVCCMaintenance(db txnstore.Store, req *kvrpcpb.MVCCMaintenanceRequest) (uint64, *kvrpcpb.KeyError, error) {
-	var entries []*entrykv.Entry
+	var entries []*txnstore.Entry
 	for _, tombstone := range req.GetTombstones() {
 		if tombstone == nil {
 			continue
@@ -872,7 +871,7 @@ func applyTestMVCCMaintenance(db txnstore.Store, req *kvrpcpb.MVCCMaintenanceReq
 			releaseTestEntries(entries)
 			return 0, &kvrpcpb.KeyError{Abort: "empty key"}, nil
 		}
-		entries = append(entries, entrykv.NewInternalEntry(cf, tombstone.GetKey(), tombstone.GetVersion(), nil, entrykv.BitDelete, 0))
+		entries = append(entries, txnstore.NewInternalEntry(cf, tombstone.GetKey(), tombstone.GetVersion(), nil, txnstore.BitDelete, 0))
 	}
 	defer releaseTestEntries(entries)
 	if err := db.ApplyInternalEntries(entries); err != nil {
@@ -881,7 +880,7 @@ func applyTestMVCCMaintenance(db txnstore.Store, req *kvrpcpb.MVCCMaintenanceReq
 	return uint64(len(entries)), nil, nil
 }
 
-func releaseTestEntries(entries []*entrykv.Entry) {
+func releaseTestEntries(entries []*txnstore.Entry) {
 	for _, entry := range entries {
 		if entry != nil {
 			entry.DecrRef()
@@ -889,12 +888,12 @@ func releaseTestEntries(entries []*entrykv.Entry) {
 	}
 }
 
-func testMaintenanceColumnFamily(cf kvrpcpb.InternalEntryTombstone_ColumnFamily) (entrykv.ColumnFamily, bool) {
+func testMaintenanceColumnFamily(cf kvrpcpb.InternalEntryTombstone_ColumnFamily) (txnstore.ColumnFamily, bool) {
 	switch cf {
 	case kvrpcpb.InternalEntryTombstone_DEFAULT:
-		return entrykv.CFDefault, true
+		return txnstore.CFDefault, true
 	case kvrpcpb.InternalEntryTombstone_WRITE:
-		return entrykv.CFWrite, true
+		return txnstore.CFWrite, true
 	default:
 		return 0, false
 	}

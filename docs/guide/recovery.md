@@ -5,56 +5,26 @@ SPDX-License-Identifier: Apache-2.0
 
 # Recovery Model
 
-NoKV recovery is intentionally strict. Startup verifies durable metadata and
-fails fast on missing or corrupt authoritative files instead of silently
-repairing them.
+NoKV recovery is intentionally strict: authoritative state is either recovered
+from its owner or startup returns an error. The current mainline separates
+recovery ownership by layer.
 
----
-
-## 1. Startup Sequence
-
-1. Validate workdir mode and open the manifest.
-2. Run `manifest.Verify` and `wal.VerifyDir`.
-3. Open LSM tables from manifest state.
-4. Replay retained LSM WAL records that are not already covered by flushed SSTs.
-5. Open replicated control-log WAL shards and raftstore local metadata.
-6. Rebuild runtime views from local metadata and rooted coordinator state.
-
-Values are inline in LSM records. The current recovery path has no value-log
-replay or pointer reconciliation branch.
-
----
-
-## 2. Failure Policy
-
-| Failure | Policy |
+| Layer | Recovery owner |
 | --- | --- |
-| Missing SST referenced by manifest | Startup fails and leaves manifest intact |
-| Corrupt SST referenced by manifest | Startup fails and leaves manifest intact |
-| Torn WAL tail | Replay stops at the last complete record |
-| Partial `CURRENT.tmp` rewrite | Previous `CURRENT` remains authoritative |
+| Raw ordered KV | Pebble under `storage/pebble` |
+| NoKV MVCC keys and versions | `txn/storage`, `txn/mvcc`, and `local.DB` |
+| Raft logs and peer snapshots | `raftstore/raftlog` and `raftstore/snapshot` |
+| Store-local region catalog | `raftstore/localmeta` |
+| Rooted topology / authority truth | `meta/root` |
+| fsmeta namespace model | `fsmeta/exec` over `fsmeta/backend` |
 
----
-
-## 3. Recovery Tests
+The removed self-managed LSM path had manifest/SST/WAL recovery invariants.
+Those files are no longer mainline product state. Pebble workdirs use the
+Pebble format and this version does not provide an online migration path from
+old workdirs.
 
 Useful focused checks:
 
 ```bash
-go test ./... -run 'TestRecovery(FailsOnMissingSST|FailsOnCorruptSST|ManifestRewriteCrash|SlowFollowerSnapshotBacklog|SnapshotExportRoundTrip|WALReplayRestoresData)' -count=1 -v
+go test ./local/... ./txn/... ./raftstore/raftlog ./raftstore/store ./raftstore/server ./fsmeta/contract ./fsmeta/integration -count=1
 ```
-
-Relevant suites:
-
-- `db_test.go`: WAL replay, SST validation, manifest rewrite safety.
-- `engine/manifest/manager_test.go`: manifest append/rewrite safety.
-- `engine/wal/*_test.go`: WAL replay, durability, retention, backpressure.
-- `raftstore/raftlog/*_test.go`: raft log replay and snapshot import/export.
-
----
-
-## 4. Operator Commands
-
-- `nokv manifest --workdir <dir>`: inspect manifest level state.
-- `nokv stats --workdir <dir>`: inspect local runtime stats.
-- `nokv regions --workdir <dir>`: inspect local region catalog.

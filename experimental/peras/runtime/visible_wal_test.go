@@ -9,10 +9,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feichai0017/NoKV/engine/wal"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/model"
+	"github.com/feichai0017/NoKV/storage/wal"
 	"github.com/stretchr/testify/require"
 )
 

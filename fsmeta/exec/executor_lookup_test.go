@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/slab/dirpage"
-	"github.com/feichai0017/NoKV/engine/slab/negativecache"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/negativecache"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/stretchr/testify/require"

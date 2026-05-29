@@ -4,7 +4,6 @@
 package kv
 
 import (
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
 )
@@ -14,7 +13,7 @@ func applyInstallPreparedMVCCEntriesBatch(db txnstore.Store, reqs []*kvrpcpb.Ins
 		return nil, nil
 	}
 	responses := make([]*kvrpcpb.InstallPreparedMVCCEntriesResponse, len(reqs))
-	var entries []*entrykv.Entry
+	var entries []*txnstore.Entry
 	offsets := make([]int, len(reqs)+1)
 	for idx, req := range reqs {
 		batch, keyErr := buildInstallPreparedMVCCEntries(req)
@@ -51,20 +50,20 @@ func installPreparedMVCCErrorResponses(count int, keyErr *kvrpcpb.KeyError) []*k
 	return responses
 }
 
-func buildInstallPreparedMVCCEntries(req *kvrpcpb.InstallPreparedMVCCEntriesRequest) ([]*entrykv.Entry, *kvrpcpb.KeyError) {
+func buildInstallPreparedMVCCEntries(req *kvrpcpb.InstallPreparedMVCCEntriesRequest) ([]*txnstore.Entry, *kvrpcpb.KeyError) {
 	if req == nil {
 		return nil, installPreparedMVCCAbort("missing prepared mvcc install request")
 	}
 	if len(req.GetRoutingKey()) == 0 {
 		return nil, installPreparedMVCCAbort("missing routing key")
 	}
-	if req.GetCommitVersion() == 0 || req.GetCommitVersion() == entrykv.MaxVersion {
+	if req.GetCommitVersion() == 0 || req.GetCommitVersion() == txnstore.MaxVersion {
 		return nil, installPreparedMVCCAbort("invalid commit version")
 	}
 	if len(req.GetEntries()) == 0 {
 		return nil, nil
 	}
-	entries := make([]*entrykv.Entry, 0, len(req.GetEntries()))
+	entries := make([]*txnstore.Entry, 0, len(req.GetEntries()))
 	for _, prepared := range req.GetEntries() {
 		entry, keyErr := preparedMVCCEntryToInternal(req.GetCommitVersion(), prepared)
 		if keyErr != nil {
@@ -76,7 +75,7 @@ func buildInstallPreparedMVCCEntries(req *kvrpcpb.InstallPreparedMVCCEntriesRequ
 	return entries, nil
 }
 
-func preparedMVCCEntryToInternal(commitVersion uint64, prepared *kvrpcpb.PreparedMVCCEntry) (*entrykv.Entry, *kvrpcpb.KeyError) {
+func preparedMVCCEntryToInternal(commitVersion uint64, prepared *kvrpcpb.PreparedMVCCEntry) (*txnstore.Entry, *kvrpcpb.KeyError) {
 	if prepared == nil {
 		return nil, installPreparedMVCCAbort("nil prepared mvcc entry")
 	}
@@ -97,19 +96,19 @@ func preparedMVCCEntryToInternal(commitVersion uint64, prepared *kvrpcpb.Prepare
 	if prepared.GetHasValue() {
 		value = clonePreparedMVCCValue(prepared.GetValue())
 	}
-	return entrykv.NewInternalEntry(cf, prepared.GetKey(), prepared.GetVersion(), value, byte(prepared.GetMeta()), prepared.GetExpiresAt()), nil
+	return txnstore.NewInternalEntry(cf, prepared.GetKey(), prepared.GetVersion(), value, byte(prepared.GetMeta()), prepared.GetExpiresAt()), nil
 }
 
-func preparedMVCCColumnFamily(cf kvrpcpb.PreparedMVCCEntry_ColumnFamily) (entrykv.ColumnFamily, bool) {
+func preparedMVCCColumnFamily(cf kvrpcpb.PreparedMVCCEntry_ColumnFamily) (txnstore.ColumnFamily, bool) {
 	switch cf {
 	case kvrpcpb.PreparedMVCCEntry_DEFAULT:
-		return entrykv.CFDefault, true
+		return txnstore.CFDefault, true
 	case kvrpcpb.PreparedMVCCEntry_LOCK:
-		return entrykv.CFLock, true
+		return txnstore.CFLock, true
 	case kvrpcpb.PreparedMVCCEntry_WRITE:
-		return entrykv.CFWrite, true
+		return txnstore.CFWrite, true
 	default:
-		return entrykv.CFDefault, false
+		return txnstore.CFDefault, false
 	}
 }
 

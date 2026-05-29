@@ -84,7 +84,7 @@ fsmeta/
     watch/
 
 local/
-engine/
+storage/
 txn/
 raftstore/
 coordinator/
@@ -412,7 +412,7 @@ Stable path:
 make fmt
 make lint
 make test
-go test -count=1 ./fsmeta/... ./local/... ./engine/... ./txn/... ./raftstore/...
+go test -count=1 ./fsmeta/... ./local/... ./storage/... ./txn/... ./raftstore/...
 ```
 
 Distributed path:

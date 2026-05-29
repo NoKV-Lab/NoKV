@@ -7,10 +7,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feichai0017/NoKV/engine/vfs"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	rootstate "github.com/feichai0017/NoKV/meta/root/state"
 	rootstorage "github.com/feichai0017/NoKV/meta/root/storage"
+	"github.com/feichai0017/NoKV/storage/vfs"
 	"github.com/stretchr/testify/require"
 )
 

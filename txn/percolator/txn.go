@@ -24,7 +24,6 @@ import (
 
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 
-	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/txn/latch"
 	"github.com/feichai0017/NoKV/txn/mvcc"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
@@ -128,24 +127,24 @@ func planPrewriteMutation(reader *Reader, req *kvrpcpb.PrewriteRequest, mut *kvr
 			// Commit sees only the lock, not the original mutation request.
 			// Keep small values in the lock so commit can materialize the
 			// committed write without writing a default-CF record.
-			shortValue = kv.SafeCopy(nil, mut.GetValue())
+			shortValue = txnstore.SafeCopy(nil, mut.GetValue())
 			shortValueExpiresAt = mut.GetExpiresAt()
 			percolatorStats.shortValuePrewriteTotal.Add(1)
 		} else {
 			ops = append(ops,
-				versionedOp{cf: kv.CFDefault, key: key, version: req.StartVersion, meta: kv.BitDelete},
-				versionedOp{cf: kv.CFDefault, key: key, version: req.StartVersion, value: mut.Value, expires: mut.GetExpiresAt()},
+				versionedOp{cf: txnstore.CFDefault, key: key, version: req.StartVersion, meta: txnstore.BitDelete},
+				versionedOp{cf: txnstore.CFDefault, key: key, version: req.StartVersion, value: mut.Value, expires: mut.GetExpiresAt()},
 			)
 		}
 	case kvrpcpb.Mutation_Delete, kvrpcpb.Mutation_Lock:
 		ops = append(ops,
-			versionedOp{cf: kv.CFDefault, key: key, version: req.StartVersion, meta: kv.BitDelete},
+			versionedOp{cf: txnstore.CFDefault, key: key, version: req.StartVersion, meta: txnstore.BitDelete},
 		)
 	default:
 		return nil, keyErrorAbortf(errUnsupportedMutationOp, "%v", mut.Op)
 	}
 	newLock := mvcc.Lock{
-		Primary:     kv.SafeCopy(nil, req.PrimaryLock),
+		Primary:     txnstore.SafeCopy(nil, req.PrimaryLock),
 		Ts:          req.StartVersion,
 		StartTime:   currentPhysicalTimeMillis(),
 		TTL:         req.LockTtl,
@@ -155,7 +154,7 @@ func planPrewriteMutation(reader *Reader, req *kvrpcpb.PrewriteRequest, mut *kvr
 		ExpiresAt:   shortValueExpiresAt,
 	}
 	encoded := mvcc.EncodeLock(newLock)
-	ops = append(ops, versionedOp{cf: kv.CFLock, key: key, version: lockColumnTs, value: encoded})
+	ops = append(ops, versionedOp{cf: txnstore.CFLock, key: key, version: lockColumnTs, value: encoded})
 	return ops, nil
 }
 
@@ -396,7 +395,7 @@ func prepareAtomicMutate(req *kvrpcpb.TryAtomicMutateRequest) atomicMutatePrepar
 }
 
 type atomicMutatePlan struct {
-	entries     []*kv.Entry
+	entries     []*txnstore.Entry
 	appliedKeys uint64
 	keys        [][]byte
 }
@@ -454,7 +453,7 @@ func planAtomicMutateUnlocked(db txnstore.Store, req *kvrpcpb.TryAtomicMutateReq
 
 type atomicMutateApplyGroup struct {
 	requests []atomicMutateGroupRequest
-	entries  []*kv.Entry
+	entries  []*txnstore.Entry
 	keys     map[string]struct{}
 }
 
@@ -479,8 +478,8 @@ func (g *atomicMutateApplyGroup) conflicts(keys [][]byte) bool {
 	return false
 }
 
-func (g *atomicMutateApplyGroup) entriesWith(entries []*kv.Entry) []*kv.Entry {
-	out := make([]*kv.Entry, 0, len(g.entries)+len(entries))
+func (g *atomicMutateApplyGroup) entriesWith(entries []*txnstore.Entry) []*txnstore.Entry {
+	out := make([]*txnstore.Entry, 0, len(g.entries)+len(entries))
 	out = append(out, g.entries...)
 	out = append(out, entries...)
 	return out
@@ -622,12 +621,12 @@ func committedPutMatches(db txnstore.Store, write *mvcc.Write, mut *kvrpcpb.Muta
 }
 
 func defaultRecordMatches(db txnstore.Store, mut *kvrpcpb.Mutation, startVersion uint64) (bool, error) {
-	entry, err := db.GetInternalEntry(kv.CFDefault, mut.GetKey(), startVersion)
+	entry, err := db.GetInternalEntry(txnstore.CFDefault, mut.GetKey(), startVersion)
 	if err != nil {
 		return false, err
 	}
 	defer entry.DecrRef()
-	if entry.Meta&kv.BitDelete > 0 {
+	if entry.Meta&txnstore.BitDelete > 0 {
 		return false, nil
 	}
 	return bytes.Equal(entry.Value, mut.GetValue()) && entry.ExpiresAt == mut.GetExpiresAt(), nil
@@ -640,19 +639,19 @@ func committedMutationOps(mut *kvrpcpb.Mutation, startVersion, commitVersion uin
 		if len(write.ShortValue) > 0 {
 			percolatorStats.shortValueAtomicTotal.Add(1)
 			return []versionedOp{
-				{cf: kv.CFWrite, key: mut.GetKey(), version: commitVersion, value: mvcc.EncodeWrite(write)},
+				{cf: txnstore.CFWrite, key: mut.GetKey(), version: commitVersion, value: mvcc.EncodeWrite(write)},
 			}
 		}
 		return []versionedOp{
-			{cf: kv.CFDefault, key: mut.GetKey(), version: startVersion, meta: kv.BitDelete},
-			{cf: kv.CFDefault, key: mut.GetKey(), version: startVersion, value: mut.GetValue(), expires: mut.GetExpiresAt()},
-			{cf: kv.CFWrite, key: mut.GetKey(), version: commitVersion, value: mvcc.EncodeWrite(write)},
+			{cf: txnstore.CFDefault, key: mut.GetKey(), version: startVersion, meta: txnstore.BitDelete},
+			{cf: txnstore.CFDefault, key: mut.GetKey(), version: startVersion, value: mut.GetValue(), expires: mut.GetExpiresAt()},
+			{cf: txnstore.CFWrite, key: mut.GetKey(), version: commitVersion, value: mvcc.EncodeWrite(write)},
 		}
 	case kvrpcpb.Mutation_Delete:
 		write := mvcc.EncodeWrite(mvcc.Write{Kind: mut.GetOp(), StartTs: startVersion})
 		return []versionedOp{
-			{cf: kv.CFDefault, key: mut.GetKey(), version: startVersion, meta: kv.BitDelete},
-			{cf: kv.CFWrite, key: mut.GetKey(), version: commitVersion, value: write},
+			{cf: txnstore.CFDefault, key: mut.GetKey(), version: startVersion, meta: txnstore.BitDelete},
+			{cf: txnstore.CFWrite, key: mut.GetKey(), version: commitVersion, value: write},
 		}
 	default:
 		return nil
@@ -662,7 +661,7 @@ func committedMutationOps(mut *kvrpcpb.Mutation, startVersion, commitVersion uin
 func committedWriteForMutation(mut *kvrpcpb.Mutation, startVersion uint64) mvcc.Write {
 	write := mvcc.Write{Kind: mut.GetOp(), StartTs: startVersion}
 	if mvcc.CanInlineShortValue(mut.GetOp(), mut.GetValue()) {
-		write.ShortValue = kv.SafeCopy(nil, mut.GetValue())
+		write.ShortValue = txnstore.SafeCopy(nil, mut.GetValue())
 		write.ExpiresAt = mut.GetExpiresAt()
 	}
 	return write
@@ -861,7 +860,7 @@ func CheckTxnStatus(db txnstore.Store, latches *latch.Manager, req *kvrpcpb.Chec
 		if req.CallerStartTs > 0 && lock.MinCommitTs < req.CallerStartTs+1 {
 			lock.MinCommitTs = req.CallerStartTs + 1
 			if err := applyVersionedOps(db, versionedOp{
-				cf:      kv.CFLock,
+				cf:      txnstore.CFLock,
 				key:     req.PrimaryKey,
 				version: lockColumnTs,
 				value:   mvcc.EncodeLock(*lock),
@@ -956,7 +955,7 @@ func TxnHeartBeat(db txnstore.Store, latches *latch.Manager, req *kvrpcpb.TxnHea
 		if desiredTTL > lock.TTL {
 			lock.TTL = desiredTTL
 			if err := applyVersionedOps(db, versionedOp{
-				cf:      kv.CFLock,
+				cf:      txnstore.CFLock,
 				key:     req.PrimaryKey,
 				version: lockColumnTs,
 				value:   mvcc.EncodeLock(*lock),
@@ -1041,10 +1040,10 @@ func planCommitKeyWithLock(reader *Reader, key []byte, lock *mvcc.Lock, commitVe
 			return nil, keyErrorTxnAlreadyRolledBack()
 		}
 		return []versionedOp{{
-			cf:      kv.CFLock,
+			cf:      txnstore.CFLock,
 			key:     key,
 			version: lockColumnTs,
-			meta:    kv.BitDelete,
+			meta:    txnstore.BitDelete,
 		}}, nil
 	}
 
@@ -1054,14 +1053,14 @@ func planCommitKeyWithLock(reader *Reader, key []byte, lock *mvcc.Lock, commitVe
 
 	write := mvcc.Write{Kind: lock.Kind, StartTs: lock.Ts}
 	if len(lock.ShortValue) > 0 {
-		write.ShortValue = kv.SafeCopy(nil, lock.ShortValue)
+		write.ShortValue = txnstore.SafeCopy(nil, lock.ShortValue)
 		write.ExpiresAt = lock.ExpiresAt
 		percolatorStats.shortValueCommitTotal.Add(1)
 	}
 	entry := mvcc.EncodeWrite(write)
 	return []versionedOp{
-		{cf: kv.CFWrite, key: key, version: commitVersion, value: entry},
-		{cf: kv.CFLock, key: key, version: lockColumnTs, meta: kv.BitDelete},
+		{cf: txnstore.CFWrite, key: key, version: commitVersion, value: entry},
+		{cf: txnstore.CFLock, key: key, version: lockColumnTs, meta: txnstore.BitDelete},
 	}, nil
 }
 
@@ -1109,17 +1108,17 @@ func planRollbackKey(reader *Reader, key []byte, startTs uint64) ([]versionedOp,
 	// A short-value prewrite never created a default-CF record, so rollback
 	// only needs the rollback marker and lock tombstone for that case.
 	if lock == nil || lock.Ts != startTs || len(lock.ShortValue) == 0 {
-		ops = append(ops, versionedOp{cf: kv.CFDefault, key: key, version: startTs, meta: kv.BitDelete})
+		ops = append(ops, versionedOp{cf: txnstore.CFDefault, key: key, version: startTs, meta: txnstore.BitDelete})
 	}
-	ops = append(ops, versionedOp{cf: kv.CFWrite, key: key, version: startTs, value: rollback})
+	ops = append(ops, versionedOp{cf: txnstore.CFWrite, key: key, version: startTs, value: rollback})
 	if lock != nil && lock.Ts == startTs {
-		ops = append(ops, versionedOp{cf: kv.CFLock, key: key, version: lockColumnTs, meta: kv.BitDelete})
+		ops = append(ops, versionedOp{cf: txnstore.CFLock, key: key, version: lockColumnTs, meta: txnstore.BitDelete})
 	}
 	return ops, nil
 }
 
 type versionedOp struct {
-	cf      kv.ColumnFamily
+	cf      txnstore.ColumnFamily
 	key     []byte
 	version uint64
 	value   []byte
@@ -1129,7 +1128,7 @@ type versionedOp struct {
 
 type twoPCApplyGroup struct {
 	requests []twoPCApplyRequest
-	entries  []*kv.Entry
+	entries  []*txnstore.Entry
 	keys     map[string]struct{}
 }
 
@@ -1198,22 +1197,22 @@ func applyVersionedOps(db txnstore.Store, ops ...versionedOp) error {
 	return applyVersionedEntries(db, entries)
 }
 
-func versionedOpsToEntries(ops ...versionedOp) []*kv.Entry {
-	entries := make([]*kv.Entry, 0, len(ops))
+func versionedOpsToEntries(ops ...versionedOp) []*txnstore.Entry {
+	entries := make([]*txnstore.Entry, 0, len(ops))
 	for _, op := range ops {
-		entries = append(entries, kv.NewInternalEntry(op.cf, op.key, op.version, op.value, op.meta, op.expires))
+		entries = append(entries, txnstore.NewInternalEntry(op.cf, op.key, op.version, op.value, op.meta, op.expires))
 	}
 	return entries
 }
 
-func applyVersionedEntries(db txnstore.Store, entries []*kv.Entry) error {
+func applyVersionedEntries(db txnstore.Store, entries []*txnstore.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 	return db.ApplyInternalEntries(entries)
 }
 
-func releaseEntries(entries []*kv.Entry) {
+func releaseEntries(entries []*txnstore.Entry) {
 	for _, entry := range entries {
 		if entry != nil {
 			entry.DecrRef()

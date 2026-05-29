@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/wal"
 	perasfsmeta "github.com/feichai0017/NoKV/experimental/peras/adapters/fsmeta"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -26,6 +25,7 @@ import (
 	fsmetaraftstore "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
 	fsmetaserver "github.com/feichai0017/NoKV/fsmeta/server"
 	metricspkg "github.com/feichai0017/NoKV/metrics"
+	"github.com/feichai0017/NoKV/storage/wal"
 	"google.golang.org/grpc"
 )
 

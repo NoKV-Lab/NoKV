@@ -7,10 +7,10 @@ import (
 	"context"
 	"testing"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	local "github.com/feichai0017/NoKV/local"
 	storemvcc "github.com/feichai0017/NoKV/raftstore/mvcc"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 )
 

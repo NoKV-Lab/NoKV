@@ -9,11 +9,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/local"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 )
 
@@ -327,7 +327,6 @@ func openPerasReplayDB(t *testing.T) *local.DB {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = filepath.Join(t.TempDir(), "db")
 	opt.MemTableSize = 1 << 12
-	opt.SSTableMaxSz = 1 << 20
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })

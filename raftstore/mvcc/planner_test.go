@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	local "github.com/feichai0017/NoKV/local"
@@ -17,6 +16,7 @@ import (
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	storemvcc "github.com/feichai0017/NoKV/raftstore/mvcc"
 	"github.com/feichai0017/NoKV/txn/mvcc"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +31,6 @@ func newMVCCGCPlannerTestOptions(t *testing.T) *local.Options {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
 	opt.MemTableSize = 1 << 12
-	opt.SSTableMaxSz = 1 << 20
 	return opt
 }
 

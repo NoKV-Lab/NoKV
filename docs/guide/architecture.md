@@ -5,302 +5,117 @@ SPDX-License-Identifier: Apache-2.0
 
 # NoKV Architecture Overview
 
-NoKV delivers a hybrid storage engine that can operate as a standalone embedded KV store or as a distributed StoreKV-backed service. The distributed RPC surface follows a TinyKV/TiKV-style region + MVCC design, but the service identity and deployment model are NoKV's own. This document captures the key building blocks, how they interact, and the execution flow from client to disk.
+NoKV is being kept on a three-layer metadata architecture:
 
-> Read this page if you want the shortest route from “what is NoKV” to “which package owns which part of the system”.
+1. `fsmeta` owns inode, dentry, workspace namespace, watch, snapshot, session,
+   quota, and artifact-style metadata semantics.
+2. The distributed execution layer (`raftstore`, `txn`, `coordinator`,
+   `meta/root`) owns replicated execution, MVCC transactions, routing, TSO,
+   rooted topology, authority, and recovery facts.
+3. `storage/*` owns raw ordered key/value persistence. The default
+   implementation is Pebble through `storage/pebble`.
 
-This architecture is also meant to support NoKV as a **maintainable and extensible distributed storage research platform**. The point is not only to describe how the current system runs, but to make the package boundaries, lifecycle ownership, and experiment surfaces explicit enough that new storage-engine, metadata, control-plane, and distributed-runtime ideas can be added without rebuilding the repository around each new topic.
+Pebble replaces the physical ordered-KV/LSM substrate only. NoKV keeps its own
+MVCC internal-key encoding (`txn/storage`), transaction protocol (`txn/mvcc`,
+`txn/percolator`), raft execution, and fsmeta inode/dentry model.
 
-At a high level, the codebase is organized around four long-lived layers:
+## Package Layout
 
-- **Local DB facade and runtime internals** – the `local.DB` API plus local-only commit, iterator, stats, and background service wiring.
-- **Single-node engine substrate** – `engine/*` owns WAL, LSM, manifest, slab sidecars, file, and VFS mechanics.
-- **Distributed execution and control plane** – `raftstore/*`, `meta/*`, and `coordinator/*` host replicated execution, rooted metadata, and cluster control logic.
-- **Experiment and evidence layer** – `experimental/*`, `benchmark/*`, scripts, and docs keep research mechanisms and evaluation claims attached to the implementation without making them part of the stable product path.
+```text
+fsmeta/
+  model/          # inode/dentry/session/quota/snapshot domain model
+  layout/         # ordered namespace key layout and value codecs
+  backend/        # minimal MVCC metadata backend contract
+  exec/           # semantic execution and compiler
+  runtime/local/  # embedded fsmeta runtime
+  runtime/raftstore/
 
-## Reader Map
+txn/
+  storage/        # MVCC internal keys, column families, entries, timestamps
+  mvcc/           # MVCC read/write planning
+  percolator/     # 2PC transaction protocol
+  latch/
 
-- If you care about the embedded engine, focus on sections 2 and 5.
-- If you care about distributed runtime ownership, focus on sections 3, 4, and 5.
-- If you care about migration and recovery, read this page together with [`migration.md`](migration.md) and [`recovery.md`](recovery.md).
+raftstore/
+  kv/             # StoreKV apply bridge to MVCC/percolator/prepared install
+  store/          # peer lifecycle and routing inside one store process
+  peer/           # raft peer runtime
+  snapshot/       # internal MVCC-entry snapshot payloads for peer bootstrap
 
----
-
-## 1. High-Level Layout
-
-```
-┌─────────────────────────┐   StoreKV gRPC  ┌─────────────────────────┐
-│ raftstore Service       │◀──────────────▶ │ raftstore/client        │
-└───────────┬─────────────┘                 │  (Get / Scan / Mutate)  │
-            │                               └─────────────────────────┘
-            │ ReadCommand / ProposeCommand
-            ▼
-┌─────────────────────────┐
-│ store.Store / peer.Peer │  ← multi-Raft region lifecycle
-│  ├ Local peer catalog   │
-│  ├ Router / region catalog │
-│  └ transport (gRPC)     │
-└───────────┬─────────────┘
-            │ Apply via kv.Apply
-            ▼
-┌─────────────────────────┐
-│ kv.Apply dispatch       │
-│  ├ Get / Scan           │
-│  ├ Percolator MVCC      │
-│  ├ Prepared MVCC install│
-│  └ Latch manager        │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Embedded NoKV core      │
-│  ├ WAL Manager          │
-│  ├ MemTable / Flush     │
-│  ├ SST / Compaction     │
-│  └ Manifest / Stats     │
-└─────────────────────────┘
+storage/
+  kv/             # raw ordered KV contract
+  pebble/         # default Pebble backend
+  memory/         # tests
+  wal/file/vfs/   # low-level runtime support
 ```
 
-- **Embedded mode** uses `local.Open` directly: WAL→MemTable→SST durability, inline metadata values, non-transactional APIs with internal version ordering, and rich stats.
-- **Distributed mode** layers `raftstore` on top: multi-Raft regions reuse the same WAL, keep store-local recovery metadata separate from storage manifest state, expose metrics, and serve StoreKV RPCs including Percolator MVCC. The current Peras segment install command is a legacy experimental path that should move behind a generic install boundary.
-- **Control plane split**: `raft_config` provides bootstrap topology; Coordinator provides runtime routing/TSO/control-plane state in cluster mode.
-- **Clients** obtain leader-aware routing, automatic NotLeader/EpochNotMatch retries, and two-phase commit helpers.
+`engine/*`, operator-facing `raftstore/migrate`, and the old SST migration fast
+path are no longer mainline packages. This version does not support online
+migration from old self-managed LSM workdirs into Pebble workdirs.
 
-### Same system, two shapes
+## Write Path
 
 ```mermaid
 flowchart LR
-    App["App / CLI / fsmeta client"]
-    App --> Embedded["Embedded NoKV DB"]
-    App --> RPC["StoreKV RPC / raftstore/client"]
-
-    subgraph "Standalone shape"
-        Embedded --> Core["WAL + LSM + MVCC"]
-    end
-
-    subgraph "Distributed shape"
-        RPC --> Server["server.Node"]
-        Server --> Store["store.Store"]
-        Store --> Peer["peer.Peer"]
-        Peer --> Core
-        Store --> Coordinator["Coordinator"]
-    end
-
-    Embedded -. migrate init / seed .-> Store
+    Client["Client / fsmeta API"] --> Exec["fsmeta/exec"]
+    Exec --> Backend["fsmeta/backend.Store"]
+    Backend --> Local["runtime/local"] --> LocalDB["local.DB"]
+    Backend --> Raft["runtime/raftstore"] --> StoreKV["raftstore/kv"]
+    StoreKV --> Txn["txn/mvcc + txn/percolator"]
+    LocalDB --> MVCC["txn/storage internal keys"]
+    Txn --> MVCC
+    MVCC --> Raw["storage/kv raw ordered bytes"]
+    Raw --> Pebble["storage/pebble"]
 ```
 
-### Detailed Runtime Paths
+The important boundary is between `fsmeta/backend` and `storage/kv`:
 
-For function-level call chains with sequence diagrams (embedded write/read,
-iterator scan, distributed read/write via Raft apply), see
-[`docs/guide/runtime.md`](runtime.md).
+- `fsmeta/backend` is an MVCC metadata contract with timestamps, predicates,
+  mutations, scans, and atomic mutation semantics.
+- `storage/kv` is raw ordered bytes: get, put, delete, range delete, iterator,
+  batch, snapshot, sync, close, and small stats.
 
----
+Keeping both contracts separate lets NoKV swap the physical engine without
+changing fsmeta semantics or distributed transaction behavior.
 
-## 2. Embedded Engine
+## Local Runtime
 
-### Code entry points
+`local.DB` is the embedded database facade. It now opens a Pebble-backed raw
+store at `<workdir>/pebble`, while preserving NoKV's existing internal-key
+layout:
 
-If you want to inspect the embedded side first, start here:
+- column families are encoded into the raw key
+- MVCC timestamps keep the existing inverted ordering
+- `local.DB` still exposes NoKV internal-entry iterators for MVCC, raftlog, and
+  raftstore snapshot code
+- control/raft WAL utilities remain under `storage/wal`; they are not the
+  physical Pebble WAL
 
-```go
-opt := local.NewDefaultOptions()
-opt.WorkDir = "./workdir"
+The local fsmeta runtime (`fsmeta/runtime/local`) uses the same `fsmeta/backend`
+contract as the raftstore runtime. It is the default path for demos and
+single-node agent-workspace deployments.
 
-db, err := local.Open(opt)
-if err != nil {
-    panic(err)
-}
-defer db.Close()
+## Distributed Runtime
 
-_ = db.Set([]byte("hello"), []byte("world"))
-entry, _ := db.Get([]byte("hello"))
-fmt.Println(string(entry.Value))
-```
+The distributed path keeps these responsibilities separate:
 
-Then read:
+- `meta/root` is rooted truth for topology, authority, grants, seals, and
+  lifecycle facts.
+- `coordinator` is a rebuildable serving plane for routing, TSO, and store
+  discovery.
+- `raftstore` hosts replicated region execution and applies StoreKV commands.
+- `txn/*` owns MVCC and transaction semantics.
+- `fsmeta/runtime/raftstore` adapts fsmeta execution to StoreKV/MVCC. Raftstore
+  itself must not understand inode/dentry semantics.
 
-- `db.go`
-- `engine/lsm/`
-- `engine/wal/`
-- `engine/slab/` for derived sidecar caches
+`raftstore/snapshot` is now an internal MVCC-entry snapshot format for raft peer
+bootstrap and raft snapshot apply. It is not a generic migration feature and it
+does not expose storage-engine SST details.
 
-### 2.1 WAL & MemTable
-- `wal.Manager` appends `[len|type|payload|crc]` records (typed WAL), rotates segments, and replays logs on crash.
-- `MemTable` accumulates writes until full, then enters the flush queue; the concrete flush runtime runs `Enqueue → Build → Install → Release`, logs edits, and releases WAL segments.
-- Writes are handled by commit workers that append one WAL batch and then apply the same entries to the memtable.
+## Experimental Systems
 
-### 2.3 Manifest
-- `manifest.Manager` stores only storage-engine metadata: SST metadata and WAL coverage carried by SST edits. Store-local raft replay pointers live in `raftstore/localmeta`.
-- `CURRENT` provides crash-safe pointer updates for storage-engine metadata. Region descriptors are no longer stored in the storage manifest.
-
-### 2.4 LSM Compaction & Landing Buffer
-- `lsm.compaction` drives compaction cycles; `lsm.levelManager` supplies table metadata and executes the plan.
-- Planning is split inside `lsm`: `PlanFor*` selects table IDs + key ranges, then LSM resolves IDs back to tables and runs the merge.
-- `lsm.State` guards overlapping key ranges and tracks in-flight table IDs.
-- Landing shard selection is policy-driven in `lsm` (`PickShardOrder` / `PickShardByBacklog`) while the landing buffer remains in `lsm`.
-
-```mermaid
-flowchart TD
-  Manager["lsm.compaction"] --> LSM["lsm.levelManager"]
-  LSM -->|TableMeta snapshot| Planner["PlanFor*"]
-  Planner --> Plan["lsm.Plan (fid+range)"]
-  Plan -->|resolvePlanLocked| Exec["LSM executor"]
-  Exec --> State["lsm.State guard"]
-  Exec --> Build["subcompact/build SST"]
-  Build --> Manifest["manifest edits"]
-  L0["L0 tables"] -->|moveToLanding| Landing["landing buffer shards"]
-  Landing -->|LandingDrain: landing-only| Main["Main tables"]
-  Landing -->|LandingKeep: landing-merge| Landing
-```
-
-### 2.5 Distributed Transaction And Experimental Install Path
-- `percolator` implements Prewrite/Commit/ResolveLock/CheckTxnStatus; `kv.Apply` dispatches raft commands to these helpers.
-- Experimental Peras code lowers fsmeta semantic segments into prepared MVCC entries before calling raftstore. Raftstore installs only the prepared entries and no longer decodes Peras segment payloads.
-- MVCC timestamps come from the distributed client/Coordinator TSO flow, not from an embedded standalone transaction API.
-- Watermarks (`utils.WaterMark`) are used in durability/visibility coordination; they have no background goroutine and advance via mutex + atomics.
-
-### 2.6 Write Pipeline & Backpressure
-- Writes enqueue into a commit queue inside `db.go` where requests are coalesced into batches before a commit worker drains them.
-- The commit worker appends one inline-value WAL batch, applies the same entries to the active memtable, and then honors `SyncWrites` with a WAL fsync step.
-- Batch sizing adapts to backlog through `WriteBatchMaxCount`, `WriteBatchMaxSize`, and `WriteBatchWait`.
-- Backpressure is enforced in two places: LSM throttling toggles `db.blockWrites` when L0 backlog grows, and Thermos can reject hot keys via `WriteHotKeyLimit`.
-
-### 2.7 Ref-Count Lifecycle Contracts
-
-NoKV uses fail-fast reference counting for internal pooled/owned objects. `DecrRef` underflow is treated as a lifecycle bug and panics.
-
-| Object | Owned by | Borrowed by | Release rule |
-| --- | --- | --- | --- |
-| `kv.Entry` (pooled) | internal write/read pipelines | codec iterator, memtable/lsm internal reads, request batches | Must call `DecrRef` exactly once per borrow. |
-| `kv.Entry` (detached public result) | caller | none | Returned by `DB.Get`; **must not** call `DecrRef`. |
-| `kv.Entry` (borrowed internal result) | caller | yes (`DecrRef`) | Returned by `DB.GetInternalEntry`; caller must release exactly once. |
-| `request` | commit queue/worker | waiter path (`Wait`) | `IncrRef` on enqueue; `Wait` does one `DecrRef`; zero returns request to pool and releases entries. |
-| `table` | level/main+landing lists, block cache | table iterators, prefetch workers | Removed tables are decremented once after manifest+in-memory swap; zero deletes SST. |
-| `Skiplist` / `ART` index | memtable | iterators | Iterator creation increments index ref; iterator `Close` decrements; double-close is idempotent. |
-
----
-
-## 3. Replication Layer (raftstore)
-
-### Code entry points
-
-If you want to inspect the distributed side first, start here:
-
-```go
-srv, err := server.NewNode(server.Config{
-    Storage: server.Storage{
-        MVCC:     db,
-        Raft:     raftlog.NewDBLog(db),
-        Snapshot: snapshot.NewDBStore(db),
-    },
-    Store: store.Config{StoreID: 1},
-    Raft: myraft.Config{ElectionTick: 10, HeartbeatTick: 2, PreVote: true},
-    TransportAddr: "127.0.0.1:20160",
-})
-if err != nil {
-    panic(err)
-}
-defer srv.Close()
-```
-
-Then read:
-
-- `raftstore/server/node.go`
-- `raftstore/store/store.go`
-- `raftstore/peer/peer.go`
-- `raftstore/raftlog/wal_storage.go`
-- `raftstore/localmeta/store.go`
-
-| Package | Responsibility |
-| --- | --- |
-| [`store`](https://github.com/feichai0017/NoKV/blob/main/raftstore/store) | Region catalog/runtime root, router, RegionMetrics, scheduler + command runtimes, helpers such as `StartPeer` / `SplitRegion`. |
-| [`peer`](https://github.com/feichai0017/NoKV/blob/main/raftstore/peer) | Wraps etcd/raft `RawNode`, handles Ready pipeline, snapshot resend queue, backlog instrumentation. |
-| [`raftlog`](https://github.com/feichai0017/NoKV/blob/main/raftstore/raftlog) | WALStorage/DiskStorage/MemoryStorage, reusing the DB's WAL while keeping store-local raft replay metadata in sync. |
-| [`transport`](https://github.com/feichai0017/NoKV/blob/main/raftstore/transport) | gRPC transport for Raft Step messages, connection management, retries/blocks/TLS. Also acts as the host for StoreKV RPC. |
-| [`kv`](https://github.com/feichai0017/NoKV/blob/main/raftstore/kv) | StoreKV RPC handler plus `kv.Apply` bridging Raft commands to MVCC logic. It still carries the legacy experimental Peras install path during migration. |
-| [`server`](https://github.com/feichai0017/NoKV/blob/main/raftstore/server) | `Config` + `NewNode` combine DB, Store, transport, and StoreKV service into a reusable node instance. |
-
-### 3.1 Bootstrap Sequence
-1. `server.NewNode` wires DB, store configuration (StoreID, hooks, scheduler), Raft config, and transport address. It registers StoreKV RPC on the shared gRPC server and sets `transport.SetHandler(store.Step)`.
-2. CLI (`nokv serve`) or application enumerates the local peer catalog and calls `Store.StartPeer` for every Region containing the local store:
-   - `peer.Config` includes Raft params, transport, `kv.NewEntryApplier`, peer storage, and Region metadata.
-   - Router registration, regionManager bookkeeping, optional `Peer.Bootstrap` with initial peer list, leader campaign.
-3. Peers from other stores can be configured through `transport.SetPeer(peerID, addr)` (raft peer ID). In cluster mode, runtime routing/control-plane decisions come from Coordinator.
-
-### 3.2 Command Paths
-- **ReadCommand** (`Get`/`Scan`): validate Region & leader, execute Raft ReadIndex (`LinearizableRead`) and `WaitApplied`, then run `commandApplier` (i.e. `kv.Apply` in read mode) to fetch data from the DB. This yields leader-strong reads with an explicit Raft linearizability barrier.
-- **ProposeCommand** (write): encode the request, push through Router to the leader peer, replicate via Raft, and apply in `kv.Apply` which maps to MVCC operations. The current Peras install command is a legacy experimental branch in this apply path.
-
-### 3.3 Transport
-- gRPC server handles Step RPCs and StoreKV RPCs on the same endpoint; peers are registered via `SetPeer`.
-- Retry policies (`WithRetry`) and TLS credentials are configurable. Tests cover partitions, blocked peers, and slow followers.
-
----
-
-## 4. StoreKV Service
-
-`raftstore/kv/service.go` exposes `nokv.kv.v1.StoreKV` RPCs:
-
-| RPC | Execution | Result |
-| --- | --- | --- |
-| `Get` | `store.ReadCommand` → `kv.Apply` GET | `pb.GetResponse` / `RegionError` |
-| `Scan` | `store.ReadCommand` → `kv.Apply` SCAN | `pb.ScanResponse` / `RegionError` |
-| `Prewrite` | `store.ProposeCommand` → `percolator.Prewrite` | `pb.PrewriteResponse` |
-| `Commit` | `store.ProposeCommand` → `percolator.Commit` | `pb.CommitResponse` |
-| `ResolveLock` | `percolator.ResolveLock` | `pb.ResolveLockResponse` |
-| `CheckTxnStatus` | `percolator.CheckTxnStatus` | `pb.CheckTxnStatusResponse` |
-| `InstallPreparedMVCCEntries` | `store.ProposeCommand` → prepared-entry install branch | `pb.InstallPreparedMVCCEntriesResponse` |
-
-`nokv serve` is the CLI entry point—open the DB, construct `server.Node`, register peers, start local Raft peers, and display a local peer catalog summary (Regions, key ranges, peers). `scripts/dev/cluster.sh` builds the CLI, seeds local peer catalogs, and launches the 333 separated layout (3 meta-root peers + 1 coordinator + all configured stores) on localhost, handling cleanup on Ctrl+C.
-
-The RPC request/response shape is intentionally close to TinyKV/TiKV so the MVCC and region semantics remain familiar, while the service name exposed on the wire is the store-side `nokv.kv.v1.StoreKV`.
-
----
-
-## 5. Client Workflow
-
-`raftstore/client` offers a leader-aware client with retry logic and convenient helpers:
-
-- **Initialization**: provide a Coordinator-backed `RegionResolver` (`GetRegionByKey`) and `StoreResolver` (`GetStore`) so runtime routing and store discovery are Coordinator-driven.
-- **Reads**: `Get` and `Scan` pick the leader store for a key range, issue StoreKV RPCs, and retry on NotLeader/EpochNotMatch.
-- **Writes**: `Mutate` bundles operations per region and drives Prewrite/Commit (primary first, secondaries after); `Put` and `Delete` are convenience wrappers using the same 2PC path.
-- **Timestamps**: clients must supply `startVersion`/`commitVersion`. For distributed demos, use Coordinator (`nokv coordinator`) to obtain globally increasing values before calling `TwoPhaseCommit`.
-- **Bootstrap helpers**: `scripts/dev/cluster.sh --config raft_config.example.json` builds the binaries, seeds local peer catalogs via `nokv-config catalog`, launches the 3 meta-root peers + coordinator, and starts the stores declared in the config.
-
-**Example (fsmeta bucket regions)**
-1. `raft_config.example.json` declares `fsmeta_region_bootstrap` for the default mounts.
-2. `nokv-config regions` expands that declaration into ordinary byte ranges, with one range per fsmeta affinity bucket plus gap ranges.
-3. `Mutate(ctx, primary, mutations, startTs, commitTs, ttl)` still sees only region descriptors and retries on stale epochs or leader changes.
-4. See `raftstore/server/node_test.go` for a full end-to-end example using real `server.Node` instances.
-
----
-
-## 6. Failure Handling
-
-- Manifest edits capture only storage metadata. Store-local region recovery state and raft replay pointers are loaded from `raftstore/localmeta`.
-- WAL replay reconstructs memtables and Raft groups.
-- `Stats.StartStats` resumes metrics sampling immediately after restart, making it easy to verify recovery correctness via `nokv stats`.
-
----
-
-## 7. Observability & Tooling
-
-- `StatsSnapshot` publishes flush/compaction/WAL/raft/region/hot/cache metrics. `nokv stats` and the expvar endpoint expose the same data.
-- `nokv regions` inspects the local peer catalog.
-- `nokv serve` advertises Region samples on startup (ID, key range, peers) for quick verification.
-- Inspect scheduler/control-plane state via Coordinator APIs/metrics.
-- Scripts:
-  - `scripts/dev/cluster.sh` – launch a multi-node NoKV cluster locally.
-  - `RECOVERY_TRACE_METRICS=1 go test ./... -run 'TestRecovery(FailsOnMissingSST|FailsOnCorruptSST|ManifestRewriteCrash|SlowFollowerSnapshotBacklog|SnapshotExportRoundTrip|WALReplayRestoresData)' -count=1 -v` – crash-recovery validation.
-  - `CHAOS_TRACE_METRICS=1 go test -run 'TestGRPCTransport(HandlesPartition|MetricsWatchdog|MetricsBlockedPeers)' -count=1 -v ./raftstore/transport` – inject network faults and observe transport metrics.
-
----
-
-## 8. When to Use NoKV
-
-- **Embedded**: call `local.Open`, use the local non-transactional DB APIs.
-- **Distributed**: deploy `nokv serve` nodes, use `raftstore/client` (or any StoreKV gRPC client) to perform reads, scans, and 2PC writes.
-- **Observability-first**: inspection via CLI or expvar is built-in; Region, WAL, Flush, and Raft metrics are accessible without extra instrumentation.
-
-See also [`docs/guide/raftstore.md`](raftstore.md) for deeper internals, [`docs/guide/coordinator.md`](coordinator.md) for control-plane details, and [`docs/guide/testing.md`](testing.md) for coverage details.
+`experimental/*` is the boundary for research mechanisms. Peras, Thermos, and
+future experiments can attach to neutral fsmeta or raftstore extension points,
+but stable fsmeta, txn, raftstore, and storage packages should not import
+experimental packages directly unless the code contract explicitly allows the
+adapter.

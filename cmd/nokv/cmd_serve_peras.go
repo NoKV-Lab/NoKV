@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/feichai0017/NoKV/engine/wal"
+	"github.com/feichai0017/NoKV/storage/wal"
 )
 
 func parseSegmentWitnessWALPolicy(value string) (wal.DurabilityPolicy, error) {

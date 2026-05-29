@@ -10,13 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/wal"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
+	"github.com/feichai0017/NoKV/storage/wal"
 	"github.com/stretchr/testify/require"
 )
 

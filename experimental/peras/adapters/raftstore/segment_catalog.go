@@ -7,21 +7,20 @@ import (
 	"bytes"
 	"slices"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 )
 
 type SegmentCatalogStore interface {
-	NewInternalIterator(*index.Options) index.Iterator
+	NewInternalIterator(*entrykv.Options) entrykv.Iterator
 }
 
 func LoadPerasSegmentCatalogs(store SegmentCatalogStore) ([]fsperas.SegmentCatalogRecord, error) {
 	if store == nil {
 		return nil, fsperas.ErrSegmentCatalogStoreRequired
 	}
-	it := store.NewInternalIterator(&index.Options{IsAsc: true})
+	it := store.NewInternalIterator(&entrykv.Options{IsAsc: true})
 	if it == nil {
 		return nil, fsperas.ErrSegmentCatalogStoreRequired
 	}
@@ -95,7 +94,7 @@ func LoadPerasSegmentCatalogInstallForObjectKey(store SegmentCatalogStore, segme
 	if err != nil {
 		return false, err
 	}
-	it := store.NewInternalIterator(&index.Options{IsAsc: true})
+	it := store.NewInternalIterator(&entrykv.Options{IsAsc: true})
 	if it == nil {
 		return false, fsperas.ErrSegmentCatalogStoreRequired
 	}
@@ -139,7 +138,7 @@ func LoadPerasSegmentCatalogIndexInstall(store SegmentCatalogStore, root [32]byt
 	if err != nil {
 		return false, err
 	}
-	it := store.NewInternalIterator(&index.Options{IsAsc: true})
+	it := store.NewInternalIterator(&entrykv.Options{IsAsc: true})
 	if it == nil {
 		return false, fsperas.ErrSegmentCatalogStoreRequired
 	}
@@ -175,7 +174,7 @@ func LoadPerasSegmentCatalogForObjectKey(store SegmentCatalogStore, segment fspe
 	if _, err := perasSegmentObjectBucket(segment, catalogKey); err != nil {
 		return fsperas.SegmentCatalogRecord{}, false, err
 	}
-	it := store.NewInternalIterator(&index.Options{IsAsc: true})
+	it := store.NewInternalIterator(&entrykv.Options{IsAsc: true})
 	if it == nil {
 		return fsperas.SegmentCatalogRecord{}, false, fsperas.ErrSegmentCatalogStoreRequired
 	}

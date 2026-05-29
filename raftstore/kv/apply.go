@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	raftcmdpb "github.com/feichai0017/NoKV/pb/raft"
 	myraft "github.com/feichai0017/NoKV/raft"
@@ -396,11 +394,11 @@ func applyMVCCMaintenance(db txnstore.Store, req *kvrpcpb.MVCCMaintenanceRequest
 	return &kvrpcpb.MVCCMaintenanceResponse{AppliedEntries: uint64(len(entries))}, nil
 }
 
-func buildMVCCMaintenanceEntries(req *kvrpcpb.MVCCMaintenanceRequest) ([]*kv.Entry, *kvrpcpb.KeyError) {
+func buildMVCCMaintenanceEntries(req *kvrpcpb.MVCCMaintenanceRequest) ([]*txnstore.Entry, *kvrpcpb.KeyError) {
 	if req == nil || len(req.GetTombstones()) == 0 {
 		return nil, nil
 	}
-	entries := make([]*kv.Entry, 0, len(req.GetTombstones()))
+	entries := make([]*txnstore.Entry, 0, len(req.GetTombstones()))
 	for i, tombstone := range req.GetTombstones() {
 		if tombstone == nil {
 			continue
@@ -414,7 +412,7 @@ func buildMVCCMaintenanceEntries(req *kvrpcpb.MVCCMaintenanceRequest) ([]*kv.Ent
 			releaseEntries(entries)
 			return nil, maintenanceAbort("empty key")
 		}
-		entry := kv.NewInternalEntry(cf, tombstone.GetKey(), tombstone.GetVersion(), nil, kv.BitDelete, 0)
+		entry := txnstore.NewInternalEntry(cf, tombstone.GetKey(), tombstone.GetVersion(), nil, txnstore.BitDelete, 0)
 		if entry == nil {
 			releaseEntries(entries)
 			return nil, maintenanceAbort(fmt.Sprintf("entry %d build failed", i))
@@ -424,7 +422,7 @@ func buildMVCCMaintenanceEntries(req *kvrpcpb.MVCCMaintenanceRequest) ([]*kv.Ent
 	return entries, nil
 }
 
-func releaseEntries(entries []*kv.Entry) {
+func releaseEntries(entries []*txnstore.Entry) {
 	for _, entry := range entries {
 		if entry != nil {
 			entry.DecrRef()
@@ -432,12 +430,12 @@ func releaseEntries(entries []*kv.Entry) {
 	}
 }
 
-func maintenanceColumnFamily(cf kvrpcpb.InternalEntryTombstone_ColumnFamily) (kv.ColumnFamily, bool) {
+func maintenanceColumnFamily(cf kvrpcpb.InternalEntryTombstone_ColumnFamily) (txnstore.ColumnFamily, bool) {
 	switch cf {
 	case kvrpcpb.InternalEntryTombstone_DEFAULT:
-		return kv.CFDefault, true
+		return txnstore.CFDefault, true
 	case kvrpcpb.InternalEntryTombstone_WRITE:
-		return kv.CFWrite, true
+		return txnstore.CFWrite, true
 	default:
 		return 0, false
 	}
@@ -510,7 +508,7 @@ func handleGet(db txnstore.Store, req *kvrpcpb.GetRequest) (*kvrpcpb.GetResponse
 	if lock != nil && req.GetVersion() >= lock.Ts {
 		keyErr := &kvrpcpb.KeyError{Locked: &kvrpcpb.Locked{
 			PrimaryLock: lock.Primary,
-			Key:         kv.SafeCopy(nil, req.GetKey()),
+			Key:         txnstore.SafeCopy(nil, req.GetKey()),
 			LockVersion: lock.Ts,
 			LockTtl:     lock.TTL,
 			LockType:    lock.Kind,
@@ -541,9 +539,9 @@ func handleScan(db txnstore.Store, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanRespo
 	}
 	readTs := req.GetVersion()
 	if readTs == 0 {
-		readTs = kv.MaxVersion
+		readTs = txnstore.MaxVersion
 	}
-	iter := db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := db.NewInternalIterator(&txnstore.Options{IsAsc: true})
 	defer func() { _ = iter.Close() }()
 
 	startKey := append([]byte(nil), req.GetStartKey()...)
@@ -551,7 +549,7 @@ func handleScan(db txnstore.Store, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanRespo
 	started := len(startKey) == 0
 
 	resp := &kvrpcpb.ScanResponse{}
-	iter.Seek(kv.InternalKey(kv.CFWrite, startKey, kv.MaxVersion))
+	iter.Seek(txnstore.InternalKey(txnstore.CFWrite, startKey, txnstore.MaxVersion))
 	reader := percolator.NewReader(db)
 	for iter.Valid() && len(resp.Kvs) < limit {
 		item := iter.Item()
@@ -564,16 +562,16 @@ func handleScan(db txnstore.Store, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanRespo
 			iter.Next()
 			continue
 		}
-		cf, userKey, _, ok := kv.SplitInternalKey(entry.Key)
+		cf, userKey, _, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			return nil, fmt.Errorf("kv: scan iterator expects internal key, got %x", entry.Key)
 		}
-		if cf != kv.CFWrite {
+		if cf != txnstore.CFWrite {
 			// Since iterator is seeked into CFWrite range, encountering any non-write CF
 			// means there are no more write records for subsequent keys.
 			break
 		}
-		key := kv.SafeCopy(nil, userKey)
+		key := txnstore.SafeCopy(nil, userKey)
 		if len(key) == 0 {
 			iter.Next()
 			continue
@@ -611,7 +609,7 @@ func handleScan(db txnstore.Store, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanRespo
 	return resp, nil
 }
 
-func advanceToNextUserKey(iter index.Iterator, current []byte) {
+func advanceToNextUserKey(iter txnstore.Iterator, current []byte) {
 	if iter == nil {
 		return
 	}
@@ -624,7 +622,7 @@ func advanceToNextUserKey(iter index.Iterator, current []byte) {
 		if entry == nil {
 			continue
 		}
-		_, userKey, _, ok := kv.SplitInternalKey(entry.Key)
+		_, userKey, _, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			utils.CondPanicFunc(true, func() error {
 				return fmt.Errorf("kv: advanceToNextUserKey expects internal key, got %x", entry.Key)
@@ -637,7 +635,7 @@ func advanceToNextUserKey(iter index.Iterator, current []byte) {
 	}
 }
 
-func collectVisibleValue(db txnstore.Store, iter index.Iterator, key []byte, readTs uint64) ([]byte, uint64, bool, error) {
+func collectVisibleValue(db txnstore.Store, iter txnstore.Iterator, key []byte, readTs uint64) ([]byte, uint64, bool, error) {
 	for iter.Valid() {
 		item := iter.Item()
 		if item == nil {
@@ -649,11 +647,11 @@ func collectVisibleValue(db txnstore.Store, iter index.Iterator, key []byte, rea
 			iter.Next()
 			continue
 		}
-		cf, userKey, ts, ok := kv.SplitInternalKey(entry.Key)
+		cf, userKey, ts, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			return nil, 0, false, fmt.Errorf("kv: collectVisibleValue expects internal key, got %x", entry.Key)
 		}
-		if cf != kv.CFWrite || !bytes.Equal(userKey, key) {
+		if cf != txnstore.CFWrite || !bytes.Equal(userKey, key) {
 			return nil, 0, false, nil
 		}
 		if ts > readTs {
@@ -682,7 +680,7 @@ func collectVisibleValue(db txnstore.Store, iter index.Iterator, key []byte, rea
 					return nil, 0, false, nil
 				}
 			} else {
-				entryVal, err := db.GetInternalEntry(kv.CFDefault, key, write.StartTs)
+				entryVal, err := db.GetInternalEntry(txnstore.CFDefault, key, write.StartTs)
 				if err != nil {
 					if errors.Is(err, utils.ErrKeyNotFound) {
 						iter.Next()
@@ -695,7 +693,7 @@ func collectVisibleValue(db txnstore.Store, iter index.Iterator, key []byte, rea
 					advanceToNextUserKey(iter, key)
 					return nil, 0, false, nil
 				}
-				value = kv.SafeCopy(nil, entryVal.Value)
+				value = txnstore.SafeCopy(nil, entryVal.Value)
 				expiresAt = entryVal.ExpiresAt
 				entryVal.DecrRef()
 			}
@@ -713,7 +711,7 @@ func lockedError(key []byte, lock *mvcc.Lock) *kvrpcpb.KeyError {
 	return &kvrpcpb.KeyError{
 		Locked: &kvrpcpb.Locked{
 			PrimaryLock: lock.Primary,
-			Key:         kv.SafeCopy(nil, key),
+			Key:         txnstore.SafeCopy(nil, key),
 			LockVersion: lock.Ts,
 			LockTtl:     lock.TTL,
 			LockType:    lock.Kind,

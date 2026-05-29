@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/index"
 	local "github.com/feichai0017/NoKV/local"
+	index "github.com/feichai0017/NoKV/txn/storage"
 )
 
 func newBenchDB(b *testing.B, optFn func(*local.Options)) *local.DB {

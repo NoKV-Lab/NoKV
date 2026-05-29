@@ -34,9 +34,6 @@ func TestDBLogUsesDedicatedControlWAL(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, storage.Append([]myraft.Entry{{Index: 1, Term: 1, Data: []byte("raft")}}))
 
-	for _, mgr := range db.LSMWALs() {
-		require.Equal(t, uint64(0), mgr.Metrics().RecordCounts.RaftEntries)
-	}
 	matches, err := filepath.Glob(filepath.Join(db.WorkDir(), "control-wal-*", "*.wal"))
 	require.NoError(t, err)
 	require.NotEmpty(t, matches)

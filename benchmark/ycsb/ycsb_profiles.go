@@ -11,7 +11,6 @@ import (
 	"github.com/cockroachdb/pebble"
 	badger "github.com/dgraph-io/badger/v4"
 	badgeropts "github.com/dgraph-io/badger/v4/options"
-	nokvlsm "github.com/feichai0017/NoKV/engine/lsm"
 	local "github.com/feichai0017/NoKV/local"
 )
 
@@ -87,18 +86,11 @@ func defaultBadgerCacheBudgetMB(totalMB int) (blockMB, indexMB int) {
 // would otherwise muddy benchmark numbers. The shape is intentionally
 // production-like so that perf changes in NewDefaultOptions are picked
 // up by YCSB on the next run without manual re-sync.
-func buildNoKVBenchmarkOptions(dir string, opts ycsbEngineOptions, memtable local.MemTableEngine) *local.Options {
+func buildNoKVBenchmarkOptions(dir string, opts ycsbEngineOptions) *local.Options {
 	cfg := local.NewDefaultOptions()
 	cfg.WorkDir = dir
-	if memtable != "" {
-		cfg.MemTableEngine = memtable
-	}
-	if opts.NoKVCompactionPolicy != "" {
-		cfg.CompactionPolicy = local.CompactionPolicy(opts.NoKVCompactionPolicy)
-	}
 
 	cfg.MemTableSize = int64(opts.MemtableMB) << 20
-	cfg.SSTableMaxSz = int64(opts.SSTableMB) << 20
 	cfg.WriteBatchMaxCount = ycsbNoKVWriteBatchMaxCount
 	cfg.WriteBatchMaxSize = ycsbNoKVWriteBatchMaxSize
 	cfg.MaxBatchCount = ycsbNoKVWriteBatchMaxCount
@@ -112,8 +104,8 @@ func buildNoKVBenchmarkOptions(dir string, opts ycsbEngineOptions, memtable loca
 	cfg.IndexCacheBytes = cacheBudgetBytes(indexCacheMB)
 
 	// Per-test sweep override; otherwise inherit NewDefaultOptions().
-	if n := ycsbNoKVLSMShards(); n > 0 {
-		cfg.LSMShardCount = n
+	if n := ycsbNoKVWriteShards(); n > 0 {
+		cfg.WriteShardCount = n
 	}
 
 	// Disable background helpers and timing-sensitive heuristics so
@@ -126,16 +118,16 @@ func buildNoKVBenchmarkOptions(dir string, opts ycsbEngineOptions, memtable loca
 	// Maximum-throughput profile: skip the production defaults that trade
 	// CPU for IO benefits. YCSB uses generic keys, so it deliberately does
 	// not provide a semantic key shape for local shard or prefix-bloom hints.
-	cfg.BlockCompression = nokvlsm.BlockCompressionNone
+	cfg.BlockCompression = local.BlockCompressionNone
 	cfg.UserKeyShapeExtractor = nil
 
 	return cfg
 }
 
-// ycsbNoKVLSMShards reads NOKV_TEST_LSM_SHARDS for ad-hoc sweeps. Zero or
+// ycsbNoKVWriteShards reads NOKV_TEST_WRITE_SHARDS for ad-hoc sweeps. Zero or
 // invalid falls back to the constructor default (4).
-func ycsbNoKVLSMShards() int {
-	if v := os.Getenv("NOKV_TEST_LSM_SHARDS"); v != "" {
+func ycsbNoKVWriteShards() int {
+	if v := os.Getenv("NOKV_TEST_WRITE_SHARDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}

@@ -4,8 +4,6 @@
 package admin
 
 import (
-	"fmt"
-
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	"google.golang.org/grpc/codes"
 )
@@ -31,10 +29,6 @@ func rpcInvalidArgument(message string) error {
 	return rpcAdminError(nokverrors.KindInvalidArgument, codes.InvalidArgument, message, reasonInvalidRequest)
 }
 
-func rpcInvalidArgumentf(format string, args ...any) error {
-	return rpcInvalidArgument(fmt.Sprintf(format, args...))
-}
-
 func rpcServiceNotConfigured(message string) error {
 	return rpcAdminError(nokverrors.KindProtocolViolation, codes.FailedPrecondition, message, reasonServiceNotConfigured)
 }
@@ -49,22 +43,6 @@ func rpcPrecondition(err error) error {
 		kind = nokverrors.KindProtocolViolation
 	}
 	return rpcAdminError(kind, codes.FailedPrecondition, err.Error(), reasonPrecondition)
-}
-
-func rpcPreconditionf(format string, args ...any) error {
-	return rpcAdminError(nokverrors.KindProtocolViolation, codes.FailedPrecondition, fmt.Sprintf(format, args...), reasonPrecondition)
-}
-
-func rpcNotFoundf(format string, args ...any) error {
-	return rpcAdminError(nokverrors.KindNotFound, codes.NotFound, fmt.Sprintf(format, args...), reasonRegionNotHosted)
-}
-
-func rpcNotLeaderf(format string, args ...any) error {
-	return rpcAdminError(nokverrors.KindNotLeader, codes.FailedPrecondition, fmt.Sprintf(format, args...), reasonRegionNotLeader)
-}
-
-func rpcInternalf(format string, args ...any) error {
-	return rpcAdminError(nokverrors.KindProtocolViolation, codes.Internal, fmt.Sprintf(format, args...), reasonInternal)
 }
 
 func rpcAdminError(kind nokverrors.Kind, code codes.Code, message, reason string) error {

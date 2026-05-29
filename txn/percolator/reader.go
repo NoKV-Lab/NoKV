@@ -9,14 +9,12 @@ import (
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/txn/mvcc"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 )
 
-const lockColumnTs = kv.MaxVersion
+const lockColumnTs = txnstore.MaxVersion
 
 // Reader provides helper methods to inspect MVCC state within a DB instance.
 type Reader struct {
@@ -30,7 +28,7 @@ func NewReader(db txnstore.Store) *Reader {
 
 // GetLock returns the lock stored for the provided key, if any.
 func (r *Reader) GetLock(key []byte) (*mvcc.Lock, error) {
-	entry, err := r.db.GetInternalEntry(kv.CFLock, key, lockColumnTs)
+	entry, err := r.db.GetInternalEntry(txnstore.CFLock, key, lockColumnTs)
 	if err != nil {
 		if err == utils.ErrKeyNotFound {
 			return nil, nil
@@ -38,7 +36,7 @@ func (r *Reader) GetLock(key []byte) (*mvcc.Lock, error) {
 		return nil, err
 	}
 	defer entry.DecrRef()
-	if entry.Meta&kv.BitDelete > 0 || entry.Value == nil {
+	if entry.Meta&txnstore.BitDelete > 0 || entry.Value == nil {
 		return nil, nil
 	}
 	lock, err := mvcc.DecodeLock(entry.Value)
@@ -116,9 +114,9 @@ func (r *Reader) GetValue(key []byte, readTs uint64) ([]byte, uint64, error) {
 		if write.ExpiresAt > 0 && write.ExpiresAt <= uint64(time.Now().Unix()) {
 			return nil, 0, utils.ErrKeyNotFound
 		}
-		return kv.SafeCopy(nil, write.ShortValue), write.ExpiresAt, nil
+		return txnstore.SafeCopy(nil, write.ShortValue), write.ExpiresAt, nil
 	}
-	entry, err := r.db.GetInternalEntry(kv.CFDefault, key, write.StartTs)
+	entry, err := r.db.GetInternalEntry(txnstore.CFDefault, key, write.StartTs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -126,7 +124,7 @@ func (r *Reader) GetValue(key []byte, readTs uint64) ([]byte, uint64, error) {
 	if entry.IsDeletedOrExpired() {
 		return nil, 0, utils.ErrKeyNotFound
 	}
-	return kv.SafeCopy(nil, entry.Value), entry.ExpiresAt, nil
+	return txnstore.SafeCopy(nil, entry.Value), entry.ExpiresAt, nil
 }
 
 func (r *Reader) getWriteForRead(key []byte, readTs uint64) (*mvcc.Write, uint64, error) {
@@ -152,12 +150,12 @@ func (r *Reader) getWriteForRead(key []byte, readTs uint64) (*mvcc.Write, uint64
 }
 
 func (r *Reader) scanWrites(key []byte, fn func(mvcc.Write, uint64) bool) error {
-	iter := r.db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := r.db.NewInternalIterator(&txnstore.Options{IsAsc: true})
 	defer func() { _ = iter.Close() }()
 	if iter == nil {
 		return nil
 	}
-	iter.Seek(kv.InternalKey(kv.CFWrite, key, kv.MaxVersion))
+	iter.Seek(txnstore.InternalKey(txnstore.CFWrite, key, txnstore.MaxVersion))
 	for iter.Valid() {
 		item := iter.Item()
 		if item == nil {
@@ -169,18 +167,18 @@ func (r *Reader) scanWrites(key []byte, fn func(mvcc.Write, uint64) bool) error 
 			iter.Next()
 			continue
 		}
-		cf, userKey, ts, ok := kv.SplitInternalKey(entry.Key)
+		cf, userKey, ts, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			return fmt.Errorf("percolator: scanWrites expects internal key, got %x", entry.Key)
 		}
-		if cf != kv.CFWrite {
+		if cf != txnstore.CFWrite {
 			break
 		}
 		if !bytes.Equal(userKey, key) {
 			iter.Next()
 			break
 		}
-		if entry.Meta&kv.BitDelete > 0 {
+		if entry.Meta&txnstore.BitDelete > 0 {
 			iter.Next()
 			continue
 		}

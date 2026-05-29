@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
@@ -126,7 +124,7 @@ func collectResolveLockBatch(ctx context.Context, db txnstore.Store, currentTime
 	if db == nil {
 		return batch, errNilMVCCStore
 	}
-	iter := db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := db.NewInternalIterator(&txnstore.Options{IsAsc: true})
 	if iter == nil {
 		batch.done = true
 		return batch, nil
@@ -144,19 +142,19 @@ func collectResolveLockBatch(ctx context.Context, db txnstore.Store, currentTime
 			continue
 		}
 		entry := item.Entry()
-		cf, userKey, _, ok := entrykv.SplitInternalKey(entry.Key)
+		cf, userKey, _, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			return batch, fmt.Errorf("raftstore/mvcc: expected internal lock key, got %x", entry.Key)
 		}
-		if cf != entrykv.CFLock {
+		if cf != txnstore.CFLock {
 			batch.done = true
 			return batch, nil
 		}
 		if maxLocks > 0 && batch.scan.ScannedLocks >= maxLocks {
 			return batch, nil
 		}
-		batch.lastUserKey = entrykv.SafeCopy(batch.lastUserKey, userKey)
-		if entry.Meta&entrykv.BitDelete > 0 {
+		batch.lastUserKey = txnstore.SafeCopy(batch.lastUserKey, userKey)
+		if entry.Meta&txnstore.BitDelete > 0 {
 			batch.scan.DeletedLockMarkers++
 			iter.Next()
 			continue
@@ -173,7 +171,7 @@ func collectResolveLockBatch(ctx context.Context, db txnstore.Store, currentTime
 		}
 		batch.scan.ExpiredLocks++
 		batch.locks = append(batch.locks, lockRecord{
-			key:  entrykv.SafeCopy(nil, userKey),
+			key:  txnstore.SafeCopy(nil, userKey),
 			lock: lock,
 		})
 		iter.Next()
@@ -185,20 +183,20 @@ func collectResolveLockBatch(ctx context.Context, db txnstore.Store, currentTime
 	return batch, nil
 }
 
-func seekLockStart(iter index.Iterator, afterUserKey []byte) {
+func seekLockStart(iter txnstore.Iterator, afterUserKey []byte) {
 	if len(afterUserKey) == 0 {
-		iter.Seek(entrykv.InternalKey(entrykv.CFLock, nil, entrykv.MaxVersion))
+		iter.Seek(txnstore.InternalKey(txnstore.CFLock, nil, txnstore.MaxVersion))
 		return
 	}
-	iter.Seek(entrykv.InternalKey(entrykv.CFLock, afterUserKey, 0))
+	iter.Seek(txnstore.InternalKey(txnstore.CFLock, afterUserKey, 0))
 	for iter.Valid() {
 		item := iter.Item()
 		if item == nil || item.Entry() == nil {
 			iter.Next()
 			continue
 		}
-		cf, userKey, _, ok := entrykv.SplitInternalKey(item.Entry().Key)
-		if !ok || cf != entrykv.CFLock || !bytes.Equal(userKey, afterUserKey) {
+		cf, userKey, _, ok := txnstore.SplitInternalKey(item.Entry().Key)
+		if !ok || cf != txnstore.CFLock || !bytes.Equal(userKey, afterUserKey) {
 			return
 		}
 		iter.Next()
@@ -263,7 +261,7 @@ func resolveOneLock(ctx context.Context, resolver LockResolver, currentTs, curre
 	}
 	if commitTs := status.GetCommitVersion(); commitTs > 0 {
 		return &resolveLockDecision{
-			key:      entrykv.SafeCopy(nil, rec.key),
+			key:      txnstore.SafeCopy(nil, rec.key),
 			startTs:  rec.lock.Ts,
 			commitTs: commitTs,
 		}, nil
@@ -272,7 +270,7 @@ func resolveOneLock(ctx context.Context, resolver LockResolver, currentTs, curre
 	case kvrpcpb.CheckTxnStatusAction_CheckTxnStatusTTLExpireRollback,
 		kvrpcpb.CheckTxnStatusAction_CheckTxnStatusLockNotExistRollback:
 		decision := &resolveLockDecision{
-			key:     entrykv.SafeCopy(nil, rec.key),
+			key:     txnstore.SafeCopy(nil, rec.key),
 			startTs: rec.lock.Ts,
 		}
 		if bytes.Equal(rec.key, rec.lock.Primary) {
@@ -285,7 +283,7 @@ func resolveOneLock(ctx context.Context, resolver LockResolver, currentTs, curre
 }
 
 func lockForKey(db txnstore.Store, key []byte) (*txnmvcc.Lock, error) {
-	entry, err := db.GetInternalEntry(entrykv.CFLock, key, entrykv.MaxVersion)
+	entry, err := db.GetInternalEntry(txnstore.CFLock, key, txnstore.MaxVersion)
 	if err != nil {
 		if errors.Is(err, utils.ErrKeyNotFound) {
 			return nil, nil
@@ -296,7 +294,7 @@ func lockForKey(db txnstore.Store, key []byte) (*txnmvcc.Lock, error) {
 		return nil, nil
 	}
 	defer entry.DecrRef()
-	if entry.Meta&entrykv.BitDelete > 0 || entry.Value == nil {
+	if entry.Meta&txnstore.BitDelete > 0 || entry.Value == nil {
 		return nil, nil
 	}
 	lock, err := txnmvcc.DecodeLock(entry.Value)
@@ -307,13 +305,13 @@ func lockForKey(db txnstore.Store, key []byte) (*txnmvcc.Lock, error) {
 }
 
 func writeByStartTs(db txnstore.Store, key []byte, startTs uint64) (txnmvcc.Write, uint64, bool, error) {
-	iter := db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := db.NewInternalIterator(&txnstore.Options{IsAsc: true})
 	if iter == nil {
 		return txnmvcc.Write{}, 0, false, nil
 	}
 	defer func() { _ = iter.Close() }()
 
-	iter.Seek(entrykv.InternalKey(entrykv.CFWrite, key, entrykv.MaxVersion))
+	iter.Seek(txnstore.InternalKey(txnstore.CFWrite, key, txnstore.MaxVersion))
 	for iter.Valid() {
 		item := iter.Item()
 		if item == nil || item.Entry() == nil {
@@ -321,14 +319,14 @@ func writeByStartTs(db txnstore.Store, key []byte, startTs uint64) (txnmvcc.Writ
 			continue
 		}
 		entry := item.Entry()
-		cf, userKey, commitTs, ok := entrykv.SplitInternalKey(entry.Key)
+		cf, userKey, commitTs, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			return txnmvcc.Write{}, 0, false, fmt.Errorf("raftstore/mvcc: expected internal write key, got %x", entry.Key)
 		}
-		if cf != entrykv.CFWrite || !bytes.Equal(userKey, key) {
+		if cf != txnstore.CFWrite || !bytes.Equal(userKey, key) {
 			break
 		}
-		if entry.Meta&entrykv.BitDelete > 0 {
+		if entry.Meta&txnstore.BitDelete > 0 {
 			iter.Next()
 			continue
 		}
@@ -369,7 +367,7 @@ func groupResolveLockCommands(decisions []resolveLockDecision) []resolveLockComm
 			index[k] = idx
 			groups = append(groups, resolveLockCommand{startTs: decision.startTs, commitTs: decision.commitTs})
 		}
-		groups[idx].keys = append(groups[idx].keys, entrykv.SafeCopy(nil, decision.key))
+		groups[idx].keys = append(groups[idx].keys, txnstore.SafeCopy(nil, decision.key))
 	}
 	return groups
 }

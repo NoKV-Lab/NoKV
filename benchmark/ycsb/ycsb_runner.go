@@ -18,8 +18,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	local "github.com/feichai0017/NoKV/local"
 )
 
 type ycsbWorkload struct {
@@ -361,10 +359,6 @@ func newYCSBEngine(engineName string, opts ycsbEngineOptions) (ycsbEngine, error
 	switch engineName {
 	case "nokv":
 		return newNoKVEngine(opts), nil
-	case "nokv-skiplist":
-		return newNoKVEngineWithMemtable(opts, "nokv-skiplist", "NoKV-skiplist", local.MemTableEngineSkiplist), nil
-	case "nokv-art":
-		return newNoKVEngineWithMemtable(opts, "nokv-art", "NoKV-art", local.MemTableEngineART), nil
 	case "badger":
 		return newBadgerEngine(opts), nil
 	case "pebble":

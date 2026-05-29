@@ -12,10 +12,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/feichai0017/NoKV/engine/vfs"
 	metaregion "github.com/feichai0017/NoKV/meta/region"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
 	metapb "github.com/feichai0017/NoKV/pb/meta"
+	"github.com/feichai0017/NoKV/storage/vfs"
 	"google.golang.org/protobuf/proto"
 )
 

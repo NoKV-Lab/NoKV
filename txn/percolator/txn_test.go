@@ -8,18 +8,15 @@ import (
 	"errors"
 	"fmt"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/lsm"
 	local "github.com/feichai0017/NoKV/local"
 	"github.com/feichai0017/NoKV/txn/latch"
 	"github.com/feichai0017/NoKV/txn/mvcc"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 )
 
@@ -27,7 +24,6 @@ func testOptionsForDir(dir string) *local.Options {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = dir
 	opt.MemTableSize = 1 << 12
-	opt.SSTableMaxSz = 1 << 20
 	return opt
 }
 
@@ -83,43 +79,10 @@ func atomicMutateStat(t *testing.T, stats map[string]any, key string) uint64 {
 	return got
 }
 
-func latestWALPath(t *testing.T, dir string) string {
-	t.Helper()
-	// LSM data plane is sharded into <dir>/lsm-wal-XX/. Per-key affinity
-	// sends every write for one key to one shard, so the "active" WAL is
-	// whichever shard's segment is largest — that's the one tests want
-	// to truncate.
-	files, err := filepath.Glob(filepath.Join(dir, "lsm-wal-*", "*.wal"))
-	require.NoError(t, err)
-	require.NotEmpty(t, files)
-	var (
-		bestPath string
-		bestSize int64
-	)
-	for _, f := range files {
-		info, err := os.Stat(f)
-		require.NoError(t, err)
-		if info.Size() > bestSize {
-			bestSize = info.Size()
-			bestPath = f
-		}
-	}
-	require.NotEmpty(t, bestPath)
-	return bestPath
-}
-
-func truncateTail(t *testing.T, path string, trim int64) {
-	t.Helper()
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	require.Greater(t, info.Size(), trim)
-	require.NoError(t, os.Truncate(path, info.Size()-trim))
-}
-
 type rollbackTestStore struct {
 	applyInternalEntries func(entries []*kv.Entry) error
 	getInternalEntry     func(cf kv.ColumnFamily, key []byte, version uint64) (*kv.Entry, error)
-	newInternalIterator  func(opt *index.Options) index.Iterator
+	newInternalIterator  func(opt *kv.Options) kv.Iterator
 }
 
 func (s rollbackTestStore) ApplyInternalEntries(entries []*kv.Entry) error {
@@ -136,7 +99,7 @@ func (s rollbackTestStore) GetInternalEntry(cf kv.ColumnFamily, key []byte, vers
 	return nil, utils.ErrKeyNotFound
 }
 
-func (s rollbackTestStore) NewInternalIterator(opt *index.Options) index.Iterator {
+func (s rollbackTestStore) NewInternalIterator(opt *kv.Options) kv.Iterator {
 	if s.newInternalIterator != nil {
 		return s.newInternalIterator(opt)
 	}
@@ -169,7 +132,7 @@ func (s *countingStore) GetInternalEntry(cf kv.ColumnFamily, key []byte, version
 	return s.base.GetInternalEntry(cf, key, version)
 }
 
-func (s *countingStore) NewInternalIterator(opt *index.Options) index.Iterator {
+func (s *countingStore) NewInternalIterator(opt *kv.Options) kv.Iterator {
 	return s.base.NewInternalIterator(opt)
 }
 
@@ -191,7 +154,7 @@ func (s *countingAtomicStore) CanApplyInternalEntriesAtomically(entries []*kv.En
 }
 
 type testIterator struct {
-	items []index.Item
+	items []kv.Item
 	idx   int
 }
 
@@ -207,7 +170,7 @@ func (it *testIterator) Rewind() {
 	it.idx = 0
 }
 
-func (it *testIterator) Item() index.Item {
+func (it *testIterator) Item() kv.Item {
 	if !it.Valid() {
 		return nil
 	}
@@ -269,7 +232,7 @@ func TestPrewriteAndCommitPut(t *testing.T) {
 
 func TestApplyAtomicMutateMaterializesCommittedKeys(t *testing.T) {
 	opt := testOptionsForDir(filepath.Join(t.TempDir(), "db"))
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -317,7 +280,7 @@ func TestApplyAtomicMutateStatsRecordLocalFallback(t *testing.T) {
 
 func TestApplyAtomicMutateBatchFusesIndependentRequests(t *testing.T) {
 	opt := testOptionsForDir(t.TempDir())
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -352,18 +315,18 @@ func TestApplyAtomicMutateBatchFusesIndependentRequests(t *testing.T) {
 	require.Equal(t, atomicMutateStat(t, before, "atomic_fused_apply_entries_total")+2, atomicMutateStat(t, after, "atomic_fused_apply_entries_total"))
 }
 
-func TestApplyAtomicMutateBatchSplitsDifferentLocalApplyGroups(t *testing.T) {
+func TestApplyAtomicMutateBatchUsesSinglePebbleApplyGroup(t *testing.T) {
 	const shardCount = 4
 
 	opt := testOptionsForDir(t.TempDir())
-	opt.LSMShardCount = shardCount
+	opt.WriteShardCount = shardCount
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
 	first, second := keysWithAscendingCommitShards(t, shardCount)
-	firstShard := lsm.ShardForInternalKey(kv.InternalKey(kv.CFDefault, first, 50), shardCount)
-	secondShard := lsm.ShardForInternalKey(kv.InternalKey(kv.CFDefault, second, 52), shardCount)
+	firstShard := testShardForInternalKey(kv.InternalKey(kv.CFDefault, first, 50), shardCount)
+	secondShard := testShardForInternalKey(kv.InternalKey(kv.CFDefault, second, 52), shardCount)
 	require.NotEqual(t, firstShard, secondShard)
 
 	store := newCountingAtomicStore(db)
@@ -377,13 +340,13 @@ func TestApplyAtomicMutateBatchSplitsDifferentLocalApplyGroups(t *testing.T) {
 		require.False(t, result.Fallback)
 		require.Equal(t, uint64(1), result.AppliedKeys)
 	}
-	require.Equal(t, 2, store.applyCalls)
-	require.Equal(t, []int{1, 1}, store.appliedEntryCounts)
+	require.Equal(t, 1, store.applyCalls)
+	require.Equal(t, []int{2}, store.appliedEntryCounts)
 }
 
 func TestApplyAtomicMutateBatchPreservesOverlappingRequestOrder(t *testing.T) {
 	opt := testOptionsForDir(t.TempDir())
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -408,7 +371,7 @@ func TestApplyAtomicMutateBatchPreservesOverlappingRequestOrder(t *testing.T) {
 
 func TestApplyAtomicMutateBatchApplyFailureMarksWholeFusedGroup(t *testing.T) {
 	opt := testOptionsForDir(t.TempDir())
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -519,7 +482,7 @@ func TestApplyAtomicMutateValueEqualsPredicate(t *testing.T) {
 
 func TestApplyAtomicMutateRejectsLockedPredicate(t *testing.T) {
 	opt := testOptionsForDir(filepath.Join(t.TempDir(), "db"))
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -1153,8 +1116,8 @@ func TestCommitReturnsRetryableOnWriteLookupErrorWhenLockMissing(t *testing.T) {
 
 	latches := latch.NewManager(32)
 	store := rollbackTestStore{
-		newInternalIterator: func(opt *index.Options) index.Iterator {
-			return &testIterator{items: []index.Item{badEntry}}
+		newInternalIterator: func(opt *kv.Options) kv.Iterator {
+			return &testIterator{items: []kv.Item{badEntry}}
 		},
 	}
 
@@ -1250,7 +1213,7 @@ func TestCommitAfterBatchPrewritePreservesShardAffinityAcrossRestart(t *testing.
 
 	dir := filepath.Join(t.TempDir(), "db")
 	opt := testOptionsForDir(dir)
-	opt.LSMShardCount = shardCount
+	opt.WriteShardCount = shardCount
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 
@@ -1293,7 +1256,7 @@ func keysWithAscendingCommitShards(t *testing.T, shardCount int) ([]byte, []byte
 	keysByShard := make([][]byte, shardCount)
 	for i := range 10000 {
 		key := fmt.Appendf(nil, "affinity-%d", i)
-		shardID := lsm.ShardForInternalKey(kv.InternalKey(kv.CFLock, key, lockColumnTs), shardCount)
+		shardID := testShardForInternalKey(kv.InternalKey(kv.CFLock, key, lockColumnTs), shardCount)
 		if shardID >= 0 && shardID < shardCount && keysByShard[shardID] == nil {
 			keysByShard[shardID] = key
 		}
@@ -1309,19 +1272,15 @@ func keysWithAscendingCommitShards(t *testing.T, shardCount int) ([]byte, []byte
 	return nil, nil
 }
 
-func keysWithSameCommitShard(t *testing.T, shardCount int) ([]byte, []byte, int) {
-	t.Helper()
-	keysByShard := make([][]byte, shardCount)
-	for i := range 10000 {
-		key := fmt.Appendf(nil, "same-affinity-%d", i)
-		shardID := lsm.ShardForInternalKey(kv.InternalKey(kv.CFDefault, key, 1), shardCount)
-		if keysByShard[shardID] != nil {
-			return keysByShard[shardID], key, shardID
-		}
-		keysByShard[shardID] = key
+func testShardForInternalKey(internalKey []byte, shardCount int) int {
+	if shardCount <= 1 {
+		return 0
 	}
-	t.Fatalf("could not find same-shard keys for shardCount=%d", shardCount)
-	return nil, nil, 0
+	_, userKey, _, ok := kv.SplitInternalKey(internalKey)
+	if !ok || len(userKey) == 0 {
+		return 0
+	}
+	return utils.ShardForUserKey(userKey, shardCount)
 }
 
 func TestCommitBatchCommitTsExpiredDoesNotApplyPartialCommits(t *testing.T) {
@@ -1880,96 +1839,6 @@ func TestResolveLockCommitTsExpired(t *testing.T) {
 	require.Nil(t, write)
 }
 
-func TestPrewriteRecoveryDropsCorruptedBatch(t *testing.T) {
-	workDir := filepath.Join(t.TempDir(), "db")
-	db, err := local.Open(testOptionsForDir(workDir))
-	require.NoError(t, err)
-	latches := latch.NewManager(16)
-	key := []byte("prewrite-corrupt")
-	startTs := uint64(101)
-
-	pre := &kvrpcpb.PrewriteRequest{
-		Mutations: []*kvrpcpb.Mutation{{
-			Op:    kvrpcpb.Mutation_Put,
-			Key:   key,
-			Value: []byte("value"),
-		}},
-		PrimaryLock:  key,
-		StartVersion: startTs,
-		LockTtl:      1000,
-	}
-	require.Empty(t, Prewrite(db, latches, pre))
-	require.NoError(t, db.SyncWAL())
-	require.NoError(t, db.Close())
-
-	walPath := latestWALPath(t, workDir)
-	truncateTail(t, walPath, 2)
-
-	db2, err := local.Open(testOptionsForDir(workDir))
-	require.NoError(t, err)
-	defer func() { _ = db2.Close() }()
-	reader := NewReader(db2)
-
-	lock, err := reader.GetLock(key)
-	require.NoError(t, err)
-	require.Nil(t, lock)
-
-	_, err = db2.GetInternalEntry(kv.CFDefault, key, startTs)
-	require.ErrorIs(t, err, utils.ErrKeyNotFound)
-}
-
-func TestCommitRecoveryDropsCorruptedCommitBatch(t *testing.T) {
-	workDir := filepath.Join(t.TempDir(), "db")
-	db, err := local.Open(testOptionsForDir(workDir))
-	require.NoError(t, err)
-	latches := latch.NewManager(16)
-	key := []byte("commit-corrupt")
-	startTs := uint64(201)
-	commitTs := uint64(301)
-
-	pre := &kvrpcpb.PrewriteRequest{
-		Mutations: []*kvrpcpb.Mutation{{
-			Op:    kvrpcpb.Mutation_Put,
-			Key:   key,
-			Value: []byte("value"),
-		}},
-		PrimaryLock:  key,
-		StartVersion: startTs,
-		LockTtl:      1000,
-	}
-	require.Empty(t, Prewrite(db, latches, pre))
-	require.NoError(t, db.SyncWAL())
-
-	require.Nil(t, Commit(db, latches, &kvrpcpb.CommitRequest{
-		Keys:          [][]byte{key},
-		StartVersion:  startTs,
-		CommitVersion: commitTs,
-	}))
-	require.NoError(t, db.SyncWAL())
-	require.NoError(t, db.Close())
-
-	walPath := latestWALPath(t, workDir)
-	truncateTail(t, walPath, 2)
-
-	db2, err := local.Open(testOptionsForDir(workDir))
-	require.NoError(t, err)
-	defer func() { _ = db2.Close() }()
-	reader := NewReader(db2)
-
-	lock, err := reader.GetLock(key)
-	require.NoError(t, err)
-	require.NotNil(t, lock)
-	require.Equal(t, startTs, lock.Ts)
-	require.Equal(t, []byte("value"), lock.ShortValue)
-
-	write, _, err := reader.GetWriteByStartTs(key, startTs)
-	require.NoError(t, err)
-	require.Nil(t, write)
-
-	_, err = db2.GetInternalEntry(kv.CFDefault, key, startTs)
-	require.ErrorIs(t, err, utils.ErrKeyNotFound)
-}
-
 func TestCheckTxnStatusTTLExpire(t *testing.T) {
 	db := openTestDB(t)
 	latches := latch.NewManager(16)
@@ -2438,7 +2307,7 @@ func TestPrewriteLargeValueKeepsDefaultCF(t *testing.T) {
 
 func TestAtomicMutateShortValueSkipsDefaultCF(t *testing.T) {
 	opt := testOptionsForDir(filepath.Join(t.TempDir(), "db"))
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -2596,8 +2465,8 @@ func TestRollbackKeyReturnsRetryableWhenWriteLookupFails(t *testing.T) {
 	t.Cleanup(badEntry.DecrRef)
 
 	store := rollbackTestStore{
-		newInternalIterator: func(opt *index.Options) index.Iterator {
-			return &testIterator{items: []index.Item{badEntry}}
+		newInternalIterator: func(opt *kv.Options) kv.Iterator {
+			return &testIterator{items: []kv.Item{badEntry}}
 		},
 	}
 

@@ -18,7 +18,6 @@ import (
 	raftcmdpb "github.com/feichai0017/NoKV/pb/raft"
 
 	"github.com/feichai0017/NoKV/coordinator/storecontrol"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	myraft "github.com/feichai0017/NoKV/raft"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/peer"
@@ -140,18 +139,18 @@ func TestStoreProposeMVCCMaintenance(t *testing.T) {
 	t.Cleanup(func() { st.StopPeer(p.ID()) })
 	require.NoError(t, p.Campaign())
 
-	entry := entrykv.NewInternalEntry(entrykv.CFWrite, []byte("gc-key"), 33, nil, entrykv.BitDelete, 0)
+	entry := txnstore.NewInternalEntry(txnstore.CFWrite, []byte("gc-key"), 33, nil, txnstore.BitDelete, 0)
 	defer entry.DecrRef()
-	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), []*entrykv.Entry{entry})
+	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), []*txnstore.Entry{entry})
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), applied)
 	require.Equal(t, uint64(1), writes)
 	require.Zero(t, defaults)
 
-	got, err := db.GetInternalEntry(entrykv.CFWrite, []byte("gc-key"), 33)
+	got, err := db.GetInternalEntry(txnstore.CFWrite, []byte("gc-key"), 33)
 	require.NoError(t, err)
 	defer got.DecrRef()
-	require.NotZero(t, got.Meta&entrykv.BitDelete)
+	require.NotZero(t, got.Meta&txnstore.BitDelete)
 }
 
 func TestStoreProposeMVCCMaintenanceFailsClosedWhenNotLeader(t *testing.T) {
@@ -184,14 +183,14 @@ func TestStoreProposeMVCCMaintenanceFailsClosedWhenNotLeader(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { st.StopPeer(p.ID()) })
 
-	entry := entrykv.NewInternalEntry(entrykv.CFWrite, []byte("gc-not-leader-key"), 33, nil, entrykv.BitDelete, 0)
+	entry := txnstore.NewInternalEntry(txnstore.CFWrite, []byte("gc-not-leader-key"), 33, nil, txnstore.BitDelete, 0)
 	defer entry.DecrRef()
-	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), []*entrykv.Entry{entry})
+	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), []*txnstore.Entry{entry})
 	require.ErrorContains(t, err, "region 119")
 	require.Zero(t, applied)
 	require.Zero(t, writes)
 	require.Zero(t, defaults)
-	_, err = db.GetInternalEntry(entrykv.CFWrite, []byte("gc-not-leader-key"), 33)
+	_, err = db.GetInternalEntry(txnstore.CFWrite, []byte("gc-not-leader-key"), 33)
 	require.Error(t, err)
 }
 
@@ -236,11 +235,11 @@ func TestStoreProposeMVCCMaintenanceConvergesAfterPartialRegionFailure(t *testin
 	}
 	require.NoError(t, st.applyRegionMetaSilent(right))
 
-	leftEntry := entrykv.NewInternalEntry(entrykv.CFWrite, []byte("b-gc-key"), 33, nil, entrykv.BitDelete, 0)
+	leftEntry := txnstore.NewInternalEntry(txnstore.CFWrite, []byte("b-gc-key"), 33, nil, txnstore.BitDelete, 0)
 	defer leftEntry.DecrRef()
-	rightEntry := entrykv.NewInternalEntry(entrykv.CFWrite, []byte("t-gc-key"), 44, nil, entrykv.BitDelete, 0)
+	rightEntry := txnstore.NewInternalEntry(txnstore.CFWrite, []byte("t-gc-key"), 44, nil, txnstore.BitDelete, 0)
 	defer rightEntry.DecrRef()
-	entries := []*entrykv.Entry{leftEntry, rightEntry}
+	entries := []*txnstore.Entry{leftEntry, rightEntry}
 
 	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), entries)
 	require.ErrorContains(t, err, "region 122")
@@ -248,11 +247,11 @@ func TestStoreProposeMVCCMaintenanceConvergesAfterPartialRegionFailure(t *testin
 	require.Equal(t, uint64(1), writes)
 	require.Zero(t, defaults)
 
-	gotLeft, err := db.GetInternalEntry(entrykv.CFWrite, []byte("b-gc-key"), 33)
+	gotLeft, err := db.GetInternalEntry(txnstore.CFWrite, []byte("b-gc-key"), 33)
 	require.NoError(t, err)
 	defer gotLeft.DecrRef()
-	require.NotZero(t, gotLeft.Meta&entrykv.BitDelete)
-	_, err = db.GetInternalEntry(entrykv.CFWrite, []byte("t-gc-key"), 44)
+	require.NotZero(t, gotLeft.Meta&txnstore.BitDelete)
+	_, err = db.GetInternalEntry(txnstore.CFWrite, []byte("t-gc-key"), 44)
 	require.Error(t, err)
 
 	rightCfg := &peer.Config{
@@ -279,10 +278,10 @@ func TestStoreProposeMVCCMaintenanceConvergesAfterPartialRegionFailure(t *testin
 	require.Equal(t, uint64(2), applied)
 	require.Equal(t, uint64(2), writes)
 	require.Zero(t, defaults)
-	gotRight, err := db.GetInternalEntry(entrykv.CFWrite, []byte("t-gc-key"), 44)
+	gotRight, err := db.GetInternalEntry(txnstore.CFWrite, []byte("t-gc-key"), 44)
 	require.NoError(t, err)
 	defer gotRight.DecrRef()
-	require.NotZero(t, gotRight.Meta&entrykv.BitDelete)
+	require.NotZero(t, gotRight.Meta&txnstore.BitDelete)
 }
 
 func TestStoreProposeMVCCMaintenanceRoutesAfterSplit(t *testing.T) {
@@ -330,25 +329,25 @@ func TestStoreProposeMVCCMaintenanceRoutesAfterSplit(t *testing.T) {
 		return ok && status.Hosted && status.Leader
 	}, time.Second, 10*time.Millisecond)
 
-	leftEntry := entrykv.NewInternalEntry(entrykv.CFWrite, []byte("b-post-split-gc"), 33, nil, entrykv.BitDelete, 0)
+	leftEntry := txnstore.NewInternalEntry(txnstore.CFWrite, []byte("b-post-split-gc"), 33, nil, txnstore.BitDelete, 0)
 	defer leftEntry.DecrRef()
-	rightEntry := entrykv.NewInternalEntry(entrykv.CFWrite, []byte("t-post-split-gc"), 44, nil, entrykv.BitDelete, 0)
+	rightEntry := txnstore.NewInternalEntry(txnstore.CFWrite, []byte("t-post-split-gc"), 44, nil, txnstore.BitDelete, 0)
 	defer rightEntry.DecrRef()
 
-	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), []*entrykv.Entry{leftEntry, rightEntry})
+	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), []*txnstore.Entry{leftEntry, rightEntry})
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), applied)
 	require.Equal(t, uint64(2), writes)
 	require.Zero(t, defaults)
 
-	gotLeft, err := db.GetInternalEntry(entrykv.CFWrite, []byte("b-post-split-gc"), 33)
+	gotLeft, err := db.GetInternalEntry(txnstore.CFWrite, []byte("b-post-split-gc"), 33)
 	require.NoError(t, err)
 	defer gotLeft.DecrRef()
-	require.NotZero(t, gotLeft.Meta&entrykv.BitDelete)
-	gotRight, err := db.GetInternalEntry(entrykv.CFWrite, []byte("t-post-split-gc"), 44)
+	require.NotZero(t, gotLeft.Meta&txnstore.BitDelete)
+	gotRight, err := db.GetInternalEntry(txnstore.CFWrite, []byte("t-post-split-gc"), 44)
 	require.NoError(t, err)
 	defer gotRight.DecrRef()
-	require.NotZero(t, gotRight.Meta&entrykv.BitDelete)
+	require.NotZero(t, gotRight.Meta&txnstore.BitDelete)
 }
 
 func TestStoreResolveLocks(t *testing.T) {
@@ -512,9 +511,9 @@ func applyTestLockRecord(t *testing.T, db txnstore.Store, key []byte, startTs, t
 		TTL:       ttl,
 		Kind:      kvrpcpb.Mutation_Put,
 	})
-	entry := entrykv.NewInternalEntry(entrykv.CFLock, key, entrykv.MaxVersion, lock, 0, 0)
+	entry := txnstore.NewInternalEntry(txnstore.CFLock, key, txnstore.MaxVersion, lock, 0, 0)
 	defer entry.DecrRef()
-	require.NoError(t, db.ApplyInternalEntries([]*entrykv.Entry{entry}))
+	require.NoError(t, db.ApplyInternalEntries([]*txnstore.Entry{entry}))
 }
 
 func mvccTestPeerBuilder(t *testing.T, db *local.DB, localMeta *localmeta.Store, storeID uint64) PeerBuilder {
@@ -579,15 +578,15 @@ func TestStoreProposeMVCCMaintenanceRejectsNonTombstone(t *testing.T) {
 	t.Cleanup(func() { st.StopPeer(p.ID()) })
 	require.NoError(t, p.Campaign())
 
-	entry := entrykv.NewInternalEntry(entrykv.CFWrite, []byte("gc-key"), 33, nil, 0, 0)
+	entry := txnstore.NewInternalEntry(txnstore.CFWrite, []byte("gc-key"), 33, nil, 0, 0)
 	defer entry.DecrRef()
-	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), []*entrykv.Entry{entry})
+	applied, writes, defaults, err := st.ProposeMVCCMaintenance(context.Background(), []*txnstore.Entry{entry})
 	require.ErrorContains(t, err, "not a tombstone")
 	require.Zero(t, applied)
 	require.Zero(t, writes)
 	require.Zero(t, defaults)
 
-	_, err = db.GetInternalEntry(entrykv.CFWrite, []byte("gc-key"), 33)
+	_, err = db.GetInternalEntry(txnstore.CFWrite, []byte("gc-key"), 33)
 	require.Error(t, err)
 }
 

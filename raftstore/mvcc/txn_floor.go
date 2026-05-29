@@ -7,8 +7,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
 )
@@ -33,13 +31,13 @@ func PlanTxnFloor(ctx context.Context, db txnstore.Store) (TxnFloor, error) {
 	if db == nil {
 		return floor, errNilMVCCStore
 	}
-	iter := db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := db.NewInternalIterator(&txnstore.Options{IsAsc: true})
 	if iter == nil {
 		return floor, nil
 	}
 	defer func() { _ = iter.Close() }()
 
-	iter.Seek(entrykv.InternalKey(entrykv.CFLock, nil, entrykv.MaxVersion))
+	iter.Seek(txnstore.InternalKey(txnstore.CFLock, nil, txnstore.MaxVersion))
 	for iter.Valid() {
 		if err := ctx.Err(); err != nil {
 			return floor, err
@@ -50,14 +48,14 @@ func PlanTxnFloor(ctx context.Context, db txnstore.Store) (TxnFloor, error) {
 			continue
 		}
 		entry := item.Entry()
-		cf, userKey, _, ok := entrykv.SplitInternalKey(entry.Key)
+		cf, userKey, _, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			return floor, fmt.Errorf("raftstore/mvcc: expected internal lock key, got %x", entry.Key)
 		}
-		if cf != entrykv.CFLock {
+		if cf != txnstore.CFLock {
 			break
 		}
-		if entry.Meta&entrykv.BitDelete > 0 {
+		if entry.Meta&txnstore.BitDelete > 0 {
 			iter.Next()
 			continue
 		}

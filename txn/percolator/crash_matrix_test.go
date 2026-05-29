@@ -5,14 +5,9 @@ package percolator
 
 import (
 	"errors"
-	"fmt"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/lsm"
-	"github.com/feichai0017/NoKV/engine/vfs"
 	local "github.com/feichai0017/NoKV/local"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/feichai0017/NoKV/txn/latch"
@@ -65,126 +60,41 @@ func TestPercolatorCrashMatrixBatchPrewriteApplyFailureRetries(t *testing.T) {
 	}
 }
 
-func TestPercolatorCrashMatrixAtomicMutateCrossShardFallsBackBeforeFault(t *testing.T) {
+func TestPercolatorCrashMatrixAtomicMutateCrossShardUsesPebbleBatch(t *testing.T) {
 	const shardCount = 4
 
-	workDir := filepath.Join(t.TempDir(), "db")
+	workDir := t.TempDir()
 	startTs := uint64(300)
 	commitTs := uint64(320)
 	dentryKey, inodeKey := keysWithAscendingCommitShards(t, shardCount)
-	dentryShard := lsm.ShardForInternalKey(kv.InternalKey(kv.CFDefault, dentryKey, startTs), shardCount)
-	inodeShard := lsm.ShardForInternalKey(kv.InternalKey(kv.CFDefault, inodeKey, startTs), shardCount)
-	require.NotEqual(t, dentryShard, inodeShard)
-
-	injected := errors.New("atomic mutate cross-shard wal write injected")
-	targetWAL := filepath.Join(workDir, fmt.Sprintf("lsm-wal-%02d", inodeShard), "00001.wal")
-	var armed atomic.Bool
-	var fired atomic.Bool
-	policy := vfs.NewFaultPolicy()
-	policy.SetHook(func(op vfs.Op, path string) error {
-		if op == vfs.OpFileWrite && path == targetWAL && armed.Load() && fired.CompareAndSwap(false, true) {
-			return injected
-		}
-		return nil
-	})
 
 	opt := testOptionsForDir(workDir)
-	opt.LSMShardCount = shardCount
-	opt.FS = vfs.NewFaultFSWithPolicy(vfs.OSFS{}, policy)
+	opt.WriteShardCount = shardCount
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 
 	latches := latch.NewManager(32)
 	req := atomicPutIfAbsentRequest(startTs, commitTs, dentryKey, []byte("dentry-value"), inodeKey, []byte("inode-value"))
 
-	// Cross-shard local writes are not one atomic apply group in the current DB.
-	// The region-local fast path must return fallback before touching WAL, so
-	// the regular Percolator 2PC path remains the only recovery authority.
-	armed.Store(true)
 	result := ApplyAtomicMutate(db, latches, req)
 	require.Nil(t, result.Error)
-	require.True(t, result.Fallback)
-	require.False(t, fired.Load(), "fallback must happen before WAL write on shard %d", inodeShard)
-	_ = db.Close()
-
-	reopenedOpt := testOptionsForDir(workDir)
-	reopenedOpt.LSMShardCount = shardCount
-	db, err = local.Open(reopenedOpt)
-	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
-
-	reader := NewReader(db)
-	for _, key := range [][]byte{dentryKey, inodeKey} {
-		_, _, err := reader.GetValue(key, commitTs+1)
-		require.ErrorIs(t, err, utils.ErrKeyNotFound, "failed fsmeta create must not publish key %q", key)
-	}
-
-	require.Empty(t, Prewrite(db, latches, &kvrpcpb.PrewriteRequest{
-		PrimaryLock:  dentryKey,
-		StartVersion: startTs + 100,
-		LockTtl:      3000,
-		Mutations: []*kvrpcpb.Mutation{
-			{Op: kvrpcpb.Mutation_Put, Key: dentryKey, Value: []byte("dentry-value"), AssertionNotExist: true},
-			{Op: kvrpcpb.Mutation_Put, Key: inodeKey, Value: []byte("inode-value"), AssertionNotExist: true},
-		},
-	}))
-	require.Nil(t, Commit(db, latches, &kvrpcpb.CommitRequest{
-		Keys:          [][]byte{dentryKey, inodeKey},
-		StartVersion:  startTs + 100,
-		CommitVersion: commitTs + 100,
-	}))
-}
-
-func TestPercolatorCrashMatrixAtomicMutateSameShardFailureDoesNotPublishPartialCreate(t *testing.T) {
-	const shardCount = 4
-
-	workDir := filepath.Join(t.TempDir(), "db")
-	startTs := uint64(500)
-	commitTs := uint64(520)
-	dentryKey, inodeKey, shardID := keysWithSameCommitShard(t, shardCount)
-
-	injected := errors.New("atomic mutate same-shard wal write injected")
-	targetWAL := filepath.Join(workDir, fmt.Sprintf("lsm-wal-%02d", shardID), "00001.wal")
-	var armed atomic.Bool
-	var fired atomic.Bool
-	policy := vfs.NewFaultPolicy()
-	policy.SetHook(func(op vfs.Op, path string) error {
-		if op == vfs.OpFileWrite && path == targetWAL && armed.Load() && fired.CompareAndSwap(false, true) {
-			return injected
-		}
-		return nil
-	})
-
-	opt := testOptionsForDir(workDir)
-	opt.LSMShardCount = shardCount
-	opt.FS = vfs.NewFaultFSWithPolicy(vfs.OSFS{}, policy)
-	db, err := local.Open(opt)
-	require.NoError(t, err)
-
-	latches := latch.NewManager(32)
-	req := atomicPutIfAbsentRequest(startTs, commitTs, dentryKey, []byte("dentry-value"), inodeKey, []byte("inode-value"))
-
-	// Same-shard atomic mutate may attempt the fast path. A WAL write failure
-	// happens before the memtable apply, so restart must not expose either key.
-	armed.Store(true)
-	result := ApplyAtomicMutate(db, latches, req)
-	require.NotNil(t, result.Error)
-	require.Contains(t, result.Error.GetRetryable(), injected.Error())
 	require.False(t, result.Fallback)
-	require.True(t, fired.Load(), "expected targeted WAL failure on shard %d", shardID)
+	require.Equal(t, uint64(2), result.AppliedKeys)
 	_ = db.Close()
 
 	reopenedOpt := testOptionsForDir(workDir)
-	reopenedOpt.LSMShardCount = shardCount
+	reopenedOpt.WriteShardCount = shardCount
 	db, err = local.Open(reopenedOpt)
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
 	reader := NewReader(db)
-	for _, key := range [][]byte{dentryKey, inodeKey} {
-		_, _, err := reader.GetValue(key, commitTs+1)
-		require.ErrorIs(t, err, utils.ErrKeyNotFound, "failed atomic mutate must not publish key %q", key)
-	}
+	value, _, err := reader.GetValue(dentryKey, commitTs+1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("dentry-value"), value)
+	value, _, err = reader.GetValue(inodeKey, commitTs+1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("inode-value"), value)
 }
 
 func TestPercolatorCrashMatrixPrimaryCommittedSecondaryRecovered(t *testing.T) {

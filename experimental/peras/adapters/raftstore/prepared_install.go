@@ -6,10 +6,10 @@ package raftstore
 import (
 	"bytes"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 )
 
 const segmentInstallDiagnosticLabel = "peras_segment_install"

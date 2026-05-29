@@ -10,8 +10,8 @@ import (
 	"time"
 
 	coordclient "github.com/feichai0017/NoKV/coordinator/client"
-	"github.com/feichai0017/NoKV/engine/slab/dirpage"
-	"github.com/feichai0017/NoKV/engine/slab/negativecache"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/negativecache"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
 	"github.com/feichai0017/NoKV/fsmeta/model"

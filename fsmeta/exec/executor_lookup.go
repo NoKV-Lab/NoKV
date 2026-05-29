@@ -9,8 +9,8 @@ import (
 	"fmt"
 
 	xxhash "github.com/cespare/xxhash/v2"
-	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"

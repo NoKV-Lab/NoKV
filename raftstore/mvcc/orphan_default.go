@@ -7,9 +7,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-
-	"github.com/feichai0017/NoKV/engine/index"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
 )
 
@@ -40,12 +37,12 @@ type OrphanDefaultStats struct {
 // ApplyOrphanDefaultsReplicated deletes orphan CFDefault records through a
 // replicated maintenance command. Use this path for cluster-mode stores.
 func ApplyOrphanDefaultsReplicated(ctx context.Context, db txnstore.Store, proposer MaintenanceProposer, opt OrphanDefaultOptions) (OrphanDefaultStats, error) {
-	return applyOrphanDefaultsWith(ctx, db, opt, func(ctx context.Context, entries []*entrykv.Entry) (maintenanceSubmitResult, error) {
+	return applyOrphanDefaultsWith(ctx, db, opt, func(ctx context.Context, entries []*txnstore.Entry) (maintenanceSubmitResult, error) {
 		return proposeMaintenanceEntries(ctx, proposer, entries)
 	})
 }
 
-type orphanDefaultSubmitFn func(context.Context, []*entrykv.Entry) (maintenanceSubmitResult, error)
+type orphanDefaultSubmitFn func(context.Context, []*txnstore.Entry) (maintenanceSubmitResult, error)
 
 func applyOrphanDefaultsWith(ctx context.Context, db txnstore.Store, opt OrphanDefaultOptions, submit orphanDefaultSubmitFn) (OrphanDefaultStats, error) {
 	var stats OrphanDefaultStats
@@ -77,7 +74,7 @@ func applyOrphanDefaultsWith(ctx context.Context, db txnstore.Store, opt OrphanD
 
 type orphanDefaultBatch struct {
 	scan        OrphanDefaultStats
-	entries     []*entrykv.Entry
+	entries     []*txnstore.Entry
 	lastUserKey []byte
 	lastVersion uint64
 	done        bool
@@ -88,7 +85,7 @@ func collectOrphanDefaultBatch(ctx context.Context, db txnstore.Store, afterUser
 	if db == nil {
 		return batch, errNilMVCCStore
 	}
-	iter := db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := db.NewInternalIterator(&txnstore.Options{IsAsc: true})
 	if iter == nil {
 		batch.done = true
 		return batch, nil
@@ -106,17 +103,17 @@ func collectOrphanDefaultBatch(ctx context.Context, db txnstore.Store, afterUser
 			continue
 		}
 		entry := item.Entry()
-		cf, userKey, startTs, ok := entrykv.SplitInternalKey(entry.Key)
+		cf, userKey, startTs, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			return batch, fmt.Errorf("raftstore/mvcc: expected internal default key, got %x", entry.Key)
 		}
-		if cf != entrykv.CFDefault {
+		if cf != txnstore.CFDefault {
 			batch.done = true
 			return batch, nil
 		}
-		batch.lastUserKey = entrykv.SafeCopy(batch.lastUserKey, userKey)
+		batch.lastUserKey = txnstore.SafeCopy(batch.lastUserKey, userKey)
 		batch.lastVersion = startTs
-		if entry.Meta&entrykv.BitDelete > 0 {
+		if entry.Meta&txnstore.BitDelete > 0 {
 			batch.scan.DeletedDefaultMarkers++
 			iter.Next()
 			continue
@@ -132,7 +129,7 @@ func collectOrphanDefaultBatch(ctx context.Context, db txnstore.Store, afterUser
 			continue
 		}
 		batch.scan.OrphanDefaults++
-		batch.entries = append(batch.entries, entrykv.NewInternalEntry(entrykv.CFDefault, userKey, startTs, nil, entrykv.BitDelete, 0))
+		batch.entries = append(batch.entries, txnstore.NewInternalEntry(txnstore.CFDefault, userKey, startTs, nil, txnstore.BitDelete, 0))
 		iter.Next()
 		if len(batch.entries) >= maxEntries {
 			return batch, nil
@@ -155,20 +152,20 @@ func defaultHasOwner(db txnstore.Store, userKey []byte, startTs uint64) (bool, e
 	return lock != nil && lock.Ts == startTs, nil
 }
 
-func seekDefaultStart(iter index.Iterator, afterUserKey []byte, afterVersion uint64) {
+func seekDefaultStart(iter txnstore.Iterator, afterUserKey []byte, afterVersion uint64) {
 	if len(afterUserKey) == 0 {
-		iter.Seek(entrykv.InternalKey(entrykv.CFDefault, nil, entrykv.MaxVersion))
+		iter.Seek(txnstore.InternalKey(txnstore.CFDefault, nil, txnstore.MaxVersion))
 		return
 	}
-	iter.Seek(entrykv.InternalKey(entrykv.CFDefault, afterUserKey, afterVersion))
+	iter.Seek(txnstore.InternalKey(txnstore.CFDefault, afterUserKey, afterVersion))
 	for iter.Valid() {
 		item := iter.Item()
 		if item == nil || item.Entry() == nil {
 			iter.Next()
 			continue
 		}
-		cf, userKey, version, ok := entrykv.SplitInternalKey(item.Entry().Key)
-		if !ok || cf != entrykv.CFDefault || !bytes.Equal(userKey, afterUserKey) || version != afterVersion {
+		cf, userKey, version, ok := txnstore.SplitInternalKey(item.Entry().Key)
+		if !ok || cf != txnstore.CFDefault || !bytes.Equal(userKey, afterUserKey) || version != afterVersion {
 			return
 		}
 		iter.Next()

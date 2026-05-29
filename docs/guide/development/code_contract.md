@@ -46,12 +46,14 @@ Package boundaries follow ownership of truth, not convenience.
 
 | Package | Owns | Must Not Do |
 | --- | --- | --- |
-| `engine/` | Single-node storage engine internals. | Import distributed control-plane, fsmeta, raftstore, or global error taxonomy. |
+| `storage/kv/` | Raw ordered key/value backend contract. | Expose MVCC, fsmeta, raftstore, migration, SST, or protobuf semantics. |
+| `storage/pebble/`, `storage/memory/` | Concrete raw ordered KV backends. | Own MVCC timestamps, column families, transactions, fsmeta layout, raftstore routing, or migration policy. |
+| `storage/wal/`, `storage/file/`, `storage/vfs/` | Low-level file, WAL, and VFS support for concrete runtime internals. | Become public fsmeta, txn, raftstore, or migration contracts. |
 | `local/` | Embedded DB facade and local runtime assembly. | Know fsmeta, coordinator, root, or raftstore semantics. |
+| `txn/storage/` | MVCC internal keys, column families, timestamp encoding, entries, and transaction storage contract. | Import Percolator, raftstore, fsmeta, coordinator, root, or concrete storage backends. |
 | `txn/` | Transaction protocol layers. | Let `mvcc`, `storage`, or `latch` depend on Percolator or raftstore. |
 | `raftstore/` | Region Raft execution and data-plane apply. | Interpret fsmeta namespace semantics. |
-| `raftstore/snapshot/` | Backend-neutral region snapshot protocol for migration and peer bootstrap. | Import engine, local DB, or SST-specific table/manifest implementations. |
-| `raftstore/snapshot/sst/` | LSM external-SST region snapshot export, streaming, ingest, and rollback implementation. | Become a generic fsmeta/backend or raftstore/snapshot contract. |
+| `raftstore/snapshot/` | Raftstore-internal MVCC entry snapshot protocol for peer bootstrap and raft snapshot apply. | Import concrete storage engines, local DB, fsmeta, migration, or SST/table/manifest implementations. |
 | `meta/root/` | Rooted truth for authority, topology, grants, seals, and lifecycle facts. | Import coordinator service/client packages. |
 | `coordinator/` | Rebuildable control-plane view, routing, and service orchestration. | Become the source of truth for rooted facts. |
 | `fsmeta/model/` | Storage-engine-neutral namespace model: inode/dentry records, operation request/result shapes, and model validation. | Import key/value layout, protobuf, raftstore, coordinator, root, Peras, or concrete backend packages. |
@@ -79,21 +81,25 @@ Every new package must have a clear owner and one sentence of responsibility in
 
 The current responsibility map is:
 
-- `engine/*`: bytes, tables, manifests, WAL, indexes, VFS, compaction. It does
-  not know regions, root authority, fsmeta, or transactions.
-- `local/*`: embedded DB assembly around engine primitives. It may collect
-  local stats, but it does not own distributed truth.
+- `storage/kv/*`: raw ordered KV contract only.
+- `storage/pebble/*`: default Pebble-backed raw KV implementation.
+- `storage/memory/*`: test raw KV implementation.
+- `storage/wal`, `storage/file`, `storage/vfs`: low-level support packages used
+  by concrete runtimes. They are not fsmeta or migration contracts.
+- `fsmeta/cache/*`: derived namespace sidecar caches such as dirpage and
+  negative-cache slabs. They can be rebuilt and do not own authoritative
+  namespace truth.
+- `local/*`: embedded DB assembly around the raw storage backend, NoKV MVCC key
+  encoding, local stats, workdir mode, and commit queues. It may collect local
+  stats, but it does not own distributed truth.
 - `txn/mvcc`, `txn/storage`, `txn/latch`: reusable transaction building blocks.
   They remain protocol-neutral.
 - `txn/percolator`: 2PC/MVCC protocol logic on top of transaction primitives.
-- `raftstore/*`: replicated region execution, apply, split/merge, migration,
-  and internal install commands.
-- `raftstore/snapshot/*`: backend-neutral region snapshot descriptors and
-  streaming protocol. SST manifests, table files, file IDs, compatibility
-  checks, and rollback details live under `raftstore/snapshot/sst/*`.
-- `raftstore/migrate/*`: operator migration workflow. It may call concrete
-  snapshot implementations such as SST, but migration is not a generic fsmeta
-  backend capability.
+- `raftstore/*`: replicated region execution, apply, split/merge, peer
+  lifecycle, and internal install commands.
+- `raftstore/snapshot/*`: raftstore-internal MVCC entry snapshot payloads for
+  peer bootstrap and raft snapshot apply. Operator migration and SST fast paths
+  are not part of the mainline backend contract.
 - `meta/root/*`: rooted truth for cluster and metadata authority facts.
 - `coordinator/*`: rebuildable serving layer over root facts.
 - `fsmeta/model/*`: storage-engine-neutral inode/dentry/session/quota/snapshot
@@ -102,8 +108,9 @@ The current responsibility map is:
   and operation key plans for ordered storage backends.
 - `fsmeta/backend/*`: minimal MVCC metadata backend contract. It contains
   backend-neutral key/value, mutation, predicate, atomic mutation, and stats
-  surfaces only. Migration, SST ingest/export, LSM diagnostics, and raftstore
-  RPC conversion remain in concrete runtime or operations packages.
+  surfaces only. Migration, SST ingest/export, LSM diagnostics, raw storage
+  stats, and raftstore RPC conversion remain in concrete runtime or operations
+  packages.
 - `fsmeta/observe/*`: runtime-neutral watch and snapshot observation surfaces.
 - `fsmeta/*`: package-level architecture anchor only.
 - `fsmeta/exec/*`: semantic compiler, executor, and runtime-neutral holder

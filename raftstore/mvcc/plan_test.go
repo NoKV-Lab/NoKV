@@ -8,12 +8,12 @@ import (
 	"errors"
 	"testing"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	local "github.com/feichai0017/NoKV/local"
 	rootstate "github.com/feichai0017/NoKV/meta/root/state"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	storemvcc "github.com/feichai0017/NoKV/raftstore/mvcc"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 )
 

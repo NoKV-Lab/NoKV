@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/lsm"
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -18,12 +16,12 @@ import (
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	raftcmdpb "github.com/feichai0017/NoKV/pb/raft"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	local "github.com/feichai0017/NoKV/local"
 	myraft "github.com/feichai0017/NoKV/raft"
 	"github.com/feichai0017/NoKV/raftstore/command"
 	"github.com/feichai0017/NoKV/txn/mvcc"
 	"github.com/feichai0017/NoKV/txn/percolator"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -336,7 +334,7 @@ func TestNewApplierRejectsFsmetaWritesWhenVisibleAuthorityViewIsStale(t *testing
 func TestNewBatchApplierSplitsAroundFencedVisibleAuthorityWrite(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -386,7 +384,7 @@ func TestNewBatchApplierSplitsAroundFencedVisibleAuthorityWrite(t *testing.T) {
 func TestApplyTryAtomicMutateCommandMaterializesBothKeys(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -426,7 +424,7 @@ func TestApplyTryAtomicMutateCommandMaterializesBothKeys(t *testing.T) {
 func TestApplyTryAtomicMutateBatchFusesLocalApply(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -460,7 +458,7 @@ func TestApplyTryAtomicMutateBatchFusesLocalApply(t *testing.T) {
 func TestApplyBatchFusesTryAtomicMutateAcrossRaftRequests(t *testing.T) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.LSMShardCount = 1
+	opt.WriteShardCount = 1
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -536,19 +534,19 @@ func TestApplyPrewriteBatchFusesLocalApply(t *testing.T) {
 	require.Equal(t, []int{2}, store.appliedEntryCounts)
 }
 
-func TestApplyTryAtomicMutateCommandFallsBackForCrossShardBatch(t *testing.T) {
+func TestApplyTryAtomicMutateCommandAppliesCrossShardPebbleBatch(t *testing.T) {
 	const shardCount = 4
 
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.LSMShardCount = shardCount
+	opt.WriteShardCount = shardCount
 	db, err := local.Open(opt)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
 	startVersion := uint64(30)
 	commitVersion := uint64(31)
-	dentryKey, inodeKey := keysWithDifferentDefaultShardsForApplyTest(t, shardCount, startVersion)
+	dentryKey, inodeKey := keysWithDifferentDefaultShardsForApplyTest(t, shardCount)
 	resp, err := Apply(db, nil, &raftcmdpb.RaftCmdRequest{
 		Requests: []*raftcmdpb.Request{{
 			CmdType: raftcmdpb.CmdType_CMD_TRY_ATOMIC_MUTATE,
@@ -571,14 +569,16 @@ func TestApplyTryAtomicMutateCommandFallsBackForCrossShardBatch(t *testing.T) {
 	atomicResp := resp.GetResponses()[0].GetTryAtomicMutate()
 	require.NotNil(t, atomicResp)
 	require.Nil(t, atomicResp.GetError())
-	require.True(t, atomicResp.GetFallbackToTwoPhaseCommit())
-	require.Zero(t, atomicResp.GetAppliedKeys())
+	require.False(t, atomicResp.GetFallbackToTwoPhaseCommit())
+	require.Equal(t, uint64(2), atomicResp.GetAppliedKeys())
 
 	reader := percolator.NewReader(db)
-	for _, key := range [][]byte{dentryKey, inodeKey} {
-		_, _, err := reader.GetValue(key, commitVersion)
-		require.ErrorIs(t, err, utils.ErrKeyNotFound)
-	}
+	value, _, err := reader.GetValue(dentryKey, commitVersion)
+	require.NoError(t, err)
+	require.Equal(t, []byte("ino=42"), value)
+	value, _, err = reader.GetValue(inodeKey, commitVersion)
+	require.NoError(t, err)
+	require.Equal(t, []byte("attrs"), value)
 }
 
 func atomicPutForApplyTest(startVersion, commitVersion uint64, key, value []byte) *kvrpcpb.TryAtomicMutateRequest {
@@ -644,16 +644,16 @@ func (s *countingAtomicApplyStore) GetInternalEntry(cf entrykv.ColumnFamily, key
 	return s.base.GetInternalEntry(cf, key, version)
 }
 
-func (s *countingAtomicApplyStore) NewInternalIterator(opt *index.Options) index.Iterator {
+func (s *countingAtomicApplyStore) NewInternalIterator(opt *entrykv.Options) entrykv.Iterator {
 	return s.base.NewInternalIterator(opt)
 }
 
-func keysWithDifferentDefaultShardsForApplyTest(t *testing.T, shardCount int, version uint64) ([]byte, []byte) {
+func keysWithDifferentDefaultShardsForApplyTest(t *testing.T, shardCount int) ([]byte, []byte) {
 	t.Helper()
 	keysByShard := make([][]byte, shardCount)
 	for i := range 10000 {
 		key := fmt.Appendf(nil, "apply-atomic-%d", i)
-		shardID := lsm.ShardForInternalKey(entrykv.InternalKey(entrykv.CFDefault, key, version), shardCount)
+		shardID := utils.ShardForUserKey(key, shardCount)
 		if shardID >= 0 && shardID < shardCount && keysByShard[shardID] == nil {
 			keysByShard[shardID] = key
 		}
@@ -757,7 +757,7 @@ func (s *failingMaintenanceStore) GetInternalEntry(entrykv.ColumnFamily, []byte,
 	return nil, errors.New("not implemented")
 }
 
-func (s *failingMaintenanceStore) NewInternalIterator(*index.Options) index.Iterator {
+func (s *failingMaintenanceStore) NewInternalIterator(*entrykv.Options) entrykv.Iterator {
 	return nil
 }
 

@@ -6,25 +6,23 @@
 // associated ack lifecycle. The Pipeline owns its queue + dispatch
 // state; the Host interface is the (intentionally narrow) set of DB
 // hooks the pipeline calls into for actual storage operations
-// (LSM.SetBatchGroup, WAL.Sync) and for read-only state
+// (commit-store batch apply and Sync) and for read-only state
 // signals (block/slow-write throttle, hot-key tracking, write metrics).
 //
 // The hot path is fan-out by per-shard channel: the dispatcher pulls
 // each batch off the MPSC queue and routes it to one shard's processor
 // using key-affinity hashing. The processor coalesces a burst of
-// batches arriving on its channel into a single LSM.SetBatchGroup +
+// batches arriving on its channel into a single commit-store SetBatchGroup +
 // (optional) Sync, then acks each originating
 // batch with the per-batch failedAt fanned back out.
 package commit
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/wal"
 	"github.com/feichai0017/NoKV/metrics"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 	pkgerrors "github.com/pkg/errors"
 )
@@ -43,18 +41,17 @@ type Config struct {
 	UserKeyShardKey    func(userKey []byte) []byte
 }
 
-// LSM is the narrow LSM surface the pipeline writes through. Implemented
-// by engine/lsm.LSM.
-type LSM interface {
+// CommitStore is the narrow commit-store surface the pipeline writes through.
+type CommitStore interface {
 	SetBatchGroup(shardID int, groups [][]*kv.Entry) (int, error)
+	Sync() error
 	ThrottleRateBytesPerSec() uint64
 }
 
 // Host wires the Pipeline back into its DB. The interface stays read-only so
-// write admission and LSM apply remain owned by the pipeline.
+// write admission and CommitStore apply remain owned by the pipeline.
 type Host interface {
-	CommitLSM() LSM
-	LSMWALs() []*wal.Manager
+	CommitStore() CommitStore
 	WriteMetrics() *metrics.WriteMetrics
 
 	// Throttle/lifecycle indicators consulted by Send before queueing.
@@ -149,7 +146,7 @@ func (p *Pipeline) Send(entries []*kv.Entry, waitOnThrottle bool) (*Request, err
 		return nil, utils.ErrTxnTooBig
 	}
 	if p.host.SlowWritesActive() {
-		if lsmSrc := p.host.CommitLSM(); lsmSrc != nil {
+		if lsmSrc := p.host.CommitStore(); lsmSrc != nil {
 			if d := SlowdownDelay(size, lsmSrc.ThrottleRateBytesPerSec()); d > 0 {
 				time.Sleep(d)
 			}
@@ -355,7 +352,7 @@ func routeUserKeyToShard(userKey []byte, shardCount int, shardKey func([]byte) [
 }
 
 // processor runs the per-batch CPU pipeline (collect -> applyRequests ->
-// ack) for batches pinned to one LSM shard. The
+// ack) for batches pinned to one CommitStore shard. The
 // processor owns its shard end-to-end: WAL append, memtable apply, and
 // (when sync is inline) WAL fsync all hit one Manager, so there is no
 // Manager.mu contention across processors.
@@ -363,14 +360,13 @@ func routeUserKeyToShard(userKey []byte, shardCount int, shardKey func([]byte) [
 // Burst coalescing: when the dispatcher delivers small batches faster
 // than the processor can drain them, the processor pulls every batch
 // already sitting in its channel and merges them into a single
-// LSM.SetBatchGroup + (optional) Sync. That collapses N
+// CommitStore.SetBatchGroup + (optional) Sync. That collapses N
 // fsync/flush syscalls into one per burst. SetBatch atomicity is
-// preserved because each batch's groups are still atomic (LSM
+// preserved because each batch's groups are still atomic (CommitStore
 // processes them in order with per-group atomicity); failedAt from the
 // merged apply is fanned back out to the originating batches.
 func (p *Pipeline) processor(shardID int) {
 	defer p.wg.Done()
-	walMgr := p.host.LSMWALs()[shardID]
 	burst := make([]*CommitBatch, 0, 8)
 	for first := range p.dispatch[shardID] {
 		burst = burst[:0]
@@ -388,13 +384,13 @@ func (p *Pipeline) processor(shardID int) {
 				break drain
 			}
 		}
-		p.runBurst(walMgr, shardID, burst)
+		p.runBurst(shardID, burst)
 	}
 }
 
 // runBurst processes a burst of batches as a single WAL append +
 // memtable apply, then fans the result back to each batch for ack.
-func (p *Pipeline) runBurst(walMgr *wal.Manager, shardID int, burst []*CommitBatch) {
+func (p *Pipeline) runBurst(shardID int, burst []*CommitBatch) {
 	if len(burst) == 0 {
 		return
 	}
@@ -403,7 +399,7 @@ func (p *Pipeline) runBurst(walMgr *wal.Manager, shardID int, burst []*CommitBat
 	// high N the dispatcher rarely buffers more than one batch per shard
 	// and the merge cost dominates the savings.
 	if len(burst) == 1 {
-		p.runSingle(walMgr, shardID, burst[0])
+		p.runSingle(shardID, burst[0])
 		return
 	}
 	burstStart := time.Now()
@@ -478,7 +474,7 @@ func (p *Pipeline) runBurst(walMgr *wal.Manager, shardID int, burst []*CommitBat
 	syncErr := applyErr
 	if applyErr == nil && p.cfg.SyncWrites {
 		syncStart := time.Now()
-		syncErr = walMgr.Sync()
+		syncErr = p.host.CommitStore().Sync()
 		if wm != nil {
 			wm.RecordSync(time.Since(syncStart), len(burst))
 		}
@@ -499,7 +495,7 @@ func (p *Pipeline) runBurst(walMgr *wal.Manager, shardID int, burst []*CommitBat
 // runSingle is the burst-size-1 fast path. It mirrors the per-batch
 // pipeline (no merge / boundaries / per-batch failedAt fan-out) to
 // eliminate coalesce overhead when there is no extra batch to drain.
-func (p *Pipeline) runSingle(walMgr *wal.Manager, shardID int, batch *CommitBatch) {
+func (p *Pipeline) runSingle(shardID int, batch *CommitBatch) {
 	wm := p.host.WriteMetrics()
 	batch.BatchStart = time.Now()
 	requests, totalEntries, totalSize, waitSum := collectCommitRequests(batch.Reqs, batch.BatchStart)
@@ -531,7 +527,7 @@ func (p *Pipeline) runSingle(walMgr *wal.Manager, shardID int, batch *CommitBatc
 
 	if err == nil && p.cfg.SyncWrites {
 		syncStart := time.Now()
-		err = walMgr.Sync()
+		err = p.host.CommitStore().Sync()
 		if wm != nil {
 			wm.RecordSync(time.Since(syncStart), 1)
 		}
@@ -549,11 +545,8 @@ func (p *Pipeline) runSingle(walMgr *wal.Manager, shardID int, batch *CommitBatc
 
 func (p *Pipeline) syncWorker() {
 	defer p.syncWG.Done()
-	wals := p.host.LSMWALs()
 	wm := p.host.WriteMetrics()
 	pending := make([]*SyncBatch, 0, 64)
-	// per-shard buckets so one fsync covers many batches on the same WAL
-	buckets := make(map[int][]*SyncBatch, len(wals))
 	for first := range p.syncQueue {
 		pending = append(pending, first)
 	drain:
@@ -569,32 +562,15 @@ func (p *Pipeline) syncWorker() {
 			}
 		}
 
-		for _, sb := range pending {
-			buckets[sb.ShardID] = append(buckets[sb.ShardID], sb)
-		}
 		syncStart := time.Now()
-		errsByShard := make(map[int]error, len(buckets))
-		for shardID, sbs := range buckets {
-			if len(sbs) == 0 {
-				continue
-			}
-			mgr := wals[shardID]
-			if mgr == nil {
-				errsByShard[shardID] = fmt.Errorf("commit: lsm wal shard %d not initialized", shardID)
-				continue
-			}
-			errsByShard[shardID] = mgr.Sync()
-		}
+		syncErr := p.host.CommitStore().Sync()
 		if wm != nil {
 			wm.RecordSync(time.Since(syncStart), len(pending))
 		}
 		for _, sb := range pending {
-			p.ackBatch(sb.Reqs, sb.Pool, sb.Requests, sb.FailedAt, errsByShard[sb.ShardID])
+			p.ackBatch(sb.Reqs, sb.Pool, sb.Requests, sb.FailedAt, syncErr)
 		}
 		pending = pending[:0]
-		for k := range buckets {
-			buckets[k] = buckets[k][:0]
-		}
 	}
 }
 
@@ -656,7 +632,7 @@ func (p *Pipeline) releaseBatch(batch *CommitBatch) {
 	p.batchPool.Put(batch.Pool)
 }
 
-// ApplyRequests writes reqs into LSM shard shardID. Exported so root-package
+// ApplyRequests writes reqs into CommitStore shard shardID. Exported so root-package
 // integration tests can drive the apply path directly without going through
 // the queue.
 func (p *Pipeline) ApplyRequests(reqs []*Request, shardID int) (int, error) {
@@ -664,7 +640,7 @@ func (p *Pipeline) ApplyRequests(reqs []*Request, shardID int) (int, error) {
 }
 
 func (p *Pipeline) applyRequests(reqs []*Request, shardID int) (int, error) {
-	failedAt, err := p.writeRequestsToLSM(reqs, shardID)
+	failedAt, err := p.writeRequestsToStore(reqs, shardID)
 	if err != nil {
 		return failedAt, pkgerrors.Wrap(err, "writeRequests")
 	}
@@ -699,15 +675,15 @@ func finishCommitRequests(reqs []*CommitRequest, defaultErr error, perReqErr map
 	}
 }
 
-func (p *Pipeline) writeRequestsToLSM(reqs []*Request, shardID int) (int, error) {
+func (p *Pipeline) writeRequestsToStore(reqs []*Request, shardID int) (int, error) {
 	groups := make([][]*kv.Entry, 0, len(reqs))
 	groupToReq := make([]int, 0, len(reqs))
 	for i, r := range reqs {
 		if r == nil || len(r.Entries) == 0 {
 			continue
 		}
-		if err := prepareLSMRequest(r); err != nil {
-			// Nothing has reached the LSM yet, so the whole commit batch must fail.
+		if err := prepareStoreRequest(r); err != nil {
+			// Nothing has reached the CommitStore yet, so the whole commit batch must fail.
 			return 0, err
 		}
 		groups = append(groups, r.Entries)
@@ -716,7 +692,7 @@ func (p *Pipeline) writeRequestsToLSM(reqs []*Request, shardID int) (int, error)
 	if len(groups) == 0 {
 		return -1, nil
 	}
-	failedGroup, err := p.host.CommitLSM().SetBatchGroup(shardID, groups)
+	failedGroup, err := p.host.CommitStore().SetBatchGroup(shardID, groups)
 	if err != nil {
 		if failedGroup >= 0 && failedGroup < len(groupToReq) {
 			return groupToReq[failedGroup], err
@@ -726,6 +702,6 @@ func (p *Pipeline) writeRequestsToLSM(reqs []*Request, shardID int) (int, error)
 	return -1, nil
 }
 
-func prepareLSMRequest(b *Request) error {
+func prepareStoreRequest(b *Request) error {
 	return nil
 }

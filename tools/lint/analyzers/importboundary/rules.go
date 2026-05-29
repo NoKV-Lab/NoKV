@@ -108,10 +108,42 @@ var Rules = []Rule{
 		},
 	},
 	{
-		Name:          "embedded engine stays free of global error taxonomy",
-		PackagePrefix: ModulePath + "/engine",
+		Name:          "raw storage contract stays semantics-free",
+		PackagePrefix: ModulePath + "/storage/kv",
 		Forbidden: []string{
 			ModulePath + "/errors",
+			ModulePath + "/fsmeta",
+			ModulePath + "/txn",
+			ModulePath + "/raftstore",
+			ModulePath + "/coordinator",
+			ModulePath + "/meta/root",
+			ModulePath + "/pb",
+		},
+	},
+	{
+		Name:          "raw storage engines stay below MVCC and distributed semantics",
+		PackagePrefix: ModulePath + "/storage/pebble",
+		Forbidden: []string{
+			ModulePath + "/errors",
+			ModulePath + "/fsmeta",
+			ModulePath + "/txn",
+			ModulePath + "/raftstore",
+			ModulePath + "/coordinator",
+			ModulePath + "/meta/root",
+			ModulePath + "/pb",
+		},
+	},
+	{
+		Name:          "memory storage engines stay below MVCC and distributed semantics",
+		PackagePrefix: ModulePath + "/storage/memory",
+		Forbidden: []string{
+			ModulePath + "/errors",
+			ModulePath + "/fsmeta",
+			ModulePath + "/txn",
+			ModulePath + "/raftstore",
+			ModulePath + "/coordinator",
+			ModulePath + "/meta/root",
+			ModulePath + "/pb",
 		},
 	},
 	{
@@ -137,7 +169,6 @@ var Rules = []Rule{
 		PackagePrefix: ModulePath + "/fsmeta/backend",
 		Forbidden: []string{
 			ModulePath + "/pb",
-			ModulePath + "/engine",
 			ModulePath + "/local",
 			ModulePath + "/raftstore",
 			ModulePath + "/coordinator",
@@ -157,8 +188,12 @@ var Rules = []Rule{
 		PackagePrefix: ModulePath + "/raftstore/snapshot",
 		PackageExact:  true,
 		Forbidden: []string{
-			ModulePath + "/engine",
+			ModulePath + "/storage/pebble",
+			ModulePath + "/storage/memory",
+			ModulePath + "/storage/wal",
+			ModulePath + "/storage/file",
 			ModulePath + "/local",
+			ModulePath + "/fsmeta",
 		},
 	},
 	{

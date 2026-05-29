@@ -12,11 +12,9 @@ benchmark script (`scripts/run_benchmarks.sh`).
 
 The benchmark harness uses the YCSB workloads (A/B/C/D/E/F) to exercise NoKV,
 Badger, and Pebble by default (RocksDB is optional via build tags) with a fixed total operation count and report both
-throughput and latency percentiles. The default `nokv` engine tracks the
-project default memtable configuration (`art`); for explicit memtable
-comparisons, NoKV can also be split into `nokv-skiplist` and `nokv-art`
-variants. The default script runs a load phase to seed data, then executes each
-workload and collects:
+throughput and latency percentiles. The default `nokv` engine uses the local
+Pebble-backed NoKV runtime. The default script runs a load phase to seed data,
+then executes each workload and collects:
 - Ops/s, average latency, and latency percentiles (P50/P95/P99)
 - Operation mix counts (reads, updates, inserts, scans, read-modify-write)
 - Value size stats and total data size
@@ -49,8 +47,7 @@ flowchart TD
 Key components:
 
 - Engine interface: `benchmark/ycsb/ycsb_engine.go` defines `Read/Insert/Update/Scan`
-  and per-engine implementations live in `benchmark/ycsb/ycsb_engine_*` (including
-  `nokv-skiplist` / `nokv-art` for memtable-only comparisons).
+  and per-engine implementations live in `benchmark/ycsb/ycsb_engine_*`.
 - Engine profiles: each engine is constructed from an explicit benchmark
   profile in `benchmark/ycsb/ycsb_profiles.go`; the harness does not inherit
   `local.NewDefaultOptions()` or `badger.DefaultOptions()` implicitly, which

@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/coordinator/storecontrol"
-	"github.com/feichai0017/NoKV/engine/index"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	local "github.com/feichai0017/NoKV/local"
 	metaregion "github.com/feichai0017/NoKV/meta/region"
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
@@ -30,10 +28,10 @@ import (
 	"github.com/feichai0017/NoKV/raftstore/peer"
 	"github.com/feichai0017/NoKV/raftstore/raftlog"
 	serverpkg "github.com/feichai0017/NoKV/raftstore/server"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	raftstorestats "github.com/feichai0017/NoKV/raftstore/stats"
 	storepkg "github.com/feichai0017/NoKV/raftstore/store"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -46,9 +44,8 @@ func TestNodeStartsKVService(t *testing.T) {
 	db, _ := openTestDB(t)
 	node, err := serverpkg.NewNode(serverpkg.Config{
 		Storage: serverpkg.Storage{
-			MVCC:     db,
-			Raft:     raftlog.NewDBLog(db),
-			Snapshot: snapshotpkg.NewDBStore(db),
+			MVCC: db,
+			Raft: raftlog.NewDBLog(db),
 		},
 		Store: storepkg.Config{
 			StoreID: 1,
@@ -81,9 +78,8 @@ func TestNodePreservesConfiguredAdvertiseAddrs(t *testing.T) {
 	scheduler := &captureScheduler{}
 	node, err := serverpkg.NewNode(serverpkg.Config{
 		Storage: serverpkg.Storage{
-			MVCC:     db,
-			Raft:     raftlog.NewDBLog(db),
-			Snapshot: snapshotpkg.NewDBStore(db),
+			MVCC: db,
+			Raft: raftlog.NewDBLog(db),
 		},
 		Store: storepkg.Config{
 			StoreID:           1,
@@ -114,9 +110,8 @@ func TestNodeAutoStartsMVCCMaintenanceWorker(t *testing.T) {
 
 	node, err := serverpkg.NewNode(serverpkg.Config{
 		Storage: serverpkg.Storage{
-			MVCC:     db,
-			Raft:     raftlog.NewDBLog(db),
-			Snapshot: snapshotpkg.NewDBStore(db),
+			MVCC: db,
+			Raft: raftlog.NewDBLog(db),
 		},
 		Store: storepkg.Config{
 			StoreID:   1,
@@ -171,7 +166,7 @@ func TestNodeAutoStartsMVCCMaintenanceWorker(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
-func TestNodeRequiresSnapshotStorage(t *testing.T) {
+func TestNodeDerivesSnapshotStorageFromMVCC(t *testing.T) {
 	node, err := serverpkg.NewNode(serverpkg.Config{
 		Storage: serverpkg.Storage{
 			MVCC: fakeMVCCStore{},
@@ -182,9 +177,9 @@ func TestNodeRequiresSnapshotStorage(t *testing.T) {
 		},
 		TransportAddr: "127.0.0.1:0",
 	})
-	require.Nil(t, node)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "snapshot storage")
+	require.NoError(t, err)
+	require.NotNil(t, node)
+	require.NoError(t, node.Close())
 }
 
 func applyServerMVCCPutVersion(t *testing.T, db *local.DB, key []byte, commitTs, startTs uint64, value string) {
@@ -235,9 +230,8 @@ func TestNodeStartsRaftAdminService(t *testing.T) {
 	db, localMeta := openTestDB(t)
 	node, err := serverpkg.NewNode(serverpkg.Config{
 		Storage: serverpkg.Storage{
-			MVCC:     db,
-			Raft:     raftlog.NewDBLog(db),
-			Snapshot: snapshotpkg.NewDBStore(db),
+			MVCC: db,
+			Raft: raftlog.NewDBLog(db),
 		},
 		Store: storepkg.Config{
 			StoreID:   1,
@@ -353,9 +347,8 @@ func TestNodeWithClientTwoPhaseCommit(t *testing.T) {
 
 		node, err := serverpkg.NewNode(serverpkg.Config{
 			Storage: serverpkg.Storage{
-				MVCC:     db,
-				Raft:     raftlog.NewDBLog(db),
-				Snapshot: snapshotpkg.NewDBStore(db),
+				MVCC: db,
+				Raft: raftlog.NewDBLog(db),
 			},
 			Store: storepkg.Config{
 				StoreID:   nodes[i].storeID,
@@ -447,7 +440,7 @@ func (fakeMVCCStore) ApplyInternalEntries(entries []*entrykv.Entry) error { retu
 func (fakeMVCCStore) GetInternalEntry(cf entrykv.ColumnFamily, key []byte, version uint64) (*entrykv.Entry, error) {
 	return nil, fmt.Errorf("not implemented")
 }
-func (fakeMVCCStore) NewInternalIterator(opt *index.Options) index.Iterator { return nil }
+func (fakeMVCCStore) NewInternalIterator(opt *entrykv.Options) entrykv.Iterator { return nil }
 
 type fakeRaftLog struct{}
 

@@ -113,11 +113,11 @@ listing, atomic rename, overwrite publish, subtree move, snapshot, watch, writer
 sessions, quota, and remove. Applications do not have to rediscover those
 protocols with ad hoc `Get` / `Put` / `Scan` sequences.
 
-### Tunable local engine
+### Local-first metadata runtime
 
-NoKV ships with its own embedded KV engine, WAL, LSM, MVCC, transaction path,
-watch plumbing, and metadata executor. The default development path is local
-and self-contained:
+NoKV ships with a local fsmeta runtime, NoKV MVCC encoding, transaction path,
+watch plumbing, and a default Pebble-backed raw ordered-KV backend. The default
+development path is local and self-contained:
 
 ```text
 application / SDK
@@ -273,21 +273,17 @@ multi-host production.
 | A complete distributed filesystem | CephFS, JuiceFS | NoKV is not a filesystem. It can provide the metadata substrate a filesystem-shaped frontend consumes. |
 | A production object store | MinIO, Ceph RGW, S3-compatible storage | NoKV is not an object store. It provides namespace metadata and body references above an object backend. |
 | A custom AI workload metadata service | NoKV | NoKV gives you namespace, watch, snapshot, atomic publish, and local-first metadata execution without rebuilding the control plane. |
-| A production distributed KV | TiKV, FoundationDB, CockroachDB | NoKV does not compete with generic KV systems. It is metadata-native and can run on its own engine today. |
+| A production distributed KV | TiKV, FoundationDB, CockroachDB | NoKV does not compete with generic KV systems. It is metadata-native and can run on a Pebble-backed local runtime today. |
 | Production distributed SQL | CockroachDB, TiDB, Postgres | Use SQL for relational query workloads. Use NoKV when namespace semantics and metadata commit points are the core problem. |
-| Just an embedded LSM | Pebble, Badger | NoKV's engine is not a drop-in LSM library; it exists to serve the metadata runtime. |
+| Just an embedded LSM | Pebble, Badger | NoKV is not a drop-in LSM library; it uses raw ordered-KV engines below metadata semantics. |
 | A Raft library | etcd/raft, dragonboat | NoKV's raftstore is built on top of `etcd/raft` `RawNode`; owned code is the metadata/runtime integration. |
 
 ## Architecture
 
-<p align="center">
-  <img src="./docs/public/img/architecture.svg" alt="NoKV Architecture" width="100%" />
-</p>
-
 | Layer | Responsibility |
 |---|---|
 | `fsmeta` | Workspace namespace metadata contract, executor, client, and gateway. |
-| `local` / `engine` / `txn` | Embedded KV, MVCC, WAL, LSM, transaction, and cache substrate. |
+| `local` / `txn` / `storage` | Embedded runtime, MVCC internal keys, transaction protocol, and raw ordered-KV backend. |
 | `raftstore` / `coordinator` / `meta/root` | Distributed runtime, routing, TSO, rooted authority, and scale-out metadata execution. |
 | `experimental` | Research mechanisms such as Peras and Thermos. |
 
@@ -378,7 +374,6 @@ curl http://127.0.0.1:9101/debug/vars | jq '.nokv_fsmeta_executor, .nokv_fsmeta_
 
 # Offline forensics from a stopped node's workdir.
 nokv stats --workdir ./artifacts/cluster/store-1
-nokv manifest --workdir ./artifacts/cluster/store-1
 nokv regions --workdir ./artifacts/cluster/store-1 --json
 ```
 
@@ -395,17 +390,18 @@ and CLI reference: [`docs/guide/cli.md`](./docs/guide/cli.md).
 | [`sdk/runmetadata/`](./sdk/runmetadata) | Run metadata prototypes for AI workload lineage. | - |
 | [`meta/root/`](./meta/root) | Typed rooted truth kernel for authority, topology, lifecycle, snapshots, and quota fences. | [Rooted Truth](./docs/guide/rooted_truth.md) |
 | [`coordinator/`](./coordinator) | Routing, TSO, store discovery, root-event publish, and streaming subscribe. | [Coordinator](./docs/guide/coordinator.md) |
-| [`raftstore/`](./raftstore) | Multi-Raft, transport, membership, SST snapshot install, and apply observer. | [RaftStore](./docs/guide/raftstore.md) |
+| [`raftstore/`](./raftstore) | Multi-Raft replicated execution, transport, peer lifecycle, MVCC apply, and raft snapshot bootstrap. | [RaftStore](./docs/guide/raftstore.md) |
 | [`txn/percolator/`](./txn/percolator) | Distributed MVCC 2PC and `AssertionNotExist`. | [Percolator](./docs/guide/percolator.md) |
-| [`local/`](./local) | Embedded single-node engine facade, local stats, workdir mode, and default fsmeta runtime substrate. | [Runtime](./docs/guide/runtime.md) |
-| [`engine/lsm/`](./engine/lsm) | MemTable, flush, leveled compaction, and SST. | [LSM](./docs/guide/memtable.md) |
-| [`engine/wal/`](./engine/wal) | WAL segments, CRC, rotation, and replay. | [WAL](./docs/guide/wal.md) |
-| [`engine/slab/`](./engine/slab) | Append-only mmap segment substrate for derived sidecar caches. | [VFS](./docs/guide/vfs.md) |
-| [`engine/manifest/`](./engine/manifest) | VersionEdit log and atomic `CURRENT`. | [Manifest](./docs/guide/manifest.md) |
-| [`engine/vfs/`](./engine/vfs) | VFS abstraction, FaultFS, and cross-platform atomic rename. | [VFS](./docs/guide/vfs.md) |
+| [`txn/storage/`](./txn/storage) | MVCC column families, internal keys, timestamp encoding, entries, and transaction storage contract. | [Runtime](./docs/guide/runtime.md) |
+| [`local/`](./local) | Embedded DB facade over NoKV MVCC encoding and the default Pebble raw storage backend. | [Runtime](./docs/guide/runtime.md) |
+| [`storage/kv/`](./storage/kv) | Raw ordered KV backend contract below MVCC and fsmeta semantics. | [Architecture](./docs/guide/architecture.md) |
+| [`storage/pebble/`](./storage/pebble) | Default Pebble-backed raw ordered KV implementation. | [Architecture](./docs/guide/architecture.md) |
+| [`storage/wal/`](./storage/wal) | WAL segment utilities used by control/raft internals. | [WAL](./docs/guide/wal.md) |
+| [`storage/vfs/`](./storage/vfs) | VFS abstraction, FaultFS, and cross-platform atomic rename. | [VFS](./docs/guide/vfs.md) |
+| [`fsmeta/cache/`](./fsmeta/cache) | Derived fsmeta sidecar caches such as dirpage and negative-cache slabs. | [fsmeta](./docs/guide/fsmeta.md) |
 | [`experimental/`](./experimental) | Boundary for research mechanisms such as Peras and Thermos. | [Experimental Boundary Plan](./docs/guide/experimental_boundary_plan.md) |
 | [`experimental/thermos/`](./experimental/thermos) | Optional hot-key observer. | [Thermos](./docs/guide/thermos.md) |
-| [`cmd/nokv/`](./cmd/nokv) | CLI: stats, manifest, regions, migrate, mount, and quota. | [CLI](./docs/guide/cli.md) |
+| [`cmd/nokv/`](./cmd/nokv) | CLI: stats, execution diagnostics, regions, serve, coordinator, meta-root, mount, quota, and audit. | [CLI](./docs/guide/cli.md) |
 | [`cmd/nokv-fsmeta/`](./cmd/nokv-fsmeta) | Standalone fsmeta gRPC gateway. | [fsmeta](./docs/guide/fsmeta.md) |
 
 ## Observability

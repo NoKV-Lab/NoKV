@@ -6,12 +6,12 @@ package raftstore
 import (
 	"bytes"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 )
 
 func BuildMVCCSegmentInstallEntries(segment fsperas.PerasSegment, version uint64) ([]*entrykv.Entry, error) {

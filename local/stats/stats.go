@@ -10,37 +10,25 @@ package stats
 
 import (
 	"expvar"
-	"maps"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/lsm"
-	"github.com/feichai0017/NoKV/engine/wal"
 	"github.com/feichai0017/NoKV/experimental/thermos"
 	"github.com/feichai0017/NoKV/metrics"
+	rawkv "github.com/feichai0017/NoKV/storage/kv"
+	"github.com/feichai0017/NoKV/storage/wal"
 	"github.com/feichai0017/NoKV/utils"
 )
-
-// LSMSource is the narrow LSM surface stats reads from. Implemented by
-// engine/lsm.LSM.
-type LSMSource interface {
-	Diagnostics() lsm.Diagnostics
-	ThrottlePressurePermille() uint32
-	ThrottleRateBytesPerSec() uint64
-}
 
 // Host wires the Stats subsystem back into its DB host. Every accessor
 // is read-only; Stats never mutates host state.
 type Host interface {
-	// Storage subsystems.
-	LSM() LSMSource
-	LSMWALs() []*wal.Manager
 	// ControlWALsLocked invokes fn while holding the host's control-WAL mutex.
 	// Stats only iterates the slice while the lock is held.
 	ControlWALsLocked(fn func(wals []*wal.Manager))
 	BackgroundWatchdogs() []*wal.Watchdog
+	StorageStats() rawkv.Stats
 	HotWrite() *thermos.RotatingThermos
 	IteratorReused() uint64
 	WriteMetrics() *metrics.WriteMetrics
@@ -105,27 +93,6 @@ type LSMLevelStats struct {
 	MergeRuns                   int64   `json:"landing_merge_runs"`
 	MergeMs                     float64 `json:"landing_merge_ms"`
 	MergeTables                 int64   `json:"landing_merge_tables"`
-}
-
-func levelMetricsToStats(lvl metrics.LevelMetrics) LSMLevelStats {
-	return LSMLevelStats{
-		Level:                       lvl.Level,
-		TableCount:                  lvl.TableCount,
-		SizeBytes:                   lvl.SizeBytes,
-		ValueBytes:                  lvl.ValueBytes,
-		StaleBytes:                  lvl.StaleBytes,
-		LandingTables:               lvl.LandingTableCount,
-		LandingSizeBytes:            lvl.LandingSizeBytes,
-		LandingValueBytes:           lvl.LandingValueBytes,
-		ValueDensity:                lvl.ValueDensity,
-		LandingValueDensity:         lvl.LandingValueDensity,
-		LandingRuns:                 lvl.LandingRuns,
-		LandingMs:                   lvl.LandingMs,
-		LandingTablesCompactedCount: lvl.LandingTablesCompacted,
-		MergeRuns:                   lvl.LandingMergeRuns,
-		MergeMs:                     lvl.LandingMergeMs,
-		MergeTables:                 lvl.LandingMergeTables,
-	}
 }
 
 // StatsSnapshot captures a point-in-time view of internal backlog metrics.
@@ -404,119 +371,8 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	if thresh := s.host.ControlLogLagWarnSegments(); thresh > 0 {
 		snap.Raft.LagWarnThreshold = thresh
 	}
+	snap.Entries = int64(s.host.StorageStats().KeysEstimate)
 
-	// Flush backlog and LSM diagnostics.
-	if lsmSrc := s.host.LSM(); lsmSrc != nil {
-		diag := lsmSrc.Diagnostics()
-		snap.Compaction.ValueWeight = diag.Compaction.ValueWeight
-		alertThreshold := diag.Compaction.AlertThreshold
-		fstats := diag.Flush
-		snap.Flush.Pending = fstats.Pending
-		snap.Flush.QueueLength = fstats.Queue
-		snap.Flush.Active = fstats.Active
-		if fstats.WaitCount > 0 {
-			snap.Flush.WaitMs = float64(fstats.WaitNs) / float64(fstats.WaitCount) / 1e6
-		}
-		if fstats.WaitLastNs > 0 {
-			snap.Flush.LastWaitMs = float64(fstats.WaitLastNs) / 1e6
-		}
-		if fstats.WaitMaxNs > 0 {
-			snap.Flush.MaxWaitMs = float64(fstats.WaitMaxNs) / 1e6
-		}
-		if fstats.BuildCount > 0 {
-			snap.Flush.BuildMs = float64(fstats.BuildNs) / float64(fstats.BuildCount) / 1e6
-		}
-		if fstats.BuildLastNs > 0 {
-			snap.Flush.LastBuildMs = float64(fstats.BuildLastNs) / 1e6
-		}
-		if fstats.BuildMaxNs > 0 {
-			snap.Flush.MaxBuildMs = float64(fstats.BuildMaxNs) / 1e6
-		}
-		if fstats.ReleaseCount > 0 {
-			snap.Flush.ReleaseMs = float64(fstats.ReleaseNs) / float64(fstats.ReleaseCount) / 1e6
-		}
-		if fstats.ReleaseLastNs > 0 {
-			snap.Flush.LastReleaseMs = float64(fstats.ReleaseLastNs) / 1e6
-		}
-		if fstats.ReleaseMaxNs > 0 {
-			snap.Flush.MaxReleaseMs = float64(fstats.ReleaseMaxNs) / 1e6
-		}
-		snap.Flush.Completed = fstats.Completed
-		snap.Compaction.Backlog = diag.Compaction.Backlog
-		snap.Compaction.MaxScore = diag.Compaction.MaxScore
-		if levels := diag.Levels; len(levels) > 0 {
-			snap.LSM.Levels = make([]LSMLevelStats, 0, len(levels))
-			var maxDensity float64
-			var landingRuns, landingMergeRuns int64
-			var landingMs, landingMergeMs float64
-			var landingTables, landingMergeTables int64
-			for _, lvl := range levels {
-				statsLvl := levelMetricsToStats(lvl)
-				snap.LSM.Levels = append(snap.LSM.Levels, statsLvl)
-				if statsLvl.ValueDensity > maxDensity {
-					maxDensity = statsLvl.ValueDensity
-				}
-				if statsLvl.LandingValueDensity > maxDensity {
-					maxDensity = statsLvl.LandingValueDensity
-				}
-				landingRuns += statsLvl.LandingRuns
-				landingMergeRuns += statsLvl.MergeRuns
-				landingMs += statsLvl.LandingMs
-				landingMergeMs += statsLvl.MergeMs
-				landingTables += statsLvl.LandingTablesCompactedCount
-				landingMergeTables += statsLvl.MergeTables
-			}
-			snap.Compaction.LandingRuns = landingRuns
-			snap.Compaction.MergeRuns = landingMergeRuns
-			snap.Compaction.LandingMs = landingMs
-			snap.Compaction.MergeMs = landingMergeMs
-			snap.Compaction.LandingTables = landingTables
-			snap.Compaction.MergeTables = landingMergeTables
-			snap.LSM.ValueDensityMax = maxDensity
-			if alertThreshold > 0 && maxDensity >= alertThreshold {
-				snap.LSM.ValueDensityAlert = true
-				delta := maxDensity - alertThreshold
-				recommend := snap.Compaction.ValueWeight + delta
-				if recommend < snap.Compaction.ValueWeight {
-					recommend = snap.Compaction.ValueWeight
-				}
-				if recommend > 4.0 {
-					recommend = 4.0
-				}
-				snap.Compaction.ValueWeightSuggested = math.Round(recommend*100) / 100
-			}
-		}
-		if len(snap.LSM.Levels) > 0 {
-			var totalValue int64
-			for _, lvl := range snap.LSM.Levels {
-				totalValue += lvl.ValueBytes + lvl.LandingValueBytes
-			}
-			snap.LSM.ValueBytesTotal = totalValue
-		}
-		snap.LSM.RangeFilter = RangeFilterStatsSnapshot{
-			PointCandidates:   diag.RangeFilter.PointCandidates,
-			PointPruned:       diag.RangeFilter.PointPruned,
-			BoundedCandidates: diag.RangeFilter.BoundedCandidates,
-			BoundedPruned:     diag.RangeFilter.BoundedPruned,
-			Fallbacks:         diag.RangeFilter.Fallbacks,
-		}
-		snap.Entries = diag.Entries
-		snap.Compaction.LastDurationMs = diag.Compaction.LastDurationMs
-		snap.Compaction.MaxDurationMs = diag.Compaction.MaxDurationMs
-		snap.Compaction.Runs = diag.Compaction.Runs
-		cm := diag.Cache
-		if total := cm.L0Hits + cm.L0Misses; total > 0 {
-			snap.Cache.BlockL0HitRate = float64(cm.L0Hits) / float64(total)
-		}
-		if total := cm.L1Hits + cm.L1Misses; total > 0 {
-			snap.Cache.BlockL1HitRate = float64(cm.L1Hits) / float64(total)
-		}
-		if total := cm.IndexHits + cm.IndexMisses; total > 0 {
-			snap.Cache.IndexHitRate = float64(cm.IndexHits) / float64(total)
-		}
-		snap.Write.ThrottlePressure = lsmSrc.ThrottlePressurePermille()
-		snap.Write.ThrottleRate = lsmSrc.ThrottleRateBytesPerSec()
-	}
 	snap.LSM.Mmap = metrics.MmapAdviceStats()
 	snap.LSM.Prefetch = metrics.TablePrefetchStats()
 
@@ -565,67 +421,13 @@ func (s *Stats) Snapshot() StatsSnapshot {
 
 	snap.MVCCGC = s.host.MVCCGCStatsSnapshot()
 
-	var (
-		wstats         *wal.Metrics
-		segmentMetrics map[uint32]wal.RecordMetrics
-		ptrs           map[uint64]ControlLogPointer
-	)
-	// Aggregate metrics across every LSM data-plane WAL shard. Each
-	// shard owns its own fd / fsync worker, so we sum SegmentCount /
-	// RecordCounts and take the highest ActiveSegment as a coarse
-	// health signal. Per-segment metrics are unioned (segment IDs are
-	// allocated from a single global counter so they never collide
-	// across shards).
-	var aggregated wal.Metrics
-	var anyShardStats bool
-	for _, mgr := range s.host.LSMWALs() {
-		if mgr == nil {
-			continue
-		}
-		shardStats := mgr.Metrics()
-		if shardStats != nil {
-			anyShardStats = true
-			if shardStats.ActiveSegment > aggregated.ActiveSegment {
-				aggregated.ActiveSegment = shardStats.ActiveSegment
-			}
-			aggregated.ActiveSize += shardStats.ActiveSize
-			aggregated.SegmentCount += shardStats.SegmentCount
-			aggregated.RemovedSegments += shardStats.RemovedSegments
-			aggregated.SegmentsWithRaftRecords += shardStats.SegmentsWithRaftRecords
-			aggregated.RecordCounts.Entries += shardStats.RecordCounts.Entries
-			aggregated.RecordCounts.RaftEntries += shardStats.RecordCounts.RaftEntries
-			aggregated.RecordCounts.RaftStates += shardStats.RecordCounts.RaftStates
-			aggregated.RecordCounts.RaftSnapshots += shardStats.RecordCounts.RaftSnapshots
-			aggregated.RecordCounts.Other += shardStats.RecordCounts.Other
-		}
-		shardSegments := mgr.SegmentMetrics()
-		if segmentMetrics == nil {
-			segmentMetrics = shardSegments
-		} else {
-			maps.Copy(segmentMetrics, shardSegments)
-		}
-	}
-	if anyShardStats {
-		wstats = &aggregated
-		snap.WAL.ActiveSegment = int64(aggregated.ActiveSegment)
-		snap.WAL.ActiveSize = aggregated.ActiveSize
-		snap.WAL.SegmentCount = int64(aggregated.SegmentCount)
-		snap.WAL.SegmentsRemoved = aggregated.RemovedSegments
-	}
+	var ptrs map[uint64]ControlLogPointer
 	if ptrFn := s.host.ControlLogPointerSnapshot(); ptrFn != nil {
 		ptrs = ptrFn()
 		snap.Raft.GroupCount = len(ptrs)
 	}
 
-	analysis := metrics.AnalyzeWALBacklog(wstats, segmentMetrics)
-	snap.WAL.RecordCounts = analysis.RecordCounts
-	snap.WAL.SegmentsWithRaftRecords = analysis.SegmentsWithRaft
 	removableRaftSegments := 0
-	for _, id := range analysis.RemovableSegments {
-		if segmentMetrics[id].RaftRecords() > 0 && wstats != nil && id < wstats.ActiveSegment {
-			removableRaftSegments++
-		}
-	}
 	s.host.ControlWALsLocked(func(wals []*wal.Manager) {
 		for _, mgr := range wals {
 			if mgr == nil {

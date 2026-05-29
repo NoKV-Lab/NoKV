@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/index"
 	local "github.com/feichai0017/NoKV/local"
 	iterpkg "github.com/feichai0017/NoKV/local/internal/iterator"
+	index "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,7 +29,6 @@ func newTestOptions(t *testing.T) *local.Options {
 	t.Helper()
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.SSTableMaxSz = 1 << 12
 	opt.MemTableSize = 1 << 12
 	opt.MaxBatchCount = 10
 	opt.MaxBatchSize = 1 << 20

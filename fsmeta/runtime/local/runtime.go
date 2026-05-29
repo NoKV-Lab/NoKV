@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/slab/dirpage"
-	"github.com/feichai0017/NoKV/engine/slab/negativecache"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/negativecache"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"

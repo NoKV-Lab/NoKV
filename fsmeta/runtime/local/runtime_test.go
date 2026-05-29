@@ -6,6 +6,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -55,13 +56,14 @@ func TestOpenCreateLookupSurvivesRestart(t *testing.T) {
 	require.Greater(t, next.Inode.Inode, created.Inode.Inode)
 }
 
-func TestOpenUsesShardedLocalDBByDefault(t *testing.T) {
+func TestOpenUsesPebbleLocalStoreByDefault(t *testing.T) {
 	ctx := context.Background()
-	rt, err := Open(ctx, Options{WorkDir: t.TempDir(), Mount: testMount()})
+	workDir := t.TempDir()
+	rt, err := Open(ctx, Options{WorkDir: workDir, Mount: testMount()})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rt.Close()) }()
 
-	require.Len(t, rt.DB.LSMWALs(), 4)
+	require.DirExists(t, filepath.Join(workDir, "pebble"))
 }
 
 func TestLocalInodeAllocatorChoosesWorkspaceShard(t *testing.T) {

@@ -13,10 +13,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/feichai0017/NoKV/engine/wal"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
+	"github.com/feichai0017/NoKV/storage/wal"
 )
 
 type WALVisibleLog struct {

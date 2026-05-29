@@ -11,13 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
 	localdb "github.com/feichai0017/NoKV/local"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/feichai0017/NoKV/txn/latch"
 	"github.com/feichai0017/NoKV/txn/mvcc"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 )
 
@@ -122,7 +121,7 @@ func (r *Runner) Scan(ctx context.Context, startKey []byte, limit uint32, versio
 	if limit == 0 {
 		return nil, nil
 	}
-	iter := r.db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := r.db.NewInternalIterator(&kv.Options{IsAsc: true})
 	if iter == nil {
 		return nil, nil
 	}
@@ -723,7 +722,7 @@ func (r *Runner) committedPutMatches(write mvcc.Write, mut *backend.Mutation, st
 }
 
 func (r *Runner) scanWrites(key []byte, fn func(mvcc.Write, uint64) bool) error {
-	iter := r.db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := r.db.NewInternalIterator(&kv.Options{IsAsc: true})
 	if iter == nil {
 		return nil
 	}
@@ -827,7 +826,7 @@ func maxObservedVersion(db *localdb.DB) (uint64, error) {
 	if db == nil {
 		return 0, nil
 	}
-	iter := db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := db.NewInternalIterator(&kv.Options{IsAsc: true})
 	if iter == nil {
 		return 0, nil
 	}

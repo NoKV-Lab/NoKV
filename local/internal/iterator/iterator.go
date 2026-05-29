@@ -2,29 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package iterator implements the user-facing DB iterator state machine on top
-// of an LSM merge iterator. local.DB keeps the NewIterator and
+// of NoKV internal-key storage iteration. local.DB keeps the NewIterator and
 // NewInternalIterator wrappers as thin facades so callers continue to write
 // db.NewIterator(...), while the actual state-machine code lives here.
 package iterator
 
 import (
 	"bytes"
-
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/lsm"
-	lsmiter "github.com/feichai0017/NoKV/engine/lsm/iterator"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 )
 
-// Storage is the narrow LSM surface the user-facing iterator needs:
-// build the merged per-shard sub-iterators, query for any active range
-// tombstone, and pin a snapshot view if there is one. Implemented by
-// engine/lsm.LSM.
+// Storage is the narrow internal-key surface the user-facing iterator needs.
 type Storage interface {
-	NewIterators(opt *index.Options) []index.Iterator
-	HasAnyRangeTombstone() bool
-	PinRangeTombstoneView() *lsm.RangeTombstoneView
+	NewInternalIterator(opt *kv.Options) kv.Iterator
+	IsKeyCoveredByRangeTombstone(cf kv.ColumnFamily, userKey []byte, version uint64) bool
 }
 
 // Deps wires the iterator into its host.
@@ -33,15 +25,12 @@ type Deps struct {
 	Pool    *IteratorPool
 }
 
-// DBIterator wraps the merged LSM iterators.
+// DBIterator wraps one internal-key iterator and materializes user-visible rows.
 type DBIterator struct {
-	iitr index.Iterator
-	pool *IteratorPool
-	ctx  *IteratorContext
-	rtv  *lsm.RangeTombstoneView
-	// rtCheck indicates whether this iterator snapshot needs tombstone
-	// coverage checks.
-	rtCheck bool
+	iitr    kv.Iterator
+	pool    *IteratorPool
+	ctx     *IteratorContext
+	storage Storage
 
 	lowerBound []byte
 	upperBound []byte
@@ -95,15 +84,18 @@ func (it *Item) ValueCopy(dst []byte) ([]byte, error) {
 }
 
 // New creates a user-facing iterator over user keys in the default column family.
-func New(deps Deps, opt *index.Options) index.Iterator {
+func New(deps Deps, opt *kv.Options) kv.Iterator {
 	if opt == nil {
-		opt = &index.Options{}
+		opt = &kv.Options{}
 	}
 	ctx := deps.Pool.Get()
-	ctx.Append(deps.Storage.NewIterators(opt)...)
+	if deps.Storage != nil {
+		ctx.Append(deps.Storage.NewInternalIterator(opt))
+	}
 	itr := &DBIterator{
 		pool:       deps.Pool,
 		ctx:        ctx,
+		storage:    deps.Storage,
 		lowerBound: opt.LowerBound,
 		upperBound: opt.UpperBound,
 		hasLower:   len(opt.LowerBound) > 0,
@@ -111,24 +103,19 @@ func New(deps Deps, opt *index.Options) index.Iterator {
 		isAsc:      opt.IsAsc,
 	}
 	itr.item.e = &itr.entry
-	itr.iitr = lsmiter.NewMergeIterator(ctx.Iterators(), !opt.IsAsc)
-	if deps.Storage != nil {
-		itr.rtCheck = deps.Storage.HasAnyRangeTombstone()
-	}
-	if itr.rtCheck {
-		itr.rtv = deps.Storage.PinRangeTombstoneView()
+	if iters := ctx.Iterators(); len(iters) > 0 {
+		itr.iitr = iters[0]
 	}
 	return itr
 }
 
 // NewInternal returns an iterator over internal keys (CF marker + user key + timestamp).
 // Callers should decode kv.Entry.Key via kv.SplitInternalKey and handle ok=false.
-func NewInternal(storage Storage, opt *index.Options) index.Iterator {
+func NewInternal(storage Storage, opt *kv.Options) kv.Iterator {
 	if opt == nil {
-		opt = &index.Options{}
+		opt = &kv.Options{}
 	}
-	iters := storage.NewIterators(opt)
-	return lsmiter.NewMergeIterator(iters, !opt.IsAsc)
+	return storage.NewInternalIterator(opt)
 }
 
 // Next advances to the next visible key/value pair.
@@ -203,7 +190,7 @@ func (iter *DBIterator) Seek(key []byte) {
 }
 
 // Item returns the currently materialized item, or nil when iterator is invalid.
-func (iter *DBIterator) Item() index.Item {
+func (iter *DBIterator) Item() kv.Item {
 	if iter == nil || !iter.valid {
 		return nil
 	}
@@ -226,10 +213,6 @@ func (iter *DBIterator) Close() error {
 	iter.resetIterationState()
 	if iter.pool != nil && iter.ctx != nil {
 		iter.pool.Put(iter.ctx)
-	}
-	if iter.rtv != nil {
-		iter.rtv.Close()
-		iter.rtv = nil
 	}
 	iter.ctx = nil
 	return err
@@ -492,7 +475,7 @@ func (iter *DBIterator) materializeDecoded(src *kv.Entry, cf kv.ColumnFamily, us
 		ValThreshold: src.ValThreshold,
 	}
 	// Check if this key is covered by a range tombstone.
-	if iter.rtCheck && iter.rtv != nil && iter.rtv.IsKeyCovered(cf, userKey, ts) {
+	if iter.storage != nil && iter.storage.IsKeyCoveredByRangeTombstone(cf, userKey, ts) {
 		return false, nil
 	}
 	iter.entry.Key = userKey

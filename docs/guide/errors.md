@@ -55,9 +55,8 @@ Examples:
 
 ### Domain-specific sentinels
 
-- `engine/kv/errors.go`: checksum and partial-entry decode sentinels
-- `engine/vfs/vfs.go`: `ErrRenameNoReplaceUnsupported`
-- `engine/lsm/compaction.go`: compaction planner/runtime domain errors
+- `txn/storage/errors.go`: checksum and partial-entry decode sentinels
+- `storage/vfs/vfs.go`: `ErrRenameNoReplaceUnsupported`
 - `raftstore/peer/errors.go`: peer lifecycle/state errors
 - `txn/percolator/errors.go`: transaction protocol key-error builders and
   Percolator protocol sentinels
@@ -71,7 +70,7 @@ Examples:
   sentinels
 - `pb/errorpb.proto`: region/store routing protobuf errors (`RegionError`,
   `StoreNotMatch`, `RegionNotFound`, `KeyNotInRegion`, ...)
-- `engine/wal/errors.go`: WAL encode/decode and segment errors
+- `storage/wal/errors.go`: WAL encode/decode and segment errors
 - `coordinator/catalog/errors.go`: Coordinator metadata and range validation errors
 - `experimental/peras/exec/errors.go`: Peras admission, segment, replay, and witness
   sentinels used by holder/runtime control flow
@@ -84,25 +83,27 @@ Examples:
 
 ## 5. Propagation in Hot Paths
 
-1. Embedded write path (`DB.Set*` -> commit worker -> LSM/WAL):
+1. Embedded write path (`DB.Set*` -> commit pipeline -> Pebble raw store):
    - validation returns direct sentinel (`ErrEmptyKey`, `ErrNilValue`, `ErrInvalidRequest`);
    - storage boundary errors are wrapped with context and preserved via `%w`.
 2. Distributed command path (`kv.Service` -> `Store.*Command` -> `kv.Apply`):
    - region/leader/store/range failures are mapped to `errorpb` messages in protobuf responses;
    - execution failures return Go errors to RPC layer and are translated to gRPC status.
-3. Recovery/replay path (WAL/Vlog/Manifest):
-   - partial/corrupt records return domain sentinels and are handled by truncation or
-     restart logic in upper layers.
+3. Recovery/replay path:
+   - Pebble owns raw KV recovery; raft/control WAL consumers surface partial or
+     corrupt records through domain sentinels and fail startup when the owner
+     cannot prove safe replay.
 
 ---
 
-## 6. Embedded Engine Boundary Map
+## 6. Local Storage Boundary Map
 
-The single-node engine packages (`engine/*`, `utils`) must not import the root
-`errors` package. The `local/errkind` mapper is the explicit DB boundary where
-engine sentinels become the stable cross-boundary error taxonomy. The root
-error package owns gRPC and distributed transaction adaptation, so importing it
-from the embedded engine would invert the architecture.
+The raw storage packages (`storage/kv`, `storage/pebble`, `storage/memory`) and
+transaction-storage primitives must not import the root `errors` package. The
+`local/errkind` mapper is the explicit DB boundary where local sentinels become
+the stable cross-boundary error taxonomy. The root error package owns gRPC and
+distributed transaction adaptation, so importing it from storage would invert
+the architecture.
 
 Use `errkind.Classify(err)` from `local/errkind` at DB facade, RPC, or
 local fsmeta runtime boundaries. Current mapping:
@@ -111,13 +112,13 @@ local fsmeta runtime boundaries. Current mapping:
 | --- | --- |
 | `utils.ErrKeyNotFound` | `KindNotFound` |
 | `utils.ErrEmptyKey`, `utils.ErrNilValue`, `utils.ErrInvalidRequest` | `KindInvalidArgument` |
-| invalid LSM options / WAL manager wiring | `KindInvalidArgument` |
+| invalid storage options / WAL manager wiring | `KindInvalidArgument` |
 | unsupported required VFS capability | `KindInvalidArgument` |
 | `utils.ErrTxnTooBig` | `KindResourceExhausted` |
-| blocked writes, hot-key throttle, WAL backpressure, retained WAL segment, LSM fill-table pressure | `KindRetryable` |
-| `utils.ErrDBClosed`, closed LSM/flush runtime | `KindAborted` |
+| blocked writes, hot-key throttle, WAL backpressure, retained WAL segment | `KindRetryable` |
+| `utils.ErrDBClosed`, closed storage runtime | `KindAborted` |
 | KV checksum/partial-entry and WAL partial/empty-record errors | `KindCorruption` |
-| nil LSM/flush runtime/memtable wiring | `KindProtocolViolation` |
+| nil storage/runtime wiring | `KindProtocolViolation` |
 
 Pure package-local control-flow sentinels, such as `utils.ErrStop`, stay local
 and map to `KindUnknown` if accidentally observed outside their package.

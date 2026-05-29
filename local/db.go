@@ -16,18 +16,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/lsm"
-	"github.com/feichai0017/NoKV/engine/manifest"
-	"github.com/feichai0017/NoKV/engine/vfs"
-	"github.com/feichai0017/NoKV/engine/wal"
 	"github.com/feichai0017/NoKV/experimental/thermos"
 	"github.com/feichai0017/NoKV/local/internal/commit"
 	iterpkg "github.com/feichai0017/NoKV/local/internal/iterator"
 	"github.com/feichai0017/NoKV/local/stats"
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
 	"github.com/feichai0017/NoKV/metrics"
+	rawkv "github.com/feichai0017/NoKV/storage/kv"
+	pebblestore "github.com/feichai0017/NoKV/storage/pebble"
+	"github.com/feichai0017/NoKV/storage/vfs"
+	"github.com/feichai0017/NoKV/storage/wal"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 )
 
@@ -41,9 +40,9 @@ const nonTxnMaxVersion = kv.MaxVersion
 // and per-Manager.mu contention. Must be a power of two — controlWALShard
 // uses `& (N-1)` for placement.
 //
-// Total Manager budget under the LSM data-plane sharding plan:
-// 4 control-log + 4 LSM data = 8 Managers. There is no separate control-plane
-// Manager — db.wal is dissolved into the LSM shards.
+// Total Manager budget under the CommitStore data-plane sharding plan:
+// 4 control-log + 4 CommitStore data = 8 Managers. There is no separate control-plane
+// Manager — db.wal is dissolved into the CommitStore shards.
 const defaultControlWALShards = 4
 
 type (
@@ -62,16 +61,10 @@ type (
 	// DB is the global handle for the engine and owns shared resources.
 	DB struct {
 		sync.RWMutex
-		opt     *Options
-		fs      vfs.FS
-		dirLock io.Closer
-		lsm     *lsm.LSM
-		// lsmWALs holds one WAL Manager per LSM data-plane shard. The
-		// number of entries is db.opt.LSMShardCount (resolved at Open).
-		// Each Manager has its own fd, fsync worker, and bufio.Writer so
-		// commit workers do not contend on a single Manager.mu.
-		lsmWALs          []*wal.Manager
-		lsmWatchdogs     []*wal.Watchdog
+		opt              *Options
+		fs               vfs.FS
+		dirLock          io.Closer
+		store            rawkv.Store
 		controlWALMu     sync.Mutex
 		controlWALs      [defaultControlWALShards]*wal.Manager
 		controlWatchdogs [defaultControlWALShards]*wal.Watchdog
@@ -132,33 +125,7 @@ func (db *DB) openDurability() error {
 	if err := db.runRecoveryChecks(); err != nil {
 		return fmt.Errorf("open db: recovery checks: %w", err)
 	}
-
-	n := db.opt.LSMShardCount
-	if n <= 0 {
-		return fmt.Errorf("open db: LSMShardCount must be > 0")
-	}
-	db.lsmWALs = make([]*wal.Manager, n)
-	for shard := range n {
-		dir := db.lsmWALDir(shard)
-		if err := db.fs.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("open db: ensure lsm wal dir %d: %w", shard, err)
-		}
-		mgr, err := wal.Open(wal.Config{
-			Dir:        dir,
-			BufferSize: db.opt.WALBufferSize,
-			FS:         db.fs,
-		})
-		if err != nil {
-			return fmt.Errorf("open db: lsm wal shard %d: %w", shard, err)
-		}
-		db.lsmWALs[shard] = mgr
-	}
 	return nil
-}
-
-// lsmWALDir returns the per-shard WAL directory for the LSM data plane.
-func (db *DB) lsmWALDir(shard int) string {
-	return filepath.Join(db.opt.WorkDir, fmt.Sprintf("lsm-wal-%02d", shard))
 }
 
 func controlRetentionMark(ptrs map[uint64]stats.ControlLogPointer) wal.RetentionMark {
@@ -196,24 +163,63 @@ func (db *DB) checkWorkDirMode() error {
 }
 
 func (db *DB) openEngine() error {
-	lsmCore, err := lsm.NewLSM(db.runtimeLSMOptions(), db.lsmWALs)
+	store, err := pebblestore.Open(pebblestore.Options{
+		Dir:           db.storageDir(),
+		SyncWrites:    db.opt.SyncWrites,
+		CacheBytes:    db.opt.BlockCacheBytes + db.opt.IndexCacheBytes,
+		MemTableBytes: uint64(max(db.opt.MemTableSize, 0)),
+	})
 	if err != nil {
-		return fmt.Errorf("open db: lsm init: %w", err)
+		return fmt.Errorf("open db: pebble init: %w", err)
 	}
-	db.lsm = lsmCore
-	db.nonTxnVersion.Store(db.lsm.Diagnostics().MaxVersion)
+	db.store = store
+	maxVersion, err := db.scanMaxDefaultVersion()
+	if err != nil {
+		return fmt.Errorf("open db: scan max version: %w", err)
+	}
+	db.nonTxnVersion.Store(maxVersion)
 	db.iterPool = iterpkg.NewIteratorPool()
 	db.background.Init(stats.New(db, 0))
 	return nil
 }
 
+func (db *DB) storageDir() string {
+	return filepath.Join(db.opt.WorkDir, "pebble")
+}
+
+func (db *DB) scanMaxDefaultVersion() (uint64, error) {
+	if db == nil || db.store == nil {
+		return 0, nil
+	}
+	iter, err := db.newRawIterator(rawkv.IteratorOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = iter.Close() }()
+	var maxVersion uint64
+	for iter.Rewind(); iter.Valid(); iter.Next() {
+		entry := iter.Item().Entry()
+		if entry == nil {
+			continue
+		}
+		cf, _, ts, ok := kv.SplitInternalKey(entry.Key)
+		if !ok || cf != kv.CFDefault || ts == kv.MaxVersion {
+			continue
+		}
+		if ts > maxVersion {
+			maxVersion = ts
+		}
+	}
+	return maxVersion, nil
+}
+
 func (db *DB) startWriteRuntime() {
-	// One commit processor per LSM data-plane shard. Each processor
+	// One commit processor per CommitStore data-plane shard. Each processor
 	// owns its shard's WAL Manager — no cross-shard sharing means no
 	// Manager.mu contention on the hot write path. The dispatcher fans
 	// batches out by per-key affinity so each batch lives on exactly
 	// one shard (preserving SetBatch atomicity).
-	workers := db.opt.LSMShardCount
+	workers := db.opt.WriteShardCount
 	if workers <= 0 {
 		workers = 1
 	}
@@ -229,40 +235,6 @@ func (db *DB) startWriteRuntime() {
 		UserKeyShardKey:    db.userKeyShardKey,
 	}, db)
 	db.pipeline.Start()
-}
-
-func (db *DB) runtimeLSMOptions() *lsm.Options {
-	baseTableSize := db.opt.MemTableSize
-	if baseTableSize <= 0 {
-		baseTableSize = 8 << 20
-	}
-	if baseTableSize < 8<<20 {
-		baseTableSize = 8 << 20
-	}
-	if db.opt.SSTableMaxSz > 0 && baseTableSize > db.opt.SSTableMaxSz {
-		baseTableSize = db.opt.SSTableMaxSz
-	}
-	baseLevelSize := max(baseTableSize*4, 32<<20)
-	cfg := &lsm.Options{
-		FS:                       db.fs,
-		WorkDir:                  db.opt.WorkDir,
-		MemTableSize:             db.opt.MemTableSize,
-		MemTableEngine:           string(db.opt.MemTableEngine),
-		SSTableMaxSz:             db.opt.SSTableMaxSz,
-		BlockSize:                lsm.DefaultBlockSize,
-		BloomFalsePositive:       lsm.DefaultBloomFalsePositive,
-		BaseLevelSize:            baseLevelSize,
-		LevelSizeMultiplier:      lsm.DefaultLevelSizeMultiplier,
-		BaseTableSize:            baseTableSize,
-		TableSizeMultiplier:      lsm.DefaultTableSizeMultiplier,
-		MaxLevelNum:              utils.MaxLevelNum,
-		CompactionPolicy:         string(db.opt.CompactionPolicy),
-		ManifestSync:             db.opt.ManifestSync,
-		ManifestRewriteThreshold: db.opt.ManifestRewriteThreshold,
-		ThrottleCallback:         db.ApplyThrottle,
-	}
-	db.opt.applyLSMSharedOptions(cfg)
-	return cfg
 }
 
 func (db *DB) controlWALFor(groupID uint64) (*wal.Manager, error) {
@@ -369,39 +341,13 @@ func Open(opt *Options) (_ *DB, err error) {
 		return nil, err
 	}
 	db.startWriteRuntime()
-	watchdogConfigs := make([]wal.WatchdogConfig, 0, len(db.lsmWALs))
-	for _, mgr := range db.lsmWALs {
-		if mgr == nil {
-			continue
-		}
-		watchdogConfigs = append(watchdogConfigs, wal.WatchdogConfig{
-			Manager:      mgr,
-			Interval:     db.opt.WALAutoGCInterval,
-			MinRemovable: db.opt.WALAutoGCMinRemovable,
-			MaxBatch:     db.opt.WALAutoGCMaxBatch,
-			WarnRatio:    db.opt.WALTypedRecordWarnRatio,
-			WarnSegments: db.opt.WALTypedRecordWarnSegments,
-		})
-	}
-	db.background.Start(backgroundConfig{
-		StartCompacter:     db.lsm.StartCompacter,
-		EnableWALWatchdog:  db.opt.EnableWALWatchdog,
-		WALWatchdogConfigs: watchdogConfigs,
-	})
+	db.background.Start(backgroundConfig{})
 	return db, nil
 }
 
 func (db *DB) runRecoveryChecks() error {
 	if db == nil || db.opt == nil {
 		return fmt.Errorf("recovery checks: options not initialized")
-	}
-	if err := manifest.Verify(db.opt.WorkDir, db.fs); err != nil {
-		if !stderrors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	if err := wal.VerifyDir(db.opt.WorkDir, db.fs); err != nil {
-		return err
 	}
 	for shard := range defaultControlWALShards {
 		if err := wal.VerifyDir(db.controlWALDir(shard), db.fs); err != nil {
@@ -446,31 +392,15 @@ func (db *DB) closeInternal() error {
 		db.hotWrite.Close()
 	}
 
-	if db.lsm != nil {
-		if err := db.lsm.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("lsm close: %w", err))
+	if db.store != nil {
+		if err := db.store.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("storage close: %w", err))
 		}
-		db.lsm = nil
+		db.store = nil
 	}
 
 	if err := db.closeControlWALs(); err != nil {
 		errs = append(errs, err)
-	}
-
-	for shard, wd := range db.lsmWatchdogs {
-		if wd != nil {
-			wd.Stop()
-			db.lsmWatchdogs[shard] = nil
-		}
-	}
-	for shard, mgr := range db.lsmWALs {
-		if mgr == nil {
-			continue
-		}
-		if err := mgr.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("lsm wal shard %d close: %w", shard, err))
-		}
-		db.lsmWALs[shard] = nil
 	}
 
 	if db.dirLock != nil {
@@ -624,7 +554,7 @@ func (db *DB) nextNonTxnVersion() uint64 {
 // be mutated until this call returns.
 //
 // Multi-key internal batches are regrouped by the same key-affinity router used
-// by the commit pipeline before they reach the sharded LSM. That keeps every
+// by the commit pipeline before they reach the sharded CommitStore. That keeps every
 // write/delete for one user key on one shard, which is required for
 // same-version MVCC tombstones such as Percolator lock removal.
 func (db *DB) ApplyInternalEntries(entries []*kv.Entry) error {
@@ -667,8 +597,7 @@ func (db *DB) GetInternalEntry(cf kv.ColumnFamily, key []byte, version uint64) (
 	if len(key) == 0 {
 		return nil, utils.ErrEmptyKey
 	}
-	internalKey := kv.InternalKey(cf, key, version)
-	entry, err := db.loadBorrowedEntry(internalKey)
+	entry, err := db.findVisibleInternalEntry(cf, key, version)
 	if err != nil {
 		return nil, err
 	}
@@ -690,17 +619,15 @@ func (db *DB) MaterializeInternalEntry(src *kv.Entry) (*kv.Entry, error) {
 	copy(keyCopy, src.Key)
 	valueCopy := buf[len(src.Key):]
 	copy(valueCopy, src.Value)
-	return &kv.Entry{
-		Key:          keyCopy,
-		Value:        valueCopy,
-		ExpiresAt:    src.ExpiresAt,
-		CF:           src.CF,
-		Meta:         src.Meta,
-		Version:      src.Version,
-		Offset:       src.Offset,
-		Hlen:         src.Hlen,
-		ValThreshold: src.ValThreshold,
-	}, nil
+	entry := kv.NewEntry(keyCopy, valueCopy)
+	entry.ExpiresAt = src.ExpiresAt
+	entry.CF = src.CF
+	entry.Meta = src.Meta
+	entry.Version = src.Version
+	entry.Offset = src.Offset
+	entry.Hlen = src.Hlen
+	entry.ValThreshold = src.ValThreshold
+	return entry, nil
 }
 
 // Get reads the latest visible value for key from the default column family.
@@ -714,9 +641,7 @@ func (db *DB) Get(key []byte) (*kv.Entry, error) {
 	if len(key) == 0 {
 		return nil, utils.ErrEmptyKey
 	}
-	// Non-transactional API: use the max sentinel timestamp (not for MVCC).
-	internalKey := kv.InternalKey(kv.CFDefault, key, nonTxnMaxVersion)
-	entry, err := db.lsm.Get(internalKey)
+	entry, err := db.findVisibleInternalEntry(kv.CFDefault, key, kv.MaxVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -756,44 +681,51 @@ func (db *DB) Get(key []byte) (*kv.Entry, error) {
 	}, nil
 }
 
-// loadBorrowedEntry fetches one internal-key record from LSM.
-//
-// Ownership contract:
-//   - The returned entry is a borrowed, pool-managed object.
-//   - The caller MUST call DecrRef exactly once when finished.
-//
-// Error behavior:
-//   - Returns ErrKeyNotFound when no record exists.
-//   - Returns ErrInvalidRequest when the loaded key is not in internal-key form.
-func (db *DB) loadBorrowedEntry(internalKey []byte) (*kv.Entry, error) {
-	entry, err := db.lsm.Get(internalKey)
+func (db *DB) findVisibleInternalEntry(cf kv.ColumnFamily, key []byte, readVersion uint64) (*kv.Entry, error) {
+	if len(key) == 0 {
+		return nil, utils.ErrEmptyKey
+	}
+	seekKey := kv.InternalKey(cf, key, readVersion)
+	iter, err := db.newRawIterator(rawkv.IteratorOptions{})
 	if err != nil {
 		return nil, err
 	}
-	if entry == nil {
-		return nil, utils.ErrKeyNotFound
+	defer func() { _ = iter.Close() }()
+	iter.Seek(seekKey)
+	for iter.Valid() {
+		entry := iter.Item().Entry()
+		if entry == nil {
+			iter.Next()
+			continue
+		}
+		entryCF, userKey, ts, ok := kv.SplitInternalKey(entry.Key)
+		if !ok || entryCF != cf {
+			iter.Next()
+			continue
+		}
+		if !bytes.Equal(userKey, key) {
+			return nil, utils.ErrKeyNotFound
+		}
+		if entry.IsRangeDelete() {
+			iter.Next()
+			continue
+		}
+		if db.IsKeyCoveredByRangeTombstone(cf, userKey, ts) {
+			return nil, utils.ErrKeyNotFound
+		}
+		entry.IncrRef()
+		return entry, nil
 	}
-	if entry.IsRangeDelete() {
-		entry.DecrRef()
-		return nil, utils.ErrKeyNotFound
-	}
-
-	// Range tombstone coverage is checked in lsm.Get() while memtables are pinned.
-
-	if !entry.PopulateInternalMeta() {
-		entry.DecrRef()
-		return nil, utils.ErrInvalidRequest
-	}
-	return entry, nil
+	return nil, utils.ErrKeyNotFound
 }
 
 // NewIterator creates a DB-level iterator over user keys in the default
 // column family. The state machine + Item materialization live in
 // local/internal/iterator; this method wires DB internals (lsm, iterPool)
 // into iterpkg.New as a thin facade.
-func (db *DB) NewIterator(opt *index.Options) index.Iterator {
+func (db *DB) NewIterator(opt *kv.Options) kv.Iterator {
 	return iterpkg.New(iterpkg.Deps{
-		Storage: db.lsm,
+		Storage: db,
 		Pool:    db.iterPool,
 	}, opt)
 }
@@ -801,8 +733,29 @@ func (db *DB) NewIterator(opt *index.Options) index.Iterator {
 // NewInternalIterator returns an iterator over internal keys (CF marker +
 // user key + timestamp). Callers should decode kv.Entry.Key via
 // kv.SplitInternalKey and handle ok=false.
-func (db *DB) NewInternalIterator(opt *index.Options) index.Iterator {
-	return iterpkg.NewInternal(db.lsm, opt)
+func (db *DB) NewInternalIterator(opt *kv.Options) kv.Iterator {
+	if opt == nil {
+		opt = &kv.Options{}
+	}
+	iter, err := db.newRawIterator(rawkv.IteratorOptions{
+		LowerBound: internalIteratorBound(opt.LowerBound),
+		UpperBound: internalIteratorBound(opt.UpperBound),
+		Reverse:    !opt.IsAsc,
+	})
+	if err != nil {
+		return &errorIterator{err: err}
+	}
+	return iter
+}
+
+func internalIteratorBound(bound []byte) []byte {
+	if len(bound) == 0 {
+		return nil
+	}
+	if _, _, _, ok := kv.SplitInternalKey(bound); ok {
+		return bound
+	}
+	return kv.InternalKey(kv.CFDefault, bound, kv.MaxVersion)
 }
 
 // Info returns the live stats collector for snapshot/diagnostic access.
@@ -819,9 +772,13 @@ func (db *DB) Info() *stats.Stats {
 // over DB struct fields so the snapshot logic can live in local/stats without
 // importing the local DB implementation.
 
-func (db *DB) LSM() stats.LSMSource                 { return db.lsm }
-func (db *DB) LSMWALs() []*wal.Manager              { return db.lsmWALs }
 func (db *DB) BackgroundWatchdogs() []*wal.Watchdog { return db.background.WALWatchdogs() }
+func (db *DB) StorageStats() rawkv.Stats {
+	if db == nil || db.store == nil {
+		return rawkv.Stats{}
+	}
+	return db.store.Stats()
+}
 func (db *DB) SetMVCCGCStatsSnapshotSource(source func() stats.MVCCGCStatsSnapshot) {
 	if db == nil || source == nil {
 		return
@@ -911,7 +868,7 @@ func (db *DB) ThrottleSignal() <-chan struct{} {
 	return ch
 }
 
-func (db *DB) CommitLSM() commit.LSM { return db.lsm }
+func (db *DB) CommitStore() commit.CommitStore { return db }
 
 // SetRegionMetrics attaches region metrics recorder so Stats snapshot and expvar
 // include region state counts.
@@ -922,39 +879,22 @@ func (db *DB) SetRegionMetrics(rm *metrics.RegionMetrics) {
 	db.background.SetRegionMetrics(rm)
 }
 
-// SyncWAL fans an fsync across every LSM data-plane WAL Manager. Used by
-// administrative durability calls; the hot write path syncs only the
-// shard the commit processor is pinned to.
+// SyncWAL preserves the administrative durability hook used by transaction
+// tests. The Pebble-backed local store owns its own WAL, so this delegates to
+// the raw store sync boundary instead of exposing data-plane WAL managers.
 func (db *DB) SyncWAL() error {
-	if db == nil || len(db.lsmWALs) == 0 {
+	if db == nil || db.store == nil {
 		return fmt.Errorf("db: wal is unavailable")
 	}
-	var errs []error
-	for shard, mgr := range db.lsmWALs {
-		if mgr == nil {
-			continue
-		}
-		if err := mgr.Sync(); err != nil {
-			errs = append(errs, fmt.Errorf("lsm wal shard %d sync: %w", shard, err))
-		}
-	}
-	return stderrors.Join(errs...)
+	return db.store.Sync()
 }
 
-// ReplayWAL replays every LSM data-plane WAL Manager in shard order.
-// Cross-shard ordering is not preserved — callers must rely on internal-key
-// MVCC timestamps for record ordering.
+// ReplayWAL is intentionally empty for the Pebble-backed data path. Pebble owns
+// physical WAL recovery internally; NoKV no longer exposes data WAL replay as a
+// product API.
 func (db *DB) ReplayWAL(fn func(info wal.EntryInfo, payload []byte) error) error {
-	if db == nil || len(db.lsmWALs) == 0 {
+	if db == nil || db.store == nil {
 		return fmt.Errorf("db: wal is unavailable")
-	}
-	for shard, mgr := range db.lsmWALs {
-		if mgr == nil {
-			continue
-		}
-		if err := mgr.Replay(fn); err != nil {
-			return fmt.Errorf("lsm wal shard %d replay: %w", shard, err)
-		}
 	}
 	return nil
 }
@@ -964,14 +904,14 @@ func (db *DB) IsClosed() bool {
 	return db.isClosed.Load() == 1
 }
 
-func (db *DB) ApplyThrottle(state lsm.WriteThrottleState) {
+func (db *DB) ApplyThrottle(state commit.WriteThrottleState) {
 	state = commit.NormalizeWriteThrottleState(state)
 	stop := int32(0)
 	slow := int32(0)
 	switch state {
-	case lsm.WriteThrottleStop:
+	case commit.WriteThrottleStop:
 		stop = 1
-	case lsm.WriteThrottleSlowdown:
+	case commit.WriteThrottleSlowdown:
 		slow = 1
 	}
 	prevStop := db.blockWrites.Swap(stop)
@@ -985,10 +925,10 @@ func (db *DB) ApplyThrottle(state lsm.WriteThrottleState) {
 	db.throttleMu.Unlock()
 	close(ch)
 	switch state {
-	case lsm.WriteThrottleStop:
-		slog.Default().Warn("write stop enabled due to compaction backlog")
-	case lsm.WriteThrottleSlowdown:
-		slog.Default().Info("write slowdown enabled due to compaction backlog")
+	case commit.WriteThrottleStop:
+		slog.Default().Warn("write stop enabled")
+	case commit.WriteThrottleSlowdown:
+		slog.Default().Info("write slowdown enabled")
 	default:
 		slog.Default().Info("write throttling cleared")
 	}
@@ -1026,78 +966,18 @@ func (db *DB) batchSet(entries []*kv.Entry) error {
 }
 
 func (db *DB) batchSetInternalEntries(entries []*kv.Entry) error {
-	groups := db.groupInternalEntriesByShard(entries)
-	for i, group := range groups {
-		if len(group) == 0 {
-			continue
-		}
-		if err := db.batchSet(group); err != nil {
-			// Entries for later shard groups were ref-counted by
-			// ApplyInternalEntries but have not been handed to the commit
-			// pipeline yet. The failing group is cleaned up by batchSet on
-			// enqueue failure, or owned by the pipeline if it reached apply.
-			releaseEntryGroups(groups[i+1:])
-			return err
-		}
-	}
-	return nil
+	return db.batchSet(entries)
 }
 
 // CanApplyInternalEntriesAtomically reports whether ApplyInternalEntries will
-// persist entries as one local LSM apply group. The check intentionally uses
-// the same shard grouping path as ApplyInternalEntries; callers must not
-// duplicate this routing logic outside the DB boundary.
+// persist entries as one local Pebble write batch.
 func (db *DB) CanApplyInternalEntriesAtomically(entries []*kv.Entry) bool {
-	groups := db.groupInternalEntriesByShard(entries)
-	nonEmpty := 0
-	for _, group := range groups {
-		if len(group) == 0 {
-			continue
-		}
-		nonEmpty++
-		if nonEmpty > 1 {
+	for _, entry := range entries {
+		if entry == nil || len(entry.Key) == 0 {
 			return false
 		}
 	}
 	return true
-}
-
-func (db *DB) groupInternalEntriesByShard(entries []*kv.Entry) [][]*kv.Entry {
-	if len(entries) <= 1 {
-		return [][]*kv.Entry{entries}
-	}
-	shardCount := 1
-	if db != nil && db.opt != nil && db.opt.LSMShardCount > 1 {
-		shardCount = db.opt.LSMShardCount
-	}
-	if shardCount <= 1 {
-		return [][]*kv.Entry{entries}
-	}
-	buckets := make([][]*kv.Entry, shardCount)
-	order := make([]int, 0, shardCount)
-	for _, entry := range entries {
-		if entry == nil {
-			continue
-		}
-		shardID := db.shardForInternalKey(entry.Key, shardCount)
-		if len(buckets[shardID]) == 0 {
-			order = append(order, shardID)
-		}
-		buckets[shardID] = append(buckets[shardID], entry)
-	}
-	groups := make([][]*kv.Entry, 0, len(order))
-	for _, shardID := range order {
-		groups = append(groups, buckets[shardID])
-	}
-	return groups
-}
-
-func (db *DB) shardForInternalKey(internalKey []byte, shardCount int) int {
-	_, userKey, _, ok := kv.SplitInternalKey(internalKey)
-	if !ok || len(userKey) == 0 {
-		return 0
-	}
-	return utils.ShardForUserKey(db.userKeyShardKeyOrUserKey(userKey), shardCount)
 }
 
 func (db *DB) userKeyShardKey(userKey []byte) []byte {
@@ -1107,57 +987,304 @@ func (db *DB) userKeyShardKey(userKey []byte) []byte {
 	return db.opt.UserKeyShapeExtractor(userKey).shardKey()
 }
 
-func (db *DB) userKeyShardKeyOrUserKey(userKey []byte) []byte {
-	if key := db.userKeyShardKey(userKey); len(key) > 0 {
-		return key
-	}
-	return userKey
-}
-
-func releaseEntryGroups(groups [][]*kv.Entry) {
-	for _, group := range groups {
-		for _, entry := range group {
-			if entry != nil {
-				entry.DecrRef()
-			}
-		}
-	}
-}
-
-func (db *DB) requireOpenLSM() (*lsm.LSM, error) {
-	if db == nil || db.IsClosed() || db.lsm == nil {
-		return nil, fmt.Errorf("db: snapshot bridge requires open db")
-	}
-	return db.lsm, nil
-}
-
-func (db *DB) ExternalSSTOptions() *lsm.Options {
-	lsmCore, err := db.requireOpenLSM()
-	if err != nil {
-		return nil
-	}
-	return lsmCore.ExternalSSTOptions()
-}
-
-func (db *DB) ImportExternalSST(paths []string) (*lsm.ExternalSSTImportResult, error) {
-	lsmCore, err := db.requireOpenLSM()
-	if err != nil {
-		return nil, err
-	}
-	return lsmCore.ImportExternalSST(paths)
-}
-
-func (db *DB) RollbackExternalSST(fileIDs []uint64) error {
-	lsmCore, err := db.requireOpenLSM()
-	if err != nil {
-		return err
-	}
-	return lsmCore.RollbackExternalSST(fileIDs)
-}
-
 func (db *DB) WorkDir() string {
 	if db == nil || db.opt == nil {
 		return ""
 	}
 	return db.opt.WorkDir
+}
+
+func (db *DB) SetBatchGroup(_ int, groups [][]*kv.Entry) (int, error) {
+	for i, group := range groups {
+		if len(group) == 0 {
+			continue
+		}
+		batch := rawkv.Batch{Ops: make([]rawkv.Mutation, 0, len(group))}
+		for _, entry := range group {
+			if entry == nil || len(entry.Key) == 0 {
+				return i, utils.ErrEmptyKey
+			}
+			physicalKey, err := encodePhysicalKey(entry.Key)
+			if err != nil {
+				return i, err
+			}
+			batch.Ops = append(batch.Ops, rawkv.Mutation{
+				Op:    rawkv.PutOp,
+				Key:   physicalKey,
+				Value: encodeStoredEntry(entry),
+			})
+		}
+		if err := db.store.ApplyBatch(batch); err != nil {
+			return i, err
+		}
+	}
+	return -1, nil
+}
+
+func (db *DB) Sync() error {
+	if db == nil || db.store == nil {
+		return fmt.Errorf("db: storage is unavailable")
+	}
+	return db.store.Sync()
+}
+
+func (db *DB) ThrottleRateBytesPerSec() uint64 { return 0 }
+
+func (db *DB) IsKeyCoveredByRangeTombstone(cf kv.ColumnFamily, userKey []byte, version uint64) bool {
+	if db == nil || db.store == nil {
+		return false
+	}
+	iter, err := db.newRawIterator(rawkv.IteratorOptions{})
+	if err != nil {
+		return false
+	}
+	defer func() { _ = iter.Close() }()
+	for iter.Rewind(); iter.Valid(); iter.Next() {
+		entry := iter.Item().Entry()
+		if entry == nil || !entry.IsRangeDelete() {
+			continue
+		}
+		tombstoneCF, start, tombstoneVersion, ok := kv.SplitInternalKey(entry.Key)
+		if !ok || tombstoneCF != cf {
+			continue
+		}
+		if tombstoneVersion < version {
+			continue
+		}
+		if bytes.Compare(userKey, start) >= 0 && bytes.Compare(userKey, entry.RangeEnd()) < 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func encodeStoredEntry(entry *kv.Entry) []byte {
+	vs := kv.ValueStruct{
+		Meta:      entry.Meta,
+		Value:     entry.Value,
+		ExpiresAt: entry.ExpiresAt,
+	}
+	out := make([]byte, vs.EncodedSize())
+	vs.EncodeValue(out)
+	return out
+}
+
+func decodeStoredEntry(internalKey []byte, encoded []byte) (*kv.Entry, error) {
+	if len(encoded) == 0 {
+		return nil, utils.ErrInvalidRequest
+	}
+	var vs kv.ValueStruct
+	vs.DecodeValue(encoded)
+	keyCopy := append([]byte(nil), internalKey...)
+	valueCopy := make([]byte, len(vs.Value))
+	copy(valueCopy, vs.Value)
+	entry := kv.NewValueStructEntry(keyCopy, kv.ValueStruct{
+		Meta:      vs.Meta,
+		Value:     valueCopy,
+		ExpiresAt: vs.ExpiresAt,
+	})
+	if !entry.PopulateInternalMeta() {
+		entry.DecrRef()
+		return nil, utils.ErrInvalidRequest
+	}
+	return entry, nil
+}
+
+func (db *DB) newRawIterator(opts rawkv.IteratorOptions) (kv.Iterator, error) {
+	if db == nil || db.store == nil {
+		return nil, fmt.Errorf("db: storage is unavailable")
+	}
+	var err error
+	if len(opts.LowerBound) > 0 {
+		opts.LowerBound, err = encodePhysicalKey(opts.LowerBound)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(opts.UpperBound) > 0 {
+		opts.UpperBound, err = encodePhysicalKey(opts.UpperBound)
+		if err != nil {
+			return nil, err
+		}
+	}
+	raw, err := db.store.NewIterator(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &internalIterator{raw: raw, reverse: opts.Reverse}, nil
+}
+
+type internalIterator struct {
+	raw     rawkv.Iterator
+	reverse bool
+	entry   *kv.Entry
+	item    internalIteratorItem
+}
+
+type internalIteratorItem struct {
+	entry *kv.Entry
+}
+
+type errorIterator struct {
+	err error
+}
+
+func (it *errorIterator) Next()       {}
+func (it *errorIterator) Rewind()     {}
+func (it *errorIterator) Seek([]byte) {}
+func (it *errorIterator) Valid() bool { return false }
+func (it *errorIterator) Item() kv.Item {
+	return nil
+}
+func (it *errorIterator) Close() error {
+	if it == nil {
+		return nil
+	}
+	return it.err
+}
+
+func (item *internalIteratorItem) Entry() *kv.Entry {
+	if item == nil {
+		return nil
+	}
+	return item.entry
+}
+
+func (it *internalIterator) Next() {
+	it.releaseItem()
+	if it.reverse {
+		it.raw.Prev()
+		return
+	}
+	it.raw.Next()
+}
+
+func (it *internalIterator) Valid() bool {
+	return it != nil && it.raw != nil && it.raw.Valid()
+}
+
+func (it *internalIterator) Rewind() {
+	it.releaseItem()
+	if it.reverse {
+		it.raw.Last()
+		return
+	}
+	it.raw.First()
+}
+
+func (it *internalIterator) Item() kv.Item {
+	if !it.Valid() {
+		return nil
+	}
+	it.releaseItem()
+	logicalKey, err := decodePhysicalKey(it.raw.Key())
+	if err != nil {
+		return nil
+	}
+	value, err := it.raw.Value()
+	if err != nil {
+		return nil
+	}
+	entry, err := decodeStoredEntry(logicalKey, value)
+	if err != nil {
+		return nil
+	}
+	it.entry = entry
+	it.item.entry = entry
+	return &it.item
+}
+
+func (it *internalIterator) Close() error {
+	if it == nil || it.raw == nil {
+		return nil
+	}
+	it.releaseItem()
+	return it.raw.Close()
+}
+
+func (it *internalIterator) Seek(key []byte) {
+	if it == nil || it.raw == nil {
+		return
+	}
+	it.releaseItem()
+	physicalKey, err := encodePhysicalKey(key)
+	if err != nil {
+		return
+	}
+	if !it.reverse {
+		it.raw.Seek(physicalKey)
+		return
+	}
+	if !it.raw.Seek(physicalKey) {
+		it.raw.Last()
+		return
+	}
+	if bytes.Compare(it.raw.Key(), physicalKey) > 0 {
+		it.raw.Prev()
+	}
+}
+
+func (it *internalIterator) releaseItem() {
+	if it == nil || it.entry == nil {
+		return
+	}
+	it.entry.DecrRef()
+	it.entry = nil
+	it.item.entry = nil
+}
+
+func encodePhysicalKey(internalKey []byte) ([]byte, error) {
+	cf, userKey, _, ok := kv.SplitInternalKey(internalKey)
+	if !ok {
+		return nil, utils.ErrInvalidRequest
+	}
+	out := make([]byte, 0, 4+len(userKey)*2+2+8)
+	out = append(out, 0xff, 'C', 'F', byte(cf))
+	for _, b := range userKey {
+		if b == 0 {
+			out = append(out, 0, 0xff)
+			continue
+		}
+		out = append(out, b)
+	}
+	out = append(out, 0, 0)
+	out = append(out, internalKey[len(internalKey)-8:]...)
+	return out, nil
+}
+
+func decodePhysicalKey(physicalKey []byte) ([]byte, error) {
+	if len(physicalKey) < 4+2+8 ||
+		physicalKey[0] != 0xff ||
+		physicalKey[1] != 'C' ||
+		physicalKey[2] != 'F' {
+		return nil, utils.ErrInvalidRequest
+	}
+	cf := kv.ColumnFamily(physicalKey[3])
+	if !cf.Valid() {
+		return nil, utils.ErrInvalidRequest
+	}
+	body := physicalKey[4 : len(physicalKey)-8]
+	userKey := make([]byte, 0, len(body))
+	for i := 0; i < len(body); i++ {
+		b := body[i]
+		if b != 0 {
+			userKey = append(userKey, b)
+			continue
+		}
+		if i+1 >= len(body) {
+			return nil, utils.ErrInvalidRequest
+		}
+		next := body[i+1]
+		i++
+		if next == 0 {
+			logical := kv.InternalKey(cf, userKey, kv.Timestamp(physicalKey[len(physicalKey)-8:]))
+			copy(logical[len(logical)-8:], physicalKey[len(physicalKey)-8:])
+			return logical, nil
+		}
+		if next != 0xff {
+			return nil, utils.ErrInvalidRequest
+		}
+		userKey = append(userKey, 0)
+	}
+	return nil, utils.ErrInvalidRequest
 }

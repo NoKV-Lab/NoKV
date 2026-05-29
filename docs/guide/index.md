@@ -44,7 +44,7 @@ All three consume the **same** rooted truth in `meta/root` and the **same** nati
 | Complete reference (primitives + lifecycle + deployment) | [fsmeta](./fsmeta) |
 | Rooted truth kernel (`meta/root`) | [Rooted Truth](./rooted_truth) |
 | Coordinator (route / TSO / heartbeats / WatchRootEvents stream) | [Coordinator](./coordinator) |
-| Snapshot / authority / quota lifecycle | [Migration](./migration) · [Recovery](./recovery) |
+| Snapshot / authority / quota lifecycle | [Recovery](./recovery) |
 
 ### 🏛️ Distributed runtime — the layer below fsmeta
 
@@ -52,25 +52,22 @@ All three consume the **same** rooted truth in `meta/root` and the **same** nati
 |---|---|
 | Raftstore overview (store / peer / admin) | [Raftstore](./raftstore) |
 | Control plane ↔ execution plane contract | [Control & Execution Protocols](./control_and_execution_protocols) |
-| Standalone → distributed migration | [Migration](./migration) |
+| Storage backend refactor / migration status | [Migration Status](./migration) |
 | Recovery model | [Recovery](./recovery) |
 | Percolator MVCC 2PC + AssertionNotExist | [Percolator](./percolator) |
 | Runtime call chains (sequence diagrams) | [Runtime](./runtime) |
 
-### 🔧 Storage engine internals — the foundation
+### 🔧 Storage backend internals — the foundation
 
-The single-node substrate everything sits on. Independently usable as an embedded Go LSM, with distributed runtime built through NoKV's raftstore integration.
+The single-node substrate everything sits on. The default physical backend is
+Pebble through `storage/pebble`; NoKV keeps MVCC and metadata semantics above
+that raw ordered-KV boundary.
 
 | Topic | Doc |
 |---|---|
 | High-level architecture | [Architecture](./architecture) |
 | WAL discipline and replay | [WAL](./wal) |
-| MemTable + ART/SkipList | [Memtable](./memtable) |
-| Flush pipeline | [Flush](./flush) |
-| Leveled compaction + landing buffer | [Compaction](./compaction) · [Landing Buffer](./landing_buffer) |
-| Manifest semantics | [Manifest](./manifest) |
-| Range filter | [Range Filter](./range_filter) |
-| Block / row cache | [Cache](./cache) |
+| Removed legacy LSM/migration status | [Migration Status](./migration) |
 | VFS abstraction + FaultFS | [VFS](./vfs) · [File](./file) |
 | Entry / error model | [Entry](./entry) · [Error Handling](./errors) |
 
@@ -88,12 +85,12 @@ stable fsmeta product contract.
 
 | Topic | Doc |
 |---|---|
-| **CLI reference** (`nokv` — stats / manifest / regions / mount / quota / migrate) | [CLI](./cli) |
+| **CLI reference** (`nokv` — stats / execution / regions / serve / coordinator / meta-root / mount / quota / audit) | [CLI](./cli) |
 | Configuration (one JSON file shared by all binaries) | [Configuration](./config) |
 | Cluster demo | [Cluster Demo](./demo) |
 | Scripts layout | [Scripts](./scripts) |
 | Stats / expvar / metrics | [Stats & Observability](./stats) |
-| Testing strategy (failpoints, chaos, restart, migration) | [Testing](./testing) |
+| Testing strategy (failpoints, chaos, restart) | [Testing](./testing) |
 
 ### 🧑‍💻 Development contract
 
@@ -116,7 +113,7 @@ Layer 2  meta/root         ← rooted authority truth
          raftstore         ← per-region Raft + apply observer
          percolator        ← 2PC + MVCC + AssertionNotExist + commit-ts retry
    │
-Layer 3  engine            ← LSM + ART memtable + WAL + slab sidecar substrate
+Layer 3  storage           ← raw ordered KV (Pebble by default) + low-level runtime support
 
 Experimental mechanisms such as Peras and Thermos live behind the stable
 contract and should move under `experimental/` as they are cleaned up.
@@ -166,10 +163,10 @@ Full walkthrough: [Getting Started](./getting_started) · CLI reference: [CLI](.
 |---|---|
 | **[fsmeta service](./fsmeta)** | The headline product — namespace metadata API |
 | **[Formal specs (spec/)](https://github.com/feichai0017/NoKV/blob/main/spec/README.md)** | TLA+ / TLC models for transition safety |
-| **[CLI surface](./cli)** | `nokv` — stats, manifest, regions, mount, quota, migrate |
+| **[CLI surface](./cli)** | `nokv` — stats, execution, regions, serve, coordinator, meta-root, mount, quota, audit |
 | **[Topology config](./config)** | One JSON file shared by scripts, Docker, all CLI |
 | **[Coordinator](./coordinator)** | Route / TSO / heartbeat / root-event subscribe |
 | **[Rooted truth](./rooted_truth)** | `meta/root` typed event log |
 | **[Percolator / MVCC](./percolator)** | 2PC primitives in distributed mode |
 | **[Runtime call chains](./runtime)** | Function-level sequence diagrams |
-| **[Testing](./testing)** | Failpoints, chaos, restart, migration |
+| **[Testing](./testing)** | Failpoints, chaos, restart |

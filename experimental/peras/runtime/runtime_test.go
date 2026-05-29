@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/wal"
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
@@ -28,6 +27,7 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta/observe"
 	"github.com/feichai0017/NoKV/fsmeta/proof"
 	rootproto "github.com/feichai0017/NoKV/meta/root/protocol"
+	"github.com/feichai0017/NoKV/storage/wal"
 	"github.com/stretchr/testify/require"
 )
 

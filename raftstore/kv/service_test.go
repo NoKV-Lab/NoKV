@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	local "github.com/feichai0017/NoKV/local"
 	myraft "github.com/feichai0017/NoKV/raft"
 	"github.com/feichai0017/NoKV/raftstore/command"
@@ -22,6 +21,7 @@ import (
 	raftstorestats "github.com/feichai0017/NoKV/raftstore/stats"
 	"github.com/feichai0017/NoKV/raftstore/store"
 	"github.com/feichai0017/NoKV/txn/mvcc"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

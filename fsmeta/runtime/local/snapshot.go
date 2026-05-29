@@ -9,12 +9,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootstate "github.com/feichai0017/NoKV/meta/root/state"
+	"github.com/feichai0017/NoKV/txn/storage"
 )
 
 // SnapshotRegistry tracks locally published snapshot tokens. When constructed
@@ -211,7 +210,7 @@ func (r *SnapshotRegistry) load(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	iter := r.runner.db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := r.runner.db.NewInternalIterator(&storage.Options{IsAsc: true})
 	if iter == nil {
 		return nil
 	}
@@ -220,7 +219,7 @@ func (r *SnapshotRegistry) load(ctx context.Context) error {
 		loaded      uint64
 		lastUserKey []byte
 	)
-	iter.Seek(kv.InternalKey(kv.CFWrite, prefix, kv.MaxVersion))
+	iter.Seek(storage.InternalKey(storage.CFWrite, prefix, storage.MaxVersion))
 	for iter.Valid() {
 		if err := ctxErr(ctx); err != nil {
 			return err
@@ -230,11 +229,11 @@ func (r *SnapshotRegistry) load(ctx context.Context) error {
 			iter.Next()
 			continue
 		}
-		cf, userKey, _, ok := kv.SplitInternalKey(item.Entry().Key)
+		cf, userKey, _, ok := storage.SplitInternalKey(item.Entry().Key)
 		if !ok {
 			return errInvalidInternalEntry
 		}
-		if cf != kv.CFWrite || !bytes.HasPrefix(userKey, prefix) {
+		if cf != storage.CFWrite || !bytes.HasPrefix(userKey, prefix) {
 			break
 		}
 		if bytes.Equal(userKey, lastUserKey) {
@@ -261,7 +260,7 @@ func (r *SnapshotRegistry) readSnapshotRecord(key []byte) (model.SnapshotSubtree
 	if !ok || parts.Kind != layout.KeyKindSnapshot {
 		return model.SnapshotSubtreeToken{}, false, layout.ErrInvalidKey
 	}
-	value, ok, err := r.runner.readValue(key, kv.MaxVersion)
+	value, ok, err := r.runner.readValue(key, storage.MaxVersion)
 	if err != nil || !ok {
 		return model.SnapshotSubtreeToken{}, ok, err
 	}

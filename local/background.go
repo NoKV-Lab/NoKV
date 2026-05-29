@@ -7,8 +7,8 @@ import (
 	stderrors "errors"
 	"fmt"
 
-	"github.com/feichai0017/NoKV/engine/wal"
 	"github.com/feichai0017/NoKV/metrics"
+	"github.com/feichai0017/NoKV/storage/wal"
 	"github.com/feichai0017/NoKV/utils"
 )
 

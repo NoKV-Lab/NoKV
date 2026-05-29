@@ -1,11 +1,10 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package snapshot defines the backend-neutral region snapshot protocol used
-// by raftstore migration and peer bootstrap flows.
+// Package snapshot defines raftstore-internal region snapshot payloads.
 //
-// Concrete payload formats belong in subpackages. The current LSM external-SST
-// implementation lives in raftstore/snapshot/sst, so SST manifests, table file
-// IDs, compatibility checks, and rollback hooks do not become a generic
-// storage-backend contract.
+// The payload stores canonical NoKV MVCC internal entries plus region metadata.
+// It is used for raft peer bootstrap and catch-up only; operator migration,
+// SST ingest/export, physical table manifests, and file IDs are intentionally
+// outside the generic storage-backend contract.
 package snapshot

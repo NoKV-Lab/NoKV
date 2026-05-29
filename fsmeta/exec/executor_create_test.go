@@ -8,8 +8,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/feichai0017/NoKV/engine/slab/negativecache"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/negativecache"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"

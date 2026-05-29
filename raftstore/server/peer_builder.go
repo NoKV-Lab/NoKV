@@ -10,6 +10,7 @@ import (
 	"github.com/feichai0017/NoKV/raftstore/kv"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/peer"
+	"github.com/feichai0017/NoKV/raftstore/snapshot"
 	"github.com/feichai0017/NoKV/raftstore/store"
 	"github.com/feichai0017/NoKV/raftstore/transport"
 )
@@ -30,21 +31,19 @@ func defaultPeerBuilder(storage Storage, localMeta *localmeta.Store, storeID uin
 		if err != nil {
 			return nil, fmt.Errorf("raftstore/server: open peer storage for region %d: %w", meta.ID, err)
 		}
-		if storage.Snapshot == nil {
-			return nil, fmt.Errorf("raftstore/server: snapshot storage is required")
-		}
+		snapshotStore := snapshot.NewStore(storage.MVCC)
 		snapshotApply := func(payload []byte) (localmeta.RegionMeta, error) {
-			result, err := storage.Snapshot.ImportSnapshot(payload)
+			result, err := snapshotStore.ImportSnapshot(payload)
 			if err != nil {
 				return localmeta.RegionMeta{}, err
 			}
-			return result.Meta.Region, nil
+			return result.Descriptor.Region, nil
 		}
 		return &peer.Config{
 			RaftConfig:     defaultRaftConfig(baseRaft, peerID),
 			Transport:      tr,
 			Apply:          kv.NewEntryApplier(storage.MVCC),
-			SnapshotExport: storage.Snapshot.ExportSnapshot,
+			SnapshotExport: snapshotStore.ExportSnapshot,
 			SnapshotApply:  snapshotApply,
 			Storage:        peerStorage,
 			GroupID:        meta.ID,

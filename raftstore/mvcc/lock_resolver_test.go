@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"testing"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	local "github.com/feichai0017/NoKV/local"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	storemvcc "github.com/feichai0017/NoKV/raftstore/mvcc"
 	"github.com/feichai0017/NoKV/txn/latch"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
 	"github.com/feichai0017/NoKV/txn/percolator"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 )
 

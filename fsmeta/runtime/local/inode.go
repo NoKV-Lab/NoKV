@@ -8,11 +8,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 )
 
 // InodeAllocator assigns monotonically increasing local inode IDs.
@@ -112,7 +111,7 @@ func maxInodeInStore(db *localdb.DB, mount model.MountIdentity) (model.InodeID, 
 	if db == nil {
 		return 0, nil
 	}
-	iter := db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := db.NewInternalIterator(&kv.Options{IsAsc: true})
 	if iter == nil {
 		return 0, nil
 	}

@@ -36,7 +36,7 @@ import (
 	"github.com/feichai0017/NoKV/raftstore/peer"
 	"github.com/feichai0017/NoKV/raftstore/raftlog"
 	serverpkg "github.com/feichai0017/NoKV/raftstore/server"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
 	raftstorestats "github.com/feichai0017/NoKV/raftstore/stats"
 	storepkg "github.com/feichai0017/NoKV/raftstore/store"
 	"google.golang.org/grpc"
@@ -109,9 +109,8 @@ func StartNodeWithConfig(tb testing.TB, storeID uint64, dir string, cfg NodeConf
 	}
 	srv, err := serverpkg.NewNode(serverpkg.Config{
 		Storage: serverpkg.Storage{
-			MVCC:     db,
-			Raft:     raftlog.NewDBLog(db),
-			Snapshot: snapshotpkg.NewDBStore(db),
+			MVCC: db,
+			Raft: raftlog.NewDBLog(db),
 		},
 		Store: storepkg.Config{
 			StoreID:           storeID,
@@ -689,13 +688,13 @@ func AssertValue(tb testing.TB, db *local.DB, key, value []byte) {
 }
 
 func peerConfig(node *Node, meta localmeta.RegionMeta, peerID uint64, storage raftlog.PeerStorage) *peer.Config {
-	snapshotStore := snapshotpkg.NewDBStore(node.DB)
+	snapshotStore := snapshotpkg.NewStore(node.DB)
 	snapshotApply := func(payload []byte) (localmeta.RegionMeta, error) {
 		result, err := snapshotStore.ImportSnapshot(payload)
 		if err != nil {
 			return localmeta.RegionMeta{}, err
 		}
-		return result.Meta.Region, nil
+		return result.Descriptor.Region, nil
 	}
 	return &peer.Config{
 		RaftConfig:     raftConfig(peerID, node.EnableLeaseRead),

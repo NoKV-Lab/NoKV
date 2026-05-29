@@ -6,24 +6,24 @@ package local
 import (
 	"time"
 
-	lsmpkg "github.com/feichai0017/NoKV/engine/lsm"
-	"github.com/feichai0017/NoKV/engine/vfs"
-	"github.com/feichai0017/NoKV/engine/wal"
 	"github.com/feichai0017/NoKV/local/stats"
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
+	"github.com/feichai0017/NoKV/storage/vfs"
+	"github.com/feichai0017/NoKV/storage/wal"
 )
 
 const (
-	defaultWriteBatchMaxCount       = 64
-	defaultWriteBatchMaxSize  int64 = 1 << 20
-	defaultThermosTopK              = 16
-	// defaultLSMShardCount is the number of WAL Manager + memtable pairs
-	// that back the LSM data plane. Each shard runs on its own fd, fsync
-	// worker, and bufio.Writer so writes do not contend on a single
-	// Manager.mu. The commit pipeline launches one processor per shard,
-	// so write concurrency is determined entirely by LSMShardCount —
-	// there is no separate CommitWorkers knob. Must be a power of two.
-	defaultLSMShardCount = 4
+	defaultWriteBatchMaxCount         = 64
+	defaultWriteBatchMaxSize    int64 = 1 << 20
+	defaultThermosTopK                = 16
+	defaultBlockCacheBytes      int64 = 256 << 20
+	defaultIndexCacheBytes      int64 = 128 << 20
+	defaultWriteThrottleMinRate int64 = 32 << 20
+	defaultWriteThrottleMaxRate int64 = 128 << 20
+	// defaultWriteShardCount is the number of commit processors used by the
+	// local write pipeline. Pebble persists the final raw batch; this count only
+	// controls local admission and coalescing parallelism. Must be a power of two.
+	defaultWriteShardCount = 4
 )
 
 // Options holds the top-level database configuration.
@@ -37,10 +37,8 @@ type Options struct {
 	// must opt into seeded/cluster directories explicitly.
 	AllowedModes []workdirmode.Mode
 
-	WorkDir        string
-	MemTableSize   int64
-	MemTableEngine MemTableEngine
-	SSTableMaxSz   int64
+	WorkDir      string
+	MemTableSize int64
 	// MaxBatchCount bounds the number of entries grouped into one internal
 	// write batch. NewDefaultOptions exposes a concrete default; zero is only
 	// interpreted Open resolves the constructor default when left zero.
@@ -86,21 +84,19 @@ type Options struct {
 	// WAL fsync from the commit pipeline. When false (the default), the commit
 	// worker performs fsync inline. Only effective when SyncWrites is true.
 	SyncPipeline bool
-	// LSMShardCount is the number of WAL Manager + memtable pairs that back
-	// the LSM data plane and equivalently the number of commit-pipeline
-	// processors (one per shard, pinned end-to-end so SetBatch atomicity
-	// is preserved). The shard router uses `& (N-1)` for placement so the
-	// value must be a power of two. Zero falls back to the constructor
-	// default; non-power-of-two values are rounded DOWN to the nearest
-	// power of two during Open (e.g. 6 → 4, 12 → 8).
-	LSMShardCount int
+	// WriteShardCount is the number of local commit-pipeline processors. The
+	// shard router uses `& (N-1)` for placement so the value must be a power of
+	// two. Zero falls back to the constructor default; non-power-of-two values
+	// are rounded DOWN to the nearest power of two during Open (e.g. 6 -> 4,
+	// 12 -> 8).
+	WriteShardCount int
 	// UserKeyShapeExtractor optionally exposes runtime-derived key structure to
 	// local storage. Nil keeps generic full-key hashing and disables semantic
 	// prefix bloom filters.
 	UserKeyShapeExtractor UserKeyShapeExtractor
 	ManifestSync          bool
-	// ManifestRewriteThreshold triggers a manifest rewrite when the active
-	// MANIFEST file grows beyond this size (bytes). Values <= 0 disable rewrites.
+	// ManifestRewriteThreshold is retained as an inert legacy config slot while
+	// Pebble owns physical metadata below storage/pebble.
 	ManifestRewriteThreshold int64
 	// WriteHotKeyLimit caps how many consecutive writes a single key can issue
 	// before the DB returns utils.ErrHotKeyWriteThrottle. Zero disables write-path
@@ -123,10 +119,13 @@ type Options struct {
 	// BlockCacheBytes bounds the in-memory budget for cached L0/L1 data blocks.
 	// Deeper levels continue to rely on the OS page cache.
 	BlockCacheBytes int64
-	// IndexCacheBytes bounds the in-memory budget for decoded SSTable indexes.
+	// IndexCacheBytes is reserved for storage backends that expose a separate
+	// index-cache budget. Pebble currently folds it into the raw backend cache.
 	IndexCacheBytes int64
-	// BlockCompression controls SST data-block compression.
-	BlockCompression lsmpkg.BlockCompression
+	// BlockCompression is retained as a local storage tuning knob. Pebble is
+	// now the default physical engine, so NoKV no longer exposes CommitStore table
+	// compression types through this API.
+	BlockCompression BlockCompression
 
 	// ControlLogLagWarnSegments determines how many WAL segments one replicated
 	// control-log consumer can lag behind the active segment before stats
@@ -163,77 +162,8 @@ type Options struct {
 	// snapshot. Nil disables control-log backlog accounting.
 	ControlLogPointerSnapshot func() map[uint64]stats.ControlLogPointer
 
-	// NumCompactors controls how many background compaction workers are spawned.
-	// Zero uses an auto value derived from the host CPU count.
-	NumCompactors int
-	// CompactionPolicy selects how compaction priorities are arranged.
-	// Supported values: leveled, tiered, hybrid.
-	CompactionPolicy CompactionPolicy
-	// NumLevelZeroTables controls when write throttling kicks in and feeds into
-	// the compaction priority calculation. NewDefaultOptions populates a concrete
-	// default; Open resolves the constructor default when left zero.
-	NumLevelZeroTables int
-	// L0SlowdownWritesTrigger starts write pacing when L0 table count reaches
-	// this threshold. Defaults are populated up front; zero is only interpreted
-	// Open resolves the constructor default when left zero.
-	L0SlowdownWritesTrigger int
-	// L0StopWritesTrigger blocks writes when L0 table count reaches this
-	// threshold. Defaults are populated up front; zero is only interpreted as a
-	// Open resolves the constructor default when left zero.
-	L0StopWritesTrigger int
-	// L0ResumeWritesTrigger clears throttling only when L0 table count drops to
-	// this threshold or lower. Defaults are populated up front; zero is only
-	// interpreted Open resolves the constructor default when left zero.
-	L0ResumeWritesTrigger int
-	// CompactionSlowdownTrigger starts write pacing when max compaction score
-	// reaches this value. Defaults are populated up front; zero is only
-	// interpreted Open resolves the constructor default when left zero.
-	CompactionSlowdownTrigger float64
-	// CompactionStopTrigger blocks writes when max compaction score reaches this
-	// value. Defaults are populated up front; zero is only interpreted as a
-	// Open resolves the constructor default when left zero.
-	CompactionStopTrigger float64
-	// CompactionResumeTrigger clears throttling only when max compaction score
-	// drops to this value or lower. Defaults are populated up front; zero is only
-	// interpreted Open resolves the constructor default when left zero.
-	CompactionResumeTrigger float64
-	// LandingCompactBatchSize decides how many L0 tables to promote into the
-	// landing buffer per compaction cycle. NewDefaultOptions populates a concrete
-	// default; Open resolves the constructor default when left zero.
-	LandingCompactBatchSize int
-	// LandingBacklogMergeScore triggers a landing-merge task when the landing
-	// backlog score exceeds this threshold. Defaults are populated up front; zero
-	// is only interpreted Open resolves the constructor default when left zero.
-	LandingBacklogMergeScore float64
-
-	// CompactionValueWeight adjusts how aggressively the scheduler prioritises
-	// levels whose entries carry a high value-byte density.
-	CompactionValueWeight float64
-	// CompactionTombstoneWeight adjusts how aggressively the scheduler
-	// prioritizes levels with high range tombstone density.
-	CompactionTombstoneWeight float64
-	// TTLCompactionMinAge forces stale-data cleanup for max-level SSTables
-	// older than this age. Zero disables age-triggered cleanup.
-	TTLCompactionMinAge time.Duration
-
-	// CompactionWriteBytesPerSec paces compaction output writes. Zero disables
-	// pacing. Flush writes are never paced.
-	CompactionWriteBytesPerSec int64
-	// CompactionPacingBypassL0 bypasses output pacing when L0 table count
-	// reaches this threshold. Zero lets Open derive a conservative threshold
-	// when compaction pacing is enabled.
-	CompactionPacingBypassL0 int
-
-	// CompactionValueAlertThreshold triggers stats alerts when a level's
-	// value-density (value bytes / total bytes) exceeds this ratio.
-	CompactionValueAlertThreshold float64
-
-	// LandingShardParallelism caps how many landing shards can be compacted in a
-	// single landing-only pass. A value <= 0 falls back to 1 (sequential).
-	LandingShardParallelism int
-
 	// NegativeCachePersistent enables snapshot-on-Close + restore-on-Open for
-	// the in-memory negative cache, backed by an engine/slab segment under
+	// the in-memory negative cache, backed by an fsmeta/cache slab segment under
 	// WorkDir/negative-slab/. Default false. When enabled, a process restart
 	// skips the cold-start re-warm phase for previously-known not-found keys
 	// (fsmeta Lookup misses, S3 GetObject 404, HDFS path probes). The slab
@@ -247,21 +177,13 @@ type Options struct {
 	NegativeCacheSlabMaxSize int64
 }
 
-// CompactionPolicy defines compaction priority-arrangement strategy.
-type CompactionPolicy string
+// BlockCompression selects physical block compression where the backend
+// exposes a matching control.
+type BlockCompression string
 
 const (
-	CompactionPolicyLeveled CompactionPolicy = "leveled"
-	CompactionPolicyTiered  CompactionPolicy = "tiered"
-	CompactionPolicyHybrid  CompactionPolicy = "hybrid"
-)
-
-// MemTableEngine selects the in-memory index implementation used by memtables.
-type MemTableEngine string
-
-const (
-	MemTableEngineSkiplist MemTableEngine = "skiplist"
-	MemTableEngineART      MemTableEngine = "art"
+	BlockCompressionNone   BlockCompression = "none"
+	BlockCompressionSnappy BlockCompression = "snappy"
 )
 
 // NewDefaultOptions returns the default option set.
@@ -269,8 +191,6 @@ func NewDefaultOptions() *Options {
 	opt := &Options{
 		WorkDir:                   "./work_test",
 		MemTableSize:              64 << 20,
-		MemTableEngine:            MemTableEngineART,
-		SSTableMaxSz:              256 << 20,
 		ThermosEnabled:            false,
 		ThermosBits:               12,
 		ThermosTopK:               defaultThermosTopK,
@@ -282,48 +202,30 @@ func NewDefaultOptions() *Options {
 		ThermosWindowSlots:        8,
 		ThermosWindowSlotDuration: 250 * time.Millisecond,
 		// Conservative defaults to avoid long batch-induced pauses.
-		WriteBatchMaxCount:            defaultWriteBatchMaxCount,
-		WriteBatchMaxSize:             defaultWriteBatchMaxSize,
-		LSMShardCount:                 defaultLSMShardCount,
-		MaxBatchCount:                 defaultWriteBatchMaxCount,
-		MaxBatchSize:                  defaultWriteBatchMaxSize,
-		BlockCacheBytes:               lsmpkg.DefaultBlockCacheBytes,
-		IndexCacheBytes:               lsmpkg.DefaultIndexCacheBytes,
-		BlockCompression:              lsmpkg.DefaultBlockCompression,
-		SyncWrites:                    false,
-		ManifestSync:                  false,
-		ManifestRewriteThreshold:      64 << 20,
-		WriteHotKeyLimit:              128,
-		WriteBatchWait:                200 * time.Microsecond,
-		WriteThrottleMinRate:          lsmpkg.DefaultWriteThrottleMinRate,
-		WriteThrottleMaxRate:          lsmpkg.DefaultWriteThrottleMaxRate,
-		ControlLogLagWarnSegments:     8,
-		EnableWALWatchdog:             true,
-		WALBufferSize:                 wal.DefaultBufferSize,
-		WALAutoGCInterval:             15 * time.Second,
-		WALAutoGCMinRemovable:         1,
-		WALAutoGCMaxBatch:             4,
-		WALTypedRecordWarnRatio:       0.35,
-		WALTypedRecordWarnSegments:    6,
-		CompactionValueWeight:         lsmpkg.DefaultCompactionValueWeight,
-		CompactionTombstoneWeight:     lsmpkg.DefaultCompactionTombstoneWeight,
-		CompactionValueAlertThreshold: lsmpkg.DefaultCompactionValueAlertThreshold,
+		WriteBatchMaxCount:         defaultWriteBatchMaxCount,
+		WriteBatchMaxSize:          defaultWriteBatchMaxSize,
+		WriteShardCount:            defaultWriteShardCount,
+		MaxBatchCount:              defaultWriteBatchMaxCount,
+		MaxBatchSize:               defaultWriteBatchMaxSize,
+		BlockCacheBytes:            defaultBlockCacheBytes,
+		IndexCacheBytes:            defaultIndexCacheBytes,
+		BlockCompression:           BlockCompressionSnappy,
+		SyncWrites:                 false,
+		ManifestSync:               false,
+		ManifestRewriteThreshold:   64 << 20,
+		WriteHotKeyLimit:           128,
+		WriteBatchWait:             200 * time.Microsecond,
+		WriteThrottleMinRate:       defaultWriteThrottleMinRate,
+		WriteThrottleMaxRate:       defaultWriteThrottleMaxRate,
+		ControlLogLagWarnSegments:  8,
+		EnableWALWatchdog:          true,
+		WALBufferSize:              wal.DefaultBufferSize,
+		WALAutoGCInterval:          15 * time.Second,
+		WALAutoGCMinRemovable:      1,
+		WALAutoGCMaxBatch:          4,
+		WALTypedRecordWarnRatio:    0.35,
+		WALTypedRecordWarnSegments: 6,
 	}
-
-	// Relax L0 throttling defaults and increase compaction parallelism a bit to
-	// reduce write-path sleeps under load.
-	opt.NumLevelZeroTables = lsmpkg.DefaultNumLevelZeroTables
-	opt.L0SlowdownWritesTrigger = lsmpkg.DefaultNumLevelZeroTables
-	opt.L0StopWritesTrigger = lsmpkg.DefaultNumLevelZeroTables * 3
-	opt.L0ResumeWritesTrigger = 24
-	opt.CompactionSlowdownTrigger = lsmpkg.DefaultCompactionSlowdownTrigger
-	opt.CompactionStopTrigger = lsmpkg.DefaultCompactionStopTrigger
-	opt.CompactionResumeTrigger = lsmpkg.DefaultCompactionResumeTrigger
-	opt.LandingCompactBatchSize = lsmpkg.DefaultLandingCompactBatchSize
-	opt.LandingBacklogMergeScore = lsmpkg.DefaultLandingBacklogMergeScore
-	opt.NumCompactors = 4
-	opt.CompactionPolicy = CompactionPolicyLeveled
-	opt.LandingShardParallelism = 2
 	return opt
 }
 
@@ -333,12 +235,6 @@ func NewDefaultOptions() *Options {
 func (opt *Options) resolveOpenDefaults() {
 	if opt == nil {
 		return
-	}
-	if opt.MemTableEngine == "" {
-		opt.MemTableEngine = MemTableEngineART
-	}
-	if opt.CompactionPolicy == "" {
-		opt.CompactionPolicy = CompactionPolicyLeveled
 	}
 	if opt.ThermosTopK <= 0 {
 		opt.ThermosTopK = defaultThermosTopK
@@ -358,98 +254,38 @@ func (opt *Options) resolveOpenDefaults() {
 	if opt.WriteBatchWait < 0 {
 		opt.WriteBatchWait = 0
 	}
-	opt.normalizeLSMSharedOptions()
+	opt.normalizeStorageOptions()
 	if opt.WALBufferSize <= 0 {
 		opt.WALBufferSize = wal.DefaultBufferSize
 	}
-	if opt.LSMShardCount <= 0 {
-		opt.LSMShardCount = defaultLSMShardCount
+	if opt.WriteShardCount <= 0 {
+		opt.WriteShardCount = defaultWriteShardCount
 	}
 	// Power-of-two so the eventual hash routing can use & (N-1).
-	if opt.LSMShardCount&(opt.LSMShardCount-1) != 0 {
+	if opt.WriteShardCount&(opt.WriteShardCount-1) != 0 {
 		// Round down to nearest power of two; never zero.
 		n := 1
-		for n*2 <= opt.LSMShardCount {
+		for n*2 <= opt.WriteShardCount {
 			n *= 2
 		}
-		opt.LSMShardCount = n
+		opt.WriteShardCount = n
 	}
 }
 
-func (opt *Options) normalizeLSMSharedOptions() {
-	cfg := &lsmpkg.Options{}
-	opt.applyLSMSharedOptions(cfg)
-	cfg.NormalizeInPlace()
-	opt.copyNormalizedLSMOptions(cfg)
-}
-
-func (opt *Options) applyLSMSharedOptions(dst *lsmpkg.Options) {
-	if opt == nil || dst == nil {
+func (opt *Options) normalizeStorageOptions() {
+	if opt == nil {
 		return
 	}
-	dst.NumCompactors = opt.NumCompactors
-	dst.NumLevelZeroTables = opt.NumLevelZeroTables
-	dst.L0SlowdownWritesTrigger = opt.L0SlowdownWritesTrigger
-	dst.L0StopWritesTrigger = opt.L0StopWritesTrigger
-	dst.L0ResumeWritesTrigger = opt.L0ResumeWritesTrigger
-	dst.CompactionSlowdownTrigger = opt.CompactionSlowdownTrigger
-	dst.CompactionStopTrigger = opt.CompactionStopTrigger
-	dst.CompactionResumeTrigger = opt.CompactionResumeTrigger
-	dst.WriteThrottleMinRate = opt.WriteThrottleMinRate
-	dst.WriteThrottleMaxRate = opt.WriteThrottleMaxRate
-	dst.LandingCompactBatchSize = opt.LandingCompactBatchSize
-	dst.LandingBacklogMergeScore = opt.LandingBacklogMergeScore
-	dst.LandingShardParallelism = opt.LandingShardParallelism
-	dst.CompactionValueWeight = opt.CompactionValueWeight
-	dst.CompactionTombstoneWeight = opt.CompactionTombstoneWeight
-	dst.TTLCompactionMinAge = opt.TTLCompactionMinAge
-	dst.CompactionWriteBytesPerSec = opt.CompactionWriteBytesPerSec
-	dst.CompactionPacingBypassL0 = opt.CompactionPacingBypassL0
-	dst.CompactionValueAlertThreshold = opt.CompactionValueAlertThreshold
-	dst.BlockCacheBytes = opt.BlockCacheBytes
-	dst.IndexCacheBytes = opt.IndexCacheBytes
-	dst.PrefixExtractor = opt.lsmPrefixExtractor()
-	dst.BlockCompression = opt.BlockCompression
-	dst.NegativeCachePersistent = opt.NegativeCachePersistent
-	dst.NegativeCacheSlabMaxSize = opt.NegativeCacheSlabMaxSize
-}
-
-func (opt *Options) copyNormalizedLSMOptions(src *lsmpkg.Options) {
-	if opt == nil || src == nil {
-		return
+	if opt.BlockCacheBytes <= 0 {
+		opt.BlockCacheBytes = defaultBlockCacheBytes
 	}
-	opt.NumCompactors = src.NumCompactors
-	opt.NumLevelZeroTables = src.NumLevelZeroTables
-	opt.L0SlowdownWritesTrigger = src.L0SlowdownWritesTrigger
-	opt.L0StopWritesTrigger = src.L0StopWritesTrigger
-	opt.L0ResumeWritesTrigger = src.L0ResumeWritesTrigger
-	opt.CompactionSlowdownTrigger = src.CompactionSlowdownTrigger
-	opt.CompactionStopTrigger = src.CompactionStopTrigger
-	opt.CompactionResumeTrigger = src.CompactionResumeTrigger
-	opt.WriteThrottleMinRate = src.WriteThrottleMinRate
-	opt.WriteThrottleMaxRate = src.WriteThrottleMaxRate
-	opt.LandingCompactBatchSize = src.LandingCompactBatchSize
-	opt.LandingBacklogMergeScore = src.LandingBacklogMergeScore
-	opt.LandingShardParallelism = src.LandingShardParallelism
-	opt.CompactionValueWeight = src.CompactionValueWeight
-	opt.CompactionTombstoneWeight = src.CompactionTombstoneWeight
-	opt.TTLCompactionMinAge = src.TTLCompactionMinAge
-	opt.CompactionWriteBytesPerSec = src.CompactionWriteBytesPerSec
-	opt.CompactionPacingBypassL0 = src.CompactionPacingBypassL0
-	opt.CompactionValueAlertThreshold = src.CompactionValueAlertThreshold
-	opt.BlockCacheBytes = src.BlockCacheBytes
-	opt.IndexCacheBytes = src.IndexCacheBytes
-	opt.BlockCompression = src.BlockCompression
-	opt.NegativeCachePersistent = src.NegativeCachePersistent
-	opt.NegativeCacheSlabMaxSize = src.NegativeCacheSlabMaxSize
-}
-
-func (opt *Options) lsmPrefixExtractor() lsmpkg.PrefixExtractor {
-	if opt == nil || opt.UserKeyShapeExtractor == nil {
-		return nil
+	if opt.IndexCacheBytes < 0 {
+		opt.IndexCacheBytes = 0
 	}
-	return func(userKey []byte) []byte {
-		shape := opt.UserKeyShapeExtractor(userKey)
-		return shape.BloomPrefix
+	if opt.WriteThrottleMinRate <= 0 {
+		opt.WriteThrottleMinRate = defaultWriteThrottleMinRate
+	}
+	if opt.WriteThrottleMaxRate <= 0 || opt.WriteThrottleMaxRate < opt.WriteThrottleMinRate {
+		opt.WriteThrottleMaxRate = max(opt.WriteThrottleMinRate, defaultWriteThrottleMaxRate)
 	}
 }

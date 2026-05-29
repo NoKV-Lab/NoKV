@@ -7,13 +7,13 @@ import (
 	metaregion "github.com/feichai0017/NoKV/meta/region"
 	"testing"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	local "github.com/feichai0017/NoKV/local"
 	myraft "github.com/feichai0017/NoKV/raft"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/peer"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
 	"github.com/feichai0017/NoKV/raftstore/store/router"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -21,11 +21,11 @@ import (
 func testSSTApply(t *testing.T, db *local.DB) peer.SnapshotApplyFunc {
 	t.Helper()
 	return func(payload []byte) (localmeta.RegionMeta, error) {
-		result, err := snapshotpkg.NewDBStore(db).ImportSnapshot(payload)
+		result, err := snapshotpkg.NewStore(db).ImportSnapshot(payload)
 		if err != nil {
 			return localmeta.RegionMeta{}, err
 		}
-		return result.Meta.Region, nil
+		return result.Descriptor.Region, nil
 	}
 }
 
@@ -46,7 +46,7 @@ func TestStoreStepBootstrapsPeerFromSnapshotPayload(t *testing.T) {
 		},
 		State: metaregion.ReplicaStateRunning,
 	}
-	payload, err := snapshotpkg.NewDBStore(sourceDB).ExportSnapshot(region)
+	payload, err := snapshotpkg.NewStore(sourceDB).ExportSnapshot(region)
 	require.NoError(t, err)
 
 	targetDB, targetMeta := openStoreDB(t)
@@ -123,7 +123,7 @@ func TestStoreInstallRegionSnapshotBootstrapsPeer(t *testing.T) {
 		},
 		State: metaregion.ReplicaStateRunning,
 	}
-	payload, err := snapshotpkg.NewDBStore(sourceDB).ExportSnapshot(region)
+	payload, err := snapshotpkg.NewStore(sourceDB).ExportSnapshot(region)
 	require.NoError(t, err)
 
 	targetDB, targetMeta := openStoreDB(t)

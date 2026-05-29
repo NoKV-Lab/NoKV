@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/feichai0017/NoKV/engine/vfs"
+	"github.com/feichai0017/NoKV/storage/vfs"
 )
 
 // Mode describes the lifecycle mode of one workdir.

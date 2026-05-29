@@ -19,7 +19,7 @@ go install ./cmd/nokv
 
 ## Shared Flags
 
-- `--workdir <path>`: NoKV database directory (must contain `CURRENT` for manifest commands)
+- `--workdir <path>`: NoKV database directory
 - `--json`: JSON output (default is plain text)
 - `--expvar <url>`: for `stats`, fetch from `/debug/vars`
 - `--no-region-metrics`: for offline `stats`, skip attaching runtime region metrics
@@ -42,7 +42,6 @@ Common fields:
 - `write.queue_depth`, `write.queue_entries`, `write.hot_key_limited`
 - `region.total`, `region.running`, `region.removing`
 - `hot.write_keys`
-- `lsm.levels`, `lsm.value_bytes_total`
 - `transport.*`
 
 Example:
@@ -72,69 +71,10 @@ Example:
 nokv execution --addr 127.0.0.1:20161 --json
 ```
 
-### `nokv manifest`
-
-- Reads manifest version state
-- Shows per-level file info
-
 ### `nokv regions`
 
 - Dumps the local peer catalog used for store recovery (state/range/epoch/peers)
 - Supports `--json`
-
-### `nokv migrate plan`
-
-- Runs a read-only preflight check for standalone -> cluster-seed migration
-- Verifies manifest and WAL structure without repairing tails
-- Reports current mode, local catalog occupancy, blockers, and next step
-
-### `nokv migrate init`
-
-- Converts a standalone workdir into a single-store seeded cluster directory
-- Writes `MODE.json`, the full-range local region catalog entry, and the initial
-  raft durable metadata
-- Exports a logical seed snapshot under `RAFTSTORE_SNAPSHOTS/region-<id>`
-- After `init`, ordinary standalone opens must reject the workdir unless the
-  caller explicitly opts into distributed modes
-
-### `nokv migrate status`
-
-- Reads `MODE.json` when present and otherwise reports `standalone`
-- Shows current mode plus seed identifiers (`store`, `region`, `peer`)
-
-### `nokv migrate expand`
-
-- Sends one or more `AddPeer` requests to the leader store's admin gRPC endpoint
-- Supports sequential rollout with repeated `--target <store>:<peer>[@addr]`
-- Optionally polls leader and target stores until each new peer is published,
-  hosted, and has applied at least one raft index
-- Common flags:
-  - `--addr` leader store admin address
-  - `--region`
-  - `--target <store>:<peer>[@addr]` (repeatable)
-  - `--wait` overall wait timeout (`0` disables waiting)
-  - `--poll-interval`
-
-### `nokv migrate remove-peer`
-
-- Sends one `RemovePeer` request to the leader store's admin gRPC endpoint
-- Optionally waits until the leader metadata drops the peer and the target store
-  no longer reports it as hosted
-- Common flags:
-  - `--addr` leader store admin address
-  - `--target-addr` target store admin address for removal wait checks
-  - `--region`, `--peer`
-  - `--wait`, `--poll-interval`
-
-### `nokv migrate transfer-leader`
-
-- Sends one `TransferLeader` request to the leader store's admin gRPC endpoint
-- Optionally waits until the target peer becomes the observed region leader
-- Common flags:
-  - `--addr` current leader store admin address
-  - `--target-addr` target store admin address for leader wait checks
-  - `--region`, `--peer`
-  - `--wait`, `--poll-interval`
 
 ### `nokv serve`
 
@@ -173,6 +113,13 @@ Restart semantics:
 - `--store-id` must match the durable workdir identity once the workdir has been used
 - `--store-addr` is only an exceptional static override; it is keyed by stable
   `storeID`, not by mutable runtime `peerID`
+
+### Removed migration commands
+
+The old operator-facing `nokv migrate` and `nokv manifest` commands are no
+longer part of the mainline CLI. Pebble-backed workdirs use the current raw
+storage format and this version does not provide an online migration path from
+old self-managed LSM workdirs.
 
 ### `nokv coordinator`
 

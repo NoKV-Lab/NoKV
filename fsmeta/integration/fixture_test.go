@@ -24,7 +24,6 @@ import (
 	metapb "github.com/feichai0017/NoKV/pb/meta"
 	"github.com/feichai0017/NoKV/raftstore/client"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
-	"github.com/feichai0017/NoKV/raftstore/migrate"
 	"github.com/feichai0017/NoKV/raftstore/testcluster"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -62,13 +61,7 @@ func openRealClusterRuntimeWithOptions(t *testing.T, ctx context.Context, opts .
 		peerID   = uint64(101)
 	)
 	coord.JoinStore(t, storeID)
-	_, err := migrate.Init(migrate.InitConfig{
-		WorkDir:  seedDir,
-		StoreID:  storeID,
-		RegionID: regionID,
-		PeerID:   peerID,
-	})
-	require.NoError(t, err)
+	seedLocalRegion(t, seedDir, storeID, regionID, peerID, nil, nil)
 
 	node := testcluster.StartNodeWithConfig(t, storeID, seedDir, testcluster.NodeConfig{
 		AllowedModes:      []workdirmode.Mode{workdirmode.ModeSeeded, workdirmode.ModeCluster},
@@ -135,13 +128,7 @@ func openSplitRealClusterExecutorWithOptions(t *testing.T, ctx context.Context, 
 		childPeerID    = uint64(102)
 	)
 	coord.JoinStore(t, storeID)
-	_, err := migrate.Init(migrate.InitConfig{
-		WorkDir:  seedDir,
-		StoreID:  storeID,
-		RegionID: parentRegionID,
-		PeerID:   parentPeerID,
-	})
-	require.NoError(t, err)
+	seedLocalRegion(t, seedDir, storeID, parentRegionID, parentPeerID, nil, nil)
 
 	node := testcluster.StartNodeWithConfig(t, storeID, seedDir, testcluster.NodeConfig{
 		AllowedModes:      []workdirmode.Mode{workdirmode.ModeSeeded, workdirmode.ModeCluster},
@@ -209,6 +196,31 @@ func openSplitRealClusterExecutorWithOptions(t *testing.T, ctx context.Context, 
 	executor, err := fsmetaexec.New(runner, executorOpts...)
 	require.NoError(t, err)
 	return executor
+}
+
+func seedLocalRegion(t *testing.T, dir string, storeID, regionID, peerID uint64, start, end []byte) localmeta.RegionMeta {
+	t.Helper()
+	meta := localmeta.RegionMeta{
+		ID:       regionID,
+		StartKey: append([]byte(nil), start...),
+		EndKey:   append([]byte(nil), end...),
+		Epoch: metaregion.Epoch{
+			Version:     1,
+			ConfVersion: 1,
+		},
+		Peers: []metaregion.Peer{{StoreID: storeID, PeerID: peerID}},
+	}
+	store, err := localmeta.OpenLocalStore(dir, nil)
+	require.NoError(t, err)
+	require.NoError(t, store.SaveRegion(meta))
+	require.NoError(t, store.Close())
+	require.NoError(t, workdirmode.Write(dir, workdirmode.State{
+		Mode:     workdirmode.ModeSeeded,
+		StoreID:  storeID,
+		RegionID: regionID,
+		PeerID:   peerID,
+	}))
+	return meta
 }
 
 type testMountResolver struct {

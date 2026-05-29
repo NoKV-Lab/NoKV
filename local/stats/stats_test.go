@@ -12,10 +12,9 @@ import (
 	"encoding/json"
 	"expvar"
 	"testing"
-	"time"
 
-	"github.com/feichai0017/NoKV/engine/lsm"
 	local "github.com/feichai0017/NoKV/local"
+	"github.com/feichai0017/NoKV/local/internal/commit"
 	"github.com/feichai0017/NoKV/local/stats"
 	metaregion "github.com/feichai0017/NoKV/meta/region"
 	"github.com/feichai0017/NoKV/metrics"
@@ -33,7 +32,6 @@ func newTestOptions(t *testing.T) *local.Options {
 	t.Helper()
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
-	opt.SSTableMaxSz = 1 << 12
 	opt.MemTableSize = 1 << 12
 	opt.MaxBatchCount = 10
 	opt.MaxBatchSize = 1 << 20
@@ -64,10 +62,7 @@ func TestStatsCollectSnapshots(t *testing.T) {
 	require.Equal(t, []byte("stats-value"), entry.Value)
 
 	snap := db.Info().Snapshot()
-	require.Greater(t, snap.Entries, int64(0))
 	require.Empty(t, snap.Hot.WriteKeys)
-	require.Greater(t, snap.WAL.SegmentCount, int64(0))
-	require.Greater(t, snap.WAL.RecordCounts.Entries, uint64(0))
 	require.False(t, snap.WAL.TypedRecordWarning)
 	require.Equal(t, uint64(0), snap.WAL.AutoGCRuns)
 	require.Equal(t, uint64(0), snap.WAL.AutoGCRemoved)
@@ -90,8 +85,6 @@ func TestStatsCollectSnapshots(t *testing.T) {
 	require.Equal(t, snap.Flush.Pending, exported.Flush.Pending)
 	require.Equal(t, snap.Compaction.Backlog, exported.Compaction.Backlog)
 	require.Equal(t, snap.Write.BatchesTotal, exported.Write.BatchesTotal)
-	require.Equal(t, snap.WAL.ActiveSegment, exported.WAL.ActiveSegment)
-	require.Equal(t, snap.WAL.SegmentsRemoved, exported.WAL.SegmentsRemoved)
 	require.Equal(t, snap.Region.Total, exported.Region.Total)
 	require.Equal(t, snap.LSM.Mmap, exported.LSM.Mmap)
 	require.Equal(t, snap.LSM.Prefetch, exported.LSM.Prefetch)
@@ -114,32 +107,23 @@ func TestStatsSnapshotTracksThrottleAndWalRemovals(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	require.NoError(t, db.Set([]byte("wal-metrics"), []byte("value")))
-	lsmCore := db.LSM().(*lsm.LSM)
-	require.NoError(t, lsmCore.Rotate())
-	require.Eventually(t, func() bool {
-		return db.Info().Snapshot().WAL.SegmentsRemoved > 0
-	}, 5*time.Second, 10*time.Millisecond)
-
-	db.ApplyThrottle(lsm.WriteThrottleStop)
-	defer db.ApplyThrottle(lsm.WriteThrottleNone)
+	db.ApplyThrottle(commit.WriteThrottleStop)
+	defer db.ApplyThrottle(commit.WriteThrottleNone)
 
 	snap := db.Info().Snapshot()
 	require.True(t, snap.Write.ThrottleActive)
 	require.Equal(t, "stop", snap.Write.ThrottleMode)
 	require.Equal(t, uint32(1000), snap.Write.ThrottlePressure)
 	require.Equal(t, uint64(0), snap.Write.ThrottleRate)
-	require.Greater(t, snap.WAL.SegmentsRemoved, uint64(0))
-	require.Greater(t, snap.WAL.SegmentCount, int64(0))
 
 	db.Info().Collect()
 	exported := loadExpvarStatsSnapshot(t)
-	require.Equal(t, snap.WAL.SegmentsRemoved, exported.WAL.SegmentsRemoved)
 	require.True(t, exported.Write.ThrottleActive)
 	require.Equal(t, "stop", exported.Write.ThrottleMode)
 	require.Equal(t, uint32(1000), exported.Write.ThrottlePressure)
 	require.Equal(t, uint64(0), exported.Write.ThrottleRate)
 
-	db.ApplyThrottle(lsm.WriteThrottleNone)
+	db.ApplyThrottle(commit.WriteThrottleNone)
 	snapAfter := db.Info().Snapshot()
 	require.False(t, snapAfter.Write.ThrottleActive)
 	require.Equal(t, "none", snapAfter.Write.ThrottleMode)

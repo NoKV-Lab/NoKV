@@ -7,11 +7,11 @@ import (
 	"context"
 	"fmt"
 
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	metapb "github.com/feichai0017/NoKV/pb/meta"
 	raftcmdpb "github.com/feichai0017/NoKV/pb/raft"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
+	entrykv "github.com/feichai0017/NoKV/txn/storage"
 )
 
 // ProposeMVCCMaintenance submits prebuilt MVCC tombstones through Raft. This

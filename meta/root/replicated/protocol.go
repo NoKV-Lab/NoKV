@@ -11,8 +11,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/feichai0017/NoKV/engine/vfs"
 	myraft "github.com/feichai0017/NoKV/raft"
+	"github.com/feichai0017/NoKV/storage/vfs"
 )
 
 // protocolStateFileName stores replicated metadata protocol recovery state.

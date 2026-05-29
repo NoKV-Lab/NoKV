@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/vfs"
 	rootfile "github.com/feichai0017/NoKV/meta/root/storage/file"
 	myraft "github.com/feichai0017/NoKV/raft"
+	"github.com/feichai0017/NoKV/storage/vfs"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
 

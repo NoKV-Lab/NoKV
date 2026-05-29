@@ -47,11 +47,11 @@ func TestEvaluateCatchesForbiddenBoundaries(t *testing.T) {
 			wantPackage: ModulePath + "/fsmeta/backend",
 		},
 		{
-			name:        "raftstore snapshot protocol importing engine",
+			name:        "raftstore snapshot protocol importing concrete storage engine",
 			pkg:         ModulePath + "/raftstore/snapshot",
-			imports:     []string{ModulePath + "/engine/lsm"},
+			imports:     []string{ModulePath + "/storage/pebble"},
 			wantRule:    "raftstore snapshot protocol stays backend-neutral",
-			wantImport:  ModulePath + "/engine/lsm",
+			wantImport:  ModulePath + "/storage/pebble",
 			wantPackage: ModulePath + "/raftstore/snapshot",
 		},
 		{
@@ -87,12 +87,12 @@ func TestEvaluateCatchesForbiddenBoundaries(t *testing.T) {
 			wantPackage: ModulePath + "/local/internal/commit",
 		},
 		{
-			name:        "engine taking global errors",
-			pkg:         ModulePath + "/engine/lsm",
+			name:        "raw storage engine taking global errors",
+			pkg:         ModulePath + "/storage/pebble",
 			imports:     []string{ModulePath + "/errors"},
-			wantRule:    "embedded engine stays free of global error taxonomy",
+			wantRule:    "raw storage engines stay below MVCC and distributed semantics",
 			wantImport:  ModulePath + "/errors",
-			wantPackage: ModulePath + "/engine/lsm",
+			wantPackage: ModulePath + "/storage/pebble",
 		},
 		{
 			name:        "meta root reaching into coordinator",

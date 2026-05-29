@@ -5,8 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # File and mmap primitives
 
-The `engine/file` package provides low-level file and mmap helpers shared by
-WAL, SST, and slab consumers.
+The `storage/file` package provides low-level file and mmap helpers for storage
+runtime internals.
 
 ---
 
@@ -35,7 +35,7 @@ WAL, SST, and slab consumers.
 | Layer | Usage |
 | --- | --- |
 | WAL | Segment files and fsync/rotation tests |
-| SST | mmap-backed table files and block reads |
+| Pebble/raw storage adapters | file and mmap helpers when a concrete backend needs them |
 | slab | append-only sidecar segments for namespace-derived caches |
 
 The file layer intentionally does not encode storage semantics such as WAL

@@ -122,31 +122,10 @@ This split is deliberate:
 
 ## Migration Workflow
 
-### `scripts/ops/migrate-cluster.sh`
-- Purpose: one-shot local operator wrapper for the standalone-to-cluster migration path.
-- Drives:
-  - `nokv migrate plan`
-  - `nokv migrate init`
-  - `nokv migrate expand`
-  - optional `transfer-leader`
-  - optional `remove-peer`
-- Example:
-  ```bash
-  ./scripts/ops/migrate-cluster.sh \
-    --config ./raft_config.example.json \
-    --workdir ./artifacts/standalone \
-    --seed-store 1 \
-    --seed-region 1 \
-    --seed-peer 101 \
-    --target 2:201 \
-    --target 3:301 \
-    --transfer-leader 201 \
-    --remove-peer 101
-  ```
-- Notes:
-  - seed workdir must already contain standalone data
-  - target store workdirs must be fresh
-  - uses the migration CLI as the only source of truth
+The old `scripts/ops/migrate-cluster.sh` wrapper has been removed together with
+the operator-facing `nokv migrate` CLI. Current Pebble-backed workdirs are a new
+format and this version does not provide online migration from old self-managed
+LSM workdirs.
 
 ## Shared Shell Rules
 

@@ -24,7 +24,6 @@ import (
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/raftlog"
 	serverpkg "github.com/feichai0017/NoKV/raftstore/server"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	storepkg "github.com/feichai0017/NoKV/raftstore/store"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -35,9 +34,8 @@ func testStorage(db *local.DB) serverpkg.Storage {
 		return serverpkg.Storage{}
 	}
 	return serverpkg.Storage{
-		MVCC:     db,
-		Raft:     raftlog.NewDBLog(db),
-		Snapshot: snapshotpkg.NewDBStore(db),
+		MVCC: db,
+		Raft: raftlog.NewDBLog(db),
 	}
 }
 
@@ -436,9 +434,8 @@ func newTestServerWithMeta(t *testing.T, db *local.DB, storeID uint64, localMeta
 	t.Helper()
 	server, err := serverpkg.NewNode(serverpkg.Config{
 		Storage: serverpkg.Storage{
-			MVCC:     db,
-			Raft:     raftlog.NewDBLog(db),
-			Snapshot: snapshotpkg.NewDBStore(db),
+			MVCC: db,
+			Raft: raftlog.NewDBLog(db),
 		},
 		Store: storepkg.Config{
 			StoreID:   storeID,

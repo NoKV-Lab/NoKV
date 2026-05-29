@@ -11,10 +11,10 @@ import (
 	"io"
 	"sync"
 
-	"github.com/feichai0017/NoKV/engine/wal"
 	myraft "github.com/feichai0017/NoKV/raft"
 	"github.com/feichai0017/NoKV/raftstore/failpoints"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
+	"github.com/feichai0017/NoKV/storage/wal"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
 

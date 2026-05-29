@@ -14,9 +14,10 @@ import (
 type Format string
 
 const (
-	// FormatSST is implemented by raftstore/snapshot/sst using external SST
-	// export and ingest hooks.
-	FormatSST Format = "sst"
+	// FormatEntries stores canonical NoKV MVCC internal entries. It is the
+	// built-in raft snapshot payload format and does not depend on a physical
+	// LSM/SST implementation.
+	FormatEntries Format = "entries"
 )
 
 // Descriptor is the backend-neutral identity of one region snapshot.
@@ -27,16 +28,15 @@ type Descriptor struct {
 	CreatedAt  time.Time
 }
 
-// ImportResult is the backend-neutral result of staging one region snapshot.
-// Concrete implementations may attach rollback state privately.
+// ImportResult reports one imported region snapshot.
 type ImportResult struct {
 	Descriptor Descriptor
-	Rollback   func() error
 }
 
-// RegionStore streams region snapshots without exposing how a storage backend
-// materializes the payload.
-type RegionStore interface {
-	ExportRegionSnapshotTo(w io.Writer, region localmeta.RegionMeta) (Descriptor, error)
-	ImportRegionSnapshotFrom(r io.Reader) (ImportResult, error)
+// Store exports and imports raftstore-internal region snapshot payloads.
+type Store interface {
+	ExportSnapshot(region localmeta.RegionMeta) ([]byte, error)
+	ImportSnapshot(payload []byte) (*ImportResult, error)
+	ExportSnapshotTo(w io.Writer, region localmeta.RegionMeta) (Descriptor, error)
+	ImportSnapshotFrom(r io.Reader) (*ImportResult, error)
 }

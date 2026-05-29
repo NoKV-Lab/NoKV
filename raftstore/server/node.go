@@ -64,9 +64,6 @@ func NewNode(cfg Config) (*Node, error) {
 	if cfg.Storage.MVCC == nil {
 		return nil, fmt.Errorf("raftstore/server: MVCC storage is required")
 	}
-	if cfg.Storage.Snapshot == nil {
-		return nil, fmt.Errorf("raftstore/server: snapshot storage is required")
-	}
 	if cfg.Store.StoreID == 0 {
 		return nil, fmt.Errorf("raftstore/server: StoreID must be set")
 	}
@@ -108,7 +105,7 @@ func NewNode(cfg Config) (*Node, error) {
 
 	st := store.NewStore(storeCfg)
 	kvService := kv.NewService(st)
-	adminService := admin.NewServiceWithSnapshot(st, cfg.Storage.Snapshot)
+	adminService := admin.NewService(st)
 	if err := tr.RegisterServer(func(reg grpc.ServiceRegistrar) {
 		kvrpcpb.RegisterStoreKVServer(reg, kvService)
 		adminpb.RegisterRaftAdminServer(reg, adminService)

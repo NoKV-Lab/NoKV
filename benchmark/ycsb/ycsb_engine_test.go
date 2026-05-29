@@ -11,7 +11,6 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	badgeropts "github.com/dgraph-io/badger/v4/options"
-	local "github.com/feichai0017/NoKV/local"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,14 +83,12 @@ func TestLatencyRecorderEdgeCases(t *testing.T) {
 
 func TestBuildNoKVBenchmarkOptions(t *testing.T) {
 	opts := buildNoKVBenchmarkOptions(t.TempDir(), ycsbEngineOptions{
-		BlockCacheMB:         512,
-		MemtableMB:           64,
-		SSTableMB:            512,
-		SyncWrites:           false,
-		NoKVCompactionPolicy: "leveled",
-	}, local.MemTableEngineART)
+		BlockCacheMB: 512,
+		MemtableMB:   64,
+		SSTableMB:    512,
+		SyncWrites:   false,
+	})
 
-	require.Equal(t, local.MemTableEngineART, opts.MemTableEngine)
 	require.False(t, opts.ThermosEnabled)
 	require.Zero(t, opts.WriteBatchWait)
 	require.Zero(t, opts.WriteHotKeyLimit)
@@ -105,13 +102,12 @@ func TestBuildNoKVBenchmarkOptions(t *testing.T) {
 
 func TestBuildNoKVBenchmarkOptionsExplicitCacheOverrides(t *testing.T) {
 	opts := buildNoKVBenchmarkOptions(t.TempDir(), ycsbEngineOptions{
-		BlockCacheMB:         512,
-		NoKVIndexCacheMB:     64,
-		MemtableMB:           64,
-		SSTableMB:            512,
-		SyncWrites:           false,
-		NoKVCompactionPolicy: "leveled",
-	}, local.MemTableEngineART)
+		BlockCacheMB:     512,
+		NoKVIndexCacheMB: 64,
+		MemtableMB:       64,
+		SSTableMB:        512,
+		SyncWrites:       false,
+	})
 
 	require.Equal(t, int64(448)<<20, opts.BlockCacheBytes)
 	require.Equal(t, int64(64)<<20, opts.IndexCacheBytes)

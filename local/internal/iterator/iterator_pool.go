@@ -7,7 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/feichai0017/NoKV/engine/index"
+	index "github.com/feichai0017/NoKV/txn/storage"
 )
 
 // IteratorContext owns the temporary iterator slice used to assemble one DB

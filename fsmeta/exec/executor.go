@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 

@@ -26,11 +26,8 @@ Key option groups (see `options.go` for the full list):
   - `WriteBatchMaxCount`, `WriteBatchMaxSize`, `WriteBatchWait`
   - `MaxBatchCount`, `MaxBatchSize`
   - `WriteThrottleMinRate`, `WriteThrottleMaxRate`
-- **LSM & compaction**
-  - `MemTableSize`, `MemTableEngine`, `SSTableMaxSz`, `NumCompactors`
-  - `NumLevelZeroTables`, `LandingCompactBatchSize`, `LandingBacklogMergeScore`
-  - `CompactionValueWeight`, `CompactionValueAlertThreshold`
-- **Caches**
+- **Raw storage backend**
+  - `MemTableSize`
   - `BlockCacheBytes`, `IndexCacheBytes`
 - **Hot key throttling**
   - `WriteHotKeyLimit`
@@ -58,9 +55,9 @@ defer db.Close()
 ```
 
 Notes:
-- `NewDefaultOptions()` populates concrete compaction/landing defaults up front.
-  `Open()` resolves constructor-owned defaults once, then the DB and LSM layers
-  consume the resolved values directly.
+- `NewDefaultOptions()` populates the embedded Pebble-backed local runtime
+  defaults up front. `Open()` resolves constructor-owned defaults once, then
+  the DB and raw storage backend consume the resolved values directly.
 - `WriteBatchMaxCount`, `WriteBatchMaxSize`, `MaxBatchCount`, `MaxBatchSize`,
   `WriteThrottleMinRate`, `WriteThrottleMaxRate`, and `WALBufferSize` now also
   expose concrete defaults through `NewDefaultOptions()`. If you construct
@@ -73,7 +70,7 @@ Notes:
     as `batchSet`.
 - Write slowdown is bandwidth-driven: `WriteThrottleMaxRate` applies when
   slowdown first becomes active, and pressure lowers the target rate toward
-  `WriteThrottleMinRate` as compaction debt approaches the stop threshold.
+  `WriteThrottleMinRate`.
 
 ### Load Options From TOML
 

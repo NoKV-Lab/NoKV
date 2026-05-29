@@ -8,9 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/lsm"
 	"github.com/feichai0017/NoKV/experimental/thermos"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,10 +34,10 @@ func TestShouldThrottleHotWrite(t *testing.T) {
 }
 
 func TestNormalizeWriteThrottleState(t *testing.T) {
-	require.Equal(t, lsm.WriteThrottleNone, NormalizeWriteThrottleState(lsm.WriteThrottleNone))
-	require.Equal(t, lsm.WriteThrottleSlowdown, NormalizeWriteThrottleState(lsm.WriteThrottleSlowdown))
-	require.Equal(t, lsm.WriteThrottleStop, NormalizeWriteThrottleState(lsm.WriteThrottleStop))
-	require.Equal(t, lsm.WriteThrottleNone, NormalizeWriteThrottleState(lsm.WriteThrottleState(99)))
+	require.Equal(t, WriteThrottleNone, NormalizeWriteThrottleState(WriteThrottleNone))
+	require.Equal(t, WriteThrottleSlowdown, NormalizeWriteThrottleState(WriteThrottleSlowdown))
+	require.Equal(t, WriteThrottleStop, NormalizeWriteThrottleState(WriteThrottleStop))
+	require.Equal(t, WriteThrottleNone, NormalizeWriteThrottleState(WriteThrottleState(99)))
 }
 
 func TestSlowdownDelay(t *testing.T) {

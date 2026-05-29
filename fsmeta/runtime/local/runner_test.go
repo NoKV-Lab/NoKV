@@ -10,11 +10,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/feichai0017/NoKV/engine/kv"
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
+	"github.com/feichai0017/NoKV/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,37 +51,38 @@ func TestRunnerProvidesSnapshotReads(t *testing.T) {
 	require.Equal(t, []byte("one"), rows[0].Value)
 }
 
-func TestRunnerRejectsCrossShardMutationWhenCallerOwnedDBIsNotAtomic(t *testing.T) {
+func TestRunnerMutateHandlesCrossShardPebbleBatch(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.LSMShardCount = 4
+	opts.WriteShardCount = 4
 	opts.UserKeyShapeExtractor = nil
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
 	require.NoError(t, err)
 
-	first, second := keysOnDifferentLocalShards(t, db, 4)
+	first, second := keysOnDifferentLogicalShards(t, 4)
 	start, err := runner.ReserveTimestamp(context.Background(), 2)
 	require.NoError(t, err)
-	_, err = runner.Mutate(context.Background(), first, []*backend.Mutation{
+	commit, err := runner.Mutate(context.Background(), first, []*backend.Mutation{
 		{Op: backend.MutationPut, Key: first, Value: []byte("a")},
 		{Op: backend.MutationPut, Key: second, Value: []byte("b")},
 	}, start, start+1, 0)
-	require.ErrorIs(t, err, errNonAtomicApplyGroup)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, commit, start+1)
 }
 
 func TestRunnerInstallMutationsAtCommitAcceptsCrossShard(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.LSMShardCount = 4
+	opts.WriteShardCount = 4
 	opts.UserKeyShapeExtractor = nil
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
 	require.NoError(t, err)
 
-	first, second := keysOnDifferentLocalShards(t, db, 4)
+	first, second := keysOnDifferentLogicalShards(t, 4)
 	ctx := context.Background()
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
@@ -127,7 +128,7 @@ func TestRunnerInstallMutationsAtCommitAllowsMissingDeletePrimary(t *testing.T) 
 func TestRunnerInstallMutationsAtCommitChunksLargeGroups(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.LSMShardCount = 1
+	opts.WriteShardCount = 1
 	opts.UserKeyShapeExtractor = nil
 	// Squeeze the per-batch budget so the install path is forced to chunk.
 	opts.MaxBatchCount = 8
@@ -165,7 +166,7 @@ func TestRunnerInstallMutationsAtCommitChunksLargeGroups(t *testing.T) {
 func TestRunnerInstallMutationsAtCommitRespectsSmallMaxBatchSize(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.LSMShardCount = 1
+	opts.WriteShardCount = 1
 	opts.UserKeyShapeExtractor = nil
 	opts.MaxBatchCount = 10_000
 	opts.MaxBatchSize = 64
@@ -197,7 +198,7 @@ func TestRunnerInstallMutationsAtCommitRespectsSmallMaxBatchSize(t *testing.T) {
 func TestRunnerInstallMutationsAtCommitChunksDeleteGroupsBelowStrictLimit(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.LSMShardCount = 1
+	opts.WriteShardCount = 1
 	opts.UserKeyShapeExtractor = nil
 	opts.MaxBatchCount = 8
 	opts.MaxBatchSize = 64 << 10
@@ -328,17 +329,17 @@ func TestRunnerTryAtomicMutateRejectsValuePredicateMismatch(t *testing.T) {
 	require.Equal(t, uint64(1), runner.Stats()["atomic_predicate_rejected_total"])
 }
 
-func TestRunnerTryAtomicMutateFallsBackWhenCallerOwnedDBIsNotAtomic(t *testing.T) {
+func TestRunnerTryAtomicMutateHandlesCrossShardPebbleBatch(t *testing.T) {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = t.TempDir()
-	opts.LSMShardCount = 4
+	opts.WriteShardCount = 4
 	opts.UserKeyShapeExtractor = nil
 	db := openTestDB(t, opts)
 	defer func() { require.NoError(t, db.Close()) }()
 	runner, err := NewRunner(db)
 	require.NoError(t, err)
 
-	first, second := keysOnDifferentLocalShards(t, db, 4)
+	first, second := keysOnDifferentLogicalShards(t, 4)
 	start, err := runner.ReserveTimestamp(context.Background(), 2)
 	require.NoError(t, err)
 	handled, err := runner.TryAtomicMutate(context.Background(), first, nil, []*backend.Mutation{
@@ -346,8 +347,8 @@ func TestRunnerTryAtomicMutateFallsBackWhenCallerOwnedDBIsNotAtomic(t *testing.T
 		{Op: backend.MutationPut, Key: second, Value: []byte("b")},
 	}, start, start+1)
 	require.NoError(t, err)
-	require.False(t, handled)
-	require.Equal(t, uint64(1), runner.Stats()["atomic_apply_group_rejected_total"])
+	require.True(t, handled)
+	require.Equal(t, uint64(0), runner.Stats()["atomic_apply_group_rejected_total"])
 }
 
 func TestRunnerTryAtomicMutateSerializesConcurrentSameKey(t *testing.T) {
@@ -405,25 +406,19 @@ func TestRunnerTryAtomicMutateSerializesConcurrentSameKey(t *testing.T) {
 	require.True(t, ok)
 }
 
-func keysOnDifferentLocalShards(t *testing.T, db *localdb.DB, shards int) ([]byte, []byte) {
+func keysOnDifferentLogicalShards(t *testing.T, shards int) ([]byte, []byte) {
 	t.Helper()
 	var first []byte
+	var firstShard int
 	for i := range 1024 {
 		key := []byte{byte('a' + i%26), byte(i / 26)}
-		entry := kv.NewInternalEntry(kv.CFDefault, key, 1, []byte("v"), 0, 0)
-		same := db.CanApplyInternalEntriesAtomically([]*kv.Entry{entry})
-		entry.DecrRef()
-		require.True(t, same)
+		shard := utils.ShardForUserKey(key, shards)
 		if first == nil {
 			first = append([]byte(nil), key...)
+			firstShard = shard
 			continue
 		}
-		a := kv.NewInternalEntry(kv.CFDefault, first, 1, []byte("a"), 0, 0)
-		b := kv.NewInternalEntry(kv.CFDefault, key, 1, []byte("b"), 0, 0)
-		atomic := db.CanApplyInternalEntriesAtomically([]*kv.Entry{a, b})
-		a.DecrRef()
-		b.DecrRef()
-		if !atomic {
+		if shard != firstShard {
 			return first, append([]byte(nil), key...)
 		}
 	}
@@ -460,7 +455,7 @@ func openTestDB(t *testing.T, opts *localdb.Options) *localdb.DB {
 	if opts == nil {
 		opts = localdb.NewDefaultOptions()
 		opts.WorkDir = t.TempDir()
-		opts.LSMShardCount = 1
+		opts.WriteShardCount = 1
 	}
 	db, err := localdb.Open(opts)
 	require.NoError(t, err)
@@ -470,7 +465,7 @@ func openTestDB(t *testing.T, opts *localdb.Options) *localdb.DB {
 func testDBOptions(dir string, shards int) *localdb.Options {
 	opts := localdb.NewDefaultOptions()
 	opts.WorkDir = dir
-	opts.LSMShardCount = shards
+	opts.WriteShardCount = shards
 	return opts
 }
 

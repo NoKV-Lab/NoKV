@@ -13,12 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/wal"
 	fsmetaclient "github.com/feichai0017/NoKV/fsmeta/client"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/observe"
 	fsmetalocal "github.com/feichai0017/NoKV/fsmeta/runtime/local"
+	"github.com/feichai0017/NoKV/storage/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"

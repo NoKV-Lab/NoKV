@@ -7,9 +7,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/lsm"
 	"github.com/feichai0017/NoKV/experimental/thermos"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 )
 
 // HotWriteConfig captures write-admission hot-key tracking knobs without
@@ -25,6 +24,17 @@ type HotWriteConfig struct {
 	NodeSampleBits   uint8
 	RotationInterval time.Duration
 }
+
+// WriteThrottleState is the local write-admission state exposed by the commit
+// pipeline. Physical storage engines may decide how to derive it, but local.DB
+// can also set it directly in tests and administrative paths.
+type WriteThrottleState uint8
+
+const (
+	WriteThrottleNone WriteThrottleState = iota
+	WriteThrottleSlowdown
+	WriteThrottleStop
+)
 
 // NewHotWriteRing builds the optional hot-key tracker used by the DB write
 // runtime. A nil ring means the feature is disabled.
@@ -74,12 +84,12 @@ func ShouldThrottleHotWrite(ring *thermos.RotatingThermos, limit int32, cf kv.Co
 }
 
 // NormalizeWriteThrottleState clamps unknown states back to WriteThrottleNone.
-func NormalizeWriteThrottleState(state lsm.WriteThrottleState) lsm.WriteThrottleState {
+func NormalizeWriteThrottleState(state WriteThrottleState) WriteThrottleState {
 	switch state {
-	case lsm.WriteThrottleNone, lsm.WriteThrottleSlowdown, lsm.WriteThrottleStop:
+	case WriteThrottleNone, WriteThrottleSlowdown, WriteThrottleStop:
 		return state
 	default:
-		return lsm.WriteThrottleNone
+		return WriteThrottleNone
 	}
 }
 

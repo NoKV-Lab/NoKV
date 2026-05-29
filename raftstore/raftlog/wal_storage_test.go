@@ -13,11 +13,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/wal"
 	metaregion "github.com/feichai0017/NoKV/meta/region"
 	myraft "github.com/feichai0017/NoKV/raft"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
+	"github.com/feichai0017/NoKV/storage/wal"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
 

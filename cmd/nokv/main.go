@@ -26,12 +26,8 @@ func main() {
 		err = runStatsCmd(os.Stdout, args)
 	case "execution":
 		err = runExecutionCmd(os.Stdout, args)
-	case "manifest":
-		err = runManifestCmd(os.Stdout, args)
 	case "regions":
 		err = runRegionsCmd(os.Stdout, args)
-	case "migrate":
-		err = runMigrateCmd(os.Stdout, args)
 	case "serve":
 		err = runServeCmd(os.Stdout, args)
 	case "coordinator":
@@ -62,9 +58,7 @@ func printUsage(w io.Writer) {
 	Commands:
 	  stats     Dump runtime backlog metrics (requires working directory or expvar endpoint)
 	  execution Query raftstore execution-plane diagnostics from admin RPC
-	  manifest  Inspect manifest state and levels
 	  regions   Show the local peer catalog used for store recovery
-	  migrate   Inspect or convert a standalone workdir for distributed mode
 	  serve     Start StoreKV gRPC service backed by a local raftstore
 	  coordinator Start coordinator gRPC service (control plane)
 	  meta-root Start metadata root gRPC service

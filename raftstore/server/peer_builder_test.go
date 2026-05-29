@@ -5,27 +5,23 @@ package server
 
 import (
 	"fmt"
-	"io"
 	"testing"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	metaregion "github.com/feichai0017/NoKV/meta/region"
 	myraft "github.com/feichai0017/NoKV/raft"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/raftlog"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/stretchr/testify/require"
 )
 
 type fakeBuilderMVCCStore struct{}
 
-func (fakeBuilderMVCCStore) ApplyInternalEntries(entries []*entrykv.Entry) error { return nil }
-func (fakeBuilderMVCCStore) GetInternalEntry(cf entrykv.ColumnFamily, key []byte, version uint64) (*entrykv.Entry, error) {
+func (fakeBuilderMVCCStore) ApplyInternalEntries(entries []*txnstore.Entry) error { return nil }
+func (fakeBuilderMVCCStore) GetInternalEntry(cf txnstore.ColumnFamily, key []byte, version uint64) (*txnstore.Entry, error) {
 	return nil, fmt.Errorf("not implemented")
 }
-func (fakeBuilderMVCCStore) NewInternalIterator(opt *index.Options) index.Iterator { return nil }
+func (fakeBuilderMVCCStore) NewInternalIterator(opt *txnstore.Options) txnstore.Iterator { return nil }
 
 type fakeBuilderRaftLog struct{}
 
@@ -33,22 +29,8 @@ func (fakeBuilderRaftLog) Open(groupID uint64, meta *localmeta.Store) (raftlog.P
 	return nil, nil
 }
 
-type fakeBuilderSnapshotStore struct{}
-
-func (fakeBuilderSnapshotStore) ExportSnapshot(localmeta.RegionMeta) ([]byte, error) { return nil, nil }
-func (fakeBuilderSnapshotStore) ImportSnapshot([]byte) (*snapshotpkg.ImportResult, error) {
-	return &snapshotpkg.ImportResult{}, nil
-}
-func (fakeBuilderSnapshotStore) ExportSnapshotTo(io.Writer, localmeta.RegionMeta) (snapshotpkg.Meta, error) {
-	return snapshotpkg.Meta{}, nil
-}
-func (fakeBuilderSnapshotStore) ImportSnapshotFrom(io.Reader) (*snapshotpkg.ImportResult, error) {
-	return &snapshotpkg.ImportResult{}, nil
-}
-
 var _ txnstore.Store = fakeBuilderMVCCStore{}
 var _ RaftLog = fakeBuilderRaftLog{}
-var _ snapshotpkg.SnapshotStore = fakeBuilderSnapshotStore{}
 
 func TestDefaultRaftConfigAppliesDefaults(t *testing.T) {
 	cfg := defaultRaftConfig(myraft.Config{}, 17)
@@ -87,24 +69,10 @@ func TestDefaultPeerBuilderRequiresLocalPeer(t *testing.T) {
 	require.Contains(t, err.Error(), "missing peer")
 }
 
-func TestDefaultPeerBuilderRequiresSnapshotStorage(t *testing.T) {
+func TestDefaultPeerBuilderEnablesFastLeaseRead(t *testing.T) {
 	builder := defaultPeerBuilder(Storage{
 		MVCC: fakeBuilderMVCCStore{},
 		Raft: fakeBuilderRaftLog{},
-	}, nil, 1, myraft.Config{}, nil)
-	_, err := builder(localmeta.RegionMeta{
-		ID:    7,
-		Peers: []metaregion.Peer{{StoreID: 1, PeerID: 11}},
-	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "snapshot storage")
-}
-
-func TestDefaultPeerBuilderEnablesFastLeaseRead(t *testing.T) {
-	builder := defaultPeerBuilder(Storage{
-		MVCC:     fakeBuilderMVCCStore{},
-		Raft:     fakeBuilderRaftLog{},
-		Snapshot: fakeBuilderSnapshotStore{},
 	}, nil, 1, myraft.Config{}, nil)
 	cfg, err := builder(localmeta.RegionMeta{
 		ID:    7,

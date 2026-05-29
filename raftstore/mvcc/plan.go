@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feichai0017/NoKV/engine/index"
-	entrykv "github.com/feichai0017/NoKV/engine/kv"
 	txnmvcc "github.com/feichai0017/NoKV/txn/mvcc"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
 )
@@ -70,12 +68,12 @@ func Plan(ctx context.Context, db txnstore.Store, policy SafePointPolicy) (PlanS
 // batch is submitted as a replicated raft command; there is intentionally no
 // local direct-apply path for production GC.
 func ApplyReplicated(ctx context.Context, db txnstore.Store, proposer MaintenanceProposer, policy SafePointPolicy, opt ApplyOptions) (ApplyStats, error) {
-	return applyWith(ctx, db, policy, opt, func(ctx context.Context, entries []*entrykv.Entry) (maintenanceSubmitResult, error) {
+	return applyWith(ctx, db, policy, opt, func(ctx context.Context, entries []*txnstore.Entry) (maintenanceSubmitResult, error) {
 		return proposeMaintenanceEntries(ctx, proposer, entries)
 	})
 }
 
-type applySubmitFn func(context.Context, []*entrykv.Entry) (maintenanceSubmitResult, error)
+type applySubmitFn func(context.Context, []*txnstore.Entry) (maintenanceSubmitResult, error)
 
 func applyWith(ctx context.Context, db txnstore.Store, policy SafePointPolicy, opt ApplyOptions, submit applySubmitFn) (ApplyStats, error) {
 	var stats ApplyStats
@@ -126,7 +124,7 @@ func walk(ctx context.Context, db txnstore.Store, policy SafePointPolicy, afterU
 	if db == nil {
 		return result, errNilMVCCStore
 	}
-	iter := db.NewInternalIterator(&index.Options{IsAsc: true})
+	iter := db.NewInternalIterator(&txnstore.Options{IsAsc: true})
 	if iter == nil {
 		return result, nil
 	}
@@ -141,7 +139,7 @@ func walk(ctx context.Context, db txnstore.Store, policy SafePointPolicy, afterU
 		if len(currentKey) == 0 {
 			return nil
 		}
-		result.lastUserKey = entrykv.SafeCopy(result.lastUserKey, currentKey)
+		result.lastUserKey = txnstore.SafeCopy(result.lastUserKey, currentKey)
 		var safePoint uint64
 		safePoint, decisions = policy.AppendPlanWritesForKey(decisions[:0], currentKey, versions)
 		stats.recordGroup(policy.RequestedSafePoint, safePoint, decisions)
@@ -172,11 +170,11 @@ func walk(ctx context.Context, db txnstore.Store, policy SafePointPolicy, afterU
 			continue
 		}
 		entry := item.Entry()
-		cf, userKey, commitTs, ok := entrykv.SplitInternalKey(entry.Key)
+		cf, userKey, commitTs, ok := txnstore.SplitInternalKey(entry.Key)
 		if !ok {
 			return result, fmt.Errorf("raftstore/mvcc: expected internal key, got %x", entry.Key)
 		}
-		if cf != entrykv.CFWrite {
+		if cf != txnstore.CFWrite {
 			break
 		}
 		if len(currentKey) > 0 && !bytes.Equal(currentKey, userKey) {
@@ -188,9 +186,9 @@ func walk(ctx context.Context, db txnstore.Store, policy SafePointPolicy, afterU
 			}
 		}
 		if len(currentKey) == 0 {
-			currentKey = entrykv.SafeCopy(nil, userKey)
+			currentKey = txnstore.SafeCopy(nil, userKey)
 		}
-		if entry.Meta&entrykv.BitDelete > 0 {
+		if entry.Meta&txnstore.BitDelete > 0 {
 			stats.DeletedWriteMarkers++
 			iter.Next()
 			continue
@@ -208,20 +206,20 @@ func walk(ctx context.Context, db txnstore.Store, policy SafePointPolicy, afterU
 	return result, flush()
 }
 
-func seekStart(iter index.Iterator, afterUserKey []byte) {
+func seekStart(iter txnstore.Iterator, afterUserKey []byte) {
 	if len(afterUserKey) == 0 {
-		iter.Seek(entrykv.InternalKey(entrykv.CFWrite, nil, entrykv.MaxVersion))
+		iter.Seek(txnstore.InternalKey(txnstore.CFWrite, nil, txnstore.MaxVersion))
 		return
 	}
-	iter.Seek(entrykv.InternalKey(entrykv.CFWrite, afterUserKey, 0))
+	iter.Seek(txnstore.InternalKey(txnstore.CFWrite, afterUserKey, 0))
 	for iter.Valid() {
 		item := iter.Item()
 		if item == nil || item.Entry() == nil {
 			iter.Next()
 			continue
 		}
-		cf, userKey, _, ok := entrykv.SplitInternalKey(item.Entry().Key)
-		if !ok || cf != entrykv.CFWrite || !bytes.Equal(userKey, afterUserKey) {
+		cf, userKey, _, ok := txnstore.SplitInternalKey(item.Entry().Key)
+		if !ok || cf != txnstore.CFWrite || !bytes.Equal(userKey, afterUserKey) {
 			return
 		}
 		iter.Next()
@@ -230,7 +228,7 @@ func seekStart(iter index.Iterator, afterUserKey []byte) {
 
 type applyBatch struct {
 	plan        PlanStats
-	entries     []*entrykv.Entry
+	entries     []*txnstore.Entry
 	lastUserKey []byte
 	done        bool
 }
@@ -258,7 +256,7 @@ func collectApplyBatch(ctx context.Context, db txnstore.Store, policy SafePointP
 	return batch, nil
 }
 
-func buildDeletes(userKey []byte, decisions []txnmvcc.GCWriteDecision) (writes, defaults []*entrykv.Entry) {
+func buildDeletes(userKey []byte, decisions []txnmvcc.GCWriteDecision) (writes, defaults []*txnstore.Entry) {
 	retainedDefault := make(map[uint64]struct{})
 	for _, decision := range decisions {
 		if decision.RetainDefaultStartTs != 0 {
@@ -269,14 +267,14 @@ func buildDeletes(userKey []byte, decisions []txnmvcc.GCWriteDecision) (writes, 
 		if decision.Keep {
 			continue
 		}
-		writes = append(writes, entrykv.NewInternalEntry(entrykv.CFWrite, userKey, decision.CommitTs, nil, entrykv.BitDelete, 0))
+		writes = append(writes, txnstore.NewInternalEntry(txnstore.CFWrite, userKey, decision.CommitTs, nil, txnstore.BitDelete, 0))
 		if !txnmvcc.WriteNeedsDefaultRecord(decision.Write) {
 			continue
 		}
 		if _, ok := retainedDefault[decision.Write.StartTs]; ok {
 			continue
 		}
-		defaults = append(defaults, entrykv.NewInternalEntry(entrykv.CFDefault, userKey, decision.Write.StartTs, nil, entrykv.BitDelete, 0))
+		defaults = append(defaults, txnstore.NewInternalEntry(txnstore.CFDefault, userKey, decision.Write.StartTs, nil, txnstore.BitDelete, 0))
 	}
 	return writes, defaults
 }
@@ -337,7 +335,7 @@ func (s *ApplyStats) add(other PlanStats) {
 	}
 }
 
-func releaseEntries(entries []*entrykv.Entry) {
+func releaseEntries(entries []*txnstore.Entry) {
 	for _, entry := range entries {
 		if entry != nil {
 			entry.DecrRef()

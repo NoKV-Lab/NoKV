@@ -80,7 +80,7 @@ type Store interface {
 }
 ```
 
-`fsmeta/backend` deliberately has no protobuf, raftstore, local DB, engine, SST,
+`fsmeta/backend` deliberately has no protobuf, raftstore, local DB, concrete storage engine, SST,
 or migration types. `fsmeta/exec` produces backend-neutral mutations and
 predicates; runtime adapters translate those into their concrete commit path.
 For example, `fsmeta/runtime/local` applies them through the embedded local
@@ -107,9 +107,9 @@ The layering constraints are:
 - `fsmeta/runtime/raftstore` is the scale-out adapter; it owns the raftstore wiring.
 - `meta/root` does not store high-frequency inode/dentry data — only lifecycle / authority truth.
 - `raftstore` and `percolator` don't understand fsmeta operations; they provide transactions and apply observation. Existing Peras install support is being isolated behind the experimental boundary.
-- `raftstore/migrate`, raftstore snapshot transfer, and LSM/SST ingest/export
-  are operational capabilities of the concrete distributed storage stack. They
-  are not part of the generic fsmeta backend contract.
+- Raftstore peer bootstrap snapshots and concrete storage diagnostics are
+  operational capabilities of the distributed runtime. They are not part of the
+  generic fsmeta backend contract.
 
 ## 5. Native primitives
 

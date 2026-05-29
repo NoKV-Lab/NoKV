@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	"github.com/feichai0017/NoKV/fsmeta/backend"
+	"github.com/feichai0017/NoKV/fsmeta/cache/slab/dirpage"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"

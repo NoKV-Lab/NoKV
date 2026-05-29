@@ -10,7 +10,6 @@ import (
 	"sort"
 	"testing"
 
-	local "github.com/feichai0017/NoKV/local"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,9 +22,8 @@ func TestNoKVEngineCRUD(t *testing.T) {
 	})
 
 	require.Equal(t, "NoKV", engine.Name())
-	nokv, ok := engine.(*nokvEngine)
+	_, ok := engine.(*nokvEngine)
 	require.True(t, ok)
-	require.Equal(t, local.MemTableEngineART, nokv.memtableEngine)
 	require.NoError(t, engine.Open(true))
 	defer func() {
 		require.NoError(t, engine.Close())

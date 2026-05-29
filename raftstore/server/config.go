@@ -12,7 +12,6 @@ import (
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	storemvcc "github.com/feichai0017/NoKV/raftstore/mvcc"
 	"github.com/feichai0017/NoKV/raftstore/raftlog"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	"github.com/feichai0017/NoKV/raftstore/store"
 	"github.com/feichai0017/NoKV/raftstore/transport"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"
@@ -88,9 +87,8 @@ type MVCCMaintenanceConfig struct {
 
 // Storage captures the engine capabilities raftstore needs.
 type Storage struct {
-	MVCC     txnstore.Store
-	Raft     RaftLog
-	Snapshot snapshotpkg.SnapshotStore
+	MVCC txnstore.Store
+	Raft RaftLog
 }
 
 type RaftLog interface {

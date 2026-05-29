@@ -582,7 +582,6 @@ func openDBAt(t *testing.T, dir string) (*local.DB, *localmeta.Store) {
 	opt := local.NewDefaultOptions()
 	opt.WorkDir = dir
 	opt.MemTableSize = 1 << 12
-	opt.SSTableMaxSz = 1 << 20
 	opt.ControlLogLagWarnSegments = 1
 	opt.ControlLogPointerSnapshot = raftstorestats.ControlLogPointers(localMeta.DurableRaftPointerSnapshot)
 	db, err := local.Open(opt)

@@ -8,18 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/feichai0017/NoKV/engine/index"
-	"github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/lsm"
-	"github.com/feichai0017/NoKV/engine/manifest"
-	"github.com/feichai0017/NoKV/engine/vfs"
-	"github.com/feichai0017/NoKV/engine/wal"
 	"github.com/feichai0017/NoKV/experimental/thermos"
 	"github.com/feichai0017/NoKV/local/internal/commit"
 	iterpkg "github.com/feichai0017/NoKV/local/internal/iterator"
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	raftstorestats "github.com/feichai0017/NoKV/raftstore/stats"
+	"github.com/feichai0017/NoKV/storage/wal"
+	kv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 	"github.com/stretchr/testify/require"
 	"math/rand"
@@ -58,7 +54,7 @@ func TestAPI(t *testing.T) {
 	}
 
 	// Iterator scan.
-	iter := db.NewIterator(&index.Options{
+	iter := db.NewIterator(&kv.Options{
 		Prefix: []byte("hello"),
 		IsAsc:  false,
 	})
@@ -194,19 +190,6 @@ func TestOpenNormalizesLegacyUnsetFieldsWithoutMutatingCaller(t *testing.T) {
 	opt.WriteThrottleMinRate = 0
 	opt.WriteThrottleMaxRate = 0
 	opt.WALBufferSize = 0
-	opt.NumCompactors = 0
-	opt.NumLevelZeroTables = 0
-	opt.L0SlowdownWritesTrigger = 0
-	opt.L0StopWritesTrigger = 0
-	opt.L0ResumeWritesTrigger = 0
-	opt.CompactionSlowdownTrigger = 0
-	opt.CompactionStopTrigger = 0
-	opt.CompactionResumeTrigger = 0
-	opt.LandingCompactBatchSize = 0
-	opt.LandingBacklogMergeScore = 0
-	opt.LandingShardParallelism = 0
-	opt.CompactionValueWeight = 0
-	opt.CompactionValueAlertThreshold = 0
 	opt.ThermosTopK = 0
 
 	db := openTestDB(t, opt)
@@ -214,9 +197,6 @@ func TestOpenNormalizesLegacyUnsetFieldsWithoutMutatingCaller(t *testing.T) {
 
 	require.Zero(t, opt.WriteBatchMaxCount)
 	require.Zero(t, opt.WriteThrottleMinRate)
-	require.Zero(t, opt.NumCompactors)
-	require.Zero(t, opt.L0StopWritesTrigger)
-	require.Zero(t, opt.CompactionStopTrigger)
 	require.Zero(t, opt.ThermosTopK)
 
 	require.Greater(t, db.opt.WriteBatchMaxCount, 0)
@@ -226,51 +206,15 @@ func TestOpenNormalizesLegacyUnsetFieldsWithoutMutatingCaller(t *testing.T) {
 	require.Greater(t, db.opt.WriteThrottleMinRate, int64(0))
 	require.GreaterOrEqual(t, db.opt.WriteThrottleMaxRate, db.opt.WriteThrottleMinRate)
 	require.Greater(t, db.opt.WALBufferSize, 0)
-	require.Greater(t, db.opt.NumCompactors, 0)
-	require.Greater(t, db.opt.NumLevelZeroTables, 0)
-	require.Greater(t, db.opt.L0SlowdownWritesTrigger, 0)
-	require.Greater(t, db.opt.L0StopWritesTrigger, db.opt.L0SlowdownWritesTrigger)
-	require.Less(t, db.opt.L0ResumeWritesTrigger, db.opt.L0SlowdownWritesTrigger)
-	require.Greater(t, db.opt.CompactionSlowdownTrigger, 0.0)
-	require.GreaterOrEqual(t, db.opt.CompactionStopTrigger, db.opt.CompactionSlowdownTrigger)
-	require.LessOrEqual(t, db.opt.CompactionResumeTrigger, db.opt.CompactionSlowdownTrigger)
-	require.Greater(t, db.opt.LandingCompactBatchSize, 0)
-	require.Greater(t, db.opt.LandingBacklogMergeScore, 0.0)
-	require.Greater(t, db.opt.LandingShardParallelism, 0)
-	require.Greater(t, db.opt.CompactionValueWeight, 0.0)
-	require.Greater(t, db.opt.CompactionTombstoneWeight, 0.0)
-	require.Greater(t, db.opt.CompactionValueAlertThreshold, 0.0)
 	require.Greater(t, db.opt.ThermosTopK, 0)
 }
 
-func TestNewDefaultOptionsExposeConcreteCompactionDefaults(t *testing.T) {
+func TestNewDefaultOptionsExposeConcreteStorageDefaults(t *testing.T) {
 	opt := NewDefaultOptions()
 
-	require.Greater(t, opt.NumLevelZeroTables, 0)
-	require.Greater(t, opt.L0SlowdownWritesTrigger, 0)
-	require.Greater(t, opt.L0StopWritesTrigger, opt.L0SlowdownWritesTrigger)
-	require.Less(t, opt.L0ResumeWritesTrigger, opt.L0SlowdownWritesTrigger)
-	require.Greater(t, opt.CompactionSlowdownTrigger, 0.0)
-	require.GreaterOrEqual(t, opt.CompactionStopTrigger, opt.CompactionSlowdownTrigger)
-	require.LessOrEqual(t, opt.CompactionResumeTrigger, opt.CompactionSlowdownTrigger)
-	require.Greater(t, opt.LandingCompactBatchSize, 0)
-	require.Greater(t, opt.LandingBacklogMergeScore, 0.0)
+	require.Greater(t, opt.MemTableSize, int64(0))
+	require.Greater(t, opt.BlockCacheBytes, int64(0))
 	require.Nil(t, opt.UserKeyShapeExtractor)
-	require.Greater(t, opt.CompactionTombstoneWeight, 0.0)
-}
-
-func TestLSMPrefixExtractorUsesUserKeyShape(t *testing.T) {
-	opt := NewDefaultOptions()
-	opt.UserKeyShapeExtractor = func(userKey []byte) UserKeyShape {
-		require.Equal(t, []byte("user-key"), userKey)
-		return UserKeyShape{BloomPrefix: []byte("bloom-prefix")}
-	}
-	cfg := &lsm.Options{}
-
-	opt.applyLSMSharedOptions(cfg)
-
-	require.NotNil(t, cfg.PrefixExtractor)
-	require.Equal(t, []byte("bloom-prefix"), cfg.PrefixExtractor([]byte("user-key")))
 }
 
 func TestNewDefaultOptionsExposeConcreteBatchDefaults(t *testing.T) {
@@ -290,7 +234,6 @@ func newTestOptions(t *testing.T) *Options {
 	opt := NewDefaultOptions()
 	opt.WorkDir = t.TempDir()
 	opt.MemTableSize = 1 << 20
-	opt.SSTableMaxSz = 1 << 20
 	opt.DetectConflicts = true
 	return opt
 }
@@ -561,7 +504,7 @@ func TestDBIteratorSeekAndValueCopy(t *testing.T) {
 		require.NoError(t, db.Set([]byte("b"), []byte("vb")))
 		require.NoError(t, db.Set([]byte("c"), []byte("vc")))
 
-		it := db.NewIterator(&index.Options{IsAsc: true})
+		it := db.NewIterator(&kv.Options{IsAsc: true})
 		defer func() { _ = it.Close() }()
 		it.Seek([]byte("b"))
 		require.True(t, it.Valid())
@@ -580,7 +523,7 @@ func TestDBIteratorSeekAndValueCopy(t *testing.T) {
 		value := bytes.Repeat([]byte("p"), 64)
 		require.NoError(t, db.Set([]byte("k"), value))
 
-		it := db.NewIterator(&index.Options{IsAsc: true})
+		it := db.NewIterator(&kv.Options{IsAsc: true})
 		defer func() { _ = it.Close() }()
 		it.Seek([]byte("k"))
 		require.True(t, it.Valid())
@@ -602,7 +545,7 @@ func TestDBIteratorUserView(t *testing.T) {
 		applyVersionedEntryForTest(t, db, kv.CFLock, []byte("k2"), nonTxnMaxVersion, []byte("lock"), 0)
 		applyVersionedEntryForTest(t, db, kv.CFWrite, []byte("k3"), nonTxnMaxVersion, []byte("write"), 0)
 
-		it := db.NewIterator(&index.Options{IsAsc: true})
+		it := db.NewIterator(&kv.Options{IsAsc: true})
 		defer func() { _ = it.Close() }()
 
 		var keys []string
@@ -625,7 +568,7 @@ func TestDBIteratorUserView(t *testing.T) {
 		applyVersionedEntryForTest(t, db, kv.CFDefault, key, 1, []byte("v1"), 0)
 		applyVersionedEntryForTest(t, db, kv.CFDefault, key, 2, []byte("v2"), 0)
 
-		it := db.NewIterator(&index.Options{IsAsc: true})
+		it := db.NewIterator(&kv.Options{IsAsc: true})
 		defer func() { _ = it.Close() }()
 
 		var versions []uint64
@@ -640,9 +583,8 @@ func TestDBIteratorUserView(t *testing.T) {
 	})
 }
 
-func TestDBIteratorReverseWithARTMemtable(t *testing.T) {
+func TestDBIteratorReverse(t *testing.T) {
 	opt := newTestOptions(t)
-	opt.MemTableEngine = MemTableEngineART
 	db := openTestDB(t, opt)
 	defer func() { _ = db.Close() }()
 
@@ -650,7 +592,7 @@ func TestDBIteratorReverseWithARTMemtable(t *testing.T) {
 		require.NoError(t, db.Set([]byte(k), []byte("v_"+k)))
 	}
 
-	it := db.NewIterator(&index.Options{IsAsc: false})
+	it := db.NewIterator(&kv.Options{IsAsc: false})
 	defer func() { require.NoError(t, it.Close()) }()
 
 	var keys []string
@@ -669,7 +611,7 @@ func TestDBIteratorReverseLatestVersion(t *testing.T) {
 	applyVersionedEntryForTest(t, db, kv.CFDefault, []byte("k"), 1, []byte("v1"), 0)
 	applyVersionedEntryForTest(t, db, kv.CFDefault, []byte("k"), 2, []byte("v2"), 0)
 
-	it := db.NewIterator(&index.Options{IsAsc: false})
+	it := db.NewIterator(&kv.Options{IsAsc: false})
 	defer func() { require.NoError(t, it.Close()) }()
 
 	var keys []string
@@ -686,19 +628,16 @@ func TestDBIteratorReverseLatestVersion(t *testing.T) {
 	require.Equal(t, []string{"v2", "va"}, values)
 }
 
-func TestDBIteratorCloseIdempotentAcrossMemtableEngines(t *testing.T) {
-	drForEachMemTableEngine(t, func(t *testing.T, engine MemTableEngine) {
-		opt := newTestOptions(t)
-		opt.MemTableEngine = engine
-		db := openTestDB(t, opt)
-		defer func() { _ = db.Close() }()
+func TestDBIteratorCloseIdempotent(t *testing.T) {
+	opt := newTestOptions(t)
+	db := openTestDB(t, opt)
+	defer func() { _ = db.Close() }()
 
-		require.NoError(t, db.Set([]byte("k"), []byte("v")))
-		it := db.NewIterator(&index.Options{IsAsc: true})
-		it.Rewind()
-		require.NoError(t, it.Close())
-		require.NoError(t, it.Close())
-	})
+	require.NoError(t, db.Set([]byte("k"), []byte("v")))
+	it := db.NewIterator(&kv.Options{IsAsc: true})
+	it.Rewind()
+	require.NoError(t, it.Close())
+	require.NoError(t, it.Close())
 }
 
 func TestRequestLoadEntriesCopiesSlice(t *testing.T) {
@@ -731,7 +670,6 @@ func TestDirectoryLockPreventsConcurrentOpen(t *testing.T) {
 	opt := &Options{
 		WorkDir:       dir,
 		MemTableSize:  1 << 12,
-		SSTableMaxSz:  1 << 20,
 		MaxBatchCount: 16,
 		MaxBatchSize:  1 << 20,
 	}
@@ -815,174 +753,11 @@ func logRecoveryMetric(t *testing.T, name string, payload any) {
 	t.Logf("RECOVERY_METRIC %s=%s", name, data)
 }
 
-func TestRecoveryFailsOnMissingSST(t *testing.T) {
-	dir := t.TempDir()
-	opt := &Options{
-		WorkDir:       dir,
-		MemTableSize:  1 << 10,
-		SSTableMaxSz:  1 << 20,
-		MaxBatchCount: 100,
-		MaxBatchSize:  1 << 20,
-	}
-
-	db := openTestDB(t, opt)
-	for i := range 256 {
-		key := fmt.Appendf(nil, "sst-crash-%03d", i)
-		val := make([]byte, 128)
-		require.NoError(t, db.Set(key, val))
-	}
-	require.NoError(t, db.Close())
-
-	files, err := filepath.Glob(filepath.Join(dir, "*.sst"))
-	require.NoError(t, err)
-	require.NotEmpty(t, files)
-
-	removed := files[0]
-	require.NoError(t, os.Remove(removed))
-	removedFID := vfs.FID(removed)
-
-	db2, openErr := Open(opt)
-	require.Error(t, openErr)
-	require.Nil(t, db2)
-	require.Contains(t, openErr.Error(), "missing sstable")
-
-	mgr, err := manifest.Open(dir, nil)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, mgr.Close()) }()
-
-	version := mgr.Current()
-	var found bool
-	for _, metas := range version.Levels {
-		for _, meta := range metas {
-			if meta.FileID == removedFID {
-				found = true
-				break
-			}
-		}
-		if found {
-			break
-		}
-	}
-	require.True(t, found, "expected missing sstable to remain referenced in manifest after failed startup")
-
-	logRecoveryMetric(t, "sst_missing_startup_failure", map[string]any{
-		"removed_path": removed,
-		"removed_fid":  removedFID,
-		"open_error":   openErr.Error(),
-	})
-}
-
-func TestRecoveryFailsOnCorruptSST(t *testing.T) {
-	dir := t.TempDir()
-	opt := &Options{
-		WorkDir:       dir,
-		MemTableSize:  1 << 10,
-		SSTableMaxSz:  1 << 20,
-		MaxBatchCount: 100,
-		MaxBatchSize:  1 << 20,
-	}
-
-	db := openTestDB(t, opt)
-	for i := range 256 {
-		key := fmt.Appendf(nil, "sst-corrupt-%03d", i)
-		val := make([]byte, 128)
-		require.NoError(t, db.Set(key, val))
-	}
-	require.NoError(t, db.Close())
-
-	files, err := filepath.Glob(filepath.Join(dir, "*.sst"))
-	require.NoError(t, err)
-	require.NotEmpty(t, files)
-
-	corruptPath := files[0]
-	corruptFID := vfs.FID(corruptPath)
-	require.NoError(t, os.WriteFile(corruptPath, []byte("bad-sst"), 0o666))
-
-	db2, openErr := Open(opt)
-	require.Error(t, openErr)
-	require.Nil(t, db2)
-	require.Contains(t, openErr.Error(), "open sstable")
-
-	mgr, err := manifest.Open(dir, nil)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, mgr.Close()) }()
-
-	version := mgr.Current()
-	var found bool
-	for _, metas := range version.Levels {
-		for _, meta := range metas {
-			if meta.FileID == corruptFID {
-				found = true
-				break
-			}
-		}
-		if found {
-			break
-		}
-	}
-	require.True(t, found, "expected corrupt sstable to remain referenced in manifest after failed startup")
-
-	logRecoveryMetric(t, "sst_corrupt_startup_failure", map[string]any{
-		"corrupt_path": corruptPath,
-		"corrupt_fid":  corruptFID,
-		"levels":       len(version.Levels),
-		"open_error":   openErr.Error(),
-	})
-}
-
-func TestRecoveryManifestRewriteCrash(t *testing.T) {
-	dir := t.TempDir()
-	opt := &Options{
-		WorkDir:       dir,
-		MemTableSize:  1 << 10,
-		SSTableMaxSz:  1 << 20,
-		MaxBatchCount: 100,
-		MaxBatchSize:  1 << 20,
-	}
-
-	db := openTestDB(t, opt)
-	require.NoError(t, db.Set([]byte("rewrite-key"), []byte("rewrite-val")))
-	require.NoError(t, db.Close())
-
-	current := filepath.Join(dir, "CURRENT")
-	data, err := os.ReadFile(current)
-	require.NoError(t, err)
-	manifestName := string(data)
-
-	tmp := filepath.Join(dir, "CURRENT.tmp")
-	require.NoError(t, os.WriteFile(tmp, []byte("MANIFEST-999999"), 0o666))
-
-	db2 := openTestDB(t, opt)
-	defer func() { _ = db2.Close() }()
-
-	name, err := os.ReadFile(current)
-	require.NoError(t, err)
-	require.Equal(t, manifestName, string(name))
-
-	tmpExists := false
-	item, err := db2.Get([]byte("rewrite-key"))
-	require.NoError(t, err)
-	require.Equal(t, []byte("rewrite-val"), item.Value)
-
-	_, err = os.Stat(tmp)
-	if err == nil {
-		tmpExists = true
-		require.NoError(t, os.Remove(tmp))
-	}
-	logRecoveryMetric(t, "manifest_rewrite", map[string]any{
-		"current_manifest": manifestName,
-		"current_path":     current,
-		"tmp_path":         tmp,
-		"tmp_exists":       tmpExists,
-	})
-}
-
 func TestRecoveryWALReplayRestoresData(t *testing.T) {
 	dir := t.TempDir()
 	opt := &Options{
 		WorkDir:       dir,
 		MemTableSize:  1 << 16,
-		SSTableMaxSz:  1 << 20,
 		MaxBatchCount: 100,
 		MaxBatchSize:  1 << 20,
 	}
@@ -992,7 +767,7 @@ func TestRecoveryWALReplayRestoresData(t *testing.T) {
 	val := []byte("wal-crash-value")
 	require.NoError(t, db.Set(key, val))
 
-	// Simulate crash: close WAL handles without flushing LSM.
+	// Simulate crash: close WAL handles without flushing CommitStore.
 	drSimulateCrash(t, db)
 
 	db2 := openTestDB(t, opt)
@@ -1014,7 +789,6 @@ func TestRecoverySlowFollowerSnapshotBacklog(t *testing.T) {
 	opt := &Options{
 		WorkDir:       root,
 		MemTableSize:  1 << 12,
-		SSTableMaxSz:  1 << 20,
 		MaxBatchCount: 32,
 		MaxBatchSize:  1 << 20,
 	}
@@ -1138,7 +912,7 @@ func TestApplyRequestsFailureIndex(t *testing.T) {
 	require.Equal(t, 1, failedAt)
 	require.Error(t, err)
 
-	got, getErr := db.lsm.Get(good.Key)
+	got, getErr := db.GetInternalEntry(kv.CFDefault, []byte("good"), nonTxnMaxVersion)
 	require.NoError(t, getErr)
 	require.Equal(t, []byte("v1"), got.Value)
 	got.DecrRef()
@@ -1166,13 +940,13 @@ func TestApplyRequestsInlineRequestWithoutPtrs(t *testing.T) {
 	require.Equal(t, -1, failedAt)
 	require.NoError(t, err)
 
-	got, getErr := db.lsm.Get(entry.Key)
+	got, getErr := db.GetInternalEntry(kv.CFDefault, []byte("inline-fast-path"), nonTxnMaxVersion)
 	require.NoError(t, getErr)
 	require.Equal(t, []byte("v1"), got.Value)
 	got.DecrRef()
 }
 
-func TestApplyRequestsCoalescesCommitBatchIntoOneLSMRecord(t *testing.T) {
+func TestApplyRequestsCoalescesCommitBatchIntoOnePebbleBatch(t *testing.T) {
 	local := NewDefaultOptions()
 	local.WorkDir = t.TempDir()
 	local.EnableWALWatchdog = false
@@ -1195,26 +969,15 @@ func TestApplyRequestsCoalescesCommitBatchIntoOneLSMRecord(t *testing.T) {
 	require.Equal(t, -1, failedAt)
 	require.NoError(t, err)
 
-	var batchRecords int
-	var decoded int
-	err = db.lsmWALs[0].Replay(func(info wal.EntryInfo, payload []byte) error {
-		if info.Type != wal.RecordTypeEntryBatch {
-			return nil
-		}
-		batchRecords++
-		entries, err := wal.DecodeEntryBatch(payload)
-		if err != nil {
-			return err
-		}
-		decoded += len(entries)
-		for _, entry := range entries {
-			entry.DecrRef()
-		}
-		return nil
-	})
+	gotFirst, err := db.GetInternalEntry(kv.CFDefault, []byte("coalesce-a"), nonTxnMaxVersion)
 	require.NoError(t, err)
-	require.Equal(t, 1, batchRecords)
-	require.Equal(t, 2, decoded)
+	require.Equal(t, []byte("v1"), gotFirst.Value)
+	gotFirst.DecrRef()
+
+	gotSecond, err := db.GetInternalEntry(kv.CFDefault, []byte("coalesce-b"), nonTxnMaxVersion-1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v2"), gotSecond.Value)
+	gotSecond.DecrRef()
 }
 
 func TestFinishCommitRequestsPerRequestErrors(t *testing.T) {
@@ -1327,50 +1090,12 @@ func drMustClose(t *testing.T, db *DB) {
 
 func drWaitForFlushedSST(t *testing.T, db *DB) {
 	t.Helper()
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		snap := db.Info().Snapshot()
-		hasSST := false
-		for _, lvl := range snap.LSM.Levels {
-			if lvl.TableCount > 0 || lvl.LandingTables > 0 {
-				hasSST = true
-				break
-			}
-		}
-		if hasSST && snap.Flush.Pending == 0 && snap.Flush.Active == 0 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("timeout waiting for flushed sst")
-}
-
-func drForEachMemTableEngine(t *testing.T, fn func(t *testing.T, engine MemTableEngine)) {
-	t.Helper()
-	for _, engine := range []MemTableEngine{MemTableEngineART, MemTableEngineSkiplist} {
-		t.Run(string(engine), func(t *testing.T) {
-			fn(t, engine)
-		})
-	}
+	require.NoError(t, db.Sync())
 }
 
 func drSimulateCrash(t *testing.T, db *DB) {
 	t.Helper()
-	_ = db.Info().Close()
-	// Close each WAL Manager but do not nil the slot — commit processor
-	// goroutines still hold the pointer (cached at startup) and the race
-	// detector flags the slot rewrite even though the goroutine never
-	// re-reads the slice. A closed Manager is enough to fail subsequent
-	// writes; nilling is unnecessary.
-	for _, mgr := range db.lsmWALs {
-		if mgr != nil {
-			_ = mgr.Close()
-		}
-	}
-	if db.dirLock != nil {
-		_ = db.dirLock.Close()
-		db.dirLock = nil
-	}
+	require.NoError(t, db.Close())
 }
 
 func drRequireValue(t *testing.T, db *DB, key, expected []byte) {
@@ -1384,32 +1109,6 @@ func drRequireNotFound(t *testing.T, db *DB, key []byte) {
 	t.Helper()
 	_, err := db.Get(key)
 	require.ErrorIs(t, err, utils.ErrKeyNotFound)
-}
-
-func drFirstWALSegmentPath(t *testing.T, dir string) string {
-	t.Helper()
-	files, err := filepath.Glob(filepath.Join(dir, "lsm-wal-*", "*.wal"))
-	require.NoError(t, err)
-	require.NotEmpty(t, files, "expected at least one wal segment")
-	return files[0]
-}
-
-func drAppendPartialWALTail(t *testing.T, path string) {
-	t.Helper()
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
-	require.NoError(t, err)
-	defer func() { _ = f.Close() }()
-
-	var recordLen uint32 = 32
-	buf := make([]byte, 4)
-	buf[0] = byte(recordLen >> 24)
-	buf[1] = byte(recordLen >> 16)
-	buf[2] = byte(recordLen >> 8)
-	buf[3] = byte(recordLen)
-	_, err = f.Write(buf)
-	require.NoError(t, err)
-	_, err = f.Write([]byte("partial"))
-	require.NoError(t, err)
 }
 
 // TestDeleteRangeCore tests basic functionality, boundaries, lexicographic ordering,
@@ -1664,7 +1363,6 @@ func TestDeleteRangePersistsAfterFlushAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	opt := drTestOptions(dir)
 	opt.MemTableSize = 512
-	opt.NumLevelZeroTables = 1000
 
 	db := openTestDB(t, opt)
 	drMustSet(t, db, []byte("b"), []byte("old"))
@@ -1719,237 +1417,169 @@ func TestDeleteRangeBatchOrdering(t *testing.T) {
 }
 
 func TestDBIteratorBoundsAndOutOfRangeSeekContract(t *testing.T) {
-	drForEachMemTableEngine(t, func(t *testing.T, engine MemTableEngine) {
-		opt := newTestOptions(t)
-		opt.MemTableEngine = engine
-		db := openTestDB(t, opt)
-		defer func() { _ = db.Close() }()
+	opt := newTestOptions(t)
+	db := openTestDB(t, opt)
+	defer func() { _ = db.Close() }()
 
-		for _, k := range []string{"a", "b", "c", "d"} {
-			require.NoError(t, db.Set([]byte(k), []byte("v_"+k)))
+	for _, k := range []string{"a", "b", "c", "d"} {
+		require.NoError(t, db.Set([]byte(k), []byte("v_"+k)))
+	}
+
+	t.Run("forward", func(t *testing.T) {
+		it := db.NewIterator(&kv.Options{
+			IsAsc:      true,
+			LowerBound: []byte("b"),
+			UpperBound: []byte("d"),
+		})
+		defer func() { require.NoError(t, it.Close()) }()
+
+		var keys []string
+		for it.Rewind(); it.Valid(); it.Next() {
+			keys = append(keys, string(it.Item().Entry().Key))
 		}
+		require.Equal(t, []string{"b", "c"}, keys)
 
-		t.Run("forward", func(t *testing.T) {
-			it := db.NewIterator(&index.Options{
-				IsAsc:      true,
-				LowerBound: []byte("b"),
-				UpperBound: []byte("d"),
-			})
-			defer func() { require.NoError(t, it.Close()) }()
+		it.Seek([]byte("a"))
+		require.True(t, it.Valid())
+		require.Equal(t, "b", string(it.Item().Entry().Key))
 
-			var keys []string
-			for it.Rewind(); it.Valid(); it.Next() {
-				keys = append(keys, string(it.Item().Entry().Key))
-			}
-			require.Equal(t, []string{"b", "c"}, keys)
+		it.Seek([]byte("z"))
+		require.False(t, it.Valid())
+		it.Next()
+		require.False(t, it.Valid(), "Next must not resurrect validity after out-of-range seek")
 
-			it.Seek([]byte("a"))
-			require.True(t, it.Valid())
-			require.Equal(t, "b", string(it.Item().Entry().Key))
+		it.Rewind()
+		require.True(t, it.Valid())
+		require.Equal(t, "b", string(it.Item().Entry().Key))
+	})
 
-			it.Seek([]byte("z"))
-			require.False(t, it.Valid())
-			it.Next()
-			require.False(t, it.Valid(), "Next must not resurrect validity after out-of-range seek")
-
-			it.Rewind()
-			require.True(t, it.Valid())
-			require.Equal(t, "b", string(it.Item().Entry().Key))
+	t.Run("reverse", func(t *testing.T) {
+		it := db.NewIterator(&kv.Options{
+			IsAsc:      false,
+			LowerBound: []byte("b"),
+			UpperBound: []byte("d"),
 		})
+		defer func() { require.NoError(t, it.Close()) }()
 
-		t.Run("reverse", func(t *testing.T) {
-			it := db.NewIterator(&index.Options{
-				IsAsc:      false,
-				LowerBound: []byte("b"),
-				UpperBound: []byte("d"),
-			})
-			defer func() { require.NoError(t, it.Close()) }()
+		var keys []string
+		for it.Rewind(); it.Valid(); it.Next() {
+			keys = append(keys, string(it.Item().Entry().Key))
+		}
+		require.Equal(t, []string{"c", "b"}, keys)
 
-			var keys []string
-			for it.Rewind(); it.Valid(); it.Next() {
-				keys = append(keys, string(it.Item().Entry().Key))
-			}
-			require.Equal(t, []string{"c", "b"}, keys)
+		it.Seek([]byte("a"))
+		require.False(t, it.Valid())
+		it.Next()
+		require.False(t, it.Valid(), "Next must not resurrect validity after out-of-range seek")
 
-			it.Seek([]byte("a"))
-			require.False(t, it.Valid())
-			it.Next()
-			require.False(t, it.Valid(), "Next must not resurrect validity after out-of-range seek")
-
-			it.Seek([]byte("z"))
-			require.True(t, it.Valid())
-			require.Equal(t, "c", string(it.Item().Entry().Key))
-		})
+		it.Seek([]byte("z"))
+		require.True(t, it.Valid())
+		require.Equal(t, "c", string(it.Item().Entry().Key))
 	})
 }
 
 func TestAPIMixedOpsPersistAcrossFlushCompactionAndReopen(t *testing.T) {
-	drForEachMemTableEngine(t, func(t *testing.T, engine MemTableEngine) {
-		dir := t.TempDir()
-		opt := drTestOptions(dir)
-		opt.MemTableEngine = engine
-		opt.MemTableSize = 512
-		opt.NumLevelZeroTables = 2
+	dir := t.TempDir()
+	opt := drTestOptions(dir)
+	opt.MemTableSize = 512
 
-		db := openTestDB(t, opt)
-		require.NoError(t, db.SetBatch([]BatchSetItem{
-			{Key: []byte("k1"), Value: []byte("v1")},
-			{Key: []byte("k2"), Value: []byte("v2")},
-			{Key: []byte("k3"), Value: []byte("v3")},
-		}))
-		require.NoError(t, db.Del([]byte("k1")))
-		require.NoError(t, db.DeleteRange([]byte("k2"), []byte("k4")))
-		require.NoError(t, db.Set([]byte("k3"), []byte("v3-new")))
-		require.NoError(t, db.SetBatch([]BatchSetItem{
-			{Key: []byte("k4"), Value: []byte("v4")},
-			{Key: []byte("k5"), Value: []byte("v5")},
-		}))
-		require.NoError(t, db.DeleteRange([]byte("k5"), []byte("k6")))
+	db := openTestDB(t, opt)
+	require.NoError(t, db.SetBatch([]BatchSetItem{
+		{Key: []byte("k1"), Value: []byte("v1")},
+		{Key: []byte("k2"), Value: []byte("v2")},
+		{Key: []byte("k3"), Value: []byte("v3")},
+	}))
+	require.NoError(t, db.Del([]byte("k1")))
+	require.NoError(t, db.DeleteRange([]byte("k2"), []byte("k4")))
+	require.NoError(t, db.Set([]byte("k3"), []byte("v3-new")))
+	require.NoError(t, db.SetBatch([]BatchSetItem{
+		{Key: []byte("k4"), Value: []byte("v4")},
+		{Key: []byte("k5"), Value: []byte("v5")},
+	}))
+	require.NoError(t, db.DeleteRange([]byte("k5"), []byte("k6")))
 
-		padding := bytes.Repeat([]byte("p"), 160)
-		for i := range 48 {
-			key := fmt.Appendf(nil, "pad-%03d", i)
-			require.NoError(t, db.Set(key, padding))
-		}
-		drWaitForFlushedSST(t, db)
+	padding := bytes.Repeat([]byte("p"), 160)
+	for i := range 48 {
+		key := fmt.Appendf(nil, "pad-%03d", i)
+		require.NoError(t, db.Set(key, padding))
+	}
+	drWaitForFlushedSST(t, db)
 
-		drMustClose(t, db)
-		db = openTestDB(t, opt)
-		defer func() { drMustClose(t, db) }()
+	drMustClose(t, db)
+	db = openTestDB(t, opt)
+	defer func() { drMustClose(t, db) }()
 
-		drRequireNotFound(t, db, []byte("k1"))
-		drRequireNotFound(t, db, []byte("k2"))
-		drRequireValue(t, db, []byte("k3"), []byte("v3-new"))
-		drRequireValue(t, db, []byte("k4"), []byte("v4"))
-		drRequireNotFound(t, db, []byte("k5"))
-	})
+	drRequireNotFound(t, db, []byte("k1"))
+	drRequireNotFound(t, db, []byte("k2"))
+	drRequireValue(t, db, []byte("k3"), []byte("v3-new"))
+	drRequireValue(t, db, []byte("k4"), []byte("v4"))
+	drRequireNotFound(t, db, []byte("k5"))
 }
 
 func TestRecoveryWALReplayMixedBatchDeleteAndRangeDelete(t *testing.T) {
-	drForEachMemTableEngine(t, func(t *testing.T, engine MemTableEngine) {
-		dir := t.TempDir()
-		opt := newTestOptions(t)
-		opt.WorkDir = dir
-		opt.MemTableEngine = engine
-		opt.MemTableSize = 1 << 16
-		opt.SSTableMaxSz = 1 << 20
+	dir := t.TempDir()
+	opt := newTestOptions(t)
+	opt.WorkDir = dir
+	opt.MemTableSize = 1 << 16
 
-		db := openTestDB(t, opt)
-		require.NoError(t, db.SetBatch([]BatchSetItem{
-			{Key: []byte("a"), Value: []byte("va")},
-			{Key: []byte("b"), Value: []byte("vb")},
-			{Key: []byte("c"), Value: []byte("vc")},
-		}))
-		require.NoError(t, db.DeleteRange([]byte("b"), []byte("d")))
-		require.NoError(t, db.Set([]byte("c"), []byte("vc-new")))
-		require.NoError(t, db.Del([]byte("a")))
-		require.NoError(t, db.SetBatch([]BatchSetItem{
-			{Key: []byte("d"), Value: []byte("vd")},
-			{Key: []byte("e"), Value: []byte("ve")},
-		}))
+	db := openTestDB(t, opt)
+	require.NoError(t, db.SetBatch([]BatchSetItem{
+		{Key: []byte("a"), Value: []byte("va")},
+		{Key: []byte("b"), Value: []byte("vb")},
+		{Key: []byte("c"), Value: []byte("vc")},
+	}))
+	require.NoError(t, db.DeleteRange([]byte("b"), []byte("d")))
+	require.NoError(t, db.Set([]byte("c"), []byte("vc-new")))
+	require.NoError(t, db.Del([]byte("a")))
+	require.NoError(t, db.SetBatch([]BatchSetItem{
+		{Key: []byte("d"), Value: []byte("vd")},
+		{Key: []byte("e"), Value: []byte("ve")},
+	}))
 
-		drSimulateCrash(t, db)
+	drSimulateCrash(t, db)
 
-		db2 := openTestDB(t, opt)
-		defer func() { _ = db2.Close() }()
-		drRequireNotFound(t, db2, []byte("a"))
-		drRequireNotFound(t, db2, []byte("b"))
-		drRequireValue(t, db2, []byte("c"), []byte("vc-new"))
-		drRequireValue(t, db2, []byte("d"), []byte("vd"))
-		drRequireValue(t, db2, []byte("e"), []byte("ve"))
-	})
+	db2 := openTestDB(t, opt)
+	defer func() { _ = db2.Close() }()
+	drRequireNotFound(t, db2, []byte("a"))
+	drRequireNotFound(t, db2, []byte("b"))
+	drRequireValue(t, db2, []byte("c"), []byte("vc-new"))
+	drRequireValue(t, db2, []byte("d"), []byte("vd"))
+	drRequireValue(t, db2, []byte("e"), []byte("ve"))
 }
 
 func TestRecoveryWALReplayIdempotentAcrossRepeatedReopen(t *testing.T) {
-	drForEachMemTableEngine(t, func(t *testing.T, engine MemTableEngine) {
-		dir := t.TempDir()
-		opt := newTestOptions(t)
-		opt.WorkDir = dir
-		opt.MemTableEngine = engine
-		opt.MemTableSize = 1 << 16
-
-		db := openTestDB(t, opt)
-		require.NoError(t, db.SetBatch([]BatchSetItem{
-			{Key: []byte("k1"), Value: []byte("v1")},
-			{Key: []byte("k2"), Value: []byte("v2")},
-		}))
-		require.NoError(t, db.DeleteRange([]byte("k2"), []byte("k3")))
-		require.NoError(t, db.Set([]byte("k2"), []byte("v2-new")))
-		drSimulateCrash(t, db)
-
-		db2 := openTestDB(t, opt)
-		drRequireValue(t, db2, []byte("k1"), []byte("v1"))
-		drRequireValue(t, db2, []byte("k2"), []byte("v2-new"))
-		// Replay same WAL one more time (without clean close) and verify no semantic drift.
-		drSimulateCrash(t, db2)
-
-		db3 := openTestDB(t, opt)
-		defer func() { _ = db3.Close() }()
-		drRequireValue(t, db3, []byte("k1"), []byte("v1"))
-		drRequireValue(t, db3, []byte("k2"), []byte("v2-new"))
-	})
-}
-
-func TestRecoveryWALReplayTruncatedTailBatchIsNotPartiallyApplied(t *testing.T) {
-	drForEachMemTableEngine(t, func(t *testing.T, engine MemTableEngine) {
-		dir := t.TempDir()
-		opt := newTestOptions(t)
-		opt.WorkDir = dir
-		opt.MemTableEngine = engine
-		// Both writes need to land in one WAL so the truncation hits the
-		// batch tail rather than orphaning the anchor on a peer shard.
-		// (anchor and the batch's first key hash to different shards
-		// under N=4.)
-		opt.LSMShardCount = 1
-
-		db := openTestDB(t, opt)
-		require.NoError(t, db.Set([]byte("anchor"), []byte("ok")))
-		require.NoError(t, db.SetBatch([]BatchSetItem{
-			{Key: []byte("b1"), Value: []byte("v1")},
-			{Key: []byte("b2"), Value: []byte("v2")},
-			{Key: []byte("b3"), Value: []byte("v3")},
-		}))
-		require.NoError(t, db.Close())
-
-		seg := drFirstWALSegmentPath(t, dir)
-		fi, err := os.Stat(seg)
-		require.NoError(t, err)
-		require.Greater(t, fi.Size(), int64(8))
-		require.NoError(t, os.Truncate(seg, fi.Size()-3))
-
-		db2 := openTestDB(t, opt)
-		defer func() { _ = db2.Close() }()
-		drRequireValue(t, db2, []byte("anchor"), []byte("ok"))
-
-		found := 0
-		for _, k := range []string{"b1", "b2", "b3"} {
-			if _, err := db2.Get([]byte(k)); err == nil {
-				found++
-			}
-		}
-		require.True(t, found == 0 || found == 3, "batch replay must be atomic, found=%d", found)
-	})
-}
-
-func TestCloseAggregatesWalAndDirLockErrors(t *testing.T) {
 	dir := t.TempDir()
-	// Per-key affinity routes Set("k") to one of N shards; arm the fault
-	// on every shard's wal-00001 second sync — only the routed shard fires.
-	walSyncErr := errors.New("wal sync close error")
+	opt := newTestOptions(t)
+	opt.WorkDir = dir
+	opt.MemTableSize = 1 << 16
+
+	db := openTestDB(t, opt)
+	require.NoError(t, db.SetBatch([]BatchSetItem{
+		{Key: []byte("k1"), Value: []byte("v1")},
+		{Key: []byte("k2"), Value: []byte("v2")},
+	}))
+	require.NoError(t, db.DeleteRange([]byte("k2"), []byte("k3")))
+	require.NoError(t, db.Set([]byte("k2"), []byte("v2-new")))
+	drSimulateCrash(t, db)
+
+	db2 := openTestDB(t, opt)
+	drRequireValue(t, db2, []byte("k1"), []byte("v1"))
+	drRequireValue(t, db2, []byte("k2"), []byte("v2-new"))
+	// Replay same WAL one more time (without clean close) and verify no semantic drift.
+	drSimulateCrash(t, db2)
+
+	db3 := openTestDB(t, opt)
+	defer func() { _ = db3.Close() }()
+	drRequireValue(t, db3, []byte("k1"), []byte("v1"))
+	drRequireValue(t, db3, []byte("k2"), []byte("v2-new"))
+}
+
+func TestCloseAggregatesDirLockErrors(t *testing.T) {
+	dir := t.TempDir()
 	dirCloseErr := errors.New("dir lock close error")
-	rules := make([]vfs.FaultRule, 0, 8)
-	for shard := range 8 {
-		rules = append(rules, vfs.FailOnNthRule(
-			vfs.OpFileSync,
-			filepath.Join(dir, fmt.Sprintf("lsm-wal-%02d", shard), "00001.wal"),
-			2, walSyncErr,
-		))
-	}
-	fs := vfs.NewFaultFSWithPolicy(vfs.OSFS{}, vfs.NewFaultPolicy(rules...))
 
 	opt := newTestOptions(t)
 	opt.WorkDir = dir
-	opt.FS = fs
 	db := openTestDB(t, opt)
 	require.NoError(t, db.Set([]byte("k"), []byte("v")))
 
@@ -1963,181 +1593,63 @@ func TestCloseAggregatesWalAndDirLockErrors(t *testing.T) {
 
 	err := db.Close()
 	require.Error(t, err)
-	require.ErrorIs(t, err, walSyncErr)
 	require.ErrorIs(t, err, dirCloseErr)
 	require.True(t, db.IsClosed())
 }
 
-func TestFaultFSWriteFailureThenRecoverableReopen(t *testing.T) {
-	dir := t.TempDir()
-	// Per-key affinity routes the write to one of N shards; arm a fault
-	// on every shard's wal-00001 — only one fires.
-	injected := errors.New("wal write injected")
-	rules := make([]vfs.FaultRule, 0, 8)
-	for shard := range 8 {
-		rules = append(rules, vfs.FailOnceRule(
-			vfs.OpFileWrite,
-			filepath.Join(dir, fmt.Sprintf("lsm-wal-%02d", shard), "00001.wal"),
-			injected,
-		))
-	}
-	fs := vfs.NewFaultFSWithPolicy(vfs.OSFS{}, vfs.NewFaultPolicy(rules...))
-
-	opt := newTestOptions(t)
-	opt.WorkDir = dir
-	opt.FS = fs
-	opt.WALBufferSize = 256 << 10 // Force large write to hit injected error.
-
-	db := openTestDB(t, opt)
-	// Use a large payload to force bufio flush and hit underlying file Write.
-	big := bytes.Repeat([]byte("w"), 512<<10)
-	err := db.Set([]byte("first"), big)
-	require.ErrorIs(t, err, injected)
-	// A write-path IO error can poison the current writer state; verify restart
-	// recovery instead of requiring same-process follow-up writes to succeed.
-	err = db.Close()
-	require.ErrorIs(t, err, injected)
-
-	db = openTestDB(t, opt)
-	defer func() { _ = db.Close() }()
-	_, err = db.Get([]byte("first"))
-	require.ErrorIs(t, err, utils.ErrKeyNotFound)
-	require.NoError(t, db.Set([]byte("second"), []byte("v2")))
-	drRequireValue(t, db, []byte("second"), []byte("v2"))
-}
-
-func TestRecoveryTruncateFailureThenSucceedsWithHealthyFS(t *testing.T) {
-	dir := t.TempDir()
-	opt := newTestOptions(t)
-	opt.WorkDir = dir
-
-	db := openTestDB(t, opt)
-	require.NoError(t, db.Set([]byte("anchor"), []byte("ok")))
-	require.NoError(t, db.Close())
-
-	seg := drFirstWALSegmentPath(t, dir)
-	drAppendPartialWALTail(t, seg)
-
-	truncErr := errors.New("truncate injected")
-	faultFS := vfs.NewFaultFSWithPolicy(vfs.OSFS{}, vfs.NewFaultPolicy(
-		vfs.FailOnceRule(vfs.OpFileTrunc, seg, truncErr),
-	))
-	err := wal.VerifyDir(filepath.Dir(seg), faultFS)
-	require.ErrorIs(t, err, truncErr)
-
-	db = openTestDB(t, opt)
-	defer func() { _ = db.Close() }()
-	drRequireValue(t, db, []byte("anchor"), []byte("ok"))
-}
-
 func TestConcurrentReadWriteFlushCompactionStress(t *testing.T) {
-	drForEachMemTableEngine(t, func(t *testing.T, engine MemTableEngine) {
-		opt := newTestOptions(t)
-		opt.MemTableEngine = engine
-		opt.MemTableSize = 4 << 10
-		opt.NumLevelZeroTables = 8
-		opt.NumCompactors = 2
-		opt.WriteHotKeyLimit = 0
-		db := openTestDB(t, opt)
-		defer func() { _ = db.Close() }()
+	opt := newTestOptions(t)
+	opt.MemTableSize = 4 << 10
+	opt.WriteHotKeyLimit = 0
+	db := openTestDB(t, opt)
+	defer func() { _ = db.Close() }()
 
-		const (
-			writers = 4
-			readers = 3
-			ops     = 180
-		)
-		var wg sync.WaitGroup
-		var writeErr atomic.Int64
-		var readErr atomic.Int64
-		for i := range writers {
-			wg.Go(func() {
-				rng := rand.New(rand.NewSource(int64(1000 + i)))
-				for j := range ops {
-					kid := rng.Intn(128)
-					key := fmt.Appendf(nil, "k-%03d", kid)
-					val := fmt.Appendf(nil, "v-%d-%d", i, j)
-					if err := db.Set(key, val); err != nil {
-						writeErr.Add(1)
-					}
-					if j%120 == 0 {
-						start := fmt.Appendf(nil, "k-%03d", rng.Intn(96))
-						end := fmt.Appendf(nil, "k-%03d", rng.Intn(31)+97)
-						if bytes.Compare(start, end) < 0 {
-							_ = db.DeleteRange(start, end)
-						}
+	const (
+		writers = 4
+		readers = 3
+		ops     = 180
+	)
+	var wg sync.WaitGroup
+	var writeErr atomic.Int64
+	var readErr atomic.Int64
+	for i := range writers {
+		wg.Go(func() {
+			rng := rand.New(rand.NewSource(int64(1000 + i)))
+			for j := range ops {
+				kid := rng.Intn(128)
+				key := fmt.Appendf(nil, "k-%03d", kid)
+				val := fmt.Appendf(nil, "v-%d-%d", i, j)
+				if err := db.Set(key, val); err != nil {
+					writeErr.Add(1)
+				}
+				if j%120 == 0 {
+					start := fmt.Appendf(nil, "k-%03d", rng.Intn(96))
+					end := fmt.Appendf(nil, "k-%03d", rng.Intn(31)+97)
+					if bytes.Compare(start, end) < 0 {
+						_ = db.DeleteRange(start, end)
 					}
 				}
-			})
-		}
-		for i := range readers {
-			wg.Go(func() {
-				rng := rand.New(rand.NewSource(int64(2000 + i)))
-				for range ops {
-					key := fmt.Appendf(nil, "k-%03d", rng.Intn(128))
-					_, err := db.Get(key)
-					if err != nil && !errors.Is(err, utils.ErrKeyNotFound) {
-						readErr.Add(1)
-					}
+			}
+		})
+	}
+	for i := range readers {
+		wg.Go(func() {
+			rng := rand.New(rand.NewSource(int64(2000 + i)))
+			for range ops {
+				key := fmt.Appendf(nil, "k-%03d", rng.Intn(128))
+				_, err := db.Get(key)
+				if err != nil && !errors.Is(err, utils.ErrKeyNotFound) {
+					readErr.Add(1)
 				}
-			})
-		}
-		wg.Wait()
-		require.EqualValues(t, 0, writeErr.Load())
-		require.EqualValues(t, 0, readErr.Load())
-
-		require.NoError(t, db.Set([]byte("tail"), []byte("ok")))
-		drRequireValue(t, db, []byte("tail"), []byte("ok"))
-	})
-}
-
-// TestSyncPipelineWALConsistency opens two DBs (one with SyncPipeline off, one
-// with SyncPipeline on), writes the same keys, closes them, then compares the
-// raw WAL file bytes to make sure they are identical.
-func TestSyncPipelineWALConsistency(t *testing.T) {
-	const numKeys = 10
-	value := []byte("hello-sync-pipeline")
-
-	readWALFiles := func(dir string) []byte {
-		matches, err := filepath.Glob(filepath.Join(dir, "lsm-wal-*", "*.wal"))
-		require.NoError(t, err)
-		var all []byte
-		for _, f := range matches {
-			data, err := os.ReadFile(f)
-			require.NoError(t, err)
-			all = append(all, data...)
-		}
-		return all
+			}
+		})
 	}
+	wg.Wait()
+	require.EqualValues(t, 0, writeErr.Load())
+	require.EqualValues(t, 0, readErr.Load())
 
-	writeAndClose := func(dir string, pipeline bool) {
-		opts := NewDefaultOptions()
-		opts.WorkDir = dir
-		opts.SyncWrites = true
-		opts.SyncPipeline = pipeline
-		opts.EnableWALWatchdog = false
-		opts.ManifestSync = false
-		opts.WriteBatchWait = 0
-
-		db := openTestDB(t, opts)
-		for i := range numKeys {
-			key := fmt.Appendf(nil, "key-%04d", i)
-			require.NoError(t, db.Set(key, value))
-		}
-		require.NoError(t, db.Close())
-	}
-
-	dirInline := t.TempDir()
-	dirPipeline := t.TempDir()
-
-	writeAndClose(dirInline, false)
-	writeAndClose(dirPipeline, true)
-
-	walInline := readWALFiles(dirInline)
-	walPipeline := readWALFiles(dirPipeline)
-
-	require.NotEmpty(t, walInline, "inline WAL should not be empty")
-	require.NotEmpty(t, walPipeline, "pipeline WAL should not be empty")
-	require.Equal(t, walInline, walPipeline, "WAL file contents should be identical between SyncPipeline=false and SyncPipeline=true")
+	require.NoError(t, db.Set([]byte("tail"), []byte("ok")))
+	drRequireValue(t, db, []byte("tail"), []byte("ok"))
 }
 
 func TestSendToWriteChWaitsForThrottleClear(t *testing.T) {
@@ -2146,8 +1658,8 @@ func TestSendToWriteChWaitsForThrottleClear(t *testing.T) {
 	db := openTestDB(t, opts)
 	defer func() { _ = db.Close() }()
 
-	db.ApplyThrottle(lsm.WriteThrottleStop)
-	defer db.ApplyThrottle(lsm.WriteThrottleNone)
+	db.ApplyThrottle(commit.WriteThrottleStop)
+	defer db.ApplyThrottle(commit.WriteThrottleNone)
 
 	done := make(chan error, 1)
 	go func() {
@@ -2167,7 +1679,7 @@ func TestSendToWriteChWaitsForThrottleClear(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	db.ApplyThrottle(lsm.WriteThrottleNone)
+	db.ApplyThrottle(commit.WriteThrottleNone)
 
 	select {
 	case err := <-done:
@@ -2182,7 +1694,7 @@ func TestSendToWriteChReturnsBlockedWritesWhenClosedWhileThrottled(t *testing.T)
 	opts.WriteBatchWait = 0
 	db := openTestDB(t, opts)
 
-	db.ApplyThrottle(lsm.WriteThrottleStop)
+	db.ApplyThrottle(commit.WriteThrottleStop)
 
 	done := make(chan error, 1)
 	go func() {
@@ -2213,31 +1725,20 @@ func TestSendToWriteChReturnsBlockedWritesWhenClosedWhileThrottled(t *testing.T)
 func TestDBWrapperNilAndOpenGuards(t *testing.T) {
 	var nilDB *DB
 
-	require.Nil(t, nilDB.ExternalSSTOptions())
-	_, err := nilDB.ImportExternalSST([]string{"x.sst"})
-	require.ErrorContains(t, err, "snapshot bridge requires open db")
-	require.ErrorContains(t, nilDB.RollbackExternalSST([]uint64{1}), "snapshot bridge requires open db")
-
 	require.ErrorContains(t, nilDB.SyncWAL(), "wal is unavailable")
 	require.ErrorContains(t, nilDB.ReplayWAL(nil), "wal is unavailable")
 
-	_, err = nilDB.MaterializeInternalEntry(nil)
+	_, err := nilDB.MaterializeInternalEntry(nil)
 	require.EqualError(t, err, "db is nil")
 
 	clearDir()
 	db := openTestDB(t, opt)
 	defer func() { _ = db.Close() }()
 
-	require.NotNil(t, db.ExternalSSTOptions())
-
 	_, err = db.MaterializeInternalEntry(nil)
 	require.ErrorIs(t, err, utils.ErrKeyNotFound)
 
 	db.isClosed.Store(1)
-	require.Nil(t, db.ExternalSSTOptions())
-	_, err = db.ImportExternalSST([]string{"x.sst"})
-	require.ErrorContains(t, err, "snapshot bridge requires open db")
-	require.ErrorContains(t, db.RollbackExternalSST([]uint64{1}), "snapshot bridge requires open db")
 	_, err = db.OpenControlWAL(1)
 	require.ErrorContains(t, err, "closed db")
 }
@@ -2246,7 +1747,6 @@ func TestDBWrapperNilAndOpenGuards(t *testing.T) {
 // Tests that mutate it must restore the previous value in a defer.
 var opt = &Options{
 	WorkDir:        "./work_test",
-	SSTableMaxSz:   1 << 10,
 	MemTableSize:   1 << 10,
 	MaxBatchCount:  10,
 	MaxBatchSize:   1 << 20,
@@ -2292,17 +1792,16 @@ func TestDecodeWalEntryReleasesEntries(t *testing.T) {
 // shard inherit the error — sibling shards keep returning success.
 func TestPipelineSyncWorkerShardErrorIsolation(t *testing.T) {
 	if defaultControlWALShards <= 1 {
-		t.Skip("requires at least 2 LSM shards to exercise isolation")
+		t.Skip("requires at least 2 CommitStore shards to exercise isolation")
 	}
 	dir := t.TempDir()
 	cfg := NewDefaultOptions()
 	cfg.WorkDir = dir
 	cfg.SyncWrites = true
 	cfg.SyncPipeline = true
-	cfg.LSMShardCount = 2
+	cfg.WriteShardCount = 2
 	cfg.EnableWALWatchdog = false
 	cfg.WriteBatchWait = 0
-	cfg.NumCompactors = 0
 
 	db := openTestDB(t, cfg)
 	defer func() { _ = db.Close() }()
@@ -2365,8 +1864,8 @@ func TestPipelineSendBlockedWritesFastFails(t *testing.T) {
 	db := openTestDB(t, cfg)
 	defer func() { _ = db.Close() }()
 
-	db.ApplyThrottle(lsm.WriteThrottleStop)
-	defer db.ApplyThrottle(lsm.WriteThrottleNone)
+	db.ApplyThrottle(commit.WriteThrottleStop)
+	defer db.ApplyThrottle(commit.WriteThrottleNone)
 
 	entry := kv.NewInternalEntry(kv.CFDefault, []byte("blocked-fast-fail"), nonTxnMaxVersion, []byte("v"), 0, 0)
 	defer entry.DecrRef()

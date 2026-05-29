@@ -4,7 +4,6 @@
 package store
 
 import (
-	"context"
 	"fmt"
 
 	metaregion "github.com/feichai0017/NoKV/meta/region"
@@ -12,7 +11,7 @@ import (
 	"github.com/feichai0017/NoKV/raftstore/failpoints"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/peer"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
 	"github.com/feichai0017/NoKV/raftstore/store/router"
 )
 
@@ -189,7 +188,7 @@ func (s *Store) startPeerFromSnapshot(msg myraft.Message) error {
 	}
 	metaFile, err := snapshotpkg.ReadPayloadMeta(msg.Snapshot.Data)
 	if err != nil {
-		return fmt.Errorf("raftstore: decode sst snapshot payload meta: %w", err)
+		return fmt.Errorf("raftstore: decode snapshot payload meta: %w", err)
 	}
 	meta := metaFile.Region
 	if meta.ID == 0 {
@@ -239,7 +238,7 @@ func (s *Store) InstallRegionSnapshot(snap myraft.Snapshot) (localmeta.RegionMet
 	}
 	metaFile, err := snapshotpkg.ReadPayloadMeta(snap.Data)
 	if err != nil {
-		return localmeta.RegionMeta{}, fmt.Errorf("raftstore: decode install sst snapshot payload: %w", err)
+		return localmeta.RegionMeta{}, fmt.Errorf("raftstore: decode install snapshot payload: %w", err)
 	}
 	meta := metaFile.Region
 	if meta.ID == 0 {
@@ -294,110 +293,6 @@ func (s *Store) InstallRegionSnapshot(snap myraft.Snapshot) (localmeta.RegionMet
 	}
 	s.regions.SetPeer(meta.ID, p)
 	if err := s.applyRegionMeta(meta); err != nil {
-		s.router.Deregister(localPeer.PeerID)
-		s.regions.SetPeer(meta.ID, nil)
-		_ = p.Close()
-		return localmeta.RegionMeta{}, err
-	}
-	return meta, nil
-}
-
-// InstallRegionSSTSnapshot installs one migration-only SST snapshot payload on
-// the local store. The raft snapshot metadata is applied to the peer storage
-// first, then SST files are ingested before the peer is published.
-func (s *Store) InstallRegionSSTSnapshot(ctx context.Context, snap myraft.Snapshot, meta localmeta.RegionMeta, install func() (func() error, error)) (localmeta.RegionMeta, error) {
-	if s == nil {
-		return localmeta.RegionMeta{}, errNilStore
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return localmeta.RegionMeta{}, err
-	}
-	if myraft.IsEmptySnap(snap) {
-		return localmeta.RegionMeta{}, errInstallRegionSSTRequiresSnapshot
-	}
-	if meta.ID == 0 {
-		return localmeta.RegionMeta{}, errInstallRegionSSTRequiresRegionMeta
-	}
-	if install == nil {
-		return localmeta.RegionMeta{}, errInstallRegionSSTRequiresCallback
-	}
-	var localPeer metaregion.Peer
-	for _, peerMeta := range meta.Peers {
-		if peerMeta.StoreID == s.storeID {
-			localPeer = peerMeta
-			break
-		}
-	}
-	if localPeer.PeerID == 0 {
-		return localmeta.RegionMeta{}, errRegionDoesNotAssignPeer(meta.ID, s.storeID)
-	}
-	if existing, ok := s.Peer(localPeer.PeerID); ok && existing != nil {
-		return localmeta.RegionMeta{}, errPeerAlreadyHosted(localPeer.PeerID, meta.ID)
-	}
-	if s.peerBuilder == nil {
-		return localmeta.RegionMeta{}, errInstallRegionSSTRequiresPeerBuild
-	}
-	cfg, err := s.peerBuilder(meta)
-	if err != nil {
-		return localmeta.RegionMeta{}, fmt.Errorf("raftstore: build install peer for region %d: %w", meta.ID, err)
-	}
-	if cfg == nil {
-		return localmeta.RegionMeta{}, errPeerBuilderReturnedNilConfig(meta.ID)
-	}
-	if cfg.RaftConfig.ID != localPeer.PeerID {
-		return localmeta.RegionMeta{}, fmt.Errorf("raftstore: install sst snapshot peer mismatch want=%d got=%d", localPeer.PeerID, cfg.RaftConfig.ID)
-	}
-	cfgCopy := *cfg
-	cfgCopy.ConfChange = s.handlePeerConfChange
-	cfgCopy.AllowSnapshotInstallRetry = true
-	cfgCopy = s.wirePeerConfig(cfgCopy, false)
-	p, err := peer.NewPeer(&cfgCopy)
-	if err != nil {
-		return localmeta.RegionMeta{}, fmt.Errorf("raftstore: new sst install peer %d for region %d: %w", localPeer.PeerID, meta.ID, err)
-	}
-	snapNoData := snap
-	snapNoData.Data = nil
-	msg := myraft.Message{Type: myraft.MsgSnapshot, To: localPeer.PeerID, Snapshot: &snapNoData}
-	if err := p.Step(msg); err != nil {
-		_ = p.Close()
-		return localmeta.RegionMeta{}, err
-	}
-	if err := ctx.Err(); err != nil {
-		_ = p.Close()
-		return localmeta.RegionMeta{}, err
-	}
-	rollback, err := install()
-	if err != nil {
-		_ = p.Close()
-		return localmeta.RegionMeta{}, fmt.Errorf("raftstore: install sst payload for region %d: %w", meta.ID, err)
-	}
-	cleanup := func() {
-		if rollback != nil {
-			_ = rollback()
-		}
-	}
-	p.ApplyRegionMetaMirror(meta)
-	if err := ctx.Err(); err != nil {
-		cleanup()
-		_ = p.Close()
-		return localmeta.RegionMeta{}, err
-	}
-	if failpoints.ShouldFailAfterSnapshotApplyBeforePublish() {
-		cleanup()
-		_ = p.Close()
-		return localmeta.RegionMeta{}, errFailpointAfterSnapshotApply
-	}
-	if err := s.router.Register(p); err != nil {
-		cleanup()
-		_ = p.Close()
-		return localmeta.RegionMeta{}, err
-	}
-	s.regions.SetPeer(meta.ID, p)
-	if err := s.applyRegionMeta(meta); err != nil {
-		cleanup()
 		s.router.Deregister(localPeer.PeerID)
 		s.regions.SetPeer(meta.ID, nil)
 		_ = p.Close()

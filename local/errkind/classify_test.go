@@ -7,12 +7,10 @@ import (
 	"fmt"
 	"testing"
 
-	enginekv "github.com/feichai0017/NoKV/engine/kv"
-	"github.com/feichai0017/NoKV/engine/lsm"
-	"github.com/feichai0017/NoKV/engine/lsm/flush"
-	"github.com/feichai0017/NoKV/engine/vfs"
-	"github.com/feichai0017/NoKV/engine/wal"
 	nokverrors "github.com/feichai0017/NoKV/errors"
+	"github.com/feichai0017/NoKV/storage/vfs"
+	"github.com/feichai0017/NoKV/storage/wal"
+	enginekv "github.com/feichai0017/NoKV/txn/storage"
 	"github.com/feichai0017/NoKV/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -41,11 +39,6 @@ func TestClassifyMapsEmbeddedEngineErrors(t *testing.T) {
 		{
 			name: "nil value",
 			err:  utils.ErrNilValue,
-			kind: nokverrors.KindInvalidArgument,
-		},
-		{
-			name: "lsm config",
-			err:  lsm.ErrLSMNilWALManager,
 			kind: nokverrors.KindInvalidArgument,
 		},
 		{
@@ -84,11 +77,6 @@ func TestClassifyMapsEmbeddedEngineErrors(t *testing.T) {
 			kind: nokverrors.KindAborted,
 		},
 		{
-			name: "closed lsm aborted",
-			err:  lsm.ErrLSMClosed,
-			kind: nokverrors.KindAborted,
-		},
-		{
 			name: "checksum corruption",
 			err:  enginekv.ErrBadChecksum,
 			kind: nokverrors.KindCorruption,
@@ -97,11 +85,6 @@ func TestClassifyMapsEmbeddedEngineErrors(t *testing.T) {
 			name: "wal partial record corruption",
 			err:  wal.ErrPartialRecord,
 			kind: nokverrors.KindCorruption,
-		},
-		{
-			name: "nil runtime protocol violation",
-			err:  flush.ErrNil,
-			kind: nokverrors.KindProtocolViolation,
 		},
 		{
 			name: "control flow remains local",

@@ -3,143 +3,17 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# WAL Subsystem
+# WAL Boundaries
 
-NoKV's write-ahead log mirrors RocksDB's durability model and is implemented as a compact typed log. WAL appends happen alongside memtable writes through the DB commit pipeline; metadata values are stored inline, so replay does not depend on a separate blob layer.
+`storage/wal` contains typed WAL segment utilities used by control-log and raft
+runtime internals. It is not the physical data-plane WAL for the Pebble-backed
+raw storage backend; Pebble owns its own WAL below `storage/pebble`.
 
----
+NoKV keeps WAL consumers explicit:
 
-## 1. File Layout & Naming
+- raft logs use `raftstore/raftlog`
+- local control-log shards use `storage/wal`
+- raw key/value persistence uses Pebble through `storage/pebble`
 
-- Location: `${Options.WorkDir}/wal/`.
-- Naming pattern: `%05d.wal` (e.g. `00001.wal`).
-- Rotation threshold: configurable via `wal.Config.SegmentSize` (defaults to 64 MiB, minimum 64 KiB).
-- Verification: `wal.VerifyDir` ensures the directory exists prior to `DB.Open`.
-
-On open, `wal.Manager` scans the directory, sorts segment IDs, and resumes the highest ID—exactly how RocksDB re-opens its MANIFEST and WAL sequence files.
-
----
-
-## 2. Record Format
-
-```text
-uint32 length (big-endian, includes type + payload)
-uint8  type
-[]byte payload
-uint32 checksum (CRC32 Castagnoli over type + payload)
-```
-
-- Checksums use `kv.CastagnoliCrcTable`, the same polynomial used by RocksDB (Castagnoli). Record encoding/decoding lives in `engine/wal/record.go`.
-- The type byte allows mixing LSM mutations with raft log/state/snapshot records in the same WAL segment.
-- Appends are buffered by `bufio.Writer` so batches become single system calls.
-- Replay stops cleanly at truncated tails; tests simulate torn writes by truncating the final bytes and verifying replay remains idempotent (`engine/wal/manager_test.go::TestManagerReplayHandlesTruncate`).
-
----
-
-## 3. Public API (Go)
-
-```go
-mgr, _ := wal.Open(wal.Config{Dir: path})
-info, _ := mgr.AppendEntry(wal.DurabilityFlushed, entry)
-batchInfo, _ := mgr.AppendEntryBatch(wal.DurabilityFlushed, entries)
-typedInfos, _ := mgr.AppendRecords(wal.DurabilityFsyncBatched, wal.Record{
-    Type:    wal.RecordTypeRaftEntry,
-    Payload: raftPayload,
-})
-_ = mgr.Sync()
-_ = mgr.Rotate()
-_ = mgr.Replay(func(info wal.EntryInfo, payload []byte) error {
-    // reapply to memtable
-    return nil
-})
-```
-
-Key behaviours:
-- `AppendEntry`/`AppendEntryBatch`/`AppendRecords` automatically call `ensureCapacity` to decide when to rotate; they return `EntryInfo{SegmentID, Offset, Length}` so upper layers can keep storage WAL checkpoints and store-local raft replay pointers.
-- Every append must declare a `DurabilityPolicy`: `DurabilityBuffered` (writer buffer only), `DurabilityFlushed` (OS page cache), `DurabilityFsync` (fsync now), or `DurabilityFsyncBatched` (fsync contract reserved for the group-commit pipeline).
-- `Sync` flushes the active file (used for `Options.SyncWrites`).
-- `Rotate` forces a new segment (used after flush/compaction checkpoints similar to RocksDB's `LogFileManager::SwitchLog`).
-- `Replay` iterates segments in numeric order, forwarding each payload to the callback. Errors abort replay so recovery can surface corruption early.
-- Metrics (`wal.Manager.Metrics`) reveal the active segment ID, total segments, and number of removed segments—these feed directly into `StatsSnapshot` and `nokv stats` output.
-- `RegisterRetention` lets LSM and raft participants publish the oldest WAL segment they still need. `RemoveSegment` rejects retained segments with `ErrSegmentRetained`.
-
-NoKV stores metadata values inline in the LSM. The WAL is only the durability
-and replay log; it is not paired with a separate blob layer.
-
----
-
-## 4. Integration Points
-
-| Call Site | Purpose |
-| --- | --- |
-| `lsm.memTable.setBatch` | Encodes each entry (`kv.EncodeEntry`) and appends to WAL before inserting into the active memtable index (`ART` by default, `skiplist` when explicitly selected). |
-| `DB.commitWorker` | Commit worker applies batched writes via `writeToLSM`, which calls `lsm.SetBatch` and appends one WAL entry-batch record per request batch. |
-| `DB.Set` / `DB.SetBatch` / `DB.SetWithTTL` / `DB.Del` / `DB.DeleteRange` / `DB.ApplyInternalEntries` | User/internal writes all flow through the same commit queue and eventually reach `lsm.SetBatch` + WAL append. |
-| `engine/lsm/level_manager.go::flush` | Persists WAL checkpoint via `manifest.LogEdits(EditAddFile, EditLogPointer)` during flush install. |
-| `engine/lsm/level_manager.go::flush` + `engine/lsm/levelManager.canRemoveWalSegment` | Removes obsolete WAL segments after storage checkpoint and `raftstore/localmeta` replay constraints are satisfied. |
-| `db.runRecoveryChecks` | Ensures WAL directory invariants before manifest replay, similar to Badger's directory bootstrap. |
-
----
-
-## 5. Metrics & Observability
-
-`Stats.collect` reads the manager metrics and exposes them as:
-- `NoKV.Local.Stats.wal.active_segment`
-- `NoKV.Local.Stats.wal.segment_count`
-- `NoKV.Local.Stats.wal.segments_removed`
-
-The CLI command `nokv stats --workdir <dir>` prints these alongside backlog, making WAL health visible without manual inspection. In high-throughput scenarios the active segment ID mirrors RocksDB's `LOG` number growth.
-
----
-
-## 6. WAL Watchdog (Auto GC)
-
-The WAL watchdog runs inside the DB process to keep WAL backlog in check and
-surface warnings when raft-typed records dominate the log. It:
-
-- Samples WAL metrics + per-segment metrics and combines them with
-  `raftstore/localmeta` raft pointer snapshots to compute removable segments.
-- Filters those candidates through all registered WAL retention participants
-  before deleting any segment.
-- Removes up to `WALAutoGCMaxBatch` segments when at least
-  `WALAutoGCMinRemovable` are eligible.
-- Exposes counters (`wal.auto_gc_runs/removed/last_unix`) and warning state
-  (`wal.typed_record_ratio/warning/reason`) through `StatsSnapshot.WAL`.
-
-Relevant options (see `options.go` for defaults):
-- `EnableWALWatchdog`
-- `WALAutoGCInterval`
-- `WALAutoGCMinRemovable`
-- `WALAutoGCMaxBatch`
-- `WALTypedRecordWarnRatio`
-- `WALTypedRecordWarnSegments`
-
-For hard admission control, `wal.Config.MaxSegments` rejects segment growth with
-`ErrWALBackpressure` once the WAL reaches the configured segment cap.
-
----
-
-## 7. Recovery Walkthrough
-
-1. `wal.Open` reopens the highest segment, leaving the file pointer at the end (`switchSegmentLocked`).
-2. `manifest.Manager` supplies the WAL checkpoint (segment + offset) while building the version. Replay skips entries up to this checkpoint, ensuring we only reapply writes not yet materialised in SSTables.
-3. `wal.Manager.Replay` (invoked by the LSM recovery path) rebuilds memtables from entries newer than the manifest checkpoint. Values are inline, so recovery does not need a separate blob pass.
-4. If the final record is partially written, the CRC mismatch stops replay and the segment is truncated during recovery tests, mimicking RocksDB's tolerant behaviour.
-
----
-
-## 8. Operational Tips
-
-- Configure `Options.SyncWrites=true` for DB-level synchronous durability. Raft log/state/snapshot appends use the WAL `DurabilityFsyncBatched` contract directly.
-- After large flushes, forcing `Rotate` keeps WAL files short, reducing replay time.
-- Archived WAL segments can be copied alongside manifest files for hot-backup strategies—since the manifest contains the WAL log number, snapshots behave like RocksDB's `Checkpoints`.
-
----
-
-## 9. Truncation Metadata
-
-- `raftstore/raftlog/wal_storage` keeps a per-group index of `[firstIndex,lastIndex]` spans for each WAL record so it can map raft log indices back to the segment that stored them.
-- When a log is truncated (either via snapshot or future compaction hooks), the store-local metadata in `raftstore/localmeta` is updated with the index/term, segment ID (`RaftLogPointer.SegmentIndex`), and byte offset (`RaftLogPointer.TruncatedOffset`) that delimit the remaining WAL data.
-- `engine/lsm/levelManager.canRemoveWalSegment` blocks garbage collection whenever any raft group still references a segment through that store-local truncation metadata, preventing slow followers from losing required WAL history while letting aggressively compacted groups release older segments earlier.
-
-For broader context, read the [architecture overview](architecture.md) and [flush pipeline](flush.md) documents.
+The old self-managed LSM WAL/flush/manifest coupling has been removed from the
+mainline storage architecture.
