@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
@@ -59,6 +60,6 @@ func txnCommitExpired(key []byte, commitVersion, minCommitVersion uint64) error 
 	})
 }
 
-func txnUnsupportedMutation(op kvrpcpb.Mutation_Op) error {
-	return txnAbort(fmt.Errorf("%w: %s", errUnsupportedMutation, op.String()))
+func txnUnsupportedMutation(op backend.MutationOp) error {
+	return txnAbort(fmt.Errorf("%w: %d", errUnsupportedMutation, op))
 }

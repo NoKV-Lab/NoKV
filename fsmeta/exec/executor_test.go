@@ -17,6 +17,7 @@ import (
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	nokverrors "github.com/feichai0017/NoKV/errors"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -28,7 +29,7 @@ import (
 type fakeRunner struct {
 	nextTS              uint64
 	data                map[string][]byte
-	mutations           [][]*kvrpcpb.Mutation
+	mutations           [][]*backend.Mutation
 	getCalls            int
 	scanVersions        []uint64
 	batchVersions       []uint64
@@ -43,8 +44,8 @@ type fakeRunner struct {
 
 type atomicMutateCall struct {
 	primary       []byte
-	predicates    []*kvrpcpb.AtomicPredicate
-	mutations     []*kvrpcpb.Mutation
+	predicates    []*backend.Predicate
+	mutations     []*backend.Mutation
 	startVersion  uint64
 	commitVersion uint64
 }
@@ -79,7 +80,7 @@ func testMountAdmission() MountAdmission {
 	}
 }
 
-func newTestExecutor(runner TxnRunner, opts ...Option) (*Executor, error) {
+func newTestExecutor(runner backend.Store, opts ...Option) (*Executor, error) {
 	defaults := []Option{WithMountResolver(&fakeMountResolver{records: map[model.MountID]MountAdmission{
 		testMountIdentity.MountID: testMountAdmission(),
 	}})}
@@ -260,7 +261,7 @@ type fakeSubtreePublisher struct {
 type fakeQuotaResolver struct {
 	err                error
 	changes            [][]QuotaChange
-	mutation           *kvrpcpb.Mutation
+	mutation           *backend.Mutation
 	allowVisibleCommit bool
 	perasChecks        [][]QuotaChange
 }
@@ -334,13 +335,13 @@ type subtreePublishCall struct {
 	frontier uint64
 }
 
-func (q *fakeQuotaResolver) ReserveQuota(_ context.Context, _ TxnRunner, changes []QuotaChange, _ uint64) ([]*kvrpcpb.Mutation, error) {
+func (q *fakeQuotaResolver) ReserveQuota(_ context.Context, _ backend.Store, changes []QuotaChange, _ uint64) ([]*backend.Mutation, error) {
 	q.changes = append(q.changes, append([]QuotaChange(nil), changes...))
 	if q.err != nil {
 		return nil, q.err
 	}
 	if q.mutation != nil {
-		return []*kvrpcpb.Mutation{cloneMutation(q.mutation)}, nil
+		return []*backend.Mutation{cloneMutation(q.mutation)}, nil
 	}
 	return nil, nil
 }
@@ -874,7 +875,7 @@ func (r *fakeRunner) BatchGet(_ context.Context, keys [][]byte, version uint64) 
 	return out, nil
 }
 
-func (r *fakeRunner) Scan(_ context.Context, startKey []byte, limit uint32, version uint64) ([]KV, error) {
+func (r *fakeRunner) Scan(_ context.Context, startKey []byte, limit uint32, version uint64) ([]backend.KV, error) {
 	r.scanVersions = append(r.scanVersions, version)
 	if len(r.scanErrs) > 0 {
 		err := r.scanErrs[0]
@@ -892,12 +893,12 @@ func (r *fakeRunner) Scan(_ context.Context, startKey []byte, limit uint32, vers
 	sort.Slice(keys, func(i, j int) bool {
 		return bytes.Compare(keys[i], keys[j]) < 0
 	})
-	out := make([]KV, 0, limit)
+	out := make([]backend.KV, 0, limit)
 	for _, key := range keys {
 		if uint32(len(out)) >= limit {
 			break
 		}
-		out = append(out, KV{
+		out = append(out, backend.KV{
 			Key:   append([]byte(nil), key...),
 			Value: append([]byte(nil), r.data[string(key)]...),
 		})
@@ -905,15 +906,15 @@ func (r *fakeRunner) Scan(_ context.Context, startKey []byte, limit uint32, vers
 	return out, nil
 }
 
-func (r *fakeRunner) Mutate(_ context.Context, primary []byte, mutations []*kvrpcpb.Mutation, _, commitVersion, _ uint64) (uint64, error) {
+func (r *fakeRunner) Mutate(_ context.Context, primary []byte, mutations []*backend.Mutation, _, commitVersion, _ uint64) (uint64, error) {
 	return r.applyMutations(primary, mutations, commitVersion, r.actualCommitVersion)
 }
 
-func (r *fakeRunner) MutateAtCommit(_ context.Context, primary []byte, mutations []*kvrpcpb.Mutation, _, commitVersion, _ uint64) (uint64, error) {
+func (r *fakeRunner) MutateAtCommit(_ context.Context, primary []byte, mutations []*backend.Mutation, _, commitVersion, _ uint64) (uint64, error) {
 	return r.applyMutations(primary, mutations, commitVersion, 0)
 }
 
-func (r *fakeRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mutation, commitVersion, overrideCommitVersion uint64) (uint64, error) {
+func (r *fakeRunner) applyMutations(primary []byte, mutations []*backend.Mutation, commitVersion, overrideCommitVersion uint64) (uint64, error) {
 	if len(r.mutateErrs) > 0 {
 		err := r.mutateErrs[0]
 		r.mutateErrs = r.mutateErrs[1:]
@@ -924,15 +925,15 @@ func (r *fakeRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mutatio
 	if r.mutateErr != nil {
 		return 0, r.mutateErr
 	}
-	cloned := make([]*kvrpcpb.Mutation, 0, len(mutations))
+	cloned := make([]*backend.Mutation, 0, len(mutations))
 	hasPrimary := len(mutations) == 0
 	for _, mut := range mutations {
-		if mut.GetAssertionNotExist() {
-			if _, ok := r.data[string(mut.GetKey())]; ok {
+		if mut.AssertionNotExist {
+			if _, ok := r.data[string(mut.Key)]; ok {
 				return 0, model.ErrExists
 			}
 		}
-		if bytes.Equal(mut.GetKey(), primary) {
+		if bytes.Equal(mut.Key, primary) {
 			hasPrimary = true
 		}
 		cloned = append(cloned, cloneMutation(mut))
@@ -941,11 +942,11 @@ func (r *fakeRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mutatio
 		return 0, fmt.Errorf("primary key %q not present in mutations", primary)
 	}
 	for _, mut := range cloned {
-		switch mut.GetOp() {
-		case kvrpcpb.Mutation_Put:
-			r.data[string(mut.GetKey())] = append([]byte(nil), mut.GetValue()...)
-		case kvrpcpb.Mutation_Delete:
-			delete(r.data, string(mut.GetKey()))
+		switch mut.Op {
+		case backend.MutationPut:
+			r.data[string(mut.Key)] = append([]byte(nil), mut.Value...)
+		case backend.MutationDelete:
+			delete(r.data, string(mut.Key))
 		}
 	}
 	r.mutations = append(r.mutations, cloned)
@@ -955,7 +956,7 @@ func (r *fakeRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mutatio
 	return commitVersion, nil
 }
 
-func (r *fakeAtomicRunner) TryAtomicMutate(_ context.Context, primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) (bool, error) {
+func (r *fakeAtomicRunner) TryAtomicMutate(_ context.Context, primary []byte, predicates []*backend.Predicate, mutations []*backend.Mutation, startVersion, commitVersion uint64) (bool, error) {
 	r.atomicCalls = append(r.atomicCalls, atomicMutateCall{
 		primary:       cloneBytes(primary),
 		predicates:    cloneAtomicPredicates(predicates),
@@ -973,42 +974,42 @@ func (r *fakeAtomicRunner) TryAtomicMutate(_ context.Context, primary []byte, pr
 		if pred == nil {
 			continue
 		}
-		_, exists := r.data[string(pred.GetKey())]
-		switch pred.GetKind() {
-		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS:
+		_, exists := r.data[string(pred.Key)]
+		switch pred.Kind {
+		case backend.PredicateNotExists:
 			if exists {
 				return true, model.ErrExists
 			}
-		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_EXISTS:
+		case backend.PredicateExists:
 			if !exists {
 				return true, model.ErrNotFound
 			}
-		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS:
-			if !exists || !bytes.Equal(r.data[string(pred.GetKey())], pred.GetExpectedValue()) {
+		case backend.PredicateValueEquals:
+			if !exists || !bytes.Equal(r.data[string(pred.Key)], pred.ExpectedValue) {
 				return true, model.ErrInvalidValue
 			}
 		default:
 			return true, model.ErrInvalidRequest
 		}
 	}
-	cloned := make([]*kvrpcpb.Mutation, 0, len(mutations))
+	cloned := make([]*backend.Mutation, 0, len(mutations))
 	for _, mut := range mutations {
 		if mut == nil {
 			continue
 		}
-		if mut.GetAssertionNotExist() {
-			if _, exists := r.data[string(mut.GetKey())]; exists {
+		if mut.AssertionNotExist {
+			if _, exists := r.data[string(mut.Key)]; exists {
 				return true, model.ErrExists
 			}
 		}
 		cloned = append(cloned, cloneMutation(mut))
 	}
 	for _, mut := range cloned {
-		switch mut.GetOp() {
-		case kvrpcpb.Mutation_Put:
-			r.data[string(mut.GetKey())] = append([]byte(nil), mut.GetValue()...)
-		case kvrpcpb.Mutation_Delete:
-			delete(r.data, string(mut.GetKey()))
+		switch mut.Op {
+		case backend.MutationPut:
+			r.data[string(mut.Key)] = append([]byte(nil), mut.Value...)
+		case backend.MutationDelete:
+			delete(r.data, string(mut.Key))
 		}
 	}
 	return true, nil
@@ -1018,7 +1019,7 @@ func (r *fakeAtomicRunner) AtomicMutatePreservesReadOrder() bool {
 	return true
 }
 
-func (r *fakeSpeculativeAtomicRunner) TryAtomicMutate(_ context.Context, primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) (bool, error) {
+func (r *fakeSpeculativeAtomicRunner) TryAtomicMutate(_ context.Context, primary []byte, predicates []*backend.Predicate, mutations []*backend.Mutation, startVersion, commitVersion uint64) (bool, error) {
 	r.atomicCalls = append(r.atomicCalls, atomicMutateCall{
 		primary:       cloneBytes(primary),
 		predicates:    cloneAtomicPredicates(predicates),
@@ -1122,9 +1123,9 @@ func renameAffinity(t *testing.T, from, to model.InodeID) string {
 	require.NoError(t, err)
 	destination, err := layout.EncodeDentryKey(testMountIdentity, to, "new")
 	require.NoError(t, err)
-	return atomicOnePhaseAffinity(source, []*kvrpcpb.Mutation{
-		{Op: kvrpcpb.Mutation_Delete, Key: source},
-		{Op: kvrpcpb.Mutation_Put, Key: destination},
+	return atomicOnePhaseAffinity(source, []*backend.Mutation{
+		{Op: backend.MutationDelete, Key: source},
+		{Op: backend.MutationPut, Key: destination},
 	})
 }
 
@@ -1140,16 +1141,16 @@ func seedSession(t *testing.T, runner *fakeRunner, mount model.MountID, record m
 	runner.data[string(ownerKey)] = value
 }
 
-func cloneMutation(mut *kvrpcpb.Mutation) *kvrpcpb.Mutation {
+func cloneMutation(mut *backend.Mutation) *backend.Mutation {
 	if mut == nil {
 		return nil
 	}
-	return &kvrpcpb.Mutation{
-		Op:                mut.GetOp(),
-		Key:               append([]byte(nil), mut.GetKey()...),
-		Value:             append([]byte(nil), mut.GetValue()...),
-		AssertionNotExist: mut.GetAssertionNotExist(),
-		ExpiresAt:         mut.GetExpiresAt(),
+	return &backend.Mutation{
+		Op:                mut.Op,
+		Key:               append([]byte(nil), mut.Key...),
+		Value:             append([]byte(nil), mut.Value...),
+		AssertionNotExist: mut.AssertionNotExist,
+		ExpiresAt:         mut.ExpiresAt,
 	}
 }
 

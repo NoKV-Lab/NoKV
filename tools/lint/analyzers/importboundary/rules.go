@@ -125,9 +125,24 @@ var Rules = []Rule{
 		Name:          "fsmeta executor stays runtime-neutral",
 		PackagePrefix: ModulePath + "/fsmeta/exec",
 		Forbidden: []string{
+			ModulePath + "/pb",
 			ModulePath + "/coordinator",
 			ModulePath + "/raftstore",
 			ModulePath + "/meta/root",
+			ModulePath + "/local",
+		},
+	},
+	{
+		Name:          "fsmeta backend stays storage-neutral",
+		PackagePrefix: ModulePath + "/fsmeta/backend",
+		Forbidden: []string{
+			ModulePath + "/pb",
+			ModulePath + "/engine",
+			ModulePath + "/local",
+			ModulePath + "/raftstore",
+			ModulePath + "/coordinator",
+			ModulePath + "/meta/root",
+			ModulePath + "/experimental/peras",
 		},
 	},
 	{
@@ -135,6 +150,15 @@ var Rules = []Rule{
 		PackagePrefix: ModulePath + "/fsmeta/exec/watch",
 		Forbidden: []string{
 			ModulePath + "/raftstore/store",
+		},
+	},
+	{
+		Name:          "raftstore snapshot protocol stays backend-neutral",
+		PackagePrefix: ModulePath + "/raftstore/snapshot",
+		PackageExact:  true,
+		Forbidden: []string{
+			ModulePath + "/engine",
+			ModulePath + "/local",
 		},
 	},
 	{

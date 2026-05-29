@@ -6,9 +6,9 @@ package exec
 import (
 	"context"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 // GetQuotaUsage returns the current persisted usage counter for one quota
@@ -45,7 +45,7 @@ func (e *Executor) GetQuotaUsage(ctx context.Context, req model.QuotaUsageReques
 	return layout.DecodeUsageValue(value)
 }
 
-func (e *Executor) reserveQuota(ctx context.Context, changes []QuotaChange, startVersion uint64) ([]*kvrpcpb.Mutation, error) {
+func (e *Executor) reserveQuota(ctx context.Context, changes []QuotaChange, startVersion uint64) ([]*backend.Mutation, error) {
 	if e == nil || e.quotas == nil {
 		return nil, nil
 	}

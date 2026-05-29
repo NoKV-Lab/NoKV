@@ -26,7 +26,7 @@ import (
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/peer"
 	"github.com/feichai0017/NoKV/raftstore/raftlog"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	raftstorestats "github.com/feichai0017/NoKV/raftstore/stats"
 	"github.com/feichai0017/NoKV/raftstore/store"
 	"github.com/feichai0017/NoKV/utils"

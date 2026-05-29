@@ -6,10 +6,10 @@ package exec
 import (
 	"context"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 func (e *Executor) tryVisibleUpdateInode(ctx context.Context, program compile.UpdateInodeProgram, mount model.MountIdentity, req model.UpdateInodeRequest) (model.InodeRecord, bool, error) {
@@ -166,8 +166,8 @@ func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest
 		if err != nil {
 			return err
 		}
-		mutations := []*kvrpcpb.Mutation{{
-			Op:    kvrpcpb.Mutation_Put,
+		mutations := []*backend.Mutation{{
+			Op:    backend.MutationPut,
 			Key:   cloneBytes(plan.MutateKeys[0]),
 			Value: value,
 		}}
@@ -184,7 +184,7 @@ func (e *Executor) UpdateInode(ctx context.Context, req model.UpdateInodeRequest
 			mutations = append(mutations, quotaMutations...)
 		}
 		if sizeDelta == 0 || len(mutations) == 1 {
-			predicates := []*kvrpcpb.AtomicPredicate{
+			predicates := []*backend.Predicate{
 				atomicValueEquals(plan.ReadKeys[0], dentryValue),
 				atomicValueEquals(plan.MutateKeys[0], oldInodeValue),
 			}

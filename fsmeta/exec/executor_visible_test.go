@@ -7,6 +7,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -113,7 +114,7 @@ func TestExecutorMergeVisibleOverlayScanUsesOrderedMerge(t *testing.T) {
 		{Key: []byte("k/c"), Value: []byte("overlay-c")},
 		{Key: []byte("k/e"), Value: []byte("overlay-e")},
 	}}}
-	base := []KV{
+	base := []backend.KV{
 		{Key: []byte("k/a"), Value: []byte("base-a")},
 		{Key: []byte("k/b"), Value: []byte("base-b")},
 		{Key: []byte("k/d"), Value: []byte("base-d")},
@@ -121,7 +122,7 @@ func TestExecutorMergeVisibleOverlayScanUsesOrderedMerge(t *testing.T) {
 
 	merged := executor.mergeVisibleOverlayScan(base, []byte("k/"), 4)
 
-	require.Equal(t, []KV{
+	require.Equal(t, []backend.KV{
 		{Key: []byte("k/a"), Value: []byte("base-a")},
 		{Key: []byte("k/c"), Value: []byte("overlay-c")},
 		{Key: []byte("k/d"), Value: []byte("base-d")},

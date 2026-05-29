@@ -7,9 +7,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -71,9 +71,9 @@ func TestExecutorRenameSubtreeMovesDentry(t *testing.T) {
 	}, record)
 	require.Len(t, runner.mutations, 1)
 	require.Len(t, runner.mutations[0], 4)
-	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][0].GetOp())
-	require.Equal(t, kvrpcpb.Mutation_Put, runner.mutations[0][1].GetOp())
-	require.True(t, runner.mutations[0][1].GetAssertionNotExist())
+	require.Equal(t, backend.MutationDelete, runner.mutations[0][0].Op)
+	require.Equal(t, backend.MutationPut, runner.mutations[0][1].Op)
+	require.True(t, runner.mutations[0][1].AssertionNotExist)
 	require.Equal(t, []subtreePublishCall{{mount: "vol", root: model.RootInode, frontier: 2}}, publisher.starts)
 	require.Equal(t, []subtreePublishCall{{mount: "vol", root: model.RootInode, frontier: 2}}, publisher.completes)
 }

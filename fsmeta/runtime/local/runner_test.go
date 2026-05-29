@@ -12,9 +12,9 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/kv"
 	nokverrors "github.com/feichai0017/NoKV/errors"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,8 +28,8 @@ func TestRunnerProvidesSnapshotReads(t *testing.T) {
 	key := []byte("alpha")
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	commit, err := runner.Mutate(ctx, key, []*kvrpcpb.Mutation{{
-		Op:    kvrpcpb.Mutation_Put,
+	commit, err := runner.Mutate(ctx, key, []*backend.Mutation{{
+		Op:    backend.MutationPut,
 		Key:   key,
 		Value: []byte("one"),
 	}}, start, start+1, 0)
@@ -64,9 +64,9 @@ func TestRunnerRejectsCrossShardMutationWhenCallerOwnedDBIsNotAtomic(t *testing.
 	first, second := keysOnDifferentLocalShards(t, db, 4)
 	start, err := runner.ReserveTimestamp(context.Background(), 2)
 	require.NoError(t, err)
-	_, err = runner.Mutate(context.Background(), first, []*kvrpcpb.Mutation{
-		{Op: kvrpcpb.Mutation_Put, Key: first, Value: []byte("a")},
-		{Op: kvrpcpb.Mutation_Put, Key: second, Value: []byte("b")},
+	_, err = runner.Mutate(context.Background(), first, []*backend.Mutation{
+		{Op: backend.MutationPut, Key: first, Value: []byte("a")},
+		{Op: backend.MutationPut, Key: second, Value: []byte("b")},
 	}, start, start+1, 0)
 	require.ErrorIs(t, err, errNonAtomicApplyGroup)
 }
@@ -85,9 +85,9 @@ func TestRunnerInstallMutationsAtCommitAcceptsCrossShard(t *testing.T) {
 	ctx := context.Background()
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	commit, err := runner.InstallMutationsAtCommit(ctx, first, []*kvrpcpb.Mutation{
-		{Op: kvrpcpb.Mutation_Put, Key: first, Value: []byte("a")},
-		{Op: kvrpcpb.Mutation_Put, Key: second, Value: []byte("b")},
+	commit, err := runner.InstallMutationsAtCommit(ctx, first, []*backend.Mutation{
+		{Op: backend.MutationPut, Key: first, Value: []byte("a")},
+		{Op: backend.MutationPut, Key: second, Value: []byte("b")},
 	}, start, start+1)
 	require.NoError(t, err, "install must tolerate cross-shard groups that percolator commits reject")
 	require.Equal(t, start+1, commit)
@@ -112,8 +112,8 @@ func TestRunnerInstallMutationsAtCommitAllowsMissingDeletePrimary(t *testing.T) 
 	key := []byte("install-delete-missing")
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	commit, err := runner.InstallMutationsAtCommit(ctx, key, []*kvrpcpb.Mutation{{
-		Op:  kvrpcpb.Mutation_Delete,
+	commit, err := runner.InstallMutationsAtCommit(ctx, key, []*backend.Mutation{{
+		Op:  backend.MutationDelete,
 		Key: key,
 	}}, start, start+1)
 	require.NoError(t, err, "segment install must accept tombstones for keys already absent")
@@ -141,11 +141,11 @@ func TestRunnerInstallMutationsAtCommitChunksLargeGroups(t *testing.T) {
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
 	const n = 64
-	mutations := make([]*kvrpcpb.Mutation, 0, n)
+	mutations := make([]*backend.Mutation, 0, n)
 	for i := range n {
 		k := []byte("install-chunk-" + string(rune('A'+i/26)) + string(rune('a'+i%26)))
-		mutations = append(mutations, &kvrpcpb.Mutation{
-			Op:    kvrpcpb.Mutation_Put,
+		mutations = append(mutations, &backend.Mutation{
+			Op:    backend.MutationPut,
 			Key:   append([]byte(nil), k...),
 			Value: []byte("v"),
 		})
@@ -174,10 +174,10 @@ func TestRunnerInstallMutationsAtCommitRespectsSmallMaxBatchSize(t *testing.T) {
 	runner, err := NewRunner(db)
 	require.NoError(t, err)
 
-	mutations := make([]*kvrpcpb.Mutation, 0, 5)
+	mutations := make([]*backend.Mutation, 0, 5)
 	for i := range 5 {
-		mutations = append(mutations, &kvrpcpb.Mutation{
-			Op:    kvrpcpb.Mutation_Put,
+		mutations = append(mutations, &backend.Mutation{
+			Op:    backend.MutationPut,
 			Key:   []byte{byte('a' + i), byte('k')},
 			Value: bytes.Repeat([]byte{byte('v')}, 18),
 		})
@@ -188,7 +188,7 @@ func TestRunnerInstallMutationsAtCommitRespectsSmallMaxBatchSize(t *testing.T) {
 	for _, chunk := range chunks {
 		var size int64
 		for _, mutation := range chunk {
-			size += int64(len(mutation.GetKey()) + len(mutation.GetValue()))
+			size += int64(len(mutation.Key) + len(mutation.Value))
 		}
 		require.LessOrEqual(t, size, int64(56))
 	}
@@ -210,11 +210,11 @@ func TestRunnerInstallMutationsAtCommitChunksDeleteGroupsBelowStrictLimit(t *tes
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
 	const n = 16
-	mutations := make([]*kvrpcpb.Mutation, 0, n)
+	mutations := make([]*backend.Mutation, 0, n)
 	for i := range n {
 		k := []byte("install-delete-" + string(rune('a'+i)))
-		mutations = append(mutations, &kvrpcpb.Mutation{
-			Op:  kvrpcpb.Mutation_Delete,
+		mutations = append(mutations, &backend.Mutation{
+			Op:  backend.MutationDelete,
 			Key: append([]byte(nil), k...),
 		})
 	}
@@ -235,8 +235,8 @@ func TestRunnerInstallMutationsAtCommitRejectsBadCommitVersion(t *testing.T) {
 	// commitVersion must be strictly greater than startVersion — same
 	// contract as MutateAtCommit so callers can't accidentally clobber
 	// MVCC ordering through the install path.
-	_, err = runner.InstallMutationsAtCommit(ctx, []byte("x"), []*kvrpcpb.Mutation{
-		{Op: kvrpcpb.Mutation_Put, Key: []byte("x"), Value: []byte("v")},
+	_, err = runner.InstallMutationsAtCommit(ctx, []byte("x"), []*backend.Mutation{
+		{Op: backend.MutationPut, Key: []byte("x"), Value: []byte("v")},
 	}, start, start)
 	require.Error(t, err)
 }
@@ -273,12 +273,12 @@ func TestRunnerTryAtomicMutateAppliesPredicateCheckedGroup(t *testing.T) {
 	ctx := context.Background()
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	handled, err := runner.TryAtomicMutate(ctx, []byte("alpha"), []*kvrpcpb.AtomicPredicate{
-		{Key: []byte("alpha"), Kind: kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS},
-		{Key: []byte("beta"), Kind: kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS},
-	}, []*kvrpcpb.Mutation{
-		{Op: kvrpcpb.Mutation_Put, Key: []byte("alpha"), Value: []byte("one")},
-		{Op: kvrpcpb.Mutation_Put, Key: []byte("beta"), Value: []byte("two")},
+	handled, err := runner.TryAtomicMutate(ctx, []byte("alpha"), []*backend.Predicate{
+		{Key: []byte("alpha"), Kind: backend.PredicateNotExists},
+		{Key: []byte("beta"), Kind: backend.PredicateNotExists},
+	}, []*backend.Mutation{
+		{Op: backend.MutationPut, Key: []byte("alpha"), Value: []byte("one")},
+		{Op: backend.MutationPut, Key: []byte("beta"), Value: []byte("two")},
 	}, start, start+1)
 	require.NoError(t, err)
 	require.True(t, handled)
@@ -301,8 +301,8 @@ func TestRunnerTryAtomicMutateRejectsValuePredicateMismatch(t *testing.T) {
 	ctx := context.Background()
 	start, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	_, err = runner.Mutate(ctx, []byte("alpha"), []*kvrpcpb.Mutation{{
-		Op:    kvrpcpb.Mutation_Put,
+	_, err = runner.Mutate(ctx, []byte("alpha"), []*backend.Mutation{{
+		Op:    backend.MutationPut,
 		Key:   []byte("alpha"),
 		Value: []byte("one"),
 	}}, start, start+1, 0)
@@ -310,12 +310,12 @@ func TestRunnerTryAtomicMutateRejectsValuePredicateMismatch(t *testing.T) {
 
 	nextStart, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	handled, err := runner.TryAtomicMutate(ctx, []byte("beta"), []*kvrpcpb.AtomicPredicate{{
+	handled, err := runner.TryAtomicMutate(ctx, []byte("beta"), []*backend.Predicate{{
 		Key:           []byte("alpha"),
-		Kind:          kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS,
+		Kind:          backend.PredicateValueEquals,
 		ExpectedValue: []byte("stale"),
-	}}, []*kvrpcpb.Mutation{{
-		Op:    kvrpcpb.Mutation_Put,
+	}}, []*backend.Mutation{{
+		Op:    backend.MutationPut,
 		Key:   []byte("beta"),
 		Value: []byte("two"),
 	}}, nextStart, nextStart+1)
@@ -341,9 +341,9 @@ func TestRunnerTryAtomicMutateFallsBackWhenCallerOwnedDBIsNotAtomic(t *testing.T
 	first, second := keysOnDifferentLocalShards(t, db, 4)
 	start, err := runner.ReserveTimestamp(context.Background(), 2)
 	require.NoError(t, err)
-	handled, err := runner.TryAtomicMutate(context.Background(), first, nil, []*kvrpcpb.Mutation{
-		{Op: kvrpcpb.Mutation_Put, Key: first, Value: []byte("a")},
-		{Op: kvrpcpb.Mutation_Put, Key: second, Value: []byte("b")},
+	handled, err := runner.TryAtomicMutate(context.Background(), first, nil, []*backend.Mutation{
+		{Op: backend.MutationPut, Key: first, Value: []byte("a")},
+		{Op: backend.MutationPut, Key: second, Value: []byte("b")},
 	}, start, start+1)
 	require.NoError(t, err)
 	require.False(t, handled)
@@ -372,11 +372,11 @@ func TestRunnerTryAtomicMutateSerializesConcurrentSameKey(t *testing.T) {
 				errCh <- reserveErr
 				return
 			}
-			handled, mutateErr := runner.TryAtomicMutate(ctx, key, []*kvrpcpb.AtomicPredicate{{
+			handled, mutateErr := runner.TryAtomicMutate(ctx, key, []*backend.Predicate{{
 				Key:  key,
-				Kind: kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS,
-			}}, []*kvrpcpb.Mutation{{
-				Op:    kvrpcpb.Mutation_Put,
+				Kind: backend.PredicateNotExists,
+			}}, []*backend.Mutation{{
+				Op:    backend.MutationPut,
 				Key:   key,
 				Value: []byte{byte(i)},
 			}}, ts, ts+1)
@@ -438,8 +438,8 @@ func TestRunnerRestartsAboveObservedTimestamp(t *testing.T) {
 	require.NoError(t, err)
 	start, err := runner.ReserveTimestamp(context.Background(), 2)
 	require.NoError(t, err)
-	_, err = runner.Mutate(context.Background(), []byte("k"), []*kvrpcpb.Mutation{{
-		Op:    kvrpcpb.Mutation_Put,
+	_, err = runner.Mutate(context.Background(), []byte("k"), []*backend.Mutation{{
+		Op:    backend.MutationPut,
 		Key:   []byte("k"),
 		Value: []byte("v"),
 	}}, start, start+1, 0)

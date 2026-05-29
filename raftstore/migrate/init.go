@@ -16,7 +16,7 @@ import (
 	"github.com/feichai0017/NoKV/raftstore/failpoints"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/raftlog"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	raftstorestats "github.com/feichai0017/NoKV/raftstore/stats"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )

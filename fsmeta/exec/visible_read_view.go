@@ -8,6 +8,7 @@ import (
 	"context"
 	"sort"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -407,7 +408,7 @@ func (e *Executor) batchGetMergedValuesOrderedAt(ctx context.Context, keys [][]b
 	return values, present, nil
 }
 
-func (e *Executor) mergeVisibleOverlayScan(kvs []KV, start []byte, limit uint32) []KV {
+func (e *Executor) mergeVisibleOverlayScan(kvs []backend.KV, start []byte, limit uint32) []backend.KV {
 	overlay := e.visibleOverlay()
 	if overlay == nil || limit == 0 {
 		return kvs
@@ -419,11 +420,11 @@ func (e *Executor) mergeVisibleOverlayScan(kvs []KV, start []byte, limit uint32)
 	return mergeOverlayScanRows(kvs, overlayKVs, limit)
 }
 
-func (e *Executor) mergeVisibleDirectoryOverlayScan(kvs []KV, prefix, start []byte, limit uint32) ([]KV, uint32, bool) {
+func (e *Executor) mergeVisibleDirectoryOverlayScan(kvs []backend.KV, prefix, start []byte, limit uint32) ([]backend.KV, uint32, bool) {
 	return e.mergeVisibleDirectoryOverlayScanAt(kvs, prefix, start, limit, 0, 0)
 }
 
-func (e *Executor) mergeVisibleDirectoryOverlayScanAt(kvs []KV, prefix, start []byte, limit uint32, overlayGeneration, sealedGeneration uint64) ([]KV, uint32, bool) {
+func (e *Executor) mergeVisibleDirectoryOverlayScanAt(kvs []backend.KV, prefix, start []byte, limit uint32, overlayGeneration, sealedGeneration uint64) ([]backend.KV, uint32, bool) {
 	overlayKVs, usedIndex := e.scanVisibleDirectoryOverlayRowsAt(overlayGeneration, sealedGeneration, prefix, start, limit)
 	if len(overlayKVs) == 0 {
 		return kvs, 0, usedIndex
@@ -522,7 +523,7 @@ func trimVisibleDirectoryOverlayBatch(prefix []byte, overlayKVs []VisibleOverlay
 	return out
 }
 
-func (e *Executor) scanMergedDirectoryRowsAt(ctx context.Context, plan compile.DirectoryReadPlan, version uint64, snapshotRead bool, overlayGeneration, sealedGeneration uint64) ([]KV, uint32, uint32, bool, error) {
+func (e *Executor) scanMergedDirectoryRowsAt(ctx context.Context, plan compile.DirectoryReadPlan, version uint64, snapshotRead bool, overlayGeneration, sealedGeneration uint64) ([]backend.KV, uint32, uint32, bool, error) {
 	var overlayKVs []VisibleOverlayKV
 	var usedIndex bool
 	if snapshotRead {
@@ -531,7 +532,7 @@ func (e *Executor) scanMergedDirectoryRowsAt(ctx context.Context, plan compile.D
 		overlayKVs, usedIndex = e.scanVisibleDirectoryOverlayRowsAt(overlayGeneration, sealedGeneration, plan.Prefix, plan.StartKey, plan.Limit)
 	}
 	start := cloneBytes(plan.StartKey)
-	baseRows := make([]KV, 0, plan.Limit)
+	baseRows := make([]backend.KV, 0, plan.Limit)
 	var baseTotal uint32
 	for {
 		batch, err := e.runner.Scan(ctx, start, plan.Limit, version)
@@ -548,8 +549,8 @@ func (e *Executor) scanMergedDirectoryRowsAt(ctx context.Context, plan compile.D
 	}
 }
 
-func mergeOverlayScanRows(kvs []KV, overlayKVs []VisibleOverlayKV, limit uint32) []KV {
-	out := make([]KV, 0, int(limit))
+func mergeOverlayScanRows(kvs []backend.KV, overlayKVs []VisibleOverlayKV, limit uint32) []backend.KV {
+	out := make([]backend.KV, 0, int(limit))
 	base, overlay := 0, 0
 	for len(out) < int(limit) && (base < len(kvs) || overlay < len(overlayKVs)) {
 		switch {
@@ -578,14 +579,14 @@ func mergeOverlayScanRows(kvs []KV, overlayKVs []VisibleOverlayKV, limit uint32)
 	return out
 }
 
-func appendOverlayScanKV(out []KV, kv VisibleOverlayKV) []KV {
+func appendOverlayScanKV(out []backend.KV, kv VisibleOverlayKV) []backend.KV {
 	if kv.Delete {
 		return out
 	}
-	return append(out, KV{Key: kv.Key, Value: kv.Value})
+	return append(out, backend.KV{Key: kv.Key, Value: kv.Value})
 }
 
-func directoryMergeComplete(kvs []KV, prefix []byte, limit uint32) bool {
+func directoryMergeComplete(kvs []backend.KV, prefix []byte, limit uint32) bool {
 	if limit == 0 {
 		return true
 	}
@@ -602,7 +603,7 @@ func directoryMergeComplete(kvs []KV, prefix []byte, limit uint32) bool {
 	return false
 }
 
-func directoryBaseScanMayContinue(batch []KV, prefix []byte, limit uint32) bool {
+func directoryBaseScanMayContinue(batch []backend.KV, prefix []byte, limit uint32) bool {
 	if limit == 0 || uint32(len(batch)) < limit {
 		return false
 	}

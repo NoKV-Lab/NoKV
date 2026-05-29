@@ -47,8 +47,8 @@ func TestExecutorCreateAndLookup(t *testing.T) {
 
 	require.Len(t, runner.mutations, 1)
 	require.Len(t, runner.mutations[0], 3)
-	require.True(t, runner.mutations[0][1].GetAssertionNotExist())
-	require.True(t, runner.mutations[0][2].GetAssertionNotExist())
+	require.True(t, runner.mutations[0][1].AssertionNotExist)
+	require.True(t, runner.mutations[0][2].AssertionNotExist)
 }
 
 func TestExecutorCreateVisibleCommitServesLookupOverlay(t *testing.T) {

@@ -9,8 +9,8 @@ SPDX-License-Identifier: Apache-2.0
 
 - Topic: NoKV's workspace namespace metadata substrate.
 - Core objects: Mount, Inode, Dentry, SubtreeAuthority, SnapshotEpoch, QuotaFence, UsageCounter.
-- Default local call chain: `fsmeta/runtime/local -> fsmeta/exec -> local MVCC TxnRunner`.
-- Distributed call chain: `fsmeta/client -> fsmeta/server -> fsmeta/exec -> fsmeta/runtime/raftstore -> raftstore + txn/percolator + coordinator/meta-root`.
+- Default local call chain: `fsmeta/runtime/local -> fsmeta/exec -> fsmeta/backend.Store -> local MVCC`.
+- Distributed call chain: `fsmeta/client -> fsmeta/server -> fsmeta/exec -> fsmeta/backend.Store implemented by fsmeta/runtime/raftstore -> raftstore + txn/percolator + coordinator/meta-root`.
 - Experimental Peras call chain: `fsmeta/exec -> Peras visible runtime -> witness quorum + segment install`.
 - Code contract: wire is in `pb/fsmeta/fsmeta.proto`, the executor is in `fsmeta/exec`, local runtime is `fsmeta/runtime/local.Open`, and the scale-out adapter is `fsmeta/runtime/raftstore.Open`.
 
@@ -66,18 +66,26 @@ Both keys and values carry a magic + schema version. Values use a hand-written b
 
 ## 4. Execution boundary
 
-`fsmeta/exec.Executor` depends on a single narrow interface:
+`fsmeta/exec.Executor` depends on one narrow storage contract in
+`fsmeta/backend`:
 
 ```go
-type TxnRunner interface {
+type Store interface {
     ReserveTimestamp(ctx context.Context, count uint64) (uint64, error)
     Get(ctx context.Context, key []byte, version uint64) ([]byte, bool, error)
     BatchGet(ctx context.Context, keys [][]byte, version uint64) (map[string][]byte, error)
-    Scan(ctx context.Context, startKey []byte, limit uint32, version uint64) ([]KV, error)
-    Mutate(ctx context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion, lockTTL uint64) (uint64, error)
-    MutateAtCommit(ctx context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion, lockTTL uint64) (uint64, error)
+    Scan(ctx context.Context, startKey []byte, limit uint32, version uint64) ([]backend.KV, error)
+    Mutate(ctx context.Context, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion, lockTTL uint64) (uint64, error)
+    MutateAtCommit(ctx context.Context, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion, lockTTL uint64) (uint64, error)
 }
 ```
+
+`fsmeta/backend` deliberately has no protobuf, raftstore, local DB, engine, SST,
+or migration types. `fsmeta/exec` produces backend-neutral mutations and
+predicates; runtime adapters translate those into their concrete commit path.
+For example, `fsmeta/runtime/local` applies them through the embedded local
+MVCC implementation, while `fsmeta/runtime/raftstore` converts them to
+raftstore KV RPC/proto mutations inside the adapter package.
 
 The default product runtime is `fsmeta/runtime/local.Open`. It wires one embedded database, one local mount admission record, a local inode allocator, a durable MVCC runner, and local watch/snapshot adapters. This is the path for demos, agent workspace integrations, and small deployments.
 
@@ -99,6 +107,9 @@ The layering constraints are:
 - `fsmeta/runtime/raftstore` is the scale-out adapter; it owns the raftstore wiring.
 - `meta/root` does not store high-frequency inode/dentry data — only lifecycle / authority truth.
 - `raftstore` and `percolator` don't understand fsmeta operations; they provide transactions and apply observation. Existing Peras install support is being isolated behind the experimental boundary.
+- `raftstore/migrate`, raftstore snapshot transfer, and LSM/SST ingest/export
+  are operational capabilities of the concrete distributed storage stack. They
+  are not part of the generic fsmeta backend contract.
 
 ## 5. Native primitives
 
@@ -148,7 +159,7 @@ The current dentry schema references the parent directory via `parent_inode_id`,
 The extra semantics live in the authority layer:
 
 - publish `SubtreeHandoffStarted` before mutation;
-- the dentry mutation goes through `TxnRunner.MutateAtCommit` using the rooted handoff commit timestamp;
+- the dentry mutation goes through `backend.Store.MutateAtCommit` using the rooted handoff commit timestamp;
 - publish `SubtreeHandoffCompleted` after mutation;
 - the runtime monitor uses `WatchRootEvents` to discover pending handoffs and complete them.
 

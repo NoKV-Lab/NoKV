@@ -10,7 +10,7 @@ import (
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
 	"github.com/feichai0017/NoKV/raftstore/failpoints"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
-	"github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshot "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	"github.com/stretchr/testify/require"
 )
 

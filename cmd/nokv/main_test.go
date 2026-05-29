@@ -24,7 +24,7 @@ import (
 	workdirmode "github.com/feichai0017/NoKV/local/workdir"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	migratepkg "github.com/feichai0017/NoKV/raftstore/migrate"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	storepkg "github.com/feichai0017/NoKV/raftstore/store"
 	"github.com/stretchr/testify/require"
 )

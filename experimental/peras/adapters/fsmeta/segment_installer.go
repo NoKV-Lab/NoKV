@@ -14,7 +14,7 @@ import (
 	perasraftstore "github.com/feichai0017/NoKV/experimental/peras/adapters/raftstore"
 	fsperas "github.com/feichai0017/NoKV/experimental/peras/exec"
 	runtimeperas "github.com/feichai0017/NoKV/experimental/peras/runtime"
-	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	fsmetamodel "github.com/feichai0017/NoKV/fsmeta/observe"
 	stable "github.com/feichai0017/NoKV/fsmeta/runtime/raftstore"
@@ -32,7 +32,7 @@ type perasSegmentRouteGrouper interface {
 }
 
 type segmentCatalogScanRunner interface {
-	Scan(context.Context, []byte, uint32, uint64) ([]fsmetaexec.KV, error)
+	Scan(context.Context, []byte, uint32, uint64) ([]backend.KV, error)
 }
 
 type fsmetaWatchRouter interface {

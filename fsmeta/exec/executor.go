@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 const (
@@ -32,56 +32,11 @@ const (
 	maxTxnLockRetryBudget         = time.Hour
 )
 
-// KV is the minimal key/value tuple the fsmeta executor consumes from scans.
-type KV struct {
-	Key   []byte
-	Value []byte
-}
-
-// TxnRunner is the NoKV transaction surface required by fsmeta execution.
-//
-// ReserveTimestamp returns the first timestamp in a consecutive range of count
-// timestamps. Mutate must provide Percolator-style atomicity for all mutations
-// and return the commit timestamp that made the mutation visible. MutateAtCommit
-// is reserved for operations whose commit timestamp is already part of an
-// external authority protocol, so the runner must not allocate a later commit_ts.
-type TxnRunner interface {
-	ReserveTimestamp(ctx context.Context, count uint64) (uint64, error)
-	Get(ctx context.Context, key []byte, version uint64) ([]byte, bool, error)
-	BatchGet(ctx context.Context, keys [][]byte, version uint64) (map[string][]byte, error)
-	Scan(ctx context.Context, startKey []byte, limit uint32, version uint64) ([]KV, error)
-	Mutate(ctx context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion, lockTTL uint64) (uint64, error)
-	MutateAtCommit(ctx context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion, lockTTL uint64) (uint64, error)
-}
-
-// AtomicMutateOnePhase is a raw one-phase mutation capability. It is not enough
-// by itself for fsmeta semantic execution: caller-allocated commit timestamps
-// can otherwise let a read at a later timestamp race ahead of a delayed 1PC
-// apply and observe a fractured directory/inode view.
-type AtomicMutateOnePhase interface {
-	TryAtomicMutate(ctx context.Context, primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) (handled bool, err error)
-}
-
-// ReadOrderedAtomicMutateOnePhase is the one-phase mutation contract the
-// fsmeta executor may consume. Implementations must guarantee that a read at
-// version T cannot miss any successful 1PC write whose commit version is <= T
-// merely because the write had not reached the storage apply boundary yet.
-type ReadOrderedAtomicMutateOnePhase interface {
-	AtomicMutateOnePhase
-	AtomicMutatePreservesReadOrder() bool
-}
-
 // InodeAllocator assigns Create inode IDs. The executor allocates once before
 // transaction retry so a retry cannot publish a different inode for the same
 // logical Create after a conflict or ambiguous transport error.
 type InodeAllocator interface {
 	AllocateCreateInode(ctx context.Context, mount model.MountIdentity, parent model.InodeID, name string) (model.InodeID, error)
-}
-
-// statsProvider is implemented by lower fsmeta runtime layers that can expose
-// their own counters without becoming part of the transaction execution API.
-type statsProvider interface {
-	Stats() map[string]any
 }
 
 // MountAdmission is the executor's mount-admission view.
@@ -140,9 +95,9 @@ type DirPageCache interface {
 	Stats() dirpage.Stats
 }
 
-// Executor interprets fsmeta operation plans against a TxnRunner.
+// Executor interprets fsmeta operation plans against a backend.Store.
 type Executor struct {
-	runner                  TxnRunner
+	runner                  backend.Store
 	inodes                  InodeAllocator
 	mounts                  MountResolver
 	quotas                  QuotaResolver
@@ -276,7 +231,7 @@ func WithVisibleCommitter(committer VisibleCommitter) Option {
 }
 
 // New constructs an fsmeta executor.
-func New(runner TxnRunner, opts ...Option) (*Executor, error) {
+func New(runner backend.Store, opts ...Option) (*Executor, error) {
 	if runner == nil {
 		return nil, errRunnerRequired
 	}

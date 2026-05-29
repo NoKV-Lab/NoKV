@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/feichai0017/NoKV/engine/slab/negativecache"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -177,7 +178,7 @@ func TestExecutorCreateVisibleCommitSkipsSharedQuota(t *testing.T) {
 	seedDirectory(t, runner, "vol", 7)
 	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
-	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
+	quota := &fakeQuotaResolver{mutation: &backend.Mutation{Op: backend.MutationPut, Key: quotaKey, Value: []byte("usage")}}
 	committer := &fakeVisibleCommitter{}
 	executor, err := newTestExecutor(
 		runner,
@@ -420,15 +421,15 @@ func TestExecutorCreateUsesAtomicMutateOnePhaseWhenHandled(t *testing.T) {
 	require.Equal(t, uint64(1), call.startVersion)
 	require.Equal(t, uint64(2), call.commitVersion)
 	require.Len(t, call.predicates, 3)
-	require.Equal(t, plan.ReadKeys[0], call.predicates[0].GetKey())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, call.predicates[0].GetKind())
-	require.Equal(t, plan.MutateKeys[1], call.predicates[1].GetKey())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS, call.predicates[1].GetKind())
-	require.Equal(t, plan.MutateKeys[2], call.predicates[2].GetKey())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS, call.predicates[2].GetKind())
+	require.Equal(t, plan.ReadKeys[0], call.predicates[0].Key)
+	require.Equal(t, backend.PredicateValueEquals, call.predicates[0].Kind)
+	require.Equal(t, plan.MutateKeys[1], call.predicates[1].Key)
+	require.Equal(t, backend.PredicateNotExists, call.predicates[1].Kind)
+	require.Equal(t, plan.MutateKeys[2], call.predicates[2].Key)
+	require.Equal(t, backend.PredicateNotExists, call.predicates[2].Kind)
 	require.Len(t, call.mutations, 3)
-	require.True(t, call.mutations[1].GetAssertionNotExist())
-	require.True(t, call.mutations[2].GetAssertionNotExist())
+	require.True(t, call.mutations[1].AssertionNotExist)
+	require.True(t, call.mutations[2].AssertionNotExist)
 	require.Empty(t, base.mutations)
 
 	record, err := executor.Lookup(context.Background(), model.LookupRequest{
@@ -517,7 +518,7 @@ func TestExecutorCreateSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	runner := &fakeAtomicRunner{fakeRunner: base, handled: true}
 	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 0)
 	require.NoError(t, err)
-	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
+	quota := &fakeQuotaResolver{mutation: &backend.Mutation{Op: backend.MutationPut, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{22}}), WithQuotaResolver(quota))
 	require.NoError(t, err)
 
@@ -542,7 +543,7 @@ func TestExecutorCreateSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	require.Empty(t, runner.atomicCalls)
 	require.Len(t, base.mutations, 1)
 	require.Len(t, base.mutations[0], 4)
-	require.Equal(t, quotaKey, base.mutations[0][3].GetKey())
+	require.Equal(t, quotaKey, base.mutations[0][3].Key)
 }
 
 func TestExecutorCreateRejectsExistingDentry(t *testing.T) {
@@ -622,7 +623,7 @@ func TestExecutorCreateReservesQuotaInsideMutation(t *testing.T) {
 	seedDirectory(t, runner, "vol", 7)
 	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 0)
 	require.NoError(t, err)
-	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
+	quota := &fakeQuotaResolver{mutation: &backend.Mutation{Op: backend.MutationPut, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithInodeAllocator(&fakeInodeAllocator{ids: []model.InodeID{22}}), WithQuotaResolver(quota))
 	require.NoError(t, err)
 
@@ -635,7 +636,7 @@ func TestExecutorCreateReservesQuotaInsideMutation(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, [][]QuotaChange{{{Mount: "vol", MountKeyID: 1, Scope: 7, Bytes: 4096, Inodes: 1}}}, quota.changes)
 	require.Len(t, runner.mutations, 1)
-	require.Equal(t, quotaKey, runner.mutations[0][3].GetKey())
+	require.Equal(t, quotaKey, runner.mutations[0][3].Key)
 }
 
 func TestExecutorCreateRejectsQuotaExceededBeforeMutation(t *testing.T) {

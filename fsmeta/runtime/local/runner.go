@@ -13,7 +13,7 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/index"
 	"github.com/feichai0017/NoKV/engine/kv"
-	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	localdb "github.com/feichai0017/NoKV/local"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/feichai0017/NoKV/txn/latch"
@@ -23,7 +23,7 @@ import (
 
 const localRunnerLatchStripes = 1024
 
-// Runner adapts local.DB to fsmetaexec.TxnRunner with single-node MVCC commits.
+// Runner adapts local.DB to backend.Store with single-node MVCC commits.
 type Runner struct {
 	db *localdb.DB
 
@@ -40,10 +40,10 @@ type Runner struct {
 }
 
 type mutationObserver interface {
-	ObserveMutation(commitVersion uint64, mutations []*kvrpcpb.Mutation)
+	ObserveMutation(commitVersion uint64, mutations []*backend.Mutation)
 }
 
-// NewRunner constructs a local fsmeta TxnRunner.
+// NewRunner constructs a local fsmeta backend store.
 func NewRunner(db *localdb.DB) (*Runner, error) {
 	if db == nil {
 		return nil, errDBRequired
@@ -118,7 +118,7 @@ func (r *Runner) BatchGet(ctx context.Context, keys [][]byte, version uint64) (m
 }
 
 // Scan returns up to limit visible key/value pairs starting at startKey.
-func (r *Runner) Scan(ctx context.Context, startKey []byte, limit uint32, version uint64) ([]fsmetaexec.KV, error) {
+func (r *Runner) Scan(ctx context.Context, startKey []byte, limit uint32, version uint64) ([]backend.KV, error) {
 	if limit == 0 {
 		return nil, nil
 	}
@@ -127,7 +127,7 @@ func (r *Runner) Scan(ctx context.Context, startKey []byte, limit uint32, versio
 		return nil, nil
 	}
 	defer func() { _ = iter.Close() }()
-	out := make([]fsmetaexec.KV, 0, limit)
+	out := make([]backend.KV, 0, limit)
 	var lastUserKey []byte
 	iter.Seek(kv.InternalKey(kv.CFWrite, startKey, kv.MaxVersion))
 	for iter.Valid() && uint32(len(out)) < limit {
@@ -156,7 +156,7 @@ func (r *Runner) Scan(ctx context.Context, startKey []byte, limit uint32, versio
 			return nil, err
 		}
 		if ok {
-			out = append(out, fsmetaexec.KV{Key: cloneBytes(userKey), Value: value})
+			out = append(out, backend.KV{Key: cloneBytes(userKey), Value: value})
 		}
 		iter.Next()
 	}
@@ -166,12 +166,12 @@ func (r *Runner) Scan(ctx context.Context, startKey []byte, limit uint32, versio
 // Mutate commits all mutations atomically at the effective local commit
 // timestamp. The effective timestamp may move forward when another timestamp
 // was observed after the caller reserved its speculative commit timestamp.
-func (r *Runner) Mutate(ctx context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion, _ uint64) (uint64, error) {
+func (r *Runner) Mutate(ctx context.Context, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion, _ uint64) (uint64, error) {
 	return r.mutate(ctx, primary, mutations, startVersion, commitVersion, true)
 }
 
 // MutateAtCommit commits all mutations exactly at commitVersion.
-func (r *Runner) MutateAtCommit(ctx context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion, _ uint64) (uint64, error) {
+func (r *Runner) MutateAtCommit(ctx context.Context, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion, _ uint64) (uint64, error) {
 	return r.mutate(ctx, primary, mutations, startVersion, commitVersion, false)
 }
 
@@ -197,7 +197,7 @@ func (r *Runner) MutateAtCommit(ctx context.Context, primary []byte, mutations [
 // commits MUST keep using MutateAtCommit, where the atomicity guard
 // protects the lock/commit-record transition that the percolator protocol
 // relies on for snapshot consistency.
-func (r *Runner) InstallMutationsAtCommit(ctx context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) (uint64, error) {
+func (r *Runner) InstallMutationsAtCommit(ctx context.Context, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64) (uint64, error) {
 	if err := ctxErr(ctx); err != nil {
 		return 0, err
 	}
@@ -237,7 +237,7 @@ func (r *Runner) AtomicMutatePreservesReadOrder() bool {
 // local DB's per-write batch count and byte budgets. Chunks preserve the
 // original ordering (each chunk is a prefix slice) so callers that rely on
 // stable mutation order across replays see the same effect.
-func (r *Runner) chunkInstallMutations(mutations []*kvrpcpb.Mutation) ([][]*kvrpcpb.Mutation, error) {
+func (r *Runner) chunkInstallMutations(mutations []*backend.Mutation) ([][]*backend.Mutation, error) {
 	if r == nil || r.db == nil {
 		return nil, errDBRequired
 	}
@@ -246,7 +246,7 @@ func (r *Runner) chunkInstallMutations(mutations []*kvrpcpb.Mutation) ([][]*kvrp
 	}
 	maxCount, maxSize := r.db.WriteBatchLimits()
 	if maxCount <= 0 && maxSize <= 0 {
-		return [][]*kvrpcpb.Mutation{mutations}, nil
+		return [][]*backend.Mutation{mutations}, nil
 	}
 	// Reserve headroom: one mutation can expand into up to three internal
 	// entries (default tombstone, default value, write marker). Keep the
@@ -258,14 +258,14 @@ func (r *Runner) chunkInstallMutations(mutations []*kvrpcpb.Mutation) ([][]*kvrp
 	if maxSize > 0 {
 		maxSize -= maxSize / 8
 	}
-	chunks := make([][]*kvrpcpb.Mutation, 0, 1)
+	chunks := make([][]*backend.Mutation, 0, 1)
 	start := 0
 	count := int64(0)
 	size := int64(0)
 	for i, mutation := range mutations {
 		var muSize int64
 		if mutation != nil {
-			muSize = int64(len(mutation.GetKey()) + len(mutation.GetValue()))
+			muSize = int64(len(mutation.Key) + len(mutation.Value))
 		}
 		if i > start && ((maxCount > 0 && count+1 > maxCount) || (maxSize > 0 && size+muSize > maxSize)) {
 			chunks = append(chunks, mutations[start:i])
@@ -285,7 +285,7 @@ func (r *Runner) chunkInstallMutations(mutations []*kvrpcpb.Mutation) ([][]*kvrp
 // TryAtomicMutate applies predicate-checked mutations through the same local
 // atomic apply group used by Mutate. handled=false means the caller-owned DB is
 // sharded in a way that cannot preserve group atomicity for this key set.
-func (r *Runner) TryAtomicMutate(ctx context.Context, primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) (bool, error) {
+func (r *Runner) TryAtomicMutate(ctx context.Context, primary []byte, predicates []*backend.Predicate, mutations []*backend.Mutation, startVersion, commitVersion uint64) (bool, error) {
 	if err := ctxErr(ctx); err != nil {
 		return true, err
 	}
@@ -328,7 +328,7 @@ func (r *Runner) Stats() map[string]any {
 	}
 }
 
-func (r *Runner) mutate(ctx context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64, allowCommitPush bool) (uint64, error) {
+func (r *Runner) mutate(ctx context.Context, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64, allowCommitPush bool) (uint64, error) {
 	if err := ctxErr(ctx); err != nil {
 		return 0, err
 	}
@@ -345,7 +345,7 @@ func (r *Runner) mutate(ctx context.Context, primary []byte, mutations []*kvrpcp
 	return effectiveCommitVersion, nil
 }
 
-func (r *Runner) applyMutationGroup(primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64, allowCommitPush bool) (uint64, mutationObserver, error) {
+func (r *Runner) applyMutationGroup(primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64, allowCommitPush bool) (uint64, mutationObserver, error) {
 	guard := r.latches.Acquire(mutationLatchKeys(primary, nil, mutations))
 	defer guard.Release()
 	effectiveCommitVersion := r.reserveMutationCommitVersion(commitVersion, allowCommitPush)
@@ -374,7 +374,7 @@ func (r *Runner) applyMutationGroup(primary []byte, mutations []*kvrpcpb.Mutatio
 // guard because install entries are versioned MVCC writes that are
 // idempotent on visibleLog replay. See InstallMutationsAtCommit for the
 // full contract.
-func (r *Runner) applyInstallMutationGroup(primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) (uint64, mutationObserver, error) {
+func (r *Runner) applyInstallMutationGroup(primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64) (uint64, mutationObserver, error) {
 	guard := r.latches.Acquire(mutationLatchKeys(primary, nil, mutations))
 	defer guard.Release()
 	effectiveCommitVersion := r.reserveMutationCommitVersion(commitVersion, false)
@@ -395,7 +395,7 @@ func (r *Runner) applyInstallMutationGroup(primary []byte, mutations []*kvrpcpb.
 	return effectiveCommitVersion, r.completeMutationApply(effectiveCommitVersion, false), nil
 }
 
-func (r *Runner) applyAtomicMutationGroup(primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) (uint64, mutationObserver, bool, error) {
+func (r *Runner) applyAtomicMutationGroup(primary []byte, predicates []*backend.Predicate, mutations []*backend.Mutation, startVersion, commitVersion uint64) (uint64, mutationObserver, bool, error) {
 	guard := r.latches.Acquire(mutationLatchKeys(primary, predicates, mutations))
 	defer guard.Release()
 	if applied, err := r.atomicMutationAlreadyApplied(mutations, startVersion, commitVersion); err != nil {
@@ -426,19 +426,19 @@ func (r *Runner) applyAtomicMutationGroup(primary []byte, predicates []*kvrpcpb.
 	return commitVersion, r.completeMutationApply(commitVersion, true), true, nil
 }
 
-func mutationLatchKeys(primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation) [][]byte {
+func mutationLatchKeys(primary []byte, predicates []*backend.Predicate, mutations []*backend.Mutation) [][]byte {
 	keys := make([][]byte, 0, 1+len(predicates)+len(mutations))
 	if len(primary) > 0 {
 		keys = append(keys, primary)
 	}
 	for _, pred := range predicates {
-		if pred != nil && len(pred.GetKey()) > 0 {
-			keys = append(keys, pred.GetKey())
+		if pred != nil && len(pred.Key) > 0 {
+			keys = append(keys, pred.Key)
 		}
 	}
 	for _, mutation := range mutations {
-		if mutation != nil && len(mutation.GetKey()) > 0 {
-			keys = append(keys, mutation.GetKey())
+		if mutation != nil && len(mutation.Key) > 0 {
+			keys = append(keys, mutation.Key)
 		}
 	}
 	return keys
@@ -487,30 +487,30 @@ func (r *Runner) currentObserver() mutationObserver {
 	return observer
 }
 
-func (r *Runner) validateAtomicPredicates(predicates []*kvrpcpb.AtomicPredicate, startVersion uint64) error {
+func (r *Runner) validateAtomicPredicates(predicates []*backend.Predicate, startVersion uint64) error {
 	for _, pred := range predicates {
-		if pred == nil || len(pred.GetKey()) == 0 {
+		if pred == nil || len(pred.Key) == 0 {
 			return txnAbort(errInvalidAtomicMutate)
 		}
-		readVersion := pred.GetReadVersion()
+		readVersion := pred.ReadVersion
 		if readVersion == 0 {
 			readVersion = startVersion
 		}
-		value, exists, err := r.readValue(pred.GetKey(), readVersion)
+		value, exists, err := r.readValue(pred.Key, readVersion)
 		if err != nil {
 			return txnRetryable(err)
 		}
-		switch pred.GetKind() {
-		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS:
+		switch pred.Kind {
+		case backend.PredicateNotExists:
 			if exists {
-				return txnAlreadyExists(pred.GetKey())
+				return txnAlreadyExists(pred.Key)
 			}
-		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_EXISTS:
+		case backend.PredicateExists:
 			if !exists {
 				return txnAbort(errInvalidAtomicMutate)
 			}
-		case kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS:
-			if !exists || !bytes.Equal(value, pred.GetExpectedValue()) {
+		case backend.PredicateValueEquals:
+			if !exists || !bytes.Equal(value, pred.ExpectedValue) {
 				return txnRetryable(errAtomicPredicate)
 			}
 		default:
@@ -520,14 +520,14 @@ func (r *Runner) validateAtomicPredicates(predicates []*kvrpcpb.AtomicPredicate,
 	return nil
 }
 
-func (r *Runner) atomicMutationAlreadyApplied(mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) (bool, error) {
+func (r *Runner) atomicMutationAlreadyApplied(mutations []*backend.Mutation, startVersion, commitVersion uint64) (bool, error) {
 	anyPresent := false
 	allPresent := true
 	for _, mut := range mutations {
 		if mut == nil {
 			continue
 		}
-		write, foundCommit, found, err := r.writeByStartVersion(mut.GetKey(), startVersion)
+		write, foundCommit, found, err := r.writeByStartVersion(mut.Key, startVersion)
 		if err != nil {
 			return false, err
 		}
@@ -536,10 +536,14 @@ func (r *Runner) atomicMutationAlreadyApplied(mutations []*kvrpcpb.Mutation, sta
 			continue
 		}
 		anyPresent = true
-		if foundCommit != commitVersion || write.Kind != mut.GetOp() {
+		expectedKind, err := backendMutationKind(mut.Op)
+		if err != nil {
+			return false, err
+		}
+		if foundCommit != commitVersion || write.Kind != expectedKind {
 			return false, nil
 		}
-		if mut.GetOp() == kvrpcpb.Mutation_Put {
+		if mut.Op == backend.MutationPut {
 			matches, err := r.committedPutMatches(write, mut, startVersion)
 			if err != nil || !matches {
 				return false, err
@@ -549,12 +553,12 @@ func (r *Runner) atomicMutationAlreadyApplied(mutations []*kvrpcpb.Mutation, sta
 	return anyPresent && allPresent, nil
 }
 
-func (r *Runner) validateMutations(primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) error {
+func (r *Runner) validateMutations(primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64) error {
 	for _, mut := range mutations {
 		if mut == nil {
 			continue
 		}
-		key := mut.GetKey()
+		key := mut.Key
 		if len(key) == 0 {
 			return txnAbort(errEmptyMutationKey)
 		}
@@ -565,7 +569,7 @@ func (r *Runner) validateMutations(primary []byte, mutations []*kvrpcpb.Mutation
 		if ok && latest > startVersion {
 			return txnCommitExpired(key, commitVersion, latest+1)
 		}
-		if mut.GetAssertionNotExist() {
+		if mut.AssertionNotExist {
 			if _, ok, err := r.readValue(key, startVersion); err != nil {
 				return txnRetryable(err)
 			} else if ok {
@@ -577,28 +581,28 @@ func (r *Runner) validateMutations(primary []byte, mutations []*kvrpcpb.Mutation
 				return txnAlreadyExists(key)
 			}
 		}
-		if bytes.Equal(key, primary) && mut.GetOp() == kvrpcpb.Mutation_Delete {
+		if bytes.Equal(key, primary) && mut.Op == backend.MutationDelete {
 			if _, ok, err := r.readValue(key, kv.MaxVersion); err != nil {
 				return txnRetryable(err)
 			} else if !ok {
 				return txnKeyError(&kvrpcpb.KeyError{Retryable: utils.ErrKeyNotFound.Error()})
 			}
 		}
-		switch mut.GetOp() {
-		case kvrpcpb.Mutation_Put, kvrpcpb.Mutation_Delete:
+		switch mut.Op {
+		case backend.MutationPut, backend.MutationDelete:
 		default:
-			return txnUnsupportedMutation(mut.GetOp())
+			return txnUnsupportedMutation(mut.Op)
 		}
 	}
 	return nil
 }
 
-func (r *Runner) validateInstallMutations(mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) error {
+func (r *Runner) validateInstallMutations(mutations []*backend.Mutation, startVersion, commitVersion uint64) error {
 	for _, mut := range mutations {
 		if mut == nil {
 			continue
 		}
-		key := mut.GetKey()
+		key := mut.Key
 		if len(key) == 0 {
 			return txnAbort(errEmptyMutationKey)
 		}
@@ -609,10 +613,10 @@ func (r *Runner) validateInstallMutations(mutations []*kvrpcpb.Mutation, startVe
 		if ok && latest > startVersion {
 			return txnCommitExpired(key, commitVersion, latest+1)
 		}
-		switch mut.GetOp() {
-		case kvrpcpb.Mutation_Put, kvrpcpb.Mutation_Delete:
+		switch mut.Op {
+		case backend.MutationPut, backend.MutationDelete:
 		default:
-			return txnUnsupportedMutation(mut.GetOp())
+			return txnUnsupportedMutation(mut.Op)
 		}
 	}
 	return nil
@@ -700,11 +704,11 @@ func (r *Runner) writeByStartVersion(key []byte, startVersion uint64) (mvcc.Writ
 	return foundWrite, foundCommit, found, err
 }
 
-func (r *Runner) committedPutMatches(write mvcc.Write, mut *kvrpcpb.Mutation, startVersion uint64) (bool, error) {
+func (r *Runner) committedPutMatches(write mvcc.Write, mut *backend.Mutation, startVersion uint64) (bool, error) {
 	if len(write.ShortValue) > 0 {
-		return bytes.Equal(write.ShortValue, mut.GetValue()) && write.ExpiresAt == mut.GetExpiresAt(), nil
+		return bytes.Equal(write.ShortValue, mut.Value) && write.ExpiresAt == mut.ExpiresAt, nil
 	}
-	entry, err := r.db.GetInternalEntry(kv.CFDefault, mut.GetKey(), startVersion)
+	entry, err := r.db.GetInternalEntry(kv.CFDefault, mut.Key, startVersion)
 	if err != nil {
 		if errors.Is(err, utils.ErrKeyNotFound) {
 			return false, nil
@@ -715,7 +719,7 @@ func (r *Runner) committedPutMatches(write mvcc.Write, mut *kvrpcpb.Mutation, st
 	if entry.IsDeletedOrExpired() {
 		return false, nil
 	}
-	return bytes.Equal(entry.Value, mut.GetValue()) && entry.ExpiresAt == mut.GetExpiresAt(), nil
+	return bytes.Equal(entry.Value, mut.Value) && entry.ExpiresAt == mut.ExpiresAt, nil
 }
 
 func (r *Runner) scanWrites(key []byte, fn func(mvcc.Write, uint64) bool) error {
@@ -762,43 +766,43 @@ type versionedOp struct {
 	expires uint64
 }
 
-func buildMutationEntries(mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) ([]*kv.Entry, error) {
+func buildMutationEntries(mutations []*backend.Mutation, startVersion, commitVersion uint64) ([]*kv.Entry, error) {
 	ops := make([]versionedOp, 0, len(mutations)*3)
 	for _, mut := range mutations {
 		if mut == nil {
 			continue
 		}
-		switch mut.GetOp() {
-		case kvrpcpb.Mutation_Put:
-			write := mvcc.Write{Kind: mut.GetOp(), StartTs: startVersion}
-			if mvcc.CanInlineShortValue(mut.GetOp(), mut.GetValue()) {
-				write.ShortValue = cloneBytes(mut.GetValue())
-				write.ExpiresAt = mut.GetExpiresAt()
+		switch mut.Op {
+		case backend.MutationPut:
+			write := mvcc.Write{Kind: kvrpcpb.Mutation_Put, StartTs: startVersion}
+			if mvcc.CanInlineShortValue(kvrpcpb.Mutation_Put, mut.Value) {
+				write.ShortValue = cloneBytes(mut.Value)
+				write.ExpiresAt = mut.ExpiresAt
 				ops = append(ops, versionedOp{
 					cf:      kv.CFWrite,
-					key:     mut.GetKey(),
+					key:     mut.Key,
 					version: commitVersion,
 					value:   mvcc.EncodeWrite(write),
 				})
 				continue
 			}
 			ops = append(ops,
-				versionedOp{cf: kv.CFDefault, key: mut.GetKey(), version: startVersion, meta: kv.BitDelete},
-				versionedOp{cf: kv.CFDefault, key: mut.GetKey(), version: startVersion, value: mut.GetValue(), expires: mut.GetExpiresAt()},
-				versionedOp{cf: kv.CFWrite, key: mut.GetKey(), version: commitVersion, value: mvcc.EncodeWrite(write)},
+				versionedOp{cf: kv.CFDefault, key: mut.Key, version: startVersion, meta: kv.BitDelete},
+				versionedOp{cf: kv.CFDefault, key: mut.Key, version: startVersion, value: mut.Value, expires: mut.ExpiresAt},
+				versionedOp{cf: kv.CFWrite, key: mut.Key, version: commitVersion, value: mvcc.EncodeWrite(write)},
 			)
-		case kvrpcpb.Mutation_Delete:
+		case backend.MutationDelete:
 			ops = append(ops,
-				versionedOp{cf: kv.CFDefault, key: mut.GetKey(), version: startVersion, meta: kv.BitDelete},
+				versionedOp{cf: kv.CFDefault, key: mut.Key, version: startVersion, meta: kv.BitDelete},
 				versionedOp{
 					cf:      kv.CFWrite,
-					key:     mut.GetKey(),
+					key:     mut.Key,
 					version: commitVersion,
-					value:   mvcc.EncodeWrite(mvcc.Write{Kind: mut.GetOp(), StartTs: startVersion}),
+					value:   mvcc.EncodeWrite(mvcc.Write{Kind: kvrpcpb.Mutation_Delete, StartTs: startVersion}),
 				},
 			)
 		default:
-			return nil, txnUnsupportedMutation(mut.GetOp())
+			return nil, txnUnsupportedMutation(mut.Op)
 		}
 	}
 	entries := make([]*kv.Entry, 0, len(ops))
@@ -806,6 +810,17 @@ func buildMutationEntries(mutations []*kvrpcpb.Mutation, startVersion, commitVer
 		entries = append(entries, kv.NewInternalEntry(op.cf, op.key, op.version, op.value, op.meta, op.expires))
 	}
 	return entries, nil
+}
+
+func backendMutationKind(op backend.MutationOp) (kvrpcpb.Mutation_Op, error) {
+	switch op {
+	case backend.MutationPut:
+		return kvrpcpb.Mutation_Put, nil
+	case backend.MutationDelete:
+		return kvrpcpb.Mutation_Delete, nil
+	default:
+		return kvrpcpb.Mutation_Put, txnUnsupportedMutation(op)
+	}
 }
 
 func maxObservedVersion(db *localdb.DB) (uint64, error) {

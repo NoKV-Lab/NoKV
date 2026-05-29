@@ -12,7 +12,7 @@ import (
 	"github.com/feichai0017/NoKV/raftstore/failpoints"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	"github.com/feichai0017/NoKV/raftstore/peer"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	"github.com/feichai0017/NoKV/raftstore/store/router"
 )
 

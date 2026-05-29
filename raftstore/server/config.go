@@ -12,7 +12,7 @@ import (
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
 	storemvcc "github.com/feichai0017/NoKV/raftstore/mvcc"
 	"github.com/feichai0017/NoKV/raftstore/raftlog"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	"github.com/feichai0017/NoKV/raftstore/store"
 	"github.com/feichai0017/NoKV/raftstore/transport"
 	txnstore "github.com/feichai0017/NoKV/txn/storage"

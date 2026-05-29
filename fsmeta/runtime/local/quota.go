@@ -9,10 +9,10 @@ import (
 	"math"
 	"sync/atomic"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 // QuotaLedger maintains local usage counters without enforcing rooted limits.
@@ -39,7 +39,7 @@ func NewQuotaLedger() *QuotaLedger {
 
 // ReserveQuota implements fsmetaexec.QuotaResolver. Local quotas are unlimited
 // and read-derived, so the hot write path does not carry quota counter keys.
-func (q *QuotaLedger) ReserveQuota(ctx context.Context, runner fsmetaexec.TxnRunner, changes []fsmetaexec.QuotaChange, startVersion uint64) ([]*kvrpcpb.Mutation, error) {
+func (q *QuotaLedger) ReserveQuota(ctx context.Context, runner backend.Store, changes []fsmetaexec.QuotaChange, startVersion uint64) ([]*backend.Mutation, error) {
 	if q == nil || runner == nil || len(changes) == 0 {
 		return nil, nil
 	}
@@ -59,7 +59,7 @@ func (q *QuotaLedger) AllowVisibleQuota(context.Context, []fsmetaexec.QuotaChang
 
 // ReadQuotaUsage derives local unlimited-quota diagnostics from visible dentries
 // instead of forcing every metadata write to update a mount-wide counter key.
-func (q *QuotaLedger) ReadQuotaUsage(ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity, scope model.InodeID, version uint64) (model.UsageRecord, bool, error) {
+func (q *QuotaLedger) ReadQuotaUsage(ctx context.Context, runner backend.Store, mount model.MountIdentity, scope model.InodeID, version uint64) (model.UsageRecord, bool, error) {
 	if q == nil || runner == nil {
 		return model.UsageRecord{}, false, nil
 	}
@@ -102,7 +102,7 @@ func (q *QuotaLedger) Stats() map[string]any {
 	}
 }
 
-func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity, prefix []byte, version uint64) (model.UsageRecord, error) {
+func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner backend.Store, mount model.MountIdentity, prefix []byte, version uint64) (model.UsageRecord, error) {
 	var usage model.UsageRecord
 	start := append([]byte(nil), prefix...)
 	for {
@@ -139,7 +139,7 @@ func (q *QuotaLedger) deriveQuotaUsageFromDentries(ctx context.Context, runner f
 	}
 }
 
-func (q *QuotaLedger) readQuotaInode(ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity, inodeID model.InodeID, version uint64) (model.InodeRecord, bool, error) {
+func (q *QuotaLedger) readQuotaInode(ctx context.Context, runner backend.Store, mount model.MountIdentity, inodeID model.InodeID, version uint64) (model.InodeRecord, bool, error) {
 	key, err := layout.EncodeInodeKey(mount, inodeID)
 	if err != nil {
 		return model.InodeRecord{}, false, err

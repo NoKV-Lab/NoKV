@@ -12,7 +12,7 @@ import (
 	"io"
 
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	"github.com/feichai0017/NoKV/raftstore/store"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )

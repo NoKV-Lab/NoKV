@@ -7,9 +7,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,8 +34,8 @@ func TestExecutorUpdateInodeUsesAtomicMutateWithValuePredicates(t *testing.T) {
 	require.Len(t, runner.atomicCalls, 1)
 	require.Empty(t, base.mutations)
 	requireAtomicStatUint(t, executor.Stats(), model.OperationUpdateInode, "success_total", 1)
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[0].GetKind())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[1].GetKind())
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[0].predicates[0].Kind)
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[0].predicates[1].Kind)
 
 	stored, ok, err := executor.readInode(context.Background(), testMountIdentity, 22, 99)
 	require.NoError(t, err)
@@ -50,7 +50,7 @@ func TestExecutorUpdateInodeSkipsAtomicMutateWhenQuotaMutates(t *testing.T) {
 	seedInode(t, runner.fakeRunner, "vol", model.InodeRecord{Inode: 22, Type: model.InodeTypeFile, Size: 1024, LinkCount: 1})
 	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
-	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
+	quota := &fakeQuotaResolver{mutation: &backend.Mutation{Op: backend.MutationPut, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
 	require.NoError(t, err)
 
@@ -178,7 +178,7 @@ func TestExecutorUpdateInodeUpdatesMutableFieldsAndQuota(t *testing.T) {
 	})
 	quotaKey, err := layout.EncodeUsageKey(testMountIdentity, 7)
 	require.NoError(t, err)
-	quota := &fakeQuotaResolver{mutation: &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: quotaKey, Value: []byte("usage")}}
+	quota := &fakeQuotaResolver{mutation: &backend.Mutation{Op: backend.MutationPut, Key: quotaKey, Value: []byte("usage")}}
 	executor, err := newTestExecutor(runner, WithQuotaResolver(quota))
 	require.NoError(t, err)
 
@@ -204,7 +204,7 @@ func TestExecutorUpdateInodeUpdatesMutableFieldsAndQuota(t *testing.T) {
 	require.Equal(t, int64(10), updated.CreatedUnixNs)
 	require.Equal(t, [][]QuotaChange{{{Mount: "vol", MountKeyID: 1, Scope: 7, Bytes: 4096}}}, quota.changes)
 	require.Len(t, runner.mutations, 1)
-	require.Equal(t, quotaKey, runner.mutations[0][1].GetKey())
+	require.Equal(t, quotaKey, runner.mutations[0][1].Key)
 
 	stored, ok, err := executor.readInode(context.Background(), testMountIdentity, 22, 99)
 	require.NoError(t, err)

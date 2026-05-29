@@ -11,6 +11,7 @@ import (
 
 	coordclient "github.com/feichai0017/NoKV/coordinator/client"
 	"github.com/feichai0017/NoKV/coordinator/storecontrol"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -20,7 +21,6 @@ import (
 	rootevent "github.com/feichai0017/NoKV/meta/root/event"
 	metawire "github.com/feichai0017/NoKV/meta/wire"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	metapb "github.com/feichai0017/NoKV/pb/meta"
 	"github.com/feichai0017/NoKV/raftstore/client"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
@@ -242,7 +242,7 @@ func registerMount(t *testing.T, ctx context.Context, coord *coordclient.GRPCCli
 	require.True(t, resp.GetAccepted())
 }
 
-func seedRootInode(t *testing.T, ctx context.Context, runner fsmetaexec.TxnRunner, mount model.MountIdentity) {
+func seedRootInode(t *testing.T, ctx context.Context, runner backend.Store, mount model.MountIdentity) {
 	t.Helper()
 	key, err := layout.EncodeInodeKey(mount, model.RootInode)
 	require.NoError(t, err)
@@ -265,8 +265,8 @@ func seedRootInode(t *testing.T, ctx context.Context, runner fsmetaexec.TxnRunne
 	require.NoError(t, err)
 	startVersion, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	_, err = runner.Mutate(ctx, key, []*kvrpcpb.Mutation{{
-		Op:                kvrpcpb.Mutation_Put,
+	_, err = runner.Mutate(ctx, key, []*backend.Mutation{{
+		Op:                backend.MutationPut,
 		Key:               key,
 		Value:             value,
 		AssertionNotExist: true,

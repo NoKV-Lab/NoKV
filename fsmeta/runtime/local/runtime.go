@@ -12,11 +12,11 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
 	"github.com/feichai0017/NoKV/engine/slab/negativecache"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	localdb "github.com/feichai0017/NoKV/local"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 // Runtime is a complete fsmeta runtime backed by one embedded local.DB.
@@ -227,8 +227,8 @@ func bootstrapRootInode(ctx context.Context, runner *Runner, mount fsmetaexec.Mo
 	if err != nil {
 		return err
 	}
-	_, err = runner.Mutate(ctx, key, []*kvrpcpb.Mutation{{
-		Op:                kvrpcpb.Mutation_Put,
+	_, err = runner.Mutate(ctx, key, []*backend.Mutation{{
+		Op:                backend.MutationPut,
 		Key:               key,
 		Value:             value,
 		AssertionNotExist: true,

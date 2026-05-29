@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
@@ -94,10 +95,10 @@ func (e *Executor) Stats() map[string]any {
 		"negative_cache_enabled":     e.negCache != nil,
 		"dirpage_cache_enabled":      e.dirPages != nil,
 	}
-	if stats, ok := e.runner.(statsProvider); ok {
+	if stats, ok := e.runner.(backend.StatsProvider); ok {
 		out["runner"] = stats.Stats()
 	}
-	if stats, ok := e.visibleCommitter.(statsProvider); ok {
+	if stats, ok := e.visibleCommitter.(backend.StatsProvider); ok {
 		out["visible_committer"] = stats.Stats()
 	}
 	if e.dirPages != nil {
@@ -108,7 +109,7 @@ func (e *Executor) Stats() map[string]any {
 		out["dirpage_store_ok"] = stats.StoreOK
 		out["dirpage_dropped"] = stats.Dropped
 	}
-	if stats, ok := e.inodes.(statsProvider); ok {
+	if stats, ok := e.inodes.(backend.StatsProvider); ok {
 		out["inode_allocator"] = stats.Stats()
 	}
 	return out

@@ -10,6 +10,7 @@ import (
 
 	xxhash "github.com/cespare/xxhash/v2"
 	"github.com/feichai0017/NoKV/engine/slab/dirpage"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -450,7 +451,7 @@ func (e *Executor) scanDentries(ctx context.Context, plan compile.DirectoryReadP
 }
 
 func (e *Executor) scanDentriesAt(ctx context.Context, plan compile.DirectoryReadPlan, version uint64, snapshotRead bool, overlayGeneration, sealedGeneration uint64) ([]model.DentryRecord, error) {
-	var kvs []KV
+	var kvs []backend.KV
 	stats := compile.DirectoryReadStats{UsedOverlayOnly: plan.OverlayOnly}
 	if !plan.OverlayOnly {
 		if plan.IncludeOverlay {

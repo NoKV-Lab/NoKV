@@ -29,6 +29,8 @@ var (
 	errNilAllocIDResponse          = nokverrors.New(nokverrors.KindProtocolViolation, "fsmeta/runtime/raftstore: nil alloc id response")
 	errEmptyAllocIDResponse        = nokverrors.New(nokverrors.KindProtocolViolation, "fsmeta/runtime/raftstore: empty alloc id response")
 	errNoUsableInodeID             = nokverrors.New(nokverrors.KindProtocolViolation, "fsmeta/runtime/raftstore: no usable inode id in allocation batch")
+	errUnsupportedMutationOp       = nokverrors.New(nokverrors.KindInvalidArgument, "fsmeta/runtime/raftstore: unsupported backend mutation op")
+	errUnsupportedPredicateKind    = nokverrors.New(nokverrors.KindInvalidArgument, "fsmeta/runtime/raftstore: unsupported backend predicate kind")
 )
 
 func errTSOCountMismatch(got, requested uint64) error {

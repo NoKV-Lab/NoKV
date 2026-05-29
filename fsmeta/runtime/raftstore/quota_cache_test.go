@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,15 +42,15 @@ func (r *fakeTxnRunner) BatchGet(context.Context, [][]byte, uint64) (map[string]
 	return nil, nil
 }
 
-func (r *fakeTxnRunner) Scan(context.Context, []byte, uint32, uint64) ([]fsmetaexec.KV, error) {
+func (r *fakeTxnRunner) Scan(context.Context, []byte, uint32, uint64) ([]backend.KV, error) {
 	return nil, nil
 }
 
-func (r *fakeTxnRunner) Mutate(context.Context, []byte, []*kvrpcpb.Mutation, uint64, uint64, uint64) (uint64, error) {
+func (r *fakeTxnRunner) Mutate(context.Context, []byte, []*backend.Mutation, uint64, uint64, uint64) (uint64, error) {
 	return 0, nil
 }
 
-func (r *fakeTxnRunner) MutateAtCommit(context.Context, []byte, []*kvrpcpb.Mutation, uint64, uint64, uint64) (uint64, error) {
+func (r *fakeTxnRunner) MutateAtCommit(context.Context, []byte, []*backend.Mutation, uint64, uint64, uint64) (uint64, error) {
 	return 0, nil
 }
 
@@ -82,8 +82,8 @@ func TestQuotaReserveWritesUsageCountersInTransaction(t *testing.T) {
 	require.Len(t, mutations, 2)
 
 	for _, mut := range mutations {
-		require.Equal(t, kvrpcpb.Mutation_Put, mut.GetOp())
-		usage, err := layout.DecodeUsageValue(mut.GetValue())
+		require.Equal(t, backend.MutationPut, mut.Op)
+		usage, err := layout.DecodeUsageValue(mut.Value)
 		require.NoError(t, err)
 		require.Equal(t, model.UsageRecord{Bytes: 1024, Inodes: 1}, usage)
 	}

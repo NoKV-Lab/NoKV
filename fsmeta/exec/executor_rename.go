@@ -8,10 +8,10 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 func (e *Executor) tryVisibleRename(ctx context.Context, compiled compile.CompiledOp, move renameMove) (bool, error) {
@@ -198,7 +198,7 @@ func (e *Executor) Rename(ctx context.Context, req model.RenameRequest) error {
 // RenameReplace atomically publishes the source dentry at the destination name,
 // replacing an existing non-directory destination dentry when present. It is the
 // artifact publish primitive: no subtree handoff or durability barrier is
-// emitted, and all namespace/index mutations commit in one KV transaction.
+// emitted, and all namespace/index mutations commit in one backend.KV transaction.
 func (e *Executor) RenameReplace(ctx context.Context, req model.RenameReplaceRequest) (model.RenameReplaceResult, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)
 	if err != nil {
@@ -312,7 +312,7 @@ func (e *Executor) RenameSubtree(ctx context.Context, req model.RenameSubtreeReq
 	return nil
 }
 
-func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan layout.OperationPlan, move renameMove, startVersion uint64) (model.RenameReplaceResult, []*kvrpcpb.Mutation, error) {
+func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan layout.OperationPlan, move renameMove, startVersion uint64) (model.RenameReplaceResult, []*backend.Mutation, error) {
 	sourceDentry, err := e.readDentry(ctx, plan.ReadKeys[0], startVersion)
 	if err != nil {
 		return model.RenameReplaceResult{}, nil, fmt.Errorf("source dentry: %w", err)
@@ -400,8 +400,8 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan layou
 	if err != nil {
 		return model.RenameReplaceResult{}, nil, err
 	}
-	putDestination := &kvrpcpb.Mutation{
-		Op:    kvrpcpb.Mutation_Put,
+	putDestination := &backend.Mutation{
+		Op:    backend.MutationPut,
 		Key:   cloneBytes(plan.MutateKeys[1]),
 		Value: replacementValue,
 	}
@@ -416,19 +416,19 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan layou
 	if err != nil {
 		return model.RenameReplaceResult{}, nil, err
 	}
-	mutations := []*kvrpcpb.Mutation{
+	mutations := []*backend.Mutation{
 		{
-			Op:  kvrpcpb.Mutation_Delete,
+			Op:  backend.MutationDelete,
 			Key: cloneBytes(plan.MutateKeys[0]),
 		},
 		putDestination,
 	}
 	if move.fromParent == move.toParent {
-		mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue})
+		mutations = append(mutations, &backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue})
 	} else {
 		mutations = append(mutations,
-			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue},
-			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[3]), Value: toParentValue},
+			&backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue},
+			&backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[3]), Value: toParentValue},
 		)
 	}
 
@@ -449,8 +449,8 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan layou
 		}
 		if destinationInode.LinkCount <= 1 {
 			result.OldInodeDeleted = true
-			mutations = append(mutations, &kvrpcpb.Mutation{
-				Op:  kvrpcpb.Mutation_Delete,
+			mutations = append(mutations, &backend.Mutation{
+				Op:  backend.MutationDelete,
 				Key: cloneBytes(destinationInodeKey),
 			})
 		} else {
@@ -459,8 +459,8 @@ func (e *Executor) prepareRenameReplaceMutations(ctx context.Context, plan layou
 			if err != nil {
 				return model.RenameReplaceResult{}, nil, err
 			}
-			mutations = append(mutations, &kvrpcpb.Mutation{
-				Op:    kvrpcpb.Mutation_Put,
+			mutations = append(mutations, &backend.Mutation{
+				Op:    backend.MutationPut,
 				Key:   cloneBytes(destinationInodeKey),
 				Value: destinationValue,
 			})
@@ -493,7 +493,7 @@ func validateRenameReplaceDentryInode(dentry model.DentryRecord, inode model.Ino
 	return nil
 }
 
-func (e *Executor) prepareRenameMutations(ctx context.Context, plan layout.OperationPlan, move renameMove, startVersion uint64, movedSize *uint64, movedInode *bool) ([]*kvrpcpb.Mutation, []*kvrpcpb.AtomicPredicate, error) {
+func (e *Executor) prepareRenameMutations(ctx context.Context, plan layout.OperationPlan, move renameMove, startVersion uint64, movedSize *uint64, movedInode *bool) ([]*backend.Mutation, []*backend.Predicate, error) {
 	record, err := e.readDentry(ctx, plan.ReadKeys[0], startVersion)
 	if err != nil {
 		return nil, nil, err
@@ -550,24 +550,24 @@ func (e *Executor) prepareRenameMutations(ctx context.Context, plan layout.Opera
 	if err != nil {
 		return nil, nil, err
 	}
-	mutations := []*kvrpcpb.Mutation{
+	mutations := []*backend.Mutation{
 		{
-			Op:  kvrpcpb.Mutation_Delete,
+			Op:  backend.MutationDelete,
 			Key: cloneBytes(plan.MutateKeys[0]),
 		},
 		{
-			Op:                kvrpcpb.Mutation_Put,
+			Op:                backend.MutationPut,
 			Key:               cloneBytes(plan.MutateKeys[1]),
 			Value:             value,
 			AssertionNotExist: true,
 		},
 	}
 	if move.fromParent == move.toParent {
-		mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue})
+		mutations = append(mutations, &backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue})
 	} else {
 		mutations = append(mutations,
-			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue},
-			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[3]), Value: toParentValue},
+			&backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[2]), Value: fromParentValue},
+			&backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[3]), Value: toParentValue},
 		)
 	}
 	if *movedInode {
@@ -580,7 +580,7 @@ func (e *Executor) prepareRenameMutations(ctx context.Context, plan layout.Opera
 		}
 		mutations = append(mutations, quotaMutations...)
 	}
-	predicates := []*kvrpcpb.AtomicPredicate{
+	predicates := []*backend.Predicate{
 		atomicValueEquals(plan.ReadKeys[0], sourceDentryValue),
 		atomicNotExists(plan.ReadKeys[1]),
 		atomicValueEquals(fromParent.key, fromParent.value),

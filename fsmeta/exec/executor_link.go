@@ -7,10 +7,10 @@ import (
 	"context"
 	"errors"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 func (e *Executor) tryVisibleLink(ctx context.Context, program compile.LinkProgram, mount model.MountIdentity, req model.LinkRequest) (bool, error) {
@@ -196,20 +196,20 @@ func (e *Executor) Link(ctx context.Context, req model.LinkRequest) error {
 		if err != nil {
 			return err
 		}
-		mutations := []*kvrpcpb.Mutation{
+		mutations := []*backend.Mutation{
 			{
-				Op:                kvrpcpb.Mutation_Put,
+				Op:                backend.MutationPut,
 				Key:               cloneBytes(plan.ReadKeys[1]),
 				Value:             dentryValue,
 				AssertionNotExist: true,
 			},
 			{
-				Op:    kvrpcpb.Mutation_Put,
+				Op:    backend.MutationPut,
 				Key:   inodeKey,
 				Value: inodeValue,
 			},
 			{
-				Op:    kvrpcpb.Mutation_Put,
+				Op:    backend.MutationPut,
 				Key:   cloneBytes(plan.MutateKeys[1]),
 				Value: parentValue,
 			},
@@ -230,7 +230,7 @@ func (e *Executor) Link(ctx context.Context, req model.LinkRequest) error {
 			// equal the records read by this attempt. These value predicates are
 			// the correctness boundary that prevents overwriting a concurrent
 			// UpdateInode with an older inode body.
-			predicates := []*kvrpcpb.AtomicPredicate{
+			predicates := []*backend.Predicate{
 				atomicValueEquals(plan.ReadKeys[0], sourceDentryValue),
 				atomicNotExists(plan.ReadKeys[1]),
 				atomicValueEquals(inodeKey, oldInodeValue),

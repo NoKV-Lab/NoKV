@@ -1,14 +1,14 @@
 // Copyright 2024-2026 The NoKV Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-package snapshot_test
+package sst_test
 
 import (
 	"testing"
 
 	local "github.com/feichai0017/NoKV/local"
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
-	"github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshot "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 	"github.com/stretchr/testify/require"
 )
 

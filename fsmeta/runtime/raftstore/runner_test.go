@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
-	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
 	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
@@ -146,8 +146,8 @@ func TestRunnerTryAtomicMutateRecordsUnsupportedKV(t *testing.T) {
 	runner, err := NewRunner(&fakeRunnerKV{}, &fakeRunnerTSO{resp: &coordpb.TsoResponse{Timestamp: 10, Count: 2}})
 	require.NoError(t, err)
 
-	handled, err := runner.TryAtomicMutate(context.Background(), []byte("p"), nil, []*kvrpcpb.Mutation{{
-		Op:  kvrpcpb.Mutation_Put,
+	handled, err := runner.TryAtomicMutate(context.Background(), []byte("p"), nil, []*backend.Mutation{{
+		Op:  backend.MutationPut,
 		Key: []byte("p"),
 	}}, 10, 11)
 	require.NoError(t, err)
@@ -178,8 +178,8 @@ func TestRunnerMutateAllocatesCommitTimestampAfterPrewrite(t *testing.T) {
 	runner, err := NewRunner(kv, &fakeRunnerTSO{resp: &coordpb.TsoResponse{Timestamp: 20, Count: 1}})
 	require.NoError(t, err)
 
-	actual, err := runner.Mutate(context.Background(), []byte("p"), []*kvrpcpb.Mutation{{
-		Op:  kvrpcpb.Mutation_Put,
+	actual, err := runner.Mutate(context.Background(), []byte("p"), []*backend.Mutation{{
+		Op:  backend.MutationPut,
 		Key: []byte("p"),
 	}}, 10, 11, 3000)
 	require.NoError(t, err)
@@ -189,4 +189,4 @@ func TestRunnerMutateAllocatesCommitTimestampAfterPrewrite(t *testing.T) {
 
 var _ KVClient = (*fakeRunnerKV)(nil)
 var _ TSOClient = (*fakeRunnerTSO)(nil)
-var _ fsmetaexec.TxnRunner = (*Runner)(nil)
+var _ backend.Store = (*Runner)(nil)

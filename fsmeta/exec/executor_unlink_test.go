@@ -7,8 +7,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,8 +47,8 @@ func TestExecutorUnlinkRemovesDentry(t *testing.T) {
 	require.ErrorIs(t, err, model.ErrNotFound)
 	require.Len(t, runner.mutations, 1)
 	require.Len(t, runner.mutations[0], 3)
-	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][0].GetOp())
-	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][1].GetOp())
+	require.Equal(t, backend.MutationDelete, runner.mutations[0][0].Op)
+	require.Equal(t, backend.MutationDelete, runner.mutations[0][1].Op)
 	_, ok, err := executor.readInode(context.Background(), testMountIdentity, 22, 99)
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -81,8 +81,8 @@ func TestExecutorRemoveRemovesDentry(t *testing.T) {
 	require.Empty(t, base.mutations)
 	require.Len(t, runner.atomicCalls, 1)
 	require.Len(t, runner.atomicCalls[0].mutations, 3)
-	require.Equal(t, kvrpcpb.Mutation_Delete, runner.atomicCalls[0].mutations[0].GetOp())
-	require.Equal(t, kvrpcpb.Mutation_Delete, runner.atomicCalls[0].mutations[1].GetOp())
+	require.Equal(t, backend.MutationDelete, runner.atomicCalls[0].mutations[0].Op)
+	require.Equal(t, backend.MutationDelete, runner.atomicCalls[0].mutations[1].Op)
 	requireAtomicStatUint(t, executor.Stats(), model.OperationRemove, "success_total", 1)
 }
 
@@ -100,8 +100,8 @@ func TestExecutorUnlinkUsesAtomicMutateWithValuePredicates(t *testing.T) {
 	require.Len(t, runner.atomicCalls, 1)
 	require.Empty(t, base.mutations)
 	requireAtomicStatUint(t, executor.Stats(), model.OperationUnlink, "success_total", 1)
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[0].GetKind())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[1].GetKind())
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[0].predicates[0].Kind)
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[0].predicates[1].Kind)
 	_, ok, err := executor.readInode(context.Background(), testMountIdentity, 22, 99)
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -249,9 +249,9 @@ func TestExecutorRemoveDirectoryRemovesEmptyDirectory(t *testing.T) {
 	require.Zero(t, parent.ChildCount)
 	require.Len(t, runner.mutations, 1)
 	require.Len(t, runner.mutations[0], 3)
-	require.Equal(t, kvrpcpb.Mutation_Put, runner.mutations[0][0].GetOp())
-	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][1].GetOp())
-	require.Equal(t, kvrpcpb.Mutation_Delete, runner.mutations[0][2].GetOp())
+	require.Equal(t, backend.MutationPut, runner.mutations[0][0].Op)
+	require.Equal(t, backend.MutationDelete, runner.mutations[0][1].Op)
+	require.Equal(t, backend.MutationDelete, runner.mutations[0][2].Op)
 }
 
 func TestExecutorRemoveDirectoryReservesNegativeQuota(t *testing.T) {

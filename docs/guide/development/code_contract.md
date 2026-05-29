@@ -50,13 +50,16 @@ Package boundaries follow ownership of truth, not convenience.
 | `local/` | Embedded DB facade and local runtime assembly. | Know fsmeta, coordinator, root, or raftstore semantics. |
 | `txn/` | Transaction protocol layers. | Let `mvcc`, `storage`, or `latch` depend on Percolator or raftstore. |
 | `raftstore/` | Region Raft execution and data-plane apply. | Interpret fsmeta namespace semantics. |
+| `raftstore/snapshot/` | Backend-neutral region snapshot protocol for migration and peer bootstrap. | Import engine, local DB, or SST-specific table/manifest implementations. |
+| `raftstore/snapshot/sst/` | LSM external-SST region snapshot export, streaming, ingest, and rollback implementation. | Become a generic fsmeta/backend or raftstore/snapshot contract. |
 | `meta/root/` | Rooted truth for authority, topology, grants, seals, and lifecycle facts. | Import coordinator service/client packages. |
 | `coordinator/` | Rebuildable control-plane view, routing, and service orchestration. | Become the source of truth for rooted facts. |
 | `fsmeta/model/` | Storage-engine-neutral namespace model: inode/dentry records, operation request/result shapes, and model validation. | Import key/value layout, protobuf, raftstore, coordinator, root, Peras, or concrete backend packages. |
 | `fsmeta/layout/` | Ordered-key backend layout: key/value codecs, key-family kinds, affinity buckets, placement ranges, and operation key plans. | Own namespace semantics, protobuf, raftstore, coordinator, root, Peras, or concrete backend clients. |
+| `fsmeta/backend/` | Storage-engine-neutral MVCC metadata backend contract consumed by fsmeta execution. | Import protobuf, engine, local, raftstore, coordinator, root, Peras, or concrete backend packages. |
 | `fsmeta/observe/` | Runtime-neutral watch and snapshot observation surfaces: requests, cursors, events, subscriptions, apply notifications, and snapshot publication hooks. | Own namespace model objects, storage runtimes, protobuf conversion, raftstore, coordinator, root, Peras, or backend clients. |
 | `fsmeta/` | Package-level architecture anchor. | Re-own model/layout/observe types or add forwarding aliases for `fsmeta/model`, `fsmeta/layout`, or `fsmeta/observe`. |
-| `fsmeta/exec/` | Semantic execution, compiler, and holder logic. | Import `raftstore`, `coordinator`, or `meta/root`. |
+| `fsmeta/exec/` | Semantic execution, compiler, and holder logic over the `fsmeta/backend` contract. | Import protobuf, `raftstore`, `coordinator`, `meta/root`, or concrete backend packages. |
 | `fsmeta/runtime/` | Runtime adapters that bind fsmeta execution to storage backends. | Reinterpret compiler semantics without going through the compiler contract. |
 | `cmd/` | Binary assembly, flags, env, and config wiring. | Contain core protocol or storage logic. |
 | `pb/`, `*/wire/` | Proto definitions and conversion glue. | Leak protobuf structs into storage or semantic cores when a domain type exists. |
@@ -85,16 +88,27 @@ The current responsibility map is:
 - `txn/percolator`: 2PC/MVCC protocol logic on top of transaction primitives.
 - `raftstore/*`: replicated region execution, apply, split/merge, migration,
   and internal install commands.
+- `raftstore/snapshot/*`: backend-neutral region snapshot descriptors and
+  streaming protocol. SST manifests, table files, file IDs, compatibility
+  checks, and rollback details live under `raftstore/snapshot/sst/*`.
+- `raftstore/migrate/*`: operator migration workflow. It may call concrete
+  snapshot implementations such as SST, but migration is not a generic fsmeta
+  backend capability.
 - `meta/root/*`: rooted truth for cluster and metadata authority facts.
 - `coordinator/*`: rebuildable serving layer over root facts.
 - `fsmeta/model/*`: storage-engine-neutral inode/dentry/session/quota/snapshot
   model objects, operation request/result types, and model validation.
 - `fsmeta/layout/*`: namespace key layout, value codecs, placement planning,
   and operation key plans for ordered storage backends.
+- `fsmeta/backend/*`: minimal MVCC metadata backend contract. It contains
+  backend-neutral key/value, mutation, predicate, atomic mutation, and stats
+  surfaces only. Migration, SST ingest/export, LSM diagnostics, and raftstore
+  RPC conversion remain in concrete runtime or operations packages.
 - `fsmeta/observe/*`: runtime-neutral watch and snapshot observation surfaces.
 - `fsmeta/*`: package-level architecture anchor only.
 - `fsmeta/exec/*`: semantic compiler, executor, and runtime-neutral holder
-  logic.
+  logic. It may depend on `fsmeta/backend`, but it must not import protobuf or
+  concrete storage runtimes.
 - `fsmeta/runtime/*`: concrete runtime bindings from fsmeta execution to
   raftstore or other storage backends.
 - `experimental/peras/*`: Peras admission, visible-log, witness, segment, and

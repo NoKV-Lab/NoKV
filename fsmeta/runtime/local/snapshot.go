@@ -11,10 +11,10 @@ import (
 
 	"github.com/feichai0017/NoKV/engine/index"
 	"github.com/feichai0017/NoKV/engine/kv"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	rootstate "github.com/feichai0017/NoKV/meta/root/state"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 // SnapshotRegistry tracks locally published snapshot tokens. When constructed
@@ -88,8 +88,8 @@ func (r *SnapshotRegistry) PublishSnapshotSubtree(ctx context.Context, token mod
 		if err != nil {
 			return err
 		}
-		if err := r.applySnapshotMutation(ctx, storageKey, &kvrpcpb.Mutation{
-			Op:    kvrpcpb.Mutation_Put,
+		if err := r.applySnapshotMutation(ctx, storageKey, &backend.Mutation{
+			Op:    backend.MutationPut,
 			Key:   storageKey,
 			Value: value,
 		}); err != nil {
@@ -127,8 +127,8 @@ func (r *SnapshotRegistry) RetireSnapshotSubtree(ctx context.Context, token mode
 		if err != nil {
 			return err
 		}
-		if err := r.applySnapshotMutation(ctx, storageKey, &kvrpcpb.Mutation{
-			Op:  kvrpcpb.Mutation_Delete,
+		if err := r.applySnapshotMutation(ctx, storageKey, &backend.Mutation{
+			Op:  backend.MutationDelete,
 			Key: storageKey,
 		}); err != nil {
 			return err
@@ -278,12 +278,12 @@ func (r *SnapshotRegistry) readSnapshotRecord(key []byte) (model.SnapshotSubtree
 	return token, true, nil
 }
 
-func (r *SnapshotRegistry) applySnapshotMutation(ctx context.Context, primary []byte, mutation *kvrpcpb.Mutation) error {
+func (r *SnapshotRegistry) applySnapshotMutation(ctx context.Context, primary []byte, mutation *backend.Mutation) error {
 	startVersion, err := r.runner.ReserveTimestamp(ctx, 2)
 	if err != nil {
 		return err
 	}
-	_, _, err = r.runner.applyMutationGroup(primary, []*kvrpcpb.Mutation{mutation}, startVersion, startVersion+1, false)
+	_, _, err = r.runner.applyMutationGroup(primary, []*backend.Mutation{mutation}, startVersion, startVersion+1, false)
 	return err
 }
 

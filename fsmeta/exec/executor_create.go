@@ -6,10 +6,10 @@ package exec
 import (
 	"context"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 func (e *Executor) tryVisibleCreate(ctx context.Context, program compile.CreateProgram, mount model.MountIdentity, req model.CreateRequest, dentryValue, inodeValue []byte) (bool, error) {
@@ -120,26 +120,26 @@ func (e *Executor) Create(ctx context.Context, req model.CreateRequest) (model.C
 		if err != nil {
 			return err
 		}
-		mutations := []*kvrpcpb.Mutation{
+		mutations := []*backend.Mutation{
 			{
-				Op:    kvrpcpb.Mutation_Put,
+				Op:    backend.MutationPut,
 				Key:   cloneBytes(plan.MutateKeys[0]),
 				Value: parentValue,
 			},
 			{
-				Op:                kvrpcpb.Mutation_Put,
+				Op:                backend.MutationPut,
 				Key:               cloneBytes(plan.MutateKeys[1]),
 				Value:             dentryValue,
 				AssertionNotExist: true,
 			},
 			{
-				Op:                kvrpcpb.Mutation_Put,
+				Op:                backend.MutationPut,
 				Key:               cloneBytes(plan.MutateKeys[2]),
 				Value:             inodeValue,
 				AssertionNotExist: true,
 			},
 		}
-		predicates := []*kvrpcpb.AtomicPredicate{
+		predicates := []*backend.Predicate{
 			atomicValueEquals(parent.key, parent.value),
 			atomicNotExists(plan.MutateKeys[1]),
 			atomicNotExists(plan.MutateKeys[2]),

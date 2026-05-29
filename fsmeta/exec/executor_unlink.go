@@ -6,10 +6,10 @@ package exec
 import (
 	"context"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 type removeDentryRequest struct {
@@ -120,12 +120,12 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 		if err != nil {
 			return err
 		}
-		mutations := []*kvrpcpb.Mutation{{
-			Op:  kvrpcpb.Mutation_Delete,
+		mutations := []*backend.Mutation{{
+			Op:  backend.MutationDelete,
 			Key: cloneBytes(plan.MutateKeys[0]),
 		}}
 		attemptResult := model.RemoveResult{RemovedDentry: record}
-		predicates := []*kvrpcpb.AtomicPredicate{atomicValueEquals(plan.PrimaryKey, dentryValue)}
+		predicates := []*backend.Predicate{atomicValueEquals(plan.PrimaryKey, dentryValue)}
 		parent, err := e.readDirectoryInode(ctx, mount, req.Parent, startVersion)
 		if err != nil {
 			return err
@@ -157,14 +157,14 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 			predicates = append(predicates, atomicValueEquals(inodeKey, oldInodeValue))
 			if inode.LinkCount <= 1 {
 				attemptResult.InodeDeleted = true
-				mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Delete, Key: inodeKey})
+				mutations = append(mutations, &backend.Mutation{Op: backend.MutationDelete, Key: inodeKey})
 			} else {
 				inode.LinkCount--
 				inodeValue, err := layout.EncodeInodeValue(inode)
 				if err != nil {
 					return err
 				}
-				mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: inodeKey, Value: inodeValue})
+				mutations = append(mutations, &backend.Mutation{Op: backend.MutationPut, Key: inodeKey, Value: inodeValue})
 			}
 			quotaMutations, err := e.reserveQuota(ctx, []QuotaChange{{
 				Mount:      req.Mount,
@@ -179,7 +179,7 @@ func (e *Executor) removeDentry(ctx context.Context, mount model.MountIdentity, 
 			mutations = append(mutations, quotaMutations...)
 		}
 		result = attemptResult
-		mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[1]), Value: parentValue})
+		mutations = append(mutations, &backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[1]), Value: parentValue})
 		if len(mutations) == len(predicates) {
 			return e.mutateWithAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, predicates, mutations, startVersion, commitVersion)
 		}
@@ -288,13 +288,13 @@ func (e *Executor) RemoveDirectory(ctx context.Context, req model.RemoveDirector
 		if err != nil {
 			return err
 		}
-		mutations := []*kvrpcpb.Mutation{
-			{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[0]), Value: parentValue},
-			{Op: kvrpcpb.Mutation_Delete, Key: cloneBytes(plan.MutateKeys[1])},
-			{Op: kvrpcpb.Mutation_Delete, Key: inodeKey},
+		mutations := []*backend.Mutation{
+			{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[0]), Value: parentValue},
+			{Op: backend.MutationDelete, Key: cloneBytes(plan.MutateKeys[1])},
+			{Op: backend.MutationDelete, Key: inodeKey},
 		}
 		mutations = append(mutations, quotaMutations...)
-		predicates := []*kvrpcpb.AtomicPredicate{
+		predicates := []*backend.Predicate{
 			atomicValueEquals(parent.key, parent.value),
 			atomicValueEquals(plan.PrimaryKey, dentryValue),
 			atomicValueEquals(inodeKey, inodeValue),

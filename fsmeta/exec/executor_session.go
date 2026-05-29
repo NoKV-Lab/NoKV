@@ -10,10 +10,10 @@ import (
 	"sort"
 	"time"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 func (e *Executor) tryVisibleOpenWriteSession(ctx context.Context, program compile.OpenWriteSessionProgram, mount model.MountIdentity, req model.OpenWriteSessionRequest) (model.SessionRecord, bool, error) {
@@ -261,7 +261,7 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSess
 		}
 		candidate := model.SessionRecord{Session: req.Session, Inode: req.Inode, ExpiresUnixNs: expiresUnixNs}
 		now := nowTime.UnixNano()
-		predicates := make([]*kvrpcpb.AtomicPredicate, 0, 4)
+		predicates := make([]*backend.Predicate, 0, 4)
 		if existing, ok, err := e.readSessionByKey(ctx, mount, plan.ReadKeys[1], startVersion); err != nil {
 			return err
 		} else if ok && sessionLive(existing, now) {
@@ -275,7 +275,7 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSess
 		} else {
 			predicates = append(predicates, atomicNotExists(plan.ReadKeys[1]))
 		}
-		mutations := make([]*kvrpcpb.Mutation, 0, 3)
+		mutations := make([]*backend.Mutation, 0, 3)
 		if owner, ok, err := e.readSessionByKey(ctx, mount, plan.ReadKeys[2], startVersion); err != nil {
 			return err
 		} else if ok {
@@ -296,7 +296,7 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSess
 					return err
 				} else if ok && bytes.Equal(value, ownerValue) {
 					predicates = append(predicates, atomicValueEquals(staleSessionKey, ownerValue))
-					mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Delete, Key: staleSessionKey})
+					mutations = append(mutations, &backend.Mutation{Op: backend.MutationDelete, Key: staleSessionKey})
 				}
 			}
 		} else {
@@ -307,8 +307,8 @@ func (e *Executor) OpenWriteSession(ctx context.Context, req model.OpenWriteSess
 			return err
 		}
 		mutations = append(mutations,
-			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[0]), Value: value},
-			&kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[1]), Value: value},
+			&backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[0]), Value: value},
+			&backend.Mutation{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[1]), Value: value},
 		)
 		predicates = append(predicates, atomicValueEquals(inodeKey, inodeValue))
 		// Open is a value-sensitive admission path: the session-id key, owner
@@ -387,11 +387,11 @@ func (e *Executor) HeartbeatWriteSession(ctx context.Context, req model.Heartbea
 		if err != nil {
 			return err
 		}
-		mutations := []*kvrpcpb.Mutation{
-			{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[0]), Value: value},
-			{Op: kvrpcpb.Mutation_Put, Key: cloneBytes(plan.MutateKeys[1]), Value: value},
+		mutations := []*backend.Mutation{
+			{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[0]), Value: value},
+			{Op: backend.MutationPut, Key: cloneBytes(plan.MutateKeys[1]), Value: value},
 		}
-		predicates := []*kvrpcpb.AtomicPredicate{
+		predicates := []*backend.Predicate{
 			atomicValueEquals(plan.ReadKeys[0], sessionValue),
 			atomicValueEquals(plan.ReadKeys[1], ownerValue),
 		}
@@ -441,8 +441,8 @@ func (e *Executor) CloseWriteSession(ctx context.Context, req model.CloseWriteSe
 		if err != nil {
 			return err
 		}
-		mutations := []*kvrpcpb.Mutation{{Op: kvrpcpb.Mutation_Delete, Key: cloneBytes(plan.MutateKeys[0])}}
-		predicates := []*kvrpcpb.AtomicPredicate{atomicValueEquals(plan.ReadKeys[0], sessionValue)}
+		mutations := []*backend.Mutation{{Op: backend.MutationDelete, Key: cloneBytes(plan.MutateKeys[0])}}
+		predicates := []*backend.Predicate{atomicValueEquals(plan.ReadKeys[0], sessionValue)}
 		ownerKey, err := layout.EncodeInodeSessionKey(mount, session.Inode)
 		if err != nil {
 			return err
@@ -455,7 +455,7 @@ func (e *Executor) CloseWriteSession(ctx context.Context, req model.CloseWriteSe
 				return err
 			}
 			predicates = append(predicates, atomicValueEquals(ownerKey, ownerValue))
-			mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Delete, Key: ownerKey})
+			mutations = append(mutations, &backend.Mutation{Op: backend.MutationDelete, Key: ownerKey})
 		}
 		return e.mutateWithAtomicOnePhase(ctx, plan.Kind, plan.PrimaryKey, predicates, mutations, startVersion, commitVersion)
 	}, delta.Authority); err != nil {
@@ -576,9 +576,9 @@ func (e *Executor) ExpireWriteSessions(ctx context.Context, req model.ExpireWrit
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
-		mutations := make([]*kvrpcpb.Mutation, 0, len(deletes))
+		mutations := make([]*backend.Mutation, 0, len(deletes))
 		for _, key := range keys {
-			mutations = append(mutations, &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Delete, Key: deletes[key]})
+			mutations = append(mutations, &backend.Mutation{Op: backend.MutationDelete, Key: deletes[key]})
 		}
 		primary := deletes[keys[0]]
 		if _, err := e.runner.Mutate(ctx, primary, mutations, startVersion, commitVersion, e.lockTTL); err != nil {

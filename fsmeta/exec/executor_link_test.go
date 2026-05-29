@@ -7,8 +7,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,9 +95,9 @@ func TestExecutorLinkUsesAtomicMutateWithValuePredicates(t *testing.T) {
 	require.Len(t, runner.atomicCalls, 1)
 	require.Empty(t, base.mutations)
 	requireAtomicStatUint(t, executor.Stats(), model.OperationLink, "success_total", 1)
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[0].GetKind())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS, runner.atomicCalls[0].predicates[1].GetKind())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[2].GetKind())
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[0].predicates[0].Kind)
+	require.Equal(t, backend.PredicateNotExists, runner.atomicCalls[0].predicates[1].Kind)
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[0].predicates[2].Kind)
 	inode, ok, err := executor.readInode(context.Background(), testMountIdentity, 22, 99)
 	require.NoError(t, err)
 	require.True(t, ok)

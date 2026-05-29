@@ -11,11 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	coordpb "github.com/feichai0017/NoKV/pb/coordinator"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 const defaultQuotaTTL = time.Second
@@ -67,7 +67,7 @@ type quotaDelta struct {
 // The returned mutations are intentionally plain Put/Delete mutations; the
 // Percolator conflict check on the shared usage keys serializes concurrent
 // writers across fsmeta gateway processes.
-func (c *quotaCache) ReserveQuota(ctx context.Context, runner fsmetaexec.TxnRunner, changes []fsmetaexec.QuotaChange, startVersion uint64) ([]*kvrpcpb.Mutation, error) {
+func (c *quotaCache) ReserveQuota(ctx context.Context, runner backend.Store, changes []fsmetaexec.QuotaChange, startVersion uint64) ([]*backend.Mutation, error) {
 	if c == nil || c.coord == nil || runner == nil || len(changes) == 0 {
 		return nil, nil
 	}
@@ -75,7 +75,7 @@ func (c *quotaCache) ReserveQuota(ctx context.Context, runner fsmetaexec.TxnRunn
 	if err != nil {
 		return nil, err
 	}
-	mutations := make([]*kvrpcpb.Mutation, 0, len(deltas))
+	mutations := make([]*backend.Mutation, 0, len(deltas))
 	for subject, delta := range deltas {
 		mut, err := c.reserveSubject(ctx, runner, subject, delta, startVersion)
 		if err != nil {
@@ -147,7 +147,7 @@ func addDelta(out map[quotaSubject]quotaDelta, subject quotaSubject, bytesDelta,
 	out[subject] = delta
 }
 
-func (c *quotaCache) reserveSubject(ctx context.Context, runner fsmetaexec.TxnRunner, subject quotaSubject, delta quotaDelta, startVersion uint64) (*kvrpcpb.Mutation, error) {
+func (c *quotaCache) reserveSubject(ctx context.Context, runner backend.Store, subject quotaSubject, delta quotaDelta, startVersion uint64) (*backend.Mutation, error) {
 	c.checksTotal.Add(1)
 	fence, ok, err := c.resolve(ctx, subject)
 	if err != nil {
@@ -177,16 +177,16 @@ func (c *quotaCache) reserveSubject(ctx context.Context, runner fsmetaexec.TxnRu
 	}
 	c.usageMutationsTotal.Add(1)
 	if next.Bytes == 0 && next.Inodes == 0 {
-		return &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Delete, Key: key}, nil
+		return &backend.Mutation{Op: backend.MutationDelete, Key: key}, nil
 	}
 	value, err := layout.EncodeUsageValue(next)
 	if err != nil {
 		return nil, err
 	}
-	return &kvrpcpb.Mutation{Op: kvrpcpb.Mutation_Put, Key: key, Value: value}, nil
+	return &backend.Mutation{Op: backend.MutationPut, Key: key, Value: value}, nil
 }
 
-func readUsage(ctx context.Context, runner fsmetaexec.TxnRunner, key []byte, version uint64) (model.UsageRecord, error) {
+func readUsage(ctx context.Context, runner backend.Store, key []byte, version uint64) (model.UsageRecord, error) {
 	value, ok, err := runner.Get(ctx, key, version)
 	if err != nil {
 		return model.UsageRecord{}, err

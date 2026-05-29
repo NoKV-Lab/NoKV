@@ -8,11 +8,11 @@ import (
 	"maps"
 	"sync/atomic"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	fsmetawatch "github.com/feichai0017/NoKV/fsmeta/exec/watch"
 	"github.com/feichai0017/NoKV/fsmeta/model"
 	"github.com/feichai0017/NoKV/fsmeta/observe"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
 const (
@@ -62,7 +62,7 @@ func (w *Watcher) Subscribe(ctx context.Context, req observe.WatchRequest) (obse
 
 // ObserveMutation publishes one replayable local watch cursor after a mutation
 // group has been durably applied.
-func (w *Watcher) ObserveMutation(commitVersion uint64, mutations []*kvrpcpb.Mutation) {
+func (w *Watcher) ObserveMutation(commitVersion uint64, mutations []*backend.Mutation) {
 	if w == nil || w.Router == nil || commitVersion == 0 {
 		return
 	}
@@ -104,19 +104,19 @@ func (w *Watcher) Stats() map[string]any {
 	return out
 }
 
-func mutationWatchKeys(mutations []*kvrpcpb.Mutation) [][]byte {
+func mutationWatchKeys(mutations []*backend.Mutation) [][]byte {
 	seen := map[string]struct{}{}
 	keys := make([][]byte, 0, len(mutations))
 	for _, mutation := range mutations {
 		if mutation == nil {
 			continue
 		}
-		switch mutation.GetOp() {
-		case kvrpcpb.Mutation_Put, kvrpcpb.Mutation_Delete:
+		switch mutation.Op {
+		case backend.MutationPut, backend.MutationDelete:
 		default:
 			continue
 		}
-		key := mutation.GetKey()
+		key := mutation.Key
 		if len(key) == 0 {
 			continue
 		}

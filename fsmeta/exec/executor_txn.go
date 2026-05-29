@@ -12,15 +12,15 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
-	kvrpcpb "github.com/feichai0017/NoKV/pb/kv"
 )
 
-func (e *Executor) mutateWithAtomicOnePhase(ctx context.Context, kind model.OperationKind, primary []byte, predicates []*kvrpcpb.AtomicPredicate, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) error {
+func (e *Executor) mutateWithAtomicOnePhase(ctx context.Context, kind model.OperationKind, primary []byte, predicates []*backend.Predicate, mutations []*backend.Mutation, startVersion, commitVersion uint64) error {
 	stats := e.atomicOnePhaseCounters(kind)
-	onePhase, ok := e.runner.(ReadOrderedAtomicMutateOnePhase)
+	onePhase, ok := e.runner.(backend.ReadOrderedAtomicMutator)
 	if !ok || !onePhase.AtomicMutatePreservesReadOrder() {
 		if stats != nil {
 			stats.runnerUnsupportedTotal.Add(1)
@@ -77,17 +77,17 @@ func (s *atomicOnePhaseCounters) affinityFallbacks(affinity string) uint64 {
 	return s.fallbacksByAffinity[affinity]
 }
 
-func atomicOnePhaseAffinity(primary []byte, mutations []*kvrpcpb.Mutation) string {
+func atomicOnePhaseAffinity(primary []byte, mutations []*backend.Mutation) string {
 	const virtualShards = 64
 	shards := make([]int, 0, 1+len(mutations))
 	if len(primary) > 0 {
 		shards = append(shards, layout.ShardForUserKey(primary, virtualShards))
 	}
 	for _, mutation := range mutations {
-		if mutation == nil || len(mutation.GetKey()) == 0 {
+		if mutation == nil || len(mutation.Key) == 0 {
 			continue
 		}
-		shards = append(shards, layout.ShardForUserKey(mutation.GetKey(), virtualShards))
+		shards = append(shards, layout.ShardForUserKey(mutation.Key, virtualShards))
 	}
 	if len(shards) == 0 {
 		return "empty"
@@ -103,7 +103,7 @@ func atomicOnePhaseAffinity(primary []byte, mutations []*kvrpcpb.Mutation) strin
 	return string(out)
 }
 
-func (e *Executor) mutateWithoutAtomicOnePhase(ctx context.Context, kind model.OperationKind, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64) error {
+func (e *Executor) mutateWithoutAtomicOnePhase(ctx context.Context, kind model.OperationKind, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64) error {
 	if stats := e.atomicOnePhaseCounters(kind); stats != nil {
 		stats.skipTotal.Add(1)
 	}
@@ -349,36 +349,36 @@ func cloneBytes(in []byte) []byte {
 	return append([]byte(nil), in...)
 }
 
-func cloneMutations(in []*kvrpcpb.Mutation) []*kvrpcpb.Mutation {
-	out := make([]*kvrpcpb.Mutation, 0, len(in))
+func cloneMutations(in []*backend.Mutation) []*backend.Mutation {
+	out := make([]*backend.Mutation, 0, len(in))
 	for _, mut := range in {
 		if mut == nil {
 			out = append(out, nil)
 			continue
 		}
-		out = append(out, &kvrpcpb.Mutation{
-			Op:                mut.GetOp(),
-			Key:               cloneBytes(mut.GetKey()),
-			Value:             cloneBytes(mut.GetValue()),
-			AssertionNotExist: mut.GetAssertionNotExist(),
-			ExpiresAt:         mut.GetExpiresAt(),
+		out = append(out, &backend.Mutation{
+			Op:                mut.Op,
+			Key:               cloneBytes(mut.Key),
+			Value:             cloneBytes(mut.Value),
+			AssertionNotExist: mut.AssertionNotExist,
+			ExpiresAt:         mut.ExpiresAt,
 		})
 	}
 	return out
 }
 
-func cloneAtomicPredicates(in []*kvrpcpb.AtomicPredicate) []*kvrpcpb.AtomicPredicate {
-	out := make([]*kvrpcpb.AtomicPredicate, 0, len(in))
+func cloneAtomicPredicates(in []*backend.Predicate) []*backend.Predicate {
+	out := make([]*backend.Predicate, 0, len(in))
 	for _, pred := range in {
 		if pred == nil {
 			out = append(out, nil)
 			continue
 		}
-		out = append(out, &kvrpcpb.AtomicPredicate{
-			Key:           cloneBytes(pred.GetKey()),
-			Kind:          pred.GetKind(),
-			ReadVersion:   pred.GetReadVersion(),
-			ExpectedValue: cloneBytes(pred.GetExpectedValue()),
+		out = append(out, &backend.Predicate{
+			Key:           cloneBytes(pred.Key),
+			Kind:          pred.Kind,
+			ReadVersion:   pred.ReadVersion,
+			ExpectedValue: cloneBytes(pred.ExpectedValue),
 		})
 	}
 	return out
@@ -420,14 +420,14 @@ func isRetryableRouteRefresh(err error) bool {
 	}
 }
 
-func atomicNotExists(key []byte) *kvrpcpb.AtomicPredicate {
-	return &kvrpcpb.AtomicPredicate{Key: cloneBytes(key), Kind: kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_NOT_EXISTS}
+func atomicNotExists(key []byte) *backend.Predicate {
+	return &backend.Predicate{Key: cloneBytes(key), Kind: backend.PredicateNotExists}
 }
 
-func atomicValueEquals(key, value []byte) *kvrpcpb.AtomicPredicate {
-	return &kvrpcpb.AtomicPredicate{
+func atomicValueEquals(key, value []byte) *backend.Predicate {
+	return &backend.Predicate{
 		Key:           cloneBytes(key),
-		Kind:          kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS,
+		Kind:          backend.PredicateValueEquals,
 		ExpectedValue: cloneBytes(value),
 	}
 }

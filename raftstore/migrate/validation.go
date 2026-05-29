@@ -7,7 +7,7 @@ import (
 	"fmt"
 
 	localmeta "github.com/feichai0017/NoKV/raftstore/localmeta"
-	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot"
+	snapshotpkg "github.com/feichai0017/NoKV/raftstore/snapshot/sst"
 )
 
 func validateSeedArtifacts(workDir string, storeID, regionID, peerID uint64) error {

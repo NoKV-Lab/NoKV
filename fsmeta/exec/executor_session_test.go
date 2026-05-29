@@ -9,6 +9,7 @@ import (
 	"time"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	"github.com/feichai0017/NoKV/fsmeta/exec/compile"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -232,8 +233,8 @@ func TestExecutorWriteSessionLifecycleUsesAtomicMutateWithValuePredicates(t *tes
 	requireAtomicStatUint(t, stats, model.OperationOpenWriteSession, "success_total", 1)
 	requireAtomicStatUint(t, stats, model.OperationHeartbeatSession, "success_total", 1)
 	requireAtomicStatUint(t, stats, model.OperationCloseSession, "success_total", 1)
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[1].predicates[0].GetKind())
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[2].predicates[0].GetKind())
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[1].predicates[0].Kind)
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[2].predicates[0].Kind)
 }
 
 func TestExecutorOpenWriteSessionUsesAtomicMutateForStaleSessionCleanup(t *testing.T) {
@@ -264,7 +265,7 @@ func TestExecutorOpenWriteSessionUsesAtomicMutateForStaleSessionCleanup(t *testi
 	require.Empty(t, base.mutations)
 	require.NotContains(t, runner.data, string(oldSessionKey))
 	requireAtomicStatUint(t, executor.Stats(), model.OperationOpenWriteSession, "success_total", 1)
-	require.Equal(t, kvrpcpb.AtomicPredicateKind_ATOMIC_PREDICATE_KIND_VALUE_EQUALS, runner.atomicCalls[0].predicates[2].GetKind())
+	require.Equal(t, backend.PredicateValueEquals, runner.atomicCalls[0].predicates[2].Kind)
 }
 
 func TestExecutorWriteSessionRejectsNonPositiveTTL(t *testing.T) {

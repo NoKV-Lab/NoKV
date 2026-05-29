@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/feichai0017/NoKV/fsmeta/backend"
 	fsmetaexec "github.com/feichai0017/NoKV/fsmeta/exec"
 	"github.com/feichai0017/NoKV/fsmeta/layout"
 	"github.com/feichai0017/NoKV/fsmeta/model"
@@ -158,7 +159,7 @@ func (r *versionedRunner) BatchGet(_ context.Context, keys [][]byte, version uin
 	return out, nil
 }
 
-func (r *versionedRunner) Scan(_ context.Context, startKey []byte, limit uint32, version uint64) ([]fsmetaexec.KV, error) {
+func (r *versionedRunner) Scan(_ context.Context, startKey []byte, limit uint32, version uint64) ([]backend.KV, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	keys := make([][]byte, 0, len(r.data))
@@ -172,13 +173,13 @@ func (r *versionedRunner) Scan(_ context.Context, startKey []byte, limit uint32,
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
-	out := make([]fsmetaexec.KV, 0, limit)
+	out := make([]backend.KV, 0, limit)
 	for _, key := range keys {
 		if uint32(len(out)) >= limit {
 			break
 		}
 		value, _ := r.visibleLocked(key, version)
-		out = append(out, fsmetaexec.KV{
+		out = append(out, backend.KV{
 			Key:   append([]byte(nil), key...),
 			Value: value,
 		})
@@ -186,15 +187,15 @@ func (r *versionedRunner) Scan(_ context.Context, startKey []byte, limit uint32,
 	return out, nil
 }
 
-func (r *versionedRunner) Mutate(_ context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion, _ uint64) (uint64, error) {
+func (r *versionedRunner) Mutate(_ context.Context, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion, _ uint64) (uint64, error) {
 	return r.applyMutations(primary, mutations, startVersion, commitVersion, true)
 }
 
-func (r *versionedRunner) MutateAtCommit(_ context.Context, primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion, _ uint64) (uint64, error) {
+func (r *versionedRunner) MutateAtCommit(_ context.Context, primary []byte, mutations []*backend.Mutation, startVersion, commitVersion, _ uint64) (uint64, error) {
 	return r.applyMutations(primary, mutations, startVersion, commitVersion, false)
 }
 
-func (r *versionedRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mutation, startVersion, commitVersion uint64, allowCommitPush bool) (uint64, error) {
+func (r *versionedRunner) applyMutations(primary []byte, mutations []*backend.Mutation, startVersion, commitVersion uint64, allowCommitPush bool) (uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// The contract fake has no lock table, so it models Percolator's
@@ -208,38 +209,38 @@ func (r *versionedRunner) applyMutations(primary []byte, mutations []*kvrpcpb.Mu
 		}
 	}
 	for _, mut := range mutations {
-		if latest, ok := r.latestVersionLocked(mut.GetKey()); ok && latest > startVersion {
+		if latest, ok := r.latestVersionLocked(mut.Key); ok && latest > startVersion {
 			return 0, versionedTxnError{errors: []*kvrpcpb.KeyError{{
 				CommitTsExpired: &kvrpcpb.CommitTsExpired{
-					Key:         append([]byte(nil), mut.GetKey()...),
+					Key:         append([]byte(nil), mut.Key...),
 					CommitTs:    commitVersion,
 					MinCommitTs: latest + 1,
 				},
 			}}}
 		}
-		if mut.GetAssertionNotExist() {
-			if _, ok := r.visibleLocked(mut.GetKey(), startVersion); ok {
+		if mut.AssertionNotExist {
+			if _, ok := r.visibleLocked(mut.Key, startVersion); ok {
 				return 0, model.ErrExists
 			}
-			if _, ok := r.visibleLatestLocked(mut.GetKey()); ok {
+			if _, ok := r.visibleLatestLocked(mut.Key); ok {
 				return 0, model.ErrExists
 			}
 		}
-		if bytes.Equal(mut.GetKey(), primary) && mut.GetOp() == kvrpcpb.Mutation_Delete {
-			if _, ok := r.visibleLatestLocked(mut.GetKey()); !ok {
+		if bytes.Equal(mut.Key, primary) && mut.Op == backend.MutationDelete {
+			if _, ok := r.visibleLatestLocked(mut.Key); !ok {
 				return 0, model.ErrNotFound
 			}
 		}
 	}
 	for _, mut := range mutations {
-		key := string(mut.GetKey())
-		switch mut.GetOp() {
-		case kvrpcpb.Mutation_Put:
+		key := string(mut.Key)
+		switch mut.Op {
+		case backend.MutationPut:
 			r.data[key] = append(r.data[key], versionedValue{
 				version: effectiveCommitVersion,
-				value:   append([]byte(nil), mut.GetValue()...),
+				value:   append([]byte(nil), mut.Value...),
 			})
-		case kvrpcpb.Mutation_Delete:
+		case backend.MutationDelete:
 			r.data[key] = append(r.data[key], versionedValue{
 				version: effectiveCommitVersion,
 				deleted: true,
@@ -290,9 +291,9 @@ func TestVersionedRunnerDelaysPreallocatedCommitPastConcurrentRead(t *testing.T)
 
 	seedStart, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	_, err = runner.Mutate(ctx, epsilonKey, []*kvrpcpb.Mutation{
-		{Op: kvrpcpb.Mutation_Put, Key: epsilonKey, Value: epsilonValue},
-		{Op: kvrpcpb.Mutation_Put, Key: inodeKey, Value: inodeValueOneLink},
+	_, err = runner.Mutate(ctx, epsilonKey, []*backend.Mutation{
+		{Op: backend.MutationPut, Key: epsilonKey, Value: epsilonValue},
+		{Op: backend.MutationPut, Key: inodeKey, Value: inodeValueOneLink},
 	}, seedStart, seedStart+1, 0)
 	require.NoError(t, err)
 
@@ -300,9 +301,9 @@ func TestVersionedRunnerDelaysPreallocatedCommitPastConcurrentRead(t *testing.T)
 	require.NoError(t, err)
 	readVersion, err := runner.ReserveTimestamp(ctx, 1)
 	require.NoError(t, err)
-	_, err = runner.Mutate(ctx, etaKey, []*kvrpcpb.Mutation{
-		{Op: kvrpcpb.Mutation_Put, Key: etaKey, Value: etaValue, AssertionNotExist: true},
-		{Op: kvrpcpb.Mutation_Put, Key: inodeKey, Value: inodeValueTwoLinks},
+	_, err = runner.Mutate(ctx, etaKey, []*backend.Mutation{
+		{Op: backend.MutationPut, Key: etaKey, Value: etaValue, AssertionNotExist: true},
+		{Op: backend.MutationPut, Key: inodeKey, Value: inodeValueTwoLinks},
 	}, linkStart, linkStart+1, 0)
 	require.NoError(t, err)
 
@@ -336,15 +337,15 @@ func TestVersionedRunnerRejectsStaleConcurrentMutation(t *testing.T) {
 	require.NoError(t, err)
 	staleStart, err := runner.ReserveTimestamp(ctx, 2)
 	require.NoError(t, err)
-	_, err = runner.Mutate(ctx, key, []*kvrpcpb.Mutation{{
-		Op:    kvrpcpb.Mutation_Put,
+	_, err = runner.Mutate(ctx, key, []*backend.Mutation{{
+		Op:    backend.MutationPut,
 		Key:   key,
 		Value: []byte("first"),
 	}}, firstStart, firstStart+1, 0)
 	require.NoError(t, err)
 
-	_, err = runner.Mutate(ctx, key, []*kvrpcpb.Mutation{{
-		Op:    kvrpcpb.Mutation_Put,
+	_, err = runner.Mutate(ctx, key, []*backend.Mutation{{
+		Op:    backend.MutationPut,
 		Key:   key,
 		Value: []byte("stale"),
 	}}, staleStart, staleStart+1, 0)
