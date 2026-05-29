@@ -70,7 +70,7 @@ ordered-KV backend boundary.
 |---|---|
 | High-level architecture | [Architecture](./architecture) |
 | WAL discipline and replay | [WAL](./wal) |
-| VFS abstraction + FaultFS | [VFS](./vfs) · [File](./file) |
+| VFS abstraction + FaultFS | [VFS](./vfs) |
 | Entry / error model | [Entry](./entry) · [Error Handling](./errors) |
 
 ### 🧪 Experimental mechanisms
