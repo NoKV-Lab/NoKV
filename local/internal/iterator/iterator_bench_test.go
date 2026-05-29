@@ -24,7 +24,6 @@ func newBenchDB(b *testing.B, optFn func(*local.Options)) *local.DB {
 	opt.WorkDir = b.TempDir()
 	opt.EnableWALWatchdog = false
 	opt.SyncWrites = false
-	opt.ManifestSync = false
 	opt.WriteBatchWait = 0
 	if optFn != nil {
 		optFn(opt)

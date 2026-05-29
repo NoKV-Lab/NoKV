@@ -4,16 +4,13 @@
 // Package negativecache is the slab-backed Derived consumer that
 // remembers "this key does not exist". Lookups against keys that have
 // been recorded as missing return Has(true), letting the caller skip
-// the expensive authoritative probe (LSM Bloom + index + data block in
-// the lsm wiring; fsmeta path probe in the fsmeta wiring).
+// the expensive authoritative probe.
 //
 // The cache is intentionally generic — it is keyed by an opaque
-// "full key" (e.g. an LSM internal key, or a fsmeta path-at-version),
-// and uses a caller-supplied GroupKeyFn to extract the invalidation
-// group key (e.g. base user key, or fsmeta path). When Invalidate is
-// called for any full key, the per-group generation is bumped so every
-// previously-cached entry whose group matches becomes stale on the
-// next Has lookup.
+// "full key" and uses a caller-supplied GroupKeyFn to extract the
+// invalidation group key. When Invalidate is called for any full key, the
+// per-group generation is bumped so every previously-cached entry whose group
+// matches becomes stale on the next Has lookup.
 //
 // Persistence is optional and best-effort (Derived consistency class):
 //
@@ -23,10 +20,8 @@
 //   - A corrupt or missing snapshot is silently ignored — the only
 //     consequence is a re-warm window after restart.
 //
-// This package replaces the lsm-internal negativeCache + negativePersist
-// pair so a single typed consumer owns the in-memory cache, the slab
-// persistence, and the wire format. The lsm package becomes a thin
-// adapter that supplies kv.InternalToBaseKey as GroupKeyFn.
+// A single typed consumer owns the in-memory cache, the slab persistence, and
+// the wire format.
 package negativecache
 
 import (

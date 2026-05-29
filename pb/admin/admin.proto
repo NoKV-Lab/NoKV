@@ -38,39 +38,6 @@ message TransferLeaderResponse {
   nokv.meta.v1.RegionDescriptor region = 1;
 }
 
-message ExportRegionSnapshotRequest {
-  uint64 region_id = 1;
-}
-
-message ExportRegionSnapshotResponse {
-  bytes snapshot = 1;
-  nokv.meta.v1.RegionDescriptor region = 2;
-}
-
-message ExportRegionSnapshotStreamRequest {
-  uint64 region_id = 1;
-}
-
-message ExportRegionSnapshotStreamResponse {
-  bytes snapshot_header = 1;
-  nokv.meta.v1.RegionDescriptor region = 2;
-  bytes chunk = 3;
-}
-
-message ImportRegionSnapshotRequest {
-  bytes snapshot = 1;
-}
-
-message ImportRegionSnapshotResponse {
-  nokv.meta.v1.RegionDescriptor region = 1;
-}
-
-message ImportRegionSnapshotStreamRequest {
-  bytes snapshot_header = 1;
-  nokv.meta.v1.RegionDescriptor region = 2;
-  bytes chunk = 3;
-}
-
 message RegionRuntimeStatusRequest {
   uint64 region_id = 1;
 }
@@ -175,10 +142,6 @@ service RaftAdmin {
   rpc AddPeer(AddPeerRequest) returns (AddPeerResponse);
   rpc RemovePeer(RemovePeerRequest) returns (RemovePeerResponse);
   rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
-  rpc ExportRegionSnapshot(ExportRegionSnapshotRequest) returns (ExportRegionSnapshotResponse);
-  rpc ExportRegionSnapshotStream(ExportRegionSnapshotStreamRequest) returns (stream ExportRegionSnapshotStreamResponse);
-  rpc ImportRegionSnapshot(ImportRegionSnapshotRequest) returns (ImportRegionSnapshotResponse);
-  rpc ImportRegionSnapshotStream(stream ImportRegionSnapshotStreamRequest) returns (ImportRegionSnapshotResponse);
   rpc RegionRuntimeStatus(RegionRuntimeStatusRequest) returns (RegionRuntimeStatusResponse);
   rpc ExecutionStatus(ExecutionStatusRequest) returns (ExecutionStatusResponse);
 }

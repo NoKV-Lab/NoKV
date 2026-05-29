@@ -35,8 +35,8 @@ runtime internals.
 | Layer | Usage |
 | --- | --- |
 | WAL | Segment files and fsync/rotation tests |
-| Pebble/raw storage adapters | file and mmap helpers when a concrete backend needs them |
+| Raw storage adapters | file and mmap helpers when a concrete backend needs them |
 | slab | append-only sidecar segments for namespace-derived caches |
 
 The file layer intentionally does not encode storage semantics such as WAL
-record headers, SST block formats, or slab consumer payloads.
+record headers, backend table/block formats, or slab consumer payloads.

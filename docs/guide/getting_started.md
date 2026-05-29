@@ -131,16 +131,16 @@ Micro benchmarks:
 go test -bench=. -run=^$ ./...
 ```
 
-YCSB (default: NoKV + Badger + Pebble, workloads A-F):
+fsmeta workload matrix:
 
 ```bash
-make bench
+NOKV_FSMETA_BENCH_MODE=local make fsmeta-bench
 ```
 
 Override defaults with env vars:
 
 ```bash
-YCSB_RECORDS=1000000 YCSB_OPS=1000000 YCSB_CONC=8 make bench
+NOKV_FSMETA_PROFILE=official NOKV_FSMETA_WORKLOADS=mdtest-easy make fsmeta-bench
 ```
 Detailed benchmark methodology and latest result snapshots are maintained in:
 [`benchmark/README.md`](https://github.com/feichai0017/NoKV/blob/main/benchmark/README.md).
@@ -155,4 +155,4 @@ make clean
 ## Troubleshooting
 - **WAL replay errors after crash**: wipe the workdir and restart the cluster.
 - **Port conflicts**: adjust addresses in `raft_config.example.json`.
-- **Slow startup**: reduce `YCSB_RECORDS` or `YCSB_OPS` when benchmarking locally.
+- **Slow startup**: use `NOKV_FSMETA_PROFILE=median` for a smaller local benchmark run.

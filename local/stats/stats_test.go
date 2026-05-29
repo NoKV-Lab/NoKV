@@ -69,11 +69,11 @@ func TestStatsCollectSnapshots(t *testing.T) {
 	require.Greater(t, snap.Write.BatchesTotal, int64(0))
 	require.False(t, snap.Write.ThrottleActive)
 	require.Equal(t, db.IteratorReused(), snap.Cache.IteratorReused)
-	require.GreaterOrEqual(t, snap.LSM.Mmap.Madvise, mmapBefore.Madvise+1)
-	require.GreaterOrEqual(t, snap.LSM.Mmap.MadviseFailed, mmapBefore.MadviseFailed+1)
-	require.GreaterOrEqual(t, snap.LSM.Prefetch.Launched, prefetchBefore.Launched+1)
-	require.GreaterOrEqual(t, snap.LSM.Prefetch.Completed, prefetchBefore.Completed+1)
-	require.GreaterOrEqual(t, snap.LSM.Prefetch.Aborted, prefetchBefore.Aborted+1)
+	require.GreaterOrEqual(t, snap.Storage.Mmap.Madvise, mmapBefore.Madvise+1)
+	require.GreaterOrEqual(t, snap.Storage.Mmap.MadviseFailed, mmapBefore.MadviseFailed+1)
+	require.GreaterOrEqual(t, snap.Storage.Prefetch.Launched, prefetchBefore.Launched+1)
+	require.GreaterOrEqual(t, snap.Storage.Prefetch.Completed, prefetchBefore.Completed+1)
+	require.GreaterOrEqual(t, snap.Storage.Prefetch.Aborted, prefetchBefore.Aborted+1)
 
 	require.Equal(t, int64(2), snap.Region.Total)
 	require.Equal(t, int64(1), snap.Region.Running)
@@ -81,13 +81,9 @@ func TestStatsCollectSnapshots(t *testing.T) {
 
 	db.Info().Collect()
 	exported := loadExpvarStatsSnapshot(t)
-	require.Equal(t, snap.Entries, exported.Entries)
-	require.Equal(t, snap.Flush.Pending, exported.Flush.Pending)
-	require.Equal(t, snap.Compaction.Backlog, exported.Compaction.Backlog)
+	require.Equal(t, snap.Storage, exported.Storage)
 	require.Equal(t, snap.Write.BatchesTotal, exported.Write.BatchesTotal)
 	require.Equal(t, snap.Region.Total, exported.Region.Total)
-	require.Equal(t, snap.LSM.Mmap, exported.LSM.Mmap)
-	require.Equal(t, snap.LSM.Prefetch, exported.LSM.Prefetch)
 
 	// Legacy scalar keys are intentionally removed.
 	require.Nil(t, expvar.Get("NoKV.Local.Stats.Flush.Pending"))

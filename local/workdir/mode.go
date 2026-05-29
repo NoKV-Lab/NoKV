@@ -54,7 +54,7 @@ func Read(workDir string) (State, error) {
 	case ModeStandalone, ModePreparing, ModeSeeded, ModeCluster:
 		return state, nil
 	default:
-		return State{}, fmt.Errorf("unknown migration mode %q", state.Mode)
+		return State{}, fmt.Errorf("unknown workdir mode %q", state.Mode)
 	}
 }
 

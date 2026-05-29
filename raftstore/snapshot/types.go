@@ -16,7 +16,7 @@ type Format string
 const (
 	// FormatEntries stores canonical NoKV MVCC internal entries. It is the
 	// built-in raft snapshot payload format and does not depend on a physical
-	// LSM/SST implementation.
+	// table-file implementation.
 	FormatEntries Format = "entries"
 )
 

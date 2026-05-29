@@ -12,13 +12,13 @@ NoKV now groups shell entrypoints by role instead of keeping every helper flat u
 | Path | Role |
 | --- | --- |
 | `scripts/dev` | Local development and bootstrap helpers for running a cluster from `raft_config*.json`. |
-| `scripts/ops` | Operator-style workflows that drive the formal migration CLI. |
+| `scripts/ops` | Operator-style wrappers for bootstrap and long-running processes. |
 | `scripts/lib` | Shared shell helpers for config lookup, workdir hygiene, and build/bootstrap rules. |
 | `scripts/*.sh` | Tooling or benchmark entrypoints that are still intentionally top-level. |
 
 This split is deliberate:
 - `dev` scripts are allowed to help with local experiments and smoke tests.
-- `ops` scripts must treat the migration CLI as source of truth and stay stricter.
+- `ops` scripts must treat durable workdirs and config parsing strictly.
 - `lib` is where shared rules live, so shell semantics do not drift across scripts.
 
 ## Bootstrap & Local Launch
@@ -120,12 +120,12 @@ This split is deliberate:
   - `--coordinator-id` is required (stable grant holder id)
   - forwards shutdown signals to `nokv coordinator`
 
-## Migration Workflow
+## Removed Migration Workflow
 
 The old `scripts/ops/migrate-cluster.sh` wrapper has been removed together with
-the operator-facing `nokv migrate` CLI. Current Pebble-backed workdirs are a new
-format and this version does not provide online migration from old self-managed
-LSM workdirs.
+the operator-facing `nokv migrate` CLI. Current workdirs use the selected raw
+backend format: Pebble today, Holt once its adapter is wired. This version does
+not provide online migration from old self-managed LSM workdirs.
 
 ## Shared Shell Rules
 
@@ -153,17 +153,13 @@ This is where shell-level correctness rules should keep living. New scripts shou
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/run_benchmarks.sh` | Execute YCSB benchmarks (default engines: NoKV/Badger/Pebble, optional RocksDB). |
-| `scripts/build_rocksdb.sh` | Build local RocksDB artifacts used by benchmark comparisons. |
+| `scripts/run_fsmeta_benchmarks.sh` | Execute the fsmeta workload matrix in local or Docker Compose mode. |
 | `scripts/debug.sh` | Wrap `dlv test` for focused debugging. |
 | `scripts/gen.sh` | Format protobufs and regenerate Go bindings through Buf. |
 
 For recovery and transport fault validation, use direct Go tests instead of shell wrappers:
 
 ```bash
-RECOVERY_TRACE_METRICS=1 \
-go test ./... -run 'TestRecovery(FailsOnMissingSST|FailsOnCorruptSST|ManifestRewriteCrash|SlowFollowerSnapshotBacklog|SnapshotExportRoundTrip|WALReplayRestoresData)' -count=1 -v
-
 CHAOS_TRACE_METRICS=1 \
 go test -run 'TestGRPCTransport(HandlesPartition|MetricsWatchdog|MetricsBlockedPeers)' -count=1 -v ./raftstore/transport
 ```

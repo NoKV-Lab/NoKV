@@ -24,15 +24,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RaftAdmin_AddPeer_FullMethodName                    = "/nokv.admin.v1.RaftAdmin/AddPeer"
-	RaftAdmin_RemovePeer_FullMethodName                 = "/nokv.admin.v1.RaftAdmin/RemovePeer"
-	RaftAdmin_TransferLeader_FullMethodName             = "/nokv.admin.v1.RaftAdmin/TransferLeader"
-	RaftAdmin_ExportRegionSnapshot_FullMethodName       = "/nokv.admin.v1.RaftAdmin/ExportRegionSnapshot"
-	RaftAdmin_ExportRegionSnapshotStream_FullMethodName = "/nokv.admin.v1.RaftAdmin/ExportRegionSnapshotStream"
-	RaftAdmin_ImportRegionSnapshot_FullMethodName       = "/nokv.admin.v1.RaftAdmin/ImportRegionSnapshot"
-	RaftAdmin_ImportRegionSnapshotStream_FullMethodName = "/nokv.admin.v1.RaftAdmin/ImportRegionSnapshotStream"
-	RaftAdmin_RegionRuntimeStatus_FullMethodName        = "/nokv.admin.v1.RaftAdmin/RegionRuntimeStatus"
-	RaftAdmin_ExecutionStatus_FullMethodName            = "/nokv.admin.v1.RaftAdmin/ExecutionStatus"
+	RaftAdmin_AddPeer_FullMethodName             = "/nokv.admin.v1.RaftAdmin/AddPeer"
+	RaftAdmin_RemovePeer_FullMethodName          = "/nokv.admin.v1.RaftAdmin/RemovePeer"
+	RaftAdmin_TransferLeader_FullMethodName      = "/nokv.admin.v1.RaftAdmin/TransferLeader"
+	RaftAdmin_RegionRuntimeStatus_FullMethodName = "/nokv.admin.v1.RaftAdmin/RegionRuntimeStatus"
+	RaftAdmin_ExecutionStatus_FullMethodName     = "/nokv.admin.v1.RaftAdmin/ExecutionStatus"
 )
 
 // RaftAdminClient is the client API for RaftAdmin service.
@@ -42,10 +38,6 @@ type RaftAdminClient interface {
 	AddPeer(ctx context.Context, in *AddPeerRequest, opts ...grpc.CallOption) (*AddPeerResponse, error)
 	RemovePeer(ctx context.Context, in *RemovePeerRequest, opts ...grpc.CallOption) (*RemovePeerResponse, error)
 	TransferLeader(ctx context.Context, in *TransferLeaderRequest, opts ...grpc.CallOption) (*TransferLeaderResponse, error)
-	ExportRegionSnapshot(ctx context.Context, in *ExportRegionSnapshotRequest, opts ...grpc.CallOption) (*ExportRegionSnapshotResponse, error)
-	ExportRegionSnapshotStream(ctx context.Context, in *ExportRegionSnapshotStreamRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRegionSnapshotStreamResponse], error)
-	ImportRegionSnapshot(ctx context.Context, in *ImportRegionSnapshotRequest, opts ...grpc.CallOption) (*ImportRegionSnapshotResponse, error)
-	ImportRegionSnapshotStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportRegionSnapshotStreamRequest, ImportRegionSnapshotResponse], error)
 	RegionRuntimeStatus(ctx context.Context, in *RegionRuntimeStatusRequest, opts ...grpc.CallOption) (*RegionRuntimeStatusResponse, error)
 	ExecutionStatus(ctx context.Context, in *ExecutionStatusRequest, opts ...grpc.CallOption) (*ExecutionStatusResponse, error)
 }
@@ -88,58 +80,6 @@ func (c *raftAdminClient) TransferLeader(ctx context.Context, in *TransferLeader
 	return out, nil
 }
 
-func (c *raftAdminClient) ExportRegionSnapshot(ctx context.Context, in *ExportRegionSnapshotRequest, opts ...grpc.CallOption) (*ExportRegionSnapshotResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ExportRegionSnapshotResponse)
-	err := c.cc.Invoke(ctx, RaftAdmin_ExportRegionSnapshot_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *raftAdminClient) ExportRegionSnapshotStream(ctx context.Context, in *ExportRegionSnapshotStreamRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRegionSnapshotStreamResponse], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &RaftAdmin_ServiceDesc.Streams[0], RaftAdmin_ExportRegionSnapshotStream_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[ExportRegionSnapshotStreamRequest, ExportRegionSnapshotStreamResponse]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RaftAdmin_ExportRegionSnapshotStreamClient = grpc.ServerStreamingClient[ExportRegionSnapshotStreamResponse]
-
-func (c *raftAdminClient) ImportRegionSnapshot(ctx context.Context, in *ImportRegionSnapshotRequest, opts ...grpc.CallOption) (*ImportRegionSnapshotResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ImportRegionSnapshotResponse)
-	err := c.cc.Invoke(ctx, RaftAdmin_ImportRegionSnapshot_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *raftAdminClient) ImportRegionSnapshotStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportRegionSnapshotStreamRequest, ImportRegionSnapshotResponse], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &RaftAdmin_ServiceDesc.Streams[1], RaftAdmin_ImportRegionSnapshotStream_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[ImportRegionSnapshotStreamRequest, ImportRegionSnapshotResponse]{ClientStream: stream}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RaftAdmin_ImportRegionSnapshotStreamClient = grpc.ClientStreamingClient[ImportRegionSnapshotStreamRequest, ImportRegionSnapshotResponse]
-
 func (c *raftAdminClient) RegionRuntimeStatus(ctx context.Context, in *RegionRuntimeStatusRequest, opts ...grpc.CallOption) (*RegionRuntimeStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RegionRuntimeStatusResponse)
@@ -167,10 +107,6 @@ type RaftAdminServer interface {
 	AddPeer(context.Context, *AddPeerRequest) (*AddPeerResponse, error)
 	RemovePeer(context.Context, *RemovePeerRequest) (*RemovePeerResponse, error)
 	TransferLeader(context.Context, *TransferLeaderRequest) (*TransferLeaderResponse, error)
-	ExportRegionSnapshot(context.Context, *ExportRegionSnapshotRequest) (*ExportRegionSnapshotResponse, error)
-	ExportRegionSnapshotStream(*ExportRegionSnapshotStreamRequest, grpc.ServerStreamingServer[ExportRegionSnapshotStreamResponse]) error
-	ImportRegionSnapshot(context.Context, *ImportRegionSnapshotRequest) (*ImportRegionSnapshotResponse, error)
-	ImportRegionSnapshotStream(grpc.ClientStreamingServer[ImportRegionSnapshotStreamRequest, ImportRegionSnapshotResponse]) error
 	RegionRuntimeStatus(context.Context, *RegionRuntimeStatusRequest) (*RegionRuntimeStatusResponse, error)
 	ExecutionStatus(context.Context, *ExecutionStatusRequest) (*ExecutionStatusResponse, error)
 }
@@ -190,18 +126,6 @@ func (UnimplementedRaftAdminServer) RemovePeer(context.Context, *RemovePeerReque
 }
 func (UnimplementedRaftAdminServer) TransferLeader(context.Context, *TransferLeaderRequest) (*TransferLeaderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method TransferLeader not implemented")
-}
-func (UnimplementedRaftAdminServer) ExportRegionSnapshot(context.Context, *ExportRegionSnapshotRequest) (*ExportRegionSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ExportRegionSnapshot not implemented")
-}
-func (UnimplementedRaftAdminServer) ExportRegionSnapshotStream(*ExportRegionSnapshotStreamRequest, grpc.ServerStreamingServer[ExportRegionSnapshotStreamResponse]) error {
-	return status.Error(codes.Unimplemented, "method ExportRegionSnapshotStream not implemented")
-}
-func (UnimplementedRaftAdminServer) ImportRegionSnapshot(context.Context, *ImportRegionSnapshotRequest) (*ImportRegionSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ImportRegionSnapshot not implemented")
-}
-func (UnimplementedRaftAdminServer) ImportRegionSnapshotStream(grpc.ClientStreamingServer[ImportRegionSnapshotStreamRequest, ImportRegionSnapshotResponse]) error {
-	return status.Error(codes.Unimplemented, "method ImportRegionSnapshotStream not implemented")
 }
 func (UnimplementedRaftAdminServer) RegionRuntimeStatus(context.Context, *RegionRuntimeStatusRequest) (*RegionRuntimeStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RegionRuntimeStatus not implemented")
@@ -283,60 +207,6 @@ func _RaftAdmin_TransferLeader_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
-func _RaftAdmin_ExportRegionSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ExportRegionSnapshotRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RaftAdminServer).ExportRegionSnapshot(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: RaftAdmin_ExportRegionSnapshot_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftAdminServer).ExportRegionSnapshot(ctx, req.(*ExportRegionSnapshotRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _RaftAdmin_ExportRegionSnapshotStream_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(ExportRegionSnapshotStreamRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(RaftAdminServer).ExportRegionSnapshotStream(m, &grpc.GenericServerStream[ExportRegionSnapshotStreamRequest, ExportRegionSnapshotStreamResponse]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RaftAdmin_ExportRegionSnapshotStreamServer = grpc.ServerStreamingServer[ExportRegionSnapshotStreamResponse]
-
-func _RaftAdmin_ImportRegionSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ImportRegionSnapshotRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RaftAdminServer).ImportRegionSnapshot(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: RaftAdmin_ImportRegionSnapshot_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftAdminServer).ImportRegionSnapshot(ctx, req.(*ImportRegionSnapshotRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _RaftAdmin_ImportRegionSnapshotStream_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(RaftAdminServer).ImportRegionSnapshotStream(&grpc.GenericServerStream[ImportRegionSnapshotStreamRequest, ImportRegionSnapshotResponse]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RaftAdmin_ImportRegionSnapshotStreamServer = grpc.ClientStreamingServer[ImportRegionSnapshotStreamRequest, ImportRegionSnapshotResponse]
-
 func _RaftAdmin_RegionRuntimeStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RegionRuntimeStatusRequest)
 	if err := dec(in); err != nil {
@@ -393,14 +263,6 @@ var RaftAdmin_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RaftAdmin_TransferLeader_Handler,
 		},
 		{
-			MethodName: "ExportRegionSnapshot",
-			Handler:    _RaftAdmin_ExportRegionSnapshot_Handler,
-		},
-		{
-			MethodName: "ImportRegionSnapshot",
-			Handler:    _RaftAdmin_ImportRegionSnapshot_Handler,
-		},
-		{
 			MethodName: "RegionRuntimeStatus",
 			Handler:    _RaftAdmin_RegionRuntimeStatus_Handler,
 		},
@@ -409,17 +271,6 @@ var RaftAdmin_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RaftAdmin_ExecutionStatus_Handler,
 		},
 	},
-	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "ExportRegionSnapshotStream",
-			Handler:       _RaftAdmin_ExportRegionSnapshotStream_Handler,
-			ServerStreams: true,
-		},
-		{
-			StreamName:    "ImportRegionSnapshotStream",
-			Handler:       _RaftAdmin_ImportRegionSnapshotStream_Handler,
-			ClientStreams: true,
-		},
-	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "admin/admin.proto",
 }

@@ -6,8 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # Legacy Flush Design
 
 The old NoKV-owned LSM flush pipeline has been removed from the mainline.
-Pebble now owns physical memtable flush and compaction below the `storage/kv`
-raw ordered-KV contract.
+Physical memtable flush and compaction belong to the concrete raw backend:
+Pebble today, Holt once its adapter is wired, or any future implementation of
+`storage/kv.Store`.
 
 NoKV still owns higher-level commit, MVCC, raft, and fsmeta semantics above
 that boundary.

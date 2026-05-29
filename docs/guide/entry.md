@@ -3,14 +3,13 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Entry Model
+# Entry And Internal Key Model
 
-NoKV uses `kv.Entry` as the shared in-memory record type for WAL payloads,
-memtable indexes, SST blocks, compaction, and iterator materialization.
+NoKV keeps MVCC entry encoding above the physical storage backend. Pebble and
+Holt see ordered byte keys and byte values; they do not interpret fsmeta,
+raftstore, or transaction semantics.
 
----
-
-## 1. Internal Key Shape
+## Internal Key Shape
 
 User-facing keys are converted into internal MVCC keys:
 
@@ -18,65 +17,62 @@ User-facing keys are converted into internal MVCC keys:
 <column-family><user-key><descending timestamp>
 ```
 
-Helpers:
+Helpers live in `txn/storage`:
 
-- `kv.BaseKey(cf, userKey)` builds the column-family-prefixed key.
-- `kv.InternalKey(cf, userKey, ts)` appends the MVCC timestamp.
-- `kv.SplitInternalKey` recovers `(cf, userKey, ts)`.
+- `BaseKey(cf, userKey)` builds the column-family-prefixed key.
+- `InternalKey(cf, userKey, ts)` appends the MVCC timestamp.
+- `SplitInternalKey` recovers `(cf, userKey, ts)`.
 
----
+This shape is intentionally backend-neutral. Pebble stores it as one ordered key
+space. Holt may later map the same logical domains to multiple internal trees,
+but that routing must remain hidden behind `storage/kv.Store`.
 
-## 2. Value Shape
+## Value Shape
 
-Values are stored inline. The encoded value payload contains:
+Values are stored inline in NoKV's MVCC entry format:
 
 ```text
 Meta | ExpiresAt | Value bytes
 ```
 
-`BitDelete`, `BitRangeDelete`, and expiry timestamps participate in visibility
-filtering. NoKV stores user values inline; there is no value-log pointer format
-in the current entry model.
+Delete markers, range-delete markers, and expiry timestamps participate in
+visibility filtering above the raw backend. There is no product-level value-log
+pointer format in the current mainline.
 
----
-
-## 3. Write Path
+## Write Path
 
 ```mermaid
 flowchart TD
-  A["Set / SetBatch / ApplyInternalEntries"] --> B["NewInternalEntry"]
-  B --> C["commit queue"]
-  C --> D["WAL entry-batch append"]
-  D --> E["memtable apply"]
-  E --> F["flush to SST"]
+  A["fsmeta / txn / raftstore mutation"] --> B["txn/storage entry encoding"]
+  B --> C["local.DB commit queue"]
+  C --> D["storage/kv batch"]
+  D --> E["storage/pebble today"]
+  D -. "same contract" .-> F["storage/holt target"]
 ```
 
-Durability order is strict: append the WAL record first, then index the same
-entries in the memtable. A WAL error leaves the memtable unchanged.
+Durability and ordering guarantees come from the selected raw backend plus
+NoKV's MVCC/transaction protocol above it. The backend owns its own WAL,
+memtable, flush, and compaction internals.
 
----
-
-## 4. Read Path
+## Read Path
 
 ```mermaid
 flowchart TD
-  A["Get / iterator materialize"] --> B["LSM lookup"]
-  B --> C{"delete / expired?"}
-  C -- yes --> D["skip / not found"]
-  C -- no --> E["return inline value"]
+  A["Get / Scan / Iterator"] --> B["MVCC internal key range"]
+  B --> C["storage/kv snapshot or iterator"]
+  C --> D{"delete / expired / hidden by newer version?"}
+  D -- yes --> E["skip / not found"]
+  D -- no --> F["return visible value"]
 ```
 
-Borrowed internal entries must be released with `DecrRef`. Public `Get` results
-are detached copies and must not be released by the caller.
+Borrowed internal entries must be released with `DecrRef`. Public `Get`
+results are detached copies and must not be released by the caller.
 
----
-
-## 5. Refcount Rules
+## Refcount Rules
 
 | Producer | Ownership | Rule |
 | --- | --- | --- |
-| `kv.NewEntry` / `kv.NewInternalEntry` | Caller owns one ref | Call `DecrRef` after submit or use |
-| `LSM.Get` | Borrowed pooled entry | Caller must call `DecrRef` |
-| `DB.GetInternalEntry` | Borrowed internal entry | Caller must call `DecrRef` |
-| `DB.Get` | Detached public copy | Caller must not call `DecrRef` |
-| Iterator `Item.Entry()` | Iterator-owned view | Valid until iterator advances/closes |
+| `NewEntry` / `NewInternalEntry` | Caller owns one ref | Call `DecrRef` after submit or use. |
+| `DB.GetInternalEntry` | Borrowed internal entry | Caller must call `DecrRef`. |
+| `DB.Get` | Detached public copy | Caller must not call `DecrRef`. |
+| Iterator `Item.Entry()` | Iterator-owned view | Valid until iterator advances or closes. |

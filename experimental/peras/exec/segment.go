@@ -90,7 +90,7 @@ type SegmentReadHeader struct {
 
 // PerasSegment is the authority-local install unit produced by sealing a
 // batch of Peras operations. It is queryable before later materialization into
-// the ordinary LSM layout.
+// the ordinary MVCC layout.
 type PerasSegment struct {
 	EpochID  uint64
 	Versions ReplayVersionRange

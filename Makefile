@@ -4,7 +4,7 @@
 # NoKV Makefile
 # Provides standardized commands for development workflow
 
-.PHONY: help build test test-short test-race test-coverage lint lint-nokv test-lint verify fmt clean docker-up docker-dev-up docker-down bench fsmeta-bench
+.PHONY: help build test test-short test-race test-coverage lint lint-nokv test-lint verify fmt clean docker-up docker-dev-up docker-down fsmeta-bench
 .PHONY: test-contract-smoke test-raftstore-contract-smoke test-history-smoke test-model-smoke test-crash-matrix-smoke test-deterministic-simulation-smoke test-correctness-smoke test-correctness-nightly test-docker-chaos test-soak-smoke test-soak-24h test-soak-72h
 .PHONY: install-tools install-tla-tools test-tla-smoke test-tla-nightly
 .PHONY: proto proto-check proto-breaking-check
@@ -47,7 +47,6 @@ help:
 	@echo "  make proto              - Format .proto files and regenerate protobuf Go code"
 	@echo "  make proto-check        - Verify proto format, lint, and generated code"
 	@echo "  make proto-breaking-check - Run Buf breaking checks against main"
-	@echo "  make bench              - Run benchmarks"
 	@echo "  make fsmeta-bench       - Run fsmeta workload matrix (set NOKV_FSMETA_BENCH_MODE=local|compose)"
 	@echo "  make install-tools      - Install development tools"
 	@echo "  make install-tla-tools  - Install pinned TLC locally under third_party/"
@@ -240,11 +239,6 @@ proto-breaking-check:
 	fi; \
 	buf breaking --against ".git#ref=$$base_ref,subdir=pb"
 	@echo "✓ Proto breaking checks passed"
-
-# Run benchmarks
-bench:
-	@echo "Running benchmarks..."
-	./scripts/run_benchmarks.sh
 
 # Install development tools
 install-tools:

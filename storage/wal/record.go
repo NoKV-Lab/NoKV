@@ -18,7 +18,7 @@ import (
 type RecordType uint8
 
 const (
-	// RecordTypeEntry represents an LSM mutation (default behaviour).
+	// RecordTypeEntry represents one encoded MVCC entry.
 	RecordTypeEntry RecordType = iota
 	// RecordTypeRaftEntry encodes a batch of raft log entries.
 	RecordTypeRaftEntry
@@ -26,7 +26,7 @@ const (
 	RecordTypeRaftState
 	// RecordTypeRaftSnapshot encodes a raft snapshot payload.
 	RecordTypeRaftSnapshot
-	// RecordTypeEntryBatch encodes a batch of LSM mutations in one WAL record.
+	// RecordTypeEntryBatch encodes a batch of MVCC entries in one WAL record.
 	RecordTypeEntryBatch
 	// RecordTypeWitnessEvidence encodes subsystem witness evidence.
 	RecordTypeWitnessEvidence

@@ -6,10 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 <script setup lang="ts">
 const stats = [
   {
-    value: '632k',
-    unit: 'ops/sec',
-    label: 'YCSB-D throughput',
-    sub: 'NoKV single-node, M3 Pro · 2.2× Badger · 3.2× Pebble',
+    value: 'fsmeta',
+    unit: 'core',
+    label: 'Workspace metadata API',
+    sub: 'Create, ReadDirPlus, watch, snapshot, atomic publish',
   },
   {
     value: '42×',

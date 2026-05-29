@@ -16,10 +16,11 @@ var entryPool = sync.Pool{
 	},
 }
 
-// Entry is the generic key/value mutation container used across the engine.
+// Entry is the generic key/value mutation container used across NoKV's MVCC
+// layer.
 //
 // It can hold:
-//   - fully encoded internal key/value payloads destined for WAL/SST paths
+//   - fully encoded internal key/value payloads destined for WAL or raw KV apply
 //   - borrowed or detached results produced by iterators and table lookups
 //   - scratch entries used by tests and internal buffering
 //

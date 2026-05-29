@@ -5,7 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # RaftStore Deep Dive
 
-`raftstore` powers NoKV’s distributed mode by layering multi-Raft replication on top of the embedded storage engine. Its RPC surface is exposed as the `NoKV` gRPC service, while the command model still tracks the TinyKV/TiKV region + MVCC design. This note explains the major packages, the boot and command paths, how transport and storage interact, and the supporting tooling for observability and testing.
+`raftstore` powers NoKV's distributed mode by layering multi-Raft replication
+on top of the selected raw ordered-KV backend. Its RPC surface is exposed as
+the `NoKV` gRPC service, while the command model still tracks the TinyKV/TiKV
+region + MVCC design. This note explains the major packages, the boot and
+command paths, how transport and storage interact, and the supporting tooling
+for observability and testing.
 
 > Read this page if you want to answer one question precisely: which package owns which responsibility once NoKV leaves standalone mode and becomes a cluster.
 
@@ -18,7 +23,9 @@ admission, transition execution, publish boundaries, and restart state, read
 - Start with section 1 if you want package ownership.
 - Jump to section 3 if you want request execution.
 - Jump to section 8 if you care about split/merge and control-plane behavior.
-- Read this together with [`coordinator.md`](coordinator.md) and [`migration.md`](migration.md) if your focus is lifecycle rather than just request flow.
+- Read this together with [`coordinator.md`](coordinator.md) and
+  [`architecture.md`](architecture.md) if your focus is lifecycle rather than
+  just request flow.
 
 ---
 
@@ -105,8 +112,8 @@ flowchart TD
 
 ### Write (via Propose)
 1. Write RPCs (Prewrite/Commit/…) call `Store.ProposeCommand`, encoding the command and routing to the leader peer.
-2. The leader appends the encoded request to raft, replicates, and once committed the command pipeline hands data to `kv.Apply`, which maps Prewrite/Commit/ResolveLock to `percolator` and `InstallPreparedMVCCEntries` to the generic prepared-entry installer. The legacy experimental Peras command is still accepted during the migration, but it lowers segment payloads into the same prepared-entry installer.
-3. `engine.WALStorage` persists raft entries/state snapshots and updates `raftstore/localmeta` raft pointers. This keeps WAL GC and raft truncation aligned without polluting the storage manifest.
+2. The leader appends the encoded request to raft, replicates, and once committed the command pipeline hands data to `kv.Apply`, which maps Prewrite/Commit/ResolveLock to `percolator` and `InstallPreparedMVCCEntries` to the generic prepared-entry installer. Experimental Peras install lowers segment payloads into the same prepared-entry installer.
+3. `raftstore/raftlog` persists raft entries/state snapshots and updates `raftstore/localmeta` raft pointers. This keeps raft log GC and raft truncation aligned without exposing storage-backend internals.
 4. Raft apply only accepts command-encoded payloads (`RaftCmdRequest`). Legacy raw KV payloads are rejected as unsupported.
 
 ### Command flow diagram
@@ -150,11 +157,13 @@ sequenceDiagram
 
 ---
 
-## 5. Storage Backend (engine)
+## 5. Storage Backend
 
-- `WALStorage` piggybacks on the embedded WAL: each Raft group writes typed entries, HardState, and snapshots into the shared log.
+- `raftstore/raftlog` persists each raft group's entries, HardState, and snapshots.
 - `raftstore/localmeta` persists the store-local raft replay pointer used by WAL GC and replay.
-- Alternative storage backends (`DiskStorage`, `MemoryStorage`) are available for tests and special scenarios.
+- StoreKV state is materialized through NoKV MVCC into the selected `storage/kv`
+  backend. Pebble is the default local backend; Holt should plug in below the
+  same raw storage contract.
 
 ---
 
@@ -200,8 +209,8 @@ The design rule is:
 - `Coordinator` decides and observes at the cluster level.
 - `Store/Peer` own local truth and apply.
 
-That split is what keeps migration and scheduling from becoming a second,
-parallel truth path.
+That split is what keeps scheduling from becoming a second, parallel truth
+path.
 
 ### 8.2 Split / Merge
 - **Split**: leaders call `Store.ProposeSplit`, which writes a split
@@ -209,7 +218,7 @@ parallel truth path.
   `Store.SplitRegion` updates the parent range/epoch and starts the child peer.
 - **Merge**: leaders call `Store.ProposeMerge`, writing a merge `AdminCommand`.
   On apply, the target region range/epoch is expanded and the source peer is
-  stopped/removed from the manifest.
+  stopped/removed from the store-local catalog.
 - These operations are explicit/manual and are not auto-triggered by
   size/traffic heuristics.
 

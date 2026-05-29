@@ -49,7 +49,8 @@ remain visible until the next cleanup pass.
 
 ## 3. Data model
 
-`fsmeta`'s key schema is in `fsmeta/keys.go`; value schema is in `fsmeta/value.go`.
+`fsmeta`'s ordered key schema is in `fsmeta/layout`; storage-engine-neutral
+record types live in `fsmeta/model`.
 
 | Object | Storage location | Notes |
 |---|---|---|
@@ -80,9 +81,10 @@ type Store interface {
 }
 ```
 
-`fsmeta/backend` deliberately has no protobuf, raftstore, local DB, concrete storage engine, SST,
-or migration types. `fsmeta/exec` produces backend-neutral mutations and
-predicates; runtime adapters translate those into their concrete commit path.
+`fsmeta/backend` deliberately has no protobuf, raftstore, local DB, concrete
+raw-storage, SST, or migration types. `fsmeta/exec` produces backend-neutral
+mutations and predicates; runtime adapters translate those into their concrete
+commit path.
 For example, `fsmeta/runtime/local` applies them through the embedded local
 MVCC implementation, while `fsmeta/runtime/raftstore` converts them to
 raftstore KV RPC/proto mutations inside the adapter package.

@@ -272,37 +272,30 @@ func TestShardForUserKeyKeepsSegmentCatalogAtomic(t *testing.T) {
 	require.Equal(t, target, ShardForUserKey(indexB, shards))
 }
 
-func TestUserKeyShapeExtractsAffinityAndBloomPrefixes(t *testing.T) {
+func TestUserKeyShapeExtractsAffinity(t *testing.T) {
 	mount := testMount
 	const inode model.InodeID = 42
 
 	bucketPrefix, err := EncodeBucketPrefix(mount, BucketForInodeID(inode))
 	require.NoError(t, err)
 
-	dentryPrefix, err := EncodeDentryPrefix(mount, inode)
-	require.NoError(t, err)
 	dentry, err := EncodeDentryKey(mount, inode, "checkpoint")
 	require.NoError(t, err)
 	dentryShape := UserKeyShape(dentry)
 	require.Equal(t, bucketPrefix, dentryShape.LocalityPrefix)
 	require.Equal(t, bucketPrefix, dentryShape.ShardKey)
 	require.Equal(t, byte(KeyKindDentry), dentryShape.Family)
-	require.Equal(t, dentryPrefix, dentryShape.BloomPrefix)
 
 	session, err := EncodeSessionKey(mount, inode, "writer-1")
-	require.NoError(t, err)
-	owner, err := EncodeInodeSessionKey(mount, inode)
 	require.NoError(t, err)
 	sessionShape := UserKeyShape(session)
 	require.Equal(t, bucketPrefix, sessionShape.LocalityPrefix)
 	require.Equal(t, byte(KeyKindSession), sessionShape.Family)
-	require.Equal(t, owner[:len(owner)-1], sessionShape.BloomPrefix)
 
 	inodeKey, err := EncodeInodeKey(mount, inode)
 	require.NoError(t, err)
 	inodeShape := UserKeyShape(inodeKey)
 	require.Equal(t, bucketPrefix, inodeShape.LocalityPrefix)
-	require.Equal(t, inodeKey, inodeShape.BloomPrefix)
 }
 
 func TestShardForUserKeyUsesShapeLocalityAcrossFamilies(t *testing.T) {
@@ -356,7 +349,7 @@ func TestMountAtomicUserKeyShapePinsMountToOneShard(t *testing.T) {
 	for _, key := range keys[1:] {
 		shape := MountAtomicUserKeyShape(key)
 		require.Equal(t, target, utils.ShardForUserKey(shape.ShardKey, shards))
-		require.NotEmpty(t, shape.BloomPrefix)
+		require.NotEmpty(t, shape.LocalityPrefix)
 	}
 }
 

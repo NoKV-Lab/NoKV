@@ -5,7 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # VFS
 
-The `vfs` package provides a small filesystem abstraction used by WAL, manifest, SST, slab, and raftstore paths.
+The `storage/vfs` package provides a small filesystem abstraction used by
+NoKV-owned low-level files such as control WALs, raft metadata, slab sidecars,
+and tests. It is not the Pebble or Holt physical storage API; concrete backends
+own their own file layout below `storage/kv`.
 
 ---
 
@@ -46,7 +49,8 @@ The `vfs` package provides a small filesystem abstraction used by WAL, manifest,
 
 `vfs.SyncDir(fs, dir)` fsyncs directory metadata to persist entry updates (create/rename/remove).
 
-This is used in strict durability paths (for example SST install before manifest publication) to guarantee directory entry persistence.
+This is used in strict durability paths that create, rename, or remove NoKV
+owned files to guarantee directory entry persistence.
 
 ---
 
@@ -58,7 +62,7 @@ This is used in strict durability paths (for example SST install before manifest
 - File-handle faults: write/sync/close/truncate
 - Rename fault matching supports `src`/`dst` targeting
 
-Used to test manifest/WAL/recovery failure paths deterministically.
+Used to test WAL/recovery failure paths deterministically.
 
 ---
 

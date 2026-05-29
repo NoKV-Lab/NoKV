@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// versionedKey simulates an LSM internal key: user_key + 0x00 separator
+// versionedKey simulates a versioned full key: user_key + 0x00 separator
 // + 1-byte version. The "group key" is the user_key portion (everything
 // up to the separator).
 func versionedKey(user string, version byte) []byte {

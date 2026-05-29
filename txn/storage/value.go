@@ -8,8 +8,8 @@ import (
 	"unsafe"
 )
 
-// ValueStruct is the serialized form of an inline value used inside Entry.Value,
-// SST blocks, and WAL payloads.
+// ValueStruct is the serialized form of an inline value used inside Entry.Value
+// and WAL payloads.
 //
 // Binary layout (EncodeValue):
 //

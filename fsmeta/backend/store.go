@@ -51,8 +51,8 @@ type Predicate struct {
 //
 // Mutation atomicity is defined over the supplied mutation group. Implementors
 // may use a local one-phase write, Percolator 2PC, or another equivalent
-// protocol, but migration, SST ingest/export, and engine diagnostics are
-// intentionally outside this contract.
+// protocol, but operational data movement, physical ingest/export, and engine
+// diagnostics are intentionally outside this contract.
 type Store interface {
 	ReserveTimestamp(ctx context.Context, count uint64) (uint64, error)
 	Get(ctx context.Context, key []byte, version uint64) ([]byte, bool, error)

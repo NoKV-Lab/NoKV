@@ -284,7 +284,7 @@ func (e *Executor) ReadDir(ctx context.Context, req model.ReadDirRequest) ([]mod
 //
 // Snapshot-versioned reads bypass the cache: pages are tagged with the
 // "latest" frontier and a stale snapshot-versioned read might disagree
-// with the live cache, so we keep that path on the authoritative LSM
+// with the live cache, so we keep that path on the authoritative backend
 // route.
 func (e *Executor) ReadDirPlus(ctx context.Context, req model.ReadDirRequest) ([]model.DentryAttrPair, error) {
 	mountRecord, err := e.resolveActiveMount(ctx, req.Mount)

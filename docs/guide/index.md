@@ -7,7 +7,12 @@ SPDX-License-Identifier: Apache-2.0
 
 **NoKV** is the open-source counterpart of the *"stateless schema layer + transactional KV"* pattern that powers Meta Tectonic (over ZippyDB), Google Colossus (over Bigtable), and DeepSeek 3FS (over FoundationDB). The headline service is **`fsmeta`** — a filesystem-shaped metadata API for AI agent workspaces, with the same contract available to distributed filesystems and object-storage namespace layers.
 
-The interesting part is not the feature list. The interesting part is that **layer separation is enforced in code**: the fsmeta executor consumes a narrow `TxnRunner`; `fsmeta/runtime/local` is the default embedded runtime; `fsmeta/runtime/raftstore` owns scale-out raftstore wiring; `meta/root` keeps only lifecycle / authority truth; the storage engine never learns that a namespace exists.
+The interesting part is not the feature list. The interesting part is that
+**layer separation is enforced in code**: the fsmeta executor consumes a narrow
+backend contract; `fsmeta/runtime/local` is the default embedded runtime;
+`fsmeta/runtime/raftstore` owns scale-out raftstore wiring; `meta/root` keeps
+only lifecycle / authority truth; raw storage backends such as Pebble and Holt
+never learn that a namespace exists.
 
 > Looking for the landing page, headline benchmarks, and the `Why NoKV vs X?` matrix? See the [homepage](/).
 
@@ -18,8 +23,6 @@ The interesting part is not the feature list. The interesting part is that **lay
 1. **[fsmeta](./fsmeta)** — namespace metadata service (the headline). Primitives, lifecycle authority, deployment.
 2. **[Architecture](./architecture)** — layered architecture. Where each module lives, what each layer is allowed to know.
 3. **[Control & Execution Protocols](./control_and_execution_protocols)** — the contract between control plane (`coordinator/`), execution plane (`raftstore/`), and rooted truth (`meta/root/`).
-
-Current cleanup roadmap: [Product Core And Experimental Boundary Plan](./experimental_boundary_plan).
 
 ---
 
@@ -52,22 +55,21 @@ All three consume the **same** rooted truth in `meta/root` and the **same** nati
 |---|---|
 | Raftstore overview (store / peer / admin) | [Raftstore](./raftstore) |
 | Control plane ↔ execution plane contract | [Control & Execution Protocols](./control_and_execution_protocols) |
-| Storage backend refactor / migration status | [Migration Status](./migration) |
 | Recovery model | [Recovery](./recovery) |
 | Percolator MVCC 2PC + AssertionNotExist | [Percolator](./percolator) |
 | Runtime call chains (sequence diagrams) | [Runtime](./runtime) |
 
 ### 🔧 Storage backend internals — the foundation
 
-The single-node substrate everything sits on. The default physical backend is
-Pebble through `storage/pebble`; NoKV keeps MVCC and metadata semantics above
-that raw ordered-KV boundary.
+The physical substrate everything sits on. Pebble is the default backend
+through `storage/pebble`; Holt is the owned backend target at the same
+`storage/kv` boundary. NoKV keeps MVCC and metadata semantics above that raw
+ordered-KV boundary.
 
 | Topic | Doc |
 |---|---|
 | High-level architecture | [Architecture](./architecture) |
 | WAL discipline and replay | [WAL](./wal) |
-| Removed legacy LSM/migration status | [Migration Status](./migration) |
 | VFS abstraction + FaultFS | [VFS](./vfs) · [File](./file) |
 | Entry / error model | [Entry](./entry) · [Error Handling](./errors) |
 
@@ -78,7 +80,6 @@ stable fsmeta product contract.
 
 | Topic | Doc |
 |---|---|
-| Product core vs experimental boundary | [Experimental Boundary Plan](./experimental_boundary_plan) |
 | Hot-key observer (Thermos) | [Thermos](./thermos) |
 
 ### 🛠️ Operations and tooling
@@ -113,7 +114,7 @@ Layer 2  meta/root         ← rooted authority truth
          raftstore         ← per-region Raft + apply observer
          percolator        ← 2PC + MVCC + AssertionNotExist + commit-ts retry
    │
-Layer 3  storage           ← raw ordered KV (Pebble by default) + low-level runtime support
+Layer 3  storage           ← raw ordered KV (Pebble default, Holt target) + low-level runtime support
 
 Experimental mechanisms such as Peras and Thermos live behind the stable
 contract and should move under `experimental/` as they are cleaned up.
@@ -122,7 +123,9 @@ contract and should move under `experimental/` as they are cleaned up.
 **Four boundaries enforced in code:**
 
 1. **fsmeta-first API.** Metadata operations expose filesystem / object-namespace shapes directly, instead of forcing users to assemble them from raw KV calls.
-2. **Layer separation enforced.** The fsmeta executor consumes a narrow `TxnRunner`; the default runtime adapter owns raftstore wiring; lower layers do not import fsmeta.
+2. **Layer separation enforced.** The fsmeta executor consumes the narrow
+   `fsmeta/backend.Store` contract; runtime adapters own local or raftstore
+   wiring; lower layers do not import fsmeta.
 3. **Multi-gateway-safe.** Quota fences are rooted truth; usage counters are data-plane keys updated in the same Percolator transaction as metadata mutations. Subtree handoff uses rooted events plus runtime repair.
 4. **Root-event driven lifecycle.** `coordinator.WatchRootEvents` pushes mount retire / quota fence / pending handoff changes after bootstrap; the monitor interval is reconnect backoff.
 

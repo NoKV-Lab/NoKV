@@ -323,7 +323,8 @@ func DecodeEntryFrom(r io.Reader) (*Entry, uint32, error) {
 	return entry, recordLen, nil
 }
 
-// EstimateEncodeSize estimates the encoded size of an entry in WAL/SST streams.
+// EstimateEncodeSize estimates the encoded size of an entry in WAL and
+// snapshot streams.
 func EstimateEncodeSize(e *Entry) int {
 	return len(e.Key) + len(e.Value) + 8 /* ExpiresAt uint64 */ +
 		crc32.Size + MaxEntryHeaderSize

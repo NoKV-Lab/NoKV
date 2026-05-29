@@ -33,9 +33,9 @@ const rows = [
     tone: 'partner',
   },
   {
-    need: 'Just an embedded LSM',
-    alt: 'Pebble, Badger',
-    fit: 'NoKV\'s engine is not a drop-in library.',
+    need: 'Just an embedded ordered KV',
+    alt: 'Pebble, Holt',
+    fit: 'NoKV is not a drop-in KV. It uses Pebble today and is shaped so our Holt backend can plug in below metadata semantics.',
     tone: 'neutral',
   },
   {

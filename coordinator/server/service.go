@@ -14,9 +14,6 @@
 // catalog (region/event validation), view (directory + store health),
 // storage (rooted adapter), audit (snapshot + trace audit), and the root
 // authority protocol consumed from meta/root/protocol.
-//
-// Design references: docs/guide/coordinator.md, docs/guide/control_and_execution_protocols.md,
-// docs/guide/rooted_truth.md.
 package server
 
 import (

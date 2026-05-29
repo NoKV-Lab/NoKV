@@ -7,12 +7,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"testing"
 	"time"
 
 	adminpb "github.com/feichai0017/NoKV/pb/admin"
-	metapb "github.com/feichai0017/NoKV/pb/meta"
 	adminclient "github.com/feichai0017/NoKV/raftstore/admin"
 	"github.com/stretchr/testify/require"
 )
@@ -31,14 +29,6 @@ func (f *fakeAdminClient) RemovePeer(context.Context, *adminpb.RemovePeerRequest
 }
 
 func (f *fakeAdminClient) TransferLeader(context.Context, *adminpb.TransferLeaderRequest) (*adminpb.TransferLeaderResponse, error) {
-	return nil, nil
-}
-
-func (f *fakeAdminClient) ExportRegionSnapshotStream(context.Context, *adminpb.ExportRegionSnapshotStreamRequest) (*adminclient.SnapshotExportStream, error) {
-	return nil, nil
-}
-
-func (f *fakeAdminClient) ImportRegionSnapshotStream(context.Context, []byte, *metapb.RegionDescriptor, io.Reader) (*adminpb.ImportRegionSnapshotResponse, error) {
 	return nil, nil
 }
 

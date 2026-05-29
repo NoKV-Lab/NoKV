@@ -23,25 +23,6 @@ jobs:
           go-version: '1.26.2'
 
       # Smoke-only: just run the micro benchmarks to catch crashes / build
-      # breaks. Historical tracking via benchmark-action/github-action-benchmark
-      # used a `gh-pages` branch that no longer exists after migrating the docs
-      # site to actions/deploy-pages; removed instead of being reintroduced.
+      # breaks. Historical tracking is intentionally outside the main repo.
       - name: Run micro benchmarks
         run: go test -bench=. -run=^$ -benchtime=100ms -count=1 ./...
-
-  ycsb-bench:
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'run-benchmark')
-    runs-on: ubuntu-latest
-    timeout-minutes: 70
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.26.2'
-
-      - name: Run YCSB benchmarks (NoKV)
-        env:
-          YCSB_GO_TEST_TIMEOUT: 60m
-        run: make bench

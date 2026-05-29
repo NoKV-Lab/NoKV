@@ -20,5 +20,5 @@ type ConfChangeEvent struct {
 
 // ConfChangeHandler is invoked whenever a configuration change entry is
 // applied. Returning an error aborts Ready processing so callers can surface
-// failures (for example manifest persistence errors) to the raftstore.
+// local catalog persistence failures to the raftstore.
 type ConfChangeHandler func(ConfChangeEvent) error

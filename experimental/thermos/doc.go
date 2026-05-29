@@ -3,7 +3,7 @@
 
 // Package thermos contains the optional hotspot-detection experiment.
 //
-// Stable engine paths should depend on narrow observation interfaces. Direct
-// imports from local write-admission code are migration-era exceptions tracked
+// Stable storage paths should depend on narrow observation interfaces. Direct
+// imports from local write-admission code are explicit experiment hooks tracked
 // by the import-boundary tests.
 package thermos

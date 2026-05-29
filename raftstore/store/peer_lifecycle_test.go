@@ -18,7 +18,7 @@ import (
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
 
-func testSSTApply(t *testing.T, db *local.DB) peer.SnapshotApplyFunc {
+func testSnapshotApply(t *testing.T, db *local.DB) peer.SnapshotApplyFunc {
 	t.Helper()
 	return func(payload []byte) (localmeta.RegionMeta, error) {
 		result, err := snapshotpkg.NewStore(db).ImportSnapshot(payload)
@@ -62,7 +62,7 @@ func TestStoreStepBootstrapsPeerFromSnapshotPayload(t *testing.T) {
 			},
 			Transport:     noopTransport{},
 			Apply:         func([]myraft.Entry) error { return nil },
-			SnapshotApply: testSSTApply(t, targetDB),
+			SnapshotApply: testSnapshotApply(t, targetDB),
 			Storage:       mustPeerStorage(t, targetDB, targetMeta, meta.ID),
 			GroupID:       meta.ID,
 			Region:        localmeta.CloneRegionMetaPtr(&meta),
@@ -139,7 +139,7 @@ func TestStoreInstallRegionSnapshotBootstrapsPeer(t *testing.T) {
 			},
 			Transport:     noopTransport{},
 			Apply:         func([]myraft.Entry) error { return nil },
-			SnapshotApply: testSSTApply(t, targetDB),
+			SnapshotApply: testSnapshotApply(t, targetDB),
 			Storage:       mustPeerStorage(t, targetDB, targetMeta, meta.ID),
 			GroupID:       meta.ID,
 			Region:        localmeta.CloneRegionMetaPtr(&meta),
@@ -192,7 +192,7 @@ func TestStoreInstallRegionSnapshotRejectsCorruptPayloadWithoutHostingPeer(t *te
 			},
 			Transport:     noopTransport{},
 			Apply:         func([]myraft.Entry) error { return nil },
-			SnapshotApply: testSSTApply(t, targetDB),
+			SnapshotApply: testSnapshotApply(t, targetDB),
 			Storage:       mustPeerStorage(t, targetDB, targetMeta, meta.ID),
 			GroupID:       meta.ID,
 			Region:        localmeta.CloneRegionMetaPtr(&meta),

@@ -26,7 +26,7 @@ import (
 )
 
 // ApplyFunc consumes committed raft log entries and applies them to the user
-// state machine (LSM, MVCC, etc).
+// state machine.
 type ApplyFunc func(entries []myraft.Entry) error
 
 // ApplyTask is the committed-entry unit handed from the raft peer into the

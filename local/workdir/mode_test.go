@@ -59,7 +59,7 @@ func TestReadRejectsUnknownMode(t *testing.T) {
 	}
 
 	_, err := Read(dir)
-	if err == nil || !strings.Contains(err.Error(), "unknown migration mode") {
+	if err == nil || !strings.Contains(err.Error(), "unknown workdir mode") {
 		t.Fatalf("expected unknown mode error, got %v", err)
 	}
 }

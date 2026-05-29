@@ -18,8 +18,8 @@ func NormalizeShardCount(shards int) int {
 }
 
 // ShardForUserKey returns the local data-plane shard for a user key. The hash
-// is shared by local LSM routing and fsmeta placement decisions; changing it is
-// therefore a storage-layout change, not a benchmark-only knob.
+// is shared by local apply routing and fsmeta placement decisions; changing it
+// is therefore a storage-layout change, not a benchmark-only knob.
 func ShardForUserKey(userKey []byte, shardCount int) int {
 	shardCount = NormalizeShardCount(shardCount)
 	if shardCount <= 1 || len(userKey) == 0 {

@@ -54,19 +54,8 @@ func renderStats(w io.Writer, snap stats.StatsSnapshot, asJSON bool) error {
 		return enc.Encode(snap)
 	}
 
-	_, _ = fmt.Fprintf(w, "Entries               %d\n", snap.Entries)
-	_, _ = fmt.Fprintf(w, "Flush.Pending          %d\n", snap.Flush.Pending)
-	_, _ = fmt.Fprintf(w, "Compaction.Backlog     %d\n", snap.Compaction.Backlog)
-	_, _ = fmt.Fprintf(w, "Compaction.MaxScore    %.2f\n", snap.Compaction.MaxScore)
-	_, _ = fmt.Fprintf(w, "Flush.Wait.LastMs      %.2f\n", snap.Flush.LastWaitMs)
-	_, _ = fmt.Fprintf(w, "Flush.Wait.MaxMs       %.2f\n", snap.Flush.MaxWaitMs)
-	_, _ = fmt.Fprintf(w, "Flush.Build.LastMs     %.2f\n", snap.Flush.LastBuildMs)
-	_, _ = fmt.Fprintf(w, "Flush.Build.MaxMs      %.2f\n", snap.Flush.MaxBuildMs)
-	_, _ = fmt.Fprintf(w, "Flush.Release.LastMs   %.2f\n", snap.Flush.LastReleaseMs)
-	_, _ = fmt.Fprintf(w, "Flush.Release.MaxMs    %.2f\n", snap.Flush.MaxReleaseMs)
-	_, _ = fmt.Fprintf(w, "Compaction.LastMs      %.2f\n", snap.Compaction.LastDurationMs)
-	_, _ = fmt.Fprintf(w, "Compaction.MaxMs       %.2f\n", snap.Compaction.MaxDurationMs)
-	_, _ = fmt.Fprintf(w, "Compaction.Runs        %d\n", snap.Compaction.Runs)
+	_, _ = fmt.Fprintf(w, "Storage.KeysEstimate  %d\n", snap.Storage.KeysEstimate)
+	_, _ = fmt.Fprintf(w, "Storage.SizeBytes     %d\n", snap.Storage.SizeBytes)
 	_, _ = fmt.Fprintf(w, "Write.HotKeyThrottled  %d\n", snap.Write.HotKeyLimited)
 	if snap.Hot.WriteRing != nil {
 		hs := snap.Hot.WriteRing
@@ -82,17 +71,6 @@ func renderStats(w io.Writer, snap stats.StatsSnapshot, asJSON bool) error {
 			_, _ = fmt.Fprintf(w, "Thermos.Decay          every=%s shift=%d\n",
 				hs.DecayInterval.String(), hs.DecayShift)
 		}
-	}
-	_, _ = fmt.Fprintf(w, "Compaction.ValueWeight %.2f", snap.Compaction.ValueWeight)
-	if snap.Compaction.ValueWeightSuggested > snap.Compaction.ValueWeight {
-		_, _ = fmt.Fprintf(w, " (suggested %.2f)", snap.Compaction.ValueWeightSuggested)
-	}
-	_, _ = fmt.Fprintln(w)
-	if snap.LSM.ValueDensityMax > 0 {
-		_, _ = fmt.Fprintf(w, "LSM.ValueDensityMax    %.2f\n", snap.LSM.ValueDensityMax)
-	}
-	if snap.LSM.ValueDensityAlert {
-		_, _ = fmt.Fprintln(w, "LSM.ValueDensityAlert  true")
 	}
 	_, _ = fmt.Fprintf(w, "WAL.ActiveSegment      %d (segments=%d removed=%d)\n", snap.WAL.ActiveSegment, snap.WAL.SegmentCount, snap.WAL.SegmentsRemoved)
 	_, _ = fmt.Fprintf(w, "WAL.ActiveSize         %d bytes\n", snap.WAL.ActiveSize)
@@ -205,21 +183,6 @@ func renderStats(w io.Writer, snap stats.StatsSnapshot, asJSON bool) error {
 				snap.MVCCGC.OrphanDefaults,
 				snap.MVCCGC.AppliedOrphanDefaults,
 			)
-		}
-	}
-	if snap.LSM.ValueBytesTotal > 0 {
-		_, _ = fmt.Fprintf(w, "LSM.ValueBytesTotal   %d\n", snap.LSM.ValueBytesTotal)
-	}
-	if len(snap.LSM.Levels) > 0 {
-		_, _ = fmt.Fprintln(w, "LSM.Levels:")
-		for _, lvl := range snap.LSM.Levels {
-			_, _ = fmt.Fprintf(w, "  - L%d tables=%d size=%dB value=%dB stale=%dB",
-				lvl.Level, lvl.TableCount, lvl.SizeBytes, lvl.ValueBytes, lvl.StaleBytes)
-			if lvl.LandingTables > 0 {
-				_, _ = fmt.Fprintf(w, " landingTables=%d landingSize=%dB landingValue=%dB",
-					lvl.LandingTables, lvl.LandingSizeBytes, lvl.LandingValueBytes)
-			}
-			_, _ = fmt.Fprintln(w)
 		}
 	}
 	if len(snap.Hot.WriteKeys) > 0 {

@@ -5,12 +5,10 @@ package local
 
 // UserKeyShape describes runtime-derived key structure that the local engine
 // can use without importing higher-level metadata packages. Shape data is not
-// persisted; it only guides shard routing and SST prefix bloom construction.
+// persisted; it only guides local commit-shard routing.
 type UserKeyShape struct {
 	// LocalityPrefix groups keys that should share one local apply group.
 	LocalityPrefix []byte
-	// BloomPrefix is the prefix stored in SST prefix bloom filters.
-	BloomPrefix []byte
 	// ShardKey is the exact byte sequence used for local shard routing. When
 	// empty, LocalityPrefix is used; when both are empty the full user key is
 	// hashed by the generic router.

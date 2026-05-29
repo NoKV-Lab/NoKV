@@ -45,8 +45,8 @@ func TestRunStatsCmd(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &snap); err != nil {
 		t.Fatalf("unmarshal snapshot: %v", err)
 	}
-	if snap.Entries == 0 {
-		t.Fatalf("expected entry count > 0")
+	if snap.Storage.SizeBytes == 0 {
+		t.Fatalf("expected storage size > 0")
 	}
 }
 
@@ -61,13 +61,13 @@ func TestLocalStatsSnapshotAllowsSeededWorkdir(t *testing.T) {
 
 	snap, err := localStatsSnapshot(dir, false)
 	require.NoError(t, err)
-	require.Greater(t, snap.Entries, int64(0))
+	require.NotNil(t, snap)
 }
 
 func TestRenderStatsWarnLine(t *testing.T) {
 	var buf bytes.Buffer
 	snap := stats.StatsSnapshot{
-		Entries: 1,
+		Storage: stats.StorageStatsSnapshot{KeysEstimate: 1},
 		WAL: stats.WALStatsSnapshot{
 			ActiveSegment:   7,
 			SegmentCount:    3,
@@ -95,8 +95,8 @@ func TestRenderStatsWarnLine(t *testing.T) {
 	if !strings.Contains(out, "Regions.Total") {
 		t.Fatalf("expected Regions.Total line in output, got: %q", out)
 	}
-	if !strings.Contains(out, "Compaction.ValueWeight") {
-		t.Fatalf("expected Compaction.ValueWeight line in output, got: %q", out)
+	if !strings.Contains(out, "Storage.SizeBytes") {
+		t.Fatalf("expected Storage.SizeBytes line in output, got: %q", out)
 	}
 }
 func TestRunRegionsCmd(t *testing.T) {
@@ -132,15 +132,12 @@ func TestFetchExpvarSnapshot(t *testing.T) {
 	handler.HandleFunc("/debug/vars", func(w http.ResponseWriter, r *http.Request) {
 		payload := map[string]any{
 			"NoKV.Local.Stats": map[string]any{
-				"entries": float64(12),
+				"storage": map[string]any{
+					"keys_estimate": float64(12),
+				},
 				"hot": map[string]any{
 					"write_keys": []any{
 						map[string]any{"key": "k1", "count": float64(3)},
-					},
-				},
-				"lsm": map[string]any{
-					"levels": []any{
-						map[string]any{"level": float64(0), "tables": float64(1)},
 					},
 				},
 			},
@@ -153,18 +150,18 @@ func TestFetchExpvarSnapshot(t *testing.T) {
 	url := strings.TrimPrefix(server.URL, "http://")
 	snap, err := fetchExpvarSnapshot(url)
 	require.NoError(t, err)
-	require.Equal(t, int64(12), snap.Entries)
+	require.Equal(t, uint64(12), snap.Storage.KeysEstimate)
 	require.Len(t, snap.Hot.WriteKeys, 1)
 	require.Equal(t, "k1", snap.Hot.WriteKeys[0].Key)
-	require.Len(t, snap.LSM.Levels, 1)
-	require.Equal(t, 0, snap.LSM.Levels[0].Level)
 }
 
 func TestFetchExpvarSnapshotWithPath(t *testing.T) {
 	handler := http.NewServeMux()
 	handler.HandleFunc("/debug/vars", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"NoKV.Local.Stats": map[string]any{"entries": float64(2)},
+			"NoKV.Local.Stats": map[string]any{
+				"storage": map[string]any{"keys_estimate": float64(2)},
+			},
 		})
 	})
 	server := httptest.NewServer(handler)
@@ -172,7 +169,7 @@ func TestFetchExpvarSnapshotWithPath(t *testing.T) {
 
 	snap, err := fetchExpvarSnapshot(server.URL + "/debug/vars")
 	require.NoError(t, err)
-	require.Equal(t, int64(2), snap.Entries)
+	require.Equal(t, uint64(2), snap.Storage.KeysEstimate)
 }
 
 func TestParseExpvarSnapshotHotKeysList(t *testing.T) {
@@ -355,7 +352,7 @@ func TestRunStatsCmdExpvarPlain(t *testing.T) {
 	handler.HandleFunc("/debug/vars", func(w http.ResponseWriter, r *http.Request) {
 		payload := map[string]any{
 			"NoKV.Local.Stats": map[string]any{
-				"entries": float64(9),
+				"storage": map[string]any{"keys_estimate": float64(9)},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(payload)
@@ -366,7 +363,7 @@ func TestRunStatsCmdExpvarPlain(t *testing.T) {
 	var buf bytes.Buffer
 	err := runStatsCmd(&buf, []string{"-expvar", server.URL})
 	require.NoError(t, err)
-	require.Contains(t, buf.String(), "Entries")
+	require.Contains(t, buf.String(), "Storage.KeysEstimate")
 }
 
 func TestFetchExpvarSnapshotBadStatus(t *testing.T) {
@@ -397,7 +394,9 @@ func TestFetchExpvarSnapshotTrailingSlash(t *testing.T) {
 	handler := http.NewServeMux()
 	handler.HandleFunc("/debug/vars", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"NoKV.Local.Stats": map[string]any{"entries": float64(1)},
+			"NoKV.Local.Stats": map[string]any{
+				"storage": map[string]any{"keys_estimate": float64(1)},
+			},
 		})
 	})
 	server := httptest.NewServer(handler)
@@ -406,20 +405,15 @@ func TestFetchExpvarSnapshotTrailingSlash(t *testing.T) {
 	url := strings.TrimPrefix(server.URL, "http://") + "/"
 	snap, err := fetchExpvarSnapshot(url)
 	require.NoError(t, err)
-	require.Equal(t, int64(1), snap.Entries)
+	require.Equal(t, uint64(1), snap.Storage.KeysEstimate)
 }
 
 func TestParseExpvarSnapshotFull(t *testing.T) {
 	data := map[string]any{
 		"NoKV.Local.Stats": map[string]any{
-			"entries": float64(11),
-			"flush": map[string]any{
-				"pending": float64(2),
-			},
-			"compaction": map[string]any{
-				"max_score":              float64(1.5),
-				"value_weight":           float64(2.0),
-				"value_weight_suggested": float64(2.4),
+			"storage": map[string]any{
+				"keys_estimate": float64(11),
+				"size_bytes":    float64(4096),
 			},
 			"write": map[string]any{
 				"hot_key_limited": float64(4),
@@ -430,23 +424,6 @@ func TestParseExpvarSnapshotFull(t *testing.T) {
 				"max_lag_segments": float64(5),
 				"min_log_segment":  float64(1),
 				"max_log_segment":  float64(9),
-			},
-			"lsm": map[string]any{
-				"value_bytes_total":   float64(10),
-				"value_density_max":   float64(3.5),
-				"value_density_alert": true,
-				"levels": []any{
-					map[string]any{
-						"level":               float64(0),
-						"tables":              float64(1),
-						"size_bytes":          float64(10),
-						"value_bytes":         float64(5),
-						"stale_bytes":         float64(2),
-						"landing_tables":      float64(1),
-						"landing_size_bytes":  float64(3),
-						"landing_value_bytes": float64(4),
-					},
-				},
 			},
 			"region": map[string]any{
 				"total":     float64(4),
@@ -470,52 +447,21 @@ func TestParseExpvarSnapshotFull(t *testing.T) {
 		},
 	}
 	snap := parseExpvarSnapshot(data)
-	require.Equal(t, int64(11), snap.Entries)
+	require.Equal(t, uint64(11), snap.Storage.KeysEstimate)
+	require.Equal(t, uint64(4096), snap.Storage.SizeBytes)
 	require.Equal(t, uint64(4), snap.Write.HotKeyLimited)
-	require.True(t, snap.LSM.ValueDensityAlert)
 	require.Len(t, snap.Hot.WriteKeys, 1)
-	require.Len(t, snap.LSM.Levels, 1)
 }
 
 func TestRenderStatsFull(t *testing.T) {
 	var buf bytes.Buffer
 	snap := stats.StatsSnapshot{
-		Entries: 1,
-		Flush: stats.FlushStatsSnapshot{
-			Pending:       2,
-			LastWaitMs:    1,
-			MaxWaitMs:     2,
-			LastBuildMs:   3,
-			MaxBuildMs:    4,
-			LastReleaseMs: 5,
-			MaxReleaseMs:  6,
-		},
-		Compaction: stats.CompactionStatsSnapshot{
-			Backlog:              3,
-			MaxScore:             4.5,
-			LastDurationMs:       1.2,
-			MaxDurationMs:        2.3,
-			Runs:                 1,
-			ValueWeight:          1.0,
-			ValueWeightSuggested: 2.0,
+		Storage: stats.StorageStatsSnapshot{
+			KeysEstimate: 1,
+			SizeBytes:    4096,
 		},
 		Write: stats.WriteStatsSnapshot{
 			HotKeyLimited: 2,
-		},
-		LSM: stats.LSMStatsSnapshot{
-			ValueDensityMax:   1.5,
-			ValueDensityAlert: true,
-			ValueBytesTotal:   10,
-			Levels: []stats.LSMLevelStats{{
-				Level:             0,
-				TableCount:        1,
-				SizeBytes:         2,
-				ValueBytes:        3,
-				StaleBytes:        4,
-				LandingTables:     1,
-				LandingSizeBytes:  2,
-				LandingValueBytes: 3,
-			}},
 		},
 		WAL: stats.WALStatsSnapshot{
 			ActiveSegment:           1,
@@ -586,7 +532,7 @@ func TestRenderStatsFull(t *testing.T) {
 	require.Contains(t, out, "MVCCGC.ResolveLocks")
 	require.Contains(t, out, "MVCCGC.Apply")
 	require.Contains(t, out, "MVCCGC.OrphanDefaults")
-	require.Contains(t, out, "LSM.Levels:")
+	require.Contains(t, out, "Storage.SizeBytes")
 	require.Contains(t, out, "WriteHotKeys:")
 }
 

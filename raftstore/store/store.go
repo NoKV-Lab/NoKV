@@ -13,8 +13,6 @@
 // Transitions (peer add/remove, region split/merge, descriptor publish)
 // are expressed as typed events through transition_builder.go and
 // transition_executor.go, then published to coordinator via PublishRootEvent.
-//
-// See docs/guide/raftstore.md and docs/guide/control_and_execution_protocols.md.
 package store
 
 import (

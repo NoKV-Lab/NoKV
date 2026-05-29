@@ -11,7 +11,7 @@ recovery ownership by layer.
 
 | Layer | Recovery owner |
 | --- | --- |
-| Raw ordered KV | Pebble under `storage/pebble` |
+| Raw ordered KV | Concrete `storage/kv` backend: Pebble today, Holt target |
 | NoKV MVCC keys and versions | `txn/storage`, `txn/mvcc`, and `local.DB` |
 | Raft logs and peer snapshots | `raftstore/raftlog` and `raftstore/snapshot` |
 | Store-local region catalog | `raftstore/localmeta` |
@@ -19,9 +19,9 @@ recovery ownership by layer.
 | fsmeta namespace model | `fsmeta/exec` over `fsmeta/backend` |
 
 The removed self-managed LSM path had manifest/SST/WAL recovery invariants.
-Those files are no longer mainline product state. Pebble workdirs use the
-Pebble format and this version does not provide an online migration path from
-old workdirs.
+Those files are no longer mainline product state. Concrete backends own their
+own physical recovery formats, and this version does not provide an online
+migration path from old self-managed LSM workdirs.
 
 Useful focused checks:
 

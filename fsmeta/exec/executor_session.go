@@ -565,7 +565,7 @@ func (e *Executor) ExpireWriteSessions(ctx context.Context, req model.ExpireWrit
 		if authorityScopeEmpty(drainScope) {
 			drainScope = delta.Authority
 		}
-		// Fallback expiration mutates base LSM session keys. Drain only after
+		// Fallback expiration mutates base session keys. Drain only after
 		// concrete expired keys are known so ordinary visible session updates do
 		// not wait behind speculative maintenance scans.
 		if err := e.drainVisibleAuthority(ctx, drainScope); err != nil {

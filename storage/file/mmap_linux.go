@@ -105,7 +105,7 @@ func OpenMmapFile(fs vfs.FS, filename string, flag int, maxSz int) (*MmapFile, e
 		return nil, errors.Wrapf(err, "unable to open: %s", filename)
 	}
 	writable := flag != os.O_RDONLY
-	// if the sst file layer has been opened, use its original size
+	// if the mapped file has been opened, use its original size
 	if fileInfo, err := handle.Stat(); err == nil && fileInfo != nil && fileInfo.Size() > 0 {
 		maxSz = int(fileInfo.Size())
 	}

@@ -11,10 +11,9 @@
 //
 // The hot path is fan-out by per-shard channel: the dispatcher pulls
 // each batch off the MPSC queue and routes it to one shard's processor
-// using key-affinity hashing. The processor coalesces a burst of
-// batches arriving on its channel into a single commit-store SetBatchGroup +
-// (optional) Sync, then acks each originating
-// batch with the per-batch failedAt fanned back out.
+// using key-affinity hashing. The processor coalesces a burst of batches
+// arriving on its channel into one commit-store SetBatchGroup + optional Sync,
+// then acks each originating batch with the per-batch failedAt fanned back out.
 package commit
 
 import (
@@ -146,8 +145,8 @@ func (p *Pipeline) Send(entries []*kv.Entry, waitOnThrottle bool) (*Request, err
 		return nil, utils.ErrTxnTooBig
 	}
 	if p.host.SlowWritesActive() {
-		if lsmSrc := p.host.CommitStore(); lsmSrc != nil {
-			if d := SlowdownDelay(size, lsmSrc.ThrottleRateBytesPerSec()); d > 0 {
+		if commitStore := p.host.CommitStore(); commitStore != nil {
+			if d := SlowdownDelay(size, commitStore.ThrottleRateBytesPerSec()); d > 0 {
 				time.Sleep(d)
 			}
 		}
@@ -351,11 +350,10 @@ func routeUserKeyToShard(userKey []byte, shardCount int, shardKey func([]byte) [
 	return utils.ShardForUserKey(userKey, shardCount)
 }
 
-// processor runs the per-batch CPU pipeline (collect -> applyRequests ->
-// ack) for batches pinned to one CommitStore shard. The
-// processor owns its shard end-to-end: WAL append, memtable apply, and
-// (when sync is inline) WAL fsync all hit one Manager, so there is no
-// Manager.mu contention across processors.
+// processor runs the per-batch CPU pipeline (collect -> applyRequests -> ack)
+// for batches pinned to one CommitStore shard. The processor owns its shard
+// end-to-end: WAL append, raw KV apply, and (when sync is inline) WAL fsync all
+// hit one Manager, so there is no Manager.mu contention across processors.
 //
 // Burst coalescing: when the dispatcher delivers small batches faster
 // than the processor can drain them, the processor pulls every batch
@@ -388,8 +386,8 @@ func (p *Pipeline) processor(shardID int) {
 	}
 }
 
-// runBurst processes a burst of batches as a single WAL append +
-// memtable apply, then fans the result back to each batch for ack.
+// runBurst processes a burst of batches as a single WAL append + raw KV apply,
+// then fans the result back to each batch for ack.
 func (p *Pipeline) runBurst(shardID int, burst []*CommitBatch) {
 	if len(burst) == 0 {
 		return

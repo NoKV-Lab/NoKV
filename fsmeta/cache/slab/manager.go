@@ -66,7 +66,7 @@ func (cfg Config) resolve() (Config, error) {
 
 // Manager owns a directory of mmap-backed Segment files and the rotation
 // lifecycle between them. It does not understand what the bytes mean —
-// no value pointer, no bucket routing, no GC sample logic, no main-manifest
+// no value pointer, no bucket routing, no GC sample logic, no product index
 // integration. Those are consumer concerns layered on top.
 //
 // Concurrency model:

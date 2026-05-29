@@ -10,8 +10,6 @@
 // event is codified. meta/root/replicated persists the events through a
 // 3-peer raft quorum; callers under meta/root/server, meta/root/client,
 // coordinator/, and raftstore/ consume the resulting State as truth.
-//
-// See docs/guide/rooted_truth.md for the overall kernel design.
 package state
 
 import (

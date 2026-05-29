@@ -11,14 +11,13 @@ import (
 const (
 	adminReasonMetadata = "raft_admin_reason"
 
-	reasonCanceled              = "canceled"
-	reasonInvalidRequest        = "invalid_request"
-	reasonServiceNotConfigured  = "service_not_configured"
-	reasonSnapshotNotConfigured = "snapshot_not_configured"
-	reasonRegionNotHosted       = "region_not_hosted"
-	reasonRegionNotLeader       = "region_not_leader"
-	reasonPrecondition          = "failed_precondition"
-	reasonInternal              = "internal"
+	reasonCanceled             = "canceled"
+	reasonInvalidRequest       = "invalid_request"
+	reasonServiceNotConfigured = "service_not_configured"
+	reasonRegionNotHosted      = "region_not_hosted"
+	reasonRegionNotLeader      = "region_not_leader"
+	reasonPrecondition         = "failed_precondition"
+	reasonInternal             = "internal"
 )
 
 func rpcCanceled(err error) error {
@@ -31,10 +30,6 @@ func rpcInvalidArgument(message string) error {
 
 func rpcServiceNotConfigured(message string) error {
 	return rpcAdminError(nokverrors.KindProtocolViolation, codes.FailedPrecondition, message, reasonServiceNotConfigured)
-}
-
-func rpcSnapshotNotConfigured(message string) error {
-	return rpcAdminError(nokverrors.KindProtocolViolation, codes.FailedPrecondition, message, reasonSnapshotNotConfigured)
 }
 
 func rpcPrecondition(err error) error {

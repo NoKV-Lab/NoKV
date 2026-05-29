@@ -63,7 +63,7 @@ func TestAPI(t *testing.T) {
 		it := iter.Item()
 		t.Logf("db.NewIterator key=%s, value=%s, expiresAt=%d", it.Entry().Key, it.Entry().Value, it.Entry().ExpiresAt)
 	}
-	t.Logf("db.Stats.Entries=%+v", db.Info().Snapshot().Entries)
+	t.Logf("db.Stats.Storage=%+v", db.Info().Snapshot().Storage)
 	// Delete.
 	if err := db.Del([]byte("hello")); err != nil {
 		t.Fatal(err)
@@ -1088,7 +1088,7 @@ func drMustClose(t *testing.T, db *DB) {
 	}
 }
 
-func drWaitForFlushedSST(t *testing.T, db *DB) {
+func drWaitForStorageSync(t *testing.T, db *DB) {
 	t.Helper()
 	require.NoError(t, db.Sync())
 }
@@ -1284,8 +1284,8 @@ func TestDeleteRangeComplex(t *testing.T) {
 	}
 }
 
-// TestDeleteRangeWithCompaction tests range deletion behavior during compaction.
-func TestDeleteRangeWithCompaction(t *testing.T) {
+// TestDeleteRangeWithStorageRewrite tests range deletion across durable storage rewrite points.
+func TestDeleteRangeWithStorageRewrite(t *testing.T) {
 	opt := drTestOptions(t.TempDir())
 	opt.MemTableSize = 1024
 	db := openTestDB(t, opt)
@@ -1374,7 +1374,7 @@ func TestDeleteRangePersistsAfterFlushAndReopen(t *testing.T) {
 		key := fmt.Appendf(nil, "pad-%03d", i)
 		drMustSet(t, db, key, padding)
 	}
-	drWaitForFlushedSST(t, db)
+	drWaitForStorageSync(t, db)
 	drMustClose(t, db)
 
 	db = openTestDB(t, opt)
@@ -1478,7 +1478,7 @@ func TestDBIteratorBoundsAndOutOfRangeSeekContract(t *testing.T) {
 	})
 }
 
-func TestAPIMixedOpsPersistAcrossFlushCompactionAndReopen(t *testing.T) {
+func TestAPIMixedOpsPersistAcrossStorageRewriteAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	opt := drTestOptions(dir)
 	opt.MemTableSize = 512
@@ -1503,7 +1503,7 @@ func TestAPIMixedOpsPersistAcrossFlushCompactionAndReopen(t *testing.T) {
 		key := fmt.Appendf(nil, "pad-%03d", i)
 		require.NoError(t, db.Set(key, padding))
 	}
-	drWaitForFlushedSST(t, db)
+	drWaitForStorageSync(t, db)
 
 	drMustClose(t, db)
 	db = openTestDB(t, opt)
@@ -1597,7 +1597,7 @@ func TestCloseAggregatesDirLockErrors(t *testing.T) {
 	require.True(t, db.IsClosed())
 }
 
-func TestConcurrentReadWriteFlushCompactionStress(t *testing.T) {
+func TestConcurrentReadWriteStorageRewriteStress(t *testing.T) {
 	opt := newTestOptions(t)
 	opt.MemTableSize = 4 << 10
 	opt.WriteHotKeyLimit = 0

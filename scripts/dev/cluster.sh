@@ -196,7 +196,7 @@ done
 for idx in "${!STORE_IDS[@]}"; do
   store_dir="${STORE_WORKDIRS[$idx]}"
   if [[ -f "$store_dir/CURRENT" ]]; then
-    echo "Store ${STORE_IDS[$idx]} already bootstrapped; skipping manifest seeding"
+    echo "Store ${STORE_IDS[$idx]} already bootstrapped; skipping local peer-catalog seeding"
     continue
   fi
   nokv_assert_fresh_workdir "$store_dir" "cluster.sh: store ${STORE_IDS[$idx]} has stale files; refusing to seed into dirty directory"

@@ -65,7 +65,7 @@ import { withBase } from 'vitepress'
           <span class="hero-trust-row">
             <span class="trust-chip">FoundationDB-class KV</span>
             <span class="trust-chip">etcd/raft</span>
-            <span class="trust-chip">your-own storage engine</span>
+            <span class="trust-chip">Pebble / Holt backend</span>
           </span>
         </div>
       </div>

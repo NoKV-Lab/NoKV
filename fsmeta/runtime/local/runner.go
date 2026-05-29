@@ -183,8 +183,8 @@ func (r *Runner) MutateAtCommit(ctx context.Context, primary []byte, mutations [
 //
 // Contract for callers: every mutation is a versioned MVCC write whose effect
 // is idempotent on retry. The local DB still routes mutations to their
-// affinity-correct LSM shard internally, so each shard's group is atomically
-// fsynced; the relaxation is only at the cross-shard and cross-chunk
+// affinity-correct commit shard internally, so each shard's group is
+// atomically fsynced; the relaxation is only at the cross-shard and cross-chunk
 // boundary. The caller is responsible for not exposing the install as
 // complete until the function returns nil — partial completion on crash is
 // recovered by visibleLog replay re-running the same install with the same

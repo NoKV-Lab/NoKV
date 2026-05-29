@@ -160,7 +160,6 @@ func mountAtomicUserKeyShape(key []byte) localdb.UserKeyShape {
 func localUserKeyShape(shape layout.KeyShape) localdb.UserKeyShape {
 	return localdb.UserKeyShape{
 		LocalityPrefix: shape.LocalityPrefix,
-		BloomPrefix:    shape.BloomPrefix,
 		ShardKey:       shape.ShardKey,
 		Family:         shape.Family,
 	}

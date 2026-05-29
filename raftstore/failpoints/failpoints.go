@@ -22,10 +22,10 @@ const (
 	// been applied to local durable state but before the store publishes the new
 	// peer/runtime into its router and region catalog.
 	AfterSnapshotApplyBeforePublish
-	// AfterInitModePreparing simulates a crash after migration init has written
+	// AfterInitModePreparing simulates a crash after distributed init has written
 	// MODE=preparing but before any local catalog or snapshot state is published.
 	AfterInitModePreparing
-	// AfterInitCatalogPersist simulates a crash after migration init has written
+	// AfterInitCatalogPersist simulates a crash after distributed init has written
 	// local region catalog state but before seed snapshot export and seeded mode.
 	AfterInitCatalogPersist
 	// AfterInitSeedSnapshot simulates a crash after the seed snapshot files
@@ -70,19 +70,19 @@ func ShouldFailAfterSnapshotApplyBeforePublish() bool {
 	return Current()&AfterSnapshotApplyBeforePublish != 0
 }
 
-// ShouldFailAfterInitModePreparing reports whether migration init should stop
+// ShouldFailAfterInitModePreparing reports whether distributed init should stop
 // immediately after persisting MODE=preparing.
 func ShouldFailAfterInitModePreparing() bool {
 	return Current()&AfterInitModePreparing != 0
 }
 
-// ShouldFailAfterInitCatalogPersist reports whether migration init should stop
+// ShouldFailAfterInitCatalogPersist reports whether distributed init should stop
 // immediately after persisting local region catalog state.
 func ShouldFailAfterInitCatalogPersist() bool {
 	return Current()&AfterInitCatalogPersist != 0
 }
 
-// ShouldFailAfterInitSeedSnapshot reports whether migration init should stop
+// ShouldFailAfterInitSeedSnapshot reports whether distributed init should stop
 // after exporting the seed snapshot files but before seeded finalization.
 func ShouldFailAfterInitSeedSnapshot() bool {
 	return Current()&AfterInitSeedSnapshot != 0

@@ -26,9 +26,9 @@ const layers = [
   },
   {
     tier: 'L3',
-    name: 'engine',
-    role: 'LSM + ART memtable + WAL + slab sidecar substrate',
-    parts: ['WAL', 'MemTable', 'Flush', 'Leveled compaction', 'Manifest', 'VFS'],
+    name: 'storage/kv · pebble · holt',
+    role: 'Replaceable raw ordered KV backend',
+    parts: ['storage/kv contract', 'Pebble default', 'Holt target adapter', 'VFS / file support'],
   },
 ]
 </script>
@@ -41,9 +41,9 @@ const layers = [
         Three layers. Hard boundaries. Enforced in code.
       </h2>
       <p class="nokv-lead">
-        The fsmeta executor consumes a narrow <code>TxnRunner</code>. The default
-        runtime adapter owns raftstore wiring. Lower layers do not import fsmeta. The
-        storage engine never learns that a namespace exists.
+        The fsmeta executor consumes a narrow <code>fsmeta/backend.Store</code>.
+        Runtime adapters own local or raftstore wiring. Lower layers do not import
+        fsmeta. The raw storage backend never learns that a namespace exists.
       </p>
     </div>
 

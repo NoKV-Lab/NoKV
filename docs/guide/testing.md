@@ -22,7 +22,7 @@ go test -count=1 ./cmd/nokv ./cmd/nokv-fsmeta
 
 | Layer | Primary tests |
 | --- | --- |
-| Raw storage | `storage/kv`, `storage/pebble`, `storage/memory` |
+| Raw storage | `storage/kv`, `storage/pebble`, `storage/memory`; add `storage/holt` here when wired |
 | MVCC storage encoding | `txn/storage`, `txn/mvcc`, `txn/percolator` |
 | Local runtime | `local/...`, `fsmeta/runtime/local` |
 | Distributed runtime | `raftstore/kv`, `raftstore/store`, `raftstore/server`, `raftstore/admin`, `fsmeta/runtime/raftstore` |

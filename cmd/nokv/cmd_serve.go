@@ -45,7 +45,6 @@ func fsmetaLocalUserKeyShape(key []byte) local.UserKeyShape {
 	shape := layout.UserKeyShape(key)
 	return local.UserKeyShape{
 		LocalityPrefix: shape.LocalityPrefix,
-		BloomPrefix:    shape.BloomPrefix,
 		ShardKey:       shape.ShardKey,
 		Family:         shape.Family,
 	}

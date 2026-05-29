@@ -19,6 +19,6 @@ const (
 )
 
 var (
-	// CastagnoliCrcTable is the shared CRC32 polynomial used across WAL and SST codecs.
+	// CastagnoliCrcTable is the shared CRC32 polynomial used across entry streams.
 	CastagnoliCrcTable = crc32.MakeTable(crc32.Castagnoli)
 )

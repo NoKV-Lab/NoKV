@@ -11,7 +11,7 @@ import (
 )
 
 // Phase 5f benches measure the dirpage cache substrate cost in
-// isolation. End-to-end "DirPage fast path vs full LSM Scan + N inode
+// isolation. End-to-end "DirPage fast path vs full backend Scan + N inode
 // BatchGet" comparisons live with the fsmeta integration once a real
 // DB benchmark fixture is wired in (Phase 5g).
 //
@@ -79,7 +79,7 @@ func BenchmarkDirPageLookupWarm(b *testing.B) {
 }
 
 // BenchmarkDirPageLookupMiss measures the cost of a cache miss (the
-// fsmeta caller will then fall back to LSM scan + materialize). The
+// fsmeta caller will then fall back to backend scan + materialize). The
 // in-memory index probe is the only work; no page read or decode.
 func BenchmarkDirPageLookupMiss(b *testing.B) {
 	c := newBenchCache(b, 16<<10)
@@ -95,7 +95,7 @@ func BenchmarkDirPageLookupMiss(b *testing.B) {
 
 // BenchmarkDirPageMaterializeAsync measures the cost of writing a fresh
 // page set for directories of varying size. This is the cost the fsmeta
-// caller pays on the cold path (after an LSM Scan + N inode BatchGet
+// caller pays on the cold path (after a backend Scan + N inode BatchGet
 // produces the assembled DentryAttrPair slice).
 func BenchmarkDirPageMaterializeAsync(b *testing.B) {
 	const blobSize = 96

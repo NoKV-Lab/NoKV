@@ -5,7 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Thermos
 
-`experimental/thermos` is NoKV's optional internal hotspot detector. It is no longer part of the default read path or LSM compaction planning.
+`experimental/thermos` is NoKV's optional internal hotspot detector. It is no
+longer part of the default read path or physical storage-backend planning.
 
 ## Current Role
 
@@ -22,11 +23,12 @@ If `ThermosEnabled=false`, the DB runs without Thermos tracking on the hot path.
 These integrations were intentionally removed from the default engine path:
 
 - read-path hot tracking and asynchronous read prefetch
-- LSM compaction scoring based on hot-key overlap
+- physical compaction scoring inside Pebble or Holt
 - legacy value placement experiments
 - hot-write batch enlargement heuristics
 
-NoKV now stores values inline in the LSM, so Thermos does not participate in value placement.
+NoKV now stores values through the selected raw storage backend, so Thermos does
+not participate in value placement.
 
 ## Data Structure
 
@@ -55,7 +57,8 @@ These capabilities are still useful for optional write throttling and operationa
 
 When both `ThermosEnabled` and `WriteHotKeyLimit > 0` are set, NoKV records write frequency by `CF + UserKey` and returns `utils.ErrHotKeyWriteThrottle` once the limit is reached.
 
-This path exists to protect the engine from pathological skew. It is intentionally independent from cache warming and compaction.
+This path exists to protect metadata execution from pathological skew. It is
+intentionally independent from backend cache warming and compaction.
 
 ## Stats
 

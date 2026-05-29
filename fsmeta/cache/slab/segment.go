@@ -7,7 +7,7 @@
 // append bytes, read a (offset, length) range, seal/truncate/sync the file,
 // and remap between read-only and writable. It does NOT know what the bytes
 // mean — there is no value pointer, no bucket routing, no business GC, no
-// manifest integration. Those are consumer concerns.
+// product-level indexing. Those are consumer concerns.
 package slab
 
 import (

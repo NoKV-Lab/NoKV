@@ -77,8 +77,8 @@ const cols = [
 
       <div class="footer-bottom">
         <span class="footer-fine">
-          Apache-2.0 · Built from scratch — own storage engine, own raftstore on
-          <code>etcd/raft</code> RawNode, own coordinator.
+          Apache-2.0 · fsmeta metadata semantics, distributed execution, and
+          Pebble / Holt-class storage backends.
         </span>
         <span class="footer-fine">© 2025 NoKV Contributors</span>
       </div>

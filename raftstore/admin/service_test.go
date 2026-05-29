@@ -364,15 +364,3 @@ func requireAdminRPCError(t *testing.T, err error, code codes.Code, kind nokverr
 	require.Equal(t, kind, gotKind)
 	require.Equal(t, reason, metadata[adminReasonMetadata])
 }
-
-func TestServiceRegionSnapshotMigrationUnsupported(t *testing.T) {
-	svc := NewService(store.NewStore(store.Config{StoreID: 1}))
-
-	_, err := svc.ExportRegionSnapshot(context.Background(), &adminpb.ExportRegionSnapshotRequest{RegionId: 1})
-	requireAdminRPCError(t, err, codes.FailedPrecondition, nokverrors.KindProtocolViolation, reasonSnapshotNotConfigured)
-	require.ErrorContains(t, err, "region snapshot migration is not supported")
-
-	_, err = svc.ImportRegionSnapshot(context.Background(), &adminpb.ImportRegionSnapshotRequest{Snapshot: []byte("payload")})
-	requireAdminRPCError(t, err, codes.FailedPrecondition, nokverrors.KindProtocolViolation, reasonSnapshotNotConfigured)
-	require.ErrorContains(t, err, "region snapshot migration is not supported")
-}

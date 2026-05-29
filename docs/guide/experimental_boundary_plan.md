@@ -43,7 +43,9 @@ The default story should be:
 ```text
 fsmeta API
   -> local runtime
-  -> single-node MVCC storage
+  -> local MVCC
+  -> storage/kv
+  -> Pebble today / Holt adapter later
 ```
 
 The scale-out story should be:
@@ -52,6 +54,7 @@ The scale-out story should be:
 fsmeta API
   -> raftstore runtime
   -> coordinator + meta/root + raftstore + transaction substrate
+  -> storage/kv on each store
 ```
 
 The research story should be:
@@ -72,19 +75,26 @@ The long-term package map should look like this:
 
 ```text
 fsmeta/
+  model/
+  layout/
+  backend/
+  observe/
   client/
   server/
   exec/
   runtime/
     local/
     raftstore/
-  internal/
-    layout/
-    snapshot/
-    watch/
 
 local/
 storage/
+  kv/
+  pebble/
+  holt/
+  memory/
+  wal/
+  file/
+  vfs/
 txn/
 raftstore/
 coordinator/
@@ -107,11 +117,17 @@ The exact final Go package names can be adjusted during migration, but the
 ownership rule should not change:
 
 - `fsmeta` is the stable namespace API.
-- `local` and `raftstore` are stable storage/runtime substrates.
+- `fsmeta/model`, `fsmeta/layout`, `fsmeta/backend`, and `fsmeta/observe`
+  are stable semantic boundaries for the namespace layer.
+- `local` and `raftstore` are stable runtime substrates.
+- `storage/kv` is the raw ordered-KV contract; `storage/pebble` is the default
+  concrete backend, and `storage/holt` is the expected placement for the Holt
+  adapter once wired.
 - `experimental/peras` may depend on stable fsmeta and raftstore interfaces.
-- `experimental/thermos` may depend on stable engine observation interfaces.
+- `experimental/thermos` may depend on stable admission or backend-observation
+  interfaces, but not on concrete storage internals.
 - stable lower layers should not import experimental packages except through
-  explicitly allowlisted migration adapters. The final target is no stable
+  explicitly allowlisted temporary adapters. The final target is no stable
   imports from `experimental/peras`.
 
 ## Stable Versus Experimental
@@ -149,7 +165,7 @@ visible-before-durable metadata execution:
 - TLA+ models and benchmark harnesses
 
 Thermos belongs in `experimental/thermos` because its current role is an
-optional hotspot detector and throttling experiment, not a required engine
+optional hotspot detector and throttling experiment, not a required backend
 feature.
 
 Experimental packages may still be useful and well-tested. The distinction is
@@ -158,10 +174,10 @@ mechanism should be removable without changing the stable product API.
 
 ## Boundary Rules
 
-1. `fsmeta` must not import `experimental/peras` outside explicit migration
+1. `fsmeta` must not import `experimental/peras` outside explicit temporary
    adapters.
 2. `raftstore` must not import `experimental/peras/exec` outside explicit
-   migration adapters.
+   temporary adapters.
 3. `meta/root` should store generic authority truth, not Peras-specific segment
    truth in the stable state path.
 4. `coordinator` should expose generic rooted events and routing views, not
@@ -269,13 +285,13 @@ Exit criteria:
 - Peras imports stable fsmeta and raftstore interfaces.
 - Peras can be disabled without changing the stable runtime.
 
-Current migration state:
+Current state:
 
 - Peras implementation packages have moved to `experimental/peras/exec`,
   `experimental/peras/runtime`, and `experimental/peras/adapters/raftstore`.
 - Stable packages still have explicit Peras adapter files. These imports are
-  temporary migration edges and should shrink as later phases remove the
-  old StoreKV/raft command surface.
+  temporary edges and should shrink as later phases remove the old
+  StoreKV/raft command surface.
 
 ### Phase 5: Move Witness Out Of StoreKV
 
@@ -365,7 +381,7 @@ less entangled with raftstore.
 Actions:
 
 - Move optional detector code into `experimental/thermos`.
-- Keep a stable engine observation interface for write-hot events.
+- Keep a stable admission or backend-observation interface for write-hot events.
 - Keep production throttling disabled by default unless explicitly configured.
 - Keep stats export stable enough for operators, but mark Thermos stats as
   experimental.

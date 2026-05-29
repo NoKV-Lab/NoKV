@@ -17,7 +17,6 @@ const (
 	defaultWriteBatchMaxSize    int64 = 1 << 20
 	defaultThermosTopK                = 16
 	defaultBlockCacheBytes      int64 = 256 << 20
-	defaultIndexCacheBytes      int64 = 128 << 20
 	defaultWriteThrottleMinRate int64 = 32 << 20
 	defaultWriteThrottleMaxRate int64 = 128 << 20
 	// defaultWriteShardCount is the number of commit processors used by the
@@ -32,7 +31,7 @@ type Options struct {
 	// Nil defaults to vfs.OSFS.
 	FS vfs.FS
 
-	// AllowedModes limits which migration workdir modes Open accepts. An empty
+	// AllowedModes limits which workdir runtime modes Open accepts. An empty
 	// allow-list means standalone-only. Cluster runtime and offline diagnostics
 	// must opt into seeded/cluster directories explicitly.
 	AllowedModes []workdirmode.Mode
@@ -92,12 +91,8 @@ type Options struct {
 	WriteShardCount int
 	// UserKeyShapeExtractor optionally exposes runtime-derived key structure to
 	// local storage. Nil keeps generic full-key hashing and disables semantic
-	// prefix bloom filters.
+	// affinity routing.
 	UserKeyShapeExtractor UserKeyShapeExtractor
-	ManifestSync          bool
-	// ManifestRewriteThreshold is retained as an inert legacy config slot while
-	// Pebble owns physical metadata below storage/pebble.
-	ManifestRewriteThreshold int64
 	// WriteHotKeyLimit caps how many consecutive writes a single key can issue
 	// before the DB returns utils.ErrHotKeyWriteThrottle. Zero disables write-path
 	// throttling.
@@ -116,16 +111,9 @@ type Options struct {
 	// default; zero lets Open resolve the constructor default.
 	WriteThrottleMaxRate int64
 
-	// BlockCacheBytes bounds the in-memory budget for cached L0/L1 data blocks.
-	// Deeper levels continue to rely on the OS page cache.
+	// BlockCacheBytes bounds the in-memory cache budget passed to the raw
+	// ordered-KV backend.
 	BlockCacheBytes int64
-	// IndexCacheBytes is reserved for storage backends that expose a separate
-	// index-cache budget. Pebble currently folds it into the raw backend cache.
-	IndexCacheBytes int64
-	// BlockCompression is retained as a local storage tuning knob. Pebble is
-	// now the default physical engine, so NoKV no longer exposes CommitStore table
-	// compression types through this API.
-	BlockCompression BlockCompression
 
 	// ControlLogLagWarnSegments determines how many WAL segments one replicated
 	// control-log consumer can lag behind the active segment before stats
@@ -177,15 +165,6 @@ type Options struct {
 	NegativeCacheSlabMaxSize int64
 }
 
-// BlockCompression selects physical block compression where the backend
-// exposes a matching control.
-type BlockCompression string
-
-const (
-	BlockCompressionNone   BlockCompression = "none"
-	BlockCompressionSnappy BlockCompression = "snappy"
-)
-
 // NewDefaultOptions returns the default option set.
 func NewDefaultOptions() *Options {
 	opt := &Options{
@@ -208,11 +187,7 @@ func NewDefaultOptions() *Options {
 		MaxBatchCount:              defaultWriteBatchMaxCount,
 		MaxBatchSize:               defaultWriteBatchMaxSize,
 		BlockCacheBytes:            defaultBlockCacheBytes,
-		IndexCacheBytes:            defaultIndexCacheBytes,
-		BlockCompression:           BlockCompressionSnappy,
 		SyncWrites:                 false,
-		ManifestSync:               false,
-		ManifestRewriteThreshold:   64 << 20,
 		WriteHotKeyLimit:           128,
 		WriteBatchWait:             200 * time.Microsecond,
 		WriteThrottleMinRate:       defaultWriteThrottleMinRate,
@@ -278,9 +253,6 @@ func (opt *Options) normalizeStorageOptions() {
 	}
 	if opt.BlockCacheBytes <= 0 {
 		opt.BlockCacheBytes = defaultBlockCacheBytes
-	}
-	if opt.IndexCacheBytes < 0 {
-		opt.IndexCacheBytes = 0
 	}
 	if opt.WriteThrottleMinRate <= 0 {
 		opt.WriteThrottleMinRate = defaultWriteThrottleMinRate

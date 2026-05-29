@@ -1240,7 +1240,7 @@ func TestCommitAfterBatchPrewritePreservesShardAffinityAcrossRestart(t *testing.
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
-	// This reproduces the sharded-LSM failure mode behind the review comment:
+	// This reproduces the sharded-apply failure mode behind the review comment:
 	// if a batch prewrite routes every key by the first key's shard, then a
 	// later single-key commit can put the second key's lock tombstone on its
 	// real shard while the stale lock remains on the first shard. After restart

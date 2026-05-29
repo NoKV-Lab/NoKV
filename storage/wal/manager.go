@@ -483,7 +483,7 @@ func (m *Manager) applyDurabilityLocked(policy DurabilityPolicy) error {
 	case DurabilityFlushed:
 		// Group-commit batching is a net loss here: bufio.Flush is too
 		// cheap (~10μs) for the debounce window to amortize. We tried
-		// it and the LSM SetBatch single-shard benchmark regressed 4×.
+		// it and the single-shard commit benchmark regressed 4×.
 		// The fsync-batched path remains a separate beast — the slow
 		// fsync syscall actually benefits from coalescing.
 		if m.writer != nil {

@@ -236,4 +236,4 @@ Related docs:
 - [Coordinator](coordinator.md) — how the control plane consumes rooted state,
   including the Eunomia production-hardening backlog
 - [Control and Execution Plane Protocols](control_and_execution_protocols.md) — the full contract between `meta/root`, `coordinator/`, and `raftstore/`
-- [Migration Status](migration.md) — current storage-backend migration policy
+- [Architecture](architecture.md) — storage-backend boundaries and the Pebble/Holt adapter model

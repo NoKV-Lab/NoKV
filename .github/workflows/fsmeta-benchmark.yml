@@ -16,7 +16,6 @@ on:
       - "coordinator/**"
       - "Dockerfile"
       - "docker-compose.yml"
-      - "engine/**"
       - "errors/**"
       - "fsmeta/**"
       - "go.mod"
@@ -29,6 +28,7 @@ on:
       - "proto/**"
       - "raftstore/**"
       - "scripts/run_fsmeta_benchmarks.sh"
+      - "storage/**"
       - "txn/**"
       - "utils/**"
   workflow_dispatch:

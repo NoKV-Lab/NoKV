@@ -5,7 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # CLI (`cmd/nokv`) Reference
 
-`nokv` provides operational visibility similar to RocksDB `ldb` / Badger CLI, with script-friendly JSON output.
+`nokv` provides operational visibility for NoKV metadata and distributed
+runtime state, with script-friendly JSON output.
 
 ---
 
@@ -35,9 +36,7 @@ go install ./cmd/nokv
 
 Common fields:
 
-- `entries`
-- `flush.pending`, `flush.queue_length`, `flush.last_wait_ms`
-- `compaction.backlog`, `compaction.max_score`
+- `storage.keys_estimate`, `storage.size_bytes`
 - `wal.active_segment`, `wal.segment_count`, `wal.typed_record_ratio`
 - `write.queue_depth`, `write.queue_entries`, `write.hot_key_limited`
 - `region.total`, `region.running`, `region.removing`
@@ -47,7 +46,7 @@ Common fields:
 Example:
 
 ```bash
-nokv stats --workdir ./testdata/db --json | jq '.flush.queue_length'
+nokv stats --workdir ./testdata/db --json | jq '.storage.size_bytes'
 ```
 
 ### `nokv execution`
@@ -117,9 +116,9 @@ Restart semantics:
 ### Removed migration commands
 
 The old operator-facing `nokv migrate` and `nokv manifest` commands are no
-longer part of the mainline CLI. Pebble-backed workdirs use the current raw
-storage format and this version does not provide an online migration path from
-old self-managed LSM workdirs.
+longer part of the mainline CLI. Current workdirs use the selected raw backend
+format: Pebble today, Holt once its adapter is wired. This version does not
+provide an online migration path from old self-managed LSM workdirs.
 
 ### `nokv coordinator`
 

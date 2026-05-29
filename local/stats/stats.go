@@ -75,74 +75,27 @@ type ControlLogPointer struct {
 	SegmentIndex uint64
 }
 
-// LSMLevelStats captures aggregated metrics per LSM level.
-type LSMLevelStats struct {
-	Level                       int     `json:"level"`
-	TableCount                  int     `json:"tables"`
-	SizeBytes                   int64   `json:"size_bytes"`
-	ValueBytes                  int64   `json:"value_bytes"`
-	StaleBytes                  int64   `json:"stale_bytes"`
-	LandingTables               int     `json:"landing_tables"`
-	LandingSizeBytes            int64   `json:"landing_size_bytes"`
-	LandingValueBytes           int64   `json:"landing_value_bytes"`
-	ValueDensity                float64 `json:"value_density"`
-	LandingValueDensity         float64 `json:"landing_value_density"`
-	LandingRuns                 int64   `json:"landing_runs"`
-	LandingMs                   float64 `json:"landing_ms"`
-	LandingTablesCompactedCount int64   `json:"landing_tables_compacted"`
-	MergeRuns                   int64   `json:"landing_merge_runs"`
-	MergeMs                     float64 `json:"landing_merge_ms"`
-	MergeTables                 int64   `json:"landing_merge_tables"`
-}
-
 // StatsSnapshot captures a point-in-time view of internal backlog metrics.
 type StatsSnapshot struct {
-	Entries    int64                        `json:"entries"`
-	Flush      FlushStatsSnapshot           `json:"flush"`
-	Compaction CompactionStatsSnapshot      `json:"compaction"`
-	WAL        WALStatsSnapshot             `json:"wal"`
-	Raft       RaftStatsSnapshot            `json:"raft"`
-	Write      WriteStatsSnapshot           `json:"write"`
-	Region     RegionStatsSnapshot          `json:"region"`
-	MVCCGC     MVCCGCStatsSnapshot          `json:"mvcc_gc"`
-	Hot        HotStatsSnapshot             `json:"hot"`
-	Cache      CacheStatsSnapshot           `json:"cache"`
-	LSM        LSMStatsSnapshot             `json:"lsm"`
-	Transport  metrics.GRPCTransportMetrics `json:"transport"`
+	Storage   StorageStatsSnapshot         `json:"storage"`
+	WAL       WALStatsSnapshot             `json:"wal"`
+	Raft      RaftStatsSnapshot            `json:"raft"`
+	Write     WriteStatsSnapshot           `json:"write"`
+	Region    RegionStatsSnapshot          `json:"region"`
+	MVCCGC    MVCCGCStatsSnapshot          `json:"mvcc_gc"`
+	Hot       HotStatsSnapshot             `json:"hot"`
+	Cache     CacheStatsSnapshot           `json:"cache"`
+	Transport metrics.GRPCTransportMetrics `json:"transport"`
 }
 
-// FlushStatsSnapshot summarizes flush queue depth and stage timing.
-type FlushStatsSnapshot struct {
-	Pending       int64   `json:"pending"`
-	QueueLength   int64   `json:"queue_length"`
-	Active        int64   `json:"active"`
-	WaitMs        float64 `json:"wait_ms"`
-	LastWaitMs    float64 `json:"last_wait_ms"`
-	MaxWaitMs     float64 `json:"max_wait_ms"`
-	BuildMs       float64 `json:"build_ms"`
-	LastBuildMs   float64 `json:"last_build_ms"`
-	MaxBuildMs    float64 `json:"max_build_ms"`
-	ReleaseMs     float64 `json:"release_ms"`
-	LastReleaseMs float64 `json:"last_release_ms"`
-	MaxReleaseMs  float64 `json:"max_release_ms"`
-	Completed     int64   `json:"completed"`
-}
-
-// CompactionStatsSnapshot summarizes compaction backlog, runtime, and landing behavior.
-type CompactionStatsSnapshot struct {
-	Backlog              int64   `json:"backlog"`
-	MaxScore             float64 `json:"max_score"`
-	LastDurationMs       float64 `json:"last_duration_ms"`
-	MaxDurationMs        float64 `json:"max_duration_ms"`
-	Runs                 uint64  `json:"runs"`
-	LandingRuns          int64   `json:"landing_runs"`
-	MergeRuns            int64   `json:"landing_merge_runs"`
-	LandingMs            float64 `json:"landing_ms"`
-	MergeMs              float64 `json:"landing_merge_ms"`
-	LandingTables        int64   `json:"landing_tables"`
-	MergeTables          int64   `json:"landing_merge_tables"`
-	ValueWeight          float64 `json:"value_weight"`
-	ValueWeightSuggested float64 `json:"value_weight_suggested,omitempty"`
+// StorageStatsSnapshot is the backend-neutral local storage view. It avoids
+// physical engine internals such as table levels or rewrite scheduling
+// planner state.
+type StorageStatsSnapshot struct {
+	KeysEstimate uint64                        `json:"keys_estimate,omitempty"`
+	SizeBytes    uint64                        `json:"size_bytes,omitempty"`
+	Mmap         metrics.MmapAdviceSnapshot    `json:"mmap"`
+	Prefetch     metrics.TablePrefetchSnapshot `json:"prefetch"`
 }
 
 // WALStatsSnapshot captures WAL head position, record mix, and watchdog status.
@@ -256,32 +209,12 @@ type HotStatsSnapshot struct {
 	WriteRing *thermos.Stats `json:"write_ring,omitempty"`
 }
 
-// CacheStatsSnapshot captures block/index/bloom hit-rate indicators.
+// CacheStatsSnapshot captures cache and iterator reuse indicators.
 type CacheStatsSnapshot struct {
 	BlockL0HitRate float64 `json:"block_l0_hit_rate"`
 	BlockL1HitRate float64 `json:"block_l1_hit_rate"`
 	IndexHitRate   float64 `json:"index_hit_rate"`
 	IteratorReused uint64  `json:"iterator_reused"`
-}
-
-// LSMStatsSnapshot summarizes per-level storage shape and value-density signals.
-type LSMStatsSnapshot struct {
-	Levels            []LSMLevelStats               `json:"levels,omitempty"`
-	ValueBytesTotal   int64                         `json:"value_bytes_total"`
-	ValueDensityMax   float64                       `json:"value_density_max"`
-	ValueDensityAlert bool                          `json:"value_density_alert"`
-	RangeFilter       RangeFilterStatsSnapshot      `json:"range_filter"`
-	Mmap              metrics.MmapAdviceSnapshot    `json:"mmap"`
-	Prefetch          metrics.TablePrefetchSnapshot `json:"prefetch"`
-}
-
-// RangeFilterStatsSnapshot summarizes range-filter pruning activity on read paths.
-type RangeFilterStatsSnapshot struct {
-	PointCandidates   uint64 `json:"point_candidates"`
-	PointPruned       uint64 `json:"point_pruned"`
-	BoundedCandidates uint64 `json:"bounded_candidates"`
-	BoundedPruned     uint64 `json:"bounded_pruned"`
-	Fallbacks         uint64 `json:"fallbacks"`
 }
 
 // New constructs a Stats wired to host. interval defaults to 5s when 0.
@@ -371,10 +304,11 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	if thresh := s.host.ControlLogLagWarnSegments(); thresh > 0 {
 		snap.Raft.LagWarnThreshold = thresh
 	}
-	snap.Entries = int64(s.host.StorageStats().KeysEstimate)
-
-	snap.LSM.Mmap = metrics.MmapAdviceStats()
-	snap.LSM.Prefetch = metrics.TablePrefetchStats()
+	storageStats := s.host.StorageStats()
+	snap.Storage.KeysEstimate = storageStats.KeysEstimate
+	snap.Storage.SizeBytes = storageStats.SizeBytes
+	snap.Storage.Mmap = metrics.MmapAdviceStats()
+	snap.Storage.Prefetch = metrics.TablePrefetchStats()
 
 	if wm := s.host.WriteMetrics(); wm != nil {
 		wsnap := wm.Snapshot()

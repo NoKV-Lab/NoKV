@@ -5,19 +5,20 @@ SPDX-License-Identifier: Apache-2.0
 
 # NoKV Architecture Overview
 
-NoKV is being kept on a three-layer metadata architecture:
+NoKV is organized as a three-layer metadata system:
 
 1. `fsmeta` owns inode, dentry, workspace namespace, watch, snapshot, session,
    quota, and artifact-style metadata semantics.
-2. The distributed execution layer (`raftstore`, `txn`, `coordinator`,
-   `meta/root`) owns replicated execution, MVCC transactions, routing, TSO,
-   rooted topology, authority, and recovery facts.
-3. `storage/*` owns raw ordered key/value persistence. The default
-   implementation is Pebble through `storage/pebble`.
+2. The distributed execution layer (`meta/root`, `coordinator`, `raftstore`,
+   `txn`) owns rooted authority, routing, TSO, replicated execution, MVCC
+   transactions, and recovery facts.
+3. `storage/*` owns raw ordered key/value persistence. Pebble is the default
+   implementation in this repo. Holt is the owned backend target that should
+   plug in at the same `storage/kv` boundary.
 
-Pebble replaces the physical ordered-KV/LSM substrate only. NoKV keeps its own
-MVCC internal-key encoding (`txn/storage`), transaction protocol (`txn/mvcc`,
-`txn/percolator`), raft execution, and fsmeta inode/dentry model.
+Pebble and Holt replace only the physical ordered-KV substrate. NoKV keeps its
+own MVCC internal-key encoding (`txn/storage`), transaction protocols
+(`txn/mvcc`, `txn/percolator`), raft execution, and fsmeta inode/dentry model.
 
 ## Package Layout
 
@@ -49,9 +50,13 @@ storage/
   wal/file/vfs/   # low-level runtime support
 ```
 
-`engine/*`, operator-facing `raftstore/migrate`, and the old SST migration fast
-path are no longer mainline packages. This version does not support online
-migration from old self-managed LSM workdirs into Pebble workdirs.
+`storage/holt` is the expected placement for the Holt adapter once it is wired
+into this repository. It should implement `storage/kv.Store`; it should not
+import fsmeta, raftstore, coordinator, root, protobuf, or MVCC packages.
+
+`engine/*`, operator-facing `raftstore/migrate`, and SST import/export are not
+mainline packages. This version does not provide online migration from old
+self-managed LSM workdirs into Pebble or Holt workdirs.
 
 ## Write Path
 
@@ -66,6 +71,7 @@ flowchart LR
     Txn --> MVCC
     MVCC --> Raw["storage/kv raw ordered bytes"]
     Raw --> Pebble["storage/pebble"]
+    Raw -. "same contract" .-> Holt["storage/holt target"]
 ```
 
 The important boundary is between `fsmeta/backend` and `storage/kv`:
@@ -78,22 +84,42 @@ The important boundary is between `fsmeta/backend` and `storage/kv`:
 Keeping both contracts separate lets NoKV swap the physical engine without
 changing fsmeta semantics or distributed transaction behavior.
 
+## Storage Backend Contract
+
+The raw backend must provide:
+
+- ordered point reads and range iteration;
+- atomic batch apply;
+- range delete;
+- point-in-time snapshot reads;
+- explicit `Sync`, `Close`, and small backend-neutral stats.
+
+The backend must not own:
+
+- MVCC timestamp ordering or column-family semantics;
+- fsmeta inode/dentry layout;
+- raftstore region routing;
+- root/coordinator authority facts;
+- migration, SST ingest/export, or product-level backup semantics.
+
+That rule is what lets Pebble and Holt be interchangeable under NoKV's metadata
+execution model.
+
 ## Local Runtime
 
-`local.DB` is the embedded database facade. It now opens a Pebble-backed raw
-store at `<workdir>/pebble`, while preserving NoKV's existing internal-key
-layout:
+`local.DB` is the embedded database facade. It opens a raw storage backend and
+preserves NoKV's internal-key layout:
 
-- column families are encoded into the raw key
-- MVCC timestamps keep the existing inverted ordering
-- `local.DB` still exposes NoKV internal-entry iterators for MVCC, raftlog, and
-  raftstore snapshot code
+- column families are encoded into the raw key;
+- MVCC timestamps keep the existing inverted ordering;
+- `local.DB` exposes internal-entry iterators for MVCC, raftlog, and raftstore
+  snapshot code;
 - control/raft WAL utilities remain under `storage/wal`; they are not the
-  physical Pebble WAL
+  physical Pebble or Holt WAL.
 
-The local fsmeta runtime (`fsmeta/runtime/local`) uses the same `fsmeta/backend`
-contract as the raftstore runtime. It is the default path for demos and
-single-node agent-workspace deployments.
+The local fsmeta runtime (`fsmeta/runtime/local`) uses the same
+`fsmeta/backend` contract as the raftstore runtime. It is the default path for
+demos, local agent-workspace deployments, and storage-backend experimentation.
 
 ## Distributed Runtime
 
@@ -108,9 +134,9 @@ The distributed path keeps these responsibilities separate:
 - `fsmeta/runtime/raftstore` adapts fsmeta execution to StoreKV/MVCC. Raftstore
   itself must not understand inode/dentry semantics.
 
-`raftstore/snapshot` is now an internal MVCC-entry snapshot format for raft peer
+`raftstore/snapshot` is an internal MVCC-entry snapshot format for raft peer
 bootstrap and raft snapshot apply. It is not a generic migration feature and it
-does not expose storage-engine SST details.
+does not expose concrete storage-engine table files.
 
 ## Experimental Systems
 

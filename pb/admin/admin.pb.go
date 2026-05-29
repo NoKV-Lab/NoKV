@@ -613,354 +613,6 @@ func (x *TransferLeaderResponse) GetRegion() *meta.RegionDescriptor {
 	return nil
 }
 
-type ExportRegionSnapshotRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RegionId      uint64                 `protobuf:"varint,1,opt,name=region_id,json=regionId,proto3" json:"region_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ExportRegionSnapshotRequest) Reset() {
-	*x = ExportRegionSnapshotRequest{}
-	mi := &file_admin_admin_proto_msgTypes[6]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ExportRegionSnapshotRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ExportRegionSnapshotRequest) ProtoMessage() {}
-
-func (x *ExportRegionSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[6]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ExportRegionSnapshotRequest.ProtoReflect.Descriptor instead.
-func (*ExportRegionSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{6}
-}
-
-func (x *ExportRegionSnapshotRequest) GetRegionId() uint64 {
-	if x != nil {
-		return x.RegionId
-	}
-	return 0
-}
-
-type ExportRegionSnapshotResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Snapshot      []byte                 `protobuf:"bytes,1,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
-	Region        *meta.RegionDescriptor `protobuf:"bytes,2,opt,name=region,proto3" json:"region,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ExportRegionSnapshotResponse) Reset() {
-	*x = ExportRegionSnapshotResponse{}
-	mi := &file_admin_admin_proto_msgTypes[7]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ExportRegionSnapshotResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ExportRegionSnapshotResponse) ProtoMessage() {}
-
-func (x *ExportRegionSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[7]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ExportRegionSnapshotResponse.ProtoReflect.Descriptor instead.
-func (*ExportRegionSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{7}
-}
-
-func (x *ExportRegionSnapshotResponse) GetSnapshot() []byte {
-	if x != nil {
-		return x.Snapshot
-	}
-	return nil
-}
-
-func (x *ExportRegionSnapshotResponse) GetRegion() *meta.RegionDescriptor {
-	if x != nil {
-		return x.Region
-	}
-	return nil
-}
-
-type ExportRegionSnapshotStreamRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RegionId      uint64                 `protobuf:"varint,1,opt,name=region_id,json=regionId,proto3" json:"region_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ExportRegionSnapshotStreamRequest) Reset() {
-	*x = ExportRegionSnapshotStreamRequest{}
-	mi := &file_admin_admin_proto_msgTypes[8]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ExportRegionSnapshotStreamRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ExportRegionSnapshotStreamRequest) ProtoMessage() {}
-
-func (x *ExportRegionSnapshotStreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[8]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ExportRegionSnapshotStreamRequest.ProtoReflect.Descriptor instead.
-func (*ExportRegionSnapshotStreamRequest) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{8}
-}
-
-func (x *ExportRegionSnapshotStreamRequest) GetRegionId() uint64 {
-	if x != nil {
-		return x.RegionId
-	}
-	return 0
-}
-
-type ExportRegionSnapshotStreamResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	SnapshotHeader []byte                 `protobuf:"bytes,1,opt,name=snapshot_header,json=snapshotHeader,proto3" json:"snapshot_header,omitempty"`
-	Region         *meta.RegionDescriptor `protobuf:"bytes,2,opt,name=region,proto3" json:"region,omitempty"`
-	Chunk          []byte                 `protobuf:"bytes,3,opt,name=chunk,proto3" json:"chunk,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
-}
-
-func (x *ExportRegionSnapshotStreamResponse) Reset() {
-	*x = ExportRegionSnapshotStreamResponse{}
-	mi := &file_admin_admin_proto_msgTypes[9]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ExportRegionSnapshotStreamResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ExportRegionSnapshotStreamResponse) ProtoMessage() {}
-
-func (x *ExportRegionSnapshotStreamResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[9]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ExportRegionSnapshotStreamResponse.ProtoReflect.Descriptor instead.
-func (*ExportRegionSnapshotStreamResponse) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{9}
-}
-
-func (x *ExportRegionSnapshotStreamResponse) GetSnapshotHeader() []byte {
-	if x != nil {
-		return x.SnapshotHeader
-	}
-	return nil
-}
-
-func (x *ExportRegionSnapshotStreamResponse) GetRegion() *meta.RegionDescriptor {
-	if x != nil {
-		return x.Region
-	}
-	return nil
-}
-
-func (x *ExportRegionSnapshotStreamResponse) GetChunk() []byte {
-	if x != nil {
-		return x.Chunk
-	}
-	return nil
-}
-
-type ImportRegionSnapshotRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Snapshot      []byte                 `protobuf:"bytes,1,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ImportRegionSnapshotRequest) Reset() {
-	*x = ImportRegionSnapshotRequest{}
-	mi := &file_admin_admin_proto_msgTypes[10]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ImportRegionSnapshotRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ImportRegionSnapshotRequest) ProtoMessage() {}
-
-func (x *ImportRegionSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[10]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ImportRegionSnapshotRequest.ProtoReflect.Descriptor instead.
-func (*ImportRegionSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{10}
-}
-
-func (x *ImportRegionSnapshotRequest) GetSnapshot() []byte {
-	if x != nil {
-		return x.Snapshot
-	}
-	return nil
-}
-
-type ImportRegionSnapshotResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Region        *meta.RegionDescriptor `protobuf:"bytes,1,opt,name=region,proto3" json:"region,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ImportRegionSnapshotResponse) Reset() {
-	*x = ImportRegionSnapshotResponse{}
-	mi := &file_admin_admin_proto_msgTypes[11]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ImportRegionSnapshotResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ImportRegionSnapshotResponse) ProtoMessage() {}
-
-func (x *ImportRegionSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[11]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ImportRegionSnapshotResponse.ProtoReflect.Descriptor instead.
-func (*ImportRegionSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{11}
-}
-
-func (x *ImportRegionSnapshotResponse) GetRegion() *meta.RegionDescriptor {
-	if x != nil {
-		return x.Region
-	}
-	return nil
-}
-
-type ImportRegionSnapshotStreamRequest struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	SnapshotHeader []byte                 `protobuf:"bytes,1,opt,name=snapshot_header,json=snapshotHeader,proto3" json:"snapshot_header,omitempty"`
-	Region         *meta.RegionDescriptor `protobuf:"bytes,2,opt,name=region,proto3" json:"region,omitempty"`
-	Chunk          []byte                 `protobuf:"bytes,3,opt,name=chunk,proto3" json:"chunk,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
-}
-
-func (x *ImportRegionSnapshotStreamRequest) Reset() {
-	*x = ImportRegionSnapshotStreamRequest{}
-	mi := &file_admin_admin_proto_msgTypes[12]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ImportRegionSnapshotStreamRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ImportRegionSnapshotStreamRequest) ProtoMessage() {}
-
-func (x *ImportRegionSnapshotStreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[12]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ImportRegionSnapshotStreamRequest.ProtoReflect.Descriptor instead.
-func (*ImportRegionSnapshotStreamRequest) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{12}
-}
-
-func (x *ImportRegionSnapshotStreamRequest) GetSnapshotHeader() []byte {
-	if x != nil {
-		return x.SnapshotHeader
-	}
-	return nil
-}
-
-func (x *ImportRegionSnapshotStreamRequest) GetRegion() *meta.RegionDescriptor {
-	if x != nil {
-		return x.Region
-	}
-	return nil
-}
-
-func (x *ImportRegionSnapshotStreamRequest) GetChunk() []byte {
-	if x != nil {
-		return x.Chunk
-	}
-	return nil
-}
-
 type RegionRuntimeStatusRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RegionId      uint64                 `protobuf:"varint,1,opt,name=region_id,json=regionId,proto3" json:"region_id,omitempty"`
@@ -970,7 +622,7 @@ type RegionRuntimeStatusRequest struct {
 
 func (x *RegionRuntimeStatusRequest) Reset() {
 	*x = RegionRuntimeStatusRequest{}
-	mi := &file_admin_admin_proto_msgTypes[13]
+	mi := &file_admin_admin_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -982,7 +634,7 @@ func (x *RegionRuntimeStatusRequest) String() string {
 func (*RegionRuntimeStatusRequest) ProtoMessage() {}
 
 func (x *RegionRuntimeStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[13]
+	mi := &file_admin_admin_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -995,7 +647,7 @@ func (x *RegionRuntimeStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegionRuntimeStatusRequest.ProtoReflect.Descriptor instead.
 func (*RegionRuntimeStatusRequest) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{13}
+	return file_admin_admin_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RegionRuntimeStatusRequest) GetRegionId() uint64 {
@@ -1021,7 +673,7 @@ type RegionRuntimeStatusResponse struct {
 
 func (x *RegionRuntimeStatusResponse) Reset() {
 	*x = RegionRuntimeStatusResponse{}
-	mi := &file_admin_admin_proto_msgTypes[14]
+	mi := &file_admin_admin_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1033,7 +685,7 @@ func (x *RegionRuntimeStatusResponse) String() string {
 func (*RegionRuntimeStatusResponse) ProtoMessage() {}
 
 func (x *RegionRuntimeStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[14]
+	mi := &file_admin_admin_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1046,7 +698,7 @@ func (x *RegionRuntimeStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegionRuntimeStatusResponse.ProtoReflect.Descriptor instead.
 func (*RegionRuntimeStatusResponse) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{14}
+	return file_admin_admin_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *RegionRuntimeStatusResponse) GetKnown() bool {
@@ -1113,7 +765,7 @@ type ExecutionStatusRequest struct {
 
 func (x *ExecutionStatusRequest) Reset() {
 	*x = ExecutionStatusRequest{}
-	mi := &file_admin_admin_proto_msgTypes[15]
+	mi := &file_admin_admin_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1125,7 +777,7 @@ func (x *ExecutionStatusRequest) String() string {
 func (*ExecutionStatusRequest) ProtoMessage() {}
 
 func (x *ExecutionStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[15]
+	mi := &file_admin_admin_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1138,7 +790,7 @@ func (x *ExecutionStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionStatusRequest.ProtoReflect.Descriptor instead.
 func (*ExecutionStatusRequest) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{15}
+	return file_admin_admin_proto_rawDescGZIP(), []int{8}
 }
 
 type ExecutionAdmissionStatus struct {
@@ -1158,7 +810,7 @@ type ExecutionAdmissionStatus struct {
 
 func (x *ExecutionAdmissionStatus) Reset() {
 	*x = ExecutionAdmissionStatus{}
-	mi := &file_admin_admin_proto_msgTypes[16]
+	mi := &file_admin_admin_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1170,7 +822,7 @@ func (x *ExecutionAdmissionStatus) String() string {
 func (*ExecutionAdmissionStatus) ProtoMessage() {}
 
 func (x *ExecutionAdmissionStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[16]
+	mi := &file_admin_admin_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1183,7 +835,7 @@ func (x *ExecutionAdmissionStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionAdmissionStatus.ProtoReflect.Descriptor instead.
 func (*ExecutionAdmissionStatus) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{16}
+	return file_admin_admin_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ExecutionAdmissionStatus) GetObserved() bool {
@@ -1264,7 +916,7 @@ type ExecutionTopologyStatus struct {
 
 func (x *ExecutionTopologyStatus) Reset() {
 	*x = ExecutionTopologyStatus{}
-	mi := &file_admin_admin_proto_msgTypes[17]
+	mi := &file_admin_admin_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1276,7 +928,7 @@ func (x *ExecutionTopologyStatus) String() string {
 func (*ExecutionTopologyStatus) ProtoMessage() {}
 
 func (x *ExecutionTopologyStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[17]
+	mi := &file_admin_admin_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1289,7 +941,7 @@ func (x *ExecutionTopologyStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionTopologyStatus.ProtoReflect.Descriptor instead.
 func (*ExecutionTopologyStatus) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{17}
+	return file_admin_admin_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ExecutionTopologyStatus) GetTransitionId() string {
@@ -1356,7 +1008,7 @@ type ExecutionRestartStatus struct {
 
 func (x *ExecutionRestartStatus) Reset() {
 	*x = ExecutionRestartStatus{}
-	mi := &file_admin_admin_proto_msgTypes[18]
+	mi := &file_admin_admin_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1368,7 +1020,7 @@ func (x *ExecutionRestartStatus) String() string {
 func (*ExecutionRestartStatus) ProtoMessage() {}
 
 func (x *ExecutionRestartStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[18]
+	mi := &file_admin_admin_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1381,7 +1033,7 @@ func (x *ExecutionRestartStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionRestartStatus.ProtoReflect.Descriptor instead.
 func (*ExecutionRestartStatus) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{18}
+	return file_admin_admin_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ExecutionRestartStatus) GetState() ExecutionRestartState {
@@ -1444,7 +1096,7 @@ type ExecutionStatusResponse struct {
 
 func (x *ExecutionStatusResponse) Reset() {
 	*x = ExecutionStatusResponse{}
-	mi := &file_admin_admin_proto_msgTypes[19]
+	mi := &file_admin_admin_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1456,7 +1108,7 @@ func (x *ExecutionStatusResponse) String() string {
 func (*ExecutionStatusResponse) ProtoMessage() {}
 
 func (x *ExecutionStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_admin_proto_msgTypes[19]
+	mi := &file_admin_admin_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1469,7 +1121,7 @@ func (x *ExecutionStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionStatusResponse.ProtoReflect.Descriptor instead.
 func (*ExecutionStatusResponse) Descriptor() ([]byte, []int) {
-	return file_admin_admin_proto_rawDescGZIP(), []int{19}
+	return file_admin_admin_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ExecutionStatusResponse) GetLastAdmission() *ExecutionAdmissionStatus {
@@ -1513,26 +1165,7 @@ const file_admin_admin_proto_rawDesc = "" +
 	"\tregion_id\x18\x01 \x01(\x04R\bregionId\x12\x17\n" +
 	"\apeer_id\x18\x02 \x01(\x04R\x06peerId\"P\n" +
 	"\x16TransferLeaderResponse\x126\n" +
-	"\x06region\x18\x01 \x01(\v2\x1e.nokv.meta.v1.RegionDescriptorR\x06region\":\n" +
-	"\x1bExportRegionSnapshotRequest\x12\x1b\n" +
-	"\tregion_id\x18\x01 \x01(\x04R\bregionId\"r\n" +
-	"\x1cExportRegionSnapshotResponse\x12\x1a\n" +
-	"\bsnapshot\x18\x01 \x01(\fR\bsnapshot\x126\n" +
-	"\x06region\x18\x02 \x01(\v2\x1e.nokv.meta.v1.RegionDescriptorR\x06region\"@\n" +
-	"!ExportRegionSnapshotStreamRequest\x12\x1b\n" +
-	"\tregion_id\x18\x01 \x01(\x04R\bregionId\"\x9b\x01\n" +
-	"\"ExportRegionSnapshotStreamResponse\x12'\n" +
-	"\x0fsnapshot_header\x18\x01 \x01(\fR\x0esnapshotHeader\x126\n" +
-	"\x06region\x18\x02 \x01(\v2\x1e.nokv.meta.v1.RegionDescriptorR\x06region\x12\x14\n" +
-	"\x05chunk\x18\x03 \x01(\fR\x05chunk\"9\n" +
-	"\x1bImportRegionSnapshotRequest\x12\x1a\n" +
-	"\bsnapshot\x18\x01 \x01(\fR\bsnapshot\"V\n" +
-	"\x1cImportRegionSnapshotResponse\x126\n" +
-	"\x06region\x18\x01 \x01(\v2\x1e.nokv.meta.v1.RegionDescriptorR\x06region\"\x9a\x01\n" +
-	"!ImportRegionSnapshotStreamRequest\x12'\n" +
-	"\x0fsnapshot_header\x18\x01 \x01(\fR\x0esnapshotHeader\x126\n" +
-	"\x06region\x18\x02 \x01(\v2\x1e.nokv.meta.v1.RegionDescriptorR\x06region\x12\x14\n" +
-	"\x05chunk\x18\x03 \x01(\fR\x05chunk\"9\n" +
+	"\x06region\x18\x01 \x01(\v2\x1e.nokv.meta.v1.RegionDescriptorR\x06region\"9\n" +
 	"\x1aRegionRuntimeStatusRequest\x12\x1b\n" +
 	"\tregion_id\x18\x01 \x01(\x04R\bregionId\"\xad\x02\n" +
 	"\x1bRegionRuntimeStatusResponse\x12\x14\n" +
@@ -1612,16 +1245,12 @@ const file_admin_admin_proto_rawDesc = "" +
 	"\x15ExecutionRestartState\x12'\n" +
 	"#EXECUTION_RESTART_STATE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dEXECUTION_RESTART_STATE_READY\x10\x01\x12$\n" +
-	" EXECUTION_RESTART_STATE_DEGRADED\x10\x022\xbe\a\n" +
+	" EXECUTION_RESTART_STATE_DEGRADED\x10\x022\xd7\x03\n" +
 	"\tRaftAdmin\x12H\n" +
 	"\aAddPeer\x12\x1d.nokv.admin.v1.AddPeerRequest\x1a\x1e.nokv.admin.v1.AddPeerResponse\x12Q\n" +
 	"\n" +
 	"RemovePeer\x12 .nokv.admin.v1.RemovePeerRequest\x1a!.nokv.admin.v1.RemovePeerResponse\x12]\n" +
-	"\x0eTransferLeader\x12$.nokv.admin.v1.TransferLeaderRequest\x1a%.nokv.admin.v1.TransferLeaderResponse\x12o\n" +
-	"\x14ExportRegionSnapshot\x12*.nokv.admin.v1.ExportRegionSnapshotRequest\x1a+.nokv.admin.v1.ExportRegionSnapshotResponse\x12\x83\x01\n" +
-	"\x1aExportRegionSnapshotStream\x120.nokv.admin.v1.ExportRegionSnapshotStreamRequest\x1a1.nokv.admin.v1.ExportRegionSnapshotStreamResponse0\x01\x12o\n" +
-	"\x14ImportRegionSnapshot\x12*.nokv.admin.v1.ImportRegionSnapshotRequest\x1a+.nokv.admin.v1.ImportRegionSnapshotResponse\x12}\n" +
-	"\x1aImportRegionSnapshotStream\x120.nokv.admin.v1.ImportRegionSnapshotStreamRequest\x1a+.nokv.admin.v1.ImportRegionSnapshotResponse(\x01\x12l\n" +
+	"\x0eTransferLeader\x12$.nokv.admin.v1.TransferLeaderRequest\x1a%.nokv.admin.v1.TransferLeaderResponse\x12l\n" +
 	"\x13RegionRuntimeStatus\x12).nokv.admin.v1.RegionRuntimeStatusRequest\x1a*.nokv.admin.v1.RegionRuntimeStatusResponse\x12`\n" +
 	"\x0fExecutionStatus\x12%.nokv.admin.v1.ExecutionStatusRequest\x1a&.nokv.admin.v1.ExecutionStatusResponseB.Z,github.com/feichai0017/NoKV/pb/admin;adminpbb\x06proto3"
 
@@ -1638,75 +1267,56 @@ func file_admin_admin_proto_rawDescGZIP() []byte {
 }
 
 var file_admin_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_admin_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_admin_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_admin_admin_proto_goTypes = []any{
-	(ExecutionAdmissionClass)(0),               // 0: nokv.admin.v1.ExecutionAdmissionClass
-	(ExecutionAdmissionReason)(0),              // 1: nokv.admin.v1.ExecutionAdmissionReason
-	(ExecutionTopologyOutcome)(0),              // 2: nokv.admin.v1.ExecutionTopologyOutcome
-	(ExecutionPublishState)(0),                 // 3: nokv.admin.v1.ExecutionPublishState
-	(ExecutionRestartState)(0),                 // 4: nokv.admin.v1.ExecutionRestartState
-	(*AddPeerRequest)(nil),                     // 5: nokv.admin.v1.AddPeerRequest
-	(*AddPeerResponse)(nil),                    // 6: nokv.admin.v1.AddPeerResponse
-	(*RemovePeerRequest)(nil),                  // 7: nokv.admin.v1.RemovePeerRequest
-	(*RemovePeerResponse)(nil),                 // 8: nokv.admin.v1.RemovePeerResponse
-	(*TransferLeaderRequest)(nil),              // 9: nokv.admin.v1.TransferLeaderRequest
-	(*TransferLeaderResponse)(nil),             // 10: nokv.admin.v1.TransferLeaderResponse
-	(*ExportRegionSnapshotRequest)(nil),        // 11: nokv.admin.v1.ExportRegionSnapshotRequest
-	(*ExportRegionSnapshotResponse)(nil),       // 12: nokv.admin.v1.ExportRegionSnapshotResponse
-	(*ExportRegionSnapshotStreamRequest)(nil),  // 13: nokv.admin.v1.ExportRegionSnapshotStreamRequest
-	(*ExportRegionSnapshotStreamResponse)(nil), // 14: nokv.admin.v1.ExportRegionSnapshotStreamResponse
-	(*ImportRegionSnapshotRequest)(nil),        // 15: nokv.admin.v1.ImportRegionSnapshotRequest
-	(*ImportRegionSnapshotResponse)(nil),       // 16: nokv.admin.v1.ImportRegionSnapshotResponse
-	(*ImportRegionSnapshotStreamRequest)(nil),  // 17: nokv.admin.v1.ImportRegionSnapshotStreamRequest
-	(*RegionRuntimeStatusRequest)(nil),         // 18: nokv.admin.v1.RegionRuntimeStatusRequest
-	(*RegionRuntimeStatusResponse)(nil),        // 19: nokv.admin.v1.RegionRuntimeStatusResponse
-	(*ExecutionStatusRequest)(nil),             // 20: nokv.admin.v1.ExecutionStatusRequest
-	(*ExecutionAdmissionStatus)(nil),           // 21: nokv.admin.v1.ExecutionAdmissionStatus
-	(*ExecutionTopologyStatus)(nil),            // 22: nokv.admin.v1.ExecutionTopologyStatus
-	(*ExecutionRestartStatus)(nil),             // 23: nokv.admin.v1.ExecutionRestartStatus
-	(*ExecutionStatusResponse)(nil),            // 24: nokv.admin.v1.ExecutionStatusResponse
-	(*meta.RegionDescriptor)(nil),              // 25: nokv.meta.v1.RegionDescriptor
+	(ExecutionAdmissionClass)(0),        // 0: nokv.admin.v1.ExecutionAdmissionClass
+	(ExecutionAdmissionReason)(0),       // 1: nokv.admin.v1.ExecutionAdmissionReason
+	(ExecutionTopologyOutcome)(0),       // 2: nokv.admin.v1.ExecutionTopologyOutcome
+	(ExecutionPublishState)(0),          // 3: nokv.admin.v1.ExecutionPublishState
+	(ExecutionRestartState)(0),          // 4: nokv.admin.v1.ExecutionRestartState
+	(*AddPeerRequest)(nil),              // 5: nokv.admin.v1.AddPeerRequest
+	(*AddPeerResponse)(nil),             // 6: nokv.admin.v1.AddPeerResponse
+	(*RemovePeerRequest)(nil),           // 7: nokv.admin.v1.RemovePeerRequest
+	(*RemovePeerResponse)(nil),          // 8: nokv.admin.v1.RemovePeerResponse
+	(*TransferLeaderRequest)(nil),       // 9: nokv.admin.v1.TransferLeaderRequest
+	(*TransferLeaderResponse)(nil),      // 10: nokv.admin.v1.TransferLeaderResponse
+	(*RegionRuntimeStatusRequest)(nil),  // 11: nokv.admin.v1.RegionRuntimeStatusRequest
+	(*RegionRuntimeStatusResponse)(nil), // 12: nokv.admin.v1.RegionRuntimeStatusResponse
+	(*ExecutionStatusRequest)(nil),      // 13: nokv.admin.v1.ExecutionStatusRequest
+	(*ExecutionAdmissionStatus)(nil),    // 14: nokv.admin.v1.ExecutionAdmissionStatus
+	(*ExecutionTopologyStatus)(nil),     // 15: nokv.admin.v1.ExecutionTopologyStatus
+	(*ExecutionRestartStatus)(nil),      // 16: nokv.admin.v1.ExecutionRestartStatus
+	(*ExecutionStatusResponse)(nil),     // 17: nokv.admin.v1.ExecutionStatusResponse
+	(*meta.RegionDescriptor)(nil),       // 18: nokv.meta.v1.RegionDescriptor
 }
 var file_admin_admin_proto_depIdxs = []int32{
-	25, // 0: nokv.admin.v1.AddPeerResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
-	25, // 1: nokv.admin.v1.RemovePeerResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
-	25, // 2: nokv.admin.v1.TransferLeaderResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
-	25, // 3: nokv.admin.v1.ExportRegionSnapshotResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
-	25, // 4: nokv.admin.v1.ExportRegionSnapshotStreamResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
-	25, // 5: nokv.admin.v1.ImportRegionSnapshotResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
-	25, // 6: nokv.admin.v1.ImportRegionSnapshotStreamRequest.region:type_name -> nokv.meta.v1.RegionDescriptor
-	25, // 7: nokv.admin.v1.RegionRuntimeStatusResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
-	0,  // 8: nokv.admin.v1.ExecutionAdmissionStatus.class:type_name -> nokv.admin.v1.ExecutionAdmissionClass
-	1,  // 9: nokv.admin.v1.ExecutionAdmissionStatus.reason:type_name -> nokv.admin.v1.ExecutionAdmissionReason
-	2,  // 10: nokv.admin.v1.ExecutionTopologyStatus.outcome:type_name -> nokv.admin.v1.ExecutionTopologyOutcome
-	3,  // 11: nokv.admin.v1.ExecutionTopologyStatus.publish:type_name -> nokv.admin.v1.ExecutionPublishState
-	4,  // 12: nokv.admin.v1.ExecutionRestartStatus.state:type_name -> nokv.admin.v1.ExecutionRestartState
-	21, // 13: nokv.admin.v1.ExecutionStatusResponse.last_admission:type_name -> nokv.admin.v1.ExecutionAdmissionStatus
-	23, // 14: nokv.admin.v1.ExecutionStatusResponse.restart:type_name -> nokv.admin.v1.ExecutionRestartStatus
-	22, // 15: nokv.admin.v1.ExecutionStatusResponse.topology:type_name -> nokv.admin.v1.ExecutionTopologyStatus
-	5,  // 16: nokv.admin.v1.RaftAdmin.AddPeer:input_type -> nokv.admin.v1.AddPeerRequest
-	7,  // 17: nokv.admin.v1.RaftAdmin.RemovePeer:input_type -> nokv.admin.v1.RemovePeerRequest
-	9,  // 18: nokv.admin.v1.RaftAdmin.TransferLeader:input_type -> nokv.admin.v1.TransferLeaderRequest
-	11, // 19: nokv.admin.v1.RaftAdmin.ExportRegionSnapshot:input_type -> nokv.admin.v1.ExportRegionSnapshotRequest
-	13, // 20: nokv.admin.v1.RaftAdmin.ExportRegionSnapshotStream:input_type -> nokv.admin.v1.ExportRegionSnapshotStreamRequest
-	15, // 21: nokv.admin.v1.RaftAdmin.ImportRegionSnapshot:input_type -> nokv.admin.v1.ImportRegionSnapshotRequest
-	17, // 22: nokv.admin.v1.RaftAdmin.ImportRegionSnapshotStream:input_type -> nokv.admin.v1.ImportRegionSnapshotStreamRequest
-	18, // 23: nokv.admin.v1.RaftAdmin.RegionRuntimeStatus:input_type -> nokv.admin.v1.RegionRuntimeStatusRequest
-	20, // 24: nokv.admin.v1.RaftAdmin.ExecutionStatus:input_type -> nokv.admin.v1.ExecutionStatusRequest
-	6,  // 25: nokv.admin.v1.RaftAdmin.AddPeer:output_type -> nokv.admin.v1.AddPeerResponse
-	8,  // 26: nokv.admin.v1.RaftAdmin.RemovePeer:output_type -> nokv.admin.v1.RemovePeerResponse
-	10, // 27: nokv.admin.v1.RaftAdmin.TransferLeader:output_type -> nokv.admin.v1.TransferLeaderResponse
-	12, // 28: nokv.admin.v1.RaftAdmin.ExportRegionSnapshot:output_type -> nokv.admin.v1.ExportRegionSnapshotResponse
-	14, // 29: nokv.admin.v1.RaftAdmin.ExportRegionSnapshotStream:output_type -> nokv.admin.v1.ExportRegionSnapshotStreamResponse
-	16, // 30: nokv.admin.v1.RaftAdmin.ImportRegionSnapshot:output_type -> nokv.admin.v1.ImportRegionSnapshotResponse
-	16, // 31: nokv.admin.v1.RaftAdmin.ImportRegionSnapshotStream:output_type -> nokv.admin.v1.ImportRegionSnapshotResponse
-	19, // 32: nokv.admin.v1.RaftAdmin.RegionRuntimeStatus:output_type -> nokv.admin.v1.RegionRuntimeStatusResponse
-	24, // 33: nokv.admin.v1.RaftAdmin.ExecutionStatus:output_type -> nokv.admin.v1.ExecutionStatusResponse
-	25, // [25:34] is the sub-list for method output_type
-	16, // [16:25] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	18, // 0: nokv.admin.v1.AddPeerResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
+	18, // 1: nokv.admin.v1.RemovePeerResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
+	18, // 2: nokv.admin.v1.TransferLeaderResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
+	18, // 3: nokv.admin.v1.RegionRuntimeStatusResponse.region:type_name -> nokv.meta.v1.RegionDescriptor
+	0,  // 4: nokv.admin.v1.ExecutionAdmissionStatus.class:type_name -> nokv.admin.v1.ExecutionAdmissionClass
+	1,  // 5: nokv.admin.v1.ExecutionAdmissionStatus.reason:type_name -> nokv.admin.v1.ExecutionAdmissionReason
+	2,  // 6: nokv.admin.v1.ExecutionTopologyStatus.outcome:type_name -> nokv.admin.v1.ExecutionTopologyOutcome
+	3,  // 7: nokv.admin.v1.ExecutionTopologyStatus.publish:type_name -> nokv.admin.v1.ExecutionPublishState
+	4,  // 8: nokv.admin.v1.ExecutionRestartStatus.state:type_name -> nokv.admin.v1.ExecutionRestartState
+	14, // 9: nokv.admin.v1.ExecutionStatusResponse.last_admission:type_name -> nokv.admin.v1.ExecutionAdmissionStatus
+	16, // 10: nokv.admin.v1.ExecutionStatusResponse.restart:type_name -> nokv.admin.v1.ExecutionRestartStatus
+	15, // 11: nokv.admin.v1.ExecutionStatusResponse.topology:type_name -> nokv.admin.v1.ExecutionTopologyStatus
+	5,  // 12: nokv.admin.v1.RaftAdmin.AddPeer:input_type -> nokv.admin.v1.AddPeerRequest
+	7,  // 13: nokv.admin.v1.RaftAdmin.RemovePeer:input_type -> nokv.admin.v1.RemovePeerRequest
+	9,  // 14: nokv.admin.v1.RaftAdmin.TransferLeader:input_type -> nokv.admin.v1.TransferLeaderRequest
+	11, // 15: nokv.admin.v1.RaftAdmin.RegionRuntimeStatus:input_type -> nokv.admin.v1.RegionRuntimeStatusRequest
+	13, // 16: nokv.admin.v1.RaftAdmin.ExecutionStatus:input_type -> nokv.admin.v1.ExecutionStatusRequest
+	6,  // 17: nokv.admin.v1.RaftAdmin.AddPeer:output_type -> nokv.admin.v1.AddPeerResponse
+	8,  // 18: nokv.admin.v1.RaftAdmin.RemovePeer:output_type -> nokv.admin.v1.RemovePeerResponse
+	10, // 19: nokv.admin.v1.RaftAdmin.TransferLeader:output_type -> nokv.admin.v1.TransferLeaderResponse
+	12, // 20: nokv.admin.v1.RaftAdmin.RegionRuntimeStatus:output_type -> nokv.admin.v1.RegionRuntimeStatusResponse
+	17, // 21: nokv.admin.v1.RaftAdmin.ExecutionStatus:output_type -> nokv.admin.v1.ExecutionStatusResponse
+	17, // [17:22] is the sub-list for method output_type
+	12, // [12:17] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_admin_admin_proto_init() }
@@ -1720,7 +1330,7 @@ func file_admin_admin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_admin_admin_proto_rawDesc), len(file_admin_admin_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   20,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

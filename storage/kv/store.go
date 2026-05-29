@@ -7,7 +7,8 @@ package kv
 
 // Store is the physical ordered KV boundary. It deliberately exposes raw
 // byte keys and values only; MVCC timestamps, column families, raftstore
-// regions, fsmeta layout, migration, and SST details live above this package.
+// regions, fsmeta layout, operator data movement, and table-file details live
+// above this package.
 type Store interface {
 	Get(key []byte) ([]byte, bool, error)
 	Put(key, value []byte) error

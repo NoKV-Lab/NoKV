@@ -44,10 +44,9 @@ func (c Config) resolve() Config {
 // concurrent use and exposes a small Lookup / Materialize / Invalidate
 // surface.
 //
-// Consistency model: Derived. LSM (the consumer's backing store, owned
-// outside this package) is authoritative; pages here can be lost / stale
-// without affecting correctness — Lookup returns false on stale and the
-// caller falls back to its source of truth.
+// Consistency model: Derived. The consumer's backing store is authoritative;
+// pages here can be lost / stale without affecting correctness — Lookup returns
+// false on stale and the caller falls back to its source of truth.
 type Cache struct {
 	cfg    Config
 	mgr    *slab.Manager

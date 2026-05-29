@@ -63,7 +63,7 @@ func MetadataChartConfig(cfg MetadataFigureConfig) (GroupedBarChartConfig, error
 	case MetadataPresetMetadataLatency:
 		base.Title = fallback(cfg.Title, "Metadata Service Latency Comparison")
 		base.YLabel = fallback(cfg.YLabel, "Latency (µs)")
-		base.SeriesOrder = []string{"nokv", "rocksdb", "pebble", "badger"}
+		base.SeriesOrder = []string{"local", "raftstore", "external"}
 	default:
 		return GroupedBarChartConfig{}, fmt.Errorf("unsupported metadata preset %q", cfg.Preset)
 	}

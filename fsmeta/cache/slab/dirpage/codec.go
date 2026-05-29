@@ -4,12 +4,12 @@
 // Package dirpage implements the DirPageSlab Derived consumer of
 // fsmeta/cache/slab. It materializes individual (mount, parent_inode, cursor,
 // limit) directory pages as packed records in a slab so that ReadDirPlus
-// can short-circuit a fan-out of one LSM prefix scan + N inode Gets into
+// can short-circuit a fan-out of one backend prefix scan + N inode Gets into
 // a single sequential page read.
 //
 // Wire format and consistency model in brief:
 //
-//   - LSM is authoritative; pages here are best-effort cache (Derived
+//   - The backend is authoritative; pages here are best-effort cache (Derived
 //     consistency class).
 //   - Each materialized directory becomes one or more page records in a
 //     slab segment, sequenced by page_no.
@@ -39,7 +39,7 @@ const dirPageMagic uint32 = 0x4c535044
 
 // dirPageVersion is the current dirpage slab format. NoKV has not shipped a
 // stable dirpage cache format yet, so development-time incompatible changes
-// update this format directly instead of carrying migration branches.
+// update this format directly instead of carrying compatibility branches.
 const dirPageVersion uint16 = 1
 
 // recordHeaderFixed is the size of the magic + version prefix we read

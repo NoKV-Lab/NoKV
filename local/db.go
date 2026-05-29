@@ -166,7 +166,7 @@ func (db *DB) openEngine() error {
 	store, err := pebblestore.Open(pebblestore.Options{
 		Dir:           db.storageDir(),
 		SyncWrites:    db.opt.SyncWrites,
-		CacheBytes:    db.opt.BlockCacheBytes + db.opt.IndexCacheBytes,
+		CacheBytes:    db.opt.BlockCacheBytes,
 		MemTableBytes: uint64(max(db.opt.MemTableSize, 0)),
 	})
 	if err != nil {
@@ -721,7 +721,7 @@ func (db *DB) findVisibleInternalEntry(cf kv.ColumnFamily, key []byte, readVersi
 
 // NewIterator creates a DB-level iterator over user keys in the default
 // column family. The state machine + Item materialization live in
-// local/internal/iterator; this method wires DB internals (lsm, iterPool)
+// local/internal/iterator; this method wires DB internals (store, iterPool)
 // into iterpkg.New as a thin facade.
 func (db *DB) NewIterator(opt *kv.Options) kv.Iterator {
 	return iterpkg.New(iterpkg.Deps{

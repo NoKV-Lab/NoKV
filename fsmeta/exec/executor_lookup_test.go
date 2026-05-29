@@ -859,7 +859,7 @@ func TestExecutorNegativeCacheLookupShortCircuit(t *testing.T) {
 
 	req := model.LookupRequest{Mount: "vol", Parent: model.RootInode, Name: "missing"}
 
-	// First lookup: real LSM probe (runner.Get), records the miss.
+	// First lookup: real backend probe (runner.Get), records the miss.
 	_, err = executor.Lookup(context.Background(), req)
 	require.ErrorIs(t, err, model.ErrNotFound)
 	firstGetCalls := runner.getCalls

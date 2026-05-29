@@ -65,7 +65,7 @@ type Options struct {
 	NegativeCacheDir string
 
 	// DirPageCacheDir enables the slab-backed ReadDirPlus page cache. Empty
-	// disables it. Pages are derived from authoritative LSM reads and are
+	// disables it. Pages are derived from authoritative backend reads and are
 	// invalidated by fsmeta mutations.
 	DirPageCacheDir string
 

@@ -133,18 +133,9 @@ func (s *Store) Stats() rawkv.Stats {
 		return rawkv.Stats{}
 	}
 	metrics := s.db.Metrics()
-	stats := rawkv.Stats{
+	return rawkv.Stats{
 		SizeBytes: uint64(metrics.DiskSpaceUsage()) + metrics.MemTable.Size,
 	}
-	iter, err := s.db.NewIter(nil)
-	if err != nil {
-		return stats
-	}
-	defer func() { _ = iter.Close() }()
-	for ok := iter.First(); ok; ok = iter.Next() {
-		stats.KeysEstimate++
-	}
-	return stats
 }
 
 type snapshot struct {
@@ -179,10 +170,10 @@ type iterator struct {
 	it *cpebble.Iterator
 }
 
-//forwarding-ok: iterator adapts Pebble's concrete iterator to storage/kv.Iterator.
+// forwarding-ok: iterator adapts Pebble's concrete iterator to storage/kv.Iterator.
 func (it *iterator) First() bool { return it.it.First() }
 
-//forwarding-ok: iterator adapts Pebble's concrete iterator to storage/kv.Iterator.
+// forwarding-ok: iterator adapts Pebble's concrete iterator to storage/kv.Iterator.
 func (it *iterator) Last() bool { return it.it.Last() }
 func (it *iterator) Seek(key []byte) bool {
 	return it.it.SeekGE(key)

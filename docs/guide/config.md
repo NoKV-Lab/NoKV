@@ -55,9 +55,11 @@ defer db.Close()
 ```
 
 Notes:
-- `NewDefaultOptions()` populates the embedded Pebble-backed local runtime
-  defaults up front. `Open()` resolves constructor-owned defaults once, then
-  the DB and raw storage backend consume the resolved values directly.
+- `NewDefaultOptions()` populates the embedded local runtime defaults up front.
+  The selected raw backend is Pebble today; Holt should plug in later behind
+  the same `storage/kv` boundary. `Open()` resolves constructor-owned defaults
+  once, then the DB and raw storage backend consume the resolved values
+  directly.
 - `WriteBatchMaxCount`, `WriteBatchMaxSize`, `MaxBatchCount`, `MaxBatchSize`,
   `WriteThrottleMinRate`, `WriteThrottleMaxRate`, and `WALBufferSize` now also
   expose concrete defaults through `NewDefaultOptions()`. If you construct

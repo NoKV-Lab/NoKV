@@ -10,10 +10,8 @@
 // (txn/latch) shared per raftstore/kv service instance.
 // The timestamp oracle is provided by coordinator/tso.
 //
-// This package is used in distributed mode only. Embedded DB APIs
-// go straight through the engine substrate without percolator's 2PC.
-//
-// See docs/guide/percolator.md for the protocol walkthrough.
+// This package is used in distributed mode only. Embedded DB APIs use the
+// local MVCC path without percolator's 2PC.
 package percolator
 
 import (
@@ -351,8 +349,8 @@ func ApplyAtomicMutateBatch(db txnstore.Store, latches *latch.Manager, reqs []*k
 			continue
 		}
 		// A request can be locally atomic by itself while belonging to a
-		// different LSM shard than the current group. Split the group instead
-		// of turning a valid 1PC request into a 2PC fallback.
+		// different local apply shard than the current group. Split the group
+		// instead of turning a valid 1PC request into a 2PC fallback.
 		if !group.empty() && !planner.CanApplyInternalEntriesAtomically(group.entriesWith(plan.entries)) {
 			group.flush(db, results)
 		}
@@ -1191,7 +1189,7 @@ func applyVersionedOps(db txnstore.Store, ops ...versionedOp) error {
 	}
 	entries := versionedOpsToEntries(ops...)
 	// NoKV's DB regroups these internal entries by commit-pipeline shard before
-	// they reach the sharded LSM. Percolator batches at the protocol phase
+	// they reach the raw storage backend. Percolator batches at the protocol phase
 	// boundary; storage keeps the per-key placement invariant.
 	defer releaseEntries(entries)
 	return applyVersionedEntries(db, entries)

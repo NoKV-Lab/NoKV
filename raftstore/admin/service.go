@@ -81,48 +81,6 @@ func (s *Service) TransferLeader(ctx context.Context, req *adminpb.TransferLeade
 	return &adminpb.TransferLeaderResponse{Region: localmeta.DescriptorToProto(runtime.Meta)}, nil
 }
 
-// ExportRegionSnapshot is intentionally unsupported. Operator-facing region
-// snapshot migration was removed from the generic storage contract; raft keeps
-// its internal peer snapshot path.
-func (s *Service) ExportRegionSnapshot(ctx context.Context, req *adminpb.ExportRegionSnapshotRequest) (*adminpb.ExportRegionSnapshotResponse, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, rpcCanceled(err)
-	}
-	_ = req
-	return nil, rpcSnapshotNotConfigured("region snapshot migration is not supported")
-}
-
-// ExportRegionSnapshotStream is intentionally unsupported. Raft internal
-// snapshots are sent over raft transport, not the admin migration API.
-func (s *Service) ExportRegionSnapshotStream(req *adminpb.ExportRegionSnapshotStreamRequest, stream adminpb.RaftAdmin_ExportRegionSnapshotStreamServer) error {
-	ctx := stream.Context()
-	if err := ctx.Err(); err != nil {
-		return rpcCanceled(err)
-	}
-	_ = req
-	return rpcSnapshotNotConfigured("region snapshot migration is not supported")
-}
-
-// ImportRegionSnapshot is intentionally unsupported. New peers receive region
-// state through raft's internal snapshot protocol.
-func (s *Service) ImportRegionSnapshot(ctx context.Context, req *adminpb.ImportRegionSnapshotRequest) (*adminpb.ImportRegionSnapshotResponse, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, rpcCanceled(err)
-	}
-	_ = req
-	return nil, rpcSnapshotNotConfigured("region snapshot migration is not supported")
-}
-
-// ImportRegionSnapshotStream is intentionally unsupported. New peers receive
-// region state through raft's internal snapshot protocol.
-func (s *Service) ImportRegionSnapshotStream(stream adminpb.RaftAdmin_ImportRegionSnapshotStreamServer) error {
-	ctx := stream.Context()
-	if err := ctx.Err(); err != nil {
-		return rpcCanceled(err)
-	}
-	return rpcSnapshotNotConfigured("region snapshot migration is not supported")
-}
-
 // RegionRuntimeStatus returns store-local runtime information for one region.
 func (s *Service) RegionRuntimeStatus(ctx context.Context, req *adminpb.RegionRuntimeStatusRequest) (*adminpb.RegionRuntimeStatusResponse, error) {
 	if err := ctx.Err(); err != nil {

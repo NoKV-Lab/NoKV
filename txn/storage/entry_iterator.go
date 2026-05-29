@@ -8,7 +8,7 @@ import (
 	"io"
 )
 
-// EntryIterator sequentially decodes entries stored using the unified WAL/SST
+// EntryIterator sequentially decodes entries stored using NoKV's entry-stream
 // record layout:
 //
 //	| header(varint fields) | key bytes | value bytes | crc32 (4B) |

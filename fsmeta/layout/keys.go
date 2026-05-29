@@ -77,11 +77,10 @@ type KeyParts struct {
 }
 
 // KeyShape describes runtime-derived structure for one encoded fsmeta key.
-// Runtime adapters may use it for local shard routing and prefix filters
-// without making layout depend on a concrete storage engine.
+// Runtime adapters may use it for local shard routing without making layout
+// depend on a concrete storage engine.
 type KeyShape struct {
 	LocalityPrefix []byte
-	BloomPrefix    []byte
 	ShardKey       []byte
 	Family         byte
 }
@@ -445,8 +444,7 @@ func MountKeyResolver(key []byte) (uint64, bool) {
 
 // UserKeyShape exposes fsmeta key shape to the local engine without making the
 // engine import fsmeta. The shape keeps all keys in one mount-local affinity
-// bucket on the same local shard and gives prefix bloom filters record-family
-// prefixes that match the current key layout.
+// bucket on the same local shard.
 func UserKeyShape(key []byte) KeyShape {
 	mountKeyID, bucketPos, err := decodeMountPrefix(key)
 	if err != nil || len(key)-bucketPos < encodedBucketBytes+1 {
@@ -462,7 +460,6 @@ func UserKeyShape(key []byte) KeyShape {
 	}
 	switch kind {
 	case KeyKindMount:
-		shape.BloomPrefix = key[:bodyPos]
 	case KeyKindDentry:
 		if len(key) < bodyPos+8 {
 			return KeyShape{}
@@ -473,23 +470,19 @@ func UserKeyShape(key []byte) KeyShape {
 			bucket := ChooseWorkspaceBucket(model.MountIdentity{MountKeyID: mountKeyID}, string(name))
 			shape.ShardKey = encodeKeyPrefixForMountKeyID(mountKeyID, bucket, KeyKindDentry, 0)[:kindPos]
 		}
-		shape.BloomPrefix = key[:bodyPos+8]
 	case KeyKindInode, KeyKindChunk, KeyKindSession, KeyKindUsage:
 		if len(key) < bodyPos+8 {
 			return KeyShape{}
 		}
-		shape.BloomPrefix = key[:bodyPos+8]
 	case KeyKindSnapshot:
 		if len(key) < bodyPos+16 {
 			return KeyShape{}
 		}
-		shape.BloomPrefix = key[:bodyPos+8]
 	case KeyKindSegment:
 		if len(key) < bodyPos+33 {
 			return KeyShape{}
 		}
 		shape.ShardKey = segmentShardKey(mountKeyID, key[bodyPos+1:bodyPos+33])
-		shape.BloomPrefix = key[:bodyPos+33]
 	default:
 		return KeyShape{}
 	}
@@ -497,17 +490,16 @@ func UserKeyShape(key []byte) KeyShape {
 }
 
 // MountAtomicUserKeyShape keeps all records for one mount on one local apply
-// shard while preserving record-family bloom prefixes. The embedded fsmeta
-// direct-MVCC runtime uses this stricter shape so multi-key namespace
+// shard. The embedded fsmeta direct-MVCC runtime uses this stricter shape so multi-key namespace
 // operations remain one local WAL/apply group even when the storage engine has
-// multiple LSM shards.
+// multiple commit shards.
 func MountAtomicUserKeyShape(key []byte) KeyShape {
 	_, bucketPos, err := decodeMountPrefix(key)
 	if err != nil || bucketPos <= 0 {
 		return KeyShape{}
 	}
 	shape := UserKeyShape(key)
-	if len(shape.BloomPrefix) == 0 && shape.Family == 0 {
+	if len(shape.LocalityPrefix) == 0 && shape.Family == 0 {
 		return KeyShape{}
 	}
 	mountPrefix := key[:bucketPos]

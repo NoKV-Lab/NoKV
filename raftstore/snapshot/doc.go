@@ -4,7 +4,7 @@
 // Package snapshot defines raftstore-internal region snapshot payloads.
 //
 // The payload stores canonical NoKV MVCC internal entries plus region metadata.
-// It is used for raft peer bootstrap and catch-up only; operator migration,
-// SST ingest/export, physical table manifests, and file IDs are intentionally
-// outside the generic storage-backend contract.
+// It is used for raft peer bootstrap and catch-up only; physical ingest/export,
+// table-file metadata and concrete file IDs are intentionally outside the generic
+// storage-backend contract.
 package snapshot

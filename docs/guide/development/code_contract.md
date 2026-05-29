@@ -47,7 +47,7 @@ Package boundaries follow ownership of truth, not convenience.
 | Package | Owns | Must Not Do |
 | --- | --- | --- |
 | `storage/kv/` | Raw ordered key/value backend contract. | Expose MVCC, fsmeta, raftstore, migration, SST, or protobuf semantics. |
-| `storage/pebble/`, `storage/memory/` | Concrete raw ordered KV backends. | Own MVCC timestamps, column families, transactions, fsmeta layout, raftstore routing, or migration policy. |
+| `storage/pebble/`, `storage/holt/`, `storage/memory/` | Concrete raw ordered KV backends. | Own MVCC timestamps, column families, transactions, fsmeta layout, raftstore routing, or migration policy. |
 | `storage/wal/`, `storage/file/`, `storage/vfs/` | Low-level file, WAL, and VFS support for concrete runtime internals. | Become public fsmeta, txn, raftstore, or migration contracts. |
 | `local/` | Embedded DB facade and local runtime assembly. | Know fsmeta, coordinator, root, or raftstore semantics. |
 | `txn/storage/` | MVCC internal keys, column families, timestamp encoding, entries, and transaction storage contract. | Import Percolator, raftstore, fsmeta, coordinator, root, or concrete storage backends. |
@@ -83,6 +83,7 @@ The current responsibility map is:
 
 - `storage/kv/*`: raw ordered KV contract only.
 - `storage/pebble/*`: default Pebble-backed raw KV implementation.
+- `storage/holt/*`: owned Holt backend adapter once it is wired into this repo.
 - `storage/memory/*`: test raw KV implementation.
 - `storage/wal`, `storage/file`, `storage/vfs`: low-level support packages used
   by concrete runtimes. They are not fsmeta or migration contracts.

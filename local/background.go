@@ -24,7 +24,7 @@ type backgroundStatsCollector interface {
 // backgroundConfig describes the runtime hooks needed to start DB-scoped
 // background services.
 //
-// WALWatchdogConfigs supports the LSM data plane's per-shard WAL
+// WALWatchdogConfigs supports the local data plane's per-shard WAL
 // Managers: one watchdog per Manager keeps backlog metrics and auto-GC
 // scoped to that shard's segments.
 type backgroundConfig struct {
@@ -127,7 +127,7 @@ func (s *backgroundServices) SetRegionMetrics(rm *metrics.RegionMetrics) {
 	s.stats.SetRegionMetrics(rm)
 }
 
-// WALWatchdogs returns every running WAL watchdog (one per LSM
+// WALWatchdogs returns every running WAL watchdog (one per local commit
 // data-plane shard). Stats collectors that surface backlog metrics
 // aggregate across the slice.
 func (s *backgroundServices) WALWatchdogs() []*wal.Watchdog {

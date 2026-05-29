@@ -102,7 +102,7 @@ func TestStartStorePeersNil(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestStartStorePeersManifestMissing(t *testing.T) {
+func TestStartStorePeersLocalMetadataMissing(t *testing.T) {
 	realDB := newTestDB(t)
 	server := newTestServer(t, realDB, 1)
 	defer func() {

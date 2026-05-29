@@ -99,13 +99,11 @@ func CompareBaseKeys(key1, key2 []byte) int {
 
 // CompareBaseKeysAssumeValid compares the CF+user-key portions of two
 // internal keys without validating the CF marker. Both arguments MUST be
-// canonical internal keys (length > 8, produced by InternalKey or read
-// out of an SST that was produced by it). Use CompareBaseKeys for
-// untrusted input. Hot paths that have already established the input is
-// internal — SST boundary checks, landing-buffer search, level handler
-// pruning — should prefer this variant: profiles show the validation
-// overhead in InternalToBaseKey + SplitBaseKey can dominate the actual
-// memcmp it wraps.
+// canonical internal keys (length > 8, produced by InternalKey or decoded from
+// a trusted entry stream). Use CompareBaseKeys for untrusted input. Hot paths
+// that have already established the input is internal should prefer this
+// variant: profiles show the validation overhead in InternalToBaseKey +
+// SplitBaseKey can dominate the actual memcmp it wraps.
 func CompareBaseKeysAssumeValid(key1, key2 []byte) int {
 	return bytes.Compare(key1[:len(key1)-8], key2[:len(key2)-8])
 }
@@ -125,7 +123,7 @@ func CompareUserKeys(key1, key2 []byte) int {
 }
 
 // InternalKey encodes (column family, user key, version) into the canonical
-// on-disk layout used by the LSM:
+// internal layout used above raw ordered-KV backends:
 //
 //	+------------+----------+----------------------+
 //	| CF marker  | User key | Timestamp (uint64 BE)|

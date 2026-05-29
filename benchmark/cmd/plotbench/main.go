@@ -17,8 +17,7 @@ func main() {
 	var (
 		input         = flag.String("input", "", "input CSV path")
 		output        = flag.String("output", "", "output figure path (.svg/.pdf/.png)")
-		format        = flag.String("format", "ycsb", "input format: ycsb or observations")
-		metric        = flag.String("metric", "throughput_ops_per_sec", "metric for ycsb format")
+		format        = flag.String("format", "observations", "input format: observations")
 		title         = flag.String("title", "", "plot title")
 		xlabel        = flag.String("xlabel", "", "x-axis label override")
 		ylabel        = flag.String("ylabel", "", "y-axis label override")
@@ -49,8 +48,6 @@ func main() {
 		os.Exit(1)
 	}
 	switch *format {
-	case "ycsb":
-		err = renderYCSB(*input, *metric, plotCfg.Chart)
 	case "observations":
 		err = renderObservations(*input, *preset, plotCfg)
 	default:
@@ -60,17 +57,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "plotbench: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-func renderYCSB(input, metric string, cfg benchplot.GroupedBarChartConfig) error {
-	results, err := benchplot.ReadYCSBResultsCSV(input)
-	if err != nil {
-		return err
-	}
-	return benchplot.WriteGroupedBarChartFromResults(results, benchplot.ResultGroupedBarChartConfig{
-		Metric:                benchplot.ResultMetric(metric),
-		GroupedBarChartConfig: cfg,
-	})
 }
 
 func renderObservations(input, preset string, cfg benchplot.PlotConfig) error {
