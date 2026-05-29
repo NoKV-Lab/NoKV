@@ -18,6 +18,17 @@ import (
 	"github.com/feichai0017/NoKV/fsmeta/model"
 )
 
+type historyRun struct {
+	seed  int64
+	state *fsmetacontract.Model
+	ops   []fsmetacontract.Operation
+}
+
+type historyScopeClient interface {
+	Create(context.Context, model.CreateRequest) (model.CreateResult, error)
+	Lookup(context.Context, model.LookupRequest) (model.DentryRecord, error)
+}
+
 func main() {
 	var (
 		addr               = flag.String("addr", "127.0.0.1:8090", "FSMetadata gRPC address")
@@ -28,6 +39,7 @@ func main() {
 		batch              = flag.Int("batch", 3, "concurrent history batch size")
 		timeout            = flag.Duration("timeout", 60*time.Second, "overall command timeout")
 		scope              = flag.String("scope-prefix", "history", "unique root directory prefix for isolating each generated history")
+		readyFile          = flag.String("ready-file", "", "optional file written after all history scopes are prepared")
 		allowIndeterminate = flag.Bool("allow-indeterminate-errors", false, "treat retryable availability errors as operations with unknown commit outcome")
 	)
 	flag.Parse()
@@ -48,36 +60,73 @@ func main() {
 	defer func() { _ = cli.Close() }()
 
 	mountID := model.MountID(*mount)
-	for seed := *start; seed < *start+int64(*seeds); seed++ {
+	runs, err := prepareAndSignalHistoryRuns(ctx, cli, mountID, *start, *seeds, *steps, *scope, *readyFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	opts := fsmetacontract.HistoryOptions{AllowIndeterminateErrors: *allowIndeterminate}
+	if err := runHistoryRuns(ctx, cli, runs, *batch, opts); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func prepareAndSignalHistoryRuns(ctx context.Context, cli historyScopeClient, mountID model.MountID, start int64, seeds, steps int, scopePrefix, readyFile string) ([]historyRun, error) {
+	runs, err := prepareHistoryRuns(ctx, cli, mountID, start, seeds, steps, scopePrefix)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeReadyFile(readyFile); err != nil {
+		return nil, fmt.Errorf("write history ready file: %w", err)
+	}
+	return runs, nil
+}
+
+func prepareHistoryRuns(ctx context.Context, cli historyScopeClient, mountID model.MountID, start int64, seeds, steps int, scopePrefix string) ([]historyRun, error) {
+	runs := make([]historyRun, 0, seeds)
+	for seed := start; seed < start+int64(seeds); seed++ {
 		state := fsmetacontract.NewModel(mountID)
 		unique := time.Now().UnixNano()
-		scopeName := fmt.Sprintf("%s-%06d-%d", *scope, seed, unique)
+		scopeName := fmt.Sprintf("%s-%06d-%d", scopePrefix, seed, unique)
 		scopeInode := model.InodeID(9_000_000_000 + seed*1_000_000 + unique%1_000_000)
 		scopeOp := scopeCreateOperation(mountID, scopeName, scopeInode)
 		scopeResult, err := createScopeWithRetry(ctx, cli, scopeOp)
 		if err != nil {
-			log.Fatalf("create history scope seed=%d: %v", seed, err)
+			return nil, fmt.Errorf("create history scope seed=%d: %w", seed, err)
 		}
 		scopeOp.Inode = scopeResult.Inode.Inode
 		scopeInode = scopeResult.Inode.Inode
 		if got := state.Apply(scopeOp); got.Err != nil {
-			log.Fatalf("apply history scope seed=%d: %v", seed, got.Err)
+			return nil, fmt.Errorf("apply history scope seed=%d: %w", seed, got.Err)
 		}
-		ops := externalHistoryOps(fsmetacontract.GenerateScript(seed, *steps), mountID, scopeInode, scopeInode)
+		ops := externalHistoryOps(fsmetacontract.GenerateScript(seed, steps), mountID, scopeInode, scopeInode)
 		if len(ops) == 0 {
-			log.Fatalf("seed %d generated no external-safe operations", seed)
+			return nil, fmt.Errorf("seed %d generated no external-safe operations", seed)
 		}
-		historyExec, err := fsmetacontract.NewInodeMappingExecutor(cli)
-		if err != nil {
-			log.Fatalf("open history inode mapper: %v", err)
-		}
-		opts := fsmetacontract.HistoryOptions{AllowIndeterminateErrors: *allowIndeterminate}
-		if err := fsmetacontract.RunConcurrentBatches(ctx, historyExec, state, ops, *batch, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "fsmeta history failed seed=%d steps=%d filtered_ops=%d\n", seed, *steps, len(ops))
-			log.Fatal(err)
-		}
-		log.Printf("fsmeta history passed seed=%d filtered_ops=%d", seed, len(ops))
+		runs = append(runs, historyRun{seed: seed, state: state, ops: ops})
 	}
+	return runs, nil
+}
+
+func runHistoryRuns(ctx context.Context, exec fsmetacontract.Executor, runs []historyRun, batch int, opts fsmetacontract.HistoryOptions) error {
+	for _, run := range runs {
+		historyExec, err := fsmetacontract.NewInodeMappingExecutor(exec)
+		if err != nil {
+			return fmt.Errorf("open history inode mapper: %w", err)
+		}
+		if err := fsmetacontract.RunConcurrentBatches(ctx, historyExec, run.state, run.ops, batch, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "fsmeta history failed seed=%d filtered_ops=%d\n", run.seed, len(run.ops))
+			return err
+		}
+		log.Printf("fsmeta history passed seed=%d filtered_ops=%d", run.seed, len(run.ops))
+	}
+	return nil
+}
+
+func writeReadyFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	return os.WriteFile(path, []byte(time.Now().Format(time.RFC3339Nano)+"\n"), 0o644)
 }
 
 func scopeCreateOperation(mount model.MountID, scopeName string, scopeInode model.InodeID) fsmetacontract.Operation {
@@ -92,7 +141,7 @@ func scopeCreateOperation(mount model.MountID, scopeName string, scopeInode mode
 	}
 }
 
-func createScopeWithRetry(ctx context.Context, cli fsmetaclient.Client, op fsmetacontract.Operation) (model.CreateResult, error) {
+func createScopeWithRetry(ctx context.Context, cli historyScopeClient, op fsmetacontract.Operation) (model.CreateResult, error) {
 	delay := 100 * time.Millisecond
 	for {
 		req := model.CreateRequest{

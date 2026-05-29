@@ -19,6 +19,7 @@ CHAOS_INTERVAL="${NOKV_DOCKER_CHAOS_INTERVAL:-5}"
 ALLOW_INDETERMINATE="${NOKV_DOCKER_CHAOS_ALLOW_INDETERMINATE:-1}"
 TOOLS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nokv-fsmeta-chaos.XXXXXX")"
 chaos_pid=""
+history_pid=""
 
 dump_cluster_state() {
   if [[ "${NOKV_DOCKER_CHAOS_DUMP_LOGS:-1}" != "1" ]]; then
@@ -38,6 +39,14 @@ stop_chaos() {
   docker compose up -d --no-deps coordinator-1 coordinator-2 coordinator-3 store-1 store-2 store-3 meta-root-1 meta-root-2 meta-root-3 fsmeta >/dev/null 2>&1 || true
 }
 
+stop_history() {
+  if [[ -n "$history_pid" ]] && kill -0 "$history_pid" 2>/dev/null; then
+    kill "$history_pid" 2>/dev/null || true
+    wait "$history_pid" 2>/dev/null || true
+  fi
+  history_pid=""
+}
+
 recover_service() {
   local service="$1"
   docker compose up -d --no-deps "$service"
@@ -48,6 +57,7 @@ cleanup() {
   if [[ "$status" != "0" ]]; then
     dump_cluster_state
   fi
+  stop_history
   stop_chaos
   rm -rf "$TOOLS_DIR"
   if [[ "${NOKV_DOCKER_CHAOS_DOWN:-0}" == "1" ]]; then
@@ -173,13 +183,25 @@ chaos_loop() {
   done
 }
 
+wait_history_ready() {
+  local pid="$1"
+  local ready_file="$2"
+  local deadline=$((SECONDS + READY_TIMEOUT))
+  while [[ ! -f "$ready_file" ]]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      return $?
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for fsmeta history scope preparation" >&2
+      stop_history
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 wait_fsmeta
-if [[ "${NOKV_DOCKER_CHAOS_NEMESIS:-1}" == "1" ]]; then
-  inject_recovery_fault 1
-  wait_fsmeta
-  chaos_loop &
-  chaos_pid="$!"
-fi
 
 history_args=(
   --addr "$ADDR"
@@ -197,7 +219,20 @@ if [[ "$ALLOW_INDETERMINATE" == "1" ]]; then
   history_args+=(--allow-indeterminate-errors)
 fi
 
-"$TOOLS_DIR/nokv-fsmeta-history" "${history_args[@]}"
+if [[ "${NOKV_DOCKER_CHAOS_NEMESIS:-1}" == "1" ]]; then
+  history_ready_file="$TOOLS_DIR/history.ready"
+  inject_recovery_fault 1
+  wait_fsmeta
+  "$TOOLS_DIR/nokv-fsmeta-history" "${history_args[@]}" --ready-file "$history_ready_file" &
+  history_pid="$!"
+  wait_history_ready "$history_pid" "$history_ready_file"
+  chaos_loop &
+  chaos_pid="$!"
+  wait "$history_pid"
+  history_pid=""
+else
+  "$TOOLS_DIR/nokv-fsmeta-history" "${history_args[@]}"
+fi
 
 stop_chaos
 wait_fsmeta

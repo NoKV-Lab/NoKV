@@ -4,6 +4,10 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	nokverrors "github.com/feichai0017/NoKV/errors"
@@ -61,6 +65,62 @@ func TestRetryScopeCreateErrorIncludesStartupAvailabilityWindows(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPrepareAndSignalHistoryRunsWritesReadyAfterAllScopes(t *testing.T) {
+	readyFile := filepath.Join(t.TempDir(), "history.ready")
+	cli := &readyAwareScopeClient{
+		t:         t,
+		readyFile: readyFile,
+		nextInode: 1000,
+	}
+	runs, err := prepareAndSignalHistoryRuns(context.Background(), cli, "vol", 1, 2, 4, "history", readyFile)
+	if err != nil {
+		t.Fatalf("prepareAndSignalHistoryRuns() error=%v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("prepared runs=%d, want 2", len(runs))
+	}
+	if cli.creates != 2 {
+		t.Fatalf("scope creates=%d, want 2", cli.creates)
+	}
+	if _, err := os.Stat(readyFile); err != nil {
+		t.Fatalf("ready file was not written after scope preparation: %v", err)
+	}
+}
+
+type readyAwareScopeClient struct {
+	t         *testing.T
+	readyFile string
+	creates   int
+	nextInode model.InodeID
+}
+
+func (c *readyAwareScopeClient) Create(_ context.Context, req model.CreateRequest) (model.CreateResult, error) {
+	c.t.Helper()
+	if _, err := os.Stat(c.readyFile); err == nil {
+		c.t.Fatalf("ready file was written before all scope creates completed")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		c.t.Fatalf("stat ready file: %v", err)
+	}
+	c.creates++
+	inode := c.nextInode
+	c.nextInode++
+	return model.CreateResult{
+		Dentry: model.DentryRecord{
+			Parent: req.Parent,
+			Name:   req.Name,
+			Inode:  inode,
+			Type:   req.Attrs.Type,
+		},
+		Inode: req.Attrs.InodeRecord(inode),
+	}, nil
+}
+
+func (c *readyAwareScopeClient) Lookup(context.Context, model.LookupRequest) (model.DentryRecord, error) {
+	c.t.Helper()
+	c.t.Fatalf("Lookup should not be needed after successful scope create")
+	return model.DentryRecord{}, nil
 }
 
 func requireOp(t *testing.T, op fsmetacontract.Operation, kind fsmetacontract.OperationKind, mount model.MountID, parent model.InodeID, name string, inode model.InodeID) {
