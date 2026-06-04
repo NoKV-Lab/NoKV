@@ -5,9 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Product Design
 
-NoKV is an AI-native filesystem control plane. It presents a file interface
-for training jobs and agent workspaces, keeps namespace metadata in Holt, and
-stores file bodies in external object storage.
+NoKV is a Rust filesystem for AI training and agent workspaces. It presents a
+file interface, keeps namespace metadata in Holt, and stores file bodies in
+external object storage.
 
 The product is not a generic distributed KV database, a full NAS replacement,
 or a raw S3 mount. It owns filesystem metadata semantics and delegates byte
@@ -198,7 +198,7 @@ v0 local:
   Rust SDK
   CLI
   long-running local server with health, stats, manual GC endpoints, and
-  framed metadata RPC plus HTTP debug/control endpoints
+  framed metadata RPC plus HTTP health, stats, and manual GC control endpoints
   Rust metadata client for path and inode namespace operations
   Rust file client for direct object upload, metadata publish, body read
   plans, and direct object range reads

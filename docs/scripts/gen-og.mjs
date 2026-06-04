@@ -57,13 +57,13 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" v
 
   <g transform="translate(72,232)">
     <rect x="0" y="0" width="14" height="6" rx="3" fill="#60a5fa"/>
-    <text x="26" y="6" font-family="monospace" font-size="18" font-weight="700" fill="#60a5fa" letter-spacing="3.2">OPEN SOURCE  ·  APACHE-2.0  ·  RUST DFS</text>
+    <text x="26" y="6" font-family="monospace" font-size="18" font-weight="700" fill="#60a5fa" letter-spacing="3.2">OPEN SOURCE  ·  APACHE-2.0  ·  RUST FILESYSTEM</text>
   </g>
 
-  <text x="72" y="330" font-family="sans-serif" font-size="72" font-weight="800" fill="#f1f5f9" letter-spacing="-2.6">Rust filesystem for</text>
-  <text x="72" y="420" font-family="sans-serif" font-size="72" font-weight="800" fill="url(#title-grad)" letter-spacing="-2.6">AI workspaces.</text>
+  <text x="72" y="318" font-family="sans-serif" font-size="68" font-weight="800" fill="#f1f5f9" letter-spacing="-2.4">Rust filesystem for</text>
+  <text x="72" y="398" font-family="sans-serif" font-size="68" font-weight="800" fill="url(#title-grad)" letter-spacing="-2.4">AI training and agents.</text>
 
-  <text x="72" y="486" font-family="sans-serif" font-size="26" font-weight="400" fill="#b4becc">Holt metadata  ·  S3-compatible bodies  ·  agent workspace namespace.</text>
+  <text x="72" y="486" font-family="sans-serif" font-size="26" font-weight="400" fill="#b4becc">Holt metadata  ·  S3-compatible bodies  ·  FUSE and SDK paths.</text>
 
   <g transform="translate(72,556)" font-family="monospace" font-size="18" fill="#8b94a7">
     <text>github.com/feichai0017/NoKV</text>

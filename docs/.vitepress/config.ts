@@ -13,7 +13,7 @@ export default withMermaid(
     title: 'NoKV',
     titleTemplate: ':title — NoKV',
     description:
-      'Open-source Rust filesystem for AI training and agent workspaces.',
+      'Rust filesystem for AI training and agent workspaces, backed by Holt metadata and S3-compatible object storage.',
     cleanUrls: true,
     lastUpdated: true,
     appearance: 'dark',
@@ -29,28 +29,28 @@ export default withMermaid(
       ['meta', { name: 'theme-color', content: '#3b82f6' }],
       ['meta', { property: 'og:type', content: 'website' }],
       ['meta', { property: 'og:url', content: `${SITE_URL}/` }],
-      ['meta', { property: 'og:title', content: 'NoKV — Rust filesystem for AI workspaces.' }],
+      ['meta', { property: 'og:title', content: 'NoKV — Rust filesystem for AI training and agent workspaces.' }],
       [
         'meta',
         {
           property: 'og:description',
           content:
-            'Rust metadata layer with Holt-backed namespace state and S3-compatible object storage. Apache-2.0.',
+            'Holt-backed metadata, S3-compatible object bodies, FUSE, and SDK paths for AI training and agent workspaces. Apache-2.0.',
         },
       ],
       ['meta', { property: 'og:image', content: OG_IMAGE }],
       ['meta', { property: 'og:image:width', content: '1200' }],
       ['meta', { property: 'og:image:height', content: '630' }],
-      ['meta', { property: 'og:image:alt', content: 'NoKV — Rust filesystem for AI workspaces.' }],
+      ['meta', { property: 'og:image:alt', content: 'NoKV — Rust filesystem for AI training and agent workspaces.' }],
       ['meta', { property: 'og:site_name', content: 'NoKV' }],
       ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
-      ['meta', { name: 'twitter:title', content: 'NoKV — Rust filesystem for AI workspaces.' }],
+      ['meta', { name: 'twitter:title', content: 'NoKV — Rust filesystem for AI training and agent workspaces.' }],
       [
         'meta',
         {
           name: 'twitter:description',
           content:
-            'Rust metadata layer with Holt-backed namespace state and S3-compatible object storage. Apache-2.0.',
+            'Holt-backed metadata, S3-compatible object bodies, FUSE, and SDK paths for AI training and agent workspaces. Apache-2.0.',
         },
       ],
       ['meta', { name: 'twitter:image', content: OG_IMAGE }],
