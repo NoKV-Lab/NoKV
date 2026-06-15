@@ -31,7 +31,7 @@ nokv-server = { path = "crates/nokv-server", version = "0.1.0" }
 nokv = { path = "crates/nokv", version = "0.1.0" }
 nokv-bench = { path = "bench", version = "0.1.0" }
 fuser = { version = "0.17.0", default-features = false }
-holt = { version = "0.5.4", default-features = false }
+holt = { version = "0.7.1", default-features = false }
 libc = "0.2"
 opendal = { version = "0.57.0", default-features = false, features = ["blocking", "executors-tokio", "reqwest-rustls-tls", "services-s3"] }
 rmp-serde = "1.3"
