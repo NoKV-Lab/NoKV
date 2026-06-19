@@ -18,10 +18,14 @@ Before reviewing or editing a PR:
 
 Check for:
 
-- Scope drift across `nokv-types`, `nokv-meta`, `nokv-object`,
+- Scope drift across `nokv-types`, `nokv-meta`, `nokv-object`, `nokv-agent`,
   `nokv-client`, `nokv-fuse`, docs, and example files.
 - Missing DCO `Signed-off-by` trailers.
 - Package-boundary violations.
+- `nokv-agent` depending on `nokv-client`, `nokv-protocol`, or `nokv-control`:
+  the agent tool surface stays transport-free, and the embedded
+  `impl AgentNamespace for NoKvFs` lives in `nokv-agent` so `nokv-meta` gains no
+  reverse dependency on it.
 - New helpers that reimplement standard library or existing repository helpers.
 - Misuse of `utils/` for domain-specific or single-use code.
 - Misplaced errors, metrics, stats, validation, recovery, or encoding code.
