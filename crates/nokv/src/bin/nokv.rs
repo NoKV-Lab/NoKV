@@ -121,6 +121,7 @@ enum Command {
         options: MountCliOptions,
     },
     Serve,
+    Mcp,
     Gc {
         limit: usize,
     },
@@ -486,6 +487,10 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         }
         Command::Serve => {
             nokv_server::run(server_options_from_config(config)).map_err(from_io)?;
+        }
+        Command::Mcp => {
+            let client = open_client(&config)?;
+            run_mcp(client).map_err(from_io)?;
         }
         Command::Gc { limit } => {
             let body = control_get(&config, &format!("/gc?limit={limit}"))?;
@@ -1242,6 +1247,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             })
         }
         "serve" => exact_args(args, 1).map(|()| Command::Serve),
+        "mcp" => exact_args(args, 1).map(|()| Command::Mcp),
         "backup" => exact_args(args, 1).map(|()| Command::Backup),
         "restore" => exact_args(args, 1).map(|()| Command::Restore),
         "fsck" => exact_args(args, 1).map(|()| Command::Fsck),
@@ -1699,6 +1705,166 @@ fn from_io(err: impl Error) -> CliError {
     CliError::Io(err.to_string())
 }
 
+fn run_mcp(client: Client) -> std::io::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_mcp_stream(client, stdin.lock(), stdout.lock())
+}
+
+fn run_mcp_stream<O>(
+    client: NoKvFsClient<O>,
+    mut reader: impl std::io::BufRead,
+    mut writer: impl std::io::Write,
+) -> std::io::Result<()>
+where
+    O: nokv_object::ObjectStore + Send + Sync + 'static,
+{
+    use serde_json::json;
+
+    #[derive(serde::Deserialize)]
+    struct JsonRpcRequest {
+        id: Option<serde_json::Value>,
+        method: String,
+        params: Option<serde_json::Value>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CallToolParams {
+        name: String,
+        arguments: Option<serde_json::Value>,
+    }
+
+    fn jsonrpc_response(
+        id: Option<serde_json::Value>,
+        result: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        })
+    }
+
+    fn jsonrpc_error(id: Option<serde_json::Value>, code: i64, message: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        })
+    }
+
+    fn handle_request<O2>(
+        req: JsonRpcRequest,
+        client: &NoKvFsClient<O2>,
+    ) -> Result<serde_json::Value, (i64, String)>
+    where
+        O2: nokv_object::ObjectStore + Send + Sync + 'static,
+    {
+        match req.method.as_str() {
+            "initialize" => Ok(json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "nokv-mcp",
+                    "version": "0.1.0"
+                }
+            })),
+            "initialized" => Ok(json!({})),
+            "ping" => Ok(json!({})),
+            "tools/list" => {
+                let tools: Vec<serde_json::Value> = nokv_client::agent_tool_definitions()
+                    .into_iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.parameters,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "tools": tools
+                }))
+            }
+            "tools/call" => {
+                let params = req
+                    .params
+                    .ok_or_else(|| (-32602, "Missing params for tools/call".to_string()))?;
+                let tool_call: CallToolParams = serde_json::from_value(params)
+                    .map_err(|e| (-32602, format!("Invalid params for tools/call: {}", e)))?;
+                let args = tool_call.arguments.unwrap_or_else(|| json!({}));
+                match nokv_client::execute_agent_tool(client, &tool_call.name, &args) {
+                    Ok(val) => {
+                        let text = serde_json::to_string_pretty(&val).unwrap_or_default();
+                        Ok(json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": text,
+                                }
+                            ]
+                        }))
+                    }
+                    Err(err) => {
+                        let text = err.to_string();
+                        Ok(json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": text,
+                                }
+                            ],
+                            "isError": true
+                        }))
+                    }
+                }
+            }
+            other => Err((-32601, format!("Method not found: {}", other))),
+        }
+    }
+
+    let mut line = String::new();
+
+    while reader.read_line(&mut line)? > 0 {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line.clear();
+            continue;
+        }
+
+        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            Ok(req) => {
+                let is_notification = req.id.is_none();
+                let id = req.id.clone();
+                let res = handle_request(req, &client);
+                if !is_notification {
+                    let resp = match res {
+                        Ok(val) => jsonrpc_response(id, val),
+                        Err((code, msg)) => jsonrpc_error(id, code, &msg),
+                    };
+                    serde_json::to_writer(&mut writer, &resp)?;
+                    writer.write_all(b"\n")?;
+                    writer.flush()?;
+                }
+            }
+            Err(_) => {
+                let resp = jsonrpc_error(None, -32700, "Parse error");
+                serde_json::to_writer(&mut writer, &resp)?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+            }
+        }
+        line.clear();
+    }
+
+    Ok(())
+}
+
 fn from_client(err: impl Error) -> CliError {
     CliError::Client(err.to_string())
 }
@@ -1728,6 +1894,7 @@ Usage:\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount [--read-only] [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount-snapshot SNAPSHOT_ID [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] [--control-backend etcd] serve\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mcp\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] backup\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] restore\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] fsck\n\
@@ -2628,5 +2795,53 @@ mod tests {
             parse(vec![s("--no-metadata-checkpoint-archive"), s("serve")]).unwrap();
         assert_eq!(command, Command::Serve);
         assert_eq!(disabled.metadata_checkpoint_archive_prefix, None);
+    }
+
+    #[test]
+    fn parse_mcp_command() {
+        let command = parse(vec![s("mcp")]).unwrap().1;
+        assert_eq!(command, Command::Mcp);
+        assert!(matches!(
+            parse(vec![s("mcp"), s("extra")]),
+            Err(CliError::TooManyArguments)
+        ));
+    }
+
+    #[test]
+    fn test_mcp_server_stdio() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store.clone());
+
+        // Prepare some requests
+        let reqs = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"test-client","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ls","arguments":{"path":"/"}}}"#,
+        ].join("\n") + "\n";
+
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+
+        let output = String::from_utf8(writer).unwrap();
+        let mut lines = output.lines();
+
+        // 1. Check initialize response
+        let resp1: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp1["id"], 1);
+        assert_eq!(resp1["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(resp1["result"]["serverInfo"]["name"], "nokv-mcp");
+
+        // 2. Check tools/list response
+        let resp2: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp2["id"], 2);
+        let tools = resp2["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "ls"));
+
+        // 3. Check tools/call response
+        let resp3: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp3["id"], 3);
+        assert!(resp3["result"]["content"][0]["text"].as_str().is_some());
     }
 }

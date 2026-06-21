@@ -126,9 +126,20 @@ over the same `AgentNamespace` trait whether the namespace is embedded
 transport-free — it depends only on `nokv-meta`, `nokv-object`, and
 `nokv-types`. See the [contributor handbook](docs/development/nokv-agent.md).
 
-**Today** the agent verbs ship in the Rust SDK; filesystem operations ship in
-the `nokv` CLI and FUSE mount. An **MCP server is in development** — follow
-[#354](https://github.com/feichai0017/NoKV/issues/354).
+**Today** the agent verbs ship in the Rust SDK, the FUSE mount, and a native Model Context Protocol (MCP) server. To run the MCP server over stdio:
+
+```bash
+cargo run --release -p nokv --bin nokv -- mcp
+```
+
+To configure it in your MCP client (e.g., Cursor, VS Code, or Claude Desktop), add the command configuration:
+
+```json
+"nokv-mcp": {
+  "command": "/path/to/NoKV/target/release/nokv",
+  "args": ["mcp"]
+}
+```
 
 ## 📊 Measured Evidence
 
@@ -332,7 +343,8 @@ Implemented today:
   backend;
 - read-only snapshot mounts, snapshot-version reads, typed watch replay, and
   FUSE cache invalidation from watch events;
-- pending-object GC and metadata history GC tied to snapshot retention.
+- pending-object GC and metadata history GC tied to snapshot retention;
+- a Model Context Protocol (MCP) server exposing the seven read-only agent tools (`ls`, `stat`, `catalog`, `read`, `find`, `aggregate`, `grep`) over stdio transport.
 
 Not implemented yet:
 
@@ -340,8 +352,6 @@ Not implemented yet:
   with checkpoint + shared-log failover, not replicated;
 - intra-subtree sharding (a single hot subtree is capped at one shard), learner
   read scaling, and chaos-tested failover timing;
-- an MCP server for the agent verbs — in development, tracked in
-  [#354](https://github.com/feichai0017/NoKV/issues/354);
 - Kubernetes CSI packages;
 - full POSIX hardening such as ACL enforcement, broad external compatibility
   gate coverage, and mature multi-client cache coherence.

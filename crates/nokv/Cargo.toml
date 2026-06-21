@@ -21,6 +21,8 @@ nokv-meta.workspace = true
 nokv-object.workspace = true
 nokv-server.workspace = true
 nokv-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 
 [[bin]]
