@@ -109,6 +109,23 @@ address, with the metadata guarantees the workload actually needs:
 The primary write model is write-once publish, matching how datasets,
 checkpoints, and artifacts are commonly written.
 
+## 🤝 Contributing
+
+Contributions are welcome, from first-timers to seasoned Rustaceans. Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started: it covers setup, conventions, and the review gate. Pick up a [good first issue](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22), or follow the recommended newcomer track in [#354](https://github.com/NoKV-Lab/NoKV/issues/354) (MCP server for the agent namespace surface).
+
+To understand the project first, read [Why filesystems](https://nokv.io/blog/agents-want-filesystems), [the metadata engine](https://nokv.io/blog/holt-in-nokv), and [the benchmark](https://nokv.io/benchmark).
+
+## 📚 Documentation
+
+- [Architecture](docs/architecture.md)
+- [Product Design](docs/product-design.md)
+- [AI-Native Metadata HA And Fast Path](docs/metadata-ha-fast-path.md)
+- [Metadata Schema](docs/metadata-schema.md)
+- [Object Layout](docs/object-layout.md)
+- [Checkpointing](docs/checkpointing.md)
+- [RustFS Backend](docs/rustfs.md)
+- [Benchmarks](docs/benchmarks.md)
+
 ## 🤖 The Agent Interface
 
 `ls` · `stat` · `catalog` · `find` · `aggregate` · `read` · `grep`
@@ -195,29 +212,7 @@ checkpoint-image + shared-log, epoch-fenced failover — not yet consensus
 replication — so it is not yet a JuiceFS/3FS class production-HA distributed
 filesystem.
 
-## 🏗️ Architecture
 
-```text
-crates/
-  nokv-types     storage-neutral namespace model types
-  nokv-protocol  framed metadata RPC DTOs and binary codec
-  nokv-meta      schema, MetadataCommand, Holt store, service core
-  nokv-control   shard ownership, epochs, and failover coordination
-  nokv-object    S3-compatible object body storage helpers
-  nokv-agent     transport-free agent tool surface (the seven read verbs)
-  nokv-client    Rust SDK over metadata service and object backend
-  nokv-fuse      low-level FUSE frontend
-  nokv-server    long-running metad process and framed RPC service
-  nokv           CLI binary
-
-bench/             system workload benchmark harness
-docs/              product, architecture, layout, RustFS, and benchmark docs
-```
-
-For artifact and checkpoint publish, object bytes are uploaded first, then the
-metadata commit publishes the dentry, inode projection, and body manifest
-atomically. A crash between the two leaves orphan objects for GC, never a
-corrupt namespace. See [Architecture](https://nokv.io/architecture).
 
 ## 🚦 Quick Start
 
@@ -293,143 +288,6 @@ covered by the FUSE smoke test.
 | [`nokv-server`](https://crates.io/crates/nokv-server) | Long-running metad process and framed RPC |
 | [`nokv`](https://crates.io/crates/nokv) | `nokv` CLI binary |
 
-## ✅ Current Status
-
-Implemented today:
-
-- low-level FUSE frontend for lookup, getattr, readdir, readdirplus, create,
-  mkdir, symlink/readlink, rename, unlink, rmdir, read, write, flush, release,
-  fsync, setattr/truncate, hardlink, xattr, advisory locks, special files,
-  `statfs`, `lseek`, `fallocate`, and `copy_file_range`;
-- Holt-backed local metadata service with inode/dentry canonical metadata,
-  dentry projection, command predicates, command dedupe, and history records;
-- chunked object data path where file bodies are split into immutable object
-  blocks and published by metadata manifest;
-- S3-compatible object backend, with RustFS as the local development default;
-- Rust SDK and `nokv` CLI for namespace operations, artifact publish,
-  metadata server access, and object range reads;
-- the seven-verb agent query surface (`ls`/`stat`/`catalog`/`find`/
-  `aggregate`/`read`/`grep`) in the dedicated `nokv-agent` crate, re-exported
-  through the Rust SDK, with LLM-ready tool definitions;
-- long-running `nokv-server` with health, readiness, stats, manual GC, and
-  framed binary metadata RPC;
-- `nokv-control` shard ownership store (in-memory plus optional etcd-backed
-  session leases behind the `etcd` feature) and a server shard-owner guard that
-  installs and renews lease epochs into the metadata commit fence;
-- multi-shard distributed metadata: subtree/path-prefix sharding (one Holt engine
-  per shard), high-bit shard-tagged global inodes, etcd control-plane routing with
-  client re-resolve on owner handoff, and cross-shard grafts that present a single
-  FUSE namespace across shards;
-- logical metadata log segment codec/archive/replay foundation, plus controlled
-  server sync shared-log ACK mode that publishes `LogRef` before successful RPC
-  ACKs, including grouped independent-batch log segments;
-- controlled metadata failover smoke that restores a checkpoint, replays the
-  shared log, starts the bumped-epoch owner, and accepts a new metadata write;
-- local multi-process metadata HA + multi-shard fleet smoke scripts that exercise
-  etcd ownership, RustFS-backed checkpoint/log archive, owner death, epoch
-  failover, post-failover replay, and a SIGSTOP/SIGCONT stale-owner fence mode;
-- a Python SDK (PyO3) and fsspec filesystem with reads, writes, namespace ops,
-  snapshots, atomic checkpoint publish/resolve, and a torch DataLoader + DCP
-  backend;
-- read-only snapshot mounts, snapshot-version reads, typed watch replay, and
-  FUSE cache invalidation from watch events;
-- pending-object GC and metadata history GC tied to snapshot retention.
-
-Not implemented yet:
-
-- consensus-replicated metadata (Raft/Paxos) — HA today is single-writer-per-shard
-  with checkpoint + shared-log failover, not replicated;
-- intra-subtree sharding (a single hot subtree is capped at one shard), learner
-  read scaling, and chaos-tested failover timing;
-- an MCP server for the agent verbs — in development, tracked in
-  [#354](https://github.com/feichai0017/NoKV/issues/354);
-- Kubernetes CSI packages;
-- full POSIX hardening such as ACL enforcement, broad external compatibility
-  gate coverage, and mature multi-client cache coherence.
-
-## Benchmarks
-
-The root `bench/` package contains all benchmark entry points. System workload
-runs use `nokv-bench`:
-
-```bash
-cargo run --release -p nokv-bench --bin nokv-bench -- \
-  --profile smoke \
-  --workload all
-```
-
-Key workloads:
-
-- `mdtest-easy` and `mdtest-hard` metadata smoke workloads;
-- `metadata-negative-lookup`, `artifact-index-lookup`, and
-  `metadata-concurrent-read` Holt metadata read-path workloads;
-- `metadata-durability-batch` batch metadata create workload with comparable
-  `local-only` and `sync-shared-log` ACK phases;
-- `checkpoint-publish` object-backed checkpoint publish/read;
-- `training-read` dataset-shaped object reads;
-- `mlperf-dlio` generated MLPerf Storage/DLIO-style training and checkpoint
-  shape;
-- metadata HA smoke through `scripts/run-metadata-ha-smoke.sh` for owner leases,
-  epoch fencing, checkpoint restore, shared-log replay, failover RTO timing, and
-  stale-owner write rejection.
-
-All workloads are single-node service runs; see
-[docs/benchmarks.md](docs/benchmarks.md) for the full workload list, profiles,
-and gates.
-
-The agent-interface benchmark — harness, tasks, judge, report, and the raw
-telemetry behind the numbers above — lives under
-[`bench/agent-interface/`](bench/agent-interface/README.md) and runs through
-the same package:
-
-```bash
-cargo run --release -p nokv-bench --bin yanex-agent-bench -- list-tasks
-```
-
-For the fast AI-training product gate, run:
-
-```bash
-scripts/run-ai-training-smoke.sh
-```
-
-The default gate covers Holt metadata read concurrency, checkpoint publish, and
-DLIO-style object reads/writes. Most benchmark workloads are still single-node
-service runs. Training-cluster claims need separate runs that report
-replication, cache, object-store, and durability settings.
-
-Run `scripts/run-ai-training-smoke.sh fuse-smoke` when the local machine has a
-working FUSE installation and you want the mounted POSIX smoke in the same
-workflow.
-
-For the local metadata HA gate, run:
-
-```bash
-scripts/run-metadata-ha-smoke.sh
-```
-
-It requires RustFS, AWS CLI, curl, and either a local `etcd` binary or
-`NOKV_HA_ETCD_ENDPOINTS` pointing at an external etcd cluster.
-Set `NOKV_HA_METRICS_JSON=/tmp/nokv-ha.json` to keep the emitted
-`HA_SMOKE_METRICS` JSON for CI or benchmark reports.
-Set `NOKV_HA_STALE_OWNER_CHAOS=1` to run the local stale-owner fence mode; that
-mode uses `NOKV_HA_OWNER_B_BIND` for the replacement owner.
-
-## 📚 Documentation
-
-- [Architecture](docs/architecture.md)
-- [Product Design](docs/product-design.md)
-- [AI-Native Metadata HA And Fast Path](docs/metadata-ha-fast-path.md)
-- [Metadata Schema](docs/metadata-schema.md)
-- [Object Layout](docs/object-layout.md)
-- [Checkpointing](docs/checkpointing.md)
-- [RustFS Backend](docs/rustfs.md)
-- [Benchmarks](docs/benchmarks.md)
-
-## 🤝 Contributing
-
-Contributions are welcome, from first-timers to seasoned Rustaceans. Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started: it covers setup, conventions, and the review gate. Pick up a [good first issue](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22), or follow the recommended newcomer track in [#354](https://github.com/NoKV-Lab/NoKV/issues/354) (MCP server for the agent namespace surface).
-
-To understand the project first, read [Why filesystems](https://nokv.io/blog/agents-want-filesystems), [the metadata engine](https://nokv.io/blog/holt-in-nokv), and [the benchmark](https://nokv.io/benchmark).
 
 ## 📄 License
 
