@@ -57,6 +57,15 @@ SPDX-License-Identifier: Apache-2.0
   </table>
 </div>
 
+<div align="center">
+  <a href="https://github.com/orgs/NoKV-Lab/discussions/378">
+    <img src="docs/public/img/community/nokv-lingtai-banner-en.png" alt="NoKV × Lingtai — Design Partner Collaboration" width="100%" />
+  </a>
+</div>
+
+> [!NOTE]
+> **NoKV × Lingtai — design partnership.** We've started a design-partner collaboration with [Lingtai](https://github.com/Lingtai-AI/lingtai), exploring NoKV as the workspace-checkpoint, artifact-provenance, and metadata substrate beneath filesystem-native agent runtimes. [Read the announcement →](https://github.com/orgs/NoKV-Lab/discussions/378)
+
 <br/>
 
 ## What Is NoKV?
