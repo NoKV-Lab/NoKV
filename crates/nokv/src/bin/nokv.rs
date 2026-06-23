@@ -121,6 +121,7 @@ enum Command {
         options: MountCliOptions,
     },
     Serve,
+    Mcp,
     Gc {
         limit: usize,
     },
@@ -486,6 +487,10 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         }
         Command::Serve => {
             nokv_server::run(server_options_from_config(config)).map_err(from_io)?;
+        }
+        Command::Mcp => {
+            let client = open_client(&config)?;
+            run_mcp(client).map_err(from_io)?;
         }
         Command::Gc { limit } => {
             let body = control_get(&config, &format!("/gc?limit={limit}"))?;
@@ -1242,6 +1247,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             })
         }
         "serve" => exact_args(args, 1).map(|()| Command::Serve),
+        "mcp" => exact_args(args, 1).map(|()| Command::Mcp),
         "backup" => exact_args(args, 1).map(|()| Command::Backup),
         "restore" => exact_args(args, 1).map(|()| Command::Restore),
         "fsck" => exact_args(args, 1).map(|()| Command::Fsck),
@@ -1706,6 +1712,109 @@ fn from_client(err: impl Error) -> CliError {
 fn from_object(err: impl Error) -> CliError {
     CliError::Client(err.to_string())
 }
+fn run_mcp(client: Client) -> std::io::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_mcp_stream(client, stdin.lock(), stdout.lock())
+}
+
+fn run_mcp_stream<O>(
+    client: nokv_client::NoKvFsClient<O>,
+    mut reader: impl std::io::BufRead,
+    mut writer: impl std::io::Write,
+) -> std::io::Result<()>
+where
+    O: nokv_object::ObjectStore + Send + Sync + 'static,
+{
+    use serde_json::json;
+
+    #[derive(serde::Deserialize)]
+    struct JsonRpcRequest {
+        id: Option<serde_json::Value>,
+        method: String,
+        params: Option<serde_json::Value>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CallToolParams {
+        name: String,
+        arguments: Option<serde_json::Value>,
+    }
+
+    fn ok_response(id: Option<serde_json::Value>, result: serde_json::Value) -> serde_json::Value {
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    }
+
+    fn err_response(id: Option<serde_json::Value>, code: i64, message: &str) -> serde_json::Value {
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+    }
+
+    let mut line = String::new();
+    while reader.read_line(&mut line)? > 0 {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+                Err(_) => err_response(None, -32700, "Parse error"),
+                Ok(req) => {
+                    let is_notification = req.id.is_none();
+                    let id = req.id.clone();
+                    let result = match req.method.as_str() {
+                        "initialize" => Ok(json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "nokv-mcp", "version": "0.1.0" }
+                        })),
+                        "initialized" | "ping" => Ok(json!({})),
+                        "tools/list" => {
+                            let tools: Vec<serde_json::Value> =
+                                nokv_agent::agent_tool_definitions()
+                                    .into_iter()
+                                    .map(|t| json!({
+                                        "name": t.name,
+                                        "description": t.description,
+                                        "inputSchema": t.parameters,
+                                    }))
+                                    .collect();
+                            Ok(json!({ "tools": tools }))
+                        }
+                        "tools/call" => {
+                            let params = req.params.unwrap_or(json!({}));
+                            match serde_json::from_value::<CallToolParams>(params) {
+                                Err(e) => Err((-32602_i64, format!("Invalid params: {e}"))),
+                                Ok(call) => {
+                                    let args = call.arguments.unwrap_or(json!({}));
+                                    match nokv_agent::execute_agent_tool(&client, &call.name, &args) {
+                                        Ok(val) => Ok(json!({
+                                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&val).unwrap_or_default() }]
+                                        })),
+                                        Err(err) => Ok(json!({
+                                            "content": [{ "type": "text", "text": err.to_string() }],
+                                            "isError": true
+                                        })),
+                                    }
+                                }
+                            }
+                        }
+                        other => Err((-32601_i64, format!("Method not found: {other}"))),
+                    };
+                    if is_notification {
+                        line.clear();
+                        continue;
+                    }
+                    match result {
+                        Ok(val) => ok_response(id, val),
+                        Err((code, msg)) => err_response(id, code, &msg),
+                    }
+                }
+            };
+            serde_json::to_writer(&mut writer, &response)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        }
+        line.clear();
+    }
+    Ok(())
+}
 
 fn print_help(out: &mut impl Write) -> io::Result<()> {
     writeln!(
@@ -1728,6 +1837,7 @@ Usage:\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount [--read-only] [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount-snapshot SNAPSHOT_ID [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] [--control-backend etcd] serve\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mcp\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] backup\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] restore\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] fsck\n\

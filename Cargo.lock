@@ -1376,6 +1376,7 @@ dependencies = [
 name = "nokv"
 version = "0.1.0"
 dependencies = [
+ "nokv-agent",
  "nokv-client",
  "nokv-control",
  "nokv-fuse",
@@ -1383,6 +1384,8 @@ dependencies = [
  "nokv-object",
  "nokv-server",
  "nokv-types",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
 ]
