@@ -4,33 +4,26 @@ SPDX-License-Identifier: Apache-2.0
 -->
 
 <div align="center">
-  <img src="./docs/public/img/logo.png" width="360" alt="NoKV" />
+  <img src="./docs/public/img/logo.png" width="320" alt="NoKV" />
 
   <p>
     <strong>Metadata control plane for object-backed agent artifacts.</strong>
   </p>
 
   <p>
-    <a href="https://github.com/feichai0017/NoKV/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/feichai0017/NoKV/rust.yml?branch=main&label=ci" /></a>
-    <img alt="Rust Version" src="https://img.shields.io/badge/rust-1.88%2B-f74c00?logo=rust&logoColor=white" />
-  </p>
-
-  <p>
-    <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-yellow" />
-    <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv"><img alt="CNCF Landscape" src="https://img.shields.io/badge/CNCF%20Landscape-listed-5699C6?logo=cncf&logoColor=white" /></a>
-    <a href="https://dbdb.io/db/nokv"><img alt="DBDB.io" src="https://img.shields.io/badge/DBDB.io-profiled-244A64" /></a>
-    <a href="https://deepwiki.com/feichai0017/NoKV"><img alt="DeepWiki" src="https://img.shields.io/badge/DeepWiki-Ask-6f42c1" /></a>
-  </p>
-
-  <p>
-    <a href="https://nokv.io/architecture">Docs</a> ·
-    <a href="https://nokv.io/blog/agents-want-filesystems">Why Filesystems</a> ·
-    <a href="#-quick-start">Quick Start</a> ·
-    <a href="#-measured-evidence">Benchmarks</a> ·
-    <a href="https://github.com/feichai0017/NoKV/discussions">Discussions</a> ·
-    <a href="#-contributing">Contributing</a>
+    <a href="https://nokv.io/architecture"><strong>Docs</strong></a> ·
+    <a href="https://nokv.io/blog/agents-want-filesystems"><strong>Why Filesystems</strong></a> ·
+    <a href="#-quick-start"><strong>Quick Start</strong></a> ·
+    <a href="#-measured-evidence"><strong>Benchmarks</strong></a> ·
+    <a href="https://github.com/feichai0017/NoKV/discussions"><strong>Discussions</strong></a> ·
+    <a href="#-contributing"><strong>Contributing</strong></a> ·
+    <a href="https://deepwiki.com/feichai0017/NoKV"><strong>DeepWiki</strong></a>
   </p>
 </div>
+
+---
+
+## Latest update
 
 <div align="center">
   <a href="https://github.com/orgs/NoKV-Lab/discussions/378">
@@ -39,21 +32,37 @@ SPDX-License-Identifier: Apache-2.0
 </div>
 
 > [!NOTE]
-> **NoKV × Lingtai — design partnership.** [Read the announcement →](https://github.com/orgs/NoKV-Lab/discussions/378)
+> **NoKV × Lingtai** is now a design partner collaboration.  
+> [Read the announcement →](https://github.com/orgs/NoKV-Lab/discussions/378)
 
-<br/>
+---
 
-## Endorsements
+## Recognition
 
-<p align="center">
-  <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv"><img src="./docs/public/img/recognition/cncf.svg" width="64" alt="Linux Foundation CNCF Landscape" /></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://dbdb.io/db/nokv"><img src="./docs/public/img/recognition/dbdb.svg" width="64" alt="DBDB.io Database of Databases" /></a>
-</p>
-
-<p align="center">
-  <sub><strong>Linux Foundation CNCF Landscape</strong>: listed in AI Native Infra / Storage and Cloud Native Storage &nbsp;·&nbsp; <strong>DBDB.io</strong>: database profile (current NoKV is the Rust filesystem product line)</sub>
-</p>
+<table>
+  <tr>
+    <td align="center" width="120">
+      <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv">
+        <img src="./docs/public/img/recognition/cncf.svg" width="56" alt="Linux Foundation CNCF Landscape" />
+      </a>
+    </td>
+    <td>
+      <strong>CNCF Landscape</strong><br/>
+      Listed in <strong>AI Native Infra / Storage</strong> and <strong>Cloud Native Storage</strong>.
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://dbdb.io/db/nokv">
+        <img src="./docs/public/img/recognition/dbdb.svg" width="56" alt="DBDB.io Database of Databases" />
+      </a>
+    </td>
+    <td>
+      <strong>DBDB.io</strong><br/>
+      Profiled on DBDB.io. The current NoKV entry refers to the Rust filesystem product line.
+    </td>
+  </tr>
+</table>
 
 ## What Is NoKV?
 
