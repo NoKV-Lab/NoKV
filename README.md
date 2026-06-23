@@ -32,7 +32,7 @@ SPDX-License-Identifier: Apache-2.0
 
 > **NoKV × Lingtai** is now a design partner collaboration.  
 >
-> [Read the announcement(中文） →](https://github.com/orgs/NoKV-Lab/discussions/380)
+> [中文公告 →](https://github.com/orgs/NoKV-Lab/discussions/380)
 >
 > [Read the announcement(English) →](https://github.com/orgs/NoKV-Lab/discussions/378)
 
