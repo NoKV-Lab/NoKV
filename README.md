@@ -27,7 +27,8 @@ SPDX-License-Identifier: Apache-2.0
     <a href="https://nokv.io/blog/agents-want-filesystems">Why Filesystems</a> ·
     <a href="#-quick-start">Quick Start</a> ·
     <a href="#-measured-evidence">Benchmarks</a> ·
-    <a href="https://github.com/feichai0017/NoKV/discussions">Discussions</a>
+    <a href="https://github.com/feichai0017/NoKV/discussions">Discussions</a> ·
+    <a href="#-contributing">Contributing</a>
   </p>
 
   <h3>Listed In The AI-Native Storage Ecosystem</h3>
@@ -423,6 +424,12 @@ mode uses `NOKV_HA_OWNER_B_BIND` for the replacement owner.
 - [Checkpointing](docs/checkpointing.md)
 - [RustFS Backend](docs/rustfs.md)
 - [Benchmarks](docs/benchmarks.md)
+
+## 🤝 Contributing
+
+Contributions are welcome, from first-timers to seasoned Rustaceans. Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started: it covers setup, conventions, and the review gate. Pick up a [good first issue](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22), or follow the recommended newcomer track in [#354](https://github.com/NoKV-Lab/NoKV/issues/354) (MCP server for the agent namespace surface).
+
+To understand the project first, read [Why filesystems](https://nokv.io/blog/agents-want-filesystems), [the metadata engine](https://nokv.io/blog/holt-in-nokv), and [the benchmark](https://nokv.io/benchmark).
 
 ## 📄 License
 

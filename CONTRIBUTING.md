@@ -7,9 +7,33 @@ SPDX-License-Identifier: Apache-2.0
 
 Thanks for contributing. This file is the authoritative contribution guide for this repository.
 
+## Start Here
+
+Welcome, and thanks for your interest in NoKV. Whether this is your first open-source PR or your hundredth, we're glad you're here.
+
+NoKV gives AI agents a filesystem (directories, paths, listing, reading) instead of a database to query. File bodies live as immutable blocks in S3-compatible object storage; NoKV manages the metadata layer on top. The bet: agents burn far fewer tokens walking a directory tree than reasoning over a SQL schema. The agent surface is seven verbs over the namespace: `ls`, `stat`, `find` (navigate), `read`, `grep` (read content), and `catalog`, `aggregate` (summarize). They are exposed to MCP (Model Context Protocol) clients via the `nokv-agent` crate. See the Agent Interface section of the [README](README.md) for the full description of this surface.
+
+### New here? Read these three first (in order)
+
+1. **Why:** [Agents Want Filesystems: Agent-Friendly Interfaces Are a Token-Efficiency Strategy](https://nokv.io/blog/agents-want-filesystems): the product argument for why a filesystem-shaped interface cuts agent token use (~45% fewer tokens, ~39% lower cost) versus a SQL schema.
+2. **How:** [List a directory in 131 nanoseconds: holt, the metadata engine inside nokv](https://nokv.io/blog/holt-in-nokv): the metadata engine, an adaptive radix tree built for path-shaped keys.
+3. **Evidence:** [Agent Interface Benchmark — NoKV](https://nokv.io/benchmark): 875 Yanex runs, the NoKV namespace vs. raw SQLite, showing 1.83x fewer prompt tokens, 1.63x lower cost, and 4.5/5 vs. 4.4/5 tasks solved.
+
+### Make your first contribution
+
+- Browse [good first issues](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for a scoped starting point.
+- Recommended newcomer track: [#354: MCP server for the agent namespace surface](https://github.com/NoKV-Lab/NoKV/issues/354), which exposes the seven-verb agent surface to MCP clients over stdio.
+- For a new bug or feature, open an issue via the [template chooser](https://github.com/NoKV-Lab/NoKV/issues/new/choose). For broad design, onboarding, or meta topics, open a [Discussion](https://github.com/NoKV-Lab/NoKV/discussions) first.
+
+Before you open a PR, read **[Issues and Proposals](#issues-and-proposals)**, **Branch and Commit Conventions** (including DCO sign-off), and **Pull Request Rules** below. Those sections are the source of truth for branch names, commit format, the local make-gate, and review expectations.
+
+### Reporting security issues
+
+Do not open a public issue with exploit details. Follow the private reporting process in [SECURITY.md](SECURITY.md). If private reporting is unavailable, open a minimal public issue asking for a private follow-up channel, with no exploit details, secrets, or proof-of-concept.
+
 ## Scope
 
-- Repository: `github.com/feichai0017/NoKV`
+- Repository: `github.com/NoKV-Lab/NoKV`
 - Main branch: `main`
 - Main product line: Rust NoKV under `crates/`
 - Rust toolchain: stable
@@ -21,7 +45,7 @@ Thanks for contributing. This file is the authoritative contribution guide for t
 3. Install Rust stable and Node.js for documentation builds.
 
 ```bash
-git clone https://github.com/feichai0017/NoKV.git
+git clone https://github.com/NoKV-Lab/NoKV.git
 cd NoKV
 git remote rename origin upstream
 cargo fetch
