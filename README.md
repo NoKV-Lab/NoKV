@@ -4,60 +4,65 @@ SPDX-License-Identifier: Apache-2.0
 -->
 
 <div align="center">
-  <img src="./docs/public/img/logo.png" width="360" alt="NoKV" />
+  <img src="./docs/public/img/logo.png" width="320" alt="NoKV" />
 
   <p>
     <strong>Metadata control plane for object-backed agent artifacts.</strong>
   </p>
 
   <p>
-    <a href="https://github.com/feichai0017/NoKV/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/feichai0017/NoKV/rust.yml?branch=main&label=ci" /></a>
-    <img alt="Rust Version" src="https://img.shields.io/badge/rust-1.88%2B-f74c00?logo=rust&logoColor=white" />
+    <a href="https://nokv.io/architecture"><strong>Docs</strong></a> ·
+    <a href="https://nokv.io/blog/agents-want-filesystems"><strong>Why Filesystems</strong></a> ·
+    <a href="#-quick-start"><strong>Quick Start</strong></a> ·
+    <a href="#-measured-evidence"><strong>Benchmarks</strong></a> ·
+    <a href="https://github.com/feichai0017/NoKV/discussions"><strong>Discussions</strong></a> ·
+    <a href="#-contributing"><strong>Contributing</strong></a> ·
+    <a href="https://deepwiki.com/feichai0017/NoKV"><strong>DeepWiki</strong></a>
   </p>
-
-  <p>
-    <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-yellow" />
-    <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv"><img alt="CNCF Landscape" src="https://img.shields.io/badge/CNCF%20Landscape-listed-5699C6?logo=cncf&logoColor=white" /></a>
-    <a href="https://dbdb.io/db/nokv"><img alt="DBDB.io" src="https://img.shields.io/badge/DBDB.io-profiled-244A64" /></a>
-    <a href="https://deepwiki.com/feichai0017/NoKV"><img alt="DeepWiki" src="https://img.shields.io/badge/DeepWiki-Ask-6f42c1" /></a>
-  </p>
-
-  <p>
-    <a href="https://nokv.io/architecture">Docs</a> ·
-    <a href="https://nokv.io/blog/agents-want-filesystems">Why Filesystems</a> ·
-    <a href="#-quick-start">Quick Start</a> ·
-    <a href="#-measured-evidence">Benchmarks</a> ·
-    <a href="https://github.com/feichai0017/NoKV/discussions">Discussions</a> ·
-    <a href="#-contributing">Contributing</a>
-  </p>
-
-  <h3>Listed In The AI-Native Storage Ecosystem</h3>
-
-  <table>
-    <tr>
-      <td align="center" width="360">
-        <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv">
-          <img src="./docs/public/img/recognition/cncf.svg" width="128" alt="Cloud Native Computing Foundation" />
-        </a>
-        <br />
-        <strong>Linux Foundation CNCF Landscape</strong>
-        <br />
-        <sub>Listed in AI Native Infra / Storage and Cloud Native Storage.</sub>
-      </td>
-      <td align="center" width="360">
-        <a href="https://dbdb.io/db/nokv">
-          <img src="./docs/public/img/recognition/dbdb.svg" width="128" alt="DBDB.io Database of Databases" />
-        </a>
-        <br />
-        <strong>DBDB.io Database of Databases</strong>
-        <br />
-        <sub>Historical database profile; current NoKV is the Rust filesystem product line.</sub>
-      </td>
-    </tr>
-  </table>
 </div>
 
-<br/>
+
+## Latest update
+
+<div align="center">
+  <a href="https://github.com/orgs/NoKV-Lab/discussions/378">
+    <img src="docs/public/img/community/nokv-lingtai-banner-en.png" alt="NoKV × Lingtai — Design Partner Collaboration" width="100%" />
+  </a>
+</div>
+
+> **NoKV × Lingtai** is now a design partner collaboration.  
+>
+> [中文公告 →](https://github.com/orgs/NoKV-Lab/discussions/380)
+>
+> [Read the announcement(English) →](https://github.com/orgs/NoKV-Lab/discussions/378)
+
+
+## Recognition
+
+<table>
+  <tr>
+    <td align="center" width="120">
+      <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv">
+        <img src="./docs/public/img/recognition/cncf.svg" width="56" alt="Linux Foundation CNCF Landscape" />
+      </a>
+    </td>
+    <td>
+      <strong>CNCF Landscape</strong><br/>
+      Listed in <strong>AI Native Infra / Storage</strong> and <strong>Cloud Native Storage</strong>.
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://dbdb.io/db/nokv">
+        <img src="./docs/public/img/recognition/dbdb.svg" width="56" alt="DBDB.io Database of Databases" />
+      </a>
+    </td>
+    <td>
+      <strong>DBDB.io</strong><br/>
+      Profiled on DBDB.io. The current NoKV entry refers to the Rust filesystem product line.
+    </td>
+  </tr>
+</table>
 
 ## What Is NoKV?
 
@@ -147,45 +152,6 @@ transport-free — it depends only on `nokv-meta`, `nokv-object`, and
 **Today** the agent verbs ship in the Rust SDK; filesystem operations ship in
 the `nokv` CLI and FUSE mount. An **MCP server is in development** — follow
 [#354](https://github.com/feichai0017/NoKV/issues/354).
-
-## 📊 Measured Evidence
-
-**Agent interface.** We gave the same agent (`gpt-5.4-mini`) the same 875-run
-experiment corpus through two surfaces — raw SQL over SQLite, and the NoKV
-namespace — across five tasks, 10 repeats per arm and task (100 fully stateless
-runs), judged against deterministic gold facts neither arm can see:
-
-| Set mean (per 5-task pass) | Raw SQLite | NoKV namespace |
-| --- | --- | --- |
-| Tasks solved correctly | 4.40 / 5 | **4.50 / 5** |
-| Prompt tokens (incl. cached) | 151,572 | **82,827 (−45%)** |
-| Cost (USD, list rates) | $0.0708 | **$0.0433 (−39%)** |
-
-In this 10-repeat sample, the token gap widens to ~2.4× on the
-compound-exploration subset, and SQL won the single-shot analytics task —
-per-task results, wins and losses both, are in the report. Harness, tasks,
-judge, and the raw telemetry of all 100 runs are committed, so every published
-number is recomputable: see
-[`bench/agent-interface/`](bench/agent-interface/BENCHMARK_REPORT.md).
-
-**Storage engine.** Local engineering baselines, not official MLPerf results.
-Single-node service numbers are release builds through the NoKV server and Holt
-metadata path. FUSE comparison numbers depend on kernel/FUSE, object backend,
-cache settings, and workload shape.
-
-| Workload | Result |
-| --- | --- |
-| Metadata create (`mdtest`, 65k records) | **~127K ops/s** (single-writer, batched service path) |
-| Same, one directory of 65k entries | Same order of throughput; path-native ART does not degrade on large directories |
-| Checkpoint publish (1 MiB blocks, concurrency 16) | **~1.1 GiB/s** in the service/object benchmark |
-| Dataset read (16 KiB samples, concurrency 16) | **~3,000 samples/s** in the service/object benchmark |
-| Resident metadata | **~1.5 KiB / file** in the measured shape |
-| Atomic checkpoint | Object bytes land first; metadata publishes a new generation atomically |
-
-Same-machine FUSE-vs-FUSE smoke against one RustFS endpoint currently shows
-NoKV behind JuiceFS on the end-to-end mounted path. That gap is expected to come
-from FUSE/RPC fixed costs and data-plane cache/writeback maturity, not from the
-Holt metadata engine alone.
 
 ## NoKV vs JuiceFS
 
