@@ -1769,11 +1769,13 @@ where
                             let tools: Vec<serde_json::Value> =
                                 nokv_agent::agent_tool_definitions()
                                     .into_iter()
-                                    .map(|t| json!({
-                                        "name": t.name,
-                                        "description": t.description,
-                                        "inputSchema": t.parameters,
-                                    }))
+                                    .map(|t| {
+                                        json!({
+                                            "name": t.name,
+                                            "description": t.description,
+                                            "inputSchema": t.parameters,
+                                        })
+                                    })
                                     .collect();
                             Ok(json!({ "tools": tools }))
                         }
@@ -1783,7 +1785,8 @@ where
                                 Err(e) => Err((-32602_i64, format!("Invalid params: {e}"))),
                                 Ok(call) => {
                                     let args = call.arguments.unwrap_or(json!({}));
-                                    match nokv_agent::execute_agent_tool(&client, &call.name, &args) {
+                                    match nokv_agent::execute_agent_tool(&client, &call.name, &args)
+                                    {
                                         Ok(val) => Ok(json!({
                                             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&val).unwrap_or_default() }]
                                         })),
@@ -2740,14 +2743,14 @@ mod tests {
         assert_eq!(disabled.metadata_checkpoint_archive_prefix, None);
     }
     #[test]
-fn parse_mcp_command() {
-    let command = parse(vec![s("mcp")]).unwrap().1;
-    assert_eq!(command, Command::Mcp);
-    assert!(matches!(
-        parse(vec![s("mcp"), s("extra")]),
-        Err(CliError::TooManyArguments)
-    ));
-}
+    fn parse_mcp_command() {
+        let command = parse(vec![s("mcp")]).unwrap().1;
+        assert_eq!(command, Command::Mcp);
+        assert!(matches!(
+            parse(vec![s("mcp"), s("extra")]),
+            Err(CliError::TooManyArguments)
+        ));
+    }
 
     #[test]
     fn test_mcp_server_stdio() {
