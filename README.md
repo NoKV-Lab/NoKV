@@ -30,31 +30,6 @@ SPDX-License-Identifier: Apache-2.0
     <a href="https://github.com/feichai0017/NoKV/discussions">Discussions</a> ·
     <a href="#-contributing">Contributing</a>
   </p>
-
-  <h3>Listed In The AI-Native Storage Ecosystem</h3>
-
-  <table>
-    <tr>
-      <td align="center" width="360">
-        <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv">
-          <img src="./docs/public/img/recognition/cncf.svg" width="128" alt="Cloud Native Computing Foundation" />
-        </a>
-        <br />
-        <strong>Linux Foundation CNCF Landscape</strong>
-        <br />
-        <sub>Listed in AI Native Infra / Storage and Cloud Native Storage.</sub>
-      </td>
-      <td align="center" width="360">
-        <a href="https://dbdb.io/db/nokv">
-          <img src="./docs/public/img/recognition/dbdb.svg" width="128" alt="DBDB.io Database of Databases" />
-        </a>
-        <br />
-        <strong>DBDB.io Database of Databases</strong>
-        <br />
-        <sub>Historical database profile; current NoKV is the Rust filesystem product line.</sub>
-      </td>
-    </tr>
-  </table>
 </div>
 
 <div align="center">
@@ -67,6 +42,18 @@ SPDX-License-Identifier: Apache-2.0
 > **NoKV × Lingtai — design partnership.** We've started a design-partner collaboration with [Lingtai](https://github.com/Lingtai-AI/lingtai), exploring NoKV as the workspace-checkpoint, artifact-provenance, and metadata substrate beneath filesystem-native agent runtimes. [Read the announcement →](https://github.com/orgs/NoKV-Lab/discussions/378)
 
 <br/>
+
+## Endorsements
+
+<p align="center">
+  <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv"><img src="./docs/public/img/recognition/cncf.svg" width="64" alt="Linux Foundation CNCF Landscape" /></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://dbdb.io/db/nokv"><img src="./docs/public/img/recognition/dbdb.svg" width="64" alt="DBDB.io Database of Databases" /></a>
+</p>
+
+<p align="center">
+  <sub><strong>Linux Foundation CNCF Landscape</strong>: listed in AI Native Infra / Storage and Cloud Native Storage &nbsp;·&nbsp; <strong>DBDB.io</strong>: database profile (current NoKV is the Rust filesystem product line)</sub>
+</p>
 
 ## What Is NoKV?
 
