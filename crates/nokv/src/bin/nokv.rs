@@ -2739,4 +2739,40 @@ mod tests {
         assert_eq!(command, Command::Serve);
         assert_eq!(disabled.metadata_checkpoint_archive_prefix, None);
     }
+    #[test]
+fn parse_mcp_command() {
+    let command = parse(vec![s("mcp")]).unwrap().1;
+    assert_eq!(command, Command::Mcp);
+    assert!(matches!(
+        parse(vec![s("mcp"), s("extra")]),
+        Err(CliError::TooManyArguments)
+    ));
+}
+
+    #[test]
+    fn test_mcp_server_stdio() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store.clone());
+        let reqs = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"test-client","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ls","arguments":{"path":"/"}}}"#,
+        ].join("\n") + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let mut lines = output.lines();
+        let resp1: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp1["id"], 1);
+        assert_eq!(resp1["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(resp1["result"]["serverInfo"]["name"], "nokv-mcp");
+        let resp2: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp2["id"], 2);
+        let tools = resp2["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "ls"));
+        let resp3: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp3["id"], 3);
+        assert!(resp3["result"]["content"][0]["text"].as_str().is_some());
+    }
 }
