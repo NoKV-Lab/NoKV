@@ -21,7 +21,6 @@ SPDX-License-Identifier: Apache-2.0
   </p>
 </div>
 
----
 
 ## Latest update
 
@@ -37,7 +36,6 @@ SPDX-License-Identifier: Apache-2.0
 >
 > [Read the announcement(English) →](https://github.com/orgs/NoKV-Lab/discussions/378)
 
----
 
 ## Recognition
 
@@ -154,45 +152,6 @@ transport-free — it depends only on `nokv-meta`, `nokv-object`, and
 **Today** the agent verbs ship in the Rust SDK; filesystem operations ship in
 the `nokv` CLI and FUSE mount. An **MCP server is in development** — follow
 [#354](https://github.com/feichai0017/NoKV/issues/354).
-
-## 📊 Measured Evidence
-
-**Agent interface.** We gave the same agent (`gpt-5.4-mini`) the same 875-run
-experiment corpus through two surfaces — raw SQL over SQLite, and the NoKV
-namespace — across five tasks, 10 repeats per arm and task (100 fully stateless
-runs), judged against deterministic gold facts neither arm can see:
-
-| Set mean (per 5-task pass) | Raw SQLite | NoKV namespace |
-| --- | --- | --- |
-| Tasks solved correctly | 4.40 / 5 | **4.50 / 5** |
-| Prompt tokens (incl. cached) | 151,572 | **82,827 (−45%)** |
-| Cost (USD, list rates) | $0.0708 | **$0.0433 (−39%)** |
-
-In this 10-repeat sample, the token gap widens to ~2.4× on the
-compound-exploration subset, and SQL won the single-shot analytics task —
-per-task results, wins and losses both, are in the report. Harness, tasks,
-judge, and the raw telemetry of all 100 runs are committed, so every published
-number is recomputable: see
-[`bench/agent-interface/`](bench/agent-interface/BENCHMARK_REPORT.md).
-
-**Storage engine.** Local engineering baselines, not official MLPerf results.
-Single-node service numbers are release builds through the NoKV server and Holt
-metadata path. FUSE comparison numbers depend on kernel/FUSE, object backend,
-cache settings, and workload shape.
-
-| Workload | Result |
-| --- | --- |
-| Metadata create (`mdtest`, 65k records) | **~127K ops/s** (single-writer, batched service path) |
-| Same, one directory of 65k entries | Same order of throughput; path-native ART does not degrade on large directories |
-| Checkpoint publish (1 MiB blocks, concurrency 16) | **~1.1 GiB/s** in the service/object benchmark |
-| Dataset read (16 KiB samples, concurrency 16) | **~3,000 samples/s** in the service/object benchmark |
-| Resident metadata | **~1.5 KiB / file** in the measured shape |
-| Atomic checkpoint | Object bytes land first; metadata publishes a new generation atomically |
-
-Same-machine FUSE-vs-FUSE smoke against one RustFS endpoint currently shows
-NoKV behind JuiceFS on the end-to-end mounted path. That gap is expected to come
-from FUSE/RPC fixed costs and data-plane cache/writeback maturity, not from the
-Holt metadata engine alone.
 
 ## NoKV vs JuiceFS
 
