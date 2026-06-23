@@ -55,7 +55,7 @@ caller (bench / SDK / MCP)
 | `serde_json` | Tool argument parsing and result JSON. The **only** serde dependency. |
 
 It depends on **none** of `nokv-client`, `nokv-protocol`, `nokv-control`. That
-is the whole point — and it is enforced (see §4, cycle rule).
+is the whole point — and it is enforced (see [the cycle rule](#4-invariants-do-not-break-these)).
 
 ### Remote (RPC) — stays in `nokv-client`
 
@@ -111,7 +111,7 @@ The seven tools are **read-only**: `ls`, `stat`, `catalog`, `read`, `find`,
 exists (`ls`/`stat`/`catalog`), then query and read only what is needed
 (`find`/`aggregate`/`read`/`grep`).
 
-## 4. Invariants — do not break these
+## 4. Invariants (do not break these)
 
 1. **Transport-free.** `nokv-agent` must never depend on `nokv-client`,
    `nokv-protocol`, or `nokv-control`. A reverse edge would create a dependency
@@ -120,7 +120,7 @@ exists (`ls`/`stat`/`catalog`), then query and read only what is needed
 2. **Read-only verb surface.** The `AgentNamespace` trait exposes only the six
    read verbs. Writes (e.g. `register_namespace_index`) stay as inherent methods
    on `NoKvFs` in `nokv-meta`, off the trait. Keep the model-facing surface
-   read-only unless a write contract is explicitly designed (see §6).
+   read-only unless a write contract is explicitly designed (see [the roadmap](#6-roadmap-verbs-we-expect-to-add)).
 3. **Orphan-rule placement.** `impl AgentNamespace for NoKvFs<M, O>` lives in
    `nokv-agent` (local trait + foreign type → legal). This is what lets the
    embedded path work **without** `nokv-meta` gaining a dependency on
@@ -156,7 +156,7 @@ The flow crosses two crates because the verb logic stays in `nokv-meta`:
    `nokv-agent` (no engine needed), and confirm the benchmark tool-registry test
    still matches the arm surface.
 
-## 6. Roadmap — verbs we expect to add
+## 6. Roadmap (verbs we expect to add)
 
 The current surface answers **read** questions over a namespace. NoKV already
 implements the write/stateful semantics below in `nokv-meta`/`nokv-client`; the
