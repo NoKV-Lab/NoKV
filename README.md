@@ -149,9 +149,37 @@ over the same `AgentNamespace` trait whether the namespace is embedded
 transport-free — it depends only on `nokv-meta`, `nokv-object`, and
 `nokv-types`. See the [contributor handbook](docs/development/nokv-agent.md).
 
-**Today** the agent verbs ship in the Rust SDK; filesystem operations ship in
-the `nokv` CLI and FUSE mount. An **MCP server is in development** — follow
-[#354](https://github.com/feichai0017/NoKV/issues/354).
+**Today** the agent verbs ship in the Rust SDK, the `nokv` CLI and FUSE
+mount, and a native MCP server over stdio transport. Run `nokv mcp` to
+serve the seven read-only agent tools to any MCP-capable client.
+
+```bash
+cargo run --release -p nokv --bin nokv -- mcp
+```
+
+To configure it in an MCP client (e.g. Cursor, VS Code, Claude Desktop):
+
+```json
+{
+  "nokv-mcp": {
+    "command": "/path/to/NoKV/target/release/nokv",
+    "args": ["mcp"]
+  }
+}
+```
+
+The same `--server-bind`, `--object-backend`, `--mount`, and control-plane
+flags from the rest of the CLI apply, e.g.:
+
+```bash
+nokv --server-bind 127.0.0.1:7777 --object-backend rustfs mcp
+```
+
+**v1 constraints:** stdio transport only (no HTTP/SSE); read-only — the
+seven existing agent tools only, no write or publish tools; no network
+registration path for `register_namespace_index` (it remains
+embedded-only — see the [contributor handbook](docs/development/nokv-agent.md)
+section 6 for why).
 
 ## NoKV vs JuiceFS
 

@@ -121,6 +121,7 @@ enum Command {
         options: MountCliOptions,
     },
     Serve,
+    Mcp,
     Gc {
         limit: usize,
     },
@@ -486,6 +487,10 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         }
         Command::Serve => {
             nokv_server::run(server_options_from_config(config)).map_err(from_io)?;
+        }
+        Command::Mcp => {
+            let client = open_client(&config)?;
+            run_mcp(client).map_err(from_io)?;
         }
         Command::Gc { limit } => {
             let body = control_get(&config, &format!("/gc?limit={limit}"))?;
@@ -1242,6 +1247,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             })
         }
         "serve" => exact_args(args, 1).map(|()| Command::Serve),
+        "mcp" => exact_args(args, 1).map(|()| Command::Mcp),
         "backup" => exact_args(args, 1).map(|()| Command::Backup),
         "restore" => exact_args(args, 1).map(|()| Command::Restore),
         "fsck" => exact_args(args, 1).map(|()| Command::Fsck),
@@ -1706,6 +1712,190 @@ fn from_client(err: impl Error) -> CliError {
 fn from_object(err: impl Error) -> CliError {
     CliError::Client(err.to_string())
 }
+fn run_mcp(client: Client) -> std::io::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_mcp_stream(client, stdin.lock(), stdout.lock())
+}
+
+fn run_mcp_stream<O>(
+    client: nokv_client::NoKvFsClient<O>,
+    mut reader: impl std::io::BufRead,
+    mut writer: impl std::io::Write,
+) -> std::io::Result<()>
+where
+    O: nokv_object::ObjectStore + Send + Sync + 'static,
+{
+    use serde_json::json;
+
+    #[derive(serde::Deserialize)]
+    struct JsonRpcRequest {
+        jsonrpc: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_some")]
+        id: Option<Option<serde_json::Value>>,
+        method: Option<String>,
+        params: Option<serde_json::Value>,
+    }
+
+    fn deserialize_some<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<Option<serde_json::Value>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::Deserialize::deserialize(deserializer).map(Some)
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CallToolParams {
+        name: String,
+        arguments: Option<serde_json::Value>,
+    }
+
+    fn ok_response(id: Option<serde_json::Value>, result: serde_json::Value) -> serde_json::Value {
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    }
+
+    fn err_response(id: Option<serde_json::Value>, code: i64, message: &str) -> serde_json::Value {
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+    }
+
+    let mut line = String::new();
+    while reader.read_line(&mut line)? > 0 {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let maybe_response = match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Err(_) => Some(err_response(None, -32700, "Parse error")),
+                Ok(raw) => {
+                    if raw.is_array() {
+                        Some(err_response(
+                            None,
+                            -32600,
+                            "Batch requests are not supported",
+                        ))
+                    } else if !raw.is_object() {
+                        Some(err_response(None, -32600, "Invalid Request"))
+                    } else {
+                        match serde_json::from_value::<JsonRpcRequest>(raw) {
+                            Err(_) => Some(err_response(None, -32600, "Invalid Request")),
+                            Ok(req) => {
+                                let id = req.id.clone().flatten();
+                                if req.jsonrpc.as_deref() != Some("2.0") {
+                                    Some(err_response(
+                                        id,
+                                        -32600,
+                                        "Invalid Request: jsonrpc must be \"2.0\"",
+                                    ))
+                                } else if req.method.is_none() {
+                                    Some(err_response(
+                                        id,
+                                        -32600,
+                                        "Invalid Request: missing method",
+                                    ))
+                                } else {
+                                    let is_notification = req.id.is_none();
+                                    let method = req.method.clone().unwrap();
+                                    let result = match method.as_str() {
+                                        "initialize" => {
+                                            const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+                                                &["2024-11-05", "2025-03-26"];
+                                            let requested = req
+                                                .params
+                                                .as_ref()
+                                                .and_then(|p| p.get("protocolVersion"))
+                                                .and_then(|v| v.as_str());
+                                            match requested {
+                                                Some(v)
+                                                    if SUPPORTED_PROTOCOL_VERSIONS
+                                                        .contains(&v) =>
+                                                {
+                                                    Ok(json!({
+                                                        "protocolVersion": v,
+                                                        "capabilities": { "tools": {} },
+                                                        "serverInfo": { "name": "nokv-mcp", "version": "0.1.0" }
+                                                    }))
+                                                }
+                                                Some(v) => Err((
+                                                    -32602_i64,
+                                                    format!(
+                                                        "unsupported protocol version {v}; supported: {}",
+                                                        SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                                                    ),
+                                                )),
+                                                None => Ok(json!({
+                                                    "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
+                                                    "capabilities": { "tools": {} },
+                                                    "serverInfo": { "name": "nokv-mcp", "version": "0.1.0" }
+                                                })),
+                                            }
+                                        }
+                                        "initialized" | "ping" => Ok(json!({})),
+                                        "tools/list" => {
+                                            let tools: Vec<serde_json::Value> =
+                                                nokv_agent::agent_tool_definitions()
+                                                    .into_iter()
+                                                    .map(|t| {
+                                                        json!({
+                                                            "name": t.name,
+                                                            "description": t.description,
+                                                            "inputSchema": t.parameters,
+                                                        })
+                                                    })
+                                                    .collect();
+                                            Ok(json!({ "tools": tools }))
+                                        }
+                                        "tools/call" => {
+                                            let params = req.params.clone().unwrap_or(json!({}));
+                                            match serde_json::from_value::<CallToolParams>(params) {
+                                                Err(e) => Err((
+                                                    -32602_i64,
+                                                    format!("Invalid params: {e}"),
+                                                )),
+                                                Ok(call) => {
+                                                    let args = call.arguments.unwrap_or(json!({}));
+                                                    match nokv_agent::execute_agent_tool(
+                                                        &client, &call.name, &args,
+                                                    ) {
+                                                        Ok(val) => Ok(json!({
+                                                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&val).unwrap_or_default() }],
+                                                            "structuredContent": val,
+                                                        })),
+                                                        Err(err) => Ok(json!({
+                                                            "content": [{ "type": "text", "text": err.to_string() }],
+                                                            "isError": true
+                                                        })),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        other => {
+                                            Err((-32601_i64, format!("Method not found: {other}")))
+                                        }
+                                    };
+                                    if is_notification {
+                                        None
+                                    } else {
+                                        Some(match result {
+                                            Ok(val) => ok_response(id, val),
+                                            Err((code, msg)) => err_response(id, code, &msg),
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(response) = maybe_response {
+                serde_json::to_writer(&mut writer, &response)?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+            }
+        }
+        line.clear();
+    }
+    Ok(())
+}
 
 fn print_help(out: &mut impl Write) -> io::Result<()> {
     writeln!(
@@ -1728,6 +1918,7 @@ Usage:\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount [--read-only] [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount-snapshot SNAPSHOT_ID [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] [--control-backend etcd] serve\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mcp\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] backup\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] restore\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] fsck\n\
@@ -2628,5 +2819,250 @@ mod tests {
             parse(vec![s("--no-metadata-checkpoint-archive"), s("serve")]).unwrap();
         assert_eq!(command, Command::Serve);
         assert_eq!(disabled.metadata_checkpoint_archive_prefix, None);
+    }
+    #[test]
+    fn parse_mcp_command() {
+        let command = parse(vec![s("mcp")]).unwrap().1;
+        assert_eq!(command, Command::Mcp);
+        assert!(matches!(
+            parse(vec![s("mcp"), s("extra")]),
+            Err(CliError::TooManyArguments)
+        ));
+    }
+
+    #[test]
+    fn test_mcp_server_stdio() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store.clone());
+        let reqs = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"test-client","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ls","arguments":{"path":"/"}}}"#,
+        ].join("\n") + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let mut lines = output.lines();
+        let resp1: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp1["id"], 1);
+        assert_eq!(resp1["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(resp1["result"]["serverInfo"]["name"], "nokv-mcp");
+        let resp2: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp2["id"], 2);
+        let tools = resp2["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "ls"));
+        let resp3: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resp3["id"], 3);
+        assert!(resp3["result"]["content"][0]["text"].as_str().is_some());
+    }
+
+    #[test]
+    fn mcp_tools_list_exposes_exactly_seven_tools() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["ls", "stat", "catalog", "read", "aggregate", "find", "grep"]
+        );
+    }
+
+    #[test]
+    fn mcp_tools_list_passes_input_schema_unchanged() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let ls_tool = tools.iter().find(|t| t["name"] == "ls").unwrap();
+        let expected = nokv_agent::agent_tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "ls")
+            .unwrap();
+        assert_eq!(ls_tool["inputSchema"], expected.parameters);
+    }
+
+    #[test]
+    fn mcp_tools_call_returns_structured_content() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ls","arguments":{"path":"/"}}}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert!(resp["result"]["structuredContent"].is_object());
+        assert!(resp["result"]["content"][0]["text"].as_str().is_some());
+    }
+
+    #[test]
+    fn mcp_tools_call_unknown_tool_returns_error_without_crashing() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nonexistent","arguments":{}}}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[test]
+    fn mcp_tools_call_invalid_params_returns_jsonrpc_error() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{}}}"#
+            .to_owned()
+            + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn mcp_unknown_method_returns_method_not_found() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"nonexistent/method"}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn mcp_rejects_missing_jsonrpc_field() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"id":1,"method":"tools/list"}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn mcp_rejects_wrong_jsonrpc_version() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"1.0","id":1,"method":"tools/list"}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn mcp_rejects_invalid_json_with_parse_error() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = "not valid json\n".to_owned();
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn mcp_rejects_batch_requests() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn mcp_id_null_gets_a_response_not_treated_as_notification() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        assert!(!output.is_empty());
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert!(resp["result"].is_object());
+    }
+
+    #[test]
+    fn mcp_missing_id_is_treated_as_notification_no_response() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","method":"initialized"}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn mcp_initialize_rejects_unsupported_protocol_version() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn mcp_initialize_accepts_second_supported_version() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], "2025-03-26");
+    }
+
+    #[test]
+    fn mcp_initialize_defaults_when_version_omitted() {
+        let store = MemoryObjectStore::new();
+        let client = NoKvFsClient::connect(spawn_test_server(), store);
+        let reqs = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.to_owned() + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream(client, reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
     }
 }
