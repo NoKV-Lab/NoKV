@@ -6,6 +6,7 @@
 
 use std::fmt;
 
+mod agent;
 mod artifact;
 #[cfg(test)]
 mod artifact_tests;
@@ -19,6 +20,7 @@ use nokv_meta::{MetadError, MetadataError};
 use nokv_object::ObjectError;
 use nokv_types::{AdvisoryLock, PathError, PathMetadata};
 
+pub use agent::{agent_tool_definitions, execute_agent_tool, AgentNamespace, AgentToolDefinition};
 pub use artifact::{
     normalize_artifact_path, ArtifactBackend, ArtifactInfo, ArtifactRepository,
     ArtifactRepositoryOptions,

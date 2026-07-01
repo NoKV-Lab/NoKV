@@ -92,6 +92,27 @@ pub enum MetadataRpcRequest {
         after_name_hex: Option<String>,
         limit: usize,
     },
+    StatCard {
+        path: String,
+    },
+    ListPage {
+        path: String,
+        cursor: Option<String>,
+        limit: u64,
+    },
+    FindPaths {
+        request: Box<WireNamespaceFindRequest>,
+    },
+    AggregatePaths {
+        request: Box<WireNamespaceAggregateRequest>,
+    },
+    GrepPaths {
+        request: Box<WireNamespaceGrepRequest>,
+    },
+    ReadPage {
+        path: String,
+        options: Box<WireNamespaceReadOptions>,
+    },
     CreateDir {
         parent: u64,
         name: String,
@@ -484,6 +505,24 @@ pub enum MetadataRpcResult {
     PathMetadata {
         metadata: Option<WirePathMetadata>,
     },
+    NamespaceCard {
+        card: Option<Box<WireNamespaceCard>>,
+    },
+    NamespaceListPage {
+        page: Box<WireNamespaceListPage>,
+    },
+    NamespaceFindResult {
+        result: Box<WireNamespaceFindResult>,
+    },
+    NamespaceAggregateResult {
+        result: Box<WireNamespaceAggregateResult>,
+    },
+    NamespaceGrepResult {
+        result: Box<WireNamespaceGrepResult>,
+    },
+    NamespaceReadPage {
+        page: Box<WireNamespaceReadPage>,
+    },
     RenameReplace {
         entry: Box<WireDentryWithAttr>,
         replaced: Option<Box<WireDentryWithAttr>>,
@@ -560,6 +599,409 @@ pub struct WireAdvisoryLock {
 pub struct WirePathMetadata {
     pub attr: WireInodeAttr,
     pub body: Option<WireBodyDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNamespaceCardKind {
+    File,
+    Directory,
+    Symlink,
+    Special,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNamespaceRecordType {
+    DirectoryEntries,
+    JsonArray,
+    JsonObject,
+    YamlMapping,
+    TextLines,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireRecordCountProvenance {
+    LiveNamespace,
+    StructuredBody,
+    MaterializedIndex,
+    Approximate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceRecordCount {
+    pub count: u64,
+    pub provenance: WireRecordCountProvenance,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceSchema {
+    pub record_type: WireNamespaceRecordType,
+    pub fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNamespaceInclude {
+    Body,
+    Schema,
+    Sample,
+    Catalog,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceFilterCapability {
+    pub field: WireNamespaceFindField,
+    pub operators: Vec<WireNamespacePredicateOp>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceQueryCatalog {
+    pub filterable: Vec<WireNamespaceFilterCapability>,
+    pub sortable: Vec<WireNamespaceSortField>,
+    pub facetable: Vec<WireNamespaceFindField>,
+    pub facets: Vec<WireNamespaceFacetSummary>,
+    pub projections: Vec<WireNamespaceInclude>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceFacetSummary {
+    pub field: WireNamespaceFindField,
+    pub values: Vec<WireNamespaceFacetValue>,
+    pub distinct_count: u64,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceFacetValue {
+    pub value: WireNamespacePredicateValue,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceCard {
+    pub path: String,
+    pub name: String,
+    pub kind: WireNamespaceCardKind,
+    pub evidence: String,
+    pub snapshot_id: Option<u64>,
+    pub inode: u64,
+    pub generation: u64,
+    pub size_bytes: Option<u64>,
+    pub entry_count: Option<u64>,
+    pub record_count: Option<WireNamespaceRecordCount>,
+    pub schema: Option<WireNamespaceSchema>,
+    pub sample: Vec<String>,
+    pub body: Option<WireBodyDescriptor>,
+    pub catalog: WireNamespaceQueryCatalog,
+    pub indexed_values: Vec<WireNamespaceIndexValue>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceListPage {
+    pub path: String,
+    pub evidence: String,
+    pub snapshot_id: Option<u64>,
+    pub entry_count: u64,
+    pub entries: Vec<WireNamespaceCard>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct WireNamespaceFindField {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNamespacePredicateOp {
+    Eq,
+    NotEqual,
+    In,
+    Prefix,
+    Suffix,
+    Contains,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Exists,
+    NotExists,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum WireNamespacePredicateValue {
+    String(String),
+    U64(u64),
+    F64(f64),
+    List(Vec<WireNamespacePredicateValue>),
+}
+
+impl PartialEq for WireNamespacePredicateValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::U64(left), Self::U64(right)) => left == right,
+            (Self::F64(left), Self::F64(right)) => {
+                left.total_cmp(right) == std::cmp::Ordering::Equal
+            }
+            (Self::List(left), Self::List(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for WireNamespacePredicateValue {}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespacePredicate {
+    pub field: WireNamespaceFindField,
+    pub op: WireNamespacePredicateOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<WireNamespacePredicateValue>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct WireNamespaceSortField {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceIndexValue {
+    pub field: WireNamespaceFindField,
+    pub value: WireNamespacePredicateValue,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNamespaceSortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceSort {
+    pub field: WireNamespaceSortField,
+    pub direction: WireNamespaceSortDirection,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceFindRequest {
+    pub path: String,
+    pub predicates: Vec<WireNamespacePredicate>,
+    pub sort: Vec<WireNamespaceSort>,
+    pub include: Vec<WireNamespaceInclude>,
+    #[serde(default)]
+    pub facets: Vec<WireNamespaceFindField>,
+    pub cursor: Option<String>,
+    pub limit: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceFindResult {
+    pub path: String,
+    pub evidence: String,
+    pub snapshot_id: Option<u64>,
+    pub match_count: u64,
+    pub matches: Vec<WireNamespaceCard>,
+    #[serde(default)]
+    pub facets: Vec<WireNamespaceFacetSummary>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+    pub scanned_entries: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNamespaceFieldSourceKind {
+    Namespace,
+    MaterializedIndex,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceFieldSource {
+    pub evidence: String,
+    pub source_path: String,
+    pub source_kind: WireNamespaceFieldSourceKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceFieldValue {
+    pub field: WireNamespaceFindField,
+    pub value: WireNamespacePredicateValue,
+    pub source: WireNamespaceFieldSource,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNamespaceAggregateOp {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceAggregateMeasure {
+    pub name: String,
+    pub op: WireNamespaceAggregateOp,
+    pub field: Option<WireNamespaceFindField>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceAggregateSort {
+    pub field: String,
+    pub direction: WireNamespaceSortDirection,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceAggregateRequest {
+    pub path: String,
+    pub predicates: Vec<WireNamespacePredicate>,
+    pub group_by: Vec<WireNamespaceFindField>,
+    pub measures: Vec<WireNamespaceAggregateMeasure>,
+    pub sort: Vec<WireNamespaceAggregateSort>,
+    pub limit: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum WireNamespaceAggregateValue {
+    U64(u64),
+    F64(f64),
+    Null,
+}
+
+impl PartialEq for WireNamespaceAggregateValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::U64(left), Self::U64(right)) => left == right,
+            (Self::F64(left), Self::F64(right)) => {
+                left.total_cmp(right) == std::cmp::Ordering::Equal
+            }
+            (Self::Null, Self::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for WireNamespaceAggregateValue {}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceAggregateOutputMeasure {
+    pub name: String,
+    pub op: WireNamespaceAggregateOp,
+    pub field: Option<WireNamespaceFindField>,
+    pub value: WireNamespaceAggregateValue,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceAggregateSample {
+    pub path: String,
+    pub evidence: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceAggregateGroup {
+    pub key: Vec<WireNamespaceFieldValue>,
+    pub measures: Vec<WireNamespaceAggregateOutputMeasure>,
+    pub evidence: String,
+    pub sample_matches: Vec<WireNamespaceAggregateSample>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceAggregateResult {
+    pub path: String,
+    pub evidence: String,
+    pub snapshot_id: Option<u64>,
+    pub predicates: Vec<WireNamespacePredicate>,
+    pub input_match_count: u64,
+    pub row_count: u64,
+    pub group_count: u64,
+    pub groups: Vec<WireNamespaceAggregateGroup>,
+    pub truncated: bool,
+    pub scanned_entries: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceGrepRequest {
+    pub path: String,
+    pub pattern: String,
+    pub recursive: bool,
+    pub cursor: Option<String>,
+    pub limit: u64,
+    pub max_files: Option<u64>,
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceGrepMatch {
+    pub path: String,
+    pub line_number: u64,
+    pub snippet: String,
+    pub evidence: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceGrepResult {
+    pub path: String,
+    pub pattern: String,
+    pub recursive: bool,
+    pub evidence: String,
+    pub snapshot_id: Option<u64>,
+    pub matches: Vec<WireNamespaceGrepMatch>,
+    pub files_scanned: u64,
+    pub bytes_read: u64,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireNamespaceReadFormat {
+    Structured,
+    Bytes,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceReadOptions {
+    pub format: WireNamespaceReadFormat,
+    pub cursor: Option<String>,
+    pub offset: u64,
+    pub limit: u64,
+    pub expected_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceReadItem {
+    pub index: u64,
+    pub value_json: String,
+    pub evidence: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceReadPage {
+    pub path: String,
+    pub evidence: String,
+    pub snapshot_id: Option<u64>,
+    pub generation: u64,
+    pub total_size_bytes: u64,
+    pub format: WireNamespaceReadFormat,
+    pub record_type: Option<WireNamespaceRecordType>,
+    pub record_count: Option<u64>,
+    pub cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+    pub items: Vec<WireNamespaceReadItem>,
+    pub bytes: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1141,6 +1583,7 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         MetadataRpcRequest::LookupPath { path }
         | MetadataRpcRequest::StatPath { path }
         | MetadataRpcRequest::ReadDirPlusPath { path }
+        | MetadataRpcRequest::StatCard { path }
         | MetadataRpcRequest::CreateDirPath { path, .. }
         | MetadataRpcRequest::CreateFilePath { path, .. }
         | MetadataRpcRequest::RemoveFilePath { path }
@@ -1148,6 +1591,8 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         | MetadataRpcRequest::SnapshotSubtreePath { path }
         | MetadataRpcRequest::ReadIndexedPathPage { path, .. }
         | MetadataRpcRequest::ReadDirPlusPathPage { path, .. }
+        | MetadataRpcRequest::ReadPage { path, .. }
+        | MetadataRpcRequest::ListPage { path, .. }
         | MetadataRpcRequest::StatPathAtSnapshot { path, .. }
         | MetadataRpcRequest::ReadDirPlusPathAtSnapshot { path, .. }
         | MetadataRpcRequest::ReadFilePathAtSnapshot { path, .. }
@@ -1157,6 +1602,9 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         MetadataRpcRequest::CreateFilesInDirPath { parent_path, .. } => {
             RoutingKey::Path(parent_path)
         }
+        MetadataRpcRequest::FindPaths { request } => RoutingKey::Path(&request.path),
+        MetadataRpcRequest::AggregatePaths { request } => RoutingKey::Path(&request.path),
+        MetadataRpcRequest::GrepPaths { request } => RoutingKey::Path(&request.path),
         // A batch open routes by its FIRST entry's path. The client guarantees
         // every batch it sends is single-shard (it groups requests by shard before
         // sending), so the first path's owner owns the whole batch; an empty batch
@@ -1229,6 +1677,23 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_codec_round_trips_metadata_request() {
+        let request = MetadataRpcRequest::GrepPaths {
+            request: Box::new(WireNamespaceGrepRequest {
+                path: "/runs".to_owned(),
+                pattern: "needle".to_owned(),
+                recursive: true,
+                cursor: Some("1:0".to_owned()),
+                limit: 10,
+                max_files: Some(20),
+                max_bytes: Some(4096),
+            }),
+        };
+        let encoded = encode_request(&request).unwrap();
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+    }
 
     #[test]
     fn binary_codec_round_trips_open_path_read_plan() {
@@ -1498,7 +1963,26 @@ mod tests {
     fn binary_codec_round_trips_metadata_envelope() {
         let envelope = MetadataRpcEnvelope {
             ok: true,
-            result: Some(MetadataRpcResult::PathMetadata { metadata: None }),
+            result: Some(MetadataRpcResult::NamespaceGrepResult {
+                result: Box::new(WireNamespaceGrepResult {
+                    path: "/runs".to_owned(),
+                    pattern: "needle".to_owned(),
+                    recursive: true,
+                    evidence: "nokv-native:///runs".to_owned(),
+                    snapshot_id: Some(9),
+                    matches: vec![WireNamespaceGrepMatch {
+                        path: "/runs/a.txt".to_owned(),
+                        line_number: 2,
+                        snippet: "needle".to_owned(),
+                        evidence: "nokv-native:///runs/a.txt@generation:7#L2".to_owned(),
+                        generation: 7,
+                    }],
+                    files_scanned: 1,
+                    bytes_read: 16,
+                    next_cursor: None,
+                    truncated: false,
+                }),
+            }),
             error: None,
             error_kind: None,
         };

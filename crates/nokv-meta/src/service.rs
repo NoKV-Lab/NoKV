@@ -5,6 +5,7 @@
 //! into `MetadataCommand`s and stores file bodies through an object-store
 //! boundary. It does not own Holt trees, Raft replication, FUSE, or protobuf.
 
+mod agent;
 mod allocator;
 mod backup;
 mod checkpoint;
@@ -53,12 +54,15 @@ use crate::command::{
 use crate::layout::{
     allocator_key, chunk_manifest_key, chunk_manifest_prefix, decode_allocator_state,
     decode_body_descriptor, decode_chunk_manifest, decode_dentry_projection, decode_inode_attr,
-    decode_object_gc_record, decode_snapshot_pin, decode_watch_event, dentry_key,
-    dentry_mount_prefix, dentry_prefix, encode_allocator_state, encode_body_descriptor,
-    encode_chunk_manifest, encode_dentry_projection, encode_inode_attr, encode_object_gc_record,
-    encode_snapshot_pin, encode_watch_event, gc_object_key, gc_queue_prefix, inode_key,
-    path_index_key, path_index_prefix, snapshot_pin_key, snapshot_pin_prefix, watch_log_key,
-    watch_log_prefix, xattr_key, xattr_prefix, PATH_INDEX_DELIMITER,
+    decode_object_gc_record, decode_path_index_catalog, decode_path_index_row, decode_snapshot_pin,
+    decode_watch_event, dentry_key, dentry_mount_prefix, dentry_prefix, encode_allocator_state,
+    encode_body_descriptor, encode_chunk_manifest, encode_dentry_projection, encode_inode_attr,
+    encode_object_gc_record, encode_path_index_catalog, encode_path_index_row, encode_snapshot_pin,
+    encode_watch_event, gc_object_key, gc_queue_prefix, inode_key, path_index_catalog_key,
+    path_index_key, path_index_prefix, path_index_row_key, path_index_row_prefix, snapshot_pin_key,
+    snapshot_pin_prefix, watch_log_key, watch_log_prefix, xattr_key, xattr_prefix,
+    PathIndexCatalogRecord, PathIndexFieldRecord, PathIndexRowRecord, PathIndexValueRecord,
+    PATH_INDEX_DELIMITER,
 };
 use nokv_object::{
     plan_chunk_manifest_reads, BlockReadOptions, ChunkStore, ChunkWriteOptions, ChunkWriteRange,
@@ -72,6 +76,22 @@ use nokv_types::{
     SpecialNodeSpec, WatchCursor, WatchEvent, WatchEventKind, WatchRecord,
 };
 use sha2::{Digest, Sha256};
+
+pub use agent::{
+    NamespaceAggregateGroup, NamespaceAggregateMeasure, NamespaceAggregateOp,
+    NamespaceAggregateOutputMeasure, NamespaceAggregateRequest, NamespaceAggregateResult,
+    NamespaceAggregateSample, NamespaceAggregateSort, NamespaceAggregateValue,
+    NamespaceBodyDescriptor, NamespaceCard, NamespaceCardKind, NamespaceFacetSummary,
+    NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind, NamespaceFieldValue,
+    NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest, NamespaceFindResult,
+    NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult, NamespaceInclude,
+    NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow, NamespaceIndexValue,
+    NamespaceListOptions, NamespaceListPage, NamespacePredicate, NamespacePredicateOp,
+    NamespacePredicateValue, NamespaceQueryCatalog, NamespaceReadFormat, NamespaceReadItem,
+    NamespaceReadOptions, NamespaceReadPage, NamespaceRecordCount, NamespaceRecordType,
+    NamespaceSchema, NamespaceSort, NamespaceSortDirection, NamespaceSortField,
+    RecordCountProvenance,
+};
 
 const BODY_SUMMARY_CHUNK_INDEX: u64 = u64::MAX;
 const ALLOCATOR_VERSION_RESERVATION: u64 = 1024;
@@ -1367,6 +1387,7 @@ fn kind_name(kind: CommandKind) -> &'static [u8] {
         CommandKind::RenewSnapshot => b"renew-snapshot",
         CommandKind::WatchSubtree => b"watch-subtree",
         CommandKind::CleanupObjects => b"cleanup-objects",
+        CommandKind::RegisterNamespaceIndex => b"register-namespace-index",
     }
 }
 
@@ -1433,7 +1454,7 @@ impl fmt::Display for MetadError {
             Self::InvalidPreparedArtifact(err) => {
                 write!(f, "invalid prepared artifact: {err}")
             }
-            Self::InvalidQuery(err) => write!(f, "invalid metadata query: {err}"),
+            Self::InvalidQuery(err) => write!(f, "invalid namespace query: {err}"),
             Self::StaleBodyGeneration { expected, current } => write!(
                 f,
                 "body generation {expected} is stale; current generation is {current}"

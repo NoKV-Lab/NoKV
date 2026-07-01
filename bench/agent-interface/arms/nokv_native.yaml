@@ -1,15 +1,15 @@
 arm_id: nokv_native_v1
 version: 1
-interface_name: NoKV Agent Native API
+interface_name: NoKV Product Native Agent API
 mode: warm_interface
-purpose: Read-only access to the nokv-agent fs-shaped Holt store.
+purpose: Product-native read-only namespace access.
 
 runtime_context:
-  surface: nokv_agent_native
+  surface: nokv_native_namespace
   entrypoint: /yanex
   access: read_only
   path_model:
-    - Paths are absolute nokv-agent paths, not DFS namespace inodes.
+    - Paths are absolute NoKV namespace paths.
     - Runs live under /yanex/runs; each run directory holds its run files and an artifacts/ subdirectory with log and output files such as stdout.txt and stderr.txt.
     - For paths outside this documented layout, discover children from returned cards or catalogs before use.
   field_discovery:

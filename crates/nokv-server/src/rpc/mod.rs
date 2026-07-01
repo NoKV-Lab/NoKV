@@ -30,9 +30,12 @@ use crate::server::{Server, ServerError};
 
 use batch::{create_path_batch_envelopes, execute_batch, CreatePathKind};
 use wire::{
-    dentry_name, err_envelope, inode_id, prepared_artifact, protocol_error, staged_object_set,
-    update_attr, wire_body_read_plan, wire_dentry, wire_open_path_read_plan,
-    wire_prepared_artifact, wire_subtree_delta, xattr_set_mode,
+    dentry_name, err_envelope, inode_id, namespace_aggregate_request, namespace_find_request,
+    namespace_grep_request, namespace_read_options, prepared_artifact, protocol_error,
+    staged_object_set, update_attr, wire_body_read_plan, wire_dentry,
+    wire_namespace_aggregate_result, wire_namespace_card, wire_namespace_find_result,
+    wire_namespace_grep_result, wire_namespace_list_page, wire_namespace_read_page,
+    wire_open_path_read_plan, wire_prepared_artifact, wire_subtree_delta, xattr_set_mode,
 };
 
 fn handle_binary_rpc(server: &Server, body: &[u8]) -> Result<Vec<u8>, ServerError> {
@@ -235,6 +238,63 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
             Ok(MetadataRpcResult::DentriesPage {
                 entries: page.entries.iter().map(wire_dentry).collect(),
                 next_name_hex: page.next_cursor.as_ref().map(encode_name_cursor),
+            })
+        }
+        MetadataRpcRequest::StatCard { path } => {
+            let card = slot.service().stat_card(&path)?;
+            Ok(MetadataRpcResult::NamespaceCard {
+                card: card
+                    .as_ref()
+                    .map(|card| Box::new(wire_namespace_card(card))),
+            })
+        }
+        MetadataRpcRequest::ListPage {
+            path,
+            cursor,
+            limit,
+        } => {
+            let limit = usize::try_from(limit).map_err(|_| {
+                ServerError::Metadata(MetadError::InvalidQuery(
+                    "namespace list limit exceeds platform limit".to_owned(),
+                ))
+            })?;
+            let page = slot
+                .service()
+                .list_page(&path, nokv_meta::NamespaceListOptions { cursor, limit })?;
+            Ok(MetadataRpcResult::NamespaceListPage {
+                page: Box::new(wire_namespace_list_page(&page)?),
+            })
+        }
+        MetadataRpcRequest::FindPaths { request } => {
+            let result = slot
+                .service()
+                .find_paths(namespace_find_request(*request)?)?;
+            Ok(MetadataRpcResult::NamespaceFindResult {
+                result: Box::new(wire_namespace_find_result(&result)?),
+            })
+        }
+        MetadataRpcRequest::AggregatePaths { request } => {
+            let result = slot
+                .service()
+                .aggregate_paths(namespace_aggregate_request(*request)?)?;
+            Ok(MetadataRpcResult::NamespaceAggregateResult {
+                result: Box::new(wire_namespace_aggregate_result(&result)),
+            })
+        }
+        MetadataRpcRequest::GrepPaths { request } => {
+            let result = slot
+                .service()
+                .grep_paths(namespace_grep_request(*request)?)?;
+            Ok(MetadataRpcResult::NamespaceGrepResult {
+                result: Box::new(wire_namespace_grep_result(&result)?),
+            })
+        }
+        MetadataRpcRequest::ReadPage { path, options } => {
+            let page = slot
+                .service()
+                .read_page(&path, namespace_read_options(*options)?)?;
+            Ok(MetadataRpcResult::NamespaceReadPage {
+                page: Box::new(wire_namespace_read_page(&page)?),
             })
         }
         MetadataRpcRequest::CreateDir {
@@ -899,6 +959,12 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::ReadDirPlusPath { .. }
         | MetadataRpcRequest::ReadDirPlusPathPage { .. }
         | MetadataRpcRequest::ReadIndexedPathPage { .. }
+        | MetadataRpcRequest::StatCard { .. }
+        | MetadataRpcRequest::ListPage { .. }
+        | MetadataRpcRequest::FindPaths { .. }
+        | MetadataRpcRequest::AggregatePaths { .. }
+        | MetadataRpcRequest::GrepPaths { .. }
+        | MetadataRpcRequest::ReadPage { .. }
         | MetadataRpcRequest::StatPathAtSnapshot { .. }
         | MetadataRpcRequest::ReadDirPlusPathAtSnapshot { .. }
         | MetadataRpcRequest::ReadFileAtSnapshot { .. }

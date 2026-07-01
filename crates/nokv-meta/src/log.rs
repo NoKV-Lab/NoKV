@@ -659,6 +659,7 @@ fn command_kind_tag(kind: CommandKind) -> u8 {
         CommandKind::RenewSnapshot => 19,
         CommandKind::WatchSubtree => 20,
         CommandKind::CleanupObjects => 21,
+        CommandKind::RegisterNamespaceIndex => 22,
     }
 }
 
@@ -685,6 +686,7 @@ fn command_kind_from_tag(tag: u8) -> Result<CommandKind, MetadataLogError> {
         19 => Ok(CommandKind::RenewSnapshot),
         20 => Ok(CommandKind::WatchSubtree),
         21 => Ok(CommandKind::CleanupObjects),
+        22 => Ok(CommandKind::RegisterNamespaceIndex),
         tag => Err(MetadataLogError::InvalidCommandKind(tag)),
     }
 }

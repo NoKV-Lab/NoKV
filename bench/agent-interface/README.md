@@ -11,15 +11,28 @@ crate and is documented in `docs/benchmarks.md`.
 
 ## Current Status
 
-The measured NoKV arm is the dedicated `nokv-agent` crate, not the DFS
-metadata service. `nokv-agent` owns an agent-native, fs-shaped Holt store and
-exposes `ls`, `stat`, `catalog`, `read`, `aggregate`, `find`, and `grep` over
-its own records.
+The NoKV product crates expose the low-level native namespace surface used
+by the benchmark:
 
-Native grep matches a case-insensitive literal substring and returns matching
-lines with line numbers, so log-extraction tasks resolve body facts without
-full file reads. The raw `nokv-*` commands in this harness still exist for DFS
-namespace debugging and verification, but they are not the measured NoKV arm.
+- `nokv-meta`: `stat_card`, `list_page`, `find_paths`, `grep_paths`, and
+  `read_page`, plus native indexed `aggregate_paths`;
+- `nokv-protocol`: `StatCard`, `ListPage`, `FindPaths`, `AggregatePaths`,
+  `GrepPaths`, and `ReadPage` RPC DTOs;
+- `nokv-client`: SDK methods plus the product-native agent adapter exposing
+  `ls`, `stat`, `catalog`, `read`, `find`, `aggregate`, and `grep`;
+- `nokv-server`: framed metadata RPC handlers for the same operations.
+
+Native grep is now implemented through `nokv-meta`, `nokv-protocol`, and
+`nokv-server` as a product-native file-content scan. The current five-task
+Phase 1 registry exposes `ls`, `stat`, `catalog`, `read`, `aggregate`, `find`,
+and `grep`. Native grep matches a case-insensitive literal substring and
+returns matching lines with line numbers, so log-extraction tasks resolve
+body facts without full file reads.
+
+The benchmark arm named `nokv_native_v1` uses the `nokv-client` agent adapter
+with the Phase 1 tool profile above. The harness translates OpenAI tool calls
+into product API calls, but does not own the measured card, find, index catalog,
+aggregation, pagination, or consistency semantics.
 
 The default Phase 1 API surface is `openai_agents_responses_schema_once`. The
 Rust harness still owns batch planning, local judging, telemetry JSONL, and
@@ -55,7 +68,6 @@ bench/data/yanex-demo/
   corpus/
   sqlite/yanex.db
   nokv/meta
-  nokv-agent/holt
   rustfs/
   manifest.json
   results/
@@ -71,7 +83,7 @@ The Phase 1 harness compares two read-only arms:
 | Arm | Surface |
 | --- | --- |
 | `sqlite_raw_v1` | Raw SQLite schema/query/blob tools (including line-oriented `grep_blob`) plus ETL-maintained agent-index materialization tables. |
-| `nokv_native_v1` | `nokv-agent` agent-native fs-shaped Holt store with `ls`, `stat`, `catalog`, `read`, `aggregate`, `find`, and `grep`. |
+| `nokv_native_v1` | NoKV product-native agent adapter. |
 
 The fixed Phase 1 tasks live in `tasks/phase1_readonly.yaml`. The rubric
 lives in `rubric/phase1_readonly.yaml`.
@@ -96,7 +108,7 @@ oracles are judge-side data and are never exposed to either arm.
 
 The benchmark has one core A/B comparison:
 
-- Raw SQLite tools vs NoKV Agent Native.
+- Raw SQLite tools vs NoKV Native Namespace.
 
 ## Materialized Index Fairness
 
@@ -111,17 +123,15 @@ can differ by surface, but the visible catalog fields, index facts, and
 limitations must not give one arm hidden task answers that the paired arm
 cannot discover through its own public interface.
 
-## NoKV Agent Native Definition
+## NoKV Native Definition
 
-In this benchmark, "NoKV native" means that the agent-facing tools map to
-`nokv-agent` APIs over an agent-native Holt store. The harness may adapt OpenAI
-tool calls and enforce limits, but it must not own the measured index or body
-lookup semantics.
+In this benchmark, "NoKV native" must mean that the agent-facing tools map to
+NoKV product APIs. The harness may adapt OpenAI tool calls into SDK calls and
+enforce limits, but it must not own the measured metadata semantics.
 
 Target native behavior:
 
-- `ls`/`stat` return typed agent-native directory/file cards, not flat file
-  entries.
+- `ls`/`stat` return typed directory/file cards, not flat file entries.
 - `entry_count`, `record_count`, `schema`, `sample`, compact body descriptors,
   catalog fields, and indexed values are available through `stat`.
 - `stat` cards avoid evidence, snapshot, generation, and storage-internal body
@@ -135,13 +145,13 @@ Target native behavior:
 - `catalog(path, field_prefix, include_facets)` provides compact field
   discovery without requiring a full stat card; facets are opt-in.
 - `aggregate(path, predicates, group_by, measures, sort, limit)` provides
-  compact summaries over indexed agent records.
+  compact summaries over indexed namespace facts.
 - paginated results include truncation state and `next_cursor` when more
   results exist.
 
 Generated `/index/*.json` files must not become hidden answer files. They can
 support facet-count tasks, but they are not a substitute for product-level
-typed agent indexes or future derived metric/set-pipeline APIs.
+typed index namespaces or future derived metric/set-pipeline APIs.
 
 ## Prepare Data
 
@@ -227,8 +237,10 @@ cargo run -p nokv-bench --bin yanex-agent-bench -- nokv-stat \
   --path /yanex/runs/00023013/metadata.json
 ```
 
-The `nokv-*` direct commands above remain raw debugging commands. The
-`nokv_native_v1` benchmark arm reads the prepared `nokv-agent/holt` store.
+The `nokv-*` direct commands above remain raw debugging commands. The benchmark
+arm uses the product-native `ls`/`stat`/`catalog`/`read`/`find`/`aggregate`/`grep`
+adapter exposed by `nokv-client`; the harness passes tool calls through
+without owning any namespace semantics.
 
 Inspect SQLite schema:
 
@@ -258,7 +270,8 @@ the input rate; completion tokens at the output rate.
 - Judge-side gold (gold SQL or file-body oracles) is never exposed to either
   arm.
 - Do not implement one-sided semantics in the harness as benchmark-only
-  shortcuts. The harness adapter should stay thin over `nokv-agent`, and the
-  raw SQLite arm keeps line-oriented `grep_blob` parity for body search.
+  shortcuts; the harness stays a thin adapter over `nokv-client` and
+  `nokv-meta`, and the raw SQLite arm keeps line-oriented `grep_blob`
+  parity for body search.
 - The published benchmark report lives at `bench/agent-interface/BENCHMARK_REPORT.md`;
   its raw telemetry is committed under `bench/agent-interface/results/`.

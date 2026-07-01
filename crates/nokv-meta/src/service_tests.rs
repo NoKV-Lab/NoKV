@@ -823,6 +823,197 @@ fn validated_path_index_lookup_cache_reuses_repeated_stat_result() {
 }
 
 #[test]
+fn namespace_find_body_facets_do_not_require_body_projection() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/runs/a.json", "runs/a.json", br#"{"loss":0.4}"#);
+    publish_path_artifact(&service, "/runs/b.log", "runs/b.log", b"loss=0.3\n");
+
+    let result = service
+        .find_paths(NamespaceFindRequest {
+            path: "/runs".to_owned(),
+            predicates: Vec::new(),
+            sort: Vec::new(),
+            include: Vec::new(),
+            facets: vec![NamespaceFindField::body_content_type()],
+            cursor: None,
+            limit: 10,
+        })
+        .unwrap();
+
+    assert_eq!(result.match_count, 2);
+    assert!(result.matches.iter().all(|card| card.body.is_none()));
+    assert_eq!(result.facets.len(), 1);
+    assert_eq!(
+        result.facets[0].field,
+        NamespaceFindField::body_content_type()
+    );
+    assert_eq!(result.facets[0].values[0].count, 2);
+}
+
+#[test]
+fn namespace_find_tolerates_exists_predicate_payloads() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/runs/a.json", "runs/a.json", br#"{"loss":0.4}"#);
+
+    let result = service
+        .find_paths(NamespaceFindRequest {
+            path: "/runs".to_owned(),
+            predicates: vec![NamespacePredicate {
+                field: NamespaceFindField::body_content_type(),
+                op: NamespacePredicateOp::Exists,
+                value: Some(NamespacePredicateValue::String("ignored".to_owned())),
+            }],
+            sort: Vec::new(),
+            include: Vec::new(),
+            facets: Vec::new(),
+            cursor: None,
+            limit: 10,
+        })
+        .unwrap();
+
+    assert_eq!(result.match_count, 1);
+    assert_eq!(result.matches[0].path, "/runs/a.json");
+}
+
+#[test]
+fn namespace_grep_cursor_resumes_at_next_unemitted_match() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(
+        &service,
+        "/runs/train.log",
+        "runs/train.log",
+        b"loss=1\nloss=2\n",
+    );
+
+    let first = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs/train.log".to_owned(),
+            pattern: "loss".to_owned(),
+            recursive: false,
+            cursor: None,
+            limit: 1,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap();
+    assert_eq!(first.matches.len(), 1);
+    assert_eq!(first.matches[0].line_number, 1);
+
+    let second = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs/train.log".to_owned(),
+            pattern: "loss".to_owned(),
+            recursive: false,
+            cursor: first.next_cursor,
+            limit: 1,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap();
+    assert_eq!(second.matches.len(), 1);
+    assert_eq!(second.matches[0].line_number, 2);
+}
+
+#[test]
+fn namespace_read_bytes_honors_returned_cursor() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/runs/a.bin", "runs/a.bin", b"abcdef");
+
+    let first = service
+        .read_page(
+            "/runs/a.bin",
+            NamespaceReadOptions {
+                format: NamespaceReadFormat::Bytes,
+                cursor: None,
+                offset: 0,
+                limit: 2,
+                expected_generation: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(first.bytes.as_deref(), Some(b"ab".as_slice()));
+
+    let second = service
+        .read_page(
+            "/runs/a.bin",
+            NamespaceReadOptions {
+                format: NamespaceReadFormat::Bytes,
+                cursor: first.next_cursor,
+                offset: 0,
+                limit: 2,
+                expected_generation: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(second.bytes.as_deref(), Some(b"cd".as_slice()));
+}
+
+#[test]
+fn register_namespace_index_rejects_rows_outside_registered_path() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+
+    let err = service
+        .register_namespace_index(NamespaceIndexRegistration {
+            path: "/runs".to_owned(),
+            fields: vec![NamespaceIndexField {
+                field: NamespaceFindField::new("run.status"),
+                operators: vec![NamespacePredicateOp::Eq],
+                sortable: false,
+                facetable: true,
+            }],
+            rows: vec![NamespaceIndexRow {
+                path: "/archive/a.json".to_owned(),
+                values: Vec::new(),
+            }],
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(err, MetadError::InvalidQuery(message) if message.contains("outside registered namespace"))
+    );
+}
+
+#[test]
+fn register_namespace_index_uses_metadata_predicate_fence() {
+    let metadata = HoltMetadataStore::open_memory().unwrap();
+    let service = NoKvFs::new(
+        MountId::new(1).unwrap(),
+        metadata.clone(),
+        MemoryObjectStore::new(),
+    );
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+
+    let before = metadata.metadata_store_stats();
+    service
+        .register_namespace_index(NamespaceIndexRegistration {
+            path: "/runs".to_owned(),
+            fields: vec![NamespaceIndexField {
+                field: NamespaceFindField::new("run.status"),
+                operators: vec![NamespacePredicateOp::Eq],
+                sortable: false,
+                facetable: true,
+            }],
+            rows: vec![NamespaceIndexRow {
+                path: "/runs/a.json".to_owned(),
+                values: vec![NamespaceIndexValue {
+                    field: NamespaceFindField::new("run.status"),
+                    value: NamespacePredicateValue::String("completed".to_owned()),
+                }],
+            }],
+        })
+        .unwrap();
+    let after = metadata.metadata_store_stats();
+
+    assert_eq!(after.predicate_total - before.predicate_total, 1);
+}
+
+#[test]
 fn stale_path_index_falls_back_to_canonical_namespace() {
     let service = service();
     let runs = service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
@@ -4376,7 +4567,7 @@ fn log_replay_command(
 ) -> MetadataCommand {
     MetadataCommand {
         request_id: request_id.to_vec(),
-        kind: CommandKind::CleanupObjects,
+        kind: CommandKind::RegisterNamespaceIndex,
         read_version: Version::new(read_version).unwrap(),
         commit_version: Version::new(commit_version).unwrap(),
         primary_family: RecordFamily::System,

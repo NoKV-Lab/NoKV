@@ -6,7 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nokv_control::ControlStore;
-use nokv_meta::{DentryWithAttr, ObjectTransferStats, RenameReplaceResult};
+use nokv_meta::{
+    DentryWithAttr, NamespaceAggregateRequest, NamespaceAggregateResult, NamespaceCard,
+    NamespaceFindRequest, NamespaceFindResult, NamespaceGrepRequest, NamespaceGrepResult,
+    NamespaceListOptions, NamespaceListPage, NamespaceReadOptions, NamespaceReadPage,
+    ObjectTransferStats, RenameReplaceResult,
+};
 use nokv_object::{
     BlockCache, BlockReadOptions, ChunkStore, ChunkWriteOptions, ChunkedWrite, DataFabricReadStats,
     LayoutReadExecutor, LayoutReadRequest, ObjectBlockCache, ObjectError, ObjectPrefetchOptions,
@@ -233,6 +238,47 @@ where
 
     pub fn metadata(&self) -> &MetadataClient {
         &self.metadata
+    }
+
+    pub fn stat_card(&self, path: &str) -> Result<Option<NamespaceCard>, ClientError> {
+        self.metadata.stat_card(path)
+    }
+
+    pub fn namespace_list_page(
+        &self,
+        path: &str,
+        options: NamespaceListOptions,
+    ) -> Result<NamespaceListPage, ClientError> {
+        self.metadata.namespace_list_page(path, options)
+    }
+
+    pub fn find_paths(
+        &self,
+        request: NamespaceFindRequest,
+    ) -> Result<NamespaceFindResult, ClientError> {
+        self.metadata.find_paths(request)
+    }
+
+    pub fn aggregate_paths(
+        &self,
+        request: NamespaceAggregateRequest,
+    ) -> Result<NamespaceAggregateResult, ClientError> {
+        self.metadata.aggregate_paths(request)
+    }
+
+    pub fn grep_paths(
+        &self,
+        request: NamespaceGrepRequest,
+    ) -> Result<NamespaceGrepResult, ClientError> {
+        self.metadata.grep_paths(request)
+    }
+
+    pub fn read_page(
+        &self,
+        path: &str,
+        options: NamespaceReadOptions,
+    ) -> Result<NamespaceReadPage, ClientError> {
+        self.metadata.read_page(path, options)
     }
 
     pub fn set_block_cache_enabled(&mut self, enabled: bool) {

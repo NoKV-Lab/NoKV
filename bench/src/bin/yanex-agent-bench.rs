@@ -16,20 +16,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
-use nokv_agent::{
-    agent_tool_definitions, execute_agent_tool, AgentFindField, AgentFs, AgentId,
-    AgentIndexField as NativeAgentIndexField,
-    AgentIndexRegistration as NativeAgentIndexRegistration, AgentIndexRow as NativeAgentIndexRow,
-    AgentIndexValue as NativeAgentIndexValue, AgentPredicateOp as NativeAgentPredicateOp,
-    AgentPredicateValue as NativeAgentPredicateValue, AgentStore as NativeAgentStore,
-    HoltAgentStore as AgentHoltStore,
-};
+use nokv_agent::{agent_tool_definitions, execute_agent_tool};
 use nokv_client::{
     ArtifactBackend, ArtifactMetadata, ArtifactRepository, ArtifactRepositoryOptions, ClientError,
 };
 use nokv_meta::{
-    DentryWithAttr, HoltMetadataStore, MetadError, MetadataStore, NoKvFs, PreparedArtifact,
-    PublishArtifactRange, PublishArtifactSession, RenameReplaceResult,
+    DentryWithAttr, HoltMetadataStore, MetadError, MetadataStore, NamespaceFindField,
+    NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow, NamespaceIndexValue,
+    NamespacePredicateOp, NamespacePredicateValue, NoKvFs, PreparedArtifact, PublishArtifactRange,
+    PublishArtifactSession, RenameReplaceResult,
 };
 use nokv_object::{ObjectStore, S3ObjectStore, S3ObjectStoreOptions};
 use nokv_types::{BodyDescriptor, DentryName, FileType, InodeAttr, MountId, PathMetadata};
@@ -76,7 +71,7 @@ fn main() {
     if let Err(err) = run(env::args().skip(1).collect()) {
         eprintln!("error: {err}");
         eprintln!(
-            "\nUsage:\n  yanex-agent-bench prepare --archive PATH --data-root PATH [--reset] [s3 options]\n  yanex-agent-bench verify --data-root PATH [--run-id ID] [s3 options]\n  yanex-agent-bench tools --arm ARM\n  yanex-agent-bench list-tasks\n  yanex-agent-bench show-task --task-id ID\n  yanex-agent-bench gold --data-root PATH --task-id ID\n  yanex-agent-bench judge --data-root PATH --arm ARM --task-id ID --answer-json PATH\n  yanex-agent-bench run-task --data-root PATH --arm ARM --task-id ID --output-jsonl PATH [--base-profile PATH] [--api-surface SURFACE] [--model MODEL] [--max-completion-tokens N]\n  yanex-agent-bench run-batch --data-root PATH --output-jsonl PATH [--base-profile PATH] [--api-surface SURFACE] [--repeats N|--repeat N] [--arm ARM] [--task-id ID]\n  yanex-agent-bench sqlite-show-schema --db PATH\n  yanex-agent-bench sqlite-query --db PATH --sql SQL\n  yanex-agent-bench sqlite-read-blob --db PATH --blob-ref REF --offset N --limit N\n  yanex-agent-bench nokv-list|nokv-stat|nokv-read --data-root PATH --path PATH [...]\n"
+            "\nUsage:\n  yanex-agent-bench prepare --archive PATH --data-root PATH [--reset] [s3 options]\n  yanex-agent-bench nokv-register-indexes --data-root PATH [s3 options]\n  yanex-agent-bench verify --data-root PATH [--run-id ID] [s3 options]\n  yanex-agent-bench tools --arm ARM\n  yanex-agent-bench list-tasks\n  yanex-agent-bench show-task --task-id ID\n  yanex-agent-bench gold --data-root PATH --task-id ID\n  yanex-agent-bench judge --data-root PATH --arm ARM --task-id ID --answer-json PATH\n  yanex-agent-bench run-task --data-root PATH --arm ARM --task-id ID --output-jsonl PATH [--base-profile PATH] [--api-surface SURFACE] [--model MODEL] [--max-completion-tokens N]\n  yanex-agent-bench run-batch --data-root PATH --output-jsonl PATH [--base-profile PATH] [--api-surface SURFACE] [--repeats N|--repeat N] [--arm ARM] [--task-id ID]\n  yanex-agent-bench sqlite-show-schema --db PATH\n  yanex-agent-bench sqlite-query --db PATH --sql SQL\n  yanex-agent-bench sqlite-read-blob --db PATH --blob-ref REF --offset N --limit N\n  yanex-agent-bench nokv-list|nokv-stat|nokv-read --data-root PATH --path PATH [...]\n"
         );
         std::process::exit(2);
     }
@@ -89,6 +84,7 @@ fn run(args: Vec<String>) -> Result<(), HarnessError> {
     let options = Options::parse(&args[1..])?;
     match command {
         "prepare" => prepare(options),
+        "nokv-register-indexes" => nokv_register_indexes(options),
         "verify" => verify(options).map(|report| {
             println!(
                 "{}",
@@ -300,7 +296,6 @@ struct PrepareManifest {
     missing_artifact_refs: usize,
     sqlite_db: String,
     nokv_meta: String,
-    nokv_agent: String,
     status_counts: BTreeMap<String, usize>,
     tag_counts: BTreeMap<String, usize>,
     script_counts: BTreeMap<String, usize>,
@@ -310,7 +305,7 @@ struct PrepareManifest {
 struct VerificationReport {
     run_id_sample: String,
     sqlite: SqliteMaterializationReport,
-    nokv_native: NoKvMaterializationReport,
+    nokv_native: NamespaceMaterializationReport,
     all_available_reads_match: bool,
 }
 
@@ -332,8 +327,9 @@ struct SqliteMaterializationReport {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
-struct NoKvMaterializationReport {
+struct NamespaceMaterializationReport {
     files_checked: usize,
+    agent_catalog_fields_checked: usize,
     run_files_checked: usize,
     index_files_checked: usize,
     missing_artifacts_checked: usize,
@@ -685,8 +681,12 @@ struct ToolExecutionOutcome {
 }
 
 enum ArmRuntime {
-    SqliteRaw { conn: Connection },
-    NokvNative { fs: AgentFs<AgentHoltStore> },
+    SqliteRaw {
+        conn: Connection,
+    },
+    NokvNative {
+        service: Box<NoKvFs<HoltMetadataStore, S3ObjectStore>>,
+    },
 }
 
 struct ToolWorker {
@@ -1088,13 +1088,11 @@ fn prepare(options: Options) -> Result<(), HarnessError> {
     let corpus_root = data_root.join("corpus");
     let sqlite_path = sqlite_path(data_root);
     let nokv_meta_path = nokv_meta_path(data_root);
-    let agent_path = nokv_agent_path(data_root);
 
     if options.reset {
         remove_if_exists(&corpus_root)?;
         remove_if_exists(&sqlite_path)?;
         remove_if_exists(&nokv_meta_path)?;
-        remove_if_exists(&agent_path)?;
     }
     fs::create_dir_all(data_root).map_err(from_io)?;
     if !corpus_root.exists() {
@@ -1105,7 +1103,6 @@ fn prepare(options: Options) -> Result<(), HarnessError> {
     let indexes = derive_indexes(&runs)?;
     prepare_sqlite(&sqlite_path, &runs, &indexes)?;
     prepare_nokv(&nokv_meta_path, &options.s3, &runs, &indexes)?;
-    prepare_agent(&agent_path, &runs, &indexes)?;
 
     let manifest = PrepareManifest {
         archive_sha256: file_sha256(archive)?,
@@ -1124,7 +1121,6 @@ fn prepare(options: Options) -> Result<(), HarnessError> {
         missing_artifact_refs: runs.iter().map(missing_artifact_ref_count).sum(),
         sqlite_db: sqlite_path.display().to_string(),
         nokv_meta: nokv_meta_path.display().to_string(),
-        nokv_agent: agent_path.display().to_string(),
         status_counts: indexes.status_counts,
         tag_counts: indexes.tag_counts,
         script_counts: indexes.script_counts,
@@ -1135,8 +1131,8 @@ fn prepare(options: Options) -> Result<(), HarnessError> {
     )
     .map_err(from_io)?;
     println!(
-        "prepared run_count={} sqlite={} nokv_meta={} nokv_agent={}",
-        manifest.run_count, manifest.sqlite_db, manifest.nokv_meta, manifest.nokv_agent
+        "prepared run_count={} sqlite={} nokv_meta={}",
+        manifest.run_count, manifest.sqlite_db, manifest.nokv_meta
     );
     Ok(())
 }
@@ -3190,7 +3186,7 @@ fn write_http_json_response(
 }
 
 impl ArmRuntime {
-    fn open(arm: &str, data_root: &Path, _s3: &S3Options) -> Result<Self, HarnessError> {
+    fn open(arm: &str, data_root: &Path, s3: &S3Options) -> Result<Self, HarnessError> {
         match arm {
             "sqlite_raw_v1" => {
                 ensure_sqlite_agent_index_materialization(data_root)?;
@@ -3203,7 +3199,7 @@ impl ArmRuntime {
                 })
             }
             "nokv_native_v1" => Ok(Self::NokvNative {
-                fs: open_existing_agent(&nokv_agent_path(data_root))?,
+                service: Box::new(open_existing_nokv(&nokv_meta_path(data_root), s3)?),
             }),
             other => Err(HarnessError::Corpus(format!(
                 "unknown benchmark arm {other}"
@@ -3239,7 +3235,9 @@ impl ArmRuntime {
         };
         let result = match self {
             Self::SqliteRaw { conn } => execute_sqlite_raw_tool(conn, &call.function.name, &args),
-            Self::NokvNative { fs } => execute_nokv_tool(fs, &call.function.name, &args),
+            Self::NokvNative { service } => {
+                execute_nokv_tool(service.as_ref(), &call.function.name, &args)
+            }
         };
         match result {
             Ok(content) => tool_success_outcome(content),
@@ -3291,13 +3289,18 @@ fn execute_sqlite_raw_tool(
     }
 }
 
-fn execute_nokv_tool<S>(fs: &AgentFs<S>, name: &str, args: &Value) -> Result<Value, HarnessError>
+fn execute_nokv_tool<M, O>(
+    service: &NoKvFs<M, O>,
+    name: &str,
+    args: &Value,
+) -> Result<Value, HarnessError>
 where
-    S: NativeAgentStore,
+    M: MetadataStore,
+    O: ObjectStore,
 {
     match name {
         "ls" | "stat" | "catalog" | "read" | "find" | "aggregate" | "grep" => {
-            execute_agent_tool(fs, name, args).map_err(from_nokv)
+            execute_agent_tool(service, name, args).map_err(from_nokv)
         }
         other => Err(HarnessError::Corpus(format!(
             "unknown NoKV native tool {other}"
@@ -4419,13 +4422,13 @@ fn verify_sqlite_agent_index(
 fn verify_nokv_namespace<O>(
     conn: &Connection,
     service: &NoKvFs<HoltMetadataStore, O>,
-) -> Result<NoKvMaterializationReport, HarnessError>
+) -> Result<NamespaceMaterializationReport, HarnessError>
 where
     O: ObjectStore,
 {
     let files = sqlite_files(conn)?;
     let missing = missing_artifact_paths(conn)?;
-    let mut report = NoKvMaterializationReport::default();
+    let mut report = NamespaceMaterializationReport::default();
     let mut generations = BTreeSet::new();
     for (sqlite_file_path, bytes) in &files {
         let nokv_path = nokv_path_for_sqlite_file(sqlite_file_path)?;
@@ -4485,7 +4488,61 @@ where
         report.missing_artifacts_checked += 1;
     }
     report.metadata_generations_observed = generations.len();
+    verify_nokv_agent_catalog(service, &mut report)?;
     Ok(report)
+}
+
+fn verify_nokv_agent_catalog<O>(
+    service: &NoKvFs<HoltMetadataStore, O>,
+    report: &mut NamespaceMaterializationReport,
+) -> Result<(), HarnessError>
+where
+    O: ObjectStore,
+{
+    const INDEX_FIELD_PREFIXES: [&str; 6] =
+        ["run.", "artifact.", "param.", "metric.", "group.", "git."];
+    let expected = nokv_agent_index_fields()
+        .iter()
+        .map(|field| field.field.id.clone())
+        .collect::<BTreeSet<_>>();
+    let catalog = execute_agent_tool(
+        service,
+        "catalog",
+        &json!({"path": format!("/{NOKV_PREFIX}/runs"), "include_facets": false}),
+    )
+    .map_err(from_nokv)?;
+    let mut actual = BTreeSet::new();
+    for group in catalog["catalog"]["filterable"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        for field in group["fields"].as_array().into_iter().flatten() {
+            if let Some(id) = field.as_str() {
+                actual.insert(id.to_owned());
+            }
+        }
+    }
+    for field in &expected {
+        report.agent_catalog_fields_checked += 1;
+        if !actual.contains(field) {
+            report.mismatches.push(format!(
+                "agent catalog misses registered index field {field}"
+            ));
+        }
+    }
+    for field in &actual {
+        if INDEX_FIELD_PREFIXES
+            .iter()
+            .any(|prefix| field.starts_with(prefix))
+            && !expected.contains(field)
+        {
+            report.mismatches.push(format!(
+                "agent catalog exposes stale index field {field}; rerun prepare --reset or nokv-register-indexes"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn sqlite_files(conn: &Connection) -> Result<BTreeMap<String, Vec<u8>>, HarnessError> {
@@ -5182,7 +5239,7 @@ fn sqlite_agent_index_materialization_current(conn: &Connection) -> Result<bool,
     let run_count = sqlite_count(conn, "SELECT COUNT(*) FROM experiments")?;
     let index_count = sqlite_count(conn, "SELECT COUNT(*) FROM run_agent_index")?;
     let catalog_count = sqlite_count(conn, "SELECT COUNT(*) FROM run_agent_index_catalog")?;
-    Ok(run_count == index_count && catalog_count == yanex_index_fields().len())
+    Ok(run_count == index_count && catalog_count == nokv_agent_index_fields().len())
 }
 
 fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool, HarnessError> {
@@ -5707,7 +5764,7 @@ fn insert_agent_index_materialization(
     conn: &Connection,
     runs: &[CorpusRun],
 ) -> Result<(), HarnessError> {
-    for field in yanex_index_fields() {
+    for field in nokv_agent_index_fields() {
         let operators = field
             .operators
             .iter()
@@ -5728,7 +5785,7 @@ fn insert_agent_index_materialization(
 
     let lr_batch_groups = train_lr_batch_groups(runs);
     for run in runs {
-        let row = yanex_index_row_with_groups(run, &lr_batch_groups);
+        let row = nokv_agent_index_row_with_groups(run, &lr_batch_groups);
         insert_agent_index_row(conn, run, &row)?;
     }
     Ok(())
@@ -5737,18 +5794,18 @@ fn insert_agent_index_materialization(
 fn insert_agent_index_row(
     conn: &Connection,
     run: &CorpusRun,
-    row: &NativeAgentIndexRow,
+    row: &NamespaceIndexRow,
 ) -> Result<(), HarnessError> {
     for value in &row.values {
         match &value.value {
-            NativeAgentPredicateValue::String(value_text) => {
+            NamespacePredicateValue::String(value_text) => {
                 conn.execute(
                     "INSERT OR IGNORE INTO run_agent_index_values VALUES (?1, ?2, 'string', ?3, NULL, NULL)",
                     params![run.id, value.field.id, value_text],
                 )
                 .map_err(from_sql)?;
             }
-            NativeAgentPredicateValue::U64(raw_value) => {
+            NamespacePredicateValue::U64(raw_value) => {
                 let value_i64 = u64_to_i64(*raw_value, "run_agent_index_values.value_u64")?;
                 conn.execute(
                     "INSERT OR IGNORE INTO run_agent_index_values VALUES (?1, ?2, 'u64', ?3, ?4, NULL)",
@@ -5756,14 +5813,14 @@ fn insert_agent_index_row(
                 )
                 .map_err(from_sql)?;
             }
-            NativeAgentPredicateValue::F64(raw_value) => {
+            NamespacePredicateValue::F64(raw_value) => {
                 conn.execute(
                     "INSERT OR IGNORE INTO run_agent_index_values VALUES (?1, ?2, 'f64', ?3, NULL, ?4)",
                     params![run.id, value.field.id, raw_value.to_string(), raw_value],
                 )
                 .map_err(from_sql)?;
             }
-            NativeAgentPredicateValue::List(_) => {
+            NamespacePredicateValue::List(_) => {
                 return Err(HarnessError::Corpus(
                     "run_agent_index_values does not support list index values".to_owned(),
                 ));
@@ -5813,34 +5870,34 @@ fn insert_agent_index_row(
     Ok(())
 }
 
-fn benchmark_predicate_op_name(op: &NativeAgentPredicateOp) -> &'static str {
+fn benchmark_predicate_op_name(op: &NamespacePredicateOp) -> &'static str {
     match op {
-        NativeAgentPredicateOp::Eq => "eq",
-        NativeAgentPredicateOp::NotEqual => "ne",
-        NativeAgentPredicateOp::In => "in",
-        NativeAgentPredicateOp::Prefix => "prefix",
-        NativeAgentPredicateOp::Suffix => "suffix",
-        NativeAgentPredicateOp::Contains => "contains",
-        NativeAgentPredicateOp::GreaterThan => "gt",
-        NativeAgentPredicateOp::GreaterThanOrEqual => "gte",
-        NativeAgentPredicateOp::LessThan => "lt",
-        NativeAgentPredicateOp::LessThanOrEqual => "lte",
-        NativeAgentPredicateOp::Exists => "exists",
-        NativeAgentPredicateOp::NotExists => "not_exists",
+        NamespacePredicateOp::Eq => "eq",
+        NamespacePredicateOp::NotEqual => "ne",
+        NamespacePredicateOp::In => "in",
+        NamespacePredicateOp::Prefix => "prefix",
+        NamespacePredicateOp::Suffix => "suffix",
+        NamespacePredicateOp::Contains => "contains",
+        NamespacePredicateOp::GreaterThan => "gt",
+        NamespacePredicateOp::GreaterThanOrEqual => "gte",
+        NamespacePredicateOp::LessThan => "lt",
+        NamespacePredicateOp::LessThanOrEqual => "lte",
+        NamespacePredicateOp::Exists => "exists",
+        NamespacePredicateOp::NotExists => "not_exists",
     }
 }
 
-fn benchmark_index_value_kind(field: &NativeAgentIndexField) -> &'static str {
+fn benchmark_index_value_kind(field: &NamespaceIndexField) -> &'static str {
     if field.field.id.starts_with("metric.") {
         return "f64";
     }
     if field.operators.iter().any(|op| {
         matches!(
             op,
-            NativeAgentPredicateOp::GreaterThan
-                | NativeAgentPredicateOp::GreaterThanOrEqual
-                | NativeAgentPredicateOp::LessThan
-                | NativeAgentPredicateOp::LessThanOrEqual
+            NamespacePredicateOp::GreaterThan
+                | NamespacePredicateOp::GreaterThanOrEqual
+                | NamespacePredicateOp::LessThan
+                | NamespacePredicateOp::LessThanOrEqual
         )
     }) {
         "u64"
@@ -5849,42 +5906,39 @@ fn benchmark_index_value_kind(field: &NativeAgentIndexField) -> &'static str {
     }
 }
 
-fn index_string(values: &[NativeAgentIndexValue], field: &str) -> Option<String> {
+fn index_string(values: &[NamespaceIndexValue], field: &str) -> Option<String> {
     values.iter().find_map(|value| {
         (value.field.id == field).then_some(match &value.value {
-            NativeAgentPredicateValue::String(value) => Some(value.clone()),
-            NativeAgentPredicateValue::U64(_)
-            | NativeAgentPredicateValue::F64(_)
-            | NativeAgentPredicateValue::List(_) => None,
+            NamespacePredicateValue::String(value) => Some(value.clone()),
+            NamespacePredicateValue::U64(_)
+            | NamespacePredicateValue::F64(_)
+            | NamespacePredicateValue::List(_) => None,
         })?
     })
 }
 
-fn index_u64_i64(
-    values: &[NativeAgentIndexValue],
-    field: &str,
-) -> Result<Option<i64>, HarnessError> {
+fn index_u64_i64(values: &[NamespaceIndexValue], field: &str) -> Result<Option<i64>, HarnessError> {
     values
         .iter()
         .find_map(|value| {
             (value.field.id == field).then_some(match &value.value {
-                NativeAgentPredicateValue::String(_)
-                | NativeAgentPredicateValue::F64(_)
-                | NativeAgentPredicateValue::List(_) => None,
-                NativeAgentPredicateValue::U64(value) => Some(*value),
+                NamespacePredicateValue::String(_)
+                | NamespacePredicateValue::F64(_)
+                | NamespacePredicateValue::List(_) => None,
+                NamespacePredicateValue::U64(value) => Some(*value),
             })?
         })
         .map(|value| u64_to_i64(value, field))
         .transpose()
 }
 
-fn index_f64(values: &[NativeAgentIndexValue], field: &str) -> Option<f64> {
+fn index_f64(values: &[NamespaceIndexValue], field: &str) -> Option<f64> {
     values.iter().find_map(|value| {
         (value.field.id == field).then_some(match &value.value {
-            NativeAgentPredicateValue::F64(value) => Some(*value),
-            NativeAgentPredicateValue::String(_)
-            | NativeAgentPredicateValue::U64(_)
-            | NativeAgentPredicateValue::List(_) => None,
+            NamespacePredicateValue::F64(value) => Some(*value),
+            NamespacePredicateValue::String(_)
+            | NamespacePredicateValue::U64(_)
+            | NamespacePredicateValue::List(_) => None,
         })?
     })
 }
@@ -6104,117 +6158,31 @@ fn prepare_nokv(
         repo.put_bytes(&format!("{NOKV_PREFIX}{}", path), bytes.clone())
             .map_err(from_nokv)?;
     }
+    register_nokv_agent_indexes(&service, runs)?;
     Ok(())
 }
 
-fn prepare_agent(
-    agent_path: &Path,
+fn register_nokv_agent_indexes<O>(
+    service: &NoKvFs<HoltMetadataStore, O>,
     runs: &[CorpusRun],
-    indexes: &DerivedIndexes,
-) -> Result<(), HarnessError> {
-    if let Some(parent) = agent_path.parent() {
-        fs::create_dir_all(parent).map_err(from_io)?;
-    }
-    fs::create_dir_all(agent_path).map_err(from_io)?;
-    let store = AgentHoltStore::open(agent_path).map_err(from_nokv)?;
-    let agent_fs = AgentFs::new(nokv_agent_id(), store);
-    agent_fs.bootstrap().map_err(from_nokv)?;
-    agent_fs
-        .create_dir_all(&format!("/{NOKV_PREFIX}/runs"))
-        .map_err(from_nokv)?;
-    agent_fs
-        .create_dir_all(&format!("/{NOKV_PREFIX}/index"))
-        .map_err(from_nokv)?;
-
-    for run in runs {
-        agent_fs
-            .put_file(
-                &format!("/{NOKV_PREFIX}/runs/{}/metadata.json", run.id),
-                run.metadata_bytes.clone(),
-                Some("application/json".to_owned()),
-            )
-            .map_err(from_nokv)?;
-        if let Some(bytes) = &run.params_bytes {
-            agent_fs
-                .put_file(
-                    &format!("/{NOKV_PREFIX}/runs/{}/params.yaml", run.id),
-                    bytes.clone(),
-                    Some("application/yaml".to_owned()),
-                )
-                .map_err(from_nokv)?;
-        }
-        if let Some(bytes) = &run.metrics_bytes {
-            agent_fs
-                .put_file(
-                    &format!("/{NOKV_PREFIX}/runs/{}/metrics.json", run.id),
-                    bytes.clone(),
-                    Some("application/json".to_owned()),
-                )
-                .map_err(from_nokv)?;
-        }
-        if let Some(bytes) = &run.dependencies_bytes {
-            agent_fs
-                .put_file(
-                    &format!("/{NOKV_PREFIX}/runs/{}/dependencies.json", run.id),
-                    bytes.clone(),
-                    Some("application/json".to_owned()),
-                )
-                .map_err(from_nokv)?;
-        }
-        for artifact in &run.artifacts {
-            agent_fs
-                .put_file(
-                    &format!(
-                        "/{NOKV_PREFIX}/runs/{}/artifacts/{}",
-                        run.id, artifact.relative_path
-                    ),
-                    artifact.bytes.clone(),
-                    Some(agent_artifact_content_type(&artifact.relative_path).to_owned()),
-                )
-                .map_err(from_nokv)?;
-        }
-    }
-    for (path, bytes) in &indexes.files {
-        agent_fs
-            .put_file(
-                &format!("/{NOKV_PREFIX}{path}"),
-                bytes.clone(),
-                Some("application/json".to_owned()),
-            )
-            .map_err(from_nokv)?;
-    }
-    register_agent_indexes(&agent_fs, runs)?;
-    agent_fs.store().checkpoint().map_err(from_nokv)?;
-    Ok(())
-}
-
-fn register_agent_indexes(
-    agent_fs: &AgentFs<AgentHoltStore>,
-    runs: &[CorpusRun],
-) -> Result<(), HarnessError> {
+) -> Result<(), HarnessError>
+where
+    O: ObjectStore,
+{
     let lr_batch_groups = train_lr_batch_groups(runs);
-    agent_fs
-        .register_index(NativeAgentIndexRegistration {
+    service
+        .register_namespace_index(NamespaceIndexRegistration {
             path: format!("/{NOKV_PREFIX}/runs"),
-            fields: yanex_index_fields(),
+            fields: nokv_agent_index_fields(),
             rows: runs
                 .iter()
-                .map(|run| yanex_index_row_with_groups(run, &lr_batch_groups))
+                .map(|run| nokv_agent_index_row_with_groups(run, &lr_batch_groups))
                 .collect(),
         })
         .map_err(from_nokv)
 }
 
-fn agent_artifact_content_type(path: &str) -> &'static str {
-    match artifact_type(path) {
-        "json" => "application/json",
-        "text" | "patch" => "text/plain",
-        "yaml" => "application/yaml",
-        _ => "application/octet-stream",
-    }
-}
-
-fn yanex_index_fields() -> Vec<NativeAgentIndexField> {
+fn nokv_agent_index_fields() -> Vec<NamespaceIndexField> {
     vec![
         string_index_field("run.id", true, true),
         string_index_field("run.name", true, true),
@@ -6253,14 +6221,14 @@ fn yanex_index_fields() -> Vec<NativeAgentIndexField> {
 }
 
 #[cfg(test)]
-fn yanex_index_row(run: &CorpusRun) -> NativeAgentIndexRow {
-    yanex_index_row_with_groups(run, &BTreeMap::new())
+fn nokv_agent_index_row(run: &CorpusRun) -> NamespaceIndexRow {
+    nokv_agent_index_row_with_groups(run, &BTreeMap::new())
 }
 
-fn yanex_index_row_with_groups(
+fn nokv_agent_index_row_with_groups(
     run: &CorpusRun,
     lr_batch_groups: &BTreeMap<String, LrBatchGroupSummary>,
-) -> NativeAgentIndexRow {
+) -> NamespaceIndexRow {
     let summary = run_summary(run);
     let mut values = Vec::new();
     push_index_string(&mut values, "run.id", &run.id);
@@ -6354,7 +6322,7 @@ fn yanex_index_row_with_groups(
         u64::from(git_dirty),
     );
 
-    NativeAgentIndexRow {
+    NamespaceIndexRow {
         path: format!("/{NOKV_PREFIX}/runs/{}", run.id),
         values,
     }
@@ -6402,7 +6370,7 @@ fn train_lr_batch_groups(runs: &[CorpusRun]) -> BTreeMap<String, LrBatchGroupSum
 }
 
 fn push_lr_batch_group_values(
-    values: &mut Vec<NativeAgentIndexValue>,
+    values: &mut Vec<NamespaceIndexValue>,
     run: &CorpusRun,
     groups: &BTreeMap<String, LrBatchGroupSummary>,
 ) {
@@ -6439,7 +6407,7 @@ fn lr_batch_key_string(key: &LrBatchKey) -> String {
     format!("lr={};batch={}", key.learning_rate, key.batch_size)
 }
 
-fn push_param_index_values(values: &mut Vec<NativeAgentIndexValue>, run: &CorpusRun) {
+fn push_param_index_values(values: &mut Vec<NamespaceIndexValue>, run: &CorpusRun) {
     for (param_path, field_id) in PARAM_INDEX_FIELDS {
         let Some(value_json) = param_index_value(run, param_path) else {
             continue;
@@ -6458,7 +6426,7 @@ fn param_index_value(run: &CorpusRun, param_path: &str) -> Option<String> {
         .map(|value| serde_json::to_string(&yaml_to_json(value)).expect("yaml json serializes"))
 }
 
-fn push_metric_index_values(values: &mut Vec<NativeAgentIndexValue>, run: &CorpusRun) {
+fn push_metric_index_values(values: &mut Vec<NamespaceIndexValue>, run: &CorpusRun) {
     if let Some(metric) = metric_min(run, "val_loss") {
         push_metric_value(values, "metric.val_loss.min", metric);
     }
@@ -6496,65 +6464,65 @@ fn metric_records(run: &CorpusRun) -> impl Iterator<Item = &serde_json::Map<Stri
         .filter_map(Value::as_object)
 }
 
-fn push_metric_value(values: &mut Vec<NativeAgentIndexValue>, field: &str, value: f64) {
+fn push_metric_value(values: &mut Vec<NamespaceIndexValue>, field: &str, value: f64) {
     if value.is_finite() {
-        values.push(NativeAgentIndexValue {
-            field: AgentFindField::new(field),
-            value: NativeAgentPredicateValue::F64(value),
+        values.push(NamespaceIndexValue {
+            field: NamespaceFindField::new(field),
+            value: NamespacePredicateValue::F64(value),
         });
     }
 }
 
-fn string_index_field(id: &'static str, facetable: bool, sortable: bool) -> NativeAgentIndexField {
-    NativeAgentIndexField {
-        field: AgentFindField::new(id),
+fn string_index_field(id: &'static str, facetable: bool, sortable: bool) -> NamespaceIndexField {
+    NamespaceIndexField {
+        field: NamespaceFindField::new(id),
         operators: vec![
-            NativeAgentPredicateOp::Eq,
-            NativeAgentPredicateOp::NotEqual,
-            NativeAgentPredicateOp::In,
-            NativeAgentPredicateOp::Prefix,
-            NativeAgentPredicateOp::Suffix,
-            NativeAgentPredicateOp::Contains,
-            NativeAgentPredicateOp::Exists,
-            NativeAgentPredicateOp::NotExists,
+            NamespacePredicateOp::Eq,
+            NamespacePredicateOp::NotEqual,
+            NamespacePredicateOp::In,
+            NamespacePredicateOp::Prefix,
+            NamespacePredicateOp::Suffix,
+            NamespacePredicateOp::Contains,
+            NamespacePredicateOp::Exists,
+            NamespacePredicateOp::NotExists,
         ],
         sortable,
         facetable,
     }
 }
 
-fn u64_index_field(id: &'static str, facetable: bool, sortable: bool) -> NativeAgentIndexField {
-    NativeAgentIndexField {
-        field: AgentFindField::new(id),
+fn u64_index_field(id: &'static str, facetable: bool, sortable: bool) -> NamespaceIndexField {
+    NamespaceIndexField {
+        field: NamespaceFindField::new(id),
         operators: vec![
-            NativeAgentPredicateOp::Eq,
-            NativeAgentPredicateOp::NotEqual,
-            NativeAgentPredicateOp::In,
-            NativeAgentPredicateOp::GreaterThan,
-            NativeAgentPredicateOp::GreaterThanOrEqual,
-            NativeAgentPredicateOp::LessThan,
-            NativeAgentPredicateOp::LessThanOrEqual,
-            NativeAgentPredicateOp::Exists,
-            NativeAgentPredicateOp::NotExists,
+            NamespacePredicateOp::Eq,
+            NamespacePredicateOp::NotEqual,
+            NamespacePredicateOp::In,
+            NamespacePredicateOp::GreaterThan,
+            NamespacePredicateOp::GreaterThanOrEqual,
+            NamespacePredicateOp::LessThan,
+            NamespacePredicateOp::LessThanOrEqual,
+            NamespacePredicateOp::Exists,
+            NamespacePredicateOp::NotExists,
         ],
         sortable,
         facetable,
     }
 }
 
-fn f64_index_field(id: &'static str, facetable: bool, sortable: bool) -> NativeAgentIndexField {
-    NativeAgentIndexField {
-        field: AgentFindField::new(id),
+fn f64_index_field(id: &'static str, facetable: bool, sortable: bool) -> NamespaceIndexField {
+    NamespaceIndexField {
+        field: NamespaceFindField::new(id),
         operators: vec![
-            NativeAgentPredicateOp::Eq,
-            NativeAgentPredicateOp::NotEqual,
-            NativeAgentPredicateOp::In,
-            NativeAgentPredicateOp::GreaterThan,
-            NativeAgentPredicateOp::GreaterThanOrEqual,
-            NativeAgentPredicateOp::LessThan,
-            NativeAgentPredicateOp::LessThanOrEqual,
-            NativeAgentPredicateOp::Exists,
-            NativeAgentPredicateOp::NotExists,
+            NamespacePredicateOp::Eq,
+            NamespacePredicateOp::NotEqual,
+            NamespacePredicateOp::In,
+            NamespacePredicateOp::GreaterThan,
+            NamespacePredicateOp::GreaterThanOrEqual,
+            NamespacePredicateOp::LessThan,
+            NamespacePredicateOp::LessThanOrEqual,
+            NamespacePredicateOp::Exists,
+            NamespacePredicateOp::NotExists,
         ],
         sortable,
         facetable,
@@ -6562,7 +6530,7 @@ fn f64_index_field(id: &'static str, facetable: bool, sortable: bool) -> NativeA
 }
 
 fn push_index_optional_string(
-    values: &mut Vec<NativeAgentIndexValue>,
+    values: &mut Vec<NamespaceIndexValue>,
     field: &str,
     value: Option<&str>,
 ) {
@@ -6571,25 +6539,37 @@ fn push_index_optional_string(
     }
 }
 
-fn push_index_string(values: &mut Vec<NativeAgentIndexValue>, field: &str, value: &str) {
+fn push_index_string(values: &mut Vec<NamespaceIndexValue>, field: &str, value: &str) {
     if value.is_empty() {
         return;
     }
-    values.push(NativeAgentIndexValue {
-        field: AgentFindField::new(field),
-        value: NativeAgentPredicateValue::String(value.to_owned()),
+    values.push(NamespaceIndexValue {
+        field: NamespaceFindField::new(field),
+        value: NamespacePredicateValue::String(value.to_owned()),
     });
 }
 
-fn push_index_u64(values: &mut Vec<NativeAgentIndexValue>, field: &str, value: u64) {
-    values.push(NativeAgentIndexValue {
-        field: AgentFindField::new(field),
-        value: NativeAgentPredicateValue::U64(value),
+fn push_index_u64(values: &mut Vec<NamespaceIndexValue>, field: &str, value: u64) {
+    values.push(NamespaceIndexValue {
+        field: NamespaceFindField::new(field),
+        value: NamespacePredicateValue::U64(value),
     });
 }
 
 fn artifact_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+fn nokv_register_indexes(options: Options) -> Result<(), HarnessError> {
+    let data_root = required_data_root(&options)?;
+    let runs = load_runs(&data_root.join("corpus"))?;
+    let service = open_existing_nokv(&nokv_meta_path(&data_root), &options.s3)?;
+    register_nokv_agent_indexes(&service, &runs)?;
+    print_json(&json!({
+        "status": "completed",
+        "run_count": runs.len(),
+        "indexed_path": format!("/{NOKV_PREFIX}/runs"),
+    }))
 }
 
 fn agent_tool_debug(options: Options) -> Result<(), HarnessError> {
@@ -6607,7 +6587,9 @@ fn agent_tool_debug(options: Options) -> Result<(), HarnessError> {
     let mut runtime = ArmRuntime::open(&arm, &data_root, &options.s3)?;
     let result = match &mut runtime {
         ArmRuntime::SqliteRaw { conn } => execute_sqlite_raw_tool(conn, &tool_name, &args)?,
-        ArmRuntime::NokvNative { fs } => execute_nokv_tool(fs, &tool_name, &args)?,
+        ArmRuntime::NokvNative { service } => {
+            execute_nokv_tool(service.as_ref(), &tool_name, &args)?
+        }
     };
     let compact =
         serde_json::to_string(&result).map_err(|err| HarnessError::Json(err.to_string()))?;
@@ -6634,15 +6616,6 @@ fn open_existing_nokv(
     .map_err(from_nokv)
 }
 
-fn open_existing_agent(agent_path: &Path) -> Result<AgentFs<AgentHoltStore>, HarnessError> {
-    let store = AgentHoltStore::open(agent_path).map_err(from_nokv)?;
-    Ok(AgentFs::new(nokv_agent_id(), store))
-}
-
-fn nokv_agent_id() -> AgentId {
-    AgentId::new("yanex")
-}
-
 fn s3_options(s3: &S3Options) -> S3ObjectStoreOptions {
     S3ObjectStoreOptions::rustfs(
         s3.bucket.clone(),
@@ -6658,10 +6631,6 @@ fn sqlite_path(data_root: &Path) -> PathBuf {
 
 fn nokv_meta_path(data_root: &Path) -> PathBuf {
     data_root.join("nokv").join("meta")
-}
-
-fn nokv_agent_path(data_root: &Path) -> PathBuf {
-    data_root.join("nokv-agent").join("holt")
 }
 
 fn first_experiment_id(conn: &Connection) -> Result<String, HarnessError> {
@@ -7169,6 +7138,7 @@ mod tests {
             repo.put_bytes(&format!("{NOKV_PREFIX}{}", path), bytes.clone())
                 .unwrap();
         }
+        register_nokv_agent_indexes(&service, runs).unwrap();
         service
     }
 
@@ -7182,13 +7152,13 @@ mod tests {
     }
 
     #[test]
-    fn yanex_index_row_uses_catalog_field_ids() {
+    fn nokv_agent_index_row_uses_catalog_field_ids() {
         let mut run = sample_run();
         run.metadata["git"] = json!({
             "has_uncommitted_changes": true,
             "patch_file": "missing.patch"
         });
-        let row = yanex_index_row(&run);
+        let row = nokv_agent_index_row(&run);
         let values = row
             .values
             .iter()
@@ -7196,10 +7166,10 @@ mod tests {
                 (
                     value.field.id.as_str(),
                     match &value.value {
-                        NativeAgentPredicateValue::String(value) => json!(value),
-                        NativeAgentPredicateValue::U64(value) => json!(value),
-                        NativeAgentPredicateValue::F64(value) => json!(value),
-                        NativeAgentPredicateValue::List(value) => json!(value
+                        NamespacePredicateValue::String(value) => json!(value),
+                        NamespacePredicateValue::U64(value) => json!(value),
+                        NamespacePredicateValue::F64(value) => json!(value),
+                        NamespacePredicateValue::List(value) => json!(value
                             .iter()
                             .map(|item| format!("{item:?}"))
                             .collect::<Vec<_>>()),
@@ -7223,8 +7193,8 @@ mod tests {
     }
 
     #[test]
-    fn yanex_index_fields_expose_params_metric_and_group_discovery_summaries() {
-        let field_ids = yanex_index_fields()
+    fn nokv_agent_index_fields_expose_params_metric_and_group_discovery_summaries() {
+        let field_ids = nokv_agent_index_fields()
             .into_iter()
             .map(|field| field.field.id)
             .collect::<BTreeSet<_>>();
@@ -7244,7 +7214,7 @@ mod tests {
     fn train_lr_batch_groups_project_only_discovery_fields_into_run_index_rows() {
         let run = sample_run();
         let groups = train_lr_batch_groups(std::slice::from_ref(&run));
-        let row = yanex_index_row_with_groups(&run, &groups);
+        let row = nokv_agent_index_row_with_groups(&run, &groups);
         let values = row
             .values
             .iter()
@@ -7252,10 +7222,10 @@ mod tests {
                 (
                     value.field.id.as_str(),
                     match &value.value {
-                        NativeAgentPredicateValue::String(value) => json!(value),
-                        NativeAgentPredicateValue::U64(value) => json!(value),
-                        NativeAgentPredicateValue::F64(value) => json!(value),
-                        NativeAgentPredicateValue::List(value) => json!(value
+                        NamespacePredicateValue::String(value) => json!(value),
+                        NamespacePredicateValue::U64(value) => json!(value),
+                        NamespacePredicateValue::F64(value) => json!(value),
+                        NamespacePredicateValue::List(value) => json!(value
                             .iter()
                             .map(|item| format!("{item:?}"))
                             .collect::<Vec<_>>()),
@@ -7408,7 +7378,7 @@ mod tests {
         assert!(report.agent_index_values_checked > 0);
         assert_eq!(
             report.agent_index_catalog_checked,
-            yanex_index_fields().len()
+            nokv_agent_index_fields().len()
         );
         assert!(report.mismatches.is_empty(), "{:?}", report.mismatches);
     }
@@ -7612,23 +7582,32 @@ mod tests {
     }
 
     #[test]
-    fn nokv_native_grep_tool_maps_to_agent_native_surface() {
-        let dir = tempfile::tempdir().unwrap();
-        let agent_fs = AgentFs::new(
-            nokv_agent_id(),
-            AgentHoltStore::open(dir.path().join("agent")).unwrap(),
+    fn nokv_native_grep_tool_maps_to_product_service_surface() {
+        let objects = nokv_object::MemoryObjectStore::new();
+        let service = NoKvFs::new(
+            MountId::new(1).unwrap(),
+            HoltMetadataStore::open_memory().unwrap(),
+            objects,
         );
-        agent_fs.bootstrap().unwrap();
-        agent_fs
-            .put_file(
-                "/runs/stdout.txt",
-                b"first\nneedle hit\n".to_vec(),
-                Some("text/plain".to_owned()),
-            )
+        service.bootstrap_root(0o755, 1000, 1000).unwrap();
+        let runs = service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+        service
+            .publish_artifact(nokv_meta::PublishArtifact {
+                parent: runs.attr.inode,
+                name: nokv_types::DentryName::new(b"stdout.txt".to_vec()).unwrap(),
+                producer: "unit-test".to_owned(),
+                digest_uri: "sha256:test".to_owned(),
+                content_type: "text/plain".to_owned(),
+                manifest_id: "runs/stdout.txt".to_owned(),
+                bytes: b"first\nneedle hit\n".to_vec(),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            })
             .unwrap();
 
         let result = execute_nokv_tool(
-            &agent_fs,
+            &service,
             "grep",
             &json!({
                 "path": "/runs",
@@ -7839,7 +7818,7 @@ mod tests {
 
         assert!(readme.contains("## Valid Comparisons"));
         assert!(readme.contains("one core A/B comparison"));
-        assert!(readme.contains("Raw SQLite tools vs NoKV Agent Native"));
+        assert!(readme.contains("Raw SQLite tools vs NoKV Native Namespace"));
     }
 
     #[test]

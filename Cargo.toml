@@ -37,7 +37,7 @@ nokv = { path = "crates/nokv", version = "0.1.0" }
 nokv-python = { path = "crates/nokv-python", version = "0.1.0" }
 nokv-bench = { path = "bench", version = "0.1.0" }
 fuser = { version = "0.17.0", default-features = false }
-holt = { version = "0.8", default-features = false }
+holt = { version = "0.7.3", default-features = false }
 etcd-client = { version = "0.19.0", default-features = false }
 libc = "0.2"
 opendal = { version = "0.57.0", default-features = false, features = ["blocking", "executors-tokio", "reqwest-rustls-tls", "services-s3"] }

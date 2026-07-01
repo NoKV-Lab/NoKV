@@ -811,9 +811,9 @@ dependencies = [
 
 [[package]]
 name = "holt"
-version = "0.8.0"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93c14f1ce243962c1ad068a9876252c4e23448f8f6123b5f429a6465f54b9362"
+checksum = "4f7180148389fd08f76cdd05ad47640acd1b72b6a5cd2379d1496de96af32e01"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
@@ -1376,6 +1376,7 @@ dependencies = [
 name = "nokv"
 version = "0.1.0"
 dependencies = [
+ "nokv-agent",
  "nokv-client",
  "nokv-control",
  "nokv-fuse",
@@ -1383,6 +1384,8 @@ dependencies = [
  "nokv-object",
  "nokv-server",
  "nokv-types",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
 ]
@@ -1391,10 +1394,10 @@ dependencies = [
 name = "nokv-agent"
 version = "0.1.0"
 dependencies = [
- "holt",
- "serde",
+ "nokv-meta",
+ "nokv-object",
+ "nokv-types",
  "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -1424,6 +1427,7 @@ dependencies = [
 name = "nokv-client"
 version = "0.1.0"
 dependencies = [
+ "nokv-agent",
  "nokv-control",
  "nokv-meta",
  "nokv-object",
