@@ -3162,6 +3162,7 @@ mod tests {
                 "nokv_workbench_stat",
                 "nokv_workbench_read",
                 "nokv_workbench_grep",
+                "nokv_workbench_find",
                 "nokv_workbench_commit",
                 "nokv_workbench_snapshot",
             ]
@@ -3346,31 +3347,53 @@ mod tests {
             "/workbenches/spedas-task-001/input/event.json"
         );
         assert_eq!(
-            responses[4]["result"]["structuredContent"]["result"]["entries"][0]["name"],
+            responses[4]["result"]["structuredContent"]["entries"][0]["name"],
             "spectrum.csv"
         );
         assert_eq!(
-            responses[5]["result"]["structuredContent"]["result"]["card"]["path"],
+            responses[4]["result"]["structuredContent"]["entries"][0]["relative_path"],
+            "spectrum.csv"
+        );
+        assert_eq!(
+            responses[4]["result"]["structuredContent"]["entries"][0]["section"],
+            "outputs"
+        );
+        assert_eq!(
+            responses[5]["result"]["structuredContent"]["card"]["path"],
             "/workbenches/spedas-task-001/outputs/spectrum.csv"
         );
         assert_eq!(
-            responses[6]["result"]["structuredContent"]["result"]["record_type"], "text_lines",
+            responses[5]["result"]["structuredContent"]["card"]["relative_path"],
+            "spectrum.csv"
+        );
+        assert_eq!(
+            responses[5]["result"]["structuredContent"]["card"]["content_type"],
+            "text/csv"
+        );
+        assert!(
+            responses[5]["result"]["structuredContent"]["card"]["digest_uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_eq!(
+            responses[6]["result"]["structuredContent"]["record_type"], "text_lines",
             "read response: {}",
             responses[6]
         );
         assert_eq!(
-            responses[6]["result"]["structuredContent"]["result"]["items"][0]["value"]["text"],
+            responses[6]["result"]["structuredContent"]["items"][0]["value"]["text"],
             "freq,power"
         );
         assert_eq!(
-            responses[7]["result"]["structuredContent"]["result"]["matches"][0]["path"],
-            "/workbenches/spedas-task-001/outputs/spectrum.csv"
+            responses[7]["result"]["structuredContent"]["matches"][0]["relative_path"],
+            "spectrum.csv"
         );
         assert_eq!(
             responses[8]["result"]["structuredContent"]["path"],
             "/workbenches/spedas-task-001/metadata/run_manifest.json"
         );
-        let manifest_items = responses[9]["result"]["structuredContent"]["result"]["items"]
+        let manifest_items = responses[9]["result"]["structuredContent"]["items"]
             .as_array()
             .unwrap();
         assert!(
@@ -3386,6 +3409,117 @@ mod tests {
                 .as_u64()
                 .unwrap()
                 > 0
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_find_lists_committed_workbenches_with_manifest_summary() {
+        let responses = run_workbench_mcp_requests(vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_create",
+                    "arguments": {"id": "spedas-task-010"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_create",
+                    "arguments": {"id": "spedas-task-011"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_commit",
+                    "arguments": {
+                        "id": "spedas-task-010",
+                        "manifest": {
+                            "task": "spedas-task-010",
+                            "dataset": "spedas",
+                            "outputs": ["outputs/spectrum.csv"]
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_find",
+                    "arguments": {
+                        "committed": true,
+                        "manifest_pattern": "spedas",
+                        "limit": 10
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_find",
+                    "arguments": {
+                        "committed": false,
+                        "limit": 10
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_find",
+                    "arguments": {
+                        "committed": true,
+                        "include_manifest": true,
+                        "limit": 10
+                    }
+                }
+            }),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        assert_eq!(
+            responses[3]["result"]["structuredContent"]["matches"][0]["workbench_id"],
+            "spedas-task-010"
+        );
+        assert_eq!(
+            responses[3]["result"]["structuredContent"]["matches"][0]["committed"],
+            true
+        );
+        assert!(responses[3]["result"]["structuredContent"]["matches"][0]["manifest"].is_null());
+        assert_eq!(
+            responses[3]["result"]["structuredContent"]["matches"][0]["manifest_summary"]
+                ["manifest_task"],
+            "spedas-task-010"
+        );
+        assert_eq!(
+            responses[4]["result"]["structuredContent"]["matches"][0]["workbench_id"],
+            "spedas-task-011"
+        );
+        assert_eq!(
+            responses[4]["result"]["structuredContent"]["matches"][0]["committed"],
+            false
+        );
+        assert_eq!(
+            responses[5]["result"]["structuredContent"]["matches"][0]["manifest"]["manifest"]
+                ["dataset"],
+            "spedas"
         );
     }
 
