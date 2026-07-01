@@ -14,18 +14,14 @@ default = []
 etcd = ["nokv-control/etcd", "nokv-server/etcd"]
 
 [dependencies]
-base64.workspace = true
 nokv-client.workspace = true
 nokv-control.workspace = true
 nokv-fuse.workspace = true
 nokv-meta.workspace = true
 nokv-object.workspace = true
 nokv-server.workspace = true
-nokv-agent.workspace = true
 nokv-types.workspace = true
 sha2.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 
 [[bin]]
 name = "nokv"

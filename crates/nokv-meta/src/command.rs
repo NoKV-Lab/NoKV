@@ -52,7 +52,6 @@ pub enum CommandKind {
     RenewSnapshot,
     WatchSubtree,
     CleanupObjects,
-    RegisterNamespaceIndex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

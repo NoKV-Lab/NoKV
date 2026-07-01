@@ -7,10 +7,12 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "NoKV agent tool surface: transport-free dispatch over the metadata namespace verbs."
+description = "NoKV agent runtime and Holt-backed index primitives."
 
 [dependencies]
-nokv-meta.workspace = true
-nokv-object.workspace = true
-nokv-types.workspace = true
+holt.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

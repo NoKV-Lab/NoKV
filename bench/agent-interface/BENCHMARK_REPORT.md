@@ -1,4 +1,4 @@
-# Agent Interface Benchmark Report: Namespace Surface vs Raw SQL
+# Agent Interface Benchmark Report: NoKV Agent Surface vs Raw SQL
 
 **NoKV agent-interface benchmark — final results, 2026-06-10**
 
@@ -10,8 +10,8 @@ state, and raw stdout/stderr logs):
 
 - `sqlite_raw_v1` — a raw SQLite surface: live schema discovery, bounded
   read-only SQL, byte-range blob reads, and a line-oriented `grep_blob`.
-- `nokv_native_v1` — the NoKV product-native namespace surface: `ls`, `stat`,
-  `catalog`, `find`, `aggregate`, `read`, and namespace-recursive `grep`.
+- `nokv_native_v1` — the NoKV agent-native surface from `nokv-agent`: `ls`,
+  `stat`, `catalog`, `find`, `aggregate`, `read`, and scoped `grep`.
 
 The agent model is `gpt-5.4-mini`, 10 repeats per arm/task pair
 (2 batches x 5 repeats, 100 runs total), identical prompts, judged against
@@ -19,7 +19,7 @@ deterministic gold facts that neither arm can see. Every run is a fully
 stateless episode: the agent starts from a cleared context each time and
 carries nothing over from previous tasks or repeats.
 
-| Set mean (per 5-task pass) | Raw SQLite | NoKV namespace | SQLite / NoKV |
+| Set mean (per 5-task pass) | Raw SQLite | NoKV agent | SQLite / NoKV |
 | --- | --- | --- | --- |
 | Tasks solved correctly | 4.40 / 5 | **4.50 / 5** | — |
 | Prompt tokens (incl. cached) | 151,572 | **82,827** | **1.83x** |
@@ -30,7 +30,7 @@ carries nothing over from previous tasks or repeats.
 On the three compound exploration tasks — the workloads agents actually
 struggle with — the gap widens:
 
-| Compound tasks (T1+T3+T5) | Raw SQLite | NoKV namespace | SQLite / NoKV |
+| Compound tasks (T1+T3+T5) | Raw SQLite | NoKV agent | SQLite / NoKV |
 | --- | --- | --- | --- |
 | Prompt tokens | 127,450 | **53,300** | **2.39x** |
 | Cost (USD) | $0.0558 | **$0.0286** | **1.95x** |
@@ -82,7 +82,7 @@ learning rate, batch size, stdout size, and git state for each."*
 checkpoint file the sampler loaded and the loaded model's parameter count
 (both printed only in the sampler's stdout log)."*
 
-- **NoKV (35.8k tokens):** one namespace-recursive `grep` for the dataset
+- **NoKV (35.8k tokens):** one scoped `grep` for the dataset
   line identifies the ten run directories — the path *is* the cohort
   handle. Scoped greps per run directory return the `Checkpoint:` and
   `Model parameters:` lines directly, issued as parallel calls.
@@ -93,7 +93,7 @@ checkpoint file the sampler loaded and the loaded model's parameter count
   It gets the right answer — by paying for it.
 - Honesty note: NoKV's correctness on this task is 60% (one cohort
   over-inclusion, one missed extraction across 10 repeats); SQLite is 100%
-  at 2.4x the price. Per *correct* answer the namespace surface is still
+  at 2.4x the price. Per *correct* answer the NoKV agent surface is still
   cheaper ($0.0297 vs $0.0322).
 
 ### T5 — Incident triage (cohort + line-level citation)
@@ -110,7 +110,7 @@ a KeyboardInterrupt, and the line number of its last occurrence."*
   blob handle or reads bodies and counts. It now succeeds — at twice the
   cost — and only since the arm gained a line-oriented search tool.
 
-### Why the namespace surface wins here
+### Why the NoKV Agent Surface Wins Here
 
 1. **Paths are cohort handles.** A run is a directory; finding it and
    reading from it are the same address space. The relational surface
@@ -132,7 +132,7 @@ a KeyboardInterrupt, and the line number of its last occurrence."*
 Honesty matters for this comparison: on single-shot structured analytics the
 relational surface remains excellent. T2 (a metric leaderboard) is a
 schema-dump plus one SELECT — 4.8k tokens, hard to beat. T4 (find the best
-run, then check one log line) is a statistical tie. The namespace surface
+run, then check one log line) is a statistical tie. The NoKV agent surface
 wins *compound* exploration, not every query shape — which is consistent
 with where agent workloads are actually heading.
 
@@ -146,13 +146,12 @@ with where agent workloads are actually heading.
   The per-run tool bridge also rejects calls carrying another run's id, so
   neither conversation state nor tool state can leak between runs.
 - Both arms expose a case-insensitive, line-oriented body search with line
-  numbers: NoKV `grep` (namespace-recursive) and SQLite `grep_blob`
+  numbers: NoKV agent `grep` and SQLite `grep_blob`
   (per blob handle). The residual difference is the surface itself, not a
   missing tool.
-- Both arms see logically equal index facts: the NoKV catalog fields and
-  the SQLite `run_agent_index_*` tables are materialized from the same
-  registration, and `verify` fails if the NoKV catalog drifts from the
-  registered field set.
+- Both arms see logically equal index facts: the `nokv-agent` catalog fields
+  and the SQLite `run_agent_index_*` tables are materialized from the same
+  Yanex index registration.
 - Judge-side gold (gold SQL for the structured tasks, file-body oracles for
   the log tasks) is never exposed to either arm.
 - All harness, client, and metadata test suites pass; runs require a fresh

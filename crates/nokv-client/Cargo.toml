@@ -10,7 +10,6 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-nokv-agent.workspace = true
 nokv-control.workspace = true
 nokv-meta.workspace = true
 nokv-object.workspace = true
