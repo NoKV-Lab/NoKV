@@ -9,6 +9,14 @@ This repository uses `docs/development/code_contract.md` as the source of truth
 for Rust package boundaries, naming, errors, metrics, tests, DCO, and storage
 safety review.
 
+## Local Collaboration Direction
+
+Treat LingTai as the active partner and integration target for this repository.
+Do not preserve, debug, document, or route around Yanex-specific workflows unless
+the user explicitly asks for Yanex work. Yanex artifacts are historical
+benchmark/demo material only; they must not drive new NoKV behavior, scripts,
+docs, naming, preflight decisions, or compatibility paths.
+
 Before reviewing or editing a PR:
 
 1. Read `docs/development/code_contract.md`.
