@@ -24,6 +24,7 @@ repository = "https://github.com/feichai0017/NoKV"
 homepage = "https://nokv.io"
 
 [workspace.dependencies]
+base64 = "0.22.1"
 nokv-types = { path = "crates/nokv-types", version = "0.1.0" }
 nokv-protocol = { path = "crates/nokv-protocol", version = "0.1.0" }
 nokv-meta = { path = "crates/nokv-meta", version = "0.1.0" }

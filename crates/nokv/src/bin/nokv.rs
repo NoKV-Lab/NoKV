@@ -1,5 +1,8 @@
 //! Minimal NoKV command line interface.
 
+#[path = "nokv/workbench_mcp.rs"]
+mod workbench_mcp;
+
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -121,7 +124,7 @@ enum Command {
         options: MountCliOptions,
     },
     Serve,
-    Mcp,
+    Mcp(McpCliOptions),
     Gc {
         limit: usize,
     },
@@ -172,6 +175,19 @@ struct MountCliOptions {
     writeback: nokv_fuse::FuseWritebackOptions,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct McpCliOptions {
+    profile: McpProfile,
+    workbench_root: Option<String>,
+    workbench_max_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpProfile {
+    Agent,
+    Workbench,
+}
+
 #[derive(Debug)]
 enum CliError {
     MissingValue(&'static str),
@@ -202,6 +218,16 @@ impl Default for MountCliOptions {
             prefetch: defaults.prefetch,
             read_pipeline: defaults.read_pipeline,
             writeback: defaults.writeback,
+        }
+    }
+}
+
+impl Default for McpCliOptions {
+    fn default() -> Self {
+        Self {
+            profile: McpProfile::Agent,
+            workbench_root: None,
+            workbench_max_bytes: workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES,
         }
     }
 }
@@ -488,9 +514,9 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         Command::Serve => {
             nokv_server::run(server_options_from_config(config)).map_err(from_io)?;
         }
-        Command::Mcp => {
+        Command::Mcp(options) => {
             let client = open_client(&config)?;
-            run_mcp(client).map_err(from_io)?;
+            run_mcp(client, options, config.uid, config.gid).map_err(from_io)?;
         }
         Command::Gc { limit } => {
             let body = control_get(&config, &format!("/gc?limit={limit}"))?;
@@ -1137,6 +1163,65 @@ fn parse_archive_prefix(raw: &str, option: &str) -> Result<String, CliError> {
     Ok(prefix.to_owned())
 }
 
+fn parse_mcp_args(args: &[String]) -> Result<McpCliOptions, CliError> {
+    let mut options = McpCliOptions::default();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--profile" => {
+                index += 1;
+                options.profile = parse_mcp_profile(value(args, index, "--profile")?)?;
+            }
+            "--workbench-root" => {
+                index += 1;
+                let root = workbench_mcp::normalize_workbench_root(value(
+                    args,
+                    index,
+                    "--workbench-root",
+                )?)
+                .map_err(|err| CliError::InvalidOption {
+                    field: "workbench-root",
+                    value: err,
+                })?;
+                options.workbench_root = Some(root);
+            }
+            "--workbench-max-bytes" => {
+                index += 1;
+                options.workbench_max_bytes = parse_usize(
+                    value(args, index, "--workbench-max-bytes")?,
+                    "workbench-max-bytes",
+                )?;
+            }
+            other => return Err(CliError::UnknownOption(other.to_owned())),
+        }
+        index += 1;
+    }
+    if options.profile == McpProfile::Workbench && options.workbench_root.is_none() {
+        return Err(CliError::MissingArgument("workbench root"));
+    }
+    if options.profile == McpProfile::Agent
+        && (options.workbench_root.is_some()
+            || options.workbench_max_bytes != workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES)
+    {
+        return Err(CliError::InvalidOption {
+            field: "mcp profile",
+            value: "workbench options require --profile workbench".to_owned(),
+        });
+    }
+    Ok(options)
+}
+
+fn parse_mcp_profile(raw: &str) -> Result<McpProfile, CliError> {
+    match raw {
+        "agent" => Ok(McpProfile::Agent),
+        "workbench" => Ok(McpProfile::Workbench),
+        _ => Err(CliError::InvalidOption {
+            field: "profile",
+            value: raw.to_owned(),
+        }),
+    }
+}
+
 fn object_config(
     backend: ObjectBackendKind,
     mut s3: S3ObjectStoreOptions,
@@ -1247,7 +1332,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             })
         }
         "serve" => exact_args(args, 1).map(|()| Command::Serve),
-        "mcp" => exact_args(args, 1).map(|()| Command::Mcp),
+        "mcp" => parse_mcp_args(args).map(Command::Mcp),
         "backup" => exact_args(args, 1).map(|()| Command::Backup),
         "restore" => exact_args(args, 1).map(|()| Command::Restore),
         "fsck" => exact_args(args, 1).map(|()| Command::Fsck),
@@ -1712,14 +1797,36 @@ fn from_client(err: impl Error) -> CliError {
 fn from_object(err: impl Error) -> CliError {
     CliError::Client(err.to_string())
 }
-fn run_mcp(client: Client) -> std::io::Result<()> {
+fn run_mcp(client: Client, options: McpCliOptions, uid: u32, gid: u32) -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    run_mcp_stream(client, stdin.lock(), stdout.lock())
+    run_mcp_stream_with_options(client, options, uid, gid, stdin.lock(), stdout.lock())
 }
 
+#[cfg(test)]
 fn run_mcp_stream<O>(
     client: nokv_client::NoKvFsClient<O>,
+    mut reader: impl std::io::BufRead,
+    mut writer: impl std::io::Write,
+) -> std::io::Result<()>
+where
+    O: nokv_object::ObjectStore + Send + Sync + 'static,
+{
+    run_mcp_stream_with_options(
+        client,
+        McpCliOptions::default(),
+        DEFAULT_UID,
+        DEFAULT_GID,
+        &mut reader,
+        &mut writer,
+    )
+}
+
+fn run_mcp_stream_with_options<O>(
+    client: nokv_client::NoKvFsClient<O>,
+    options: McpCliOptions,
+    uid: u32,
+    gid: u32,
     mut reader: impl std::io::BufRead,
     mut writer: impl std::io::Write,
 ) -> std::io::Result<()>
@@ -1759,6 +1866,19 @@ where
     fn err_response(id: Option<serde_json::Value>, code: i64, message: &str) -> serde_json::Value {
         json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
     }
+
+    let workbench_options = match options.profile {
+        McpProfile::Agent => None,
+        McpProfile::Workbench => Some(workbench_mcp::WorkbenchMcpOptions {
+            root: options
+                .workbench_root
+                .clone()
+                .expect("workbench profile requires a root"),
+            max_bytes: options.workbench_max_bytes,
+            uid,
+            gid,
+        }),
+    };
 
     let mut line = String::new();
     while reader.read_line(&mut line)? > 0 {
@@ -1832,17 +1952,24 @@ where
                                         }
                                         "initialized" | "ping" => Ok(json!({})),
                                         "tools/list" => {
-                                            let tools: Vec<serde_json::Value> =
-                                                nokv_agent::agent_tool_definitions()
-                                                    .into_iter()
-                                                    .map(|t| {
-                                                        json!({
-                                                            "name": t.name,
-                                                            "description": t.description,
-                                                            "inputSchema": t.parameters,
-                                                        })
+                                            let definitions = match options.profile {
+                                                McpProfile::Agent => {
+                                                    nokv_agent::agent_tool_definitions()
+                                                }
+                                                McpProfile::Workbench => {
+                                                    workbench_mcp::tool_definitions()
+                                                }
+                                            };
+                                            let tools: Vec<serde_json::Value> = definitions
+                                                .into_iter()
+                                                .map(|t| {
+                                                    json!({
+                                                        "name": t.name,
+                                                        "description": t.description,
+                                                        "inputSchema": t.parameters,
                                                     })
-                                                    .collect();
+                                                })
+                                                .collect();
                                             Ok(json!({ "tools": tools }))
                                         }
                                         "tools/call" => {
@@ -1854,9 +1981,26 @@ where
                                                 )),
                                                 Ok(call) => {
                                                     let args = call.arguments.unwrap_or(json!({}));
-                                                    match nokv_agent::execute_agent_tool(
-                                                        &client, &call.name, &args,
-                                                    ) {
+                                                    let tool_result = match options.profile {
+                                                        McpProfile::Agent => {
+                                                            nokv_agent::execute_agent_tool(
+                                                                &client, &call.name, &args,
+                                                            )
+                                                            .map_err(|err| err.to_string())
+                                                        }
+                                                        McpProfile::Workbench => {
+                                                            workbench_mcp::execute_tool(
+                                                                &client,
+                                                                workbench_options
+                                                                    .as_ref()
+                                                                    .expect("workbench options"),
+                                                                &call.name,
+                                                                &args,
+                                                            )
+                                                            .map_err(|err| err.to_string())
+                                                        }
+                                                    };
+                                                    match tool_result {
                                                         Ok(val) => Ok(json!({
                                                             "content": [{ "type": "text", "text": serde_json::to_string_pretty(&val).unwrap_or_default() }],
                                                             "structuredContent": val,
@@ -1919,7 +2063,7 @@ Usage:\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount [--read-only] [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount-snapshot SNAPSHOT_ID [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] [--control-backend etcd] serve\n\
-  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mcp\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mcp [--profile agent|workbench] [--workbench-root PATH] [--workbench-max-bytes BYTES]\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] backup\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] restore\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] fsck\n\
@@ -2039,15 +2183,15 @@ mod tests {
     use std::thread;
 
     use nokv_client::NoKvFsClient;
-    use nokv_object::{MemoryObjectStore, ObjectKey, ObjectStore};
+    use nokv_object::{LocalObjectStore, MemoryObjectStore, ObjectKey, ObjectStore};
     use tempfile::tempdir;
 
     fn s(value: &str) -> String {
         value.to_owned()
     }
 
-    fn fake_server_object_config() -> ObjectStoreConfig {
-        ObjectStoreConfig::s3(S3ObjectStoreOptions {
+    fn fake_s3_options() -> S3ObjectStoreOptions {
+        S3ObjectStoreOptions {
             bucket: "test".to_owned(),
             root: "/".to_owned(),
             region: "auto".to_owned(),
@@ -2057,10 +2201,18 @@ mod tests {
             session_token: None,
             virtual_host_style: false,
             skip_signature: true,
-        })
+        }
+    }
+
+    fn fake_server_object_config() -> ObjectStoreConfig {
+        ObjectStoreConfig::s3(fake_s3_options())
     }
 
     fn spawn_test_server() -> SocketAddr {
+        spawn_test_server_with_object_config(fake_server_object_config())
+    }
+
+    fn spawn_test_server_with_object_config(object: ObjectStoreConfig) -> SocketAddr {
         let dir = tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap();
@@ -2069,7 +2221,7 @@ mod tests {
             mount: MountId::new(1).unwrap(),
             meta_path: dir.path().join("meta"),
             metadata_checkpoint_archive_prefix: None,
-            object: fake_server_object_config(),
+            object,
             uid: 1000,
             gid: 1000,
             object_gc: ObjectGcOptions {
@@ -2824,11 +2976,127 @@ mod tests {
     #[test]
     fn parse_mcp_command() {
         let command = parse(vec![s("mcp")]).unwrap().1;
-        assert_eq!(command, Command::Mcp);
+        assert_eq!(command, Command::Mcp(McpCliOptions::default()));
+        assert_eq!(
+            parse(vec![
+                s("mcp"),
+                s("--profile"),
+                s("workbench"),
+                s("--workbench-root"),
+                s("/workbenches")
+            ])
+            .unwrap()
+            .1,
+            Command::Mcp(McpCliOptions {
+                profile: McpProfile::Workbench,
+                workbench_root: Some(s("/workbenches")),
+                workbench_max_bytes: workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES,
+            })
+        );
+        assert_eq!(
+            parse(vec![
+                s("mcp"),
+                s("--profile"),
+                s("workbench"),
+                s("--workbench-root"),
+                s("/workbenches/"),
+                s("--workbench-max-bytes"),
+                s("1024")
+            ])
+            .unwrap()
+            .1,
+            Command::Mcp(McpCliOptions {
+                profile: McpProfile::Workbench,
+                workbench_root: Some(s("/workbenches")),
+                workbench_max_bytes: 1024,
+            })
+        );
         assert!(matches!(
             parse(vec![s("mcp"), s("extra")]),
-            Err(CliError::TooManyArguments)
+            Err(CliError::UnknownOption(_))
         ));
+        assert!(matches!(
+            parse(vec![s("mcp"), s("--profile"), s("workbench")]),
+            Err(CliError::MissingArgument("workbench root"))
+        ));
+        assert!(matches!(
+            parse(vec![s("mcp"), s("--workbench-root"), s("/workbenches")]),
+            Err(CliError::InvalidOption {
+                field: "mcp profile",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(vec![s("mcp"), s("--profile"), s("unknown")]),
+            Err(CliError::InvalidOption {
+                field: "profile",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(vec![
+                s("mcp"),
+                s("--profile"),
+                s("workbench"),
+                s("--workbench-root"),
+                s("/")
+            ]),
+            Err(CliError::InvalidOption {
+                field: "workbench-root",
+                ..
+            })
+        ));
+    }
+
+    fn workbench_mcp_options() -> McpCliOptions {
+        McpCliOptions {
+            profile: McpProfile::Workbench,
+            workbench_root: Some(s("/workbenches")),
+            workbench_max_bytes: workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES,
+        }
+    }
+
+    fn run_workbench_mcp_requests(requests: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        run_workbench_mcp_requests_with_options(workbench_mcp_options(), requests)
+    }
+
+    fn run_workbench_mcp_requests_with_options(
+        options: McpCliOptions,
+        requests: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        let object_dir = tempdir().unwrap();
+        let object_root = object_dir.path().join("objects");
+        let client_store =
+            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+        let client = NoKvFsClient::connect(
+            spawn_test_server_with_object_config(ObjectStoreConfig::tiered_local(
+                object_root,
+                fake_s3_options(),
+            )),
+            client_store,
+        );
+        let reqs = requests
+            .into_iter()
+            .map(|request| serde_json::to_string(&request).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let reader = std::io::Cursor::new(reqs);
+        let mut writer = Vec::new();
+        run_mcp_stream_with_options(
+            client,
+            options,
+            DEFAULT_UID,
+            DEFAULT_GID,
+            reader,
+            &mut writer,
+        )
+        .unwrap();
+        String::from_utf8(writer)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     #[test]
@@ -2874,6 +3142,484 @@ mod tests {
             names,
             vec!["ls", "stat", "catalog", "read", "aggregate", "find", "grep"]
         );
+    }
+
+    #[test]
+    fn workbench_mcp_tools_are_prefixed_and_isolated() {
+        let responses = run_workbench_mcp_requests(vec![serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })]);
+        let tools = responses[0]["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "nokv_workbench_create",
+                "nokv_workbench_put_file",
+                "nokv_workbench_list",
+                "nokv_workbench_stat",
+                "nokv_workbench_read",
+                "nokv_workbench_grep",
+                "nokv_workbench_commit",
+                "nokv_workbench_snapshot",
+            ]
+        );
+        assert!(names.iter().all(|name| name.starts_with("nokv_workbench_")));
+        assert!(!names.contains(&"read"));
+        assert!(!names.contains(&"grep"));
+    }
+
+    #[test]
+    fn workbench_mcp_tool_schemas_are_closed() {
+        let responses = run_workbench_mcp_requests(vec![serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })]);
+        let tools = responses[0]["result"]["tools"].as_array().unwrap();
+        for tool in tools {
+            assert_eq!(tool["inputSchema"]["type"], "object");
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert!(tool["inputSchema"]["properties"].is_object());
+        }
+    }
+
+    #[test]
+    fn workbench_mcp_create_put_read_list_stat_grep_commit_snapshot_flow() {
+        let responses = run_workbench_mcp_requests(vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_create",
+                    "arguments": {"id": "spedas-task-001"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "section": "input",
+                        "path": "event.json",
+                        "text": "{\"event\":\"storm\"}",
+                        "content_type": "application/json"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "section": "outputs",
+                        "path": "spectrum.csv",
+                        "text": "freq,power\n1,2\n",
+                        "content_type": "text/csv"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "section": "scripts",
+                        "path": "analysis.py",
+                        "text": "print('spedas')\n",
+                        "content_type": "text/x-python"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_list",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "section": "outputs"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_stat",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "section": "outputs",
+                        "path": "spectrum.csv"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_read",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "section": "outputs",
+                        "path": "spectrum.csv",
+                        "format": "structured"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_grep",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "section": "outputs",
+                        "pattern": "freq",
+                        "recursive": true
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_commit",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "manifest": {
+                            "task": "spedas-task-001",
+                            "outputs": ["outputs/spectrum.csv"]
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_read",
+                    "arguments": {
+                        "id": "spedas-task-001",
+                        "section": "metadata",
+                        "path": "run_manifest.json",
+                        "format": "structured"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_snapshot",
+                    "arguments": {"id": "spedas-task-001"}
+                }
+            }),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["path"],
+            "/workbenches/spedas-task-001/input/event.json"
+        );
+        assert_eq!(
+            responses[4]["result"]["structuredContent"]["result"]["entries"][0]["name"],
+            "spectrum.csv"
+        );
+        assert_eq!(
+            responses[5]["result"]["structuredContent"]["result"]["card"]["path"],
+            "/workbenches/spedas-task-001/outputs/spectrum.csv"
+        );
+        assert_eq!(
+            responses[6]["result"]["structuredContent"]["result"]["record_type"], "text_lines",
+            "read response: {}",
+            responses[6]
+        );
+        assert_eq!(
+            responses[6]["result"]["structuredContent"]["result"]["items"][0]["value"]["text"],
+            "freq,power"
+        );
+        assert_eq!(
+            responses[7]["result"]["structuredContent"]["result"]["matches"][0]["path"],
+            "/workbenches/spedas-task-001/outputs/spectrum.csv"
+        );
+        assert_eq!(
+            responses[8]["result"]["structuredContent"]["path"],
+            "/workbenches/spedas-task-001/metadata/run_manifest.json"
+        );
+        let manifest_items = responses[9]["result"]["structuredContent"]["result"]["items"]
+            .as_array()
+            .unwrap();
+        assert!(
+            manifest_items.iter().any(|item| {
+                item["value"]["key"] == "schema"
+                    && item["value"]["value"] == "nokv.workbench.run_manifest.v0"
+            }),
+            "manifest read response: {}",
+            responses[9]
+        );
+        assert!(
+            responses[10]["result"]["structuredContent"]["snapshot_id"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_rejects_path_escape_and_default_overwrite() {
+        let responses = run_workbench_mcp_requests(vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_create",
+                    "arguments": {"id": "spedas-task-002"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-002",
+                        "section": "outputs",
+                        "path": "../escape.csv",
+                        "text": "bad"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-002",
+                        "section": "outputs",
+                        "path": "spectrum.csv",
+                        "text": "freq,power\n1,2\n"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-002",
+                        "section": "outputs",
+                        "path": "spectrum.csv",
+                        "text": "freq,power\n1,3\n"
+                    }
+                }
+            }),
+        ]);
+        assert_eq!(responses[1]["result"]["isError"], true);
+        assert_eq!(responses[3]["result"]["isError"], true);
+    }
+
+    #[test]
+    fn workbench_mcp_rejects_invalid_ids_sections_payloads_and_manifest() {
+        let responses = run_workbench_mcp_requests(vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_create",
+                    "arguments": {"id": "_bad"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-004",
+                        "section": "tmp",
+                        "path": "x.txt",
+                        "text": "x"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-004",
+                        "section": "outputs",
+                        "path": "x.txt",
+                        "text": "x",
+                        "base64": "eA=="
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-004",
+                        "section": "outputs",
+                        "path": "x.txt"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-004",
+                        "section": "outputs",
+                        "path": "x.txt",
+                        "base64": "not base64"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_commit",
+                    "arguments": {
+                        "id": "spedas-task-004",
+                        "manifest": "done"
+                    }
+                }
+            }),
+        ]);
+        for response in responses {
+            assert_eq!(response["result"]["isError"], true);
+        }
+    }
+
+    #[test]
+    fn workbench_mcp_respects_max_bytes_and_replace_true() {
+        let mut options = workbench_mcp_options();
+        options.workbench_max_bytes = 4;
+        let responses = run_workbench_mcp_requests_with_options(
+            options,
+            vec![
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "nokv_workbench_put_file",
+                        "arguments": {
+                            "id": "spedas-task-005",
+                            "section": "outputs",
+                            "path": "small.txt",
+                            "text": "12345"
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "nokv_workbench_put_file",
+                        "arguments": {
+                            "id": "spedas-task-005",
+                            "section": "outputs",
+                            "path": "small.txt",
+                            "text": "1234"
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "nokv_workbench_put_file",
+                        "arguments": {
+                            "id": "spedas-task-005",
+                            "section": "outputs",
+                            "path": "small.txt",
+                            "text": "abcd",
+                            "replace": true
+                        }
+                    }
+                }),
+            ],
+        );
+        assert_eq!(responses[0]["result"]["isError"], true);
+        assert_ne!(responses[1]["result"]["isError"], true);
+        assert_ne!(responses[2]["result"]["isError"], true);
+        assert_eq!(responses[2]["result"]["structuredContent"]["replace"], true);
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_requires_commit_manifest() {
+        let responses = run_workbench_mcp_requests(vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_create",
+                    "arguments": {"id": "spedas-task-003"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "nokv_workbench_snapshot",
+                    "arguments": {"id": "spedas-task-003"}
+                }
+            }),
+        ]);
+        assert_ne!(responses[0]["result"]["isError"], true);
+        assert_eq!(responses[1]["result"]["isError"], true);
+        assert!(responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not committed"));
     }
 
     #[test]

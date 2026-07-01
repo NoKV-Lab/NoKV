@@ -14,6 +14,7 @@ default = []
 etcd = ["nokv-control/etcd", "nokv-server/etcd"]
 
 [dependencies]
+base64.workspace = true
 nokv-client.workspace = true
 nokv-control.workspace = true
 nokv-fuse.workspace = true
