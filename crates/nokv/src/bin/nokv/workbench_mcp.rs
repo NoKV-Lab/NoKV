@@ -15,7 +15,7 @@ pub const DEFAULT_WORKBENCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_WORKBENCH_FIND_LIMIT: usize = 50;
 const MAX_WORKBENCH_FIND_LIMIT: usize = 100;
 
-const SECTIONS: &[&str] = &["input", "scripts", "outputs", "logs", "metadata"];
+pub const SECTIONS: &[&str] = &["input", "scripts", "outputs", "logs", "metadata"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkbenchMcpOptions {
@@ -91,7 +91,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_list",
             description:
-                "List a workbench, section, or subdirectory through the NoKV namespace. Not recursive.",
+                "List a workbench, section, or subdirectory through the NoKV namespace. Not recursive. Entries written outside the standard sections by other NoKV clients are returned with section null; such entries cannot be addressed by the other workbench tools.",
             parameters: json!({
                 "type": "object",
                 "required": ["id"],
@@ -142,7 +142,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_grep",
             description:
-                "Search workbench file bodies for a case-insensitive literal substring. This is not regex grep.",
+                "Search workbench file bodies for a case-insensitive literal substring. This is not regex grep. Matches in files written outside the standard sections by other NoKV clients are returned with section null; such files cannot be addressed by the other workbench tools.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "pattern", "recursive"],
@@ -699,6 +699,27 @@ fn path_scope(
     id: &str,
     path: &str,
 ) -> Result<WorkbenchPathScope, WorkbenchToolError> {
+    scoped_path(options, id, path, false)
+}
+
+/// Scope for paths returned by enumeration (list entries, grep matches).
+/// Other NoKV clients share the namespace and may have written entries
+/// outside the standard sections; those are surfaced with `section: null`
+/// and a workbench-relative path instead of failing the whole call.
+fn enumerated_path_scope(
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    path: &str,
+) -> Result<WorkbenchPathScope, WorkbenchToolError> {
+    scoped_path(options, id, path, true)
+}
+
+fn scoped_path(
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    path: &str,
+    tolerate_non_section: bool,
+) -> Result<WorkbenchPathScope, WorkbenchToolError> {
     let base = workbench_path(options, id);
     if path == base {
         return Ok(WorkbenchPathScope {
@@ -711,15 +732,20 @@ fn path_scope(
     let rest = path.strip_prefix(&prefix).ok_or_else(|| {
         WorkbenchToolError::new(format!("path {path} is outside workbench {base}"))
     })?;
+    let first = rest.split('/').next().unwrap_or(rest);
+    if let Err(err) = validate_section(first) {
+        if !tolerate_non_section {
+            return Err(err);
+        }
+        return Ok(WorkbenchPathScope {
+            path: path.to_owned(),
+            section: None,
+            relative_path: Some(rest.to_owned()),
+        });
+    }
     let (section, relative_path) = match rest.split_once('/') {
-        Some((section, relative_path)) => {
-            validate_section(section)?;
-            (section.to_owned(), Some(relative_path.to_owned()))
-        }
-        None => {
-            validate_section(rest)?;
-            (rest.to_owned(), None)
-        }
+        Some((section, relative_path)) => (section.to_owned(), Some(relative_path.to_owned())),
+        None => (rest.to_owned(), None),
     };
     Ok(WorkbenchPathScope {
         path: path.to_owned(),
@@ -737,7 +763,7 @@ fn compact_list_entry(
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkbenchToolError::new("list entry missing path"))?;
-    let scope = path_scope(options, id, path)?;
+    let scope = enumerated_path_scope(options, id, path)?;
     Ok(json!({
         "name": entry.get("name").cloned().unwrap_or(Value::Null),
         "path": scope.path,
@@ -778,7 +804,7 @@ fn compact_grep_match(
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkbenchToolError::new("grep match missing path"))?;
-    let scope = path_scope(options, id, path)?;
+    let scope = enumerated_path_scope(options, id, path)?;
     Ok(json!({
         "path": scope.path,
         "section": scope.section,
@@ -1316,5 +1342,44 @@ mod tests {
         assert!(validate_workbench_id("spedas-task-001").is_ok());
         assert!(validate_workbench_id("_bad").is_err());
         assert!(validate_workbench_id("bad/path").is_err());
+    }
+
+    #[test]
+    fn scopes_enumerated_paths_outside_sections_as_null_section() {
+        let options = WorkbenchMcpOptions {
+            root: "/workbenches".to_owned(),
+            max_bytes: DEFAULT_WORKBENCH_MAX_BYTES,
+            uid: 1000,
+            gid: 1000,
+        };
+        let scope = |path| enumerated_path_scope(&options, "wb", path).unwrap();
+        assert_eq!(
+            scope("/workbenches/wb/outputs/plot.png"),
+            WorkbenchPathScope {
+                path: "/workbenches/wb/outputs/plot.png".to_owned(),
+                section: Some("outputs".to_owned()),
+                relative_path: Some("plot.png".to_owned()),
+            }
+        );
+        assert_eq!(
+            scope("/workbenches/wb/note.txt"),
+            WorkbenchPathScope {
+                path: "/workbenches/wb/note.txt".to_owned(),
+                section: None,
+                relative_path: Some("note.txt".to_owned()),
+            }
+        );
+        assert_eq!(
+            scope("/workbenches/wb/junk/scratch.txt"),
+            WorkbenchPathScope {
+                path: "/workbenches/wb/junk/scratch.txt".to_owned(),
+                section: None,
+                relative_path: Some("junk/scratch.txt".to_owned()),
+            }
+        );
+        assert!(enumerated_path_scope(&options, "wb", "/elsewhere/file").is_err());
+        // The strict variant used for request targets keeps rejecting.
+        assert!(path_scope(&options, "wb", "/workbenches/wb/junk/scratch.txt").is_err());
+        assert!(path_scope(&options, "wb", "/workbenches/wb/note.txt").is_err());
     }
 }

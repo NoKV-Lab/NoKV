@@ -3584,6 +3584,195 @@ mod tests {
     }
 
     #[test]
+    fn workbench_mcp_list_and_grep_tolerate_out_of_band_entries() {
+        let object_dir = tempdir().unwrap();
+        let object_root = object_dir.path().join("objects");
+        let addr = spawn_test_server_with_object_config(ObjectStoreConfig::tiered_local(
+            object_root.clone(),
+            fake_s3_options(),
+        ));
+        let connect = || {
+            let store =
+                LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+            NoKvFsClient::connect(addr, store)
+        };
+        let run_requests = |requests: Vec<serde_json::Value>| -> Vec<serde_json::Value> {
+            let reqs = requests
+                .into_iter()
+                .map(|request| serde_json::to_string(&request).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            let reader = std::io::Cursor::new(reqs);
+            let mut writer = Vec::new();
+            run_mcp_stream_with_options(
+                connect(),
+                workbench_mcp_options(),
+                DEFAULT_UID,
+                DEFAULT_GID,
+                reader,
+                &mut writer,
+            )
+            .unwrap();
+            String::from_utf8(writer)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+
+        let setup = run_requests(vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_create",
+                    "arguments": {"id": "spedas-task-003"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_put_file",
+                    "arguments": {
+                        "id": "spedas-task-003",
+                        "section": "outputs",
+                        "path": "spectrum.csv",
+                        "text": "freq,power\n1,2\n",
+                        "content_type": "text/csv"
+                    }
+                }
+            }),
+        ]);
+        for (index, response) in setup.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "setup response {index}: {response}"
+            );
+        }
+
+        let out_of_band_metadata = |name: &str| ArtifactMetadata {
+            producer: "outside-writer".to_owned(),
+            digest_uri: "sha256:demo".to_owned(),
+            content_type: "text/plain".to_owned(),
+            manifest_id: name.to_owned(),
+            mode: DEFAULT_MODE_FILE,
+            uid: DEFAULT_UID,
+            gid: DEFAULT_GID,
+        };
+        let out_of_band = connect();
+        out_of_band
+            .put_artifact(
+                "/workbenches/spedas-task-003/note.txt",
+                b"scratch note".to_vec(),
+                out_of_band_metadata("note.txt"),
+            )
+            .unwrap();
+        out_of_band
+            .metadata()
+            .mkdir(
+                "/workbenches/spedas-task-003/junk",
+                DEFAULT_MODE_DIR,
+                DEFAULT_UID,
+                DEFAULT_GID,
+            )
+            .unwrap();
+        out_of_band
+            .put_artifact(
+                "/workbenches/spedas-task-003/junk/scratch.txt",
+                b"freq rogue\n".to_vec(),
+                out_of_band_metadata("junk/scratch.txt"),
+            )
+            .unwrap();
+
+        let responses = run_requests(vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_list",
+                    "arguments": {"id": "spedas-task-003"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_grep",
+                    "arguments": {
+                        "id": "spedas-task-003",
+                        "pattern": "freq",
+                        "recursive": true
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_stat",
+                    "arguments": {
+                        "id": "spedas-task-003",
+                        "path": "junk/scratch.txt"
+                    }
+                }
+            }),
+        ]);
+        for (index, response) in responses.iter().take(2).enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        // Out-of-band entries are enumerable but stay unaddressable: request
+        // targets keep the strict section validation.
+        assert_eq!(
+            responses[2]["result"]["isError"], true,
+            "stat of out-of-band entry must keep failing: {}",
+            responses[2]
+        );
+
+        let entries = responses[0]["result"]["structuredContent"]["entries"]
+            .as_array()
+            .unwrap();
+        let entry = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("missing list entry {name}: {entries:?}"))
+        };
+        for section in workbench_mcp::SECTIONS {
+            assert_eq!(entry(section)["section"], *section);
+        }
+        assert_eq!(entry("note.txt")["section"], serde_json::Value::Null);
+        assert_eq!(entry("note.txt")["relative_path"], "note.txt");
+        assert_eq!(entry("junk")["section"], serde_json::Value::Null);
+        assert_eq!(entry("junk")["relative_path"], "junk");
+
+        let matches = responses[1]["result"]["structuredContent"]["matches"]
+            .as_array()
+            .unwrap();
+        let match_for = |path: &str| {
+            matches
+                .iter()
+                .find(|match_| match_["path"] == path)
+                .unwrap_or_else(|| panic!("missing grep match {path}: {matches:?}"))
+        };
+        let section_match = match_for("/workbenches/spedas-task-003/outputs/spectrum.csv");
+        assert_eq!(section_match["section"], "outputs");
+        assert_eq!(section_match["relative_path"], "spectrum.csv");
+        let alien_match = match_for("/workbenches/spedas-task-003/junk/scratch.txt");
+        assert_eq!(alien_match["section"], serde_json::Value::Null);
+        assert_eq!(alien_match["relative_path"], "junk/scratch.txt");
+    }
+
+    #[test]
     fn workbench_mcp_put_file_ignores_empty_unused_payload_variant() {
         let responses = run_workbench_mcp_requests(vec![
             serde_json::json!({
