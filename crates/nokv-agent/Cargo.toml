@@ -10,9 +10,11 @@ homepage.workspace = true
 description = "NoKV agent runtime and Holt-backed index primitives."
 
 [dependencies]
+base64.workspace = true
 holt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

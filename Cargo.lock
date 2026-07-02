@@ -1391,9 +1391,11 @@ dependencies = [
 name = "nokv-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "holt",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
 ]
 

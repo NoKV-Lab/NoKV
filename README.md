@@ -154,6 +154,7 @@ operations stay in the Rust SDK, the `nokv` CLI, and the FUSE mount.
 
 ```bash
 cargo run --release -p nokv-agent --bin nokv-agent -- mcp
+cargo run --release -p nokv-agent --bin nokv-agent -- mcp --profile workbench
 ```
 
 To configure it in an MCP client (e.g. Cursor, VS Code, Claude Desktop):
@@ -168,9 +169,11 @@ To configure it in an MCP client (e.g. Cursor, VS Code, Claude Desktop):
 ```
 
 Use `--store` to choose where the local agent store is kept and `--agent` to
-choose the default agent identity. **v1 constraints:** stdio transport only
-(no HTTP/SSE); read-only — the seven existing agent tools only, no write or
-publish tools; no DFS namespace adapter.
+scope records by agent identity. The workbench profile is also agent-native:
+it writes task files, manifests, and logical snapshot records into the same
+Holt-backed `AgentFs` store rather than into the NoKV DFS namespace.
+**v1 constraints:** stdio transport only (no HTTP/SSE); no DFS namespace
+adapter.
 
 ## 📊 Measured Evidence
 

@@ -10,6 +10,10 @@ event model, idempotent event ingestion, secondary indexes, coverage state,
 typed query execution, and the agent-native fs-shaped tool surface. The durable
 backend is Holt through `HoltAgentStore`.
 
+This crate also owns agent-native workbench tools. Those tools use `AgentFs`
+records in the Holt-backed agent store; they are not NoKV DFS workbench
+adapters.
+
 This crate does not expose NoKV DFS namespace tools. It must not depend on
 `nokv-meta`, `nokv-object`, `nokv-client`, `nokv-protocol`, `nokv-control`, or
 `nokv-fuse`.
@@ -25,8 +29,11 @@ This crate does not expose NoKV DFS namespace tools. It must not depend on
 - `AgentFs`, agent-native file/body nodes, catalog registrations, and
   `ls`/`stat`/`catalog`/`read`/`aggregate`/`find`/`grep` tools over those
   records.
+- Agent-native workbench MCP tools, rooted in `AgentFs`, for task-scoped
+  input/scripts/outputs/logs/metadata files and logical commit/snapshot
+  records.
 - The `nokv-agent` CLI, including the stdio MCP entry point for the
-  agent-native tool surface.
+  agent-native and workbench tool profiles.
 
 `nokv-agent` must not own:
 
@@ -70,9 +77,12 @@ as Lingtai's SQLite `logs/log.sqlite` sidecar while preserving `events.jsonl`
 as source of truth and fallback.
 
 The stdio MCP server also lives in this crate. `run_mcp_stream` accepts an
-`AgentFs<S>` and serves the same seven tool definitions through JSON-RPC. The
-`nokv-agent mcp` command opens a local Holt-backed agent store and runs that
-server. Product crates must not add NoKV DFS namespace adapters here.
+`AgentFs<S>` and serves the base seven tool definitions through JSON-RPC. The
+generic `run_mcp_surface_stream` entry point serves alternate agent-native
+surfaces, including the workbench profile. `nokv-agent mcp` opens a local
+Holt-backed agent store and runs the base tool profile; `nokv-agent mcp
+--profile workbench` serves the workbench tools over the same store. Product
+crates must not add NoKV DFS namespace adapters here.
 
 Durable key layout is private to `nokv-agent`:
 
@@ -127,6 +137,7 @@ For Lingtai-style event indexing, preserve these invariants:
 | Event index implementation | `crates/nokv-agent/src/index.rs` |
 | Agent-native fs-shaped model | `crates/nokv-agent/src/fs.rs`, `crates/nokv-agent/src/model.rs` |
 | Agent tool surface | `crates/nokv-agent/src/tool.rs` |
+| Agent-native workbench surface | `crates/nokv-agent/src/workbench.rs` |
 | MCP stdio server | `crates/nokv-agent/src/mcp.rs` |
 | CLI binary | `crates/nokv-agent/src/bin/nokv-agent.rs` |
 | Private durable key layout | `crates/nokv-agent/src/key.rs` |

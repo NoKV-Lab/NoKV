@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{agent_tool_definitions, execute_agent_tool, AgentFs, AgentStore};
+use crate::{agent_tool_definitions, execute_agent_tool, AgentFs, AgentStore, AgentToolDefinition};
 
 #[derive(Deserialize)]
 struct JsonRpcRequest {
@@ -27,6 +27,25 @@ struct CallToolParams {
     arguments: Option<Value>,
 }
 
+pub trait McpToolSurface {
+    fn tool_definitions(&self) -> Vec<AgentToolDefinition>;
+
+    fn execute_tool(&self, name: &str, args: &Value) -> Result<Value, String>;
+}
+
+impl<S> McpToolSurface for AgentFs<S>
+where
+    S: AgentStore,
+{
+    fn tool_definitions(&self) -> Vec<AgentToolDefinition> {
+        agent_tool_definitions()
+    }
+
+    fn execute_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
+        execute_agent_tool(self, name, args).map_err(|err| err.to_string())
+    }
+}
+
 pub fn run_mcp<S>(fs: &AgentFs<S>) -> io::Result<()>
 where
     S: AgentStore,
@@ -36,19 +55,33 @@ where
     run_mcp_stream(fs, stdin.lock(), stdout.lock())
 }
 
+pub fn run_mcp_surface(surface: &impl McpToolSurface) -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    run_mcp_surface_stream(surface, stdin.lock(), stdout.lock())
+}
+
 pub fn run_mcp_stream<S>(
     fs: &AgentFs<S>,
-    mut reader: impl BufRead,
-    mut writer: impl Write,
+    reader: impl BufRead,
+    writer: impl Write,
 ) -> io::Result<()>
 where
     S: AgentStore,
 {
+    run_mcp_surface_stream(fs, reader, writer)
+}
+
+pub fn run_mcp_surface_stream(
+    surface: &impl McpToolSurface,
+    mut reader: impl BufRead,
+    mut writer: impl Write,
+) -> io::Result<()> {
     let mut line = String::new();
     while reader.read_line(&mut line)? > 0 {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            let maybe_response = handle_line(fs, trimmed);
+            let maybe_response = handle_line(surface, trimmed);
             if let Some(response) = maybe_response {
                 serde_json::to_writer(&mut writer, &response)?;
                 writer.write_all(b"\n")?;
@@ -60,10 +93,7 @@ where
     Ok(())
 }
 
-fn handle_line<S>(fs: &AgentFs<S>, trimmed: &str) -> Option<Value>
-where
-    S: AgentStore,
-{
+fn handle_line(surface: &(impl McpToolSurface + ?Sized), trimmed: &str) -> Option<Value> {
     match serde_json::from_str::<Value>(trimmed) {
         Err(_) => Some(err_response(None, -32700, "Parse error")),
         Ok(raw) => {
@@ -79,16 +109,13 @@ where
             }
             match serde_json::from_value::<JsonRpcRequest>(raw) {
                 Err(_) => Some(err_response(None, -32600, "Invalid Request")),
-                Ok(req) => handle_request(fs, req),
+                Ok(req) => handle_request(surface, req),
             }
         }
     }
 }
 
-fn handle_request<S>(fs: &AgentFs<S>, req: JsonRpcRequest) -> Option<Value>
-where
-    S: AgentStore,
-{
+fn handle_request(surface: &(impl McpToolSurface + ?Sized), req: JsonRpcRequest) -> Option<Value> {
     let id = req.id.clone().flatten();
     if req.jsonrpc.as_deref() != Some("2.0") {
         return Some(err_response(
@@ -106,7 +133,8 @@ where
         "initialize" => initialize_result(req.params.as_ref()),
         "initialized" | "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
-            "tools": agent_tool_definitions()
+            "tools": surface
+                .tool_definitions()
                 .into_iter()
                 .map(|tool| {
                     json!({
@@ -117,7 +145,7 @@ where
                 })
                 .collect::<Vec<_>>()
         })),
-        "tools/call" => call_tool_result(fs, req.params),
+        "tools/call" => call_tool_result(surface, req.params),
         other => Err((-32601_i64, format!("Method not found: {other}"))),
     };
 
@@ -132,41 +160,32 @@ where
 }
 
 fn initialize_result(params: Option<&Value>) -> Result<Value, (i64, String)> {
-    const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26"];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+        &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
     let requested = params
         .and_then(|p| p.get("protocolVersion"))
         .and_then(Value::as_str);
-    match requested {
-        Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => Ok(json!({
-            "protocolVersion": v,
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "nokv-mcp", "version": "0.1.0" }
-        })),
-        Some(v) => Err((
-            -32602_i64,
-            format!(
-                "unsupported protocol version {v}; supported: {}",
-                SUPPORTED_PROTOCOL_VERSIONS.join(", ")
-            ),
-        )),
-        None => Ok(json!({
-            "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "nokv-mcp", "version": "0.1.0" }
-        })),
-    }
+    let negotiated = match requested {
+        Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => version,
+        _ => SUPPORTED_PROTOCOL_VERSIONS[0],
+    };
+    Ok(json!({
+        "protocolVersion": negotiated,
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "nokv-mcp", "version": "0.1.0" }
+    }))
 }
 
-fn call_tool_result<S>(fs: &AgentFs<S>, params: Option<Value>) -> Result<Value, (i64, String)>
-where
-    S: AgentStore,
-{
+fn call_tool_result(
+    surface: &(impl McpToolSurface + ?Sized),
+    params: Option<Value>,
+) -> Result<Value, (i64, String)> {
     let params = params.unwrap_or_else(|| json!({}));
     match serde_json::from_value::<CallToolParams>(params) {
         Err(e) => Err((-32602_i64, format!("Invalid params: {e}"))),
         Ok(call) => {
             let args = call.arguments.unwrap_or_else(|| json!({}));
-            match execute_agent_tool(fs, &call.name, &args) {
+            match surface.execute_tool(&call.name, &args) {
                 Ok(val) => Ok(json!({
                     "content": [{
                         "type": "text",
@@ -335,23 +354,23 @@ mod tests {
     }
 
     #[test]
-    fn initialize_version_handling_is_explicit() {
+    fn initialize_negotiates_protocol_versions() {
         assert_eq!(
             request(
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#
-            )["error"]["code"],
-            -32602
+            )["result"]["protocolVersion"],
+            "2025-11-25"
         );
         assert_eq!(
             request(
-                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#
             )["result"]["protocolVersion"],
-            "2025-03-26"
+            "2025-06-18"
         );
         assert_eq!(
             request(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)["result"]
                 ["protocolVersion"],
-            "2024-11-05"
+            "2025-11-25"
         );
     }
 }
