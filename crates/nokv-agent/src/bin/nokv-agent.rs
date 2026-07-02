@@ -212,9 +212,29 @@ fn parse_usize(raw: &str, field: &'static str) -> Result<usize, CliError> {
     })
 }
 
+// Emitted on stderr only: stdout carries the JSON-RPC stream. The store path
+// must already be canonicalized so hosts see where the cwd-relative default
+// actually landed.
+fn mcp_banner(options: &McpOptions, store: &std::path::Path) -> String {
+    let profile = match options.profile {
+        McpProfile::Agent => "agent",
+        McpProfile::Workbench => "workbench",
+    };
+    let mut banner = format!(
+        "nokv-agent mcp: backend=embedded-holt profile={profile} store={}",
+        store.display()
+    );
+    if options.profile == McpProfile::Workbench {
+        banner.push_str(&format!(" workbench-root={}", options.workbench_root));
+    }
+    banner
+}
+
 fn run_mcp(config: &Config, options: &McpOptions) -> Result<(), CliError> {
     fs::create_dir_all(&config.store).map_err(from_io)?;
     let store = HoltAgentStore::open(&config.store).map_err(from_agent)?;
+    let store_path = fs::canonicalize(&config.store).map_err(from_io)?;
+    eprintln!("{}", mcp_banner(options, &store_path));
     let agent_fs = AgentFs::new(config.agent.clone(), store);
     agent_fs.bootstrap().map_err(from_agent)?;
     match options.profile {
@@ -316,6 +336,26 @@ mod tests {
                 workbench_root: "/agents/work".to_owned(),
                 workbench_max_bytes: 1024,
             })
+        );
+    }
+
+    #[test]
+    fn mcp_banner_reports_backend_profile_and_store() {
+        let store = std::path::Path::new("/abs/store");
+        assert_eq!(
+            mcp_banner(&McpOptions::default(), store),
+            "nokv-agent mcp: backend=embedded-holt profile=agent store=/abs/store"
+        );
+
+        let options = McpOptions {
+            profile: McpProfile::Workbench,
+            workbench_root: "/agents/work".to_owned(),
+            workbench_max_bytes: 1024,
+        };
+        assert_eq!(
+            mcp_banner(&options, store),
+            "nokv-agent mcp: backend=embedded-holt profile=workbench \
+             store=/abs/store workbench-root=/agents/work"
         );
     }
 

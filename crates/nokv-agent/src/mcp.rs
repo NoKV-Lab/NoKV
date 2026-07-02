@@ -173,7 +173,10 @@ fn initialize_result(params: Option<&Value>) -> Result<Value, (i64, String)> {
     Ok(json!({
         "protocolVersion": negotiated,
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "nokv-mcp", "version": "0.1.0" }
+        // This name must stay distinct from the DFS-backed `nokv mcp` server
+        // ("nokv-mcp"): serverInfo.name is the only handshake field clients
+        // can rely on to tell the two backends apart.
+        "serverInfo": { "name": "nokv-agent-mcp", "version": env!("CARGO_PKG_VERSION") }
     }))
 }
 
@@ -252,7 +255,13 @@ mod tests {
         let resp1: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(resp1["id"], 1);
         assert_eq!(resp1["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(resp1["result"]["serverInfo"]["name"], "nokv-mcp");
+        // Must differ from the DFS-backed `nokv mcp` server ("nokv-mcp") so
+        // clients can tell the two backends apart at handshake time.
+        assert_eq!(resp1["result"]["serverInfo"]["name"], "nokv-agent-mcp");
+        assert_eq!(
+            resp1["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
 
         let resp2: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         let tools = resp2["result"]["tools"].as_array().unwrap();
