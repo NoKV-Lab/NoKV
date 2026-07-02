@@ -115,7 +115,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         },
         AgentToolDefinition {
             name: "workbench_list",
-            description: "List a workbench, section, or subdirectory.",
+            description: "List a workbench, section, or subdirectory. Not recursive. Entries written outside the standard sections through the embedded agent store are returned with section null and cannot be addressed by the other workbench tools.",
             parameters: json!({
                 "type": "object",
                 "required": ["id"],
@@ -163,7 +163,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         },
         AgentToolDefinition {
             name: "workbench_grep",
-            description: "Search workbench file bodies for a case-insensitive literal substring.",
+            description: "Search workbench file bodies for a case-insensitive literal substring. This is not regex grep. Matches in files written outside the standard sections through the embedded agent store are returned with section null and cannot be addressed by the other workbench tools.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "pattern", "recursive"],
@@ -381,7 +381,18 @@ fn shape_read_tool_result(
             "relative_path": scope.relative_path,
             "path": scope.path,
             "entry_count": result.get("entry_count").cloned().unwrap_or(Value::Null),
-            "entries": result.get("entries").cloned().unwrap_or_else(|| json!([])),
+            "entries": result
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| compact_list_entry(options, id, entry))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .map(Value::Array)
+                .unwrap_or_else(|| json!([])),
             "next_cursor": result.get("next_cursor").cloned().unwrap_or(Value::Null),
             "truncated": result.get("truncated").cloned().unwrap_or(Value::Bool(false)),
         })),
@@ -420,7 +431,18 @@ fn shape_read_tool_result(
             "path": scope.path,
             "pattern": result.get("pattern").cloned().unwrap_or(Value::Null),
             "recursive": result.get("recursive").cloned().unwrap_or(Value::Bool(false)),
-            "matches": result.get("matches").cloned().unwrap_or_else(|| json!([])),
+            "matches": result
+                .get("matches")
+                .and_then(Value::as_array)
+                .map(|matches| {
+                    matches
+                        .iter()
+                        .map(|match_| compact_grep_match(options, id, match_))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .map(Value::Array)
+                .unwrap_or_else(|| json!([])),
             "files_scanned": result.get("files_scanned").cloned().unwrap_or(Value::Null),
             "next_cursor": result.get("next_cursor").cloned().unwrap_or(Value::Null),
             "truncated": result.get("truncated").cloned().unwrap_or(Value::Bool(false)),
@@ -923,6 +945,28 @@ fn path_scope(
     id: &str,
     path: &str,
 ) -> Result<WorkbenchPathScope, WorkbenchToolError> {
+    scoped_path(options, id, path, false)
+}
+
+/// Scope for paths returned by enumeration (list entries, grep matches).
+/// Other embedders of the agent store share the namespace and may have
+/// written entries outside the standard sections; those are surfaced with
+/// `section: null` and a workbench-relative path instead of failing the
+/// whole call.
+fn enumerated_path_scope(
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    path: &str,
+) -> Result<WorkbenchPathScope, WorkbenchToolError> {
+    scoped_path(options, id, path, true)
+}
+
+fn scoped_path(
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    path: &str,
+    tolerate_non_section: bool,
+) -> Result<WorkbenchPathScope, WorkbenchToolError> {
     let base = workbench_path(options, id);
     if path == base {
         return Ok(WorkbenchPathScope {
@@ -937,21 +981,66 @@ fn path_scope(
             "path escaped workbench root: {path}"
         )));
     };
+    let first = rest.split('/').next().unwrap_or(rest);
+    if let Err(err) = validate_section(first) {
+        if !tolerate_non_section {
+            return Err(err);
+        }
+        return Ok(WorkbenchPathScope {
+            path: path.to_owned(),
+            section: None,
+            relative_path: Some(rest.to_owned()),
+        });
+    }
     let (section, relative_path) = match rest.split_once('/') {
-        Some((section, relative_path)) => {
-            validate_section(section)?;
-            (section.to_owned(), Some(relative_path.to_owned()))
-        }
-        None => {
-            validate_section(rest)?;
-            (rest.to_owned(), None)
-        }
+        Some((section, relative_path)) => (section.to_owned(), Some(relative_path.to_owned())),
+        None => (rest.to_owned(), None),
     };
     Ok(WorkbenchPathScope {
         path: path.to_owned(),
         section: Some(section),
         relative_path,
     })
+}
+
+fn compact_list_entry(
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    entry: &Value,
+) -> Result<Value, WorkbenchToolError> {
+    let path = entry
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkbenchToolError::new("list entry missing path"))?;
+    let scope = enumerated_path_scope(options, id, path)?;
+    Ok(json!({
+        "name": entry.get("name").cloned().unwrap_or(Value::Null),
+        "path": scope.path,
+        "section": scope.section,
+        "relative_path": scope.relative_path,
+        "kind": entry.get("kind").cloned().unwrap_or(Value::Null),
+        "size_bytes": entry.get("size_bytes").cloned().unwrap_or(Value::Null),
+        "entry_count": entry.get("entry_count").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+fn compact_grep_match(
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    match_: &Value,
+) -> Result<Value, WorkbenchToolError> {
+    let path = match_
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkbenchToolError::new("grep match missing path"))?;
+    let scope = enumerated_path_scope(options, id, path)?;
+    Ok(json!({
+        "path": scope.path,
+        "section": scope.section,
+        "relative_path": scope.relative_path,
+        "line_number": match_.get("line_number").cloned().unwrap_or(Value::Null),
+        "snippet": match_.get("snippet").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn payload_bytes(
@@ -1199,5 +1288,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read["path"], "/workbenches/task-1/input/sub/leaf.txt");
+    }
+
+    #[test]
+    fn list_and_grep_tolerate_out_of_band_entries() {
+        let (fs, options) = surface();
+        execute_tool(&fs, &options, "workbench_create", &json!({"id":"task-oob"})).unwrap();
+        execute_tool(
+            &fs,
+            &options,
+            "workbench_put_file",
+            &json!({
+                "id":"task-oob",
+                "section":"outputs",
+                "path":"spectrum.csv",
+                "text":"freq,power\n1,2\n",
+                "content_type":"text/csv"
+            }),
+        )
+        .unwrap();
+        // Out-of-band writes through the embedded API, outside the sections.
+        fs.put_file(
+            "/workbenches/task-oob/note.txt",
+            b"scratch note".to_vec(),
+            None,
+        )
+        .unwrap();
+        fs.put_file(
+            "/workbenches/task-oob/junk/scratch.txt",
+            b"freq rogue\n".to_vec(),
+            None,
+        )
+        .unwrap();
+
+        let list =
+            execute_tool(&fs, &options, "workbench_list", &json!({"id":"task-oob"})).unwrap();
+        let entries = list["entries"].as_array().unwrap();
+        let entry = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("missing list entry {name}: {entries:?}"))
+        };
+        for section in SECTIONS {
+            assert_eq!(entry(section)["section"], *section);
+        }
+        assert_eq!(entry("note.txt")["section"], Value::Null);
+        assert_eq!(entry("note.txt")["relative_path"], "note.txt");
+        assert_eq!(entry("junk")["section"], Value::Null);
+        assert_eq!(entry("junk")["relative_path"], "junk");
+
+        let grep = execute_tool(
+            &fs,
+            &options,
+            "workbench_grep",
+            &json!({"id":"task-oob","pattern":"freq","recursive":true}),
+        )
+        .unwrap();
+        let matches = grep["matches"].as_array().unwrap();
+        let match_for = |path: &str| {
+            matches
+                .iter()
+                .find(|match_| match_["path"] == path)
+                .unwrap_or_else(|| panic!("missing grep match {path}: {matches:?}"))
+        };
+        let section_match = match_for("/workbenches/task-oob/outputs/spectrum.csv");
+        assert_eq!(section_match["section"], "outputs");
+        assert_eq!(section_match["relative_path"], "spectrum.csv");
+        let alien_match = match_for("/workbenches/task-oob/junk/scratch.txt");
+        assert_eq!(alien_match["section"], Value::Null);
+        assert_eq!(alien_match["relative_path"], "junk/scratch.txt");
+
+        // Request targets stay strict: out-of-band entries are unaddressable.
+        assert!(execute_tool(
+            &fs,
+            &options,
+            "workbench_stat",
+            &json!({"id":"task-oob","section":"junk","path":"scratch.txt"})
+        )
+        .is_err());
     }
 }
