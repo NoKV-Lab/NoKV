@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
-use crate::fs::{normalize_path, path_name};
+use crate::fs::{normalize_path, parent_path, path_name};
 use crate::{
     AgentFs, AgentIndexError, AgentIndexField, AgentIndexResult, AgentIndexRow, AgentNode,
     AgentNodeKind, AgentPredicateOp, AgentPredicateValue, AgentStore,
@@ -21,113 +21,9 @@ const MAX_GREP_LIMIT: usize = 100;
 pub use crate::AgentToolDefinition;
 
 pub fn agent_tool_definitions() -> Vec<AgentToolDefinition> {
-    vec![
-        AgentToolDefinition {
-            name: "ls",
-            description: "List direct children in the agent-native filesystem-shaped store.",
-            parameters: json!({
-                "type": "object",
-                "required": ["path"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "cursor": {"type": ["string", "null"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE_LIMIT}
-                },
-                "additionalProperties": false
-            }),
-        },
-        AgentToolDefinition {
-            name: "stat",
-            description: "Inspect one agent-native path and its query catalog/indexed values.",
-            parameters: json!({
-                "type": "object",
-                "required": ["path"],
-                "properties": {"path": {"type": "string"}},
-                "additionalProperties": false
-            }),
-        },
-        AgentToolDefinition {
-            name: "catalog",
-            description: "Discover field ids for find predicates, projections, sort, facets, and aggregate fields.",
-            parameters: json!({
-                "type": "object",
-                "required": ["path"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "field_prefix": {"type": ["string", "null"]},
-                    "include_facets": {"type": "boolean"}
-                },
-                "additionalProperties": false
-            }),
-        },
-        AgentToolDefinition {
-            name: "read",
-            description: "Read file body content from the agent-native store.",
-            parameters: json!({
-                "type": "object",
-                "required": ["path"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "format": {"type": "string", "enum": ["structured", "bytes"]},
-                    "cursor": {"type": ["string", "null"]},
-                    "offset": {"type": "integer", "minimum": 0},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE_LIMIT}
-                },
-                "additionalProperties": false
-            }),
-        },
-        AgentToolDefinition {
-            name: "aggregate",
-            description: "Compute summary rows using catalog field ids: count, sum, avg, min, max, group, filter, and sort.",
-            parameters: json!({
-                "type": "object",
-                "required": ["path", "measures"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "predicates": {"type": "array", "items": {"type": "object"}},
-                    "group_by": {"type": "array", "items": {"type": "string"}},
-                    "measures": {"type": "array", "items": {"type": "object"}},
-                    "sort": {"type": "array", "items": {"type": "object"}},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_AGGREGATE_LIMIT}
-                },
-                "additionalProperties": false
-            }),
-        },
-        AgentToolDefinition {
-            name: "find",
-            description: "Search agent-native indexed paths with predicates, projection fields, sort, and facets.",
-            parameters: json!({
-                "type": "object",
-                "required": ["path"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "predicates": {"type": "array", "items": {"type": "object"}},
-                    "fields": {"type": "array", "items": {"type": "string"}},
-                    "facets": {"type": "array", "items": {"type": "string"}},
-                    "sort": {"type": "array", "items": {"type": "object"}},
-                    "cursor": {"type": ["string", "null"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_FIND_LIMIT}
-                },
-                "additionalProperties": false
-            }),
-        },
-        AgentToolDefinition {
-            name: "grep",
-            description: "Search text files for a case-insensitive literal substring and return matching lines.",
-            parameters: json!({
-                "type": "object",
-                "required": ["path", "pattern", "recursive"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "pattern": {"type": "string"},
-                    "recursive": {"type": "boolean"},
-                    "cursor": {"type": ["string", "null"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_GREP_LIMIT}
-                },
-                "additionalProperties": false
-            }),
-        },
-    ]
+    // Shared with the crate-root DFS dispatcher so both backends present
+    // byte-identical tool names, descriptions, and parameter schemas.
+    crate::agent_tool_definitions()
 }
 
 pub fn execute_agent_tool<S>(fs: &AgentFs<S>, name: &str, args: &Value) -> AgentIndexResult<Value>
@@ -154,12 +50,22 @@ where
 {
     let path = required_string_arg(args, "path")?;
     let limit = optional_usize_arg(args, "limit", MAX_PAGE_LIMIT)?.unwrap_or(DEFAULT_PAGE_LIMIT);
-    let cursor = optional_string_arg(args, "cursor")?.and_then(hex_cursor);
+    let cursor = optional_string_arg(args, "cursor")?
+        .map(|raw| {
+            hex_cursor(&raw)
+                .ok_or_else(|| AgentIndexError::InvalidArgument(format!("invalid cursor: {raw}")))
+        })
+        .transpose()?;
+    let entry_count = fs.list(path, None, usize::MAX)?.0.len();
     let (entries, next_cursor, truncated) = fs.list(path, cursor.as_deref(), limit)?;
+    let entries = entries
+        .iter()
+        .map(|node| list_entry_json(fs, node))
+        .collect::<AgentIndexResult<Vec<_>>>()?;
     Ok(json!({
         "path": normalize_path(path)?,
-        "entry_count": entries.len(),
-        "entries": entries.iter().map(list_entry_json).collect::<Vec<_>>(),
+        "entry_count": entry_count,
+        "entries": entries,
         "next_cursor": next_cursor.as_deref().map(hex_encode),
         "truncated": truncated,
     }))
@@ -173,10 +79,34 @@ where
     let node = fs
         .node(path)?
         .ok_or_else(|| AgentIndexError::NotFound(path.to_owned()))?;
-    let rows = fs.index_rows(path).unwrap_or_default();
+    let row = indexed_row_for_path(fs, path)?;
     Ok(json!({
-        "card": card_json(&node, &fs.catalog(path).unwrap_or_default(), rows.first()),
+        "card": card_json(&node, &fs.catalog(path).unwrap_or_default(), row.as_ref()),
     }))
+}
+
+/// Find the index row registered for exactly `path`, searching every
+/// registration root along the ancestor chain (rows live under the root
+/// they were registered with, not under their own path).
+fn indexed_row_for_path<S>(fs: &AgentFs<S>, path: &str) -> AgentIndexResult<Option<AgentIndexRow>>
+where
+    S: AgentStore,
+{
+    let normalized = normalize_path(path)?;
+    let mut ancestor = normalized.clone();
+    loop {
+        if let Some(row) = fs
+            .index_rows(&ancestor)?
+            .into_iter()
+            .find(|row| row.path == normalized)
+        {
+            return Ok(Some(row));
+        }
+        if ancestor == "/" {
+            return Ok(None);
+        }
+        ancestor = parent_path(&ancestor)?;
+    }
 }
 
 fn execute_catalog<S>(fs: &AgentFs<S>, args: &Value) -> AgentIndexResult<Value>
@@ -190,12 +120,55 @@ where
     let rows = fs.index_rows(path)?;
     let catalog = catalog_json(&fields, &rows, field_prefix.as_deref(), include_facets);
     let catalog_empty = fields.is_empty();
+    let child_catalogs = if catalog_empty
+        && fs
+            .node(path)?
+            .is_some_and(|node| node.kind == AgentNodeKind::Directory)
+    {
+        child_catalogs_json(fs, path, include_facets)?
+    } else {
+        Vec::new()
+    };
     Ok(json!({
         "path": normalize_path(path)?,
         "catalog_empty": catalog_empty,
         "catalog": catalog,
-        "child_catalogs": [],
+        "child_catalogs": child_catalogs,
     }))
+}
+
+fn child_catalogs_json<S>(
+    fs: &AgentFs<S>,
+    path: &str,
+    include_facets: bool,
+) -> AgentIndexResult<Vec<Value>>
+where
+    S: AgentStore,
+{
+    let (entries, _, _) = fs.list(path, None, 20)?;
+    let mut children = Vec::new();
+    for entry in entries {
+        if entry.kind != AgentNodeKind::Directory {
+            continue;
+        }
+        let fields = fs.catalog(&entry.path)?;
+        if fields.is_empty() {
+            continue;
+        }
+        let rows = if include_facets {
+            fs.index_rows(&entry.path)?
+        } else {
+            Vec::new()
+        };
+        children.push(json!({
+            "path": entry.path,
+            "catalog": catalog_json(&fields, &rows, None, include_facets),
+        }));
+        if children.len() == 5 {
+            break;
+        }
+    }
+    Ok(children)
 }
 
 fn execute_find<S>(fs: &AgentFs<S>, args: &Value) -> AgentIndexResult<Value>
@@ -204,6 +177,12 @@ where
 {
     let path = required_string_arg(args, "path")?;
     let fields = fields_arg(args)?;
+    if object_args(args)?.contains_key("include") {
+        return Err(AgentIndexError::InvalidArgument(
+            "unsupported argument include; use stat for schema or sample and read for body content"
+                .to_owned(),
+        ));
+    }
     let predicates = predicates_arg(args)?;
     let sort = sort_arg(args)?;
     let facets = facets_arg(args)?;
@@ -281,18 +260,19 @@ where
     let offset = cursor_offset(args)?;
     let needle = pattern.to_lowercase();
     let mut all_matches = Vec::new();
-    let mut bytes_read = 0_usize;
     let files = fs.files_under(path, recursive)?;
     for file in &files {
         let bytes = fs.read_file(&file.path)?;
-        bytes_read = bytes_read.saturating_add(bytes.len());
+        if bytes.contains(&0) {
+            continue;
+        }
         let text = String::from_utf8_lossy(&bytes);
         for (line_index, line) in text.lines().enumerate() {
             if line.to_lowercase().contains(&needle) {
                 all_matches.push(json!({
                     "path": file.path,
                     "line_number": line_index + 1,
-                    "snippet": line,
+                    "snippet": line.chars().take(240).collect::<String>(),
                 }));
             }
         }
@@ -310,7 +290,6 @@ where
         "recursive": recursive,
         "matches": matches,
         "files_scanned": files.len(),
-        "bytes_read": bytes_read,
         "next_cursor": (next_offset < match_count).then(|| next_offset.to_string()),
         "truncated": next_offset < match_count,
     }))
@@ -327,23 +306,34 @@ where
         .unwrap_or("structured");
     let offset = optional_u64_arg(args, "offset")?.unwrap_or(0) as usize;
     let limit = optional_usize_arg(args, "limit", MAX_PAGE_LIMIT)?.unwrap_or(DEFAULT_PAGE_LIMIT);
-    let cursor = cursor_offset(args)?;
-    let bytes = fs.read_file(path)?;
+    let cursor = optional_string_arg(args, "cursor")?;
+    let normalized = normalize_path(path)?;
+    let node = fs
+        .node(&normalized)?
+        .ok_or_else(|| AgentIndexError::NotFound(normalized.clone()))?;
+    let bytes = fs.read_file(&normalized)?;
     if format == "bytes" {
-        let end = offset.saturating_add(limit).min(bytes.len());
-        let range = bytes.get(offset..end).unwrap_or_default().to_vec();
+        // The cursor, when provided, wins over offset; mirrors the DFS
+        // parse_byte_cursor semantics so returned next_cursor values page.
+        let start = match cursor.as_deref() {
+            Some(raw) => raw.parse::<usize>().map_err(|err| {
+                AgentIndexError::InvalidArgument(format!("invalid cursor: {err}"))
+            })?,
+            None => offset,
+        };
+        let end = start.saturating_add(limit).min(bytes.len());
+        let range = bytes.get(start..end).unwrap_or_default().to_vec();
         return Ok(json!({
-            "path": normalize_path(path)?,
+            "path": normalized,
             "total_size_bytes": bytes.len(),
             "format": "bytes",
             "record_type": null,
             "record_count": null,
-            "cursor": offset.to_string(),
+            "cursor": cursor,
             "next_cursor": (end < bytes.len()).then(|| end.to_string()),
             "truncated": end < bytes.len(),
             "items": [],
             "bytes": range,
-            "bytes_read": end.saturating_sub(offset),
         }));
     }
     if format != "structured" {
@@ -351,28 +341,42 @@ where
             "unsupported read format {format}; expected structured or bytes"
         )));
     }
-    let records = structured_records(path, &bytes);
+    let start = match cursor.as_deref() {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|err| AgentIndexError::InvalidArgument(format!("invalid cursor: {err}")))?,
+        None => 0,
+    };
+    let content_type = node
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let (record_type, records) = structured_records(&normalized, content_type, &bytes)?;
     let record_count = records.len();
+    if record_count > MAX_PAGE_LIMIT {
+        return Err(AgentIndexError::InvalidArgument(format!(
+            "structured pagination for {path} has {record_count} records; use stat record_count or find with catalog predicates and limit=1, then read match_count"
+        )));
+    }
     let items = records
         .into_iter()
         .enumerate()
-        .skip(cursor)
+        .skip(start)
         .take(limit)
         .map(|(index, value)| json!({"index": index, "value": value}))
         .collect::<Vec<_>>();
-    let next_offset = cursor.saturating_add(items.len());
+    let next_offset = start.saturating_add(items.len());
     Ok(json!({
-        "path": normalize_path(path)?,
+        "path": normalized,
         "total_size_bytes": bytes.len(),
         "format": "structured",
-        "record_type": "json",
+        "record_type": record_type,
         "record_count": record_count,
-        "cursor": cursor.to_string(),
+        "cursor": cursor,
         "next_cursor": (next_offset < record_count).then(|| next_offset.to_string()),
         "truncated": next_offset < record_count,
         "items": items,
         "bytes": null,
-        "bytes_read": bytes.len(),
     }))
 }
 
@@ -418,14 +422,21 @@ fn card_json(node: &AgentNode, catalog: &[AgentIndexField], row: Option<&AgentIn
     })
 }
 
-fn list_entry_json(node: &AgentNode) -> Value {
-    json!({
+fn list_entry_json<S>(fs: &AgentFs<S>, node: &AgentNode) -> AgentIndexResult<Value>
+where
+    S: AgentStore,
+{
+    let entry_count = match node.kind {
+        AgentNodeKind::Directory => Some(fs.list(&node.path, None, usize::MAX)?.0.len()),
+        AgentNodeKind::File => None,
+    };
+    Ok(json!({
         "path": node.path,
         "name": node.name,
         "kind": node_kind_name(&node.kind),
         "size_bytes": node.size_bytes,
-        "entry_count": null,
-    })
+        "entry_count": entry_count,
+    }))
 }
 
 fn find_match_json(row: &AgentIndexRow, fields: Option<&[String]>) -> Value {
@@ -588,6 +599,11 @@ fn predicate_value_matches(
 }
 
 fn value_eq(left: &AgentPredicateValue, right: &AgentPredicateValue) -> bool {
+    // Integers compare exactly; the f64 round-trip loses precision above
+    // 2^53 and would report distinct u64 values as equal.
+    if let (AgentPredicateValue::U64(left), AgentPredicateValue::U64(right)) = (left, right) {
+        return left == right;
+    }
     if let Some((left, right)) = numeric_pair(left, right) {
         return (left - right).abs() < f64::EPSILON;
     }
@@ -786,22 +802,99 @@ fn json_compare(left: Option<&Value>, right: Option<&Value>) -> Ordering {
     }
 }
 
-fn structured_records(path: &str, bytes: &[u8]) -> Vec<Value> {
-    let text = String::from_utf8_lossy(bytes);
-    if path.ends_with(".jsonl") {
-        return text
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .collect();
+fn structured_records(
+    path: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> AgentIndexResult<(&'static str, Vec<Value>)> {
+    if is_json_path(path, content_type) {
+        return json_records(bytes);
     }
-    if path.ends_with(".json") {
-        return match serde_json::from_slice::<Value>(bytes) {
-            Ok(Value::Array(values)) => values,
-            Ok(value) => vec![value],
-            Err(_) => vec![Value::String(text.to_string())],
+    if is_yaml_path(path, content_type) {
+        return yaml_records(bytes);
+    }
+    if is_text_path(path, content_type) {
+        return text_records(bytes);
+    }
+    Err(AgentIndexError::InvalidArgument(format!(
+        "structured read does not support content type {content_type} for {path}"
+    )))
+}
+
+fn is_json_path(path: &str, content_type: &str) -> bool {
+    content_type == "application/json" || path.ends_with(".json")
+}
+
+fn is_yaml_path(path: &str, content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "application/yaml" | "application/x-yaml" | "text/yaml"
+    ) || path.ends_with(".yaml")
+        || path.ends_with(".yml")
+}
+
+fn is_text_path(path: &str, content_type: &str) -> bool {
+    content_type.starts_with("text/") || path.ends_with(".txt") || path.ends_with(".log")
+}
+
+fn json_records(bytes: &[u8]) -> AgentIndexResult<(&'static str, Vec<Value>)> {
+    let value = serde_json::from_slice::<Value>(bytes).map_err(|err| {
+        AgentIndexError::InvalidArgument(format!("structured JSON parse failed: {err}"))
+    })?;
+    match value {
+        Value::Array(items) => Ok(("json_array", items)),
+        Value::Object(map) => {
+            let mut entries = map.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let items = entries
+                .into_iter()
+                .map(|(key, value)| json!({"key": key, "value": value}))
+                .collect();
+            Ok(("json_object", items))
+        }
+        _ => Err(AgentIndexError::InvalidArgument(
+            "structured JSON read supports arrays and objects".to_owned(),
+        )),
+    }
+}
+
+fn yaml_records(bytes: &[u8]) -> AgentIndexResult<(&'static str, Vec<Value>)> {
+    let value = serde_yaml::from_slice::<serde_yaml::Value>(bytes).map_err(|err| {
+        AgentIndexError::InvalidArgument(format!("structured YAML parse failed: {err}"))
+    })?;
+    let serde_yaml::Value::Mapping(map) = value else {
+        return Err(AgentIndexError::InvalidArgument(
+            "structured YAML read supports mappings".to_owned(),
+        ));
+    };
+    let mut entries = Vec::new();
+    for (key, value) in map {
+        let Some(key) = key.as_str() else {
+            continue;
         };
+        entries.push((
+            key.to_owned(),
+            serde_json::to_value(value).unwrap_or(Value::Null),
+        ));
     }
-    vec![Value::String(text.to_string())]
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let items = entries
+        .into_iter()
+        .map(|(key, value)| json!({"key": key, "value": value}))
+        .collect();
+    Ok(("yaml_mapping", items))
+}
+
+fn text_records(bytes: &[u8]) -> AgentIndexResult<(&'static str, Vec<Value>)> {
+    let text = std::str::from_utf8(bytes).map_err(|err| {
+        AgentIndexError::InvalidArgument(format!("structured text parse failed: {err}"))
+    })?;
+    let items = text
+        .lines()
+        .enumerate()
+        .map(|(index, line)| json!({"line": index + 1, "text": line}))
+        .collect();
+    Ok(("text_lines", items))
 }
 
 fn predicates_arg(args: &Value) -> AgentIndexResult<Vec<Predicate>> {
@@ -829,6 +922,11 @@ fn predicate_arg(value: &Value) -> AgentIndexResult<Predicate> {
             let value = raw_value.ok_or_else(|| {
                 AgentIndexError::InvalidArgument("predicate op in requires array value".to_owned())
             })?;
+            if !value.is_array() {
+                return Err(AgentIndexError::InvalidArgument(
+                    "predicate op in requires array value".to_owned(),
+                ));
+            }
             Some(AgentPredicateValue::from_json(value).ok_or_else(|| {
                 AgentIndexError::InvalidArgument("unsupported predicate value".to_owned())
             })?)
@@ -851,19 +949,19 @@ fn predicate_arg(value: &Value) -> AgentIndexResult<Predicate> {
 fn predicate_op_arg(op: &str) -> AgentIndexResult<AgentPredicateOp> {
     match op {
         "eq" => Ok(AgentPredicateOp::Eq),
-        "ne" => Ok(AgentPredicateOp::NotEqual),
+        "ne" | "not_equal" => Ok(AgentPredicateOp::NotEqual),
         "in" => Ok(AgentPredicateOp::In),
         "prefix" => Ok(AgentPredicateOp::Prefix),
         "suffix" => Ok(AgentPredicateOp::Suffix),
         "contains" => Ok(AgentPredicateOp::Contains),
-        "gt" => Ok(AgentPredicateOp::GreaterThan),
-        "gte" => Ok(AgentPredicateOp::GreaterThanOrEqual),
-        "lt" => Ok(AgentPredicateOp::LessThan),
-        "lte" => Ok(AgentPredicateOp::LessThanOrEqual),
+        "gt" | "greater_than" => Ok(AgentPredicateOp::GreaterThan),
+        "gte" | "greater_than_or_equal" => Ok(AgentPredicateOp::GreaterThanOrEqual),
+        "lt" | "less_than" => Ok(AgentPredicateOp::LessThan),
+        "lte" | "less_than_or_equal" => Ok(AgentPredicateOp::LessThanOrEqual),
         "exists" => Ok(AgentPredicateOp::Exists),
         "not_exists" => Ok(AgentPredicateOp::NotExists),
         other => Err(AgentIndexError::InvalidArgument(format!(
-            "unsupported predicate op {other}"
+            "unsupported predicate operator {other}"
         ))),
     }
 }
@@ -884,13 +982,21 @@ fn sort_item_arg(value: &Value) -> AgentIndexResult<Sort> {
     let object = value.as_object().ok_or_else(|| {
         AgentIndexError::InvalidArgument("sort item must be an object".to_owned())
     })?;
-    Ok(Sort {
-        field: string_property(object, "field")?.to_owned(),
-        desc: object
-            .get("direction")
-            .and_then(Value::as_str)
-            .is_some_and(|direction| direction == "desc"),
-    })
+    let field = string_property(object, "field")?.to_owned();
+    let direction = object
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("asc");
+    let desc = match direction {
+        "asc" => false,
+        "desc" => true,
+        other => {
+            return Err(AgentIndexError::InvalidArgument(format!(
+                "unsupported sort direction {other}"
+            )))
+        }
+    };
+    Ok(Sort { field, desc })
 }
 
 fn aggregate_sort_arg(args: &Value) -> AgentIndexResult<Vec<Sort>> {
@@ -923,21 +1029,35 @@ fn measures_arg(args: &Value) -> AgentIndexResult<Vec<Measure>> {
             let object = value.as_object().ok_or_else(|| {
                 AgentIndexError::InvalidArgument("measure must be an object".to_owned())
             })?;
-            Ok(Measure {
-                name: string_property(object, "name")?.to_owned(),
-                op: string_property(object, "op")?.to_owned(),
-                field: object
-                    .get("field")
-                    .and_then(|value| (!value.is_null()).then_some(value))
-                    .map(|value| {
-                        value.as_str().map(str::to_owned).ok_or_else(|| {
-                            AgentIndexError::InvalidArgument(
-                                "measure field must be a string or null".to_owned(),
-                            )
-                        })
+            let name = string_property(object, "name")?.to_owned();
+            if name.is_empty() {
+                return Err(AgentIndexError::InvalidArgument(
+                    "measure name must not be empty".to_owned(),
+                ));
+            }
+            let op = string_property(object, "op")?.to_owned();
+            if !matches!(op.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+                return Err(AgentIndexError::InvalidArgument(format!(
+                    "unsupported aggregate op {op}"
+                )));
+            }
+            let field = object
+                .get("field")
+                .and_then(|value| (!value.is_null()).then_some(value))
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        AgentIndexError::InvalidArgument(
+                            "measure field must be a string or null".to_owned(),
+                        )
                     })
-                    .transpose()?,
-            })
+                })
+                .transpose()?;
+            if op != "count" && field.is_none() {
+                return Err(AgentIndexError::InvalidArgument(format!(
+                    "measure {name} with op {op} requires field"
+                )));
+            }
+            Ok(Measure { name, op, field })
         })
         .collect()
 }
@@ -1037,7 +1157,7 @@ fn cursor_offset(args: &Value) -> AgentIndexResult<usize> {
         .map(|cursor| {
             cursor
                 .parse::<usize>()
-                .map_err(|_| AgentIndexError::InvalidArgument(format!("invalid cursor {cursor}")))
+                .map_err(|err| AgentIndexError::InvalidArgument(format!("invalid cursor: {err}")))
         })
         .transpose()
         .map(|value| value.unwrap_or(0))
@@ -1085,7 +1205,7 @@ fn hex_encode(raw: &[u8]) -> String {
     out
 }
 
-fn hex_cursor(raw: String) -> Option<Vec<u8>> {
+fn hex_cursor(raw: &str) -> Option<Vec<u8>> {
     if !raw.len().is_multiple_of(2) {
         return None;
     }
@@ -1242,5 +1362,586 @@ mod tests {
         assert_eq!(result["matches"][0]["path"], "/runs/run-1/stdout.txt");
         assert_eq!(result["matches"][0]["line_number"], 2);
         assert_eq!(result["matches"][0]["snippet"], "needle hit");
+    }
+
+    #[test]
+    fn tool_definitions_match_root_dispatcher() {
+        let root = crate::agent_tool_definitions();
+        let native = agent_tool_definitions();
+        assert_eq!(native, root);
+    }
+
+    #[test]
+    fn read_bytes_pages_advance_with_cursor() {
+        let fs = sample_agent_fs();
+        fs.put_file("/runs/run-1/blob.bin", b"0123456789".to_vec(), None)
+            .unwrap();
+
+        let first = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/blob.bin", "format": "bytes", "limit": 4}),
+        )
+        .unwrap();
+        assert_eq!(first["bytes"], json!(b"0123".to_vec()));
+        assert_eq!(first["cursor"], Value::Null);
+        assert_eq!(first["next_cursor"], "4");
+        assert_eq!(first["truncated"], true);
+
+        let second = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({
+                "path": "/runs/run-1/blob.bin",
+                "format": "bytes",
+                "limit": 4,
+                "offset": 0,
+                "cursor": first["next_cursor"],
+            }),
+        )
+        .unwrap();
+        assert_eq!(second["bytes"], json!(b"4567".to_vec()));
+        assert_eq!(second["cursor"], "4");
+        assert_eq!(second["next_cursor"], "8");
+
+        let via_offset = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/blob.bin", "format": "bytes", "limit": 4, "offset": 8}),
+        )
+        .unwrap();
+        assert_eq!(via_offset["bytes"], json!(b"89".to_vec()));
+        assert_eq!(via_offset["next_cursor"], Value::Null);
+        assert_eq!(via_offset["truncated"], false);
+    }
+
+    #[test]
+    fn read_rejects_malformed_cursor() {
+        let fs = sample_agent_fs();
+
+        let err = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/stdout.txt", "format": "bytes", "cursor": "zz"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid cursor:"),
+            "unexpected error: {err}"
+        );
+
+        let err = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/stdout.txt", "format": "structured", "cursor": "zz"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid cursor:"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn structured_read_returns_sorted_json_object_records() {
+        let fs = sample_agent_fs();
+        fs.put_file(
+            "/runs/run-1/metadata.json",
+            b"{\"b\":2,\"a\":1}".to_vec(),
+            Some("application/json".to_owned()),
+        )
+        .unwrap();
+
+        let result = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/metadata.json", "format": "structured"}),
+        )
+        .unwrap();
+
+        assert_eq!(result["record_type"], "json_object");
+        assert_eq!(result["record_count"], 2);
+        assert_eq!(result["cursor"], Value::Null);
+        assert_eq!(result["items"][0]["value"], json!({"key": "a", "value": 1}));
+        assert_eq!(result["items"][1]["value"], json!({"key": "b", "value": 2}));
+        assert!(result.get("bytes_read").is_none());
+    }
+
+    #[test]
+    fn structured_read_returns_json_array_records() {
+        let fs = sample_agent_fs();
+        fs.put_file(
+            "/runs/run-1/rows.json",
+            b"[{\"loss\":0.2},{\"loss\":0.7}]".to_vec(),
+            Some("application/json".to_owned()),
+        )
+        .unwrap();
+
+        let result = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/rows.json", "format": "structured"}),
+        )
+        .unwrap();
+
+        assert_eq!(result["record_type"], "json_array");
+        assert_eq!(result["record_count"], 2);
+        assert_eq!(result["items"][0]["value"], json!({"loss": 0.2}));
+    }
+
+    #[test]
+    fn structured_read_rejects_json_scalars_and_parse_failures() {
+        let fs = sample_agent_fs();
+        fs.put_file(
+            "/runs/run-1/scalar.json",
+            b"42".to_vec(),
+            Some("application/json".to_owned()),
+        )
+        .unwrap();
+        fs.put_file(
+            "/runs/run-1/broken.json",
+            b"{not json".to_vec(),
+            Some("application/json".to_owned()),
+        )
+        .unwrap();
+
+        let err = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/scalar.json", "format": "structured"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("structured JSON read supports arrays and objects"),
+            "unexpected error: {err}"
+        );
+
+        let err = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/broken.json", "format": "structured"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("structured JSON parse failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn structured_read_returns_text_lines_for_text_files() {
+        let fs = sample_agent_fs();
+        fs.put_file("/runs/run-1/tail.log", b"alpha\nbeta\n".to_vec(), None)
+            .unwrap();
+        // .jsonl is not a structured suffix; it reads as text only when the
+        // producer declares a text content type, matching the DFS dispatcher.
+        fs.put_file(
+            "/runs/run-1/events.jsonl",
+            b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
+            Some("text/plain".to_owned()),
+        )
+        .unwrap();
+
+        let log = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/tail.log", "format": "structured"}),
+        )
+        .unwrap();
+        assert_eq!(log["record_type"], "text_lines");
+        assert_eq!(log["record_count"], 2);
+        assert_eq!(
+            log["items"][0]["value"],
+            json!({"line": 1, "text": "alpha"})
+        );
+        assert_eq!(log["items"][1]["value"], json!({"line": 2, "text": "beta"}));
+
+        let jsonl = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/events.jsonl", "format": "structured"}),
+        )
+        .unwrap();
+        assert_eq!(jsonl["record_type"], "text_lines");
+        assert_eq!(
+            jsonl["items"][0]["value"],
+            json!({"line": 1, "text": "{\"a\":1}"})
+        );
+    }
+
+    #[test]
+    fn structured_read_returns_yaml_mapping_records() {
+        let fs = sample_agent_fs();
+        fs.put_file(
+            "/runs/run-1/config.yaml",
+            b"beta: 2\nalpha: 1\n".to_vec(),
+            None,
+        )
+        .unwrap();
+
+        let result = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/config.yaml", "format": "structured"}),
+        )
+        .unwrap();
+
+        assert_eq!(result["record_type"], "yaml_mapping");
+        assert_eq!(
+            result["items"][0]["value"],
+            json!({"key": "alpha", "value": 1})
+        );
+        assert_eq!(
+            result["items"][1]["value"],
+            json!({"key": "beta", "value": 2})
+        );
+    }
+
+    #[test]
+    fn structured_read_rejects_unsupported_content_types() {
+        let fs = sample_agent_fs();
+        fs.put_file("/runs/run-1/blob.bin", vec![1, 2, 3], None)
+            .unwrap();
+
+        let err = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/blob.bin", "format": "structured"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "structured read does not support content type application/octet-stream for /runs/run-1/blob.bin"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn structured_read_guards_large_record_sets() {
+        let fs = sample_agent_fs();
+        let body = (0..150).map(|i| format!("line-{i}\n")).collect::<String>();
+        fs.put_file(
+            "/runs/run-1/big.log",
+            body.into_bytes(),
+            Some("text/plain".to_owned()),
+        )
+        .unwrap();
+
+        let err = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/big.log", "format": "structured"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "structured pagination for /runs/run-1/big.log has 150 records; use stat record_count or find with catalog predicates and limit=1, then read match_count"
+            ),
+            "unexpected error: {err}"
+        );
+
+        let bytes = execute_agent_tool(
+            &fs,
+            "read",
+            &json!({"path": "/runs/run-1/big.log", "format": "bytes", "limit": 8}),
+        )
+        .unwrap();
+        assert_eq!(bytes["truncated"], true);
+    }
+
+    #[test]
+    fn ls_reports_full_entry_counts_and_pages() {
+        let fs = sample_agent_fs();
+        fs.put_file("/runs/run-3/stdout.txt", b"x\n".to_vec(), None)
+            .unwrap();
+
+        let first = execute_agent_tool(&fs, "ls", &json!({"path": "/runs", "limit": 2})).unwrap();
+        assert_eq!(first["entry_count"], 3);
+        assert_eq!(first["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["entries"][0]["kind"], "directory");
+        assert_eq!(first["entries"][0]["entry_count"], 1);
+
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let second = execute_agent_tool(
+            &fs,
+            "ls",
+            &json!({"path": "/runs", "cursor": cursor, "limit": 2}),
+        )
+        .unwrap();
+        assert_eq!(second["entry_count"], 3);
+        assert_eq!(second["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(second["truncated"], false);
+
+        let leaf = execute_agent_tool(&fs, "ls", &json!({"path": "/runs/run-1"})).unwrap();
+        assert_eq!(leaf["entries"][0]["kind"], "file");
+        assert_eq!(leaf["entries"][0]["entry_count"], Value::Null);
+    }
+
+    #[test]
+    fn ls_rejects_malformed_cursor() {
+        let fs = sample_agent_fs();
+
+        let err =
+            execute_agent_tool(&fs, "ls", &json!({"path": "/runs", "cursor": "zz"})).unwrap_err();
+        assert_eq!(
+            err,
+            AgentIndexError::InvalidArgument("invalid cursor: zz".to_owned())
+        );
+    }
+
+    #[test]
+    fn stat_resolves_indexed_values_along_ancestor_chain() {
+        let fs = sample_agent_fs();
+
+        let root = execute_agent_tool(&fs, "stat", &json!({"path": "/runs"})).unwrap();
+        assert_eq!(root["card"]["indexed_values"], json!([]));
+
+        let child = execute_agent_tool(&fs, "stat", &json!({"path": "/runs/run-1"})).unwrap();
+        let values = child["card"]["indexed_values"].as_array().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["field"], "run.status");
+        assert_eq!(values[0]["value"], "done");
+        assert_eq!(values[1]["field"], "metric.loss");
+    }
+
+    #[test]
+    fn grep_skips_binary_files_and_truncates_snippets() {
+        let fs = sample_agent_fs();
+        let mut binary = b"needle".to_vec();
+        binary.push(0);
+        fs.put_file("/runs/run-1/binary.dat", binary, None).unwrap();
+        let long_line = format!("needle {}", "x".repeat(500));
+        fs.put_file("/runs/run-2/long.txt", long_line.into_bytes(), None)
+            .unwrap();
+
+        let result = execute_agent_tool(
+            &fs,
+            "grep",
+            &json!({"path": "/runs", "pattern": "needle", "recursive": true}),
+        )
+        .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert!(
+            matches
+                .iter()
+                .all(|match_| match_["path"] != "/runs/run-1/binary.dat"),
+            "binary file must be skipped: {matches:?}"
+        );
+        let long_match = matches
+            .iter()
+            .find(|match_| match_["path"] == "/runs/run-2/long.txt")
+            .unwrap();
+        assert_eq!(long_match["snippet"].as_str().unwrap().chars().count(), 240);
+        assert_eq!(result["files_scanned"], 4);
+        assert!(result.get("bytes_read").is_none());
+    }
+
+    #[test]
+    fn value_eq_compares_large_u64_exactly() {
+        let fs = sample_agent_fs();
+        fs.register_index(AgentIndexRegistration {
+            path: "/counters".to_owned(),
+            fields: vec![AgentIndexField {
+                field: AgentFindField::new("seq"),
+                operators: vec![AgentPredicateOp::Eq, AgentPredicateOp::In],
+                sortable: false,
+                facetable: false,
+            }],
+            rows: vec![
+                AgentIndexRow {
+                    path: "/counters/a".to_owned(),
+                    values: vec![index_value(
+                        "seq",
+                        AgentPredicateValue::U64(9007199254740992),
+                    )],
+                },
+                AgentIndexRow {
+                    path: "/counters/b".to_owned(),
+                    values: vec![index_value(
+                        "seq",
+                        AgentPredicateValue::U64(9007199254740993),
+                    )],
+                },
+            ],
+        })
+        .unwrap();
+
+        let result = execute_agent_tool(
+            &fs,
+            "find",
+            &json!({
+                "path": "/counters",
+                "predicates": [{"field": "seq", "op": "eq", "value": 9007199254740993_u64}],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["match_count"], 1);
+        assert_eq!(result["matches"][0]["path"], "/counters/b");
+    }
+
+    #[test]
+    fn in_predicate_rejects_scalar_values() {
+        let fs = sample_agent_fs();
+
+        let err = execute_agent_tool(
+            &fs,
+            "find",
+            &json!({
+                "path": "/runs",
+                "predicates": [{"field": "run.status", "op": "in", "value": "done"}],
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AgentIndexError::InvalidArgument("predicate op in requires array value".to_owned())
+        );
+    }
+
+    #[test]
+    fn predicate_op_aliases_match_root_dispatcher() {
+        let fs = sample_agent_fs();
+
+        let result = execute_agent_tool(
+            &fs,
+            "find",
+            &json!({
+                "path": "/runs",
+                "predicates": [{"field": "metric.loss", "op": "greater_than", "value": 0.5}],
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["match_count"], 1);
+
+        let err = execute_agent_tool(
+            &fs,
+            "find",
+            &json!({
+                "path": "/runs",
+                "predicates": [{"field": "metric.loss", "op": "between", "value": 0.5}],
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AgentIndexError::InvalidArgument("unsupported predicate operator between".to_owned())
+        );
+    }
+
+    #[test]
+    fn sort_rejects_unsupported_direction() {
+        let fs = sample_agent_fs();
+
+        let err = execute_agent_tool(
+            &fs,
+            "find",
+            &json!({
+                "path": "/runs",
+                "sort": [{"field": "metric.loss", "direction": "sideways"}],
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AgentIndexError::InvalidArgument("unsupported sort direction sideways".to_owned())
+        );
+    }
+
+    #[test]
+    fn find_rejects_include_argument() {
+        let fs = sample_agent_fs();
+
+        let err = execute_agent_tool(&fs, "find", &json!({"path": "/runs", "include": ["body"]}))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AgentIndexError::InvalidArgument(
+                "unsupported argument include; use stat for schema or sample and read for body content"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn aggregate_validates_measures_at_parse_time() {
+        let fs = sample_agent_fs();
+
+        let err = execute_agent_tool(
+            &fs,
+            "aggregate",
+            &json!({
+                "path": "/runs",
+                "measures": [{"name": "m", "op": "median", "field": "metric.loss"}],
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AgentIndexError::InvalidArgument("unsupported aggregate op median".to_owned())
+        );
+
+        let err = execute_agent_tool(
+            &fs,
+            "aggregate",
+            &json!({
+                "path": "/runs",
+                "measures": [{"name": "", "op": "count"}],
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AgentIndexError::InvalidArgument("measure name must not be empty".to_owned())
+        );
+
+        let err = execute_agent_tool(
+            &fs,
+            "aggregate",
+            &json!({
+                "path": "/runs",
+                "measures": [{"name": "total", "op": "sum"}],
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AgentIndexError::InvalidArgument("measure total with op sum requires field".to_owned())
+        );
+    }
+
+    #[test]
+    fn catalog_surfaces_child_catalogs_for_uncatalogued_directories() {
+        let fs = sample_agent_fs();
+
+        let result = execute_agent_tool(&fs, "catalog", &json!({"path": "/"})).unwrap();
+
+        assert_eq!(result["catalog_empty"], true);
+        let children = result["child_catalogs"].as_array().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["path"], "/runs");
+        assert_eq!(
+            children[0]["catalog"]["sortable"],
+            json!(["run.status", "metric.loss"])
+        );
+
+        let indexed = execute_agent_tool(&fs, "catalog", &json!({"path": "/runs"})).unwrap();
+        assert_eq!(indexed["catalog_empty"], false);
+        assert_eq!(indexed["child_catalogs"], json!([]));
+    }
+
+    #[test]
+    fn invalid_argument_errors_use_neutral_prefix() {
+        let fs = sample_agent_fs();
+
+        let err = execute_agent_tool(&fs, "warp", &json!({})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid agent argument: unknown agent tool warp"
+        );
     }
 }

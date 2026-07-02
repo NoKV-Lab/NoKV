@@ -81,6 +81,9 @@ pub fn normalize_workbench_root(raw: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+// Parameter schemas below must stay byte-identical to the DFS-backed
+// definitions in crates/nokv/src/bin/nokv/workbench_mcp.rs; the golden
+// constants in tests/workbench_parity.rs pin that contract.
 pub fn tool_definitions() -> Vec<AgentToolDefinition> {
     vec![
         AgentToolDefinition {
@@ -90,7 +93,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                 "type": "object",
                 "required": ["id"],
                 "properties": {
-                    "id": {"type": "string"}
+                    "id": {"type": "string", "description": "Workbench id, e.g. spedas-task-001."}
                 },
                 "additionalProperties": false
             }),
@@ -104,7 +107,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                 "properties": {
                     "id": {"type": "string"},
                     "section": {"type": "string", "enum": SECTIONS},
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": "Path relative to section. Do not prefix it with the section name."},
                     "text": {"type": "string"},
                     "base64": {"type": "string"},
                     "content_type": {"type": "string"},
@@ -122,7 +125,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                 "properties": {
                     "id": {"type": "string"},
                     "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
-                    "path": {"type": ["string", "null"]},
+                    "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
                     "cursor": {"type": ["string", "null"]},
                     "limit": {"type": "integer", "minimum": 1}
                 },
@@ -138,7 +141,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                 "properties": {
                     "id": {"type": "string"},
                     "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
-                    "path": {"type": ["string", "null"]}
+                    "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."}
                 },
                 "additionalProperties": false
             }),
@@ -152,7 +155,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                 "properties": {
                     "id": {"type": "string"},
                     "section": {"type": "string", "enum": SECTIONS},
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": "Path relative to section. Do not prefix it with the section name."},
                     "format": {"type": "string", "enum": ["structured", "bytes"]},
                     "cursor": {"type": ["string", "null"]},
                     "offset": {"type": "integer", "minimum": 0},
@@ -170,7 +173,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                 "properties": {
                     "id": {"type": "string"},
                     "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
-                    "path": {"type": ["string", "null"]},
+                    "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
                     "pattern": {"type": "string"},
                     "recursive": {"type": "boolean"},
                     "cursor": {"type": ["string", "null"]},
@@ -185,9 +188,9 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "committed": {"type": ["boolean", "null"]},
-                    "manifest_pattern": {"type": ["string", "null"]},
-                    "include_manifest": {"type": "boolean"},
+                    "committed": {"type": ["boolean", "null"], "description": "Filter by completion marker. Null or omitted returns all workbenches."},
+                    "manifest_pattern": {"type": ["string", "null"], "description": "Case-insensitive literal substring filter over metadata/run_manifest.json."},
+                    "include_manifest": {"type": "boolean", "description": "Include full run_manifest.json envelopes. Defaults false."},
                     "cursor": {"type": ["string", "null"]},
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_FIND_LIMIT}
                 },
@@ -310,6 +313,8 @@ where
         "relative_path": rel_path,
         "path": path,
         "size_bytes": size_bytes,
+        "inode": Value::Null,
+        "generation": Value::Null,
         "digest_uri": digest_uri,
         "content_type": content_type,
         "replace": replace,
@@ -361,16 +366,20 @@ where
     }
     let result = execute_agent_tool(fs, read_tool, &Value::Object(forwarded))
         .map_err(|err| WorkbenchToolError::new(err.to_string()))?;
-    shape_read_tool_result(options, &id, &target, read_tool, result)
+    shape_read_tool_result(fs, options, &id, &target, read_tool, result)
 }
 
-fn shape_read_tool_result(
+fn shape_read_tool_result<S>(
+    fs: &AgentFs<S>,
     options: &WorkbenchMcpOptions,
     id: &str,
     target: &str,
     read_tool: &str,
     result: Value,
-) -> Result<Value, WorkbenchToolError> {
+) -> Result<Value, WorkbenchToolError>
+where
+    S: AgentStore,
+{
     let scope = path_scope(options, id, target)?;
     match read_tool {
         "ls" => Ok(json!({
@@ -396,15 +405,21 @@ fn shape_read_tool_result(
             "next_cursor": result.get("next_cursor").cloned().unwrap_or(Value::Null),
             "truncated": result.get("truncated").cloned().unwrap_or(Value::Bool(false)),
         })),
-        "stat" => Ok(json!({
-            "status": "success",
-            "workbench_id": id,
-            "workbench_path": workbench_path(options, id),
-            "section": scope.section,
-            "relative_path": scope.relative_path,
-            "path": scope.path,
-            "card": result.get("card").cloned().unwrap_or(Value::Null),
-        })),
+        "stat" => {
+            let node = fs.node(&scope.path)?.ok_or_else(|| {
+                WorkbenchToolError::new(format!("path not found: {}", scope.path))
+            })?;
+            let card = compact_stat_card(fs, &scope, &node)?;
+            Ok(json!({
+                "status": "success",
+                "workbench_id": id,
+                "workbench_path": workbench_path(options, id),
+                "section": scope.section,
+                "relative_path": scope.relative_path,
+                "path": scope.path,
+                "card": card,
+            }))
+        }
         "read" => Ok(json!({
             "status": "success",
             "workbench_id": id,
@@ -464,9 +479,10 @@ where
     let committed_filter = optional_bool(args, "committed")?;
     let manifest_pattern = optional_string(args, "manifest_pattern")?;
     let include_manifest = optional_bool(args, "include_manifest")?.unwrap_or(false);
-    let offset = optional_string(args, "cursor")?
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(0);
+    let cursor = optional_string(args, "cursor")?;
+    if let Some(raw) = cursor {
+        validate_list_cursor(raw)?;
+    }
     let limit = optional_usize(args, "limit")?.unwrap_or(DEFAULT_FIND_LIMIT);
     if limit == 0 || limit > MAX_FIND_LIMIT {
         return Err(WorkbenchToolError::new(format!(
@@ -479,17 +495,34 @@ where
             "path": options.root,
             "matches": [],
             "match_count": 0,
+            "entry_count": 0,
             "next_cursor": Value::Null,
             "truncated": false,
         }));
     }
+    // DFS-shaped pagination: page the root directory listing, then filter
+    // only the current page. match_count is per page, so a page may hold
+    // fewer than `limit` matches (or none) while next_cursor is non-null.
+    let list_args = json!({
+        "path": options.root,
+        "cursor": cursor,
+        "limit": limit,
+    });
+    let page = execute_agent_tool(fs, "ls", &list_args)
+        .map_err(|err| WorkbenchToolError::new(err.to_string()))?;
+    let entries = page
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WorkbenchToolError::new("workbench root listing missing entries"))?;
     let mut matches = Vec::new();
-    for node in fs.list(&options.root, None, usize::MAX)?.0 {
-        if node.kind != crate::AgentNodeKind::Directory {
+    for entry in entries {
+        if entry.get("kind").and_then(Value::as_str) != Some("directory") {
             continue;
         }
-        let id = node.name.clone();
-        let summary = workbench_manifest_summary(fs, options, &id, include_manifest)?;
+        let Some(id) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let summary = workbench_manifest_summary(fs, options, id, include_manifest)?;
         if let Some(committed) = committed_filter {
             if summary.committed != committed {
                 continue;
@@ -499,27 +532,37 @@ where
             let Some(text) = summary.manifest_text.as_deref() else {
                 continue;
             };
-            if !text.to_lowercase().contains(&pattern.to_lowercase()) {
+            if !text
+                .to_ascii_lowercase()
+                .contains(&pattern.to_ascii_lowercase())
+            {
                 continue;
             }
         }
-        matches.push(summary_json(options, &id, summary));
+        matches.push(summary_json(options, id, summary));
     }
     let match_count = matches.len();
-    let page = matches
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-    let next_offset = offset.saturating_add(page.len());
     Ok(json!({
         "status": "success",
         "path": options.root,
-        "matches": page,
+        "matches": matches,
         "match_count": match_count,
-        "next_cursor": (next_offset < match_count).then(|| next_offset.to_string()),
-        "truncated": next_offset < match_count,
+        "entry_count": page.get("entry_count").cloned().unwrap_or(Value::Null),
+        "next_cursor": page.get("next_cursor").cloned().unwrap_or(Value::Null),
+        "truncated": page.get("truncated").cloned().unwrap_or(Value::Bool(false)),
     }))
+}
+
+/// The underlying `ls` cursor is a hex-encoded store key. Reject malformed
+/// cursors before forwarding so a bad cursor can never silently restart the
+/// listing from the first page.
+fn validate_list_cursor(raw: &str) -> Result<(), WorkbenchToolError> {
+    let valid = raw.len().is_multiple_of(2) && raw.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if valid {
+        Ok(())
+    } else {
+        Err(WorkbenchToolError::new(format!("invalid cursor {raw}")))
+    }
 }
 
 fn commit_workbench<S>(
@@ -533,8 +576,11 @@ where
     let id = required_workbench_id(args)?;
     let manifest = args
         .get("manifest")
-        .and_then(Value::as_object)
-        .ok_or_else(|| WorkbenchToolError::new("missing object argument manifest"))?;
+        .cloned()
+        .ok_or_else(|| WorkbenchToolError::new("missing required argument manifest"))?;
+    if !manifest.is_object() {
+        return Err(WorkbenchToolError::new("manifest must be a JSON object"));
+    }
     let replace = optional_bool(args, "replace")?.unwrap_or(false);
     ensure_standard_dirs(fs, options, &id)?;
     let path = section_path(options, &id, "metadata", Some("run_manifest.json"));
@@ -543,8 +589,10 @@ where
             "run_manifest.json already exists; set replace=true to overwrite",
         ));
     }
+    // Same data-at-rest schema as the DFS-backed workbench so one consumer
+    // can parse manifests from either backend; "backend" marks lineage.
     let envelope = json!({
-        "schema": "nokv.agent.workbench.run_manifest.v0",
+        "schema": "nokv.workbench.run_manifest.v0",
         "backend": "nokv-agent",
         "workbench_id": id,
         "workbench_path": workbench_path(options, &id),
@@ -552,13 +600,17 @@ where
         "manifest": manifest,
     });
     let bytes = serde_json::to_vec_pretty(&envelope)
-        .map_err(|err| WorkbenchToolError::new(err.to_string()))?;
+        .map_err(|err| WorkbenchToolError::new(format!("failed to encode manifest: {err}")))?;
     let digest_uri = digest_uri(&bytes);
+    let size_bytes = bytes.len();
     fs.put_file(&path, bytes, Some("application/json".to_owned()))?;
     Ok(json!({
         "status": "success",
         "workbench_id": id,
-        "manifest_path": path,
+        "path": path,
+        "size_bytes": size_bytes,
+        "inode": Value::Null,
+        "generation": Value::Null,
         "digest_uri": digest_uri,
         "replace": replace,
         "backend": "nokv-agent",
@@ -575,15 +627,27 @@ where
 {
     let id = required_workbench_id(args)?;
     let manifest_path = section_path(options, &id, "metadata", Some("run_manifest.json"));
-    let manifest = fs
-        .read_file(&manifest_path)
-        .map_err(|_| WorkbenchToolError::new("workbench must be committed before snapshot"))?;
-    let files = fs.files_under(&workbench_path(options, &id), true)?;
+    if fs.node(&manifest_path)?.is_none() {
+        return Err(WorkbenchToolError::new(format!(
+            "workbench {id} is not committed; missing {manifest_path}"
+        )));
+    }
+    let manifest = fs.read_file(&manifest_path)?;
+    let path = workbench_path(options, &id);
+    // Prior snapshot records are excluded from the digest and file manifest
+    // so re-snapshotting unchanged content yields the same snapshot id.
+    let snapshots_prefix = format!(
+        "{}/",
+        section_path(options, &id, "metadata", Some("snapshots"))
+    );
+    let files = fs.files_under(&path, true)?;
     let mut hasher = Sha256::new();
     hasher.update(&manifest);
     let file_manifest = files
         .into_iter()
-        .filter(|node| node.kind == crate::AgentNodeKind::File)
+        .filter(|node| {
+            node.kind == crate::AgentNodeKind::File && !node.path.starts_with(&snapshots_prefix)
+        })
         .map(|node| {
             let bytes = fs.read_file(&node.path)?;
             hasher.update(node.path.as_bytes());
@@ -596,7 +660,10 @@ where
         })
         .collect::<Result<Vec<_>, AgentIndexError>>()?;
     let digest = hasher.finalize();
-    let snapshot_id = u64::from_be_bytes(digest[0..8].try_into().unwrap());
+    // Keep the id within 2^53 so JSON consumers with IEEE-754 numbers do not
+    // lose precision; the full digest travels in snapshot_digest.
+    let snapshot_id = u64::from_be_bytes(digest[0..8].try_into().unwrap()) & ((1 << 53) - 1);
+    let snapshot_digest = format!("sha256:{digest:x}");
     let snapshot_path = section_path(
         options,
         &id,
@@ -608,8 +675,9 @@ where
         "backend": "nokv-agent",
         "snapshot_kind": "logical",
         "snapshot_id": snapshot_id,
+        "snapshot_digest": snapshot_digest,
         "workbench_id": id,
-        "workbench_path": workbench_path(options, &id),
+        "workbench_path": path,
         "manifest_path": manifest_path,
         "created_at_unix_seconds": unix_seconds(),
         "files": file_manifest,
@@ -620,7 +688,9 @@ where
     Ok(json!({
         "status": "success",
         "workbench_id": id,
+        "path": path,
         "snapshot_id": snapshot_id,
+        "snapshot_digest": snapshot_digest,
         "snapshot_kind": "logical",
         "snapshot_path": snapshot_path,
         "read_version": Value::Null,
@@ -632,6 +702,8 @@ where
 struct WorkbenchManifestSummary {
     committed: bool,
     manifest_path: Option<String>,
+    manifest_size_bytes: Option<usize>,
+    manifest_digest_uri: Option<String>,
     manifest_text: Option<String>,
     envelope: Option<Value>,
     include_manifest: bool,
@@ -658,18 +730,25 @@ where
         return Ok(WorkbenchManifestSummary {
             committed: false,
             manifest_path: None,
+            manifest_size_bytes: None,
+            manifest_digest_uri: None,
             manifest_text: None,
             envelope: None,
             include_manifest,
         });
     };
-    let text = String::from_utf8(bytes)
-        .map_err(|err| WorkbenchToolError::new(format!("manifest is not UTF-8: {err}")))?;
+    let manifest_size_bytes = bytes.len();
+    let manifest_digest_uri = digest_uri(&bytes);
+    let text = String::from_utf8(bytes).map_err(|err| {
+        WorkbenchToolError::new(format!("run manifest is not valid UTF-8: {err}"))
+    })?;
     let envelope = serde_json::from_str::<Value>(&text)
-        .map_err(|err| WorkbenchToolError::new(format!("manifest is not JSON: {err}")))?;
+        .map_err(|err| WorkbenchToolError::new(format!("run manifest is not valid JSON: {err}")))?;
     Ok(WorkbenchManifestSummary {
         committed: true,
         manifest_path: Some(manifest_path),
+        manifest_size_bytes: Some(manifest_size_bytes),
+        manifest_digest_uri: Some(manifest_digest_uri),
         manifest_text: Some(text),
         envelope: Some(envelope),
         include_manifest,
@@ -691,6 +770,11 @@ fn summary_json(
         "path": workbench_path(options, id),
         "committed": summary.committed,
         "manifest_path": summary.manifest_path,
+        "manifest_size_bytes": summary.manifest_size_bytes,
+        // The embedded store has no write generations; digest_uri is the
+        // stable cross-backend change signal.
+        "manifest_generation": Value::Null,
+        "manifest_digest_uri": summary.manifest_digest_uri,
         "manifest_summary": manifest_summary,
         "manifest": if summary.include_manifest { summary.envelope } else { None },
     })
@@ -877,9 +961,14 @@ fn normalize_relative_path(
             "{field} must not contain empty components"
         )));
     }
-    if raw.contains('\\') || raw.contains('\0') {
+    if raw.contains('\\') {
         return Err(WorkbenchToolError::new(format!(
-            "{field} must use POSIX separators and contain no NUL bytes"
+            "{field} must use POSIX separators"
+        )));
+    }
+    if raw.contains('\0') {
+        return Err(WorkbenchToolError::new(format!(
+            "{field} contains a NUL byte"
         )));
     }
     for component in raw.split('/') {
@@ -899,10 +988,11 @@ fn normalize_absolute_path(raw: &str, field: &'static str) -> Result<String, Str
     if !raw.starts_with('/') {
         return Err(format!("{field} must be an absolute agent path"));
     }
-    if raw.contains('\\') || raw.contains('\0') {
-        return Err(format!(
-            "{field} must use POSIX separators and contain no NUL bytes"
-        ));
+    if raw.contains('\\') {
+        return Err(format!("{field} must use POSIX separators"));
+    }
+    if raw.contains('\0') {
+        return Err(format!("{field} contains a NUL byte"));
     }
     let trimmed = raw.trim_end_matches('/');
     let path = if trimmed.is_empty() { "/" } else { trimmed };
@@ -978,7 +1068,7 @@ fn scoped_path(
     let prefix = format!("{base}/");
     let Some(rest) = path.strip_prefix(&prefix) else {
         return Err(WorkbenchToolError::new(format!(
-            "path escaped workbench root: {path}"
+            "path {path} is outside workbench {base}"
         )));
     };
     let first = rest.split('/').next().unwrap_or(rest);
@@ -1024,6 +1114,56 @@ fn compact_list_entry(
     }))
 }
 
+/// Same card shape as the DFS-backed workbench stat. Fields the embedded
+/// store has no concept of (inode, generation, record_count) are explicit
+/// nulls so consumers can share one parser across backends.
+fn compact_stat_card<S>(
+    fs: &AgentFs<S>,
+    scope: &WorkbenchPathScope,
+    node: &crate::AgentNode,
+) -> Result<Value, WorkbenchToolError>
+where
+    S: AgentStore,
+{
+    let is_file = node.kind == AgentNodeKind::File;
+    let entry_count = if is_file {
+        Value::Null
+    } else {
+        json!(fs.list(&scope.path, None, usize::MAX)?.0.len())
+    };
+    // The embedded store does not persist digests; hash the body on read.
+    // Bodies are bounded by the workbench max_bytes write path.
+    let digest = if is_file {
+        json!(digest_uri(&fs.read_file(&scope.path)?))
+    } else {
+        Value::Null
+    };
+    let content_type = if is_file {
+        json!(node
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_owned()))
+    } else {
+        Value::Null
+    };
+    Ok(json!({
+        "name": node.name,
+        "path": scope.path,
+        "section": scope.section,
+        "relative_path": scope.relative_path,
+        "kind": if is_file { "file" } else { "directory" },
+        "size_bytes": node.size_bytes,
+        "entry_count": entry_count,
+        "record_count": Value::Null,
+        "inode": Value::Null,
+        "generation": Value::Null,
+        "content_type": content_type,
+        "digest_uri": digest,
+        "producer": is_file.then_some("nokv-agent"),
+        "manifest_id": is_file.then(|| scope.path.trim_start_matches('/').to_owned()),
+    }))
+}
+
 fn compact_grep_match(
     options: &WorkbenchMcpOptions,
     id: &str,
@@ -1050,6 +1190,20 @@ fn payload_bytes(
     let text = optional_string(args, "text")?;
     let encoded = optional_string(args, "base64")?;
     let (bytes, content_type) = match (text, encoded) {
+        (Some(text), Some("")) if !text.is_empty() => {
+            (text.as_bytes().to_vec(), "text/plain; charset=utf-8")
+        }
+        (Some(""), Some(encoded)) if !encoded.is_empty() => (
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|err| WorkbenchToolError::new(format!("invalid base64 payload: {err}")))?,
+            "application/octet-stream",
+        ),
+        (Some(_), Some(_)) => {
+            return Err(WorkbenchToolError::new(
+                "provide exactly one of text or base64",
+            ))
+        }
         (Some(text), None) => (text.as_bytes().to_vec(), "text/plain; charset=utf-8"),
         (None, Some(encoded)) => (
             base64::engine::general_purpose::STANDARD
@@ -1057,7 +1211,7 @@ fn payload_bytes(
                 .map_err(|err| WorkbenchToolError::new(format!("invalid base64 payload: {err}")))?,
             "application/octet-stream",
         ),
-        _ => {
+        (None, None) => {
             return Err(WorkbenchToolError::new(
                 "provide exactly one of text or base64",
             ))
@@ -1202,8 +1356,12 @@ mod tests {
             "/workbenches/task-1/input/event.json"
         );
         assert_eq!(
-            responses[2]["result"]["structuredContent"]["items"][0]["value"]["event"],
-            "flare"
+            responses[2]["result"]["structuredContent"]["record_type"],
+            "json_object"
+        );
+        assert_eq!(
+            responses[2]["result"]["structuredContent"]["items"][0]["value"],
+            json!({"key": "event", "value": "flare"})
         );
         assert_eq!(
             responses[3]["result"]["structuredContent"]["backend"],
@@ -1212,6 +1370,391 @@ mod tests {
         assert_eq!(
             responses[4]["result"]["structuredContent"]["snapshot_kind"],
             "logical"
+        );
+    }
+
+    #[test]
+    fn put_file_payload_tolerates_empty_counterpart() {
+        let (fs, options) = surface();
+        // (text, base64="") writes the text payload.
+        let response = execute_tool(
+            &fs,
+            &options,
+            "workbench_put_file",
+            &json!({"id":"task-1","section":"input","path":"a.txt","text":"x","base64":""}),
+        )
+        .unwrap();
+        assert_eq!(response["size_bytes"], 1);
+        assert_eq!(response["content_type"], "text/plain; charset=utf-8");
+        // (text="", base64) decodes the base64 payload.
+        let response = execute_tool(
+            &fs,
+            &options,
+            "workbench_put_file",
+            &json!({"id":"task-1","section":"input","path":"b.bin","text":"","base64":"aGk="}),
+        )
+        .unwrap();
+        assert_eq!(response["size_bytes"], 2);
+        assert_eq!(response["content_type"], "application/octet-stream");
+        assert_eq!(
+            fs.read_file("/workbenches/task-1/input/b.bin").unwrap(),
+            b"hi".to_vec()
+        );
+        // A lone empty text still writes an empty file.
+        let response = execute_tool(
+            &fs,
+            &options,
+            "workbench_put_file",
+            &json!({"id":"task-1","section":"input","path":"c.txt","text":""}),
+        )
+        .unwrap();
+        assert_eq!(response["size_bytes"], 0);
+        // Ambiguous combinations keep failing.
+        for args in [
+            json!({"id":"task-1","section":"input","path":"d","text":"","base64":""}),
+            json!({"id":"task-1","section":"input","path":"d","text":"x","base64":"eQ=="}),
+            json!({"id":"task-1","section":"input","path":"d"}),
+        ] {
+            let err = execute_tool(&fs, &options, "workbench_put_file", &args).unwrap_err();
+            assert_eq!(err.to_string(), "provide exactly one of text or base64");
+        }
+    }
+
+    #[test]
+    fn put_file_reports_null_inode_and_generation() {
+        let (fs, options) = surface();
+        let response = execute_tool(
+            &fs,
+            &options,
+            "workbench_put_file",
+            &json!({"id":"task-1","section":"input","path":"a.txt","text":"x"}),
+        )
+        .unwrap();
+        assert_eq!(response["inode"], Value::Null);
+        assert_eq!(response["generation"], Value::Null);
+    }
+
+    #[test]
+    fn commit_response_and_envelope_align_with_dfs() {
+        let (fs, options) = surface();
+        let response = execute_tool(
+            &fs,
+            &options,
+            "workbench_commit",
+            &json!({"id":"task-1","manifest":{"task":"flare-search"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            response["path"],
+            "/workbenches/task-1/metadata/run_manifest.json"
+        );
+        let bytes = fs
+            .read_file("/workbenches/task-1/metadata/run_manifest.json")
+            .unwrap();
+        assert_eq!(response["size_bytes"], bytes.len());
+        assert_eq!(response["inode"], Value::Null);
+        assert_eq!(response["generation"], Value::Null);
+        assert_eq!(response["digest_uri"], digest_uri(&bytes));
+        assert!(response.get("manifest_path").is_none());
+        let envelope: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(envelope["schema"], "nokv.workbench.run_manifest.v0");
+        assert_eq!(envelope["backend"], "nokv-agent");
+        assert_eq!(envelope["manifest"]["task"], "flare-search");
+    }
+
+    #[test]
+    fn commit_validates_manifest_argument() {
+        let (fs, options) = surface();
+        let err =
+            execute_tool(&fs, &options, "workbench_commit", &json!({"id":"task-1"})).unwrap_err();
+        assert_eq!(err.to_string(), "missing required argument manifest");
+        let err = execute_tool(
+            &fs,
+            &options,
+            "workbench_commit",
+            &json!({"id":"task-1","manifest":"str"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "manifest must be a JSON object");
+    }
+
+    #[test]
+    fn find_pages_root_listing_like_dfs() {
+        let (fs, options) = surface();
+        for index in 1..=5 {
+            execute_tool(
+                &fs,
+                &options,
+                "workbench_create",
+                &json!({"id": format!("wb-{index}")}),
+            )
+            .unwrap();
+        }
+        for index in 1..=3 {
+            execute_tool(
+                &fs,
+                &options,
+                "workbench_commit",
+                &json!({"id": format!("wb-{index}"), "manifest": {"task": "Flare-Search"}}),
+            )
+            .unwrap();
+        }
+        // Page through the root listing; match_count counts the current page.
+        let mut cursor = Value::Null;
+        let mut total = 0;
+        let mut pages = 0;
+        loop {
+            let page = execute_tool(
+                &fs,
+                &options,
+                "workbench_find",
+                &json!({"cursor": cursor, "limit": 2}),
+            )
+            .unwrap();
+            let matches = page["matches"].as_array().unwrap();
+            assert!(matches.len() <= 2);
+            assert_eq!(page["match_count"], matches.len());
+            assert!(page["entry_count"].is_number());
+            total += matches.len();
+            pages += 1;
+            cursor = page["next_cursor"].clone();
+            if cursor.is_null() {
+                assert_eq!(page["truncated"], false);
+                break;
+            }
+        }
+        assert_eq!(total, 5);
+        assert_eq!(pages, 3);
+        // committed filter drops uncommitted workbenches within each page.
+        let committed = execute_tool(
+            &fs,
+            &options,
+            "workbench_find",
+            &json!({"committed": true, "limit": 100}),
+        )
+        .unwrap();
+        assert_eq!(committed["match_count"], 3);
+        let uncommitted = execute_tool(
+            &fs,
+            &options,
+            "workbench_find",
+            &json!({"committed": false, "limit": 100}),
+        )
+        .unwrap();
+        assert_eq!(uncommitted["match_count"], 2);
+        // Manifest pattern matching is ASCII case-insensitive.
+        let pattern = execute_tool(
+            &fs,
+            &options,
+            "workbench_find",
+            &json!({"manifest_pattern": "flare-search", "limit": 100}),
+        )
+        .unwrap();
+        assert_eq!(pattern["match_count"], 3);
+    }
+
+    #[test]
+    fn find_rejects_malformed_cursor() {
+        let (fs, options) = surface();
+        execute_tool(&fs, &options, "workbench_create", &json!({"id":"wb-1"})).unwrap();
+        let err = execute_tool(
+            &fs,
+            &options,
+            "workbench_find",
+            &json!({"cursor": "garbage"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "invalid cursor garbage");
+        let err =
+            execute_tool(&fs, &options, "workbench_find", &json!({"cursor": "zz"})).unwrap_err();
+        assert_eq!(err.to_string(), "invalid cursor zz");
+    }
+
+    #[test]
+    fn find_empty_root_reports_entry_count() {
+        let (fs, options) = surface();
+        let response = execute_tool(&fs, &options, "workbench_find", &json!({})).unwrap();
+        assert_eq!(response["match_count"], 0);
+        assert_eq!(response["entry_count"], 0);
+        assert_eq!(response["next_cursor"], Value::Null);
+        assert_eq!(response["truncated"], false);
+    }
+
+    #[test]
+    fn find_reports_manifest_summary_fields() {
+        let (fs, options) = surface();
+        execute_tool(&fs, &options, "workbench_create", &json!({"id":"wb-1"})).unwrap();
+        let commit = execute_tool(
+            &fs,
+            &options,
+            "workbench_commit",
+            &json!({"id":"wb-1","manifest":{"task":"flare"}}),
+        )
+        .unwrap();
+        let found = execute_tool(&fs, &options, "workbench_find", &json!({})).unwrap();
+        let entry = &found["matches"][0];
+        let bytes = fs
+            .read_file("/workbenches/wb-1/metadata/run_manifest.json")
+            .unwrap();
+        assert_eq!(entry["manifest_size_bytes"], bytes.len());
+        assert_eq!(entry["manifest_digest_uri"], commit["digest_uri"]);
+        assert_eq!(entry["manifest_generation"], Value::Null);
+        assert_eq!(
+            entry["manifest_summary"]["schema"],
+            "nokv.workbench.run_manifest.v0"
+        );
+        // Uncommitted workbenches report the same keys as nulls.
+        execute_tool(&fs, &options, "workbench_create", &json!({"id":"wb-2"})).unwrap();
+        let found = execute_tool(&fs, &options, "workbench_find", &json!({})).unwrap();
+        let entry = found["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["workbench_id"] == "wb-2")
+            .unwrap();
+        assert_eq!(entry["manifest_size_bytes"], Value::Null);
+        assert_eq!(entry["manifest_digest_uri"], Value::Null);
+        assert_eq!(entry["manifest_generation"], Value::Null);
+    }
+
+    #[test]
+    fn stat_returns_compact_card() {
+        let (fs, options) = surface();
+        let put = execute_tool(
+            &fs,
+            &options,
+            "workbench_put_file",
+            &json!({"id":"task-1","section":"input","path":"data.bin","base64":"aGk="}),
+        )
+        .unwrap();
+        let stat = execute_tool(
+            &fs,
+            &options,
+            "workbench_stat",
+            &json!({"id":"task-1","section":"input","path":"data.bin"}),
+        )
+        .unwrap();
+        let card = &stat["card"];
+        assert_eq!(card["name"], "data.bin");
+        assert_eq!(card["path"], "/workbenches/task-1/input/data.bin");
+        assert_eq!(card["section"], "input");
+        assert_eq!(card["relative_path"], "data.bin");
+        assert_eq!(card["kind"], "file");
+        assert_eq!(card["size_bytes"], 2);
+        assert_eq!(card["entry_count"], Value::Null);
+        assert_eq!(card["record_count"], Value::Null);
+        assert_eq!(card["inode"], Value::Null);
+        assert_eq!(card["generation"], Value::Null);
+        assert_eq!(card["content_type"], "application/octet-stream");
+        assert_eq!(card["digest_uri"], put["digest_uri"]);
+        assert_eq!(card["producer"], "nokv-agent");
+        assert_eq!(card["manifest_id"], "workbenches/task-1/input/data.bin");
+        for leaked in ["schema", "sample", "catalog", "indexed_values", "body"] {
+            assert!(card.get(leaked).is_none(), "card leaks {leaked}");
+        }
+        // Workbench root card counts direct children.
+        let stat = execute_tool(&fs, &options, "workbench_stat", &json!({"id":"task-1"})).unwrap();
+        let card = &stat["card"];
+        assert_eq!(card["kind"], "directory");
+        assert_eq!(card["entry_count"], SECTIONS.len());
+        assert_eq!(card["section"], Value::Null);
+        assert_eq!(card["digest_uri"], Value::Null);
+        assert_eq!(card["producer"], Value::Null);
+        assert_eq!(card["manifest_id"], Value::Null);
+    }
+
+    #[test]
+    fn snapshot_is_idempotent_and_stays_within_53_bits() {
+        let (fs, options) = surface();
+        execute_tool(
+            &fs,
+            &options,
+            "workbench_put_file",
+            &json!({"id":"task-1","section":"outputs","path":"result.txt","text":"done"}),
+        )
+        .unwrap();
+        execute_tool(
+            &fs,
+            &options,
+            "workbench_commit",
+            &json!({"id":"task-1","manifest":{"task":"flare"}}),
+        )
+        .unwrap();
+        let first =
+            execute_tool(&fs, &options, "workbench_snapshot", &json!({"id":"task-1"})).unwrap();
+        let second =
+            execute_tool(&fs, &options, "workbench_snapshot", &json!({"id":"task-1"})).unwrap();
+        assert_eq!(first["snapshot_id"], second["snapshot_id"]);
+        assert_eq!(first["snapshot_digest"], second["snapshot_digest"]);
+        let id = first["snapshot_id"].as_u64().unwrap();
+        assert!(id < (1 << 53));
+        let digest = first["snapshot_digest"].as_str().unwrap();
+        assert!(digest.starts_with("sha256:"));
+        assert_eq!(first["path"], "/workbenches/task-1");
+        assert_eq!(first["read_version"], Value::Null);
+        // The record file name uses the same 53-bit id.
+        let snapshot_path = first["snapshot_path"].as_str().unwrap();
+        assert_eq!(
+            snapshot_path,
+            format!("/workbenches/task-1/metadata/snapshots/{id}.json")
+        );
+        let record: Value = serde_json::from_slice(&fs.read_file(snapshot_path).unwrap()).unwrap();
+        assert_eq!(record["snapshot_id"], id);
+        // Prior snapshot records are excluded from the file manifest.
+        let files = record["files"].as_array().unwrap();
+        assert!(files.iter().all(|file| !file["path"]
+            .as_str()
+            .unwrap()
+            .contains("/metadata/snapshots/")));
+    }
+
+    #[test]
+    fn snapshot_requires_commit_with_dfs_message() {
+        let (fs, options) = surface();
+        execute_tool(&fs, &options, "workbench_create", &json!({"id":"task-1"})).unwrap();
+        let err =
+            execute_tool(&fs, &options, "workbench_snapshot", &json!({"id":"task-1"})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "workbench task-1 is not committed; missing /workbenches/task-1/metadata/run_manifest.json"
+        );
+    }
+
+    #[test]
+    fn path_validation_messages_align_with_dfs() {
+        assert_eq!(
+            normalize_relative_path("bad\\path", "path", false)
+                .unwrap_err()
+                .to_string(),
+            "path must use POSIX separators"
+        );
+        assert_eq!(
+            normalize_relative_path("bad\0path", "path", false)
+                .unwrap_err()
+                .to_string(),
+            "path contains a NUL byte"
+        );
+        assert_eq!(
+            normalize_absolute_path("relative", "workbench_root").unwrap_err(),
+            "workbench_root must be an absolute agent path"
+        );
+        assert_eq!(
+            normalize_absolute_path("/a\\b", "workbench_root").unwrap_err(),
+            "workbench_root must use POSIX separators"
+        );
+        assert_eq!(
+            normalize_absolute_path("/a\0b", "workbench_root").unwrap_err(),
+            "workbench_root contains a NUL byte"
+        );
+        let options = WorkbenchMcpOptions {
+            root: DEFAULT_WORKBENCH_ROOT.to_owned(),
+            max_bytes: DEFAULT_WORKBENCH_MAX_BYTES,
+        };
+        assert_eq!(
+            path_scope(&options, "wb", "/elsewhere/file")
+                .unwrap_err()
+                .to_string(),
+            "path /elsewhere/file is outside workbench /workbenches/wb"
         );
     }
 
