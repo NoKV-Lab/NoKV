@@ -32,7 +32,7 @@ Defaults:
 RustFS endpoint:  http://127.0.0.1:9000
 NoKV server bind: 127.0.0.1:7799
 bucket:           nokv-lingtai-workbench
-workbench root:   /workbenches
+workbench root:   /agents/{agent_id}/wb (kernel expands {agent_id} per agent)
 state dir:        target/lingtai-workbench
 ```
 
@@ -139,7 +139,7 @@ python3 ./scripts/lingtai-workbench/install_workbench_mcp.py \
   --object-backend rustfs \
   --s3-endpoint http://127.0.0.1:9000 \
   --s3-bucket nokv-lingtai-workbench \
-  --workbench-root /workbenches
+  --workbench-root '/agents/{agent_id}/wb'
 ```
 
 The installer upserts the `nokv-workbench` MCP server registration. Re-running

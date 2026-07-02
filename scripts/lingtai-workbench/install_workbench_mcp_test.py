@@ -183,6 +183,38 @@ class InstallWorkbenchMcpTest(unittest.TestCase):
 
             self.assertEqual(resolved, only_agent)
 
+    def test_default_workbench_root_matches_lingtai_per_agent_contract(self):
+        # Contract with lingtai-kernel: the kernel expands {agent_id} at MCP
+        # launch (Agent._expand_agent_placeholders), and its bundled
+        # nokv-workbench skill assets use this exact template. Both delivery
+        # paths must install the same per-agent root.
+        self.assertEqual(self.module.DEFAULT_WORKBENCH_ROOT, "/agents/{agent_id}/wb")
+
+    def test_install_with_default_root_preserves_agent_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent_dir = self.make_agent(Path(tmp))
+            config = self.module.InstallConfig(
+                nokv_bin="/repo/target/debug/nokv",
+                server_bind="127.0.0.1:7799",
+                object_backend="rustfs",
+                s3_endpoint="http://127.0.0.1:9000",
+                s3_bucket="nokv-lingtai-workbench",
+                workbench_root=self.module.DEFAULT_WORKBENCH_ROOT,
+            )
+
+            self.module.configure_agent(agent_dir, config)
+
+            registry = [
+                json.loads(line)
+                for line in (agent_dir / "mcp_registry.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                registry[0]["args"][-2:],
+                ["--workbench-root", "/agents/{agent_id}/wb"],
+            )
+            init = json.loads((agent_dir / "init.json").read_text())
+            self.assertEqual(init["mcp"]["nokv-workbench"]["args"], registry[0]["args"])
+
     def test_resolve_agent_dir_rejects_ambiguous_non_coordinator_agents(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

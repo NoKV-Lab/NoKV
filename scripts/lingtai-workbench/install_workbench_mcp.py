@@ -13,7 +13,10 @@ DEFAULT_MCP_NAME = "nokv-workbench"
 DEFAULT_BUCKET = "nokv-lingtai-workbench"
 DEFAULT_ENDPOINT = "http://127.0.0.1:9000"
 DEFAULT_SERVER_BIND = "127.0.0.1:7799"
-DEFAULT_WORKBENCH_ROOT = "/workbenches"
+# Per-agent tenant isolation: the {agent_id} placeholder is written verbatim
+# and expanded by lingtai-kernel at MCP launch (Agent._expand_agent_placeholders).
+# Must stay identical to the kernel's bundled nokv-workbench skill assets.
+DEFAULT_WORKBENCH_ROOT = "/agents/{agent_id}/wb"
 
 
 @dataclass(frozen=True)
