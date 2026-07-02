@@ -1,9 +1,16 @@
-//! NoKV agent tool surface.
+//! NoKV agent tool surface and agent-native runtime.
 //!
-//! Transport-free agent tooling: the JSON tool definitions exposed to a model,
-//! the dispatcher that maps a tool call onto a namespace verb, argument
-//! validation, and result shaping. Depends only on `nokv-meta`, `nokv-object`
-//! and `nokv-types` — never on `nokv-client`, `nokv-protocol` or `nokv-control`.
+//! Two independent layers live in this crate:
+//!
+//! 1. The transport-free namespace tool surface (crate root): the JSON tool
+//!    definitions exposed to a model, the dispatcher that maps a tool call
+//!    onto a namespace verb, argument validation, and result shaping. This
+//!    layer depends only on `nokv-meta`, `nokv-object` and `nokv-types` —
+//!    never on `nokv-client`, `nokv-protocol` or `nokv-control`.
+//! 2. The agent-native runtime (`AgentFs`, `AgentEventIndex`, [`native`],
+//!    the `nokv-agent` binary): an embedded Holt-backed store for agent
+//!    state, independent of the NoKV DFS. It shares tool names and JSON
+//!    shapes with layer 1 where practical but talks to its own store.
 
 use nokv_meta::{
     MetadataStore, NamespaceAggregateGroup, NamespaceAggregateMeasure, NamespaceAggregateOp,
@@ -19,6 +26,50 @@ use nokv_meta::{
 };
 use nokv_object::ObjectStore;
 use serde_json::{json, Map, Value};
+
+mod codec;
+mod error;
+mod event;
+mod fs;
+mod holt;
+mod index;
+mod key;
+mod mcp;
+mod model;
+mod query;
+mod store;
+mod tool;
+mod workbench;
+
+pub use error::{AgentIndexError, AgentIndexResult};
+pub use event::{
+    AgentId, EventBatch, EventId, EventRecord, IndexCoverage, IngestReport, SourceRef,
+};
+pub use fs::AgentFs;
+pub use holt::HoltAgentStore;
+pub use index::AgentEventIndex;
+pub use mcp::{run_mcp, run_mcp_stream, run_mcp_surface, run_mcp_surface_stream, McpToolSurface};
+pub use model::{
+    AgentFindField, AgentIndexField, AgentIndexRegistration, AgentIndexRow, AgentIndexValue,
+    AgentNode, AgentNodeKind, AgentPredicateOp, AgentPredicateValue,
+};
+pub use query::{EventOrder, EventPage, EventQuery};
+pub use store::{
+    AgentBatch, AgentCommit, AgentMutation, AgentScanItem, AgentScanPage, AgentStore, ScanDirection,
+};
+pub use workbench::{
+    normalize_workbench_root, WorkbenchMcpOptions, WorkbenchMcpSurface,
+    DEFAULT_WORKBENCH_MAX_BYTES, DEFAULT_WORKBENCH_ROOT,
+};
+
+/// Agent-native tool dispatch over [`AgentFs`].
+///
+/// Same tool names as the crate-root namespace dispatcher, but executing
+/// against the embedded Holt-backed store instead of the NoKV DFS. Kept in a
+/// named module because the root exports of the same names serve `NoKvFs`.
+pub mod native {
+    pub use crate::tool::{agent_tool_definitions, execute_agent_tool};
+}
 
 /// Error surface for the agent tool layer.
 ///

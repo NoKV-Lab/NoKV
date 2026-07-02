@@ -198,3 +198,32 @@ design issue before adding a write verb to the trait.
 
 See also the [code contract](code_contract.md) and the
 [PR review checklist](pr_review_checklist.md).
+
+## 8. The agent-native runtime (embedded Holt store)
+
+Alongside the namespace tool surface above, the crate ships an **agent-native
+runtime**: an embedded, Holt-backed store for agent state that does not touch
+the NoKV DFS at all.
+
+- `HoltAgentStore` — embedded Holt tree (`open_file` / `open_memory`); one
+  live process per store directory (Holt holds a `flock` on it).
+- `AgentFs` — fs-shaped records (nodes, file bodies, child edges, catalogs,
+  index rows) keyed per `AgentId`. Write paths refuse to change a node's
+  kind: a file is never silently converted into a directory or vice versa.
+- `AgentEventIndex` — event rows plus typed/secondary indexes and coverage
+  rows, ingested from an append-only source (e.g. `events.jsonl`) in one
+  atomic batch. Ingestion is idempotent by `(source_file, source_offset)`,
+  including duplicates within a single batch; coverage is advance-only so
+  replaying an old batch never regresses `file_size`.
+- `nokv_agent::native::{agent_tool_definitions, execute_agent_tool}` — the
+  same seven read-tool names as the crate root, but executing against
+  `AgentFs` instead of `NoKvFs`. The root exports keep serving the DFS.
+- The `nokv-agent` binary — `nokv-agent mcp` (base profile) and
+  `nokv-agent mcp --profile workbench` serve these tools over MCP stdio
+  against a local store (`--store`, default `.nokv/agent`).
+
+The runtime is **additive**: nothing in the DFS product line depends on it,
+`nokv mcp` (including the DFS-backed workbench profile) is unchanged, and the
+two layers share tool names and JSON shapes but not storage. Treat it as the
+integration seam for agent-local state (LingTai-style derived index
+replacement) rather than a substitute for the namespace surface.
