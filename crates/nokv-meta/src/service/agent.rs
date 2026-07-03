@@ -432,8 +432,8 @@ pub struct NamespaceAggregateResult {
 pub struct NamespaceGrepRequest {
     pub path: String,
     pub pattern: String,
-    /// When non-empty, a line matches if it contains any entry; `pattern` is
-    /// then ignored.
+    /// OR alternatives unioned with `pattern`: a line matches if it contains
+    /// `pattern` or any entry (case-insensitive, deduplicated).
     pub patterns: Vec<String>,
     pub recursive: bool,
     /// Basename filter supporting `*` and `?`; unmatched files are skipped

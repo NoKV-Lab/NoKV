@@ -64,6 +64,9 @@ const DEFAULT_AGENT_AGGREGATE_LIMIT: usize = 20;
 const MAX_AGENT_AGGREGATE_LIMIT: usize = 100;
 const DEFAULT_AGENT_GREP_LIMIT: usize = 100;
 const MAX_AGENT_GREP_LIMIT: usize = 300;
+/// Mirror of the metadata server's grep pattern cap (nokv-meta
+/// MAX_GREP_PATTERNS); enforced there, advertised in the schema here.
+const MAX_AGENT_GREP_PATTERNS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentToolDefinition {
@@ -343,14 +346,14 @@ pub fn agent_tool_definitions() -> Vec<AgentToolDefinition> {
         },
         AgentToolDefinition {
             name: "grep",
-            description: "Search file bodies for case-insensitive literal substrings and return matching lines with line numbers. patterns adds OR alternatives to pattern; glob filters file names. Scope path to one directory or file when known.",
+            description: "Search file bodies for case-insensitive literal substrings and return matching lines with line numbers. patterns adds OR alternatives to pattern (at most 16); glob filters file names. Scope path to one directory or file when known.",
             parameters: json!({
                 "type": "object",
                 "required": ["path", "pattern", "recursive"],
                 "properties": {
                     "path": {"type": "string"},
                     "pattern": {"type": "string"},
-                    "patterns": {"type": "array", "items": {"type": "string"}},
+                    "patterns": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_AGENT_GREP_PATTERNS},
                     "glob": {"type": ["string", "null"]},
                     "recursive": {"type": "boolean"},
                     "cursor": {"type": ["string", "null"]},
@@ -2513,7 +2516,7 @@ mod tests {
         assert_eq!(grep.parameters["properties"]["limit"]["maximum"], 300);
         assert_eq!(
             grep.parameters["properties"]["patterns"],
-            json!({"type": "array", "items": {"type": "string"}})
+            json!({"type": "array", "items": {"type": "string"}, "maxItems": 16})
         );
         assert_eq!(
             grep.parameters["properties"]["glob"],

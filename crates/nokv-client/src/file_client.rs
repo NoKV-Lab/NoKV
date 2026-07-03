@@ -1856,7 +1856,10 @@ where
         let new_size = base_size
             .checked_add(delta.len() as u64)
             .ok_or_else(|| ClientError::Protocol("append size exceeds u64".to_owned()))?;
-        let prepared = self.metadata.prepare_artifact_path(path, true)?;
+        let prepared = self
+            .metadata
+            .prepare_artifact_path(path, true)
+            .map_err(|err| fold_append_prepare_not_found(err, expected_generation))?;
         if prepared.old_generation != base_generation {
             // A writer landed between lookup and prepare; the staged offset
             // would be wrong, so fail before writing any blocks.
@@ -1914,9 +1917,10 @@ where
                 created: false,
             }),
             Err(err) => {
-                self.objects
-                    .delete_staged(&staged)
-                    .map_err(ClientError::Object)?;
+                // Best-effort cleanup: a failed staged-object delete must not
+                // replace the publish error, whose classification
+                // (is_artifact_write_conflict) drives the caller's retry loop.
+                let _ = self.objects.delete_staged(&staged);
                 Err(err)
             }
         }
@@ -1947,9 +1951,10 @@ where
         {
             Ok(result) => Ok(result),
             Err(err) => {
-                self.objects
-                    .delete_staged(&staged)
-                    .map_err(ClientError::Object)?;
+                // Best-effort cleanup: a failed staged-object delete must not
+                // replace the publish error, whose classification
+                // (is_artifact_write_conflict) drives the caller's retry loop.
+                let _ = self.objects.delete_staged(&staged);
                 Err(err)
             }
         }
@@ -2238,6 +2243,23 @@ fn artifact_write_conflict() -> ClientError {
     ClientError::Metadata(nokv_meta::MetadError::Metadata(
         nokv_meta::MetadataError::PredicateFailed,
     ))
+}
+
+/// Classify a failed `prepare_artifact_path` inside
+/// [`NoKvFsClient::append_artifact`] after the initial lookup found the file:
+/// a `NotFound` here means a concurrent delete won the race. Without a pinned
+/// generation that is a retryable conflict — the caller's retry loop re-reads
+/// and takes the create branch — while a pinned generation or any other
+/// failure keeps its original error.
+fn fold_append_prepare_not_found(
+    err: ClientError,
+    expected_generation: Option<u64>,
+) -> ClientError {
+    if expected_generation.is_none() && crate::is_metadata_not_found(&err) {
+        artifact_write_conflict()
+    } else {
+        err
+    }
 }
 
 fn artifact_body_generation(entry: &DentryWithAttr) -> u64 {
@@ -2645,6 +2667,31 @@ mod tests {
         assert!(!is_artifact_write_conflict(&ClientError::Protocol(
             "file /x is missing body descriptor".to_owned(),
         )));
+    }
+
+    /// A file deleted between `lookup` and `prepare` inside `append_artifact`
+    /// must classify as a retryable conflict when no generation is pinned, so
+    /// the caller's retry loop re-reads and takes the create branch.
+    #[test]
+    fn append_prepare_not_found_folds_to_conflict_only_without_pinned_generation() {
+        let not_found = || ClientError::Metadata(nokv_meta::MetadError::NotFound);
+        assert!(is_artifact_write_conflict(&fold_append_prepare_not_found(
+            not_found(),
+            None
+        )));
+        // A pinned generation keeps the original error surface.
+        assert!(matches!(
+            fold_append_prepare_not_found(not_found(), Some(7)),
+            ClientError::Metadata(nokv_meta::MetadError::NotFound)
+        ));
+        // Non-NotFound errors pass through untouched.
+        assert!(matches!(
+            fold_append_prepare_not_found(
+                ClientError::Metadata(nokv_meta::MetadError::NotFile),
+                None
+            ),
+            ClientError::Metadata(nokv_meta::MetadError::NotFile)
+        ));
     }
 
     #[test]

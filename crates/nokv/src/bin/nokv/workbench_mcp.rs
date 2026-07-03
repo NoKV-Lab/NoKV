@@ -18,10 +18,14 @@ const DEFAULT_WORKBENCH_FIND_LIMIT: usize = 50;
 const MAX_WORKBENCH_FIND_LIMIT: usize = 100;
 // Schema-declared caps mirroring the agent tool limits (nokv-agent lib.rs);
 // the agent layer enforces them, these keep the advertised schemas honest.
+const MAX_WORKBENCH_LIST_LIMIT: usize = 100;
 const MAX_WORKBENCH_SEARCH_LIMIT: usize = 10;
 const MAX_WORKBENCH_AGGREGATE_LIMIT: usize = 100;
 const MAX_WORKBENCH_READ_LIMIT: usize = 300;
 const MAX_WORKBENCH_GREP_LIMIT: usize = 300;
+/// Mirror of the metadata server's grep pattern cap (nokv-meta
+/// MAX_GREP_PATTERNS); enforced there, advertised and pre-checked here.
+const MAX_WORKBENCH_GREP_PATTERNS: usize = 16;
 /// Retries after a lost artifact-write CAS; every attempt re-reads current state.
 const WRITE_CONFLICT_RETRIES: usize = 5;
 /// Linear backoff step between conflict retries. Zero-interval retries make N
@@ -34,6 +38,15 @@ const WRITE_CONFLICT_BACKOFF_STEP_MS: u64 = 10;
 /// Linear `attempt * 10ms` backoff plus a 0-8ms desync offset derived from the
 /// process id and the current clock nanoseconds, so two workbench processes
 /// that lost the same race do not wake in lockstep (no rand dependency).
+/// Wrap a write conflict that survived the whole retry budget into an
+/// actionable error: the caller learns the write is safe to re-issue while
+/// the original error text stays available for diagnosis.
+fn write_conflict_exhausted(attempts: usize, err: impl fmt::Display) -> WorkbenchToolError {
+    WorkbenchToolError::new(format!(
+        "write conflicted with concurrent writers after {attempts} attempts; retry the call ({err})"
+    ))
+}
+
 fn write_conflict_backoff(attempt: usize) {
     let jitter_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -122,7 +135,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_append",
             description:
-                "Append bytes to the end of one workbench file, creating it when missing. Safe under concurrent writers: conflicting appends are retried automatically. After an append, stat digest_uri describes the appended delta manifest, not the full content sha256.",
+                "Append bytes to the end of one workbench file, creating it when missing. Safe under concurrent writers: conflicting appends are retried automatically. After an append, stat digest_uri describes the appended delta bytes, not the full content sha256.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "section", "path"],
@@ -167,7 +180,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                     "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
                     "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
                     "cursor": {"type": ["string", "null"]},
-                    "limit": {"type": "integer", "minimum": 1}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_LIST_LIMIT}
                 },
                 "additionalProperties": false
             }),
@@ -200,9 +213,9 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                     "path": {"type": "string", "description": "Path relative to section. Do not prefix it with the section name."},
                     "format": {"type": "string", "enum": ["structured", "bytes"]},
                     "cursor": {"type": ["string", "null"]},
-                    "offset": {"type": "integer", "minimum": 0},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Start offset for the read; ignored when cursor is set."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_READ_LIMIT},
-                    "if_none_match": {"type": "integer", "minimum": 0, "description": "Generation from a previous response. When it still matches, only not_modified and generation are returned."}
+                    "if_none_match": {"type": "integer", "minimum": 0, "description": "Generation from a previous response. When it still matches, the file body is skipped and the response carries not_modified=true plus the unchanged generation."}
                 },
                 "additionalProperties": false
             }),
@@ -210,7 +223,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_grep",
             description:
-                "Search workbench file bodies for case-insensitive literal substrings. This is not regex grep. patterns adds OR alternatives; when patterns is omitted and pattern contains '|', pattern is split on '|' into OR alternatives (empty segments dropped). glob filters file basenames with * and ?. Matches in files written outside the standard sections by other NoKV clients are returned with section null; such files cannot be addressed by the other workbench tools.",
+                "Search workbench file bodies for case-insensitive literal substrings. This is not regex grep. patterns adds OR alternatives (at most 16); when patterns is omitted and pattern contains '|', pattern is split on '|' into OR alternatives (empty segments dropped, same 16-alternative cap). glob filters file basenames with * and ?. Matches in files written outside the standard sections by other NoKV clients are returned with section null; such files cannot be addressed by the other workbench tools.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "pattern", "recursive"],
@@ -219,7 +232,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                     "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
                     "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
                     "pattern": {"type": "string"},
-                    "patterns": {"type": "array", "items": {"type": "string"}},
+                    "patterns": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_WORKBENCH_GREP_PATTERNS},
                     "glob": {"type": ["string", "null"], "description": "Basename filter supporting * and ?."},
                     "recursive": {"type": "boolean"},
                     "cursor": {"type": ["string", "null"]},
@@ -231,7 +244,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_search",
             description:
-                "Query workbench paths by metadata with catalog field predicates, sort, projections, and facets. Omit id to search across every workbench under the root. Complements workbench_find, which discovers workbenches by their committed manifest; use workbench_grep for file content search.",
+                "Query workbench paths by metadata with catalog field predicates, sort, projections, and facets. Omit id to search across every workbench under the root. Complements workbench_find, which discovers workbenches by their committed manifest; use workbench_grep for file content search. Directories created under the root by other NoKV clients appear with their directory name as workbench_id; such entries cannot be addressed by the other workbench tools.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -530,6 +543,9 @@ where
                 attempts += 1;
                 write_conflict_backoff(attempts);
             }
+            Err(err) if is_artifact_write_conflict(&err) => {
+                return Err(write_conflict_exhausted(attempts + 1, err))
+            }
             Err(err) => return Err(client_error(err)),
         }
     };
@@ -603,6 +619,22 @@ where
         } else {
             text.replacen(old_string, new_string, 1)
         };
+        if new_text == text {
+            // A byte-identical replacement publishing a new generation would
+            // invalidate if_none_match caches and CAS pins for nothing;
+            // report success at the current state instead.
+            return Ok(json!({
+                "status": "success",
+                "workbench_id": id,
+                "section": section,
+                "relative_path": rel_path,
+                "path": path,
+                "replacements": replacements,
+                "size_bytes": entry.attr.size,
+                "generation": entry.attr.generation,
+                "no_change": true,
+            }));
+        }
         let new_bytes = new_text.into_bytes();
         if new_bytes.len() > options.max_bytes {
             return Err(WorkbenchToolError::new(format!(
@@ -625,6 +657,9 @@ where
                 attempts += 1;
                 write_conflict_backoff(attempts);
             }
+            Err(err) if is_artifact_write_conflict(&err) => {
+                return Err(write_conflict_exhausted(attempts + 1, err))
+            }
             Err(err) => return Err(client_error(err)),
         }
     };
@@ -638,6 +673,7 @@ where
         "replacements": replacements,
         "size_bytes": result.entry.attr.size,
         "generation": result.entry.attr.generation,
+        "no_change": false,
     }))
 }
 
@@ -661,12 +697,14 @@ where
     };
     if read_tool == "read" {
         if let Some(expected) = optional_u64(args, "if_none_match")? {
-            let metadata = client
-                .metadata()
-                .stat_path(&target)
-                .map_err(client_error)?
+            // A missing ancestor and a missing leaf are the same absence to
+            // the caller; fold both into one not-found message.
+            let metadata = stat_path_or_absent(client, &target)?
                 .ok_or_else(|| WorkbenchToolError::new(format!("path not found: {target}")))?;
-            if metadata.attr.generation == expected {
+            // Only a file body can be conditionally skipped. Anything else
+            // falls through to the main read path so a directory fails with
+            // the same error an unconditional read reports.
+            if metadata.attr.file_type == FileType::File && metadata.attr.generation == expected {
                 let scope = path_scope(options, &id, &target)?;
                 return Ok(json!({
                     "status": "success",
@@ -703,7 +741,7 @@ where
         "grep" => {
             forwarded.remove("format");
             forwarded.remove("offset");
-            split_piped_grep_pattern(&mut forwarded);
+            split_piped_grep_pattern(&mut forwarded)?;
         }
         _ => {}
     }
@@ -714,29 +752,40 @@ where
 
 /// `pattern: "a|b"` without an explicit `patterns` array is treated as OR
 /// alternatives, matching what agents expect from grep pipes. Empty segments
-/// are dropped; a pattern of only pipes stays a literal search.
-fn split_piped_grep_pattern(forwarded: &mut serde_json::Map<String, Value>) {
+/// are dropped; a pattern of only pipes stays a literal search. More
+/// alternatives than the server accepts fail here with an actionable error
+/// instead of the server's opaque `patterns` cap message.
+fn split_piped_grep_pattern(
+    forwarded: &mut serde_json::Map<String, Value>,
+) -> Result<(), WorkbenchToolError> {
     let has_patterns = forwarded
         .get("patterns")
         .and_then(Value::as_array)
         .is_some_and(|patterns| !patterns.is_empty());
     if has_patterns {
-        return;
+        return Ok(());
     }
     let Some(pattern) = forwarded.get("pattern").and_then(Value::as_str) else {
-        return;
+        return Ok(());
     };
     if !pattern.contains('|') {
-        return;
+        return Ok(());
     }
     let alternatives = pattern
         .split('|')
         .filter(|part| !part.is_empty())
         .map(|part| Value::String(part.to_owned()))
         .collect::<Vec<_>>();
+    if alternatives.len() > MAX_WORKBENCH_GREP_PATTERNS {
+        return Err(WorkbenchToolError::new(format!(
+            "pattern contains {} '|'-separated alternatives; at most {MAX_WORKBENCH_GREP_PATTERNS} are supported",
+            alternatives.len()
+        )));
+    }
     if !alternatives.is_empty() {
         forwarded.insert("patterns".to_owned(), Value::Array(alternatives));
     }
+    Ok(())
 }
 
 fn shape_read_tool_result<O>(
@@ -935,7 +984,7 @@ where
     // A root that no workbench has materialized yet is an empty result for
     // cross-workbench queries, not an error.
     if id.is_none()
-        && matches!(query_tool, "find" | "aggregate")
+        && matches!(query_tool, "find" | "aggregate" | "catalog")
         && stat_path_or_absent(client, &options.root)?.is_none()
     {
         return Ok(empty_query_result(query_tool, &options.root));
@@ -975,6 +1024,20 @@ fn empty_query_result(query_tool: &str, root: &str) -> Value {
             "facets": [],
             "next_cursor": Value::Null,
             "truncated": false,
+        }),
+        // Field-level mirror of the agent catalog output (nokv-agent
+        // execute_catalog) for a root with no fields to discover.
+        "catalog" => json!({
+            "status": "success",
+            "path": root,
+            "catalog_empty": true,
+            "catalog": {
+                "filterable": [],
+                "sortable": [],
+                "facetable": [],
+                "facets": [],
+            },
+            "child_catalogs": [],
         }),
         _ => json!({
             "status": "success",
@@ -1927,6 +1990,62 @@ mod tests {
         assert!(validate_workbench_id("spedas-task-001").is_ok());
         assert!(validate_workbench_id("_bad").is_err());
         assert!(validate_workbench_id("bad/path").is_err());
+    }
+
+    #[test]
+    fn write_conflict_exhausted_keeps_inner_error_and_retry_guidance() {
+        let message = write_conflict_exhausted(6, "metadata predicate failed").to_string();
+        assert!(
+            message.contains("conflicted with concurrent writers after 6 attempts; retry the call"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("metadata predicate failed"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn split_piped_grep_pattern_enforces_alternative_cap() {
+        let forwarded_for = |pattern: String| {
+            let mut map = serde_json::Map::new();
+            map.insert("pattern".to_owned(), Value::String(pattern));
+            map
+        };
+        let join = |count: usize| {
+            (0..count)
+                .map(|index| format!("alt-{index}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+
+        let mut sixteen = forwarded_for(join(16));
+        split_piped_grep_pattern(&mut sixteen).unwrap();
+        assert_eq!(sixteen["patterns"].as_array().unwrap().len(), 16);
+
+        let mut seventeen = forwarded_for(join(17));
+        let error = split_piped_grep_pattern(&mut seventeen)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "pattern contains 17 '|'-separated alternatives; at most 16 are supported"
+            ),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_catalog_result_mirrors_agent_catalog_shape() {
+        let result = empty_query_result("catalog", "/workbenches");
+        assert_eq!(result["status"], "success");
+        assert_eq!(result["path"], "/workbenches");
+        assert_eq!(result["catalog_empty"], true);
+        assert_eq!(result["catalog"]["filterable"], json!([]));
+        assert_eq!(result["catalog"]["sortable"], json!([]));
+        assert_eq!(result["catalog"]["facetable"], json!([]));
+        assert_eq!(result["catalog"]["facets"], json!([]));
+        assert_eq!(result["child_catalogs"], json!([]));
     }
 
     #[test]
