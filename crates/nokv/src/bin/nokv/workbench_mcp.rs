@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use nokv_agent::AgentToolDefinition;
-use nokv_client::{ArtifactMetadata, NoKvFsClient};
+use nokv_client::{is_artifact_write_conflict, ArtifactMetadata, NoKvFsClient};
 use nokv_object::ObjectStore;
 use nokv_types::{FileType, PathMetadata};
 use serde_json::{json, Value};
@@ -14,6 +14,14 @@ use crate::{DEFAULT_MODE_DIR, DEFAULT_MODE_FILE};
 pub const DEFAULT_WORKBENCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_WORKBENCH_FIND_LIMIT: usize = 50;
 const MAX_WORKBENCH_FIND_LIMIT: usize = 100;
+// Schema-declared caps mirroring the agent tool limits (nokv-agent lib.rs);
+// the agent layer enforces them, these keep the advertised schemas honest.
+const MAX_WORKBENCH_SEARCH_LIMIT: usize = 10;
+const MAX_WORKBENCH_AGGREGATE_LIMIT: usize = 100;
+const MAX_WORKBENCH_READ_LIMIT: usize = 300;
+const MAX_WORKBENCH_GREP_LIMIT: usize = 300;
+/// Retries after a lost artifact-write CAS; every attempt re-reads current state.
+const WRITE_CONFLICT_RETRIES: usize = 3;
 
 pub const SECTIONS: &[&str] = &["input", "scripts", "outputs", "logs", "metadata"];
 
@@ -89,6 +97,42 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
             }),
         },
         AgentToolDefinition {
+            name: "workbench_append",
+            description:
+                "Append bytes to the end of one workbench file, creating it when missing. Safe under concurrent writers: conflicting appends are retried automatically. After an append, stat digest_uri describes the appended delta manifest, not the full content sha256.",
+            parameters: json!({
+                "type": "object",
+                "required": ["id", "section", "path"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "section": {"type": "string", "enum": SECTIONS},
+                    "path": {"type": "string", "description": "Path relative to section. Do not prefix it with the section name."},
+                    "text": {"type": "string"},
+                    "base64": {"type": "string"},
+                    "content_type": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+        },
+        AgentToolDefinition {
+            name: "workbench_edit",
+            description:
+                "Replace an exact string in one workbench text file. Fails when old_string is missing or not unique unless replace_all=true; concurrent writes are retried with re-validation.",
+            parameters: json!({
+                "type": "object",
+                "required": ["id", "section", "path", "old_string", "new_string"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "section": {"type": "string", "enum": SECTIONS},
+                    "path": {"type": "string", "description": "Path relative to section. Do not prefix it with the section name."},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            }),
+        },
+        AgentToolDefinition {
             name: "workbench_list",
             description:
                 "List a workbench, section, or subdirectory through the NoKV namespace. Not recursive. Entries written outside the standard sections by other NoKV clients are returned with section null; such entries cannot be addressed by the other workbench tools.",
@@ -123,7 +167,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_read",
             description:
-                "Read one workbench file through the NoKV namespace. Structured mode returns JSON, YAML, or text records; bytes mode returns byte ranges.",
+                "Read one workbench file through the NoKV namespace. Structured mode returns JSON, YAML, or text records; bytes mode returns byte ranges. Pass if_none_match with a previously returned generation to skip the body when the file is unchanged.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "section", "path"],
@@ -134,7 +178,8 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                     "format": {"type": "string", "enum": ["structured", "bytes"]},
                     "cursor": {"type": ["string", "null"]},
                     "offset": {"type": "integer", "minimum": 0},
-                    "limit": {"type": "integer", "minimum": 1}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_READ_LIMIT},
+                    "if_none_match": {"type": "integer", "minimum": 0, "description": "Generation from a previous response. When it still matches, only not_modified and generation are returned."}
                 },
                 "additionalProperties": false
             }),
@@ -142,7 +187,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_grep",
             description:
-                "Search workbench file bodies for a case-insensitive literal substring. This is not regex grep. Matches in files written outside the standard sections by other NoKV clients are returned with section null; such files cannot be addressed by the other workbench tools.",
+                "Search workbench file bodies for case-insensitive literal substrings. This is not regex grep. patterns adds OR alternatives; when patterns is omitted and pattern contains '|', pattern is split on '|' into OR alternatives (empty segments dropped). glob filters file basenames with * and ?. Matches in files written outside the standard sections by other NoKV clients are returned with section null; such files cannot be addressed by the other workbench tools.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "pattern", "recursive"],
@@ -151,9 +196,88 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                     "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
                     "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
                     "pattern": {"type": "string"},
+                    "patterns": {"type": "array", "items": {"type": "string"}},
+                    "glob": {"type": ["string", "null"], "description": "Basename filter supporting * and ?."},
                     "recursive": {"type": "boolean"},
                     "cursor": {"type": ["string", "null"]},
-                    "limit": {"type": "integer", "minimum": 1}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_GREP_LIMIT}
+                },
+                "additionalProperties": false
+            }),
+        },
+        AgentToolDefinition {
+            name: "workbench_search",
+            description:
+                "Query workbench paths by metadata with catalog field predicates, sort, projections, and facets. Omit id to search across every workbench under the root. Complements workbench_find, which discovers workbenches by their committed manifest; use workbench_grep for file content search.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": ["string", "null"], "description": "Workbench id. Omit to search across all workbenches."},
+                    "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
+                    "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
+                    "predicates": predicates_parameter_schema(),
+                    "sort": sort_parameter_schema(),
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "facets": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "cursor": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_SEARCH_LIMIT}
+                },
+                "additionalProperties": false
+            }),
+        },
+        AgentToolDefinition {
+            name: "workbench_aggregate",
+            description:
+                "Compute summary rows over workbench paths using catalog field ids: count, sum, avg, min, max, group, filter, and sort. Omit id to aggregate across every workbench under the root.",
+            parameters: json!({
+                "type": "object",
+                "required": ["measures"],
+                "properties": {
+                    "id": {"type": ["string", "null"], "description": "Workbench id. Omit to aggregate across all workbenches."},
+                    "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
+                    "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
+                    "predicates": predicates_parameter_schema(),
+                    "group_by": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "measures": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name", "op"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "op": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"]},
+                                "field": {"type": ["string", "null"]}
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "sort": sort_parameter_schema(),
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_AGGREGATE_LIMIT}
+                },
+                "additionalProperties": false
+            }),
+        },
+        AgentToolDefinition {
+            name: "workbench_catalog",
+            description:
+                "Discover catalog field ids for workbench_search and workbench_aggregate predicates, projections, sort, facets, and measures. Omit id to inspect the workbench root.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": ["string", "null"], "description": "Workbench id. Omit to inspect the workbench root."},
+                    "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
+                    "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
+                    "field_prefix": {"type": ["string", "null"]},
+                    "include_facets": {"type": "boolean"}
                 },
                 "additionalProperties": false
             }),
@@ -205,6 +329,54 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
     ]
 }
 
+// Mirrors of the agent find/aggregate sub-schemas (nokv-agent
+// agent_tool_definitions); keep them in sync when the agent schemas change.
+fn predicates_parameter_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["field", "op"],
+            "properties": {
+                "field": {"type": "string"},
+                "op": {
+                    "type": "string",
+                    "enum": ["eq", "ne", "in", "prefix", "suffix", "contains", "gt", "gte", "lt", "lte", "exists", "not_exists"]
+                },
+                "value": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "integer", "minimum": 0},
+                        {"type": "number"},
+                        {"type": "boolean"},
+                        {
+                            "type": "array",
+                            "items": {"type": ["string", "integer", "number", "boolean"]}
+                        },
+                        {"type": "null"}
+                    ]
+                }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn sort_parameter_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["field"],
+            "properties": {
+                "field": {"type": "string"},
+                "direction": {"type": "string", "enum": ["asc", "desc"]}
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
 pub fn execute_tool<O>(
     client: &NoKvFsClient<O>,
     options: &WorkbenchMcpOptions,
@@ -217,10 +389,15 @@ where
     match name {
         "workbench_create" => create_workbench(client, options, args),
         "workbench_put_file" => put_file(client, options, args),
+        "workbench_append" => append_file(client, options, args),
+        "workbench_edit" => edit_file(client, options, args),
         "workbench_list" => execute_read_tool(client, options, "ls", args),
         "workbench_stat" => execute_read_tool(client, options, "stat", args),
         "workbench_read" => execute_read_tool(client, options, "read", args),
         "workbench_grep" => execute_read_tool(client, options, "grep", args),
+        "workbench_search" => execute_query_tool(client, options, "find", args),
+        "workbench_aggregate" => execute_query_tool(client, options, "aggregate", args),
+        "workbench_catalog" => execute_query_tool(client, options, "catalog", args),
         "workbench_find" => find_workbenches(client, options, args),
         "workbench_commit" => commit_workbench(client, options, args),
         "workbench_snapshot" => snapshot_workbench(client, options, args),
@@ -296,6 +473,149 @@ where
     }))
 }
 
+fn append_file<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let id = required_workbench_id(args)?;
+    let section = required_section(args)?;
+    let rel_path = required_section_relative_path(args, section, "path")?;
+    let (bytes, default_content_type) = payload_bytes(args, options.max_bytes)?;
+    let content_type = optional_string(args, "content_type")?
+        .unwrap_or(default_content_type)
+        .to_owned();
+
+    ensure_standard_dirs(client, options, &id)?;
+    ensure_parent_dirs(client, options, &id, section, &rel_path)?;
+    let path = section_path(options, &id, section, Some(&rel_path));
+    // The digest covers the appended delta only: computing a full-content
+    // sha256 would force a read of the whole file on every append.
+    let digest_uri = digest_uri(&bytes);
+    let appended_bytes = bytes.len();
+    let mut attempts = 0;
+    let outcome = loop {
+        let metadata = artifact_metadata(options, &path, &digest_uri, &content_type);
+        // append_artifact re-reads the current end offset on every call, so a
+        // lost race against a concurrent writer is safe to retry as-is.
+        match client.append_artifact(&path, bytes.clone(), metadata, None) {
+            Ok(outcome) => break outcome,
+            Err(err) if is_artifact_write_conflict(&err) && attempts < WRITE_CONFLICT_RETRIES => {
+                attempts += 1;
+            }
+            Err(err) => return Err(client_error(err)),
+        }
+    };
+
+    Ok(json!({
+        "status": "success",
+        "workbench_id": id,
+        "section": section,
+        "relative_path": rel_path,
+        "path": path,
+        "appended_bytes": appended_bytes,
+        "size_bytes": outcome.new_size,
+        "generation": outcome.generation,
+        "created": outcome.created,
+    }))
+}
+
+fn edit_file<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let id = required_workbench_id(args)?;
+    let section = required_section(args)?;
+    let rel_path = required_section_relative_path(args, section, "path")?;
+    let old_string = required_string(args, "old_string")?;
+    if old_string.is_empty() {
+        return Err(WorkbenchToolError::new("old_string must not be empty"));
+    }
+    let new_string = required_string(args, "new_string")?;
+    let replace_all = optional_bool(args, "replace_all")?.unwrap_or(false);
+    let path = section_path(options, &id, section, Some(&rel_path));
+
+    let mut attempts = 0;
+    let (result, replacements) = loop {
+        let entry = client
+            .metadata()
+            .lookup(&path)
+            .map_err(client_error)?
+            .ok_or_else(|| WorkbenchToolError::new(format!("path not found: {path}")))?;
+        if entry.attr.file_type != FileType::File {
+            return Err(WorkbenchToolError::new(format!(
+                "path exists but is not a file: {path}"
+            )));
+        }
+        if entry.attr.size > options.max_bytes as u64 {
+            return Err(WorkbenchToolError::new(format!(
+                "file exceeds max_bytes: {} > {}",
+                entry.attr.size, options.max_bytes
+            )));
+        }
+        let text = String::from_utf8(client.cat(&path).map_err(client_error)?)
+            .map_err(|err| WorkbenchToolError::new(format!("file is not valid UTF-8: {err}")))?;
+        let count = text.matches(old_string).count();
+        if count == 0 {
+            return Err(WorkbenchToolError::new(format!(
+                "old_string not found in {path}"
+            )));
+        }
+        if count > 1 && !replace_all {
+            return Err(WorkbenchToolError::new(format!(
+                "old_string found {count} times — use replace_all=true or provide more context"
+            )));
+        }
+        let replacements = if replace_all { count } else { 1 };
+        let new_text = if replace_all {
+            text.replace(old_string, new_string)
+        } else {
+            text.replacen(old_string, new_string, 1)
+        };
+        let new_bytes = new_text.into_bytes();
+        if new_bytes.len() > options.max_bytes {
+            return Err(WorkbenchToolError::new(format!(
+                "payload exceeds max_bytes: {} > {}",
+                new_bytes.len(),
+                options.max_bytes
+            )));
+        }
+        let body = entry
+            .body
+            .as_ref()
+            .ok_or_else(|| WorkbenchToolError::new(format!("path has no file body: {path}")))?;
+        let digest_uri = digest_uri(&new_bytes);
+        let metadata = artifact_metadata(options, &path, &digest_uri, &body.content_type);
+        match client.put_artifact_replace_if_generation(&path, new_bytes, metadata, body.generation)
+        {
+            Ok(result) => break (result, replacements),
+            Err(err) if is_artifact_write_conflict(&err) && attempts < WRITE_CONFLICT_RETRIES => {
+                // A writer landed since our read; re-read and re-validate.
+                attempts += 1;
+            }
+            Err(err) => return Err(client_error(err)),
+        }
+    };
+
+    Ok(json!({
+        "status": "success",
+        "workbench_id": id,
+        "section": section,
+        "relative_path": rel_path,
+        "path": path,
+        "replacements": replacements,
+        "size_bytes": result.entry.attr.size,
+        "generation": result.entry.attr.generation,
+    }))
+}
+
 fn execute_read_tool<O>(
     client: &NoKvFsClient<O>,
     options: &WorkbenchMcpOptions,
@@ -314,6 +634,28 @@ where
         }
         _ => scoped_path_from_optional_args(options, &id, args)?,
     };
+    if read_tool == "read" {
+        if let Some(expected) = optional_u64(args, "if_none_match")? {
+            let metadata = client
+                .metadata()
+                .stat_path(&target)
+                .map_err(client_error)?
+                .ok_or_else(|| WorkbenchToolError::new(format!("path not found: {target}")))?;
+            if metadata.attr.generation == expected {
+                let scope = path_scope(options, &id, &target)?;
+                return Ok(json!({
+                    "status": "success",
+                    "workbench_id": id,
+                    "workbench_path": workbench_path(options, &id),
+                    "section": scope.section,
+                    "relative_path": scope.relative_path,
+                    "path": scope.path,
+                    "not_modified": true,
+                    "generation": expected,
+                }));
+            }
+        }
+    }
     let mut forwarded = args
         .as_object()
         .cloned()
@@ -331,16 +673,45 @@ where
         "read" => {
             forwarded.remove("pattern");
             forwarded.remove("recursive");
+            forwarded.remove("if_none_match");
         }
         "grep" => {
             forwarded.remove("format");
             forwarded.remove("offset");
+            split_piped_grep_pattern(&mut forwarded);
         }
         _ => {}
     }
     let result = nokv_agent::execute_agent_tool(client, read_tool, &Value::Object(forwarded))
         .map_err(|err| WorkbenchToolError::new(err.to_string()))?;
     shape_read_tool_result(client, options, &id, &target, read_tool, result)
+}
+
+/// `pattern: "a|b"` without an explicit `patterns` array is treated as OR
+/// alternatives, matching what agents expect from grep pipes. Empty segments
+/// are dropped; a pattern of only pipes stays a literal search.
+fn split_piped_grep_pattern(forwarded: &mut serde_json::Map<String, Value>) {
+    let has_patterns = forwarded
+        .get("patterns")
+        .and_then(Value::as_array)
+        .is_some_and(|patterns| !patterns.is_empty());
+    if has_patterns {
+        return;
+    }
+    let Some(pattern) = forwarded.get("pattern").and_then(Value::as_str) else {
+        return;
+    };
+    if !pattern.contains('|') {
+        return;
+    }
+    let alternatives = pattern
+        .split('|')
+        .filter(|part| !part.is_empty())
+        .map(|part| Value::String(part.to_owned()))
+        .collect::<Vec<_>>();
+    if !alternatives.is_empty() {
+        forwarded.insert("patterns".to_owned(), Value::Array(alternatives));
+    }
 }
 
 fn shape_read_tool_result<O>(
@@ -435,6 +806,7 @@ fn shape_file_read_result(
         "section": scope.section.clone(),
         "relative_path": scope.relative_path.clone(),
         "path": scope.path.clone(),
+        "generation": result.get("generation").cloned().unwrap_or(Value::Null),
         "total_size_bytes": result.get("total_size_bytes").cloned().unwrap_or(Value::Null),
         "format": result.get("format").cloned().unwrap_or(Value::Null),
         "record_type": result.get("record_type").cloned().unwrap_or(Value::Null),
@@ -473,6 +845,157 @@ fn shape_grep_result(
         "files_scanned": result.get("files_scanned").cloned().unwrap_or(Value::Null),
         "next_cursor": result.get("next_cursor").cloned().unwrap_or(Value::Null),
         "truncated": result.get("truncated").cloned().unwrap_or(Value::Bool(false)),
+    }))
+}
+
+/// Thin wrapper over the agent query tools (`find`, `aggregate`, `catalog`):
+/// translates workbench scoping into an absolute path, forwards the remaining
+/// arguments untouched, and enriches find matches with workbench coordinates.
+fn execute_query_tool<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    query_tool: &str,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let id = match optional_string(args, "id")? {
+        Some(id) => {
+            validate_workbench_id(id)?;
+            Some(id.to_owned())
+        }
+        None => None,
+    };
+    let target = match &id {
+        Some(id) => scoped_path_from_optional_args(options, id, args)?,
+        None => {
+            if optional_string(args, "section")?.is_some() {
+                return Err(WorkbenchToolError::new(
+                    "section requires id when querying across the workbench root",
+                ));
+            }
+            if optional_string(args, "path")?.is_some() {
+                return Err(WorkbenchToolError::new(
+                    "path requires id when querying across the workbench root",
+                ));
+            }
+            options.root.clone()
+        }
+    };
+    // A root that no workbench has materialized yet is an empty result for
+    // cross-workbench queries, not an error.
+    if id.is_none()
+        && matches!(query_tool, "find" | "aggregate")
+        && client
+            .metadata()
+            .stat_path(&options.root)
+            .map_err(client_error)?
+            .is_none()
+    {
+        return Ok(empty_query_result(query_tool, &options.root));
+    }
+    let mut forwarded = args
+        .as_object()
+        .cloned()
+        .ok_or_else(|| WorkbenchToolError::new("tool arguments must be a JSON object"))?;
+    forwarded.insert("path".to_owned(), Value::String(target.clone()));
+    forwarded.remove("id");
+    forwarded.remove("section");
+    let result = nokv_agent::execute_agent_tool(client, query_tool, &Value::Object(forwarded))
+        .map_err(|err| WorkbenchToolError::new(err.to_string()))?;
+    match query_tool {
+        "find" => shape_search_result(options, &target, result),
+        "aggregate" | "catalog" => {
+            let mut object = result
+                .as_object()
+                .cloned()
+                .ok_or_else(|| WorkbenchToolError::new(format!("{query_tool} result malformed")))?;
+            object.insert("status".to_owned(), json!("success"));
+            Ok(Value::Object(object))
+        }
+        other => Err(WorkbenchToolError::new(format!(
+            "unsupported query tool {other}"
+        ))),
+    }
+}
+
+fn empty_query_result(query_tool: &str, root: &str) -> Value {
+    match query_tool {
+        "find" => json!({
+            "status": "success",
+            "path": root,
+            "match_count": 0,
+            "matches": [],
+            "facets": [],
+            "next_cursor": Value::Null,
+            "truncated": false,
+        }),
+        _ => json!({
+            "status": "success",
+            "path": root,
+            "input_match_count": 0,
+            "row_count": 0,
+            "group_count": 0,
+            "groups": [],
+            "truncated": false,
+        }),
+    }
+}
+
+fn shape_search_result(
+    options: &WorkbenchMcpOptions,
+    target: &str,
+    result: Value,
+) -> Result<Value, WorkbenchToolError> {
+    let matches = result
+        .get("matches")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WorkbenchToolError::new("find result missing matches"))?
+        .iter()
+        .map(|match_| enrich_search_match(options, match_))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "status": "success",
+        "path": target,
+        "match_count": result.get("match_count").cloned().unwrap_or(Value::Null),
+        "matches": matches,
+        "facets": result.get("facets").cloned().unwrap_or_else(|| json!([])),
+        "next_cursor": result.get("next_cursor").cloned().unwrap_or(Value::Null),
+        "truncated": result.get("truncated").cloned().unwrap_or(Value::Bool(false)),
+    }))
+}
+
+/// A match path is `<root>/<workbench_id>[/...]`: the first segment below the
+/// root names the workbench and the rest is scoped like enumeration output.
+fn enrich_search_match(
+    options: &WorkbenchMcpOptions,
+    match_: &Value,
+) -> Result<Value, WorkbenchToolError> {
+    let path = match_
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkbenchToolError::new("find match missing path"))?;
+    let prefix = format!("{}/", options.root);
+    let Some(rest) = path.strip_prefix(&prefix) else {
+        // The root itself can satisfy a predicate; it has no workbench
+        // coordinates to enrich with.
+        return Ok(json!({
+            "workbench_id": Value::Null,
+            "path": path,
+            "section": Value::Null,
+            "relative_path": Value::Null,
+            "values": match_.get("values").cloned().unwrap_or(Value::Null),
+        }));
+    };
+    let workbench_id = rest.split('/').next().unwrap_or(rest);
+    let scope = enumerated_path_scope(options, workbench_id, path)?;
+    Ok(json!({
+        "workbench_id": workbench_id,
+        "path": scope.path,
+        "section": scope.section,
+        "relative_path": scope.relative_path,
+        "values": match_.get("values").cloned().unwrap_or(Value::Null),
     }))
 }
 
@@ -1283,6 +1806,15 @@ fn optional_bool(args: &Value, name: &'static str) -> Result<Option<bool>, Workb
         None | Some(Value::Null) => Ok(None),
         Some(value) => value.as_bool().map(Some).ok_or_else(|| {
             WorkbenchToolError::new(format!("{name} must be a boolean when provided"))
+        }),
+    }
+}
+
+fn optional_u64(args: &Value, name: &'static str) -> Result<Option<u64>, WorkbenchToolError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            WorkbenchToolError::new(format!("{name} must be an integer when provided"))
         }),
     }
 }

@@ -934,7 +934,11 @@ pub struct WireNamespaceAggregateResult {
 pub struct WireNamespaceGrepRequest {
     pub path: String,
     pub pattern: String,
+    #[serde(default)]
+    pub patterns: Vec<String>,
     pub recursive: bool,
+    #[serde(default)]
+    pub name_glob: Option<String>,
     pub cursor: Option<String>,
     pub limit: u64,
     pub max_files: Option<u64>,
@@ -954,6 +958,8 @@ pub struct WireNamespaceGrepMatch {
 pub struct WireNamespaceGrepResult {
     pub path: String,
     pub pattern: String,
+    #[serde(default)]
+    pub patterns: Vec<String>,
     pub recursive: bool,
     pub evidence: String,
     pub snapshot_id: Option<u64>,
@@ -1684,7 +1690,9 @@ mod tests {
             request: Box::new(WireNamespaceGrepRequest {
                 path: "/runs".to_owned(),
                 pattern: "needle".to_owned(),
+                patterns: vec!["needle".to_owned(), "营养".to_owned()],
                 recursive: true,
+                name_glob: Some("*.md".to_owned()),
                 cursor: Some("1:0".to_owned()),
                 limit: 10,
                 max_files: Some(20),
@@ -1693,6 +1701,39 @@ mod tests {
         };
         let encoded = encode_request(&request).unwrap();
         assert_eq!(decode_request(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn grep_request_decodes_payload_without_patterns_or_name_glob() {
+        // Payload shaped like a pre-`patterns` peer: the fields are absent
+        // from the struct map and must default on decode.
+        #[derive(Serialize)]
+        struct LegacyGrepRequest {
+            path: String,
+            pattern: String,
+            recursive: bool,
+            cursor: Option<String>,
+            limit: u64,
+            max_files: Option<u64>,
+            max_bytes: Option<u64>,
+        }
+        let legacy = LegacyGrepRequest {
+            path: "/runs".to_owned(),
+            pattern: "needle".to_owned(),
+            recursive: true,
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        };
+        let mut encoded = Vec::new();
+        legacy
+            .serialize(&mut rmp_serde::Serializer::new(&mut encoded).with_struct_map())
+            .unwrap();
+        let decoded: WireNamespaceGrepRequest = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.pattern, "needle");
+        assert!(decoded.patterns.is_empty());
+        assert_eq!(decoded.name_glob, None);
     }
 
     #[test]
@@ -1967,6 +2008,7 @@ mod tests {
                 result: Box::new(WireNamespaceGrepResult {
                     path: "/runs".to_owned(),
                     pattern: "needle".to_owned(),
+                    patterns: vec!["needle".to_owned()],
                     recursive: true,
                     evidence: "nokv-native:///runs".to_owned(),
                     snapshot_id: Some(9),

@@ -3060,6 +3060,15 @@ mod tests {
         run_workbench_mcp_requests_with_options(workbench_mcp_options(), requests)
     }
 
+    fn workbench_tool_call(id: u64, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        })
+    }
+
     fn run_workbench_mcp_requests_with_options(
         options: McpCliOptions,
         requests: Vec<serde_json::Value>,
@@ -3075,6 +3084,45 @@ mod tests {
             )),
             client_store,
         );
+        run_workbench_mcp_requests_on_client(client, options, requests)
+    }
+
+    /// One process-lifetime server shared by the workbench MCP tests that only
+    /// need isolation by workbench id. Every spawned test server leaks its
+    /// threads for the process lifetime, so per-test servers exhaust OS
+    /// resources as the suite grows; tests that touch distinct workbench ids
+    /// share this one instead.
+    fn shared_workbench_mcp_server() -> &'static (SocketAddr, PathBuf) {
+        static SERVER: std::sync::OnceLock<(SocketAddr, PathBuf)> = std::sync::OnceLock::new();
+        SERVER.get_or_init(|| {
+            let object_dir = tempdir().unwrap();
+            let object_root = object_dir.path().join("objects");
+            let addr = spawn_test_server_with_object_config(ObjectStoreConfig::tiered_local(
+                object_root.clone(),
+                fake_s3_options(),
+            ));
+            // The server thread serves for the process lifetime; keep its
+            // object root alive with it.
+            std::mem::forget(object_dir);
+            (addr, object_root)
+        })
+    }
+
+    fn run_shared_workbench_mcp_requests(
+        requests: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        let (addr, object_root) = shared_workbench_mcp_server();
+        let store =
+            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+        let client = NoKvFsClient::connect(*addr, store);
+        run_workbench_mcp_requests_on_client(client, workbench_mcp_options(), requests)
+    }
+
+    fn run_workbench_mcp_requests_on_client(
+        client: NoKvFsClient<LocalObjectStore>,
+        options: McpCliOptions,
+        requests: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
         let reqs = requests
             .into_iter()
             .map(|request| serde_json::to_string(&request).unwrap())
@@ -3146,7 +3194,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_tools_use_workbench_prefix_and_are_isolated() {
-        let responses = run_workbench_mcp_requests(vec![serde_json::json!({
+        let responses = run_shared_workbench_mcp_requests(vec![serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list"
@@ -3158,10 +3206,15 @@ mod tests {
             vec![
                 "workbench_create",
                 "workbench_put_file",
+                "workbench_append",
+                "workbench_edit",
                 "workbench_list",
                 "workbench_stat",
                 "workbench_read",
                 "workbench_grep",
+                "workbench_search",
+                "workbench_aggregate",
+                "workbench_catalog",
                 "workbench_find",
                 "workbench_commit",
                 "workbench_snapshot",
@@ -3175,7 +3228,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_tool_schemas_are_closed() {
-        let responses = run_workbench_mcp_requests(vec![serde_json::json!({
+        let responses = run_shared_workbench_mcp_requests(vec![serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list"
@@ -3190,7 +3243,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_create_put_read_list_stat_grep_commit_snapshot_flow() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3526,7 +3579,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_rejects_path_escape_and_default_overwrite() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3773,8 +3826,667 @@ mod tests {
     }
 
     #[test]
+    fn workbench_mcp_search_queries_paths_with_predicates_and_enrichment() {
+        // The "-searchmark.csv" suffix is unique to this test so the
+        // cross-workbench query stays exact on the shared server.
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_create",
+                serde_json::json!({"id": "wb-search-a"}),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-search-a",
+                    "section": "outputs",
+                    "path": "spectrum-searchmark.csv",
+                    "text": "freq,power\n1,2\n",
+                    "content_type": "text/csv"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-search-a",
+                    "section": "input",
+                    "path": "event.json",
+                    "text": "{\"event\":\"storm\"}",
+                    "content_type": "application/json"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_create",
+                serde_json::json!({"id": "wb-search-b"}),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-search-b",
+                    "section": "outputs",
+                    "path": "other-searchmark.csv",
+                    "text": "freq,power\n3,4\n",
+                    "content_type": "text/csv"
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_search",
+                serde_json::json!({
+                    "id": "wb-search-a",
+                    "predicates": [{"field": "name", "op": "suffix", "value": ".csv"}]
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_search",
+                serde_json::json!({
+                    "predicates": [{"field": "name", "op": "suffix", "value": "-searchmark.csv"}],
+                    "fields": ["name"]
+                }),
+            ),
+            workbench_tool_call(
+                8,
+                "workbench_search",
+                serde_json::json!({
+                    "id": "wb-search-a",
+                    "limit": 11
+                }),
+            ),
+            workbench_tool_call(
+                9,
+                "workbench_search",
+                serde_json::json!({
+                    "section": "outputs"
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().take(7).enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let scoped = &responses[5]["result"]["structuredContent"];
+        assert_eq!(scoped["status"], "success", "search response: {scoped}");
+        assert_eq!(scoped["match_count"], 1);
+        assert_eq!(scoped["matches"][0]["workbench_id"], "wb-search-a");
+        assert_eq!(scoped["matches"][0]["section"], "outputs");
+        assert_eq!(
+            scoped["matches"][0]["relative_path"],
+            "spectrum-searchmark.csv"
+        );
+        assert_eq!(
+            scoped["matches"][0]["path"],
+            "/workbenches/wb-search-a/outputs/spectrum-searchmark.csv"
+        );
+
+        let cross = &responses[6]["result"]["structuredContent"];
+        assert_eq!(cross["match_count"], 2, "cross response: {cross}");
+        let matches = cross["matches"].as_array().unwrap();
+        let ids: Vec<&str> = matches
+            .iter()
+            .map(|m| m["workbench_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"wb-search-a"), "matches: {matches:?}");
+        assert!(ids.contains(&"wb-search-b"), "matches: {matches:?}");
+        assert!(
+            matches
+                .iter()
+                .all(|m| m["values"]["name"].as_str().unwrap().ends_with(".csv")),
+            "matches: {matches:?}"
+        );
+
+        assert_eq!(responses[7]["result"]["isError"], true);
+        assert!(responses[7]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("limit must be between 1 and 10"));
+        // section/path scoping only makes sense inside one workbench.
+        assert_eq!(responses[8]["result"]["isError"], true);
+    }
+
+    #[test]
+    fn workbench_mcp_search_returns_empty_results_when_root_is_missing() {
+        let responses = run_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_search",
+            serde_json::json!({}),
+        )]);
+        assert_ne!(
+            responses[0]["result"]["isError"], true,
+            "response: {}",
+            responses[0]
+        );
+        let result = &responses[0]["result"]["structuredContent"];
+        assert_eq!(result["status"], "success");
+        assert_eq!(result["match_count"], 0);
+        assert_eq!(result["matches"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn workbench_mcp_aggregate_counts_grouped_rows() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-agg"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "section": "outputs",
+                    "path": "a.csv",
+                    "text": "a\n",
+                    "content_type": "text/csv"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "section": "outputs",
+                    "path": "b.csv",
+                    "text": "b\n",
+                    "content_type": "text/csv"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "section": "input",
+                    "path": "c.json",
+                    "text": "{}",
+                    "content_type": "application/json"
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_aggregate",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "section": "outputs",
+                    "predicates": [{"field": "kind", "op": "eq", "value": "file"}],
+                    "measures": [{"name": "files", "op": "count"}]
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_aggregate",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "predicates": [{"field": "kind", "op": "eq", "value": "file"}],
+                    "group_by": ["body.content_type"],
+                    "measures": [{"name": "n", "op": "count"}]
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let total = &responses[4]["result"]["structuredContent"];
+        assert_eq!(total["status"], "success", "aggregate response: {total}");
+        assert_eq!(total["groups"][0]["values"]["files"], 2);
+
+        let grouped = &responses[5]["result"]["structuredContent"];
+        let groups = grouped["groups"].as_array().unwrap();
+        let group_count = |content_type: &str| {
+            groups
+                .iter()
+                .find(|group| group["key"]["body.content_type"] == content_type)
+                .unwrap_or_else(|| panic!("missing group {content_type}: {groups:?}"))["values"]
+                ["n"]
+                .clone()
+        };
+        assert_eq!(group_count("text/csv"), 2);
+        assert_eq!(group_count("application/json"), 1);
+    }
+
+    #[test]
+    fn workbench_mcp_catalog_returns_builtin_query_fields() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-cat"})),
+            workbench_tool_call(2, "workbench_catalog", serde_json::json!({"id": "wb-cat"})),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        let result = &responses[1]["result"]["structuredContent"];
+        assert_eq!(result["status"], "success", "catalog response: {result}");
+        assert_eq!(result["catalog_empty"], false);
+        let filterable: Vec<String> = result["catalog"]["filterable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["fields"].as_array().unwrap().clone())
+            .map(|field| field.as_str().unwrap().to_owned())
+            .collect();
+        for field in [
+            "path",
+            "name",
+            "kind",
+            "size_bytes",
+            "body.content_type",
+            "body.producer",
+            "body.manifest_id",
+        ] {
+            assert!(
+                filterable.contains(&field.to_owned()),
+                "missing builtin field {field}: {filterable:?}"
+            );
+        }
+        assert_eq!(filterable.len(), 7, "filterable: {filterable:?}");
+    }
+
+    #[test]
+    fn workbench_mcp_append_creates_then_extends_and_reads_back() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_create",
+                serde_json::json!({"id": "wb-append"}),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_append",
+                serde_json::json!({
+                    "id": "wb-append",
+                    "section": "logs",
+                    "path": "run.log",
+                    "text": "line one\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_append",
+                serde_json::json!({
+                    "id": "wb-append",
+                    "section": "logs",
+                    "path": "run.log",
+                    "text": "line two\n"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-append",
+                    "section": "logs",
+                    "path": "run.log",
+                    "format": "structured"
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let first = &responses[1]["result"]["structuredContent"];
+        assert_eq!(first["status"], "success", "append response: {first}");
+        assert_eq!(first["created"], true);
+        assert_eq!(first["appended_bytes"], 9);
+        assert_eq!(first["size_bytes"], 9);
+        assert_eq!(first["path"], "/workbenches/wb-append/logs/run.log");
+        assert_eq!(first["section"], "logs");
+        assert_eq!(first["relative_path"], "run.log");
+
+        let second = &responses[2]["result"]["structuredContent"];
+        assert_eq!(second["created"], false);
+        assert_eq!(second["appended_bytes"], 9);
+        assert_eq!(second["size_bytes"], 18);
+        assert!(second["generation"].as_u64().is_some());
+
+        let read = &responses[3]["result"]["structuredContent"];
+        assert_eq!(read["items"][0]["value"]["text"], "line one");
+        assert_eq!(read["items"][1]["value"]["text"], "line two");
+    }
+
+    #[test]
+    fn workbench_mcp_edit_replaces_strings_with_lingtai_error_texts() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-edit"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "text": "hello world\nhello moon\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "old_string": "world",
+                    "new_string": "mars"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "format": "structured"
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "old_string": "absent",
+                    "new_string": "x"
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "old_string": "hello",
+                    "new_string": "hi"
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "old_string": "hello",
+                    "new_string": "hi",
+                    "replace_all": true
+                }),
+            ),
+        ]);
+
+        let edited = &responses[2]["result"]["structuredContent"];
+        assert_ne!(
+            responses[2]["result"]["isError"], true,
+            "edit response: {}",
+            responses[2]
+        );
+        assert_eq!(edited["status"], "success");
+        assert_eq!(edited["replacements"], 1);
+        assert!(edited["generation"].as_u64().is_some());
+
+        let read = &responses[3]["result"]["structuredContent"];
+        assert_eq!(read["items"][0]["value"]["text"], "hello mars");
+
+        assert_eq!(responses[4]["result"]["isError"], true);
+        assert!(responses[4]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("old_string not found in /workbenches/wb-edit/outputs/notes.txt"));
+
+        assert_eq!(responses[5]["result"]["isError"], true);
+        assert!(responses[5]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("old_string found 2 times — use replace_all=true or provide more context"));
+
+        assert_ne!(
+            responses[6]["result"]["isError"], true,
+            "replace_all response: {}",
+            responses[6]
+        );
+        assert_eq!(
+            responses[6]["result"]["structuredContent"]["replacements"],
+            2
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_read_supports_conditional_generation() {
+        // Two batches on the shared server: the second replays the generation
+        // observed by the first.
+        let setup = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-cond"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "text": "v1\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "format": "structured"
+                }),
+            ),
+        ]);
+        for (index, response) in setup.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "setup response {index}: {response}"
+            );
+        }
+        let generation = setup[2]["result"]["structuredContent"]["generation"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("read response missing generation: {}", setup[2]));
+
+        let conditional = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "if_none_match": generation
+                }),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "old_string": "v1",
+                    "new_string": "v2"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "format": "structured",
+                    "if_none_match": generation
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "limit": 301
+                }),
+            ),
+        ]);
+
+        let unchanged = &conditional[0]["result"]["structuredContent"];
+        assert_ne!(
+            conditional[0]["result"]["isError"], true,
+            "conditional response: {}",
+            conditional[0]
+        );
+        assert_eq!(unchanged["status"], "success");
+        assert_eq!(unchanged["not_modified"], true);
+        assert_eq!(unchanged["generation"], generation);
+        assert_eq!(unchanged["section"], "outputs");
+        assert_eq!(unchanged["relative_path"], "data.txt");
+        assert!(unchanged.get("items").is_none(), "unchanged: {unchanged}");
+
+        assert_ne!(conditional[1]["result"]["isError"], true);
+
+        let modified = &conditional[2]["result"]["structuredContent"];
+        assert_ne!(
+            conditional[2]["result"]["isError"], true,
+            "modified response: {}",
+            conditional[2]
+        );
+        assert!(modified["not_modified"].is_null(), "modified: {modified}");
+        assert_eq!(modified["items"][0]["value"]["text"], "v2");
+        assert_ne!(modified["generation"], generation);
+
+        assert_eq!(conditional[3]["result"]["isError"], true);
+        assert!(conditional[3]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("limit must be between 1 and 300"));
+    }
+
+    #[test]
+    fn workbench_mcp_grep_supports_patterns_glob_and_pipe_split() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-grep"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "section": "outputs",
+                    "path": "one.txt",
+                    "text": "alpha signal\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "section": "outputs",
+                    "path": "two.log",
+                    "text": "beta signal\n"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_grep",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "pattern": "alpha|beta",
+                    "recursive": true
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_grep",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "pattern": "unused",
+                    "patterns": ["alpha", "beta"],
+                    "recursive": true
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_grep",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "pattern": "alpha|beta",
+                    "glob": "*.txt",
+                    "recursive": true
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_grep",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "pattern": "signal",
+                    "recursive": true,
+                    "limit": 301
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().take(6).enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let match_paths = |response: &serde_json::Value| -> Vec<String> {
+            response["result"]["structuredContent"]["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["path"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        // Pipe in `pattern` splits into OR alternatives when `patterns` is absent.
+        let piped = match_paths(&responses[3]);
+        assert!(
+            piped.contains(&"/workbenches/wb-grep/outputs/one.txt".to_owned())
+                && piped.contains(&"/workbenches/wb-grep/outputs/two.log".to_owned()),
+            "piped matches: {piped:?}"
+        );
+
+        // Explicit `patterns` wins over `pattern`.
+        let explicit = match_paths(&responses[4]);
+        assert_eq!(explicit.len(), 2, "explicit matches: {explicit:?}");
+
+        let globbed = match_paths(&responses[5]);
+        assert_eq!(
+            globbed,
+            vec!["/workbenches/wb-grep/outputs/one.txt".to_owned()],
+            "globbed matches: {globbed:?}"
+        );
+
+        assert_eq!(responses[6]["result"]["isError"], true);
+        assert!(responses[6]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("limit must be between 1 and 300"));
+    }
+
+    #[test]
     fn workbench_mcp_put_file_ignores_empty_unused_payload_variant() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3863,7 +4575,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_rejects_section_prefixed_paths() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3917,7 +4629,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_rejects_invalid_ids_sections_payloads_and_manifest() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -4061,7 +4773,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_snapshot_requires_commit_manifest() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,

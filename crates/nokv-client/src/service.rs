@@ -2394,7 +2394,9 @@ fn wire_namespace_grep_request(
     Ok(WireNamespaceGrepRequest {
         path: request.path.clone(),
         pattern: request.pattern.clone(),
+        patterns: request.patterns.clone(),
         recursive: request.recursive,
+        name_glob: request.name_glob.clone(),
         cursor: request.cursor.clone(),
         limit: u64::try_from(request.limit)
             .map_err(|_| ClientError::Protocol("namespace grep limit exceeds u64".to_owned()))?,
@@ -2423,6 +2425,7 @@ fn namespace_grep_result(
     Ok(NamespaceGrepResult {
         path: result.path,
         pattern: result.pattern,
+        patterns: result.patterns,
         recursive: result.recursive,
         evidence: result.evidence,
         snapshot_id: result.snapshot_id,
