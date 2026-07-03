@@ -911,7 +911,7 @@ impl MetadataClient {
         match self.rmdir(prefix_path) {
             Ok(_) => {}
             // Already gone (idempotent re-run, or never created): fine.
-            Err(err) if crate::is_not_found(&err) => {}
+            Err(err) if crate::is_metadata_not_found(&err) => {}
             // ANY other child-removal failure (non-empty, transport, fence, ...)
             // means the subtree still exists, so the graft must stay registered:
             // restore the durable target we cleared in step 1 and surface the

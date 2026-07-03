@@ -6,6 +6,7 @@
 //! client-staged blocks in this harness.
 
 use std::net::{SocketAddr, TcpListener};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -266,6 +267,74 @@ fn repeated_appends_stay_readable_across_chain_compaction() {
         compacted,
         "nine appends must cross the compaction threshold at least once"
     );
+}
+
+/// Two writers with independent clients (sharing one object store so either
+/// side can read blocks the other staged) race 10 appends each — including the
+/// initial create — against one path. Every conflict-shaped error along the
+/// way must be classified by [`is_artifact_write_conflict`] so a
+/// retry-on-conflict loop converges: the file must end up with exactly the 20
+/// complete lines the writers produced.
+#[test]
+fn concurrent_appends_from_two_writers_keep_every_line() {
+    const WRITERS: usize = 2;
+    const APPENDS_PER_WRITER: usize = 10;
+    let address = spawn_test_server();
+    let objects = MemoryObjectStore::new();
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let objects = objects.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let client: TestClient = NoKvFsClient::connect(address, objects);
+                barrier.wait();
+                for index in 0..APPENDS_PER_WRITER {
+                    let line = format!("writer-{writer}-line-{index}\n").into_bytes();
+                    let manifest = format!("concurrent-{writer}-{index}");
+                    let mut attempts = 0;
+                    loop {
+                        match client.append_artifact(
+                            "/concurrent.txt",
+                            line.clone(),
+                            artifact_metadata(&manifest),
+                            None,
+                        ) {
+                            Ok(_) => break,
+                            Err(err) if is_artifact_write_conflict(&err) && attempts < 100 => {
+                                attempts += 1;
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(err) => {
+                                panic!("writer {writer} append {index} failed hard: {err:?}")
+                            }
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let client: TestClient = NoKvFsClient::connect(address, objects);
+    let content = String::from_utf8(client.cat("/concurrent.txt").unwrap()).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        WRITERS * APPENDS_PER_WRITER,
+        "appends were lost; content:\n{content}"
+    );
+    for writer in 0..WRITERS {
+        for index in 0..APPENDS_PER_WRITER {
+            let expected = format!("writer-{writer}-line-{index}");
+            assert!(
+                lines.contains(&expected.as_str()),
+                "missing line {expected}; content:\n{content}"
+            );
+        }
+    }
 }
 
 #[test]

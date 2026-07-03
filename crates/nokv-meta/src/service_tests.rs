@@ -990,6 +990,99 @@ fn namespace_grep_multiple_patterns_match_cjk() {
     assert_eq!(lines, vec![1, 3]);
 }
 
+/// `patterns` adds OR alternatives to `pattern` (union semantics); a non-empty
+/// `pattern` must keep matching when `patterns` is also provided instead of
+/// being silently dropped.
+#[test]
+fn namespace_grep_unions_pattern_with_patterns() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(
+        &service,
+        "/runs/notes.txt",
+        "runs/notes.txt",
+        "食谱更新完成\n无关的一行\n食材已备齐\n新 recipe 上线\n".as_bytes(),
+    );
+
+    let result = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs/notes.txt".to_owned(),
+            pattern: "食谱".to_owned(),
+            patterns: vec!["食材".to_owned(), "recipe".to_owned()],
+            recursive: false,
+            name_glob: None,
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap();
+
+    let lines = result
+        .matches
+        .iter()
+        .map(|entry| entry.line_number)
+        .collect::<Vec<_>>();
+    assert_eq!(lines, vec![1, 3, 4]);
+    // The echo reports the request fields verbatim.
+    assert_eq!(result.pattern, "食谱");
+    assert_eq!(result.patterns, vec!["食材", "recipe"]);
+}
+
+/// The workbench pipe-split forwards `pattern: "a|b"` together with
+/// `patterns: ["a", "b"]`. Any line containing the literal "a|b" also contains
+/// each split alternative, so union semantics must return the same match set
+/// as the split alternatives alone.
+#[test]
+fn namespace_grep_piped_pattern_union_matches_split_alternatives() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(
+        &service,
+        "/runs/mixed.log",
+        "runs/mixed.log",
+        b"alpha metric\nliteral alpha|beta row\nbeta metric\nnothing\n",
+    );
+    let request = |pattern: &str, patterns: Vec<String>| NamespaceGrepRequest {
+        path: "/runs/mixed.log".to_owned(),
+        pattern: pattern.to_owned(),
+        patterns,
+        recursive: false,
+        name_glob: None,
+        cursor: None,
+        limit: 10,
+        max_files: None,
+        max_bytes: None,
+    };
+
+    let split_only = service
+        .grep_paths(request("", vec!["alpha".to_owned(), "beta".to_owned()]))
+        .unwrap();
+    let piped_union = service
+        .grep_paths(request(
+            "alpha|beta",
+            vec!["alpha".to_owned(), "beta".to_owned()],
+        ))
+        .unwrap();
+
+    let lines = |result: &NamespaceGrepResult| {
+        result
+            .matches
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.line_number))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lines(&piped_union), lines(&split_only));
+    assert_eq!(
+        lines(&split_only),
+        vec![
+            ("/runs/mixed.log".to_owned(), 1),
+            ("/runs/mixed.log".to_owned(), 2),
+            ("/runs/mixed.log".to_owned(), 3),
+        ]
+    );
+}
+
 #[test]
 fn namespace_grep_name_glob_skips_unmatched_files_without_reading() {
     let service = service();

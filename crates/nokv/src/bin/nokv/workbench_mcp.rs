@@ -3,7 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use nokv_agent::AgentToolDefinition;
-use nokv_client::{is_artifact_write_conflict, ArtifactMetadata, NoKvFsClient};
+use nokv_client::{
+    is_artifact_write_conflict, is_metadata_not_found, ArtifactMetadata, NoKvFsClient,
+};
 use nokv_object::ObjectStore;
 use nokv_types::{FileType, PathMetadata};
 use serde_json::{json, Value};
@@ -21,7 +23,28 @@ const MAX_WORKBENCH_AGGREGATE_LIMIT: usize = 100;
 const MAX_WORKBENCH_READ_LIMIT: usize = 300;
 const MAX_WORKBENCH_GREP_LIMIT: usize = 300;
 /// Retries after a lost artifact-write CAS; every attempt re-reads current state.
-const WRITE_CONFLICT_RETRIES: usize = 3;
+const WRITE_CONFLICT_RETRIES: usize = 5;
+/// Linear backoff step between conflict retries. Zero-interval retries make N
+/// synchronized writers replay the same race until the retry budget runs out;
+/// a growing pause plus per-process jitter (see [`write_conflict_backoff`])
+/// de-synchronizes them.
+const WRITE_CONFLICT_BACKOFF_STEP_MS: u64 = 10;
+
+/// Sleep before retry number `attempt` (1-based) of a conflicted write.
+/// Linear `attempt * 10ms` backoff plus a 0-8ms desync offset derived from the
+/// process id and the current clock nanoseconds, so two workbench processes
+/// that lost the same race do not wake in lockstep (no rand dependency).
+fn write_conflict_backoff(attempt: usize) {
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|now| now.subsec_nanos() as u64)
+        .unwrap_or(0)
+        .wrapping_add(u64::from(std::process::id()))
+        % 8;
+    std::thread::sleep(std::time::Duration::from_millis(
+        (attempt as u64) * WRITE_CONFLICT_BACKOFF_STEP_MS + jitter_ms,
+    ));
+}
 
 pub const SECTIONS: &[&str] = &["input", "scripts", "outputs", "logs", "metadata"];
 
@@ -167,7 +190,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_read",
             description:
-                "Read one workbench file through the NoKV namespace. Structured mode returns JSON, YAML, or text records; bytes mode returns byte ranges. Pass if_none_match with a previously returned generation to skip the body when the file is unchanged.",
+                "Read one workbench file through the NoKV namespace. Structured mode returns JSON, YAML, or text records; bytes mode returns byte ranges as a base64 string in bytes (bytes_encoding is \"base64\"). Pass if_none_match with a previously returned generation to skip the body when the file is unchanged.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "section", "path"],
@@ -505,6 +528,7 @@ where
             Ok(outcome) => break outcome,
             Err(err) if is_artifact_write_conflict(&err) && attempts < WRITE_CONFLICT_RETRIES => {
                 attempts += 1;
+                write_conflict_backoff(attempts);
             }
             Err(err) => return Err(client_error(err)),
         }
@@ -599,6 +623,7 @@ where
             Err(err) if is_artifact_write_conflict(&err) && attempts < WRITE_CONFLICT_RETRIES => {
                 // A writer landed since our read; re-read and re-validate.
                 attempts += 1;
+                write_conflict_backoff(attempts);
             }
             Err(err) => return Err(client_error(err)),
         }
@@ -799,6 +824,29 @@ fn shape_file_read_result(
     scope: &WorkbenchPathScope,
     result: Value,
 ) -> Result<Value, WorkbenchToolError> {
+    // A bytes-mode page arrives as a JSON integer array; re-encode it as
+    // base64 so each output byte costs ~1.3 characters instead of the ~4
+    // tokens an integer element burns. Structured mode has no bytes field.
+    let (bytes, bytes_encoding) = match result.get("bytes") {
+        Some(Value::Array(values)) => {
+            let raw = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|byte| u8::try_from(byte).ok())
+                        .ok_or_else(|| {
+                            WorkbenchToolError::new("read result bytes contain a non-byte value")
+                        })
+                })
+                .collect::<Result<Vec<u8>, _>>()?;
+            (
+                Value::String(base64::engine::general_purpose::STANDARD.encode(raw)),
+                json!("base64"),
+            )
+        }
+        _ => (Value::Null, Value::Null),
+    };
     Ok(json!({
         "status": "success",
         "workbench_id": id,
@@ -815,7 +863,8 @@ fn shape_file_read_result(
         "next_cursor": result.get("next_cursor").cloned().unwrap_or(Value::Null),
         "truncated": result.get("truncated").cloned().unwrap_or(Value::Bool(false)),
         "items": result.get("items").cloned().unwrap_or_else(|| json!([])),
-        "bytes": result.get("bytes").cloned().unwrap_or(Value::Null),
+        "bytes": bytes,
+        "bytes_encoding": bytes_encoding,
     }))
 }
 
@@ -887,11 +936,7 @@ where
     // cross-workbench queries, not an error.
     if id.is_none()
         && matches!(query_tool, "find" | "aggregate")
-        && client
-            .metadata()
-            .stat_path(&options.root)
-            .map_err(client_error)?
-            .is_none()
+        && stat_path_or_absent(client, &options.root)?.is_none()
     {
         return Ok(empty_query_result(query_tool, &options.root));
     }
@@ -1018,12 +1063,7 @@ where
         )));
     }
 
-    if client
-        .metadata()
-        .stat_path(&options.root)
-        .map_err(client_error)?
-        .is_none()
-    {
+    if stat_path_or_absent(client, &options.root)?.is_none() {
         return Ok(json!({
             "status": "success",
             "path": options.root.clone(),
@@ -1142,12 +1182,7 @@ where
 {
     let id = required_workbench_id(args)?;
     let manifest_path = section_path(options, &id, "metadata", Some("run_manifest.json"));
-    if client
-        .metadata()
-        .stat_path(&manifest_path)
-        .map_err(client_error)?
-        .is_none()
-    {
+    if stat_path_or_absent(client, &manifest_path)?.is_none() {
         return Err(WorkbenchToolError::new(format!(
             "workbench {id} is not committed; missing {manifest_path}"
         )));
@@ -1347,11 +1382,10 @@ where
     O: ObjectStore + Send + Sync + 'static,
 {
     let manifest_path = section_path(options, id, "metadata", Some("run_manifest.json"));
-    let Some(metadata) = client
-        .metadata()
-        .stat_path(&manifest_path)
-        .map_err(client_error)?
-    else {
+    // An out-of-band directory under the root has no metadata/ section at all;
+    // the missing-ancestor NotFound folds into "uncommitted" like a missing
+    // manifest file does (find must tolerate such entries the way ls does).
+    let Some(metadata) = stat_path_or_absent(client, &manifest_path)? else {
         return Ok(WorkbenchManifestSummary {
             committed: false,
             manifest_path: None,
@@ -1452,6 +1486,25 @@ where
         ensure_dir_path(client, options, &path)?;
     }
     Ok(())
+}
+
+/// `stat_path` that folds "a path component does not exist" into `Ok(None)`.
+/// The metadata server reports a missing *ancestor* as a `NotFound` error
+/// while a missing leaf is `Ok(None)`; probes asking "is this subtree
+/// materialized yet" (a multi-level per-agent root, a workbench's manifest
+/// under an out-of-band directory) treat both as plain absence.
+fn stat_path_or_absent<O>(
+    client: &NoKvFsClient<O>,
+    path: &str,
+) -> Result<Option<PathMetadata>, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    match client.metadata().stat_path(path) {
+        Ok(metadata) => Ok(metadata),
+        Err(err) if is_metadata_not_found(&err) => Ok(None),
+        Err(err) => Err(client_error(err)),
+    }
 }
 
 /// Ensure `path` exists as a directory, creating any missing ancestors

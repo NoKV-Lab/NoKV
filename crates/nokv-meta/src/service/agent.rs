@@ -912,15 +912,21 @@ where
                 glob_match(&glob, &basename.chars().collect::<Vec<_>>())
             });
         }
-        let needles = if request.patterns.is_empty() {
-            vec![request.pattern.to_lowercase()]
-        } else {
-            request
-                .patterns
-                .iter()
-                .map(|pattern| pattern.to_lowercase())
-                .collect::<Vec<_>>()
-        };
+        // Union semantics: `patterns` adds OR alternatives to `pattern`, it
+        // does not replace it. Case-folded and deduplicated; validation
+        // guarantees at least one non-empty needle survives.
+        let mut needles = Vec::with_capacity(request.patterns.len() + 1);
+        for pattern in std::iter::once(request.pattern.as_str())
+            .chain(request.patterns.iter().map(String::as_str))
+        {
+            if pattern.is_empty() {
+                continue;
+            }
+            let needle = pattern.to_lowercase();
+            if !needles.contains(&needle) {
+                needles.push(needle);
+            }
+        }
         let mut matches = Vec::new();
         let mut files_scanned = 0_usize;
         let mut files_scanned_this_call = 0_usize;

@@ -3969,6 +3969,59 @@ mod tests {
         assert_eq!(result["matches"], serde_json::json!([]));
     }
 
+    /// A multi-level per-agent root (PR #390's default shape) whose ancestors
+    /// were never created must behave like the flat missing-root case: the
+    /// server reports the unresolved ancestor as a NotFound *error*, and the
+    /// workbench layer must fold that into "root not materialized = empty
+    /// results" instead of surfacing isError.
+    #[test]
+    fn workbench_mcp_queries_treat_missing_multilevel_root_as_empty() {
+        let options = McpCliOptions {
+            profile: McpProfile::Workbench,
+            workbench_root: Some(s("/agents/e2e-never/wb")),
+            workbench_max_bytes: workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES,
+        };
+        let responses = run_workbench_mcp_requests_with_options(
+            options,
+            vec![
+                workbench_tool_call(1, "workbench_find", serde_json::json!({})),
+                workbench_tool_call(2, "workbench_search", serde_json::json!({})),
+                workbench_tool_call(
+                    3,
+                    "workbench_aggregate",
+                    serde_json::json!({
+                        "predicates": [{"field": "kind", "op": "eq", "value": "file"}],
+                        "measures": [{"name": "files", "op": "count"}]
+                    }),
+                ),
+            ],
+        );
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let find = &responses[0]["result"]["structuredContent"];
+        assert_eq!(find["status"], "success", "find response: {find}");
+        assert_eq!(find["match_count"], 0);
+        assert_eq!(find["matches"], serde_json::json!([]));
+
+        let search = &responses[1]["result"]["structuredContent"];
+        assert_eq!(search["status"], "success", "search response: {search}");
+        assert_eq!(search["match_count"], 0);
+        assert_eq!(search["matches"], serde_json::json!([]));
+
+        let aggregate = &responses[2]["result"]["structuredContent"];
+        assert_eq!(
+            aggregate["status"], "success",
+            "aggregate response: {aggregate}"
+        );
+        assert_eq!(aggregate["row_count"], 0);
+        assert_eq!(aggregate["groups"], serde_json::json!([]));
+    }
+
     #[test]
     fn workbench_mcp_aggregate_counts_grouped_rows() {
         let responses = run_shared_workbench_mcp_requests(vec![
@@ -4378,6 +4431,60 @@ mod tests {
             .contains("limit must be between 1 and 300"));
     }
 
+    /// Bytes-mode reads must return a base64 string, not a JSON integer
+    /// array (which inflates the token cost of every byte to ~4 tokens).
+    #[test]
+    fn workbench_mcp_read_bytes_returns_base64_payload() {
+        use base64::Engine as _;
+        let payload: Vec<u8> = vec![
+            0x00, 0x01, 0xFE, 0xFF, 0x10, 0x20, 0x30, 0x40, 0x7F, 0x80, 0x90, 0xA0,
+        ];
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-bytes"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-bytes",
+                    "section": "outputs",
+                    "path": "blob.bin",
+                    "base64": base64::engine::general_purpose::STANDARD.encode(&payload),
+                    "content_type": "application/octet-stream"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-bytes",
+                    "section": "outputs",
+                    "path": "blob.bin",
+                    "format": "bytes",
+                    "offset": 2,
+                    "limit": 8
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let read = &responses[2]["result"]["structuredContent"];
+        assert_eq!(read["status"], "success", "read response: {read}");
+        assert_eq!(read["bytes_encoding"], "base64", "read response: {read}");
+        let encoded = read["bytes"]
+            .as_str()
+            .unwrap_or_else(|| panic!("bytes must be a base64 string: {read}"));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(decoded, payload[2..10].to_vec(), "read response: {read}");
+        assert_eq!(read["total_size_bytes"], payload.len());
+    }
+
     #[test]
     fn workbench_mcp_grep_supports_patterns_glob_and_pipe_split() {
         let responses = run_shared_workbench_mcp_requests(vec![
@@ -4404,6 +4511,16 @@ mod tests {
             ),
             workbench_tool_call(
                 4,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "section": "outputs",
+                    "path": "three.md",
+                    "text": "gamma note\n"
+                }),
+            ),
+            workbench_tool_call(
+                5,
                 "workbench_grep",
                 serde_json::json!({
                     "id": "wb-grep",
@@ -4412,17 +4529,17 @@ mod tests {
                 }),
             ),
             workbench_tool_call(
-                5,
+                6,
                 "workbench_grep",
                 serde_json::json!({
                     "id": "wb-grep",
-                    "pattern": "unused",
+                    "pattern": "gamma",
                     "patterns": ["alpha", "beta"],
                     "recursive": true
                 }),
             ),
             workbench_tool_call(
-                6,
+                7,
                 "workbench_grep",
                 serde_json::json!({
                     "id": "wb-grep",
@@ -4432,7 +4549,7 @@ mod tests {
                 }),
             ),
             workbench_tool_call(
-                7,
+                8,
                 "workbench_grep",
                 serde_json::json!({
                     "id": "wb-grep",
@@ -4442,7 +4559,7 @@ mod tests {
                 }),
             ),
         ]);
-        for (index, response) in responses.iter().take(6).enumerate() {
+        for (index, response) in responses.iter().take(7).enumerate() {
             assert_ne!(
                 response["result"]["isError"], true,
                 "response {index}: {response}"
@@ -4459,26 +4576,31 @@ mod tests {
         };
 
         // Pipe in `pattern` splits into OR alternatives when `patterns` is absent.
-        let piped = match_paths(&responses[3]);
+        let piped = match_paths(&responses[4]);
         assert!(
             piped.contains(&"/workbenches/wb-grep/outputs/one.txt".to_owned())
                 && piped.contains(&"/workbenches/wb-grep/outputs/two.log".to_owned()),
             "piped matches: {piped:?}"
         );
 
-        // Explicit `patterns` wins over `pattern`.
-        let explicit = match_paths(&responses[4]);
-        assert_eq!(explicit.len(), 2, "explicit matches: {explicit:?}");
+        // `patterns` adds OR alternatives to `pattern` (union), it does not
+        // replace it: the gamma-only file must match alongside alpha/beta.
+        let unioned = match_paths(&responses[5]);
+        assert_eq!(unioned.len(), 3, "union matches: {unioned:?}");
+        assert!(
+            unioned.contains(&"/workbenches/wb-grep/outputs/three.md".to_owned()),
+            "union matches: {unioned:?}"
+        );
 
-        let globbed = match_paths(&responses[5]);
+        let globbed = match_paths(&responses[6]);
         assert_eq!(
             globbed,
             vec!["/workbenches/wb-grep/outputs/one.txt".to_owned()],
             "globbed matches: {globbed:?}"
         );
 
-        assert_eq!(responses[6]["result"]["isError"], true);
-        assert!(responses[6]["result"]["content"][0]["text"]
+        assert_eq!(responses[7]["result"]["isError"], true);
+        assert!(responses[7]["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("limit must be between 1 and 300"));

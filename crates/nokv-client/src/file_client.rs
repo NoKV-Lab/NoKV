@@ -2216,8 +2216,20 @@ impl ScatterPackedRangePlan {
 /// `expected_generation`, a concurrent writer racing prepare/publish, or a
 /// create racing another create. Callers recover by re-reading the current
 /// generation and retrying.
+///
+/// `MissingBodyDescriptor` counts too: a concurrent self-contained publish
+/// (chain compaction) reclaims every superseded generation's manifest records
+/// in its commit, so a publish prepared against one of those generations fails
+/// resolving its base chain *before* it reaches the dentry CAS that would have
+/// reported `PredicateFailed`. It is the same lost race with the same
+/// recovery; only writes ever surface it through this path (reads report it
+/// as a hard error and never consult this classifier).
 pub fn is_artifact_write_conflict(err: &ClientError) -> bool {
     crate::is_metadata_predicate_failed(err)
+        || matches!(
+            err,
+            ClientError::Metadata(nokv_meta::MetadError::MissingBodyDescriptor)
+        )
 }
 
 // Client-side guard failures surface as the same predicate error a server-side
@@ -2612,6 +2624,27 @@ mod tests {
     fn response_body(json: &str) -> Vec<u8> {
         let envelope: MetadataRpcEnvelope = serde_json::from_str(json).unwrap();
         encode_envelope(&envelope).unwrap()
+    }
+
+    #[test]
+    fn artifact_write_conflict_classifies_transient_write_races() {
+        // The two shapes a lost write race decodes to over the wire.
+        assert!(is_artifact_write_conflict(&ClientError::Metadata(
+            nokv_meta::MetadError::Metadata(nokv_meta::MetadataError::PredicateFailed),
+        )));
+        assert!(is_artifact_write_conflict(&ClientError::Metadata(
+            nokv_meta::MetadError::MissingBodyDescriptor,
+        )));
+        // Hard errors must not be retried as conflicts.
+        assert!(!is_artifact_write_conflict(&ClientError::Metadata(
+            nokv_meta::MetadError::NotFound,
+        )));
+        assert!(!is_artifact_write_conflict(&ClientError::Metadata(
+            nokv_meta::MetadError::NotFile,
+        )));
+        assert!(!is_artifact_write_conflict(&ClientError::Protocol(
+            "file /x is missing body descriptor".to_owned(),
+        )));
     }
 
     #[test]
