@@ -4,7 +4,8 @@ use nokv_types::FileType;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    is_metadata_predicate_failed, is_not_found, ArtifactMetadata, ClientError, NoKvFsClient,
+    is_metadata_not_found, is_metadata_predicate_failed, ArtifactMetadata, ClientError,
+    NoKvFsClient,
 };
 
 const DEFAULT_ARTIFACT_FILE_MODE: u32 = 0o644;
@@ -225,20 +226,20 @@ where
         let entry = match self.backend.lookup_path(&absolute_path) {
             Ok(Some(entry)) => entry,
             Ok(None) => return Ok(()),
-            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) if is_metadata_not_found(&err) => return Ok(()),
             Err(err) => return Err(err),
         };
         if entry.attr.file_type == FileType::Directory {
             self.delete_directory_children(&normalized)?;
             match self.backend.remove_empty_dir_path(&absolute_path) {
                 Ok(_) => Ok(()),
-                Err(err) if is_not_found(&err) => Ok(()),
+                Err(err) if is_metadata_not_found(&err) => Ok(()),
                 Err(err) => Err(err),
             }
         } else {
             match self.backend.remove_file_path(&absolute_path) {
                 Ok(_) => Ok(()),
-                Err(err) if is_not_found(&err) => Ok(()),
+                Err(err) if is_metadata_not_found(&err) => Ok(()),
                 Err(err) => Err(err),
             }
         }
@@ -286,7 +287,7 @@ where
             for result in self.backend.remove_file_paths(&file_paths)? {
                 match result {
                     Ok(_) => {}
-                    Err(err) if is_not_found(&err) => {}
+                    Err(err) if is_metadata_not_found(&err) => {}
                     Err(err) => return Err(err),
                 }
             }
@@ -300,7 +301,7 @@ where
             for result in self.backend.remove_empty_dir_paths(&directory_paths)? {
                 match result {
                     Ok(_) => {}
-                    Err(err) if is_not_found(&err) => {}
+                    Err(err) if is_metadata_not_found(&err) => {}
                     Err(err) => return Err(err),
                 }
             }

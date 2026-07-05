@@ -911,7 +911,7 @@ impl MetadataClient {
         match self.rmdir(prefix_path) {
             Ok(_) => {}
             // Already gone (idempotent re-run, or never created): fine.
-            Err(err) if crate::is_not_found(&err) => {}
+            Err(err) if crate::is_metadata_not_found(&err) => {}
             // ANY other child-removal failure (non-empty, transport, fence, ...)
             // means the subtree still exists, so the graft must stay registered:
             // restore the durable target we cleared in step 1 and surface the
@@ -2394,7 +2394,9 @@ fn wire_namespace_grep_request(
     Ok(WireNamespaceGrepRequest {
         path: request.path.clone(),
         pattern: request.pattern.clone(),
+        patterns: request.patterns.clone(),
         recursive: request.recursive,
+        name_glob: request.name_glob.clone(),
         cursor: request.cursor.clone(),
         limit: u64::try_from(request.limit)
             .map_err(|_| ClientError::Protocol("namespace grep limit exceeds u64".to_owned()))?,
@@ -2423,6 +2425,7 @@ fn namespace_grep_result(
     Ok(NamespaceGrepResult {
         path: result.path,
         pattern: result.pattern,
+        patterns: result.patterns,
         recursive: result.recursive,
         evidence: result.evidence,
         snapshot_id: result.snapshot_id,

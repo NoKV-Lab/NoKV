@@ -4,6 +4,7 @@ use std::cmp::Ordering as CmpOrdering;
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const DEFAULT_SAMPLE_LIMIT: usize = 3;
 const DEFAULT_FACET_VALUE_LIMIT: usize = 10;
+const MAX_GREP_PATTERNS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NamespaceCardKind {
@@ -431,7 +432,13 @@ pub struct NamespaceAggregateResult {
 pub struct NamespaceGrepRequest {
     pub path: String,
     pub pattern: String,
+    /// OR alternatives unioned with `pattern`: a line matches if it contains
+    /// `pattern` or any entry (case-insensitive, deduplicated).
+    pub patterns: Vec<String>,
     pub recursive: bool,
+    /// Basename filter supporting `*` and `?`; unmatched files are skipped
+    /// without being read.
+    pub name_glob: Option<String>,
     pub cursor: Option<String>,
     pub limit: usize,
     pub max_files: Option<usize>,
@@ -451,6 +458,7 @@ pub struct NamespaceGrepMatch {
 pub struct NamespaceGrepResult {
     pub path: String,
     pub pattern: String,
+    pub patterns: Vec<String>,
     pub recursive: bool,
     pub evidence: String,
     pub snapshot_id: Option<u64>,
@@ -892,8 +900,33 @@ where
         let metadata = self
             .stat_path_from_at_version(InodeId::root(), &root, version)?
             .ok_or(MetadError::NotFound)?;
-        let candidates = self.grep_candidates(&root, metadata, request.recursive, version)?;
-        let pattern_lower = request.pattern.to_lowercase();
+        let mut candidates = self.grep_candidates(&root, metadata, request.recursive, version)?;
+        if let Some(name_glob) = request.name_glob.as_deref() {
+            let glob = name_glob.chars().collect::<Vec<_>>();
+            candidates.retain(|candidate| {
+                let basename = candidate
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(candidate.path.as_str());
+                glob_match(&glob, &basename.chars().collect::<Vec<_>>())
+            });
+        }
+        // Union semantics: `patterns` adds OR alternatives to `pattern`, it
+        // does not replace it. Case-folded and deduplicated; validation
+        // guarantees at least one non-empty needle survives.
+        let mut needles = Vec::with_capacity(request.patterns.len() + 1);
+        for pattern in std::iter::once(request.pattern.as_str())
+            .chain(request.patterns.iter().map(String::as_str))
+        {
+            if pattern.is_empty() {
+                continue;
+            }
+            let needle = pattern.to_lowercase();
+            if !needles.contains(&needle) {
+                needles.push(needle);
+            }
+        }
         let mut matches = Vec::new();
         let mut files_scanned = 0_usize;
         let mut files_scanned_this_call = 0_usize;
@@ -948,7 +981,8 @@ where
             };
             let text = String::from_utf8_lossy(&bytes);
             for (line_index, line) in text.lines().enumerate().skip(start_line) {
-                if !line.to_lowercase().contains(&pattern_lower) {
+                let line_lower = line.to_lowercase();
+                if !needles.iter().any(|needle| line_lower.contains(needle)) {
                     continue;
                 }
                 if matches.len() == limit {
@@ -976,6 +1010,7 @@ where
             evidence: namespace_evidence(&root, None),
             path: root,
             pattern: request.pattern,
+            patterns: request.patterns,
             recursive: request.recursive,
             snapshot_id: Some(version.get()),
             matches,
@@ -1439,7 +1474,15 @@ where
         options: NamespaceReadOptions,
     ) -> Result<NamespaceReadPage, MetadError> {
         let limit = bounded_limit(options.limit)?;
-        let offset = parse_cursor(options.cursor.as_deref())?;
+        let offset = match options.cursor.as_deref() {
+            Some(cursor) => parse_cursor(Some(cursor))?,
+            None => usize::try_from(options.offset).map_err(|_| {
+                MetadError::InvalidQuery(format!(
+                    "offset {} does not fit this platform",
+                    options.offset
+                ))
+            })?,
+        };
         let body = metadata
             .body
             .as_ref()
@@ -1560,6 +1603,26 @@ fn path_is_self_or_descendant(root: &str, path: &str) -> bool {
 
 fn validate_grep_request(request: &NamespaceGrepRequest) -> Result<(), MetadError> {
     bounded_limit(request.limit)?;
+    if request.patterns.len() > MAX_GREP_PATTERNS {
+        return Err(MetadError::InvalidQuery(format!(
+            "patterns must not exceed {MAX_GREP_PATTERNS} entries"
+        )));
+    }
+    if request.patterns.iter().any(String::is_empty) {
+        return Err(MetadError::InvalidQuery(
+            "patterns entries must not be empty".to_owned(),
+        ));
+    }
+    if request.pattern.is_empty() && request.patterns.is_empty() {
+        return Err(MetadError::InvalidQuery(
+            "pattern or patterns must be provided".to_owned(),
+        ));
+    }
+    if request.name_glob.as_deref() == Some("") {
+        return Err(MetadError::InvalidQuery(
+            "name_glob must not be empty".to_owned(),
+        ));
+    }
     if let Some(max_files) = request.max_files {
         if max_files == 0 {
             return Err(MetadError::InvalidQuery(
@@ -1575,6 +1638,33 @@ fn validate_grep_request(request: &NamespaceGrepRequest) -> Result<(), MetadErro
         }
     }
     Ok(())
+}
+
+/// Iterative glob match over Unicode scalars: `*` matches any run of
+/// characters, `?` matches exactly one. On mismatch, backtracks to the most
+/// recent `*` and lets it absorb one more character.
+fn glob_match(pattern: &[char], name: &[char]) -> bool {
+    let mut pattern_index = 0;
+    let mut name_index = 0;
+    let mut star: Option<(usize, usize)> = None;
+    while name_index < name.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == name[name_index])
+        {
+            pattern_index += 1;
+            name_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some((pattern_index, name_index));
+            pattern_index += 1;
+        } else if let Some((star_pattern, star_name)) = star {
+            pattern_index = star_pattern + 1;
+            name_index = star_name + 1;
+            star = Some((star_pattern, star_name + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[pattern_index..].iter().all(|glyph| *glyph == '*')
 }
 
 fn namespace_query_catalog(kind: NamespaceCardKind) -> NamespaceQueryCatalog {

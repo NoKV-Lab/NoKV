@@ -25,7 +25,10 @@ pub use artifact::{
     normalize_artifact_path, ArtifactBackend, ArtifactInfo, ArtifactRepository,
     ArtifactRepositoryOptions,
 };
-pub use file_client::{NoKvFsClient, PathRangeReadRequest, PathReadRange, PreparedPathRangeBatch};
+pub use file_client::{
+    is_artifact_write_conflict, AppendOutcome, NoKvFsClient, PathRangeReadRequest, PathReadRange,
+    PreparedPathRangeBatch,
+};
 pub use nokv_object::{DataFabricReadStats, ObjectReadPlan};
 pub use service::{
     ClientPreparedArtifact, CloneOutcome, MetadataClient, MetadataClientOptions, PathLayoutOpen,
@@ -128,7 +131,12 @@ fn is_metadata_predicate_failed(err: &ClientError) -> bool {
     )
 }
 
-fn is_not_found(err: &ClientError) -> bool {
+/// True when the error reports a missing path rather than a failure: a
+/// client-side component-resolution miss or the server's typed
+/// `MetadError::NotFound`. Multi-level path lookups surface a missing
+/// *ancestor* as this error where a missing leaf would be `Ok(None)`; callers
+/// probing for "does this subtree exist yet" fold both into absence.
+pub fn is_metadata_not_found(err: &ClientError) -> bool {
     matches!(
         err,
         ClientError::NotFound(_) | ClientError::Metadata(MetadError::NotFound)

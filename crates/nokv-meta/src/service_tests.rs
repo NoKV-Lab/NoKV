@@ -892,7 +892,9 @@ fn namespace_grep_cursor_resumes_at_next_unemitted_match() {
         .grep_paths(NamespaceGrepRequest {
             path: "/runs/train.log".to_owned(),
             pattern: "loss".to_owned(),
+            patterns: Vec::new(),
             recursive: false,
+            name_glob: None,
             cursor: None,
             limit: 1,
             max_files: None,
@@ -901,12 +903,16 @@ fn namespace_grep_cursor_resumes_at_next_unemitted_match() {
         .unwrap();
     assert_eq!(first.matches.len(), 1);
     assert_eq!(first.matches[0].line_number, 1);
+    assert_eq!(first.pattern, "loss");
+    assert!(first.patterns.is_empty());
 
     let second = service
         .grep_paths(NamespaceGrepRequest {
             path: "/runs/train.log".to_owned(),
             pattern: "loss".to_owned(),
+            patterns: Vec::new(),
             recursive: false,
+            name_glob: None,
             cursor: first.next_cursor,
             limit: 1,
             max_files: None,
@@ -915,6 +921,320 @@ fn namespace_grep_cursor_resumes_at_next_unemitted_match() {
         .unwrap();
     assert_eq!(second.matches.len(), 1);
     assert_eq!(second.matches[0].line_number, 2);
+}
+
+#[test]
+fn namespace_grep_multiple_patterns_match_any() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/runs/a.log", "runs/a.log", b"alpha metric\n");
+    publish_path_artifact(
+        &service,
+        "/runs/b.log",
+        "runs/b.log",
+        b"nothing here\nbeta metric\n",
+    );
+
+    let result = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs".to_owned(),
+            pattern: String::new(),
+            patterns: vec!["alpha".to_owned(), "beta".to_owned()],
+            recursive: false,
+            name_glob: None,
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.matches.len(), 2);
+    assert_eq!(result.matches[0].path, "/runs/a.log");
+    assert_eq!(result.matches[0].line_number, 1);
+    assert_eq!(result.matches[1].path, "/runs/b.log");
+    assert_eq!(result.matches[1].line_number, 2);
+    assert_eq!(result.patterns, vec!["alpha", "beta"]);
+}
+
+#[test]
+fn namespace_grep_multiple_patterns_match_cjk() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(
+        &service,
+        "/runs/notes.txt",
+        "runs/notes.txt",
+        "今日营养记录\n普通一行\n食谱更新完成\n".as_bytes(),
+    );
+
+    let result = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs/notes.txt".to_owned(),
+            pattern: String::new(),
+            patterns: vec!["营养".to_owned(), "食谱".to_owned()],
+            recursive: false,
+            name_glob: None,
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap();
+
+    let lines = result
+        .matches
+        .iter()
+        .map(|entry| entry.line_number)
+        .collect::<Vec<_>>();
+    assert_eq!(lines, vec![1, 3]);
+}
+
+/// `patterns` adds OR alternatives to `pattern` (union semantics); a non-empty
+/// `pattern` must keep matching when `patterns` is also provided instead of
+/// being silently dropped.
+#[test]
+fn namespace_grep_unions_pattern_with_patterns() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(
+        &service,
+        "/runs/notes.txt",
+        "runs/notes.txt",
+        "食谱更新完成\n无关的一行\n食材已备齐\n新 recipe 上线\n".as_bytes(),
+    );
+
+    let result = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs/notes.txt".to_owned(),
+            pattern: "食谱".to_owned(),
+            patterns: vec!["食材".to_owned(), "recipe".to_owned()],
+            recursive: false,
+            name_glob: None,
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap();
+
+    let lines = result
+        .matches
+        .iter()
+        .map(|entry| entry.line_number)
+        .collect::<Vec<_>>();
+    assert_eq!(lines, vec![1, 3, 4]);
+    // The echo reports the request fields verbatim.
+    assert_eq!(result.pattern, "食谱");
+    assert_eq!(result.patterns, vec!["食材", "recipe"]);
+}
+
+/// The workbench pipe-split forwards `pattern: "a|b"` together with
+/// `patterns: ["a", "b"]`. Any line containing the literal "a|b" also contains
+/// each split alternative, so union semantics must return the same match set
+/// as the split alternatives alone.
+#[test]
+fn namespace_grep_piped_pattern_union_matches_split_alternatives() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(
+        &service,
+        "/runs/mixed.log",
+        "runs/mixed.log",
+        b"alpha metric\nliteral alpha|beta row\nbeta metric\nnothing\n",
+    );
+    let request = |pattern: &str, patterns: Vec<String>| NamespaceGrepRequest {
+        path: "/runs/mixed.log".to_owned(),
+        pattern: pattern.to_owned(),
+        patterns,
+        recursive: false,
+        name_glob: None,
+        cursor: None,
+        limit: 10,
+        max_files: None,
+        max_bytes: None,
+    };
+
+    let split_only = service
+        .grep_paths(request("", vec!["alpha".to_owned(), "beta".to_owned()]))
+        .unwrap();
+    let piped_union = service
+        .grep_paths(request(
+            "alpha|beta",
+            vec!["alpha".to_owned(), "beta".to_owned()],
+        ))
+        .unwrap();
+
+    let lines = |result: &NamespaceGrepResult| {
+        result
+            .matches
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.line_number))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lines(&piped_union), lines(&split_only));
+    assert_eq!(
+        lines(&split_only),
+        vec![
+            ("/runs/mixed.log".to_owned(), 1),
+            ("/runs/mixed.log".to_owned(), 2),
+            ("/runs/mixed.log".to_owned(), 3),
+        ]
+    );
+}
+
+#[test]
+fn namespace_grep_name_glob_skips_unmatched_files_without_reading() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/runs/a.md", "runs/a.md", b"needle in md\n");
+    publish_path_artifact(&service, "/runs/b.log", "runs/b.log", b"needle in log\n");
+
+    let result = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs".to_owned(),
+            pattern: "needle".to_owned(),
+            patterns: Vec::new(),
+            recursive: false,
+            name_glob: Some("*.md".to_owned()),
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].path, "/runs/a.md");
+    assert_eq!(result.files_scanned, 1);
+    assert_eq!(result.bytes_read, b"needle in md\n".len());
+}
+
+#[test]
+fn namespace_grep_name_glob_matches_cjk_substring() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(
+        &service,
+        "/runs/营养日志.txt",
+        "runs/nutrition.txt",
+        "记录一\n".as_bytes(),
+    );
+    publish_path_artifact(
+        &service,
+        "/runs/训练日志.txt",
+        "runs/training.txt",
+        "记录二\n".as_bytes(),
+    );
+
+    let result = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs".to_owned(),
+            pattern: "记录".to_owned(),
+            patterns: Vec::new(),
+            recursive: false,
+            name_glob: Some("*营养*".to_owned()),
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].path, "/runs/营养日志.txt");
+    assert_eq!(result.files_scanned, 1);
+}
+
+#[test]
+fn namespace_grep_rejects_more_than_sixteen_patterns() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+
+    let err = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs".to_owned(),
+            pattern: String::new(),
+            patterns: (0..17).map(|index| format!("p{index}")).collect(),
+            recursive: false,
+            name_glob: None,
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap_err();
+
+    assert!(matches!(err, MetadError::InvalidQuery(message) if message.contains("16")));
+}
+
+#[test]
+fn namespace_grep_rejects_empty_pattern_entry() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+
+    let err = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs".to_owned(),
+            pattern: String::new(),
+            patterns: vec!["ok".to_owned(), String::new()],
+            recursive: false,
+            name_glob: None,
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap_err();
+
+    assert!(matches!(err, MetadError::InvalidQuery(message) if message.contains("empty")));
+}
+
+#[test]
+fn namespace_grep_rejects_missing_pattern_and_patterns() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+
+    let err = service
+        .grep_paths(NamespaceGrepRequest {
+            path: "/runs".to_owned(),
+            pattern: String::new(),
+            patterns: Vec::new(),
+            recursive: false,
+            name_glob: None,
+            cursor: None,
+            limit: 10,
+            max_files: None,
+            max_bytes: None,
+        })
+        .unwrap_err();
+
+    assert!(matches!(err, MetadError::InvalidQuery(message) if message.contains("pattern")));
+}
+
+#[test]
+fn namespace_read_structured_offset_without_cursor_skips_items() {
+    let service = service();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/runs/a.json", "runs/a.json", br#"["a","b","c"]"#);
+
+    let page = service
+        .read_page(
+            "/runs/a.json",
+            NamespaceReadOptions {
+                format: NamespaceReadFormat::Structured,
+                cursor: None,
+                offset: 1,
+                limit: 1,
+                expected_generation: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].index, 1);
+    assert_eq!(page.items[0].value_json, r#""b""#);
+    assert!(page.truncated);
 }
 
 #[test]

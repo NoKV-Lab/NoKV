@@ -10,13 +10,14 @@ use nokv_meta::{
     DentryWithAttr, NamespaceAggregateRequest, NamespaceAggregateResult, NamespaceCard,
     NamespaceFindRequest, NamespaceFindResult, NamespaceGrepRequest, NamespaceGrepResult,
     NamespaceListOptions, NamespaceListPage, NamespaceReadOptions, NamespaceReadPage,
-    ObjectTransferStats, RenameReplaceResult,
+    ObjectTransferStats, PublishArtifactStagedSession, RenameReplaceResult,
 };
 use nokv_object::{
-    BlockCache, BlockReadOptions, ChunkStore, ChunkWriteOptions, ChunkedWrite, DataFabricReadStats,
-    LayoutReadExecutor, LayoutReadRequest, ObjectBlockCache, ObjectError, ObjectPrefetchOptions,
-    ObjectPrefetchRequest, ObjectPrefetcher, ObjectReadBlock, ObjectReadPlan, ObjectReadPlanCache,
-    ObjectReadPlanKey, ObjectStore, StagedObjectSet, DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE,
+    BlockCache, BlockReadOptions, ChunkStore, ChunkWriteOptions, ChunkWriteRange, ChunkedWrite,
+    DataFabricReadStats, LayoutReadExecutor, LayoutReadRequest, ObjectBlockCache, ObjectError,
+    ObjectPrefetchOptions, ObjectPrefetchRequest, ObjectPrefetcher, ObjectReadBlock,
+    ObjectReadPlan, ObjectReadPlanCache, ObjectReadPlanKey, ObjectStore, StagedObjectSet,
+    DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE,
 };
 use nokv_types::{BodyDescriptor, ChunkManifest, FileType, InodeId, MountId};
 
@@ -142,6 +143,15 @@ pub struct PathRangeReadRequest {
     pub ranges: Vec<PathReadRange>,
     pub expected_generation: Option<u64>,
     pub max_gap_bytes: u64,
+}
+
+/// Result of [`NoKvFsClient::append_artifact`]: the published size/generation
+/// and whether the append created the file instead of extending it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppendOutcome {
+    pub new_size: u64,
+    pub generation: u64,
+    pub created: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1805,6 +1815,151 @@ where
         }
     }
 
+    /// Publish `delta` at the current end of `path` as a delta generation: only
+    /// the appended bytes are staged, the new body falls through to the prior
+    /// generation for the rest (the server compacts the chain when it gets
+    /// deep). A missing file is created with `delta` as its full content.
+    ///
+    /// `expected_generation` pins the body generation the caller appended
+    /// against; a mismatch — or any concurrent writer landing between prepare
+    /// and publish — fails with a conflict recognizable via
+    /// [`is_artifact_write_conflict`], which callers resolve by re-reading and
+    /// retrying.
+    pub fn append_artifact(
+        &self,
+        path: &str,
+        delta: Vec<u8>,
+        metadata: ArtifactMetadata,
+        expected_generation: Option<u64>,
+    ) -> Result<AppendOutcome, ClientError> {
+        let Some(entry) = self.metadata.lookup(path)? else {
+            if expected_generation.is_some() {
+                // The pinned generation no longer exists; that is a lost CAS,
+                // not a create.
+                return Err(artifact_write_conflict());
+            }
+            let entry = self.put_artifact(path, delta, metadata)?;
+            return Ok(AppendOutcome {
+                new_size: entry.attr.size,
+                generation: artifact_body_generation(&entry),
+                created: true,
+            });
+        };
+        if entry.attr.file_type != FileType::File {
+            return Err(ClientError::Metadata(nokv_meta::MetadError::NotFile));
+        }
+        let base_generation = entry.body.as_ref().map(|body| body.generation);
+        if expected_generation.is_some() && expected_generation != base_generation {
+            return Err(artifact_write_conflict());
+        }
+        let base_size = entry.attr.size;
+        let new_size = base_size
+            .checked_add(delta.len() as u64)
+            .ok_or_else(|| ClientError::Protocol("append size exceeds u64".to_owned()))?;
+        let prepared = self
+            .metadata
+            .prepare_artifact_path(path, true)
+            .map_err(|err| fold_append_prepare_not_found(err, expected_generation))?;
+        if prepared.old_generation != base_generation {
+            // A writer landed between lookup and prepare; the staged offset
+            // would be wrong, so fail before writing any blocks.
+            return Err(artifact_write_conflict());
+        }
+        let dirty_ranges = if delta.is_empty() {
+            Vec::new()
+        } else {
+            vec![ChunkWriteRange {
+                logical_offset: base_size,
+                bytes: delta.into(),
+            }]
+        };
+        let written = match self.objects.write_ranges_with_block_index_base(
+            dirty_ranges,
+            ChunkWriteOptions {
+                manifest_id: metadata.manifest_id.clone(),
+                mount: prepared.mount,
+                inode: prepared.inode.get(),
+                generation: prepared.generation,
+                chunk_size: DEFAULT_CHUNK_SIZE,
+                block_size: DEFAULT_BLOCK_SIZE,
+            },
+            0,
+        ) {
+            Ok(written) => written,
+            Err(err) => {
+                cleanup_staged_write_error(&self.objects, &err)?;
+                return Err(ClientError::Object(err));
+            }
+        };
+        self.record_staged_write_stats(&written);
+        let staged = written.staged_objects()?;
+        let session = PublishArtifactStagedSession {
+            parent: prepared.parent,
+            name: prepared.name.clone(),
+            producer: metadata.producer,
+            digest_uri: metadata.digest_uri,
+            content_type: metadata.content_type,
+            manifest_id: written.manifest_id.clone(),
+            size: new_size,
+            chunks: written.chunk_manifests(),
+            staged: staged.clone(),
+            mode: metadata.mode,
+            uid: metadata.uid,
+            gid: metadata.gid,
+        };
+        match self
+            .metadata
+            .publish_prepared_artifact_staged_session(prepared, session)
+        {
+            Ok(result) => Ok(AppendOutcome {
+                new_size: result.entry.attr.size,
+                generation: artifact_body_generation(&result.entry),
+                created: false,
+            }),
+            Err(err) => {
+                // Best-effort cleanup: a failed staged-object delete must not
+                // replace the publish error, whose classification
+                // (is_artifact_write_conflict) drives the caller's retry loop.
+                let _ = self.objects.delete_staged(&staged);
+                Err(err)
+            }
+        }
+    }
+
+    /// [`NoKvFsClient::put_artifact_replace`] guarded by the current body
+    /// generation: the replace publishes only while the artifact is still at
+    /// `expected_generation`, otherwise it fails with a conflict recognizable
+    /// via [`is_artifact_write_conflict`].
+    pub fn put_artifact_replace_if_generation(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        metadata: ArtifactMetadata,
+        expected_generation: u64,
+    ) -> Result<RenameReplaceResult, ClientError> {
+        let prepared = self.metadata.prepare_artifact_path(path, true)?;
+        if prepared.old_generation != Some(expected_generation) {
+            return Err(artifact_write_conflict());
+        }
+        let mode = metadata.mode;
+        let uid = metadata.uid;
+        let gid = metadata.gid;
+        let (body, chunks, staged) = self.stage_artifact_body(&prepared, &bytes, metadata)?;
+        match self
+            .metadata
+            .publish_prepared_artifact(prepared, body, chunks, mode, uid, gid)
+        {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                // Best-effort cleanup: a failed staged-object delete must not
+                // replace the publish error, whose classification
+                // (is_artifact_write_conflict) drives the caller's retry loop.
+                let _ = self.objects.delete_staged(&staged);
+                Err(err)
+            }
+        }
+    }
+
     fn stage_artifact_body(
         &self,
         prepared: &ClientPreparedArtifact,
@@ -1857,12 +2012,7 @@ where
         self.finish_staged_artifact(prepared, metadata, written)
     }
 
-    fn finish_staged_artifact(
-        &self,
-        prepared: &ClientPreparedArtifact,
-        metadata: ArtifactMetadata,
-        written: ChunkedWrite,
-    ) -> Result<(BodyDescriptor, Vec<ChunkManifest>, StagedObjectSet), ClientError> {
+    fn record_staged_write_stats(&self, written: &ChunkedWrite) {
         self.object_puts
             .fetch_add(written.object_puts as u64, Ordering::Relaxed);
         self.object_put_bytes
@@ -1877,6 +2027,15 @@ where
                 .sum::<u64>(),
             Ordering::Relaxed,
         );
+    }
+
+    fn finish_staged_artifact(
+        &self,
+        prepared: &ClientPreparedArtifact,
+        metadata: ArtifactMetadata,
+        written: ChunkedWrite,
+    ) -> Result<(BodyDescriptor, Vec<ChunkManifest>, StagedObjectSet), ClientError> {
+        self.record_staged_write_stats(&written);
         let staged = written.staged_objects()?;
         let chunks = written.chunk_manifests();
         Ok((
@@ -2056,6 +2215,59 @@ impl ScatterPackedRangePlan {
                 ClientError::Protocol("scatter packed read output end exceeds usize".to_owned())
             })
     }
+}
+
+/// True when an artifact write lost its generation guard: a stale
+/// `expected_generation`, a concurrent writer racing prepare/publish, or a
+/// create racing another create. Callers recover by re-reading the current
+/// generation and retrying.
+///
+/// `MissingBodyDescriptor` counts too: a concurrent self-contained publish
+/// (chain compaction) reclaims every superseded generation's manifest records
+/// in its commit, so a publish prepared against one of those generations fails
+/// resolving its base chain *before* it reaches the dentry CAS that would have
+/// reported `PredicateFailed`. It is the same lost race with the same
+/// recovery; only writes ever surface it through this path (reads report it
+/// as a hard error and never consult this classifier).
+pub fn is_artifact_write_conflict(err: &ClientError) -> bool {
+    crate::is_metadata_predicate_failed(err)
+        || matches!(
+            err,
+            ClientError::Metadata(nokv_meta::MetadError::MissingBodyDescriptor)
+        )
+}
+
+// Client-side guard failures surface as the same predicate error a server-side
+// publish CAS loss decodes to, so one discriminant covers both.
+fn artifact_write_conflict() -> ClientError {
+    ClientError::Metadata(nokv_meta::MetadError::Metadata(
+        nokv_meta::MetadataError::PredicateFailed,
+    ))
+}
+
+/// Classify a failed `prepare_artifact_path` inside
+/// [`NoKvFsClient::append_artifact`] after the initial lookup found the file:
+/// a `NotFound` here means a concurrent delete won the race. Without a pinned
+/// generation that is a retryable conflict — the caller's retry loop re-reads
+/// and takes the create branch — while a pinned generation or any other
+/// failure keeps its original error.
+fn fold_append_prepare_not_found(
+    err: ClientError,
+    expected_generation: Option<u64>,
+) -> ClientError {
+    if expected_generation.is_none() && crate::is_metadata_not_found(&err) {
+        artifact_write_conflict()
+    } else {
+        err
+    }
+}
+
+fn artifact_body_generation(entry: &DentryWithAttr) -> u64 {
+    entry
+        .body
+        .as_ref()
+        .map(|body| body.generation)
+        .unwrap_or(entry.attr.generation)
 }
 
 fn cleanup_staged_write_error<O: ObjectStore>(
@@ -2434,6 +2646,52 @@ mod tests {
     fn response_body(json: &str) -> Vec<u8> {
         let envelope: MetadataRpcEnvelope = serde_json::from_str(json).unwrap();
         encode_envelope(&envelope).unwrap()
+    }
+
+    #[test]
+    fn artifact_write_conflict_classifies_transient_write_races() {
+        // The two shapes a lost write race decodes to over the wire.
+        assert!(is_artifact_write_conflict(&ClientError::Metadata(
+            nokv_meta::MetadError::Metadata(nokv_meta::MetadataError::PredicateFailed),
+        )));
+        assert!(is_artifact_write_conflict(&ClientError::Metadata(
+            nokv_meta::MetadError::MissingBodyDescriptor,
+        )));
+        // Hard errors must not be retried as conflicts.
+        assert!(!is_artifact_write_conflict(&ClientError::Metadata(
+            nokv_meta::MetadError::NotFound,
+        )));
+        assert!(!is_artifact_write_conflict(&ClientError::Metadata(
+            nokv_meta::MetadError::NotFile,
+        )));
+        assert!(!is_artifact_write_conflict(&ClientError::Protocol(
+            "file /x is missing body descriptor".to_owned(),
+        )));
+    }
+
+    /// A file deleted between `lookup` and `prepare` inside `append_artifact`
+    /// must classify as a retryable conflict when no generation is pinned, so
+    /// the caller's retry loop re-reads and takes the create branch.
+    #[test]
+    fn append_prepare_not_found_folds_to_conflict_only_without_pinned_generation() {
+        let not_found = || ClientError::Metadata(nokv_meta::MetadError::NotFound);
+        assert!(is_artifact_write_conflict(&fold_append_prepare_not_found(
+            not_found(),
+            None
+        )));
+        // A pinned generation keeps the original error surface.
+        assert!(matches!(
+            fold_append_prepare_not_found(not_found(), Some(7)),
+            ClientError::Metadata(nokv_meta::MetadError::NotFound)
+        ));
+        // Non-NotFound errors pass through untouched.
+        assert!(matches!(
+            fold_append_prepare_not_found(
+                ClientError::Metadata(nokv_meta::MetadError::NotFile),
+                None
+            ),
+            ClientError::Metadata(nokv_meta::MetadError::NotFile)
+        ));
     }
 
     #[test]

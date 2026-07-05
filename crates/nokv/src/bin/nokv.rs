@@ -3060,6 +3060,15 @@ mod tests {
         run_workbench_mcp_requests_with_options(workbench_mcp_options(), requests)
     }
 
+    fn workbench_tool_call(id: u64, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        })
+    }
+
     fn run_workbench_mcp_requests_with_options(
         options: McpCliOptions,
         requests: Vec<serde_json::Value>,
@@ -3075,6 +3084,45 @@ mod tests {
             )),
             client_store,
         );
+        run_workbench_mcp_requests_on_client(client, options, requests)
+    }
+
+    /// One process-lifetime server shared by the workbench MCP tests that only
+    /// need isolation by workbench id. Every spawned test server leaks its
+    /// threads for the process lifetime, so per-test servers exhaust OS
+    /// resources as the suite grows; tests that touch distinct workbench ids
+    /// share this one instead.
+    fn shared_workbench_mcp_server() -> &'static (SocketAddr, PathBuf) {
+        static SERVER: std::sync::OnceLock<(SocketAddr, PathBuf)> = std::sync::OnceLock::new();
+        SERVER.get_or_init(|| {
+            let object_dir = tempdir().unwrap();
+            let object_root = object_dir.path().join("objects");
+            let addr = spawn_test_server_with_object_config(ObjectStoreConfig::tiered_local(
+                object_root.clone(),
+                fake_s3_options(),
+            ));
+            // The server thread serves for the process lifetime; keep its
+            // object root alive with it.
+            std::mem::forget(object_dir);
+            (addr, object_root)
+        })
+    }
+
+    fn run_shared_workbench_mcp_requests(
+        requests: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        let (addr, object_root) = shared_workbench_mcp_server();
+        let store =
+            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+        let client = NoKvFsClient::connect(*addr, store);
+        run_workbench_mcp_requests_on_client(client, workbench_mcp_options(), requests)
+    }
+
+    fn run_workbench_mcp_requests_on_client(
+        client: NoKvFsClient<LocalObjectStore>,
+        options: McpCliOptions,
+        requests: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
         let reqs = requests
             .into_iter()
             .map(|request| serde_json::to_string(&request).unwrap())
@@ -3146,7 +3194,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_tools_use_workbench_prefix_and_are_isolated() {
-        let responses = run_workbench_mcp_requests(vec![serde_json::json!({
+        let responses = run_shared_workbench_mcp_requests(vec![serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list"
@@ -3158,10 +3206,15 @@ mod tests {
             vec![
                 "workbench_create",
                 "workbench_put_file",
+                "workbench_append",
+                "workbench_edit",
                 "workbench_list",
                 "workbench_stat",
                 "workbench_read",
                 "workbench_grep",
+                "workbench_search",
+                "workbench_aggregate",
+                "workbench_catalog",
                 "workbench_find",
                 "workbench_commit",
                 "workbench_snapshot",
@@ -3175,7 +3228,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_tool_schemas_are_closed() {
-        let responses = run_workbench_mcp_requests(vec![serde_json::json!({
+        let responses = run_shared_workbench_mcp_requests(vec![serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list"
@@ -3190,7 +3243,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_create_put_read_list_stat_grep_commit_snapshot_flow() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3526,7 +3579,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_rejects_path_escape_and_default_overwrite() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3773,8 +3826,802 @@ mod tests {
     }
 
     #[test]
+    fn workbench_mcp_search_queries_paths_with_predicates_and_enrichment() {
+        // The "-searchmark.csv" suffix is unique to this test so the
+        // cross-workbench query stays exact on the shared server.
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_create",
+                serde_json::json!({"id": "wb-search-a"}),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-search-a",
+                    "section": "outputs",
+                    "path": "spectrum-searchmark.csv",
+                    "text": "freq,power\n1,2\n",
+                    "content_type": "text/csv"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-search-a",
+                    "section": "input",
+                    "path": "event.json",
+                    "text": "{\"event\":\"storm\"}",
+                    "content_type": "application/json"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_create",
+                serde_json::json!({"id": "wb-search-b"}),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-search-b",
+                    "section": "outputs",
+                    "path": "other-searchmark.csv",
+                    "text": "freq,power\n3,4\n",
+                    "content_type": "text/csv"
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_search",
+                serde_json::json!({
+                    "id": "wb-search-a",
+                    "predicates": [{"field": "name", "op": "suffix", "value": ".csv"}]
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_search",
+                serde_json::json!({
+                    "predicates": [{"field": "name", "op": "suffix", "value": "-searchmark.csv"}],
+                    "fields": ["name"]
+                }),
+            ),
+            workbench_tool_call(
+                8,
+                "workbench_search",
+                serde_json::json!({
+                    "id": "wb-search-a",
+                    "limit": 11
+                }),
+            ),
+            workbench_tool_call(
+                9,
+                "workbench_search",
+                serde_json::json!({
+                    "section": "outputs"
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().take(7).enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let scoped = &responses[5]["result"]["structuredContent"];
+        assert_eq!(scoped["status"], "success", "search response: {scoped}");
+        assert_eq!(scoped["match_count"], 1);
+        assert_eq!(scoped["matches"][0]["workbench_id"], "wb-search-a");
+        assert_eq!(scoped["matches"][0]["section"], "outputs");
+        assert_eq!(
+            scoped["matches"][0]["relative_path"],
+            "spectrum-searchmark.csv"
+        );
+        assert_eq!(
+            scoped["matches"][0]["path"],
+            "/workbenches/wb-search-a/outputs/spectrum-searchmark.csv"
+        );
+
+        let cross = &responses[6]["result"]["structuredContent"];
+        assert_eq!(cross["match_count"], 2, "cross response: {cross}");
+        let matches = cross["matches"].as_array().unwrap();
+        let ids: Vec<&str> = matches
+            .iter()
+            .map(|m| m["workbench_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"wb-search-a"), "matches: {matches:?}");
+        assert!(ids.contains(&"wb-search-b"), "matches: {matches:?}");
+        assert!(
+            matches
+                .iter()
+                .all(|m| m["values"]["name"].as_str().unwrap().ends_with(".csv")),
+            "matches: {matches:?}"
+        );
+
+        assert_eq!(responses[7]["result"]["isError"], true);
+        assert!(responses[7]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("limit must be between 1 and 10"));
+        // section/path scoping only makes sense inside one workbench.
+        assert_eq!(responses[8]["result"]["isError"], true);
+    }
+
+    #[test]
+    fn workbench_mcp_search_returns_empty_results_when_root_is_missing() {
+        let responses = run_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_search",
+            serde_json::json!({}),
+        )]);
+        assert_ne!(
+            responses[0]["result"]["isError"], true,
+            "response: {}",
+            responses[0]
+        );
+        let result = &responses[0]["result"]["structuredContent"];
+        assert_eq!(result["status"], "success");
+        assert_eq!(result["match_count"], 0);
+        assert_eq!(result["matches"], serde_json::json!([]));
+    }
+
+    /// A multi-level per-agent root (PR #390's default shape) whose ancestors
+    /// were never created must behave like the flat missing-root case: the
+    /// server reports the unresolved ancestor as a NotFound *error*, and the
+    /// workbench layer must fold that into "root not materialized = empty
+    /// results" instead of surfacing isError.
+    #[test]
+    fn workbench_mcp_queries_treat_missing_multilevel_root_as_empty() {
+        let options = McpCliOptions {
+            profile: McpProfile::Workbench,
+            workbench_root: Some(s("/agents/e2e-never/wb")),
+            workbench_max_bytes: workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES,
+        };
+        let responses = run_workbench_mcp_requests_with_options(
+            options,
+            vec![
+                workbench_tool_call(1, "workbench_find", serde_json::json!({})),
+                workbench_tool_call(2, "workbench_search", serde_json::json!({})),
+                workbench_tool_call(
+                    3,
+                    "workbench_aggregate",
+                    serde_json::json!({
+                        "predicates": [{"field": "kind", "op": "eq", "value": "file"}],
+                        "measures": [{"name": "files", "op": "count"}]
+                    }),
+                ),
+                workbench_tool_call(4, "workbench_catalog", serde_json::json!({})),
+            ],
+        );
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let find = &responses[0]["result"]["structuredContent"];
+        assert_eq!(find["status"], "success", "find response: {find}");
+        assert_eq!(find["match_count"], 0);
+        assert_eq!(find["matches"], serde_json::json!([]));
+
+        let search = &responses[1]["result"]["structuredContent"];
+        assert_eq!(search["status"], "success", "search response: {search}");
+        assert_eq!(search["match_count"], 0);
+        assert_eq!(search["matches"], serde_json::json!([]));
+
+        let aggregate = &responses[2]["result"]["structuredContent"];
+        assert_eq!(
+            aggregate["status"], "success",
+            "aggregate response: {aggregate}"
+        );
+        assert_eq!(aggregate["row_count"], 0);
+        assert_eq!(aggregate["groups"], serde_json::json!([]));
+
+        // The empty catalog must be field-level identical in shape to a real
+        // catalog result (path, catalog_empty, catalog buckets, children).
+        let catalog = &responses[3]["result"]["structuredContent"];
+        assert_eq!(catalog["status"], "success", "catalog response: {catalog}");
+        assert_eq!(catalog["path"], "/agents/e2e-never/wb");
+        assert_eq!(catalog["catalog_empty"], true);
+        assert_eq!(catalog["catalog"]["filterable"], serde_json::json!([]));
+        assert_eq!(catalog["catalog"]["sortable"], serde_json::json!([]));
+        assert_eq!(catalog["catalog"]["facetable"], serde_json::json!([]));
+        assert_eq!(catalog["catalog"]["facets"], serde_json::json!([]));
+        assert_eq!(catalog["child_catalogs"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn workbench_mcp_aggregate_counts_grouped_rows() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-agg"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "section": "outputs",
+                    "path": "a.csv",
+                    "text": "a\n",
+                    "content_type": "text/csv"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "section": "outputs",
+                    "path": "b.csv",
+                    "text": "b\n",
+                    "content_type": "text/csv"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "section": "input",
+                    "path": "c.json",
+                    "text": "{}",
+                    "content_type": "application/json"
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_aggregate",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "section": "outputs",
+                    "predicates": [{"field": "kind", "op": "eq", "value": "file"}],
+                    "measures": [{"name": "files", "op": "count"}]
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_aggregate",
+                serde_json::json!({
+                    "id": "wb-agg",
+                    "predicates": [{"field": "kind", "op": "eq", "value": "file"}],
+                    "group_by": ["body.content_type"],
+                    "measures": [{"name": "n", "op": "count"}]
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let total = &responses[4]["result"]["structuredContent"];
+        assert_eq!(total["status"], "success", "aggregate response: {total}");
+        assert_eq!(total["groups"][0]["values"]["files"], 2);
+
+        let grouped = &responses[5]["result"]["structuredContent"];
+        let groups = grouped["groups"].as_array().unwrap();
+        let group_count = |content_type: &str| {
+            groups
+                .iter()
+                .find(|group| group["key"]["body.content_type"] == content_type)
+                .unwrap_or_else(|| panic!("missing group {content_type}: {groups:?}"))["values"]
+                ["n"]
+                .clone()
+        };
+        assert_eq!(group_count("text/csv"), 2);
+        assert_eq!(group_count("application/json"), 1);
+    }
+
+    #[test]
+    fn workbench_mcp_catalog_returns_builtin_query_fields() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-cat"})),
+            workbench_tool_call(2, "workbench_catalog", serde_json::json!({"id": "wb-cat"})),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        let result = &responses[1]["result"]["structuredContent"];
+        assert_eq!(result["status"], "success", "catalog response: {result}");
+        assert_eq!(result["catalog_empty"], false);
+        let filterable: Vec<String> = result["catalog"]["filterable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["fields"].as_array().unwrap().clone())
+            .map(|field| field.as_str().unwrap().to_owned())
+            .collect();
+        for field in [
+            "path",
+            "name",
+            "kind",
+            "size_bytes",
+            "body.content_type",
+            "body.producer",
+            "body.manifest_id",
+        ] {
+            assert!(
+                filterable.contains(&field.to_owned()),
+                "missing builtin field {field}: {filterable:?}"
+            );
+        }
+        assert_eq!(filterable.len(), 7, "filterable: {filterable:?}");
+    }
+
+    #[test]
+    fn workbench_mcp_append_creates_then_extends_and_reads_back() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_create",
+                serde_json::json!({"id": "wb-append"}),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_append",
+                serde_json::json!({
+                    "id": "wb-append",
+                    "section": "logs",
+                    "path": "run.log",
+                    "text": "line one\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_append",
+                serde_json::json!({
+                    "id": "wb-append",
+                    "section": "logs",
+                    "path": "run.log",
+                    "text": "line two\n"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-append",
+                    "section": "logs",
+                    "path": "run.log",
+                    "format": "structured"
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let first = &responses[1]["result"]["structuredContent"];
+        assert_eq!(first["status"], "success", "append response: {first}");
+        assert_eq!(first["created"], true);
+        assert_eq!(first["appended_bytes"], 9);
+        assert_eq!(first["size_bytes"], 9);
+        assert_eq!(first["path"], "/workbenches/wb-append/logs/run.log");
+        assert_eq!(first["section"], "logs");
+        assert_eq!(first["relative_path"], "run.log");
+
+        let second = &responses[2]["result"]["structuredContent"];
+        assert_eq!(second["created"], false);
+        assert_eq!(second["appended_bytes"], 9);
+        assert_eq!(second["size_bytes"], 18);
+        assert!(second["generation"].as_u64().is_some());
+
+        let read = &responses[3]["result"]["structuredContent"];
+        assert_eq!(read["items"][0]["value"]["text"], "line one");
+        assert_eq!(read["items"][1]["value"]["text"], "line two");
+    }
+
+    #[test]
+    fn workbench_mcp_edit_replaces_strings_with_lingtai_error_texts() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-edit"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "text": "hello world\nhello moon\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "old_string": "world",
+                    "new_string": "mars"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "format": "structured"
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "old_string": "absent",
+                    "new_string": "x"
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "old_string": "hello",
+                    "new_string": "hi"
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-edit",
+                    "section": "outputs",
+                    "path": "notes.txt",
+                    "old_string": "hello",
+                    "new_string": "hi",
+                    "replace_all": true
+                }),
+            ),
+        ]);
+
+        let edited = &responses[2]["result"]["structuredContent"];
+        assert_ne!(
+            responses[2]["result"]["isError"], true,
+            "edit response: {}",
+            responses[2]
+        );
+        assert_eq!(edited["status"], "success");
+        assert_eq!(edited["replacements"], 1);
+        assert!(edited["generation"].as_u64().is_some());
+
+        let read = &responses[3]["result"]["structuredContent"];
+        assert_eq!(read["items"][0]["value"]["text"], "hello mars");
+
+        assert_eq!(responses[4]["result"]["isError"], true);
+        assert!(responses[4]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("old_string not found in /workbenches/wb-edit/outputs/notes.txt"));
+
+        assert_eq!(responses[5]["result"]["isError"], true);
+        assert!(responses[5]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("old_string found 2 times — use replace_all=true or provide more context"));
+
+        assert_ne!(
+            responses[6]["result"]["isError"], true,
+            "replace_all response: {}",
+            responses[6]
+        );
+        assert_eq!(
+            responses[6]["result"]["structuredContent"]["replacements"],
+            2
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_read_supports_conditional_generation() {
+        // Two batches on the shared server: the second replays the generation
+        // observed by the first.
+        let setup = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-cond"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "text": "v1\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "format": "structured"
+                }),
+            ),
+        ]);
+        for (index, response) in setup.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "setup response {index}: {response}"
+            );
+        }
+        let generation = setup[2]["result"]["structuredContent"]["generation"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("read response missing generation: {}", setup[2]));
+
+        let conditional = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "if_none_match": generation
+                }),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_edit",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "old_string": "v1",
+                    "new_string": "v2"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "format": "structured",
+                    "if_none_match": generation
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-cond",
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "limit": 301
+                }),
+            ),
+        ]);
+
+        let unchanged = &conditional[0]["result"]["structuredContent"];
+        assert_ne!(
+            conditional[0]["result"]["isError"], true,
+            "conditional response: {}",
+            conditional[0]
+        );
+        assert_eq!(unchanged["status"], "success");
+        assert_eq!(unchanged["not_modified"], true);
+        assert_eq!(unchanged["generation"], generation);
+        assert_eq!(unchanged["section"], "outputs");
+        assert_eq!(unchanged["relative_path"], "data.txt");
+        assert!(unchanged.get("items").is_none(), "unchanged: {unchanged}");
+
+        assert_ne!(conditional[1]["result"]["isError"], true);
+
+        let modified = &conditional[2]["result"]["structuredContent"];
+        assert_ne!(
+            conditional[2]["result"]["isError"], true,
+            "modified response: {}",
+            conditional[2]
+        );
+        assert!(modified["not_modified"].is_null(), "modified: {modified}");
+        assert_eq!(modified["items"][0]["value"]["text"], "v2");
+        assert_ne!(modified["generation"], generation);
+
+        assert_eq!(conditional[3]["result"]["isError"], true);
+        assert!(conditional[3]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("limit must be between 1 and 300"));
+    }
+
+    /// Bytes-mode reads must return a base64 string, not a JSON integer
+    /// array (which inflates the token cost of every byte to ~4 tokens).
+    #[test]
+    fn workbench_mcp_read_bytes_returns_base64_payload() {
+        use base64::Engine as _;
+        let payload: Vec<u8> = vec![
+            0x00, 0x01, 0xFE, 0xFF, 0x10, 0x20, 0x30, 0x40, 0x7F, 0x80, 0x90, 0xA0,
+        ];
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-bytes"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-bytes",
+                    "section": "outputs",
+                    "path": "blob.bin",
+                    "base64": base64::engine::general_purpose::STANDARD.encode(&payload),
+                    "content_type": "application/octet-stream"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": "wb-bytes",
+                    "section": "outputs",
+                    "path": "blob.bin",
+                    "format": "bytes",
+                    "offset": 2,
+                    "limit": 8
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let read = &responses[2]["result"]["structuredContent"];
+        assert_eq!(read["status"], "success", "read response: {read}");
+        assert_eq!(read["bytes_encoding"], "base64", "read response: {read}");
+        let encoded = read["bytes"]
+            .as_str()
+            .unwrap_or_else(|| panic!("bytes must be a base64 string: {read}"));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(decoded, payload[2..10].to_vec(), "read response: {read}");
+        assert_eq!(read["total_size_bytes"], payload.len());
+    }
+
+    #[test]
+    fn workbench_mcp_grep_supports_patterns_glob_and_pipe_split() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": "wb-grep"})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "section": "outputs",
+                    "path": "one.txt",
+                    "text": "alpha signal\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "section": "outputs",
+                    "path": "two.log",
+                    "text": "beta signal\n"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "section": "outputs",
+                    "path": "three.md",
+                    "text": "gamma note\n"
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_grep",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "pattern": "alpha|beta",
+                    "recursive": true
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_grep",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "pattern": "gamma",
+                    "patterns": ["alpha", "beta"],
+                    "recursive": true
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_grep",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "pattern": "alpha|beta",
+                    "glob": "*.txt",
+                    "recursive": true
+                }),
+            ),
+            workbench_tool_call(
+                8,
+                "workbench_grep",
+                serde_json::json!({
+                    "id": "wb-grep",
+                    "pattern": "signal",
+                    "recursive": true,
+                    "limit": 301
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().take(7).enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let match_paths = |response: &serde_json::Value| -> Vec<String> {
+            response["result"]["structuredContent"]["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["path"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        // Pipe in `pattern` splits into OR alternatives when `patterns` is absent.
+        let piped = match_paths(&responses[4]);
+        assert!(
+            piped.contains(&"/workbenches/wb-grep/outputs/one.txt".to_owned())
+                && piped.contains(&"/workbenches/wb-grep/outputs/two.log".to_owned()),
+            "piped matches: {piped:?}"
+        );
+
+        // `patterns` adds OR alternatives to `pattern` (union), it does not
+        // replace it: the gamma-only file must match alongside alpha/beta.
+        let unioned = match_paths(&responses[5]);
+        assert_eq!(unioned.len(), 3, "union matches: {unioned:?}");
+        assert!(
+            unioned.contains(&"/workbenches/wb-grep/outputs/three.md".to_owned()),
+            "union matches: {unioned:?}"
+        );
+
+        let globbed = match_paths(&responses[6]);
+        assert_eq!(
+            globbed,
+            vec!["/workbenches/wb-grep/outputs/one.txt".to_owned()],
+            "globbed matches: {globbed:?}"
+        );
+
+        assert_eq!(responses[7]["result"]["isError"], true);
+        assert!(responses[7]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("limit must be between 1 and 300"));
+    }
+
+    #[test]
     fn workbench_mcp_put_file_ignores_empty_unused_payload_variant() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3863,7 +4710,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_rejects_section_prefixed_paths() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -3917,7 +4764,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_rejects_invalid_ids_sections_payloads_and_manifest() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -4061,7 +4908,7 @@ mod tests {
 
     #[test]
     fn workbench_mcp_snapshot_requires_commit_manifest() {
-        let responses = run_workbench_mcp_requests(vec![
+        let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -4301,5 +5148,950 @@ mod tests {
         let output = String::from_utf8(writer).unwrap();
         let resp: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
         assert_eq!(resp["result"]["protocolVersion"], "2025-11-25");
+    }
+
+    // ==================== attack_ boundary tests (PR #392 review) ====================
+    //
+    // Adversarial TDD against the new workbench tool surface: append, edit,
+    // conditional read, search, and grep. Each test asserts either an expected
+    // failure mode (explicit error text) or an expected success semantic.
+
+    fn attack_tool_error(response: &serde_json::Value) -> String {
+        assert_eq!(
+            response["result"]["isError"], true,
+            "expected tool error, got: {response}"
+        );
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn attack_tool_ok(response: &serde_json::Value) -> serde_json::Value {
+        assert_ne!(
+            response["result"]["isError"], true,
+            "expected tool success, got: {response}"
+        );
+        response["result"]["structuredContent"].clone()
+    }
+
+    fn attack_direct_client() -> NoKvFsClient<LocalObjectStore> {
+        let (addr, object_root) = shared_workbench_mcp_server();
+        let store =
+            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+        NoKvFsClient::connect(*addr, store)
+    }
+
+    // ---------- append ----------
+
+    #[test]
+    fn attack_append_empty_text_creates_empty_file_then_grows() {
+        let wb = "attack-append-empty";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "logs", "path": "run.log", "text": ""}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "logs", "path": "run.log", "text": "data"}),
+            ),
+        ]);
+        let first = attack_tool_ok(&responses[1]);
+        assert_eq!(first["appended_bytes"], 0, "first append: {first}");
+        assert_eq!(first["size_bytes"], 0, "first append: {first}");
+        assert_eq!(first["created"], true, "first append: {first}");
+        let second = attack_tool_ok(&responses[2]);
+        assert_eq!(second["appended_bytes"], 4);
+        assert_eq!(second["size_bytes"], 4);
+        assert_eq!(second["created"], false);
+        let client = attack_direct_client();
+        assert_eq!(
+            client
+                .cat("/workbenches/attack-append-empty/logs/run.log")
+                .unwrap(),
+            b"data"
+        );
+    }
+
+    #[test]
+    fn attack_append_payload_at_exact_max_bytes_succeeds() {
+        // Dedicated server: the 16 MiB body should not pollute the shared one.
+        let wb = "attack-append-max";
+        let payload = "a".repeat(workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES);
+        let responses = run_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "big.bin", "text": payload}),
+            ),
+        ]);
+        let appended = attack_tool_ok(&responses[1]);
+        assert_eq!(
+            appended["appended_bytes"],
+            workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES as u64
+        );
+        assert_eq!(
+            appended["size_bytes"],
+            workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn attack_append_payload_one_over_max_bytes_rejected() {
+        let wb = "attack-append-over";
+        let payload = "a".repeat(workbench_mcp::DEFAULT_WORKBENCH_MAX_BYTES + 1);
+        let responses = run_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "big.bin", "text": payload}),
+            ),
+        ]);
+        let error = attack_tool_error(&responses[1]);
+        assert!(
+            error.contains("payload exceeds max_bytes"),
+            "error: {error}"
+        );
+        assert!(error.contains("16777217 > 16777216"), "error: {error}");
+    }
+
+    #[test]
+    fn attack_append_to_directory_rejected() {
+        let wb = "attack-append-dir";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "dir/file.txt", "text": "x"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "dir", "text": "y"}),
+            ),
+        ]);
+        attack_tool_ok(&responses[1]);
+        let error = attack_tool_error(&responses[2]);
+        assert!(
+            error.contains("not a file"),
+            "append onto directory must fail with a not-a-file error, got: {error}"
+        );
+        // The directory must still list its child afterwards.
+        let after = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_list",
+            serde_json::json!({"id": wb, "section": "outputs", "path": "dir"}),
+        )]);
+        let listing = attack_tool_ok(&after[0]);
+        assert_eq!(listing["entries"][0]["name"], "file.txt");
+    }
+
+    #[test]
+    fn attack_append_cannot_address_out_of_band_paths() {
+        let wb = "attack-append-oob";
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_create",
+            serde_json::json!({"id": wb}),
+        )]);
+        attack_tool_ok(&responses[0]);
+        // Another NoKV client drops a file directly under the workbench root,
+        // outside every section.
+        let direct = attack_direct_client();
+        direct
+            .put_artifact(
+                "/workbenches/attack-append-oob/oob.txt",
+                b"out-of-band".to_vec(),
+                ArtifactMetadata {
+                    producer: "outside-writer".to_owned(),
+                    digest_uri: "sha256:demo".to_owned(),
+                    content_type: "text/plain".to_owned(),
+                    manifest_id: "oob.txt".to_owned(),
+                    mode: DEFAULT_MODE_FILE,
+                    uid: DEFAULT_UID,
+                    gid: DEFAULT_GID,
+                },
+            )
+            .unwrap();
+        let attempts = run_shared_workbench_mcp_requests(vec![
+            // Escape through '..' must be rejected.
+            workbench_tool_call(
+                1,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "input", "path": "../oob.txt", "text": "hijack"}),
+            ),
+            // A fake section name must be rejected by the section enum guard.
+            workbench_tool_call(
+                2,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "oob.txt", "path": "x", "text": "hijack"}),
+            ),
+        ]);
+        let escape = attack_tool_error(&attempts[0]);
+        assert!(
+            escape.contains("'.' or '..'"),
+            "dot-dot escape error: {escape}"
+        );
+        let fake_section = attack_tool_error(&attempts[1]);
+        assert!(
+            fake_section.contains("invalid section"),
+            "fake section error: {fake_section}"
+        );
+        // The out-of-band file must be untouched.
+        assert_eq!(
+            direct
+                .cat("/workbenches/attack-append-oob/oob.txt")
+                .unwrap(),
+            b"out-of-band"
+        );
+    }
+
+    #[test]
+    fn attack_append_thirty_times_preserves_full_content() {
+        let wb = "attack-append-thirty";
+        let mut requests = vec![workbench_tool_call(
+            1,
+            "workbench_create",
+            serde_json::json!({"id": wb}),
+        )];
+        let mut expected = String::new();
+        for index in 0..30u64 {
+            let line = format!("line-{index:02}\n");
+            expected.push_str(&line);
+            requests.push(workbench_tool_call(
+                index + 2,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "logs", "path": "run.log", "text": line}),
+            ));
+        }
+        let responses = run_shared_workbench_mcp_requests(requests);
+        let mut running_size = 0u64;
+        for response in &responses[1..] {
+            let appended = attack_tool_ok(response);
+            running_size += appended["appended_bytes"].as_u64().unwrap();
+            assert_eq!(
+                appended["size_bytes"].as_u64().unwrap(),
+                running_size,
+                "append response: {appended}"
+            );
+        }
+        let client = attack_direct_client();
+        assert_eq!(
+            client
+                .cat("/workbenches/attack-append-thirty/logs/run.log")
+                .unwrap(),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn attack_append_interleaved_with_put_file_replace() {
+        let wb = "attack-append-interleave";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "text": "a"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "text": "RESET", "replace": true}),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_append",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "text": "b"}),
+            ),
+        ]);
+        let first = attack_tool_ok(&responses[1]);
+        let replaced = attack_tool_ok(&responses[2]);
+        let second = attack_tool_ok(&responses[3]);
+        assert_eq!(second["size_bytes"], 6, "final append: {second}");
+        assert!(
+            second["generation"].as_u64().unwrap() > replaced["generation"].as_u64().unwrap()
+                && replaced["generation"].as_u64().unwrap() > first["generation"].as_u64().unwrap(),
+            "generations must be monotonic: {first} / {replaced} / {second}"
+        );
+        let client = attack_direct_client();
+        assert_eq!(
+            client
+                .cat("/workbenches/attack-append-interleave/outputs/f.txt")
+                .unwrap(),
+            b"RESETb"
+        );
+    }
+
+    // ---------- edit ----------
+
+    #[test]
+    fn attack_edit_old_equals_new_is_noop_without_generation_bump() {
+        let wb = "attack-edit-noop";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "scripts", "path": "s.py", "text": "hello world"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_edit",
+                serde_json::json!({"id": wb, "section": "scripts", "path": "s.py", "old_string": "hello", "new_string": "hello"}),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_stat",
+                serde_json::json!({"id": wb, "section": "scripts", "path": "s.py"}),
+            ),
+        ]);
+        let put = attack_tool_ok(&responses[1]);
+        let edit = attack_tool_ok(&responses[2]);
+        assert_eq!(edit["replacements"], 1, "edit: {edit}");
+        // A byte-identical replacement short-circuits: success without
+        // publishing a new generation, flagged via no_change.
+        assert_eq!(edit["no_change"], true, "edit: {edit}");
+        assert_eq!(
+            edit["generation"].as_u64().unwrap(),
+            put["generation"].as_u64().unwrap(),
+            "no-op edit must not bump generation: put {put} edit {edit}"
+        );
+        let stat = attack_tool_ok(&responses[3]);
+        assert_eq!(
+            stat["card"]["generation"].as_u64().unwrap(),
+            put["generation"].as_u64().unwrap(),
+            "stat after no-op edit: {stat}"
+        );
+        let client = attack_direct_client();
+        assert_eq!(
+            client
+                .cat("/workbenches/attack-edit-noop/scripts/s.py")
+                .unwrap(),
+            b"hello world"
+        );
+    }
+
+    #[test]
+    fn attack_edit_empty_old_string_rejected() {
+        let wb = "attack-edit-emptyold";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "scripts", "path": "s.py", "text": "abc"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_edit",
+                serde_json::json!({"id": wb, "section": "scripts", "path": "s.py", "old_string": "", "new_string": "x"}),
+            ),
+        ]);
+        let error = attack_tool_error(&responses[2]);
+        assert!(
+            error.contains("old_string must not be empty"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_edit_can_empty_a_file() {
+        let wb = "attack-edit-toempty";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "text": "x"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_edit",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "old_string": "x", "new_string": ""}),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_stat",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt"}),
+            ),
+        ]);
+        let edit = attack_tool_ok(&responses[2]);
+        assert_eq!(edit["size_bytes"], 0, "edit: {edit}");
+        let stat = attack_tool_ok(&responses[3]);
+        assert_eq!(stat["card"]["size_bytes"], 0, "stat: {stat}");
+        let client = attack_direct_client();
+        assert_eq!(
+            client
+                .cat("/workbenches/attack-edit-toempty/outputs/f.txt")
+                .unwrap(),
+            b""
+        );
+    }
+
+    #[test]
+    fn attack_edit_binary_file_rejected_as_non_utf8() {
+        use base64::Engine as _;
+        let wb = "attack-edit-binary";
+        let binary = base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe, 0x00, 0x01]);
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "blob.bin", "base64": binary}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_edit",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "blob.bin", "old_string": "x", "new_string": "y"}),
+            ),
+        ]);
+        attack_tool_ok(&responses[1]);
+        let error = attack_tool_error(&responses[2]);
+        assert!(
+            error.contains("not valid UTF-8"),
+            "binary edit error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_edit_replace_all_hundred_occurrences() {
+        let wb = "attack-edit-hundred";
+        let content = "tok\n".repeat(100);
+        let expected = "TOKEN\n".repeat(100);
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "many.txt", "text": content}),
+            ),
+            // Without replace_all a multi-occurrence edit must fail loudly.
+            workbench_tool_call(
+                3,
+                "workbench_edit",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "many.txt", "old_string": "tok", "new_string": "TOKEN"}),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_edit",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "many.txt", "old_string": "tok", "new_string": "TOKEN", "replace_all": true}),
+            ),
+        ]);
+        let ambiguous = attack_tool_error(&responses[2]);
+        assert!(
+            ambiguous.contains("found 100 times"),
+            "ambiguous edit error: {ambiguous}"
+        );
+        let edit = attack_tool_ok(&responses[3]);
+        assert_eq!(edit["replacements"], 100, "edit: {edit}");
+        let client = attack_direct_client();
+        assert_eq!(
+            client
+                .cat("/workbenches/attack-edit-hundred/outputs/many.txt")
+                .unwrap(),
+            expected.as_bytes()
+        );
+    }
+
+    // ---------- conditional read ----------
+
+    #[test]
+    fn attack_read_if_none_match_zero_returns_body() {
+        let wb = "attack-cond-zero";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "text": "hello"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "if_none_match": 0}),
+            ),
+        ]);
+        let put = attack_tool_ok(&responses[1]);
+        // If a fresh artifact ever starts at generation 0, if_none_match=0
+        // would silently skip the first read; guard that invariant.
+        assert_ne!(
+            put["generation"].as_u64().unwrap(),
+            0,
+            "fresh artifact generation must not collide with if_none_match=0: {put}"
+        );
+        let read = attack_tool_ok(&responses[2]);
+        assert_ne!(read["not_modified"], true, "read: {read}");
+        assert_eq!(read["items"][0]["value"]["text"], "hello", "read: {read}");
+    }
+
+    #[test]
+    fn attack_read_if_none_match_negative_rejected() {
+        let wb = "attack-cond-negative";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "text": "hello"}),
+            ),
+            // The MCP layer does not validate JSON Schema; the tool code must
+            // reject a negative generation itself.
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "if_none_match": -1}),
+            ),
+        ]);
+        let error = attack_tool_error(&responses[2]);
+        assert!(
+            error.contains("if_none_match must be an integer"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_read_if_none_match_on_directory() {
+        let wb = "attack-cond-dir";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "d/f.txt", "text": "x"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_stat",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "d"}),
+            ),
+            // Unconditional read of a directory must fail.
+            workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "d"}),
+            ),
+        ]);
+        let stat = attack_tool_ok(&responses[2]);
+        let dir_generation = stat["card"]["generation"].as_u64().unwrap();
+        attack_tool_error(&responses[3]);
+        // Conditional read of the same directory with a matching generation:
+        // consistent behavior would be the same not-a-file error, not a
+        // not_modified success.
+        let conditional = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_read",
+            serde_json::json!({"id": wb, "section": "outputs", "path": "d", "if_none_match": dir_generation}),
+        )]);
+        assert_eq!(
+            conditional[0]["result"]["isError"], true,
+            "conditional read of a directory must fail like the unconditional \
+             read does, got: {}",
+            conditional[0]
+        );
+    }
+
+    #[test]
+    fn attack_read_if_none_match_missing_file_rejected() {
+        let wb = "attack-cond-missing";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_read",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "nope.txt", "if_none_match": 1}),
+            ),
+        ]);
+        let error = attack_tool_error(&responses[1]);
+        assert!(error.contains("path not found"), "error: {error}");
+    }
+
+    #[test]
+    fn attack_read_not_modified_then_edit_invalidates_generation() {
+        let wb = "attack-cond-invalidate";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "text": "before"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt"}),
+            ),
+        ]);
+        let read = attack_tool_ok(&responses[2]);
+        let generation = read["generation"].as_u64().unwrap();
+        let round_two = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_read",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "if_none_match": generation}),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_edit",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "old_string": "before", "new_string": "after"}),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({"id": wb, "section": "outputs", "path": "f.txt", "if_none_match": generation}),
+            ),
+        ]);
+        let unchanged = attack_tool_ok(&round_two[0]);
+        assert_eq!(unchanged["not_modified"], true, "unchanged: {unchanged}");
+        assert_eq!(
+            unchanged["generation"].as_u64().unwrap(),
+            generation,
+            "unchanged: {unchanged}"
+        );
+        attack_tool_ok(&round_two[1]);
+        let changed = attack_tool_ok(&round_two[2]);
+        assert_ne!(changed["not_modified"], true, "changed: {changed}");
+        assert!(
+            changed["generation"].as_u64().unwrap() > generation,
+            "changed: {changed}"
+        );
+        assert_eq!(
+            changed["items"][0]["value"]["text"], "after",
+            "changed: {changed}"
+        );
+    }
+
+    // ---------- search ----------
+
+    fn attack_search_fixture() -> &'static str {
+        static FIXTURE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let wb = "attack-search-fixture";
+        FIXTURE.get_or_init(|| {
+            let responses = run_shared_workbench_mcp_requests(vec![
+                workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+                workbench_tool_call(
+                    2,
+                    "workbench_put_file",
+                    serde_json::json!({"id": wb, "section": "outputs", "path": "attack-search.csv", "text": "a,b\n1,2\n", "content_type": "text/csv"}),
+                ),
+            ]);
+            for response in &responses {
+                attack_tool_ok(response);
+            }
+        });
+        wb
+    }
+
+    #[test]
+    fn attack_search_empty_predicates_matches_scope() {
+        let wb = attack_search_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_search",
+            serde_json::json!({"id": wb, "predicates": []}),
+        )]);
+        let search = attack_tool_ok(&responses[0]);
+        assert_eq!(search["status"], "success", "search: {search}");
+        assert!(
+            search["match_count"].as_u64().unwrap() >= 1,
+            "empty predicates must match the scope, got: {search}"
+        );
+    }
+
+    #[test]
+    fn attack_search_unknown_field_returns_empty_not_error() {
+        let wb = attack_search_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_search",
+            serde_json::json!({
+                "id": wb,
+                "predicates": [{"field": "totally_bogus_field", "op": "eq", "value": "x"}]
+            }),
+        )]);
+        // Documented behavior: an unknown field is not an error; the predicate
+        // silently matches nothing. (A typo'd field id is indistinguishable
+        // from a true empty result.)
+        let search = attack_tool_ok(&responses[0]);
+        assert_eq!(search["match_count"], 0, "search: {search}");
+    }
+
+    #[test]
+    fn attack_search_unknown_op_rejected() {
+        let wb = attack_search_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_search",
+            serde_json::json!({
+                "id": wb,
+                "predicates": [{"field": "name", "op": "regex", "value": ".*"}]
+            }),
+        )]);
+        let error = attack_tool_error(&responses[0]);
+        assert!(
+            error.contains("unsupported predicate operator regex"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_search_limit_zero_rejected() {
+        let wb = attack_search_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_search",
+            serde_json::json!({"id": wb, "limit": 0}),
+        )]);
+        let error = attack_tool_error(&responses[0]);
+        assert!(
+            error.contains("limit must be between 1 and 10"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_search_cross_workbench_section_without_id_rejected() {
+        attack_search_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_search",
+                serde_json::json!({"section": "outputs"}),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_search",
+                serde_json::json!({"path": "attack-search.csv"}),
+            ),
+        ]);
+        let section_error = attack_tool_error(&responses[0]);
+        assert!(
+            section_error.contains("section requires id"),
+            "error: {section_error}"
+        );
+        let path_error = attack_tool_error(&responses[1]);
+        assert!(
+            path_error.contains("path requires id"),
+            "error: {path_error}"
+        );
+    }
+
+    #[test]
+    fn attack_search_facets_on_unknown_field_do_not_error() {
+        let wb = attack_search_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_search",
+            serde_json::json!({"id": wb, "facets": ["totally_bogus_facet"]}),
+        )]);
+        let search = attack_tool_ok(&responses[0]);
+        assert_eq!(search["status"], "success", "search: {search}");
+        let facets = search["facets"].as_array().unwrap();
+        // Whatever shape comes back, an unknown facet field must not fabricate
+        // values.
+        for facet in facets {
+            assert_eq!(
+                facet["values"].as_array().map(Vec::len).unwrap_or(0),
+                0,
+                "unknown facet must have no values: {facet}"
+            );
+        }
+    }
+
+    // ---------- grep ----------
+
+    fn attack_grep_fixture() -> &'static str {
+        static FIXTURE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let wb = "attack-grep-fixture";
+        FIXTURE.get_or_init(|| {
+            let responses = run_shared_workbench_mcp_requests(vec![
+                workbench_tool_call(1, "workbench_create", serde_json::json!({"id": wb})),
+                workbench_tool_call(
+                    2,
+                    "workbench_put_file",
+                    serde_json::json!({"id": wb, "section": "logs", "path": "run.log", "text": "alpha needle beta\nplain line\n"}),
+                ),
+            ]);
+            for response in &responses {
+                attack_tool_ok(response);
+            }
+        });
+        wb
+    }
+
+    fn attack_grep_args(wb: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut args = serde_json::json!({
+            "id": wb,
+            "section": "logs",
+            "pattern": "needle",
+            "recursive": true
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        args
+    }
+
+    #[test]
+    fn attack_grep_sixteen_patterns_accepted_seventeen_rejected() {
+        let wb = attack_grep_fixture();
+        let sixteen: Vec<String> = (0..16).map(|i| format!("filler-{i}")).collect();
+        let seventeen: Vec<String> = (0..17).map(|i| format!("filler-{i}")).collect();
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_grep",
+                attack_grep_args(wb, serde_json::json!({"patterns": sixteen})),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_grep",
+                attack_grep_args(wb, serde_json::json!({"patterns": seventeen})),
+            ),
+        ]);
+        let ok = attack_tool_ok(&responses[0]);
+        assert!(
+            ok["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["snippet"].as_str().unwrap_or("").contains("needle")),
+            "16 patterns + pattern must still match: {ok}"
+        );
+        let error = attack_tool_error(&responses[1]);
+        assert!(
+            error.contains("patterns must not exceed 16"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_grep_empty_pattern_entry_rejected() {
+        let wb = attack_grep_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_grep",
+            attack_grep_args(wb, serde_json::json!({"patterns": ["ok", ""]})),
+        )]);
+        let error = attack_tool_error(&responses[0]);
+        assert!(
+            error.contains("patterns entries must not be empty"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_grep_glob_star_only_matches_everything() {
+        let wb = attack_grep_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_grep",
+            attack_grep_args(wb, serde_json::json!({"glob": "*"})),
+        )]);
+        let ok = attack_tool_ok(&responses[0]);
+        assert_eq!(
+            ok["matches"][0]["relative_path"], "run.log",
+            "glob=* grep: {ok}"
+        );
+    }
+
+    #[test]
+    fn attack_grep_empty_glob_rejected() {
+        let wb = attack_grep_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_grep",
+            attack_grep_args(wb, serde_json::json!({"glob": ""})),
+        )]);
+        let error = attack_tool_error(&responses[0]);
+        assert!(
+            error.contains("name_glob must not be empty"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_grep_empty_pattern_with_patterns_succeeds() {
+        let wb = attack_grep_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_grep",
+            serde_json::json!({
+                "id": wb,
+                "section": "logs",
+                "pattern": "",
+                "patterns": ["needle"],
+                "recursive": true
+            }),
+        )]);
+        // Schema requires pattern; an empty string plus non-empty patterns is
+        // the documented escape hatch and must behave like patterns alone.
+        let ok = attack_tool_ok(&responses[0]);
+        assert!(
+            ok["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["snippet"].as_str().unwrap_or("").contains("needle")),
+            "grep: {ok}"
+        );
+    }
+
+    #[test]
+    fn attack_grep_empty_pattern_without_patterns_rejected() {
+        let wb = attack_grep_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_grep",
+            serde_json::json!({"id": wb, "section": "logs", "pattern": "", "recursive": true}),
+        )]);
+        let error = attack_tool_error(&responses[0]);
+        assert!(
+            error.contains("pattern or patterns must be provided"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_grep_seventeen_piped_alternatives_rejected() {
+        let wb = attack_grep_fixture();
+        let pattern = (0..17)
+            .map(|i| format!("filler-{i}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_grep",
+            serde_json::json!({"id": wb, "section": "logs", "pattern": pattern, "recursive": true}),
+        )]);
+        let error = attack_tool_error(&responses[0]);
+        assert!(
+            error.contains(
+                "pattern contains 17 '|'-separated alternatives; at most 16 are supported"
+            ),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn attack_grep_pipe_only_pattern_stays_literal() {
+        let wb = attack_grep_fixture();
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            1,
+            "workbench_grep",
+            serde_json::json!({"id": wb, "section": "logs", "pattern": "|||", "recursive": true}),
+        )]);
+        // Splitting "|||" on '|' yields only empty segments, which are
+        // dropped; the pattern must stay a literal search and match nothing.
+        let ok = attack_tool_ok(&responses[0]);
+        assert_eq!(ok["matches"], serde_json::json!([]), "grep: {ok}");
     }
 }

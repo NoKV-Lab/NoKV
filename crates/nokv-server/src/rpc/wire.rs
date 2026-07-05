@@ -611,6 +611,7 @@ pub(super) fn wire_namespace_grep_result(
     Ok(WireNamespaceGrepResult {
         path: result.path.clone(),
         pattern: result.pattern.clone(),
+        patterns: result.patterns.clone(),
         recursive: result.recursive,
         evidence: result.evidence.clone(),
         snapshot_id: result.snapshot_id,
@@ -740,7 +741,9 @@ pub(super) fn namespace_grep_request(
     Ok(NamespaceGrepRequest {
         path: request.path,
         pattern: request.pattern,
+        patterns: request.patterns,
         recursive: request.recursive,
+        name_glob: request.name_glob,
         cursor: request.cursor,
         limit: usize::try_from(request.limit).map_err(|_| {
             ServerError::Metadata(MetadError::InvalidQuery(

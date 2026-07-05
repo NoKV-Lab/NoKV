@@ -56,12 +56,17 @@ impl From<nokv_meta::MetadError> for AgentError {
 
 const DEFAULT_AGENT_PAGE_LIMIT: usize = 100;
 const MAX_AGENT_PAGE_LIMIT: usize = 100;
+const DEFAULT_AGENT_READ_LIMIT: usize = 100;
+const MAX_AGENT_READ_LIMIT: usize = 300;
 const DEFAULT_AGENT_FIND_LIMIT: usize = 10;
 const MAX_AGENT_FIND_LIMIT: usize = 10;
 const DEFAULT_AGENT_AGGREGATE_LIMIT: usize = 20;
 const MAX_AGENT_AGGREGATE_LIMIT: usize = 100;
 const DEFAULT_AGENT_GREP_LIMIT: usize = 100;
-const MAX_AGENT_GREP_LIMIT: usize = 100;
+const MAX_AGENT_GREP_LIMIT: usize = 300;
+/// Mirror of the metadata server's grep pattern cap (nokv-meta
+/// MAX_GREP_PATTERNS); enforced there, advertised in the schema here.
+const MAX_AGENT_GREP_PATTERNS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentToolDefinition {
@@ -201,7 +206,7 @@ pub fn agent_tool_definitions() -> Vec<AgentToolDefinition> {
                     "format": {"type": "string", "enum": ["structured", "bytes"]},
                     "cursor": {"type": ["string", "null"]},
                     "offset": {"type": "integer", "minimum": 0},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_AGENT_PAGE_LIMIT},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_AGENT_READ_LIMIT},
                 },
                 "additionalProperties": false
             }),
@@ -341,13 +346,15 @@ pub fn agent_tool_definitions() -> Vec<AgentToolDefinition> {
         },
         AgentToolDefinition {
             name: "grep",
-            description: "Search file bodies for a case-insensitive literal substring and return matching lines with line numbers. Scope path to one directory or file when known.",
+            description: "Search file bodies for case-insensitive literal substrings and return matching lines with line numbers. patterns adds OR alternatives to pattern (at most 16); glob filters file names. Scope path to one directory or file when known.",
             parameters: json!({
                 "type": "object",
                 "required": ["path", "pattern", "recursive"],
                 "properties": {
                     "path": {"type": "string"},
                     "pattern": {"type": "string"},
+                    "patterns": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_AGENT_GREP_PATTERNS},
+                    "glob": {"type": ["string", "null"]},
                     "recursive": {"type": "boolean"},
                     "cursor": {"type": ["string", "null"]},
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_AGENT_GREP_LIMIT}
@@ -441,7 +448,9 @@ where
     let result = namespace.agent_grep_paths(NamespaceGrepRequest {
         path: path.to_owned(),
         pattern: pattern.to_owned(),
+        patterns: optional_string_array_arg(args, "patterns")?.unwrap_or_default(),
         recursive,
+        name_glob: optional_string_arg(args, "glob")?,
         cursor: optional_string_arg(args, "cursor")?,
         limit: optional_bounded_usize_arg(args, "limit", MAX_AGENT_GREP_LIMIT)?
             .unwrap_or(DEFAULT_AGENT_GREP_LIMIT),
@@ -480,7 +489,8 @@ where
         format: read_format_arg(args)?,
         cursor: optional_string_arg(args, "cursor")?,
         offset: optional_u64_arg(args, "offset")?.unwrap_or(0),
-        limit: optional_usize_arg(args, "limit")?.unwrap_or(DEFAULT_AGENT_PAGE_LIMIT),
+        limit: optional_bounded_usize_arg(args, "limit", MAX_AGENT_READ_LIMIT)?
+            .unwrap_or(DEFAULT_AGENT_READ_LIMIT),
         expected_generation: None,
     };
     guard_large_structured_pagination(namespace, path, &options)?;
@@ -505,11 +515,11 @@ where
     let Some(record_count) = card.record_count else {
         return Ok(());
     };
-    if record_count.count <= MAX_AGENT_PAGE_LIMIT {
+    if record_count.count <= MAX_AGENT_READ_LIMIT {
         return Ok(());
     }
     Err(AgentError::InvalidArgument(format!(
-        "structured pagination for {path} has {} records; use stat record_count or find with catalog predicates and limit=1, then read match_count",
+        "structured pagination for {path} has {} records; use bytes format with offset and limit, grep to locate lines, or stat record_count",
         record_count.count
     )))
 }
@@ -519,7 +529,7 @@ where
     T: AgentNamespace + ?Sized,
 {
     let path = required_string_arg(args, "path")?;
-    let fields = fields_arg(args)?;
+    let fields = optional_string_array_arg(args, "fields")?;
     reject_unsupported_find_arguments(args)?;
     let result = namespace.agent_find_paths(NamespaceFindRequest {
         path: path.to_owned(),
@@ -580,6 +590,7 @@ fn find_result_json(result: &NamespaceFindResult, fields: Option<&[String]>) -> 
 fn read_page_json(page: &NamespaceReadPage) -> Value {
     json!({
         "path": page.path,
+        "generation": page.generation,
         "total_size_bytes": page.total_size_bytes,
         "format": read_format_name(&page.format),
         "record_type": page.record_type.as_ref().map(record_type_name),
@@ -991,24 +1002,27 @@ fn reject_unsupported_find_arguments(args: &Value) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn fields_arg(args: &Value) -> Result<Option<Vec<String>>, AgentError> {
-    let Some(value) = object_args(args)?.get("fields") else {
+fn optional_string_array_arg(
+    args: &Value,
+    name: &'static str,
+) -> Result<Option<Vec<String>>, AgentError> {
+    let Some(value) = object_args(args)?.get(name) else {
         return Ok(None);
     };
     if value.is_null() {
         return Ok(None);
     }
-    let fields = value
+    let entries = value
         .as_array()
-        .ok_or_else(|| AgentError::InvalidArgument("fields must be an array".to_owned()))?
+        .ok_or_else(|| AgentError::InvalidArgument(format!("{name} must be an array")))?
         .iter()
         .map(|value| {
             value.as_str().map(str::to_owned).ok_or_else(|| {
-                AgentError::InvalidArgument("fields entries must be strings".to_owned())
+                AgentError::InvalidArgument(format!("{name} entries must be strings"))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(fields))
+    Ok(Some(entries))
 }
 
 fn facets_arg(args: &Value) -> Result<Vec<NamespaceFindField>, AgentError> {
@@ -1362,6 +1376,8 @@ mod tests {
     struct FakeNamespace {
         last_find: RefCell<Option<NamespaceFindRequest>>,
         last_aggregate: RefCell<Option<NamespaceAggregateRequest>>,
+        last_grep: RefCell<Option<NamespaceGrepRequest>>,
+        last_read: RefCell<Option<NamespaceReadOptions>>,
         read_calls: RefCell<usize>,
         record_count: usize,
         find_matches: Vec<NamespaceCard>,
@@ -1375,6 +1391,8 @@ mod tests {
             Self {
                 last_find: RefCell::new(None),
                 last_aggregate: RefCell::new(None),
+                last_grep: RefCell::new(None),
+                last_read: RefCell::new(None),
                 read_calls: RefCell::new(0),
                 record_count: 1,
                 find_matches: vec![sample_card("/runs/run-1", 1)],
@@ -1386,27 +1404,17 @@ mod tests {
 
         fn with_record_count(record_count: usize) -> Self {
             Self {
-                last_find: RefCell::new(None),
-                last_aggregate: RefCell::new(None),
-                read_calls: RefCell::new(0),
                 record_count,
                 find_matches: vec![sample_card("/runs/run-1", record_count)],
-                aggregate_result: sample_aggregate_result(),
-                stat_cards: BTreeMap::new(),
                 list_entries: vec![sample_card("/runs/run-1", record_count)],
+                ..Self::new()
             }
         }
 
         fn with_aggregate_result(aggregate_result: NamespaceAggregateResult) -> Self {
             Self {
-                last_find: RefCell::new(None),
-                last_aggregate: RefCell::new(None),
-                read_calls: RefCell::new(0),
-                record_count: 1,
-                find_matches: vec![sample_card("/runs/run-1", 1)],
                 aggregate_result,
-                stat_cards: BTreeMap::new(),
-                list_entries: vec![sample_card("/runs/run-1", 1)],
+                ..Self::new()
             }
         }
 
@@ -1427,14 +1435,10 @@ mod tests {
             stat_cards.insert(root.path.clone(), root);
             stat_cards.insert(runs.path.clone(), runs.clone());
             Self {
-                last_find: RefCell::new(None),
-                last_aggregate: RefCell::new(None),
-                read_calls: RefCell::new(0),
-                record_count: 1,
                 find_matches: vec![sample_card("/yanex/runs/run-1", 1)],
-                aggregate_result: sample_aggregate_result(),
                 stat_cards,
                 list_entries: vec![runs],
+                ..Self::new()
             }
         }
     }
@@ -1507,6 +1511,7 @@ mod tests {
             &self,
             request: NamespaceGrepRequest,
         ) -> Result<NamespaceGrepResult, AgentError> {
+            self.last_grep.replace(Some(request.clone()));
             let matched = "Checkpoint: best_model_1.0_1.pt";
             let matches = if matched
                 .to_lowercase()
@@ -1528,6 +1533,7 @@ mod tests {
             Ok(NamespaceGrepResult {
                 path: request.path.clone(),
                 pattern: request.pattern.clone(),
+                patterns: request.patterns.clone(),
                 recursive: request.recursive,
                 evidence: format!("nokv-native://{}", request.path),
                 snapshot_id: Some(1),
@@ -1542,8 +1548,9 @@ mod tests {
         fn agent_read_page(
             &self,
             path: &str,
-            _options: NamespaceReadOptions,
+            options: NamespaceReadOptions,
         ) -> Result<NamespaceReadPage, AgentError> {
+            self.last_read.replace(Some(options));
             *self.read_calls.borrow_mut() += 1;
             Ok(NamespaceReadPage {
                 path: path.to_owned(),
@@ -1595,12 +1602,13 @@ mod tests {
     }
 
     fn assert_json_lacks_agent_noise(value: &Value) {
+        // "generation" is intentionally not forbidden: read exposes it so agents
+        // can feed the conditional read validator (expected_generation).
         const FORBIDDEN_KEYS: &[&str] = &[
             "tool",
             "bytes_read",
             "evidence",
             "snapshot_id",
-            "generation",
             "field_values",
             "source_path",
             "source_kind",
@@ -2339,7 +2347,7 @@ mod tests {
 
     #[test]
     fn read_tool_rejects_large_structured_pagination() {
-        let namespace = FakeNamespace::with_record_count(MAX_AGENT_PAGE_LIMIT + 1);
+        let namespace = FakeNamespace::with_record_count(350);
 
         let err = execute_agent_tool(
             &namespace,
@@ -2354,7 +2362,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("find with catalog predicates")),
+            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("use bytes format with offset and limit, grep to locate lines, or stat record_count")),
             "unexpected error: {err:?}"
         );
         assert_eq!(*namespace.read_calls.borrow(), 0);
@@ -2362,7 +2370,7 @@ mod tests {
 
     #[test]
     fn read_tool_rejects_large_structured_initial_page() {
-        let namespace = FakeNamespace::with_record_count(MAX_AGENT_PAGE_LIMIT + 1);
+        let namespace = FakeNamespace::with_record_count(350);
 
         let err = execute_agent_tool(
             &namespace,
@@ -2376,9 +2384,281 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("find with catalog predicates")),
+            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("use bytes format with offset and limit, grep to locate lines, or stat record_count")),
             "unexpected error: {err:?}"
         );
         assert_eq!(*namespace.read_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn read_tool_reads_structured_files_within_guard_threshold() {
+        let namespace = FakeNamespace::with_record_count(250);
+
+        execute_agent_tool(
+            &namespace,
+            "read",
+            &json!({
+                "path": "/index/mid.json",
+                "format": "structured"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(*namespace.read_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn read_tool_structured_guard_allows_exactly_the_read_limit() {
+        let namespace = FakeNamespace::with_record_count(MAX_AGENT_READ_LIMIT);
+
+        execute_agent_tool(
+            &namespace,
+            "read",
+            &json!({
+                "path": "/index/boundary.json",
+                "format": "structured"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(*namespace.read_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn read_tool_returns_generation_for_conditional_reads() {
+        let namespace = FakeNamespace::new();
+
+        let output = execute_agent_tool(
+            &namespace,
+            "read",
+            &json!({
+                "path": "/runs/run-1/metadata.json",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(output["generation"], 7);
+        assert_json_lacks_agent_noise(&output);
+    }
+
+    #[test]
+    fn read_tool_schema_caps_limit_at_three_hundred() {
+        let tools = agent_tool_definitions();
+        let read = tool_definition(&tools, "read");
+
+        assert_eq!(read.parameters["properties"]["limit"]["maximum"], 300);
+    }
+
+    #[test]
+    fn read_tool_accepts_limit_of_three_hundred() {
+        let namespace = FakeNamespace::new();
+
+        execute_agent_tool(
+            &namespace,
+            "read",
+            &json!({
+                "path": "/runs/run-1/metadata.json",
+                "limit": 300
+            }),
+        )
+        .unwrap();
+
+        let options = namespace.last_read.borrow().clone().unwrap();
+        assert_eq!(options.limit, 300);
+    }
+
+    #[test]
+    fn read_tool_rejects_limit_above_three_hundred() {
+        let namespace = FakeNamespace::new();
+
+        let err = execute_agent_tool(
+            &namespace,
+            "read",
+            &json!({
+                "path": "/runs/run-1/metadata.json",
+                "limit": 301
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("limit must be between 1 and 300")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(*namespace.read_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn ls_tool_keeps_limit_capped_at_one_hundred() {
+        let namespace = FakeNamespace::new();
+
+        let err = execute_agent_tool(
+            &namespace,
+            "ls",
+            &json!({
+                "path": "/runs",
+                "limit": 101
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("limit must be between 1 and 100")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn grep_tool_schema_caps_limit_and_exposes_patterns_and_glob() {
+        let tools = agent_tool_definitions();
+        let grep = tool_definition(&tools, "grep");
+
+        assert_eq!(grep.parameters["properties"]["limit"]["maximum"], 300);
+        assert_eq!(
+            grep.parameters["properties"]["patterns"],
+            json!({"type": "array", "items": {"type": "string"}, "maxItems": 16})
+        );
+        assert_eq!(
+            grep.parameters["properties"]["glob"],
+            json!({"type": ["string", "null"]})
+        );
+        assert_eq!(
+            grep.parameters["required"],
+            json!(["path", "pattern", "recursive"])
+        );
+    }
+
+    #[test]
+    fn grep_tool_accepts_limit_of_three_hundred() {
+        let namespace = FakeNamespace::new();
+
+        execute_agent_tool(
+            &namespace,
+            "grep",
+            &json!({
+                "path": "/runs/run-1",
+                "pattern": "best_model",
+                "recursive": true,
+                "limit": 300
+            }),
+        )
+        .unwrap();
+
+        let request = namespace.last_grep.borrow().clone().unwrap();
+        assert_eq!(request.limit, 300);
+    }
+
+    #[test]
+    fn grep_tool_rejects_limit_above_three_hundred() {
+        let namespace = FakeNamespace::new();
+
+        let err = execute_agent_tool(
+            &namespace,
+            "grep",
+            &json!({
+                "path": "/runs/run-1",
+                "pattern": "best_model",
+                "recursive": true,
+                "limit": 301
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("limit must be between 1 and 300")),
+            "unexpected error: {err:?}"
+        );
+        assert!(namespace.last_grep.borrow().is_none());
+    }
+
+    #[test]
+    fn grep_tool_rejects_non_string_patterns() {
+        let namespace = FakeNamespace::new();
+
+        let err = execute_agent_tool(
+            &namespace,
+            "grep",
+            &json!({
+                "path": "/runs/run-1",
+                "pattern": "best_model",
+                "recursive": true,
+                "patterns": [1]
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("patterns entries must be strings")),
+            "unexpected error: {err:?}"
+        );
+        assert!(namespace.last_grep.borrow().is_none());
+    }
+
+    #[test]
+    fn grep_tool_rejects_non_string_glob() {
+        let namespace = FakeNamespace::new();
+
+        let err = execute_agent_tool(
+            &namespace,
+            "grep",
+            &json!({
+                "path": "/runs/run-1",
+                "pattern": "best_model",
+                "recursive": true,
+                "glob": 7
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AgentError::InvalidArgument(ref message) if message.contains("glob must be a string or null")),
+            "unexpected error: {err:?}"
+        );
+        assert!(namespace.last_grep.borrow().is_none());
+    }
+
+    #[test]
+    fn grep_tool_forwards_patterns_and_glob() {
+        let namespace = FakeNamespace::new();
+
+        execute_agent_tool(
+            &namespace,
+            "grep",
+            &json!({
+                "path": "/runs/run-1",
+                "pattern": "best_model",
+                "patterns": ["error", "warning"],
+                "glob": "*.txt",
+                "recursive": true
+            }),
+        )
+        .unwrap();
+
+        let request = namespace.last_grep.borrow().clone().unwrap();
+        assert_eq!(
+            request.patterns,
+            vec!["error".to_owned(), "warning".to_owned()]
+        );
+        assert_eq!(request.name_glob.as_deref(), Some("*.txt"));
+    }
+
+    #[test]
+    fn grep_tool_defaults_patterns_and_glob_to_unset() {
+        let namespace = FakeNamespace::new();
+
+        execute_agent_tool(
+            &namespace,
+            "grep",
+            &json!({
+                "path": "/runs/run-1",
+                "pattern": "best_model",
+                "recursive": true
+            }),
+        )
+        .unwrap();
+
+        let request = namespace.last_grep.borrow().clone().unwrap();
+        assert_eq!(request.patterns, Vec::<String>::new());
+        assert_eq!(request.name_glob, None);
     }
 }
