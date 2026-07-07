@@ -562,6 +562,15 @@ pub struct NoKvFs<M, O> {
     path_index_lookup_cache:
         Vec<Mutex<BTreeMap<PathIndexLookupCacheKey, PathIndexLookupCacheValue>>>,
     path_index_validation_cache: Vec<Mutex<BTreeMap<PathIndexValidationCacheKey, DentryWithAttr>>>,
+    /// Invalidation epoch for the three version-keyed path caches above. Commit
+    /// versions are allocated at PREPARE time (possibly one RPC before the
+    /// publish), so a read can cache pre-commit state under a `read_version`
+    /// that a still-in-flight commit later applies at — and since commits never
+    /// advance the clock past their pre-allocated version, that entry would be
+    /// served forever. Every applied write therefore bumps this epoch and clears
+    /// the caches; fills are dropped when the epoch moved between the engine
+    /// read and the insert (see `remember_*` / `purge_path_caches_after_write`).
+    path_cache_epoch: AtomicU64,
     advisory_locks: Mutex<AdvisoryLockTable>,
     clock: AtomicU64,
     reserved_version: AtomicU64,

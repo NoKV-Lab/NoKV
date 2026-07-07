@@ -3036,6 +3036,89 @@ fn prepared_artifact_staged_session_preserves_dirty_slice_overlay() {
 }
 
 #[test]
+fn stat_path_sees_append_after_read_during_prepared_publish_window() {
+    // Regression for the "concurrent read + append silently drops the last
+    // append" visibility bug: prepare pre-allocates the commit version (the
+    // clock bump), so a stat between prepare and publish caches the pre-append
+    // dentry under the exact version the publish then applies at. The publish
+    // never advances the clock past that version, so without apply-time cache
+    // purging the poisoned entry is served for the process lifetime.
+    let service = service();
+    service.create_dir_path("/w", 0o755, 1000, 1000).unwrap();
+
+    let staged_session =
+        |prepared: &PreparedArtifact, written: &ChunkedWrite, manifest_id: &str, size: u64| {
+            PublishArtifactStagedSession {
+                parent: prepared.parent,
+                name: prepared.name.clone(),
+                producer: "unit-test".to_owned(),
+                digest_uri: "unknown".to_owned(),
+                content_type: "text/plain".to_owned(),
+                manifest_id: manifest_id.to_owned(),
+                size,
+                chunks: written.chunk_manifests(),
+                staged: written.staged_objects().unwrap(),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            }
+        };
+
+    let prepared = service.prepare_artifact_create_path("/w/log.txt").unwrap();
+    let written = service
+        .stage_prepared_artifact_ranges(
+            &prepared,
+            "log-v1",
+            &[PublishArtifactRange {
+                offset: 0,
+                bytes: b"seg0|".to_vec(),
+            }],
+            0,
+        )
+        .unwrap();
+    let session = staged_session(&prepared, &written, "log-v1", 5);
+    service
+        .publish_prepared_artifact_staged_session(prepared, session)
+        .unwrap();
+
+    // Append: the replace prepare allocates the commit version V.
+    let prepared = service.prepare_artifact_replace_path("/w/log.txt").unwrap();
+    // A read inside the staging window resolves at read_version == V and
+    // caches the pre-append entry under it.
+    let before = service.stat_path("/w/log.txt").unwrap().unwrap();
+    assert_eq!(before.attr.size, 5);
+    let written = service
+        .stage_prepared_artifact_ranges(
+            &prepared,
+            "log-v2",
+            &[PublishArtifactRange {
+                offset: 5,
+                bytes: b"seg1|".to_vec(),
+            }],
+            0,
+        )
+        .unwrap();
+    let session = staged_session(&prepared, &written, "log-v2", 10);
+    service
+        .publish_prepared_artifact_staged_session(prepared, session)
+        .unwrap();
+
+    // No later write bumps the clock here: the applied publish itself must
+    // have invalidated the poisoned entry.
+    let after = service.stat_path("/w/log.txt").unwrap().unwrap();
+    assert_eq!(after.attr.size, 10);
+    assert_eq!(
+        service
+            .lookup_path("/w/log.txt")
+            .unwrap()
+            .unwrap()
+            .attr
+            .size,
+        10
+    );
+}
+
+#[test]
 fn delta_publish_writes_only_dirty_chunks_and_preserves_base() {
     let service = service();
     let name = DentryName::new(b"multi.bin".to_vec()).unwrap();

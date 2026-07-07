@@ -170,7 +170,9 @@ where
             .read()
             .unwrap_or_else(|err| err.into_inner());
         self.ensure_owner_epoch_current()?;
-        self.metadata.commit_metadata(command).map_err(Into::into)
+        let result = self.metadata.commit_metadata(command)?;
+        self.purge_path_caches_after_write();
+        Ok(result)
     }
 
     pub(super) fn commit_independent_metadata_batch(
@@ -201,6 +203,9 @@ where
                     .map_err(MetadError::from)
             })
             .collect::<Vec<_>>();
+        if !successful.is_empty() {
+            self.purge_path_caches_after_write();
+        }
 
         let log_commands = successful
             .iter()

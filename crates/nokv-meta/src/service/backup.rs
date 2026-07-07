@@ -180,6 +180,9 @@ where
         // install_checkpoint_image validates the image and rejects truncation or
         // corruption, so a torn archive surfaces as a metadata error here.
         self.metadata.install_checkpoint_image(&image)?;
+        // The image replaced the engine state wholesale, bypassing the commit
+        // funnel; entries cached before the install may not exist in it at all.
+        self.purge_path_caches_after_write();
         self.refresh_allocator_state()?;
         Ok(Some(MetadataRestoreOutcome {
             checkpoint_key: manifest.current,
