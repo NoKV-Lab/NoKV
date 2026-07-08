@@ -147,11 +147,14 @@ pub struct CloneOutcome {
 }
 
 /// Result of pinning a subtree snapshot: the durable `snapshot_id` to pass to a
-/// later rollback and the read version the snapshot captured.
+/// later rollback, the read version the snapshot captured, and when the pin's
+/// lease expires. After `lease_expires_unix_ms`, GC may reap the pin and the
+/// point-in-time view becomes unreadable — callers renew before then to keep it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotOutcome {
     pub snapshot_id: u64,
     pub read_version: u64,
+    pub lease_expires_unix_ms: u64,
 }
 
 const DEFAULT_LIST_PAGE_SIZE: usize = 1024;
@@ -1455,9 +1458,12 @@ impl MetadataClient {
         match self.call(MetadataRpcRequest::SnapshotSubtreePath {
             path: path.to_owned(),
         })? {
+            // The wire response already carries the pin's lease; surface it so
+            // callers can renew before it expires (do not drop it to 0).
             MetadataRpcResult::Snapshot { snapshot } => Ok(SnapshotOutcome {
                 snapshot_id: snapshot.snapshot_id,
                 read_version: snapshot.read_version,
+                lease_expires_unix_ms: snapshot.lease_expires_unix_ms,
             }),
             other => Err(unexpected_result(other)),
         }

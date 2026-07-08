@@ -98,13 +98,18 @@ where
         Ok(true)
     }
 
-    /// Extend a pin's lease so it keeps protecting its snapshot. Returns false if
-    /// the pin no longer exists (already retired, or reaped after expiry).
+    /// Extend a pin's lease so it keeps protecting its snapshot. Extend-only: a
+    /// renew never shortens an existing lease (Iceberg / S3 Object Lock
+    /// semantics), so a short renew can't silently drop protection below what a
+    /// prior renew already granted. Shrinking protection is expressed by
+    /// `retire`, not by renew. Returns false if the pin no longer exists
+    /// (already retired, or reaped after expiry).
     pub fn renew_snapshot(&self, snapshot_id: u64, lease_ms: u64) -> Result<bool, MetadError> {
         let Some(mut pin) = self.snapshot_pin(snapshot_id)? else {
             return Ok(false);
         };
-        pin.lease_expires_unix_ms = current_time_ms().saturating_add(lease_ms);
+        let new_expiry = current_time_ms().saturating_add(lease_ms);
+        pin.lease_expires_unix_ms = pin.lease_expires_unix_ms.max(new_expiry);
         let key = snapshot_pin_key(self.mount, snapshot_id);
         let version = self.next_version()?;
         self.commit_metadata(MetadataCommand {
