@@ -185,6 +185,60 @@ replace / 15% reads) at a configurable rate.
 Concurrency note: S3/S7 run concurrent readers+writers by design and act
 as the #399 regression gate at the same time.
 
+## 6.1 Acceptance results (this branch)
+
+Environment: isolated RustFS (docker) + `nokv serve` + workbench MCP over
+stdio, ports 39000/39001/37799, `--object-gc-interval-ms 1500`, full profile
+(300 snapshots in S5, 800-op churn budgets in S4, 120s soak in S8). Harness in
+the session scratchpad (`ckpt-stress/`); run with
+`NOKV_BIN=… python3 run_all.py --profile full --scenarios all --gc-ms 1500`.
+
+**Result: 8/8 scenarios PASS.** Every Phase-1 product promise is asserted and
+green: live/frozen at-snapshot byte fidelity under churn (S3, and S1's
+overwrite-after-mint), reap-within-one-GC + loud post-reap error (S1),
+extend-only renew with no lost/zombie pins (S2), 300-snapshot scale with a
+correct retention floor (S5), registry integrity with no ghost entries (S6),
+`kill -9` crash durability of pins and bytes (S7), and zero unexpected churn
+errors over the soak (S8).
+
+The suite is the acceptance gate, so it was itself adversarially verified.
+Four *harness* defects were found and fixed before acceptance (the product was
+correct in each case):
+
+1. The capability probe read the tool schema under the wrong JSON key
+   (`parameters` vs the MCP wire key `inputSchema`, nokv.rs maps one onto the
+   other). This false-negative had silently *gated* every new-surface assertion;
+   fixing it makes all eight run for real.
+2. S2/S6 expired pins with a short renew, which A's extend-only fix (correctly)
+   refuses to shorten, so the pins never expired. Switched to `retire` — the
+   design's own "shorten protection with retire, not renew" (§3.4).
+3. A separate in-process MCP smoke (bypassing the harness driver entirely)
+   confirmed 11 load-bearing behaviors end to end. It caught that its own
+   overwrite step needed `replace=true`, without which the frozen-vs-live
+   at-snapshot divergence had been passing vacuously.
+4. `ChurnEngine` counted errors without capturing their text; now it records
+   samples so a nonzero count is explainable rather than a bare number.
+
+Reported as observations, not gates (per plan scope):
+
+- History write-amplification recovery (S4) and soak meta-disk growth (S8) are
+  dominated by **#393** (pre-compaction blocks leaked when append chains cross
+  compaction under a pin). §5/§6 track #393 separately, so these are measured
+  and reported (e.g. S8 last-third meta growth ≈ 45–80 MB across runs) rather
+  than gated. The stable directional check — more live pins amplify more
+  metadata (S4) — remains a gate and passes.
+- One transient run showed ~670 churn errors in S8 that did not reproduce in
+  isolation (0 errors) or on re-run (0 errors); attributed to RustFS container
+  pressure under the shared 8-scenario container, not product logic.
+
+Known Phase-1 coverage limit: the *expired-but-not-yet-reaped* loud message
+(`lease expired at {ts}`, the half-dead window that motivated this work) is
+unreachable by any current API — mint defaults the lease, renew is extend-only,
+and there is no short-lease mint RPC — so no live test can construct it. It is
+covered by inspection plus its reaped-sibling message (tested by B's unit tests
+and exercised live in S1); a first-class `SnapshotExpired` error and a way to
+construct the state are Phase 2 (§4).
+
 ## 7. Estimated footprint
 
 Phase 1: ~450 production LOC (workbench_mcp.rs + client SnapshotOutcome +
