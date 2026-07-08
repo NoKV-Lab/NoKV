@@ -265,6 +265,7 @@ where
         let scan_limit = requested.saturating_add(1);
         let mut entries = Vec::<DentryWithAttr>::with_capacity(scan_limit);
         let mut stale_rows = 0_u64;
+        let cache_epoch = self.path_cache_epoch.load(Ordering::Acquire);
         loop {
             let rows = self.metadata.scan_delimited(DelimitedScanRequest {
                 family: RecordFamily::PathIndex,
@@ -282,7 +283,9 @@ where
             let mut last_marker = None;
             for item in rows {
                 last_marker = Some(delimited_scan_marker(&item));
-                let Some(entry) = self.indexed_path_child(parent, &prefix, item, version)? else {
+                let Some(entry) =
+                    self.indexed_path_child(parent, &prefix, item, version, cache_epoch)?
+                else {
                     stale_rows += 1;
                     continue;
                 };
@@ -324,6 +327,7 @@ where
         prefix: &[u8],
         item: DelimitedScanItem,
         version: Version,
+        cache_epoch: u64,
     ) -> Result<Option<DentryWithAttr>, MetadError> {
         match item {
             DelimitedScanItem::Key(item) => {
@@ -345,12 +349,19 @@ where
                     return Ok(None);
                 };
                 if canonical_version == item.version && canonical == indexed {
-                    self.remember_path_index_lookup(&item.key, version, &canonical, item.version)?;
+                    self.remember_path_index_lookup(
+                        &item.key,
+                        version,
+                        &canonical,
+                        item.version,
+                        cache_epoch,
+                    )?;
                     self.remember_validated_path_index(
                         &item.key,
                         item.version,
                         version,
                         &canonical,
+                        cache_epoch,
                     )?;
                     Ok(Some(canonical))
                 } else {
@@ -425,6 +436,7 @@ where
         if let Some(cached) = self.cached_path_resolution(root, components, version)? {
             return Ok(cached);
         }
+        let cache_epoch = self.path_cache_epoch.load(Ordering::Acquire);
         let mut current = root;
         for index in 0..components.len() {
             let prefix = &components[..=index];
@@ -441,7 +453,7 @@ where
                 return Err(MetadError::NotDirectory);
             }
             current = entry.attr.inode;
-            self.remember_path_resolution(root, prefix, version, current)?;
+            self.remember_path_resolution(root, prefix, version, current, cache_epoch)?;
         }
         Ok(current)
     }
@@ -468,6 +480,7 @@ where
         components: &[DentryName],
         version: Version,
         inode: InodeId,
+        cache_epoch: u64,
     ) -> Result<(), MetadError> {
         let key = self.path_resolution_cache_key(root, components, version);
         let shard_index = path_cache_shard_index(&key);
@@ -476,6 +489,9 @@ where
             .map_err(|err| {
                 MetadataError::Backend(format!("metadata path resolution cache poisoned: {err}"))
             })?;
+        if !self.path_cache_fill_epoch_current(cache_epoch) {
+            return Ok(());
+        }
         if cache.len() >= PATH_RESOLUTION_CACHE_MAX_ENTRIES_PER_SHARD {
             cache.clear();
         }
@@ -537,6 +553,7 @@ where
         read_version: Version,
         entry: &DentryWithAttr,
         dentry_version: Version,
+        cache_epoch: u64,
     ) -> Result<(), MetadError> {
         let key = self.path_index_lookup_cache_key(index_key, read_version);
         let shard_index = path_cache_shard_index(&key);
@@ -545,6 +562,9 @@ where
             .map_err(|err| {
                 MetadataError::Backend(format!("metadata path-index lookup cache poisoned: {err}"))
             })?;
+        if !self.path_cache_fill_epoch_current(cache_epoch) {
+            return Ok(());
+        }
         if cache.len() >= PATH_INDEX_LOOKUP_CACHE_MAX_ENTRIES_PER_SHARD {
             cache.clear();
         }
@@ -564,6 +584,7 @@ where
         index_version: Version,
         read_version: Version,
         entry: &DentryWithAttr,
+        cache_epoch: u64,
     ) -> Result<(), MetadError> {
         let key = self.path_index_validation_cache_key(index_key, index_version, read_version);
         let shard_index = path_cache_shard_index(&key);
@@ -574,11 +595,59 @@ where
                     "metadata path-index validation cache poisoned: {err}"
                 ))
             })?;
+        if !self.path_cache_fill_epoch_current(cache_epoch) {
+            return Ok(());
+        }
         if cache.len() >= PATH_INDEX_VALIDATION_CACHE_MAX_ENTRIES_PER_SHARD {
             cache.clear();
         }
         cache.insert(key, entry.clone());
         Ok(())
+    }
+
+    /// True when no write applied since the caller snapshotted the epoch (before
+    /// its engine reads). Callers hold their target shard's lock across this
+    /// check and the insert: the purger bumps the epoch before clearing any
+    /// shard, so a fill that raced a purge either loses the check here or lands
+    /// before the clear and is wiped by it — a stale entry can never survive.
+    ///
+    /// Correctness rests on the shard `Mutex`, not the atomic ordering: a fill
+    /// that outlives a purge's clear must have acquired the shard lock *after*
+    /// the purge released it, and that release→acquire edge orders the purge's
+    /// (sequenced-earlier) epoch bump before this load, so coherence forces the
+    /// load to observe it and the check fails. The `Acquire`/`Release` pairing
+    /// on the epoch itself is belt-and-suspenders: it makes that ordering hold
+    /// without leaning on the lock argument, so a future reader need not derive
+    /// it to trust the invariant.
+    fn path_cache_fill_epoch_current(&self, cache_epoch: u64) -> bool {
+        self.path_cache_epoch.load(Ordering::Acquire) == cache_epoch
+    }
+
+    /// Drop every path-cache entry after a metadata write applied. Commit
+    /// versions are pre-allocated (possibly an RPC earlier, e.g. prepared
+    /// artifacts), so an entry cached at `read_version >= commit_version` may
+    /// hold pre-commit state that no later clock bump would ever shadow; a
+    /// commit never advances the clock, so exact-version lookups would serve it
+    /// for the process lifetime. Infallible on purpose: the commit is already
+    /// durably applied, so a poisoned cache mutex must not fail the write —
+    /// clearing a poisoned map is safe.
+    ///
+    /// The bump is `AcqRel` and pairs with the `Acquire` snapshot/guard loads so
+    /// a fill that reads a stale epoch can never insert a survivor (see
+    /// `path_cache_fill_epoch_current`). It runs before the clears so any fill
+    /// still holding a pre-bump snapshot is either dropped by its guard or wiped
+    /// by the clear.
+    pub(super) fn purge_path_caches_after_write(&self) {
+        self.path_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        for shard in &self.path_resolution_cache {
+            shard.lock().unwrap_or_else(|err| err.into_inner()).clear();
+        }
+        for shard in &self.path_index_lookup_cache {
+            shard.lock().unwrap_or_else(|err| err.into_inner()).clear();
+        }
+        for shard in &self.path_index_validation_cache {
+            shard.lock().unwrap_or_else(|err| err.into_inner()).clear();
+        }
     }
 
     fn path_index_lookup_cache_key(
@@ -673,6 +742,7 @@ where
             self.path_index_hit_total.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(cached));
         }
+        let cache_epoch = self.path_cache_epoch.load(Ordering::Acquire);
         let Some(item) =
             self.metadata
                 .get_versioned(RecordFamily::PathIndex, &key, version, purpose)?
@@ -711,8 +781,20 @@ where
             return Ok(None);
         };
         if canonical_version == item.version && canonical == indexed {
-            self.remember_path_index_lookup(&key, version, &canonical, canonical_version)?;
-            self.remember_validated_path_index(&key, item.version, version, &canonical)?;
+            self.remember_path_index_lookup(
+                &key,
+                version,
+                &canonical,
+                canonical_version,
+                cache_epoch,
+            )?;
+            self.remember_validated_path_index(
+                &key,
+                item.version,
+                version,
+                &canonical,
+                cache_epoch,
+            )?;
             self.path_index_hit_total.fetch_add(1, Ordering::Relaxed);
             return Ok(Some((canonical, canonical_version)));
         }
