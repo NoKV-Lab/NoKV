@@ -89,9 +89,10 @@ must not become a second owner for NoKV namespace state.
 The index is allowed to expose CLI/server entry points such as
 `nokv-agent lingtai ingest`, `coverage`, `latest`, `session`, `session-rows`,
 `recent`, `molt-windows`, `errors`, `completion-after`, `clear-completion`,
-`notification-events`, `notification-by-id`, `notification-before`,
-`notification-after`, `notifications`, `facets`, and `trace`. These entry
-points return stable JSON for LingTai's Go adapter and the benchmark harness.
+`notification-blocks`, `notification-block-snapshots`, `notification-events`,
+`notification-by-id`, `notification-before`, `notification-after`,
+`notifications`, `facets`, and `trace`. These entry points return stable JSON
+for LingTai's Go adapter and the benchmark harness.
 
 ### Remote (RPC) — stays in `nokv-client`
 
@@ -161,6 +162,9 @@ mirror the current SQLite consumers instead of exposing raw SQL:
 - `error_events(limit)`;
 - `completion_after(type = clear_received, source_offset)`;
 - `tui_clear_completion(source_offset)`;
+- parsed `notification-blocks` rows for replacing `QueryNotificationBlocks`;
+- parsed `notification-block-snapshots` rows for replacing
+  `QueryNotificationBlockSnapshots`;
 - `notification_events(limit)`;
 - `notification_event_by_id(event_id)`;
 - `notification_neighbor(event_id, before | after)`;
@@ -216,6 +220,7 @@ growing `lib.rs`:
 | `event/types.rs` | `AgentId`, `SourceFile`, `EventId`, `EventRecord`, projected fields, coverage, and query results. |
 | `event/codec.rs` | Durable value encoding with explicit version bytes. |
 | `event/key.rs` | Holt key layout for coverage, source-offset de-dupe, event rows, type/time indexes, facets, and traces. |
+| `event/notification.rs` | LingTai notification summary/snapshot parsing for modern `_meta` envelopes and legacy `payload`/`meta` rows. |
 | `event/store.rs` | `AgentEventStore` trait and batch-ingest/query contracts. |
 | `event/holt.rs` | Holt-backed implementation over an independent agent-index directory. |
 | `event/ingest.rs` | JSONL streaming parser that records byte offsets and handles partial lines. |
@@ -228,6 +233,7 @@ Required key families:
 | `coverage/{agent}/{source_file_hash}` | O(1) file coverage: file size, min/max offset, row count. |
 | `source/{agent}/{source_file_hash}/{offset}` | Idempotent source-offset de-dupe. |
 | `event/{agent}/{event_id}` | Compact event record; event id is derived from source-file hash and source offset. |
+| `payloads:fields_json/{agent}/{event_id}/{chunk}` | External `fields_json` chunks for events whose full payload exceeds Holt's single-value limit. Reads transparently rehydrate this into `EventRecord.fields_json`. |
 | `type_id/{agent}/{type}/{rev_id}` | Latest-by-type scans. |
 | `type_ts/{agent}/{type}/{rev_ts}/{event_id}` | Recent timestamp queries. |
 | `session/{agent}/{event_id}` | Ordered session-event pointer; values store event ids and replay rows are reconstructed from `event/{agent}/{event_id}`. |
@@ -244,12 +250,17 @@ Required key families:
 
 Ingest commits bounded batches so a large LingTai log does not exceed Holt WAL
 record limits. Each batch atomically commits event rows, secondary indexes,
-materialized facet counts, and coverage. Large `fields_json` values are compacted
-into descriptors because the JSONL file remains authoritative; consumers that
-need the full payload must read by `source_file` and `source_offset`.
+materialized facet counts, and coverage. `fields_json` is preserved in the
+event record so LingTai's row projections, pretty-fields rendering, and parsed
+notification views do not lose payload content relative to SQLite.
+
+When the LingTai adapter shells out to `nokv-agent`, process-level timeout,
+freshness cache, and stale-on-error fallback remain adapter responsibilities.
+The Rust event index returns deterministic derived-index state; it does not own
+the TUI worker scheduling policy.
 
 Tests must cover replay, duplicate offsets inside one batch, chunked ingest,
-partial trailing lines, large-field compaction, source-file truncation, and
+partial trailing lines, large-field preservation, source-file truncation, and
 coverage monotonicity.
 
 ## 6. Adding a new read tool

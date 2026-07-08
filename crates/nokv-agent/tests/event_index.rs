@@ -3,10 +3,10 @@ use std::process::Command;
 
 use nokv_agent::event::{
     ingest_jsonl_reader, AgentEventStore, CompletionAfterRequest, ErrorEventsRequest,
-    HoltAgentEventStore, JsonlIngestOptions, LatestEventsRequest, NotificationLifecycleRequest,
-    NotificationNeighborDirection, NotificationNeighborRequest, RecentTimesRequest,
-    SessionEventsRequest, SessionRowsRequest, ToolFacetRequest, ToolTraceRequest,
-    TuiClearCompletionRequest,
+    HoltAgentEventStore, JsonlIngestOptions, LatestEventsRequest, NotificationBlockSnapshot,
+    NotificationLifecycleRequest, NotificationNeighborDirection, NotificationNeighborRequest,
+    NotificationSummaryEntry, RecentTimesRequest, SessionEventsRequest, SessionRowsRequest,
+    ToolFacetRequest, ToolTraceRequest, TuiClearCompletionRequest,
 };
 
 fn ingest(store: &HoltAgentEventStore, jsonl: &str) -> nokv_agent::event::IngestReport {
@@ -132,6 +132,8 @@ fn event_queries_match_lingtai_sqlite_shapes() {
         r#"{"type":"psyche_molt","ts":8.0}"#,
         "\n",
         r#"{"type":"aed_attempt","ts":9.0,"error":"over window"}"#,
+        "\n",
+        r#"{"type":"aed_exhausted","ts":9.5}"#,
         "\n",
         r#"{"type":"clear_received","ts":10.0,"source":"tui"}"#,
         "\n",
@@ -331,6 +333,14 @@ fn event_queries_match_lingtai_sqlite_shapes() {
         .unwrap()
         .unwrap();
     assert_eq!(by_id.event_type, "system_notification_published");
+    let non_notification_by_id = store
+        .notification_event_by_id(nokv_agent::event::NotificationEventByIdRequest {
+            agent_id: "agent-a".to_owned(),
+            event_id: latest[0].id,
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(non_notification_by_id.event_type, "tool_call");
     let before = store
         .notification_neighbor(NotificationNeighborRequest {
             agent_id: "agent-a".to_owned(),
@@ -378,8 +388,8 @@ fn partial_trailing_line_is_not_indexed() {
 }
 
 #[test]
-fn large_fields_json_is_compacted_for_holt_value_limit() {
-    let store = HoltAgentEventStore::open_memory().unwrap();
+fn large_fields_json_is_preserved_for_sqlite_replacement() {
+    let dir = tempfile::tempdir().unwrap();
     let large_text = "x".repeat(70 * 1024);
     let jsonl = format!(
         "{}\n",
@@ -392,20 +402,95 @@ fn large_fields_json_is_compacted_for_holt_value_limit() {
         })
     );
 
-    let report = ingest(&store, &jsonl);
-    assert_eq!(report.accepted, 1);
+    {
+        let store = HoltAgentEventStore::open_file(dir.path()).unwrap();
+        let report = ingest(&store, &jsonl);
+        assert_eq!(report.accepted, 1);
+    }
+    {
+        let store = HoltAgentEventStore::open_file(dir.path()).unwrap();
+        let events = store
+            .latest_events(LatestEventsRequest {
+                agent_id: "agent-a".to_owned(),
+                event_type: "tool_result".to_owned(),
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].projection.tool_name.as_deref(), Some("bash"));
+        assert_eq!(events[0].fields_json["result"], large_text);
+        assert!(events[0].external_fields_json.is_none());
+    }
+}
 
-    let events = store
+#[test]
+fn parsed_notification_blocks_match_lingtai_struct_fields() {
+    let store = HoltAgentEventStore::open_memory().unwrap();
+    let jsonl = concat!(
+        r#"{"type":"notification_pair_injected","ts":2.0,"call_id":"notify-call-1","summary":"note","sources":["email","system"],"meta":{"current_time":"2026-07-08T00:00:00Z","injection_seq":7,"context":{"system_tokens":11,"history_tokens":22,"usage":0.5}}}"#,
+        "\n",
+        r#"{"type":"notification_block_injected","ts":3.0,"mode":"active_tool_result","call_id":"notify-call-1","sources":["email"],"_meta":{"tool_meta":{"name":"bash"},"agent_meta":{"current_time":"2026-07-08T00:01:00Z","injection_seq":8,"context":{"system_tokens":33,"history_tokens":44,"usage":0.75}},"guidance":{"style":"brief"},"notification_guidance":"check mailbox","notifications":{"email":{"subject":"hello"}}}}"#,
+        "\n",
+        r#"{"type":"notification_block_injected","ts":4.0,"mode":"synthetic_notification_pair","call_id":"notify-call-2","payload":{"_tool":{"name":"legacy"},"_runtime":{"state":{"current_time":"legacy-now"},"guidance":{"style":"legacy"}},"_notification_guidance":"legacy guidance","notifications":{"system":{"text":"legacy"}}},"meta":{"current_time":"legacy-meta","context":{"system_tokens":1,"history_tokens":2,"usage":0.25}}}"#,
+        "\n",
+    );
+    ingest(&store, jsonl);
+
+    let pair = store
         .latest_events(LatestEventsRequest {
             agent_id: "agent-a".to_owned(),
-            event_type: "tool_result".to_owned(),
+            event_type: "notification_pair_injected".to_owned(),
             limit: 1,
         })
+        .unwrap()
+        .pop()
         .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].projection.tool_name.as_deref(), Some("bash"));
-    assert_eq!(events[0].fields_json["_nokv_compacted"], true);
-    assert_eq!(events[0].fields_json["keys"][0], "result");
+    let block = NotificationSummaryEntry::from_event(pair);
+    assert_eq!(block.source, "events.jsonl");
+    assert_eq!(block.call_id.as_deref(), Some("notify-call-1"));
+    assert_eq!(block.summary.as_deref(), Some("note"));
+    assert_eq!(block.sources, vec!["email", "system"]);
+    assert_eq!(block.meta.unwrap().context_history_tokens, Some(22));
+
+    let snapshots = store
+        .latest_events(LatestEventsRequest {
+            agent_id: "agent-a".to_owned(),
+            event_type: "notification_block_injected".to_owned(),
+            limit: 2,
+        })
+        .unwrap()
+        .into_iter()
+        .map(NotificationBlockSnapshot::from_event)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshots[0].notification_guidance.as_deref(),
+        Some("legacy guidance")
+    );
+    assert_eq!(
+        snapshots[0].agent_meta.as_ref().unwrap()["current_time"],
+        "legacy-now"
+    );
+    assert_eq!(
+        snapshots[0].meta.as_ref().unwrap().current_time.as_deref(),
+        Some("legacy-meta")
+    );
+    assert_eq!(
+        snapshots[0].notifications["system"],
+        "{\n  \"text\": \"legacy\"\n}"
+    );
+    assert_eq!(snapshots[1].tool_meta.as_ref().unwrap()["name"], "bash");
+    assert_eq!(
+        snapshots[1].notification_guidance.as_deref(),
+        Some("check mailbox")
+    );
+    assert_eq!(
+        snapshots[1].meta.as_ref().unwrap().context_usage,
+        Some(0.75)
+    );
+    assert_eq!(
+        snapshots[1].notifications["email"],
+        "{\n  \"subject\": \"hello\"\n}"
+    );
 }
 
 #[test]
@@ -449,9 +534,9 @@ fn nokv_agent_lingtai_cli_round_trips_json() {
         concat!(
             r#"{"type":"tool_call","ts":1.0,"tool_name":"read","tool_call_id":"call-1","tool_args":{"file_path":"/tmp/a.md"}}"#,
             "\n",
-            r#"{"type":"notification_pair_injected","ts":2.0,"call_id":"notify-call-1","summary":"note"}"#,
+            r#"{"type":"notification_pair_injected","ts":2.0,"call_id":"notify-call-1","summary":"note","sources":["email"],"meta":{"current_time":"now","context":{"system_tokens":1,"history_tokens":2,"usage":0.5}}}"#,
             "\n",
-            r#"{"type":"notification_block_injected","ts":3.0,"call_id":"notify-call-1","summary":"block"}"#,
+            r#"{"type":"notification_block_injected","ts":3.0,"mode":"active_tool_result","call_id":"notify-call-1","sources":["email"],"_meta":{"tool_meta":{"name":"read"},"agent_meta":{"current_time":"now","context":{"system_tokens":3,"history_tokens":4,"usage":0.75}},"guidance":{"mode":"brief"},"notification_guidance":"notify","notifications":{"email":{"subject":"hello"}}}}"#,
             "\n",
             r#"{"type":"clear_received","ts":4.0,"source":"tui"}"#,
             "\n",
@@ -600,6 +685,11 @@ fn nokv_agent_lingtai_cli_round_trips_json() {
         notification_blocks_json["events"][0]["event_type"],
         "notification_pair_injected"
     );
+    assert_eq!(notification_blocks_json["blocks"][0]["summary"], "note");
+    assert_eq!(
+        notification_blocks_json["blocks"][0]["meta"]["context_history_tokens"],
+        2
+    );
 
     let notification_block_snapshots = Command::new(bin)
         .args([
@@ -624,6 +714,14 @@ fn nokv_agent_lingtai_cli_round_trips_json() {
     assert_eq!(
         notification_block_snapshots_json["events"][0]["event_type"],
         "notification_block_injected"
+    );
+    assert_eq!(
+        notification_block_snapshots_json["snapshots"][0]["tool_meta"]["name"],
+        "read"
+    );
+    assert_eq!(
+        notification_block_snapshots_json["snapshots"][0]["notification_guidance"],
+        "notify"
     );
 
     let notification_events = Command::new(bin)

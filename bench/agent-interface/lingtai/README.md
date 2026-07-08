@@ -6,7 +6,7 @@ active integration target.
 
 LingTai keeps `logs/events.jsonl` as the authoritative log. `logs/log.sqlite`
 is a derived index used by the TUI and session rebuild paths. NoKV's target is
-the derived-index role: build a compact, semantic, agent-native index in
+the derived-index role: build a semantic, agent-native index in
 `nokv-agent` and compare it against both current and optimized SQLite baselines.
 
 ## Baseline Arms
@@ -99,12 +99,27 @@ Then map the current `sqlitelog` calls to typed commands:
 | `QueryMoltSessionWindows` | `molt-windows` |
 | `QueryRecentMoltTimes` | `recent --type psyche_molt` |
 | `QueryRecentRefreshCompleteTimes` | `recent --type refresh_complete` |
-| `QueryNotificationBlocks` | `notification-blocks` |
-| `QueryNotificationBlockSnapshots` | `notification-block-snapshots` |
+| `QueryNotificationBlocks` | `notification-blocks`; returns parsed `blocks` plus raw `events` |
+| `QueryNotificationBlockSnapshots` | `notification-block-snapshots`; returns parsed `snapshots` plus raw `events` |
 | `QueryNotifications` | `notification-events` or `notifications --ref-id/--event-id/--call-id/--channel` when a lifecycle filter is needed |
 | `QueryNotificationByID` | `notification-by-id --event-id <id>` |
 | `QueryNotificationBefore` | `notification-before --event-id <id>` |
 | `QueryNotificationAfter` | `notification-after --event-id <id>` |
+
+Replacement details that must stay visible in the LingTai adapter:
+
+- `notification-blocks` parses `notification_pair_injected` fields into the
+  same summary/meta/source shape used by `QueryNotificationBlocks`.
+- `notification-block-snapshots` parses both modern `_meta` envelopes and
+  legacy `payload`/`meta` rows used by `QueryNotificationBlockSnapshots`.
+- `errors` mirrors LingTai's current `QueryErrorEvents` default types:
+  `aed_attempt`, `aed_exhausted`, and `refresh_init_error`; rows without a
+  non-empty `error` field are skipped.
+- `notification-by-id` follows LingTai's current SQL and returns the row by id
+  without requiring the type to contain `notification`.
+- `molt-windows` returns the indexed window result. LingTai's worker-local
+  timeout, sidecar freshness cache, and stale-on-error fallback are adapter
+  responsibilities when the adapter shells out to `nokv-agent`.
 
 Keep the existing JSONL fallback when ingest, coverage, or row streaming fails,
 or when coverage does not reach the tail of `events.jsonl`.

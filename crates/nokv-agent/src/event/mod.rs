@@ -8,18 +8,22 @@ pub mod codec;
 pub mod holt;
 pub mod ingest;
 pub mod key;
+pub mod notification;
 pub mod store;
 pub mod types;
 
 pub use holt::HoltAgentEventStore;
 pub use ingest::{ingest_jsonl_reader, JsonlIngestOptions};
+pub use notification::{
+    NotificationBlockMeta, NotificationBlockSnapshot, NotificationSummaryEntry,
+};
 pub use store::AgentEventStore;
 pub use types::{
     AgentEventError, AgentEventResult, CompletionAfter, CompletionAfterRequest, ErrorEventsRequest,
-    EventProjection, EventRecord, EventTime, IndexCoverage, IngestReport, LatestEventsRequest,
-    MoltSessionWindows, NewEventRecord, NotificationEventByIdRequest, NotificationEventsRequest,
-    NotificationLifecycleRequest, NotificationNeighborDirection, NotificationNeighborRequest,
-    RecentTimesRequest, SessionEventRow, SessionEventsRequest, SessionRowsRequest, ToolFacet,
-    ToolFacetRequest, ToolTraceRequest, TuiClearCompletion, TuiClearCompletionRequest,
-    LINGTAI_SESSION_EVENT_TYPES,
+    EventProjection, EventRecord, EventTime, ExternalFieldsJsonRef, IndexCoverage, IngestReport,
+    LatestEventsRequest, MoltSessionWindows, NewEventRecord, NotificationEventByIdRequest,
+    NotificationEventsRequest, NotificationLifecycleRequest, NotificationNeighborDirection,
+    NotificationNeighborRequest, RecentTimesRequest, SessionEventRow, SessionEventsRequest,
+    SessionRowsRequest, ToolFacet, ToolFacetRequest, ToolTraceRequest, TuiClearCompletion,
+    TuiClearCompletionRequest, LINGTAI_SESSION_EVENT_TYPES,
 };

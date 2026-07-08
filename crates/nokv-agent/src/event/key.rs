@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 pub const TREE_EVENTS: &str = "events";
 pub const TREE_INDEX: &str = "index";
 pub const TREE_COVERAGE: &str = "coverage";
+pub const TREE_PAYLOADS: &str = "payloads";
 
 pub fn source_file_hash(source_file: &str) -> String {
     let digest = Sha256::digest(source_file.as_bytes());
@@ -33,6 +34,14 @@ pub fn event_key(agent_id: &str, event_id: u64) -> Vec<u8> {
 
 pub fn event_prefix(agent_id: &str) -> Vec<u8> {
     format!("event/{}/", escape(agent_id)).into_bytes()
+}
+
+pub fn fields_json_chunk_key(agent_id: &str, event_id: u64, chunk_index: usize) -> Vec<u8> {
+    format!(
+        "fields_json/{}/{event_id:020}/{chunk_index:06}",
+        escape(agent_id)
+    )
+    .into_bytes()
 }
 
 pub fn type_id_key(agent_id: &str, event_type: &str, event_id: u64) -> Vec<u8> {

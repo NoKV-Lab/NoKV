@@ -96,8 +96,16 @@ pub struct EventRecord {
     pub source_line: u64,
     pub ts: f64,
     pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_fields_json: Option<ExternalFieldsJsonRef>,
     pub fields_json: Value,
     pub projection: EventProjection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFieldsJsonRef {
+    pub encoded_bytes: usize,
+    pub chunk_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

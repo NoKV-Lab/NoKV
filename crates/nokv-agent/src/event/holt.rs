@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use holt::{DBAtomicBatch, RangeEntry, Tree, TreeConfig, DB};
+use serde_json::Value;
 
 use super::codec::{
     decode_coverage, decode_event, decode_session_event_row, decode_tool_facet, encode_coverage,
@@ -10,30 +11,36 @@ use super::codec::{
 };
 use super::ingest::empty_coverage;
 use super::key::{
-    coverage_key, event_key, id_from_index_value, id_value, notification_id_key,
-    notification_id_prefix, notification_key, notification_next_key, notification_prefix,
-    notification_prev_key, notification_rev_key, notification_rev_prefix, notification_tail_key,
-    session_key, session_prefix, source_file_hash, source_key, tool_action_facet_key,
-    tool_action_facet_prefix, tool_name_facet_key, trace_key, trace_prefix, tui_clear_rev_key,
-    tui_clear_rev_prefix, type_id_key, type_id_prefix, type_ts_key, type_ts_prefix, TREE_COVERAGE,
-    TREE_EVENTS, TREE_INDEX,
+    coverage_key, event_key, fields_json_chunk_key, id_from_index_value, id_value,
+    notification_id_key, notification_id_prefix, notification_key, notification_next_key,
+    notification_prefix, notification_prev_key, notification_rev_key, notification_rev_prefix,
+    notification_tail_key, session_key, session_prefix, source_file_hash, source_key,
+    tool_action_facet_key, tool_action_facet_prefix, tool_name_facet_key, trace_key, trace_prefix,
+    tui_clear_rev_key, tui_clear_rev_prefix, type_id_key, type_id_prefix, type_ts_key,
+    type_ts_prefix, TREE_COVERAGE, TREE_EVENTS, TREE_INDEX, TREE_PAYLOADS,
 };
 use super::store::AgentEventStore;
 use super::types::{
     AgentEventError, AgentEventResult, CompletionAfter, CompletionAfterRequest, ErrorEventsRequest,
-    EventRecord, EventTime, IndexCoverage, IngestReport, LatestEventsRequest, MoltSessionWindows,
-    NewEventRecord, NotificationEventByIdRequest, NotificationEventsRequest,
-    NotificationLifecycleRequest, NotificationNeighborDirection, NotificationNeighborRequest,
-    RecentTimesRequest, SessionEventRow, SessionEventsRequest, SessionRowsRequest, ToolFacet,
-    ToolFacetRequest, ToolTraceRequest, TuiClearCompletion, TuiClearCompletionRequest,
-    LINGTAI_SESSION_EVENT_TYPES,
+    EventRecord, EventTime, ExternalFieldsJsonRef, IndexCoverage, IngestReport,
+    LatestEventsRequest, MoltSessionWindows, NewEventRecord, NotificationEventByIdRequest,
+    NotificationEventsRequest, NotificationLifecycleRequest, NotificationNeighborDirection,
+    NotificationNeighborRequest, RecentTimesRequest, SessionEventRow, SessionEventsRequest,
+    SessionRowsRequest, ToolFacet, ToolFacetRequest, ToolTraceRequest, TuiClearCompletion,
+    TuiClearCompletionRequest, LINGTAI_SESSION_EVENT_TYPES,
 };
+
+const MAX_HOLT_VALUE_BYTES: usize = 65_000;
+const FIELDS_JSON_CHUNK_BYTES: usize = 48 * 1024;
+
+type PayloadChunkWrites = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub struct HoltAgentEventStore {
     db: DB,
     events: Tree,
     index: Tree,
     coverage: Tree,
+    payloads: Tree,
 }
 
 impl HoltAgentEventStore {
@@ -54,11 +61,15 @@ impl HoltAgentEventStore {
         let coverage = db
             .open_or_create_tree(TREE_COVERAGE)
             .map_err(to_store_error)?;
+        let payloads = db
+            .open_or_create_tree(TREE_PAYLOADS)
+            .map_err(to_store_error)?;
         Ok(Self {
             db,
             events,
             index,
             coverage,
+            payloads,
         })
     }
 
@@ -67,7 +78,7 @@ impl HoltAgentEventStore {
         self.events
             .get(&key)
             .map_err(to_store_error)?
-            .map(|bytes| decode_event(&bytes))
+            .map(|bytes| decode_event(&bytes).and_then(|record| self.resolve_fields_json(record)))
             .transpose()?
             .map(Some)
             // Large file-backed stores can expose a key through range scan
@@ -85,11 +96,40 @@ impl HoltAgentEventStore {
                 continue;
             };
             if found == key {
-                return decode_event(&value).map(Some);
+                return decode_event(&value)
+                    .and_then(|record| self.resolve_fields_json(record))
+                    .map(Some);
             }
             break;
         }
         Ok(None)
+    }
+
+    fn resolve_fields_json(&self, mut record: EventRecord) -> AgentEventResult<EventRecord> {
+        let Some(external) = record.external_fields_json.take() else {
+            return Ok(record);
+        };
+        let mut encoded = Vec::with_capacity(external.encoded_bytes);
+        for chunk_index in 0..external.chunk_count {
+            let key = fields_json_chunk_key(&record.agent_id, record.id, chunk_index);
+            let Some(chunk) = self.payloads.get(&key).map_err(to_store_error)? else {
+                return Err(AgentEventError::Store(format!(
+                    "missing fields_json chunk {chunk_index} for event {}",
+                    record.id
+                )));
+            };
+            encoded.extend_from_slice(&chunk);
+        }
+        if encoded.len() != external.encoded_bytes {
+            return Err(AgentEventError::Store(format!(
+                "fields_json payload length mismatch for event {}: expected {}, got {}",
+                record.id,
+                external.encoded_bytes,
+                encoded.len()
+            )));
+        }
+        record.fields_json = serde_json::from_slice(&encoded)?;
+        Ok(record)
     }
 
     fn scan_event_ids(&self, prefix: &[u8], limit: usize) -> AgentEventResult<Vec<u64>> {
@@ -368,6 +408,7 @@ impl AgentEventStore for HoltAgentEventStore {
                 source_line: new.source_line,
                 ts: new.ts,
                 event_type: new.event_type,
+                external_fields_json: None,
                 fields_json: new.fields_json,
                 projection: new.projection,
             };
@@ -538,7 +579,11 @@ impl AgentEventStore for HoltAgentEventStore {
         let mut out = Vec::new();
         for event_type in request.event_types {
             let prefix = type_id_prefix(&request.agent_id, &event_type);
-            out.extend(self.events_by_index_prefix(&request.agent_id, &prefix, request.limit)?);
+            out.extend(
+                self.events_by_index_prefix(&request.agent_id, &prefix, request.limit)?
+                    .into_iter()
+                    .filter(has_error_text),
+            );
         }
         out.sort_by_key(|record| Reverse(record.id));
         out.truncate(request.limit);
@@ -613,9 +658,7 @@ impl AgentEventStore for HoltAgentEventStore {
         &self,
         request: NotificationEventByIdRequest,
     ) -> AgentEventResult<Option<EventRecord>> {
-        Ok(self
-            .event_by_id(&request.agent_id, request.event_id)?
-            .filter(|record| is_notification_event_type(&record.event_type)))
+        self.event_by_id(&request.agent_id, request.event_id)
     }
 
     fn notification_neighbor(
@@ -678,11 +721,15 @@ impl AgentEventStore for HoltAgentEventStore {
 
 fn write_record_batch(batch: &mut DBAtomicBatch, source: &[u8], record: &EventRecord) {
     let id = id_value(record.id);
+    let (encoded_event, fields_json_chunks) = encode_event_for_holt(record);
     batch.put_if_absent(TREE_INDEX, source, &id);
+    for (key, chunk) in fields_json_chunks {
+        batch.put(TREE_PAYLOADS, &key, &chunk);
+    }
     batch.put(
         TREE_EVENTS,
         &event_key(&record.agent_id, record.id),
-        &encode_event(record).expect("event encodes"),
+        &encoded_event,
     );
     batch.put(
         TREE_INDEX,
@@ -754,6 +801,38 @@ fn write_record_batch(batch: &mut DBAtomicBatch, source: &[u8], record: &EventRe
     }
 }
 
+fn encode_event_for_holt(record: &EventRecord) -> (Vec<u8>, PayloadChunkWrites) {
+    let inline = encode_event(record).expect("event encodes");
+    if inline.len() <= MAX_HOLT_VALUE_BYTES {
+        return (inline, Vec::new());
+    }
+
+    let encoded_fields = serde_json::to_vec(&record.fields_json).expect("fields_json encodes");
+    let chunk_count = encoded_fields.chunks(FIELDS_JSON_CHUNK_BYTES).count();
+    let mut stored = record.clone();
+    stored.fields_json = Value::Null;
+    stored.external_fields_json = Some(ExternalFieldsJsonRef {
+        encoded_bytes: encoded_fields.len(),
+        chunk_count,
+    });
+    let encoded_event = encode_event(&stored).expect("externalized event encodes");
+    assert!(
+        encoded_event.len() <= MAX_HOLT_VALUE_BYTES,
+        "externalized event still exceeds Holt value limit"
+    );
+    let chunks = encoded_fields
+        .chunks(FIELDS_JSON_CHUNK_BYTES)
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            (
+                fields_json_chunk_key(&record.agent_id, record.id, chunk_index),
+                chunk.to_vec(),
+            )
+        })
+        .collect();
+    (encoded_event, chunks)
+}
+
 fn increment_facet(
     increments: &mut BTreeMap<Vec<u8>, ToolFacet>,
     key: Vec<u8>,
@@ -795,6 +874,14 @@ fn session_row_from_event(record: EventRecord) -> SessionEventRow {
 
 fn is_notification_event_type(event_type: &str) -> bool {
     event_type.contains("notification")
+}
+
+fn has_error_text(record: &EventRecord) -> bool {
+    record
+        .projection
+        .error
+        .as_deref()
+        .is_some_and(|error| !error.trim().is_empty())
 }
 
 fn is_tui_clear_completion_event(record: &EventRecord) -> bool {

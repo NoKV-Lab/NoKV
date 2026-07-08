@@ -2,7 +2,6 @@ use std::io::BufRead;
 
 use serde_json::{Map, Value};
 
-const MAX_INLINE_FIELDS_JSON_BYTES: usize = 32 * 1024;
 const INGEST_RECORD_BATCH_LIMIT: usize = 512;
 
 use super::store::AgentEventStore;
@@ -116,31 +115,7 @@ fn fields_json(object: &Map<String, Value>) -> Value {
     for key in ["type", "ts", "address", "agent_name"] {
         fields.remove(key);
     }
-    compact_fields_json(Value::Object(fields))
-}
-
-fn compact_fields_json(value: Value) -> Value {
-    let encoded_len = serde_json::to_vec(&value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX);
-    if encoded_len <= MAX_INLINE_FIELDS_JSON_BYTES {
-        return value;
-    }
-    let keys = value
-        .as_object()
-        .map(|object| {
-            object
-                .keys()
-                .cloned()
-                .map(Value::String)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    serde_json::json!({
-        "_nokv_compacted": true,
-        "original_json_bytes": encoded_len,
-        "keys": keys,
-    })
+    Value::Object(fields)
 }
 
 fn project_event(object: &Map<String, Value>) -> EventProjection {

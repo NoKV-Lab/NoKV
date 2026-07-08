@@ -5,29 +5,16 @@ use std::path::PathBuf;
 
 use nokv_agent::event::{
     ingest_jsonl_reader, AgentEventError, AgentEventResult, AgentEventStore,
-    CompletionAfterRequest, ErrorEventsRequest, HoltAgentEventStore, JsonlIngestOptions,
-    LatestEventsRequest, NotificationEventByIdRequest, NotificationEventsRequest,
-    NotificationLifecycleRequest, NotificationNeighborDirection, NotificationNeighborRequest,
+    CompletionAfterRequest, ErrorEventsRequest, EventRecord, HoltAgentEventStore,
+    JsonlIngestOptions, LatestEventsRequest, NotificationBlockSnapshot,
+    NotificationEventByIdRequest, NotificationEventsRequest, NotificationLifecycleRequest,
+    NotificationNeighborDirection, NotificationNeighborRequest, NotificationSummaryEntry,
     RecentTimesRequest, SessionEventsRequest, SessionRowsRequest, ToolFacetRequest,
     ToolTraceRequest, TuiClearCompletionRequest, LINGTAI_SESSION_EVENT_TYPES,
 };
 use serde_json::json;
 
-const DEFAULT_ERROR_EVENT_TYPES: &[&str] = &[
-    "aed_attempt",
-    "aed_exhausted",
-    "aed_over_window_detected",
-    "aed_timeout",
-    "aed_transient_retry",
-    "aed_transient_exhausted",
-    "daemon_error",
-    "refresh_failed_permanent",
-    "refresh_init_error",
-    "tc_wake_error",
-    "tool_call_dispatch_failed",
-    "tool_call_validation_failed",
-    "daemon_tool_call_validation_failed",
-];
+const DEFAULT_ERROR_EVENT_TYPES: &[&str] = &["aed_attempt", "aed_exhausted", "refresh_init_error"];
 
 fn main() {
     if let Err(err) = run() {
@@ -58,10 +45,8 @@ fn run() -> AgentEventResult<()> {
         "errors" => cmd_errors(args),
         "completion-after" => cmd_completion_after(args),
         "clear-completion" => cmd_clear_completion(args),
-        "notification-blocks" => cmd_latest_fixed_type(args, "notification_pair_injected"),
-        "notification-block-snapshots" => {
-            cmd_latest_fixed_type(args, "notification_block_injected")
-        }
+        "notification-blocks" => cmd_notification_blocks(args),
+        "notification-block-snapshots" => cmd_notification_block_snapshots(args),
         "notification-events" => cmd_notification_events(args),
         "notification-by-id" => cmd_notification_by_id(args),
         "notification-before" => {
@@ -132,26 +117,50 @@ fn cmd_latest(mut args: VecDeque<String>) -> AgentEventResult<()> {
     }))
 }
 
-fn cmd_latest_fixed_type(
-    mut args: VecDeque<String>,
+fn cmd_notification_blocks(mut args: VecDeque<String>) -> AgentEventResult<()> {
+    let events = latest_fixed_type(&mut args, "notification_pair_injected")?;
+    let blocks = events
+        .iter()
+        .cloned()
+        .map(NotificationSummaryEntry::from_event)
+        .collect::<Vec<_>>();
+    print_json(json!({
+        "blocks": blocks,
+        "events": events,
+    }))
+}
+
+fn cmd_notification_block_snapshots(mut args: VecDeque<String>) -> AgentEventResult<()> {
+    let events = latest_fixed_type(&mut args, "notification_block_injected")?;
+    let snapshots = events
+        .iter()
+        .cloned()
+        .map(NotificationBlockSnapshot::from_event)
+        .collect::<Vec<_>>();
+    print_json(json!({
+        "snapshots": snapshots,
+        "events": events,
+    }))
+}
+
+fn latest_fixed_type(
+    args: &mut VecDeque<String>,
     event_type: &'static str,
-) -> AgentEventResult<()> {
-    let store_path = required_path(&mut args, "--store")?;
-    let agent_id = option_value(&mut args, "--agent-id")?.unwrap_or_else(|| "default".to_owned());
-    let limit = option_value(&mut args, "--limit")?
+) -> AgentEventResult<Vec<EventRecord>> {
+    let store_path = required_path(args, "--store")?;
+    let agent_id = option_value(args, "--agent-id")?.unwrap_or_else(|| "default".to_owned());
+    let limit = option_value(args, "--limit")?
         .map(|value| parse_usize("--limit", &value))
         .transpose()?
         .unwrap_or(10);
-    reject_extra(args)?;
+    reject_extra(std::mem::take(args))?;
 
     let store = HoltAgentEventStore::open_file(store_path)?;
-    print_json(json!({
-        "events": store.latest_events(LatestEventsRequest {
-            agent_id,
-            event_type: event_type.to_owned(),
-            limit,
-        })?
-    }))
+    store.latest_events(LatestEventsRequest {
+        agent_id,
+        event_type: event_type.to_owned(),
+        limit,
+    })
 }
 
 fn cmd_session(mut args: VecDeque<String>) -> AgentEventResult<()> {
