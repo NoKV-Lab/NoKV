@@ -26,6 +26,19 @@ const MAX_WORKBENCH_GREP_LIMIT: usize = 300;
 /// Mirror of the metadata server's grep pattern cap (nokv-meta
 /// MAX_GREP_PATTERNS); enforced there, advertised and pre-checked here.
 const MAX_WORKBENCH_GREP_PATTERNS: usize = 16;
+/// Default snapshot lease when `workbench_snapshot` is called without `ttl_days`.
+/// Leases express liveness, never archival importance; a week is long enough to
+/// survive a handoff yet short enough that a forgotten pin still reaps.
+const DEFAULT_SNAPSHOT_TTL_DAYS: u64 = 7;
+/// Hard ceiling on the tool-set lease. Longer holds are the job of L1 named
+/// refs (Phase 2) or the CLI, not a lease knob; requests beyond it are rejected
+/// with that guidance so a lease never masquerades as durable retention.
+const MAX_SNAPSHOT_TTL_DAYS: u64 = 90;
+const MS_PER_DAY: u64 = 86_400_000;
+/// Checkpoint registry file, relative to a workbench's `metadata` section.
+/// Every mint/renew appends one JSON line here so checkpoints stay discoverable
+/// after the tool response is gone (Phase-1 seed for L1 named refs).
+const CHECKPOINT_REGISTRY_RELPATH: &str = "checkpoints.jsonl";
 /// Retries after a lost artifact-write CAS; every attempt re-reads current state.
 const WRITE_CONFLICT_RETRIES: usize = 5;
 /// Linear backoff step between conflict retries. Zero-interval retries make N
@@ -171,7 +184,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_list",
             description:
-                "List a workbench, section, or subdirectory through the NoKV namespace. Not recursive. Entries written outside the standard sections by other NoKV clients are returned with section null; such entries cannot be addressed by the other workbench tools.",
+                "List a workbench, section, or subdirectory through the NoKV namespace. Not recursive. Entries written outside the standard sections by other NoKV clients are returned with section null; such entries cannot be addressed by the other workbench tools. Pass at_snapshot (a snapshot id or a checkpoint name from workbench_snapshot) to list the subtree as it was at that checkpoint; an expired or reaped snapshot fails loudly.",
             parameters: json!({
                 "type": "object",
                 "required": ["id"],
@@ -180,7 +193,8 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                     "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
                     "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
                     "cursor": {"type": ["string", "null"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_LIST_LIMIT}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_LIST_LIMIT},
+                    "at_snapshot": at_snapshot_parameter_schema()
                 },
                 "additionalProperties": false
             }),
@@ -188,14 +202,15 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_stat",
             description:
-                "Inspect a workbench, section, subdirectory, or file compact card through the NoKV namespace.",
+                "Inspect a workbench, section, subdirectory, or file compact card through the NoKV namespace. Pass at_snapshot (a snapshot id or a checkpoint name from workbench_snapshot) to stat the path as it was at that checkpoint; an expired or reaped snapshot fails loudly.",
             parameters: json!({
                 "type": "object",
                 "required": ["id"],
                 "properties": {
                     "id": {"type": "string"},
                     "section": {"type": ["string", "null"], "enum": ["input", "scripts", "outputs", "logs", "metadata", null]},
-                    "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."}
+                    "path": {"type": ["string", "null"], "description": "Optional path relative to section. Do not prefix it with the section name."},
+                    "at_snapshot": at_snapshot_parameter_schema()
                 },
                 "additionalProperties": false
             }),
@@ -203,7 +218,7 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_read",
             description:
-                "Read one workbench file through the NoKV namespace. Structured mode returns JSON, YAML, or text records; bytes mode returns byte ranges as a base64 string in bytes (bytes_encoding is \"base64\"). Pass if_none_match with a previously returned generation to skip the body when the file is unchanged.",
+                "Read one workbench file through the NoKV namespace. Structured mode returns JSON, YAML, or text records; bytes mode returns byte ranges as a base64 string in bytes (bytes_encoding is \"base64\"). Pass if_none_match with a previously returned generation to skip the body when the file is unchanged. Pass at_snapshot (a snapshot id or a checkpoint name from workbench_snapshot) to read the file as it was at that checkpoint: bytes mode reads a byte range, any other mode returns text_lines for UTF-8 text (offset and limit count lines) and errors for non-text content (structured record reads at a snapshot are not yet supported); an expired or reaped snapshot fails loudly.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "section", "path"],
@@ -213,9 +228,10 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                     "path": {"type": "string", "description": "Path relative to section. Do not prefix it with the section name."},
                     "format": {"type": "string", "enum": ["structured", "bytes"]},
                     "cursor": {"type": ["string", "null"]},
-                    "offset": {"type": "integer", "minimum": 0, "description": "Start offset for the read; ignored when cursor is set."},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Start offset for the read; ignored when cursor is set. Bytes are counted in bytes; a text at_snapshot read counts lines."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORKBENCH_READ_LIMIT},
-                    "if_none_match": {"type": "integer", "minimum": 0, "description": "Generation from a previous response. When it still matches, the file body is skipped and the response carries not_modified=true plus the unchanged generation."}
+                    "if_none_match": {"type": "integer", "minimum": 0, "description": "Generation from a previous response. When it still matches, the file body is skipped and the response carries not_modified=true plus the unchanged generation."},
+                    "at_snapshot": at_snapshot_parameter_schema()
                 },
                 "additionalProperties": false
             }),
@@ -352,7 +368,38 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         AgentToolDefinition {
             name: "workbench_snapshot",
             description:
-                "Snapshot a committed workbench subtree and return the NoKV snapshot id and read version.",
+                "Snapshot a committed workbench subtree and hold it under a lease. Returns the NoKV snapshot id, read version, and lease_expires_at (unix ms). The lease defaults to 7 days (ttl_days), capped at 90; longer holds are not a lease knob (wait for named refs or use the CLI). Pass name ([A-Za-z0-9_-]{1,64}) to alias the checkpoint for later renew/list/at_snapshot reads. A lease expresses liveness, not archival importance: an unrenewed snapshot is reaped after it expires and the point-in-time view is lost (current files remain).",
+            parameters: json!({
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": ["string", "null"], "description": "Checkpoint alias matching [A-Za-z0-9_-]{1,64}. Resolves to this snapshot in workbench_snapshot_renew, workbench_snapshot_list, and at_snapshot reads."},
+                    "ttl_days": {"type": "integer", "minimum": 1, "maximum": MAX_SNAPSHOT_TTL_DAYS, "description": "Lease length in days. Defaults to 7; values above 90 are rejected."}
+                },
+                "additionalProperties": false
+            }),
+        },
+        AgentToolDefinition {
+            name: "workbench_snapshot_renew",
+            description:
+                "Extend the lease on a workbench snapshot before it is reaped. Identify it by snapshot_id or by the name given at mint time (resolved through the workbench checkpoint registry). ttl_days sets the new lease length from now (default 7, max 90). A snapshot already reaped after lease expiry cannot be renewed; re-mint from the current state instead.",
+            parameters: json!({
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "snapshot_id": {"type": ["integer", "null"], "minimum": 0, "description": "Snapshot id to renew. Provide exactly one of snapshot_id or name."},
+                    "name": {"type": ["string", "null"], "description": "Checkpoint name to renew. Provide exactly one of snapshot_id or name."},
+                    "ttl_days": {"type": "integer", "minimum": 1, "maximum": MAX_SNAPSHOT_TTL_DAYS, "description": "New lease length in days from now. Defaults to 7; values above 90 are rejected."}
+                },
+                "additionalProperties": false
+            }),
+        },
+        AgentToolDefinition {
+            name: "workbench_snapshot_list",
+            description:
+                "List a workbench's checkpoints from its registry, each joined with live pin state: alive, expired (reap pending), or reaped. Returns an empty list when the workbench has no registry yet. Use the snapshot ids or names here with workbench_snapshot_renew or the at_snapshot argument of workbench_stat, workbench_list, and workbench_read.",
             parameters: json!({
                 "type": "object",
                 "required": ["id"],
@@ -363,6 +410,20 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
             }),
         },
     ]
+}
+
+/// Shared schema for the `at_snapshot` argument: either a numeric snapshot id or
+/// a checkpoint name string. `additionalProperties:false` schemas above embed
+/// this so the two accepted shapes stay in sync across the read tools.
+fn at_snapshot_parameter_schema() -> Value {
+    json!({
+        "anyOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "string"},
+            {"type": "null"}
+        ],
+        "description": "Read at a checkpoint: a snapshot id (integer) or a checkpoint name (string) from workbench_snapshot."
+    })
 }
 
 // Mirrors of the agent find/aggregate sub-schemas (nokv-agent
@@ -437,6 +498,8 @@ where
         "workbench_find" => find_workbenches(client, options, args),
         "workbench_commit" => commit_workbench(client, options, args),
         "workbench_snapshot" => snapshot_workbench(client, options, args),
+        "workbench_snapshot_renew" => renew_snapshot_workbench(client, options, args),
+        "workbench_snapshot_list" => list_snapshots_workbench(client, options, args),
         other => Err(WorkbenchToolError::new(format!(
             "unknown workbench tool {other}"
         ))),
@@ -695,6 +758,17 @@ where
         }
         _ => scoped_path_from_optional_args(options, &id, args)?,
     };
+    if let Some(at_snapshot) = args.get("at_snapshot").filter(|value| !value.is_null()) {
+        return execute_at_snapshot_read_tool(
+            client,
+            options,
+            &id,
+            read_tool,
+            &target,
+            at_snapshot,
+            args,
+        );
+    }
     if read_tool == "read" {
         if let Some(expected) = optional_u64(args, "if_none_match")? {
             // A missing ancestor and a missing leaf are the same absence to
@@ -1244,6 +1318,14 @@ where
     O: ObjectStore + Send + Sync + 'static,
 {
     let id = required_workbench_id(args)?;
+    let name = match optional_string(args, "name")? {
+        Some(raw) => {
+            validate_snapshot_name(raw)?;
+            Some(raw.to_owned())
+        }
+        None => None,
+    };
+    let (ttl_days, ttl_defaulted) = resolve_ttl_days(args)?;
     let manifest_path = section_path(options, &id, "metadata", Some("run_manifest.json"));
     if stat_path_or_absent(client, &manifest_path)?.is_none() {
         return Err(WorkbenchToolError::new(format!(
@@ -1251,17 +1333,724 @@ where
         )));
     }
     let path = workbench_path(options, &id);
+    // Mint at the default 1h lease, then extend to the requested ttl and read
+    // the pin back so lease_expires_at is the server's authoritative deadline,
+    // never a client-computed guess (three low-frequency RPCs, no new op).
     let snapshot = client
         .metadata()
         .snapshot_subtree_path(&path)
         .map_err(client_error)?;
-    Ok(json!({
+    let snapshot_id = snapshot.snapshot_id;
+    let lease_ms = ttl_days.saturating_mul(MS_PER_DAY);
+    client
+        .metadata()
+        .renew_snapshot(snapshot_id, lease_ms)
+        .map_err(client_error)?;
+    let pin = client
+        .metadata()
+        .snapshot_pin(snapshot_id)
+        .map_err(client_error)?;
+    let lease_expires_unix_ms = pin.as_ref().map(|pin| pin.lease_expires_unix_ms);
+    let read_version = pin
+        .as_ref()
+        .map(|pin| pin.read_version)
+        .unwrap_or(snapshot.read_version);
+    let created_at = unix_ms();
+    let registry_entry = json!({
+        "name": name,
+        "snapshot_id": snapshot_id,
+        "read_version": read_version,
+        "lease_expires_unix_ms": lease_expires_unix_ms,
+        "created_at": created_at,
+        "reason": "mint",
+    });
+    let registry = registry_write_status(append_checkpoint_registry_line(
+        client,
+        options,
+        &id,
+        &registry_entry,
+    ));
+    let mut out = json!({
         "status": "success",
         "workbench_id": id,
         "path": path,
-        "snapshot_id": snapshot.snapshot_id,
-        "read_version": snapshot.read_version,
+        "snapshot_id": snapshot_id,
+        "read_version": read_version,
+        "name": name,
+        "ttl_days": ttl_days,
+        "lease_expires_at": lease_expires_unix_ms,
+        "lease_expires_unix_ms": lease_expires_unix_ms,
+        "registry": registry,
+    });
+    if ttl_defaulted {
+        out["expiry_warning"] = json!(format!(
+            "lease defaulted to {DEFAULT_SNAPSHOT_TTL_DAYS} days; this snapshot is reaped after it expires unless renewed. Renew before a handoff that must outlive the lease, or pass ttl_days."
+        ));
+    }
+    Ok(out)
+}
+
+fn renew_snapshot_workbench<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let id = required_workbench_id(args)?;
+    let (ttl_days, _ttl_defaulted) = resolve_ttl_days(args)?;
+    let snapshot_id = resolve_renew_target(client, options, &id, args)?;
+    let lease_ms = ttl_days.saturating_mul(MS_PER_DAY);
+    let renewed = client
+        .metadata()
+        .renew_snapshot(snapshot_id, lease_ms)
+        .map_err(client_error)?;
+    if !renewed {
+        return Err(WorkbenchToolError::new(format!(
+            "snapshot {snapshot_id} was reaped after lease expiry; re-mint from current state"
+        )));
+    }
+    let pin = client
+        .metadata()
+        .snapshot_pin(snapshot_id)
+        .map_err(client_error)?;
+    let lease_expires_unix_ms = pin.as_ref().map(|pin| pin.lease_expires_unix_ms);
+    let read_version = pin.as_ref().map(|pin| pin.read_version);
+    // Carry the name forward from the mint record so the renew row stays joinable
+    // with the checkpoint it extends.
+    let name = registry_name_for_snapshot(client, options, &id, snapshot_id)?;
+    let created_at = unix_ms();
+    let registry_entry = json!({
+        "name": name,
+        "snapshot_id": snapshot_id,
+        "read_version": read_version,
+        "lease_expires_unix_ms": lease_expires_unix_ms,
+        "created_at": created_at,
+        "reason": "renew",
+    });
+    let registry = registry_write_status(append_checkpoint_registry_line(
+        client,
+        options,
+        &id,
+        &registry_entry,
+    ));
+    Ok(json!({
+        "status": "success",
+        "workbench_id": id,
+        "snapshot_id": snapshot_id,
+        "name": name,
+        "renewed": true,
+        "ttl_days": ttl_days,
+        "read_version": read_version,
+        "lease_expires_at": lease_expires_unix_ms,
+        "lease_expires_unix_ms": lease_expires_unix_ms,
+        "registry": registry,
     }))
+}
+
+fn list_snapshots_workbench<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let id = required_workbench_id(args)?;
+    let entries = read_checkpoint_registry(client, options, &id)?;
+    let now = unix_ms();
+    let mut checkpoints = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let snapshot_id = entry.get("snapshot_id").and_then(Value::as_u64);
+        let (state, live_lease) = match snapshot_id {
+            Some(snapshot_id) => {
+                match client
+                    .metadata()
+                    .snapshot_pin(snapshot_id)
+                    .map_err(client_error)?
+                {
+                    None => ("reaped", None),
+                    Some(pin) => {
+                        if now >= pin.lease_expires_unix_ms {
+                            ("expired (reap pending)", Some(pin.lease_expires_unix_ms))
+                        } else {
+                            ("alive", Some(pin.lease_expires_unix_ms))
+                        }
+                    }
+                }
+            }
+            None => ("unknown", None),
+        };
+        checkpoints.push(json!({
+            "name": entry.get("name").cloned().unwrap_or(Value::Null),
+            "snapshot_id": snapshot_id,
+            "read_version": entry.get("read_version").cloned().unwrap_or(Value::Null),
+            "reason": entry.get("reason").cloned().unwrap_or(Value::Null),
+            "created_at": entry.get("created_at").cloned().unwrap_or(Value::Null),
+            "registered_lease_expires_unix_ms": entry
+                .get("lease_expires_unix_ms")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "live_lease_expires_unix_ms": live_lease,
+            "state": state,
+        }));
+    }
+    Ok(json!({
+        "status": "success",
+        "workbench_id": id,
+        "checkpoint_count": checkpoints.len(),
+        "checkpoints": checkpoints,
+    }))
+}
+
+/// At-snapshot read/stat/list. The lease is checked *before* any bytes are read
+/// so a caller never silently observes a half-dead snapshot (unchanged files
+/// still resolving while overwritten ones vanish); expiry is a loud error.
+fn execute_at_snapshot_read_tool<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    read_tool: &str,
+    target: &str,
+    at_snapshot: &Value,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    if read_tool == "grep" {
+        return Err(WorkbenchToolError::new(
+            "workbench_grep does not support at_snapshot; use workbench_read or workbench_list at the snapshot",
+        ));
+    }
+    let snapshot_id = resolve_at_snapshot(client, options, id, at_snapshot)?;
+    ensure_snapshot_live(client, snapshot_id)?;
+    let scope = path_scope(options, id, target)?;
+    // Subtree-snapshot reads address paths relative to the snapshot root (the
+    // workbench directory), so strip the workbench prefix; the absolute `target`
+    // is kept only for shaping the response coordinates.
+    let snap_path = snapshot_relative_path(options, id, target)?;
+    match read_tool {
+        "stat" => at_snapshot_stat(client, options, id, snapshot_id, &scope, &snap_path),
+        "ls" => at_snapshot_list(client, options, id, snapshot_id, &scope, target, &snap_path),
+        "read" => at_snapshot_read(client, options, id, snapshot_id, &scope, &snap_path, args),
+        other => Err(WorkbenchToolError::new(format!(
+            "at_snapshot is not supported for {other}"
+        ))),
+    }
+}
+
+/// Convert an absolute workbench path into a path relative to the workbench's
+/// snapshot subtree root (the form the at-snapshot service calls expect):
+/// the workbench root becomes `/`, and `<root>/outputs/x` becomes `/outputs/x`.
+fn snapshot_relative_path(
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    target: &str,
+) -> Result<String, WorkbenchToolError> {
+    let base = workbench_path(options, id);
+    if target == base {
+        return Ok("/".to_owned());
+    }
+    let prefix = format!("{base}/");
+    let rest = target.strip_prefix(&prefix).ok_or_else(|| {
+        WorkbenchToolError::new(format!("path {target} is outside workbench {base}"))
+    })?;
+    Ok(format!("/{rest}"))
+}
+
+fn at_snapshot_stat<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    snapshot_id: u64,
+    scope: &WorkbenchPathScope,
+    snap_path: &str,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let metadata = client
+        .metadata()
+        .stat_path_at_snapshot(snapshot_id, snap_path)
+        .map_err(client_error)?
+        .ok_or_else(|| {
+            WorkbenchToolError::new(format!(
+                "path not found at snapshot {snapshot_id}: {}",
+                scope.path
+            ))
+        })?;
+    Ok(json!({
+        "status": "success",
+        "workbench_id": id,
+        "workbench_path": workbench_path(options, id),
+        "at_snapshot": snapshot_id,
+        "section": scope.section.clone(),
+        "relative_path": scope.relative_path.clone(),
+        "path": scope.path.clone(),
+        "card": snapshot_stat_card(scope, &metadata),
+    }))
+}
+
+fn at_snapshot_list<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    snapshot_id: u64,
+    scope: &WorkbenchPathScope,
+    target: &str,
+    snap_path: &str,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let dentries = client
+        .metadata()
+        .list_path_at_snapshot(snapshot_id, snap_path)
+        .map_err(client_error)?;
+    let base = target.trim_end_matches('/');
+    let mut entries = Vec::with_capacity(dentries.len());
+    for dentry in &dentries {
+        let name = String::from_utf8_lossy(dentry.dentry.name.as_bytes()).into_owned();
+        let child_path = format!("{base}/{name}");
+        let child_scope = enumerated_path_scope(options, id, &child_path)?;
+        let is_file = dentry.attr.file_type == FileType::File;
+        entries.push(json!({
+            "name": name,
+            "path": child_scope.path,
+            "section": child_scope.section,
+            "relative_path": child_scope.relative_path,
+            "kind": file_type_kind(dentry.attr.file_type),
+            "size_bytes": if is_file { json!(dentry.attr.size) } else { Value::Null },
+            "entry_count": Value::Null,
+        }));
+    }
+    Ok(json!({
+        "status": "success",
+        "workbench_id": id,
+        "workbench_path": workbench_path(options, id),
+        "at_snapshot": snapshot_id,
+        "section": scope.section.clone(),
+        "relative_path": scope.relative_path.clone(),
+        "path": scope.path.clone(),
+        "entry_count": entries.len(),
+        "entries": entries,
+        "next_cursor": Value::Null,
+        "truncated": false,
+    }))
+}
+
+fn at_snapshot_read<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    snapshot_id: u64,
+    scope: &WorkbenchPathScope,
+    snap_path: &str,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let metadata = client
+        .metadata()
+        .stat_path_at_snapshot(snapshot_id, snap_path)
+        .map_err(client_error)?
+        .ok_or_else(|| {
+            WorkbenchToolError::new(format!(
+                "path not found at snapshot {snapshot_id}: {}",
+                scope.path
+            ))
+        })?;
+    if metadata.attr.file_type != FileType::File {
+        return Err(WorkbenchToolError::new(format!(
+            "path is not a file at snapshot {snapshot_id}: {}",
+            scope.path
+        )));
+    }
+    let size = metadata.attr.size;
+    let generation = metadata.attr.generation;
+    let offset = optional_u64(args, "offset")?.unwrap_or(0);
+    let limit = optional_usize(args, "limit")?;
+    let bytes_mode = optional_string(args, "format")? == Some("bytes");
+    let common = json!({
+        "status": "success",
+        "workbench_id": id,
+        "workbench_path": workbench_path(options, id),
+        "at_snapshot": snapshot_id,
+        "section": scope.section.clone(),
+        "relative_path": scope.relative_path.clone(),
+        "path": scope.path.clone(),
+        "generation": generation,
+        "total_size_bytes": size,
+    });
+    let mut out = common
+        .as_object()
+        .cloned()
+        .expect("common read envelope is an object");
+    if bytes_mode {
+        // Byte-range read: offset and limit count bytes. The max_bytes guard
+        // bounds a single page directly at the source read.
+        let remaining = size.saturating_sub(offset);
+        let mut len = limit
+            .map(|limit| limit as u64)
+            .unwrap_or(remaining)
+            .min(remaining);
+        if len > options.max_bytes as u64 {
+            len = options.max_bytes as u64;
+        }
+        let raw = client
+            .read_snapshot(snapshot_id, snap_path, offset, len as usize)
+            .map_err(client_error)?;
+        let returned = raw.len() as u64;
+        out.insert("format".to_owned(), json!("bytes"));
+        out.insert("record_type".to_owned(), Value::Null);
+        out.insert("record_count".to_owned(), Value::Null);
+        out.insert("cursor".to_owned(), Value::Null);
+        out.insert("next_cursor".to_owned(), Value::Null);
+        out.insert(
+            "truncated".to_owned(),
+            json!(offset.saturating_add(returned) < size),
+        );
+        out.insert("items".to_owned(), json!([]));
+        out.insert(
+            "bytes".to_owned(),
+            json!(base64::engine::general_purpose::STANDARD.encode(&raw)),
+        );
+        out.insert("bytes_encoding".to_owned(), json!("base64"));
+        return Ok(Value::Object(out));
+    }
+    // Text-lines shaping: whole file (bounded by max_bytes), offset and limit
+    // count lines. Structured record reads at a snapshot are Phase 2.
+    if size > options.max_bytes as u64 {
+        return Err(WorkbenchToolError::new(format!(
+            "file exceeds max_bytes at snapshot {snapshot_id}: {size} > {}; read it in bytes mode with offset and limit",
+            options.max_bytes
+        )));
+    }
+    let raw = client
+        .read_snapshot(snapshot_id, snap_path, 0, size as usize)
+        .map_err(client_error)?;
+    let text = String::from_utf8(raw).map_err(|_| {
+        WorkbenchToolError::new(format!(
+            "at_snapshot read of {} is not UTF-8 text; structured record reads at a snapshot are not yet supported, use format=bytes",
+            scope.path
+        ))
+    })?;
+    let lines: Vec<&str> = text.lines().collect();
+    let total_lines = lines.len();
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(total_lines);
+    let end = match limit {
+        Some(limit) => start.saturating_add(limit).min(total_lines),
+        None => total_lines,
+    };
+    let items = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset_in_page, line)| {
+            json!({
+                "index": start + offset_in_page,
+                "value": {"text": line},
+            })
+        })
+        .collect::<Vec<_>>();
+    out.insert("format".to_owned(), json!("structured"));
+    out.insert("record_type".to_owned(), json!("text_lines"));
+    out.insert("record_count".to_owned(), json!(total_lines));
+    out.insert("cursor".to_owned(), Value::Null);
+    out.insert("next_cursor".to_owned(), Value::Null);
+    out.insert("truncated".to_owned(), json!(end < total_lines));
+    out.insert("items".to_owned(), json!(items));
+    out.insert("bytes".to_owned(), Value::Null);
+    out.insert("bytes_encoding".to_owned(), Value::Null);
+    Ok(Value::Object(out))
+}
+
+fn file_type_kind(file_type: FileType) -> &'static str {
+    match file_type {
+        FileType::File => "file",
+        FileType::Directory => "directory",
+        FileType::Symlink => "symlink",
+        _ => "other",
+    }
+}
+
+/// Compact stat card built from at-snapshot metadata alone (no agent card is
+/// available at a historical version). Directory `entry_count` is left null:
+/// counting children at a snapshot would need a second listing round trip.
+fn snapshot_stat_card(scope: &WorkbenchPathScope, metadata: &PathMetadata) -> Value {
+    let body = metadata.body.as_ref();
+    let is_file = metadata.attr.file_type == FileType::File;
+    let name = scope
+        .path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_owned());
+    json!({
+        "name": name,
+        "path": scope.path.clone(),
+        "section": scope.section.clone(),
+        "relative_path": scope.relative_path.clone(),
+        "kind": file_type_kind(metadata.attr.file_type),
+        "size_bytes": if is_file { json!(metadata.attr.size) } else { Value::Null },
+        "entry_count": Value::Null,
+        "record_count": Value::Null,
+        "inode": metadata.attr.inode.get(),
+        "generation": metadata.attr.generation,
+        "content_type": body.map(|body| body.content_type.clone()),
+        "digest_uri": body.map(|body| body.digest_uri.clone()),
+        "producer": body.map(|body| body.producer.clone()),
+        "manifest_id": body.map(|body| body.manifest_id.clone()),
+    })
+}
+
+fn validate_snapshot_name(name: &str) -> Result<(), WorkbenchToolError> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(WorkbenchToolError::new(
+            "name must be 1 to 64 characters matching [A-Za-z0-9_-]",
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(WorkbenchToolError::new(
+            "name may contain only ASCII letters, digits, '_' and '-'",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the requested `ttl_days`, returning the value and whether it was
+/// defaulted (which drives the expiry warning). Rejects values above the cap
+/// with guidance toward durable retention instead of a longer lease.
+fn resolve_ttl_days(args: &Value) -> Result<(u64, bool), WorkbenchToolError> {
+    match optional_u64(args, "ttl_days")? {
+        None => Ok((DEFAULT_SNAPSHOT_TTL_DAYS, true)),
+        Some(0) => Err(WorkbenchToolError::new("ttl_days must be at least 1")),
+        Some(days) if days > MAX_SNAPSHOT_TTL_DAYS => Err(WorkbenchToolError::new(format!(
+            "ttl_days {days} exceeds the maximum of {MAX_SNAPSHOT_TTL_DAYS} days; a lease is not durable retention. Wait for named refs (Phase 2) or hold it with the CLI (renew-snapshot) for longer."
+        ))),
+        Some(days) => Ok((days, false)),
+    }
+}
+
+fn checkpoint_registry_path(options: &WorkbenchMcpOptions, id: &str) -> String {
+    section_path(options, id, "metadata", Some(CHECKPOINT_REGISTRY_RELPATH))
+}
+
+/// Append one JSON line to the workbench checkpoint registry (dogfooding the
+/// append path). A lost CAS against a concurrent mint is retried the same way
+/// `workbench_append` retries, because `append_artifact` re-reads the end offset
+/// on every attempt.
+fn append_checkpoint_registry_line<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    entry: &Value,
+) -> Result<(), WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let path = checkpoint_registry_path(options, id);
+    let mut line = serde_json::to_vec(entry).map_err(|err| {
+        WorkbenchToolError::new(format!("failed to encode checkpoint registry entry: {err}"))
+    })?;
+    line.push(b'\n');
+    let digest_uri = digest_uri(&line);
+    let mut attempts = 0;
+    loop {
+        let metadata = artifact_metadata(options, &path, &digest_uri, "application/x-ndjson");
+        match client.append_artifact(&path, line.clone(), metadata, None) {
+            Ok(_) => return Ok(()),
+            Err(err) if is_artifact_write_conflict(&err) && attempts < WRITE_CONFLICT_RETRIES => {
+                attempts += 1;
+                write_conflict_backoff(attempts);
+            }
+            Err(err) if is_artifact_write_conflict(&err) => {
+                return Err(write_conflict_exhausted(attempts + 1, err))
+            }
+            Err(err) => return Err(client_error(err)),
+        }
+    }
+}
+
+/// Turn a registry-append result into a status object. A failed registry write
+/// must not fail the snapshot itself (the pin already exists); the caller learns
+/// the write did not land so it can retry discovery rather than lose the id.
+fn registry_write_status(result: Result<(), WorkbenchToolError>) -> Value {
+    match result {
+        Ok(()) => {
+            json!({"written": true, "path_relative": format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}")})
+        }
+        Err(err) => json!({
+            "written": false,
+            "path_relative": format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}"),
+            "error": err.to_string(),
+        }),
+    }
+}
+
+fn read_checkpoint_registry<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+) -> Result<Vec<Value>, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    validate_workbench_id(id)?;
+    let path = checkpoint_registry_path(options, id);
+    if stat_path_or_absent(client, &path)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let bytes = client.cat(&path).map_err(client_error)?;
+    let text = String::from_utf8(bytes).map_err(|err| {
+        WorkbenchToolError::new(format!("checkpoint registry is not valid UTF-8: {err}"))
+    })?;
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A truncated or malformed trailing line (e.g. an interrupted append) is
+        // skipped rather than failing the whole listing.
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            entries.push(value);
+        }
+    }
+    Ok(entries)
+}
+
+/// Latest registered `snapshot_id` for a checkpoint name. The registry is
+/// append-only, so a re-minted name yields several rows; the newest wins.
+fn resolve_name_to_snapshot_id(entries: &[Value], name: &str) -> Option<u64> {
+    entries.iter().rev().find_map(|entry| {
+        if entry.get("name").and_then(Value::as_str) == Some(name) {
+            entry.get("snapshot_id").and_then(Value::as_u64)
+        } else {
+            None
+        }
+    })
+}
+
+/// Name most recently registered for a snapshot id, for carrying the alias
+/// forward onto renew rows. Returns null when the snapshot has no named row.
+fn registry_name_for_snapshot<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    snapshot_id: u64,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let entries = read_checkpoint_registry(client, options, id)?;
+    let name = entries.iter().rev().find_map(|entry| {
+        if entry.get("snapshot_id").and_then(Value::as_u64) == Some(snapshot_id) {
+            entry.get("name").filter(|value| !value.is_null()).cloned()
+        } else {
+            None
+        }
+    });
+    Ok(name.unwrap_or(Value::Null))
+}
+
+/// Resolve the `at_snapshot` argument (a numeric id or a checkpoint name) to a
+/// snapshot id. A name is looked up in the workbench registry.
+fn resolve_at_snapshot<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    value: &Value,
+) -> Result<u64, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    match value {
+        Value::Number(number) => number.as_u64().ok_or_else(|| {
+            WorkbenchToolError::new(
+                "at_snapshot must be a non-negative snapshot id or a checkpoint name",
+            )
+        }),
+        Value::String(name) => {
+            validate_snapshot_name(name)?;
+            let entries = read_checkpoint_registry(client, options, id)?;
+            resolve_name_to_snapshot_id(&entries, name).ok_or_else(|| {
+                WorkbenchToolError::new(format!(
+                    "unknown checkpoint name {name} for workbench {id}; run workbench_snapshot_list to see checkpoints"
+                ))
+            })
+        }
+        _ => Err(WorkbenchToolError::new(
+            "at_snapshot must be a snapshot id (integer) or a checkpoint name (string)",
+        )),
+    }
+}
+
+/// Resolve the renew target: exactly one of `snapshot_id` (numeric) or `name`
+/// (registry-resolved) must be given.
+fn resolve_renew_target<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    args: &Value,
+) -> Result<u64, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let snapshot_id = optional_u64(args, "snapshot_id")?;
+    let name = optional_string(args, "name")?;
+    match (snapshot_id, name) {
+        (Some(snapshot_id), None) => Ok(snapshot_id),
+        (None, Some(name)) => {
+            validate_snapshot_name(name)?;
+            let entries = read_checkpoint_registry(client, options, id)?;
+            resolve_name_to_snapshot_id(&entries, name).ok_or_else(|| {
+                WorkbenchToolError::new(format!(
+                    "unknown checkpoint name {name} for workbench {id}; run workbench_snapshot_list to see checkpoints"
+                ))
+            })
+        }
+        (Some(_), Some(_)) | (None, None) => Err(WorkbenchToolError::new(
+            "provide exactly one of snapshot_id or name",
+        )),
+    }
+}
+
+/// Loud liveness check before any at-snapshot read. A missing pin (reaped) and
+/// an expired-but-unreaped pin both fail with an explicit message naming the
+/// state, so a caller never silently reads a half-dead snapshot.
+fn ensure_snapshot_live<O>(
+    client: &NoKvFsClient<O>,
+    snapshot_id: u64,
+) -> Result<(), WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    match client
+        .metadata()
+        .snapshot_pin(snapshot_id)
+        .map_err(client_error)?
+    {
+        None => Err(WorkbenchToolError::new(format!(
+            "snapshot {snapshot_id} not found; snapshots are reaped after lease expiry"
+        ))),
+        Some(pin) => {
+            let now = unix_ms();
+            if now >= pin.lease_expires_unix_ms {
+                return Err(WorkbenchToolError::new(format!(
+                    "snapshot {snapshot_id} lease expired at {}; renew within the reap window or re-mint",
+                    pin.lease_expires_unix_ms
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1896,6 +2685,13 @@ fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
