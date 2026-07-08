@@ -5605,6 +5605,36 @@ fn renew_snapshot_restores_protection_for_an_expired_lease() {
 }
 
 #[test]
+fn renew_snapshot_is_extend_only_and_never_shortens_protection() {
+    let (service, _objects) = service_with_objects();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    let runs = service.resolve_directory_path("/runs").unwrap();
+    let pin = service.snapshot_subtree_with_lease(runs, 0).unwrap();
+
+    // Grant a long lease.
+    assert!(service.renew_snapshot(pin.snapshot_id, 3_600_000).unwrap());
+    let long = service.snapshot_pin(pin.snapshot_id).unwrap().unwrap();
+
+    // A shorter renew must NOT shorten the protection already granted: renew is
+    // extend-only (Iceberg / S3 Object Lock semantics). Shrinking protection is
+    // expressed by `retire`, never by a shorter renew silently dropping it.
+    assert!(service.renew_snapshot(pin.snapshot_id, 1_000).unwrap());
+    let after_short = service.snapshot_pin(pin.snapshot_id).unwrap().unwrap();
+    assert_eq!(
+        after_short.lease_expires_unix_ms, long.lease_expires_unix_ms,
+        "a shorter renew must never shorten protection"
+    );
+
+    // A longer renew still extends protection.
+    assert!(service.renew_snapshot(pin.snapshot_id, 7_200_000).unwrap());
+    let after_long = service.snapshot_pin(pin.snapshot_id).unwrap().unwrap();
+    assert!(
+        after_long.lease_expires_unix_ms > long.lease_expires_unix_ms,
+        "a longer renew extends protection"
+    );
+}
+
+#[test]
 fn gc_reaps_expired_snapshot_pins_but_keeps_live_ones() {
     let (service, _objects) = service_with_objects();
     service.create_dir_path("/a", 0o755, 1000, 1000).unwrap();
