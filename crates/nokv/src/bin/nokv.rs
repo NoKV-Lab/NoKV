@@ -3218,6 +3218,8 @@ mod tests {
                 "workbench_find",
                 "workbench_commit",
                 "workbench_snapshot",
+                "workbench_snapshot_renew",
+                "workbench_snapshot_list",
             ]
         );
         assert!(names.iter().all(|name| name.starts_with("workbench_")));
@@ -4934,6 +4936,373 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not committed"));
+    }
+
+    fn now_unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    const TEST_MS_PER_DAY: u64 = 86_400_000;
+
+    fn commit_snapshot_prelude(id: &str) -> Vec<serde_json::Value> {
+        vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id,
+                    "section": "outputs",
+                    "path": "result.txt",
+                    "text": "done\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_commit",
+                serde_json::json!({"id": id, "manifest": {"task": id}}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_names_and_leases_a_checkpoint() {
+        let id = "ckpt-name-001";
+        let now = now_unix_ms();
+        let mut requests = commit_snapshot_prelude(id);
+        requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": id, "name": "handoff", "ttl_days": 14}),
+        ));
+        requests.push(workbench_tool_call(
+            5,
+            "workbench_snapshot_list",
+            serde_json::json!({"id": id}),
+        ));
+        let responses = run_shared_workbench_mcp_requests(requests);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        let snap = &responses[3]["result"]["structuredContent"];
+        assert_eq!(snap["name"], "handoff", "snapshot: {snap}");
+        assert_eq!(snap["ttl_days"], 14);
+        assert_eq!(snap["registry"]["written"], true, "snapshot: {snap}");
+        assert!(snap["expiry_warning"].is_null(), "snapshot: {snap}");
+        let sid = snap["snapshot_id"].as_u64().unwrap();
+        assert!(sid > 0);
+        let lease = snap["lease_expires_at"].as_u64().unwrap();
+        assert_eq!(snap["lease_expires_unix_ms"].as_u64().unwrap(), lease);
+        assert!(
+            lease > now + 13 * TEST_MS_PER_DAY && lease < now + 15 * TEST_MS_PER_DAY,
+            "lease {lease} not ~14 days from {now}"
+        );
+        let list = &responses[4]["result"]["structuredContent"];
+        assert_eq!(list["checkpoint_count"], 1, "list: {list}");
+        assert_eq!(list["checkpoints"][0]["name"], "handoff");
+        assert_eq!(list["checkpoints"][0]["snapshot_id"].as_u64().unwrap(), sid);
+        assert_eq!(list["checkpoints"][0]["state"], "alive");
+        assert_eq!(list["checkpoints"][0]["reason"], "mint");
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_defaults_ttl_and_warns() {
+        let id = "ckpt-default-002";
+        let mut requests = commit_snapshot_prelude(id);
+        requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": id}),
+        ));
+        let responses = run_shared_workbench_mcp_requests(requests);
+        let snap = &responses[3]["result"]["structuredContent"];
+        assert_ne!(responses[3]["result"]["isError"], true, "snap: {snap}");
+        assert_eq!(snap["ttl_days"], 7);
+        assert!(snap["name"].is_null());
+        assert!(
+            snap["expiry_warning"]
+                .as_str()
+                .unwrap()
+                .contains("defaulted to 7 days"),
+            "snap: {snap}"
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_rejects_ttl_over_max() {
+        let id = "ckpt-ttlmax-003";
+        let mut requests = commit_snapshot_prelude(id);
+        requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": id, "ttl_days": 91}),
+        ));
+        let responses = run_shared_workbench_mcp_requests(requests);
+        assert_eq!(responses[3]["result"]["isError"], true);
+        assert!(responses[3]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds the maximum of 90 days"));
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_renew_extends_the_lease() {
+        let id = "ckpt-renew-004";
+        let mut requests = commit_snapshot_prelude(id);
+        requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": id, "name": "pre", "ttl_days": 1}),
+        ));
+        requests.push(workbench_tool_call(
+            5,
+            "workbench_snapshot_renew",
+            serde_json::json!({"id": id, "name": "pre", "ttl_days": 60}),
+        ));
+        let responses = run_shared_workbench_mcp_requests(requests);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        let mint = &responses[3]["result"]["structuredContent"];
+        let renew = &responses[4]["result"]["structuredContent"];
+        let lease_before = mint["lease_expires_at"].as_u64().unwrap();
+        let lease_after = renew["lease_expires_at"].as_u64().unwrap();
+        assert_eq!(renew["renewed"], true, "renew: {renew}");
+        assert_eq!(renew["name"], "pre", "renew: {renew}");
+        assert_eq!(renew["ttl_days"], 60);
+        assert!(
+            lease_after > lease_before,
+            "renew lease {lease_after} did not extend {lease_before}"
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_renew_reports_reaped_snapshot() {
+        let id = "ckpt-reaped-007";
+        let mut requests = commit_snapshot_prelude(id);
+        requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot_renew",
+            serde_json::json!({"id": id, "snapshot_id": 9_999_999}),
+        ));
+        let responses = run_shared_workbench_mcp_requests(requests);
+        assert_eq!(responses[3]["result"]["isError"], true);
+        assert!(responses[3]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("reaped after lease expiry"));
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_reads_frozen_content() {
+        let id = "ckpt-read-005";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt", "text": "alpha\nbeta\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_commit",
+                serde_json::json!({"id": id, "manifest": {"task": id}}),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_snapshot",
+                serde_json::json!({"id": id, "name": "cp1"}),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt",
+                    "text": "gamma\n", "replace": true
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt", "at_snapshot": "cp1"
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt", "format": "structured"
+                }),
+            ),
+            workbench_tool_call(
+                8,
+                "workbench_stat",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt", "at_snapshot": "cp1"
+                }),
+            ),
+            workbench_tool_call(
+                9,
+                "workbench_list",
+                serde_json::json!({"id": id, "section": "outputs", "at_snapshot": "cp1"}),
+            ),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        let sid = responses[3]["result"]["structuredContent"]["snapshot_id"]
+            .as_u64()
+            .unwrap();
+        let frozen = &responses[5]["result"]["structuredContent"];
+        assert_eq!(frozen["record_type"], "text_lines", "frozen: {frozen}");
+        assert_eq!(frozen["record_count"], 2);
+        assert_eq!(frozen["at_snapshot"].as_u64().unwrap(), sid);
+        assert_eq!(frozen["items"][0]["value"]["text"], "alpha");
+        assert_eq!(frozen["items"][1]["value"]["text"], "beta");
+        let current = &responses[6]["result"]["structuredContent"];
+        assert_eq!(current["items"][0]["value"]["text"], "gamma");
+        let card = &responses[7]["result"]["structuredContent"]["card"];
+        assert_eq!(card["size_bytes"], 11, "card: {card}");
+        assert_eq!(card["kind"], "file");
+        let listing = &responses[8]["result"]["structuredContent"];
+        let entry = listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "data.txt")
+            .unwrap_or_else(|| panic!("data.txt missing at snapshot: {listing}"));
+        assert_eq!(entry["size_bytes"], 11);
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_reads_by_numeric_id() {
+        let id = "ckpt-read-numeric-008";
+        let mint = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt", "text": "one\ntwo\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_commit",
+                serde_json::json!({"id": id, "manifest": {"task": id}}),
+            ),
+            workbench_tool_call(4, "workbench_snapshot", serde_json::json!({"id": id})),
+        ]);
+        let sid = mint[3]["result"]["structuredContent"]["snapshot_id"]
+            .as_u64()
+            .unwrap();
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                5,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt",
+                    "text": "changed\n", "replace": true
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt", "at_snapshot": sid
+                }),
+            ),
+        ]);
+        assert_ne!(
+            responses[1]["result"]["isError"], true,
+            "{:?}",
+            responses[1]
+        );
+        let frozen = &responses[1]["result"]["structuredContent"];
+        assert_eq!(frozen["record_count"], 2);
+        assert_eq!(frozen["items"][0]["value"]["text"], "one");
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_rejects_unknown_and_missing() {
+        let id = "ckpt-unknown-006";
+        let mut requests = vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt", "text": "x\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_commit",
+                serde_json::json!({"id": id, "manifest": {"task": id}}),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_snapshot",
+                serde_json::json!({"id": id, "name": "real"}),
+            ),
+        ];
+        requests.push(workbench_tool_call(
+            5,
+            "workbench_read",
+            serde_json::json!({
+                "id": id, "section": "outputs", "path": "data.txt", "at_snapshot": "ghost"
+            }),
+        ));
+        requests.push(workbench_tool_call(
+            6,
+            "workbench_read",
+            serde_json::json!({
+                "id": id, "section": "outputs", "path": "data.txt", "at_snapshot": 9_999_999
+            }),
+        ));
+        let responses = run_shared_workbench_mcp_requests(requests);
+        assert_eq!(responses[4]["result"]["isError"], true);
+        assert!(responses[4]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown checkpoint name"));
+        assert_eq!(responses[5]["result"]["isError"], true);
+        assert!(responses[5]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("reaped after lease expiry"));
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_list_empty_without_registry() {
+        let id = "ckpt-empty-009";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(2, "workbench_snapshot_list", serde_json::json!({"id": id})),
+        ]);
+        assert_ne!(
+            responses[1]["result"]["isError"], true,
+            "{:?}",
+            responses[1]
+        );
+        let list = &responses[1]["result"]["structuredContent"];
+        assert_eq!(list["checkpoint_count"], 0);
+        assert_eq!(list["checkpoints"].as_array().unwrap().len(), 0);
     }
 
     #[test]
