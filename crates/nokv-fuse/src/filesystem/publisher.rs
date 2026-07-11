@@ -479,6 +479,7 @@ fn reconstruct_pending<B: FuseBackend>(
         replace: record.replace,
         dentry_version: (record.dentry_version != 0).then_some(record.dentry_version),
         old_generation: (record.old_generation != 0).then_some(record.old_generation),
+        object_gc_claim_version: record.object_gc_claim_version,
     };
     let prepared = backend.prepared_from_record_fields(parent, name.clone(), inode, fields);
     let blocks = record
@@ -537,7 +538,10 @@ mod tests {
 
     use super::super::publish_journal::{CacheFileRef, PendingPublishRecord, PublishJournal};
     use super::super::write_session::{PendingBufferedRange, PendingBufferedUpload};
-    use super::{PendingPublish, PendingPublishTracker, PublisherWorker, WritebackPublisher};
+    use super::{
+        reconstruct_pending, PendingPublish, PendingPublishTracker, PublisherWorker,
+        WritebackPublisher,
+    };
 
     fn unsupported<T>() -> FuseBackendResult<T> {
         Err(FuseBackendError::Metadata(MetadError::Codec(
@@ -559,6 +563,7 @@ mod tests {
         generation: u64,
         replace: bool,
         dentry_version: Option<u64>,
+        object_gc_claim_version: u64,
     }
 
     #[derive(Default)]
@@ -615,6 +620,7 @@ mod tests {
                 replace: prepared.replace,
                 dentry_version: prepared.dentry_version,
                 old_generation: None,
+                object_gc_claim_version: prepared.object_gc_claim_version,
             }
         }
 
@@ -1009,6 +1015,7 @@ mod tests {
                 generation: fields.generation,
                 replace: fields.replace,
                 dentry_version: fields.dentry_version,
+                object_gc_claim_version: fields.object_gc_claim_version,
             }
         }
 
@@ -1076,6 +1083,7 @@ mod tests {
             replace: false,
             dentry_version: 0,
             old_generation: 0,
+            object_gc_claim_version: 2,
             size: 4096,
             mode: 0o644,
             uid: 0,
@@ -1097,6 +1105,7 @@ mod tests {
                 generation,
                 replace: false,
                 dentry_version: None,
+                object_gc_claim_version: 2,
             },
             parent: inode(1),
             name: name(b"file.bin"),
@@ -1109,6 +1118,17 @@ mod tests {
             gid: 0,
             uploads: vec![ready_upload(ino, generation)],
         }
+    }
+
+    #[test]
+    fn recovery_reconstructs_the_persisted_object_gc_claim() {
+        let backend = MockBackend::default();
+        let mut record = sample_record(5, 2);
+        record.object_gc_claim_version = 19;
+
+        let pending = reconstruct_pending(&backend, &record).unwrap();
+
+        assert_eq!(pending.prepared.object_gc_claim_version, 19);
     }
 
     fn wait_until<F: Fn() -> bool>(predicate: F) -> bool {

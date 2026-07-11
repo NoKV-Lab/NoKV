@@ -56,6 +56,9 @@ pub(crate) struct PreparedRecordFields {
     pub replace: bool,
     pub dentry_version: Option<u64>,
     pub old_generation: Option<u64>,
+    /// Durable object-GC claim captured before staging. Async publish journals
+    /// must persist the real claim so crash recovery never fabricates a token.
+    pub object_gc_claim_version: u64,
 }
 
 /// One writeback-cache block to re-stage during async-publish mount recovery,
@@ -810,6 +813,7 @@ where
             replace: prepared.replace,
             dentry_version: prepared.dentry_version,
             old_generation: prepared.old_generation,
+            object_gc_claim_version: prepared.object_gc_claim_version,
         }
     }
 
@@ -1359,6 +1363,7 @@ where
             dentry_version: fields.dentry_version,
             old_generation: fields.old_generation,
         })
+        .with_object_gc_claim_version(fields.object_gc_claim_version)
     }
 
     fn purge_cache_orphans(
@@ -1492,7 +1497,8 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
-        });
+        })
+        .with_object_gc_claim_version(2);
 
         let pending = backend
             .stage_prepared_artifact_shared_ranges_async(
@@ -1557,7 +1563,8 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
-        });
+        })
+        .with_object_gc_claim_version(2);
 
         let pending = backend
             .stage_prepared_artifact_shared_ranges_async(
@@ -1620,7 +1627,8 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
-        });
+        })
+        .with_object_gc_claim_version(2);
 
         let err = backend
             .stage_prepared_artifact_shared_ranges_async(

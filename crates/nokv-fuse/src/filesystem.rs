@@ -2557,6 +2557,7 @@ mod tests {
                 replace: false,
                 dentry_version: None,
                 old_generation: None,
+                object_gc_claim_version: 1,
             }
         }
 

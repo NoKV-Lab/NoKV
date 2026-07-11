@@ -11,6 +11,7 @@
 //! A crash mid-append leaves a truncated tail; `replay` stops at the first frame
 //! whose header or payload is incomplete, or whose sha256 does not match — so a
 //! torn or corrupt tail is silently dropped without losing earlier records.
+//! A complete record with an unsupported schema version instead fails closed.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -22,7 +23,11 @@ use sha2::{Digest, Sha256};
 
 const KIND_PUBLISH: u8 = 1;
 const KIND_TOMBSTONE: u8 = 2;
-const RECORD_VERSION: u8 = 1;
+// Version 2 adds the durable object-GC claim required to reconstruct a
+// prepared artifact after restart. Older records cannot be replayed safely
+// once metadata publish requires this claim, so replay rejects them instead of
+// silently treating them as a torn tail.
+const RECORD_VERSION: u8 = 2;
 const FRAME_HEADER_LEN: usize = 1 + 4 + 32;
 const TOMBSTONE_PAYLOAD_LEN: usize = 16;
 pub(crate) const JOURNAL_FILE_NAME: &str = "publish.journal";
@@ -56,6 +61,7 @@ pub(crate) struct PendingPublishRecord {
     pub replace: bool,
     pub dentry_version: u64,
     pub old_generation: u64,
+    pub object_gc_claim_version: u64,
     pub size: u64,
     pub mode: u32,
     pub uid: u32,
@@ -87,6 +93,12 @@ impl PublishJournal {
     /// Append + fsync a pending-publish record. This is the durability anchor:
     /// the caller may ack the write only after this returns.
     pub fn append_publish(&self, record: &PendingPublishRecord) -> io::Result<()> {
+        if record.object_gc_claim_version == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "publish journal record has no object GC claim version",
+            ));
+        }
         self.append_frame(KIND_PUBLISH, &encode_record(record))
     }
 
@@ -115,11 +127,26 @@ impl PublishJournal {
         while let Some((kind, payload)) = reader.next_frame() {
             match kind {
                 KIND_PUBLISH => {
-                    if let Some(record) = decode_record(payload) {
-                        records.push(record);
-                    } else {
-                        break; // unparsable record => treat the rest as torn
+                    if let Some(version) = payload.first().copied() {
+                        if version != RECORD_VERSION {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "unsupported publish journal record version {version}; expected {RECORD_VERSION}"
+                                ),
+                            ));
+                        }
                     }
+                    let Some(record) = decode_record(payload) else {
+                        break; // unparsable record => treat the rest as torn
+                    };
+                    if record.object_gc_claim_version == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "publish journal record has no object GC claim version",
+                        ));
+                    }
+                    records.push(record);
                 }
                 KIND_TOMBSTONE => {
                     if payload.len() != TOMBSTONE_PAYLOAD_LEN {
@@ -225,6 +252,7 @@ fn encode_record(record: &PendingPublishRecord) -> Vec<u8> {
     out.push(u8::from(record.replace));
     put_u64(&mut out, record.dentry_version);
     put_u64(&mut out, record.old_generation);
+    put_u64(&mut out, record.object_gc_claim_version);
     put_u64(&mut out, record.size);
     put_u32(&mut out, record.mode);
     put_u32(&mut out, record.uid);
@@ -255,6 +283,7 @@ fn decode_record(payload: &[u8]) -> Option<PendingPublishRecord> {
     let replace = r.u8()? != 0;
     let dentry_version = r.u64()?;
     let old_generation = r.u64()?;
+    let object_gc_claim_version = r.u64()?;
     let size = r.u64()?;
     let mode = r.u32()?;
     let uid = r.u32()?;
@@ -286,6 +315,7 @@ fn decode_record(payload: &[u8]) -> Option<PendingPublishRecord> {
         replace,
         dentry_version,
         old_generation,
+        object_gc_claim_version,
         size,
         mode,
         uid,
@@ -387,6 +417,7 @@ mod tests {
             replace: generation > 1,
             dentry_version: 7,
             old_generation: generation.saturating_sub(1),
+            object_gc_claim_version: 17,
             size: 4096,
             mode: 0o644,
             uid: 1000,
@@ -406,6 +437,52 @@ mod tests {
         let record = sample_record(42, 10);
         let decoded = decode_record(&encode_record(&record)).unwrap();
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn replay_fails_closed_for_legacy_record_without_object_gc_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = PublishJournal::open(dir.path()).unwrap();
+        let mut payload = encode_record(&sample_record(42, 10));
+        payload[0] = 1;
+        journal.append_frame(KIND_PUBLISH, &payload).unwrap();
+
+        let error = journal.replay().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("unsupported publish journal record version 1"));
+    }
+
+    #[test]
+    fn append_rejects_zero_object_gc_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = PublishJournal::open(dir.path()).unwrap();
+        let mut record = sample_record(42, 10);
+        record.object_gc_claim_version = 0;
+
+        let error = journal.append_publish(&record).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error
+            .to_string()
+            .contains("publish journal record has no object GC claim version"));
+    }
+
+    #[test]
+    fn replay_rejects_zero_object_gc_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = PublishJournal::open(dir.path()).unwrap();
+        let mut record = sample_record(42, 10);
+        record.object_gc_claim_version = 0;
+        journal
+            .append_frame(KIND_PUBLISH, &encode_record(&record))
+            .unwrap();
+
+        let error = journal.replay().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("publish journal record has no object GC claim version"));
     }
 
     #[test]

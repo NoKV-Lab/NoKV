@@ -1439,6 +1439,7 @@ where
             replace: fields.replace,
             dentry_version: fields.dentry_version.unwrap_or(0),
             old_generation: fields.old_generation.unwrap_or(0),
+            object_gc_claim_version: fields.object_gc_claim_version,
             size: staged.size,
             mode: staged.mode,
             uid: staged.uid,
