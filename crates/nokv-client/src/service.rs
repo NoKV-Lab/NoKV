@@ -56,13 +56,6 @@ use crate::wire::*;
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BATCH_RPC_REQUESTS: usize = 128;
 
-fn snapshot_inode_api_disabled() -> ClientError {
-    ClientError::Protocol(
-        "inode-addressed snapshot reads are disabled; use a root-bound snapshot path API"
-            .to_owned(),
-    )
-}
-
 /// Bound for re-resolve+retry in fleet mode: enough attempts to ride out a
 /// single owner handoff (old owner -> control update -> new owner) without
 /// retrying forever against a permanently-missing shard.
@@ -313,17 +306,7 @@ impl MetadataClient {
         }
     }
 
-    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
-    /// The root-bound adapter removes this inode-addressed API.
     pub fn get_attr_at_snapshot(
-        &self,
-        _snapshot_id: u64,
-        _inode: InodeId,
-    ) -> Result<Option<InodeAttr>, ClientError> {
-        Err(snapshot_inode_api_disabled())
-    }
-
-    pub fn get_attr_at_snapshot_rooted(
         &self,
         root_path: &str,
         snapshot_id: u64,
@@ -371,18 +354,7 @@ impl MetadataClient {
         }
     }
 
-    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
-    /// The root-bound adapter removes this inode-addressed API.
     pub fn lookup_plus_at_snapshot(
-        &self,
-        _snapshot_id: u64,
-        _parent: InodeId,
-        _name: DentryName,
-    ) -> Result<Option<DentryWithAttr>, ClientError> {
-        Err(snapshot_inode_api_disabled())
-    }
-
-    pub fn lookup_plus_at_snapshot_rooted(
         &self,
         root_path: &str,
         snapshot_id: u64,
@@ -431,17 +403,7 @@ impl MetadataClient {
         }
     }
 
-    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
-    /// The root-bound adapter removes this inode-addressed API.
     pub fn read_dir_plus_at_snapshot(
-        &self,
-        _snapshot_id: u64,
-        _inode: InodeId,
-    ) -> Result<Vec<DentryWithAttr>, ClientError> {
-        Err(snapshot_inode_api_disabled())
-    }
-
-    pub fn read_dir_plus_at_snapshot_rooted(
         &self,
         root_path: &str,
         snapshot_id: u64,
@@ -1906,19 +1868,7 @@ impl MetadataClient {
         }
     }
 
-    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
-    /// The root-bound adapter removes this inode-addressed API.
     pub fn read_file_at_snapshot(
-        &self,
-        _snapshot_id: u64,
-        _inode: InodeId,
-        _offset: u64,
-        _len: usize,
-    ) -> Result<Vec<u8>, ClientError> {
-        Err(snapshot_inode_api_disabled())
-    }
-
-    pub fn read_file_at_snapshot_rooted(
         &self,
         root_path: &str,
         snapshot_id: u64,
@@ -1947,17 +1897,7 @@ impl MetadataClient {
         }
     }
 
-    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
-    /// The root-bound adapter removes this inode-addressed API.
     pub fn read_symlink_at_snapshot(
-        &self,
-        _snapshot_id: u64,
-        _inode: InodeId,
-    ) -> Result<Vec<u8>, ClientError> {
-        Err(snapshot_inode_api_disabled())
-    }
-
-    pub fn read_symlink_at_snapshot_rooted(
         &self,
         root_path: &str,
         snapshot_id: u64,

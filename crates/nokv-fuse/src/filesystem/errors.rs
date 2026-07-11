@@ -60,6 +60,12 @@ fn metadata_errno(err: &MetadError) -> Errno {
         // is a live mount point), not EXDEV — there is no copy+unlink fallback
         // that would correctly tear down the graft.
         MetadError::GraftPoint => Errno::EBUSY,
+        MetadError::SnapshotLeaseExpired { .. } | MetadError::SnapshotRootMismatch { .. } => {
+            Errno::ESTALE
+        }
+        MetadError::SnapshotBindingChanged { .. } | MetadError::SnapshotRenewContended { .. } => {
+            Errno::EAGAIN
+        }
         MetadError::LockConflict(_) => Errno::EAGAIN,
         // See the note above: surface the underlying metadata/object/allocator
         // failure before it collapses into an opaque `EIO`.
@@ -76,8 +82,9 @@ fn metadata_errno(err: &MetadError) -> Errno {
             eprintln!("nokv-fuse: metadata operation failed -> EIO: {err:?}");
             Errno::EIO
         }
-        // Cross-crate metadata errors fail closed until their feature-specific
-        // FUSE adapter defines an intentional POSIX mapping.
+        // MetadError is intentionally non-exhaustive across crate boundaries.
+        // Feature-specific errors stay fail-closed until their own FUSE change
+        // defines the correct POSIX mapping.
         _ => {
             eprintln!("nokv-fuse: unsupported metadata error -> EIO: {err:?}");
             Errno::EIO

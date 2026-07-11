@@ -731,7 +731,7 @@ mod tests {
         fn get_attr_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _inode: InodeId,
+            _path_components: &[DentryName],
         ) -> FuseBackendResult<Option<InodeAttr>> {
             unsupported()
         }
@@ -745,7 +745,7 @@ mod tests {
         fn lookup_plus_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _parent: InodeId,
+            _parent_components: &[DentryName],
             _name: &DentryName,
         ) -> FuseBackendResult<Option<DentryWithAttr>> {
             unsupported()
@@ -761,7 +761,7 @@ mod tests {
         fn read_dir_plus_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _inode: InodeId,
+            _path_components: &[DentryName],
         ) -> FuseBackendResult<Vec<DentryWithAttr>> {
             unsupported()
         }
@@ -812,7 +812,7 @@ mod tests {
         fn read_file_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _inode: InodeId,
+            _path_components: &[DentryName],
             _offset: u64,
             _len: usize,
         ) -> FuseBackendResult<Vec<u8>> {
@@ -824,7 +824,7 @@ mod tests {
         fn read_symlink_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _inode: InodeId,
+            _path_components: &[DentryName],
         ) -> FuseBackendResult<Vec<u8>> {
             unsupported()
         }

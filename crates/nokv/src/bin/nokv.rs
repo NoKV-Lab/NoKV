@@ -511,6 +511,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
                         snapshot_id,
                         root: snapshot.root,
                     },
+                    snapshot_root_path: Some(root_path),
                     ..options.fuse_options(nokv_fuse::FuseAccessMode::ReadOnly)
                 },
             )

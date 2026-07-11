@@ -2,7 +2,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nokv_client::{ClientError, ClientPreparedArtifact, MetadataClient};
+use nokv_client::{
+    ClientError, ClientPreparedArtifact, ClientPreparedArtifactRecovery, MetadataClient,
+};
 use nokv_meta::{
     DentryWithAttr, MetadError, PublishArtifactStagedSession, ReadDirPlusPage, RenameReplaceResult,
     UpdateAttr, XattrSetMode,
@@ -94,7 +96,7 @@ pub(crate) trait FuseBackend: Send + Sync + 'static {
     fn get_attr_at_snapshot(
         &self,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
     ) -> FuseBackendResult<Option<InodeAttr>>;
     fn lookup_plus(
         &self,
@@ -113,7 +115,7 @@ pub(crate) trait FuseBackend: Send + Sync + 'static {
     fn lookup_plus_at_snapshot(
         &self,
         snapshot_id: u64,
-        parent: InodeId,
+        parent_components: &[DentryName],
         name: &DentryName,
     ) -> FuseBackendResult<Option<DentryWithAttr>>;
     fn read_dir_plus_page(
@@ -125,7 +127,7 @@ pub(crate) trait FuseBackend: Send + Sync + 'static {
     fn read_dir_plus_at_snapshot(
         &self,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
     ) -> FuseBackendResult<Vec<DentryWithAttr>>;
     fn rename(
         &self,
@@ -159,7 +161,7 @@ pub(crate) trait FuseBackend: Send + Sync + 'static {
     fn read_file_at_snapshot(
         &self,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
         offset: u64,
         len: usize,
     ) -> FuseBackendResult<Vec<u8>>;
@@ -167,7 +169,7 @@ pub(crate) trait FuseBackend: Send + Sync + 'static {
     fn read_symlink_at_snapshot(
         &self,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
     ) -> FuseBackendResult<Vec<u8>>;
     fn update_root_attrs(&self, changes: UpdateAttr) -> FuseBackendResult<InodeAttr>;
     fn update_attrs(
@@ -312,6 +314,7 @@ pub(crate) trait FuseBackend: Send + Sync + 'static {
 pub(crate) struct ClientFuseBackend<O> {
     metadata: MetadataClient,
     objects: Arc<O>,
+    snapshot_root_path: Option<String>,
     /// User-configured re-read block cache (`None` with `--no-block-cache`). Kept
     /// distinct from `read_cache` so cache-hit stats reflect the configured cache,
     /// not the read-ahead staging buffer.
@@ -407,6 +410,20 @@ where
         objects: O,
         options: &FuseOptions,
     ) -> FuseBackendResult<Self> {
+        let snapshot_root_path = match options.view {
+            crate::filesystem::FuseView::Live => None,
+            crate::filesystem::FuseView::Snapshot { .. } => {
+                let path = options.snapshot_root_path.as_ref().ok_or_else(|| {
+                    FuseBackendError::Metadata(MetadError::InvalidPath(
+                        "snapshot FUSE view requires an absolute snapshot_root_path".to_owned(),
+                    ))
+                })?;
+                nokv_types::parse_absolute_path(path).map_err(|err| {
+                    FuseBackendError::Metadata(MetadError::InvalidPath(err.to_string()))
+                })?;
+                Some(path.clone())
+            }
+        };
         let objects = Arc::new(objects);
         let block_cache = options.block_cache.clone().open()?;
         // The prefetcher stages read-ahead blocks into a cache that foreground
@@ -465,6 +482,7 @@ where
         Ok(Self {
             metadata,
             objects,
+            snapshot_root_path,
             block_cache,
             read_cache,
             read_plan_cache: ReadPlanCacheShards::new(
@@ -487,6 +505,14 @@ where
             writeback_cache,
             writeback_uploader,
             upload_workers: writeback.upload_workers_per_request.max(1),
+        })
+    }
+
+    fn snapshot_root_path(&self) -> FuseBackendResult<&str> {
+        self.snapshot_root_path.as_deref().ok_or_else(|| {
+            FuseBackendError::Metadata(MetadError::InvalidPath(
+                "snapshot operation requires a bound snapshot root path".to_owned(),
+            ))
         })
     }
 
@@ -815,10 +841,10 @@ where
     fn get_attr_at_snapshot(
         &self,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
     ) -> FuseBackendResult<Option<InodeAttr>> {
         self.metadata
-            .get_attr_at_snapshot(snapshot_id, inode)
+            .get_attr_at_snapshot(self.snapshot_root_path()?, snapshot_id, path_components)
             .map_err(Into::into)
     }
 
@@ -845,11 +871,16 @@ where
     fn lookup_plus_at_snapshot(
         &self,
         snapshot_id: u64,
-        parent: InodeId,
+        parent_components: &[DentryName],
         name: &DentryName,
     ) -> FuseBackendResult<Option<DentryWithAttr>> {
         self.metadata
-            .lookup_plus_at_snapshot(snapshot_id, parent, name.clone())
+            .lookup_plus_at_snapshot(
+                self.snapshot_root_path()?,
+                snapshot_id,
+                parent_components,
+                name.clone(),
+            )
             .map_err(Into::into)
     }
 
@@ -872,10 +903,10 @@ where
     fn read_dir_plus_at_snapshot(
         &self,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
     ) -> FuseBackendResult<Vec<DentryWithAttr>> {
         self.metadata
-            .read_dir_plus_at_snapshot(snapshot_id, inode)
+            .read_dir_plus_at_snapshot(self.snapshot_root_path()?, snapshot_id, path_components)
             .map_err(Into::into)
     }
 
@@ -971,12 +1002,18 @@ where
     fn read_file_at_snapshot(
         &self,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
         offset: u64,
         len: usize,
     ) -> FuseBackendResult<Vec<u8>> {
         self.metadata
-            .read_file_at_snapshot(snapshot_id, inode, offset, len)
+            .read_file_at_snapshot(
+                self.snapshot_root_path()?,
+                snapshot_id,
+                path_components,
+                offset,
+                len,
+            )
             .map_err(Into::into)
     }
 
@@ -987,10 +1024,10 @@ where
     fn read_symlink_at_snapshot(
         &self,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
     ) -> FuseBackendResult<Vec<u8>> {
         self.metadata
-            .read_symlink_at_snapshot(snapshot_id, inode)
+            .read_symlink_at_snapshot(self.snapshot_root_path()?, snapshot_id, path_components)
             .map_err(Into::into)
     }
 
@@ -1309,7 +1346,7 @@ where
         inode: InodeId,
         fields: PreparedRecordFields,
     ) -> Self::Prepared {
-        ClientPreparedArtifact {
+        ClientPreparedArtifact::from_recovery(ClientPreparedArtifactRecovery {
             mount: fields.mount,
             parent,
             name,
@@ -1321,7 +1358,7 @@ where
             replace: fields.replace,
             dentry_version: fields.dentry_version,
             old_generation: fields.old_generation,
-        }
+        })
     }
 
     fn purge_cache_orphans(
@@ -1443,7 +1480,7 @@ mod tests {
             },
         )
         .unwrap();
-        let prepared = ClientPreparedArtifact {
+        let prepared = ClientPreparedArtifact::from_recovery(ClientPreparedArtifactRecovery {
             mount: 1,
             parent: InodeId::new(1).unwrap(),
             name: DentryName::new("checkpoint.bin").unwrap(),
@@ -1455,7 +1492,7 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
-        };
+        });
 
         let pending = backend
             .stage_prepared_artifact_shared_ranges_async(
@@ -1508,7 +1545,7 @@ mod tests {
             },
         )
         .unwrap();
-        let prepared = ClientPreparedArtifact {
+        let prepared = ClientPreparedArtifact::from_recovery(ClientPreparedArtifactRecovery {
             mount: 1,
             parent: InodeId::new(1).unwrap(),
             name: DentryName::new("checkpoint.bin").unwrap(),
@@ -1520,7 +1557,7 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
-        };
+        });
 
         let pending = backend
             .stage_prepared_artifact_shared_ranges_async(
@@ -1571,7 +1608,7 @@ mod tests {
             },
         )
         .unwrap();
-        let prepared = ClientPreparedArtifact {
+        let prepared = ClientPreparedArtifact::from_recovery(ClientPreparedArtifactRecovery {
             mount: 1,
             parent: InodeId::new(1).unwrap(),
             name: DentryName::new("checkpoint.bin").unwrap(),
@@ -1583,7 +1620,7 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
-        };
+        });
 
         let err = backend
             .stage_prepared_artifact_shared_ranges_async(

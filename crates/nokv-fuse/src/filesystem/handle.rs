@@ -9,7 +9,7 @@ use fuser::{
     ReplyDirectory, ReplyDirectoryPlus,
 };
 use nokv_meta::{
-    DentryWithAttr, PublishArtifactStagedSession, ReadDirPlusPage, RenameReplaceResult,
+    DentryWithAttr, MetadError, PublishArtifactStagedSession, ReadDirPlusPage, RenameReplaceResult,
 };
 use nokv_object::{
     chunk_manifests_from_stored_chunks, manifest_digest_uri, DirtyChunkExtent, FileReadPipeline,
@@ -175,6 +175,49 @@ where
         }
     }
 
+    pub(super) fn snapshot_path_components(
+        &self,
+        inode: InodeId,
+    ) -> Result<Vec<DentryName>, FuseBackendError> {
+        let root = self.options.view.root();
+        if inode == root {
+            return Ok(Vec::new());
+        }
+        let parents = self.parents.read().map_err(|err| {
+            FuseBackendError::Metadata(MetadError::Codec(format!(
+                "snapshot parent cache lock poisoned: {err}"
+            )))
+        })?;
+        let names = self.names.read().map_err(|err| {
+            FuseBackendError::Metadata(MetadError::Codec(format!(
+                "snapshot name cache lock poisoned: {err}"
+            )))
+        })?;
+        let mut current = inode.get();
+        let mut reversed = Vec::new();
+        let mut seen = HashSet::new();
+        while current != root.get() {
+            if !seen.insert(current) {
+                return Err(FuseBackendError::Metadata(MetadError::Codec(
+                    "snapshot inode path cache contains a parent cycle".to_owned(),
+                )));
+            }
+            let parent = parents
+                .get(&current)
+                .copied()
+                .ok_or(FuseBackendError::Metadata(MetadError::NotFound))?;
+            let name = names
+                .get(&current)
+                .ok_or(FuseBackendError::Metadata(MetadError::NotFound))?;
+            reversed.push(DentryName::new(name.clone()).map_err(|err| {
+                FuseBackendError::Metadata(MetadError::InvalidPath(err.to_string()))
+            })?);
+            current = parent;
+        }
+        reversed.reverse();
+        Ok(reversed)
+    }
+
     pub(super) fn statfs_snapshot(&self) -> FuseStatfs {
         let blocks = STATFS_TOTAL_BYTES / u64::from(STATFS_BLOCK_SIZE);
         FuseStatfs {
@@ -314,7 +357,8 @@ where
         match self.options.view {
             FuseView::Live => self.backend.get_attr(inode),
             FuseView::Snapshot { snapshot_id, .. } => {
-                self.backend.get_attr_at_snapshot(snapshot_id, inode)
+                let components = self.snapshot_path_components(inode)?;
+                self.backend.get_attr_at_snapshot(snapshot_id, &components)
             }
         }
     }
@@ -343,8 +387,9 @@ where
         match self.options.view {
             FuseView::Live => self.backend.lookup_plus(parent, name),
             FuseView::Snapshot { snapshot_id, .. } => {
+                let parent_components = self.snapshot_path_components(parent)?;
                 self.backend
-                    .lookup_plus_at_snapshot(snapshot_id, parent, name)
+                    .lookup_plus_at_snapshot(snapshot_id, &parent_components, name)
             }
         }
     }
@@ -359,7 +404,10 @@ where
             FuseView::Live => self.backend.read_dir_plus_page(inode, after, limit),
             FuseView::Snapshot { snapshot_id, .. } => {
                 let requested = limit.max(1);
-                let rows = self.backend.read_dir_plus_at_snapshot(snapshot_id, inode)?;
+                let components = self.snapshot_path_components(inode)?;
+                let rows = self
+                    .backend
+                    .read_dir_plus_at_snapshot(snapshot_id, &components)?;
                 let mut entries = rows
                     .into_iter()
                     .filter(|entry| {
@@ -411,8 +459,9 @@ where
         match self.options.view {
             FuseView::Live => self.backend.read_file(inode, offset, len),
             FuseView::Snapshot { snapshot_id, .. } => {
+                let components = self.snapshot_path_components(inode)?;
                 self.backend
-                    .read_file_at_snapshot(snapshot_id, inode, offset, len)
+                    .read_file_at_snapshot(snapshot_id, &components, offset, len)
             }
         }
     }
@@ -430,8 +479,9 @@ where
                 .backend
                 .read_file_with_known_attr_pipeline(attr, offset, len, pipeline, read_plans),
             FuseView::Snapshot { snapshot_id, .. } => {
+                let components = self.snapshot_path_components(attr.inode)?;
                 self.backend
-                    .read_file_at_snapshot(snapshot_id, attr.inode, offset, len)
+                    .read_file_at_snapshot(snapshot_id, &components, offset, len)
             }
         }
     }
@@ -445,8 +495,9 @@ where
         match self.options.view {
             FuseView::Live => self.backend.read_file_with_known_attr(attr, offset, len),
             FuseView::Snapshot { snapshot_id, .. } => {
+                let components = self.snapshot_path_components(attr.inode)?;
                 self.backend
-                    .read_file_at_snapshot(snapshot_id, attr.inode, offset, len)
+                    .read_file_at_snapshot(snapshot_id, &components, offset, len)
             }
         }
     }
@@ -455,7 +506,9 @@ where
         match self.options.view {
             FuseView::Live => self.backend.read_symlink(inode),
             FuseView::Snapshot { snapshot_id, .. } => {
-                self.backend.read_symlink_at_snapshot(snapshot_id, inode)
+                let components = self.snapshot_path_components(inode)?;
+                self.backend
+                    .read_symlink_at_snapshot(snapshot_id, &components)
             }
         }
     }

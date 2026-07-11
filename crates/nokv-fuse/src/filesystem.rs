@@ -1647,6 +1647,38 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_inode_cache_reconstructs_only_root_relative_components() {
+        let root = InodeId::new(42).unwrap();
+        let options = FuseOptions {
+            view: FuseView::Snapshot {
+                snapshot_id: 7,
+                root,
+            },
+            snapshot_root_path: Some("/workbenches/source".to_owned()),
+            ..FuseOptions::default()
+        };
+        let fuse = NoKvFuse::from_backend(UnsupportedTestBackend::default(), options);
+        let directory = InodeId::new(43).unwrap();
+        let file = InodeId::new(44).unwrap();
+        fuse.remember_parent(directory, root);
+        fuse.remember_name(directory, &DentryName::new("nested").unwrap());
+        fuse.remember_parent(file, directory);
+        fuse.remember_name(file, &DentryName::new("checkpoint.bin").unwrap());
+
+        let components = fuse.snapshot_path_components(file).unwrap();
+        assert_eq!(
+            components
+                .iter()
+                .map(|component| component.as_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"nested".as_slice(), b"checkpoint.bin".as_slice()]
+        );
+        assert!(fuse
+            .snapshot_path_components(InodeId::new(99).unwrap())
+            .is_err());
+    }
+
+    #[test]
     fn statfs_snapshot_reports_nonzero_capacity_and_name_limit() {
         let fuse =
             NoKvFuse::from_backend(UnsupportedTestBackend::default(), FuseOptions::default());
@@ -2554,7 +2586,7 @@ mod tests {
         fn get_attr_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _inode: InodeId,
+            _path_components: &[DentryName],
         ) -> FuseBackendResult<Option<InodeAttr>> {
             unsupported()
         }
@@ -2578,7 +2610,7 @@ mod tests {
         fn lookup_plus_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _parent: InodeId,
+            _parent_components: &[DentryName],
             _name: &DentryName,
         ) -> FuseBackendResult<Option<DentryWithAttr>> {
             unsupported()
@@ -2596,7 +2628,7 @@ mod tests {
         fn read_dir_plus_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _inode: InodeId,
+            _path_components: &[DentryName],
         ) -> FuseBackendResult<Vec<DentryWithAttr>> {
             unsupported()
         }
@@ -2691,7 +2723,7 @@ mod tests {
         fn read_file_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _inode: InodeId,
+            _path_components: &[DentryName],
             _offset: u64,
             _len: usize,
         ) -> FuseBackendResult<Vec<u8>> {
@@ -2705,7 +2737,7 @@ mod tests {
         fn read_symlink_at_snapshot(
             &self,
             _snapshot_id: u64,
-            _inode: InodeId,
+            _path_components: &[DentryName],
         ) -> FuseBackendResult<Vec<u8>> {
             unsupported()
         }

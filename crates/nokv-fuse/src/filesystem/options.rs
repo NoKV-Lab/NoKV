@@ -34,6 +34,10 @@ pub struct FuseOptions {
     pub read_pipeline: FileReadPipelineOptions,
     pub writeback: FuseWritebackOptions,
     pub view: FuseView,
+    /// Absolute live namespace path that owns `view` when mounting a snapshot.
+    /// Required for `FuseView::Snapshot`; snapshot RPCs route and bind through
+    /// this path while all targets remain snapshot-root-relative.
+    pub snapshot_root_path: Option<String>,
     pub access: FuseAccessMode,
     pub invalidation: FuseInvalidationOptions,
     pub stats_bind: Option<SocketAddr>,
@@ -183,6 +187,7 @@ impl Default for FuseOptions {
             read_pipeline: FileReadPipelineOptions::default(),
             writeback: FuseWritebackOptions::default(),
             view: FuseView::Live,
+            snapshot_root_path: None,
             access: FuseAccessMode::ReadWrite,
             invalidation: FuseInvalidationOptions::default(),
             stats_bind: None,
