@@ -17,12 +17,15 @@ pub(crate) use transport::{
     read_frame, write_frame, MAX_FRAMED_RPC_WORKERS, MIN_FRAMED_RPC_WORKERS,
 };
 
-use nokv_meta::{MetadError, OpenPathReadPlanRequest, PublishArtifactStagedSession};
+use nokv_meta::{
+    MetadError, OpenPathReadPlanRequest, PublishArtifactStagedSession, RestoreInitialization,
+    RestoreInitializationFile,
+};
 use nokv_protocol::{
     decode_advisory_lock_kind, decode_file_type, decode_name_cursor, decode_request,
     decode_xattr_name, encode_envelope, encode_name_cursor, encode_xattr_name, MetadataRpcEnvelope,
     MetadataRpcRequest, MetadataRpcResult, WireAdvisoryLock, WireMetadataError,
-    WireOpenPathReadPlanRequest, WirePathMetadata,
+    WireOpenPathReadPlanRequest, WirePathMetadata, WireRestoreOutcome,
 };
 use nokv_types::{AdvisoryLockRequest, SpecialNodeSpec};
 
@@ -693,6 +696,44 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
                 snapshot_id: handle.snapshot_id,
             })
         }
+        MetadataRpcRequest::RestoreSubtreePathToFork {
+            source_path,
+            snapshot_id,
+            destination_path,
+            initialization,
+        } => {
+            let outcome = slot.service().restore_subtree_path_to_fork_initialized(
+                &source_path,
+                snapshot_id,
+                &destination_path,
+                RestoreInitialization {
+                    remove_relative_paths: initialization.remove_relative_paths,
+                    files: initialization
+                        .files
+                        .into_iter()
+                        .map(|file| RestoreInitializationFile {
+                            relative_path: file.relative_path,
+                            bytes: file.bytes,
+                            content_type: file.content_type,
+                            mode: file.mode,
+                            uid: file.uid,
+                            gid: file.gid,
+                        })
+                        .collect(),
+                },
+            )?;
+            Ok(MetadataRpcResult::Restore {
+                outcome: WireRestoreOutcome {
+                    operation_id: outcome.operation_id,
+                    state: "complete".to_owned(),
+                    source_root: outcome.source_root.get(),
+                    destination_root: outcome.destination_root.get(),
+                    snapshot_id: outcome.snapshot_id,
+                    read_version: outcome.read_version,
+                    cleanup_pending: outcome.cleanup_pending,
+                },
+            })
+        }
         MetadataRpcRequest::DiffSubtrees { a_path, b_path } => {
             let deltas = slot.service().diff_subtrees_path(&a_path, &b_path)?;
             Ok(MetadataRpcResult::SubtreeDeltas {
@@ -931,6 +972,19 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
                 prepared: wire_prepared_artifact(slot.service().mount_id(), &prepared),
             })
         }
+        MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared } => {
+            if prepared.mount != slot.service().mount_id().get() {
+                return Err(ServerError::Metadata(MetadError::Codec(
+                    "prepared artifact mount does not match server mount".to_owned(),
+                )));
+            }
+            let prepared = slot
+                .service()
+                .refresh_prepared_artifact_object_gc_epoch(prepared_artifact(prepared)?)?;
+            Ok(MetadataRpcResult::PreparedArtifact {
+                prepared: wire_prepared_artifact(slot.service().mount_id(), &prepared),
+            })
+        }
         MetadataRpcRequest::PublishPreparedArtifact {
             prepared,
             body,
@@ -1102,11 +1156,13 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::RenameReplacePath { .. }
         | MetadataRpcRequest::SnapshotSubtreePath { .. }
         | MetadataRpcRequest::CloneSubtreePath { .. }
+        | MetadataRpcRequest::RestoreSubtreePathToFork { .. }
         | MetadataRpcRequest::RollbackSubtreePath { .. }
         | MetadataRpcRequest::RetireSnapshot { .. }
         | MetadataRpcRequest::RenewSnapshot { .. }
         | MetadataRpcRequest::PrepareArtifact { .. }
         | MetadataRpcRequest::PrepareArtifactPath { .. }
+        | MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { .. }
         | MetadataRpcRequest::PublishPreparedArtifact { .. }
         | MetadataRpcRequest::PublishPreparedArtifactStagedSession { .. } => false,
     }

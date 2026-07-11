@@ -18,7 +18,7 @@ use nokv_meta::{
     NamespaceReadItem, NamespaceReadOptions, NamespaceReadPage, NamespaceRecordCount,
     NamespaceRecordType, NamespaceSchema, NamespaceSort, NamespaceSortDirection,
     NamespaceSortField, PublishArtifactStagedSession, RecordCountProvenance, RenameReplaceResult,
-    SnapshotRenewOutcome, SubtreeDelta, UpdateAttr, XattrSetMode,
+    RestoreInitialization, SnapshotRenewOutcome, SubtreeDelta, UpdateAttr, XattrSetMode,
 };
 use nokv_object::ObjectReadPlan;
 use nokv_protocol::{
@@ -38,7 +38,7 @@ use nokv_protocol::{
     WireNamespaceReadOptions, WireNamespaceReadPage, WireNamespaceRecordCount,
     WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort, WireNamespaceSortDirection,
     WireNamespaceSortField, WireOpenPathReadPlanRequest, WireRecordCountProvenance,
-    WireSnapshotRenewOutcome,
+    WireRestoreInitialization, WireRestoreInitializationFile, WireSnapshotRenewOutcome,
 };
 use nokv_types::{
     AdvisoryLock, AdvisoryLockRequest, BodyDescriptor, ChunkManifest, DentryName, FileType,
@@ -110,12 +110,13 @@ pub struct ClientPreparedArtifact {
     pub replace: bool,
     pub dentry_version: Option<u64>,
     pub old_generation: Option<u64>,
+    pub object_gc_claim_version: u64,
 }
 
 /// Stable reconstruction fields persisted by clients that journal a prepared
-/// artifact outside `nokv-client`. Future publish-fencing fields belong on
-/// [`ClientPreparedArtifact`] so external journals can adopt them explicitly
-/// without breaking compilation in the protocol change that introduces them.
+/// artifact outside `nokv-client`. New publish-fencing fields belong on
+/// [`ClientPreparedArtifact`] and default to a fail-closed value here until the
+/// external journal explicitly adopts them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientPreparedArtifactRecovery {
     pub mount: u64,
@@ -145,7 +146,13 @@ impl ClientPreparedArtifact {
             replace: recovery.replace,
             dentry_version: recovery.dentry_version,
             old_generation: recovery.old_generation,
+            object_gc_claim_version: 0,
         }
+    }
+
+    pub fn with_object_gc_claim_version(mut self, object_gc_claim_version: u64) -> Self {
+        self.object_gc_claim_version = object_gc_claim_version;
+        self
     }
 }
 
@@ -193,6 +200,22 @@ pub struct SnapshotOutcome {
     pub snapshot_id: u64,
     pub read_version: u64,
     pub lease_expires_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreState {
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    pub operation_id: String,
+    pub state: RestoreState,
+    pub source_root: InodeId,
+    pub destination_root: InodeId,
+    pub snapshot_id: u64,
+    pub read_version: u64,
+    pub cleanup_pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1576,6 +1599,71 @@ impl MetadataClient {
         }
     }
 
+    pub fn restore_subtree_path_to_fork(
+        &self,
+        source: &str,
+        snapshot_id: u64,
+        destination: &str,
+    ) -> Result<RestoreOutcome, ClientError> {
+        self.restore_subtree_path_to_fork_initialized(
+            source,
+            snapshot_id,
+            destination,
+            RestoreInitialization::default(),
+        )
+    }
+
+    pub fn restore_subtree_path_to_fork_initialized(
+        &self,
+        source: &str,
+        snapshot_id: u64,
+        destination: &str,
+        initialization: RestoreInitialization,
+    ) -> Result<RestoreOutcome, ClientError> {
+        self.ensure_same_shard_paths(source, destination)?;
+        match self.call(MetadataRpcRequest::RestoreSubtreePathToFork {
+            source_path: source.to_owned(),
+            snapshot_id,
+            destination_path: destination.to_owned(),
+            initialization: WireRestoreInitialization {
+                remove_relative_paths: initialization.remove_relative_paths,
+                files: initialization
+                    .files
+                    .into_iter()
+                    .map(|file| WireRestoreInitializationFile {
+                        relative_path: file.relative_path,
+                        bytes: file.bytes,
+                        content_type: file.content_type,
+                        mode: file.mode,
+                        uid: file.uid,
+                        gid: file.gid,
+                    })
+                    .collect(),
+            },
+        })? {
+            MetadataRpcResult::Restore { outcome } => {
+                let state = match outcome.state.as_str() {
+                    "complete" => RestoreState::Complete,
+                    other => {
+                        return Err(ClientError::Protocol(format!(
+                            "unknown restore state {other}"
+                        )))
+                    }
+                };
+                Ok(RestoreOutcome {
+                    operation_id: outcome.operation_id,
+                    state,
+                    source_root: inode_id(outcome.source_root)?,
+                    destination_root: inode_id(outcome.destination_root)?,
+                    snapshot_id: outcome.snapshot_id,
+                    read_version: outcome.read_version,
+                    cleanup_pending: outcome.cleanup_pending,
+                })
+            }
+            other => Err(unexpected_result(other)),
+        }
+    }
+
     pub fn snapshot_pin(
         &self,
         root_path: &str,
@@ -1937,6 +2025,18 @@ impl MetadataClient {
         match self.call(MetadataRpcRequest::PrepareArtifactPath {
             path: path.to_owned(),
             replace,
+        })? {
+            MetadataRpcResult::PreparedArtifact { prepared } => wire_prepared_artifact(prepared),
+            other => Err(unexpected_result(other)),
+        }
+    }
+
+    pub fn refresh_prepared_artifact_object_gc_epoch(
+        &self,
+        prepared: ClientPreparedArtifact,
+    ) -> Result<ClientPreparedArtifact, ClientError> {
+        match self.call(MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch {
+            prepared: prepared_artifact_to_wire(&prepared)?,
         })? {
             MetadataRpcResult::PreparedArtifact { prepared } => wire_prepared_artifact(prepared),
             other => Err(unexpected_result(other)),

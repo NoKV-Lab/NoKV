@@ -16,6 +16,7 @@ where
     O: ObjectStore,
 {
     pub fn publish_artifact(&self, request: PublishArtifact) -> Result<DentryWithAttr, MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
         let version = self.next_version()?;
         let inode = self.next_inode()?;
         let StagedArtifactBody {
@@ -44,6 +45,7 @@ where
             &projection,
             &chunks,
             version,
+            object_reference,
         ) {
             return Err(MetadError::PublishArtifactFailed {
                 source: Box::new(err),
@@ -57,6 +59,7 @@ where
         &self,
         request: PublishArtifact,
     ) -> Result<RenameReplaceResult, MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
         let (existing, dentry_version) = self
             .lookup_plus_for_write_plan(request.parent, &request.name)?
             .ok_or(MetadError::NotFound)?;
@@ -95,6 +98,7 @@ where
             old_generation,
             version,
             path_index: None,
+            object_reference,
         }) {
             return Err(MetadError::PublishArtifactFailed {
                 source: Box::new(err),
@@ -111,6 +115,16 @@ where
         &self,
         parent: InodeId,
         name: DentryName,
+    ) -> Result<PreparedArtifact, MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
+        self.prepare_artifact_create_with_object_reference(parent, name, object_reference)
+    }
+
+    fn prepare_artifact_create_with_object_reference(
+        &self,
+        parent: InodeId,
+        name: DentryName,
+        object_reference: ObjectReferenceMutation,
     ) -> Result<PreparedArtifact, MetadError> {
         let Some(parent_attr) = self.get_attr_at_version_for_purpose(
             parent,
@@ -140,13 +154,16 @@ where
             replace: false,
             dentry_version: None,
             old_generation: None,
+            object_gc_claim_version: object_reference.version().get(),
         })
     }
 
     pub fn prepare_artifact_create_path(&self, path: &str) -> Result<PreparedArtifact, MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
         let components = parse_absolute_path(path)?;
         let (parent, name) = self.resolve_parent_path(path)?;
-        let mut prepared = self.prepare_artifact_create(parent, name)?;
+        let mut prepared =
+            self.prepare_artifact_create_with_object_reference(parent, name, object_reference)?;
         prepared.path = Some(canonical_path(&components)?);
         Ok(prepared)
     }
@@ -155,6 +172,16 @@ where
         &self,
         parent: InodeId,
         name: DentryName,
+    ) -> Result<PreparedArtifact, MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
+        self.prepare_artifact_replace_with_object_reference(parent, name, object_reference)
+    }
+
+    fn prepare_artifact_replace_with_object_reference(
+        &self,
+        parent: InodeId,
+        name: DentryName,
+        object_reference: ObjectReferenceMutation,
     ) -> Result<PreparedArtifact, MetadError> {
         let (existing, dentry_version) = self
             .lookup_plus_for_write_plan(parent, &name)?
@@ -175,6 +202,7 @@ where
             replace: true,
             dentry_version: Some(dentry_version.get()),
             old_generation: existing.body.as_ref().map(|body| body.generation),
+            object_gc_claim_version: object_reference.version().get(),
         })
     }
 
@@ -182,10 +210,86 @@ where
         &self,
         path: &str,
     ) -> Result<PreparedArtifact, MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
         let (parent, name) = self.resolve_parent_path(path)?;
         let components = parse_absolute_path(path)?;
-        let mut prepared = self.prepare_artifact_replace(parent, name)?;
+        let mut prepared =
+            self.prepare_artifact_replace_with_object_reference(parent, name, object_reference)?;
         prepared.path = Some(canonical_path(&components)?);
+        Ok(prepared)
+    }
+
+    /// Refresh an unpublished prepared upload after an unrelated object-GC
+    /// epoch invalidated its object reference token. The namespace proof remains
+    /// fixed, while a fresh generation makes it
+    /// impossible to reuse objects uploaded under the stale GC epoch. Callers
+    /// must persist this returned identity before fully restaging the body.
+    pub fn refresh_prepared_artifact_object_gc_epoch(
+        &self,
+        mut prepared: PreparedArtifact,
+    ) -> Result<PreparedArtifact, MetadError> {
+        if let Some(path) = prepared.path.as_deref() {
+            let components = parse_absolute_path(path)?;
+            let Some((name, parent_components)) = components.split_last() else {
+                return Err(MetadError::InvalidPreparedArtifact(
+                    "prepared artifact path has no leaf".to_owned(),
+                ));
+            };
+            if name != &prepared.name
+                || self.resolve_components_as_directory(parent_components)? != prepared.parent
+            {
+                return Err(MetadError::InvalidPreparedArtifact(
+                    "prepared artifact path no longer matches its parent and name".to_owned(),
+                ));
+            }
+        }
+
+        let current = self.lookup_plus_for_write_plan(prepared.parent, &prepared.name)?;
+        if prepared.replace {
+            let expected = Version::new(prepared.dentry_version.ok_or_else(|| {
+                MetadError::InvalidPreparedArtifact(
+                    "replace artifact is missing dentry version".to_owned(),
+                )
+            })?)?;
+            let Some((entry, version)) = current else {
+                return Err(MetadError::NotFound);
+            };
+            if entry.attr.file_type != FileType::File {
+                return Err(MetadError::NotFile);
+            }
+            if entry.attr.inode != prepared.inode || version != expected {
+                return Err(MetadError::Metadata(MetadataError::PredicateFailed));
+            }
+        } else {
+            if prepared.dentry_version.is_some() || prepared.old_generation.is_some() {
+                return Err(MetadError::InvalidPreparedArtifact(
+                    "create artifact must not carry replace state".to_owned(),
+                ));
+            }
+            if current.is_some() || self.get_attr(prepared.inode)?.is_some() {
+                return Err(MetadError::Metadata(MetadataError::PredicateFailed));
+            }
+            let parent = self
+                .get_attr(prepared.parent)?
+                .ok_or(MetadError::NotFound)?;
+            if parent.file_type != FileType::Directory {
+                return Err(MetadError::NotDirectory);
+            }
+        }
+
+        match self.ensure_prepared_object_gc_epoch(prepared.object_gc_claim_version) {
+            Ok(()) => return Ok(prepared),
+            Err(MetadError::StalePreparedArtifactObjectGcEpoch { .. }) => {}
+            Err(err) => return Err(err),
+        }
+
+        let object_reference = self.begin_object_reference_mutation()?;
+        let generation = self.next_version()?;
+        let now_ms = current_time_ms();
+        prepared.generation = generation.get();
+        prepared.mtime_ms = now_ms;
+        prepared.ctime_ms = now_ms;
+        prepared.object_gc_claim_version = object_reference.version().get();
         Ok(prepared)
     }
 
@@ -223,6 +327,7 @@ where
             gid,
         } = request;
         validate_prepared_artifact(&prepared, &body, &chunks)?;
+        self.ensure_prepared_object_gc_epoch(prepared.object_gc_claim_version)?;
         let version = Version::new(prepared.generation)?;
         let mut attr = InodeAttr {
             inode: prepared.inode,
@@ -276,6 +381,12 @@ where
                             .map(|components| path_index_key(self.mount, &components))
                     })
                     .transpose()?,
+                object_reference: ObjectReferenceMutation::from_version(Version::new(
+                    prepared.object_gc_claim_version,
+                )?),
+            })
+            .map_err(|err| {
+                self.classify_prepared_object_gc_epoch_error(err, prepared.object_gc_claim_version)
             })?;
             Ok(RenameReplaceResult {
                 entry: projection.into(),
@@ -300,12 +411,61 @@ where
                             .map(|components| path_index_key(self.mount, &components))
                     })
                     .transpose()?,
-            )?;
+                Some(ObjectReferenceMutation::from_version(Version::new(
+                    prepared.object_gc_claim_version,
+                )?)),
+            )
+            .map_err(|err| {
+                self.classify_prepared_object_gc_epoch_error(err, prepared.object_gc_claim_version)
+            })?;
             Ok(RenameReplaceResult {
                 entry: projection.into(),
                 replaced: None,
             })
         }
+    }
+
+    fn ensure_prepared_object_gc_epoch(&self, expected: u64) -> Result<(), MetadError> {
+        let key = object_gc_claim_key(self.mount);
+        let item = self
+            .metadata
+            .get_versioned(
+                RecordFamily::System,
+                &key,
+                self.read_version()?,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .ok_or_else(|| {
+                MetadError::Codec("durable object GC claim is not initialized".to_owned())
+            })?;
+        if item.version.get() == expected
+            && matches!(decode_object_gc_claim(&item.value.0)?, ObjectGcClaim::Open)
+        {
+            return Ok(());
+        }
+        Err(MetadError::StalePreparedArtifactObjectGcEpoch {
+            expected,
+            current: item.version.get(),
+        })
+    }
+
+    fn classify_prepared_object_gc_epoch_error(
+        &self,
+        err: MetadError,
+        expected: u64,
+    ) -> MetadError {
+        if !matches!(err, MetadError::Metadata(MetadataError::PredicateFailed)) {
+            return err;
+        }
+        self.ensure_prepared_object_gc_epoch(expected)
+            .err()
+            .filter(|current| {
+                matches!(
+                    current,
+                    MetadError::StalePreparedArtifactObjectGcEpoch { .. }
+                )
+            })
+            .unwrap_or(err)
     }
 
     pub fn publish_prepared_artifact_session(

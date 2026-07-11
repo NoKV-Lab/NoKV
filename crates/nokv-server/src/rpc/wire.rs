@@ -134,6 +134,22 @@ fn wire_metad_error(err: &MetadError) -> WireMetadataError {
             dest_shard: *dest_shard,
         },
         MetadError::GraftPoint => WireMetadataError::GraftPoint,
+        MetadError::RestoreInProgress => WireMetadataError::RestoreInProgress,
+        MetadError::RestoreResourceLimit {
+            resource,
+            limit,
+            actual,
+        } => WireMetadataError::RestoreResourceLimit {
+            resource: resource.clone(),
+            limit: *limit,
+            actual: *actual,
+        },
+        MetadError::StalePreparedArtifactObjectGcEpoch { expected, current } => {
+            WireMetadataError::StalePreparedArtifactObjectGcEpoch {
+                expected: *expected,
+                current: *current,
+            }
+        }
         MetadError::SnapshotLeaseExpired {
             snapshot_id,
             lease_expires_unix_ms,
@@ -166,6 +182,17 @@ fn wire_metad_error(err: &MetadError) -> WireMetadataError {
             snapshot_id: *snapshot_id,
             attempts: *attempts,
         },
+        MetadError::RestoreHardlinkUnsupported { inode } => {
+            WireMetadataError::RestoreHardlinkUnsupported { inode: inode.get() }
+        }
+        MetadError::RestoreCrossShardUnsupported { inode } => {
+            WireMetadataError::RestoreCrossShardUnsupported { inode: inode.get() }
+        }
+        MetadError::RestoreDestinationConflict { destination } => {
+            WireMetadataError::RestoreDestinationConflict {
+                destination: destination.clone(),
+            }
+        }
         other => WireMetadataError::Metadata {
             message: other.to_string(),
         },
@@ -240,6 +267,7 @@ pub(super) fn wire_prepared_artifact(
         replace: prepared.replace,
         dentry_version: prepared.dentry_version,
         old_generation: prepared.old_generation,
+        object_gc_claim_version: prepared.object_gc_claim_version,
     }
 }
 
@@ -258,6 +286,7 @@ pub(super) fn prepared_artifact(
         replace: prepared.replace,
         dentry_version: prepared.dentry_version,
         old_generation: prepared.old_generation,
+        object_gc_claim_version: prepared.object_gc_claim_version,
     })
 }
 

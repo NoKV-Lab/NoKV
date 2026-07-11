@@ -28,6 +28,7 @@ where
     O: ObjectStore,
 {
     pub fn bootstrap_root(&self, mode: u32, uid: u32, gid: u32) -> Result<InodeAttr, MetadError> {
+        self.ensure_object_gc_claim_record()?;
         let version = self.next_version()?;
         let root = directory_attr(InodeId::root(), mode, uid, gid, version.get());
         let command = MetadataCommand {
@@ -254,6 +255,7 @@ where
         uid: u32,
         gid: u32,
     ) -> Result<DentryWithAttr, MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
         if target.is_empty() || target.contains(&0) {
             return Err(MetadError::InvalidPath(
                 "symlink target must be non-empty and must not contain NUL".to_owned(),
@@ -300,6 +302,7 @@ where
             &projection,
             &chunks,
             version,
+            object_reference,
         ) {
             return Err(MetadError::PublishArtifactFailed {
                 source: Box::new(err),
@@ -474,6 +477,7 @@ where
         name: &DentryName,
         changes: UpdateAttr,
     ) -> Result<DentryWithAttr, MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
         let (entry, dentry_version) = self
             .lookup_plus_for_write_plan(parent, name)?
             .ok_or(MetadError::NotFound)?;
@@ -568,6 +572,7 @@ where
             old_generation,
             version,
             path_index: None,
+            object_reference,
         })?;
         Ok(projection.into())
     }
@@ -625,7 +630,19 @@ where
                 op: MutationOp::Put,
                 value: Some(Value(encode_inode_attr(&attr))),
             }],
-            watch: Vec::new(),
+            watch: self
+                .watch_projection(
+                    InodeId::root(),
+                    WatchEvent {
+                        kind: WatchEventKind::UpdateAttr,
+                        parent: None,
+                        name: None,
+                        inode: InodeId::root(),
+                        version: version.get(),
+                    },
+                )
+                .into_iter()
+                .collect(),
         })?;
         Ok(attr)
     }
@@ -691,6 +708,9 @@ where
         uid: u32,
         gid: u32,
     ) -> Result<Vec<DentryWithAttr>, MetadError> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
         let parent_components = parse_absolute_path(parent_path)?;
         let parent = self.resolve_components_as_directory(&parent_components)?;
         self.create_files_in_dir_with_parent_components(parent, names, mode, uid, gid)
@@ -704,11 +724,11 @@ where
         uid: u32,
         gid: u32,
     ) -> Result<Vec<DentryWithAttr>, MetadError> {
-        let parent_components = parse_absolute_path(parent_path)?;
-        let parent = self.resolve_components_as_directory(&parent_components)?;
         if names.is_empty() {
             return Ok(Vec::new());
         }
+        let parent_components = parse_absolute_path(parent_path)?;
+        let parent = self.resolve_components_as_directory(&parent_components)?;
         ensure_unique_names(&names)?;
         let version = self.next_version()?;
         let inodes = self.next_inodes(names.len())?;
@@ -985,6 +1005,28 @@ where
         {
             mutations.push(delete_mutation(RecordFamily::PathIndex, path_index));
         }
+        let restore_shadow = match path_components {
+            Some(components) => self.restore_shadow_key_for_entry(
+                components,
+                parent,
+                name,
+                &entry,
+                predecessor(version)?,
+            )?,
+            None => self.restore_shadow_key_for_inode_entry(
+                parent,
+                name,
+                &entry,
+                predecessor(version)?,
+            )?,
+        };
+        if let Some((shadow, _)) = restore_shadow {
+            mutations.push(delete_mutation(RecordFamily::System, shadow));
+            mutations.push(delete_mutation(
+                RecordFamily::ForkShadow,
+                fork_shadow_key(self.mount, parent, name),
+            ));
+        }
         if canonical_attr.nlink == 0 {
             return Err(MetadError::InvalidPath(
                 "inode link count is already zero".to_owned(),
@@ -1183,10 +1225,132 @@ where
             delete_mutation(RecordFamily::Dentry, source_key.clone()),
             delete_mutation(RecordFamily::Inode, inode_key(self.mount, entry.attr.inode)),
         ];
+        let binding_key = fork_binding_key(self.mount, entry.attr.inode);
+        let binding = self.metadata.get_versioned(
+            RecordFamily::ForkBinding,
+            &binding_key,
+            predecessor(version)?,
+            ReadPurpose::WritePlanLocal,
+        )?;
+        let releasing_binding = binding
+            .as_ref()
+            .map(|item| {
+                let mut binding = decode_fork_binding(&item.value.0)
+                    .map_err(|err| MetadError::Codec(err.to_string()))?;
+                if binding.state != ForkBindingState::Complete {
+                    return Err(MetadError::RestoreInProgress);
+                }
+                binding.state = ForkBindingState::Releasing;
+                Ok::<_, MetadError>(binding)
+            })
+            .transpose()?;
+        let operation = releasing_binding
+            .as_ref()
+            .map(|binding| {
+                let key = restore_operation_key(self.mount, &binding.operation_digest);
+                Ok::<_, MetadError>(
+                    self.metadata
+                        .get_versioned(
+                            RecordFamily::System,
+                            &key,
+                            predecessor(version)?,
+                            ReadPurpose::WritePlanLocal,
+                        )?
+                        .map(|item| (key, item.version)),
+                )
+            })
+            .transpose()?
+            .flatten();
+        let release_key = releasing_binding
+            .as_ref()
+            .map(|binding| fork_base_ref_release_key(self.mount, binding.base_ref_set_id));
+        if let Some(releasing) = &releasing_binding {
+            // The namespace disappears atomically with Complete -> Releasing,
+            // while the durable binding and inverse rows continue protecting
+            // shared objects until the GC worker pages the ref set out.
+            mutations.push(Mutation {
+                family: RecordFamily::ForkBinding,
+                key: binding_key.clone(),
+                op: MutationOp::Put,
+                value: Some(Value(encode_fork_binding(releasing))),
+            });
+            mutations.push(Mutation {
+                family: RecordFamily::System,
+                key: release_key
+                    .as_ref()
+                    .expect("releasing binding has a release key")
+                    .clone(),
+                op: MutationOp::Put,
+                value: Some(Value(encode_fork_binding(releasing))),
+            });
+            if let Some((key, _)) = &operation {
+                mutations.push(Mutation {
+                    family: RecordFamily::System,
+                    key: key.clone(),
+                    op: MutationOp::Put,
+                    value: Some(Value(encode_fork_binding(releasing))),
+                });
+            }
+        }
         if let Some(path_index) =
             self.live_path_index_key_for_entry(path_components, parent, name, &entry, version)?
         {
             mutations.push(delete_mutation(RecordFamily::PathIndex, path_index));
+        }
+        let restore_shadow = match path_components {
+            Some(components) => self.restore_shadow_key_for_entry(
+                components,
+                parent,
+                name,
+                &entry,
+                predecessor(version)?,
+            )?,
+            None => self.restore_shadow_key_for_inode_entry(
+                parent,
+                name,
+                &entry,
+                predecessor(version)?,
+            )?,
+        };
+        if let Some((shadow, _)) = restore_shadow {
+            mutations.push(delete_mutation(RecordFamily::System, shadow));
+            mutations.push(delete_mutation(
+                RecordFamily::ForkShadow,
+                fork_shadow_key(self.mount, parent, name),
+            ));
+        }
+        let mut predicates = vec![
+            PredicateRef {
+                family: RecordFamily::Dentry,
+                key: source_key.clone(),
+                predicate: Predicate::VersionEquals(dentry_version),
+            },
+            PredicateRef {
+                family: RecordFamily::Dentry,
+                key: child_prefix,
+                predicate: Predicate::PrefixEmpty,
+            },
+        ];
+        if let Some(binding) = binding {
+            predicates.push(PredicateRef {
+                family: RecordFamily::ForkBinding,
+                key: binding_key,
+                predicate: Predicate::VersionEquals(binding.version),
+            });
+        }
+        if let Some(key) = release_key {
+            predicates.push(PredicateRef {
+                family: RecordFamily::System,
+                key,
+                predicate: Predicate::NotExists,
+            });
+        }
+        if let Some((key, version)) = operation {
+            predicates.push(PredicateRef {
+                family: RecordFamily::System,
+                key,
+                predicate: Predicate::VersionEquals(version),
+            });
         }
         let command = MetadataCommand {
             request_id: request_id(b"remove-empty-dir", self.mount, entry.attr.inode, version),
@@ -1195,18 +1359,7 @@ where
             commit_version: version,
             primary_family: RecordFamily::Dentry,
             primary_key: source_key.clone(),
-            predicates: vec![
-                PredicateRef {
-                    family: RecordFamily::Dentry,
-                    key: source_key.clone(),
-                    predicate: Predicate::VersionEquals(dentry_version),
-                },
-                PredicateRef {
-                    family: RecordFamily::Dentry,
-                    key: child_prefix,
-                    predicate: Predicate::PrefixEmpty,
-                },
-            ],
+            predicates,
             mutations,
             watch: self
                 .watch_projection(
@@ -1386,6 +1539,7 @@ where
         entry.attr.inode.shard_index() != self.shard_index()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn rename_inner(
         &self,
         parent: InodeId,
@@ -1443,7 +1597,7 @@ where
         let destination_key = dentry_key(self.mount, new_parent, &new_name);
         let projection = projection(
             new_parent,
-            new_name,
+            new_name.clone(),
             source.attr.clone(),
             source.body.clone(),
         );
@@ -1484,13 +1638,29 @@ where
                 value: Some(Value(encode_dentry_projection(&projection))),
             },
         ];
-        if let Some(source_path) = self.live_path_index_key_for_entry(
+        let live_source_path = self.live_path_index_key_for_entry(
             path_index.map(|(source, _)| source),
             parent,
             name,
             &source,
             version,
-        )? {
+        )?;
+        let restore_shadow = match path_index {
+            Some((source_components, _)) => self.restore_shadow_key_for_entry(
+                source_components,
+                parent,
+                name,
+                &source,
+                predecessor(version)?,
+            )?,
+            None => self.restore_shadow_key_for_inode_entry(
+                parent,
+                name,
+                &source,
+                predecessor(version)?,
+            )?,
+        };
+        if let Some(source_path) = live_source_path.as_ref() {
             let destination_path = path_index
                 .map(|(_, destination)| path_index_key(self.mount, destination))
                 .ok_or_else(|| {
@@ -1498,12 +1668,67 @@ where
                         "live source path index requires destination path context".to_owned(),
                     )
                 })?;
-            mutations.push(delete_mutation(RecordFamily::PathIndex, source_path));
+            mutations.push(delete_mutation(
+                RecordFamily::PathIndex,
+                source_path.clone(),
+            ));
             mutations.push(put_projection_mutation(
                 RecordFamily::PathIndex,
                 destination_path,
                 &projection,
             ));
+        }
+        if let Some((source_shadow, base_ref_set_id)) = restore_shadow {
+            mutations.push(delete_mutation(RecordFamily::System, source_shadow));
+            mutations.push(delete_mutation(
+                RecordFamily::ForkShadow,
+                fork_shadow_key(self.mount, parent, name),
+            ));
+            if live_source_path.is_none() {
+                let destination_shadow = match path_index {
+                    Some((_, destination_components)) => self.restore_shadow_destination_key(
+                        destination_components,
+                        base_ref_set_id,
+                        new_parent,
+                        &new_name,
+                        predecessor(version)?,
+                    )?,
+                    None => self.restore_shadow_destination_key_for_parent(
+                        base_ref_set_id,
+                        new_parent,
+                        &new_name,
+                        predecessor(version)?,
+                    )?,
+                };
+                if let Some(destination_shadow) = destination_shadow {
+                    mutations.push(put_projection_mutation(
+                        RecordFamily::System,
+                        destination_shadow,
+                        &projection,
+                    ));
+                    mutations.push(Mutation {
+                        family: RecordFamily::ForkShadow,
+                        key: fork_shadow_key(self.mount, new_parent, &new_name),
+                        op: MutationOp::Put,
+                        value: Some(Value(encode_restore_shadow_inverse(
+                            base_ref_set_id,
+                            &projection,
+                        ))),
+                    });
+                } else {
+                    let (_, destination_components) = path_index.ok_or_else(|| {
+                        MetadataError::Backend(
+                            "moving indexed restore entry outside its binding requires path context"
+                                .to_owned(),
+                        )
+                    })?;
+                    mutations.push(put_projection_mutation(
+                        RecordFamily::PathIndex,
+                        path_index_key(self.mount, destination_components),
+                        &projection,
+                    ));
+                }
+            }
         }
         if let Some(replaced) = &replaced {
             let replaced_inode_key = inode_key(self.mount, replaced.attr.inode);
@@ -1707,7 +1932,14 @@ where
         projection: &DentryProjection,
         version: Version,
     ) -> Result<(), MetadError> {
-        self.commit_create_projection_with_chunks(kind, projection, &[], version)
+        self.commit_create_projection_with_chunks_and_path_index(
+            kind,
+            projection,
+            &[],
+            version,
+            None,
+            None,
+        )
     }
 
     pub(super) fn commit_create_projections_with_path_indexes(
@@ -1798,7 +2030,7 @@ where
                 watch.push(event);
             }
         }
-        Ok(MetadataCommand {
+        let command = MetadataCommand {
             request_id: request_id(kind_name(kind), self.mount, parent, version),
             kind,
             read_version: predecessor(version)?,
@@ -1808,7 +2040,8 @@ where
             predicates,
             mutations,
             watch,
-        })
+        };
+        Ok(command)
     }
 
     /// Build the cross-shard graft command. Unlike every other create path this
@@ -1824,7 +2057,7 @@ where
     ) -> Result<MetadataCommand, MetadError> {
         let parent = projection.dentry.parent;
         let dentry = dentry_key(self.mount, parent, &projection.dentry.name);
-        Ok(MetadataCommand {
+        let command = MetadataCommand {
             request_id: request_id(
                 kind_name(CommandKind::CreateDir),
                 self.mount,
@@ -1868,7 +2101,8 @@ where
                 )
                 .into_iter()
                 .collect(),
-        })
+        };
+        Ok(command)
     }
 
     pub(super) fn commit_create_projection_with_chunks(
@@ -1877,12 +2111,19 @@ where
         projection: &DentryProjection,
         chunks: &[ChunkManifest],
         version: Version,
+        object_reference: ObjectReferenceMutation,
     ) -> Result<(), MetadError> {
         self.commit_create_projection_with_chunks_and_path_index(
-            kind, projection, chunks, version, None,
+            kind,
+            projection,
+            chunks,
+            version,
+            None,
+            Some(object_reference),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn commit_create_projection_with_chunks_and_path_index(
         &self,
         kind: CommandKind,
@@ -1890,6 +2131,7 @@ where
         chunks: &[ChunkManifest],
         version: Version,
         path_index: Option<Vec<u8>>,
+        object_reference: Option<ObjectReferenceMutation>,
     ) -> Result<(), MetadError> {
         let inode = projection.attr.inode;
         let dentry = dentry_key(
@@ -1934,6 +2176,21 @@ where
                 });
             }
         }
+        let mut predicates = vec![
+            PredicateRef {
+                family: RecordFamily::Inode,
+                key: inode_key(self.mount, projection.dentry.parent),
+                predicate: Predicate::Exists,
+            },
+            PredicateRef {
+                family: RecordFamily::Dentry,
+                key: dentry.clone(),
+                predicate: Predicate::NotExists,
+            },
+        ];
+        if let Some(object_reference) = object_reference {
+            predicates.push(object_reference.predicate(self.mount));
+        }
         self.commit_metadata(MetadataCommand {
             request_id: request_id(kind_name(kind), self.mount, inode, version),
             kind,
@@ -1941,18 +2198,7 @@ where
             commit_version: version,
             primary_family: RecordFamily::Dentry,
             primary_key: dentry.clone(),
-            predicates: vec![
-                PredicateRef {
-                    family: RecordFamily::Inode,
-                    key: inode_key(self.mount, projection.dentry.parent),
-                    predicate: Predicate::Exists,
-                },
-                PredicateRef {
-                    family: RecordFamily::Dentry,
-                    key: dentry,
-                    predicate: Predicate::NotExists,
-                },
-            ],
+            predicates,
             mutations,
             watch: self
                 .watch_projection(
@@ -1984,6 +2230,7 @@ where
             old_generation,
             version,
             path_index,
+            object_reference,
         } = commit;
         let inode = projection.attr.inode;
         let dentry = dentry_key(
@@ -2013,6 +2260,7 @@ where
                 predicate: Predicate::Exists,
             },
         ];
+        predicates.push(object_reference.predicate(self.mount));
         let mut mutations = vec![Mutation {
             family: RecordFamily::Inode,
             key: inode_key(self.mount, inode),

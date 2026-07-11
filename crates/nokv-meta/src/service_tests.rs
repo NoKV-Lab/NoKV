@@ -1,10 +1,14 @@
 use super::*;
-use crate::command::{ReadItem, ScanItem};
+use crate::command::{DelimitedScanItem, DelimitedScanRequest, ReadItem, ScanItem};
 use crate::holtstore::HoltMetadataStore;
+use crate::layout::{
+    fork_base_release_quarantine_prefix, fork_binding_prefix, object_gc_quarantine_prefix,
+};
 use crate::{MetadataLogEntry, MetadataLogSegment, METADATA_LOG_ZERO_DIGEST};
 use nokv_object::{MemoryObjectStore, ObjectBytes};
 use nokv_types::{AdvisoryLockKind, AdvisoryLockRequest};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Condvar};
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 struct SnapshotCommitBarrierStore {
@@ -52,6 +56,7 @@ impl MetadataStore for SnapshotCommitBarrierStore {
 
     fn commit_metadata(&self, command: MetadataCommand) -> Result<CommitResult, MetadataError> {
         if command.kind == self.kind
+            && command.primary_family == RecordFamily::Snapshot
             && self
                 .remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -129,6 +134,7 @@ impl MetadataStore for SnapshotPredicateOnceStore {
 
     fn commit_metadata(&self, command: MetadataCommand) -> Result<CommitResult, MetadataError> {
         if command.kind == CommandKind::SnapshotSubtree
+            && command.primary_family == RecordFamily::Snapshot
             && self
                 .remaining_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -298,8 +304,353 @@ impl MetadataStoreStatsProvider for PurposeTrackingStore {
     }
 }
 
+/// Test metastore that advances the durable Open object-reference claim in the
+/// same atomic apply as every detached restore command. A second bounded stage
+/// can commit only if it fetched the new claim version after the prior stage;
+/// no wall-clock scheduling or worker thread is involved.
+#[derive(Clone)]
+struct RotatingObjectGcClaimStore {
+    inner: HoltMetadataStore,
+    rotations: Arc<AtomicU64>,
+}
+
+impl RotatingObjectGcClaimStore {
+    fn new() -> Self {
+        Self {
+            inner: HoltMetadataStore::open_memory().unwrap(),
+            rotations: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn rotations(&self) -> u64 {
+        self.rotations.load(Ordering::Relaxed)
+    }
+}
+
+impl MetadataStore for RotatingObjectGcClaimStore {
+    fn get_versioned(
+        &self,
+        family: RecordFamily,
+        key: &[u8],
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<Option<ReadItem>, MetadataError> {
+        self.inner.get_versioned(family, key, version, purpose)
+    }
+
+    fn scan(&self, request: ScanRequest) -> Result<Vec<ScanItem>, MetadataError> {
+        self.inner.scan(request)
+    }
+
+    fn scan_delimited(
+        &self,
+        request: DelimitedScanRequest,
+    ) -> Result<Vec<DelimitedScanItem>, MetadataError> {
+        self.inner.scan_delimited(request)
+    }
+
+    fn commit_metadata(&self, mut command: MetadataCommand) -> Result<CommitResult, MetadataError> {
+        let claim_key = object_gc_claim_key(MountId::new(1).unwrap());
+        let rotates_claim = command.kind == CommandKind::StageDetachedRestore
+            && command.predicates.iter().any(|predicate| {
+                predicate.family == RecordFamily::System && predicate.key == claim_key
+            });
+        if rotates_claim {
+            let claim = self
+                .inner
+                .get_versioned(
+                    RecordFamily::System,
+                    &claim_key,
+                    command.read_version,
+                    ReadPurpose::WritePlanLocal,
+                )?
+                .ok_or_else(|| {
+                    MetadataError::Backend(
+                        "detached restore command references a missing object GC claim".to_owned(),
+                    )
+                })?;
+            command.mutations.push(Mutation {
+                family: RecordFamily::System,
+                key: claim_key,
+                op: MutationOp::Put,
+                value: Some(claim.value),
+            });
+        }
+        let committed = self.inner.commit_metadata(command);
+        if rotates_claim && committed.is_ok() {
+            self.rotations.fetch_add(1, Ordering::Relaxed);
+        }
+        committed
+    }
+
+    fn commit_independent_batch(
+        &self,
+        commands: &[MetadataCommand],
+    ) -> Vec<Result<CommitResult, MetadataError>> {
+        commands
+            .iter()
+            .cloned()
+            .map(|command| self.commit_metadata(command))
+            .collect()
+    }
+
+    fn committed_request_result(
+        &self,
+        request_id: &[u8],
+    ) -> Result<Option<CommitResult>, MetadataError> {
+        self.inner.committed_request_result(request_id)
+    }
+
+    fn prune_history(
+        &self,
+        request: HistoryPruneRequest,
+    ) -> Result<HistoryPruneOutcome, MetadataError> {
+        self.inner.prune_history(request)
+    }
+}
+
+#[derive(Clone)]
+struct PausingCommitStore {
+    inner: HoltMetadataStore,
+    gate: Arc<(Mutex<PauseState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct PauseState {
+    point: Option<PausePoint>,
+    reached: bool,
+    released: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PausePoint {
+    CreateFileCommit,
+    ObjectGcDeleting,
+    PathIndexGcCommit,
+}
+
+impl PausingCommitStore {
+    fn new() -> Self {
+        Self {
+            inner: HoltMetadataStore::open_memory().unwrap(),
+            gate: Arc::new((Mutex::new(PauseState::default()), Condvar::new())),
+        }
+    }
+
+    fn arm_create_file(&self) {
+        self.arm(PausePoint::CreateFileCommit);
+    }
+
+    fn arm_object_gc_deleting(&self) {
+        self.arm(PausePoint::ObjectGcDeleting);
+    }
+
+    fn arm_path_index_gc_commit(&self) {
+        self.arm(PausePoint::PathIndexGcCommit);
+    }
+
+    fn arm(&self, point: PausePoint) {
+        let (lock, _) = &*self.gate;
+        *lock.lock().unwrap() = PauseState {
+            point: Some(point),
+            reached: false,
+            released: false,
+        };
+    }
+
+    fn pause_if(&self, point: PausePoint) {
+        let (lock, changed) = &*self.gate;
+        let mut state = lock.lock().unwrap();
+        if state.point != Some(point) {
+            return;
+        }
+        state.point = None;
+        state.reached = true;
+        changed.notify_all();
+        while !state.released {
+            state = changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_reached(&self) {
+        assert!(
+            self.wait_until_reached_timeout(Duration::from_secs(10)),
+            "timed out waiting for deterministic metadata barrier"
+        );
+    }
+
+    fn wait_until_reached_timeout(&self, timeout: Duration) -> bool {
+        let (lock, changed) = &*self.gate;
+        let mut state = lock.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        while !state.reached {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timed_out) = changed.wait_timeout(state, deadline - now).unwrap();
+            state = next;
+            if timed_out.timed_out() && !state.reached {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release(&self) {
+        let (lock, changed) = &*self.gate;
+        let mut state = lock.lock().unwrap();
+        state.released = true;
+        changed.notify_all();
+    }
+}
+
+impl MetadataStore for PausingCommitStore {
+    fn get_versioned(
+        &self,
+        family: RecordFamily,
+        key: &[u8],
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<Option<ReadItem>, MetadataError> {
+        self.inner.get_versioned(family, key, version, purpose)
+    }
+
+    fn scan(&self, request: ScanRequest) -> Result<Vec<ScanItem>, MetadataError> {
+        self.inner.scan(request)
+    }
+
+    fn scan_delimited(
+        &self,
+        request: DelimitedScanRequest,
+    ) -> Result<Vec<DelimitedScanItem>, MetadataError> {
+        self.inner.scan_delimited(request)
+    }
+
+    fn commit_metadata(&self, command: MetadataCommand) -> Result<CommitResult, MetadataError> {
+        if command.primary_family == RecordFamily::System
+            && command.primary_key == path_index_gc_cursor_key(MountId::new(1).unwrap())
+        {
+            self.pause_if(PausePoint::PathIndexGcCommit);
+        }
+        if matches!(
+            command.kind,
+            CommandKind::CreateFile | CommandKind::PublishArtifact
+        ) {
+            self.pause_if(PausePoint::CreateFileCommit);
+        }
+        let pause_after = command.primary_family == RecordFamily::System
+            && command.primary_key == object_gc_claim_key(MountId::new(1).unwrap())
+            && command.mutations.iter().any(|mutation| {
+                mutation.family == RecordFamily::System
+                    && mutation.key == command.primary_key
+                    && mutation
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| value.0.first() == Some(&2))
+            });
+        let result = self.inner.commit_metadata(command);
+        if pause_after && result.is_ok() {
+            self.pause_if(PausePoint::ObjectGcDeleting);
+        }
+        result
+    }
+
+    fn commit_independent_batch(
+        &self,
+        commands: &[MetadataCommand],
+    ) -> Vec<Result<CommitResult, MetadataError>> {
+        self.inner.commit_independent_batch(commands)
+    }
+
+    fn committed_request_result(
+        &self,
+        request_id: &[u8],
+    ) -> Result<Option<CommitResult>, MetadataError> {
+        self.inner.committed_request_result(request_id)
+    }
+
+    fn prune_history(
+        &self,
+        request: HistoryPruneRequest,
+    ) -> Result<HistoryPruneOutcome, MetadataError> {
+        self.inner.prune_history(request)
+    }
+}
+
 fn service() -> NoKvFs<HoltMetadataStore, MemoryObjectStore> {
     service_with_objects().0
+}
+
+fn drain_restore_staging_cleanup<M, O>(service: &NoKvFs<M, O>)
+where
+    M: MetadataStore,
+    O: ObjectStore,
+{
+    for _ in 0..4096 {
+        let pending = service
+            .metadata
+            .scan(ScanRequest {
+                family: RecordFamily::System,
+                prefix: restore_staging_cleanup_prefix(service.mount),
+                start_after: None,
+                version: service.read_version().unwrap(),
+                limit: 1,
+                purpose: ReadPurpose::WritePlanLocal,
+            })
+            .unwrap();
+        if pending.is_empty() {
+            return;
+        }
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    panic!("restore staging cleanup did not converge within the deterministic budget");
+}
+
+fn enqueue_gc_candidate<M, O>(service: &NoKvFs<M, O>, mut record: ObjectGcRecord) -> Vec<u8>
+where
+    M: MetadataStore,
+    O: ObjectStore,
+{
+    let version = service.next_version().unwrap();
+    record.enqueue_version = version.get();
+    record.enqueue_unix_ms = service.now_ms();
+    let key = gc_object_key(
+        service.mount,
+        version.get(),
+        record.inode,
+        record.generation,
+        0,
+        0,
+    );
+    service
+        .commit_metadata(MetadataCommand {
+            request_id: request_id(
+                b"test-enqueue-gc-candidate",
+                service.mount,
+                record.inode,
+                version,
+            ),
+            kind: CommandKind::CleanupObjects,
+            read_version: predecessor(version).unwrap(),
+            commit_version: version,
+            primary_family: RecordFamily::Gc,
+            primary_key: key.clone(),
+            predicates: vec![PredicateRef {
+                family: RecordFamily::Gc,
+                key: key.clone(),
+                predicate: Predicate::NotExists,
+            }],
+            mutations: vec![Mutation {
+                family: RecordFamily::Gc,
+                key: key.clone(),
+                op: MutationOp::Put,
+                value: Some(Value(encode_object_gc_record(&record))),
+            }],
+            watch: Vec::new(),
+        })
+        .unwrap();
+    key
 }
 
 fn service_with_objects() -> (
@@ -331,8 +682,8 @@ fn artifact_request(name: DentryName, manifest_id: &str, bytes: &[u8]) -> Publis
     }
 }
 
-fn publish_path_artifact<O: ObjectStore>(
-    service: &NoKvFs<HoltMetadataStore, O>,
+fn publish_path_artifact<M: MetadataStore, O: ObjectStore>(
+    service: &NoKvFs<M, O>,
     path: &str,
     manifest_id: &str,
     bytes: &[u8],
@@ -1702,6 +2053,11 @@ fn directory_rename_leaves_descendant_path_index_as_derived_stale_cache() {
         .entry;
     let old_components = parse_absolute_path("/runs/checkpoint.bin").unwrap();
     let old_key = path_index_key(MountId::new(1).unwrap(), &old_components);
+    publish_path_artifact(&service, "/valid.bin", "valid", b"valid");
+    let valid_key = path_index_key(
+        MountId::new(1).unwrap(),
+        &parse_absolute_path("/valid.bin").unwrap(),
+    );
     assert!(metadata
         .get(
             RecordFamily::PathIndex,
@@ -1744,6 +2100,125 @@ fn directory_rename_leaves_descendant_path_index_as_derived_stale_cache() {
         service.lookup_path("/archive/checkpoint.bin").unwrap(),
         Some(artifact)
     );
+    let before_gc = metadata.metadata_store_stats();
+    service.cleanup_pending_objects(128).unwrap();
+    let after_gc = metadata.metadata_store_stats();
+    assert_eq!(
+        after_gc.atomic_apply_total - before_gc.atomic_apply_total,
+        1,
+        "the no-conflict stale-index page must use one atomic fast-path apply"
+    );
+    assert!(metadata
+        .get(
+            RecordFamily::PathIndex,
+            &old_key,
+            Version::new(u64::MAX).unwrap(),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .is_none());
+    assert!(metadata
+        .get(
+            RecordFamily::PathIndex,
+            &valid_key,
+            Version::new(u64::MAX).unwrap(),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn path_index_gc_conflict_does_not_block_other_stale_rows_and_later_converges() {
+    let metadata = PausingCommitStore::new();
+    let service = Arc::new(NoKvFs::new(
+        MountId::new(1).unwrap(),
+        metadata.clone(),
+        MemoryObjectStore::new(),
+    ));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/runs/a.bin", "a", b"a");
+    publish_path_artifact(&service, "/runs/b.bin", "b", b"b");
+    let a_key = path_index_key(service.mount, &parse_absolute_path("/runs/a.bin").unwrap());
+    let b_key = path_index_key(service.mount, &parse_absolute_path("/runs/b.bin").unwrap());
+    service.rename_path("/runs", "/archive").unwrap();
+
+    metadata.arm_path_index_gc_commit();
+    let cleanup = {
+        let service = Arc::clone(&service);
+        std::thread::spawn(move || service.cleanup_pending_objects(128))
+    };
+    metadata.wait_until_reached();
+    let a = service
+        .metadata
+        .get_versioned(
+            RecordFamily::PathIndex,
+            &a_key,
+            service.read_version().unwrap(),
+            ReadPurpose::WritePlanLocal,
+        )
+        .unwrap()
+        .unwrap();
+    let version = service.next_version().unwrap();
+    service
+        .commit_metadata(MetadataCommand {
+            request_id: b"race-stale-path-index-gc".to_vec(),
+            kind: CommandKind::CleanupObjects,
+            read_version: predecessor(version).unwrap(),
+            commit_version: version,
+            primary_family: RecordFamily::PathIndex,
+            primary_key: a_key.clone(),
+            predicates: vec![PredicateRef {
+                family: RecordFamily::PathIndex,
+                key: a_key.clone(),
+                predicate: Predicate::VersionEquals(a.version),
+            }],
+            mutations: vec![Mutation {
+                family: RecordFamily::PathIndex,
+                key: a_key.clone(),
+                op: MutationOp::Put,
+                value: Some(a.value),
+            }],
+            watch: Vec::new(),
+        })
+        .unwrap();
+    metadata.release();
+    cleanup.join().unwrap().unwrap();
+
+    assert!(service
+        .metadata
+        .get(
+            RecordFamily::PathIndex,
+            &a_key,
+            service.read_version().unwrap(),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .is_some());
+    assert!(service
+        .metadata
+        .get(
+            RecordFamily::PathIndex,
+            &b_key,
+            service.read_version().unwrap(),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .is_none());
+
+    service.cleanup_pending_objects(128).unwrap();
+    service.cleanup_pending_objects(128).unwrap();
+    assert!(service
+        .metadata
+        .get(
+            RecordFamily::PathIndex,
+            &a_key,
+            service.read_version().unwrap(),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -2316,6 +2791,7 @@ fn create_file_hot_path_write_attribution_is_bounded() {
     assert_eq!(after.history_write_total - before.history_write_total, 0);
     assert_eq!(after.watch_write_total - before.watch_write_total, 0);
     assert_eq!(after.dedupe_write_total - before.dedupe_write_total, 1);
+    assert_eq!(after.atomic_apply_total - before.atomic_apply_total, 1);
 }
 
 #[test]
@@ -3044,7 +3520,7 @@ fn prepared_artifact_session_uploads_only_dirty_ranges_and_reuses_old_blocks() {
     let before_scan = service.metadata_store_stats();
     let replaced = service
         .publish_prepared_artifact_session(
-            prepared,
+            prepared.clone(),
             PublishArtifactSession {
                 parent: InodeId::root(),
                 name,
@@ -3101,10 +3577,10 @@ fn prepared_artifact_session_splits_noncontiguous_dirty_blocks() {
 
     service
         .publish_prepared_artifact_session(
-            prepared,
+            prepared.clone(),
             PublishArtifactSession {
                 parent: InodeId::root(),
-                name,
+                name: name.clone(),
                 producer: "unit-test".to_owned(),
                 digest_uri: "unknown".to_owned(),
                 content_type: "application/octet-stream".to_owned(),
@@ -3760,6 +4236,316 @@ fn remove_file_queues_old_body_for_object_cleanup() {
 }
 
 #[test]
+fn durable_gc_claim_blocks_new_object_reference_planning_while_deleting() {
+    let metadata = PausingCommitStore::new();
+    let objects = MemoryObjectStore::new();
+    let service = Arc::new(NoKvFs::new(
+        MountId::new(1).unwrap(),
+        metadata.clone(),
+        objects.clone(),
+    ));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    let published = service
+        .publish_artifact(artifact_request(dname(b"old"), "old", b"old"))
+        .unwrap();
+    let body = published.body.as_ref().unwrap();
+    let object = block_key(published.attr.inode, body.generation, 0, 0);
+    service.remove_file_path("/old").unwrap();
+
+    metadata.arm_object_gc_deleting();
+    let cleaner = {
+        let service = Arc::clone(&service);
+        std::thread::spawn(move || service.cleanup_pending_objects(1))
+    };
+    metadata.wait_until_reached();
+
+    assert!(matches!(
+        service.prepare_artifact_create(InodeId::root(), dname(b"new")),
+        Err(MetadError::Metadata(MetadataError::PredicateFailed))
+    ));
+    metadata.release();
+    let cleaned = cleaner.join().unwrap().unwrap();
+    assert_eq!(cleaned.deleted, 1);
+    assert!(objects.head(&object).unwrap().is_none());
+}
+
+#[test]
+fn object_upload_planned_before_gc_cannot_commit_after_delete_cycle() {
+    let metadata = PausingCommitStore::new();
+    let objects = MemoryObjectStore::new();
+    let service = Arc::new(NoKvFs::new(
+        MountId::new(1).unwrap(),
+        metadata.clone(),
+        objects.clone(),
+    ));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    let name = dname(b"racing.bin");
+    let prepared = service
+        .prepare_artifact_create(InodeId::root(), name.clone())
+        .unwrap();
+    let written = service
+        .stage_prepared_artifact_ranges(
+            &prepared,
+            "racing-manifest",
+            &[PublishArtifactRange {
+                offset: 0,
+                bytes: b"racing-body".to_vec(),
+            }],
+            0,
+        )
+        .unwrap();
+    let chunks = written.chunk_manifests();
+    let block = chunks[0].slices[0].blocks[0].clone();
+    let staged = written.staged_objects().unwrap();
+    enqueue_gc_candidate(
+        service.as_ref(),
+        ObjectGcRecord {
+            inode: prepared.inode,
+            generation: prepared.generation,
+            object_key: block.object_key.clone(),
+            size: block.len,
+            digest_uri: block.digest_uri.clone(),
+            enqueue_version: 0,
+            enqueue_unix_ms: 0,
+        },
+    );
+
+    metadata.arm_create_file();
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let publisher = {
+        let service = Arc::clone(&service);
+        let name = name.clone();
+        std::thread::spawn(move || {
+            let result = service.publish_prepared_artifact_staged_session(
+                prepared,
+                PublishArtifactStagedSession {
+                    parent: InodeId::root(),
+                    name,
+                    producer: "unit-test".to_owned(),
+                    digest_uri: "sha256:racing".to_owned(),
+                    content_type: "application/octet-stream".to_owned(),
+                    manifest_id: "racing-manifest".to_owned(),
+                    size: 11,
+                    chunks,
+                    staged,
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                },
+            );
+            result_tx.send(result).unwrap();
+        })
+    };
+    if !metadata.wait_until_reached_timeout(Duration::from_secs(2)) {
+        metadata.release();
+        let early = result_rx.recv_timeout(Duration::from_secs(1));
+        if early.is_ok() {
+            publisher.join().unwrap();
+        }
+        panic!("publisher exited or stalled before commit barrier: {early:?}");
+    }
+    let cleanup = service.cleanup_pending_objects(1).unwrap();
+    assert_eq!(cleanup.deleted, 1);
+    metadata.release();
+
+    let result = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    publisher.join().unwrap();
+    assert!(matches!(
+        result,
+        Err(MetadError::PublishArtifactFailed { source, .. })
+            if matches!(*source, MetadError::StalePreparedArtifactObjectGcEpoch { .. })
+    ));
+    assert!(service.lookup_path("/racing.bin").unwrap().is_none());
+    assert!(objects
+        .head(&ObjectKey::new(block.object_key).unwrap())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn gc_rescan_preserves_object_whose_manifest_committed_first() {
+    let (service, objects) = service_with_objects();
+    let published = service
+        .publish_artifact(artifact_request(dname(b"live"), "live", b"live"))
+        .unwrap();
+    let body = published.body.as_ref().unwrap();
+    let object = block_key(published.attr.inode, body.generation, 0, 0);
+    enqueue_gc_candidate(
+        &service,
+        ObjectGcRecord {
+            inode: published.attr.inode,
+            generation: body.generation,
+            object_key: object.as_str().to_owned(),
+            size: body.size,
+            digest_uri: body.digest_uri.clone(),
+            enqueue_version: 0,
+            enqueue_unix_ms: 0,
+        },
+    );
+
+    let cleanup = service.cleanup_pending_objects(1).unwrap();
+    assert_eq!(cleanup.blocked_by_snapshots, 1);
+    assert_eq!(cleanup.deleted, 0);
+    assert!(objects.head(&object).unwrap().is_some());
+    assert_eq!(
+        service
+            .read_artifact(InodeId::root(), &dname(b"live"))
+            .unwrap(),
+        b"live"
+    );
+}
+
+#[test]
+fn reopen_resumes_durable_object_gc_claim_after_crash() {
+    let metadata = HoltMetadataStore::open_memory().unwrap();
+    let objects = MemoryObjectStore::new();
+    let service = NoKvFs::new(MountId::new(1).unwrap(), metadata.clone(), objects.clone());
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    let published = service
+        .publish_artifact(artifact_request(dname(b"old"), "old", b"old"))
+        .unwrap();
+    let body = published.body.as_ref().unwrap();
+    let object = block_key(published.attr.inode, body.generation, 0, 0);
+    service.remove_file_path("/old").unwrap();
+    let gc_row = metadata
+        .scan(ScanRequest {
+            family: RecordFamily::Gc,
+            prefix: gc_queue_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::WritePlanLocal,
+        })
+        .unwrap()
+        .pop()
+        .unwrap();
+    let claim_key = object_gc_claim_key(service.mount);
+    let claim = metadata
+        .get_versioned(
+            RecordFamily::System,
+            &claim_key,
+            service.read_version().unwrap(),
+            ReadPurpose::WritePlanLocal,
+        )
+        .unwrap()
+        .unwrap();
+    let version = service.next_version().unwrap();
+    service
+        .commit_metadata(MetadataCommand {
+            request_id: request_id(
+                b"test-leave-object-gc-deleting",
+                service.mount,
+                InodeId::root(),
+                version,
+            ),
+            kind: CommandKind::CleanupObjects,
+            read_version: predecessor(version).unwrap(),
+            commit_version: version,
+            primary_family: RecordFamily::System,
+            primary_key: claim_key.clone(),
+            predicates: vec![
+                PredicateRef {
+                    family: RecordFamily::System,
+                    key: claim_key.clone(),
+                    predicate: Predicate::VersionEquals(claim.version),
+                },
+                PredicateRef {
+                    family: RecordFamily::Gc,
+                    key: gc_row.key.clone(),
+                    predicate: Predicate::VersionEquals(gc_row.version),
+                },
+            ],
+            mutations: vec![Mutation {
+                family: RecordFamily::System,
+                key: claim_key.clone(),
+                op: MutationOp::Put,
+                value: Some(Value(
+                    encode_object_gc_claim(&ObjectGcClaim::Deleting {
+                        owner_epoch: service.epoch.load(Ordering::Relaxed),
+                        operation_token: claim.version.get(),
+                        gc_record_key: gc_row.key,
+                        gc_record_version: gc_row.version.get(),
+                    })
+                    .unwrap(),
+                )),
+            }],
+            watch: Vec::new(),
+        })
+        .unwrap();
+    drop(service);
+
+    let reopened = NoKvFs::open_existing(
+        MountId::new(1).unwrap(),
+        metadata.clone(),
+        objects.clone(),
+        0,
+    )
+    .unwrap();
+    assert!(
+        objects.head(&object).unwrap().is_some(),
+        "reopen must not mutate metadata or delete objects before ownership is established"
+    );
+    let deferred_claim = metadata
+        .get(
+            RecordFamily::System,
+            &claim_key,
+            reopened.read_version().unwrap(),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decode_object_gc_claim(&deferred_claim.0).unwrap(),
+        ObjectGcClaim::Deleting { .. }
+    ));
+
+    // The ordinary cleanup pass resumes the durable claim after the server has
+    // established its ownership and durability policy.
+    let cleanup = reopened.cleanup_pending_objects(1).unwrap();
+    assert_eq!(cleanup.deleted, 1);
+    let claim = metadata
+        .get(
+            RecordFamily::System,
+            &claim_key,
+            reopened.read_version().unwrap(),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        decode_object_gc_claim(&claim.0).unwrap(),
+        ObjectGcClaim::Open
+    );
+    assert!(metadata
+        .scan(ScanRequest {
+            family: RecordFamily::Gc,
+            prefix: gc_queue_prefix(reopened.mount),
+            start_after: None,
+            version: reopened.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    assert!(objects.head(&object).unwrap().is_none());
+
+    let cleanup = reopened.cleanup_pending_objects(1).unwrap();
+    assert_eq!(cleanup.deleted, 0);
+    assert!(metadata
+        .scan(ScanRequest {
+            family: RecordFamily::Gc,
+            prefix: gc_queue_prefix(reopened.mount),
+            start_after: None,
+            version: reopened.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    assert!(objects.head(&object).unwrap().is_none());
+}
+
+#[test]
 fn read_lease_grace_blocks_recent_object_gc_records() {
     let (service, objects) = service_with_objects();
     let name = DentryName::new(b"checkpoint.bin".to_vec()).unwrap();
@@ -4122,6 +4908,60 @@ fn history_cleanup_keeps_snapshot_reads_until_snapshot_retired() {
             )
             .unwrap(),
         None
+    );
+}
+
+#[test]
+fn history_cleanup_does_not_invalidate_a_prepared_object_upload() {
+    let (service, _) = service_with_objects();
+    let name = dname(b"upload-during-history-prune.bin");
+    let prepared = service
+        .prepare_artifact_create(InodeId::root(), name.clone())
+        .unwrap();
+
+    service.cleanup_history(100).unwrap();
+
+    let refreshed = service
+        .refresh_prepared_artifact_object_gc_epoch(prepared.clone())
+        .unwrap();
+    assert_eq!(
+        refreshed, prepared,
+        "history pruning must not rotate the object-deletion epoch"
+    );
+    let bytes = b"history-prune-independent";
+    let written = service
+        .stage_prepared_artifact_ranges(
+            &prepared,
+            "history-prune-independent",
+            &[PublishArtifactRange {
+                offset: 0,
+                bytes: bytes.to_vec(),
+            }],
+            0,
+        )
+        .unwrap();
+    service
+        .publish_prepared_artifact_staged_session(
+            prepared,
+            PublishArtifactStagedSession {
+                parent: InodeId::root(),
+                name,
+                producer: "unit-test".to_owned(),
+                digest_uri: "sha256:history-prune-independent".to_owned(),
+                content_type: "application/octet-stream".to_owned(),
+                manifest_id: "history-prune-independent".to_owned(),
+                size: bytes.len() as u64,
+                chunks: written.chunk_manifests(),
+                staged: written.staged_objects().unwrap(),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        read_artifact_at_path(&service, "/upload-during-history-prune.bin"),
+        bytes
     );
 }
 
@@ -4625,6 +5465,188 @@ fn failed_publish_returns_staged_objects_for_cleanup_and_does_not_reuse_identity
     assert!(next.attr.generation > first.attr.generation + 1);
 }
 
+#[test]
+fn prepared_publish_rejects_intervening_object_gc_epoch_and_reclaims_staging() {
+    let (service, objects) = service_with_objects();
+    let victim_name = dname(b"victim.bin");
+    service
+        .publish_artifact(artifact_request(
+            victim_name.clone(),
+            "gc-victim",
+            b"victim",
+        ))
+        .unwrap();
+    service.remove_file(InodeId::root(), &victim_name).unwrap();
+
+    let name = dname(b"late-after-gc.bin");
+    let prepared = service
+        .prepare_artifact_create(InodeId::root(), name.clone())
+        .unwrap();
+    let bytes = b"late-after-gc";
+    let written = service
+        .stage_prepared_artifact_ranges(
+            &prepared,
+            "late-after-gc",
+            &[PublishArtifactRange {
+                offset: 0,
+                bytes: bytes.to_vec(),
+            }],
+            0,
+        )
+        .unwrap();
+    let staged_before = written.staged_objects().unwrap();
+    for object in staged_before.objects() {
+        assert!(objects.head(&object.key).unwrap().is_some());
+    }
+
+    // Deleting the unrelated victim advances the durable claim through
+    // Open -> Deleting -> Open. The prepared write must not attach the newer
+    // Open epoch after upload; its original claim predicate is authoritative.
+    let cleanup = service.cleanup_pending_objects(100).unwrap();
+    assert_eq!(cleanup.deleted, 1);
+    let error = service
+        .publish_prepared_artifact_staged_session(
+            prepared.clone(),
+            PublishArtifactStagedSession {
+                parent: InodeId::root(),
+                name: name.clone(),
+                producer: "unit-test".to_owned(),
+                digest_uri: "sha256:late-after-gc".to_owned(),
+                content_type: "application/octet-stream".to_owned(),
+                manifest_id: "late-after-gc".to_owned(),
+                size: bytes.len() as u64,
+                chunks: written.chunk_manifests(),
+                staged: staged_before,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .unwrap_err();
+    let staged = match error {
+        MetadError::PublishArtifactFailed { source, staged } => {
+            assert!(matches!(
+                *source,
+                MetadError::StalePreparedArtifactObjectGcEpoch { .. }
+            ));
+            staged
+        }
+        error => panic!("unexpected prepared publish error: {error:?}"),
+    };
+    assert!(service.lookup_path("/late-after-gc.bin").unwrap().is_none());
+
+    let cleanup = service.cleanup_staged_objects(&staged).unwrap();
+    assert_eq!(cleanup.deleted, staged.len());
+    for object in staged.objects() {
+        assert!(objects.head(&object.key).unwrap().is_none());
+    }
+
+    let refreshed = service
+        .refresh_prepared_artifact_object_gc_epoch(prepared.clone())
+        .unwrap();
+    assert!(refreshed.generation > prepared.generation);
+    assert_ne!(
+        refreshed.object_gc_claim_version,
+        prepared.object_gc_claim_version
+    );
+    let rewritten = service
+        .stage_prepared_artifact_ranges(
+            &refreshed,
+            "late-after-gc",
+            &[PublishArtifactRange {
+                offset: 0,
+                bytes: bytes.to_vec(),
+            }],
+            0,
+        )
+        .unwrap();
+    let rewritten_staged = rewritten.staged_objects().unwrap();
+    service
+        .publish_prepared_artifact_staged_session(
+            refreshed,
+            PublishArtifactStagedSession {
+                parent: InodeId::root(),
+                name,
+                producer: "unit-test".to_owned(),
+                digest_uri: "sha256:late-after-gc-refreshed".to_owned(),
+                content_type: "application/octet-stream".to_owned(),
+                manifest_id: "late-after-gc".to_owned(),
+                size: bytes.len() as u64,
+                chunks: rewritten.chunk_manifests(),
+                staged: rewritten_staged.clone(),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .unwrap();
+    assert_eq!(read_artifact_at_path(&service, "/late-after-gc.bin"), bytes);
+    for object in rewritten_staged.objects() {
+        assert!(objects.head(&object.key).unwrap().is_some());
+    }
+}
+
+#[test]
+fn gc_before_first_upload_can_refresh_to_a_new_generation() {
+    let (service, objects) = service_with_objects();
+    let victim_name = dname(b"first-upload-victim.bin");
+    service
+        .publish_artifact(artifact_request(
+            victim_name.clone(),
+            "first-upload-victim",
+            b"victim",
+        ))
+        .unwrap();
+    service.remove_file(InodeId::root(), &victim_name).unwrap();
+
+    let name = dname(b"first-upload.bin");
+    let prepared = service
+        .prepare_artifact_create(InodeId::root(), name.clone())
+        .unwrap();
+    assert_eq!(service.cleanup_pending_objects(100).unwrap().deleted, 1);
+    let refreshed = service
+        .refresh_prepared_artifact_object_gc_epoch(prepared.clone())
+        .unwrap();
+    assert!(refreshed.generation > prepared.generation);
+
+    let bytes = b"uploaded-only-after-refresh";
+    let written = service
+        .stage_prepared_artifact_ranges(
+            &refreshed,
+            "first-upload",
+            &[PublishArtifactRange {
+                offset: 0,
+                bytes: bytes.to_vec(),
+            }],
+            0,
+        )
+        .unwrap();
+    let staged = written.staged_objects().unwrap();
+    service
+        .publish_prepared_artifact_staged_session(
+            refreshed,
+            PublishArtifactStagedSession {
+                parent: InodeId::root(),
+                name,
+                producer: "unit-test".to_owned(),
+                digest_uri: "sha256:first-upload".to_owned(),
+                content_type: "application/octet-stream".to_owned(),
+                manifest_id: "first-upload".to_owned(),
+                size: bytes.len() as u64,
+                chunks: written.chunk_manifests(),
+                staged: staged.clone(),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .unwrap();
+    assert_eq!(read_artifact_at_path(&service, "/first-upload.bin"), bytes);
+    for object in staged.objects() {
+        assert!(objects.head(&object.key).unwrap().is_some());
+    }
+}
+
 fn dname(raw: &[u8]) -> DentryName {
     DentryName::new(raw.to_vec()).unwrap()
 }
@@ -4898,8 +5920,8 @@ fn clone_subtree_path_rejects_non_directory() {
     ));
 }
 
-fn read_artifact_at_path(
-    service: &NoKvFs<HoltMetadataStore, MemoryObjectStore>,
+fn read_artifact_at_path<M: MetadataStore, O: ObjectStore>(
+    service: &NoKvFs<M, O>,
     path: &str,
 ) -> Vec<u8> {
     let (parent, name) = service.resolve_parent_path(path).unwrap();
@@ -5054,7 +6076,6 @@ fn rollback_subtree_rejects_foreign_or_missing_snapshot() {
     service
         .create_dir_path("/other", 0o755, 1000, 1000)
         .unwrap();
-    let other_root = service.resolve_directory_path("/other").unwrap();
     let snap = service.snapshot_subtree_path("/other").unwrap();
 
     // A snapshot of /other cannot roll back /ws.
@@ -5069,8 +6090,1648 @@ fn rollback_subtree_rejects_foreign_or_missing_snapshot() {
     ));
     // The rejected target is untouched and the legitimate one still works.
     assert!(service
-        .rollback_subtree(other_root, snap.snapshot_id)
+        .rollback_subtree_path("/other", snap.snapshot_id)
         .is_ok());
+}
+
+#[test]
+fn restore_snapshot_to_fork_is_idempotent_and_holds_borrowed_objects() {
+    let (service, objects) = service_with_objects();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    let original = publish_path_artifact(&service, "/ws/state", "ws/v1", b"version-one");
+    let original_body = original.body.as_ref().unwrap();
+    let original_block = block_key(original.attr.inode, original_body.generation, 0, 0);
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+
+    service.remove_file_path("/ws/state").unwrap();
+    publish_path_artifact(&service, "/ws/current", "ws/v2", b"version-two");
+
+    let first = service
+        .restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    let retry = service
+        .restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    assert_eq!(first, retry, "same restore request must be idempotent");
+    assert_eq!(first.state, RestoreState::Complete);
+    assert_eq!(
+        read_artifact_at_path(&service, "/restored/state"),
+        b"version-one"
+    );
+    assert!(service.lookup_path("/ws/state").unwrap().is_none());
+    assert_eq!(
+        read_artifact_at_path(&service, "/ws/current"),
+        b"version-two"
+    );
+
+    let later = service.snapshot_subtree_path("/ws").unwrap();
+    assert!(matches!(
+        service.restore_subtree_path_to_fork("/ws", later.snapshot_id, "/restored"),
+        Err(MetadError::RestoreDestinationConflict { .. })
+    ));
+
+    // The durable fork binding, not the caller's lease, owns retention after
+    // attach. Retiring both user-visible pins and running GC must not break the
+    // restored fork's borrowed v1 block.
+    assert!(service.retire_snapshot(snapshot.snapshot_id).unwrap());
+    assert!(service.retire_snapshot(later.snapshot_id).unwrap());
+    let held = service.cleanup_pending_objects(100).unwrap();
+    assert_eq!(held.deleted, 0, "held cleanup: {held:?}");
+    assert!(held.blocked_by_snapshots >= 1, "held cleanup: {held:?}");
+    assert!(objects.head(&original_block).unwrap().is_some());
+    assert_eq!(
+        read_artifact_at_path(&service, "/restored/state"),
+        b"version-one"
+    );
+
+    // Removing the destination atomically releases its durable base reference;
+    // the already-enqueued source block can then be reclaimed.
+    service.remove_file_path("/restored/state").unwrap();
+    service.remove_empty_dir_path("/restored").unwrap();
+    let released = service.cleanup_pending_objects(100).unwrap();
+    assert!(released.deleted >= 1, "released cleanup: {released:?}");
+    assert!(objects.head(&original_block).unwrap().is_none());
+}
+
+#[test]
+fn restore_borrowed_file_rename_escape_outlives_root_binding() {
+    let (service, objects) = service_with_objects();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .create_dir_path("/outside", 0o755, 1000, 1000)
+        .unwrap();
+    let original = publish_path_artifact(
+        &service,
+        "/source/state",
+        "source/state",
+        b"borrowed-after-rename",
+    );
+    let body = original.body.as_ref().unwrap();
+    let block = block_key(original.attr.inode, body.generation, 0, 0);
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+
+    service
+        .rename_path("/restored/state", "/outside/state")
+        .unwrap();
+    service.remove_empty_dir_path("/restored").unwrap();
+    service.remove_file_path("/source/state").unwrap();
+    service.remove_empty_dir_path("/source").unwrap();
+    assert!(service.retire_snapshot(snapshot.snapshot_id).unwrap());
+
+    for _ in 0..4 {
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    assert_eq!(
+        read_artifact_at_path(&service, "/outside/state"),
+        b"borrowed-after-rename"
+    );
+    assert!(objects.head(&block).unwrap().is_some());
+
+    service.remove_file_path("/outside/state").unwrap();
+    for _ in 0..6 {
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    assert!(objects.head(&block).unwrap().is_none());
+}
+
+#[test]
+fn restore_borrowed_directory_rename_escape_outlives_root_binding() {
+    let (service, objects) = service_with_objects();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .create_dir_path("/source/nested", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .create_dir_path("/outside", 0o755, 1000, 1000)
+        .unwrap();
+    let original = publish_path_artifact(
+        &service,
+        "/source/nested/state",
+        "source/nested/state",
+        b"borrowed-directory",
+    );
+    let body = original.body.as_ref().unwrap();
+    let block = block_key(original.attr.inode, body.generation, 0, 0);
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+
+    service
+        .rename_path("/restored/nested", "/outside/nested")
+        .unwrap();
+    service.remove_empty_dir_path("/restored").unwrap();
+    service.remove_file_path("/source/nested/state").unwrap();
+    service.remove_empty_dir_path("/source/nested").unwrap();
+    service.remove_empty_dir_path("/source").unwrap();
+    assert!(service.retire_snapshot(snapshot.snapshot_id).unwrap());
+
+    for _ in 0..4 {
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    assert_eq!(
+        read_artifact_at_path(&service, "/outside/nested/state"),
+        b"borrowed-directory"
+    );
+    assert!(objects.head(&block).unwrap().is_some());
+
+    service.remove_file_path("/outside/nested/state").unwrap();
+    service.remove_empty_dir_path("/outside/nested").unwrap();
+    for _ in 0..6 {
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    assert!(objects.head(&block).unwrap().is_none());
+}
+
+#[test]
+fn restore_borrowed_hardlink_escape_outlives_root_binding() {
+    let (service, objects) = service_with_objects();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    let outside = service
+        .create_dir_path("/outside", 0o755, 1000, 1000)
+        .unwrap();
+    let original = publish_path_artifact(
+        &service,
+        "/source/state",
+        "source/state",
+        b"borrowed-hardlink",
+    );
+    let body = original.body.as_ref().unwrap();
+    let block = block_key(original.attr.inode, body.generation, 0, 0);
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    let restored = service.lookup_path("/restored/state").unwrap().unwrap();
+
+    service
+        .link(restored.attr.inode, outside.attr.inode, dname(b"state"))
+        .unwrap();
+    service.remove_file_path("/restored/state").unwrap();
+    service.remove_empty_dir_path("/restored").unwrap();
+    service.remove_file_path("/source/state").unwrap();
+    service.remove_empty_dir_path("/source").unwrap();
+    assert!(service.retire_snapshot(snapshot.snapshot_id).unwrap());
+
+    for _ in 0..4 {
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    assert_eq!(
+        read_artifact_at_path(&service, "/outside/state"),
+        b"borrowed-hardlink"
+    );
+    assert!(objects.head(&block).unwrap().is_some());
+
+    service.remove_file_path("/outside/state").unwrap();
+    for _ in 0..6 {
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    assert!(objects.head(&block).unwrap().is_none());
+}
+
+#[test]
+fn restore_to_fork_preserves_snapshot_path_index_membership_only() {
+    let service = service();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .create_dir_path("/source/runs", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/runs/indexed.bin",
+        "source/indexed",
+        b"indexed",
+    );
+    service
+        .create_file_path("/source/runs/plain.bin", 0o644, 1000, 1000)
+        .unwrap();
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .remove_file_path("/source/runs/indexed.bin")
+        .unwrap();
+
+    service
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+
+    let indexed = service
+        .list_indexed_path_page("/restored/runs", None, 10)
+        .unwrap();
+    assert_eq!(
+        indexed
+            .entries
+            .iter()
+            .map(|entry| entry.dentry.name.as_bytes())
+            .collect::<Vec<_>>(),
+        vec![b"indexed.bin".as_slice()]
+    );
+    let ordinary = service
+        .read_dir_plus_path_page("/restored/runs", None, 10)
+        .unwrap();
+    assert_eq!(ordinary.entries.len(), 2);
+    assert!(ordinary
+        .entries
+        .iter()
+        .any(|entry| entry.dentry.name.as_bytes() == b"plain.bin"));
+}
+
+#[test]
+fn recursive_restore_reconstructs_snapshot_fork_shadow_after_rename_and_delete() {
+    let service = service();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/indexed.bin",
+        "source/indexed",
+        b"indexed",
+    );
+    let source_snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .restore_subtree_path_to_fork("/source", source_snapshot.snapshot_id, "/restored")
+        .unwrap();
+    let restored_snapshot = service.snapshot_subtree_path("/restored").unwrap();
+
+    service
+        .rename_path("/restored/indexed.bin", "/restored/renamed.bin")
+        .unwrap();
+    service.remove_file_path("/restored/renamed.bin").unwrap();
+    service
+        .restore_subtree_path_to_fork("/restored", restored_snapshot.snapshot_id, "/copy")
+        .unwrap();
+
+    assert_eq!(
+        service
+            .list_indexed_path_page("/copy", None, 10)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.dentry.name)
+            .collect::<Vec<_>>(),
+        vec![dname(b"indexed.bin")]
+    );
+    assert_eq!(
+        read_artifact_at_path(&service, "/copy/indexed.bin"),
+        b"indexed"
+    );
+}
+
+#[test]
+fn recursive_restore_uses_historical_fork_shadow_after_source_root_release() {
+    let service = service();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/indexed.bin",
+        "source/indexed",
+        b"indexed",
+    );
+    let source_snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .restore_subtree_path_to_fork("/source", source_snapshot.snapshot_id, "/restored")
+        .unwrap();
+    let restored_snapshot = service.snapshot_subtree_path("/restored").unwrap();
+    assert!(service
+        .restore_subtree_path_to_fork_leave_preparing(
+            "/restored",
+            restored_snapshot.snapshot_id,
+            "/copy",
+            RestoreInitialization::default(),
+        )
+        .is_err());
+
+    service.remove_file_path("/restored/indexed.bin").unwrap();
+    service.remove_empty_dir_path("/restored").unwrap();
+    for _ in 0..6 {
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    assert!(matches!(
+        service.restore_subtree_path_to_fork("/restored", restored_snapshot.snapshot_id, "/copy"),
+        Err(MetadError::RestoreInProgress)
+    ));
+    drain_restore_staging_cleanup(&service);
+    service
+        .restore_subtree_path_to_fork("/restored", restored_snapshot.snapshot_id, "/copy")
+        .unwrap();
+
+    assert_eq!(
+        service
+            .list_indexed_path_page("/copy", None, 10)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.dentry.name)
+            .collect::<Vec<_>>(),
+        vec![dname(b"indexed.bin")]
+    );
+}
+
+#[test]
+fn restored_path_index_membership_survives_file_and_directory_moves() {
+    let service = service();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .create_dir_path("/source/runs", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/runs/indexed.bin",
+        "source/indexed",
+        b"indexed",
+    );
+    service
+        .create_file_path("/source/runs/plain.bin", 0o644, 1000, 1000)
+        .unwrap();
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+
+    service
+        .rename_path("/restored/runs/indexed.bin", "/restored/runs/renamed.bin")
+        .unwrap();
+    assert_eq!(
+        service
+            .list_indexed_path_page("/restored/runs", None, 10)
+            .unwrap()
+            .entries[0]
+            .dentry
+            .name
+            .as_bytes(),
+        b"renamed.bin"
+    );
+
+    service
+        .rename_path("/restored/runs", "/restored/moved")
+        .unwrap();
+    assert_eq!(
+        service
+            .list_indexed_path_page("/restored/moved", None, 10)
+            .unwrap()
+            .entries[0]
+            .dentry
+            .name
+            .as_bytes(),
+        b"renamed.bin"
+    );
+
+    service
+        .create_dir_path("/restored/other", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .rename_path("/restored/moved/renamed.bin", "/restored/other/moved.bin")
+        .unwrap();
+    let destination = service
+        .list_indexed_path_page("/restored/other", None, 10)
+        .unwrap();
+    assert_eq!(destination.entries.len(), 1);
+    assert_eq!(destination.entries[0].dentry.name.as_bytes(), b"moved.bin");
+    assert!(service
+        .list_indexed_path_page("/restored/moved", None, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+    assert!(service
+        .lookup_path("/restored/moved/plain.bin")
+        .unwrap()
+        .is_some());
+    assert!(service
+        .list_indexed_path_page("/restored", None, 10)
+        .unwrap()
+        .entries
+        .iter()
+        .all(|entry| entry.dentry.name.as_bytes() != b"moved"));
+}
+
+#[test]
+fn restored_path_index_membership_survives_inode_api_rename() {
+    let service = service();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/indexed.bin",
+        "source/indexed",
+        b"indexed",
+    );
+    service
+        .create_dir_path("/source/runs", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/runs/nested.bin",
+        "source/runs/nested",
+        b"nested",
+    );
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    service
+        .create_dir_path("/restored/destination", 0o755, 1000, 1000)
+        .unwrap();
+    let restored = service.resolve_directory_path("/restored").unwrap();
+    let destination = service
+        .resolve_directory_path("/restored/destination")
+        .unwrap();
+    service
+        .rename(
+            restored,
+            &dname(b"indexed.bin"),
+            destination,
+            dname(b"moved.bin"),
+        )
+        .unwrap();
+    let indexed = service
+        .list_indexed_path_page("/restored/destination", None, 10)
+        .unwrap();
+    assert_eq!(indexed.entries.len(), 1);
+    assert_eq!(indexed.entries[0].dentry.name.as_bytes(), b"moved.bin");
+
+    let outside = service
+        .create_dir_path("/outside", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .rename(
+            destination,
+            &dname(b"moved.bin"),
+            outside.attr.inode,
+            dname(b"escaped.bin"),
+        )
+        .unwrap();
+    service
+        .rename(
+            restored,
+            &dname(b"runs"),
+            outside.attr.inode,
+            dname(b"escaped-runs"),
+        )
+        .unwrap();
+    let outside_indexed = service
+        .list_indexed_path_page("/outside", None, 10)
+        .unwrap();
+    assert_eq!(
+        outside_indexed
+            .entries
+            .iter()
+            .map(|entry| entry.dentry.name.as_bytes())
+            .collect::<Vec<_>>(),
+        vec![b"escaped-runs".as_slice(), b"escaped.bin".as_slice()]
+    );
+    assert_eq!(
+        service
+            .list_indexed_path_page("/outside/escaped-runs", None, 10)
+            .unwrap()
+            .entries[0]
+            .dentry
+            .name
+            .as_bytes(),
+        b"nested.bin"
+    );
+}
+
+#[test]
+fn preparing_restore_path_index_is_hidden_and_rebuilt_after_reopen() {
+    let metadata = HoltMetadataStore::open_memory().unwrap();
+    let objects = MemoryObjectStore::new();
+    let service = NoKvFs::new(MountId::new(1).unwrap(), metadata.clone(), objects.clone());
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/indexed.bin",
+        "source/indexed",
+        b"indexed",
+    );
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    assert!(service
+        .restore_subtree_path_to_fork_leave_preparing(
+            "/source",
+            snapshot.snapshot_id,
+            "/restored",
+            RestoreInitialization::default(),
+        )
+        .is_err());
+    let binding = metadata
+        .scan(ScanRequest {
+            family: RecordFamily::ForkBinding,
+            prefix: fork_binding_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .into_iter()
+        .map(|row| decode_fork_binding(&row.value.0).unwrap())
+        .next()
+        .unwrap();
+    assert_eq!(binding.state, ForkBindingState::Preparing);
+    assert_eq!(
+        metadata
+            .scan(ScanRequest {
+                family: RecordFamily::System,
+                prefix: restore_path_index_set_prefix(service.mount, binding.base_ref_set_id,),
+                start_after: None,
+                version: service.read_version().unwrap(),
+                limit: 0,
+                purpose: ReadPurpose::UserStrong,
+            })
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(service.lookup_path("/restored").unwrap().is_none());
+    assert_eq!(
+        service
+            .list_indexed_path_page("/source", None, 10)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+    drop(service);
+
+    let reopened =
+        NoKvFs::open_existing(MountId::new(1).unwrap(), metadata.clone(), objects, 0).unwrap();
+    assert_eq!(
+        metadata
+            .scan(ScanRequest {
+                family: RecordFamily::System,
+                prefix: restore_path_index_set_prefix(reopened.mount, binding.base_ref_set_id,),
+                start_after: None,
+                version: reopened.read_version().unwrap(),
+                limit: 1,
+                purpose: ReadPurpose::UserStrong,
+            })
+            .unwrap()
+            .len(),
+        1,
+        "startup preserves hidden Preparing staging for an exact retry"
+    );
+    assert!(reopened.lookup_path("/restored").unwrap().is_none());
+    assert!(matches!(
+        reopened.restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored"),
+        Err(MetadError::RestoreInProgress)
+    ));
+    drain_restore_staging_cleanup(&reopened);
+    reopened
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    assert_eq!(
+        reopened
+            .list_indexed_path_page("/restored", None, 10)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn preparing_restore_large_staging_reopens_o1_and_cleans_in_bounded_pages() {
+    const CHILDREN: usize = 160;
+    const XATTRS: usize = 160;
+    let metadata = HoltMetadataStore::open_memory().unwrap();
+    let objects = MemoryObjectStore::new();
+    let service = NoKvFs::new(MountId::new(1).unwrap(), metadata.clone(), objects.clone());
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    let source = service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .create_files_in_dir_path(
+            "/source",
+            (0..CHILDREN)
+                .map(|index| dname(format!("child-{index:04}").as_bytes()))
+                .collect(),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap();
+    for index in 0..XATTRS {
+        service
+            .set_xattr(
+                source.attr.inode,
+                format!("user.wide-{index:04}").as_bytes(),
+                vec![index as u8; 60_000],
+                XattrSetMode::Create,
+            )
+            .unwrap();
+    }
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    assert!(service
+        .restore_subtree_path_to_fork_leave_preparing(
+            "/source",
+            snapshot.snapshot_id,
+            "/restored",
+            RestoreInitialization::default(),
+        )
+        .is_err());
+    drop(service);
+
+    let before_open = metadata.metadata_store_stats();
+    let reopened =
+        NoKvFs::open_existing(MountId::new(1).unwrap(), metadata.clone(), objects, 0).unwrap();
+    let after_open = metadata.metadata_store_stats();
+    assert!(
+        after_open
+            .scan_key_returned_total
+            .saturating_sub(before_open.scan_key_returned_total)
+            <= 128,
+        "readiness work must not scale with staging membership"
+    );
+    let before_schedule = metadata.metadata_store_stats();
+    assert!(matches!(
+        reopened.restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored"),
+        Err(MetadError::RestoreInProgress)
+    ));
+    let after_schedule = metadata.metadata_store_stats();
+    assert_eq!(
+        after_schedule.scan_key_returned_total - before_schedule.scan_key_returned_total,
+        0,
+        "exact retry must schedule indexed cleanup without traversing staging"
+    );
+
+    let mut max_returned_per_pass = 0;
+    for _ in 0..4096 {
+        let pending = metadata
+            .scan(ScanRequest {
+                family: RecordFamily::System,
+                prefix: restore_staging_cleanup_prefix(reopened.mount),
+                start_after: None,
+                version: reopened.read_version().unwrap(),
+                limit: 1,
+                purpose: ReadPurpose::UserStrong,
+            })
+            .unwrap();
+        if pending.is_empty() {
+            break;
+        }
+        let before = metadata.metadata_store_stats();
+        reopened.cleanup_pending_objects(1).unwrap();
+        let after = metadata.metadata_store_stats();
+        max_returned_per_pass = max_returned_per_pass.max(
+            after
+                .scan_key_returned_total
+                .saturating_sub(before.scan_key_returned_total),
+        );
+    }
+    assert!(
+        max_returned_per_pass <= 80,
+        "bounded cleanup returned {max_returned_per_pass} keys in one pass"
+    );
+    assert!(metadata
+        .scan(ScanRequest {
+            family: RecordFamily::System,
+            prefix: restore_staging_cleanup_prefix(reopened.mount),
+            start_after: None,
+            version: reopened.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    reopened
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    assert_eq!(
+        reopened.read_dir_plus_path("/restored").unwrap().len(),
+        CHILDREN
+    );
+    assert_eq!(
+        reopened
+            .list_xattr(reopened.resolve_directory_path("/restored").unwrap())
+            .unwrap()
+            .len(),
+        XATTRS
+    );
+}
+
+#[test]
+fn restore_attach_conflict_discards_hidden_path_index_rows() {
+    let service = service();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/indexed.bin",
+        "source/indexed",
+        b"indexed",
+    );
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+    assert!(service
+        .restore_subtree_path_to_fork_leave_preparing(
+            "/source",
+            snapshot.snapshot_id,
+            "/restored",
+            RestoreInitialization::default(),
+        )
+        .is_err());
+    let binding = service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::ForkBinding,
+            prefix: fork_binding_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .into_iter()
+        .map(|row| decode_fork_binding(&row.value.0).unwrap())
+        .next()
+        .unwrap();
+    service
+        .create_dir_path("/restored", 0o755, 1000, 1000)
+        .unwrap();
+    assert!(matches!(
+        service.restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored"),
+        Err(MetadError::RestoreDestinationConflict { .. })
+    ));
+    drain_restore_staging_cleanup(&service);
+    assert!(service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::System,
+            prefix: restore_path_index_set_prefix(service.mount, binding.base_ref_set_id),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    assert!(service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::ForkBinding,
+            prefix: fork_binding_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    assert!(service
+        .list_indexed_path_page("/restored", None, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+}
+
+#[test]
+fn restore_refreshes_object_gc_claim_between_bounded_staging_commits() {
+    let metadata = RotatingObjectGcClaimStore::new();
+    let objects = MemoryObjectStore::new();
+    let service = NoKvFs::new(MountId::new(1).unwrap(), metadata.clone(), objects);
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    let source = service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .publish_artifact(PublishArtifact {
+            parent: source.attr.inode,
+            name: dname(b"state.bin"),
+            producer: "unit-test".to_owned(),
+            digest_uri: "sha256:stable".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            manifest_id: "source/state".to_owned(),
+            bytes: b"stable".to_vec(),
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+        })
+        .unwrap();
+    let snapshot = service.snapshot_subtree_path("/source").unwrap();
+
+    let outcome = service
+        .restore_subtree_path_to_fork("/source", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    assert_eq!(outcome.state, RestoreState::Complete);
+    assert!(
+        metadata.rotations() >= 2,
+        "restore must perform multiple bounded stages under independently refreshed claims"
+    );
+    let restored = service.resolve_directory_path("/restored").unwrap();
+    assert_eq!(
+        service
+            .read_artifact(restored, &dname(b"state.bin"))
+            .unwrap(),
+        b"stable"
+    );
+}
+
+#[test]
+fn completed_restore_moved_from_original_destination_is_never_reclaimed_as_staging() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/ws/state", "ws/state", b"stable");
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    service
+        .restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    service.rename_path("/restored", "/moved").unwrap();
+
+    assert!(matches!(
+        service.restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored"),
+        Err(MetadError::RestoreDestinationConflict { .. })
+    ));
+    assert_eq!(read_artifact_at_path(&service, "/moved/state"), b"stable");
+}
+
+#[test]
+fn completed_restore_retry_survives_source_and_pin_removal_after_reopen() {
+    let metadata = HoltMetadataStore::open_memory().unwrap();
+    let objects = MemoryObjectStore::new();
+    let service = NoKvFs::new(MountId::new(1).unwrap(), metadata.clone(), objects.clone());
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/ws/state", "ws/state", b"stable");
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let first = service
+        .restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    service.remove_file_path("/ws/state").unwrap();
+    service.remove_empty_dir_path("/ws").unwrap();
+    assert!(service.retire_snapshot(snapshot.snapshot_id).unwrap());
+    drop(service);
+
+    let reopened = NoKvFs::open_existing(MountId::new(1).unwrap(), metadata, objects, 0).unwrap();
+    let retry = reopened
+        .restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    assert_eq!(retry, first);
+    assert_eq!(
+        read_artifact_at_path(&reopened, "/restored/state"),
+        b"stable"
+    );
+}
+
+#[test]
+fn restore_initialization_is_complete_before_destination_attach() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    service
+        .create_dir_path("/ws/metadata", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/ws/metadata/checkpoints.jsonl",
+        "registry",
+        b"source-alias\n",
+    );
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let manifest = br#"{"schema":"restore-test-v1"}"#.to_vec();
+
+    service
+        .restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/restored",
+            RestoreInitialization {
+                remove_relative_paths: vec!["metadata/checkpoints.jsonl".to_owned()],
+                files: vec![RestoreInitializationFile {
+                    relative_path: "metadata/restore_manifest.json".to_owned(),
+                    bytes: manifest.clone(),
+                    content_type: "application/json".to_owned(),
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                }],
+            },
+        )
+        .unwrap();
+
+    assert!(service
+        .lookup_path("/restored/metadata/checkpoints.jsonl")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        read_artifact_at_path(&service, "/restored/metadata/restore_manifest.json"),
+        manifest
+    );
+    assert_eq!(
+        read_artifact_at_path(&service, "/ws/metadata/checkpoints.jsonl"),
+        b"source-alias\n"
+    );
+}
+
+#[test]
+fn restore_initialization_digest_is_canonical_and_conflict_checked() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    service
+        .create_dir_path("/ws/metadata", 0o755, 1000, 1000)
+        .unwrap();
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let file = |path: &str, bytes: &[u8]| RestoreInitializationFile {
+        relative_path: path.to_owned(),
+        bytes: bytes.to_vec(),
+        content_type: "application/json".to_owned(),
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+    };
+    let first = service
+        .restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/restored",
+            RestoreInitialization {
+                remove_relative_paths: Vec::new(),
+                files: vec![file("metadata/b.json", b"b"), file("metadata/a.json", b"a")],
+            },
+        )
+        .unwrap();
+    let retry = service
+        .restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/restored",
+            RestoreInitialization {
+                remove_relative_paths: Vec::new(),
+                files: vec![file("metadata/a.json", b"a"), file("metadata/b.json", b"b")],
+            },
+        )
+        .unwrap();
+    assert_eq!(retry, first);
+    assert!(matches!(
+        service.restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/restored",
+            RestoreInitialization {
+                remove_relative_paths: Vec::new(),
+                files: vec![
+                    file("metadata/a.json", b"changed"),
+                    file("metadata/b.json", b"b"),
+                ],
+            },
+        ),
+        Err(MetadError::RestoreDestinationConflict { .. })
+    ));
+}
+
+#[test]
+fn restore_initialization_rejects_duplicate_and_ancestor_overlaps_before_staging() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let file = |path: &str| RestoreInitializationFile {
+        relative_path: path.to_owned(),
+        bytes: b"value".to_vec(),
+        content_type: "application/json".to_owned(),
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+    };
+    let invalid = [
+        RestoreInitialization {
+            remove_relative_paths: vec!["metadata".to_owned()],
+            files: vec![file("metadata/manifest.json")],
+        },
+        RestoreInitialization {
+            remove_relative_paths: Vec::new(),
+            files: vec![file("metadata"), file("metadata/manifest.json")],
+        },
+        RestoreInitialization {
+            remove_relative_paths: vec!["metadata".to_owned(), "metadata/manifest.json".to_owned()],
+            files: Vec::new(),
+        },
+        RestoreInitialization {
+            remove_relative_paths: vec!["metadata/manifest.json".to_owned()],
+            files: vec![file("metadata/manifest.json")],
+        },
+    ];
+
+    for (index, initialization) in invalid.into_iter().enumerate() {
+        let destination = format!("/invalid-{index}");
+        assert!(matches!(
+            service.restore_subtree_path_to_fork_initialized(
+                "/ws",
+                snapshot.snapshot_id,
+                &destination,
+                initialization,
+            ),
+            Err(MetadError::InvalidPath(_))
+        ));
+        assert!(service.lookup_path(&destination).unwrap().is_none());
+    }
+    assert!(service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::ForkBinding,
+            prefix: fork_binding_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn malformed_gc_row_is_quarantined_once_without_starving_valid_candidate() {
+    let (service, objects) = service_with_objects();
+    let mut malformed_key = gc_queue_prefix(service.mount);
+    malformed_key.extend_from_slice(&0u64.to_be_bytes());
+    let version = service.next_version().unwrap();
+    service
+        .commit_metadata(MetadataCommand {
+            request_id: b"malformed-gc-row".to_vec(),
+            kind: CommandKind::CleanupObjects,
+            read_version: predecessor(version).unwrap(),
+            commit_version: version,
+            primary_family: RecordFamily::Gc,
+            primary_key: malformed_key.clone(),
+            predicates: vec![PredicateRef {
+                family: RecordFamily::Gc,
+                key: malformed_key.clone(),
+                predicate: Predicate::NotExists,
+            }],
+            mutations: vec![Mutation {
+                family: RecordFamily::Gc,
+                key: malformed_key,
+                op: MutationOp::Put,
+                value: Some(Value(b"not-an-object-gc-record".to_vec())),
+            }],
+            watch: Vec::new(),
+        })
+        .unwrap();
+
+    let object = ObjectKey::new("blocks/1/900/1/0/0").unwrap();
+    objects.put(&object, b"stale".to_vec()).unwrap();
+    enqueue_gc_candidate(
+        &service,
+        ObjectGcRecord {
+            inode: InodeId::new(900).unwrap(),
+            generation: 1,
+            object_key: object.as_str().to_owned(),
+            size: 5,
+            digest_uri: "sha256:stale".to_owned(),
+            enqueue_version: 0,
+            enqueue_unix_ms: 0,
+        },
+    );
+
+    let outcome = service.cleanup_pending_objects(10).unwrap();
+    assert_eq!(outcome.scanned, 2);
+    assert_eq!(outcome.records_removed, 2);
+    assert_eq!(outcome.deleted, 1);
+    assert!(objects.head(&object).unwrap().is_none());
+    assert!(service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::Gc,
+            prefix: gc_queue_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        service
+            .metadata
+            .scan_keys(KeyScanRequest {
+                family: RecordFamily::System,
+                prefix: object_gc_quarantine_prefix(service.mount),
+                start_after: None,
+                limit: 0,
+                purpose: ReadPurpose::UserStrong,
+            })
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn malformed_base_ref_release_job_is_quarantined_without_starving_valid_job() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/ws/state", "base", b"stable");
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    service
+        .restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored")
+        .unwrap();
+    service.remove_file_path("/restored/state").unwrap();
+    service.remove_empty_dir_path("/restored").unwrap();
+
+    let mut malformed_key = fork_base_ref_release_prefix(service.mount);
+    malformed_key.extend_from_slice(&0u64.to_be_bytes());
+    let version = service.next_version().unwrap();
+    service
+        .commit_metadata(MetadataCommand {
+            request_id: b"malformed-base-ref-release".to_vec(),
+            kind: CommandKind::CleanupObjects,
+            read_version: predecessor(version).unwrap(),
+            commit_version: version,
+            primary_family: RecordFamily::System,
+            primary_key: malformed_key.clone(),
+            predicates: vec![PredicateRef {
+                family: RecordFamily::System,
+                key: malformed_key.clone(),
+                predicate: Predicate::NotExists,
+            }],
+            mutations: vec![Mutation {
+                family: RecordFamily::System,
+                key: malformed_key,
+                op: MutationOp::Put,
+                value: Some(Value(b"not-a-fork-binding".to_vec())),
+            }],
+            watch: Vec::new(),
+        })
+        .unwrap();
+
+    for _ in 0..4 {
+        service.cleanup_pending_objects(128).unwrap();
+        if service
+            .metadata
+            .scan_keys(KeyScanRequest {
+                family: RecordFamily::System,
+                prefix: fork_base_ref_release_prefix(service.mount),
+                start_after: None,
+                limit: 1,
+                purpose: ReadPurpose::UserStrong,
+            })
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+    }
+    assert!(service
+        .metadata
+        .scan_keys(KeyScanRequest {
+            family: RecordFamily::System,
+            prefix: fork_base_ref_release_prefix(service.mount),
+            start_after: None,
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        service
+            .metadata
+            .scan_keys(KeyScanRequest {
+                family: RecordFamily::System,
+                prefix: fork_base_release_quarantine_prefix(service.mount),
+                start_after: None,
+                limit: 0,
+                purpose: ReadPurpose::UserStrong,
+            })
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn restore_initialization_size_limits_fail_before_durable_operation_creation() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let oversized = RestoreInitialization {
+        remove_relative_paths: Vec::new(),
+        files: vec![RestoreInitializationFile {
+            relative_path: "manifest.bin".to_owned(),
+            bytes: vec![0; 8 * 1024 * 1024 + 1],
+            content_type: "application/octet-stream".to_owned(),
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+        }],
+    };
+    assert!(matches!(
+        service.restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/too-large",
+            oversized,
+        ),
+        Err(MetadError::RestoreResourceLimit { resource, .. })
+            if resource == "restore initialization bytes"
+    ));
+    assert!(service.lookup_path("/too-large").unwrap().is_none());
+    assert!(service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::ForkBinding,
+            prefix: fork_binding_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn restore_initialization_semantic_error_leaves_no_hold_inode_or_object() {
+    let (service, objects) = service_with_objects();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    service
+        .create_dir_path("/ws/metadata", 0o755, 1000, 1000)
+        .unwrap();
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let inode_count_before = service
+        .metadata
+        .scan_keys(KeyScanRequest {
+            family: RecordFamily::Inode,
+            prefix: service.mount.get().to_be_bytes().to_vec(),
+            start_after: None,
+            limit: 0,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .len();
+    let object_puts_before = service.object_stats().object_puts;
+
+    assert!(matches!(
+        service.restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/invalid-semantic",
+            RestoreInitialization {
+                remove_relative_paths: vec!["metadata".to_owned()],
+                files: Vec::new(),
+            },
+        ),
+        Err(MetadError::InvalidPath(message)) if message.contains("is a directory")
+    ));
+    assert!(service.lookup_path("/invalid-semantic").unwrap().is_none());
+    assert!(service
+        .metadata
+        .scan_keys(KeyScanRequest {
+            family: RecordFamily::System,
+            prefix: fork_base_hold_prefix(service.mount),
+            start_after: None,
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    assert!(service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::ForkBinding,
+            prefix: fork_binding_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 1,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        service
+            .metadata
+            .scan_keys(KeyScanRequest {
+                family: RecordFamily::Inode,
+                prefix: service.mount.get().to_be_bytes().to_vec(),
+                start_after: None,
+                limit: 0,
+                purpose: ReadPurpose::UserStrong,
+            })
+            .unwrap()
+            .len(),
+        inode_count_before
+    );
+    assert_eq!(service.object_stats().object_puts, object_puts_before);
+    assert_eq!(objects.object_count(), 0);
+}
+
+#[test]
+fn detached_restore_initialization_emits_only_final_attach_watch() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    service
+        .create_dir_path("/ws/metadata", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/ws/metadata/checkpoints.jsonl",
+        "registry",
+        b"source\n",
+    );
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let cursor = service.watch_subtree(InodeId::root()).unwrap();
+
+    service
+        .restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/restored",
+            RestoreInitialization {
+                remove_relative_paths: vec!["metadata/checkpoints.jsonl".to_owned()],
+                files: vec![RestoreInitializationFile {
+                    relative_path: "metadata/restore_manifest.json".to_owned(),
+                    bytes: b"manifest".to_vec(),
+                    content_type: "application/json".to_owned(),
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                }],
+            },
+        )
+        .unwrap();
+
+    let records = service.replay_watch(InodeId::root(), cursor, 100).unwrap();
+    assert_eq!(records.len(), 1, "records={records:?}");
+    assert_eq!(records[0].event.kind, WatchEventKind::Create);
+    assert_eq!(records[0].event.parent, Some(InodeId::root()));
+    assert_eq!(records[0].event.name, Some(dname(b"restored")));
+}
+
+#[test]
+fn restore_base_refs_are_paged_outside_the_binding_record() {
+    const BLOCKS: usize = 129;
+    let service = service();
+    let ws = service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    let shards = (0..BLOCKS)
+        .map(|index| CheckpointShard {
+            name: dname(format!("block-{index:03}").as_bytes()),
+            bytes: vec![index as u8],
+        })
+        .collect();
+    service
+        .publish_checkpoint(ws.attr.inode, shards, 1000, 1000)
+        .unwrap();
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let outcome = service
+        .restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored")
+        .unwrap();
+
+    let binding = service
+        .metadata
+        .get(
+            RecordFamily::ForkBinding,
+            &fork_binding_key(service.mount, outcome.destination_root),
+            service.read_version().unwrap(),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(binding.0.len() < 512, "binding bytes={}", binding.0.len());
+    let refs = service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::System,
+            prefix: crate::layout::fork_base_ref_owner_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 0,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap();
+    assert_eq!(refs.len(), BLOCKS);
+    assert!(refs.iter().all(|row| row.value.0.len() < 1024));
+}
+
+#[test]
+fn restore_initialization_recovers_before_attach_and_survives_immediate_reopen() {
+    let metadata = HoltMetadataStore::open_memory().unwrap();
+    let objects = MemoryObjectStore::new();
+    let service = NoKvFs::new(MountId::new(1).unwrap(), metadata.clone(), objects.clone());
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    service
+        .create_dir_path("/ws/metadata", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/ws/metadata/checkpoints.jsonl",
+        "registry",
+        b"source-alias\n",
+    );
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    let initialization = RestoreInitialization {
+        remove_relative_paths: vec!["metadata/checkpoints.jsonl".to_owned()],
+        files: vec![RestoreInitializationFile {
+            relative_path: "metadata/restore_manifest.json".to_owned(),
+            bytes: b"complete-manifest".to_vec(),
+            content_type: "application/json".to_owned(),
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+        }],
+    };
+    assert!(service
+        .restore_subtree_path_to_fork_leave_preparing(
+            "/ws",
+            snapshot.snapshot_id,
+            "/restored",
+            initialization.clone(),
+        )
+        .is_err());
+    assert!(service.lookup_path("/restored").unwrap().is_none());
+    service
+        .remove_file_path("/ws/metadata/checkpoints.jsonl")
+        .unwrap();
+    service.remove_empty_dir_path("/ws/metadata").unwrap();
+    service.remove_empty_dir_path("/ws").unwrap();
+    assert!(service.retire_snapshot(snapshot.snapshot_id).unwrap());
+    drop(service);
+
+    let reopened = NoKvFs::open_existing(
+        MountId::new(1).unwrap(),
+        metadata.clone(),
+        objects.clone(),
+        0,
+    )
+    .unwrap();
+    assert!(reopened.lookup_path("/restored").unwrap().is_none());
+    assert!(matches!(
+        reopened.restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/restored",
+            initialization.clone(),
+        ),
+        Err(MetadError::RestoreInProgress)
+    ));
+    drain_restore_staging_cleanup(&reopened);
+    reopened
+        .restore_subtree_path_to_fork_initialized(
+            "/ws",
+            snapshot.snapshot_id,
+            "/restored",
+            initialization,
+        )
+        .unwrap();
+    drop(reopened);
+
+    let completed = NoKvFs::open_existing(MountId::new(1).unwrap(), metadata, objects, 0).unwrap();
+    assert!(completed
+        .lookup_path("/restored/metadata/checkpoints.jsonl")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        read_artifact_at_path(&completed, "/restored/metadata/restore_manifest.json"),
+        b"complete-manifest"
+    );
+}
+
+#[test]
+fn restore_rejects_hardlinks_without_visible_or_staging_leaks() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    let state = publish_path_artifact(&service, "/ws/state", "state", b"stable");
+    service
+        .link(state.attr.inode, InodeId::root(), dname(b"outside"))
+        .unwrap();
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+
+    assert!(matches!(
+        service.restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored"),
+        Err(MetadError::RestoreHardlinkUnsupported { inode }) if inode == state.attr.inode
+    ));
+    assert!(service.lookup_path("/restored").unwrap().is_none());
+    assert_eq!(read_artifact_at_path(&service, "/ws/state"), b"stable");
+    assert_eq!(read_artifact_at_path(&service, "/outside"), b"stable");
+    assert!(service
+        .metadata
+        .scan(ScanRequest {
+            family: RecordFamily::ForkBinding,
+            prefix: fork_binding_prefix(service.mount),
+            start_after: None,
+            version: service.read_version().unwrap(),
+            limit: 0,
+            purpose: ReadPurpose::UserStrong,
+        })
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn restore_rejects_cross_shard_grafts_without_attach() {
+    let service = service();
+    let ws = service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    let foreign = InodeId::compose(1, 42).unwrap();
+    service
+        .create_graft(ws.attr.inode, dname(b"foreign"), foreign, 0o755, 1000, 1000)
+        .unwrap();
+    let snapshot = service.snapshot_subtree_path("/ws").unwrap();
+
+    assert!(matches!(
+        service.restore_subtree_path_to_fork("/ws", snapshot.snapshot_id, "/restored"),
+        Err(MetadError::RestoreCrossShardUnsupported { inode }) if inode == foreign
+    ));
+    assert!(service.lookup_path("/restored").unwrap().is_none());
+    assert_eq!(
+        service
+            .lookup_path("/ws/foreign")
+            .unwrap()
+            .unwrap()
+            .attr
+            .inode,
+        foreign
+    );
+}
+
+#[test]
+fn baseline_rollback_rejects_fork_backed_destination_without_mutation() {
+    let service = service();
+    service.create_dir_path("/ws", 0o755, 1000, 1000).unwrap();
+    publish_path_artifact(&service, "/ws/state", "source", b"checkpoint");
+    let source_snapshot = service.snapshot_subtree_path("/ws").unwrap();
+    service
+        .restore_subtree_path_to_fork("/ws", source_snapshot.snapshot_id, "/restored")
+        .unwrap();
+    let restored_snapshot = service.snapshot_subtree_path("/restored").unwrap();
+    publish_path_artifact(&service, "/restored/local", "local", b"local");
+
+    assert!(matches!(
+        service.rollback_subtree_path("/restored", restored_snapshot.snapshot_id),
+        Err(MetadError::InvalidPath(message))
+            if message.contains("restore-to-fork destination")
+    ));
+    assert_eq!(
+        read_artifact_at_path(&service, "/restored/state"),
+        b"checkpoint"
+    );
+    assert_eq!(read_artifact_at_path(&service, "/restored/local"), b"local");
+
+    service.remove_file_path("/ws/state").unwrap();
+    service.remove_empty_dir_path("/ws").unwrap();
+    assert!(service
+        .retire_snapshot(source_snapshot.snapshot_id)
+        .unwrap());
+    assert!(service
+        .retire_snapshot(restored_snapshot.snapshot_id)
+        .unwrap());
+    for _ in 0..6 {
+        service.cleanup_pending_objects(128).unwrap();
+    }
+    assert_eq!(
+        read_artifact_at_path(&service, "/restored/state"),
+        b"checkpoint"
+    );
+}
+
+#[test]
+fn baseline_rollback_rejects_nested_and_renamed_fork_subtrees() {
+    let service = service();
+    service
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    service
+        .create_dir_path("/source/nested", 0o755, 1000, 1000)
+        .unwrap();
+    publish_path_artifact(
+        &service,
+        "/source/nested/state",
+        "source/nested",
+        b"checkpoint",
+    );
+    let source_snapshot = service.snapshot_subtree_path("/source").unwrap();
+    service
+        .restore_subtree_path_to_fork("/source", source_snapshot.snapshot_id, "/restored")
+        .unwrap();
+    let nested_snapshot = service.snapshot_subtree_path("/restored/nested").unwrap();
+    service.remove_file_path("/restored/nested/state").unwrap();
+
+    assert!(matches!(
+        service.rollback_subtree_path("/restored/nested", nested_snapshot.snapshot_id),
+        Err(MetadError::InvalidPath(message))
+            if message.contains("restore-to-fork destination")
+    ));
+    service.rename_path("/restored/nested", "/escaped").unwrap();
+    assert!(matches!(
+        service.rollback_subtree_path("/escaped", nested_snapshot.snapshot_id),
+        Err(MetadError::InvalidPath(message))
+            if message.contains("restore-to-fork destination")
+    ));
+    assert!(service.lookup_path("/escaped/state").unwrap().is_none());
 }
 
 #[test]
@@ -5385,7 +8046,6 @@ fn sync_metadata_log_archives_commit_before_recovery_ack() {
             METADATA_LOG_ZERO_DIGEST,
         ))
         .unwrap();
-
     let key = b"sync-log-system-key".to_vec();
     let value = b"sync-after-checkpoint".to_vec();
     let commit_version = checkpoint.commit_version + 1;
@@ -5458,7 +8118,6 @@ fn restore_metadata_with_sync_log_advances_allocator_after_replay() {
             METADATA_LOG_ZERO_DIGEST,
         ))
         .unwrap();
-
     let post_checkpoint = service
         .create_dir_path("/runs/post-checkpoint", 0o755, 1000, 1000)
         .unwrap();
@@ -5526,7 +8185,6 @@ fn sync_metadata_log_archives_independent_batch_as_one_segment() {
             METADATA_LOG_ZERO_DIGEST,
         ))
         .unwrap();
-
     let results = service.create_file_batches_in_dir_path(vec![
         CreateInDirPathBatch {
             parent_path: "/left".to_owned(),
@@ -7118,7 +9776,9 @@ fn fallback_recovery_survives_command_dedupe_rows_on_real_store() {
     service
         .commit_metadata(MetadataCommand {
             request_id: probe_request.clone(),
-            kind: CommandKind::UpdateAttr,
+            // This command only seeds a CommandDedupe row for allocator
+            // recovery coverage; it does not mutate the live namespace.
+            kind: CommandKind::StageDetachedRestore,
             read_version: predecessor(probe_version).unwrap(),
             commit_version: probe_version,
             primary_family: RecordFamily::Inode,

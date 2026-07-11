@@ -13,7 +13,8 @@ pub use names::{parse_absolute_path, DentryName, NameError, PathError};
 pub use shard::{ShardMap, ShardPrefix, ShardPrefixParseError, ShardRoute, DEFAULT_SHARD_INDEX};
 pub use types::{
     AdvisoryLock, AdvisoryLockKind, AdvisoryLockRequest, BlockDescriptor, BodyDescriptor,
-    ChunkManifest, DentryProjection, DentryRecord, FileType, ForkBinding, InodeAttr, InodeId,
-    ModelError, MountId, ObjectGcRecord, PathMetadata, ReadLease, RecordFamily, SliceManifest,
-    SnapshotPin, SpecialNodeSpec, WatchCursor, WatchEvent, WatchEventKind, WatchRecord,
+    ChunkManifest, DentryProjection, DentryRecord, FileType, ForkBinding, ForkBindingState,
+    InodeAttr, InodeId, ModelError, MountId, ObjectGcRecord, PathMetadata, ReadLease, RecordFamily,
+    SliceManifest, SnapshotPin, SpecialNodeSpec, WatchCursor, WatchEvent, WatchEventKind,
+    WatchRecord,
 };

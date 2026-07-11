@@ -90,13 +90,10 @@ fn snapshot_pin_command(request_id: &[u8], commit: u64) -> MetadataCommand {
     retention_put_command(RecordFamily::Snapshot, b"snapshot/1", request_id, commit)
 }
 
-fn fork_binding_command(request_id: &[u8], commit: u64) -> MetadataCommand {
-    retention_put_command(
-        RecordFamily::ForkBinding,
-        b"fork-binding/1",
-        request_id,
-        commit,
-    )
+const FORK_BASE_HOLD_KEY: &[u8] = b"\0\0\0\0\0\0\0\x01fork-base-hold\0restore-operation-1";
+
+fn fork_base_hold_command(request_id: &[u8], commit: u64) -> MetadataCommand {
+    retention_put_command(RecordFamily::System, FORK_BASE_HOLD_KEY, request_id, commit)
 }
 
 fn retention_put_command(
@@ -479,21 +476,21 @@ fn independent_batch_isolates_snapshot_retention_changes() {
 }
 
 #[test]
-fn independent_batch_orders_fork_binding_retention_transitions() {
+fn independent_batch_orders_fork_base_hold_retention_transitions() {
     let store = HoltMetadataStore::open_memory().unwrap();
     store
         .commit_metadata(put_command(b"dir/a", b"req-1", b"value-a", 2))
         .unwrap();
 
     let results = store.commit_independent_batch(&[
-        fork_binding_command(b"fork-1", 3),
+        fork_base_hold_command(b"fork-1", 3),
         replace_command(b"dir/a", b"req-2", b"value-b", 2, 4),
     ]);
     assert!(results.iter().all(Result::is_ok));
     assert_eq!(
         store
             .history_retention
-            .active_fork_bindings
+            .active_fork_base_holds
             .load(Ordering::Acquire),
         1
     );
@@ -512,8 +509,8 @@ fn independent_batch_orders_fork_binding_retention_transitions() {
     let history_before_release = store.metadata_store_stats().history_write_total;
     let results = store.commit_independent_batch(&[
         retention_delete_command(
-            RecordFamily::ForkBinding,
-            b"fork-binding/1",
+            RecordFamily::System,
+            FORK_BASE_HOLD_KEY,
             b"fork-retire",
             3,
             5,
@@ -524,7 +521,7 @@ fn independent_batch_orders_fork_binding_retention_transitions() {
     assert_eq!(
         store
             .history_retention
-            .active_fork_bindings
+            .active_fork_base_holds
             .load(Ordering::Acquire),
         0
     );
@@ -596,13 +593,13 @@ fn snapshot_pin_rejects_a_read_version_older_than_an_applied_writer() {
 }
 
 #[test]
-fn fork_binding_retains_point_reads_and_snapshot_scans() {
+fn fork_base_hold_retains_point_reads_and_snapshot_scans() {
     let store = HoltMetadataStore::open_memory().unwrap();
     store
         .commit_metadata(put_command(b"dir/a", b"req-1", b"value-a", 2))
         .unwrap();
     store
-        .commit_metadata(fork_binding_command(b"fork-1", 3))
+        .commit_metadata(fork_base_hold_command(b"fork-1", 3))
         .unwrap();
     store
         .commit_metadata(replace_command(b"dir/a", b"req-2", b"value-b", 2, 4))
@@ -635,6 +632,45 @@ fn fork_binding_retains_point_reads_and_snapshot_scans() {
             value: Value(b"value-a".to_vec()),
             version: version(2),
         }]
+    );
+}
+
+#[test]
+fn ordinary_fork_binding_does_not_hold_history_retention() {
+    let store = HoltMetadataStore::open_memory().unwrap();
+    store
+        .commit_metadata(put_command(b"dir/a", b"req-1", b"value-a", 2))
+        .unwrap();
+    store
+        .commit_metadata(retention_put_command(
+            RecordFamily::ForkBinding,
+            b"fork-binding/1",
+            b"fork-binding",
+            3,
+        ))
+        .unwrap();
+    store
+        .commit_metadata(replace_command(b"dir/a", b"req-2", b"value-b", 2, 4))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .history_retention
+            .active_fork_base_holds
+            .load(Ordering::Acquire),
+        0
+    );
+    assert_eq!(store.metadata_store_stats().history_write_total, 0);
+    assert_eq!(
+        store
+            .get(
+                RecordFamily::Dentry,
+                b"dir/a",
+                version(2),
+                ReadPurpose::Snapshot,
+            )
+            .unwrap(),
+        None
     );
 }
 
@@ -811,7 +847,7 @@ fn checkpoint_install_and_file_reopen_restore_all_retention_state() {
         .commit_metadata(snapshot_pin_command(b"snapshot-1", 2))
         .unwrap();
     source
-        .commit_metadata(fork_binding_command(b"fork-1", 3))
+        .commit_metadata(fork_base_hold_command(b"fork-1", 3))
         .unwrap();
     let image = source.export_checkpoint_image().unwrap();
 
@@ -821,7 +857,7 @@ fn checkpoint_install_and_file_reopen_restore_all_retention_state() {
     assert_eq!(
         restored
             .history_retention
-            .active_fork_bindings
+            .active_fork_base_holds
             .load(Ordering::Acquire),
         1
     );
@@ -841,7 +877,7 @@ fn checkpoint_install_and_file_reopen_restore_all_retention_state() {
             .commit_metadata(snapshot_pin_command(b"snapshot-1", 2))
             .unwrap();
         store
-            .commit_metadata(fork_binding_command(b"fork-1", 3))
+            .commit_metadata(fork_base_hold_command(b"fork-1", 3))
             .unwrap();
     }
     let reopened = HoltMetadataStore::open_file(path).unwrap();
@@ -849,7 +885,7 @@ fn checkpoint_install_and_file_reopen_restore_all_retention_state() {
     assert_eq!(
         reopened
             .history_retention
-            .active_fork_bindings
+            .active_fork_base_holds
             .load(Ordering::Acquire),
         1
     );
@@ -1591,6 +1627,89 @@ fn pruning_last_history_record_removes_candidate_index_key() {
         .history_key_index_tree()
         .unwrap()
         .get(&history_index_key(RecordFamily::Dentry, b"dir/a"))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn fork_shadow_history_scan_and_prune_use_candidate_index() {
+    let store = HoltMetadataStore::open_memory().unwrap();
+    let key = b"shadow/parent/child";
+    let put = MetadataCommand {
+        request_id: b"fork-shadow-put".to_vec(),
+        kind: CommandKind::CreateFile,
+        read_version: version(1),
+        commit_version: version(2),
+        primary_family: RecordFamily::ForkShadow,
+        primary_key: key.to_vec(),
+        predicates: vec![PredicateRef {
+            family: RecordFamily::ForkShadow,
+            key: key.to_vec(),
+            predicate: Predicate::NotExists,
+        }],
+        mutations: vec![Mutation {
+            family: RecordFamily::ForkShadow,
+            key: key.to_vec(),
+            op: MutationOp::Put,
+            value: Some(Value(b"shadow-value".to_vec())),
+        }],
+        watch: Vec::new(),
+    };
+    store.commit_metadata(put).unwrap();
+    store
+        .commit_metadata(snapshot_pin_command(b"fork-shadow-snapshot", 3))
+        .unwrap();
+    let delete = MetadataCommand {
+        request_id: b"fork-shadow-delete".to_vec(),
+        kind: CommandKind::RemoveFile,
+        read_version: version(3),
+        commit_version: version(4),
+        primary_family: RecordFamily::ForkShadow,
+        primary_key: key.to_vec(),
+        predicates: vec![PredicateRef {
+            family: RecordFamily::ForkShadow,
+            key: key.to_vec(),
+            predicate: Predicate::Exists,
+        }],
+        mutations: vec![Mutation {
+            family: RecordFamily::ForkShadow,
+            key: key.to_vec(),
+            op: MutationOp::Delete,
+            value: None,
+        }],
+        watch: Vec::new(),
+    };
+    store.commit_metadata(delete).unwrap();
+
+    assert_eq!(
+        store
+            .scan(ScanRequest {
+                family: RecordFamily::ForkShadow,
+                prefix: b"shadow/parent/".to_vec(),
+                start_after: None,
+                version: version(3),
+                limit: 10,
+                purpose: ReadPurpose::Snapshot,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|item| (item.key, item.value))
+            .collect::<Vec<_>>(),
+        vec![(key.to_vec(), Value(b"shadow-value".to_vec()))]
+    );
+
+    let outcome = store
+        .prune_history(HistoryPruneRequest {
+            retain_from: None,
+            retention_epoch: store.history_retention_epoch().unwrap(),
+            limit: 100,
+        })
+        .unwrap();
+    assert_eq!(outcome.removed, 2);
+    assert!(store
+        .history_key_index_tree()
+        .unwrap()
+        .get(&history_index_key(RecordFamily::ForkShadow, key))
         .unwrap()
         .is_none());
 }

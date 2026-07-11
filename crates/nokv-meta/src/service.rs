@@ -50,20 +50,29 @@ use crate::command::{
     CommandKind, CommitResult, DelimitedScanItem, DelimitedScanRequest, HistoryPruneOutcome,
     HistoryPruneRequest, KeyScanRequest, MetadataCommand, MetadataError, MetadataStore,
     MetadataStoreStats, MetadataStoreStatsProvider, Mutation, MutationOp, Predicate, PredicateRef,
-    ReadPurpose, ScanRequest, Value, Version, WatchProjection,
+    ReadPurpose, ScanItem, ScanRequest, Value, Version, WatchProjection,
 };
 use crate::layout::{
     allocator_key, chunk_manifest_key, chunk_manifest_prefix, decode_allocator_state,
-    decode_body_descriptor, decode_chunk_manifest, decode_dentry_projection, decode_inode_attr,
-    decode_object_gc_record, decode_path_index_catalog, decode_path_index_row, decode_snapshot_pin,
-    decode_watch_event, dentry_key, dentry_mount_prefix, dentry_prefix, encode_allocator_state,
-    encode_body_descriptor, encode_chunk_manifest, encode_dentry_projection, encode_inode_attr,
-    encode_object_gc_record, encode_path_index_catalog, encode_path_index_row, encode_snapshot_pin,
-    encode_watch_event, gc_object_key, gc_queue_prefix, inode_key, path_index_catalog_key,
-    path_index_key, path_index_prefix, path_index_row_key, path_index_row_prefix, snapshot_pin_key,
-    snapshot_pin_prefix, watch_log_key, watch_log_prefix, xattr_key, xattr_prefix,
-    PathIndexCatalogRecord, PathIndexFieldRecord, PathIndexRowRecord, PathIndexValueRecord,
-    PATH_INDEX_DELIMITER,
+    decode_body_descriptor, decode_chunk_manifest, decode_dentry_projection, decode_fork_binding,
+    decode_inode_attr, decode_object_gc_record, decode_path_index_catalog, decode_path_index_row,
+    decode_snapshot_pin, decode_watch_event, dentry_key, dentry_mount_prefix, dentry_prefix,
+    encode_allocator_state, encode_body_descriptor, encode_chunk_manifest,
+    encode_dentry_projection, encode_fork_binding, encode_inode_attr, encode_object_gc_record,
+    encode_path_index_catalog, encode_path_index_row, encode_snapshot_pin, encode_watch_event,
+    fork_base_hold_key, fork_base_hold_prefix, fork_base_hold_read_version,
+    fork_base_ref_digest_from_owner_key, fork_base_ref_inverse_key, fork_base_ref_inverse_prefix,
+    fork_base_ref_owner_key, fork_base_ref_release_cursor_key, fork_base_ref_release_key,
+    fork_base_ref_release_prefix, fork_base_ref_set_prefix, fork_base_release_quarantine_key,
+    fork_binding_key, fork_shadow_key, fork_shadow_prefix, gc_object_key, gc_queue_prefix,
+    gc_released_base_ref_key, inode_key, object_gc_claim_key, object_gc_quarantine_key,
+    path_index_catalog_key, path_index_gc_cursor_key, path_index_key, path_index_prefix,
+    path_index_row_key, path_index_row_prefix, restore_operation_key, restore_path_index_key,
+    restore_path_index_set_prefix, restore_staging_clean_key, restore_staging_cleanup_key,
+    restore_staging_cleanup_prefix, restore_staging_member_inode, restore_staging_member_key,
+    restore_staging_member_prefix, snapshot_pin_key, snapshot_pin_prefix, watch_log_key,
+    watch_log_prefix, xattr_key, xattr_prefix, PathIndexCatalogRecord, PathIndexFieldRecord,
+    PathIndexRowRecord, PathIndexValueRecord, PATH_INDEX_DELIMITER,
 };
 use nokv_object::{
     plan_chunk_manifest_reads, BlockReadOptions, ChunkStore, ChunkWriteOptions, ChunkWriteRange,
@@ -72,9 +81,10 @@ use nokv_object::{
 };
 use nokv_types::{
     parse_absolute_path, AdvisoryLock, BlockDescriptor, BodyDescriptor, ChunkManifest, DentryName,
-    DentryProjection, DentryRecord, FileType, InodeAttr, InodeId, ModelError, MountId,
-    ObjectGcRecord, PathError, PathMetadata, ReadLease, RecordFamily, SliceManifest, SnapshotPin,
-    SpecialNodeSpec, WatchCursor, WatchEvent, WatchEventKind, WatchRecord,
+    DentryProjection, DentryRecord, FileType, ForkBinding, ForkBindingState, InodeAttr, InodeId,
+    ModelError, MountId, ObjectGcRecord, PathError, PathMetadata, ReadLease, RecordFamily,
+    SliceManifest, SnapshotPin, SpecialNodeSpec, WatchCursor, WatchEvent, WatchEventKind,
+    WatchRecord,
 };
 use sha2::{Digest, Sha256};
 
@@ -109,6 +119,262 @@ const PATH_INDEX_LOOKUP_CACHE_MAX_ENTRIES_PER_SHARD: usize =
 const PATH_INDEX_VALIDATION_CACHE_MAX_ENTRIES_PER_SHARD: usize =
     PATH_INDEX_VALIDATION_CACHE_MAX_ENTRIES / PATH_CACHE_SHARD_COUNT;
 pub(crate) const DEFAULT_READ_LEASE_MS: u64 = 3_600_000;
+
+/// Stable request identity for restore-to-fork. It deliberately depends only on
+/// the canonical public request, so a completed retry remains resolvable after
+/// the source path or caller-owned snapshot pin disappears.
+pub fn restore_operation_id(
+    source_path: &str,
+    snapshot_id: u64,
+    destination_path: &str,
+) -> Result<String, MetadError> {
+    let source = canonical_path(&parse_absolute_path(source_path)?)?;
+    let destination = canonical_path(&parse_absolute_path(destination_path)?)?;
+    Ok(format!(
+        "restore-{}",
+        hex_digest(&restore_operation_digest(
+            &source,
+            snapshot_id,
+            &destination
+        ))
+    ))
+}
+
+fn restore_operation_digest(
+    source_path: &str,
+    snapshot_id: u64,
+    destination_path: &str,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv-restore-to-fork-request-v2\0");
+    hasher.update(source_path.as_bytes());
+    hasher.update([0]);
+    hasher.update(snapshot_id.to_be_bytes());
+    hasher.update(destination_path.as_bytes());
+    hasher.finalize().into()
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").expect("writing into String cannot fail");
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreStagingCleanupDisposition {
+    ResetForRetry,
+    Discard,
+    ForgetMembers,
+}
+
+fn encode_restore_staging_cleanup(
+    disposition: RestoreStagingCleanupDisposition,
+    binding: &ForkBinding,
+) -> Vec<u8> {
+    let encoded = encode_fork_binding(binding);
+    let mut value = Vec::with_capacity(1 + encoded.len());
+    value.push(match disposition {
+        RestoreStagingCleanupDisposition::ResetForRetry => 1,
+        RestoreStagingCleanupDisposition::Discard => 2,
+        RestoreStagingCleanupDisposition::ForgetMembers => 3,
+    });
+    value.extend_from_slice(&encoded);
+    value
+}
+
+fn decode_restore_staging_cleanup(
+    value: &[u8],
+) -> Result<(RestoreStagingCleanupDisposition, ForkBinding), MetadError> {
+    let Some((tag, binding)) = value.split_first() else {
+        return Err(MetadError::Codec(
+            "empty restore staging cleanup record".to_owned(),
+        ));
+    };
+    let disposition = match tag {
+        1 => RestoreStagingCleanupDisposition::ResetForRetry,
+        2 => RestoreStagingCleanupDisposition::Discard,
+        3 => RestoreStagingCleanupDisposition::ForgetMembers,
+        _ => {
+            return Err(MetadError::Codec(format!(
+                "invalid restore staging cleanup disposition {tag}"
+            )))
+        }
+    };
+    let binding = decode_fork_binding(binding).map_err(|err| MetadError::Codec(err.to_string()))?;
+    Ok((disposition, binding))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ForkBaseRef {
+    owner_inode: InodeId,
+    owner_generation: u64,
+    read_version: u64,
+    size: u64,
+    object_key: String,
+    digest_uri: String,
+}
+
+fn encode_fork_base_ref(reference: &ForkBaseRef) -> Result<Vec<u8>, MetadError> {
+    let key_len = u32::try_from(reference.object_key.len())
+        .map_err(|_| MetadError::Codec("fork base object key is too long".to_owned()))?;
+    let digest_len = u32::try_from(reference.digest_uri.len())
+        .map_err(|_| MetadError::Codec("fork base digest is too long".to_owned()))?;
+    let mut out = Vec::with_capacity(40 + reference.object_key.len() + reference.digest_uri.len());
+    out.extend_from_slice(&reference.owner_inode.get().to_be_bytes());
+    out.extend_from_slice(&reference.owner_generation.to_be_bytes());
+    out.extend_from_slice(&reference.read_version.to_be_bytes());
+    out.extend_from_slice(&reference.size.to_be_bytes());
+    out.extend_from_slice(&key_len.to_be_bytes());
+    out.extend_from_slice(reference.object_key.as_bytes());
+    out.extend_from_slice(&digest_len.to_be_bytes());
+    out.extend_from_slice(reference.digest_uri.as_bytes());
+    Ok(out)
+}
+
+fn decode_fork_base_ref(bytes: &[u8]) -> Result<ForkBaseRef, MetadError> {
+    fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], MetadError> {
+        let Some((head, tail)) = input.split_at_checked(len) else {
+            return Err(MetadError::Codec("fork base ref is truncated".to_owned()));
+        };
+        *input = tail;
+        Ok(head)
+    }
+    let mut input = bytes;
+    let owner_inode = InodeId::new(u64::from_be_bytes(
+        take(&mut input, 8)?.try_into().expect("u64 width"),
+    ))?;
+    let owner_generation = u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("u64 width"));
+    let read_version = u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("u64 width"));
+    let size = u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("u64 width"));
+    let key_len = u32::from_be_bytes(take(&mut input, 4)?.try_into().expect("u32 width")) as usize;
+    let object_key = String::from_utf8(take(&mut input, key_len)?.to_vec())
+        .map_err(|_| MetadError::Codec("fork base object key is not utf-8".to_owned()))?;
+    let digest_len =
+        u32::from_be_bytes(take(&mut input, 4)?.try_into().expect("u32 width")) as usize;
+    let digest_uri = String::from_utf8(take(&mut input, digest_len)?.to_vec())
+        .map_err(|_| MetadError::Codec("fork base digest is not utf-8".to_owned()))?;
+    if !input.is_empty() {
+        return Err(MetadError::Codec(
+            "fork base ref has trailing bytes".to_owned(),
+        ));
+    }
+    Ok(ForkBaseRef {
+        owner_inode,
+        owner_generation,
+        read_version,
+        size,
+        object_key,
+        digest_uri,
+    })
+}
+
+fn encode_restore_shadow_inverse(base_ref_set_id: u64, projection: &DentryProjection) -> Vec<u8> {
+    let encoded = encode_dentry_projection(projection);
+    let mut out = Vec::with_capacity(8 + encoded.len());
+    out.extend_from_slice(&base_ref_set_id.to_be_bytes());
+    out.extend_from_slice(&encoded);
+    out
+}
+
+fn decode_restore_shadow_inverse(bytes: &[u8]) -> Result<(u64, DentryProjection), MetadError> {
+    let (set, projection) = bytes
+        .split_at_checked(8)
+        .ok_or_else(|| MetadError::Codec("restore shadow inverse is truncated".to_owned()))?;
+    let base_ref_set_id = u64::from_be_bytes(set.try_into().expect("u64 width"));
+    let projection =
+        decode_dentry_projection(projection).map_err(|err| MetadError::Codec(err.to_string()))?;
+    Ok((base_ref_set_id, projection))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ObjectGcClaim {
+    Open,
+    Deleting {
+        owner_epoch: u64,
+        operation_token: u64,
+        gc_record_key: Vec<u8>,
+        gc_record_version: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ObjectReferenceMutation {
+    claim_version: Version,
+}
+
+impl ObjectReferenceMutation {
+    pub(super) fn from_version(claim_version: Version) -> Self {
+        Self { claim_version }
+    }
+
+    pub(super) fn version(self) -> Version {
+        self.claim_version
+    }
+
+    pub(super) fn predicate(self, mount: MountId) -> PredicateRef {
+        PredicateRef {
+            family: RecordFamily::System,
+            key: object_gc_claim_key(mount),
+            predicate: Predicate::VersionEquals(self.claim_version),
+        }
+    }
+}
+
+fn encode_object_gc_claim(claim: &ObjectGcClaim) -> Result<Vec<u8>, MetadError> {
+    match claim {
+        ObjectGcClaim::Open => Ok(vec![1]),
+        ObjectGcClaim::Deleting {
+            owner_epoch,
+            operation_token,
+            gc_record_key,
+            gc_record_version,
+        } => {
+            let key_len = u32::try_from(gc_record_key.len())
+                .map_err(|_| MetadError::Codec("object GC record key is too long".to_owned()))?;
+            let mut out = Vec::with_capacity(29 + gc_record_key.len());
+            out.push(2);
+            out.extend_from_slice(&owner_epoch.to_be_bytes());
+            out.extend_from_slice(&operation_token.to_be_bytes());
+            out.extend_from_slice(&gc_record_version.to_be_bytes());
+            out.extend_from_slice(&key_len.to_be_bytes());
+            out.extend_from_slice(gc_record_key);
+            Ok(out)
+        }
+    }
+}
+
+fn decode_object_gc_claim(bytes: &[u8]) -> Result<ObjectGcClaim, MetadError> {
+    match bytes {
+        [1] => Ok(ObjectGcClaim::Open),
+        [2, rest @ ..] if rest.len() >= 28 => {
+            let owner_epoch = u64::from_be_bytes(rest[..8].try_into().expect("u64 width"));
+            let operation_token = u64::from_be_bytes(rest[8..16].try_into().expect("u64 width"));
+            let gc_record_version = u64::from_be_bytes(rest[16..24].try_into().expect("u64 width"));
+            let key_len = u32::from_be_bytes(rest[24..28].try_into().expect("u32 width")) as usize;
+            if rest.len() != 28 + key_len {
+                return Err(MetadError::Codec(
+                    "object GC claim record length mismatch".to_owned(),
+                ));
+            }
+            Ok(ObjectGcClaim::Deleting {
+                owner_epoch,
+                operation_token,
+                gc_record_key: rest[28..].to_vec(),
+                gc_record_version,
+            })
+        }
+        _ => Err(MetadError::Codec(
+            "invalid durable object GC claim record".to_owned(),
+        )),
+    }
+}
+
+fn object_key_digest(object_key: &str) -> [u8; 32] {
+    Sha256::digest(object_key.as_bytes()).into()
+}
 
 // Families folded into the fallback allocator rebuild when the durable
 // `allocator_key` System record is absent. Each row contributes its commit
@@ -201,6 +467,7 @@ struct ReplaceProjectionCommit<'a> {
     old_generation: Option<u64>,
     version: Version,
     path_index: Option<Vec<u8>>,
+    object_reference: ObjectReferenceMutation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,12 +576,34 @@ pub struct PreparedArtifact {
     pub replace: bool,
     pub dentry_version: Option<u64>,
     pub old_generation: Option<u64>,
+    /// Durable object-GC Open epoch captured before upload/planning. Publish
+    /// must CAS this exact version so an intervening delete cycle cannot make a
+    /// newly committed manifest point at an object that GC already removed.
+    pub object_gc_claim_version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedPreparedArtifact {
     pub entry: DentryWithAttr,
     pub prepared: PreparedArtifact,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreInitialization {
+    /// Snapshot-root-relative files to remove before destination attach.
+    pub remove_relative_paths: Vec<String>,
+    /// Snapshot-root-relative files to create or replace before attach.
+    pub files: Vec<RestoreInitializationFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreInitializationFile {
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -434,19 +723,37 @@ pub struct RenameReplaceResult {
     pub replaced: Option<DentryWithAttr>,
 }
 
-/// Handle to a writable copy-on-write fork produced by [`NoKvFs::clone_subtree`].
+/// Handle to a writable copy-on-write fork produced by the path-based clone API.
 ///
 /// `root` is the new namespace root: it sees every file and directory the source
 /// subtree had at clone time and shares the source's object blocks (no data copy)
-/// until the fork diverges on write. `snapshot_id` is a retained snapshot pin on
-/// the source that holds the GC retention floor down so the shared base blocks are
-/// protected while the fork references them. Retire it with
-/// [`NoKvFs::retire_snapshot`] once the fork's own divergent state no longer needs
-/// the source's base objects (typically when the fork is deleted).
+/// until the fork diverges on write. `snapshot_id` identifies the construction
+/// checkpoint; it is not the destination's lifetime owner. Once attached, durable
+/// fork-base references protect every shared object independently, so retiring or
+/// expiring that checkpoint cannot make the destination unreadable. Removing the
+/// destination releases those base references through bounded GC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CloneHandle {
     pub root: InodeId,
     pub snapshot_id: u64,
+}
+
+/// Durable state returned by a restore-to-fork operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreState {
+    Complete,
+}
+
+/// Result of restoring a snapshot into a new copy-on-write workbench.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    pub operation_id: String,
+    pub state: RestoreState,
+    pub source_root: InodeId,
+    pub destination_root: InodeId,
+    pub snapshot_id: u64,
+    pub read_version: u64,
+    pub cleanup_pending: bool,
 }
 
 /// How a path differs between two subtrees, as reported by
@@ -499,6 +806,13 @@ pub enum MetadError {
         bytes: u64,
     },
     InvalidPreparedArtifact(String),
+    /// A prepared upload crossed an object-GC delete epoch. The caller may
+    /// refresh the prepared upload identity, but must mint a new generation and
+    /// fully restage the body before retrying the metadata publish.
+    StalePreparedArtifactObjectGcEpoch {
+        expected: u64,
+        current: u64,
+    },
     InvalidQuery(String),
     StaleBodyGeneration {
         expected: u64,
@@ -549,6 +863,29 @@ pub enum MetadError {
     /// point), NOT `EXDEV` — there is no copy+unlink fallback that would be
     /// correct here.
     GraftPoint,
+    /// The destination already exists but was not created by the same restore.
+    RestoreDestinationConflict {
+        destination: String,
+    },
+    /// An identical restore is still preparing or cleaning its staging tree.
+    RestoreInProgress,
+    /// A restore was rejected before staging because one bounded metadata
+    /// resource would exceed the implementation's atomic-command limit.
+    RestoreResourceLimit {
+        resource: String,
+        limit: u64,
+        actual: u64,
+    },
+    /// The restore subtree contains a non-directory inode with links outside the
+    /// tree; copying/deleting it without a link graph would corrupt that inode.
+    RestoreHardlinkUnsupported {
+        inode: InodeId,
+    },
+    /// Cross-shard grafts require a distributed transaction and are rejected by
+    /// the single-shard restore implementation.
+    RestoreCrossShardUnsupported {
+        inode: InodeId,
+    },
     SnapshotLeaseExpired {
         snapshot_id: u64,
         lease_expires_unix_ms: u64,
@@ -587,6 +924,13 @@ pub struct NoKvFs<M, O> {
     objects: O,
     allocator_gate: Mutex<()>,
     backup_gate: Mutex<()>,
+    /// Serializes restore-to-fork construction inside the active shard owner.
+    /// Durable predicates remain authoritative across processes; this gate makes
+    /// an orphaned operation hold unambiguously recoverable after restart.
+    restore_gate: Mutex<()>,
+    /// Prevents a live worker/manual GC call from mistaking another in-process
+    /// worker's durable Deleting/Pruning claim for crash recovery.
+    object_gc_gate: Mutex<()>,
     /// Serializes owner-epoch installs/observes against in-flight commits.
     /// Commits hold a read guard across their fence check + durable apply;
     /// epoch changes take the write guard. This closes the TOCTOU where a
@@ -945,6 +1289,11 @@ fn validate_prepared_artifact(
     body: &BodyDescriptor,
     chunks: &[ChunkManifest],
 ) -> Result<(), MetadError> {
+    if prepared.object_gc_claim_version == 0 {
+        return Err(MetadError::InvalidPreparedArtifact(
+            "prepared artifact is missing a durable mutation epoch".to_owned(),
+        ));
+    }
     if body.generation != prepared.generation {
         return Err(MetadError::InvalidPreparedArtifact(format!(
             "body generation {} does not match prepared generation {}",
@@ -1432,6 +1781,7 @@ fn kind_name(kind: CommandKind) -> &'static [u8] {
         CommandKind::WatchSubtree => b"watch-subtree",
         CommandKind::CleanupObjects => b"cleanup-objects",
         CommandKind::RegisterNamespaceIndex => b"register-namespace-index",
+        CommandKind::StageDetachedRestore => b"stage-detached-restore",
     }
 }
 
@@ -1498,6 +1848,10 @@ impl fmt::Display for MetadError {
             Self::InvalidPreparedArtifact(err) => {
                 write!(f, "invalid prepared artifact: {err}")
             }
+            Self::StalePreparedArtifactObjectGcEpoch { expected, current } => write!(
+                f,
+                "prepared artifact object-GC epoch {expected} is stale; current epoch is {current}"
+            ),
             Self::InvalidQuery(err) => write!(f, "invalid namespace query: {err}"),
             Self::StaleBodyGeneration { expected, current } => write!(
                 f,
@@ -1552,6 +1906,29 @@ impl fmt::Display for MetadError {
             Self::GraftPoint => write!(
                 f,
                 "path is a cross-shard graft point; use unregister-graft"
+            ),
+            Self::RestoreDestinationConflict { destination } => write!(
+                f,
+                "restore destination already exists for another operation: {destination}"
+            ),
+            Self::RestoreInProgress => write!(f, "restore operation is still in progress"),
+            Self::RestoreResourceLimit {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                f,
+                "restore resource {resource} exceeds limit {limit} (actual {actual})"
+            ),
+            Self::RestoreHardlinkUnsupported { inode } => write!(
+                f,
+                "restore does not support hard-linked inode {}",
+                inode.get()
+            ),
+            Self::RestoreCrossShardUnsupported { inode } => write!(
+                f,
+                "restore does not support cross-shard inode {}",
+                inode.get()
             ),
             Self::SnapshotLeaseExpired {
                 snapshot_id,

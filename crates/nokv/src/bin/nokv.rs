@@ -2246,6 +2246,17 @@ mod tests {
         ObjectStoreConfig::s3(fake_s3_options())
     }
 
+    fn test_tiered_object_config(object_root: PathBuf) -> ObjectStoreConfig {
+        ObjectStoreConfig::tiered_local_with_options(
+            LocalObjectStoreOptions::new(object_root),
+            fake_s3_options(),
+            TieredObjectStoreOptions {
+                put_policy: nokv_object::TieredPutPolicy::HotThenBackgroundCold,
+                ..TieredObjectStoreOptions::default()
+            },
+        )
+    }
+
     fn spawn_test_server() -> SocketAddr {
         spawn_test_server_with_object_config(fake_server_object_config())
     }
@@ -3156,10 +3167,7 @@ mod tests {
         let client_store =
             LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
         let client = NoKvFsClient::connect(
-            spawn_test_server_with_object_config(ObjectStoreConfig::tiered_local(
-                object_root,
-                fake_s3_options(),
-            )),
+            spawn_test_server_with_object_config(test_tiered_object_config(object_root)),
             client_store,
         );
         run_workbench_mcp_requests_on_client(client, options, requests)
@@ -3175,9 +3183,8 @@ mod tests {
         SERVER.get_or_init(|| {
             let object_dir = tempdir().unwrap();
             let object_root = object_dir.path().join("objects");
-            let addr = spawn_test_server_with_object_config(ObjectStoreConfig::tiered_local(
+            let addr = spawn_test_server_with_object_config(test_tiered_object_config(
                 object_root.clone(),
-                fake_s3_options(),
             ));
             // The server thread serves for the process lifetime; keep its
             // object root alive with it.
@@ -3298,6 +3305,7 @@ mod tests {
                 "workbench_snapshot",
                 "workbench_snapshot_renew",
                 "workbench_snapshot_list",
+                "workbench_restore",
             ]
         );
         assert!(names.iter().all(|name| name.starts_with("workbench_")));
@@ -3319,6 +3327,14 @@ mod tests {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             assert!(tool["inputSchema"]["properties"].is_object());
         }
+        let restore = tools
+            .iter()
+            .find(|tool| tool["name"] == "workbench_restore")
+            .unwrap();
+        let variants = restore["inputSchema"]["properties"]["at_snapshot"]["anyOf"]
+            .as_array()
+            .unwrap();
+        assert!(variants.iter().all(|variant| variant["type"] != "null"));
     }
 
     #[test]
@@ -3720,10 +3736,8 @@ mod tests {
     fn workbench_mcp_list_and_grep_tolerate_out_of_band_entries() {
         let object_dir = tempdir().unwrap();
         let object_root = object_dir.path().join("objects");
-        let addr = spawn_test_server_with_object_config(ObjectStoreConfig::tiered_local(
-            object_root.clone(),
-            fake_s3_options(),
-        ));
+        let addr =
+            spawn_test_server_with_object_config(test_tiered_object_config(object_root.clone()));
         let connect = || {
             let store =
                 LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
@@ -5109,6 +5123,121 @@ mod tests {
                 .unwrap()
                 .contains("defaulted to 7 days"),
             "snap: {snap}"
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_restore_creates_idempotent_fork_and_preserves_source() {
+        let id = "ckpt-restore-src-010";
+        let destination = "ckpt-restore-dst-010";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "state.txt", "text": "frozen\n"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_commit",
+                serde_json::json!({"id": id, "manifest": {"task": id}}),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_snapshot",
+                serde_json::json!({"id": id, "name": "older"}),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_snapshot",
+                serde_json::json!({"id": id, "name": "cp1"}),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "state.txt",
+                    "text": "current\n", "replace": true
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_restore",
+                serde_json::json!({
+                    "id": id, "at_snapshot": "cp1", "destination_id": destination
+                }),
+            ),
+            workbench_tool_call(
+                8,
+                "workbench_read",
+                serde_json::json!({
+                    "id": destination, "section": "outputs", "path": "state.txt"
+                }),
+            ),
+            workbench_tool_call(
+                9,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "state.txt"
+                }),
+            ),
+            workbench_tool_call(
+                10,
+                "workbench_restore",
+                serde_json::json!({
+                    "id": id, "at_snapshot": "cp1", "destination_id": destination
+                }),
+            ),
+            workbench_tool_call(
+                11,
+                "workbench_snapshot_list",
+                serde_json::json!({"id": destination}),
+            ),
+            workbench_tool_call(
+                12,
+                "workbench_read",
+                serde_json::json!({
+                    "id": destination,
+                    "section": "metadata",
+                    "path": "restore_manifest.json"
+                }),
+            ),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        let first = &responses[6]["result"]["structuredContent"];
+        let retry = &responses[9]["result"]["structuredContent"];
+        assert_eq!(first["operation_id"], retry["operation_id"]);
+        assert_eq!(first["destination_workbench_id"], destination);
+        assert_eq!(
+            responses[7]["result"]["structuredContent"]["items"][0]["value"]["text"],
+            "frozen"
+        );
+        assert_eq!(
+            responses[8]["result"]["structuredContent"]["items"][0]["value"]["text"],
+            "current"
+        );
+        assert_eq!(
+            responses[10]["result"]["structuredContent"]["checkpoint_count"], 0,
+            "restored workbench must start with an empty checkpoint registry"
+        );
+        let manifest_items = responses[11]["result"]["structuredContent"]["items"]
+            .as_array()
+            .unwrap();
+        let restored_from = manifest_items
+            .iter()
+            .find(|item| item["value"]["key"] == "restored_from")
+            .unwrap();
+        assert_eq!(restored_from["value"]["value"]["workbench_id"], id);
+        assert_eq!(
+            restored_from["value"]["value"]["snapshot_id"],
+            first["snapshot_id"]
         );
     }
 

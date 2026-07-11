@@ -53,6 +53,8 @@ pub enum CommandKind {
     WatchSubtree,
     CleanupObjects,
     RegisterNamespaceIndex,
+    /// Build metadata below an unreachable restore-to-fork staging root.
+    StageDetachedRestore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

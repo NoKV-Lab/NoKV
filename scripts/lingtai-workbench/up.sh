@@ -129,10 +129,13 @@ check_mcp_tools() {
       python3 -c 'import json, sys; print("\n".join(tool["name"] for tool in json.loads(sys.stdin.readline())["result"]["tools"]))'
   )"
   grep -qx 'workbench_put_file' <<<"${names}" || die "workbench_put_file is missing from MCP tools"
+  grep -qx 'workbench_snapshot_renew' <<<"${names}" || die "workbench_snapshot_renew is missing from MCP tools"
+  grep -qx 'workbench_snapshot_list' <<<"${names}" || die "workbench_snapshot_list is missing from MCP tools"
+  grep -qx 'workbench_restore' <<<"${names}" || die "workbench_restore is missing from MCP tools"
   if grep -q '^nokv_workbench_' <<<"${names}"; then
     die "old nokv_workbench_* tools are still exposed; rebuild target/debug/nokv"
   fi
-  log "MCP tools ready"
+  log "MCP checkpoint/restore tools ready"
 }
 
 main() {

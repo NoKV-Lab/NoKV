@@ -13,6 +13,8 @@ where
             objects,
             allocator_gate: Mutex::new(()),
             backup_gate: Mutex::new(()),
+            restore_gate: Mutex::new(()),
+            object_gc_gate: Mutex::new(()),
             epoch_fence: RwLock::new(()),
             path_resolution_cache: new_path_resolution_cache_shards(),
             path_index_lookup_cache: new_path_index_lookup_cache_shards(),
@@ -88,6 +90,10 @@ where
     /// and the allocator floor is then seeded into this shard's high-bit subspace
     /// exactly like [`Self::with_shard_index`]. So callers must NOT chain
     /// `.with_shard_index(...)` after `open_existing`; pass the index here.
+    ///
+    /// This constructor only reconstructs process-local state. Durable GC and
+    /// restore cleanup is resumed by the ordinary cleanup worker after the
+    /// server has acquired ownership and installed its durability policy.
     pub fn open_existing(
         mount: MountId,
         metadata: M,
@@ -110,6 +116,8 @@ where
             objects,
             allocator_gate: Mutex::new(()),
             backup_gate: Mutex::new(()),
+            restore_gate: Mutex::new(()),
+            object_gc_gate: Mutex::new(()),
             epoch_fence: RwLock::new(()),
             path_resolution_cache: new_path_resolution_cache_shards(),
             path_index_lookup_cache: new_path_index_lookup_cache_shards(),

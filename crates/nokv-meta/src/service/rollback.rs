@@ -69,11 +69,7 @@ where
     /// The net effect mirrors [`NoKvFs::owns_block_object_key`]: a block reachable
     /// from the live namespace is never reclaimed, a block reachable only from the
     /// discarded delta is.
-    pub fn rollback_subtree(
-        &self,
-        target_root: InodeId,
-        snapshot_id: u64,
-    ) -> Result<(), MetadError> {
+    fn rollback_subtree(&self, target_root: InodeId, snapshot_id: u64) -> Result<(), MetadError> {
         let pin = self
             .snapshot_pin(snapshot_id)?
             .ok_or(MetadError::NotFound)?;
@@ -84,7 +80,26 @@ where
                 target_root.get()
             )));
         }
+        if self
+            .metadata
+            .get(
+                RecordFamily::ForkBinding,
+                &fork_binding_key(self.mount, target_root),
+                self.read_version()?,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .is_some()
+        {
+            return Err(MetadError::InvalidPath(
+                "in-place rollback is not supported for a restore-to-fork destination".to_owned(),
+            ));
+        }
         let snapshot_version = Version::new(pin.read_version)?;
+        if self.subtree_contains_fork_state(target_root, snapshot_version, ReadPurpose::Snapshot)? {
+            return Err(MetadError::InvalidPath(
+                "in-place rollback is not supported for a restore-to-fork destination".to_owned(),
+            ));
+        }
 
         if self
             .get_attr_at_version_for_purpose(
@@ -131,8 +146,117 @@ where
         target_path: &str,
         snapshot_id: u64,
     ) -> Result<(), MetadError> {
-        let target_root = self.resolve_directory_path(target_path)?;
+        let target_root = self.resolve_non_fork_rollback_path(target_path)?;
         self.rollback_subtree(target_root, snapshot_id)
+    }
+
+    fn resolve_non_fork_rollback_path(&self, target_path: &str) -> Result<InodeId, MetadError> {
+        let components = parse_absolute_path(target_path)?;
+        let version = self.read_version()?;
+        let mut current = InodeId::root();
+        for name in components {
+            if self.has_fork_binding(current, version)? {
+                return Err(MetadError::InvalidPath(
+                    "in-place rollback is not supported for a restore-to-fork destination"
+                        .to_owned(),
+                ));
+            }
+            if self
+                .metadata
+                .get(
+                    RecordFamily::ForkShadow,
+                    &fork_shadow_key(self.mount, current, &name),
+                    version,
+                    ReadPurpose::WritePlanLocal,
+                )?
+                .is_some()
+            {
+                return Err(MetadError::InvalidPath(
+                    "in-place rollback is not supported for a restore-to-fork destination"
+                        .to_owned(),
+                ));
+            }
+            let (entry, _) = self
+                .lookup_plus_at_version_for_purpose(
+                    current,
+                    &name,
+                    version,
+                    ReadPurpose::WritePlanLocal,
+                )?
+                .ok_or(MetadError::NotFound)?;
+            if entry.attr.file_type != FileType::Directory {
+                return Err(MetadError::NotDirectory);
+            }
+            current = entry.attr.inode;
+        }
+        if self.has_fork_binding(current, version)? {
+            return Err(MetadError::InvalidPath(
+                "in-place rollback is not supported for a restore-to-fork destination".to_owned(),
+            ));
+        }
+        Ok(current)
+    }
+
+    fn has_fork_binding(&self, inode: InodeId, version: Version) -> Result<bool, MetadError> {
+        Ok(self
+            .metadata
+            .get(
+                RecordFamily::ForkBinding,
+                &fork_binding_key(self.mount, inode),
+                version,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .is_some())
+    }
+
+    fn subtree_contains_fork_state(
+        &self,
+        root: InodeId,
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<bool, MetadError> {
+        let mut queue = vec![root];
+        while let Some(parent) = queue.pop() {
+            for child in self.read_dir_plus_at_version_for_purpose(parent, version, purpose)? {
+                if self
+                    .metadata
+                    .get(
+                        RecordFamily::ForkShadow,
+                        &fork_shadow_key(self.mount, parent, &child.dentry.name),
+                        version,
+                        purpose,
+                    )?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+                if child.attr.file_type == FileType::Directory {
+                    queue.push(child.attr.inode);
+                    continue;
+                }
+                let Some(body) = &child.body else {
+                    continue;
+                };
+                let manifests = self.chunk_manifests_for_body_at_version(
+                    child.attr.inode,
+                    body,
+                    version,
+                    purpose,
+                )?;
+                let block_prefix = format!("blocks/{}/", self.mount.get());
+                if chunk_object_keys(&manifests).iter().any(|object_key| {
+                    object_key.starts_with(&block_prefix)
+                        && !self.owns_block_object_key(
+                            child.attr.inode,
+                            body.generation,
+                            object_key,
+                        )
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Collect every object key referenced by the materialized subtree's file

@@ -4,10 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use nokv_agent::AgentToolDefinition;
 use nokv_client::{
-    decode_name_cursor, encode_name_cursor, is_artifact_write_conflict, is_metadata_not_found,
+    decode_name_cursor, encode_name_cursor, is_artifact_write_retryable, is_metadata_not_found,
     ArtifactMetadata, ClientError, NoKvFsClient,
 };
-use nokv_meta::MetadError;
+use nokv_meta::{
+    restore_operation_id, MetadError, RestoreInitialization, RestoreInitializationFile,
+};
 use nokv_object::ObjectStore;
 use nokv_types::{FileType, PathMetadata};
 use serde_json::{json, Value};
@@ -41,28 +43,51 @@ const MS_PER_DAY: u64 = 86_400_000;
 /// Every mint/renew appends one JSON line here so checkpoints stay discoverable
 /// after the tool response is gone (Phase-1 seed for L1 named refs).
 const CHECKPOINT_REGISTRY_RELPATH: &str = "checkpoints.jsonl";
-/// Retries after a lost artifact-write CAS; every attempt re-reads current state.
-const WRITE_CONFLICT_RETRIES: usize = 5;
-/// Linear backoff step between conflict retries. Zero-interval retries make N
-/// synchronized writers replay the same race until the retry budget runs out;
-/// a growing pause plus per-process jitter (see [`write_conflict_backoff`])
-/// de-synchronizes them.
-const WRITE_CONFLICT_BACKOFF_STEP_MS: u64 = 10;
+/// Retries after a safe artifact-write restart, including a lost CAS or an
+/// object-GC epoch change. Every attempt re-enters prepare and stages a fresh,
+/// unattached generation.
+const ARTIFACT_WRITE_RETRIES: usize = 8;
+/// Linear backoff step between safe write retries. Zero-interval retries make
+/// synchronized writers and a busy object reaper repeatedly collide; a
+/// growing pause plus per-process jitter de-synchronizes them.
+const ARTIFACT_WRITE_BACKOFF_STEP_MS: u64 = 10;
 
-/// Sleep before retry number `attempt` (1-based) of a conflicted write.
+/// Sleep before retry number `attempt` (1-based) of a restartable write.
 /// Linear `attempt * 10ms` backoff plus a 0-8ms desync offset derived from the
 /// process id and the current clock nanoseconds, so two workbench processes
 /// that lost the same race do not wake in lockstep (no rand dependency).
-/// Wrap a write conflict that survived the whole retry budget into an
-/// actionable error: the caller learns the write is safe to re-issue while
-/// the original error text stays available for diagnosis.
-fn write_conflict_exhausted(attempts: usize, err: impl fmt::Display) -> WorkbenchToolError {
-    WorkbenchToolError::new(format!(
-        "write conflicted with concurrent writers after {attempts} attempts; retry the call ({err})"
-    ))
+/// Wrap a restartable write that survived the whole retry budget into a typed,
+/// retryable error while preserving the original diagnostic.
+fn artifact_write_retries_exhausted(attempts: usize, err: ClientError) -> WorkbenchToolError {
+    if let ClientError::Metadata(MetadError::StalePreparedArtifactObjectGcEpoch {
+        expected,
+        current,
+    }) = &err
+    {
+        return WorkbenchToolError::typed(
+            "StalePreparedArtifactObjectGcEpoch",
+            err.to_string(),
+            true,
+            json!({
+                "expected": expected,
+                "current": current,
+                "attempts": attempts,
+                "requires_restage": true,
+                "retry_scope": "tool_operation",
+            }),
+        );
+    }
+    WorkbenchToolError::typed(
+        "ArtifactWriteContended",
+        format!(
+            "artifact write remained contended after {attempts} attempts; retry the call ({err})"
+        ),
+        true,
+        json!({"attempts": attempts}),
+    )
 }
 
-fn write_conflict_backoff(attempt: usize) {
+fn artifact_write_backoff(attempt: usize) {
     let jitter_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|now| now.subsec_nanos() as u64)
@@ -70,7 +95,7 @@ fn write_conflict_backoff(attempt: usize) {
         .wrapping_add(u64::from(std::process::id()))
         % 8;
     std::thread::sleep(std::time::Duration::from_millis(
-        (attempt as u64) * WRITE_CONFLICT_BACKOFF_STEP_MS + jitter_ms,
+        (attempt as u64) * ARTIFACT_WRITE_BACKOFF_STEP_MS + jitter_ms,
     ));
 }
 
@@ -440,6 +465,21 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        AgentToolDefinition {
+            name: "workbench_restore",
+            description:
+                "Restore a live checkpoint into a new workbench using COW. The source remains unchanged, the destination must be absent, and exact retries are idempotent.",
+            parameters: json!({
+                "type": "object",
+                "required": ["id", "at_snapshot", "destination_id"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "at_snapshot": restore_at_snapshot_parameter_schema(),
+                    "destination_id": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -454,6 +494,16 @@ fn at_snapshot_parameter_schema() -> Value {
             {"type": "null"}
         ],
         "description": "Read at a checkpoint: a snapshot id (integer) or a checkpoint name (string) from workbench_snapshot."
+    })
+}
+
+fn restore_at_snapshot_parameter_schema() -> Value {
+    json!({
+        "anyOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "string", "minLength": 1}
+        ],
+        "description": "Required checkpoint to restore: a snapshot id (integer) or checkpoint name (non-empty string)."
     })
 }
 
@@ -531,6 +581,7 @@ where
         "workbench_snapshot" => snapshot_workbench(client, options, args),
         "workbench_snapshot_renew" => renew_snapshot_workbench(client, options, args),
         "workbench_snapshot_list" => list_snapshots_workbench(client, options, args),
+        "workbench_restore" => restore_workbench(client, options, args),
         other => Err(WorkbenchToolError::new(format!(
             "unknown workbench tool {other}"
         ))),
@@ -576,16 +627,27 @@ where
     ensure_parent_dirs(client, options, &id, section, &rel_path)?;
     let path = section_path(options, &id, section, Some(&rel_path));
     let digest_uri = digest_uri(&bytes);
-    let metadata = artifact_metadata(options, &path, &digest_uri, &content_type);
-    let entry = if replace {
-        client
-            .put_artifact_replace(&path, bytes, metadata)
-            .map_err(client_error)?
-            .entry
-    } else {
-        client
-            .put_artifact(&path, bytes, metadata)
-            .map_err(client_error)?
+    let mut attempts = 0;
+    let entry = loop {
+        let metadata = artifact_metadata(options, &path, &digest_uri, &content_type);
+        let result = if replace {
+            client
+                .put_artifact_replace(&path, bytes.clone(), metadata)
+                .map(|result| result.entry)
+        } else {
+            client.put_artifact(&path, bytes.clone(), metadata)
+        };
+        match result {
+            Ok(entry) => break entry,
+            Err(err) if is_artifact_write_retryable(&err) && attempts < ARTIFACT_WRITE_RETRIES => {
+                attempts += 1;
+                artifact_write_backoff(attempts);
+            }
+            Err(err) if is_artifact_write_retryable(&err) => {
+                return Err(artifact_write_retries_exhausted(attempts + 1, err));
+            }
+            Err(err) => return Err(client_error(err)),
+        }
     };
 
     Ok(json!({
@@ -633,12 +695,12 @@ where
         // lost race against a concurrent writer is safe to retry as-is.
         match client.append_artifact(&path, bytes.clone(), metadata, None) {
             Ok(outcome) => break outcome,
-            Err(err) if is_artifact_write_conflict(&err) && attempts < WRITE_CONFLICT_RETRIES => {
+            Err(err) if is_artifact_write_retryable(&err) && attempts < ARTIFACT_WRITE_RETRIES => {
                 attempts += 1;
-                write_conflict_backoff(attempts);
+                artifact_write_backoff(attempts);
             }
-            Err(err) if is_artifact_write_conflict(&err) => {
-                return Err(write_conflict_exhausted(attempts + 1, err))
+            Err(err) if is_artifact_write_retryable(&err) => {
+                return Err(artifact_write_retries_exhausted(attempts + 1, err))
             }
             Err(err) => return Err(client_error(err)),
         }
@@ -746,13 +808,13 @@ where
         match client.put_artifact_replace_if_generation(&path, new_bytes, metadata, body.generation)
         {
             Ok(result) => break (result, replacements),
-            Err(err) if is_artifact_write_conflict(&err) && attempts < WRITE_CONFLICT_RETRIES => {
+            Err(err) if is_artifact_write_retryable(&err) && attempts < ARTIFACT_WRITE_RETRIES => {
                 // A writer landed since our read; re-read and re-validate.
                 attempts += 1;
-                write_conflict_backoff(attempts);
+                artifact_write_backoff(attempts);
             }
-            Err(err) if is_artifact_write_conflict(&err) => {
-                return Err(write_conflict_exhausted(attempts + 1, err))
+            Err(err) if is_artifact_write_retryable(&err) => {
+                return Err(artifact_write_retries_exhausted(attempts + 1, err))
             }
             Err(err) => return Err(client_error(err)),
         }
@@ -1474,6 +1536,89 @@ where
     }))
 }
 
+fn restore_workbench<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    let id = required_workbench_id(args)?;
+    let destination_id = required_string(args, "destination_id")?.to_owned();
+    validate_workbench_id(&destination_id)?;
+    if destination_id == id {
+        return Err(WorkbenchToolError::new(
+            "destination_id must differ from the source workbench id",
+        ));
+    }
+    let at_snapshot = args
+        .get("at_snapshot")
+        .ok_or_else(|| WorkbenchToolError::new("missing required argument at_snapshot"))?;
+    let snapshot_id = resolve_at_snapshot(client, options, &id, at_snapshot)?;
+
+    let source_path = workbench_path(options, &id);
+    let destination_path = workbench_path(options, &destination_id);
+    let manifest_path = section_path(
+        options,
+        &destination_id,
+        "metadata",
+        Some("restore_manifest.json"),
+    );
+    let operation_id = restore_operation_id(&source_path, snapshot_id, &destination_path)
+        .map_err(|err| WorkbenchToolError::new(err.to_string()))?;
+    let manifest = json!({
+        "schema": "nokv.workbench.restore_manifest.v1",
+        "operation_id": operation_id,
+        "restored_from": {
+            "workbench_id": id,
+            "path": source_path.clone(),
+            "snapshot_id": snapshot_id,
+        },
+        "source_workbench_id": id,
+        "source_path": source_path.clone(),
+        "destination_workbench_id": destination_id,
+        "destination_path": destination_path.clone(),
+        "snapshot_id": snapshot_id,
+    });
+    let bytes = serde_json::to_vec_pretty(&manifest).map_err(|err| {
+        WorkbenchToolError::new(format!("failed to encode restore manifest: {err}"))
+    })?;
+    let outcome = client
+        .metadata()
+        .restore_subtree_path_to_fork_initialized(
+            &source_path,
+            snapshot_id,
+            &destination_path,
+            RestoreInitialization {
+                remove_relative_paths: vec![format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}")],
+                files: vec![RestoreInitializationFile {
+                    relative_path: "metadata/restore_manifest.json".to_owned(),
+                    bytes,
+                    content_type: "application/json".to_owned(),
+                    mode: DEFAULT_MODE_FILE,
+                    uid: options.uid,
+                    gid: options.gid,
+                }],
+            },
+        )
+        .map_err(client_error)?;
+
+    Ok(json!({
+        "status": "success",
+        "operation_id": outcome.operation_id,
+        "state": "complete",
+        "source_workbench_id": id,
+        "destination_workbench_id": destination_id,
+        "source_root": outcome.source_root.get(),
+        "destination_root": outcome.destination_root.get(),
+        "snapshot_id": outcome.snapshot_id,
+        "read_version": outcome.read_version,
+        "cleanup_pending": outcome.cleanup_pending,
+        "restore_manifest": manifest_path,
+    }))
+}
+
 #[derive(Default)]
 struct CheckpointGroup {
     name: Value,
@@ -1956,12 +2101,12 @@ where
         let metadata = artifact_metadata(options, &path, &digest_uri, "application/x-ndjson");
         match client.append_artifact(&path, line.clone(), metadata, None) {
             Ok(_) => return Ok(()),
-            Err(err) if is_artifact_write_conflict(&err) && attempts < WRITE_CONFLICT_RETRIES => {
+            Err(err) if is_artifact_write_retryable(&err) && attempts < ARTIFACT_WRITE_RETRIES => {
                 attempts += 1;
-                write_conflict_backoff(attempts);
+                artifact_write_backoff(attempts);
             }
-            Err(err) if is_artifact_write_conflict(&err) => {
-                return Err(write_conflict_exhausted(attempts + 1, err))
+            Err(err) if is_artifact_write_retryable(&err) => {
+                return Err(artifact_write_retries_exhausted(attempts + 1, err))
             }
             Err(err) => return Err(client_error(err)),
         }
@@ -2852,6 +2997,57 @@ fn client_error(err: ClientError) -> WorkbenchToolError {
             true,
             json!({"snapshot_id": snapshot_id, "attempts": attempts}),
         ),
+        ClientError::Metadata(MetadError::StalePreparedArtifactObjectGcEpoch {
+            expected,
+            current,
+        }) => WorkbenchToolError::typed(
+            "StalePreparedArtifactObjectGcEpoch",
+            err.to_string(),
+            true,
+            json!({
+                "expected": expected,
+                "current": current,
+                "requires_restage": true,
+                "retry_scope": "tool_operation",
+            }),
+        ),
+        ClientError::Metadata(MetadError::RestoreInProgress) => {
+            WorkbenchToolError::typed("RestoreInProgress", err.to_string(), true, json!({}))
+        }
+        ClientError::Metadata(MetadError::RestoreDestinationConflict { destination }) => {
+            WorkbenchToolError::typed(
+                "RestoreDestinationConflict",
+                err.to_string(),
+                false,
+                json!({"destination": destination}),
+            )
+        }
+        ClientError::Metadata(MetadError::RestoreResourceLimit {
+            resource,
+            limit,
+            actual,
+        }) => WorkbenchToolError::typed(
+            "RestoreResourceLimit",
+            err.to_string(),
+            false,
+            json!({"resource": resource, "limit": limit, "actual": actual}),
+        ),
+        ClientError::Metadata(MetadError::RestoreHardlinkUnsupported { inode }) => {
+            WorkbenchToolError::typed(
+                "RestoreHardlinkUnsupported",
+                err.to_string(),
+                false,
+                json!({"inode": inode.get()}),
+            )
+        }
+        ClientError::Metadata(MetadError::RestoreCrossShardUnsupported { inode }) => {
+            WorkbenchToolError::typed(
+                "RestoreCrossShardUnsupported",
+                err.to_string(),
+                false,
+                json!({"inode": inode.get()}),
+            )
+        }
         _ => WorkbenchToolError::typed("NoKvClientError", err.to_string(), false, json!({})),
     }
 }
@@ -2908,16 +3104,43 @@ mod tests {
     }
 
     #[test]
-    fn write_conflict_exhausted_keeps_inner_error_and_retry_guidance() {
-        let message = write_conflict_exhausted(6, "metadata predicate failed").to_string();
+    fn artifact_write_exhaustion_is_typed_retryable_and_keeps_the_cause() {
+        let error = artifact_write_retries_exhausted(
+            9,
+            ClientError::Metadata(MetadError::Metadata(
+                nokv_meta::MetadataError::PredicateFailed,
+            )),
+        );
+        let value = error.as_value();
+        let message = error.to_string();
+        assert_eq!(value["code"], "ArtifactWriteContended");
+        assert_eq!(value["retryable"], true);
+        assert_eq!(value["details"]["attempts"], 9);
         assert!(
-            message.contains("conflicted with concurrent writers after 6 attempts; retry the call"),
+            message.contains("remained contended after 9 attempts; retry the call"),
             "message: {message}"
         );
         assert!(
-            message.contains("metadata predicate failed"),
+            message.contains("metadata command predicate failed"),
             "message: {message}"
         );
+    }
+
+    #[test]
+    fn stale_object_gc_epoch_is_a_typed_retryable_tool_error() {
+        let error = client_error(ClientError::Metadata(
+            MetadError::StalePreparedArtifactObjectGcEpoch {
+                expected: 11,
+                current: 17,
+            },
+        ));
+        let value = error.as_value();
+        assert_eq!(value["code"], "StalePreparedArtifactObjectGcEpoch");
+        assert_eq!(value["retryable"], true);
+        assert_eq!(value["details"]["expected"], 11);
+        assert_eq!(value["details"]["current"], 17);
+        assert_eq!(value["details"]["requires_restage"], true);
+        assert_eq!(value["details"]["retry_scope"], "tool_operation");
     }
 
     #[test]

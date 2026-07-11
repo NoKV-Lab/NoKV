@@ -30,6 +30,231 @@ pub fn allocator_key(mount: MountId) -> Vec<u8> {
     out
 }
 
+pub fn restore_operation_key(mount: MountId, operation_digest: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 18 + operation_digest.len());
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"restore-operation\0");
+    out.extend_from_slice(operation_digest);
+    out
+}
+
+pub fn restore_path_index_set_prefix(mount: MountId, base_ref_set_id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH * 2 + 20);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"restore-path-index\0");
+    push_u64(&mut out, base_ref_set_id);
+    out.push(PATH_INDEX_DELIMITER);
+    out
+}
+
+pub fn restore_path_index_key(
+    mount: MountId,
+    base_ref_set_id: u64,
+    parent: InodeId,
+    name: &DentryName,
+) -> Vec<u8> {
+    let mut out = restore_path_index_prefix(mount, base_ref_set_id, parent);
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+pub fn restore_path_index_prefix(mount: MountId, base_ref_set_id: u64, parent: InodeId) -> Vec<u8> {
+    let mut out = restore_path_index_set_prefix(mount, base_ref_set_id);
+    push_u64(&mut out, parent.get());
+    out.push(PATH_INDEX_DELIMITER);
+    out
+}
+
+pub fn fork_base_ref_owner_prefix(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 20);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"fork-base-ref-owner\0");
+    out
+}
+
+pub fn fork_base_ref_set_prefix(mount: MountId, base_ref_set_id: u64) -> Vec<u8> {
+    let mut out = fork_base_ref_owner_prefix(mount);
+    push_u64(&mut out, base_ref_set_id);
+    out
+}
+
+pub fn fork_base_ref_owner_key(
+    mount: MountId,
+    base_ref_set_id: u64,
+    object_digest: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = fork_base_ref_set_prefix(mount, base_ref_set_id);
+    out.extend_from_slice(object_digest);
+    out
+}
+
+pub fn fork_base_ref_digest_from_owner_key(
+    mount: MountId,
+    base_ref_set_id: u64,
+    key: &[u8],
+) -> Option<[u8; 32]> {
+    let prefix = fork_base_ref_set_prefix(mount, base_ref_set_id);
+    let suffix = key.strip_prefix(prefix.as_slice())?;
+    if suffix.len() != 32 {
+        return None;
+    }
+    suffix.try_into().ok()
+}
+
+pub fn fork_base_ref_inverse_prefix(mount: MountId, object_digest: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 22 + object_digest.len());
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"fork-base-ref-inverse\0");
+    out.extend_from_slice(object_digest);
+    out
+}
+
+pub fn fork_base_ref_inverse_key(
+    mount: MountId,
+    object_digest: &[u8; 32],
+    base_ref_set_id: u64,
+) -> Vec<u8> {
+    let mut out = fork_base_ref_inverse_prefix(mount, object_digest);
+    push_u64(&mut out, base_ref_set_id);
+    out
+}
+
+pub fn fork_base_ref_release_prefix(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 22);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"fork-base-ref-release\0");
+    out
+}
+
+pub fn fork_base_ref_release_key(mount: MountId, base_ref_set_id: u64) -> Vec<u8> {
+    let mut out = fork_base_ref_release_prefix(mount);
+    push_u64(&mut out, base_ref_set_id);
+    out
+}
+
+/// Durable round-robin cursor for a releasing fork's owner rows. Live borrower
+/// rows may have to remain after the fork root is removed (for example, when a
+/// hardlink or rename moved the inode elsewhere), so a release worker must not
+/// repeatedly stop at the same retained prefix page and starve later rows.
+pub fn fork_base_ref_release_cursor_key(mount: MountId, base_ref_set_id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH * 2 + 21);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"fork-base-ref-cursor\0");
+    push_u64(&mut out, base_ref_set_id);
+    out
+}
+
+pub fn fork_base_hold_prefix(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 15);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"fork-base-hold\0");
+    out
+}
+
+pub fn fork_base_hold_key(
+    mount: MountId,
+    pinned_read_version: u64,
+    base_ref_set_id: u64,
+) -> Vec<u8> {
+    let mut out = fork_base_hold_prefix(mount);
+    push_u64(&mut out, pinned_read_version);
+    push_u64(&mut out, base_ref_set_id);
+    out
+}
+
+pub fn fork_base_hold_read_version(mount: MountId, key: &[u8]) -> Option<u64> {
+    let prefix = fork_base_hold_prefix(mount);
+    let suffix = key.strip_prefix(prefix.as_slice())?;
+    let raw = suffix.get(..8)?;
+    Some(u64::from_be_bytes(raw.try_into().ok()?))
+}
+
+pub fn object_gc_claim_key(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 16);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"object-gc-claim\0");
+    out
+}
+
+pub fn path_index_gc_cursor_key(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 21);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"path-index-gc-cursor\0");
+    out
+}
+
+pub fn object_gc_quarantine_prefix(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 21);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"object-gc-quarantine\0");
+    out
+}
+
+pub fn object_gc_quarantine_key(mount: MountId, record_digest: &[u8; 32]) -> Vec<u8> {
+    let mut out = object_gc_quarantine_prefix(mount);
+    out.extend_from_slice(record_digest);
+    out
+}
+
+pub fn fork_base_release_quarantine_prefix(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 29);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"fork-base-release-quarantine\0");
+    out
+}
+
+pub fn fork_base_release_quarantine_key(mount: MountId, job_digest: &[u8; 32]) -> Vec<u8> {
+    let mut out = fork_base_release_quarantine_prefix(mount);
+    out.extend_from_slice(job_digest);
+    out
+}
+
+pub fn restore_staging_cleanup_prefix(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 24);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"restore-staging-cleanup\0");
+    out
+}
+
+pub fn restore_staging_cleanup_key(mount: MountId, base_ref_set_id: u64) -> Vec<u8> {
+    let mut out = restore_staging_cleanup_prefix(mount);
+    push_u64(&mut out, base_ref_set_id);
+    out
+}
+
+pub fn restore_staging_clean_key(mount: MountId, base_ref_set_id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH * 2 + 22);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"restore-staging-clean\0");
+    push_u64(&mut out, base_ref_set_id);
+    out
+}
+
+pub fn restore_staging_member_prefix(mount: MountId, base_ref_set_id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH * 2 + 23);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"restore-staging-member\0");
+    push_u64(&mut out, base_ref_set_id);
+    out
+}
+
+pub fn restore_staging_member_key(mount: MountId, base_ref_set_id: u64, inode: InodeId) -> Vec<u8> {
+    let mut out = restore_staging_member_prefix(mount, base_ref_set_id);
+    push_u64(&mut out, inode.get());
+    out
+}
+
+pub fn restore_staging_member_inode(
+    mount: MountId,
+    base_ref_set_id: u64,
+    key: &[u8],
+) -> Option<InodeId> {
+    let prefix = restore_staging_member_prefix(mount, base_ref_set_id);
+    let suffix = key.strip_prefix(prefix.as_slice())?;
+    let raw: [u8; U64_WIDTH] = suffix.try_into().ok()?;
+    InodeId::new(u64::from_be_bytes(raw)).ok()
+}
+
 pub fn inode_key(mount: MountId, inode: InodeId) -> Vec<u8> {
     let mut out = inode_prefix(mount);
     push_u64(&mut out, inode.get());
@@ -189,10 +414,16 @@ pub fn fork_binding_key(mount: MountId, fork_root: InodeId) -> Vec<u8> {
     out
 }
 
-pub fn fork_shadow_key(mount: MountId, fork_inode: InodeId) -> Vec<u8> {
+pub fn fork_shadow_prefix(mount: MountId, parent: InodeId) -> Vec<u8> {
     let mut out = Vec::with_capacity(U64_WIDTH * 2);
     push_u64(&mut out, mount.get());
-    push_u64(&mut out, fork_inode.get());
+    push_u64(&mut out, parent.get());
+    out
+}
+
+pub fn fork_shadow_key(mount: MountId, parent: InodeId, name: &DentryName) -> Vec<u8> {
+    let mut out = fork_shadow_prefix(mount, parent);
+    out.extend_from_slice(name.as_bytes());
     out
 }
 
@@ -217,6 +448,19 @@ pub fn gc_object_key(
     push_u64(&mut out, generation);
     push_u64(&mut out, chunk_index);
     push_u64(&mut out, block_index);
+    out
+}
+
+pub fn gc_released_base_ref_key(
+    mount: MountId,
+    enqueue_version: u64,
+    base_ref_set_id: u64,
+    object_digest: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = gc_queue_prefix(mount);
+    push_u64(&mut out, enqueue_version);
+    push_u64(&mut out, base_ref_set_id);
+    out.extend_from_slice(object_digest);
     out
 }
 

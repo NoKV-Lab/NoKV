@@ -52,6 +52,7 @@ where
                 "checkpoint requires at least one shard".to_owned(),
             ));
         }
+        let object_reference = self.begin_object_reference_mutation()?;
 
         // Stage every shard's objects + build its (projection, chunks). Track the
         // staged object sets so a mid-stage failure reclaims them instead of
@@ -70,6 +71,10 @@ where
                 }
             };
             let version = Version::new(prepared.generation)?;
+            if prepared.object_gc_claim_version != object_reference.version().get() {
+                self.abort_staged_checkpoint(&staged_sets);
+                return Err(MetadError::Metadata(MetadataError::PredicateFailed));
+            }
             let request = PublishArtifact {
                 parent,
                 name: shard.name.clone(),
@@ -116,7 +121,12 @@ where
 
         // One atomic commit makes every shard visible together.
         let commit_version = self.next_version()?;
-        if let Err(err) = self.commit_checkpoint_shards(parent, &staged_artifacts, commit_version) {
+        if let Err(err) = self.commit_checkpoint_shards(
+            parent,
+            &staged_artifacts,
+            commit_version,
+            object_reference,
+        ) {
             self.abort_staged_checkpoint(&staged_sets);
             return Err(err);
         }
@@ -137,12 +147,14 @@ where
         parent: InodeId,
         shards: &[(DentryProjection, Vec<ChunkManifest>)],
         commit_version: Version,
+        object_reference: ObjectReferenceMutation,
     ) -> Result<(), MetadError> {
         let mut predicates = vec![PredicateRef {
             family: RecordFamily::Inode,
             key: inode_key(self.mount, parent),
             predicate: Predicate::Exists,
         }];
+        predicates.push(object_reference.predicate(self.mount));
         let mut mutations = Vec::new();
         for (proj, chunks) in shards {
             let inode = proj.attr.inode;
@@ -186,6 +198,21 @@ where
                 }
             }
         }
+        let watch = shards
+            .iter()
+            .flat_map(|(projection, _)| {
+                self.watch_projection(
+                    parent,
+                    WatchEvent {
+                        kind: WatchEventKind::PublishArtifact,
+                        parent: Some(parent),
+                        name: Some(projection.dentry.name.clone()),
+                        inode: projection.attr.inode,
+                        version: commit_version.get(),
+                    },
+                )
+            })
+            .collect();
         self.commit_metadata(MetadataCommand {
             request_id: request_id(b"publish-checkpoint", self.mount, parent, commit_version),
             kind: CommandKind::PublishArtifact,
@@ -195,7 +222,7 @@ where
             primary_key: dentry_prefix(self.mount, parent),
             predicates,
             mutations,
-            watch: Vec::new(),
+            watch,
         })?;
         Ok(())
     }

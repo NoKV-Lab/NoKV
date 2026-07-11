@@ -293,6 +293,12 @@ pub enum MetadataRpcRequest {
         target_path: String,
         snapshot_id: u64,
     },
+    RestoreSubtreePathToFork {
+        source_path: String,
+        snapshot_id: u64,
+        destination_path: String,
+        initialization: WireRestoreInitialization,
+    },
     StatPathAtSnapshot {
         root_path: String,
         snapshot_id: u64,
@@ -369,6 +375,9 @@ pub enum MetadataRpcRequest {
     PrepareArtifactPath {
         path: String,
         replace: bool,
+    },
+    RefreshPreparedArtifactObjectGcEpoch {
+        prepared: WirePreparedArtifact,
     },
     PublishPreparedArtifact {
         prepared: WirePreparedArtifact,
@@ -469,6 +478,16 @@ pub enum WireMetadataError {
     /// The target dentry is a cross-shard graft point; remove/rename of it must
     /// go through the graft lifecycle. The client maps this to `EBUSY`.
     GraftPoint,
+    RestoreInProgress,
+    RestoreResourceLimit {
+        resource: String,
+        limit: u64,
+        actual: u64,
+    },
+    StalePreparedArtifactObjectGcEpoch {
+        expected: u64,
+        current: u64,
+    },
     SnapshotLeaseExpired {
         snapshot_id: u64,
         lease_expires_unix_ms: u64,
@@ -486,6 +505,15 @@ pub enum WireMetadataError {
     SnapshotRenewContended {
         snapshot_id: u64,
         attempts: usize,
+    },
+    RestoreHardlinkUnsupported {
+        inode: u64,
+    },
+    RestoreCrossShardUnsupported {
+        inode: u64,
+    },
+    RestoreDestinationConflict {
+        destination: String,
     },
     SyncLogArchiveFailed {
         committed: bool,
@@ -586,6 +614,9 @@ pub enum MetadataRpcResult {
     CloneSubtree {
         root: u64,
         snapshot_id: u64,
+    },
+    Restore {
+        outcome: WireRestoreOutcome,
     },
     SubtreeDeltas {
         deltas: Vec<WireSubtreeDelta>,
@@ -1129,6 +1160,23 @@ pub struct WirePreparedArtifact {
     pub replace: bool,
     pub dentry_version: Option<u64>,
     pub old_generation: Option<u64>,
+    pub object_gc_claim_version: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireRestoreInitialization {
+    pub remove_relative_paths: Vec<String>,
+    pub files: Vec<WireRestoreInitializationFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireRestoreInitializationFile {
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1190,6 +1238,17 @@ pub struct WireSnapshotPin {
     pub read_version: u64,
     pub created_version: u64,
     pub lease_expires_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireRestoreOutcome {
+    pub operation_id: String,
+    pub state: String,
+    pub source_root: u64,
+    pub destination_root: u64,
+    pub snapshot_id: u64,
+    pub read_version: u64,
+    pub cleanup_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1683,6 +1742,9 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         MetadataRpcRequest::RenamePath { source, .. } => RoutingKey::Path(source),
         MetadataRpcRequest::RenameReplacePath { source, .. } => RoutingKey::Path(source),
         MetadataRpcRequest::CloneSubtreePath { src_path, .. } => RoutingKey::Path(src_path),
+        MetadataRpcRequest::RestoreSubtreePathToFork { source_path, .. } => {
+            RoutingKey::Path(source_path)
+        }
         MetadataRpcRequest::DiffSubtrees { a_path, .. } => RoutingKey::Path(a_path),
         MetadataRpcRequest::RollbackSubtreePath { target_path, .. } => {
             RoutingKey::Path(target_path)
@@ -1719,6 +1781,9 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         MetadataRpcRequest::PublishPreparedArtifact { prepared, .. } => {
             RoutingKey::Inode(prepared.parent)
         }
+        MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared } => {
+            RoutingKey::Inode(prepared.parent)
+        }
         MetadataRpcRequest::PublishPreparedArtifactStagedSession { prepared, .. } => {
             RoutingKey::Inode(prepared.parent)
         }
@@ -1733,6 +1798,74 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_artifact_codec_preserves_object_gc_epoch() {
+        let prepared = WirePreparedArtifact {
+            mount: 1,
+            parent: 2,
+            name: "artifact.bin".to_owned(),
+            path: Some("/workspace/artifact.bin".to_owned()),
+            inode: 42,
+            generation: 7,
+            mtime_ms: 8,
+            ctime_ms: 9,
+            replace: true,
+            dentry_version: Some(6),
+            old_generation: Some(5),
+            object_gc_claim_version: 12,
+        };
+        let mut encoded = Vec::new();
+        prepared
+            .serialize(&mut rmp_serde::Serializer::new(&mut encoded).with_struct_map())
+            .unwrap();
+        let decoded: WirePreparedArtifact = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, prepared);
+
+        let request = MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch {
+            prepared: prepared.clone(),
+        };
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn prepared_artifact_codec_rejects_missing_object_gc_epoch() {
+        #[derive(Serialize)]
+        struct PreparedArtifactWithoutObjectGcEpoch {
+            mount: u64,
+            parent: u64,
+            name: String,
+            inode: u64,
+            generation: u64,
+            mtime_ms: u64,
+            ctime_ms: u64,
+            replace: bool,
+            dentry_version: Option<u64>,
+            old_generation: Option<u64>,
+        }
+
+        let legacy = PreparedArtifactWithoutObjectGcEpoch {
+            mount: 1,
+            parent: 2,
+            name: "artifact.bin".to_owned(),
+            inode: 42,
+            generation: 7,
+            mtime_ms: 8,
+            ctime_ms: 9,
+            replace: false,
+            dentry_version: None,
+            old_generation: None,
+        };
+        let mut encoded = Vec::new();
+        legacy
+            .serialize(&mut rmp_serde::Serializer::new(&mut encoded).with_struct_map())
+            .unwrap();
+
+        assert!(rmp_serde::from_slice::<WirePreparedArtifact>(&encoded).is_err());
+    }
 
     #[test]
     fn binary_codec_round_trips_metadata_request() {

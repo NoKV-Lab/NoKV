@@ -660,6 +660,7 @@ fn command_kind_tag(kind: CommandKind) -> u8 {
         CommandKind::WatchSubtree => 20,
         CommandKind::CleanupObjects => 21,
         CommandKind::RegisterNamespaceIndex => 22,
+        CommandKind::StageDetachedRestore => 23,
     }
 }
 
@@ -687,6 +688,7 @@ fn command_kind_from_tag(tag: u8) -> Result<CommandKind, MetadataLogError> {
         20 => Ok(CommandKind::WatchSubtree),
         21 => Ok(CommandKind::CleanupObjects),
         22 => Ok(CommandKind::RegisterNamespaceIndex),
+        23 => Ok(CommandKind::StageDetachedRestore),
         tag => Err(MetadataLogError::InvalidCommandKind(tag)),
     }
 }

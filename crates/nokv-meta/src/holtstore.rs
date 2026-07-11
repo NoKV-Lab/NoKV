@@ -45,11 +45,11 @@ pub struct HoltMetadataStore {
 #[derive(Default)]
 struct HistoryRetentionState {
     /// Ordinary commands share the read side from planning through durable
-    /// apply. Snapshot pins and fork-base bindings take the write side, making
+    /// apply. Snapshot pins and preparing fork-base holds take the write side, making
     /// their lifetime transition indivisible from the counters used by planners.
     planning_fence: RwLock<()>,
     active_snapshot_pins: AtomicU64,
-    active_fork_bindings: AtomicU64,
+    active_fork_base_holds: AtomicU64,
     /// Monotonic process-local sequence for durable holder transitions. It is
     /// protected by `planning_fence` and serves as the seqlock/CAS token for a
     /// service-computed retention floor.
@@ -72,19 +72,19 @@ type TestHook = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HistoryRetentionDelta {
     snapshot_pins: i64,
-    fork_bindings: i64,
+    fork_base_holds: i64,
 }
 
 impl HistoryRetentionDelta {
     fn is_zero(self) -> bool {
-        self.snapshot_pins == 0 && self.fork_bindings == 0
+        self.snapshot_pins == 0 && self.fork_base_holds == 0
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RecoveredHistoryRetentionState {
     active_snapshot_pins: u64,
-    active_fork_bindings: u64,
+    active_fork_base_holds: u64,
 }
 
 #[derive(Default)]
@@ -203,7 +203,7 @@ impl HistoryRetentionState {
         Self {
             planning_fence: RwLock::new(()),
             active_snapshot_pins: AtomicU64::new(recovered.active_snapshot_pins),
-            active_fork_bindings: AtomicU64::new(recovered.active_fork_bindings),
+            active_fork_base_holds: AtomicU64::new(recovered.active_fork_base_holds),
             epoch: AtomicU64::new(1),
             max_applied_commit_version: AtomicU64::new(0),
             #[cfg(test)]
@@ -216,8 +216,8 @@ impl HistoryRetentionState {
     fn install_recovered(&self, recovered: RecoveredHistoryRetentionState) {
         self.active_snapshot_pins
             .store(recovered.active_snapshot_pins, Ordering::Release);
-        self.active_fork_bindings
-            .store(recovered.active_fork_bindings, Ordering::Release);
+        self.active_fork_base_holds
+            .store(recovered.active_fork_base_holds, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         // A checkpoint install replaces the DB while holding the exclusive
         // planning fence, so there is no surviving pre-install plan to order.
@@ -226,7 +226,7 @@ impl HistoryRetentionState {
 
     fn has_active_hold(&self) -> bool {
         self.active_snapshot_pins.load(Ordering::Acquire) > 0
-            || self.active_fork_bindings.load(Ordering::Acquire) > 0
+            || self.active_fork_base_holds.load(Ordering::Acquire) > 0
     }
 
     fn apply_delta(&self, delta: HistoryRetentionDelta) {
@@ -234,7 +234,7 @@ impl HistoryRetentionState {
             return;
         }
         apply_counter_delta(&self.active_snapshot_pins, delta.snapshot_pins);
-        apply_counter_delta(&self.active_fork_bindings, delta.fork_bindings);
+        apply_counter_delta(&self.active_fork_base_holds, delta.fork_base_holds);
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -1320,10 +1320,9 @@ impl HoltMetadataStore {
         mutations: &[PlannedMutation],
     ) -> Result<(HistoryRetentionDelta, bool), MetadataError> {
         let mut final_states = Vec::<(RecordFamily, Vec<u8>, bool)>::new();
-        for planned in mutations
-            .iter()
-            .filter(|planned| is_history_retention_family(planned.mutation.family))
-        {
+        for planned in mutations.iter().filter(|planned| {
+            is_history_retention_key(planned.mutation.family, &planned.mutation.key)
+        }) {
             let new_active = planned.mutation.op == MutationOp::Put;
             if let Some((_, _, active)) = final_states.iter_mut().find(|(family, key, _)| {
                 *family == planned.mutation.family
@@ -1349,7 +1348,9 @@ impl HoltMetadataStore {
             let family_delta = i64::from(new_active) - i64::from(old_active);
             match family {
                 RecordFamily::Snapshot => delta.snapshot_pins += family_delta,
-                RecordFamily::ForkBinding => delta.fork_bindings += family_delta,
+                RecordFamily::System if is_fork_base_hold_key(&key) => {
+                    delta.fork_base_holds += family_delta;
+                }
                 _ => unreachable!("retention family filter accepts only durable holds"),
             }
         }
@@ -1540,12 +1541,20 @@ fn recover_history_retention_state(
     db: &DB,
 ) -> Result<RecoveredHistoryRetentionState, MetadataError> {
     Ok(RecoveredHistoryRetentionState {
-        active_snapshot_pins: count_active_records(db, SNAPSHOT_CURRENT_TREE)?,
-        active_fork_bindings: count_active_records(db, FORK_BINDING_CURRENT_TREE)?,
+        active_snapshot_pins: count_active_records_matching(db, SNAPSHOT_CURRENT_TREE, |_| true)?,
+        active_fork_base_holds: count_active_records_matching(
+            db,
+            SYSTEM_CURRENT_TREE,
+            is_fork_base_hold_key,
+        )?,
     })
 }
 
-fn count_active_records(db: &DB, tree_name: &str) -> Result<u64, MetadataError> {
+fn count_active_records_matching(
+    db: &DB,
+    tree_name: &str,
+    mut key_matches: impl FnMut(&[u8]) -> bool,
+) -> Result<u64, MetadataError> {
     let tree = match db.open_tree(tree_name) {
         Ok(tree) => tree,
         Err(HoltError::TreeNotFound { .. }) => return Ok(0),
@@ -1553,30 +1562,37 @@ fn count_active_records(db: &DB, tree_name: &str) -> Result<u64, MetadataError> 
     };
     let mut total = 0_u64;
     for entry in tree.range() {
-        let RangeEntry::Key { value, .. } = entry.map_err(to_backend_error)? else {
+        let RangeEntry::Key { key, value, .. } = entry.map_err(to_backend_error)? else {
             continue;
         };
-        if decode_current_value(&value)?.1.is_some() {
+        if key_matches(&key) && decode_current_value(&value)?.1.is_some() {
             total += 1;
         }
     }
     Ok(total)
 }
 
-fn is_history_retention_family(family: RecordFamily) -> bool {
-    matches!(family, RecordFamily::Snapshot | RecordFamily::ForkBinding)
+fn is_fork_base_hold_key(key: &[u8]) -> bool {
+    key.get(8..)
+        .is_some_and(|suffix| suffix.starts_with(b"fork-base-hold\0"))
+}
+
+fn is_history_retention_key(family: RecordFamily, key: &[u8]) -> bool {
+    family == RecordFamily::Snapshot
+        || (family == RecordFamily::System && is_fork_base_hold_key(key))
 }
 
 fn command_mutates_history_retention(command: &MetadataCommand) -> bool {
     command
         .mutations
         .iter()
-        .any(|mutation| is_history_retention_family(mutation.family))
+        .any(|mutation| is_history_retention_key(mutation.family, &mutation.key))
 }
 
 fn command_advances_history_version(command: &MetadataCommand) -> bool {
     command.mutations.iter().any(|mutation| {
-        family_requires_history(mutation.family) && !is_history_retention_family(mutation.family)
+        family_requires_history(mutation.family)
+            && !is_history_retention_key(mutation.family, &mutation.key)
     })
 }
 

@@ -30,9 +30,9 @@ pub use log::{
     METADATA_LOG_ZERO_DIGEST,
 };
 pub use service::{
-    BodyReadPlan, CheckpointHandle, CheckpointShard, CloneHandle, CreateInDirPathBatch,
-    CreatedPreparedArtifact, DanglingBlock, DentryWithAttr, FsckReport, MetadError,
-    MetadataArchiveConfig, MetadataBackupOutcome, MetadataLogArchiveConfig,
+    restore_operation_id, BodyReadPlan, CheckpointHandle, CheckpointShard, CloneHandle,
+    CreateInDirPathBatch, CreatedPreparedArtifact, DanglingBlock, DentryWithAttr, FsckReport,
+    MetadError, MetadataArchiveConfig, MetadataBackupOutcome, MetadataLogArchiveConfig,
     MetadataLogRestoreOutcome, MetadataLogSegmentArchiveOutcome, MetadataLogSegmentPointer,
     MetadataLogSyncConfig, MetadataLogSyncSnapshot, MetadataRestoreOutcome, MetadataServiceStats,
     NamespaceAggregateGroup, NamespaceAggregateMeasure, NamespaceAggregateOp,
@@ -50,6 +50,6 @@ pub use service::{
     ObjectTransferStats, OpenPathReadPlan, OpenPathReadPlanRequest, PendingObjectCleanupOutcome,
     PreparedArtifact, PublishArtifact, PublishArtifactRange, PublishArtifactSession,
     PublishArtifactStagedSession, ReadDirPlusPage, RecordCountProvenance, RenameReplaceResult,
-    SnapshotReapOutcome, SnapshotRenewOutcome, SubtreeDelta, SubtreeDeltaKind, UpdateAttr,
-    XattrSetMode, DEFAULT_SNAPSHOT_LEASE_MS,
+    RestoreInitialization, RestoreInitializationFile, SnapshotReapOutcome, SnapshotRenewOutcome,
+    SubtreeDelta, SubtreeDeltaKind, UpdateAttr, XattrSetMode, DEFAULT_SNAPSHOT_LEASE_MS,
 };

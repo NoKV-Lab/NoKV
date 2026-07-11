@@ -274,51 +274,28 @@ where
     ) -> Result<ReadDirPlusPage, MetadError> {
         let requested = limit.max(1);
         let prefix = path_index_prefix(self.mount, components);
-        let mut start_after = after.map(|name| {
-            let mut marker = components.to_vec();
-            marker.push(name.clone());
-            path_index_prefix(self.mount, &marker)
-        });
-        let scan_limit = requested.saturating_add(1);
-        let mut entries = Vec::<DentryWithAttr>::with_capacity(scan_limit);
-        let mut stale_rows = 0_u64;
         let cache_epoch = self.path_cache_epoch.load(Ordering::Acquire);
-        loop {
-            let rows = self.metadata.scan_delimited(DelimitedScanRequest {
-                family: RecordFamily::PathIndex,
-                prefix: prefix.clone(),
-                start_after: start_after.clone(),
-                delimiter: PATH_INDEX_DELIMITER,
-                version,
-                limit: scan_limit,
-                purpose: ReadPurpose::UserStrong,
-            })?;
-            if rows.is_empty() {
-                break;
-            }
-            let exhausted = rows.len() < scan_limit;
-            let mut last_marker = None;
-            for item in rows {
-                last_marker = Some(delimited_scan_marker(&item));
-                let Some(entry) =
-                    self.indexed_path_child(parent, &prefix, item, version, cache_epoch)?
-                else {
-                    stale_rows += 1;
-                    continue;
-                };
-                entries.push(entry);
-                if entries.len() > requested {
-                    break;
-                }
-            }
-            if entries.len() > requested || exhausted {
-                break;
-            }
-            let Some(marker) = last_marker else {
-                break;
-            };
-            start_after = Some(marker);
+        let (live, mut stale_rows) = self.collect_live_indexed_children(
+            parent,
+            &prefix,
+            after,
+            requested,
+            version,
+            cache_epoch,
+        )?;
+        let mut merged = live
+            .into_iter()
+            .map(|entry| (entry.dentry.name.as_bytes().to_vec(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let (shadow, shadow_stale) =
+            self.collect_restore_indexed_children(parent, after, requested, version)?;
+        stale_rows = stale_rows.saturating_add(shadow_stale);
+        for entry in shadow {
+            merged
+                .entry(entry.dentry.name.as_bytes().to_vec())
+                .or_insert(entry);
         }
+        let mut entries = merged.into_values().collect::<Vec<_>>();
         let next_cursor = if entries.len() > requested {
             entries.truncate(requested);
             entries.last().map(|entry| entry.dentry.name.clone())
@@ -336,6 +313,288 @@ where
             entries,
             next_cursor,
         })
+    }
+
+    fn collect_live_indexed_children(
+        &self,
+        parent: InodeId,
+        prefix: &[u8],
+        after: Option<&DentryName>,
+        requested: usize,
+        version: Version,
+        cache_epoch: u64,
+    ) -> Result<(Vec<DentryWithAttr>, u64), MetadError> {
+        let mut start_after = after.map(|name| delimited_child_marker(prefix, name));
+        let scan_limit = requested.saturating_add(1);
+        let mut entries = Vec::<DentryWithAttr>::with_capacity(scan_limit);
+        let mut stale_rows = 0_u64;
+        loop {
+            let rows = self.metadata.scan_delimited(DelimitedScanRequest {
+                family: RecordFamily::PathIndex,
+                prefix: prefix.to_vec(),
+                start_after: start_after.clone(),
+                delimiter: PATH_INDEX_DELIMITER,
+                version,
+                limit: scan_limit,
+                purpose: ReadPurpose::UserStrong,
+            })?;
+            if rows.is_empty() {
+                break;
+            }
+            let exhausted = rows.len() < scan_limit;
+            let mut last_marker = None;
+            for item in rows {
+                last_marker = Some(delimited_scan_marker(&item));
+                let Some(entry) =
+                    self.indexed_path_child(parent, prefix, item, version, cache_epoch)?
+                else {
+                    stale_rows += 1;
+                    continue;
+                };
+                entries.push(entry);
+                if entries.len() > requested {
+                    break;
+                }
+            }
+            if entries.len() > requested || exhausted {
+                break;
+            }
+            let Some(marker) = last_marker else {
+                break;
+            };
+            start_after = Some(marker);
+        }
+        Ok((entries, stale_rows))
+    }
+
+    fn collect_restore_indexed_children(
+        &self,
+        parent: InodeId,
+        after: Option<&DentryName>,
+        requested: usize,
+        version: Version,
+    ) -> Result<(Vec<DentryWithAttr>, u64), MetadError> {
+        let prefix = fork_shadow_prefix(self.mount, parent);
+        let mut start_after = after.map(|name| fork_shadow_key(self.mount, parent, name));
+        let scan_limit = requested.saturating_add(1);
+        let mut entries = Vec::with_capacity(scan_limit);
+        let mut stale_rows = 0_u64;
+        loop {
+            let rows = self.metadata.scan(ScanRequest {
+                family: RecordFamily::ForkShadow,
+                prefix: prefix.clone(),
+                start_after: start_after.clone(),
+                version,
+                limit: scan_limit,
+                purpose: ReadPurpose::UserStrong,
+            })?;
+            if rows.is_empty() {
+                break;
+            }
+            let exhausted = rows.len() < scan_limit;
+            let mut last_marker = None;
+            for item in rows {
+                last_marker = Some(item.key.clone());
+                let Some(entry) =
+                    self.restore_indexed_path_child(parent, &prefix, &item, version)?
+                else {
+                    stale_rows += 1;
+                    continue;
+                };
+                entries.push(entry);
+                if entries.len() > requested {
+                    break;
+                }
+            }
+            if entries.len() > requested || exhausted {
+                break;
+            }
+            let Some(marker) = last_marker else {
+                break;
+            };
+            start_after = Some(marker);
+        }
+        Ok((entries, stale_rows))
+    }
+
+    pub(super) fn restore_shadow_key_for_entry(
+        &self,
+        components: &[DentryName],
+        parent: InodeId,
+        name: &DentryName,
+        entry: &DentryWithAttr,
+        version: Version,
+    ) -> Result<Option<(Vec<u8>, u64)>, MetadError> {
+        let Some((path_name, parent_components)) = components.split_last() else {
+            return Ok(None);
+        };
+        if path_name != name {
+            return Err(MetadError::InvalidPath(
+                "path-index entry name does not match path context".to_owned(),
+            ));
+        }
+        let _ = parent_components;
+        self.restore_shadow_key_for_inode_entry(parent, name, entry, version)
+    }
+
+    pub(super) fn restore_shadow_key_for_inode_entry(
+        &self,
+        parent: InodeId,
+        name: &DentryName,
+        entry: &DentryWithAttr,
+        version: Version,
+    ) -> Result<Option<(Vec<u8>, u64)>, MetadError> {
+        let inverse_key = fork_shadow_key(self.mount, parent, name);
+        let Some(value) = self.metadata.get(
+            RecordFamily::ForkShadow,
+            &inverse_key,
+            version,
+            ReadPurpose::WritePlanLocal,
+        )?
+        else {
+            return Ok(None);
+        };
+        let (base_ref_set_id, marker) = decode_restore_shadow_inverse(&value.0)?;
+        Ok((marker.attr.inode == entry.attr.inode
+            && marker.dentry.parent == parent
+            && marker.dentry.name == *name)
+            .then(|| {
+                (
+                    restore_path_index_key(self.mount, base_ref_set_id, parent, name),
+                    base_ref_set_id,
+                )
+            }))
+    }
+
+    pub(super) fn restore_shadow_destination_key(
+        &self,
+        components: &[DentryName],
+        base_ref_set_id: u64,
+        parent: InodeId,
+        name: &DentryName,
+        version: Version,
+    ) -> Result<Option<Vec<u8>>, MetadError> {
+        let Some((path_name, parent_components)) = components.split_last() else {
+            return Ok(None);
+        };
+        if path_name != name {
+            return Err(MetadError::InvalidPath(
+                "path-index destination name does not match path context".to_owned(),
+            ));
+        }
+        let _ = (parent_components, version);
+        Ok(Some(restore_path_index_key(
+            self.mount,
+            base_ref_set_id,
+            parent,
+            name,
+        )))
+    }
+
+    pub(super) fn restore_shadow_destination_key_for_parent(
+        &self,
+        base_ref_set_id: u64,
+        parent: InodeId,
+        name: &DentryName,
+        version: Version,
+    ) -> Result<Option<Vec<u8>>, MetadError> {
+        let _ = version;
+        Ok(Some(restore_path_index_key(
+            self.mount,
+            base_ref_set_id,
+            parent,
+            name,
+        )))
+    }
+
+    fn restore_indexed_path_child(
+        &self,
+        parent: InodeId,
+        prefix: &[u8],
+        item: &ScanItem,
+        version: Version,
+    ) -> Result<Option<DentryWithAttr>, MetadError> {
+        let name = DentryName::new(
+            item.key
+                .strip_prefix(prefix)
+                .ok_or_else(|| {
+                    MetadError::Codec("restore shadow escaped parent prefix".to_owned())
+                })?
+                .to_vec(),
+        )
+        .map_err(|err| MetadError::InvalidPath(err.to_string()))?;
+        let (_, indexed): (u64, DentryProjection) = decode_restore_shadow_inverse(&item.value.0)?;
+        let Some((canonical, _)) = self.lookup_plus_at_version(parent, &name, version)? else {
+            return Ok(None);
+        };
+        if indexed.attr.inode != canonical.attr.inode
+            || indexed.dentry.parent != parent
+            || indexed.dentry.name != name
+        {
+            return Ok(None);
+        }
+        if canonical.attr.file_type == FileType::Directory
+            && !self.restore_shadow_subtree_has_index(
+                canonical.attr.inode,
+                version,
+                &mut HashSet::new(),
+            )?
+        {
+            return Ok(None);
+        }
+        Ok(Some(canonical))
+    }
+
+    fn restore_shadow_subtree_has_index(
+        &self,
+        parent: InodeId,
+        version: Version,
+        visited: &mut HashSet<InodeId>,
+    ) -> Result<bool, MetadError> {
+        if !visited.insert(parent) {
+            return Ok(false);
+        }
+        let prefix = fork_shadow_prefix(self.mount, parent);
+        let mut start_after = None;
+        loop {
+            let rows = self.metadata.scan(ScanRequest {
+                family: RecordFamily::ForkShadow,
+                prefix: prefix.clone(),
+                start_after: start_after.clone(),
+                version,
+                limit: 128,
+                purpose: ReadPurpose::UserStrong,
+            })?;
+            if rows.is_empty() {
+                break;
+            }
+            let exhausted = rows.len() < 128;
+            start_after = rows.last().map(|row| row.key.clone());
+            for row in rows {
+                let (_, marker) = decode_restore_shadow_inverse(&row.value.0)?;
+                let Some((canonical, _)) =
+                    self.lookup_plus_at_version(parent, &marker.dentry.name, version)?
+                else {
+                    continue;
+                };
+                if canonical.attr.inode != marker.attr.inode {
+                    continue;
+                }
+                if canonical.attr.file_type != FileType::Directory
+                    || self.restore_shadow_subtree_has_index(
+                        canonical.attr.inode,
+                        version,
+                        visited,
+                    )?
+                {
+                    return Ok(true);
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        Ok(false)
     }
 
     fn indexed_path_child(
@@ -1472,4 +1731,12 @@ fn delimited_scan_marker(item: &DelimitedScanItem) -> Vec<u8> {
         DelimitedScanItem::Key(item) => item.key.clone(),
         DelimitedScanItem::CommonPrefix(prefix) => prefix.clone(),
     }
+}
+
+fn delimited_child_marker(prefix: &[u8], name: &DentryName) -> Vec<u8> {
+    let mut marker = Vec::with_capacity(prefix.len() + name.as_bytes().len() + 1);
+    marker.extend_from_slice(prefix);
+    marker.extend_from_slice(name.as_bytes());
+    marker.push(PATH_INDEX_DELIMITER);
+    marker
 }

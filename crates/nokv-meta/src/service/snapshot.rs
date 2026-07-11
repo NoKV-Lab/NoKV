@@ -20,10 +20,12 @@ where
     M: MetadataStore,
     O: ObjectStore,
 {
+    #[cfg(test)]
     pub(crate) fn snapshot_subtree(&self, root: InodeId) -> Result<SnapshotPin, MetadError> {
         self.snapshot_subtree_with_lease(root, DEFAULT_SNAPSHOT_LEASE_MS)
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot_subtree_with_lease(
         &self,
         root: InodeId,
@@ -546,7 +548,7 @@ where
         Ok((u64::from(self.shard_index()) << SNAPSHOT_ID_LOCAL_BITS) | local)
     }
 
-    fn ensure_snapshot_id_shard(
+    pub(super) fn ensure_snapshot_id_shard(
         &self,
         snapshot_id: u64,
         expected_root: InodeId,
@@ -563,7 +565,7 @@ where
         Ok(())
     }
 
-    fn ensure_snapshot_pin_live(&self, pin: &SnapshotPin) -> Result<(), MetadError> {
+    pub(super) fn ensure_snapshot_pin_live(&self, pin: &SnapshotPin) -> Result<(), MetadError> {
         let now_ms = self.now_ms();
         if now_ms >= pin.lease_expires_unix_ms {
             return Err(MetadError::SnapshotLeaseExpired {

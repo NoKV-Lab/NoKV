@@ -23,7 +23,8 @@ Run the full local preflight and MCP install path with:
 - starts or verifies RustFS and the `nokv-lingtai-workbench` bucket
 - verifies or starts the NoKV server at `127.0.0.1:7799`
 - checks that the LingTai TUI runtime can see the `nokv-workbench` skill
-- checks that the workbench MCP exposes `workbench_*` tools
+- checks that the workbench MCP exposes snapshot renewal, discovery, and
+  restore-to-fork tools
 - idempotently installs the MCP registration into the selected LingTai agent
 
 Defaults:
@@ -181,13 +182,21 @@ The MCP server exposes workbench tools with the `workbench_` prefix:
 ```text
 workbench_create
 workbench_put_file
+workbench_append
+workbench_edit
 workbench_list
 workbench_stat
 workbench_read
 workbench_grep
+workbench_search
+workbench_aggregate
+workbench_catalog
 workbench_find
 workbench_commit
 workbench_snapshot
+workbench_snapshot_renew
+workbench_snapshot_list
+workbench_restore
 ```
 
 The server registration name remains `nokv-workbench`; that is the MCP server
@@ -201,3 +210,8 @@ Run the installer tests with:
 python3 ./scripts/lingtai-workbench/install_workbench_mcp_test.py
 bash -n ./scripts/lingtai-workbench/up.sh
 ```
+
+The environment-gated checkpoint/restore acceptance test additionally requires
+RustFS, a real `nokv serve` process, and the LingTai source checkout selected by
+`LINGTAI_KERNEL_DIR`. It validates the MCP subprocess path rather than replacing
+it with a test JSON-RPC client.

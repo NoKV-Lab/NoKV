@@ -45,11 +45,11 @@ pub enum RecordFamily {
     Gc,
     CommandDedupe,
     History,
-    /// Anchors a lazy copy-on-write fork: maps a fork root to the source subtree
-    /// and the frozen read version it falls through to. Keyed by fork-root inode.
+    /// Durable lifecycle and exact base-reference owner for a
+    /// metadata-materialized copy-on-write fork. Keyed by fork-root inode.
     ForkBinding,
-    /// Durable `fork_inode -> source_inode` map for a lazy fork, so a bare-inode
-    /// read of an undiverged fork inode can recover the source. Keyed by fork inode.
+    /// Inverse index for borrowed PathIndex projections in a materialized fork,
+    /// keyed by destination parent inode and dentry name.
     ForkShadow,
 }
 
@@ -217,17 +217,46 @@ pub struct ReadLease {
     pub lease_expires_unix_ms: u64,
 }
 
-/// Anchor for a lazy copy-on-write fork (overlay/redirect-on-read clone): a
-/// writable `fork_root` that overlays `source_root` as seen at
-/// `pinned_read_version`. Undiverged reads fall through to the source at that
-/// version; the retained `snapshot_id` keeps the shared base blocks GC-protected.
+/// Lifecycle record for a metadata-materialized copy-on-write fork.
+///
+/// The destination has its own inode and dentry tree; reads do not redirect to
+/// the source namespace. File manifests may still reference source object blocks,
+/// so `base_ref_set_id` owns the exact durable references that protect those
+/// shared blocks, while ForkShadow indexes retain the corresponding borrowed
+/// namespace projections. `snapshot_id` and `pinned_read_version` record the
+/// construction checkpoint only; the snapshot lease is not the fork's lifetime
+/// holder after the destination is attached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkBindingState {
+    Preparing,
+    Complete,
+    /// The destination is no longer visible. Exact base-object references are
+    /// being released asynchronously before the durable binding is removed.
+    Releasing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkBinding {
     pub fork_root: InodeId,
     pub source_root: InodeId,
+    /// Historical version used to materialize the destination metadata.
     pub pinned_read_version: u64,
+    /// Construction checkpoint identity retained for provenance and retries.
     pub snapshot_id: u64,
     pub created_version: u64,
+    /// Unique incarnation of the exact base-reference set owned by this fork.
+    /// Unlike `operation_digest`, a retried destination incarnation never
+    /// reuses this identifier.
+    pub base_ref_set_id: u64,
+    /// Stable digest of `(mount, source, snapshot, read-version, destination)`.
+    /// Zero is reserved for non-restore forks.
+    pub operation_digest: [u8; 32],
+    /// Digest of the canonical detached-tree initialization. It is checked
+    /// independently from the public operation id so manifest content may carry
+    /// that stable id without creating a hashing cycle.
+    pub initialization_digest: [u8; 32],
+    pub state: ForkBindingState,
+    pub destination_path: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]

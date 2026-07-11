@@ -8,6 +8,8 @@ use crate::server::{Server, ServerError};
 
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
+const DEFAULT_MANUAL_GC_LIMIT: usize = 1024;
+const MAX_MANUAL_GC_LIMIT: usize = 16_384;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HttpRequest {
@@ -182,19 +184,28 @@ fn split_target(target: &str) -> (&str, Option<&str>) {
 
 fn gc_limit(query: Option<&str>) -> Result<usize, String> {
     let Some(query) = query else {
-        return Ok(usize::MAX);
+        return Ok(DEFAULT_MANUAL_GC_LIMIT);
     };
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
         };
         if key == "limit" {
-            return value
+            let limit = value
                 .parse::<usize>()
-                .map_err(|_| format!("invalid gc limit {value}"));
+                .map_err(|_| format!("invalid gc limit {value}"))?;
+            if limit == 0 {
+                return Ok(DEFAULT_MANUAL_GC_LIMIT);
+            }
+            if limit > MAX_MANUAL_GC_LIMIT {
+                return Err(format!(
+                    "gc limit {limit} exceeds maximum {MAX_MANUAL_GC_LIMIT}"
+                ));
+            }
+            return Ok(limit);
         }
     }
-    Ok(usize::MAX)
+    Ok(DEFAULT_MANUAL_GC_LIMIT)
 }
 
 impl HttpResponse {
@@ -283,6 +294,25 @@ mod tests {
         let server = test_server();
         let response = handle_parts(&server, "GET /gc?limit=bad HTTP/1.1", &[]);
         assert_eq!(response.status, "400 Bad Request");
+    }
+
+    #[test]
+    fn gc_limit_defaults_and_zero_are_bounded() {
+        assert_eq!(gc_limit(None).unwrap(), DEFAULT_MANUAL_GC_LIMIT);
+        assert_eq!(gc_limit(Some("limit=0")).unwrap(), DEFAULT_MANUAL_GC_LIMIT);
+        assert_eq!(
+            gc_limit(Some("unrelated=value")).unwrap(),
+            DEFAULT_MANUAL_GC_LIMIT
+        );
+    }
+
+    #[test]
+    fn gc_endpoint_rejects_limit_above_maximum() {
+        let server = test_server();
+        let request = format!("GET /gc?limit={} HTTP/1.1", MAX_MANUAL_GC_LIMIT + 1);
+        let response = handle_parts(&server, &request, &[]);
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("exceeds maximum"));
     }
 
     #[test]

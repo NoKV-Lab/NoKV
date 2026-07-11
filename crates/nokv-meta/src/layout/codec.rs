@@ -2,13 +2,15 @@ use std::fmt;
 
 use nokv_types::{
     BlockDescriptor, BodyDescriptor, ChunkManifest, DentryName, DentryProjection, DentryRecord,
-    FileType, ForkBinding, InodeAttr, InodeId, ObjectGcRecord, SliceManifest, SnapshotPin,
-    WatchEvent, WatchEventKind,
+    FileType, ForkBinding, ForkBindingState, InodeAttr, InodeId, ObjectGcRecord, SliceManifest,
+    SnapshotPin, WatchEvent, WatchEventKind,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodecError {
     Truncated,
+    InvalidMagic(&'static str),
+    UnsupportedVersion { codec: &'static str, version: u8 },
     InvalidFileType(u8),
     InvalidWatchEventKind(u8),
     InvalidOptionTag(u8),
@@ -312,24 +314,68 @@ pub fn decode_snapshot_pin(bytes: &[u8]) -> Result<SnapshotPin, CodecError> {
     Ok(pin)
 }
 
+const FORK_BINDING_MAGIC: &[u8; 4] = b"NKVF";
+const FORK_BINDING_CODEC_VERSION: u8 = 1;
+
 pub fn encode_fork_binding(binding: &ForkBinding) -> Vec<u8> {
-    let mut out = Vec::with_capacity(40);
+    let mut out = Vec::with_capacity(122 + binding.destination_path.len());
+    out.extend_from_slice(FORK_BINDING_MAGIC);
+    out.push(FORK_BINDING_CODEC_VERSION);
     push_u64(&mut out, binding.fork_root.get());
     push_u64(&mut out, binding.source_root.get());
     push_u64(&mut out, binding.pinned_read_version);
     push_u64(&mut out, binding.snapshot_id);
     push_u64(&mut out, binding.created_version);
+    push_u64(&mut out, binding.base_ref_set_id);
+    out.extend_from_slice(&binding.operation_digest);
+    out.extend_from_slice(&binding.initialization_digest);
+    out.push(match binding.state {
+        ForkBindingState::Preparing => 1,
+        ForkBindingState::Complete => 2,
+        ForkBindingState::Releasing => 3,
+    });
+    put_string(&mut out, &binding.destination_path);
     out
 }
 
 pub fn decode_fork_binding(bytes: &[u8]) -> Result<ForkBinding, CodecError> {
     let mut input = Decoder::new(bytes);
+    if input.fixed::<4>()? != *FORK_BINDING_MAGIC {
+        return Err(CodecError::InvalidMagic("fork binding"));
+    }
+    let version = input.u8()?;
+    if version != FORK_BINDING_CODEC_VERSION {
+        return Err(CodecError::UnsupportedVersion {
+            codec: "fork binding",
+            version,
+        });
+    }
+    let fork_root = inode(input.u64()?)?;
+    let source_root = inode(input.u64()?)?;
+    let pinned_read_version = input.u64()?;
+    let snapshot_id = input.u64()?;
+    let created_version = input.u64()?;
+    let base_ref_set_id = input.u64()?;
+    let operation_digest = input.fixed::<32>()?;
+    let initialization_digest = input.fixed::<32>()?;
+    let state = match input.u8()? {
+        1 => ForkBindingState::Preparing,
+        2 => ForkBindingState::Complete,
+        3 => ForkBindingState::Releasing,
+        tag => return Err(CodecError::InvalidOptionTag(tag)),
+    };
+    let destination_path = input.string()?;
     let binding = ForkBinding {
-        fork_root: inode(input.u64()?)?,
-        source_root: inode(input.u64()?)?,
-        pinned_read_version: input.u64()?,
-        snapshot_id: input.u64()?,
-        created_version: input.u64()?,
+        fork_root,
+        source_root,
+        pinned_read_version,
+        snapshot_id,
+        created_version,
+        base_ref_set_id,
+        operation_digest,
+        initialization_digest,
+        state,
+        destination_path,
     };
     input.finish()?;
     Ok(binding)
@@ -617,6 +663,10 @@ impl<'a> Decoder<'a> {
         Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
     }
 
+    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
+        Ok(self.take(N)?.try_into().expect("fixed decoder width"))
+    }
+
     fn bytes(&mut self) -> Result<&'a [u8], CodecError> {
         let len = self.u32()? as usize;
         self.take(len)
@@ -649,6 +699,10 @@ impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Truncated => write!(f, "encoded metadata value is truncated"),
+            Self::InvalidMagic(codec) => write!(f, "invalid {codec} codec magic"),
+            Self::UnsupportedVersion { codec, version } => {
+                write!(f, "unsupported {codec} codec version {version}")
+            }
             Self::InvalidFileType(tag) => write!(f, "invalid file type tag {tag}"),
             Self::InvalidWatchEventKind(tag) => write!(f, "invalid watch event kind tag {tag}"),
             Self::InvalidOptionTag(tag) => write!(f, "invalid optional value tag {tag}"),
@@ -675,6 +729,11 @@ mod tests {
             pinned_read_version: 1234,
             snapshot_id: 5678,
             created_version: 5679,
+            base_ref_set_id: 5680,
+            operation_digest: [7; 32],
+            initialization_digest: [8; 32],
+            state: ForkBindingState::Complete,
+            destination_path: "/restored".to_owned(),
         };
         assert_eq!(
             decode_fork_binding(&encode_fork_binding(&binding)).unwrap(),
@@ -684,6 +743,52 @@ mod tests {
         let mut extra = encode_fork_binding(&binding);
         extra.push(0);
         assert!(decode_fork_binding(&extra).is_err());
+    }
+
+    #[test]
+    fn fork_binding_rejects_legacy_unversioned_layout() {
+        let mut legacy = Vec::new();
+        push_u64(&mut legacy, 42);
+        push_u64(&mut legacy, 7);
+        push_u64(&mut legacy, 1234);
+        push_u64(&mut legacy, 5678);
+        push_u64(&mut legacy, 5679);
+        push_u64(&mut legacy, 5680);
+        legacy.extend_from_slice(&[7; 32]);
+        legacy.extend_from_slice(&[8; 32]);
+        legacy.push(2);
+        put_string(&mut legacy, "/restored");
+
+        assert_eq!(
+            decode_fork_binding(&legacy),
+            Err(CodecError::InvalidMagic("fork binding"))
+        );
+    }
+
+    #[test]
+    fn fork_binding_rejects_unknown_codec_version() {
+        let binding = ForkBinding {
+            fork_root: InodeId::new(42).unwrap(),
+            source_root: InodeId::new(7).unwrap(),
+            pinned_read_version: 1234,
+            snapshot_id: 5678,
+            created_version: 5679,
+            base_ref_set_id: 5680,
+            operation_digest: [7; 32],
+            initialization_digest: [8; 32],
+            state: ForkBindingState::Complete,
+            destination_path: "/restored".to_owned(),
+        };
+        let mut encoded = encode_fork_binding(&binding);
+        encoded[FORK_BINDING_MAGIC.len()] = 99;
+
+        assert_eq!(
+            decode_fork_binding(&encoded),
+            Err(CodecError::UnsupportedVersion {
+                codec: "fork binding",
+                version: 99,
+            })
+        );
     }
 
     #[test]

@@ -68,6 +68,5 @@ pub(super) fn family_requires_history(family: RecordFamily) -> bool {
             | RecordFamily::Watch
             | RecordFamily::Gc
             | RecordFamily::ForkBinding
-            | RecordFamily::ForkShadow
     )
 }

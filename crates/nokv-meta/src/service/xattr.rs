@@ -47,7 +47,19 @@ where
                 op: MutationOp::Put,
                 value: Some(Value(value)),
             }],
-            watch: Vec::new(),
+            watch: self
+                .watch_projection(
+                    InodeId::root(),
+                    WatchEvent {
+                        kind: WatchEventKind::UpdateAttr,
+                        parent: None,
+                        name: None,
+                        inode,
+                        version: version.get(),
+                    },
+                )
+                .into_iter()
+                .collect(),
         })?;
         Ok(())
     }
@@ -116,7 +128,19 @@ where
                 op: MutationOp::Delete,
                 value: None,
             }],
-            watch: Vec::new(),
+            watch: self
+                .watch_projection(
+                    InodeId::root(),
+                    WatchEvent {
+                        kind: WatchEventKind::UpdateAttr,
+                        parent: None,
+                        name: None,
+                        inode,
+                        version: version.get(),
+                    },
+                )
+                .into_iter()
+                .collect(),
         })?;
         Ok(())
     }

@@ -608,7 +608,7 @@ fn service_create_file_prepared_uses_single_frame() {
             other => panic!("unexpected request: {other:?}"),
         }
         response_body(
-            r#"{"ok":true,"result":{"type":"created_prepared_artifact","entry":{"dentry":{"parent":2,"name_hex":"636865636b706f696e742e62696e","child":40,"child_type":"file","attr_generation":7},"attr":{"inode":40,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":0,"generation":7,"mtime_ms":7,"ctime_ms":7},"body":null},"prepared":{"mount":1,"parent":2,"name":"checkpoint.bin","inode":40,"generation":8,"mtime_ms":8,"ctime_ms":8,"replace":true,"dentry_version":7,"old_generation":null}}}"#,
+            r#"{"ok":true,"result":{"type":"created_prepared_artifact","entry":{"dentry":{"parent":2,"name_hex":"636865636b706f696e742e62696e","child":40,"child_type":"file","attr_generation":7},"attr":{"inode":40,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":0,"generation":7,"mtime_ms":7,"ctime_ms":7},"body":null},"prepared":{"mount":1,"parent":2,"name":"checkpoint.bin","inode":40,"generation":8,"mtime_ms":8,"ctime_ms":8,"replace":true,"dentry_version":7,"old_generation":null,"object_gc_claim_version":12}}}"#,
         )
     });
     let client = MetadataClient::connect(addr);
@@ -625,6 +625,43 @@ fn service_create_file_prepared_uses_single_frame() {
     assert_eq!(created.prepared.inode.get(), 40);
     assert_eq!(created.prepared.generation, 8);
     assert!(created.prepared.replace);
+    assert_eq!(created.prepared.object_gc_claim_version, 12);
+}
+
+#[test]
+fn service_refresh_prepared_upload_mints_generation_and_object_gc_epoch() {
+    let addr = serve_one_request(|request| {
+        match request {
+            MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared } => {
+                assert_eq!(prepared.inode, 42);
+                assert_eq!(prepared.generation, 7);
+                assert_eq!(prepared.object_gc_claim_version, 12);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":2,"name":"artifact.bin","inode":42,"generation":13,"mtime_ms":1700000000001,"ctime_ms":1700000000001,"replace":true,"dentry_version":7,"old_generation":6,"object_gc_claim_version":14}}}"#,
+        )
+    });
+    let client = MetadataClient::connect(addr);
+    let refreshed = client
+        .refresh_prepared_artifact_object_gc_epoch(ClientPreparedArtifact {
+            mount: 1,
+            parent: InodeId::new(2).unwrap(),
+            name: DentryName::new(b"artifact.bin".to_vec()).unwrap(),
+            path: None,
+            inode: InodeId::new(42).unwrap(),
+            generation: 7,
+            mtime_ms: 1_700_000_000_000,
+            ctime_ms: 1_700_000_000_000,
+            replace: true,
+            dentry_version: Some(7),
+            old_generation: Some(6),
+            object_gc_claim_version: 12,
+        })
+        .unwrap();
+    assert_eq!(refreshed.generation, 13);
+    assert_eq!(refreshed.object_gc_claim_version, 14);
 }
 
 #[test]
@@ -2456,7 +2493,7 @@ fn service_file_client_uploads_blocks_then_publishes_metadata() {
     let store = MemoryObjectStore::new();
     let addr = serve_many(vec![
         response_body(
-            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null}}}"#,
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
         ),
         response_body(
             r#"{"ok":true,"result":{"type":"rename_replace","entry":{"dentry":{"parent":1,"name_hex":"61727469666163742e62696e","child":42,"child_type":"file","attr_generation":7},"attr":{"inode":42,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":11,"generation":7,"mtime_ms":7,"ctime_ms":7},"body":{"producer":"unit-test","digest_uri":"sha256:demo","size":11,"content_type":"application/octet-stream","manifest_id":"artifact.bin","generation":7,"base_generation":0,"chunk_size":67108864,"block_size":4194304}},"replaced":null}}"#,
@@ -2481,11 +2518,136 @@ fn service_file_client_uploads_blocks_then_publishes_metadata() {
 }
 
 #[test]
+fn service_file_client_refreshes_and_restages_after_object_gc_epoch_change() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_request_sequence(vec![
+        Box::new(|request| {
+            assert_eq!(
+                request,
+                MetadataRpcRequest::PrepareArtifactPath {
+                    path: "/artifact.bin".to_owned(),
+                    replace: false,
+                }
+            );
+            response_body(
+                r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","path":"/artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+            )
+        }),
+        Box::new(|request| {
+            let MetadataRpcRequest::PublishPreparedArtifact { prepared, body, .. } = request else {
+                panic!("expected initial prepared publish")
+            };
+            assert_eq!(prepared.parent, 1);
+            assert_eq!(prepared.path.as_deref(), Some("/artifact.bin"));
+            assert_eq!(prepared.inode, 42);
+            assert_eq!(prepared.generation, 7);
+            assert_eq!(prepared.object_gc_claim_version, 12);
+            assert_eq!(body.generation, 7);
+            response_body(
+                r#"{"ok":false,"error":"prepared artifact object-GC epoch 12 is stale; current epoch is 14","error_kind":{"type":"stale_prepared_artifact_object_gc_epoch","expected":12,"current":14}}"#,
+            )
+        }),
+        Box::new(|request| {
+            let MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared } = request
+            else {
+                panic!("expected prepared object-GC refresh")
+            };
+            assert_eq!(prepared.parent, 1);
+            assert_eq!(prepared.name, "artifact.bin");
+            assert_eq!(prepared.path.as_deref(), Some("/artifact.bin"));
+            assert_eq!(prepared.inode, 42);
+            assert_eq!(prepared.generation, 7);
+            assert_eq!(prepared.object_gc_claim_version, 12);
+            response_body(
+                r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","path":"/artifact.bin","inode":42,"generation":13,"mtime_ms":1700000000001,"ctime_ms":1700000000001,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":14}}}"#,
+            )
+        }),
+        Box::new(|request| {
+            let MetadataRpcRequest::PublishPreparedArtifact { prepared, body, .. } = request else {
+                panic!("expected refreshed prepared publish")
+            };
+            assert_eq!(prepared.parent, 1);
+            assert_eq!(prepared.path.as_deref(), Some("/artifact.bin"));
+            assert_eq!(prepared.inode, 42);
+            assert_eq!(prepared.generation, 13);
+            assert_eq!(prepared.object_gc_claim_version, 14);
+            assert_eq!(body.generation, 13);
+            response_body(
+                r#"{"ok":true,"result":{"type":"rename_replace","entry":{"dentry":{"parent":1,"name_hex":"61727469666163742e62696e","child":42,"child_type":"file","attr_generation":13},"attr":{"inode":42,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":11,"generation":13,"mtime_ms":13,"ctime_ms":13},"body":{"producer":"unit-test","digest_uri":"sha256:artifact.bin","size":11,"content_type":"application/octet-stream","manifest_id":"artifact.bin","generation":13,"base_generation":0,"chunk_size":67108864,"block_size":4194304}},"replaced":null}}"#,
+            )
+        }),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+
+    let entry = client
+        .put_artifact(
+            "/artifact.bin",
+            b"hello world".to_vec(),
+            artifact_metadata("artifact.bin"),
+        )
+        .unwrap();
+
+    assert_eq!(entry.body.unwrap().generation, 13);
+    assert!(
+        store
+            .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+            .unwrap()
+            .is_none(),
+        "the stale unattached generation must be removed before refresh"
+    );
+    assert!(
+        store
+            .head(&ObjectKey::new("blocks/1/42/13/0/0").unwrap())
+            .unwrap()
+            .is_some(),
+        "the refreshed generation must be fully restaged before publish"
+    );
+}
+
+#[test]
+fn service_file_client_replays_seekable_reader_from_its_initial_position_after_refresh() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_many(vec![
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+        ),
+        response_body(
+            r#"{"ok":false,"error":"prepared artifact object-GC epoch 12 is stale; current epoch is 14","error_kind":{"type":"stale_prepared_artifact_object_gc_epoch","expected":12,"current":14}}"#,
+        ),
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":13,"mtime_ms":1700000000001,"ctime_ms":1700000000001,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":14}}}"#,
+        ),
+        response_body(
+            r#"{"ok":true,"result":{"type":"rename_replace","entry":{"dentry":{"parent":1,"name_hex":"61727469666163742e62696e","child":42,"child_type":"file","attr_generation":13},"attr":{"inode":42,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":11,"generation":13,"mtime_ms":13,"ctime_ms":13},"body":{"producer":"unit-test","digest_uri":"sha256:artifact.bin","size":11,"content_type":"application/octet-stream","manifest_id":"artifact.bin","generation":13,"base_generation":0,"chunk_size":67108864,"block_size":4194304}},"replaced":null}}"#,
+        ),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+    let mut reader = std::io::Cursor::new(b"skip--hello world".to_vec());
+    reader.set_position(6);
+
+    let entry = client
+        .put_artifact_from_reader("/artifact.bin", reader, artifact_metadata("artifact.bin"))
+        .unwrap();
+
+    assert_eq!(entry.attr.size, 11);
+    assert_eq!(
+        store
+            .get(&ObjectKey::new("blocks/1/42/13/0/0").unwrap(), None,)
+            .unwrap(),
+        b"hello world"
+    );
+    assert!(store
+        .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn service_file_client_cleans_staged_blocks_after_publish_failure() {
     let store = MemoryObjectStore::new();
     let addr = serve_many(vec![
         response_body(
-            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null}}}"#,
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
         ),
         response_body(
             r#"{"ok":false,"error":"metadata command predicate failed","error_kind":{"type":"predicate_failed"}}"#,
@@ -2532,6 +2694,32 @@ fn service_clone_subtree_path_sends_typed_rpc_and_maps_outcome() {
         .unwrap();
     assert_eq!(outcome.root.get(), 99);
     assert_eq!(outcome.snapshot_id, 7);
+}
+
+#[test]
+fn service_restore_to_fork_sends_typed_rpc_and_maps_outcome() {
+    let addr = serve_one_request(|request| {
+        assert_eq!(
+            request,
+            MetadataRpcRequest::RestoreSubtreePathToFork {
+                source_path: "/base".to_owned(),
+                snapshot_id: 7,
+                destination_path: "/restored".to_owned(),
+                initialization: nokv_protocol::WireRestoreInitialization::default(),
+            }
+        );
+        response_body(
+            r#"{"ok":true,"result":{"type":"restore","outcome":{"operation_id":"restore-abc","state":"complete","source_root":2,"destination_root":99,"snapshot_id":7,"read_version":6,"cleanup_pending":false}}}"#,
+        )
+    });
+    let client = MetadataClient::connect(addr);
+    let outcome = client
+        .restore_subtree_path_to_fork("/base", 7, "/restored")
+        .unwrap();
+    assert_eq!(outcome.operation_id, "restore-abc");
+    assert_eq!(outcome.state, RestoreState::Complete);
+    assert_eq!(outcome.source_root.get(), 2);
+    assert_eq!(outcome.destination_root.get(), 99);
 }
 
 #[test]

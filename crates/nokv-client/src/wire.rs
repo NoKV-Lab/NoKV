@@ -86,6 +86,7 @@ pub(crate) fn wire_prepared_artifact(
         replace: prepared.replace,
         dentry_version: prepared.dentry_version,
         old_generation: prepared.old_generation,
+        object_gc_claim_version: prepared.object_gc_claim_version,
     })
 }
 
@@ -104,6 +105,7 @@ pub(crate) fn prepared_artifact_to_wire(
         replace: prepared.replace,
         dentry_version: prepared.dentry_version,
         old_generation: prepared.old_generation,
+        object_gc_claim_version: prepared.object_gc_claim_version,
     })
 }
 
@@ -262,6 +264,24 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
             dest_shard,
         }),
         WireMetadataError::GraftPoint => ClientError::Metadata(nokv_meta::MetadError::GraftPoint),
+        WireMetadataError::RestoreInProgress => {
+            ClientError::Metadata(nokv_meta::MetadError::RestoreInProgress)
+        }
+        WireMetadataError::RestoreResourceLimit {
+            resource,
+            limit,
+            actual,
+        } => ClientError::Metadata(nokv_meta::MetadError::RestoreResourceLimit {
+            resource,
+            limit,
+            actual,
+        }),
+        WireMetadataError::StalePreparedArtifactObjectGcEpoch { expected, current } => {
+            ClientError::Metadata(nokv_meta::MetadError::StalePreparedArtifactObjectGcEpoch {
+                expected,
+                current,
+            })
+        }
         WireMetadataError::SnapshotLeaseExpired {
             snapshot_id,
             lease_expires_unix_ms,
@@ -300,6 +320,21 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
             snapshot_id,
             attempts,
         }),
+        WireMetadataError::RestoreHardlinkUnsupported { inode } => match inode_id(inode) {
+            Ok(inode) => {
+                ClientError::Metadata(nokv_meta::MetadError::RestoreHardlinkUnsupported { inode })
+            }
+            Err(err) => err,
+        },
+        WireMetadataError::RestoreCrossShardUnsupported { inode } => match inode_id(inode) {
+            Ok(inode) => {
+                ClientError::Metadata(nokv_meta::MetadError::RestoreCrossShardUnsupported { inode })
+            }
+            Err(err) => err,
+        },
+        WireMetadataError::RestoreDestinationConflict { destination } => {
+            ClientError::Metadata(nokv_meta::MetadError::RestoreDestinationConflict { destination })
+        }
         WireMetadataError::SyncLogArchiveFailed { committed, message } => {
             ClientError::Metadata(nokv_meta::MetadError::SyncLogArchiveFailed {
                 committed,
