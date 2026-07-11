@@ -134,6 +134,38 @@ fn wire_metad_error(err: &MetadError) -> WireMetadataError {
             dest_shard: *dest_shard,
         },
         MetadError::GraftPoint => WireMetadataError::GraftPoint,
+        MetadError::SnapshotLeaseExpired {
+            snapshot_id,
+            lease_expires_unix_ms,
+            now_ms,
+        } => WireMetadataError::SnapshotLeaseExpired {
+            snapshot_id: *snapshot_id,
+            lease_expires_unix_ms: *lease_expires_unix_ms,
+            now_ms: *now_ms,
+        },
+        MetadError::SnapshotRootMismatch {
+            snapshot_id,
+            expected_root,
+            actual_root,
+            actual_shard,
+        } => WireMetadataError::SnapshotRootMismatch {
+            snapshot_id: *snapshot_id,
+            expected_root: expected_root.get(),
+            actual_root: actual_root.map(InodeId::get),
+            actual_shard: *actual_shard,
+        },
+        MetadError::SnapshotBindingChanged { root_path } => {
+            WireMetadataError::SnapshotBindingChanged {
+                root_path: root_path.clone(),
+            }
+        }
+        MetadError::SnapshotRenewContended {
+            snapshot_id,
+            attempts,
+        } => WireMetadataError::SnapshotRenewContended {
+            snapshot_id: *snapshot_id,
+            attempts: *attempts,
+        },
         other => WireMetadataError::Metadata {
             message: other.to_string(),
         },

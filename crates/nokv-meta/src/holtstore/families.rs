@@ -18,6 +18,7 @@ pub(super) const COMMAND_DEDUPE_CURRENT_TREE: &str = "command_dedupe_current";
 pub(super) const FORK_BINDING_CURRENT_TREE: &str = "fork_binding_current";
 pub(super) const FORK_SHADOW_CURRENT_TREE: &str = "fork_shadow_current";
 pub(super) const HISTORY_TREE: &str = "history";
+pub(super) const HISTORY_KEY_INDEX_TREE: &str = "history_key_index";
 pub(super) const METADATA_TREE_NAMES: &[&str] = &[
     SYSTEM_CURRENT_TREE,
     MOUNT_CURRENT_TREE,
@@ -35,6 +36,7 @@ pub(super) const METADATA_TREE_NAMES: &[&str] = &[
     FORK_BINDING_CURRENT_TREE,
     FORK_SHADOW_CURRENT_TREE,
     HISTORY_TREE,
+    HISTORY_KEY_INDEX_TREE,
 ];
 
 pub(super) fn current_tree_name(family: RecordFamily) -> &'static str {

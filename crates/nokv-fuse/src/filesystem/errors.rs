@@ -76,6 +76,12 @@ fn metadata_errno(err: &MetadError) -> Errno {
             eprintln!("nokv-fuse: metadata operation failed -> EIO: {err:?}");
             Errno::EIO
         }
+        // Cross-crate metadata errors fail closed until their feature-specific
+        // FUSE adapter defines an intentional POSIX mapping.
+        _ => {
+            eprintln!("nokv-fuse: unsupported metadata error -> EIO: {err:?}");
+            Errno::EIO
+        }
     }
 }
 

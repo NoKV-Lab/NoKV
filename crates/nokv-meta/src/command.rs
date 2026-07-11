@@ -145,6 +145,10 @@ pub struct MetadataStoreStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryPruneRequest {
     pub retain_from: Option<Version>,
+    /// Store-local epoch captured around the durable retention-holder scan.
+    /// Prune must reject this request if any holder was added or removed before
+    /// the delete plan is applied.
+    pub retention_epoch: u64,
     pub limit: usize,
 }
 
@@ -305,6 +309,10 @@ pub trait MetadataStore {
         _request_id: &[u8],
     ) -> Result<Option<CommitResult>, MetadataError> {
         Ok(None)
+    }
+
+    fn history_retention_epoch(&self) -> Result<u64, MetadataError> {
+        Ok(0)
     }
 
     fn prune_history(

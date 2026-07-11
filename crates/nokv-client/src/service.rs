@@ -18,7 +18,7 @@ use nokv_meta::{
     NamespaceReadItem, NamespaceReadOptions, NamespaceReadPage, NamespaceRecordCount,
     NamespaceRecordType, NamespaceSchema, NamespaceSort, NamespaceSortDirection,
     NamespaceSortField, PublishArtifactStagedSession, RecordCountProvenance, RenameReplaceResult,
-    SubtreeDelta, UpdateAttr, XattrSetMode,
+    SnapshotRenewOutcome, SubtreeDelta, UpdateAttr, XattrSetMode,
 };
 use nokv_object::ObjectReadPlan;
 use nokv_protocol::{
@@ -38,6 +38,7 @@ use nokv_protocol::{
     WireNamespaceReadOptions, WireNamespaceReadPage, WireNamespaceRecordCount,
     WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort, WireNamespaceSortDirection,
     WireNamespaceSortField, WireOpenPathReadPlanRequest, WireRecordCountProvenance,
+    WireSnapshotRenewOutcome,
 };
 use nokv_types::{
     AdvisoryLock, AdvisoryLockRequest, BodyDescriptor, ChunkManifest, DentryName, FileType,
@@ -54,6 +55,13 @@ use crate::wire::*;
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BATCH_RPC_REQUESTS: usize = 128;
+
+fn snapshot_inode_api_disabled() -> ClientError {
+    ClientError::Protocol(
+        "inode-addressed snapshot reads are disabled; use a root-bound snapshot path API"
+            .to_owned(),
+    )
+}
 
 /// Bound for re-resolve+retry in fleet mode: enough attempts to ride out a
 /// single owner handoff (old owner -> control update -> new owner) without
@@ -111,6 +119,43 @@ pub struct ClientPreparedArtifact {
     pub old_generation: Option<u64>,
 }
 
+/// Stable reconstruction fields persisted by clients that journal a prepared
+/// artifact outside `nokv-client`. Future publish-fencing fields belong on
+/// [`ClientPreparedArtifact`] so external journals can adopt them explicitly
+/// without breaking compilation in the protocol change that introduces them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientPreparedArtifactRecovery {
+    pub mount: u64,
+    pub parent: InodeId,
+    pub name: DentryName,
+    pub path: Option<String>,
+    pub inode: InodeId,
+    pub generation: u64,
+    pub mtime_ms: u64,
+    pub ctime_ms: u64,
+    pub replace: bool,
+    pub dentry_version: Option<u64>,
+    pub old_generation: Option<u64>,
+}
+
+impl ClientPreparedArtifact {
+    pub fn from_recovery(recovery: ClientPreparedArtifactRecovery) -> Self {
+        Self {
+            mount: recovery.mount,
+            parent: recovery.parent,
+            name: recovery.name,
+            path: recovery.path,
+            inode: recovery.inode,
+            generation: recovery.generation,
+            mtime_ms: recovery.mtime_ms,
+            ctime_ms: recovery.ctime_ms,
+            replace: recovery.replace,
+            dentry_version: recovery.dentry_version,
+            old_generation: recovery.old_generation,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientCreatedPreparedArtifact {
     pub entry: DentryWithAttr,
@@ -155,6 +200,12 @@ pub struct SnapshotOutcome {
     pub snapshot_id: u64,
     pub read_version: u64,
     pub lease_expires_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotPinStatus {
+    pub pin: Option<SnapshotPin>,
+    pub server_now_ms: u64,
 }
 
 const DEFAULT_LIST_PAGE_SIZE: usize = 1024;
@@ -262,14 +313,26 @@ impl MetadataClient {
         }
     }
 
+    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
+    /// The root-bound adapter removes this inode-addressed API.
     pub fn get_attr_at_snapshot(
         &self,
+        _snapshot_id: u64,
+        _inode: InodeId,
+    ) -> Result<Option<InodeAttr>, ClientError> {
+        Err(snapshot_inode_api_disabled())
+    }
+
+    pub fn get_attr_at_snapshot_rooted(
+        &self,
+        root_path: &str,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
     ) -> Result<Option<InodeAttr>, ClientError> {
         match self.call(MetadataRpcRequest::GetAttrAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
-            inode: inode.get(),
+            path_components: rpc_components(path_components)?,
         })? {
             MetadataRpcResult::InodeAttr { attr } => attr
                 .map(|attr| attr.into_inode_attr().map_err(protocol_error))
@@ -308,15 +371,28 @@ impl MetadataClient {
         }
     }
 
+    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
+    /// The root-bound adapter removes this inode-addressed API.
     pub fn lookup_plus_at_snapshot(
         &self,
+        _snapshot_id: u64,
+        _parent: InodeId,
+        _name: DentryName,
+    ) -> Result<Option<DentryWithAttr>, ClientError> {
+        Err(snapshot_inode_api_disabled())
+    }
+
+    pub fn lookup_plus_at_snapshot_rooted(
+        &self,
+        root_path: &str,
         snapshot_id: u64,
-        parent: InodeId,
+        parent_components: &[DentryName],
         name: DentryName,
     ) -> Result<Option<DentryWithAttr>, ClientError> {
         match self.call(MetadataRpcRequest::LookupPlusAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
-            parent: parent.get(),
+            parent_components: rpc_components(parent_components)?,
             name: rpc_name(&name)?,
         })? {
             MetadataRpcResult::Dentry { entry } => {
@@ -355,14 +431,26 @@ impl MetadataClient {
         }
     }
 
+    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
+    /// The root-bound adapter removes this inode-addressed API.
     pub fn read_dir_plus_at_snapshot(
         &self,
+        _snapshot_id: u64,
+        _inode: InodeId,
+    ) -> Result<Vec<DentryWithAttr>, ClientError> {
+        Err(snapshot_inode_api_disabled())
+    }
+
+    pub fn read_dir_plus_at_snapshot_rooted(
+        &self,
+        root_path: &str,
         snapshot_id: u64,
-        parent: InodeId,
+        path_components: &[DentryName],
     ) -> Result<Vec<DentryWithAttr>, ClientError> {
         match self.call(MetadataRpcRequest::ReadDirPlusAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
-            parent: parent.get(),
+            path_components: rpc_components(path_components)?,
         })? {
             MetadataRpcResult::Dentries { entries } => {
                 entries.into_iter().map(wire_dentry).collect()
@@ -1210,10 +1298,12 @@ impl MetadataClient {
 
     pub fn stat_path_at_snapshot(
         &self,
+        root_path: &str,
         snapshot_id: u64,
         path: &str,
     ) -> Result<Option<PathMetadata>, ClientError> {
         match self.call(MetadataRpcRequest::StatPathAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
             path: path.to_owned(),
         })? {
@@ -1226,16 +1316,51 @@ impl MetadataClient {
 
     pub fn list_path_at_snapshot(
         &self,
+        root_path: &str,
         snapshot_id: u64,
         path: &str,
     ) -> Result<Vec<DentryWithAttr>, ClientError> {
         match self.call(MetadataRpcRequest::ReadDirPlusPathAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
             path: path.to_owned(),
         })? {
             MetadataRpcResult::Dentries { entries } => {
                 entries.into_iter().map(wire_dentry).collect()
             }
+            other => Err(unexpected_result(other)),
+        }
+    }
+
+    pub fn list_path_at_snapshot_page(
+        &self,
+        root_path: &str,
+        snapshot_id: u64,
+        path: &str,
+        after: Option<&DentryName>,
+        limit: usize,
+    ) -> Result<ClientReadDirPlusPage, ClientError> {
+        match self.call(MetadataRpcRequest::ReadDirPlusPathAtSnapshotPage {
+            root_path: root_path.to_owned(),
+            snapshot_id,
+            path: path.to_owned(),
+            after_name_hex: after.map(encode_name_cursor),
+            limit,
+        })? {
+            MetadataRpcResult::DentriesPage {
+                entries,
+                next_name_hex,
+            } => Ok(ClientReadDirPlusPage {
+                entries: entries
+                    .into_iter()
+                    .map(wire_dentry)
+                    .collect::<Result<Vec<_>, _>>()?,
+                next_cursor: next_name_hex
+                    .as_deref()
+                    .map(decode_name_cursor)
+                    .transpose()
+                    .map_err(|err| ClientError::Protocol(err.to_string()))?,
+            }),
             other => Err(unexpected_result(other)),
         }
     }
@@ -1420,7 +1545,8 @@ impl MetadataClient {
 
     pub fn snapshot(&self, path: &str) -> Result<SnapshotPin, ClientError> {
         match self.call(MetadataRpcRequest::SnapshotSubtreePath {
-            path: path.to_owned(),
+            root_path: path.to_owned(),
+            lease_ms: nokv_meta::DEFAULT_SNAPSHOT_LEASE_MS,
         })? {
             MetadataRpcResult::Snapshot { snapshot } => wire_snapshot(snapshot),
             other => Err(unexpected_result(other)),
@@ -1455,8 +1581,17 @@ impl MetadataClient {
     }
 
     pub fn snapshot_subtree_path(&self, path: &str) -> Result<SnapshotOutcome, ClientError> {
+        self.snapshot_subtree_path_with_lease(path, nokv_meta::DEFAULT_SNAPSHOT_LEASE_MS)
+    }
+
+    pub fn snapshot_subtree_path_with_lease(
+        &self,
+        path: &str,
+        lease_ms: u64,
+    ) -> Result<SnapshotOutcome, ClientError> {
         match self.call(MetadataRpcRequest::SnapshotSubtreePath {
-            path: path.to_owned(),
+            root_path: path.to_owned(),
+            lease_ms,
         })? {
             // The wire response already carries the pin's lease; surface it so
             // callers can renew before it expires (do not drop it to 0).
@@ -1479,33 +1614,66 @@ impl MetadataClient {
         }
     }
 
-    pub fn snapshot_subtree(&self, root: InodeId) -> Result<SnapshotPin, ClientError> {
-        match self.call(MetadataRpcRequest::SnapshotSubtree { root: root.get() })? {
-            MetadataRpcResult::Snapshot { snapshot } => wire_snapshot(snapshot),
+    pub fn snapshot_pin(
+        &self,
+        root_path: &str,
+        snapshot_id: u64,
+    ) -> Result<Option<SnapshotPin>, ClientError> {
+        Ok(self.snapshot_pin_status(root_path, snapshot_id)?.pin)
+    }
+
+    pub fn snapshot_pin_status(
+        &self,
+        root_path: &str,
+        snapshot_id: u64,
+    ) -> Result<SnapshotPinStatus, ClientError> {
+        match self.call(MetadataRpcRequest::SnapshotPin {
+            root_path: root_path.to_owned(),
+            snapshot_id,
+        })? {
+            MetadataRpcResult::SnapshotPin {
+                snapshot,
+                server_now_ms,
+            } => Ok(SnapshotPinStatus {
+                pin: snapshot.map(wire_snapshot).transpose()?,
+                server_now_ms,
+            }),
             other => Err(unexpected_result(other)),
         }
     }
 
-    pub fn snapshot_pin(&self, snapshot_id: u64) -> Result<Option<SnapshotPin>, ClientError> {
-        match self.call(MetadataRpcRequest::SnapshotPin { snapshot_id })? {
-            MetadataRpcResult::SnapshotPin { snapshot } => snapshot.map(wire_snapshot).transpose(),
-            other => Err(unexpected_result(other)),
-        }
-    }
-
-    pub fn retire_snapshot(&self, snapshot_id: u64) -> Result<bool, ClientError> {
-        match self.call(MetadataRpcRequest::RetireSnapshot { snapshot_id })? {
+    pub fn retire_snapshot(&self, root_path: &str, snapshot_id: u64) -> Result<bool, ClientError> {
+        match self.call(MetadataRpcRequest::RetireSnapshot {
+            root_path: root_path.to_owned(),
+            snapshot_id,
+        })? {
             MetadataRpcResult::RetiredSnapshot { retired } => Ok(retired),
             other => Err(unexpected_result(other)),
         }
     }
 
-    pub fn renew_snapshot(&self, snapshot_id: u64, lease_ms: u64) -> Result<bool, ClientError> {
+    pub fn renew_snapshot(
+        &self,
+        root_path: &str,
+        snapshot_id: u64,
+        lease_ms: u64,
+    ) -> Result<SnapshotRenewOutcome, ClientError> {
         match self.call(MetadataRpcRequest::RenewSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
             lease_ms,
         })? {
-            MetadataRpcResult::RenewedSnapshot { renewed } => Ok(renewed),
+            MetadataRpcResult::RenewedSnapshot { outcome } => match outcome {
+                WireSnapshotRenewOutcome::Renewed { pin, extended } => {
+                    Ok(SnapshotRenewOutcome::Renewed {
+                        pin: wire_snapshot(pin)?,
+                        extended,
+                    })
+                }
+                WireSnapshotRenewOutcome::Missing { snapshot_id } => {
+                    Ok(SnapshotRenewOutcome::Missing { snapshot_id })
+                }
+            },
             other => Err(unexpected_result(other)),
         }
     }
@@ -1702,10 +1870,12 @@ impl MetadataClient {
 
     pub fn read_artifact_at_snapshot(
         &self,
+        root_path: &str,
         snapshot_id: u64,
         path: &str,
     ) -> Result<Vec<u8>, ClientError> {
         match self.call(MetadataRpcRequest::ReadArtifactPathAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
             path: path.to_owned(),
         })? {
@@ -1716,6 +1886,7 @@ impl MetadataClient {
 
     pub fn read_file_path_at_snapshot(
         &self,
+        root_path: &str,
         snapshot_id: u64,
         path: &str,
         offset: u64,
@@ -1724,6 +1895,7 @@ impl MetadataClient {
         let len = u64::try_from(len)
             .map_err(|_| ClientError::Protocol("snapshot read length exceeds u64".to_owned()))?;
         match self.call(MetadataRpcRequest::ReadFilePathAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
             path: path.to_owned(),
             offset,
@@ -1734,18 +1906,32 @@ impl MetadataClient {
         }
     }
 
+    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
+    /// The root-bound adapter removes this inode-addressed API.
     pub fn read_file_at_snapshot(
         &self,
+        _snapshot_id: u64,
+        _inode: InodeId,
+        _offset: u64,
+        _len: usize,
+    ) -> Result<Vec<u8>, ClientError> {
+        Err(snapshot_inode_api_disabled())
+    }
+
+    pub fn read_file_at_snapshot_rooted(
+        &self,
+        root_path: &str,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, ClientError> {
         let len = u64::try_from(len)
             .map_err(|_| ClientError::Protocol("snapshot read length exceeds u64".to_owned()))?;
         match self.call(MetadataRpcRequest::ReadFileAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
-            inode: inode.get(),
+            path_components: rpc_components(path_components)?,
             offset,
             len,
         })? {
@@ -1761,14 +1947,26 @@ impl MetadataClient {
         }
     }
 
+    /// Temporary fail-closed bridge for the stacked FUSE snapshot adapter.
+    /// The root-bound adapter removes this inode-addressed API.
     pub fn read_symlink_at_snapshot(
         &self,
+        _snapshot_id: u64,
+        _inode: InodeId,
+    ) -> Result<Vec<u8>, ClientError> {
+        Err(snapshot_inode_api_disabled())
+    }
+
+    pub fn read_symlink_at_snapshot_rooted(
+        &self,
+        root_path: &str,
         snapshot_id: u64,
-        inode: InodeId,
+        path_components: &[DentryName],
     ) -> Result<Vec<u8>, ClientError> {
         match self.call(MetadataRpcRequest::ReadSymlinkAtSnapshot {
+            root_path: root_path.to_owned(),
             snapshot_id,
-            inode: inode.get(),
+            path_components: rpc_components(path_components)?,
         })? {
             MetadataRpcResult::FileBytes { bytes } => Ok(bytes),
             other => Err(unexpected_result(other)),

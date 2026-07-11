@@ -30,9 +30,11 @@ pub use file_client::{
     PreparedPathRangeBatch,
 };
 pub use nokv_object::{DataFabricReadStats, ObjectReadPlan};
+pub use nokv_protocol::{decode_name_cursor, encode_name_cursor};
 pub use service::{
-    ClientPreparedArtifact, CloneOutcome, MetadataClient, MetadataClientOptions, PathLayoutOpen,
-    PathLayoutOpenRequest, SnapshotOutcome,
+    ClientPreparedArtifact, ClientPreparedArtifactRecovery, CloneOutcome, MetadataClient,
+    MetadataClientOptions, PathLayoutOpen, PathLayoutOpenRequest, SnapshotOutcome,
+    SnapshotPinStatus,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

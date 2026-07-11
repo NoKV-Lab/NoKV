@@ -212,6 +212,23 @@ where
         limit: usize,
         version: Version,
     ) -> Result<ReadDirPlusPage, MetadError> {
+        self.read_dir_plus_page_at_version_for_purpose(
+            parent,
+            after,
+            limit,
+            version,
+            ReadPurpose::UserStrong,
+        )
+    }
+
+    pub(super) fn read_dir_plus_page_at_version_for_purpose(
+        &self,
+        parent: InodeId,
+        after: Option<&DentryName>,
+        limit: usize,
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<ReadDirPlusPage, MetadError> {
         let requested = limit.max(1);
         let rows = self.metadata.scan(ScanRequest {
             family: RecordFamily::Dentry,
@@ -219,7 +236,7 @@ where
             start_after: after.map(|name| dentry_key(self.mount, parent, name)),
             version,
             limit: requested.saturating_add(1),
-            purpose: ReadPurpose::UserStrong,
+            purpose,
         })?;
         self.read_dir_plus_total.fetch_add(1, Ordering::Relaxed);
         let has_more = rows.len() > requested;

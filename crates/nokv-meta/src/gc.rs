@@ -9,7 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::command::{HistoryPruneOutcome, MetadataStore};
-use crate::service::{NoKvFs, PendingObjectCleanupOutcome, DEFAULT_READ_LEASE_MS};
+use crate::service::{
+    NoKvFs, PendingObjectCleanupOutcome, SnapshotReapOutcome, DEFAULT_READ_LEASE_MS,
+};
 use nokv_object::ObjectStore;
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
@@ -27,6 +29,9 @@ pub struct ObjectGcOptions {
 pub struct ObjectGcWorkerState {
     pub iterations: u64,
     pub last_outcome: Option<PendingObjectCleanupOutcome>,
+    /// Process-lifetime totals retained across empty GC iterations so a renew/
+    /// reaper race remains observable after the iteration that detected it.
+    pub snapshot_reap: SnapshotReapOutcome,
     pub last_error: Option<String>,
 }
 
@@ -233,6 +238,7 @@ fn run_once<M, O>(
         state.iterations += 1;
         match result {
             Ok(outcome) => {
+                accumulate_snapshot_reap(&mut state.snapshot_reap, outcome.snapshot_reap);
                 state.last_outcome = Some(outcome);
                 state.last_error = None;
             }
@@ -241,6 +247,15 @@ fn run_once<M, O>(
             }
         }
     }
+}
+
+fn accumulate_snapshot_reap(total: &mut SnapshotReapOutcome, delta: SnapshotReapOutcome) {
+    total.scanned = total.scanned.saturating_add(delta.scanned);
+    total.expired_candidates = total
+        .expired_candidates
+        .saturating_add(delta.expired_candidates);
+    total.reaped = total.reaped.saturating_add(delta.reaped);
+    total.conflicted = total.conflicted.saturating_add(delta.conflicted);
 }
 
 fn run_history_once<M, O>(service: &NoKvFs<M, O>, limit: usize, state: &Mutex<HistoryGcWorkerState>)
@@ -268,6 +283,37 @@ mod tests {
     use super::*;
     use crate::holtstore::HoltMetadataStore;
     use crate::service::PublishArtifact;
+
+    #[test]
+    fn snapshot_reap_worker_totals_survive_later_empty_iterations() {
+        let mut total = SnapshotReapOutcome::default();
+        accumulate_snapshot_reap(
+            &mut total,
+            SnapshotReapOutcome {
+                scanned: 3,
+                expired_candidates: 2,
+                reaped: 1,
+                conflicted: 1,
+            },
+        );
+        accumulate_snapshot_reap(
+            &mut total,
+            SnapshotReapOutcome {
+                scanned: 4,
+                ..SnapshotReapOutcome::default()
+            },
+        );
+
+        assert_eq!(
+            total,
+            SnapshotReapOutcome {
+                scanned: 7,
+                expired_candidates: 2,
+                reaped: 1,
+                conflicted: 1,
+            }
+        );
+    }
     use nokv_object::{MemoryObjectStore, ObjectKey};
     use nokv_types::{DentryName, InodeId, MountId};
     use std::time::Instant;
@@ -465,7 +511,7 @@ mod tests {
         });
         assert_eq!(
             service
-                .read_artifact_at_snapshot(snapshot.snapshot_id, InodeId::root(), &name)
+                .read_artifact_path_at_snapshot("/", snapshot.snapshot_id, "/snapshot-history.bin",)
                 .unwrap(),
             b"old"
         );

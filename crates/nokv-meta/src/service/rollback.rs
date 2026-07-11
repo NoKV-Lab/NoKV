@@ -1,4 +1,3 @@
-use super::clone::DirListing;
 use super::*;
 
 /// A top-level child of the rollback target captured before the atomic swap, so it
@@ -99,10 +98,9 @@ where
         }
 
         // 1. Reproduce the snapshot's subtree under a fresh detached root, sharing
-        //    the snapshot's blocks. `DirListing::Snapshot` reconstructs entries the
-        //    delta deleted, which a current-tree scan can no longer enumerate.
-        let restored_root =
-            self.materialize_subtree_at(target_root, snapshot_version, DirListing::Snapshot)?;
+        //    the snapshot's blocks. Snapshot-aware scans enumerate entries deleted
+        //    by the delta through the retained-history key index.
+        let restored_root = self.materialize_subtree_at(target_root, snapshot_version)?;
         let restored_keys = self.subtree_object_keys(restored_root)?;
 
         // 2. Capture both sides' top-level children, then graft atomically.

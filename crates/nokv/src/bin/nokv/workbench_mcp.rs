@@ -4,8 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use nokv_agent::AgentToolDefinition;
 use nokv_client::{
-    is_artifact_write_conflict, is_metadata_not_found, ArtifactMetadata, NoKvFsClient,
+    decode_name_cursor, encode_name_cursor, is_artifact_write_conflict, is_metadata_not_found,
+    ArtifactMetadata, ClientError, NoKvFsClient,
 };
+use nokv_meta::MetadError;
 use nokv_object::ObjectStore;
 use nokv_types::{FileType, PathMetadata};
 use serde_json::{json, Value};
@@ -84,14 +86,43 @@ pub struct WorkbenchMcpOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkbenchToolError {
+    code: &'static str,
     message: String,
+    retryable: bool,
+    details: Value,
 }
 
 impl WorkbenchToolError {
     fn new(message: impl Into<String>) -> Self {
         Self {
+            code: "WorkbenchToolError",
             message: message.into(),
+            retryable: false,
+            details: json!({}),
         }
+    }
+
+    fn typed(
+        code: &'static str,
+        message: impl Into<String>,
+        retryable: bool,
+        details: Value,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable,
+            details,
+        }
+    }
+
+    pub fn as_value(&self) -> Value {
+        json!({
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "details": self.details,
+        })
     }
 }
 
@@ -1333,28 +1364,16 @@ where
         )));
     }
     let path = workbench_path(options, &id);
-    // Mint at the default 1h lease, then extend to the requested ttl and read
-    // the pin back so lease_expires_at is the server's authoritative deadline,
-    // never a client-computed guess (three low-frequency RPCs, no new op).
+    let lease_ms = ttl_days.saturating_mul(MS_PER_DAY);
+    // The requested lease is part of the mint RPC, so the returned pin is the
+    // authoritative checkpoint and creation costs one metadata round trip.
     let snapshot = client
         .metadata()
-        .snapshot_subtree_path(&path)
+        .snapshot_subtree_path_with_lease(&path, lease_ms)
         .map_err(client_error)?;
     let snapshot_id = snapshot.snapshot_id;
-    let lease_ms = ttl_days.saturating_mul(MS_PER_DAY);
-    client
-        .metadata()
-        .renew_snapshot(snapshot_id, lease_ms)
-        .map_err(client_error)?;
-    let pin = client
-        .metadata()
-        .snapshot_pin(snapshot_id)
-        .map_err(client_error)?;
-    let lease_expires_unix_ms = pin.as_ref().map(|pin| pin.lease_expires_unix_ms);
-    let read_version = pin
-        .as_ref()
-        .map(|pin| pin.read_version)
-        .unwrap_or(snapshot.read_version);
+    let lease_expires_unix_ms = Some(snapshot.lease_expires_unix_ms);
+    let read_version = snapshot.read_version;
     let created_at = unix_ms();
     let registry_entry = json!({
         "name": name,
@@ -1402,21 +1421,26 @@ where
     let (ttl_days, _ttl_defaulted) = resolve_ttl_days(args)?;
     let snapshot_id = resolve_renew_target(client, options, &id, args)?;
     let lease_ms = ttl_days.saturating_mul(MS_PER_DAY);
-    let renewed = client
+    let path = workbench_path(options, &id);
+    let outcome = client
         .metadata()
-        .renew_snapshot(snapshot_id, lease_ms)
+        .renew_snapshot(&path, snapshot_id, lease_ms)
         .map_err(client_error)?;
-    if !renewed {
-        return Err(WorkbenchToolError::new(format!(
-            "snapshot {snapshot_id} was reaped after lease expiry; re-mint from current state"
-        )));
-    }
-    let pin = client
-        .metadata()
-        .snapshot_pin(snapshot_id)
-        .map_err(client_error)?;
-    let lease_expires_unix_ms = pin.as_ref().map(|pin| pin.lease_expires_unix_ms);
-    let read_version = pin.as_ref().map(|pin| pin.read_version);
+    let (pin, extended) = match outcome {
+        nokv_meta::SnapshotRenewOutcome::Renewed { pin, extended } => (pin, extended),
+        nokv_meta::SnapshotRenewOutcome::Missing { .. } => {
+            return Err(WorkbenchToolError::typed(
+                "SnapshotNotFound",
+                format!(
+                    "snapshot {snapshot_id} was reaped after lease expiry; re-mint from current state"
+                ),
+                false,
+                json!({"snapshot_id": snapshot_id}),
+            ));
+        }
+    };
+    let lease_expires_unix_ms = Some(pin.lease_expires_unix_ms);
+    let read_version = Some(pin.read_version);
     // Carry the name forward from the mint record so the renew row stays joinable
     // with the checkpoint it extends.
     let name = registry_name_for_snapshot(client, options, &id, snapshot_id)?;
@@ -1441,12 +1465,24 @@ where
         "snapshot_id": snapshot_id,
         "name": name,
         "renewed": true,
+        "extended": extended,
         "ttl_days": ttl_days,
         "read_version": read_version,
         "lease_expires_at": lease_expires_unix_ms,
         "lease_expires_unix_ms": lease_expires_unix_ms,
         "registry": registry,
     }))
+}
+
+#[derive(Default)]
+struct CheckpointGroup {
+    name: Value,
+    created_at: Value,
+    read_version: Value,
+    has_mint: bool,
+    registered_lease: Value,
+    renew_count: u64,
+    last_renewed_at: Value,
 }
 
 fn list_snapshots_workbench<O>(
@@ -1459,40 +1495,61 @@ where
 {
     let id = required_workbench_id(args)?;
     let entries = read_checkpoint_registry(client, options, &id)?;
-    let now = unix_ms();
-    let mut checkpoints = Vec::with_capacity(entries.len());
+    let root_path = workbench_path(options, &id);
+    let mut order = Vec::new();
+    let mut groups: std::collections::HashMap<u64, CheckpointGroup> =
+        std::collections::HashMap::new();
     for entry in &entries {
-        let snapshot_id = entry.get("snapshot_id").and_then(Value::as_u64);
-        let (state, live_lease) = match snapshot_id {
-            Some(snapshot_id) => {
-                match client
-                    .metadata()
-                    .snapshot_pin(snapshot_id)
-                    .map_err(client_error)?
-                {
-                    None => ("reaped", None),
-                    Some(pin) => {
-                        if now >= pin.lease_expires_unix_ms {
-                            ("expired (reap pending)", Some(pin.lease_expires_unix_ms))
-                        } else {
-                            ("alive", Some(pin.lease_expires_unix_ms))
-                        }
-                    }
-                }
+        let Some(snapshot_id) = entry.get("snapshot_id").and_then(Value::as_u64) else {
+            continue;
+        };
+        let group = groups.entry(snapshot_id).or_insert_with(|| {
+            order.push(snapshot_id);
+            CheckpointGroup::default()
+        });
+        if let Some(lease) = entry.get("lease_expires_unix_ms") {
+            group.registered_lease = lease.clone();
+        }
+        if entry.get("reason").and_then(Value::as_str) == Some("renew") {
+            group.renew_count += 1;
+            group.last_renewed_at = entry.get("created_at").cloned().unwrap_or(Value::Null);
+        } else {
+            group.has_mint = true;
+            group.name = entry.get("name").cloned().unwrap_or(Value::Null);
+            group.created_at = entry.get("created_at").cloned().unwrap_or(Value::Null);
+            group.read_version = entry.get("read_version").cloned().unwrap_or(Value::Null);
+        }
+        if group.read_version.is_null() {
+            group.read_version = entry.get("read_version").cloned().unwrap_or(Value::Null);
+        }
+    }
+
+    let mut checkpoints = Vec::with_capacity(order.len());
+    for snapshot_id in order {
+        let group = &groups[&snapshot_id];
+        let status = client
+            .metadata()
+            .snapshot_pin_status(&root_path, snapshot_id)
+            .map_err(client_error)?;
+        let (state, live_lease) = match status.pin {
+            None => ("reaped", None),
+            Some(pin) if status.server_now_ms >= pin.lease_expires_unix_ms => {
+                ("expired", Some(pin.lease_expires_unix_ms))
             }
-            None => ("unknown", None),
+            Some(pin) => ("alive", Some(pin.lease_expires_unix_ms)),
         };
         checkpoints.push(json!({
-            "name": entry.get("name").cloned().unwrap_or(Value::Null),
+            "name": group.name.clone(),
             "snapshot_id": snapshot_id,
-            "read_version": entry.get("read_version").cloned().unwrap_or(Value::Null),
-            "reason": entry.get("reason").cloned().unwrap_or(Value::Null),
-            "created_at": entry.get("created_at").cloned().unwrap_or(Value::Null),
-            "registered_lease_expires_unix_ms": entry
-                .get("lease_expires_unix_ms")
-                .cloned()
-                .unwrap_or(Value::Null),
+            "read_version": group.read_version.clone(),
+            "reason": if group.has_mint { "mint" } else { "renew" },
+            "created_at": group.created_at.clone(),
+            "renew_count": group.renew_count,
+            "last_renewed_at": group.last_renewed_at.clone(),
+            "registered_lease_expires_unix_ms": group.registered_lease.clone(),
             "live_lease_expires_unix_ms": live_lease,
+            "lease_expires_at": live_lease,
+            "server_now_ms": status.server_now_ms,
             "state": state,
         }));
     }
@@ -1525,7 +1582,6 @@ where
         ));
     }
     let snapshot_id = resolve_at_snapshot(client, options, id, at_snapshot)?;
-    ensure_snapshot_live(client, snapshot_id)?;
     let scope = path_scope(options, id, target)?;
     // Subtree-snapshot reads address paths relative to the snapshot root (the
     // workbench directory), so strip the workbench prefix; the absolute `target`
@@ -1533,7 +1589,7 @@ where
     let snap_path = snapshot_relative_path(options, id, target)?;
     match read_tool {
         "stat" => at_snapshot_stat(client, options, id, snapshot_id, &scope, &snap_path),
-        "ls" => at_snapshot_list(client, options, id, snapshot_id, &scope, target, &snap_path),
+        "ls" => at_snapshot_list(client, options, id, snapshot_id, &scope, target, args),
         "read" => at_snapshot_read(client, options, id, snapshot_id, &scope, &snap_path, args),
         other => Err(WorkbenchToolError::new(format!(
             "at_snapshot is not supported for {other}"
@@ -1573,8 +1629,8 @@ where
 {
     let metadata = client
         .metadata()
-        .stat_path_at_snapshot(snapshot_id, snap_path)
-        .map_err(client_error)?
+        .stat_path_at_snapshot(&workbench_path(options, id), snapshot_id, snap_path)
+        .map_err(|err| snapshot_client_error(snapshot_id, err))?
         .ok_or_else(|| {
             WorkbenchToolError::new(format!(
                 "path not found at snapshot {snapshot_id}: {}",
@@ -1600,15 +1656,36 @@ fn at_snapshot_list<O>(
     snapshot_id: u64,
     scope: &WorkbenchPathScope,
     target: &str,
-    snap_path: &str,
+    args: &Value,
 ) -> Result<Value, WorkbenchToolError>
 where
     O: ObjectStore + Send + Sync + 'static,
 {
-    let dentries = client
+    let limit = optional_usize(args, "limit")?.unwrap_or(MAX_WORKBENCH_LIST_LIMIT);
+    if limit == 0 || limit > MAX_WORKBENCH_LIST_LIMIT {
+        return Err(WorkbenchToolError::new(format!(
+            "limit must be between 1 and {MAX_WORKBENCH_LIST_LIMIT}"
+        )));
+    }
+    let cursor = optional_string(args, "cursor")?;
+    let after = cursor
+        .map(decode_name_cursor)
+        .transpose()
+        .map_err(|err| WorkbenchToolError::new(format!("invalid snapshot list cursor: {err}")))?;
+    let snap_path = snapshot_relative_path(options, id, target)?;
+    let page = client
         .metadata()
-        .list_path_at_snapshot(snapshot_id, snap_path)
-        .map_err(client_error)?;
+        .list_path_at_snapshot_page(
+            &workbench_path(options, id),
+            snapshot_id,
+            &snap_path,
+            after.as_ref(),
+            limit,
+        )
+        .map_err(|err| snapshot_client_error(snapshot_id, err))?;
+    let next_cursor = page.next_cursor.as_ref().map(encode_name_cursor);
+    let truncated = next_cursor.is_some();
+    let dentries = page.entries;
     let base = target.trim_end_matches('/');
     let mut entries = Vec::with_capacity(dentries.len());
     for dentry in &dentries {
@@ -1636,8 +1713,8 @@ where
         "path": scope.path.clone(),
         "entry_count": entries.len(),
         "entries": entries,
-        "next_cursor": Value::Null,
-        "truncated": false,
+        "next_cursor": next_cursor,
+        "truncated": truncated,
     }))
 }
 
@@ -1655,8 +1732,8 @@ where
 {
     let metadata = client
         .metadata()
-        .stat_path_at_snapshot(snapshot_id, snap_path)
-        .map_err(client_error)?
+        .stat_path_at_snapshot(&workbench_path(options, id), snapshot_id, snap_path)
+        .map_err(|err| snapshot_client_error(snapshot_id, err))?
         .ok_or_else(|| {
             WorkbenchToolError::new(format!(
                 "path not found at snapshot {snapshot_id}: {}",
@@ -1701,8 +1778,14 @@ where
             len = options.max_bytes as u64;
         }
         let raw = client
-            .read_snapshot(snapshot_id, snap_path, offset, len as usize)
-            .map_err(client_error)?;
+            .read_snapshot(
+                &workbench_path(options, id),
+                snapshot_id,
+                snap_path,
+                offset,
+                len as usize,
+            )
+            .map_err(|err| snapshot_client_error(snapshot_id, err))?;
         let returned = raw.len() as u64;
         out.insert("format".to_owned(), json!("bytes"));
         out.insert("record_type".to_owned(), Value::Null);
@@ -1730,8 +1813,14 @@ where
         )));
     }
     let raw = client
-        .read_snapshot(snapshot_id, snap_path, 0, size as usize)
-        .map_err(client_error)?;
+        .read_snapshot(
+            &workbench_path(options, id),
+            snapshot_id,
+            snap_path,
+            0,
+            size as usize,
+        )
+        .map_err(|err| snapshot_client_error(snapshot_id, err))?;
     let text = String::from_utf8(raw).map_err(|_| {
         WorkbenchToolError::new(format!(
             "at_snapshot read of {} is not UTF-8 text; structured record reads at a snapshot are not yet supported, use format=bytes",
@@ -2019,37 +2108,6 @@ where
         (Some(_), Some(_)) | (None, None) => Err(WorkbenchToolError::new(
             "provide exactly one of snapshot_id or name",
         )),
-    }
-}
-
-/// Loud liveness check before any at-snapshot read. A missing pin (reaped) and
-/// an expired-but-unreaped pin both fail with an explicit message naming the
-/// state, so a caller never silently reads a half-dead snapshot.
-fn ensure_snapshot_live<O>(
-    client: &NoKvFsClient<O>,
-    snapshot_id: u64,
-) -> Result<(), WorkbenchToolError>
-where
-    O: ObjectStore + Send + Sync + 'static,
-{
-    match client
-        .metadata()
-        .snapshot_pin(snapshot_id)
-        .map_err(client_error)?
-    {
-        None => Err(WorkbenchToolError::new(format!(
-            "snapshot {snapshot_id} not found; snapshots are reaped after lease expiry"
-        ))),
-        Some(pin) => {
-            let now = unix_ms();
-            if now >= pin.lease_expires_unix_ms {
-                return Err(WorkbenchToolError::new(format!(
-                    "snapshot {snapshot_id} lease expired at {}; renew within the reap window or re-mint",
-                    pin.lease_expires_unix_ms
-                )));
-            }
-            Ok(())
-        }
     }
 }
 
@@ -2745,8 +2803,69 @@ fn optional_usize(args: &Value, name: &'static str) -> Result<Option<usize>, Wor
     }
 }
 
-fn client_error(err: impl fmt::Display) -> WorkbenchToolError {
-    WorkbenchToolError::new(err.to_string())
+fn client_error(err: ClientError) -> WorkbenchToolError {
+    match &err {
+        ClientError::Metadata(MetadError::SnapshotLeaseExpired {
+            snapshot_id,
+            lease_expires_unix_ms,
+            now_ms,
+        }) => WorkbenchToolError::typed(
+            "SnapshotLeaseExpired",
+            err.to_string(),
+            false,
+            json!({
+                "snapshot_id": snapshot_id,
+                "lease_expires_unix_ms": lease_expires_unix_ms,
+                "now_ms": now_ms,
+            }),
+        ),
+        ClientError::Metadata(MetadError::SnapshotRootMismatch {
+            snapshot_id,
+            expected_root,
+            actual_root,
+            actual_shard,
+        }) => WorkbenchToolError::typed(
+            "SnapshotRootMismatch",
+            err.to_string(),
+            false,
+            json!({
+                "snapshot_id": snapshot_id,
+                "expected_root": expected_root.get(),
+                "actual_root": actual_root.map(|root| root.get()),
+                "actual_shard": actual_shard,
+            }),
+        ),
+        ClientError::Metadata(MetadError::SnapshotBindingChanged { root_path }) => {
+            WorkbenchToolError::typed(
+                "SnapshotBindingChanged",
+                err.to_string(),
+                true,
+                json!({"root_path": root_path}),
+            )
+        }
+        ClientError::Metadata(MetadError::SnapshotRenewContended {
+            snapshot_id,
+            attempts,
+        }) => WorkbenchToolError::typed(
+            "SnapshotRenewContended",
+            err.to_string(),
+            true,
+            json!({"snapshot_id": snapshot_id, "attempts": attempts}),
+        ),
+        _ => WorkbenchToolError::typed("NoKvClientError", err.to_string(), false, json!({})),
+    }
+}
+
+fn snapshot_client_error(snapshot_id: u64, err: ClientError) -> WorkbenchToolError {
+    if matches!(&err, ClientError::Metadata(MetadError::NotFound)) {
+        return WorkbenchToolError::typed(
+            "SnapshotNotFound",
+            format!("snapshot {snapshot_id} not found; it may have been reaped after lease expiry"),
+            false,
+            json!({"snapshot_id": snapshot_id}),
+        );
+    }
+    client_error(err)
 }
 
 #[cfg(test)]

@@ -4,7 +4,174 @@ use crate::holtstore::HoltMetadataStore;
 use crate::{MetadataLogEntry, MetadataLogSegment, METADATA_LOG_ZERO_DIGEST};
 use nokv_object::{MemoryObjectStore, ObjectBytes};
 use nokv_types::{AdvisoryLockKind, AdvisoryLockRequest};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+
+#[derive(Clone)]
+struct SnapshotCommitBarrierStore {
+    inner: HoltMetadataStore,
+    kind: CommandKind,
+    remaining: Arc<AtomicU64>,
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl SnapshotCommitBarrierStore {
+    fn new(kind: CommandKind, blocked_commits: u64, parties: usize) -> Self {
+        Self {
+            inner: HoltMetadataStore::open_memory().unwrap(),
+            kind,
+            remaining: Arc::new(AtomicU64::new(blocked_commits)),
+            entered: Arc::new(Barrier::new(parties)),
+            release: Arc::new(Barrier::new(parties)),
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        self.entered.wait();
+    }
+
+    fn release_blocked(&self) {
+        self.release.wait();
+    }
+}
+
+impl MetadataStore for SnapshotCommitBarrierStore {
+    fn get_versioned(
+        &self,
+        family: RecordFamily,
+        key: &[u8],
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<Option<ReadItem>, MetadataError> {
+        self.inner.get_versioned(family, key, version, purpose)
+    }
+
+    fn scan(&self, request: ScanRequest) -> Result<Vec<ScanItem>, MetadataError> {
+        self.inner.scan(request)
+    }
+
+    fn commit_metadata(&self, command: MetadataCommand) -> Result<CommitResult, MetadataError> {
+        if command.kind == self.kind
+            && self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            self.entered.wait();
+            self.release.wait();
+        }
+        self.inner.commit_metadata(command)
+    }
+
+    fn commit_independent_batch(
+        &self,
+        commands: &[MetadataCommand],
+    ) -> Vec<Result<CommitResult, MetadataError>> {
+        self.inner.commit_independent_batch(commands)
+    }
+
+    fn committed_request_result(
+        &self,
+        request_id: &[u8],
+    ) -> Result<Option<CommitResult>, MetadataError> {
+        self.inner.committed_request_result(request_id)
+    }
+
+    fn history_retention_epoch(&self) -> Result<u64, MetadataError> {
+        self.inner.history_retention_epoch()
+    }
+
+    fn prune_history(
+        &self,
+        request: HistoryPruneRequest,
+    ) -> Result<HistoryPruneOutcome, MetadataError> {
+        self.inner.prune_history(request)
+    }
+}
+
+impl MetadataStoreStatsProvider for SnapshotCommitBarrierStore {
+    fn metadata_store_stats(&self) -> MetadataStoreStats {
+        self.inner.metadata_store_stats()
+    }
+}
+
+#[derive(Clone)]
+struct SnapshotPredicateOnceStore {
+    inner: HoltMetadataStore,
+    remaining_failures: Arc<AtomicU64>,
+}
+
+impl SnapshotPredicateOnceStore {
+    fn new() -> Self {
+        Self {
+            inner: HoltMetadataStore::open_memory().unwrap(),
+            remaining_failures: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+impl MetadataStore for SnapshotPredicateOnceStore {
+    fn get_versioned(
+        &self,
+        family: RecordFamily,
+        key: &[u8],
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<Option<ReadItem>, MetadataError> {
+        self.inner.get_versioned(family, key, version, purpose)
+    }
+
+    fn scan(&self, request: ScanRequest) -> Result<Vec<ScanItem>, MetadataError> {
+        self.inner.scan(request)
+    }
+
+    fn commit_metadata(&self, command: MetadataCommand) -> Result<CommitResult, MetadataError> {
+        if command.kind == CommandKind::SnapshotSubtree
+            && self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(MetadataError::PredicateFailed);
+        }
+        self.inner.commit_metadata(command)
+    }
+
+    fn commit_independent_batch(
+        &self,
+        commands: &[MetadataCommand],
+    ) -> Vec<Result<CommitResult, MetadataError>> {
+        self.inner.commit_independent_batch(commands)
+    }
+
+    fn committed_request_result(
+        &self,
+        request_id: &[u8],
+    ) -> Result<Option<CommitResult>, MetadataError> {
+        self.inner.committed_request_result(request_id)
+    }
+
+    fn history_retention_epoch(&self) -> Result<u64, MetadataError> {
+        self.inner.history_retention_epoch()
+    }
+
+    fn prune_history(
+        &self,
+        request: HistoryPruneRequest,
+    ) -> Result<HistoryPruneOutcome, MetadataError> {
+        self.inner.prune_history(request)
+    }
+}
+
+impl MetadataStoreStatsProvider for SnapshotPredicateOnceStore {
+    fn metadata_store_stats(&self) -> MetadataStoreStats {
+        self.inner.metadata_store_stats()
+    }
+}
 
 #[derive(Clone)]
 struct PurposeTrackingStore {
@@ -111,6 +278,10 @@ impl MetadataStore for PurposeTrackingStore {
         request_id: &[u8],
     ) -> Result<Option<CommitResult>, MetadataError> {
         self.inner.committed_request_result(request_id)
+    }
+
+    fn history_retention_epoch(&self) -> Result<u64, MetadataError> {
+        self.inner.history_retention_epoch()
     }
 
     fn prune_history(
@@ -369,17 +540,17 @@ fn write_planning_reads_are_marked_local_while_user_reads_stay_strong() {
     assert!(after_snapshot.write_plan_gets > after_remove.write_plan_gets);
 
     assert!(service
-        .get_attr_at_snapshot(snapshot.snapshot_id, dir.attr.inode)
+        .get_attr_at_snapshot("/runs", snapshot.snapshot_id, &[])
         .unwrap()
         .is_some());
     assert!(service
-        .read_dir_plus_at_snapshot(snapshot.snapshot_id, dir.attr.inode)
+        .read_dir_plus_at_snapshot("/runs", snapshot.snapshot_id, &[])
         .unwrap()
         .is_empty());
     let after_snapshot_reads = metadata.counts();
-    assert_eq!(
-        after_snapshot_reads.user_strong_gets,
-        after_snapshot.user_strong_gets
+    assert!(
+        after_snapshot_reads.user_strong_gets > after_snapshot.user_strong_gets,
+        "root-path binding is resolved with strong reads before snapshot-purpose reads"
     );
     assert!(after_snapshot_reads.snapshot_gets > after_snapshot.snapshot_gets);
     assert!(after_snapshot_reads.snapshot_scans > after_snapshot.snapshot_scans);
@@ -1815,7 +1986,7 @@ fn advisory_locks_detect_conflicts_and_support_partial_unlock() {
 fn snapshot_preserves_symlink_target() {
     let service = service();
     let name = DentryName::new(b"latest".to_vec()).unwrap();
-    let created = service
+    service
         .create_symlink(
             InodeId::root(),
             name.clone(),
@@ -1830,7 +2001,7 @@ fn snapshot_preserves_symlink_target() {
     service
         .create_symlink(
             InodeId::root(),
-            name,
+            name.clone(),
             b"runs/new".to_vec(),
             0o777,
             1000,
@@ -1840,7 +2011,7 @@ fn snapshot_preserves_symlink_target() {
 
     assert_eq!(
         service
-            .read_symlink_at_snapshot(snapshot.snapshot_id, created.attr.inode)
+            .read_symlink_at_snapshot("/", snapshot.snapshot_id, std::slice::from_ref(&name))
             .unwrap(),
         b"runs/old"
     );
@@ -2073,7 +2244,7 @@ fn history_writes_are_snapshot_retention_driven() {
     let snapshot = service.snapshot_subtree(InodeId::root()).unwrap();
     assert_eq!(metadata.metadata_store_stats().active_snapshot_pin_total, 1);
     let snapshot_attr = service
-        .get_attr_at_snapshot(snapshot.snapshot_id, InodeId::root())
+        .get_attr_at_snapshot("/", snapshot.snapshot_id, &[])
         .unwrap()
         .unwrap();
     let before_retained = metadata.metadata_store_stats();
@@ -2091,7 +2262,7 @@ fn history_writes_are_snapshot_retention_driven() {
     );
     assert_eq!(
         service
-            .get_attr_at_snapshot(snapshot.snapshot_id, InodeId::root())
+            .get_attr_at_snapshot("/", snapshot.snapshot_id, &[])
             .unwrap()
             .unwrap(),
         snapshot_attr
@@ -3377,7 +3548,7 @@ fn chain_collapse_gc_is_snapshot_safe() {
     // floor blocks reclamation of everything enqueued after the snapshot.
     assert_eq!(
         service
-            .read_file_at_snapshot(pin.snapshot_id, inode, 0, 4)
+            .read_file_at_snapshot("/", pin.snapshot_id, std::slice::from_ref(&name), 0, 4)
             .unwrap(),
         b"AAAA"
     );
@@ -3390,7 +3561,7 @@ fn chain_collapse_gc_is_snapshot_safe() {
     // Snapshot read still works after the (blocked) GC pass.
     assert_eq!(
         service
-            .read_file_at_snapshot(pin.snapshot_id, inode, 0, 4)
+            .read_file_at_snapshot("/", pin.snapshot_id, std::slice::from_ref(&name), 0, 4)
             .unwrap(),
         b"AAAA"
     );
@@ -3677,7 +3848,7 @@ fn snapshot_after_replace_does_not_block_old_object_cleanup() {
 
     assert_eq!(
         service
-            .read_artifact_at_snapshot(snapshot.snapshot_id, InodeId::root(), &name)
+            .read_artifact_path_at_snapshot("/", snapshot.snapshot_id, "/checkpoint.bin")
             .unwrap(),
         b"new-body"
     );
@@ -3722,25 +3893,25 @@ fn snapshot_preserves_old_artifact_and_blocks_object_gc_until_retired() {
 
     assert_eq!(
         service
-            .read_artifact_at_snapshot(snapshot.snapshot_id, InodeId::root(), &name)
+            .read_artifact_path_at_snapshot("/", snapshot.snapshot_id, "/checkpoint.bin")
             .unwrap(),
         b"old"
     );
     assert_eq!(
         service
-            .get_attr_at_snapshot(snapshot.snapshot_id, first.attr.inode)
+            .get_attr_at_snapshot("/", snapshot.snapshot_id, std::slice::from_ref(&name))
             .unwrap(),
         Some(first.attr.clone())
     );
     assert_eq!(
         service
-            .read_file_at_snapshot(snapshot.snapshot_id, first.attr.inode, 0, 3)
+            .read_file_at_snapshot("/", snapshot.snapshot_id, std::slice::from_ref(&name), 0, 3,)
             .unwrap(),
         b"old"
     );
     assert_eq!(
         service
-            .read_dir_plus_at_snapshot(snapshot.snapshot_id, InodeId::root())
+            .read_dir_plus_at_snapshot("/", snapshot.snapshot_id, &[])
             .unwrap(),
         vec![first.clone()]
     );
@@ -3822,32 +3993,94 @@ fn snapshot_path_reads_are_rooted_at_snapshot_subtree_and_support_ranges() {
         .unwrap();
 
     let root = service
-        .stat_path_at_snapshot(snapshot.snapshot_id, "/")
+        .stat_path_at_snapshot("/scope", snapshot.snapshot_id, "/")
         .unwrap()
         .unwrap();
     assert_eq!(root.attr.inode, scope.attr.inode);
     assert_eq!(
         service
-            .read_dir_plus_path_at_snapshot(snapshot.snapshot_id, "/")
+            .read_dir_plus_path_at_snapshot("/scope", snapshot.snapshot_id, "/")
             .unwrap(),
         vec![nested.clone()]
     );
     let file = service
-        .stat_path_at_snapshot(snapshot.snapshot_id, "/nested/model.bin")
+        .stat_path_at_snapshot("/scope", snapshot.snapshot_id, "/nested/model.bin")
         .unwrap()
         .unwrap();
     assert_eq!(file.attr.generation, inside_old.attr.generation);
     assert_eq!(file.body, inside_old.body);
     assert_eq!(
         service
-            .read_file_path_at_snapshot(snapshot.snapshot_id, "/nested/model.bin", 7, 3)
+            .read_file_path_at_snapshot("/scope", snapshot.snapshot_id, "/nested/model.bin", 7, 3,)
             .unwrap(),
         b"old"
     );
     assert!(matches!(
-        service.read_file_path_at_snapshot(snapshot.snapshot_id, "/outside/model.bin", 0, 7),
+        service.read_file_path_at_snapshot(
+            "/scope",
+            snapshot.snapshot_id,
+            "/outside/model.bin",
+            0,
+            7,
+        ),
         Err(MetadError::NotFound)
     ));
+}
+
+#[test]
+fn snapshot_path_list_pages_include_entries_deleted_after_snapshot() {
+    let service = service();
+    for name in [
+        b"a.txt".as_slice(),
+        b"b.txt".as_slice(),
+        b"c.txt".as_slice(),
+    ] {
+        service
+            .create_file(
+                InodeId::root(),
+                DentryName::new(name.to_vec()).unwrap(),
+                0o644,
+                1000,
+                1000,
+            )
+            .unwrap();
+    }
+    let snapshot = service.snapshot_subtree(InodeId::root()).unwrap();
+    service
+        .rename(
+            InodeId::root(),
+            &DentryName::new(b"b.txt".to_vec()).unwrap(),
+            InodeId::root(),
+            DentryName::new(b"z.txt".to_vec()).unwrap(),
+        )
+        .unwrap();
+    service
+        .remove_file(
+            InodeId::root(),
+            &DentryName::new(b"c.txt".to_vec()).unwrap(),
+        )
+        .unwrap();
+
+    let first = service
+        .read_dir_plus_path_at_snapshot_page("/", snapshot.snapshot_id, "/", None, 2)
+        .unwrap();
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.dentry.name.as_bytes())
+            .collect::<Vec<_>>(),
+        vec![b"a.txt".as_slice(), b"b.txt".as_slice()]
+    );
+    let cursor = first.next_cursor.unwrap();
+    assert_eq!(cursor.as_bytes(), b"b.txt");
+
+    let second = service
+        .read_dir_plus_path_at_snapshot_page("/", snapshot.snapshot_id, "/", Some(&cursor), 2)
+        .unwrap();
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].dentry.name.as_bytes(), b"c.txt");
+    assert!(second.next_cursor.is_none());
 }
 
 #[test]
@@ -3870,7 +4103,7 @@ fn history_cleanup_keeps_snapshot_reads_until_snapshot_retired() {
     assert!(retained.retained_by_snapshots > 0);
     assert_eq!(
         service
-            .read_artifact_at_snapshot(snapshot.snapshot_id, InodeId::root(), &name)
+            .read_artifact_path_at_snapshot("/", snapshot.snapshot_id, "/checkpoint.bin")
             .unwrap(),
         b"old"
     );
@@ -5588,50 +5821,406 @@ fn live_snapshot_pin_blocks_object_gc_until_retired() {
 }
 
 #[test]
-fn renew_snapshot_restores_protection_for_an_expired_lease() {
-    let (service, objects) = service_with_objects();
-    // Pin starts expired, but is renewed before any GC pass reaps it.
-    let (pin, block) = snapshot_then_free_block(&service, 0);
-    assert!(service.renew_snapshot(pin.snapshot_id, 3_600_000).unwrap());
+fn renew_snapshot_rejects_expiry_at_the_deadline() {
+    let (service, _objects) = service_with_objects();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    let runs = service.resolve_directory_path("/runs").unwrap();
+    let pin = service.snapshot_subtree_with_lease(runs, 500).unwrap();
 
-    let blocked = service.cleanup_pending_objects(100).unwrap();
-    assert_eq!(blocked.blocked_by_snapshots, 1);
-    assert!(objects.head(&block).unwrap().is_some());
+    service.set_clock_override_ms(1_500);
+    assert!(matches!(
+        service.renew_snapshot(pin.snapshot_id, 3_600_000),
+        Err(MetadError::SnapshotLeaseExpired {
+            snapshot_id,
+            lease_expires_unix_ms: 1_500,
+            now_ms: 1_500,
+        }) if snapshot_id == pin.snapshot_id
+    ));
 
-    // Renewing a pin that no longer exists is a no-op.
-    assert!(!service
-        .renew_snapshot(pin.snapshot_id + 9_999, 1_000)
-        .unwrap());
+    assert_eq!(
+        service
+            .renew_snapshot(pin.snapshot_id + 9_999, 1_000)
+            .unwrap(),
+        SnapshotRenewOutcome::Missing {
+            snapshot_id: pin.snapshot_id + 9_999,
+        }
+    );
 }
 
 #[test]
 fn renew_snapshot_is_extend_only_and_never_shortens_protection() {
     let (service, _objects) = service_with_objects();
+    service.set_clock_override_ms(1_000);
     service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
     let runs = service.resolve_directory_path("/runs").unwrap();
-    let pin = service.snapshot_subtree_with_lease(runs, 0).unwrap();
+    let pin = service.snapshot_subtree_with_lease(runs, 1_000).unwrap();
 
     // Grant a long lease.
-    assert!(service.renew_snapshot(pin.snapshot_id, 3_600_000).unwrap());
-    let long = service.snapshot_pin(pin.snapshot_id).unwrap().unwrap();
+    let SnapshotRenewOutcome::Renewed {
+        pin: long,
+        extended: true,
+    } = service.renew_snapshot(pin.snapshot_id, 3_600_000).unwrap()
+    else {
+        panic!("expected an extended live pin")
+    };
 
     // A shorter renew must NOT shorten the protection already granted: renew is
     // extend-only (Iceberg / S3 Object Lock semantics). Shrinking protection is
     // expressed by `retire`, never by a shorter renew silently dropping it.
-    assert!(service.renew_snapshot(pin.snapshot_id, 1_000).unwrap());
-    let after_short = service.snapshot_pin(pin.snapshot_id).unwrap().unwrap();
+    let SnapshotRenewOutcome::Renewed {
+        pin: after_short,
+        extended: false,
+    } = service.renew_snapshot(pin.snapshot_id, 1_000).unwrap()
+    else {
+        panic!("expected an unchanged live pin")
+    };
     assert_eq!(
         after_short.lease_expires_unix_ms, long.lease_expires_unix_ms,
         "a shorter renew must never shorten protection"
     );
 
     // A longer renew still extends protection.
-    assert!(service.renew_snapshot(pin.snapshot_id, 7_200_000).unwrap());
-    let after_long = service.snapshot_pin(pin.snapshot_id).unwrap().unwrap();
+    let SnapshotRenewOutcome::Renewed {
+        pin: after_long,
+        extended: true,
+    } = service.renew_snapshot(pin.snapshot_id, 7_200_000).unwrap()
+    else {
+        panic!("expected an extended live pin")
+    };
     assert!(
         after_long.lease_expires_unix_ms > long.lease_expires_unix_ms,
         "a longer renew extends protection"
     );
+}
+
+#[test]
+fn concurrent_snapshot_renewals_preserve_the_longest_successful_lease() {
+    let store = SnapshotCommitBarrierStore::new(CommandKind::RenewSnapshot, 2, 2);
+    let objects = MemoryObjectStore::new();
+    let service = Arc::new(NoKvFs::new(MountId::new(1).unwrap(), store, objects));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    let root = service.resolve_directory_path("/runs").unwrap();
+    let pin = service.snapshot_subtree_with_lease(root, 1_000).unwrap();
+
+    let short_service = Arc::clone(&service);
+    let short = std::thread::spawn(move || short_service.renew_snapshot(pin.snapshot_id, 5_000));
+    let long_service = Arc::clone(&service);
+    let long = std::thread::spawn(move || long_service.renew_snapshot(pin.snapshot_id, 10_000));
+
+    let short = short.join().unwrap().unwrap();
+    let long = long.join().unwrap().unwrap();
+    assert!(matches!(short, SnapshotRenewOutcome::Renewed { .. }));
+    assert!(matches!(long, SnapshotRenewOutcome::Renewed { .. }));
+    assert_eq!(
+        service
+            .snapshot_pin(pin.snapshot_id)
+            .unwrap()
+            .unwrap()
+            .lease_expires_unix_ms,
+        11_000
+    );
+}
+
+#[test]
+fn sixteen_concurrent_snapshot_renewals_converge_on_the_longest_lease() {
+    const WRITERS: usize = 16;
+    let store =
+        SnapshotCommitBarrierStore::new(CommandKind::RenewSnapshot, WRITERS as u64, WRITERS);
+    let service = Arc::new(NoKvFs::new(
+        MountId::new(1).unwrap(),
+        store,
+        MemoryObjectStore::new(),
+    ));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    let root = service.resolve_directory_path("/runs").unwrap();
+    let pin = service.snapshot_subtree_with_lease(root, 1_000).unwrap();
+
+    let mut writers = Vec::new();
+    for index in 0..WRITERS {
+        let service = Arc::clone(&service);
+        let lease_ms = 2_000 + index as u64 * 1_000;
+        writers.push(std::thread::spawn(move || {
+            service.renew_snapshot(pin.snapshot_id, lease_ms)
+        }));
+    }
+    for writer in writers {
+        assert!(matches!(
+            writer.join().unwrap().unwrap(),
+            SnapshotRenewOutcome::Renewed { .. }
+        ));
+    }
+    assert_eq!(
+        service
+            .snapshot_pin(pin.snapshot_id)
+            .unwrap()
+            .unwrap()
+            .lease_expires_unix_ms,
+        18_000
+    );
+}
+
+#[test]
+fn stale_reaper_scan_cannot_delete_a_newer_pin_version() {
+    let store = SnapshotCommitBarrierStore::new(CommandKind::RetireSnapshot, 1, 2);
+    let objects = MemoryObjectStore::new();
+    let service = Arc::new(NoKvFs::new(
+        MountId::new(1).unwrap(),
+        store.clone(),
+        objects,
+    ));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/runs", 0o755, 1000, 1000).unwrap();
+    let root = service.resolve_directory_path("/runs").unwrap();
+    let pin = service.snapshot_subtree_with_lease(root, 500).unwrap();
+
+    service.set_clock_override_ms(1_500);
+    let reaper_service = Arc::clone(&service);
+    let reaper = std::thread::spawn(move || reaper_service.reclaim_expired_snapshot_pins(100));
+    store.wait_until_blocked();
+
+    // A deterministic clock rewind models a stale reaper candidate whose record
+    // was replaced before its delete applied. The version fence, not wall time,
+    // is the invariant under test.
+    service.set_clock_override_ms(1_400);
+    assert!(matches!(
+        service.renew_snapshot(pin.snapshot_id, 10_000).unwrap(),
+        SnapshotRenewOutcome::Renewed { extended: true, .. }
+    ));
+    store.release_blocked();
+
+    let outcome = reaper.join().unwrap().unwrap();
+    assert_eq!(outcome.expired_candidates, 1);
+    assert_eq!(outcome.reaped, 0);
+    assert_eq!(outcome.conflicted, 1);
+    assert!(service.snapshot_pin(pin.snapshot_id).unwrap().is_some());
+}
+
+#[test]
+fn one_reaper_conflict_does_not_block_other_expired_pins() {
+    let store = SnapshotCommitBarrierStore::new(CommandKind::RetireSnapshot, 1, 2);
+    let service = Arc::new(NoKvFs::new(
+        MountId::new(1).unwrap(),
+        store.clone(),
+        MemoryObjectStore::new(),
+    ));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/a", 0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/b", 0o755, 1000, 1000).unwrap();
+    let a = service.resolve_directory_path("/a").unwrap();
+    let b = service.resolve_directory_path("/b").unwrap();
+    let renewed = service.snapshot_subtree_with_lease(a, 500).unwrap();
+    let expired = service.snapshot_subtree_with_lease(b, 500).unwrap();
+
+    service.set_clock_override_ms(1_500);
+    let reaper_service = Arc::clone(&service);
+    let reaper = std::thread::spawn(move || reaper_service.reclaim_expired_snapshot_pins(100));
+    store.wait_until_blocked();
+    service.set_clock_override_ms(1_400);
+    assert!(matches!(
+        service.renew_snapshot(renewed.snapshot_id, 10_000).unwrap(),
+        SnapshotRenewOutcome::Renewed { extended: true, .. }
+    ));
+    store.release_blocked();
+
+    let outcome = reaper.join().unwrap().unwrap();
+    assert_eq!(outcome.expired_candidates, 2);
+    assert_eq!(outcome.reaped, 1);
+    assert_eq!(outcome.conflicted, 1);
+    assert!(service.snapshot_pin(renewed.snapshot_id).unwrap().is_some());
+    assert!(service.snapshot_pin(expired.snapshot_id).unwrap().is_none());
+}
+
+#[test]
+fn uncontended_reaper_page_uses_one_atomic_commit() {
+    let (service, _objects) = service_with_objects();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/a", 0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/b", 0o755, 1000, 1000).unwrap();
+    let a = service.resolve_directory_path("/a").unwrap();
+    let b = service.resolve_directory_path("/b").unwrap();
+    service.snapshot_subtree_with_lease(a, 500).unwrap();
+    service.snapshot_subtree_with_lease(b, 500).unwrap();
+    service.set_clock_override_ms(1_500);
+
+    let before = service.metadata_store_stats().commit_total;
+    let outcome = service.reclaim_expired_snapshot_pins(100).unwrap();
+    let commits = service.metadata_store_stats().commit_total - before;
+    assert_eq!(outcome.expired_candidates, 2);
+    assert_eq!(outcome.reaped, 2);
+    assert_eq!(outcome.conflicted, 0);
+    assert_eq!(commits, 1);
+}
+
+#[test]
+fn snapshot_path_operations_reject_a_different_root() {
+    let (service, _objects) = service_with_objects();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/a", 0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/b", 0o755, 1000, 1000).unwrap();
+    let root = service.resolve_directory_path("/a").unwrap();
+    let pin = service.snapshot_subtree_with_lease(root, 10_000).unwrap();
+
+    assert!(matches!(
+        service.stat_path_at_snapshot("/b", pin.snapshot_id, "/"),
+        Err(MetadError::SnapshotRootMismatch {
+            snapshot_id,
+            expected_root,
+            actual_root,
+            ..
+        }) if snapshot_id == pin.snapshot_id && expected_root != root && actual_root == Some(root)
+    ));
+    assert!(matches!(
+        service.renew_snapshot_path("/b", pin.snapshot_id, 20_000),
+        Err(MetadError::SnapshotRootMismatch { .. })
+    ));
+
+    service.set_clock_override_ms(pin.lease_expires_unix_ms);
+    assert!(matches!(
+        service.stat_path_at_snapshot("/a", pin.snapshot_id, "/"),
+        Err(MetadError::SnapshotLeaseExpired {
+            snapshot_id,
+            lease_expires_unix_ms,
+            now_ms,
+        }) if snapshot_id == pin.snapshot_id
+            && lease_expires_unix_ms == pin.lease_expires_unix_ms
+            && now_ms == pin.lease_expires_unix_ms
+    ));
+}
+
+#[test]
+fn snapshot_component_reads_are_root_bound_even_when_empty_or_zero_length() {
+    let (service, _objects) = service_with_objects();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/a", 0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/b", 0o755, 1000, 1000).unwrap();
+    service
+        .create_file_path("/a/inside", 0o644, 1000, 1000)
+        .unwrap();
+    service
+        .create_file_path("/b/outside", 0o644, 1000, 1000)
+        .unwrap();
+    let pin = service
+        .snapshot_subtree_path_with_lease("/a", 10_000)
+        .unwrap();
+    let inside = DentryName::new("inside").unwrap();
+    let outside = DentryName::new("outside").unwrap();
+
+    assert!(service
+        .get_attr_at_snapshot("/a", pin.snapshot_id, std::slice::from_ref(&inside))
+        .unwrap()
+        .is_some());
+    assert!(service
+        .get_attr_at_snapshot("/a", pin.snapshot_id, std::slice::from_ref(&outside))
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        service.get_attr_at_snapshot("/b", pin.snapshot_id, &[]),
+        Err(MetadError::SnapshotRootMismatch { .. })
+    ));
+    assert!(matches!(
+        service.read_file_at_snapshot("/b", pin.snapshot_id, std::slice::from_ref(&outside), 0, 0,),
+        Err(MetadError::SnapshotRootMismatch { .. })
+    ));
+}
+
+#[test]
+fn snapshot_ids_are_shard_qualified_and_foreign_ids_fail_as_root_mismatch() {
+    let source = service().with_shard_index(1);
+    source
+        .create_dir_path("/source", 0o755, 1000, 1000)
+        .unwrap();
+    let pin = source.snapshot_subtree_path("/source").unwrap();
+    assert_eq!(pin.snapshot_id >> 48, 1);
+
+    let destination = service().with_shard_index(2);
+    destination
+        .create_dir_path("/destination", 0o755, 1000, 1000)
+        .unwrap();
+    assert!(matches!(
+        destination.stat_path_at_snapshot("/destination", pin.snapshot_id, "/"),
+        Err(MetadError::SnapshotRootMismatch {
+            snapshot_id,
+            actual_root: None,
+            actual_shard: 1,
+            ..
+        }) if snapshot_id == pin.snapshot_id
+    ));
+}
+
+#[test]
+fn snapshot_renew_reports_a_concurrent_root_rebind() {
+    let store = SnapshotCommitBarrierStore::new(CommandKind::RenewSnapshot, 1, 2);
+    let service = Arc::new(NoKvFs::new(
+        MountId::new(1).unwrap(),
+        store.clone(),
+        MemoryObjectStore::new(),
+    ));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/a", 0o755, 1000, 1000).unwrap();
+    let root = service.resolve_directory_path("/a").unwrap();
+    let pin = service.snapshot_subtree_with_lease(root, 10_000).unwrap();
+
+    let renew_service = Arc::clone(&service);
+    let renew = std::thread::spawn(move || {
+        renew_service.renew_snapshot_path("/a", pin.snapshot_id, 20_000)
+    });
+    store.wait_until_blocked();
+    service.rename_path("/a", "/moved").unwrap();
+    store.release_blocked();
+
+    assert!(matches!(
+        renew.join().unwrap(),
+        Err(MetadError::SnapshotBindingChanged { root_path }) if root_path == "/a"
+    ));
+}
+
+#[test]
+fn snapshot_mint_rejects_a_concurrent_root_rebind() {
+    let store = SnapshotCommitBarrierStore::new(CommandKind::SnapshotSubtree, 1, 2);
+    let service = Arc::new(NoKvFs::new(
+        MountId::new(1).unwrap(),
+        store.clone(),
+        MemoryObjectStore::new(),
+    ));
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.set_clock_override_ms(1_000);
+    service.create_dir_path("/a", 0o755, 1000, 1000).unwrap();
+
+    let mint_service = Arc::clone(&service);
+    let mint =
+        std::thread::spawn(move || mint_service.snapshot_subtree_path_with_lease("/a", 10_000));
+    store.wait_until_blocked();
+    service.rename_path("/a", "/moved").unwrap();
+    store.release_blocked();
+
+    assert!(matches!(
+        mint.join().unwrap(),
+        Err(MetadError::SnapshotBindingChanged { root_path }) if root_path == "/a"
+    ));
+    assert_eq!(service.metadata_store_stats().active_snapshot_pin_total, 0);
+}
+
+#[test]
+fn snapshot_mint_retries_a_stable_binding_after_a_planning_conflict() {
+    let store = SnapshotPredicateOnceStore::new();
+    let service = NoKvFs::new(MountId::new(1).unwrap(), store, MemoryObjectStore::new());
+    service.bootstrap_root(0o755, 1000, 1000).unwrap();
+    service.create_dir_path("/a", 0o755, 1000, 1000).unwrap();
+
+    let pin = service
+        .snapshot_subtree_path_with_lease("/a", 10_000)
+        .unwrap();
+
+    assert_eq!(service.metadata_store_stats().active_snapshot_pin_total, 1);
+    assert_eq!(service.snapshot_pin(pin.snapshot_id).unwrap(), Some(pin));
 }
 
 #[test]

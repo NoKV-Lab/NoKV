@@ -1010,15 +1010,18 @@ fn service_snapshot_cat_uses_snapshot_file_rpc() {
         let request = decode_request(&request).unwrap();
         assert!(matches!(
             request,
-            MetadataRpcRequest::ReadArtifactPathAtSnapshot { snapshot_id, path }
-                if snapshot_id == 9 && path == "/runs/checkpoint"
+            MetadataRpcRequest::ReadArtifactPathAtSnapshot { root_path, snapshot_id, path }
+                if root_path == "/runs" && snapshot_id == 9 && path == "/checkpoint"
         ));
         let response =
             response_body(r#"{"ok":true,"result":{"type":"file_bytes","bytes":[111,108,100]}}"#);
         write_frame(&mut stream, request_id, flags, &response).unwrap();
     });
     let client = NoKvFsClient::connect(addr, MemoryObjectStore::new());
-    assert_eq!(client.cat_snapshot(9, "/runs/checkpoint").unwrap(), b"old");
+    assert_eq!(
+        client.cat_snapshot("/runs", 9, "/checkpoint").unwrap(),
+        b"old"
+    );
 }
 
 #[test]
@@ -1035,8 +1038,8 @@ fn service_snapshot_namespace_methods_use_snapshot_rooted_rpcs() {
         let request = decode_request(&request).unwrap();
         assert!(matches!(
             request,
-            MetadataRpcRequest::StatPathAtSnapshot { snapshot_id, path }
-                if snapshot_id == 9 && path == "/"
+            MetadataRpcRequest::StatPathAtSnapshot { root_path, snapshot_id, path }
+                if root_path == "/runs" && snapshot_id == 9 && path == "/"
         ));
         write_frame(
                 &mut stream,
@@ -1052,8 +1055,8 @@ fn service_snapshot_namespace_methods_use_snapshot_rooted_rpcs() {
         let request = decode_request(&request).unwrap();
         assert!(matches!(
             request,
-            MetadataRpcRequest::ReadDirPlusPathAtSnapshot { snapshot_id, path }
-                if snapshot_id == 9 && path == "/"
+            MetadataRpcRequest::ReadDirPlusPathAtSnapshot { root_path, snapshot_id, path }
+                if root_path == "/runs" && snapshot_id == 9 && path == "/"
         ));
         write_frame(
                 &mut stream,
@@ -1071,10 +1074,11 @@ fn service_snapshot_namespace_methods_use_snapshot_rooted_rpcs() {
             request,
             MetadataRpcRequest::ReadFilePathAtSnapshot {
                 snapshot_id,
+                root_path,
                 path,
                 offset,
                 len
-            } if snapshot_id == 9 && path == "/nested/model.bin" && offset == 7 && len == 3
+            } if root_path == "/runs" && snapshot_id == 9 && path == "/nested/model.bin" && offset == 7 && len == 3
         ));
         write_frame(
             &mut stream,
@@ -1088,17 +1092,65 @@ fn service_snapshot_namespace_methods_use_snapshot_rooted_rpcs() {
     let client = NoKvFsClient::connect(addr, MemoryObjectStore::new());
     let root = client
         .metadata()
-        .stat_path_at_snapshot(9, "/")
+        .stat_path_at_snapshot("/runs", 9, "/")
         .unwrap()
         .unwrap();
     assert_eq!(root.attr.inode.get(), 2);
-    let entries = client.metadata().list_path_at_snapshot(9, "/").unwrap();
+    let entries = client
+        .metadata()
+        .list_path_at_snapshot("/runs", 9, "/")
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].dentry.name.as_bytes(), b"nested");
     assert_eq!(
-        client.read_snapshot(9, "/nested/model.bin", 7, 3).unwrap(),
+        client
+            .read_snapshot("/runs", 9, "/nested/model.bin", 7, 3)
+            .unwrap(),
         b"old"
     );
+}
+
+#[test]
+fn service_snapshot_list_page_uses_cursor_rpc() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut magic = [0_u8; FRAMED_RPC_MAGIC.len()];
+        stream.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, FRAMED_RPC_MAGIC);
+        let (request_id, flags, request) = read_frame(&mut stream).unwrap();
+        let request = decode_request(&request).unwrap();
+        assert!(matches!(
+            request,
+            MetadataRpcRequest::ReadDirPlusPathAtSnapshotPage {
+                root_path,
+                snapshot_id,
+                path,
+                after_name_hex: Some(after),
+                limit,
+            } if root_path == "/workbench" && snapshot_id == 9 && path == "/outputs" && after == "612e747874" && limit == 2
+        ));
+        write_frame(
+            &mut stream,
+            request_id,
+            flags,
+            &response_body(
+                r#"{"ok":true,"result":{"type":"dentries_page","entries":[{"dentry":{"parent":2,"name_hex":"622e747874","child":3,"child_type":"file","attr_generation":3},"attr":{"inode":3,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":1,"generation":3,"mtime_ms":3,"ctime_ms":3},"body":null}],"next_name_hex":"622e747874"}}"#,
+            ),
+        )
+        .unwrap();
+    });
+
+    let client = NoKvFsClient::connect(addr, MemoryObjectStore::new());
+    let after = DentryName::new(b"a.txt".to_vec()).unwrap();
+    let page = client
+        .metadata()
+        .list_path_at_snapshot_page("/workbench", 9, "/outputs", Some(&after), 2)
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].dentry.name.as_bytes(), b"b.txt");
+    assert_eq!(page.next_cursor.unwrap().as_bytes(), b"b.txt");
 }
 
 #[test]
@@ -2523,7 +2575,8 @@ fn service_snapshot_subtree_path_sends_typed_rpc_and_maps_outcome() {
         assert_eq!(
             request,
             MetadataRpcRequest::SnapshotSubtreePath {
-                path: "/base".to_owned(),
+                root_path: "/base".to_owned(),
+                lease_ms: nokv_meta::DEFAULT_SNAPSHOT_LEASE_MS,
             }
         );
         response_body(
@@ -2534,6 +2587,33 @@ fn service_snapshot_subtree_path_sends_typed_rpc_and_maps_outcome() {
     let outcome = client.snapshot_subtree_path("/base").unwrap();
     assert_eq!(outcome.snapshot_id, 7);
     assert_eq!(outcome.read_version, 6);
+}
+
+#[test]
+fn service_snapshot_renew_returns_the_authoritative_pin() {
+    let addr = serve_one_request(|request| {
+        assert_eq!(
+            request,
+            MetadataRpcRequest::RenewSnapshot {
+                root_path: "/base".to_owned(),
+                snapshot_id: 7,
+                lease_ms: 60_000,
+            }
+        );
+        response_body(
+            r#"{"ok":true,"result":{"type":"renewed_snapshot","outcome":{"state":"renewed","pin":{"snapshot_id":7,"root":2,"read_version":6,"created_version":7,"lease_expires_unix_ms":61000},"extended":true}}}"#,
+        )
+    });
+    let client = MetadataClient::connect(addr);
+    let outcome = client.renew_snapshot("/base", 7, 60_000).unwrap();
+    match outcome {
+        nokv_meta::SnapshotRenewOutcome::Renewed { pin, extended } => {
+            assert!(extended);
+            assert_eq!(pin.snapshot_id, 7);
+            assert_eq!(pin.lease_expires_unix_ms, 61_000);
+        }
+        other => panic!("unexpected renew outcome: {other:?}"),
+    }
 }
 
 #[test]

@@ -50,5 +50,6 @@ pub use service::{
     ObjectTransferStats, OpenPathReadPlan, OpenPathReadPlanRequest, PendingObjectCleanupOutcome,
     PreparedArtifact, PublishArtifact, PublishArtifactRange, PublishArtifactSession,
     PublishArtifactStagedSession, ReadDirPlusPage, RecordCountProvenance, RenameReplaceResult,
-    SubtreeDelta, SubtreeDeltaKind, UpdateAttr, XattrSetMode, DEFAULT_SNAPSHOT_LEASE_MS,
+    SnapshotReapOutcome, SnapshotRenewOutcome, SubtreeDelta, SubtreeDeltaKind, UpdateAttr,
+    XattrSetMode, DEFAULT_SNAPSHOT_LEASE_MS,
 };
