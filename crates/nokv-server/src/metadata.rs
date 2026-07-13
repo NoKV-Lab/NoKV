@@ -101,6 +101,12 @@ impl MetadataStore for ServerMetadataStore {
         }
     }
 
+    fn history_retention_epoch(&self) -> Result<u64, MetadataError> {
+        match self {
+            Self::Direct(store) => store.history_retention_epoch(),
+        }
+    }
+
     fn prune_history(
         &self,
         request: HistoryPruneRequest,

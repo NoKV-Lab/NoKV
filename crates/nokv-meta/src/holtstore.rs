@@ -4,9 +4,10 @@
 //! Holt family trees. It does not own filesystem semantics, object storage,
 //! Raft replication, FUSE, or protobuf types.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::command::{
@@ -15,10 +16,10 @@ use crate::command::{
     MetadataCommand, MetadataError, MetadataStore, MetadataStoreStats, MetadataStoreStatsProvider,
     MutationOp, Predicate, ReadItem, ReadPurpose, ScanItem, ScanRequest, Value, Version,
 };
-use crate::layout::{history_key, history_prefix};
+use crate::layout::{history_index_key, history_index_prefix, history_key, history_prefix};
 use holt::{
-    CheckpointImage, DBAtomicBatch, Error as HoltError, KeyRangeEntryRef, KeyScanOutcome,
-    RangeEntry, RecordVersion,
+    CheckpointImage, DBAtomicBatch, Durability, Error as HoltError, KeyRangeEntryRef,
+    KeyScanOutcome, RangeEntry, RecordVersion,
 };
 use holt::{Tree, TreeConfig, DB};
 use nokv_types::RecordFamily;
@@ -28,11 +29,62 @@ mod families;
 use codec::*;
 use families::*;
 
+const HISTORY_INDEX_COMPLETE_KEY: &[u8] = b"\0history-key-index-v1-complete";
+const HISTORY_INDEX_PROGRESS_KEY: &[u8] = b"\0history-key-index-v1-progress";
+const HISTORY_INDEX_COMPLETE_VALUE: &[u8] = b"1";
+const HISTORY_INDEX_BACKFILL_BATCH_SIZE: usize = 1_024;
+const HISTORY_PRUNE_CONFLICT_RETRIES: usize = 4;
+
 #[derive(Clone)]
 pub struct HoltMetadataStore {
     db: DB,
     stats: Arc<HoltMetadataStoreCounters>,
-    active_snapshot_pins: Arc<AtomicU64>,
+    history_retention: Arc<HistoryRetentionState>,
+}
+
+#[derive(Default)]
+struct HistoryRetentionState {
+    /// Ordinary commands share the read side from planning through durable
+    /// apply. Snapshot pins and fork-base bindings take the write side, making
+    /// their lifetime transition indivisible from the counters used by planners.
+    planning_fence: RwLock<()>,
+    active_snapshot_pins: AtomicU64,
+    active_fork_bindings: AtomicU64,
+    /// Monotonic process-local sequence for durable holder transitions. It is
+    /// protected by `planning_fence` and serves as the seqlock/CAS token for a
+    /// service-computed retention floor.
+    epoch: AtomicU64,
+    /// Highest snapshot-visible commit applied through this live store handle.
+    /// This deliberately starts at zero on open: no pre-open command can still
+    /// hold this handle's planning fence, while the service restores its durable
+    /// version allocator before accepting work. Scanning the unbounded dedupe
+    /// tree at readiness would turn restart latency into O(command history).
+    max_applied_commit_version: AtomicU64,
+    #[cfg(test)]
+    after_retention_apply_before_state: std::sync::Mutex<Option<TestHook>>,
+    #[cfg(test)]
+    before_ordinary_planning_fence: std::sync::Mutex<Option<TestHook>>,
+}
+
+#[cfg(test)]
+type TestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryRetentionDelta {
+    snapshot_pins: i64,
+    fork_bindings: i64,
+}
+
+impl HistoryRetentionDelta {
+    fn is_zero(self) -> bool {
+        self.snapshot_pins == 0 && self.fork_bindings == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RecoveredHistoryRetentionState {
+    active_snapshot_pins: u64,
+    active_fork_bindings: u64,
 }
 
 #[derive(Default)]
@@ -98,7 +150,8 @@ struct CommandPlan {
     version_guards: Vec<VersionGuard>,
     prefix_empty_guards: Vec<PrefixEmptyGuard>,
     retain_history: bool,
-    snapshot_retention_delta: i64,
+    history_retention_delta: HistoryRetentionDelta,
+    adds_history_retention: bool,
 }
 
 struct PendingPlannedCommand {
@@ -115,7 +168,8 @@ struct PlannedCommandStats {
     current_delete_count: u64,
     history_write_count: u64,
     watch_write_count: u64,
-    snapshot_retention_delta: i64,
+    history_retention_delta: HistoryRetentionDelta,
+    advances_history_version: bool,
     result: CommitResult,
     dedupe_result: Vec<u8>,
 }
@@ -131,23 +185,142 @@ struct CurrentRecord {
     value: Option<Vec<u8>>,
 }
 
+struct HistoryIndexPruneUpdate {
+    key: Vec<u8>,
+    record_version: RecordVersion,
+    latest_retained: Option<u64>,
+}
+
+struct HistoryPruneDeletePlan {
+    records: Vec<(Vec<u8>, RecordVersion)>,
+    index_updates: Vec<HistoryIndexPruneUpdate>,
+}
+
+type CurrentScanCandidate = (Vec<u8>, Vec<u8>);
+
+impl HistoryRetentionState {
+    fn new(recovered: RecoveredHistoryRetentionState) -> Self {
+        Self {
+            planning_fence: RwLock::new(()),
+            active_snapshot_pins: AtomicU64::new(recovered.active_snapshot_pins),
+            active_fork_bindings: AtomicU64::new(recovered.active_fork_bindings),
+            epoch: AtomicU64::new(1),
+            max_applied_commit_version: AtomicU64::new(0),
+            #[cfg(test)]
+            after_retention_apply_before_state: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            before_ordinary_planning_fence: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn install_recovered(&self, recovered: RecoveredHistoryRetentionState) {
+        self.active_snapshot_pins
+            .store(recovered.active_snapshot_pins, Ordering::Release);
+        self.active_fork_bindings
+            .store(recovered.active_fork_bindings, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        // A checkpoint install replaces the DB while holding the exclusive
+        // planning fence, so there is no surviving pre-install plan to order.
+        self.max_applied_commit_version.store(0, Ordering::Release);
+    }
+
+    fn has_active_hold(&self) -> bool {
+        self.active_snapshot_pins.load(Ordering::Acquire) > 0
+            || self.active_fork_bindings.load(Ordering::Acquire) > 0
+    }
+
+    fn apply_delta(&self, delta: HistoryRetentionDelta) {
+        if delta.is_zero() {
+            return;
+        }
+        apply_counter_delta(&self.active_snapshot_pins, delta.snapshot_pins);
+        apply_counter_delta(&self.active_fork_bindings, delta.fork_bindings);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    fn set_after_retention_apply_before_state_hook(&self, hook: TestHook) {
+        *self
+            .after_retention_apply_before_state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_after_retention_apply_before_state_hook(&self) {
+        let hook = self
+            .after_retention_apply_before_state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_ordinary_planning_fence_hook(&self, hook: TestHook) {
+        *self
+            .before_ordinary_planning_fence
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_before_ordinary_planning_fence_hook(&self) {
+        let hook = self
+            .before_ordinary_planning_fence
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+fn apply_counter_delta(counter: &AtomicU64, delta: i64) {
+    if delta > 0 {
+        counter.fetch_add(delta as u64, Ordering::AcqRel);
+    } else if delta < 0 {
+        let decrement = delta.unsigned_abs();
+        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(decrement))
+        });
+    }
+}
+
 impl HoltMetadataStore {
     pub fn open_memory() -> Result<Self, MetadataError> {
         Self::open(TreeConfig::memory())
     }
 
     pub fn open_file(path: impl AsRef<Path>) -> Result<Self, MetadataError> {
-        Self::open(TreeConfig::new(path.as_ref()))
+        let mut config = TreeConfig::new(path.as_ref());
+        // A successful metadata RPC is a durability promise. Holt's default
+        // async WAL mode leaves a small ACK-to-flusher window in which SIGKILL
+        // can discard a committed namespace change or restore journal state.
+        config.durability = Durability::Wal { sync: true };
+        Self::open(config)
     }
 
     pub fn open(config: TreeConfig) -> Result<Self, MetadataError> {
         let db = DB::open(config).map_err(to_backend_error)?;
-        let active_snapshot_pins = count_active_snapshot_pins(&db)?;
-        Ok(Self {
+        let recovered = recover_history_retention_state(&db)?;
+        let store = Self {
             db,
             stats: Arc::new(HoltMetadataStoreCounters::default()),
-            active_snapshot_pins: Arc::new(AtomicU64::new(active_snapshot_pins)),
-        })
+            history_retention: Arc::new(HistoryRetentionState::new(recovered)),
+        };
+        // Do not create trees in a brand-new database: checkpoint installation
+        // requires a pristine DB. Existing stores, however, are migrated before
+        // they can serve reads.
+        match store.db.open_tree(HISTORY_TREE) {
+            Ok(_) => store.ensure_history_key_index()?,
+            Err(HoltError::TreeNotFound { .. }) => {}
+            Err(err) => return Err(to_backend_error(err)),
+        }
+        Ok(store)
     }
 
     pub fn checkpoint(&self) -> Result<(), MetadataError> {
@@ -166,11 +339,17 @@ impl HoltMetadataStore {
     pub fn install_checkpoint_image(&self, image: &[u8]) -> Result<(), MetadataError> {
         let checkpoint = CheckpointImage::from_bytes(image.to_vec());
         checkpoint.validate().map_err(to_backend_error)?;
+        let _fence = self
+            .history_retention
+            .planning_fence
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
         self.db
             .install_checkpoint(&checkpoint)
             .map_err(to_backend_error)?;
-        self.active_snapshot_pins
-            .store(count_active_snapshot_pins(&self.db)?, Ordering::Relaxed);
+        self.ensure_history_key_index()?;
+        self.history_retention
+            .install_recovered(recover_history_retention_state(&self.db)?);
         Ok(())
     }
 
@@ -190,6 +369,12 @@ impl HoltMetadataStore {
             .map_err(to_backend_error)
     }
 
+    fn history_key_index_tree(&self) -> Result<Tree, MetadataError> {
+        self.db
+            .open_or_create_tree(HISTORY_KEY_INDEX_TREE)
+            .map_err(to_backend_error)
+    }
+
     fn ensure_metadata_trees(&self) -> Result<(), MetadataError> {
         for name in METADATA_TREE_NAMES {
             self.db
@@ -197,6 +382,199 @@ impl HoltMetadataStore {
                 .map_err(to_backend_error)?;
         }
         Ok(())
+    }
+
+    /// Build the derived history candidate index for stores created before the
+    /// index existed. Each batch persists both its entries and the last consumed
+    /// history key, so reopening after a crash resumes without rescanning earlier
+    /// batches. The completion marker makes the steady-state check one point read.
+    fn ensure_history_key_index(&self) -> Result<(), MetadataError> {
+        let history = self.history_tree()?;
+        let index = self.history_key_index_tree()?;
+        if index
+            .get(HISTORY_INDEX_COMPLETE_KEY)
+            .map_err(to_backend_error)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        loop {
+            let progress = index
+                .get(HISTORY_INDEX_PROGRESS_KEY)
+                .map_err(to_backend_error)?;
+            let mut range = history.range();
+            if let Some(progress) = progress.as_deref() {
+                range = range.start_after(progress);
+            }
+
+            let mut updates = BTreeMap::<Vec<u8>, u64>::new();
+            let mut last_key = None;
+            let mut scanned = 0_usize;
+            for entry in range {
+                let RangeEntry::Key { key, value, .. } = entry.map_err(to_backend_error)? else {
+                    continue;
+                };
+                let index_key = history_index_key_from_record_key(&key)?;
+                let (version, _) = decode_current_value(&value)?;
+                updates
+                    .entry(index_key)
+                    .and_modify(|latest| *latest = (*latest).max(version.get()))
+                    .or_insert(version.get());
+                last_key = Some(key);
+                scanned += 1;
+                if scanned >= HISTORY_INDEX_BACKFILL_BATCH_SIZE {
+                    break;
+                }
+            }
+
+            let Some(last_key) = last_key else {
+                self.db
+                    .atomic(|batch| {
+                        batch.put(
+                            HISTORY_KEY_INDEX_TREE,
+                            HISTORY_INDEX_COMPLETE_KEY,
+                            HISTORY_INDEX_COMPLETE_VALUE,
+                        );
+                        batch.delete(HISTORY_KEY_INDEX_TREE, HISTORY_INDEX_PROGRESS_KEY);
+                    })
+                    .map_err(to_backend_error)?;
+                return Ok(());
+            };
+
+            for (key, latest) in &mut updates {
+                if let Some(existing) = index.get(key).map_err(to_backend_error)? {
+                    *latest = (*latest).max(decode_history_index_version(&existing)?);
+                }
+            }
+            self.db
+                .atomic(|batch| {
+                    for (key, latest) in &updates {
+                        batch.put(HISTORY_KEY_INDEX_TREE, key, &latest.to_be_bytes());
+                    }
+                    batch.put(
+                        HISTORY_KEY_INDEX_TREE,
+                        HISTORY_INDEX_PROGRESS_KEY,
+                        &last_key,
+                    );
+                })
+                .map_err(to_backend_error)?;
+        }
+    }
+
+    /// Snapshot scans enumerate the union of current keys and keys with retained
+    /// history, then run the same point-visibility resolver used by snapshot get.
+    /// `start_after` and `limit` are deliberately applied to visible rows rather
+    /// than candidate rows: an invisible post-snapshot key must not consume a
+    /// page slot.
+    fn scan_snapshot_rows(
+        &self,
+        request: &ScanRequest,
+    ) -> Result<(Vec<ScanItem>, usize), MetadataError> {
+        let limit = if request.limit == 0 {
+            usize::MAX
+        } else {
+            request.limit
+        };
+        let mut out = Vec::new();
+        let visited = self.visit_snapshot_visible(request, |item| {
+            out.push(item);
+            out.len() < limit
+        })?;
+        Ok((out, visited))
+    }
+
+    /// Merge the ordered current and retained-history candidate streams without
+    /// materializing either prefix. Equal keys are emitted once, preferring the
+    /// captured current value. The visitor controls early termination, which lets
+    /// normal and delimited snapshot pages stop as soon as their visible limit is
+    /// satisfied.
+    fn visit_snapshot_visible(
+        &self,
+        request: &ScanRequest,
+        mut visitor: impl FnMut(ScanItem) -> bool,
+    ) -> Result<usize, MetadataError> {
+        self.ensure_history_key_index()?;
+        let current = self.current_tree(request.family)?;
+        let history = self.history_tree()?;
+        let index = self.history_key_index_tree()?;
+
+        let current_snapshot = current
+            .snapshot(&request.prefix)
+            .map_err(to_backend_error)?;
+        let mut current_range = current_snapshot.view().range();
+        if let Some(start_after) = request.start_after.as_deref() {
+            current_range = current_range.start_after(start_after);
+        }
+        let mut current_iter = current_range.into_iter();
+
+        let index_prefix = history_index_prefix(request.family, &request.prefix);
+        let index_snapshot = index.snapshot(&index_prefix).map_err(to_backend_error)?;
+        let mut index_range = index_snapshot.view().range();
+        let index_start_after;
+        if let Some(start_after) = request.start_after.as_deref() {
+            index_start_after = history_index_key(request.family, start_after);
+            index_range = index_range.start_after(&index_start_after);
+        }
+        let mut index_iter = index_range.into_iter();
+
+        let context = VisibleReadContext {
+            family: request.family,
+            version: request.version,
+            purpose: request.purpose,
+            history: &history,
+            stats: &self.stats,
+        };
+        let mut current_head = next_current_candidate(&mut current_iter)?;
+        let mut index_head = next_history_index_candidate(request.family, &mut index_iter)?;
+        let mut visited = 0_usize;
+        while current_head.is_some() || index_head.is_some() {
+            let (key, current_value) = match (&current_head, &index_head) {
+                (Some((current_key, _)), Some(index_key)) => match current_key.cmp(index_key) {
+                    std::cmp::Ordering::Less => {
+                        let (key, value) = current_head.take().expect("head is present");
+                        current_head = next_current_candidate(&mut current_iter)?;
+                        (key, Some(value))
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let key = index_head.take().expect("head is present");
+                        index_head = next_history_index_candidate(request.family, &mut index_iter)?;
+                        (key, None)
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let (key, value) = current_head.take().expect("head is present");
+                        index_head.take();
+                        current_head = next_current_candidate(&mut current_iter)?;
+                        index_head = next_history_index_candidate(request.family, &mut index_iter)?;
+                        (key, Some(value))
+                    }
+                },
+                (Some(_), None) => {
+                    let (key, value) = current_head.take().expect("head is present");
+                    current_head = next_current_candidate(&mut current_iter)?;
+                    (key, Some(value))
+                }
+                (None, Some(_)) => {
+                    let key = index_head.take().expect("head is present");
+                    index_head = next_history_index_candidate(request.family, &mut index_iter)?;
+                    (key, None)
+                }
+                (None, None) => break,
+            };
+            visited += 1;
+            if let Some((version, value)) =
+                decode_visible_value(&key, current_value.as_deref(), &context)?
+            {
+                if !visitor(ScanItem {
+                    key,
+                    value: Value(value),
+                    version,
+                }) {
+                    break;
+                }
+            }
+        }
+        Ok(visited)
     }
 
     fn current_live_record(
@@ -254,7 +632,10 @@ impl MetadataCheckpointStore for HoltMetadataStore {
 impl MetadataStoreStatsProvider for HoltMetadataStore {
     fn metadata_store_stats(&self) -> MetadataStoreStats {
         let mut stats = self.stats.snapshot();
-        stats.active_snapshot_pin_total = self.active_snapshot_pins.load(Ordering::Relaxed);
+        stats.active_snapshot_pin_total = self
+            .history_retention
+            .active_snapshot_pins
+            .load(Ordering::Acquire);
         stats
     }
 }
@@ -283,6 +664,16 @@ impl MetadataStore for HoltMetadataStore {
     fn scan(&self, request: ScanRequest) -> Result<Vec<ScanItem>, MetadataError> {
         self.stats.scan_total.fetch_add(1, Ordering::Relaxed);
         self.stats.record_scan_purpose(request.purpose);
+        if request.purpose == ReadPurpose::Snapshot {
+            let (out, visited) = self.scan_snapshot_rows(&request)?;
+            self.stats
+                .scan_key_visited_total
+                .fetch_add(visited as u64, Ordering::Relaxed);
+            self.stats
+                .scan_key_returned_total
+                .fetch_add(out.len() as u64, Ordering::Relaxed);
+            return Ok(out);
+        }
         let limit = if request.limit == 0 {
             usize::MAX
         } else {
@@ -332,6 +723,60 @@ impl MetadataStore for HoltMetadataStore {
     ) -> Result<Vec<DelimitedScanItem>, MetadataError> {
         self.stats.scan_total.fetch_add(1, Ordering::Relaxed);
         self.stats.record_scan_purpose(request.purpose);
+        if request.purpose == ReadPurpose::Snapshot {
+            let limit = if request.limit == 0 {
+                usize::MAX
+            } else {
+                request.limit
+            };
+            let mut out = Vec::new();
+            let visited = self.visit_snapshot_visible(
+                &ScanRequest {
+                    family: request.family,
+                    prefix: request.prefix.clone(),
+                    // A delimited cursor names the collapsed key/common prefix,
+                    // not an underlying raw key. Apply it after collapsing so
+                    // children below an already-returned prefix are not repeated.
+                    start_after: None,
+                    version: request.version,
+                    limit: 0,
+                    purpose: request.purpose,
+                },
+                |item| {
+                    let suffix = item.key.get(request.prefix.len()..).unwrap_or_default();
+                    let collapsed = if let Some(offset) =
+                        suffix.iter().position(|byte| *byte == request.delimiter)
+                    {
+                        DelimitedScanItem::CommonPrefix(
+                            item.key[..request.prefix.len() + offset + 1].to_vec(),
+                        )
+                    } else {
+                        DelimitedScanItem::Key(item)
+                    };
+                    let marker = match &collapsed {
+                        DelimitedScanItem::Key(item) => item.key.as_slice(),
+                        DelimitedScanItem::CommonPrefix(prefix) => prefix.as_slice(),
+                    };
+                    if request
+                        .start_after
+                        .as_deref()
+                        .is_some_and(|start_after| marker <= start_after)
+                        || out.last() == Some(&collapsed)
+                    {
+                        return true;
+                    }
+                    out.push(collapsed);
+                    out.len() < limit
+                },
+            )?;
+            self.stats
+                .scan_key_visited_total
+                .fetch_add(visited as u64, Ordering::Relaxed);
+            self.stats
+                .scan_key_returned_total
+                .fetch_add(out.len() as u64, Ordering::Relaxed);
+            return Ok(out);
+        }
         let limit = if request.limit == 0 {
             usize::MAX
         } else {
@@ -406,6 +851,89 @@ impl MetadataStore for HoltMetadataStore {
         &self,
         commands: &[MetadataCommand],
     ) -> Vec<Result<CommitResult, MetadataError>> {
+        if commands.iter().any(command_mutates_history_retention) {
+            let _fence = self
+                .history_retention
+                .planning_fence
+                .write()
+                .unwrap_or_else(|err| err.into_inner());
+            return self.commit_independent_batch_fenced(commands);
+        }
+        let _fence = self
+            .history_retention
+            .planning_fence
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        self.commit_independent_batch_fenced(commands)
+    }
+
+    fn commit_metadata(&self, command: MetadataCommand) -> Result<CommitResult, MetadataError> {
+        if command_mutates_history_retention(&command) {
+            let _fence = self
+                .history_retention
+                .planning_fence
+                .write()
+                .unwrap_or_else(|err| err.into_inner());
+            return self.commit_metadata_fenced(command);
+        }
+        #[cfg(test)]
+        self.history_retention
+            .run_before_ordinary_planning_fence_hook();
+        let _fence = self
+            .history_retention
+            .planning_fence
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        self.commit_metadata_fenced(command)
+    }
+
+    fn committed_request_result(
+        &self,
+        request_id: &[u8],
+    ) -> Result<Option<CommitResult>, MetadataError> {
+        self.current_tree(RecordFamily::CommandDedupe)?
+            .get(request_id)
+            .map_err(to_backend_error)?
+            .as_deref()
+            .map(decode_dedupe_result)
+            .transpose()
+    }
+
+    fn history_retention_epoch(&self) -> Result<u64, MetadataError> {
+        Ok(self.history_retention.epoch.load(Ordering::Acquire))
+    }
+
+    fn prune_history(
+        &self,
+        request: HistoryPruneRequest,
+    ) -> Result<HistoryPruneOutcome, MetadataError> {
+        let _fence = self
+            .history_retention
+            .planning_fence
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
+        if self.history_retention.epoch.load(Ordering::Acquire) != request.retention_epoch {
+            return Err(MetadataError::PredicateFailed);
+        }
+        for attempt in 0..HISTORY_PRUNE_CONFLICT_RETRIES {
+            match self.prune_history_once(request) {
+                Err(MetadataError::PredicateFailed)
+                    if attempt + 1 < HISTORY_PRUNE_CONFLICT_RETRIES =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("history prune retry loop always returns")
+    }
+}
+
+impl HoltMetadataStore {
+    fn commit_independent_batch_fenced(
+        &self,
+        commands: &[MetadataCommand],
+    ) -> Vec<Result<CommitResult, MetadataError>> {
         let mut results = vec![None; commands.len()];
         let mut pending = Vec::new();
         for (index, command) in commands.iter().cloned().enumerate() {
@@ -417,9 +945,9 @@ impl MetadataStore for HoltMetadataStore {
             match self.prepare_command(&command) {
                 Ok(PreparedCommand::DedupeHit(result)) => results[index] = Some(Ok(result)),
                 Ok(PreparedCommand::Planned(plan)) => {
-                    if plan.snapshot_retention_delta != 0 {
+                    if !plan.history_retention_delta.is_zero() || plan.adds_history_retention {
                         self.commit_pending_batch(&mut pending, &mut results);
-                        results[index] = Some(self.commit_planned_command(command, plan));
+                        results[index] = Some(self.commit_planned_command_fenced(command, plan));
                     } else {
                         pending.push(PendingPlannedCommand {
                             index,
@@ -444,42 +972,40 @@ impl MetadataStore for HoltMetadataStore {
             .collect()
     }
 
-    fn commit_metadata(&self, command: MetadataCommand) -> Result<CommitResult, MetadataError> {
+    fn commit_metadata_fenced(
+        &self,
+        command: MetadataCommand,
+    ) -> Result<CommitResult, MetadataError> {
         match self.prepare_command(&command)? {
             PreparedCommand::DedupeHit(result) => Ok(result),
-            PreparedCommand::Planned(plan) => self.commit_planned_command(command, plan),
+            PreparedCommand::Planned(plan) => self.commit_planned_command_fenced(command, plan),
         }
     }
 
-    fn committed_request_result(
-        &self,
-        request_id: &[u8],
-    ) -> Result<Option<CommitResult>, MetadataError> {
-        self.current_tree(RecordFamily::CommandDedupe)?
-            .get(request_id)
-            .map_err(to_backend_error)?
-            .as_deref()
-            .map(decode_dedupe_result)
-            .transpose()
-    }
-
-    fn prune_history(
+    fn prune_history_once(
         &self,
         request: HistoryPruneRequest,
     ) -> Result<HistoryPruneOutcome, MetadataError> {
+        self.ensure_history_key_index()?;
         let remove_limit = if request.limit == 0 {
             usize::MAX
         } else {
             request.limit
         };
         let history = self.history_tree()?;
+        let index = self.history_key_index_tree()?;
         let mut outcome = HistoryPruneOutcome::default();
-        let mut keys_to_remove = Vec::new();
+        let mut records_to_remove = Vec::new();
         let mut current_prefix = Vec::new();
         let mut kept_anchor_below_floor = false;
 
         for entry in history.range() {
-            let RangeEntry::Key { key, value, .. } = entry.map_err(to_backend_error)? else {
+            let RangeEntry::Key {
+                key,
+                value,
+                version: record_version,
+            } = entry.map_err(to_backend_error)?
+            else {
                 continue;
             };
             let prefix = history_user_prefix(&key)?;
@@ -504,19 +1030,18 @@ impl MetadataStore for HoltMetadataStore {
                 Some(_) => true,
             };
             if remove {
-                keys_to_remove.push(key);
-                if keys_to_remove.len() >= remove_limit {
+                records_to_remove.push((key, record_version));
+                if records_to_remove.len() >= remove_limit {
                     break;
                 }
             }
         }
 
-        outcome.removed = self.delete_history_keys(&history, &keys_to_remove)?;
+        outcome.removed =
+            self.delete_history_records_and_update_index(&history, &index, &records_to_remove)?;
         Ok(outcome)
     }
-}
 
-impl HoltMetadataStore {
     fn prepare_command(&self, command: &MetadataCommand) -> Result<PreparedCommand, MetadataError> {
         command.validate()?;
         if let Some(result) = self.dedupe_result(&command.request_id)? {
@@ -559,7 +1084,7 @@ impl HoltMetadataStore {
             }
             Ok(None) => {
                 for item in batch {
-                    results[item.index] = Some(self.commit_metadata(item.command));
+                    results[item.index] = Some(self.commit_metadata_fenced(item.command));
                 }
             }
             Err(err) => {
@@ -575,6 +1100,7 @@ impl HoltMetadataStore {
         batch_items: &[PendingPlannedCommand],
     ) -> Result<Option<Vec<CommitResult>>, MetadataError> {
         self.ensure_metadata_trees()?;
+        self.ensure_history_key_index()?;
         let stats = batch_items
             .iter()
             .map(|item| planned_command_stats(&item.command, &item.plan))
@@ -682,7 +1208,8 @@ impl HoltMetadataStore {
         }
 
         let retain_history = self.has_active_history_retention();
-        let snapshot_retention_delta = self.snapshot_retention_delta(&mutations)?;
+        let (history_retention_delta, adds_history_retention) =
+            self.history_retention_delta(&mutations)?;
         let mut history_records = Vec::new();
         if retain_history {
             for planned in &mutations {
@@ -709,16 +1236,27 @@ impl HoltMetadataStore {
             version_guards,
             prefix_empty_guards,
             retain_history,
-            snapshot_retention_delta,
+            history_retention_delta,
+            adds_history_retention,
         })
     }
 
-    fn commit_planned_command(
+    fn commit_planned_command_fenced(
         &self,
         command: MetadataCommand,
         plan: CommandPlan,
     ) -> Result<CommitResult, MetadataError> {
+        if plan.adds_history_retention
+            && command.read_version.get()
+                < self
+                    .history_retention
+                    .max_applied_commit_version
+                    .load(Ordering::Acquire)
+        {
+            return Err(MetadataError::PredicateFailed);
+        }
         self.ensure_metadata_trees()?;
+        self.ensure_history_key_index()?;
         let stats = planned_command_stats(&command, &plan);
         let atomic_start = Instant::now();
         let committed = self
@@ -736,12 +1274,23 @@ impl HoltMetadataStore {
             return Err(MetadataError::PredicateFailed);
         }
 
+        #[cfg(test)]
+        if plan.adds_history_retention {
+            self.history_retention
+                .run_after_retention_apply_before_state_hook();
+        }
         self.record_committed_stats(&stats);
         Ok(stats.result)
     }
 
     fn record_committed_stats(&self, stats: &PlannedCommandStats) {
-        self.apply_snapshot_retention_delta(stats.snapshot_retention_delta);
+        self.history_retention
+            .apply_delta(stats.history_retention_delta);
+        if stats.advances_history_version {
+            self.history_retention
+                .max_applied_commit_version
+                .fetch_max(stats.result.commit_version.get(), Ordering::AcqRel);
+        }
         self.stats.commit_total.fetch_add(1, Ordering::Relaxed);
         self.stats
             .predicate_total
@@ -766,60 +1315,148 @@ impl HoltMetadataStore {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn snapshot_retention_delta(
+    fn history_retention_delta(
         &self,
         mutations: &[PlannedMutation],
-    ) -> Result<i64, MetadataError> {
-        let mut delta = 0_i64;
+    ) -> Result<(HistoryRetentionDelta, bool), MetadataError> {
+        let mut final_states = Vec::<(RecordFamily, Vec<u8>, bool)>::new();
         for planned in mutations
             .iter()
-            .filter(|planned| planned.mutation.family == RecordFamily::Snapshot)
+            .filter(|planned| is_history_retention_family(planned.mutation.family))
         {
-            let old_active = self
-                .current_record(RecordFamily::Snapshot, &planned.mutation.key)?
-                .is_some_and(|record| record.value.is_some());
             let new_active = planned.mutation.op == MutationOp::Put;
-            delta += i64::from(new_active) - i64::from(old_active);
+            if let Some((_, _, active)) = final_states.iter_mut().find(|(family, key, _)| {
+                *family == planned.mutation.family
+                    && key.as_slice() == planned.mutation.key.as_slice()
+            }) {
+                *active = new_active;
+            } else {
+                final_states.push((
+                    planned.mutation.family,
+                    planned.mutation.key.clone(),
+                    new_active,
+                ));
+            }
         }
-        Ok(delta)
+
+        let mut delta = HistoryRetentionDelta::default();
+        let mut adds_history_retention = false;
+        for (family, key, new_active) in final_states {
+            let old_active = self
+                .current_record(family, &key)?
+                .is_some_and(|record| record.value.is_some());
+            adds_history_retention |= !old_active && new_active;
+            let family_delta = i64::from(new_active) - i64::from(old_active);
+            match family {
+                RecordFamily::Snapshot => delta.snapshot_pins += family_delta,
+                RecordFamily::ForkBinding => delta.fork_bindings += family_delta,
+                _ => unreachable!("retention family filter accepts only durable holds"),
+            }
+        }
+        Ok((delta, adds_history_retention))
     }
 
     fn has_active_history_retention(&self) -> bool {
-        self.active_snapshot_pins.load(Ordering::Relaxed) > 0
+        self.history_retention.has_active_hold()
     }
 
-    fn apply_snapshot_retention_delta(&self, delta: i64) {
-        if delta > 0 {
-            self.active_snapshot_pins
-                .fetch_add(delta as u64, Ordering::Relaxed);
-            return;
-        }
-        if delta < 0 {
-            let decrement = delta.unsigned_abs();
-            let _ = self.active_snapshot_pins.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(decrement)),
-            );
-        }
-    }
-
-    fn delete_history_keys(
+    fn delete_history_records_and_update_index(
         &self,
         history: &Tree,
-        keys: &[Vec<u8>],
+        index: &Tree,
+        records: &[(Vec<u8>, RecordVersion)],
     ) -> Result<usize, MetadataError> {
-        if keys.is_empty() {
+        if records.is_empty() {
             return Ok(0);
         }
-        history
+
+        let plan = self.plan_history_record_deletion(history, index, records)?;
+        self.apply_history_record_deletion(&plan)?;
+        Ok(plan.records.len())
+    }
+
+    fn plan_history_record_deletion(
+        &self,
+        history: &Tree,
+        index: &Tree,
+        records: &[(Vec<u8>, RecordVersion)],
+    ) -> Result<HistoryPruneDeletePlan, MetadataError> {
+        let removed_keys = records
+            .iter()
+            .map(|(key, _)| key.as_slice())
+            .collect::<HashSet<_>>();
+        let affected_prefixes = records
+            .iter()
+            .map(|(key, _)| history_user_prefix(key).map(Vec::from))
+            .collect::<Result<HashSet<_>, _>>()?;
+        let mut index_updates = Vec::with_capacity(affected_prefixes.len());
+        for history_prefix in affected_prefixes {
+            let index_key = history_index_key_from_user_prefix(&history_prefix)?;
+            let index_record = index
+                .get_record(&index_key)
+                .map_err(to_backend_error)?
+                .ok_or_else(|| {
+                    MetadataError::Backend(
+                        "history index is missing a retained history key".to_owned(),
+                    )
+                })?;
+            let mut latest_retained = None::<u64>;
+            for entry in history.range().prefix(&history_prefix) {
+                let RangeEntry::Key { key, value, .. } = entry.map_err(to_backend_error)? else {
+                    continue;
+                };
+                if removed_keys.contains(key.as_slice()) {
+                    continue;
+                }
+                let (version, _) = decode_current_value(&value)?;
+                latest_retained =
+                    Some(latest_retained.map_or(version.get(), |latest| latest.max(version.get())));
+            }
+            index_updates.push(HistoryIndexPruneUpdate {
+                key: index_key,
+                record_version: index_record.version,
+                latest_retained,
+            });
+        }
+
+        Ok(HistoryPruneDeletePlan {
+            records: records.to_vec(),
+            index_updates,
+        })
+    }
+
+    fn apply_history_record_deletion(
+        &self,
+        plan: &HistoryPruneDeletePlan,
+    ) -> Result<(), MetadataError> {
+        let committed = self
+            .db
             .atomic(|batch| {
-                for key in keys {
-                    batch.delete(key);
+                for (key, version) in &plan.records {
+                    batch.delete_if_version(HISTORY_TREE, key, *version);
+                }
+                for update in &plan.index_updates {
+                    if let Some(latest_retained) = update.latest_retained {
+                        batch.compare_and_put(
+                            HISTORY_KEY_INDEX_TREE,
+                            &update.key,
+                            update.record_version,
+                            &latest_retained.to_be_bytes(),
+                        );
+                    } else {
+                        batch.delete_if_version(
+                            HISTORY_KEY_INDEX_TREE,
+                            &update.key,
+                            update.record_version,
+                        );
+                    }
                 }
             })
             .map_err(to_backend_error)?;
-        Ok(keys.len())
+        if !committed {
+            return Err(MetadataError::PredicateFailed);
+        }
+        Ok(())
     }
 }
 
@@ -899,14 +1536,23 @@ impl HoltMetadataStoreCounters {
     }
 }
 
-fn count_active_snapshot_pins(db: &DB) -> Result<u64, MetadataError> {
-    let snapshot = match db.open_tree(SNAPSHOT_CURRENT_TREE) {
-        Ok(snapshot) => snapshot,
+fn recover_history_retention_state(
+    db: &DB,
+) -> Result<RecoveredHistoryRetentionState, MetadataError> {
+    Ok(RecoveredHistoryRetentionState {
+        active_snapshot_pins: count_active_records(db, SNAPSHOT_CURRENT_TREE)?,
+        active_fork_bindings: count_active_records(db, FORK_BINDING_CURRENT_TREE)?,
+    })
+}
+
+fn count_active_records(db: &DB, tree_name: &str) -> Result<u64, MetadataError> {
+    let tree = match db.open_tree(tree_name) {
+        Ok(tree) => tree,
         Err(HoltError::TreeNotFound { .. }) => return Ok(0),
         Err(err) => return Err(to_backend_error(err)),
     };
     let mut total = 0_u64;
-    for entry in snapshot.range() {
+    for entry in tree.range() {
         let RangeEntry::Key { value, .. } = entry.map_err(to_backend_error)? else {
             continue;
         };
@@ -915,6 +1561,23 @@ fn count_active_snapshot_pins(db: &DB) -> Result<u64, MetadataError> {
         }
     }
     Ok(total)
+}
+
+fn is_history_retention_family(family: RecordFamily) -> bool {
+    matches!(family, RecordFamily::Snapshot | RecordFamily::ForkBinding)
+}
+
+fn command_mutates_history_retention(command: &MetadataCommand) -> bool {
+    command
+        .mutations
+        .iter()
+        .any(|mutation| is_history_retention_family(mutation.family))
+}
+
+fn command_advances_history_version(command: &MetadataCommand) -> bool {
+    command.mutations.iter().any(|mutation| {
+        family_requires_history(mutation.family) && !is_history_retention_family(mutation.family)
+    })
 }
 
 fn read_visible(
@@ -977,7 +1640,8 @@ fn planned_command_stats(command: &MetadataCommand, plan: &CommandPlan) -> Plann
             .count() as u64,
         history_write_count: plan.history_records.len() as u64 + history_tombstone_count,
         watch_write_count: command.watch.len() as u64,
-        snapshot_retention_delta: plan.snapshot_retention_delta,
+        history_retention_delta: plan.history_retention_delta,
+        advances_history_version: command_advances_history_version(command),
         result,
         dedupe_result,
     }
@@ -996,6 +1660,11 @@ fn enqueue_planned_command(
                 &history_key(*family, key, old_version.get()),
                 current,
             );
+            batch.put(
+                HISTORY_KEY_INDEX_TREE,
+                &history_index_key(*family, key),
+                &old_version.get().to_be_bytes(),
+            );
         }
     }
     for planned in &plan.mutations {
@@ -1011,6 +1680,11 @@ fn enqueue_planned_command(
                     command.commit_version.get(),
                 ),
                 &encode_tombstone_value(command.commit_version),
+            );
+            batch.put(
+                HISTORY_KEY_INDEX_TREE,
+                &history_index_key(planned.mutation.family, &planned.mutation.key),
+                &command.commit_version.get().to_be_bytes(),
             );
         }
     }
@@ -1232,6 +1906,76 @@ fn push_visible_delimited_scan_item(
             returned: 0,
         }),
     }
+}
+
+fn next_current_candidate(
+    iterator: &mut impl Iterator<Item = Result<RangeEntry, HoltError>>,
+) -> Result<Option<CurrentScanCandidate>, MetadataError> {
+    for entry in iterator {
+        if let RangeEntry::Key { key, value, .. } = entry.map_err(to_backend_error)? {
+            return Ok(Some((key, value)));
+        }
+    }
+    Ok(None)
+}
+
+fn next_history_index_candidate(
+    family: RecordFamily,
+    iterator: &mut impl Iterator<Item = Result<RangeEntry, HoltError>>,
+) -> Result<Option<Vec<u8>>, MetadataError> {
+    for entry in iterator {
+        if let RangeEntry::Key { key, .. } = entry.map_err(to_backend_error)? {
+            return history_index_user_key(family, &key).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn history_index_key_from_record_key(history_record_key: &[u8]) -> Result<Vec<u8>, MetadataError> {
+    let user_prefix = history_user_prefix(history_record_key)?;
+    history_index_key_from_user_prefix(user_prefix)
+}
+
+fn history_index_key_from_user_prefix(user_prefix: &[u8]) -> Result<Vec<u8>, MetadataError> {
+    if user_prefix.len() < 5 {
+        return Err(MetadataError::Backend(
+            "history key has a truncated family/user-key header".to_owned(),
+        ));
+    }
+    let user_key_len = u32::from_be_bytes(
+        user_prefix[1..5]
+            .try_into()
+            .expect("history user-key length has fixed width"),
+    ) as usize;
+    if user_prefix.len() != 5 + user_key_len {
+        return Err(MetadataError::Backend(
+            "history key user-key length does not match its payload".to_owned(),
+        ));
+    }
+    let mut out = Vec::with_capacity(1 + user_key_len);
+    out.push(user_prefix[0]);
+    out.extend_from_slice(&user_prefix[5..]);
+    Ok(out)
+}
+
+fn history_index_user_key(
+    family: RecordFamily,
+    index_key: &[u8],
+) -> Result<Vec<u8>, MetadataError> {
+    let expected_prefix = history_index_prefix(family, &[]);
+    let Some(user_key) = index_key.strip_prefix(expected_prefix.as_slice()) else {
+        return Err(MetadataError::Backend(
+            "history index key belongs to the wrong record family".to_owned(),
+        ));
+    };
+    Ok(user_key.to_vec())
+}
+
+fn decode_history_index_version(encoded: &[u8]) -> Result<u64, MetadataError> {
+    let bytes: [u8; 8] = encoded
+        .try_into()
+        .map_err(|_| MetadataError::Backend("history index version is malformed".to_owned()))?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 fn to_backend_error(err: impl std::fmt::Display) -> MetadataError {

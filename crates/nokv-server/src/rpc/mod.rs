@@ -113,10 +113,15 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
                     .map(nokv_protocol::WireInodeAttr::from_inode_attr),
             })
         }
-        MetadataRpcRequest::GetAttrAtSnapshot { snapshot_id, inode } => {
-            let attr = slot
-                .service()
-                .get_attr_at_snapshot(snapshot_id, inode_id(inode)?)?;
+        MetadataRpcRequest::GetAttrAtSnapshot {
+            root_path,
+            snapshot_id,
+            path_components,
+        } => {
+            let path_components = dentry_components(path_components)?;
+            let attr =
+                slot.service()
+                    .get_attr_at_snapshot(&root_path, snapshot_id, &path_components)?;
             Ok(MetadataRpcResult::InodeAttr {
                 attr: attr
                     .as_ref()
@@ -138,13 +143,16 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
             Ok(MetadataRpcResult::DentryVersion { version })
         }
         MetadataRpcRequest::LookupPlusAtSnapshot {
+            root_path,
             snapshot_id,
-            parent,
+            parent_components,
             name,
         } => {
+            let parent_components = dentry_components(parent_components)?;
             let entry = slot.service().lookup_plus_at_snapshot(
+                &root_path,
                 snapshot_id,
-                inode_id(parent)?,
+                &parent_components,
                 &dentry_name(name)?,
             )?;
             Ok(MetadataRpcResult::Dentry {
@@ -188,12 +196,16 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
             })
         }
         MetadataRpcRequest::ReadDirPlusAtSnapshot {
+            root_path,
             snapshot_id,
-            parent,
+            path_components,
         } => {
-            let entries = slot
-                .service()
-                .read_dir_plus_at_snapshot(snapshot_id, inode_id(parent)?)?;
+            let path_components = dentry_components(path_components)?;
+            let entries = slot.service().read_dir_plus_at_snapshot(
+                &root_path,
+                snapshot_id,
+                &path_components,
+            )?;
             Ok(MetadataRpcResult::Dentries {
                 entries: entries.iter().map(wire_dentry).collect(),
             })
@@ -649,22 +661,25 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
                     .map(|entry| Box::new(wire_dentry(entry))),
             })
         }
-        MetadataRpcRequest::SnapshotSubtree { root } => {
-            let snapshot = slot.service().snapshot_subtree(inode_id(root)?)?;
-            Ok(MetadataRpcResult::Snapshot {
-                snapshot: nokv_protocol::WireSnapshotPin::from_snapshot_pin(&snapshot),
-            })
-        }
-        MetadataRpcRequest::SnapshotPin { snapshot_id } => {
-            let snapshot = slot.service().snapshot_pin(snapshot_id)?;
+        MetadataRpcRequest::SnapshotPin {
+            root_path,
+            snapshot_id,
+        } => {
+            let snapshot = slot.service().snapshot_pin_path(&root_path, snapshot_id)?;
             Ok(MetadataRpcResult::SnapshotPin {
                 snapshot: snapshot
                     .as_ref()
                     .map(nokv_protocol::WireSnapshotPin::from_snapshot_pin),
+                server_now_ms: slot.service().now_ms(),
             })
         }
-        MetadataRpcRequest::SnapshotSubtreePath { path } => {
-            let snapshot = slot.service().snapshot_subtree_path(&path)?;
+        MetadataRpcRequest::SnapshotSubtreePath {
+            root_path,
+            lease_ms,
+        } => {
+            let snapshot = slot
+                .service()
+                .snapshot_subtree_path_with_lease(&root_path, lease_ms)?;
             Ok(MetadataRpcResult::Snapshot {
                 snapshot: nokv_protocol::WireSnapshotPin::from_snapshot_pin(&snapshot),
             })
@@ -692,30 +707,83 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
                 .rollback_subtree_path(&target_path, snapshot_id)?;
             Ok(MetadataRpcResult::Unit)
         }
-        MetadataRpcRequest::StatPathAtSnapshot { snapshot_id, path } => {
-            let metadata = slot.service().stat_path_at_snapshot(snapshot_id, &path)?;
+        MetadataRpcRequest::StatPathAtSnapshot {
+            root_path,
+            snapshot_id,
+            path,
+        } => {
+            let metadata = slot
+                .service()
+                .stat_path_at_snapshot(&root_path, snapshot_id, &path)?;
             Ok(MetadataRpcResult::PathMetadata {
                 metadata: metadata.as_ref().map(WirePathMetadata::from_path_metadata),
             })
         }
-        MetadataRpcRequest::ReadDirPlusPathAtSnapshot { snapshot_id, path } => {
-            let entries = slot
-                .service()
-                .read_dir_plus_path_at_snapshot(snapshot_id, &path)?;
+        MetadataRpcRequest::ReadDirPlusPathAtSnapshot {
+            root_path,
+            snapshot_id,
+            path,
+        } => {
+            let entries =
+                slot.service()
+                    .read_dir_plus_path_at_snapshot(&root_path, snapshot_id, &path)?;
             Ok(MetadataRpcResult::Dentries {
                 entries: entries.iter().map(wire_dentry).collect(),
             })
         }
-        MetadataRpcRequest::RetireSnapshot { snapshot_id } => {
-            let retired = slot.service().retire_snapshot(snapshot_id)?;
+        MetadataRpcRequest::ReadDirPlusPathAtSnapshotPage {
+            root_path,
+            snapshot_id,
+            path,
+            after_name_hex,
+            limit,
+        } => {
+            let after = after_name_hex
+                .as_deref()
+                .map(decode_name_cursor)
+                .transpose()
+                .map_err(protocol_error)?;
+            let page = slot.service().read_dir_plus_path_at_snapshot_page(
+                &root_path,
+                snapshot_id,
+                &path,
+                after.as_ref(),
+                limit,
+            )?;
+            Ok(MetadataRpcResult::DentriesPage {
+                entries: page.entries.iter().map(wire_dentry).collect(),
+                next_name_hex: page.next_cursor.as_ref().map(encode_name_cursor),
+            })
+        }
+        MetadataRpcRequest::RetireSnapshot {
+            root_path,
+            snapshot_id,
+        } => {
+            let retired = slot
+                .service()
+                .retire_snapshot_path(&root_path, snapshot_id)?;
             Ok(MetadataRpcResult::RetiredSnapshot { retired })
         }
         MetadataRpcRequest::RenewSnapshot {
+            root_path,
             snapshot_id,
             lease_ms,
         } => {
-            let renewed = slot.service().renew_snapshot(snapshot_id, lease_ms)?;
-            Ok(MetadataRpcResult::RenewedSnapshot { renewed })
+            let outcome = slot
+                .service()
+                .renew_snapshot_path(&root_path, snapshot_id, lease_ms)?;
+            let outcome = match outcome {
+                nokv_meta::SnapshotRenewOutcome::Renewed { pin, extended } => {
+                    nokv_protocol::WireSnapshotRenewOutcome::Renewed {
+                        pin: nokv_protocol::WireSnapshotPin::from_snapshot_pin(&pin),
+                        extended,
+                    }
+                }
+                nokv_meta::SnapshotRenewOutcome::Missing { snapshot_id } => {
+                    nokv_protocol::WireSnapshotRenewOutcome::Missing { snapshot_id }
+                }
+            };
+            Ok(MetadataRpcResult::RenewedSnapshot { outcome })
         }
         MetadataRpcRequest::OpenPathReadPlan {
             path,
@@ -766,13 +834,18 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
                 plan: wire_body_read_plan(&plan),
             })
         }
-        MetadataRpcRequest::ReadArtifactPathAtSnapshot { snapshot_id, path } => {
-            let bytes = slot
-                .service()
-                .read_artifact_path_at_snapshot(snapshot_id, &path)?;
+        MetadataRpcRequest::ReadArtifactPathAtSnapshot {
+            root_path,
+            snapshot_id,
+            path,
+        } => {
+            let bytes =
+                slot.service()
+                    .read_artifact_path_at_snapshot(&root_path, snapshot_id, &path)?;
             Ok(MetadataRpcResult::FileBytes { bytes })
         }
         MetadataRpcRequest::ReadFilePathAtSnapshot {
+            root_path,
             snapshot_id,
             path,
             offset,
@@ -783,35 +856,52 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
                     "snapshot read length exceeds platform limit".to_owned(),
                 ))
             })?;
-            let bytes =
-                slot.service()
-                    .read_file_path_at_snapshot(snapshot_id, &path, offset, len)?;
+            let bytes = slot.service().read_file_path_at_snapshot(
+                &root_path,
+                snapshot_id,
+                &path,
+                offset,
+                len,
+            )?;
             Ok(MetadataRpcResult::FileBytes { bytes })
         }
         MetadataRpcRequest::ReadFileAtSnapshot {
+            root_path,
             snapshot_id,
-            inode,
+            path_components,
             offset,
             len,
         } => {
+            let path_components = dentry_components(path_components)?;
             let len = usize::try_from(len).map_err(|_| {
                 ServerError::Metadata(MetadError::Codec(
                     "snapshot read length exceeds platform limit".to_owned(),
                 ))
             })?;
-            let bytes =
-                slot.service()
-                    .read_file_at_snapshot(snapshot_id, inode_id(inode)?, offset, len)?;
+            let bytes = slot.service().read_file_at_snapshot(
+                &root_path,
+                snapshot_id,
+                &path_components,
+                offset,
+                len,
+            )?;
             Ok(MetadataRpcResult::FileBytes { bytes })
         }
         MetadataRpcRequest::ReadSymlink { inode } => {
             let bytes = slot.service().read_symlink(inode_id(inode)?)?;
             Ok(MetadataRpcResult::FileBytes { bytes })
         }
-        MetadataRpcRequest::ReadSymlinkAtSnapshot { snapshot_id, inode } => {
-            let bytes = slot
-                .service()
-                .read_symlink_at_snapshot(snapshot_id, inode_id(inode)?)?;
+        MetadataRpcRequest::ReadSymlinkAtSnapshot {
+            root_path,
+            snapshot_id,
+            path_components,
+        } => {
+            let path_components = dentry_components(path_components)?;
+            let bytes = slot.service().read_symlink_at_snapshot(
+                &root_path,
+                snapshot_id,
+                &path_components,
+            )?;
             Ok(MetadataRpcResult::FileBytes { bytes })
         }
         MetadataRpcRequest::PrepareArtifact {
@@ -943,6 +1033,10 @@ fn open_path_read_plan_request(
     })
 }
 
+fn dentry_components(components: Vec<String>) -> Result<Vec<nokv_types::DentryName>, MetadError> {
+    components.into_iter().map(dentry_name).collect()
+}
+
 fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
     match request {
         MetadataRpcRequest::Batch { requests } => requests.iter().any(refreshes_metadata_view),
@@ -967,6 +1061,7 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::ReadPage { .. }
         | MetadataRpcRequest::StatPathAtSnapshot { .. }
         | MetadataRpcRequest::ReadDirPlusPathAtSnapshot { .. }
+        | MetadataRpcRequest::ReadDirPlusPathAtSnapshotPage { .. }
         | MetadataRpcRequest::ReadFileAtSnapshot { .. }
         | MetadataRpcRequest::ReadFilePathAtSnapshot { .. }
         | MetadataRpcRequest::ReadSymlink { .. }
@@ -1005,7 +1100,6 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::RenamePath { .. }
         | MetadataRpcRequest::RenameReplace { .. }
         | MetadataRpcRequest::RenameReplacePath { .. }
-        | MetadataRpcRequest::SnapshotSubtree { .. }
         | MetadataRpcRequest::SnapshotSubtreePath { .. }
         | MetadataRpcRequest::CloneSubtreePath { .. }
         | MetadataRpcRequest::RollbackSubtreePath { .. }

@@ -33,6 +33,10 @@ pub(crate) fn rpc_name(name: &DentryName) -> Result<String, ClientError> {
         .map_err(|_| ClientError::InvalidName("metadata rpc requires utf-8 names".to_owned()))
 }
 
+pub(crate) fn rpc_components(components: &[DentryName]) -> Result<Vec<String>, ClientError> {
+    components.iter().map(rpc_name).collect()
+}
+
 pub(crate) fn update_attr_to_wire(changes: UpdateAttr) -> WireUpdateAttr {
     WireUpdateAttr {
         mode: changes.mode,
@@ -258,6 +262,44 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
             dest_shard,
         }),
         WireMetadataError::GraftPoint => ClientError::Metadata(nokv_meta::MetadError::GraftPoint),
+        WireMetadataError::SnapshotLeaseExpired {
+            snapshot_id,
+            lease_expires_unix_ms,
+            now_ms,
+        } => ClientError::Metadata(nokv_meta::MetadError::SnapshotLeaseExpired {
+            snapshot_id,
+            lease_expires_unix_ms,
+            now_ms,
+        }),
+        WireMetadataError::SnapshotRootMismatch {
+            snapshot_id,
+            expected_root,
+            actual_root,
+            actual_shard,
+        } => match (
+            InodeId::new(expected_root),
+            actual_root.map(InodeId::new).transpose(),
+        ) {
+            (Ok(expected_root), Ok(actual_root)) => {
+                ClientError::Metadata(nokv_meta::MetadError::SnapshotRootMismatch {
+                    snapshot_id,
+                    expected_root,
+                    actual_root,
+                    actual_shard,
+                })
+            }
+            _ => ClientError::Protocol("snapshot root error carries an invalid inode".to_owned()),
+        },
+        WireMetadataError::SnapshotBindingChanged { root_path } => {
+            ClientError::Metadata(nokv_meta::MetadError::SnapshotBindingChanged { root_path })
+        }
+        WireMetadataError::SnapshotRenewContended {
+            snapshot_id,
+            attempts,
+        } => ClientError::Metadata(nokv_meta::MetadError::SnapshotRenewContended {
+            snapshot_id,
+            attempts,
+        }),
         WireMetadataError::SyncLogArchiveFailed { committed, message } => {
             ClientError::Metadata(nokv_meta::MetadError::SyncLogArchiveFailed {
                 committed,

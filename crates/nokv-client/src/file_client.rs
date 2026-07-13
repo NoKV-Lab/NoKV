@@ -366,19 +366,26 @@ where
         self.read_entry(path, &entry, 0, file_len(entry.attr.size)?)
     }
 
-    pub fn cat_snapshot(&self, snapshot_id: u64, path: &str) -> Result<Vec<u8>, ClientError> {
-        self.metadata.read_artifact_at_snapshot(snapshot_id, path)
+    pub fn cat_snapshot(
+        &self,
+        root_path: &str,
+        snapshot_id: u64,
+        path: &str,
+    ) -> Result<Vec<u8>, ClientError> {
+        self.metadata
+            .read_artifact_at_snapshot(root_path, snapshot_id, path)
     }
 
     pub fn read_snapshot(
         &self,
+        root_path: &str,
         snapshot_id: u64,
         path: &str,
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, ClientError> {
         self.metadata
-            .read_file_path_at_snapshot(snapshot_id, path, offset, len)
+            .read_file_path_at_snapshot(root_path, snapshot_id, path, offset, len)
     }
 
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, ClientError> {

@@ -14,6 +14,7 @@ mod command;
 mod fsck;
 mod gc;
 mod lifecycle;
+mod live_test_barrier;
 mod lock;
 mod log_archive;
 mod log_sync;
@@ -376,6 +377,7 @@ pub struct MetadataServiceStats {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PendingObjectCleanupOutcome {
+    pub snapshot_reap: SnapshotReapOutcome,
     pub scanned: usize,
     pub blocked_by_snapshots: usize,
     pub blocked_by_read_leases: usize,
@@ -383,6 +385,20 @@ pub struct PendingObjectCleanupOutcome {
     pub deleted: usize,
     pub missing: usize,
     pub records_removed: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotRenewOutcome {
+    Renewed { pin: SnapshotPin, extended: bool },
+    Missing { snapshot_id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotReapOutcome {
+    pub scanned: usize,
+    pub expired_candidates: usize,
+    pub reaped: usize,
+    pub conflicted: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -468,6 +484,7 @@ pub enum XattrSetMode {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum MetadError {
     Model(ModelError),
     Metadata(MetadataError),
@@ -532,6 +549,24 @@ pub enum MetadError {
     /// point), NOT `EXDEV` — there is no copy+unlink fallback that would be
     /// correct here.
     GraftPoint,
+    SnapshotLeaseExpired {
+        snapshot_id: u64,
+        lease_expires_unix_ms: u64,
+        now_ms: u64,
+    },
+    SnapshotRootMismatch {
+        snapshot_id: u64,
+        expected_root: InodeId,
+        actual_root: Option<InodeId>,
+        actual_shard: u16,
+    },
+    SnapshotBindingChanged {
+        root_path: String,
+    },
+    SnapshotRenewContended {
+        snapshot_id: u64,
+        attempts: usize,
+    },
     /// The command was durably committed to the local engine, but archiving its
     /// logical-log segment failed, so durability could not be acknowledged.
     /// `committed` distinguishes "applied locally, not durable" from a plain
@@ -1517,6 +1552,42 @@ impl fmt::Display for MetadError {
             Self::GraftPoint => write!(
                 f,
                 "path is a cross-shard graft point; use unregister-graft"
+            ),
+            Self::SnapshotLeaseExpired {
+                snapshot_id,
+                lease_expires_unix_ms,
+                now_ms,
+            } => write!(
+                f,
+                "snapshot {snapshot_id} lease expired at {lease_expires_unix_ms}ms (now {now_ms}ms)"
+            ),
+            Self::SnapshotRootMismatch {
+                snapshot_id,
+                expected_root,
+                actual_root,
+                actual_shard,
+            } => match actual_root {
+                Some(actual_root) => write!(
+                    f,
+                    "snapshot {snapshot_id} belongs to root inode {} on shard {actual_shard}; request expected root inode {}",
+                    actual_root.get(),
+                    expected_root.get()
+                ),
+                None => write!(
+                    f,
+                    "snapshot {snapshot_id} belongs to shard {actual_shard}; request expected root inode {}",
+                    expected_root.get()
+                ),
+            },
+            Self::SnapshotBindingChanged { root_path } => {
+                write!(f, "snapshot root binding changed while resolving {root_path}")
+            }
+            Self::SnapshotRenewContended {
+                snapshot_id,
+                attempts,
+            } => write!(
+                f,
+                "snapshot {snapshot_id} renewal remained contended after {attempts} attempts"
             ),
             Self::SyncLogArchiveFailed { committed, message } => write!(
                 f,

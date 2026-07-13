@@ -631,12 +631,17 @@ impl Server {
             object.deleted += object_outcome.deleted;
             object.missing += object_outcome.missing;
             object.records_removed += object_outcome.records_removed;
+            object.snapshot_reap.scanned += object_outcome.snapshot_reap.scanned;
+            object.snapshot_reap.expired_candidates +=
+                object_outcome.snapshot_reap.expired_candidates;
+            object.snapshot_reap.reaped += object_outcome.snapshot_reap.reaped;
+            object.snapshot_reap.conflicted += object_outcome.snapshot_reap.conflicted;
             history.scanned += history_outcome.scanned;
             history.removed += history_outcome.removed;
             history.retained_by_snapshots += history_outcome.retained_by_snapshots;
         }
         Ok(format!(
-            r#"{{"object_gc":{{"scanned":{},"blocked_by_snapshots":{},"blocked_by_read_leases":{},"attempted":{},"deleted":{},"missing":{},"records_removed":{}}},"history_gc":{{"scanned":{},"removed":{},"retained_by_snapshots":{}}}}}
+            r#"{{"object_gc":{{"scanned":{},"blocked_by_snapshots":{},"blocked_by_read_leases":{},"attempted":{},"deleted":{},"missing":{},"records_removed":{},"snapshot_reap":{{"scanned":{},"expired_candidates":{},"reaped":{},"conflicted":{}}}}},"history_gc":{{"scanned":{},"removed":{},"retained_by_snapshots":{}}}}}
 "#,
             object.scanned,
             object.blocked_by_snapshots,
@@ -645,6 +650,10 @@ impl Server {
             object.deleted,
             object.missing,
             object.records_removed,
+            object.snapshot_reap.scanned,
+            object.snapshot_reap.expired_candidates,
+            object.snapshot_reap.reaped,
+            object.snapshot_reap.conflicted,
             history.scanned,
             history.removed,
             history.retained_by_snapshots,
@@ -1233,10 +1242,15 @@ fn restore_shard_owner_recovery_refs(
 }
 
 fn object_gc_json(state: &ObjectGcWorkerState) -> String {
+    let reap = state.snapshot_reap;
     format!(
-        "{{\"iterations\":{},\"last_error\":{}}}",
+        "{{\"iterations\":{},\"last_error\":{},\"snapshot_reap\":{{\"scanned\":{},\"expired_candidates\":{},\"reaped\":{},\"conflicted\":{}}}}}",
         state.iterations,
-        json_string_or_null(state.last_error.as_deref())
+        json_string_or_null(state.last_error.as_deref()),
+        reap.scanned,
+        reap.expired_candidates,
+        reap.reaped,
+        reap.conflicted,
     )
 }
 
@@ -1513,6 +1527,25 @@ pub(crate) mod tests {
         let body = server.run_manual_gc(128).unwrap();
         assert!(body.contains("\"object_gc\""));
         assert!(body.contains("\"history_gc\""));
+    }
+
+    #[test]
+    fn object_gc_health_keeps_cumulative_reaper_conflicts() {
+        let state = ObjectGcWorkerState {
+            iterations: 9,
+            last_outcome: Some(nokv_meta::PendingObjectCleanupOutcome::default()),
+            snapshot_reap: nokv_meta::SnapshotReapOutcome {
+                scanned: 12,
+                expired_candidates: 3,
+                reaped: 2,
+                conflicted: 1,
+            },
+            last_error: None,
+        };
+
+        let json = object_gc_json(&state);
+        assert!(json.contains("\"iterations\":9"));
+        assert!(json.contains("\"conflicted\":1"));
     }
 
     #[test]

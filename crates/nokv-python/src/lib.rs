@@ -1121,49 +1121,84 @@ impl PythonNoKvClient {
     fn snapshot_pin<'py>(
         &self,
         py: Python<'py>,
+        root_path: &str,
         snapshot_id: u64,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let pin = py
-            .detach(|| self.inner.metadata().snapshot_pin(snapshot_id))
+            .detach(|| self.inner.metadata().snapshot_pin(root_path, snapshot_id))
             .map_err(runtime_error)?;
         pin.map(|pin| snapshot_pin_to_py(py, &pin)).transpose()
     }
 
-    fn retire_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<bool> {
-        py.detach(|| self.inner.metadata().retire_snapshot(snapshot_id))
-            .map_err(runtime_error)
+    fn retire_snapshot(&self, py: Python<'_>, root_path: &str, snapshot_id: u64) -> PyResult<bool> {
+        py.detach(|| {
+            self.inner
+                .metadata()
+                .retire_snapshot(root_path, snapshot_id)
+        })
+        .map_err(runtime_error)
     }
 
-    fn renew_snapshot(&self, py: Python<'_>, snapshot_id: u64, lease_ms: u64) -> PyResult<bool> {
-        py.detach(|| self.inner.metadata().renew_snapshot(snapshot_id, lease_ms))
-            .map_err(runtime_error)
+    fn renew_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        root_path: &str,
+        snapshot_id: u64,
+        lease_ms: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let outcome = py
+            .detach(|| {
+                self.inner
+                    .metadata()
+                    .renew_snapshot(root_path, snapshot_id, lease_ms)
+            })
+            .map_err(runtime_error)?;
+        let result = PyDict::new(py);
+        match outcome {
+            nokv_meta::SnapshotRenewOutcome::Renewed { pin, extended } => {
+                result.set_item("state", "renewed")?;
+                result.set_item("extended", extended)?;
+                result.set_item("pin", snapshot_pin_to_py(py, &pin)?)?;
+            }
+            nokv_meta::SnapshotRenewOutcome::Missing { snapshot_id } => {
+                result.set_item("state", "missing")?;
+                result.set_item("snapshot_id", snapshot_id)?;
+            }
+        }
+        Ok(result)
     }
 
     /// Read a whole file. With `snapshot_id` set, read it as of that subtree
     /// snapshot (reproducible reads against a pinned dataset version) — resolved
     /// through the snapshot's namespace via the path-based snapshot read.
-    #[pyo3(signature = (path, snapshot_id = None))]
+    #[pyo3(signature = (path, snapshot_id = None, snapshot_root_path = None))]
     fn cat<'py>(
         &self,
         py: Python<'py>,
         path: &str,
         snapshot_id: Option<u64>,
+        snapshot_root_path: Option<&str>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = py
             .detach(|| -> Result<Vec<u8>, nokv_client::ClientError> {
                 match snapshot_id {
                     Some(id) => {
+                        let root_path = snapshot_root_path.ok_or_else(|| {
+                            nokv_client::ClientError::Protocol(
+                                "snapshot_root_path is required with snapshot_id".to_owned(),
+                            )
+                        })?;
                         let metadata = self
                             .inner
                             .metadata()
-                            .stat_path_at_snapshot(id, path)?
+                            .stat_path_at_snapshot(root_path, id, path)?
                             .ok_or_else(|| nokv_client::ClientError::NotFound(path.to_owned()))?;
                         let size = usize::try_from(metadata.attr.size).map_err(|_| {
                             nokv_client::ClientError::Protocol(
                                 "artifact size exceeds usize".to_owned(),
                             )
                         })?;
-                        self.inner.read_snapshot(id, path, 0, size)
+                        self.inner.read_snapshot(root_path, id, path, 0, size)
                     }
                     None => self.inner.cat(path),
                 }

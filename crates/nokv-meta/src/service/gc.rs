@@ -27,8 +27,8 @@ where
     ) -> Result<PendingObjectCleanupOutcome, MetadError> {
         // Reap expired snapshot pins first so the retention floor reflects only
         // live snapshots before deciding what is reclaimable.
-        self.reclaim_expired_snapshot_pins(limit)?;
-        let now_ms = current_time_ms();
+        let snapshot_reap = self.reclaim_expired_snapshot_pins(limit)?;
+        let now_ms = self.now_ms();
         let grace_ms = duration_millis_u64(read_lease_grace);
         let version = self.read_version()?;
         let rows = self.metadata.scan(ScanRequest {
@@ -40,11 +40,15 @@ where
             purpose: ReadPurpose::UserStrong,
         })?;
         if rows.is_empty() {
-            return Ok(PendingObjectCleanupOutcome::default());
+            return Ok(PendingObjectCleanupOutcome {
+                snapshot_reap,
+                ..PendingObjectCleanupOutcome::default()
+            });
         }
         let retention_floor = self.history_retention_floor()?;
 
         let mut outcome = PendingObjectCleanupOutcome {
+            snapshot_reap,
             scanned: rows.len(),
             blocked_by_snapshots: 0,
             blocked_by_read_leases: 0,
@@ -105,10 +109,24 @@ where
     }
 
     pub fn cleanup_history(&self, limit: usize) -> Result<HistoryPruneOutcome, MetadError> {
-        let retain_from = self.history_retention_floor()?;
-        self.metadata
-            .prune_history(HistoryPruneRequest { retain_from, limit })
-            .map_err(Into::into)
+        const RETENTION_RETRIES: usize = 8;
+        for attempt in 0..RETENTION_RETRIES {
+            let before = self.metadata.history_retention_epoch()?;
+            let retain_from = self.history_retention_floor()?;
+            let after = self.metadata.history_retention_epoch()?;
+            if before != after {
+                continue;
+            }
+            match self.metadata.prune_history(HistoryPruneRequest {
+                retain_from,
+                retention_epoch: after,
+                limit,
+            }) {
+                Err(MetadataError::PredicateFailed) if attempt + 1 < RETENTION_RETRIES => continue,
+                result => return result.map_err(Into::into),
+            }
+        }
+        Err(MetadError::Metadata(MetadataError::PredicateFailed))
     }
 
     /// Whether `object_key` was minted by this `(inode, generation)` and is thus
@@ -142,7 +160,7 @@ where
             limit: 0,
             purpose: ReadPurpose::UserStrong,
         })?;
-        let now_ms = current_time_ms();
+        let now_ms = self.now_ms();
         let mut floor: Option<Version> = None;
         for row in rows {
             let pin = decode_snapshot_pin(&row.value.0)
@@ -159,12 +177,17 @@ where
         Ok(floor)
     }
 
-    /// Delete pin records whose lease has expired, returning the number reaped.
+    /// Delete pin records whose lease has expired. Every delete is fenced by the
+    /// record version observed by the scan, so an old reaper pass cannot remove
+    /// a pin that changed after it was selected.
     /// Expired pins already stop holding the retention floor (see
     /// [`Self::history_retention_floor`]); this removes their records so they do
     /// not accumulate.
-    pub(super) fn reclaim_expired_snapshot_pins(&self, limit: usize) -> Result<usize, MetadError> {
-        let now_ms = current_time_ms();
+    pub fn reclaim_expired_snapshot_pins(
+        &self,
+        limit: usize,
+    ) -> Result<SnapshotReapOutcome, MetadError> {
+        let now_ms = self.now_ms();
         let rows = self.metadata.scan(ScanRequest {
             family: RecordFamily::Snapshot,
             prefix: snapshot_pin_prefix(self.mount),
@@ -173,20 +196,34 @@ where
             limit,
             purpose: ReadPurpose::UserStrong,
         })?;
+        let scanned = rows.len();
         let mut expired = Vec::new();
         for row in rows {
             let pin = decode_snapshot_pin(&row.value.0)
                 .map_err(|err| MetadError::Codec(err.to_string()))?;
             if now_ms >= pin.lease_expires_unix_ms {
-                expired.push(row.key);
+                expired.push((row.key, row.version, pin.snapshot_id));
             }
         }
+        let mut outcome = SnapshotReapOutcome {
+            scanned,
+            expired_candidates: expired.len(),
+            reaped: 0,
+            conflicted: 0,
+        };
         if expired.is_empty() {
-            return Ok(0);
+            return Ok(outcome);
         }
-        let removed = expired.len();
+        for (_, _, snapshot_id) in &expired {
+            live_test_barrier::snapshot(*snapshot_id, "reaper-scan")?;
+        }
+
+        // Common case: one atomic command removes the whole expired page. If a
+        // single candidate changed after the scan, the command is all-or-none;
+        // fall back to the same version-fenced delete per candidate so one hot
+        // pin cannot block unrelated expired pins.
         let commit_version = self.next_version()?;
-        self.commit_metadata(MetadataCommand {
+        let batch = MetadataCommand {
             request_id: request_id(
                 b"reclaim-expired-pins",
                 self.mount,
@@ -198,14 +235,105 @@ where
             commit_version,
             primary_family: RecordFamily::Snapshot,
             primary_key: snapshot_pin_prefix(self.mount),
-            predicates: Vec::new(),
+            predicates: expired
+                .iter()
+                .map(|(key, version, _)| PredicateRef {
+                    family: RecordFamily::Snapshot,
+                    key: key.clone(),
+                    predicate: Predicate::VersionEquals(*version),
+                })
+                .collect(),
             mutations: expired
-                .into_iter()
-                .map(|key| delete_mutation(RecordFamily::Snapshot, key))
+                .iter()
+                .map(|(key, _, _)| delete_mutation(RecordFamily::Snapshot, key.clone()))
                 .collect(),
             watch: Vec::new(),
-        })?;
-        Ok(removed)
+        };
+        match self.commit_metadata(batch) {
+            Ok(_) => {
+                outcome.reaped = expired.len();
+                return Ok(outcome);
+            }
+            Err(MetadError::Metadata(MetadataError::PredicateFailed)) => {}
+            Err(MetadError::SyncLogArchiveFailed {
+                committed: true, ..
+            }) => {
+                // Atomic apply completed. Reconcile rather than issuing a
+                // second delete under a different request id.
+                for (key, _, _) in &expired {
+                    if self
+                        .metadata
+                        .get(
+                            RecordFamily::Snapshot,
+                            key,
+                            self.read_version()?,
+                            ReadPurpose::UserStrong,
+                        )?
+                        .is_none()
+                    {
+                        outcome.reaped += 1;
+                    } else {
+                        outcome.conflicted += 1;
+                    }
+                }
+                return Ok(outcome);
+            }
+            Err(err) => return Err(err),
+        }
+
+        for (key, scanned_version, _) in expired {
+            let commit_version = self.next_version()?;
+            let command = MetadataCommand {
+                request_id: request_id(
+                    b"reclaim-expired-pin",
+                    self.mount,
+                    InodeId::root(),
+                    commit_version,
+                ),
+                kind: CommandKind::RetireSnapshot,
+                read_version: predecessor(commit_version)?,
+                commit_version,
+                primary_family: RecordFamily::Snapshot,
+                primary_key: key.clone(),
+                predicates: vec![PredicateRef {
+                    family: RecordFamily::Snapshot,
+                    key: key.clone(),
+                    predicate: Predicate::VersionEquals(scanned_version),
+                }],
+                mutations: vec![delete_mutation(RecordFamily::Snapshot, key.clone())],
+                watch: Vec::new(),
+            };
+            match self.commit_metadata(command) {
+                Ok(_) => outcome.reaped += 1,
+                Err(MetadError::Metadata(MetadataError::PredicateFailed)) => {
+                    outcome.conflicted += 1;
+                }
+                Err(MetadError::SyncLogArchiveFailed {
+                    committed: true, ..
+                }) => {
+                    if self
+                        .metadata
+                        .get(
+                            RecordFamily::Snapshot,
+                            &key,
+                            self.read_version()?,
+                            ReadPurpose::UserStrong,
+                        )?
+                        .is_none()
+                    {
+                        outcome.reaped += 1;
+                    } else {
+                        outcome.conflicted += 1;
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        debug_assert_eq!(
+            outcome.reaped + outcome.conflicted,
+            outcome.expired_candidates
+        );
+        Ok(outcome)
     }
 
     pub(super) fn chunk_manifest_delete_and_gc_mutations(

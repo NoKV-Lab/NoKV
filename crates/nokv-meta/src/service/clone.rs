@@ -6,19 +6,6 @@ struct CloneFrame {
     dst_inode: InodeId,
 }
 
-/// How [`NoKvFs::materialize_subtree_at`] enumerates a directory at a read version.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DirListing {
-    /// Plain current-tree dentry scan. Correct when nothing has been deleted since
-    /// the read version (clone of the current state).
-    Live,
-    /// Current-tree scan plus reconstruction of entries that were live at the read
-    /// version but deleted afterward. Needed to roll back to a prior snapshot, since
-    /// a delete hard-removes the dentry from the current tree and a current-tree scan
-    /// can no longer see it (point reads still find it via retained history).
-    Snapshot,
-}
-
 impl<M, O> NoKvFs<M, O>
 where
     M: MetadataStore,
@@ -52,9 +39,7 @@ where
         // shared base objects are GC-protected from the moment the fork exists.
         let pin = self.snapshot_subtree(src_root)?;
         let version = Version::new(pin.read_version)?;
-        // A clone copies the *current* state, where nothing has been deleted since
-        // the version it reads, so a plain dentry scan enumerates every child.
-        let dst_root = self.materialize_subtree_at(src_root, version, DirListing::Live)?;
+        let dst_root = self.materialize_subtree_at(src_root, version)?;
         Ok(CloneHandle {
             root: dst_root,
             snapshot_id: pin.snapshot_id,
@@ -80,16 +65,13 @@ where
     /// `read_version`), otherwise the source blocks the new manifests borrow could be
     /// reclaimed out from under it.
     ///
-    /// `listing` selects how each directory is enumerated at `read_version`.
-    /// [`DirListing::Live`] is a plain current-tree dentry scan; use it when nothing
-    /// could have been deleted since `read_version` (clone). [`DirListing::Snapshot`]
-    /// additionally reconstructs entries that existed at `read_version` but were
-    /// deleted afterward (rollback), which a current-tree scan alone cannot surface.
+    /// Snapshot-aware metadata scans merge current keys with the derived retained-
+    /// history key index, so deleted entries are enumerated without a whole-history
+    /// scan or a second point-read reconstruction pass.
     pub(super) fn materialize_subtree_at(
         &self,
         src_root: InodeId,
         read_version: Version,
-        listing: DirListing,
     ) -> Result<InodeId, MetadError> {
         let Some(src_attr) =
             self.get_attr_at_version_for_purpose(src_root, read_version, ReadPurpose::Snapshot)?
@@ -121,7 +103,7 @@ where
             dst_inode: dst_root,
         }];
         while let Some(frame) = queue.pop() {
-            let children = self.list_dir_at_version(frame.src_inode, read_version, listing)?;
+            let children = self.list_dir_at_version(frame.src_inode, read_version)?;
             if !children.is_empty() {
                 let mut sub_frames =
                     self.clone_children_into(frame.dst_inode, &children, read_version)?;
@@ -132,69 +114,13 @@ where
         Ok(dst_root)
     }
 
-    /// Enumerate the children of `dir` at `version` according to `listing`.
+    /// Enumerate the children of `dir` at `version` through snapshot-aware scan.
     fn list_dir_at_version(
         &self,
         dir: InodeId,
         version: Version,
-        listing: DirListing,
     ) -> Result<Vec<DentryWithAttr>, MetadError> {
-        let mut entries =
-            self.read_dir_plus_at_version_for_purpose(dir, version, ReadPurpose::Snapshot)?;
-        if listing == DirListing::Live {
-            return Ok(entries);
-        }
-        let mut present: HashSet<Vec<u8>> = entries
-            .iter()
-            .map(|entry| entry.dentry.name.as_bytes().to_vec())
-            .collect();
-        for name in self.deleted_child_names(dir)? {
-            if !present.insert(name.as_bytes().to_vec()) {
-                continue;
-            }
-            if let Some((entry, _)) =
-                self.lookup_plus_at_version_for_purpose(dir, &name, version, ReadPurpose::Snapshot)?
-            {
-                entries.push(entry);
-            }
-        }
-        Ok(entries)
-    }
-
-    /// Names that `dir` has ever parented according to the retained dentry history.
-    /// A delete hard-removes the dentry from the current tree, so an entry that was
-    /// live at a snapshot's read version but deleted afterward is invisible to a
-    /// current-tree scan; its identity survives only in history. The caller
-    /// re-validates each name with a point read at the target version, which both
-    /// confirms the entry was live then and rejects names created *after* the
-    /// snapshot (history is unfiltered by version here).
-    fn deleted_child_names(&self, dir: InodeId) -> Result<Vec<DentryName>, MetadError> {
-        let dir_prefix = dentry_prefix(self.mount, dir);
-        let mut names = Vec::new();
-        let mut seen = HashSet::new();
-        // History keys are `[family_tag][user_key_len: u32 BE][user_key][version]`.
-        for key in self.metadata.scan_keys(KeyScanRequest {
-            family: RecordFamily::History,
-            prefix: vec![dentry_family_tag()],
-            start_after: None,
-            limit: 0,
-            purpose: ReadPurpose::Snapshot,
-        })? {
-            let Some(user_key) = decode_dentry_history_user_key(&key) else {
-                continue;
-            };
-            let Some(name_bytes) = user_key.strip_prefix(dir_prefix.as_slice()) else {
-                continue;
-            };
-            if name_bytes.is_empty() || !seen.insert(name_bytes.to_vec()) {
-                continue;
-            }
-            let Ok(name) = DentryName::new(name_bytes.to_vec()) else {
-                continue;
-            };
-            names.push(name);
-        }
-        Ok(names)
+        self.read_dir_plus_at_version_for_purpose(dir, version, ReadPurpose::Snapshot)
     }
 
     /// Path variant of [`NoKvFs::clone_subtree`].
@@ -569,30 +495,6 @@ where
         }
         Ok(())
     }
-}
-
-fn dentry_family_tag() -> u8 {
-    crate::layout::family_tag(RecordFamily::Dentry)
-}
-
-/// Extract the original user key embedded in a dentry-family history key, which is
-/// laid out `[family_tag: 1][user_key_len: u32 BE][user_key][MAX-commit: u64]`.
-/// Returns `None` for keys that are not dentry history or are malformed.
-fn decode_dentry_history_user_key(key: &[u8]) -> Option<Vec<u8>> {
-    const TAG_LEN: usize = 1;
-    const LEN_LEN: usize = 4;
-    const VERSION_LEN: usize = 8;
-    if key.first().copied()? != dentry_family_tag() {
-        return None;
-    }
-    let len_bytes = key.get(TAG_LEN..TAG_LEN + LEN_LEN)?;
-    let user_key_len = u32::from_be_bytes(len_bytes.try_into().ok()?) as usize;
-    let user_key_start = TAG_LEN + LEN_LEN;
-    let user_key_end = user_key_start.checked_add(user_key_len)?;
-    if key.len() != user_key_end + VERSION_LEN {
-        return None;
-    }
-    Some(key[user_key_start..user_key_end].to_vec())
 }
 
 fn clone_command_kind(file_type: FileType) -> CommandKind {

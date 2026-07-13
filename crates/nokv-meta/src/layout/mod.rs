@@ -234,6 +234,23 @@ pub fn history_prefix(family: RecordFamily, user_key: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Key in the derived history candidate index.
+///
+/// Unlike [`history_key`], this key deliberately omits the user-key length and
+/// commit version. The dedicated index tree already separates it from history
+/// records, so `[family_tag][user_key]` preserves the user's lexical ordering
+/// and permits efficient prefix scans for snapshot directory enumeration.
+pub fn history_index_key(family: RecordFamily, user_key: &[u8]) -> Vec<u8> {
+    history_index_prefix(family, user_key)
+}
+
+pub fn history_index_prefix(family: RecordFamily, user_key_prefix: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + user_key_prefix.len());
+    out.push(family_tag(family));
+    out.extend_from_slice(user_key_prefix);
+    out
+}
+
 pub fn family_tag(family: RecordFamily) -> u8 {
     match family {
         RecordFamily::Mount => 1,
@@ -427,5 +444,18 @@ mod tests {
         let a = history_prefix(RecordFamily::Dentry, b"a");
         let aa = history_prefix(RecordFamily::Dentry, b"aa");
         assert!(!aa.starts_with(&a));
+    }
+
+    #[test]
+    fn history_index_key_preserves_family_local_user_prefix_order() {
+        let prefix = history_index_prefix(RecordFamily::Dentry, b"dir/");
+        let a = history_index_key(RecordFamily::Dentry, b"dir/a");
+        let b = history_index_key(RecordFamily::Dentry, b"dir/b");
+        let other = history_index_key(RecordFamily::Inode, b"dir/a");
+
+        assert!(a.starts_with(&prefix));
+        assert!(b.starts_with(&prefix));
+        assert!(a < b);
+        assert!(!other.starts_with(&prefix));
     }
 }

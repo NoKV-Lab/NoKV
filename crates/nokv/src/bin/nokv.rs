@@ -119,6 +119,7 @@ enum Command {
         options: MountCliOptions,
     },
     MountSnapshot {
+        root_path: String,
         snapshot_id: u64,
         mountpoint: PathBuf,
         options: MountCliOptions,
@@ -133,6 +134,7 @@ enum Command {
     Fsck,
     Snapshot {
         path: String,
+        lease_ms: u64,
     },
     Clone {
         src: String,
@@ -147,13 +149,16 @@ enum Command {
         snapshot_id: u64,
     },
     CatSnapshot {
+        root_path: String,
         snapshot_id: u64,
         path: String,
     },
     RetireSnapshot {
+        root_path: String,
         snapshot_id: u64,
     },
     RenewSnapshot {
+        root_path: String,
         snapshot_id: u64,
         lease_ms: u64,
     },
@@ -485,6 +490,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             mount.join().map_err(from_io)?;
         }
         Command::MountSnapshot {
+            root_path,
             snapshot_id,
             mountpoint,
             options,
@@ -492,7 +498,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             let metadata = open_mount_metadata(&config)?;
             let objects = config.object.open().map_err(from_object)?;
             let snapshot = metadata
-                .snapshot_pin(snapshot_id)
+                .snapshot_pin(&root_path, snapshot_id)
                 .map_err(from_client)?
                 .ok_or_else(|| CliError::Client(format!("snapshot {snapshot_id} not found")))?;
             let mount = nokv_fuse::spawn_mount_client(
@@ -535,15 +541,15 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             let body = control_get(&config, "/fsck")?;
             print!("{body}");
         }
-        Command::Snapshot { path } => {
+        Command::Snapshot { path, lease_ms } => {
             let client = open_client(&config)?;
             let snapshot = client
                 .metadata()
-                .snapshot_subtree_path(&path)
+                .snapshot_subtree_path_with_lease(&path, lease_ms)
                 .map_err(from_client)?;
             println!(
-                "snapshot {} id={} version={}",
-                path, snapshot.snapshot_id, snapshot.read_version
+                "snapshot {} id={} version={} lease_expires_unix_ms={}",
+                path, snapshot.snapshot_id, snapshot.read_version, snapshot.lease_expires_unix_ms
             );
         }
         Command::Clone { src, dst } => {
@@ -584,32 +590,40 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
                 .map_err(from_client)?;
             println!("rolled back {} to snapshot {}", path, snapshot_id);
         }
-        Command::CatSnapshot { snapshot_id, path } => {
+        Command::CatSnapshot {
+            root_path,
+            snapshot_id,
+            path,
+        } => {
             let client = open_client(&config)?;
             let bytes = client
-                .cat_snapshot(snapshot_id, &path)
+                .cat_snapshot(&root_path, snapshot_id, &path)
                 .map_err(from_client)?;
             io::stdout().write_all(&bytes).map_err(from_io)?;
         }
-        Command::RetireSnapshot { snapshot_id } => {
+        Command::RetireSnapshot {
+            root_path,
+            snapshot_id,
+        } => {
             let client = open_client(&config)?;
             let retired = client
                 .metadata()
-                .retire_snapshot(snapshot_id)
+                .retire_snapshot(&root_path, snapshot_id)
                 .map_err(from_client)?;
             println!("retired_snapshot id={} retired={}", snapshot_id, retired);
         }
         Command::RenewSnapshot {
+            root_path,
             snapshot_id,
             lease_ms,
         } => {
             let client = open_client(&config)?;
             let renewed = client
                 .metadata()
-                .renew_snapshot(snapshot_id, lease_ms)
+                .renew_snapshot(&root_path, snapshot_id, lease_ms)
                 .map_err(from_client)?;
             println!(
-                "renewed_snapshot id={} renewed={} lease_ms={}",
+                "renewed_snapshot id={} outcome={:?} lease_ms={}",
                 snapshot_id, renewed, lease_ms
             );
         }
@@ -1321,12 +1335,15 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             })
         }
         "mount-snapshot" => {
-            if args.len() < 3 {
-                return Err(CliError::MissingArgument("snapshot id and mountpoint"));
+            if args.len() < 4 {
+                return Err(CliError::MissingArgument(
+                    "snapshot root path, id, and mountpoint",
+                ));
             }
-            let (options, mountpoint) = parse_mount_args(args, 2, false)?;
+            let (options, mountpoint) = parse_mount_args(args, 3, false)?;
             Ok(Command::MountSnapshot {
-                snapshot_id: parse_u64(&args[1], "snapshot_id")?,
+                root_path: args[1].clone(),
+                snapshot_id: parse_u64(&args[2], "snapshot_id")?,
                 mountpoint,
                 options,
             })
@@ -1345,9 +1362,17 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             }),
             _ => Err(CliError::TooManyArguments),
         },
-        "snapshot" => exact_args(args, 2).map(|()| Command::Snapshot {
-            path: args[1].clone(),
-        }),
+        "snapshot" => match args.len() {
+            2 => Ok(Command::Snapshot {
+                path: args[1].clone(),
+                lease_ms: nokv_meta::DEFAULT_SNAPSHOT_LEASE_MS,
+            }),
+            3 => Ok(Command::Snapshot {
+                path: args[1].clone(),
+                lease_ms: parse_u64(&args[2], "lease_ms")?,
+            }),
+            _ => Err(CliError::TooManyArguments),
+        },
         "clone" => exact_args(args, 3).map(|()| Command::Clone {
             src: args[1].clone(),
             dst: args[2].clone(),
@@ -1364,26 +1389,30 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             })
         }
         "cat-snapshot" => {
-            exact_args(args, 3)?;
+            exact_args(args, 4)?;
             Ok(Command::CatSnapshot {
-                snapshot_id: parse_u64(&args[1], "snapshot_id")?,
-                path: args[2].clone(),
+                root_path: args[1].clone(),
+                snapshot_id: parse_u64(&args[2], "snapshot_id")?,
+                path: args[3].clone(),
             })
         }
         "retire-snapshot" => {
-            exact_args(args, 2)?;
+            exact_args(args, 3)?;
             Ok(Command::RetireSnapshot {
-                snapshot_id: parse_u64(&args[1], "snapshot_id")?,
+                root_path: args[1].clone(),
+                snapshot_id: parse_u64(&args[2], "snapshot_id")?,
             })
         }
         "renew-snapshot" => match args.len() {
-            2 => Ok(Command::RenewSnapshot {
-                snapshot_id: parse_u64(&args[1], "snapshot_id")?,
+            3 => Ok(Command::RenewSnapshot {
+                root_path: args[1].clone(),
+                snapshot_id: parse_u64(&args[2], "snapshot_id")?,
                 lease_ms: nokv_meta::DEFAULT_SNAPSHOT_LEASE_MS,
             }),
-            3 => Ok(Command::RenewSnapshot {
-                snapshot_id: parse_u64(&args[1], "snapshot_id")?,
-                lease_ms: parse_u64(&args[2], "lease_ms")?,
+            4 => Ok(Command::RenewSnapshot {
+                root_path: args[1].clone(),
+                snapshot_id: parse_u64(&args[2], "snapshot_id")?,
+                lease_ms: parse_u64(&args[3], "lease_ms")?,
             }),
             _ => Err(CliError::TooManyArguments),
         },
@@ -1685,9 +1714,9 @@ fn exact_args(args: &[String], expected: usize) -> Result<(), CliError> {
                 Some("register-graft") | Some("unregister-graft") => "prefix",
                 Some("put-artifact") => "path and source",
                 Some("snapshot") => "path",
-                Some("cat-snapshot") => "snapshot id and path",
-                Some("retire-snapshot") => "snapshot id",
-                Some("mount-snapshot") => "snapshot id and mountpoint",
+                Some("cat-snapshot") => "snapshot root path, id, and relative path",
+                Some("retire-snapshot") => "snapshot root path and id",
+                Some("mount-snapshot") => "snapshot root path, id, and mountpoint",
                 Some("rename") | Some("rename-replace") => "source and destination",
                 Some("clone") => "source and destination paths",
                 Some("diff") => "two paths",
@@ -1986,7 +2015,14 @@ where
                                                             nokv_agent::execute_agent_tool(
                                                                 &client, &call.name, &args,
                                                             )
-                                                            .map_err(|err| err.to_string())
+                                                            .map_err(|err| {
+                                                                json!({
+                                                                    "code": "AgentToolError",
+                                                                    "message": err.to_string(),
+                                                                    "retryable": false,
+                                                                    "details": {},
+                                                                })
+                                                            })
                                                         }
                                                         McpProfile::Workbench => {
                                                             workbench_mcp::execute_tool(
@@ -1997,7 +2033,7 @@ where
                                                                 &call.name,
                                                                 &args,
                                                             )
-                                                            .map_err(|err| err.to_string())
+                                                            .map_err(|err| err.as_value())
                                                         }
                                                     };
                                                     match tool_result {
@@ -2006,8 +2042,9 @@ where
                                                             "structuredContent": val,
                                                         })),
                                                         Err(err) => Ok(json!({
-                                                            "content": [{ "type": "text", "text": err.to_string() }],
-                                                            "isError": true
+                                                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&err).unwrap_or_default() }],
+                                                            "structuredContent": err,
+                                                            "isError": true,
                                                         })),
                                                     }
                                                 }
@@ -2061,20 +2098,20 @@ Usage:\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] rename SOURCE DESTINATION\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] rename-replace SOURCE DESTINATION\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount [--read-only] [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
-  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount-snapshot SNAPSHOT_ID [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mount-snapshot ROOT_PATH SNAPSHOT_ID [--no-kernel-cache] [--direct-io] [--entry-ttl-ms MS] [--attr-ttl-ms MS] [--writeback-cache] MOUNTPOINT\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] [--control-backend etcd] serve\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] mcp [--profile agent|workbench] [--workbench-root PATH] [--workbench-max-bytes BYTES]\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] backup\n\
   nokv [--meta PATH] [--object-backend s3|rustfs] [--mount ID] restore\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] fsck\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] gc [LIMIT]\n\
-  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] snapshot PATH\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] snapshot PATH [LEASE_MS]\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] clone SRC_PATH DST_PATH\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] diff PATH_A PATH_B\n\
   nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] rollback PATH SNAPSHOT_ID\n\
-  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] cat-snapshot SNAPSHOT_ID PATH\n\
-  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] retire-snapshot SNAPSHOT_ID\n\
-  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] renew-snapshot SNAPSHOT_ID [LEASE_MS]\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] cat-snapshot ROOT_PATH SNAPSHOT_ID RELATIVE_PATH\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] retire-snapshot ROOT_PATH SNAPSHOT_ID\n\
+  nokv [--server-bind ADDR] [--object-backend s3|rustfs] [--mount ID] renew-snapshot ROOT_PATH SNAPSHOT_ID [LEASE_MS]\n\
 \n\
 Object backends:\n\
   --object-backend s3|rustfs\n\
@@ -2725,6 +2762,7 @@ mod tests {
         );
         let (_config, command) = parse(vec![
             s("mount-snapshot"),
+            s("/runs"),
             s("42"),
             s("--direct-io"),
             s("/tmp/nokv-ro"),
@@ -2733,6 +2771,7 @@ mod tests {
         assert_eq!(
             command,
             Command::MountSnapshot {
+                root_path: s("/runs"),
                 snapshot_id: 42,
                 mountpoint: PathBuf::from("/tmp/nokv-ro"),
                 options: MountCliOptions {
@@ -2742,7 +2781,12 @@ mod tests {
             }
         );
         assert!(matches!(
-            parse(vec![s("mount-snapshot"), s("bad"), s("/tmp/nokv-ro")]),
+            parse(vec![
+                s("mount-snapshot"),
+                s("/runs"),
+                s("bad"),
+                s("/tmp/nokv-ro")
+            ]),
             Err(CliError::InvalidNumber {
                 field: "snapshot_id",
                 ..
@@ -2885,23 +2929,56 @@ mod tests {
     fn parse_snapshot_commands() {
         assert_eq!(
             parse(vec![s("snapshot"), s("/runs")]).unwrap().1,
-            Command::Snapshot { path: s("/runs") }
-        );
-        assert_eq!(
-            parse(vec![s("cat-snapshot"), s("42"), s("/runs/checkpoint")])
-                .unwrap()
-                .1,
-            Command::CatSnapshot {
-                snapshot_id: 42,
-                path: s("/runs/checkpoint")
+            Command::Snapshot {
+                path: s("/runs"),
+                lease_ms: nokv_meta::DEFAULT_SNAPSHOT_LEASE_MS,
             }
         );
         assert_eq!(
-            parse(vec![s("retire-snapshot"), s("42")]).unwrap().1,
-            Command::RetireSnapshot { snapshot_id: 42 }
+            parse(vec![s("snapshot"), s("/runs"), s("200")]).unwrap().1,
+            Command::Snapshot {
+                path: s("/runs"),
+                lease_ms: 200,
+            }
         );
         assert!(matches!(
-            parse(vec![s("cat-snapshot"), s("bad"), s("/runs/checkpoint")]),
+            parse(vec![s("snapshot"), s("/runs"), s("invalid")]),
+            Err(CliError::InvalidNumber {
+                field: "lease_ms",
+                ..
+            })
+        ));
+        assert_eq!(
+            parse(vec![
+                s("cat-snapshot"),
+                s("/runs"),
+                s("42"),
+                s("/checkpoint")
+            ])
+            .unwrap()
+            .1,
+            Command::CatSnapshot {
+                root_path: s("/runs"),
+                snapshot_id: 42,
+                path: s("/checkpoint")
+            }
+        );
+        assert_eq!(
+            parse(vec![s("retire-snapshot"), s("/runs"), s("42")])
+                .unwrap()
+                .1,
+            Command::RetireSnapshot {
+                root_path: s("/runs"),
+                snapshot_id: 42,
+            }
+        );
+        assert!(matches!(
+            parse(vec![
+                s("cat-snapshot"),
+                s("/runs"),
+                s("bad"),
+                s("/checkpoint")
+            ]),
             Err(CliError::InvalidNumber {
                 field: "snapshot_id",
                 ..
@@ -5086,6 +5163,105 @@ mod tests {
     }
 
     #[test]
+    fn workbench_mcp_snapshot_list_collapses_renew_events() {
+        let id = "ckpt-dedup-010";
+        let mut requests = commit_snapshot_prelude(id);
+        requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": id, "name": "handoff", "ttl_days": 1}),
+        ));
+        requests.push(workbench_tool_call(
+            5,
+            "workbench_snapshot_renew",
+            serde_json::json!({"id": id, "name": "handoff", "ttl_days": 5}),
+        ));
+        requests.push(workbench_tool_call(
+            6,
+            "workbench_snapshot_renew",
+            serde_json::json!({"id": id, "name": "handoff", "ttl_days": 30}),
+        ));
+        requests.push(workbench_tool_call(
+            7,
+            "workbench_snapshot_list",
+            serde_json::json!({"id": id}),
+        ));
+        let responses = run_shared_workbench_mcp_requests(requests);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+        let sid = responses[3]["result"]["structuredContent"]["snapshot_id"]
+            .as_u64()
+            .unwrap();
+        let list = &responses[6]["result"]["structuredContent"];
+        assert_eq!(list["checkpoint_count"], 1, "list: {list}");
+        let checkpoint = &list["checkpoints"][0];
+        assert_eq!(checkpoint["snapshot_id"], sid, "checkpoint: {checkpoint}");
+        assert_eq!(checkpoint["name"], "handoff", "checkpoint: {checkpoint}");
+        assert_eq!(checkpoint["renew_count"], 2, "checkpoint: {checkpoint}");
+        assert_eq!(checkpoint["state"], "alive", "checkpoint: {checkpoint}");
+        assert!(
+            checkpoint["server_now_ms"].as_u64().unwrap()
+                < checkpoint["live_lease_expires_unix_ms"].as_u64().unwrap(),
+            "checkpoint: {checkpoint}"
+        );
+        assert_eq!(
+            checkpoint["lease_expires_at"], checkpoint["live_lease_expires_unix_ms"],
+            "checkpoint: {checkpoint}"
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_rejects_foreign_snapshot_ids_with_typed_errors() {
+        let source_id = "ckpt-owner-source-012";
+        let target_id = "ckpt-owner-target-012";
+        let mut source_requests = commit_snapshot_prelude(source_id);
+        source_requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": source_id, "name": "owned", "ttl_days": 7}),
+        ));
+        let source = run_shared_workbench_mcp_requests(source_requests);
+        let snapshot_id = source[3]["result"]["structuredContent"]["snapshot_id"]
+            .as_u64()
+            .unwrap();
+
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": target_id})),
+            workbench_tool_call(
+                2,
+                "workbench_read",
+                serde_json::json!({
+                    "id": target_id,
+                    "section": "outputs",
+                    "path": "result.txt",
+                    "at_snapshot": snapshot_id,
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_snapshot_renew",
+                serde_json::json!({
+                    "id": target_id,
+                    "snapshot_id": snapshot_id,
+                    "ttl_days": 30,
+                }),
+            ),
+        ]);
+        assert_ne!(responses[0]["result"]["isError"], true);
+        for response in &responses[1..] {
+            assert_eq!(response["result"]["isError"], true, "response: {response}");
+            let error = &response["result"]["structuredContent"];
+            assert_eq!(error["code"], "SnapshotRootMismatch", "error: {error}");
+            assert_eq!(error["retryable"], false, "error: {error}");
+            assert_eq!(error["details"]["snapshot_id"], snapshot_id);
+        }
+    }
+
+    #[test]
     fn workbench_mcp_snapshot_renew_reports_reaped_snapshot() {
         let id = "ckpt-reaped-007";
         let mut requests = commit_snapshot_prelude(id);
@@ -5236,6 +5412,68 @@ mod tests {
         let frozen = &responses[1]["result"]["structuredContent"];
         assert_eq!(frozen["record_count"], 2);
         assert_eq!(frozen["items"][0]["value"]["text"], "one");
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_list_pages_with_opaque_cursor() {
+        let id = "ckpt-list-page-010";
+        let mut requests = vec![workbench_tool_call(
+            1,
+            "workbench_create",
+            serde_json::json!({"id": id}),
+        )];
+        for (request_id, name) in [(2, "a.txt"), (3, "b.txt"), (4, "c.txt")] {
+            requests.push(workbench_tool_call(
+                request_id,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": name, "text": name
+                }),
+            ));
+        }
+        requests.push(workbench_tool_call(
+            5,
+            "workbench_commit",
+            serde_json::json!({"id": id, "manifest": {"task": id}}),
+        ));
+        requests.push(workbench_tool_call(
+            6,
+            "workbench_snapshot",
+            serde_json::json!({"id": id, "name": "page"}),
+        ));
+        requests.push(workbench_tool_call(
+            7,
+            "workbench_list",
+            serde_json::json!({
+                "id": id, "section": "outputs", "at_snapshot": "page", "limit": 2
+            }),
+        ));
+        let first = run_shared_workbench_mcp_requests(requests);
+        let first_page = &first[6]["result"]["structuredContent"];
+        assert_ne!(first[6]["result"]["isError"], true, "{first_page}");
+        assert_eq!(first_page["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(first_page["entries"][0]["name"], "a.txt");
+        assert_eq!(first_page["entries"][1]["name"], "b.txt");
+        assert_eq!(first_page["truncated"], true);
+        let cursor = first_page["next_cursor"].as_str().unwrap();
+
+        let second = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            8,
+            "workbench_list",
+            serde_json::json!({
+                "id": id,
+                "section": "outputs",
+                "at_snapshot": "page",
+                "limit": 2,
+                "cursor": cursor
+            }),
+        )]);
+        let second_page = &second[0]["result"]["structuredContent"];
+        assert_ne!(second[0]["result"]["isError"], true, "{second_page}");
+        assert_eq!(second_page["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(second_page["entries"][0]["name"], "c.txt");
+        assert_eq!(second_page["truncated"], false);
+        assert!(second_page["next_cursor"].is_null());
     }
 
     #[test]

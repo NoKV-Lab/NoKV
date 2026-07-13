@@ -45,8 +45,9 @@ pub enum MetadataRpcRequest {
         inode: u64,
     },
     GetAttrAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
-        inode: u64,
+        path_components: Vec<String>,
     },
     LookupPlus {
         parent: u64,
@@ -57,8 +58,9 @@ pub enum MetadataRpcRequest {
         name: String,
     },
     LookupPlusAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
-        parent: u64,
+        parent_components: Vec<String>,
         name: String,
     },
     LookupPath {
@@ -76,8 +78,9 @@ pub enum MetadataRpcRequest {
         limit: usize,
     },
     ReadDirPlusAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
-        parent: u64,
+        path_components: Vec<String>,
     },
     ReadDirPlusPath {
         path: String,
@@ -270,14 +273,13 @@ pub enum MetadataRpcRequest {
         source: String,
         destination: String,
     },
-    SnapshotSubtree {
-        root: u64,
-    },
     SnapshotPin {
+        root_path: String,
         snapshot_id: u64,
     },
     SnapshotSubtreePath {
-        path: String,
+        root_path: String,
+        lease_ms: u64,
     },
     CloneSubtreePath {
         src_path: String,
@@ -292,22 +294,33 @@ pub enum MetadataRpcRequest {
         snapshot_id: u64,
     },
     StatPathAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
         path: String,
     },
     ReadDirPlusPathAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
         path: String,
     },
+    ReadDirPlusPathAtSnapshotPage {
+        root_path: String,
+        snapshot_id: u64,
+        path: String,
+        after_name_hex: Option<String>,
+        limit: usize,
+    },
     ReadFilePathAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
         path: String,
         offset: u64,
         len: u64,
     },
     ReadFileAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
-        inode: u64,
+        path_components: Vec<String>,
         offset: u64,
         len: u64,
     },
@@ -315,13 +328,16 @@ pub enum MetadataRpcRequest {
         inode: u64,
     },
     ReadSymlinkAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
-        inode: u64,
+        path_components: Vec<String>,
     },
     RetireSnapshot {
+        root_path: String,
         snapshot_id: u64,
     },
     RenewSnapshot {
+        root_path: String,
         snapshot_id: u64,
         lease_ms: u64,
     },
@@ -341,6 +357,7 @@ pub enum MetadataRpcRequest {
         len: u64,
     },
     ReadArtifactPathAtSnapshot {
+        root_path: String,
         snapshot_id: u64,
         path: String,
     },
@@ -452,6 +469,24 @@ pub enum WireMetadataError {
     /// The target dentry is a cross-shard graft point; remove/rename of it must
     /// go through the graft lifecycle. The client maps this to `EBUSY`.
     GraftPoint,
+    SnapshotLeaseExpired {
+        snapshot_id: u64,
+        lease_expires_unix_ms: u64,
+        now_ms: u64,
+    },
+    SnapshotRootMismatch {
+        snapshot_id: u64,
+        expected_root: u64,
+        actual_root: Option<u64>,
+        actual_shard: u16,
+    },
+    SnapshotBindingChanged {
+        root_path: String,
+    },
+    SnapshotRenewContended {
+        snapshot_id: u64,
+        attempts: usize,
+    },
     SyncLogArchiveFailed {
         committed: bool,
         message: String,
@@ -532,12 +567,13 @@ pub enum MetadataRpcResult {
     },
     SnapshotPin {
         snapshot: Option<WireSnapshotPin>,
+        server_now_ms: u64,
     },
     RetiredSnapshot {
         retired: bool,
     },
     RenewedSnapshot {
-        renewed: bool,
+        outcome: WireSnapshotRenewOutcome,
     },
     OpenPathReadPlan {
         metadata: WirePathMetadata,
@@ -1157,6 +1193,18 @@ pub struct WireSnapshotPin {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WireSnapshotRenewOutcome {
+    Renewed {
+        pin: WireSnapshotPin,
+        extended: bool,
+    },
+    Missing {
+        snapshot_id: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WireReadLease {
     pub inode: u64,
     pub generation: u64,
@@ -1580,9 +1628,9 @@ pub enum RoutingKey<'a> {
     Default,
 }
 
-/// The routing dimension a request carries. For variants that bundle both a
-/// `snapshot_id` and an inode/path, key on the inode/path (the snapshot id is
-/// shard-local and not a routing key on its own).
+/// The routing dimension a request carries. Every snapshot operation routes on
+/// its absolute `root_path`; the snapshot id is shard-local and never serves as
+/// a routing key on its own.
 pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
     match request {
         // Path-addressed operations route by longest-prefix match.
@@ -1594,17 +1642,28 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         | MetadataRpcRequest::CreateFilePath { path, .. }
         | MetadataRpcRequest::RemoveFilePath { path }
         | MetadataRpcRequest::RemoveEmptyDirPath { path }
-        | MetadataRpcRequest::SnapshotSubtreePath { path }
+        | MetadataRpcRequest::SnapshotSubtreePath {
+            root_path: path, ..
+        }
         | MetadataRpcRequest::ReadIndexedPathPage { path, .. }
         | MetadataRpcRequest::ReadDirPlusPathPage { path, .. }
         | MetadataRpcRequest::ReadPage { path, .. }
         | MetadataRpcRequest::ListPage { path, .. }
-        | MetadataRpcRequest::StatPathAtSnapshot { path, .. }
-        | MetadataRpcRequest::ReadDirPlusPathAtSnapshot { path, .. }
-        | MetadataRpcRequest::ReadFilePathAtSnapshot { path, .. }
-        | MetadataRpcRequest::ReadArtifactPathAtSnapshot { path, .. }
         | MetadataRpcRequest::OpenPathReadPlan { path, .. }
         | MetadataRpcRequest::PrepareArtifactPath { path, .. } => RoutingKey::Path(path),
+        MetadataRpcRequest::SnapshotPin { root_path, .. }
+        | MetadataRpcRequest::GetAttrAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::LookupPlusAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::ReadDirPlusAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::StatPathAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::ReadDirPlusPathAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::ReadDirPlusPathAtSnapshotPage { root_path, .. }
+        | MetadataRpcRequest::ReadFilePathAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::ReadFileAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::ReadSymlinkAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::ReadArtifactPathAtSnapshot { root_path, .. }
+        | MetadataRpcRequest::RetireSnapshot { root_path, .. }
+        | MetadataRpcRequest::RenewSnapshot { root_path, .. } => RoutingKey::Path(root_path),
         MetadataRpcRequest::CreateFilesInDirPath { parent_path, .. } => {
             RoutingKey::Path(parent_path)
         }
@@ -1631,7 +1690,6 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
 
         // Inode/parent-addressed operations route on the encoded shard index.
         MetadataRpcRequest::GetAttr { inode }
-        | MetadataRpcRequest::GetAttrAtSnapshot { inode, .. }
         | MetadataRpcRequest::SetXattr { inode, .. }
         | MetadataRpcRequest::GetXattr { inode, .. }
         | MetadataRpcRequest::ListXattr { inode }
@@ -1639,15 +1697,11 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         | MetadataRpcRequest::GetAdvisoryLock { inode, .. }
         | MetadataRpcRequest::SetAdvisoryLock { inode, .. }
         | MetadataRpcRequest::ReadBodyPlan { inode, .. }
-        | MetadataRpcRequest::ReadSymlink { inode }
-        | MetadataRpcRequest::ReadSymlinkAtSnapshot { inode, .. }
-        | MetadataRpcRequest::ReadFileAtSnapshot { inode, .. } => RoutingKey::Inode(*inode),
+        | MetadataRpcRequest::ReadSymlink { inode } => RoutingKey::Inode(*inode),
         MetadataRpcRequest::LookupPlus { parent, .. }
         | MetadataRpcRequest::CurrentDentryVersion { parent, .. }
-        | MetadataRpcRequest::LookupPlusAtSnapshot { parent, .. }
         | MetadataRpcRequest::ReadDirPlus { parent }
         | MetadataRpcRequest::ReadDirPlusPage { parent, .. }
-        | MetadataRpcRequest::ReadDirPlusAtSnapshot { parent, .. }
         | MetadataRpcRequest::CreateDir { parent, .. }
         | MetadataRpcRequest::CreateGraft { parent, .. }
         | MetadataRpcRequest::RemoveGraft { parent, .. }
@@ -1662,7 +1716,6 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         MetadataRpcRequest::Link { new_parent, .. } => RoutingKey::Inode(*new_parent),
         MetadataRpcRequest::Rename { parent, .. } => RoutingKey::Inode(*parent),
         MetadataRpcRequest::RenameReplace { parent, .. } => RoutingKey::Inode(*parent),
-        MetadataRpcRequest::SnapshotSubtree { root } => RoutingKey::Inode(*root),
         MetadataRpcRequest::PublishPreparedArtifact { prepared, .. } => {
             RoutingKey::Inode(prepared.parent)
         }
@@ -1673,10 +1726,7 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         // No addressable key: target the default/root shard.
         MetadataRpcRequest::Batch { .. }
         | MetadataRpcRequest::BootstrapRoot { .. }
-        | MetadataRpcRequest::UpdateRootAttrs { .. }
-        | MetadataRpcRequest::SnapshotPin { .. }
-        | MetadataRpcRequest::RetireSnapshot { .. }
-        | MetadataRpcRequest::RenewSnapshot { .. } => RoutingKey::Default,
+        | MetadataRpcRequest::UpdateRootAttrs { .. } => RoutingKey::Default,
     }
 }
 
@@ -1893,6 +1943,50 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_path_requests_route_on_the_absolute_root_binding() {
+        let stat = MetadataRpcRequest::StatPathAtSnapshot {
+            root_path: "/agents/scout/wb".to_owned(),
+            snapshot_id: 7,
+            path: "/outputs/result.txt".to_owned(),
+        };
+        assert!(matches!(
+            request_routing_key(&stat),
+            RoutingKey::Path("/agents/scout/wb")
+        ));
+
+        let renew = MetadataRpcRequest::RenewSnapshot {
+            root_path: "/agents/scout/wb".to_owned(),
+            snapshot_id: 7,
+            lease_ms: 60_000,
+        };
+        assert!(matches!(
+            request_routing_key(&renew),
+            RoutingKey::Path("/agents/scout/wb")
+        ));
+
+        let retire = MetadataRpcRequest::RetireSnapshot {
+            root_path: "/agents/scout/wb".to_owned(),
+            snapshot_id: 7,
+        };
+        assert!(matches!(
+            request_routing_key(&retire),
+            RoutingKey::Path("/agents/scout/wb")
+        ));
+
+        let inode_free_read = MetadataRpcRequest::ReadFileAtSnapshot {
+            root_path: "/agents/scout/wb".to_owned(),
+            snapshot_id: 7,
+            path_components: vec!["outputs".to_owned(), "result.txt".to_owned()],
+            offset: 0,
+            len: 16,
+        };
+        assert!(matches!(
+            request_routing_key(&inode_free_read),
+            RoutingKey::Path("/agents/scout/wb")
+        ));
+    }
+
+    #[test]
     fn binary_codec_round_trips_clone_and_diff_requests() {
         let clone = MetadataRpcRequest::CloneSubtreePath {
             src_path: "/base".to_owned(),
@@ -1912,10 +2006,29 @@ mod tests {
     #[test]
     fn binary_codec_round_trips_snapshot_and_rollback_requests() {
         let snapshot = MetadataRpcRequest::SnapshotSubtreePath {
-            path: "/base".to_owned(),
+            root_path: "/base".to_owned(),
+            lease_ms: 60_000,
         };
         let encoded = encode_request(&snapshot).unwrap();
         assert_eq!(decode_request(&encoded).unwrap(), snapshot);
+
+        let snapshot_page = MetadataRpcRequest::ReadDirPlusPathAtSnapshotPage {
+            root_path: "/base".to_owned(),
+            snapshot_id: 7,
+            path: "/outputs".to_owned(),
+            after_name_hex: Some("612e747874".to_owned()),
+            limit: 100,
+        };
+        let encoded = encode_request(&snapshot_page).unwrap();
+        assert_eq!(decode_request(&encoded).unwrap(), snapshot_page);
+
+        let component_read = MetadataRpcRequest::GetAttrAtSnapshot {
+            root_path: "/base".to_owned(),
+            snapshot_id: 7,
+            path_components: vec!["outputs".to_owned(), "result.txt".to_owned()],
+        };
+        let encoded = encode_request(&component_read).unwrap();
+        assert_eq!(decode_request(&encoded).unwrap(), component_read);
 
         let rollback = MetadataRpcRequest::RollbackSubtreePath {
             target_path: "/base".to_owned(),

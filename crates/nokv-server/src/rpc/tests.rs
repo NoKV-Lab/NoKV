@@ -349,16 +349,32 @@ fn rpc_supports_remote_fuse_inode_operations() {
     assert_eq!(special.attr.file_type, "char_device");
     assert_eq!(special.attr.rdev, 0x1234);
 
-    let snapshot = request_envelope(&server, MetadataRpcRequest::SnapshotSubtree { root: 1 });
+    let snapshot = request_envelope(
+        &server,
+        MetadataRpcRequest::SnapshotSubtreePath {
+            root_path: "/".to_owned(),
+            lease_ms: nokv_meta::DEFAULT_SNAPSHOT_LEASE_MS,
+        },
+    );
     let snapshot_id = match snapshot.result.unwrap() {
         MetadataRpcResult::Snapshot { snapshot } => snapshot.snapshot_id,
         other => panic!("unexpected snapshot result: {other:?}"),
     };
-    let pin = request_envelope(&server, MetadataRpcRequest::SnapshotPin { snapshot_id });
+    let pin = request_envelope(
+        &server,
+        MetadataRpcRequest::SnapshotPin {
+            root_path: "/".to_owned(),
+            snapshot_id,
+        },
+    );
     match pin.result.unwrap() {
         MetadataRpcResult::SnapshotPin {
             snapshot: Some(snapshot),
-        } => assert_eq!(snapshot.snapshot_id, snapshot_id),
+            server_now_ms,
+        } => {
+            assert_eq!(snapshot.snapshot_id, snapshot_id);
+            assert!(server_now_ms > 0);
+        }
         other => panic!("unexpected snapshot pin result: {other:?}"),
     }
 }
@@ -1401,10 +1417,16 @@ fn framed_rpc_client_reuses_peer_connection() {
 
     let client = FramedRpcClient::new(addr);
     let first = client
-        .call(&MetadataRpcRequest::RetireSnapshot { snapshot_id: 1 })
+        .call(&MetadataRpcRequest::RetireSnapshot {
+            root_path: "/".to_owned(),
+            snapshot_id: 1,
+        })
         .unwrap();
     let second = client
-        .call(&MetadataRpcRequest::RetireSnapshot { snapshot_id: 2 })
+        .call(&MetadataRpcRequest::RetireSnapshot {
+            root_path: "/".to_owned(),
+            snapshot_id: 2,
+        })
         .unwrap();
     assert!(first.ok);
     assert!(second.ok);
@@ -1830,7 +1852,8 @@ fn rpc_snapshot_then_rollback_restores_namespace_to_snapshot() {
     let snapshot = request_envelope(
         &server,
         MetadataRpcRequest::SnapshotSubtreePath {
-            path: "/base".to_owned(),
+            root_path: "/base".to_owned(),
+            lease_ms: nokv_meta::DEFAULT_SNAPSHOT_LEASE_MS,
         },
     );
     assert!(snapshot.ok, "unexpected snapshot error: {snapshot:?}");
@@ -2193,6 +2216,109 @@ mod multi_shard {
             DEFAULT_SHARD_INDEX,
             "a bare-inode request for a shard-0 inode routes to shard 0"
         );
+    }
+
+    #[test]
+    fn snapshot_path_lifecycle_routes_to_the_root_owning_shard() {
+        let (server, _control, _dir) = two_shard_server();
+        let dataset = create_dir_path(&server, "/dataset");
+        create_file_path(&server, "/dataset/checkpoint.bin");
+
+        let snapshot = request_envelope(
+            &server,
+            MetadataRpcRequest::SnapshotSubtreePath {
+                root_path: "/dataset".to_owned(),
+                lease_ms: 60_000,
+            },
+        );
+        let snapshot = match snapshot.result.unwrap() {
+            MetadataRpcResult::Snapshot { snapshot } => snapshot,
+            other => panic!("unexpected snapshot result: {other:?}"),
+        };
+        assert_eq!(
+            InodeId::new(snapshot.root).unwrap().shard_index(),
+            DATASET_INDEX
+        );
+
+        let renewed = request_envelope(
+            &server,
+            MetadataRpcRequest::RenewSnapshot {
+                root_path: "/dataset".to_owned(),
+                snapshot_id: snapshot.snapshot_id,
+                lease_ms: 120_000,
+            },
+        );
+        assert!(matches!(
+            renewed.result.unwrap(),
+            MetadataRpcResult::RenewedSnapshot {
+                outcome: nokv_protocol::WireSnapshotRenewOutcome::Renewed { .. }
+            }
+        ));
+
+        let stat = request_envelope(
+            &server,
+            MetadataRpcRequest::StatPathAtSnapshot {
+                root_path: "/dataset".to_owned(),
+                snapshot_id: snapshot.snapshot_id,
+                path: "/".to_owned(),
+            },
+        );
+        let stat = match stat.result.unwrap() {
+            MetadataRpcResult::PathMetadata {
+                metadata: Some(metadata),
+            } => metadata,
+            other => panic!("unexpected snapshot stat result: {other:?}"),
+        };
+        assert_eq!(stat.attr.inode, dataset.inode);
+    }
+
+    #[test]
+    fn swapped_snapshot_ids_across_shards_are_typed_root_mismatches() {
+        let (server, _control, _dir) = two_shard_server();
+        create_dir_path(&server, "/dataset");
+        create_dir_path(&server, "/other");
+
+        let mint = |root_path: &str| {
+            let envelope = request_envelope(
+                &server,
+                MetadataRpcRequest::SnapshotSubtreePath {
+                    root_path: root_path.to_owned(),
+                    lease_ms: 60_000,
+                },
+            );
+            match envelope.result.unwrap() {
+                MetadataRpcResult::Snapshot { snapshot } => snapshot,
+                other => panic!("unexpected snapshot result: {other:?}"),
+            }
+        };
+        let dataset = mint("/dataset");
+        let other = mint("/other");
+        assert_eq!(dataset.snapshot_id >> 48, u64::from(DATASET_INDEX));
+        assert_eq!(other.snapshot_id >> 48, u64::from(DEFAULT_SHARD_INDEX));
+
+        for (root_path, snapshot_id, foreign_shard) in [
+            ("/other", dataset.snapshot_id, DATASET_INDEX),
+            ("/dataset", other.snapshot_id, DEFAULT_SHARD_INDEX),
+        ] {
+            let envelope = request_envelope(
+                &server,
+                MetadataRpcRequest::StatPathAtSnapshot {
+                    root_path: root_path.to_owned(),
+                    snapshot_id,
+                    path: "/".to_owned(),
+                },
+            );
+            assert!(!envelope.ok);
+            assert!(matches!(
+                envelope.error_kind,
+                Some(WireMetadataError::SnapshotRootMismatch {
+                    snapshot_id: actual_id,
+                    actual_root: None,
+                    actual_shard,
+                    ..
+                }) if actual_id == snapshot_id && actual_shard == foreign_shard
+            ));
+        }
     }
 
     /// Per-shard MVCC independence: the two shards mint inodes from disjoint
