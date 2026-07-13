@@ -31,10 +31,24 @@ pub enum ControlError {
     ShardNotRegistered {
         shard_id: ShardId,
     },
+    /// A server requested a fresh start for a shard that has already held an
+    /// owner epoch. Its local disk cannot be assumed authoritative; recovery
+    /// must use the explicit failover path and a checkpoint archive.
+    FreshAcquireRequiresFailover {
+        shard_id: ShardId,
+        epoch: u64,
+    },
     StaleLease {
         shard_id: ShardId,
         epoch: u64,
         lease_id: u64,
+    },
+    /// A checkpoint/log publication would make the durable recovery identity
+    /// ambiguous or move one of its references behind the recorded durable
+    /// boundary. Reject it instead of allowing the last writer to win.
+    RecoveryPublicationConflict {
+        shard_id: ShardId,
+        reason: String,
     },
     InvalidOptions(String),
     Codec(String),
@@ -80,6 +94,12 @@ impl fmt::Display for ControlError {
                 "shard {} must be registered before it can be acquired",
                 shard_id.as_str()
             ),
+            Self::FreshAcquireRequiresFailover { shard_id, epoch } => write!(
+                f,
+                "shard {} has prior owner epoch {}; use explicit failover recovery",
+                shard_id.as_str(),
+                epoch
+            ),
             Self::StaleLease {
                 shard_id,
                 epoch,
@@ -90,6 +110,11 @@ impl fmt::Display for ControlError {
                 shard_id.as_str(),
                 epoch,
                 lease_id
+            ),
+            Self::RecoveryPublicationConflict { shard_id, reason } => write!(
+                f,
+                "recovery publication for shard {} conflicts with durable state: {reason}",
+                shard_id.as_str()
             ),
             Self::InvalidOptions(err) => write!(f, "invalid control store options: {err}"),
             Self::Codec(err) => write!(f, "control store codec error: {err}"),

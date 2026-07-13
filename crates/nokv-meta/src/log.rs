@@ -56,6 +56,7 @@ pub enum MetadataLogError {
     DigestMismatch,
     SegmentDigestMismatch,
     SegmentHeaderMismatch,
+    UnexpectedShard { expected: String, actual: String },
     ChainShardMismatch { previous: String, next: String },
     ChainLsnGap { previous: u64, next: u64 },
     ChainDigestMismatch,
@@ -282,15 +283,25 @@ impl MetadataLogSegment {
 }
 
 pub fn metadata_log_replay_entries(
+    expected_shard_id: &str,
     segments: &[MetadataLogSegment],
     checkpoint_lsn: u64,
     checkpoint_digest: [u8; 32],
 ) -> Result<Vec<MetadataLogEntry>, MetadataLogError> {
+    if expected_shard_id.is_empty() {
+        return Err(MetadataLogError::EmptyShardId);
+    }
     let mut previous_lsn = checkpoint_lsn;
     let mut previous_digest = checkpoint_digest;
     let mut out = Vec::new();
     for segment in segments {
         segment.verify_follows(previous_lsn, previous_digest)?;
+        if segment.shard_id != expected_shard_id {
+            return Err(MetadataLogError::UnexpectedShard {
+                expected: expected_shard_id.to_owned(),
+                actual: segment.shard_id.clone(),
+            });
+        }
         out.extend(segment.entries.iter().cloned());
         previous_lsn = segment.last_lsn;
         previous_digest = segment.last_digest;
@@ -835,6 +846,10 @@ impl fmt::Display for MetadataLogError {
             Self::DigestMismatch => write!(f, "metadata log digest mismatch"),
             Self::SegmentDigestMismatch => write!(f, "metadata log segment digest mismatch"),
             Self::SegmentHeaderMismatch => write!(f, "metadata log segment header mismatch"),
+            Self::UnexpectedShard { expected, actual } => write!(
+                f,
+                "metadata log belongs to shard {actual}, expected {expected}"
+            ),
             Self::ChainShardMismatch { previous, next } => {
                 write!(f, "metadata log shard changed from {previous} to {next}")
             }
@@ -1147,8 +1162,13 @@ mod tests {
         let left = MetadataLogSegment::seal(vec![first.clone(), second.clone()]).unwrap();
         let right = MetadataLogSegment::seal(vec![third.clone()]).unwrap();
 
-        let replay =
-            metadata_log_replay_entries(&[left, right], 0, METADATA_LOG_ZERO_DIGEST).unwrap();
+        let replay = metadata_log_replay_entries(
+            "mount-1:/runs",
+            &[left, right],
+            0,
+            METADATA_LOG_ZERO_DIGEST,
+        )
+        .unwrap();
 
         assert_eq!(replay, vec![first, second, third]);
     }
@@ -1159,11 +1179,28 @@ mod tests {
         let segment = MetadataLogSegment::seal(vec![first]).unwrap();
 
         assert!(matches!(
-            metadata_log_replay_entries(&[segment], 0, METADATA_LOG_ZERO_DIGEST),
+            metadata_log_replay_entries("mount-1:/runs", &[segment], 0, METADATA_LOG_ZERO_DIGEST,),
             Err(MetadataLogError::ChainLsnGap {
                 previous: 0,
                 next: 2
             })
+        ));
+    }
+
+    #[test]
+    fn replay_entries_reject_a_self_consistent_foreign_shard_chain() {
+        let first = entry(b"req-1", 7, 1, 11, METADATA_LOG_ZERO_DIGEST);
+        let segment = MetadataLogSegment::seal(vec![first]).unwrap();
+
+        assert!(matches!(
+            metadata_log_replay_entries(
+                "mount-1:/other",
+                &[segment],
+                0,
+                METADATA_LOG_ZERO_DIGEST,
+            ),
+            Err(MetadataLogError::UnexpectedShard { expected, actual })
+                if expected == "mount-1:/other" && actual == "mount-1:/runs"
         ));
     }
 }

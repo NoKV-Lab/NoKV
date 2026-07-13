@@ -17,9 +17,9 @@ struct HttpRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HttpResponse {
-    status: &'static str,
-    content_type: &'static str,
-    body: String,
+    pub(crate) status: &'static str,
+    pub(crate) content_type: &'static str,
+    pub(crate) body: String,
     keep_alive: bool,
 }
 
@@ -143,7 +143,12 @@ pub(crate) fn handle_parts(server: &Server, line: &str, _body: &[u8]) -> HttpRes
     let (path, query) = split_target(target);
     match (method, path) {
         ("GET", "/healthz") => HttpResponse::text("200 OK", "ok\n"),
-        ("GET", "/readyz") => HttpResponse::text("200 OK", "ready\n"),
+        ("GET", "/readyz") => match server.check_readiness() {
+            Ok(()) => HttpResponse::text("200 OK", "ready\n"),
+            Err(err) => {
+                HttpResponse::text("503 Service Unavailable", format!("not ready: {err}\n"))
+            }
+        },
         ("GET", "/stats") => HttpResponse::json("200 OK", server.stats_json()),
         ("GET", "/gc") | ("POST", "/gc") => {
             let limit = match gc_limit(query) {

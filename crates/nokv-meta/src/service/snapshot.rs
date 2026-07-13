@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::{decode_fork_binding, fork_binding_prefix};
 
 /// Default lease for a new snapshot pin: holders renew to keep it alive; an
 /// abandoned pin expires after this so a crashed client never blocks GC forever.
@@ -10,9 +11,16 @@ const SNAPSHOT_ID_LOCAL_BITS: u32 = u64::BITS - SNAPSHOT_ID_SHARD_BITS;
 const SNAPSHOT_ID_LOCAL_MASK: u64 = (1_u64 << SNAPSHOT_ID_LOCAL_BITS) - 1;
 
 #[derive(Clone, Debug)]
-struct VersionedSnapshotPin {
-    pin: SnapshotPin,
-    version: Version,
+pub(super) struct VersionedSnapshotPin {
+    pub(super) pin: SnapshotPin,
+    pub(super) version: Version,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct VersionedForkBinding {
+    pub(super) binding: ForkBinding,
+    pub(super) key: Vec<u8>,
+    pub(super) version: Version,
 }
 
 impl<M, O> NoKvFs<M, O>
@@ -30,6 +38,7 @@ where
         lease_ms: u64,
     ) -> Result<SnapshotPin, MetadError> {
         for attempt in 0..SNAPSHOT_MINT_MAX_ATTEMPTS {
+            let object_reference = self.begin_object_reference_mutation()?;
             let Some(attr) = self.get_attr_at_version_for_purpose(
                 root,
                 self.read_version()?,
@@ -69,6 +78,7 @@ where
                         key: key.clone(),
                         predicate: Predicate::NotExists,
                     },
+                    object_reference.predicate(self.mount),
                 ],
                 mutations: vec![Mutation {
                     family: RecordFamily::Snapshot,
@@ -100,6 +110,7 @@ where
         lease_ms: u64,
     ) -> Result<SnapshotPin, MetadError> {
         for attempt in 0..SNAPSHOT_MINT_MAX_ATTEMPTS {
+            let object_reference = self.begin_object_reference_mutation()?;
             let binding_version = self.read_version()?;
             let (root, mut predicates) =
                 self.resolve_snapshot_root_binding(path, binding_version)?;
@@ -125,6 +136,7 @@ where
                     key: key.clone(),
                     predicate: Predicate::NotExists,
                 },
+                object_reference.predicate(self.mount),
             ]);
             match self.commit_metadata(MetadataCommand {
                 request_id: request_id(b"snapshot-subtree-path", self.mount, root, created_version),
@@ -143,18 +155,6 @@ where
                 watch: Vec::new(),
             }) {
                 Ok(_) => return Ok(pin),
-                Err(MetadError::SyncLogArchiveFailed {
-                    committed: true, ..
-                }) => {
-                    let durable = self.snapshot_pin(pin.snapshot_id)?;
-                    if durable.as_ref() == Some(&pin) {
-                        return Ok(pin);
-                    }
-                    return Err(MetadError::Codec(format!(
-                        "snapshot {} reported committed without its durable pin",
-                        pin.snapshot_id
-                    )));
-                }
                 Err(MetadError::Metadata(MetadataError::PredicateFailed)) => {
                     if !self.snapshot_binding_predicates_match(&binding_predicates)? {
                         return Err(MetadError::SnapshotBindingChanged {
@@ -173,79 +173,184 @@ where
 
     #[cfg(test)]
     pub(crate) fn retire_snapshot(&self, snapshot_id: u64) -> Result<bool, MetadError> {
-        let key = snapshot_pin_key(self.mount, snapshot_id);
-        if self.snapshot_pin(snapshot_id)?.is_none() {
+        let _object_gc_gate = self
+            .object_gc_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let read_version = self.read_version()?;
+        let pin =
+            self.versioned_snapshot_pin_at(snapshot_id, read_version, ReadPurpose::UserStrong)?;
+        let bindings =
+            self.fork_bindings_for_snapshot_at(snapshot_id, read_version, ReadPurpose::UserStrong)?;
+        if pin.is_none() && bindings.is_empty() {
             return Ok(false);
         }
+        self.validate_snapshot_retention_roots(snapshot_id, pin.as_ref(), &bindings, None)?;
+        self.ensure_fork_bindings_releasable(&bindings, read_version)?;
+
+        let pin_key = snapshot_pin_key(self.mount, snapshot_id);
+        let mut predicates = Vec::with_capacity(usize::from(pin.is_some()) + bindings.len());
+        let mut mutations = Vec::with_capacity(predicates.capacity());
+        if let Some(versioned) = &pin {
+            predicates.push(PredicateRef {
+                family: RecordFamily::Snapshot,
+                key: pin_key.clone(),
+                predicate: Predicate::VersionEquals(versioned.version),
+            });
+            mutations.push(delete_mutation(RecordFamily::Snapshot, pin_key.clone()));
+        }
+        for binding in &bindings {
+            predicates.push(PredicateRef {
+                family: RecordFamily::ForkBinding,
+                key: binding.key.clone(),
+                predicate: Predicate::VersionEquals(binding.version),
+            });
+            mutations.push(delete_mutation(
+                RecordFamily::ForkBinding,
+                binding.key.clone(),
+            ));
+        }
+
+        let (primary_family, primary_key, request_inode) = if let Some(versioned) = &pin {
+            (RecordFamily::Snapshot, pin_key, versioned.pin.root)
+        } else {
+            let binding = bindings
+                .first()
+                .expect("retire has either a snapshot pin or fork binding");
+            (
+                RecordFamily::ForkBinding,
+                binding.key.clone(),
+                binding.binding.source_root,
+            )
+        };
         let version = self.next_version()?;
+        let retires_binding = !bindings.is_empty();
+        if retires_binding {
+            // A detached root becomes unbound at this CAS. Enter fail-closed
+            // mode before the commit so a committed-but-unacknowledged result
+            // cannot leave the healthy fast path enabled.
+            self.mark_materialization_orphan_possible_under_gc_gate();
+        }
         self.commit_metadata(MetadataCommand {
-            request_id: request_id(b"retire-snapshot", self.mount, InodeId::root(), version),
+            request_id: request_id(b"retire-snapshot", self.mount, request_inode, version),
             kind: CommandKind::RetireSnapshot,
             read_version: predecessor(version)?,
             commit_version: version,
-            primary_family: RecordFamily::Snapshot,
-            primary_key: key.clone(),
-            predicates: vec![PredicateRef {
-                family: RecordFamily::Snapshot,
-                key: key.clone(),
-                predicate: Predicate::Exists,
-            }],
-            mutations: vec![delete_mutation(RecordFamily::Snapshot, key)],
+            primary_family,
+            primary_key,
+            predicates,
+            mutations,
             watch: Vec::new(),
         })?;
+        if retires_binding {
+            let _ = self.reconcile_materialization_orphan_state_under_gc_gate();
+        }
         Ok(true)
     }
 
+    /// Retire a source snapshot and every durable fork binding derived from it.
+    ///
+    /// Clone bindings deliberately outlive the snapshot lease. Because the
+    /// retention floor is mount-global, retirement fails closed while any
+    /// reachable effective manifest under the mount root or a live detached
+    /// fork root still borrows blocks from another inode (including hardlinks,
+    /// renames, and rollback propagation).
+    /// `root_path` is resolved at retirement time, so a renamed source is
+    /// retired through its new path; if the source path has been deleted this
+    /// path-bound API leaves the binding retained.
     pub fn retire_snapshot_path(
         &self,
         root_path: &str,
         snapshot_id: u64,
     ) -> Result<bool, MetadError> {
+        let _object_gc_gate = self
+            .object_gc_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let read_version = self.read_version()?;
         let (expected_root, mut predicates) =
             self.resolve_snapshot_root_binding(root_path, read_version)?;
+        let binding_predicates = predicates.clone();
         self.ensure_snapshot_id_shard(snapshot_id, expected_root)?;
-        let Some(versioned) =
-            self.versioned_snapshot_pin_at(snapshot_id, read_version, ReadPurpose::UserStrong)?
-        else {
+        let pin =
+            self.versioned_snapshot_pin_at(snapshot_id, read_version, ReadPurpose::UserStrong)?;
+        let bindings =
+            self.fork_bindings_for_snapshot_at(snapshot_id, read_version, ReadPurpose::UserStrong)?;
+        if pin.is_none() && bindings.is_empty() {
             return Ok(false);
-        };
-        if versioned.pin.root != expected_root {
-            return Err(MetadError::SnapshotRootMismatch {
-                snapshot_id,
-                expected_root,
-                actual_root: Some(versioned.pin.root),
-                actual_shard: self.shard_index(),
-            });
         }
-        let key = snapshot_pin_key(self.mount, snapshot_id);
-        predicates.push(PredicateRef {
-            family: RecordFamily::Snapshot,
-            key: key.clone(),
-            predicate: Predicate::VersionEquals(versioned.version),
-        });
+        self.validate_snapshot_retention_roots(
+            snapshot_id,
+            pin.as_ref(),
+            &bindings,
+            Some(expected_root),
+        )?;
+        self.ensure_fork_bindings_releasable(&bindings, read_version)?;
+
+        let pin_key = snapshot_pin_key(self.mount, snapshot_id);
+        let mut mutations = Vec::with_capacity(usize::from(pin.is_some()) + bindings.len());
+        if let Some(versioned) = &pin {
+            predicates.push(PredicateRef {
+                family: RecordFamily::Snapshot,
+                key: pin_key.clone(),
+                predicate: Predicate::VersionEquals(versioned.version),
+            });
+            mutations.push(delete_mutation(RecordFamily::Snapshot, pin_key.clone()));
+        }
+        for binding in &bindings {
+            predicates.push(PredicateRef {
+                family: RecordFamily::ForkBinding,
+                key: binding.key.clone(),
+                predicate: Predicate::VersionEquals(binding.version),
+            });
+            mutations.push(delete_mutation(
+                RecordFamily::ForkBinding,
+                binding.key.clone(),
+            ));
+        }
+
+        let (primary_family, primary_key) = if pin.is_some() {
+            (RecordFamily::Snapshot, pin_key)
+        } else {
+            (
+                RecordFamily::ForkBinding,
+                bindings
+                    .first()
+                    .expect("retire has either a snapshot pin or fork binding")
+                    .key
+                    .clone(),
+            )
+        };
         let version = self.next_version()?;
+        let retires_binding = !bindings.is_empty();
+        if retires_binding {
+            self.mark_materialization_orphan_possible_under_gc_gate();
+        }
         match self.commit_metadata(MetadataCommand {
-            request_id: request_id(
-                b"retire-snapshot-path",
-                self.mount,
-                versioned.pin.root,
-                version,
-            ),
+            request_id: request_id(b"retire-snapshot-path", self.mount, expected_root, version),
             kind: CommandKind::RetireSnapshot,
             read_version: predecessor(version)?,
             commit_version: version,
-            primary_family: RecordFamily::Snapshot,
-            primary_key: key.clone(),
+            primary_family,
+            primary_key,
             predicates,
-            mutations: vec![delete_mutation(RecordFamily::Snapshot, key)],
+            mutations,
             watch: Vec::new(),
         }) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                if retires_binding {
+                    let _ = self.reconcile_materialization_orphan_state_under_gc_gate();
+                }
+                Ok(true)
+            }
             Err(MetadError::Metadata(MetadataError::PredicateFailed)) => {
-                Err(MetadError::SnapshotBindingChanged {
-                    root_path: root_path.to_owned(),
-                })
+                if !self.snapshot_binding_predicates_match(&binding_predicates)? {
+                    Err(MetadError::SnapshotBindingChanged {
+                        root_path: root_path.to_owned(),
+                    })
+                } else {
+                    Err(MetadError::Metadata(MetadataError::PredicateFailed))
+                }
             }
             Err(err) => Err(err),
         }
@@ -284,6 +389,10 @@ where
         let requested_expiry = self.now_ms().saturating_add(lease_ms);
         let key = snapshot_pin_key(self.mount, snapshot_id);
         for _attempt in 0..SNAPSHOT_RENEW_MAX_ATTEMPTS {
+            // Capture the durable Open epoch before this attempt reads the pin.
+            // If GC starts after the live check, the renew commit conflicts and
+            // the next attempt re-reads the pin and its current lease state.
+            let object_reference = self.begin_object_reference_mutation()?;
             let read_version = self.read_version()?;
             let (bound_root, mut binding_predicates) = match root_path {
                 Some(root_path) => {
@@ -334,6 +443,7 @@ where
                 key: key.clone(),
                 predicate: Predicate::VersionEquals(versioned.version),
             });
+            binding_predicates.push(object_reference.predicate(self.mount));
             let commit_version = self.next_version()?;
             let command = MetadataCommand {
                 request_id: request_id(b"renew-snapshot", self.mount, renewed.root, commit_version),
@@ -368,25 +478,6 @@ where
                     }
                     continue;
                 }
-                Err(MetadError::SyncLogArchiveFailed {
-                    committed: true,
-                    message,
-                }) => {
-                    let reconciled = self.snapshot_pin(snapshot_id)?;
-                    if let Some(pin) = reconciled {
-                        if pin.root == renewed.root && pin.lease_expires_unix_ms >= requested_expiry
-                        {
-                            return Ok(SnapshotRenewOutcome::Renewed {
-                                pin,
-                                extended: true,
-                            });
-                        }
-                    }
-                    return Err(MetadError::SyncLogArchiveFailed {
-                        committed: true,
-                        message,
-                    });
-                }
                 Err(err) => return Err(err),
             }
         }
@@ -396,6 +487,7 @@ where
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot_pin(&self, snapshot_id: u64) -> Result<Option<SnapshotPin>, MetadError> {
         self.snapshot_pin_for_purpose(snapshot_id, ReadPurpose::UserStrong)
     }
@@ -425,6 +517,7 @@ where
         Ok(Some(pin))
     }
 
+    #[cfg(test)]
     fn snapshot_pin_for_purpose(
         &self,
         snapshot_id: u64,
@@ -435,7 +528,7 @@ where
             .map(|versioned| versioned.pin))
     }
 
-    fn versioned_snapshot_pin_at(
+    pub(super) fn versioned_snapshot_pin_at(
         &self,
         snapshot_id: u64,
         version: Version,
@@ -456,6 +549,320 @@ where
             })
         })
         .transpose()
+    }
+
+    /// Prove that raising the mount-global history floor cannot orphan any
+    /// reachable borrowed object reference. A binding may be the oldest hold for
+    /// an object borrowed by a different fork or by rollback, so source-local
+    /// lineage is insufficient: retirement fails closed while any effective
+    /// manifest reachable from the mount root or a live detached fork root names
+    /// a block owned by another inode.
+    ///
+    /// Callers hold `object_gc_gate` across this scan and the binding CAS. Clone
+    /// and rollback hold the same gate while publishing new borrowed references,
+    /// so the proof cannot race either producer.
+    pub(super) fn validate_current_dentry_projection(
+        &self,
+        row_key: &[u8],
+        projection: &DentryProjection,
+        current_version: Version,
+    ) -> Result<(), MetadError> {
+        let expected_key = dentry_key(
+            self.mount,
+            projection.dentry.parent,
+            &projection.dentry.name,
+        );
+        if row_key != expected_key {
+            return Err(MetadError::Codec(format!(
+                "dentry row key does not match borrower inode {}",
+                projection.attr.inode.get()
+            )));
+        }
+        if projection.dentry.child != projection.attr.inode
+            || projection.dentry.child_type != projection.attr.file_type
+            || projection.dentry.attr_generation != projection.attr.generation
+        {
+            return Err(MetadError::Codec(format!(
+                "dentry projection identity does not match borrower inode {}",
+                projection.attr.inode.get()
+            )));
+        }
+        if projection.attr.inode.shard_index() != self.shard_index() {
+            if projection.attr.file_type != FileType::Directory
+                || projection.attr.size != 0
+                || projection.attr.rdev != 0
+                || projection.body.is_some()
+            {
+                return Err(MetadError::Codec(format!(
+                    "foreign dentry projection is not a valid graft for inode {}",
+                    projection.attr.inode.get()
+                )));
+            }
+            return Ok(());
+        }
+
+        let Some(inode_value) = self.metadata.get(
+            RecordFamily::Inode,
+            &inode_key(self.mount, projection.attr.inode),
+            current_version,
+            ReadPurpose::WritePlanLocal,
+        )?
+        else {
+            return Err(MetadError::Codec(format!(
+                "dentry projection names missing borrower inode {}",
+                projection.attr.inode.get()
+            )));
+        };
+        let canonical_attr =
+            decode_inode_attr(&inode_value.0).map_err(|err| MetadError::Codec(err.to_string()))?;
+        if canonical_attr.inode != projection.attr.inode
+            || canonical_attr.file_type != projection.attr.file_type
+            || canonical_attr.size != projection.attr.size
+            || canonical_attr.generation != projection.attr.generation
+        {
+            return Err(MetadError::Codec(format!(
+                "dentry projection object identity does not match borrower inode {}",
+                projection.attr.inode.get()
+            )));
+        }
+
+        if let Some(body) = projection.body.as_ref() {
+            if body.size != projection.attr.size
+                || body.generation == 0
+                || body.generation > projection.attr.generation
+            {
+                return Err(MetadError::Codec(format!(
+                    "dentry projection body does not match borrower inode {}",
+                    projection.attr.inode.get()
+                )));
+            }
+            let canonical_body = self
+                .body_descriptor_at_version_for_purpose(
+                    projection.attr.inode,
+                    body.generation,
+                    current_version,
+                    ReadPurpose::WritePlanLocal,
+                )?
+                .ok_or(MetadError::MissingBodyDescriptor)?;
+            if canonical_body != *body {
+                return Err(MetadError::Codec(format!(
+                    "dentry projection body descriptor does not match borrower inode {}",
+                    projection.attr.inode.get()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_fork_bindings_releasable(
+        &self,
+        bindings: &[VersionedForkBinding],
+        current_version: Version,
+    ) -> Result<(), MetadError> {
+        let Some(versioned) = bindings.first() else {
+            return Ok(());
+        };
+        let binding = versioned.binding;
+        let purpose = ReadPurpose::WritePlanLocal;
+        let mut roots = vec![InodeId::root()];
+
+        // A clone may deliberately remain detached and is then reachable through
+        // its durable binding rather than the mount root. A rollback binding is
+        // also durable, but its materialization root is deleted by the graft; in
+        // that case the restored children are reached through the mount root.
+        // Conversely, an interrupted materialization has neither a namespace link
+        // nor a binding and must not become an immortal retention root merely
+        // because its partial dentry rows survived the crash/failure.
+        for versioned in self.versioned_fork_bindings_at(current_version, purpose)? {
+            let root = versioned.binding.fork_root;
+            let Some(attr) =
+                self.get_attr_at_version_for_purpose(root, current_version, purpose)?
+            else {
+                continue;
+            };
+            if attr.file_type != FileType::Directory {
+                return Err(MetadError::Codec(format!(
+                    "fork binding root {} is not a directory",
+                    root.get()
+                )));
+            }
+            roots.push(root);
+        }
+
+        let Some(root_attr) =
+            self.get_attr_at_version_for_purpose(InodeId::root(), current_version, purpose)?
+        else {
+            return Err(MetadError::Codec(
+                "mount root is missing during fork retention proof".to_owned(),
+            ));
+        };
+        if root_attr.file_type != FileType::Directory {
+            return Err(MetadError::Codec(
+                "mount root is not a directory during fork retention proof".to_owned(),
+            ));
+        }
+
+        let mut visited_directories = HashSet::new();
+        let mut checked_bodies = HashSet::new();
+        while let Some(parent) = roots.pop() {
+            if !visited_directories.insert(parent) {
+                continue;
+            }
+            let rows = self.metadata.scan(ScanRequest {
+                family: RecordFamily::Dentry,
+                prefix: dentry_prefix(self.mount, parent),
+                start_after: None,
+                version: current_version,
+                limit: 0,
+                purpose,
+            })?;
+            for row in rows {
+                let projection = decode_dentry_projection(&row.value.0)
+                    .map_err(|err| MetadError::Codec(err.to_string()))?;
+                self.validate_current_dentry_projection(&row.key, &projection, current_version)?;
+
+                if projection.attr.inode.shard_index() == self.shard_index()
+                    && projection.attr.file_type == FileType::Directory
+                {
+                    roots.push(projection.attr.inode);
+                }
+
+                let Some(body) = projection.body.as_ref() else {
+                    if projection.attr.size == 0 {
+                        continue;
+                    }
+                    return Err(MetadError::MissingBodyDescriptor);
+                };
+                if !checked_bodies.insert((projection.attr.inode, body.generation)) {
+                    continue;
+                }
+                let manifests = self.chunk_manifests_for_body_at_version(
+                    projection.attr.inode,
+                    body,
+                    current_version,
+                    purpose,
+                )?;
+                for block in manifests
+                    .iter()
+                    .flat_map(|manifest| &manifest.slices)
+                    .flat_map(|slice| &slice.blocks)
+                {
+                    if !self
+                        .block_object_is_owned_by_inode(projection.attr.inode, &block.object_key)?
+                    {
+                        return Err(MetadError::ForkRetentionActive {
+                            snapshot_id: binding.snapshot_id,
+                            fork_root: binding.fork_root,
+                            borrower: projection.attr.inode,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn versioned_fork_bindings_at(
+        &self,
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<Vec<VersionedForkBinding>, MetadError> {
+        self.metadata
+            .scan(ScanRequest {
+                family: RecordFamily::ForkBinding,
+                prefix: fork_binding_prefix(self.mount),
+                start_after: None,
+                version,
+                limit: 0,
+                purpose,
+            })?
+            .into_iter()
+            .map(|row| {
+                let binding = decode_fork_binding(&row.value.0)
+                    .map_err(|err| MetadError::Codec(err.to_string()))?;
+                let expected_key = fork_binding_key(self.mount, binding.fork_root);
+                if row.key != expected_key {
+                    return Err(MetadError::Codec(format!(
+                        "fork binding key does not match fork root {}",
+                        binding.fork_root.get()
+                    )));
+                }
+                if binding.fork_root.shard_index() != self.shard_index()
+                    || binding.source_root.shard_index() != self.shard_index()
+                {
+                    return Err(MetadError::Codec(format!(
+                        "fork binding {} crosses shard boundary",
+                        binding.snapshot_id
+                    )));
+                }
+                self.ensure_snapshot_id_shard(binding.snapshot_id, binding.source_root)?;
+                let snapshot_created_version = binding.snapshot_id & SNAPSHOT_ID_LOCAL_MASK;
+                if snapshot_created_version == 0
+                    || binding.pinned_read_version.checked_add(1) != Some(snapshot_created_version)
+                    || snapshot_created_version >= binding.created_version
+                    || binding.created_version != row.version.get()
+                {
+                    return Err(MetadError::Codec(format!(
+                        "fork binding {} has invalid version identity",
+                        binding.snapshot_id
+                    )));
+                }
+                Ok(VersionedForkBinding {
+                    binding,
+                    key: row.key,
+                    version: row.version,
+                })
+            })
+            .collect()
+    }
+
+    fn fork_bindings_for_snapshot_at(
+        &self,
+        snapshot_id: u64,
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<Vec<VersionedForkBinding>, MetadError> {
+        Ok(self
+            .versioned_fork_bindings_at(version, purpose)?
+            .into_iter()
+            .filter(|binding| binding.binding.snapshot_id == snapshot_id)
+            .collect())
+    }
+
+    fn validate_snapshot_retention_roots(
+        &self,
+        snapshot_id: u64,
+        pin: Option<&VersionedSnapshotPin>,
+        bindings: &[VersionedForkBinding],
+        expected_root: Option<InodeId>,
+    ) -> Result<(), MetadError> {
+        let actual_root = pin
+            .map(|versioned| versioned.pin.root)
+            .or_else(|| bindings.first().map(|binding| binding.binding.source_root));
+        if let Some(root) = actual_root {
+            if pin.is_some_and(|versioned| versioned.pin.snapshot_id != snapshot_id)
+                || bindings.iter().any(|binding| {
+                    binding.binding.snapshot_id != snapshot_id
+                        || binding.binding.source_root != root
+                        || pin.is_some_and(|versioned| {
+                            binding.binding.pinned_read_version != versioned.pin.read_version
+                        })
+                })
+            {
+                return Err(MetadError::Codec(format!(
+                    "snapshot {snapshot_id} retention records disagree on identity"
+                )));
+            }
+            if expected_root.is_some_and(|expected| expected != root) {
+                return Err(MetadError::SnapshotRootMismatch {
+                    snapshot_id,
+                    expected_root: expected_root.expect("checked as some"),
+                    actual_root: Some(root),
+                    actual_shard: self.shard_index(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn resolve_snapshot_root_binding(
@@ -563,7 +970,7 @@ where
         Ok(())
     }
 
-    fn ensure_snapshot_pin_live(&self, pin: &SnapshotPin) -> Result<(), MetadError> {
+    pub(super) fn ensure_snapshot_pin_live(&self, pin: &SnapshotPin) -> Result<(), MetadError> {
         let now_ms = self.now_ms();
         if now_ms >= pin.lease_expires_unix_ms {
             return Err(MetadError::SnapshotLeaseExpired {

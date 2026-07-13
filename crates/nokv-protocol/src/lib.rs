@@ -370,6 +370,9 @@ pub enum MetadataRpcRequest {
         path: String,
         replace: bool,
     },
+    RefreshPreparedArtifactObjectGcEpoch {
+        prepared: WirePreparedArtifact,
+    },
     PublishPreparedArtifact {
         prepared: WirePreparedArtifact,
         body: Box<WireBodyDescriptor>,
@@ -469,6 +472,10 @@ pub enum WireMetadataError {
     /// The target dentry is a cross-shard graft point; remove/rename of it must
     /// go through the graft lifecycle. The client maps this to `EBUSY`.
     GraftPoint,
+    StalePreparedArtifactObjectGcEpoch {
+        expected: u64,
+        current: u64,
+    },
     SnapshotLeaseExpired {
         snapshot_id: u64,
         lease_expires_unix_ms: u64,
@@ -482,6 +489,11 @@ pub enum WireMetadataError {
     },
     SnapshotBindingChanged {
         root_path: String,
+    },
+    ForkRetentionActive {
+        snapshot_id: u64,
+        fork_root: u64,
+        borrower: u64,
     },
     SnapshotRenewContended {
         snapshot_id: u64,
@@ -1129,6 +1141,7 @@ pub struct WirePreparedArtifact {
     pub replace: bool,
     pub dentry_version: Option<u64>,
     pub old_generation: Option<u64>,
+    pub object_gc_claim_version: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1719,6 +1732,9 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         MetadataRpcRequest::PublishPreparedArtifact { prepared, .. } => {
             RoutingKey::Inode(prepared.parent)
         }
+        MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared } => {
+            RoutingKey::Inode(prepared.parent)
+        }
         MetadataRpcRequest::PublishPreparedArtifactStagedSession { prepared, .. } => {
             RoutingKey::Inode(prepared.parent)
         }
@@ -1733,6 +1749,53 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_artifact_object_gc_epoch_round_trips() {
+        let prepared = WirePreparedArtifact {
+            mount: 1,
+            parent: 2,
+            name: "artifact.bin".to_owned(),
+            path: Some("/workspace/artifact.bin".to_owned()),
+            inode: 42,
+            generation: 7,
+            mtime_ms: 8,
+            ctime_ms: 9,
+            replace: true,
+            dentry_version: Some(6),
+            old_generation: Some(5),
+            object_gc_claim_version: 12,
+        };
+        let mut encoded = Vec::new();
+        prepared
+            .serialize(&mut rmp_serde::Serializer::new(&mut encoded).with_struct_map())
+            .unwrap();
+        let decoded: WirePreparedArtifact = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, prepared);
+
+        let request = MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch {
+            prepared: prepared.clone(),
+        };
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+
+        let error = WireMetadataError::StalePreparedArtifactObjectGcEpoch {
+            expected: 12,
+            current: 14,
+        };
+        let envelope = MetadataRpcEnvelope {
+            ok: false,
+            result: None,
+            error: Some("stale prepared artifact".to_owned()),
+            error_kind: Some(error.clone()),
+        };
+        assert_eq!(
+            decode_envelope(&encode_envelope(&envelope).unwrap()).unwrap(),
+            envelope
+        );
+    }
 
     #[test]
     fn binary_codec_round_trips_metadata_request() {

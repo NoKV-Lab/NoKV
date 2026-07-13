@@ -1,3 +1,4 @@
+use super::snapshot::VersionedSnapshotPin;
 use super::*;
 
 /// A top-level child of the rollback target captured before the atomic swap, so it
@@ -54,17 +55,18 @@ where
     /// borrows blocks whose keys are owned by inodes that the teardown destroys. Two
     /// rules keep the shared blocks alive while letting the delta's private blocks go:
     ///
-    /// * **Teardown skips shared blocks.** The detached subtree is purged with the
-    ///   restored tree's referenced object keys passed as `retained_object_keys`, so
-    ///   [`NoKvFs::chunk_manifest_delete_and_gc_mutations`] never enqueues a block the
-    ///   restored tree still points at (e.g. an unchanged file's block). Only blocks
-    ///   unique to the delta (a rewritten file's new body, a delta-only file) are
-    ///   enqueued.
-    /// * **The swap cancels stale enqueues for restored blocks.** A pre-rollback
-    ///   rewrite or delete already queued the snapshot's blocks for GC (blocked only
-    ///   by the retention floor). The swap commit deletes any pending GC record whose
-    ///   object key the restored tree references, resurrecting those blocks as live so
-    ///   they survive even after the snapshot pin is retired.
+    /// * **The swap installs durable retention.** The same atomic commit that exposes
+    ///   restored children creates a [`ForkBinding`] keyed by the materialized
+    ///   root's unique inode. Unlike the construction snapshot lease, the binding
+    ///   does not expire and its mount-wide history floor keeps every owner-side GC
+    ///   row blocked. The materialized root may then be deleted after its children
+    ///   escape to `target_root`, just like a clone binding survives its root being
+    ///   unlinked while hardlinks remain.
+    /// * **Owner GC rows are preserved.** A pre-rollback rewrite/delete may already
+    ///   have queued the snapshot blocks. Teardown also queues blocks still owned by
+    ///   the discarded current tree. Those rows remain durable; once every borrowed
+    ///   reference is rewritten or removed, explicit snapshot retirement releases the
+    ///   binding and normal object GC reclaims them.
     ///
     /// The net effect mirrors [`NoKvFs::owns_block_object_key`]: a block reachable
     /// from the live namespace is never reclaimed, a block reachable only from the
@@ -74,17 +76,16 @@ where
         target_root: InodeId,
         snapshot_id: u64,
     ) -> Result<(), MetadError> {
-        let pin = self
-            .snapshot_pin(snapshot_id)?
-            .ok_or(MetadError::NotFound)?;
-        if pin.root != target_root {
-            return Err(MetadError::InvalidPath(format!(
-                "snapshot {snapshot_id} pins inode {} but rollback target is {}",
-                pin.root.get(),
-                target_root.get()
-            )));
-        }
-        let snapshot_version = Version::new(pin.read_version)?;
+        // Rollback is a rare administrative operation. Holding the in-process
+        // GC gate across materialize -> swap prevents an expiring pin from
+        // allowing this owner to delete a borrowed block mid-operation. HA GC
+        // is separately fail-closed by the durable failover marker.
+        let _object_gc_gate = self
+            .object_gc_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let pin = self.live_rollback_snapshot_pin(target_root, snapshot_id)?;
+        let snapshot_version = Version::new(pin.pin.read_version)?;
 
         if self
             .get_attr_at_version_for_purpose(
@@ -96,12 +97,22 @@ where
         {
             return Err(MetadError::NotDirectory);
         }
+        self.ensure_rollback_tree_has_no_hardlinks(
+            target_root,
+            snapshot_version,
+            ReadPurpose::Snapshot,
+        )?;
+        self.ensure_rollback_tree_has_no_hardlinks(
+            target_root,
+            self.read_version()?,
+            ReadPurpose::WritePlanLocal,
+        )?;
 
         // 1. Reproduce the snapshot's subtree under a fresh detached root, sharing
         //    the snapshot's blocks. Snapshot-aware scans enumerate entries deleted
         //    by the delta through the retained-history key index.
         let restored_root = self.materialize_subtree_at(target_root, snapshot_version)?;
-        let restored_keys = self.subtree_object_keys(restored_root)?;
+        let restored_blocks = self.subtree_object_blocks(restored_root)?;
 
         // 2. Capture both sides' top-level children, then graft atomically.
         let old_children = self.capture_top_level_children(target_root)?;
@@ -113,15 +124,111 @@ where
         self.commit_rollback_swap(
             target_root,
             restored_root,
+            snapshot_id,
             &old_children,
             &restored_children,
-            &restored_keys,
+            &restored_blocks,
         )?;
 
         // 3. Tear down the now-detached pre-rollback subtree, reclaiming the delta's
-        //    private blocks while leaving the restored tree's shared blocks live.
-        self.purge_detached_subtree(&old_children, &restored_keys)?;
+        //    owner-side metadata and durably queueing its blocks behind the binding.
+        self.purge_detached_subtree(&old_children)?;
+        // The materialization root is bound (and intentionally deleted by the
+        // swap), while the discarded tree is now purged. Clear the slow-path
+        // marker only if a mount-wide proof finds no older unsafe orphan.
+        let _ = self.reconcile_materialization_orphan_state_under_gc_gate();
         Ok(())
+    }
+
+    /// Eager rollback currently materializes each dentry as a fresh inode. Until
+    /// hardlink groups are restored as groups, accepting a multiply-linked node
+    /// would either split one identity or let teardown delete an inode still named
+    /// outside the target subtree. Controlled restore must therefore fail closed.
+    fn ensure_rollback_tree_has_no_hardlinks(
+        &self,
+        root: InodeId,
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<(), MetadError> {
+        let mut queue = vec![root];
+        while let Some(dir) = queue.pop() {
+            for child in self.read_dir_plus_at_version_for_purpose(dir, version, purpose)? {
+                if child.attr.file_type == FileType::Directory {
+                    queue.push(child.attr.inode);
+                } else if child.attr.nlink > 1 {
+                    return Err(MetadError::InvalidPath(format!(
+                        "rollback requires a hardlink-free subtree; inode {} has {} links",
+                        child.attr.inode.get(),
+                        child.attr.nlink
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture each distinct block named by the materialized tree. The atomic
+    /// swap proactively ensures an owner-side GC row for these borrowed objects;
+    /// this covers historical base generations whose original delete path could
+    /// not otherwise enqueue them again.
+    fn subtree_object_blocks(&self, root: InodeId) -> Result<Vec<BlockDescriptor>, MetadError> {
+        let version = self.read_version()?;
+        let mut seen = HashSet::new();
+        let mut blocks = Vec::new();
+        let mut queue = vec![root];
+        while let Some(dir) = queue.pop() {
+            for child in self.read_dir_plus_at_version_for_purpose(
+                dir,
+                version,
+                ReadPurpose::WritePlanLocal,
+            )? {
+                if child.attr.file_type == FileType::Directory {
+                    queue.push(child.attr.inode);
+                }
+                let Some(body) = child.body.as_ref() else {
+                    continue;
+                };
+                for block in self
+                    .chunk_manifests_for_body_at_version(
+                        child.attr.inode,
+                        body,
+                        version,
+                        ReadPurpose::WritePlanLocal,
+                    )?
+                    .into_iter()
+                    .flat_map(|manifest| manifest.slices)
+                    .flat_map(|slice| slice.blocks)
+                {
+                    if seen.insert(block.object_key.clone()) {
+                        blocks.push(block);
+                    }
+                }
+            }
+        }
+        Ok(blocks)
+    }
+
+    fn live_rollback_snapshot_pin(
+        &self,
+        target_root: InodeId,
+        snapshot_id: u64,
+    ) -> Result<VersionedSnapshotPin, MetadError> {
+        let pin = self
+            .versioned_snapshot_pin_at(
+                snapshot_id,
+                self.read_version()?,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .ok_or(MetadError::NotFound)?;
+        if pin.pin.root != target_root {
+            return Err(MetadError::InvalidPath(format!(
+                "snapshot {snapshot_id} pins inode {} but rollback target is {}",
+                pin.pin.root.get(),
+                target_root.get()
+            )));
+        }
+        self.ensure_snapshot_pin_live(&pin.pin)?;
+        Ok(pin)
     }
 
     /// Path variant of [`NoKvFs::rollback_subtree`]. Resolves `target_path` to its
@@ -133,37 +240,6 @@ where
     ) -> Result<(), MetadError> {
         let target_root = self.resolve_directory_path(target_path)?;
         self.rollback_subtree(target_root, snapshot_id)
-    }
-
-    /// Collect every object key referenced by the materialized subtree's file
-    /// bodies. These are the blocks the restored tree shares with the snapshot; the
-    /// teardown must not reclaim them and the swap must cancel any pending GC for
-    /// them.
-    fn subtree_object_keys(&self, root: InodeId) -> Result<HashSet<String>, MetadError> {
-        let version = self.read_version()?;
-        let mut keys = HashSet::new();
-        let mut queue = vec![root];
-        while let Some(dir) = queue.pop() {
-            for child in
-                self.read_dir_plus_at_version_for_purpose(dir, version, ReadPurpose::Snapshot)?
-            {
-                match child.attr.file_type {
-                    FileType::Directory => queue.push(child.attr.inode),
-                    _ => {
-                        if let Some(body) = &child.body {
-                            let manifests = self.chunk_manifests_for_body_at_version(
-                                child.attr.inode,
-                                body,
-                                version,
-                                ReadPurpose::Snapshot,
-                            )?;
-                            keys.extend(chunk_object_keys(&manifests));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(keys)
     }
 
     /// Snapshot the target's current top-level children with their dentry versions,
@@ -202,15 +278,22 @@ where
     /// The single atomic commit that installs the restored subtree over
     /// `target_root`: it re-parents the materialized children onto `target_root`,
     /// removes delta-only children, deletes the now-empty materialized root inode,
-    /// and cancels pending GC for the blocks the restored tree resurrects.
+    /// installs durable rollback retention, and ensures owner-side GC rows for
+    /// every block the restored tree borrows.
     fn commit_rollback_swap(
         &self,
         target_root: InodeId,
         restored_root: InodeId,
+        snapshot_id: u64,
         old_children: &[OldChild],
         restored_children: &[DentryWithAttr],
-        restored_keys: &HashSet<String>,
+        restored_blocks: &[BlockDescriptor],
     ) -> Result<(), MetadError> {
+        // Capture both retention fences before the final planning reads. The
+        // pin is read again under the GC gate, then its exact record version and
+        // the exact durable Open epoch join the atomic swap.
+        let object_reference = self.begin_object_reference_mutation()?;
+        let pin = self.live_rollback_snapshot_pin(target_root, snapshot_id)?;
         let version = self.next_version()?;
         let read_version = predecessor(version)?;
 
@@ -219,12 +302,40 @@ where
             .map(|child| child.dentry.name.as_bytes())
             .collect();
 
-        let mut predicates = vec![PredicateRef {
-            family: RecordFamily::Inode,
-            key: inode_key(self.mount, target_root),
-            predicate: Predicate::Exists,
+        let binding_key = fork_binding_key(self.mount, restored_root);
+        let binding = ForkBinding {
+            fork_root: restored_root,
+            source_root: target_root,
+            pinned_read_version: pin.pin.read_version,
+            snapshot_id,
+            created_version: version.get(),
+        };
+
+        let mut predicates = vec![
+            PredicateRef {
+                family: RecordFamily::Inode,
+                key: inode_key(self.mount, target_root),
+                predicate: Predicate::Exists,
+            },
+            PredicateRef {
+                family: RecordFamily::Snapshot,
+                key: snapshot_pin_key(self.mount, snapshot_id),
+                predicate: Predicate::VersionEquals(pin.version),
+            },
+            object_reference.predicate(self.mount),
+            PredicateRef {
+                family: RecordFamily::ForkBinding,
+                key: binding_key.clone(),
+                predicate: Predicate::NotExists,
+            },
+        ];
+        let mut mutations = vec![Mutation {
+            family: RecordFamily::ForkBinding,
+            key: binding_key,
+            op: MutationOp::Put,
+            value: Some(Value(encode_fork_binding(&binding))),
         }];
-        let mut mutations = Vec::new();
+        mutations.extend(self.rollback_object_gc_mutations(restored_blocks, version)?);
 
         // Guard every current child dentry, and delete the ones the restored tree
         // does not re-establish (same-named entries are overwritten by the puts
@@ -266,10 +377,10 @@ where
             inode_key(self.mount, restored_root),
         ));
 
-        // Resurrect the snapshot's blocks the restored tree now references by
-        // cancelling any pending GC record an earlier rewrite/delete left for them.
-        mutations.extend(self.pending_gc_cancellations_for_keys(restored_keys, read_version)?);
-
+        // Materialization and swap planning may be large enough to cross the
+        // lease deadline. Reject before exposing the restored references; the
+        // pin CAS handles concurrent renew/reap after this check.
+        self.ensure_snapshot_pin_live(&pin.pin)?;
         self.commit_metadata(MetadataCommand {
             request_id: request_id(b"rollback-subtree-swap", self.mount, target_root, version),
             kind: CommandKind::RenameReplace,
@@ -284,44 +395,48 @@ where
         Ok(())
     }
 
-    /// Delete mutations for every pending object-GC record whose block the restored
-    /// tree references, so those blocks stop being scheduled for deletion.
-    fn pending_gc_cancellations_for_keys(
+    fn rollback_object_gc_mutations(
         &self,
-        restored_keys: &HashSet<String>,
-        version: Version,
+        restored_blocks: &[BlockDescriptor],
+        enqueue_version: Version,
     ) -> Result<Vec<Mutation>, MetadError> {
-        if restored_keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows = self.metadata.scan(ScanRequest {
-            family: RecordFamily::Gc,
-            prefix: gc_queue_prefix(self.mount),
-            start_after: None,
-            version,
-            limit: 0,
-            purpose: ReadPurpose::WritePlanLocal,
-        })?;
-        let mut mutations = Vec::new();
-        for row in rows {
-            let record = decode_object_gc_record(&row.value.0)
-                .map_err(|err| MetadError::Codec(err.to_string()))?;
-            if restored_keys.contains(&record.object_key) {
-                mutations.push(delete_mutation(RecordFamily::Gc, row.key));
-            }
-        }
-        Ok(mutations)
+        let enqueue_unix_ms = current_time_ms();
+        restored_blocks
+            .iter()
+            .map(|block| {
+                let (inode, generation, chunk_index, block_index) =
+                    self.canonical_block_object_identity(&block.object_key)?;
+                let record = ObjectGcRecord {
+                    inode,
+                    generation,
+                    object_key: block.object_key.clone(),
+                    size: block.len,
+                    digest_uri: block.digest_uri.clone(),
+                    enqueue_version: enqueue_version.get(),
+                    enqueue_unix_ms,
+                };
+                Ok(Mutation {
+                    family: RecordFamily::Gc,
+                    key: gc_object_key(
+                        self.mount,
+                        enqueue_version.get(),
+                        inode,
+                        generation,
+                        chunk_index,
+                        block_index,
+                    ),
+                    op: MutationOp::Put,
+                    value: Some(Value(encode_object_gc_record(&record))),
+                })
+            })
+            .collect()
     }
 
     /// Tear down the detached pre-rollback subtree rooted at the captured top-level
     /// children. Each node's metadata is deleted bottom-up and its inode-owned blocks
-    /// are enqueued for GC, except blocks the restored tree still references
-    /// (`retained_object_keys`), which stay live.
-    fn purge_detached_subtree(
-        &self,
-        old_children: &[OldChild],
-        retained_object_keys: &HashSet<String>,
-    ) -> Result<(), MetadError> {
+    /// are enqueued for GC. The rollback binding installed by the swap holds the
+    /// retention floor while the restored tree still borrows any of those blocks.
+    fn purge_detached_subtree(&self, old_children: &[OldChild]) -> Result<(), MetadError> {
         let version = self.read_version()?;
         // Discover the full detached subtree (the top-level dentries are already
         // gone, but the inodes and their descendants persist until purged).
@@ -339,8 +454,9 @@ where
                 self.classify_detached_node(&child, &mut nodes, &mut dirs);
             }
         }
+        let retained_object_keys = HashSet::new();
         for node in nodes {
-            self.purge_detached_node(&node, retained_object_keys)?;
+            self.purge_detached_node(&node, &retained_object_keys)?;
         }
         Ok(())
     }

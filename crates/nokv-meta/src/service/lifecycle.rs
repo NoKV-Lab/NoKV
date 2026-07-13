@@ -13,7 +13,13 @@ where
             objects,
             allocator_gate: Mutex::new(()),
             backup_gate: Mutex::new(()),
+            object_gc_gate: Mutex::new(()),
+            materialization_orphan_possible: AtomicBool::new(true),
+            #[cfg(test)]
+            namespace_reachability_scans: AtomicU64::new(0),
             epoch_fence: RwLock::new(()),
+            metadata_log_enable_fence: RwLock::new(()),
+            metadata_commit_log_gate: Mutex::new(()),
             path_resolution_cache: new_path_resolution_cache_shards(),
             path_index_lookup_cache: new_path_index_lookup_cache_shards(),
             path_index_validation_cache: new_path_index_validation_cache_shards(),
@@ -88,6 +94,10 @@ where
     /// and the allocator floor is then seeded into this shard's high-bit subspace
     /// exactly like [`Self::with_shard_index`]. So callers must NOT chain
     /// `.with_shard_index(...)` after `open_existing`; pass the index here.
+    ///
+    /// This constructor only reconstructs process-local state. A durable object
+    /// GC claim is resumed by the ordinary cleanup worker after ownership and
+    /// durability policy have been installed.
     pub fn open_existing(
         mount: MountId,
         metadata: M,
@@ -103,14 +113,20 @@ where
             .expect("composed allocator base inode is valid")
             .get();
         let next_inode = allocator.next_inode.max(allocator_floor);
-        Ok(Self {
+        let service = Self {
             mount,
             shard_index,
             metadata,
             objects,
             allocator_gate: Mutex::new(()),
             backup_gate: Mutex::new(()),
+            object_gc_gate: Mutex::new(()),
+            materialization_orphan_possible: AtomicBool::new(true),
+            #[cfg(test)]
+            namespace_reachability_scans: AtomicU64::new(0),
             epoch_fence: RwLock::new(()),
+            metadata_log_enable_fence: RwLock::new(()),
+            metadata_commit_log_gate: Mutex::new(()),
             path_resolution_cache: new_path_resolution_cache_shards(),
             path_index_lookup_cache: new_path_index_lookup_cache_shards(),
             path_index_validation_cache: new_path_index_validation_cache_shards(),
@@ -154,7 +170,9 @@ where
             read_dir_plus_total: AtomicU64::new(0),
             read_dir_plus_entry_total: AtomicU64::new(0),
             read_dir_plus_projection_hit_total: AtomicU64::new(0),
-        })
+        };
+        service.recover_materialization_orphan_state()?;
+        Ok(service)
     }
 
     pub fn object_stats(&self) -> ObjectTransferStats {

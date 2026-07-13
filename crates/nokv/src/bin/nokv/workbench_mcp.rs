@@ -2843,6 +2843,20 @@ fn client_error(err: ClientError) -> WorkbenchToolError {
                 json!({"root_path": root_path}),
             )
         }
+        ClientError::Metadata(MetadError::ForkRetentionActive {
+            snapshot_id,
+            fork_root,
+            borrower,
+        }) => WorkbenchToolError::typed(
+            "ForkRetentionActive",
+            err.to_string(),
+            false,
+            json!({
+                "snapshot_id": snapshot_id,
+                "fork_root": fork_root.get(),
+                "borrower": borrower.get(),
+            }),
+        ),
         ClientError::Metadata(MetadError::SnapshotRenewContended {
             snapshot_id,
             attempts,

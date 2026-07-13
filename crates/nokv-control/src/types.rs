@@ -25,6 +25,11 @@ pub struct CheckpointRef {
     pub object_key: String,
     pub lsn: u64,
     pub image_bytes: u64,
+    /// SHA-256 identity of the exact checkpoint image. Empty only when decoding
+    /// a pre-fence control record; recovery must reject those legacy refs.
+    #[serde(default)]
+    pub image_digest: String,
+    /// Digest of the logical metadata log at `lsn` (not the image digest).
     pub digest: String,
 }
 
@@ -60,6 +65,12 @@ pub struct ShardRecord {
     pub checkpoint: Option<CheckpointRef>,
     pub log: Option<LogRef>,
     pub durable_lsn: u64,
+    /// Durable proof that this shard has completed `mark_serving` at least once.
+    /// A never-served shard may safely retry Fresh acquisition after a startup
+    /// failure; every legacy record defaults to `true` on decode so historical
+    /// data is never mistaken for an empty, resurrectable shard.
+    #[serde(default = "legacy_record_ever_served")]
+    pub ever_served: bool,
     /// Reachable endpoint (host:port) of the current owner, so a client can
     /// route to it. `None` when unowned. (In this deployment the `NodeId` is the
     /// bind address, so this mirrors `owner` while owned.)
@@ -87,6 +98,10 @@ pub struct ShardRecord {
 
 fn default_shard_prefix() -> String {
     "/".to_owned()
+}
+
+fn legacy_record_ever_served() -> bool {
+    true
 }
 
 /// Derive the path prefix from a `mount-<n>:<path>` shard id, defaulting to `/`.
@@ -140,6 +155,7 @@ impl ShardRecord {
             checkpoint: None,
             log: None,
             durable_lsn: 0,
+            ever_served: false,
             endpoint: None,
             prefix,
             shard_index: 0,

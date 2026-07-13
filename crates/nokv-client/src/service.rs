@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use nokv_control::{ControlStore, ShardId, ShardRecord};
+use nokv_control::{ControlStore, ShardId, ShardRecord, ShardState};
 use nokv_meta::{
     DentryWithAttr, NamespaceAggregateGroup, NamespaceAggregateMeasure, NamespaceAggregateOp,
     NamespaceAggregateOutputMeasure, NamespaceAggregateRequest, NamespaceAggregateResult,
@@ -117,12 +117,13 @@ pub struct ClientPreparedArtifact {
     pub replace: bool,
     pub dentry_version: Option<u64>,
     pub old_generation: Option<u64>,
+    pub object_gc_claim_version: u64,
 }
 
 /// Stable reconstruction fields persisted by clients that journal a prepared
-/// artifact outside `nokv-client`. Future publish-fencing fields belong on
-/// [`ClientPreparedArtifact`] so external journals can adopt them explicitly
-/// without breaking compilation in the protocol change that introduces them.
+/// artifact outside `nokv-client`. New publish-fencing fields belong on
+/// [`ClientPreparedArtifact`] and default to a fail-closed value here until the
+/// external journal explicitly adopts them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientPreparedArtifactRecovery {
     pub mount: u64,
@@ -152,7 +153,13 @@ impl ClientPreparedArtifact {
             replace: recovery.replace,
             dentry_version: recovery.dentry_version,
             old_generation: recovery.old_generation,
+            object_gc_claim_version: 0,
         }
+    }
+
+    pub fn with_object_gc_claim_version(mut self, object_gc_claim_version: u64) -> Self {
+        self.object_gc_claim_version = object_gc_claim_version;
+        self
     }
 }
 
@@ -183,8 +190,9 @@ pub struct PathLayoutOpenRequest {
     pub expected_generation: Option<u64>,
 }
 
-/// Result of a copy-on-write subtree clone: the fork's namespace root inode and the
-/// retained snapshot pin that protects the shared base blocks.
+/// Result of a copy-on-write subtree clone: the fork's namespace root inode and
+/// the durable retention identity that protects its shared base blocks until
+/// explicit retirement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CloneOutcome {
     pub root: InodeId,
@@ -2003,6 +2011,18 @@ impl MetadataClient {
         }
     }
 
+    pub fn refresh_prepared_artifact_object_gc_epoch(
+        &self,
+        prepared: ClientPreparedArtifact,
+    ) -> Result<ClientPreparedArtifact, ClientError> {
+        match self.call(MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch {
+            prepared: prepared_artifact_to_wire(&prepared)?,
+        })? {
+            MetadataRpcResult::PreparedArtifact { prepared } => wire_prepared_artifact(prepared),
+            other => Err(unexpected_result(other)),
+        }
+    }
+
     pub fn publish_prepared_artifact(
         &self,
         prepared: ClientPreparedArtifact,
@@ -2232,9 +2252,10 @@ impl FleetRouter {
 /// Build the `(shard_map, endpoints)` pair for fleet routing from the control
 /// store. Each registered shard contributes a longest-prefix route (non-default
 /// shards only — the default shard owns `/` implicitly) and a
-/// `shard_index -> endpoint` entry. Shards without an endpoint (currently
-/// unowned) are skipped; a request that routes to one fails resolution and is
-/// retried after the next refresh.
+/// `shard_index -> endpoint` entry. Only an owner that has completed recovery
+/// and reached `Serving` is routable. Registered, unowned, and `Recovering`
+/// shards still contribute their prefix so requests fail resolution instead of
+/// falling through to the default shard, then retry after a later refresh.
 fn resolve_fleet_routes(
     control: &dyn ControlStore,
     mount: MountId,
@@ -2245,14 +2266,16 @@ fn resolve_fleet_routes(
     let mut routes = Vec::new();
     let mut endpoints = HashMap::new();
     for record in records {
-        if let Some(endpoint) = record.endpoint.as_deref() {
-            let address = endpoint.parse::<SocketAddr>().map_err(|err| {
-                ClientError::Protocol(format!(
-                    "control shard {} has unparseable endpoint {endpoint:?}: {err}",
-                    record.shard_id
-                ))
-            })?;
-            endpoints.insert(record.shard_index, address);
+        if record.state == ShardState::Serving && record.owner.is_some() {
+            if let Some(endpoint) = record.endpoint.as_deref() {
+                let address = endpoint.parse::<SocketAddr>().map_err(|err| {
+                    ClientError::Protocol(format!(
+                        "control shard {} has unparseable endpoint {endpoint:?}: {err}",
+                        record.shard_id
+                    ))
+                })?;
+                endpoints.insert(record.shard_index, address);
+            }
         }
         // The default shard owns "/" implicitly; only non-default subtree shards
         // are entered as longest-prefix routes (mirrors the server's ShardMap).

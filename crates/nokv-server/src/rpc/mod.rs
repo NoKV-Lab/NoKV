@@ -40,35 +40,15 @@ use wire::{
 
 fn handle_binary_rpc(server: &Server, body: &[u8]) -> Result<Vec<u8>, ServerError> {
     let envelope = match decode_request(body) {
-        Ok(request) => {
-            // Resolve which shard owns this request BEFORE consuming it, so a
-            // committing op publishes the LogRef of the shard that handled it
-            // (not the default shard). Batches publish per-shard inside execute,
-            // so they are excluded here.
-            let publish_index = if !matches!(request, MetadataRpcRequest::Batch { .. })
-                && commits_metadata_view(&request)
-            {
-                server.route(&request).ok().map(|slot| slot.shard_index())
-            } else {
-                None
-            };
-            match execute(server, request) {
-                Ok(result) => match if let Some(shard_index) = publish_index {
-                    server.publish_latest_metadata_log_ref_for_index(shard_index)
-                } else {
-                    Ok(None)
-                } {
-                    Ok(_) => MetadataRpcEnvelope {
-                        ok: true,
-                        result: Some(result),
-                        error: None,
-                        error_kind: None,
-                    },
-                    Err(err) => err_envelope(err),
-                },
-                Err(err) => err_envelope(err),
-            }
-        }
+        Ok(request) => match execute_visible(server, request) {
+            Ok(result) => MetadataRpcEnvelope {
+                ok: true,
+                result: Some(result),
+                error: None,
+                error_kind: None,
+            },
+            Err(err) => err_envelope(err),
+        },
         Err(err) => MetadataRpcEnvelope {
             ok: false,
             result: None,
@@ -86,7 +66,23 @@ fn handle_binary_rpc(server: &Server, body: &[u8]) -> Result<Vec<u8>, ServerErro
     })
 }
 
-fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcResult, ServerError> {
+fn execute_visible(
+    server: &Server,
+    request: MetadataRpcRequest,
+) -> Result<MetadataRpcResult, ServerError> {
+    if matches!(request, MetadataRpcRequest::Batch { .. }) {
+        return execute_unfenced(server, request);
+    }
+    let slot = server.route(&request)?;
+    let commits_metadata = commits_metadata_view(&request);
+    server
+        .execute_with_shard_visibility(slot, commits_metadata, || execute_unfenced(server, request))
+}
+
+fn execute_unfenced(
+    server: &Server,
+    request: MetadataRpcRequest,
+) -> Result<MetadataRpcResult, ServerError> {
     // A batch re-routes each sub-request to its own shard, so resolve it there.
     if let MetadataRpcRequest::Batch { requests } = request {
         return execute_batch(server, requests);
@@ -931,6 +927,19 @@ fn execute(server: &Server, request: MetadataRpcRequest) -> Result<MetadataRpcRe
                 prepared: wire_prepared_artifact(slot.service().mount_id(), &prepared),
             })
         }
+        MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared } => {
+            if prepared.mount != slot.service().mount_id().get() {
+                return Err(ServerError::Metadata(MetadError::Codec(
+                    "prepared artifact mount does not match server mount".to_owned(),
+                )));
+            }
+            let prepared = slot
+                .service()
+                .refresh_prepared_artifact_object_gc_epoch(prepared_artifact(prepared)?)?;
+            Ok(MetadataRpcResult::PreparedArtifact {
+                prepared: wire_prepared_artifact(slot.service().mount_id(), &prepared),
+            })
+        }
         MetadataRpcRequest::PublishPreparedArtifact {
             prepared,
             body,
@@ -1107,6 +1116,7 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::RenewSnapshot { .. }
         | MetadataRpcRequest::PrepareArtifact { .. }
         | MetadataRpcRequest::PrepareArtifactPath { .. }
+        | MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { .. }
         | MetadataRpcRequest::PublishPreparedArtifact { .. }
         | MetadataRpcRequest::PublishPreparedArtifactStagedSession { .. } => false,
     }

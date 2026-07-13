@@ -12,6 +12,46 @@ pub(super) fn execute_batch(
     // route to the same shard. Resolve that single slot up front and reject
     // cross-shard batches (the client must split them per shard).
     let slot = resolve_batch_slot(server, &requests)?;
+    execute_resolved_batch(server, slot, requests)
+}
+
+/// Opportunistically coalesce independently framed requests. A routing or
+/// nested-batch mismatch is reported as `None` before execution so transport can
+/// fall back to individual frames. Any error after resolution is returned and
+/// must not trigger re-execution because some batch entries may have committed.
+pub(super) fn try_execute_coalesced_batch(
+    server: &Server,
+    requests: Vec<MetadataRpcRequest>,
+) -> Result<Option<Vec<MetadataRpcEnvelope>>, ServerError> {
+    let slot = match resolve_batch_slot(server, &requests) {
+        Ok(slot) => slot,
+        Err(_) => return Ok(None),
+    };
+    match execute_resolved_batch(server, slot, requests)? {
+        MetadataRpcResult::Batch { results } => Ok(Some(results)),
+        _ => unreachable!("resolved batch executor always returns a batch result"),
+    }
+}
+
+fn execute_resolved_batch(
+    server: &Server,
+    slot: &ShardSlot,
+    requests: Vec<MetadataRpcRequest>,
+) -> Result<MetadataRpcResult, ServerError> {
+    let may_commit = requests.iter().any(super::commits_metadata_view);
+    // Resolve selected one shard before taking the visibility gate. The whole
+    // mixed/coalesced batch then holds that gate once; subrequests execute raw
+    // to avoid lock re-entry, and the post barrier runs on both Ok and Err.
+    server.execute_with_shard_visibility(slot, may_commit, || {
+        execute_batch_on_slot(server, slot, requests)
+    })
+}
+
+fn execute_batch_on_slot(
+    server: &Server,
+    slot: &ShardSlot,
+    requests: Vec<MetadataRpcRequest>,
+) -> Result<MetadataRpcResult, ServerError> {
     let mut results = Vec::with_capacity(requests.len());
     let mut iter = requests.into_iter().peekable();
     while let Some(request) = iter.next() {
@@ -114,7 +154,7 @@ fn resolve_batch_slot<'a>(
 }
 
 fn execute_envelope(server: &Server, request: MetadataRpcRequest) -> MetadataRpcEnvelope {
-    match super::execute(server, request) {
+    match super::execute_unfenced(server, request) {
         Ok(result) => ok_envelope(result),
         Err(err) => err_envelope(err),
     }

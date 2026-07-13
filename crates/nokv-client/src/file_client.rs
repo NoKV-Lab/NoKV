@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,7 @@ const MAX_READ_PIPELINES: usize = 1024;
 const MAX_READ_PLAN_CACHE_ENTRIES: usize = 4096;
 const MAX_BATCH_READ_WORKERS: usize = 32;
 const MIN_RANGE_READAHEAD_BYTES: usize = DEFAULT_BLOCK_SIZE / 4;
+const MAX_ARTIFACT_OBJECT_GC_REFRESHES: usize = 3;
 
 struct BatchReadTask {
     index: usize,
@@ -1728,48 +1729,19 @@ where
         bytes: Vec<u8>,
         metadata: ArtifactMetadata,
     ) -> Result<DentryWithAttr, ClientError> {
-        let prepared = self.metadata.prepare_artifact_path(path, false)?;
-        let mode = metadata.mode;
-        let uid = metadata.uid;
-        let gid = metadata.gid;
-        let (body, chunks, staged) = self.stage_artifact_body(&prepared, &bytes, metadata)?;
-        match self
-            .metadata
-            .publish_prepared_artifact(prepared, body, chunks, mode, uid, gid)
-        {
-            Ok(result) => Ok(result.entry),
-            Err(err) => {
-                self.objects
-                    .delete_staged(&staged)
-                    .map_err(ClientError::Object)?;
-                Err(err)
-            }
-        }
+        self.put_artifact_bytes(path, &bytes, metadata, false, None)
+            .map(|result| result.entry)
     }
 
-    pub fn put_artifact_from_reader<R: Read>(
+    pub fn put_artifact_from_reader<R: Read + Seek>(
         &self,
         path: &str,
-        reader: R,
+        mut reader: R,
         metadata: ArtifactMetadata,
     ) -> Result<DentryWithAttr, ClientError> {
         let prepared = self.metadata.prepare_artifact_path(path, false)?;
-        let mode = metadata.mode;
-        let uid = metadata.uid;
-        let gid = metadata.gid;
-        let (body, chunks, staged) = self.stage_artifact_reader(&prepared, reader, metadata)?;
-        match self
-            .metadata
-            .publish_prepared_artifact(prepared, body, chunks, mode, uid, gid)
-        {
-            Ok(result) => Ok(result.entry),
-            Err(err) => {
-                self.objects
-                    .delete_staged(&staged)
-                    .map_err(ClientError::Object)?;
-                Err(err)
-            }
-        }
+        self.put_artifact_reader(prepared, &mut reader, metadata)
+            .map(|result| result.entry)
     }
 
     pub fn put_artifact_replace(
@@ -1778,48 +1750,17 @@ where
         bytes: Vec<u8>,
         metadata: ArtifactMetadata,
     ) -> Result<RenameReplaceResult, ClientError> {
-        let prepared = self.metadata.prepare_artifact_path(path, true)?;
-        let mode = metadata.mode;
-        let uid = metadata.uid;
-        let gid = metadata.gid;
-        let (body, chunks, staged) = self.stage_artifact_body(&prepared, &bytes, metadata)?;
-        match self
-            .metadata
-            .publish_prepared_artifact(prepared, body, chunks, mode, uid, gid)
-        {
-            Ok(result) => Ok(result),
-            Err(err) => {
-                self.objects
-                    .delete_staged(&staged)
-                    .map_err(ClientError::Object)?;
-                Err(err)
-            }
-        }
+        self.put_artifact_bytes(path, &bytes, metadata, true, None)
     }
 
-    pub fn put_artifact_replace_from_reader<R: Read>(
+    pub fn put_artifact_replace_from_reader<R: Read + Seek>(
         &self,
         path: &str,
-        reader: R,
+        mut reader: R,
         metadata: ArtifactMetadata,
     ) -> Result<RenameReplaceResult, ClientError> {
         let prepared = self.metadata.prepare_artifact_path(path, true)?;
-        let mode = metadata.mode;
-        let uid = metadata.uid;
-        let gid = metadata.gid;
-        let (body, chunks, staged) = self.stage_artifact_reader(&prepared, reader, metadata)?;
-        match self
-            .metadata
-            .publish_prepared_artifact(prepared, body, chunks, mode, uid, gid)
-        {
-            Ok(result) => Ok(result),
-            Err(err) => {
-                self.objects
-                    .delete_staged(&staged)
-                    .map_err(ClientError::Object)?;
-                Err(err)
-            }
-        }
+        self.put_artifact_reader(prepared, &mut reader, metadata)
     }
 
     /// Publish `delta` at the current end of `path` as a delta generation: only
@@ -1863,7 +1804,7 @@ where
         let new_size = base_size
             .checked_add(delta.len() as u64)
             .ok_or_else(|| ClientError::Protocol("append size exceeds u64".to_owned()))?;
-        let prepared = self
+        let mut prepared = self
             .metadata
             .prepare_artifact_path(path, true)
             .map_err(|err| fold_append_prepare_not_found(err, expected_generation))?;
@@ -1872,63 +1813,92 @@ where
             // would be wrong, so fail before writing any blocks.
             return Err(artifact_write_conflict());
         }
-        let dirty_ranges = if delta.is_empty() {
-            Vec::new()
-        } else {
-            vec![ChunkWriteRange {
-                logical_offset: base_size,
-                bytes: delta.into(),
-            }]
-        };
-        let written = match self.objects.write_ranges_with_block_index_base(
-            dirty_ranges,
-            ChunkWriteOptions {
-                manifest_id: metadata.manifest_id.clone(),
-                mount: prepared.mount,
-                inode: prepared.inode.get(),
-                generation: prepared.generation,
-                chunk_size: DEFAULT_CHUNK_SIZE,
-                block_size: DEFAULT_BLOCK_SIZE,
-            },
-            0,
-        ) {
-            Ok(written) => written,
-            Err(err) => {
-                cleanup_staged_write_error(&self.objects, &err)?;
-                return Err(ClientError::Object(err));
-            }
-        };
-        self.record_staged_write_stats(&written);
-        let staged = written.staged_objects()?;
-        let session = PublishArtifactStagedSession {
-            parent: prepared.parent,
-            name: prepared.name.clone(),
-            producer: metadata.producer,
-            digest_uri: metadata.digest_uri,
-            content_type: metadata.content_type,
-            manifest_id: written.manifest_id.clone(),
-            size: new_size,
-            chunks: written.chunk_manifests(),
-            staged: staged.clone(),
-            mode: metadata.mode,
-            uid: metadata.uid,
-            gid: metadata.gid,
-        };
-        match self
-            .metadata
-            .publish_prepared_artifact_staged_session(prepared, session)
-        {
-            Ok(result) => Ok(AppendOutcome {
-                new_size: result.entry.attr.size,
-                generation: artifact_body_generation(&result.entry),
-                created: false,
-            }),
-            Err(err) => {
-                // Best-effort cleanup: a failed staged-object delete must not
-                // replace the publish error, whose classification
-                // (is_artifact_write_conflict) drives the caller's retry loop.
-                let _ = self.objects.delete_staged(&staged);
+        let mut refreshes = 0;
+        loop {
+            let dirty_ranges = if delta.is_empty() {
+                Vec::new()
+            } else {
+                vec![ChunkWriteRange {
+                    logical_offset: base_size,
+                    bytes: delta.clone().into(),
+                }]
+            };
+            let written = match self.objects.write_ranges_with_block_index_base(
+                dirty_ranges,
+                ChunkWriteOptions {
+                    manifest_id: metadata.manifest_id.clone(),
+                    mount: prepared.mount,
+                    inode: prepared.inode.get(),
+                    generation: prepared.generation,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    block_size: DEFAULT_BLOCK_SIZE,
+                },
+                0,
+            ) {
+                Ok(written) => written,
+                Err(err) => {
+                    cleanup_staged_write_error(&self.objects, &err)?;
+                    return Err(ClientError::Object(err));
+                }
+            };
+            self.record_staged_write_stats(&written);
+            let staged = written.staged_objects()?;
+            let session = PublishArtifactStagedSession {
+                parent: prepared.parent,
+                name: prepared.name.clone(),
+                producer: metadata.producer.clone(),
+                digest_uri: metadata.digest_uri.clone(),
+                content_type: metadata.content_type.clone(),
+                manifest_id: written.manifest_id.clone(),
+                size: new_size,
+                chunks: written.chunk_manifests(),
+                staged: staged.clone(),
+                mode: metadata.mode,
+                uid: metadata.uid,
+                gid: metadata.gid,
+            };
+            match self
+                .metadata
+                .publish_prepared_artifact_staged_session(prepared.clone(), session)
+            {
+                Ok(result) => {
+                    return Ok(AppendOutcome {
+                        new_size: result.entry.attr.size,
+                        generation: artifact_body_generation(&result.entry),
+                        created: false,
+                    });
+                }
                 Err(err)
+                    if is_stale_prepared_object_gc_epoch(&err)
+                        && refreshes < MAX_ARTIFACT_OBJECT_GC_REFRESHES =>
+                {
+                    self.objects
+                        .delete_staged(&staged)
+                        .map_err(ClientError::Object)?;
+                    prepared = self
+                        .metadata
+                        .refresh_prepared_artifact_object_gc_epoch(prepared)?;
+                    refreshes += 1;
+                }
+                Err(err) if is_stale_prepared_object_gc_epoch(&err) => {
+                    self.objects
+                        .delete_staged(&staged)
+                        .map_err(ClientError::Object)?;
+                    return Err(err);
+                }
+                Err(err) => {
+                    // A missing/undecodable response can arrive after the
+                    // metadata transaction committed. Deleting in that case
+                    // would turn a successful publish into a dangling object
+                    // reference, so only clean up explicit pre-commit rejects.
+                    if artifact_publish_was_definitively_rejected(&err) {
+                        // Keep the metadata error that drives the caller's
+                        // conflict classifier; terminal cleanup remains
+                        // best-effort after no new generation will be minted.
+                        let _ = self.objects.delete_staged(&staged);
+                    }
+                    return Err(err);
+                }
             }
         }
     }
@@ -1944,25 +1914,115 @@ where
         metadata: ArtifactMetadata,
         expected_generation: u64,
     ) -> Result<RenameReplaceResult, ClientError> {
-        let prepared = self.metadata.prepare_artifact_path(path, true)?;
-        if prepared.old_generation != Some(expected_generation) {
+        self.put_artifact_bytes(path, &bytes, metadata, true, Some(expected_generation))
+    }
+
+    /// Execute a replayable artifact transaction. When object GC advances
+    /// after prepare, the failed generation remains unreachable: remove it,
+    /// refresh the same namespace proof, and fully restage under the newly
+    /// minted generation before publishing again.
+    fn put_artifact_bytes(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        metadata: ArtifactMetadata,
+        replace: bool,
+        expected_generation: Option<u64>,
+    ) -> Result<RenameReplaceResult, ClientError> {
+        let mut prepared = self.metadata.prepare_artifact_path(path, replace)?;
+        if expected_generation.is_some() && prepared.old_generation != expected_generation {
             return Err(artifact_write_conflict());
         }
-        let mode = metadata.mode;
-        let uid = metadata.uid;
-        let gid = metadata.gid;
-        let (body, chunks, staged) = self.stage_artifact_body(&prepared, &bytes, metadata)?;
-        match self
-            .metadata
-            .publish_prepared_artifact(prepared, body, chunks, mode, uid, gid)
-        {
-            Ok(result) => Ok(result),
-            Err(err) => {
-                // Best-effort cleanup: a failed staged-object delete must not
-                // replace the publish error, whose classification
-                // (is_artifact_write_conflict) drives the caller's retry loop.
-                let _ = self.objects.delete_staged(&staged);
-                Err(err)
+        let mut refreshes = 0;
+        loop {
+            let (body, chunks, staged) =
+                self.stage_artifact_body(&prepared, bytes, metadata.clone())?;
+            match self.metadata.publish_prepared_artifact(
+                prepared.clone(),
+                body,
+                chunks,
+                metadata.mode,
+                metadata.uid,
+                metadata.gid,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(err) if is_stale_prepared_object_gc_epoch(&err) => {
+                    // A refreshed generation is safe only after proving the
+                    // old unattached generation no longer has staged objects.
+                    self.objects
+                        .delete_staged(&staged)
+                        .map_err(ClientError::Object)?;
+                    if refreshes >= MAX_ARTIFACT_OBJECT_GC_REFRESHES {
+                        return Err(err);
+                    }
+                    prepared = self
+                        .metadata
+                        .refresh_prepared_artifact_object_gc_epoch(prepared)?;
+                    refreshes += 1;
+                }
+                Err(err) => {
+                    if artifact_publish_was_definitively_rejected(&err) {
+                        if expected_generation.is_some() {
+                            // Preserve the compare-and-swap failure classification.
+                            let _ = self.objects.delete_staged(&staged);
+                        } else {
+                            self.objects
+                                .delete_staged(&staged)
+                                .map_err(ClientError::Object)?;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    fn put_artifact_reader<R: Read + Seek>(
+        &self,
+        mut prepared: ClientPreparedArtifact,
+        reader: &mut R,
+        metadata: ArtifactMetadata,
+    ) -> Result<RenameReplaceResult, ClientError> {
+        let initial_position = reader
+            .stream_position()
+            .map_err(|err| ClientError::Io(err.to_string()))?;
+        let mut refreshes = 0;
+        loop {
+            reader
+                .seek(SeekFrom::Start(initial_position))
+                .map_err(|err| ClientError::Io(err.to_string()))?;
+            let (body, chunks, staged) =
+                self.stage_artifact_reader(&prepared, &mut *reader, metadata.clone())?;
+            match self.metadata.publish_prepared_artifact(
+                prepared.clone(),
+                body,
+                chunks,
+                metadata.mode,
+                metadata.uid,
+                metadata.gid,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(err) if is_stale_prepared_object_gc_epoch(&err) => {
+                    self.objects
+                        .delete_staged(&staged)
+                        .map_err(ClientError::Object)?;
+                    if refreshes < MAX_ARTIFACT_OBJECT_GC_REFRESHES {
+                        prepared = self
+                            .metadata
+                            .refresh_prepared_artifact_object_gc_epoch(prepared)?;
+                        refreshes += 1;
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(err) => {
+                    if artifact_publish_was_definitively_rejected(&err) {
+                        self.objects
+                            .delete_staged(&staged)
+                            .map_err(ClientError::Object)?;
+                    }
+                    return Err(err);
+                }
             }
         }
     }
@@ -2242,6 +2302,63 @@ pub fn is_artifact_write_conflict(err: &ClientError) -> bool {
             err,
             ClientError::Metadata(nokv_meta::MetadError::MissingBodyDescriptor)
         )
+}
+
+/// True when restarting an artifact write from its read/prepare boundary is
+/// safe. A stale object-GC epoch is retryable because the file client removes
+/// the unattached generation before returning that error.
+pub fn is_artifact_write_retryable(err: &ClientError) -> bool {
+    is_artifact_write_conflict(err) || is_stale_prepared_object_gc_epoch(err)
+}
+
+fn is_stale_prepared_object_gc_epoch(err: &ClientError) -> bool {
+    matches!(
+        err,
+        ClientError::Metadata(nokv_meta::MetadError::StalePreparedArtifactObjectGcEpoch { .. })
+    )
+}
+
+/// Return true only when the server has authoritatively rejected the publish
+/// before committing metadata. Transport/protocol failures and post-commit
+/// sync-log failures are deliberately absent: keeping an unreachable staged
+/// generation is safe, while deleting a possibly live generation is not.
+fn artifact_publish_was_definitively_rejected(err: &ClientError) -> bool {
+    match err {
+        ClientError::Metadata(err) => metad_publish_was_definitively_rejected(err),
+        ClientError::LockConflict(_) | ClientError::Object(_) => true,
+        _ => false,
+    }
+}
+
+fn metad_publish_was_definitively_rejected(err: &nokv_meta::MetadError) -> bool {
+    match err {
+        nokv_meta::MetadError::Metadata(err) => matches!(
+            err,
+            nokv_meta::MetadataError::ZeroVersion
+                | nokv_meta::MetadataError::CommitBeforeRead
+                | nokv_meta::MetadataError::EmptyRequestId
+                | nokv_meta::MetadataError::EmptyPrimaryKey
+                | nokv_meta::MetadataError::PutWithoutValue
+                | nokv_meta::MetadataError::DeleteWithValue
+                | nokv_meta::MetadataError::PredicateFailed
+        ),
+        nokv_meta::MetadError::SyncLogArchiveFailed { committed, .. } => !committed,
+        nokv_meta::MetadError::PublishArtifactFailed { source, .. } => {
+            metad_publish_was_definitively_rejected(source)
+        }
+        nokv_meta::MetadError::BodySizeMismatch { .. }
+        | nokv_meta::MetadError::InvalidPreparedArtifact(_)
+        | nokv_meta::MetadError::StalePreparedArtifactObjectGcEpoch { .. }
+        | nokv_meta::MetadError::StaleBodyGeneration { .. }
+        | nokv_meta::MetadError::LockConflict(_)
+        | nokv_meta::MetadError::InvalidPath(_)
+        | nokv_meta::MetadError::NotFound
+        | nokv_meta::MetadError::NotFile
+        | nokv_meta::MetadError::NotDirectory
+        | nokv_meta::MetadError::MissingBodyDescriptor
+        | nokv_meta::MetadError::InvalidOwnerEpoch => true,
+        _ => false,
+    }
 }
 
 // Client-side guard failures surface as the same predicate error a server-side
@@ -2674,6 +2791,83 @@ mod tests {
         assert!(!is_artifact_write_conflict(&ClientError::Protocol(
             "file /x is missing body descriptor".to_owned(),
         )));
+    }
+
+    #[test]
+    fn artifact_write_retryable_includes_stale_object_gc_epoch() {
+        let stale =
+            ClientError::Metadata(nokv_meta::MetadError::StalePreparedArtifactObjectGcEpoch {
+                expected: 7,
+                current: 9,
+            });
+        assert!(!is_artifact_write_conflict(&stale));
+        assert!(is_artifact_write_retryable(&stale));
+        assert!(is_artifact_write_retryable(&ClientError::Metadata(
+            nokv_meta::MetadError::Metadata(nokv_meta::MetadataError::PredicateFailed),
+        )));
+        assert!(!is_artifact_write_retryable(&ClientError::Metadata(
+            nokv_meta::MetadError::NotFile,
+        )));
+    }
+
+    #[test]
+    fn artifact_publish_cleanup_classifier_fails_closed_for_uncertain_outcomes() {
+        let predicate = ClientError::Metadata(nokv_meta::MetadError::Metadata(
+            nokv_meta::MetadataError::PredicateFailed,
+        ));
+        let stale =
+            ClientError::Metadata(nokv_meta::MetadError::StalePreparedArtifactObjectGcEpoch {
+                expected: 7,
+                current: 9,
+            });
+        let rejected_before_commit =
+            ClientError::Metadata(nokv_meta::MetadError::SyncLogArchiveFailed {
+                committed: false,
+                message: "injected".to_owned(),
+            });
+        assert!(artifact_publish_was_definitively_rejected(&predicate));
+        assert!(artifact_publish_was_definitively_rejected(&stale));
+        assert!(artifact_publish_was_definitively_rejected(
+            &rejected_before_commit
+        ));
+
+        let backend = ClientError::Metadata(nokv_meta::MetadError::Metadata(
+            nokv_meta::MetadataError::Backend("outcome unknown".to_owned()),
+        ));
+        let failed_after_commit =
+            ClientError::Metadata(nokv_meta::MetadError::SyncLogArchiveFailed {
+                committed: true,
+                message: "injected".to_owned(),
+            });
+        assert!(!artifact_publish_was_definitively_rejected(&backend));
+        assert!(!artifact_publish_was_definitively_rejected(
+            &failed_after_commit
+        ));
+        assert!(!artifact_publish_was_definitively_rejected(
+            &ClientError::Io("response lost".to_owned())
+        ));
+        assert!(!artifact_publish_was_definitively_rejected(
+            &ClientError::Protocol("response undecodable".to_owned())
+        ));
+        for ownership_error in [
+            ClientError::Metadata(nokv_meta::MetadError::StaleOwnerEpoch {
+                owner_epoch: 7,
+                required_epoch: 8,
+            }),
+            ClientError::Metadata(nokv_meta::MetadError::LeaseExpired {
+                now_ms: 101,
+                deadline_ms: 100,
+            }),
+            ClientError::Metadata(nokv_meta::MetadError::NotOwner {
+                shard_id: "mount-1:/".to_owned(),
+                endpoint: None,
+            }),
+        ] {
+            assert!(
+                !artifact_publish_was_definitively_rejected(&ownership_error),
+                "ownership errors can surface after metadata commit: {ownership_error}"
+            );
+        }
     }
 
     /// A file deleted between `lookup` and `prepare` inside `append_artifact`
