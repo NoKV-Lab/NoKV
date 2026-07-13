@@ -36,3 +36,7 @@ path = "src/bin/nokv-bench.rs"
 [[bin]]
 name = "yanex-agent-bench"
 path = "src/bin/yanex-agent-bench.rs"
+
+[[bin]]
+name = "lingtai-index-bench"
+path = "src/bin/lingtai-index-bench.rs"

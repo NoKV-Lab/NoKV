@@ -5,15 +5,22 @@ SPDX-License-Identifier: Apache-2.0
 
 # `nokv-agent` — Contributor Handbook
 
-`nokv-agent` is the **agent tool surface** crate: the LLM-facing tool
-definitions, the dispatcher that maps a tool call onto a namespace verb,
-argument validation, result shaping, and the transport-neutral `AgentError`.
-It is deliberately small, deliberately **transport-free**, and deliberately
-**read-only** today.
+`nokv-agent` is the **agent surface** crate. Its current shipped surface is the
+LLM-facing NoKV namespace tool layer: tool definitions, the dispatcher that maps
+a tool call onto a namespace verb, argument validation, result shaping, and the
+transport-neutral `AgentError`. That surface is deliberately **transport-free**
+and **read-only**.
 
-This handbook is for contributors touching the agent surface. It covers where
+The crate is also the home for LingTai-facing agent event indexes. That index is
+a derived local view over LingTai `logs/events.jsonl`, not a NoKV DFS namespace
+adapter and not a SQL-compatibility layer. Keep this second surface separate
+from the seven namespace verbs so the DFS product path and LingTai event-index
+path can evolve independently.
+
+This handbook is for contributors touching either agent surface. It covers where
 the crate sits in the workspace, the invariants you must preserve, how to add a
-tool, and the roadmap for the verbs we expect to add next.
+namespace tool, and how to keep the LingTai event-index work inside its own
+boundary.
 
 ## 1. Why this crate exists
 
@@ -45,7 +52,8 @@ caller (bench / SDK / MCP)
                  └─ ObjectStore  (S3)                          ← bytes for grep/read, in nokv-object
 ```
 
-`nokv-agent` depends on exactly three workspace crates plus `serde_json`:
+The namespace tool surface currently depends on exactly three workspace crates
+plus `serde_json`:
 
 | Dependency | Why it is load-bearing |
 | --- | --- |
@@ -56,6 +64,35 @@ caller (bench / SDK / MCP)
 
 It depends on **none** of `nokv-client`, `nokv-protocol`, `nokv-control`. That
 is the whole point — and it is enforced (see [the cycle rule](#4-invariants-do-not-break-these)).
+
+### LingTai event index — what `nokv-agent` owns
+
+LingTai's runtime keeps `logs/events.jsonl` as the authoritative log and uses
+`logs/log.sqlite` as a derived index for TUI/session queries. NoKV's integration
+target is the derived-index layer:
+
+```
+LingTai logs/events.jsonl
+  └─ nokv-agent lingtai ingest                         ← streaming, offset-aware
+       └─ AgentEventStore                              ← semantic event-index API
+            └─ Holt-backed local agent index           ← derived view, rebuildable
+                 ├─ coverage by source file
+                 ├─ event type / timestamp indexes
+                 ├─ tool/action facets
+                 └─ tool_call_id / trace correlation
+```
+
+The event index may open its own Holt store because it is an independent local
+agent-index directory. It must not open or mutate a NoKV metadata directory and
+must not become a second owner for NoKV namespace state.
+
+The index is allowed to expose CLI/server entry points such as
+`nokv-agent lingtai ingest`, `coverage`, `latest`, `session`, `session-rows`,
+`recent`, `molt-windows`, `errors`, `completion-after`, `clear-completion`,
+`notification-blocks`, `notification-block-snapshots`, `notification-events`,
+`notification-by-id`, `notification-before`, `notification-after`,
+`notifications`, `facets`, and `trace`. These entry points return stable JSON
+for LingTai's Go adapter and the benchmark harness.
 
 ### Remote (RPC) — stays in `nokv-client`
 
@@ -111,6 +148,30 @@ The seven tools are **read-only**: `ls`, `stat`, `catalog`, `read`, `find`,
 exists (`ls`/`stat`/`catalog`), then query and read only what is needed
 (`find`/`aggregate`/`read`/`grep`).
 
+The LingTai event-index API is a separate surface. Its initial semantic queries
+mirror the current SQLite consumers instead of exposing raw SQL:
+
+- `coverage(agent, source_file)`;
+- `stream_session_events(agent, filter, order = id_asc)`;
+- `stream_session_rows(agent, order = id_asc)`, a compact LingTai
+  `SessionEventRow { ts, type, fields_json }` projection for replacing
+  SQLite's `StreamSessionEvents` hot path;
+- `latest_events(type, limit)`;
+- `recent_times(type, limit)`;
+- `molt_session_windows(agent)`;
+- `error_events(limit)`;
+- `completion_after(type = clear_received, source_offset)`;
+- `tui_clear_completion(source_offset)`;
+- parsed `notification-blocks` rows for replacing `QueryNotificationBlocks`;
+- parsed `notification-block-snapshots` rows for replacing
+  `QueryNotificationBlockSnapshots`;
+- `notification_events(limit)`;
+- `notification_event_by_id(event_id)`;
+- `notification_neighbor(event_id, before | after)`;
+- `notification_lifecycle(ref_id/event_id/call_id/channel)`;
+- `tool_facets(window, group_by = tool/action)`;
+- `tool_trace(tool_call_id)`.
+
 ## 4. Invariants (do not break these)
 
 1. **Transport-free.** `nokv-agent` must never depend on `nokv-client`,
@@ -120,7 +181,8 @@ exists (`ls`/`stat`/`catalog`), then query and read only what is needed
 2. **Read-only verb surface.** The `AgentNamespace` trait exposes only the six
    read verbs. Writes (e.g. `register_namespace_index`) stay as inherent methods
    on `NoKvFs` in `nokv-meta`, off the trait. Keep the model-facing surface
-   read-only unless a write contract is explicitly designed (see [the roadmap](#6-roadmap-verbs-we-expect-to-add)).
+   read-only unless a write contract is explicitly designed (see
+   [the roadmap](#7-roadmap-verbs-we-expect-to-add)).
 3. **Orphan-rule placement.** `impl AgentNamespace for NoKvFs<M, O>` lives in
    `nokv-agent` (local trait + foreign type → legal). This is what lets the
    embedded path work **without** `nokv-meta` gaining a dependency on
@@ -137,8 +199,71 @@ exists (`ls`/`stat`/`catalog`), then query and read only what is needed
    `Display` strings are observed by judges, telemetry, and the model. Treat any
    change to them as a behavior change, not a refactor — snapshot-test before
    and after.
+7. **JSONL remains authoritative for LingTai.** The event index is a derived
+   acceleration layer. LingTai fallback behavior must remain possible when
+   coverage is incomplete, a source file is truncated, or the index is absent.
+8. **Idempotent event ingest.** The event index keys rows by
+   `(agent_id, source_file, source_offset)`. Replaying the same JSONL range must
+   not duplicate events or roll coverage backward.
+9. **No raw-log benchmark shortcuts.** Product code may expose semantic event
+   queries and compact facets, but it must not bake benchmark task answers into
+   hidden files, tables, or special cases.
 
-## 5. Adding a new read tool
+## 5. LingTai event-index design rules
+
+The first implementation should use responsibility-based files instead of
+growing `lib.rs`:
+
+| File | Contents |
+| --- | --- |
+| `namespace.rs` | Existing namespace trait, seven tool definitions, dispatcher, parsers, and result JSON. |
+| `event/types.rs` | `AgentId`, `SourceFile`, `EventId`, `EventRecord`, projected fields, coverage, and query results. |
+| `event/codec.rs` | Durable value encoding with explicit version bytes. |
+| `event/key.rs` | Holt key layout for coverage, source-offset de-dupe, event rows, type/time indexes, facets, and traces. |
+| `event/notification.rs` | LingTai notification summary/snapshot parsing for modern `_meta` envelopes and legacy `payload`/`meta` rows. |
+| `event/store.rs` | `AgentEventStore` trait and batch-ingest/query contracts. |
+| `event/holt.rs` | Holt-backed implementation over an independent agent-index directory. |
+| `event/ingest.rs` | JSONL streaming parser that records byte offsets and handles partial lines. |
+| `src/bin/nokv-agent.rs` | LingTai CLI entry point for ingest and typed queries. |
+
+Required key families:
+
+| Family | Purpose |
+| --- | --- |
+| `coverage/{agent}/{source_file_hash}` | O(1) file coverage: file size, min/max offset, row count. |
+| `source/{agent}/{source_file_hash}/{offset}` | Idempotent source-offset de-dupe. |
+| `event/{agent}/{event_id}` | Compact event record; event id is derived from source-file hash and source offset. |
+| `payloads:fields_json/{agent}/{event_id}/{chunk}` | External `fields_json` chunks for events whose full payload exceeds Holt's single-value limit. Reads transparently rehydrate this into `EventRecord.fields_json`. |
+| `type_id/{agent}/{type}/{rev_id}` | Latest-by-type scans. |
+| `type_ts/{agent}/{type}/{rev_ts}/{event_id}` | Recent timestamp queries. |
+| `session/{agent}/{event_id}` | Ordered session-event pointer; values store event ids and replay rows are reconstructed from `event/{agent}/{event_id}`. |
+| `notification_id/{agent}/{event_id}` | LingTai notification browser before/after traversal. |
+| `notification_rev/{agent}/{rev_id}` | Newest-first `type LIKE '%notification%'` replacement. |
+| `notification_prev/{agent}/{event_id}` | Direct older-neighbor pointer for notification browser traversal. |
+| `notification_next/{agent}/{event_id}` | Direct newer-neighbor pointer for notification browser traversal. |
+| `notification_tail/{agent}` | Append-order tail pointer for notification neighbor materialization. |
+| `notification/{agent}/{field}/{value}/{event_id}` | Notification lifecycle lookup by `ref_id`, event id, call id, or channel. |
+| `tui_clear_rev/{agent}/{rev_id}` | Newest-first TUI-originated `psyche_molt` / `clear_received` completion checks. |
+| `tool/{agent}/{tool_name}/{action}/{rev_id}` | Tool/action history. |
+| `trace/{agent}/{tool_call_id}/{phase}` | Tool call/result/reasoning correlation. |
+| `facet/{agent}/{facet_name}/{bucket}` | Materialized top-N/facet counts for tool/action grouping. |
+
+Ingest commits bounded batches so a large LingTai log does not exceed Holt WAL
+record limits. Each batch atomically commits event rows, secondary indexes,
+materialized facet counts, and coverage. `fields_json` is preserved in the
+event record so LingTai's row projections, pretty-fields rendering, and parsed
+notification views do not lose payload content relative to SQLite.
+
+When the LingTai adapter shells out to `nokv-agent`, process-level timeout,
+freshness cache, and stale-on-error fallback remain adapter responsibilities.
+The Rust event index returns deterministic derived-index state; it does not own
+the TUI worker scheduling policy.
+
+Tests must cover replay, duplicate offsets inside one batch, chunked ingest,
+partial trailing lines, large-field preservation, source-file truncation, and
+coverage monotonicity.
+
+## 6. Adding a new read tool
 
 The flow crosses two crates because the verb logic stays in `nokv-meta`:
 
@@ -156,7 +281,7 @@ The flow crosses two crates because the verb logic stays in `nokv-meta`:
    `nokv-agent` (no engine needed), and confirm the benchmark tool-registry test
    still matches the arm surface.
 
-## 6. Roadmap (verbs we expect to add)
+## 7. Roadmap (verbs we expect to add)
 
 The current surface answers **read** questions over a namespace. NoKV already
 implements the write/stateful semantics below in `nokv-meta`/`nokv-client`; the
@@ -186,15 +311,19 @@ contract — argument grammar, idempotency/iflag semantics, evidence URIs, and
 limits — and an answer to "what does the model see on partial failure." Open a
 design issue before adding a write verb to the trait.
 
-## 7. Where things live
+## 8. Where things live
 
 | Concern | Location |
 | --- | --- |
-| Tool definitions, dispatch, validation, `AgentError`, embedded impl | `crates/nokv-agent/src/lib.rs` |
+| Namespace tool definitions, dispatch, validation, `AgentError`, embedded impl | `crates/nokv-agent/src/namespace.rs` |
+| LingTai event-index types, codecs, keys, ingest, Holt backend | `crates/nokv-agent/src/event/` |
+| LingTai agent-index CLI | `crates/nokv-agent/src/bin/nokv-agent.rs` |
+| LingTai workload extractor and SQLite baseline probes | `bench/agent-interface/scripts/lingtai_workload_baseline.py` |
+| LingTai SQLite vs `nokv-agent` benchmark binary | `bench/src/bin/lingtai-index-bench.rs` |
 | Public-surface integration test (the seven tools, `AgentError: Error`) | `crates/nokv-agent/tests/public_surface.rs` |
+| LingTai event-index integration tests | `crates/nokv-agent/tests/event_index.rs` |
 | Verb implementations (the six read methods) | `crates/nokv-meta/src/service/agent.rs` |
 | Remote trait impls + re-export + `From<ClientError>` | `crates/nokv-client/src/agent.rs` |
-| Real-world consumer (the agent-interface benchmark) | `bench/src/bin/yanex-agent-bench.rs` |
 
 See also the [code contract](code_contract.md) and the
 [PR review checklist](pr_review_checklist.md).

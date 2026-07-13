@@ -5,6 +5,11 @@ harness. It compares how different agent-facing surfaces affect correctness,
 token cost, tool calls, and bytes read over the same fixed Yanex experiment
 corpus.
 
+The active LingTai event-index benchmark track lives in
+`bench/agent-interface/lingtai/`. It measures LingTai `events.jsonl` and
+`log.sqlite` exports and is the benchmark path for the Holt-backed
+`nokv-agent` derived event index.
+
 This is not a storage-engine throughput benchmark. The product benchmark for
 metadata, training-read, and checkpoint workloads lives in the root `bench/`
 crate and is documented in `docs/benchmarks.md`.
