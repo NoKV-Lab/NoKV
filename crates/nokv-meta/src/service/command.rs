@@ -226,10 +226,10 @@ where
                         vec![Err(backend)],
                     )?;
                     match self.reconcile_metadata_commit_group_locked(&group) {
-                        Ok(mut resolved) => match resolved.pop().expect("single commit result") {
-                            Ok(result) => (command, result),
-                            Err(err) => return Err(err.into()),
-                        },
+                        Ok(mut resolved) => {
+                            let result = resolved.pop().expect("single commit result")?;
+                            (command, result)
+                        }
                         Err(err) => {
                             self.defer_unresolved_metadata_commit_group_locked(group)?;
                             return Err(err);
