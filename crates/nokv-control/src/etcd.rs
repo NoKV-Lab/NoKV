@@ -3,7 +3,7 @@ use std::future::Future;
 use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use tokio::runtime::{Builder, Runtime};
 
-use crate::store::ControlStore;
+use crate::store::{apply_recovery_publication, ControlStore};
 use crate::{
     decode_shard_record, encode_shard_record, CheckpointRef, ControlError, EtcdControlStoreOptions,
     LogRef, NodeId, ShardId, ShardLease, ShardRecord, ShardState,
@@ -200,11 +200,24 @@ impl ControlStore for EtcdControlStore {
                 }
             };
             if let Some(existing_owner) = current.record.owner.clone() {
-                return Err(ControlError::ShardAlreadyOwned {
-                    shard_id,
-                    owner: existing_owner,
-                    epoch: current.record.epoch,
-                });
+                // A crashed owner leaves its durable record behind after the
+                // lease-attached session key expires. Fresh may take over that
+                // stale record only when durable control state proves this shard
+                // never reached Serving and has no recovery identity. The txn's
+                // session-key create_revision guard below is the atomic liveness
+                // proof; an active prior session still rejects the takeover.
+                let never_served_empty = !current.record.ever_served
+                    && current.record.state == ShardState::Recovering
+                    && current.record.checkpoint.is_none()
+                    && current.record.log.is_none()
+                    && current.record.durable_lsn == 0;
+                if !never_served_empty {
+                    return Err(ControlError::ShardAlreadyOwned {
+                        shard_id,
+                        owner: existing_owner,
+                        epoch: current.record.epoch,
+                    });
+                }
             }
 
             let lease_id = grant_lease(&mut client, options.lease_ttl_seconds()).await?;
@@ -213,7 +226,10 @@ impl ControlStore for EtcdControlStore {
             next.endpoint = Some(owner.as_str().to_owned());
             next.epoch = next.epoch.saturating_add(1).max(1);
             next.lease_id = lease_id;
-            next.state = ShardState::Serving;
+            // A fresh lease grants recovery authority, not readiness. Only the
+            // exact-lease CAS in `mark_serving` may make the shard routable after
+            // restore and checkpoint publication have completed.
+            next.state = ShardState::Recovering;
 
             let lease = ShardLease {
                 shard_id: shard_id.clone(),
@@ -407,14 +423,9 @@ impl ControlStore for EtcdControlStore {
             validate_record_lease(&current.record, &lease)?;
 
             let mut next = current.record.clone();
-            if let Some(checkpoint) = checkpoint {
-                next.checkpoint = Some(checkpoint);
-            }
-            if let Some(log) = log {
-                next.log = Some(log);
-            }
-            next.durable_lsn = next.durable_lsn.max(durable_lsn);
+            apply_recovery_publication(&mut next, checkpoint, log, durable_lsn)?;
             next.state = ShardState::Serving;
+            next.ever_served = true;
 
             // `Compare::lease(session_key) == my lease_id` proves I am still the
             // live owner: the stable session key exists AND is attached to my
@@ -709,6 +720,57 @@ mod etcd_session_tests {
         cleanup_keys(&endpoints, &key_prefix);
     }
 
+    #[test]
+    fn fresh_resurrects_only_a_never_served_owner_after_session_expiry() {
+        let Some(endpoints) = live_etcd_endpoints() else {
+            return;
+        };
+        let key_prefix = unique_key_prefix();
+        let options = EtcdControlStoreOptions::new(endpoints.clone())
+            .with_key_prefix(key_prefix.clone())
+            .with_lease_ttl_seconds(30);
+        let store = EtcdControlStore::connect(options).expect("connect etcd control store");
+        let shard_id = ShardId::new(format!("{key_prefix}:/runs"));
+        store
+            .register_shard(shard_id.clone(), "/runs".to_owned(), 2)
+            .expect("register shard");
+
+        let first = store
+            .acquire_unassigned(shard_id.clone(), NodeId::new("node-a"))
+            .expect("first Fresh acquire");
+        assert!(!store.get_shard(&shard_id).unwrap().ever_served);
+        assert!(matches!(
+            store.acquire_unassigned(shard_id.clone(), NodeId::new("node-b")),
+            Err(ControlError::ShardAlreadyOwned { .. })
+        ));
+
+        // Crash before mark_serving: the durable record keeps owner A, while
+        // revoking its lease removes the only liveness proof.
+        revoke_lease_via_raw_client(&endpoints, first.lease_id);
+        let second = await_fresh_success(&store, &shard_id, &NodeId::new("node-b"));
+        assert_eq!(second.epoch, 2);
+        let resurrected = store.get_shard(&shard_id).unwrap();
+        assert_eq!(resurrected.owner, Some(NodeId::new("node-b")));
+        assert!(!resurrected.ever_served);
+        assert!(resurrected.checkpoint.is_none());
+        assert!(resurrected.log.is_none());
+        assert_eq!(resurrected.durable_lsn, 0);
+
+        // Once any generation reaches Serving, an expired session can only use
+        // explicit Failover; Fresh must never reinterpret it as empty.
+        store
+            .mark_serving(&second, None, None, 0)
+            .expect("mark resurrected shard serving");
+        revoke_lease_via_raw_client(&endpoints, second.lease_id);
+        let served_fresh = store.acquire_unassigned(shard_id.clone(), NodeId::new("node-c"));
+        assert!(matches!(
+            served_fresh,
+            Err(ControlError::ShardAlreadyOwned { .. })
+        ));
+
+        cleanup_keys(&endpoints, &key_prefix);
+    }
+
     /// Retry the failover until the revoked lease's session key has been reaped,
     /// so the create_revision==0 guard can pass. Bounded so a real failure still
     /// surfaces rather than hanging.
@@ -729,6 +791,28 @@ mod etcd_session_tests {
                     let _ = err;
                 }
                 Err(err) => panic!("failover did not succeed after lease revoke: {err:?}"),
+            }
+        }
+    }
+
+    fn await_fresh_success(
+        store: &EtcdControlStore,
+        shard_id: &ShardId,
+        owner: &NodeId,
+    ) -> crate::ShardLease {
+        use std::thread::sleep;
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match store.acquire_unassigned(shard_id.clone(), owner.clone()) {
+                Ok(lease) => return lease,
+                Err(err) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(100));
+                    let _ = err;
+                }
+                Err(err) => {
+                    panic!("Fresh resurrection did not succeed after lease revoke: {err:?}")
+                }
             }
         }
     }
@@ -840,6 +924,54 @@ mod etcd_session_tests {
         assert_eq!(store.get_shard(&default_shard).unwrap().shard_index, 0);
         let _ = store.release(&lease);
 
+        cleanup_keys(&endpoints, &key_prefix);
+    }
+
+    #[test]
+    fn etcd_rejects_malformed_log_without_overwriting_durable_ref() {
+        let Some(endpoints) = live_etcd_endpoints() else {
+            return;
+        };
+        let key_prefix = unique_key_prefix();
+        let options = EtcdControlStoreOptions::new(endpoints.clone())
+            .with_key_prefix(key_prefix.clone())
+            .with_lease_ttl_seconds(30);
+        let store = EtcdControlStore::connect(options).expect("connect etcd control store");
+        let shard_id = ShardId::new(format!("{key_prefix}:/runs"));
+        store
+            .register_shard(shard_id.clone(), "/runs".to_owned(), 2)
+            .expect("register shard");
+        let lease = store
+            .acquire_unassigned(shard_id.clone(), NodeId::new("node-a"))
+            .expect("acquire shard");
+        let durable = LogRef {
+            segments: vec![crate::LogSegmentRef {
+                segment_key: "meta/log/segment-1".to_owned(),
+                first_lsn: 1,
+                last_lsn: 1,
+                digest: "digest-1".to_owned(),
+            }],
+            durable_lsn: 1,
+            digest: "digest-1".to_owned(),
+        };
+        store
+            .mark_serving(&lease, None, Some(durable.clone()), 1)
+            .expect("publish durable log");
+
+        let malformed = LogRef {
+            segments: Vec::new(),
+            durable_lsn: 2,
+            digest: "digest-2".to_owned(),
+        };
+        assert!(matches!(
+            store.mark_serving(&lease, None, Some(malformed), 2),
+            Err(ControlError::RecoveryPublicationConflict { .. })
+        ));
+        let record = store.get_shard(&shard_id).unwrap();
+        assert_eq!(record.log, Some(durable));
+        assert_eq!(record.durable_lsn, 1);
+
+        let _ = store.release(&lease);
         cleanup_keys(&endpoints, &key_prefix);
     }
 

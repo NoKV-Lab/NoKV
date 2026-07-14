@@ -47,6 +47,7 @@ mod tests {
                 object_key: "meta/checkpoints/7".to_owned(),
                 lsn: 128,
                 image_bytes: 4096,
+                image_digest: "sha256:image".to_owned(),
                 digest: "ckpt-digest".to_owned(),
             }),
             log: Some(LogRef {
@@ -60,6 +61,7 @@ mod tests {
                 digest: "log-digest".to_owned(),
             }),
             durable_lsn: 144,
+            ever_served: true,
             endpoint: Some("10.0.0.1:7000".to_owned()),
             prefix: "/dataset".to_owned(),
             shard_index: 4,
@@ -79,5 +81,14 @@ mod tests {
         assert!(
             matches!(err, ControlError::Codec(message) if message.contains("unsupported shard record codec version"))
         );
+    }
+
+    #[test]
+    fn legacy_shard_record_defaults_to_ever_served_fail_closed() {
+        let bytes = br#"{"version":1,"record":{"shard_id":"mount-1:/","owner":null,"epoch":3,"lease_id":7,"state":"unassigned","checkpoint":null,"log":null,"durable_lsn":0}}"#;
+
+        let record = decode_shard_record(bytes).unwrap();
+
+        assert!(record.ever_served);
     }
 }

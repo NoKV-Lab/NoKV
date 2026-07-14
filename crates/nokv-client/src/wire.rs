@@ -86,6 +86,7 @@ pub(crate) fn wire_prepared_artifact(
         replace: prepared.replace,
         dentry_version: prepared.dentry_version,
         old_generation: prepared.old_generation,
+        object_gc_claim_version: prepared.object_gc_claim_version,
     })
 }
 
@@ -104,6 +105,7 @@ pub(crate) fn prepared_artifact_to_wire(
         replace: prepared.replace,
         dentry_version: prepared.dentry_version,
         old_generation: prepared.old_generation,
+        object_gc_claim_version: prepared.object_gc_claim_version,
     })
 }
 
@@ -262,6 +264,12 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
             dest_shard,
         }),
         WireMetadataError::GraftPoint => ClientError::Metadata(nokv_meta::MetadError::GraftPoint),
+        WireMetadataError::StalePreparedArtifactObjectGcEpoch { expected, current } => {
+            ClientError::Metadata(nokv_meta::MetadError::StalePreparedArtifactObjectGcEpoch {
+                expected,
+                current,
+            })
+        }
         WireMetadataError::SnapshotLeaseExpired {
             snapshot_id,
             lease_expires_unix_ms,
@@ -293,6 +301,20 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
         WireMetadataError::SnapshotBindingChanged { root_path } => {
             ClientError::Metadata(nokv_meta::MetadError::SnapshotBindingChanged { root_path })
         }
+        WireMetadataError::ForkRetentionActive {
+            snapshot_id,
+            fork_root,
+            borrower,
+        } => match (InodeId::new(fork_root), InodeId::new(borrower)) {
+            (Ok(fork_root), Ok(borrower)) => {
+                ClientError::Metadata(nokv_meta::MetadError::ForkRetentionActive {
+                    snapshot_id,
+                    fork_root,
+                    borrower,
+                })
+            }
+            _ => ClientError::Protocol("fork retention error carries an invalid inode".to_owned()),
+        },
         WireMetadataError::SnapshotRenewContended {
             snapshot_id,
             attempts,

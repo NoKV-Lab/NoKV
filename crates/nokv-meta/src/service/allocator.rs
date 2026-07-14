@@ -50,14 +50,6 @@ where
         {
             return Ok(());
         }
-        // Read guard held across the fence check and the reservation commit so a
-        // failover epoch bump cannot land between them.
-        let _fence = self
-            .epoch_fence
-            .read()
-            .unwrap_or_else(|err| err.into_inner());
-        self.ensure_owner_epoch_current()?;
-
         let reserved_version = current_reserved_version.max(reservation_upper_bound(
             required_version,
             ALLOCATOR_VERSION_RESERVATION,
@@ -74,8 +66,8 @@ where
                 .max(2),
         )?;
         let key = allocator_key(self.mount);
-        self.metadata
-            .commit_metadata(MetadataCommand {
+        let reservation = self.commit_metadata_from_factory(|| {
+            Ok(MetadataCommand {
                 request_id: allocator_reservation_request_id(
                     self.mount,
                     commit_version,
@@ -95,17 +87,37 @@ where
                     value: Some(Value(encode_allocator_state(
                         reserved_version,
                         reserved_next_inode,
+                        // The factory executes under the epoch read fence held
+                        // through metadata apply.
                         self.epoch.load(Ordering::Relaxed),
                     ))),
                 }],
                 watch: Vec::new(),
             })
-            .map_err(MetadError::from)?;
-        self.reserved_version
-            .store(reserved_version, Ordering::Relaxed);
-        self.reserved_next_inode
-            .store(reserved_next_inode, Ordering::Relaxed);
-        Ok(())
+        });
+        match reservation {
+            Ok(_) => {
+                // The reservation is durable in the metadata engine. Preserve
+                // that knowledge locally.
+                self.reserved_version
+                    .store(reserved_version, Ordering::Relaxed);
+                self.reserved_next_inode
+                    .store(reserved_next_inode, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(
+                err @ MetadError::SyncLogArchiveFailed {
+                    committed: true, ..
+                },
+            ) => {
+                // Keep the old process-local watermark even though Holt applied
+                // the reservation. The next prepare must re-enter this slow path
+                // so the pending segment is flushed before it can acknowledge a
+                // newly allocated generation or inode.
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub(super) fn next_version(&self) -> Result<Version, MetadError> {

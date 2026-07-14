@@ -30,20 +30,134 @@ where
     /// fork's own inode, producing new object keys; the borrowed source blocks are
     /// left untouched (a borrower never GCs another namespace's blocks).
     ///
-    /// The clone retains a snapshot pin on the source ([`CloneHandle::snapshot_id`])
-    /// so the GC retention floor protects the shared base blocks while the fork
-    /// references them. Retire it with [`NoKvFs::retire_snapshot`] when the fork no
-    /// longer needs the source's base objects (typically when the fork is deleted).
+    /// The construction snapshot is converted into a durable fork-retention
+    /// binding identified by [`CloneHandle::snapshot_id`]. Unlike the snapshot
+    /// lease, that binding does not expire: it holds the GC retention floor while
+    /// any fork reference can still reach borrowed source blocks. Retire it with
+    /// [`NoKvFs::retire_snapshot`] only after every such reference is gone,
+    /// including hardlinks moved outside the original fork root.
     pub fn clone_subtree(&self, src_root: InodeId) -> Result<CloneHandle, MetadError> {
         // Pin the source first so the read version we copy from is stable and the
         // shared base objects are GC-protected from the moment the fork exists.
         let pin = self.snapshot_subtree(src_root)?;
+        // Materialization publishes borrowed object references over multiple
+        // metadata commits. Keep this owner's GC out until the complete fork is
+        // built, then atomically replace the construction lease with a durable
+        // fork binding before exposing the handle. HA object GC is fail-closed
+        // separately.
+        let _object_gc_gate = self
+            .object_gc_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let handle = self.materialize_clone_under_gc_gate(src_root, &pin)?;
+        self.commit_detached_clone_binding(&handle, src_root, pin.read_version)?;
+        // The binding commit made this detached tree a legal root. A preexisting
+        // orphan (or a proof error) keeps the marker set; otherwise later
+        // link/rename calls return to their O(1) reachability fast path.
+        let _ = self.reconcile_materialization_orphan_state_under_gc_gate();
+        Ok(handle)
+    }
+
+    fn materialize_clone_under_gc_gate(
+        &self,
+        src_root: InodeId,
+        pin: &SnapshotPin,
+    ) -> Result<CloneHandle, MetadError> {
+        let versioned = self
+            .versioned_snapshot_pin_at(
+                pin.snapshot_id,
+                self.read_version()?,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .ok_or(MetadError::NotFound)?;
+        self.ensure_snapshot_pin_live(&versioned.pin)?;
         let version = Version::new(pin.read_version)?;
         let dst_root = self.materialize_subtree_at(src_root, version)?;
+        let retained = self
+            .versioned_snapshot_pin_at(
+                pin.snapshot_id,
+                self.read_version()?,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .ok_or(MetadError::NotFound)?;
+        if retained.pin.root != src_root || retained.pin.read_version != pin.read_version {
+            return Err(MetadError::Codec(format!(
+                "snapshot {} changed identity during clone materialization",
+                pin.snapshot_id
+            )));
+        }
+        self.ensure_snapshot_pin_live(&retained.pin)?;
         Ok(CloneHandle {
             root: dst_root,
             snapshot_id: pin.snapshot_id,
         })
+    }
+
+    fn commit_detached_clone_binding(
+        &self,
+        handle: &CloneHandle,
+        src_root: InodeId,
+        snapshot_read_version: u64,
+    ) -> Result<(), MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
+        let retained = self
+            .versioned_snapshot_pin_at(
+                handle.snapshot_id,
+                self.read_version()?,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .ok_or(MetadError::NotFound)?;
+        if retained.pin.root != src_root || retained.pin.read_version != snapshot_read_version {
+            return Err(MetadError::Codec(format!(
+                "snapshot {} changed identity before clone retention commit",
+                handle.snapshot_id
+            )));
+        }
+        self.ensure_snapshot_pin_live(&retained.pin)?;
+
+        let version = self.next_version()?;
+        let binding_key = fork_binding_key(self.mount, handle.root);
+        let binding = ForkBinding {
+            fork_root: handle.root,
+            source_root: src_root,
+            pinned_read_version: snapshot_read_version,
+            snapshot_id: handle.snapshot_id,
+            created_version: version.get(),
+        };
+        self.commit_metadata(MetadataCommand {
+            request_id: request_id(b"clone-subtree-retention", self.mount, handle.root, version),
+            kind: CommandKind::SnapshotSubtree,
+            read_version: predecessor(version)?,
+            commit_version: version,
+            primary_family: RecordFamily::ForkBinding,
+            primary_key: binding_key.clone(),
+            predicates: vec![
+                PredicateRef {
+                    family: RecordFamily::Inode,
+                    key: inode_key(self.mount, handle.root),
+                    predicate: Predicate::Exists,
+                },
+                PredicateRef {
+                    family: RecordFamily::Snapshot,
+                    key: snapshot_pin_key(self.mount, handle.snapshot_id),
+                    predicate: Predicate::VersionEquals(retained.version),
+                },
+                PredicateRef {
+                    family: RecordFamily::ForkBinding,
+                    key: binding_key.clone(),
+                    predicate: Predicate::NotExists,
+                },
+                object_reference.predicate(self.mount),
+            ],
+            mutations: vec![Mutation {
+                family: RecordFamily::ForkBinding,
+                key: binding_key,
+                op: MutationOp::Put,
+                value: Some(Value(encode_fork_binding(&binding))),
+            }],
+            watch: Vec::new(),
+        })?;
+        Ok(())
     }
 
     /// Materialize the directory subtree rooted at `src_root`, **as seen at
@@ -73,6 +187,10 @@ where
         src_root: InodeId,
         read_version: Version,
     ) -> Result<InodeId, MetadError> {
+        // Callers hold object_gc_gate. Raise the process-local slow-path marker
+        // before even validating the source so every partial metadata commit (or
+        // an error after one) remains fail-closed for inode-addressed exposure.
+        self.mark_materialization_orphan_possible_under_gc_gate();
         let Some(src_attr) =
             self.get_attr_at_version_for_purpose(src_root, read_version, ReadPurpose::Snapshot)?
         else {
@@ -135,9 +253,9 @@ where
     /// This is [`NoKvFs::clone_subtree_path`] plus a single dentry that attaches the
     /// detached fork root under `dst_path`'s parent. The fork shares the source's
     /// object blocks until it diverges on write (see [`NoKvFs::clone_subtree`]) and
-    /// the returned [`CloneHandle`] carries the retained snapshot pin exactly as the
-    /// detached clone does. `dst_path`'s parent must already exist and `dst_path`
-    /// itself must be free.
+    /// the returned [`CloneHandle`] carries the durable retention identity exactly
+    /// as the detached clone does. `dst_path`'s parent must already exist and
+    /// `dst_path` itself must be free.
     pub fn clone_subtree_path_into(
         &self,
         src_path: &str,
@@ -145,20 +263,56 @@ where
     ) -> Result<CloneHandle, MetadError> {
         let src_root = self.resolve_directory_path(src_path)?;
         let (dst_parent, dst_name) = self.resolve_parent_path(dst_path)?;
-        let handle = self.clone_subtree(src_root)?;
-        self.link_clone_root(handle.root, dst_parent, dst_name)?;
+        let pin = self.snapshot_subtree(src_root)?;
+        // Keep GC excluded through both materialization and the commit that
+        // exposes the fork. Releasing the gate between those phases would let a
+        // near-expiry pin admit DELETE before the detached tree became live.
+        let _object_gc_gate = self
+            .object_gc_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let handle = self.materialize_clone_under_gc_gate(src_root, &pin)?;
+        self.link_clone_root(
+            handle.root,
+            dst_parent,
+            dst_name,
+            src_root,
+            pin.snapshot_id,
+            pin.read_version,
+        )?;
+        let _ = self.reconcile_materialization_orphan_state_under_gc_gate();
         Ok(handle)
     }
 
     /// Attach an existing (detached) fork root inode under `dst_parent` as
-    /// `dst_name`, committing only the directory dentry that names it. The inode
-    /// already exists from [`NoKvFs::clone_subtree`]; this just makes it reachable.
+    /// `dst_name`. The same atomic commit exact-version fences the live
+    /// construction pin, installs the non-expiring fork binding, and joins the
+    /// durable object-GC Open epoch, so borrowed objects cannot be deleted
+    /// between materialization and exposure or after the snapshot lease expires.
     fn link_clone_root(
         &self,
         root: InodeId,
         dst_parent: InodeId,
         dst_name: DentryName,
+        src_root: InodeId,
+        snapshot_id: u64,
+        snapshot_read_version: u64,
     ) -> Result<(), MetadError> {
+        let object_reference = self.begin_object_reference_mutation()?;
+        let retained = self
+            .versioned_snapshot_pin_at(
+                snapshot_id,
+                self.read_version()?,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .ok_or(MetadError::NotFound)?;
+        if retained.pin.root != src_root || retained.pin.read_version != snapshot_read_version {
+            return Err(MetadError::Codec(format!(
+                "snapshot {snapshot_id} changed identity before clone link"
+            )));
+        }
+        self.ensure_snapshot_pin_live(&retained.pin)?;
+
         let version = self.next_version()?;
         let read_version = predecessor(version)?;
         let Some(mut attr) =
@@ -169,6 +323,14 @@ where
         attr.ctime_ms = current_time_ms();
         let projection = projection(dst_parent, dst_name, attr, None);
         let dentry = dentry_key(self.mount, dst_parent, &projection.dentry.name);
+        let binding_key = fork_binding_key(self.mount, root);
+        let binding = ForkBinding {
+            fork_root: root,
+            source_root: src_root,
+            pinned_read_version: snapshot_read_version,
+            snapshot_id,
+            created_version: version.get(),
+        };
         self.commit_metadata(MetadataCommand {
             request_id: request_id(b"clone-subtree-link", self.mount, root, version),
             kind: CommandKind::CreateDir,
@@ -187,12 +349,27 @@ where
                     key: dentry.clone(),
                     predicate: Predicate::NotExists,
                 },
+                PredicateRef {
+                    family: RecordFamily::Snapshot,
+                    key: snapshot_pin_key(self.mount, snapshot_id),
+                    predicate: Predicate::VersionEquals(retained.version),
+                },
+                PredicateRef {
+                    family: RecordFamily::ForkBinding,
+                    key: binding_key.clone(),
+                    predicate: Predicate::NotExists,
+                },
+                object_reference.predicate(self.mount),
             ],
-            mutations: vec![put_projection_mutation(
-                RecordFamily::Dentry,
-                dentry,
-                &projection,
-            )],
+            mutations: vec![
+                put_projection_mutation(RecordFamily::Dentry, dentry, &projection),
+                Mutation {
+                    family: RecordFamily::ForkBinding,
+                    key: binding_key,
+                    op: MutationOp::Put,
+                    value: Some(Value(encode_fork_binding(&binding))),
+                },
+            ],
             watch: Vec::new(),
         })?;
         Ok(())

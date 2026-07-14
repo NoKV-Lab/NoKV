@@ -1,8 +1,10 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use nokv_control::{
-    CheckpointRef, ControlStore, LogRef, NodeId, ShardId, ShardLease, ShardRecord, ShardState,
+    CheckpointRef, ControlError, ControlStore, LogRef, NodeId, ShardId, ShardLease, ShardRecord,
+    ShardState,
 };
 use nokv_meta::{MetadataStore, NoKvFs};
 use nokv_object::ObjectStore;
@@ -69,6 +71,9 @@ pub struct ServerShardOwnerState {
 pub(crate) struct ServerShardOwner {
     store: Arc<dyn ControlStore>,
     lease: ShardLease,
+    recovery_publish_gate: Arc<RwLock<()>>,
+    published_recovery_state: Arc<RwLock<Option<ServerShardOwnerState>>>,
+    recovery_dirty: Arc<AtomicBool>,
     /// Lease TTL (ms) for the wall-clock self-fence; `None` when auto-renewal is
     /// disabled (manual/test owners and single-node dev, which keep the fence
     /// off and rely on the epoch fence alone).
@@ -165,7 +170,8 @@ impl ServerShardOwner {
             .map(|renewal| renewal.lease_ttl.as_millis() as u64)
             .filter(|ms| *ms > 0);
         let basis_ms = service.now_ms();
-        let lease = match options.acquisition {
+        let acquisition = options.acquisition;
+        let lease = match acquisition {
             ServerShardAcquisition::Fresh => {
                 store.acquire_unassigned(options.shard_id, options.node_id)?
             }
@@ -173,15 +179,128 @@ impl ServerShardOwner {
                 store.acquire_after_failure(options.shard_id, options.node_id, previous_epoch)?
             }
         };
-        service.install_owner_epoch(lease.epoch)?;
+        // This check is deliberately after the atomic acquire. A pre-read has a
+        // TOCTOU window with another owner generation; the returned lease plus
+        // an exact record read-back is the authoritative proof. Epoch > 1 may
+        // still be a controlled Fresh resurrection only when no generation has
+        // ever reached Serving and no recovery identity has ever been published.
+        if matches!(acquisition, ServerShardAcquisition::Fresh) && lease.epoch != 1 {
+            let record = match store.get_shard(&lease.shard_id) {
+                Ok(record) => record,
+                Err(err) => {
+                    let _ = store.release(&lease);
+                    return Err(err.into());
+                }
+            };
+            let exact_lease = record.owner.as_ref() == Some(&lease.owner)
+                && record.epoch == lease.epoch
+                && record.lease_id == lease.lease_id
+                && record.state == ShardState::Recovering;
+            let never_served_empty = !record.ever_served
+                && record.checkpoint.is_none()
+                && record.log.is_none()
+                && record.durable_lsn == 0;
+            if !exact_lease || !never_served_empty {
+                let err = nokv_control::ControlError::FreshAcquireRequiresFailover {
+                    shard_id: lease.shard_id.clone(),
+                    epoch: lease.epoch,
+                };
+                let _ = store.release(&lease);
+                return Err(err.into());
+            }
+        }
+        if let Err(err) = service.install_owner_epoch(lease.epoch) {
+            // The control lease already exists, but no owner object has been
+            // constructed yet to release it. Do not strand a Recovering owner
+            // when local epoch installation rejects startup.
+            let _ = store.release(&lease);
+            return Err(err.into());
+        }
         if let Some(ttl) = lease_ttl_ms {
             service.set_lease_deadline(basis_ms.saturating_add(ttl));
         }
         Ok(Self {
             store,
             lease,
+            recovery_publish_gate: Arc::new(RwLock::new(())),
+            published_recovery_state: Arc::new(RwLock::new(None)),
+            recovery_dirty: Arc::new(AtomicBool::new(false)),
             lease_ttl_ms,
         })
+    }
+
+    pub(crate) fn lock_recovery_visibility(&self) -> RwLockReadGuard<'_, ()> {
+        self.recovery_publish_gate
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    pub(crate) fn lock_recovery_publication(&self) -> RwLockWriteGuard<'_, ()> {
+        self.recovery_publish_gate
+            .write()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    pub(crate) fn published_recovery_state(&self) -> Option<ServerShardOwnerState> {
+        self.published_recovery_state
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn mark_recovery_dirty(&self) {
+        self.recovery_dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mark_recovery_clean(&self) {
+        self.recovery_dirty.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn recovery_is_dirty(&self) -> bool {
+        self.recovery_dirty.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn verify_read_lease<M, O>(&self, service: &NoKvFs<M, O>) -> Result<(), ServerError>
+    where
+        M: MetadataStore,
+        O: ObjectStore,
+    {
+        if self.lease_ttl_ms.is_some() {
+            service.verify_owner_lease().map_err(ServerError::Metadata)
+        } else {
+            // Explicit no-background-renew mode has no local expiry deadline.
+            // Validate the stable control session on every read instead of
+            // allowing a replaced owner to serve stale data indefinitely.
+            match self.renew(service) {
+                Ok(_) => service.verify_owner_lease().map_err(ServerError::Metadata),
+                Err(err)
+                    if matches!(
+                        &err,
+                        ServerError::Control(
+                            ControlError::NotOwner { .. } | ControlError::StaleLease { .. }
+                        )
+                    ) =>
+                {
+                    let endpoint = self
+                        .store
+                        .get_shard(&self.lease.shard_id)
+                        .ok()
+                        .and_then(|record| record.endpoint);
+                    Err(ServerError::NotOwner {
+                        shard_id: self.lease.shard_id.as_str().to_owned(),
+                        endpoint,
+                    })
+                }
+                Err(err) => Err(err),
+            }
+        }
+    }
+
+    fn cache_published_recovery_state(&self, state: ServerShardOwnerState) {
+        *self
+            .published_recovery_state
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = Some(state);
     }
 
     pub(crate) fn mark_serving<M, O>(
@@ -206,15 +325,63 @@ impl ServerShardOwner {
         M: MetadataStore,
         O: ObjectStore,
     {
-        let basis_ms = service.now_ms();
-        let record = self
+        let _publication = self.lock_recovery_publication();
+        self.mark_serving_with_recovery_refs_locked(service, checkpoint, log, durable_lsn)
+    }
+
+    /// Publish while the caller already holds `recovery_publish_gate`. This is
+    /// used when the protected operation begins before the control CAS (for
+    /// example, snapshotting the sync-log tail or preparing a checkpoint).
+    pub(crate) fn mark_serving_with_recovery_refs_locked<M, O>(
+        &self,
+        service: &NoKvFs<M, O>,
+        checkpoint: Option<CheckpointRef>,
+        log: Option<LogRef>,
+        durable_lsn: u64,
+    ) -> Result<ServerShardOwnerState, ServerError>
+    where
+        M: MetadataStore,
+        O: ObjectStore,
+    {
+        // Local deadline/epoch fencing is checked immediately before the
+        // control-plane lease CAS. An owner that self-fenced must not revive
+        // itself by publishing a recovery reference.
+        service.verify_owner_lease()?;
+        let cached = self.published_recovery_state();
+        let checkpoint_for_readback = checkpoint.clone();
+        let log_for_readback = log.clone();
+        let record = match self
             .store
-            .mark_serving(&self.lease, checkpoint, log, durable_lsn)?;
+            .mark_serving(&self.lease, checkpoint, log, durable_lsn)
+        {
+            Ok(record) => record,
+            Err(mark_err) => match self.store.get_shard(&self.lease.shard_id) {
+                Ok(record)
+                    if recovery_publication_matches(
+                        &self.lease,
+                        &record,
+                        cached.as_ref(),
+                        checkpoint_for_readback.as_ref(),
+                        log_for_readback.as_ref(),
+                        durable_lsn,
+                    ) =>
+                {
+                    record
+                }
+                Ok(record) => {
+                    service.observe_required_owner_epoch(record.epoch)?;
+                    return Err(mark_err.into());
+                }
+                Err(_) => return Err(mark_err.into()),
+            },
+        };
         service.install_owner_epoch(record.epoch)?;
-        if let Some(ttl) = self.lease_ttl_ms {
-            service.set_lease_deadline(basis_ms.saturating_add(ttl));
-        }
-        Ok(owner_state(&self.lease, &record))
+        // `mark_serving` is a control-record CAS, not a lease keepalive. Never
+        // extend the local deadline here: only a successful `renew` round trip
+        // proves that the control plane extended the real lease.
+        let state = owner_state(&self.lease, &record);
+        self.cache_published_recovery_state(state.clone());
+        Ok(state)
     }
 
     pub(crate) fn renew<M, O>(
@@ -234,7 +401,9 @@ impl ServerShardOwner {
                 if let Some(ttl) = self.lease_ttl_ms {
                     service.set_lease_deadline(basis_ms.saturating_add(ttl));
                 }
-                Ok(owner_state(&self.lease, &record))
+                let state = owner_state(&self.lease, &record);
+                self.cache_published_recovery_state(state.clone());
+                Ok(state)
             }
             Err(err) => {
                 // Best-effort: observe a bumped epoch if the control plane is
@@ -260,6 +429,48 @@ impl ServerShardOwner {
         self.store.release(&self.lease)?;
         Ok(())
     }
+}
+
+fn recovery_publication_matches(
+    lease: &ShardLease,
+    record: &ShardRecord,
+    cached: Option<&ServerShardOwnerState>,
+    checkpoint: Option<&CheckpointRef>,
+    log: Option<&LogRef>,
+    durable_lsn: u64,
+) -> bool {
+    if record.owner.as_ref() != Some(&lease.owner)
+        || record.epoch != lease.epoch
+        || record.lease_id != lease.lease_id
+        || record.state != ShardState::Serving
+        || record.durable_lsn != durable_lsn
+    {
+        return false;
+    }
+
+    let expected_checkpoint = checkpoint
+        .cloned()
+        .or_else(|| cached.and_then(|state| state.checkpoint.clone()));
+    let Some(expected_checkpoint) = expected_checkpoint else {
+        // An ACK-lost no-reference publication cannot be proven without an
+        // exact previously-published recovery identity.
+        return false;
+    };
+    if record.checkpoint.as_ref() != Some(&expected_checkpoint) {
+        return false;
+    }
+
+    let mut expected_log = log
+        .cloned()
+        .or_else(|| cached.and_then(|state| state.log.clone()));
+    if expected_log
+        .as_ref()
+        .is_some_and(|expected_log| expected_log.durable_lsn <= expected_checkpoint.lsn)
+        || (checkpoint.is_some() && expected_checkpoint.lsn == durable_lsn && log.is_none())
+    {
+        expected_log = None;
+    }
+    record.log == expected_log
 }
 
 fn owner_state(lease: &ShardLease, record: &ShardRecord) -> ServerShardOwnerState {

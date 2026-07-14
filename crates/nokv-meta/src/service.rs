@@ -26,14 +26,18 @@ mod snapshot;
 mod watch;
 mod xattr;
 
-pub use self::backup::{MetadataArchiveConfig, MetadataBackupOutcome, MetadataRestoreOutcome};
+pub use self::backup::{
+    MetadataArchiveConfig, MetadataBackupOutcome, MetadataCheckpointIdentity,
+    MetadataRestoreOutcome,
+};
 pub use self::checkpoint::{CheckpointHandle, CheckpointShard};
 pub use self::fsck::{DanglingBlock, FsckReport};
 pub use self::log_archive::{
     MetadataLogArchiveConfig, MetadataLogRestoreOutcome, MetadataLogSegmentArchiveOutcome,
 };
 pub use self::log_sync::{
-    MetadataLogSegmentPointer, MetadataLogSyncConfig, MetadataLogSyncSnapshot,
+    MetadataLogPruneOutcome, MetadataLogPublicationState, MetadataLogSegmentPointer,
+    MetadataLogSyncConfig, MetadataLogSyncSnapshot,
 };
 pub use self::snapshot::DEFAULT_SNAPSHOT_LEASE_MS;
 
@@ -57,10 +61,12 @@ use crate::layout::{
     decode_body_descriptor, decode_chunk_manifest, decode_dentry_projection, decode_inode_attr,
     decode_object_gc_record, decode_path_index_catalog, decode_path_index_row, decode_snapshot_pin,
     decode_watch_event, dentry_key, dentry_mount_prefix, dentry_prefix, encode_allocator_state,
-    encode_body_descriptor, encode_chunk_manifest, encode_dentry_projection, encode_inode_attr,
-    encode_object_gc_record, encode_path_index_catalog, encode_path_index_row, encode_snapshot_pin,
-    encode_watch_event, gc_object_key, gc_queue_prefix, inode_key, path_index_catalog_key,
-    path_index_key, path_index_prefix, path_index_row_key, path_index_row_prefix, snapshot_pin_key,
+    encode_body_descriptor, encode_chunk_manifest, encode_dentry_projection, encode_fork_binding,
+    encode_inode_attr, encode_object_gc_record, encode_path_index_catalog, encode_path_index_row,
+    encode_snapshot_pin, encode_watch_event, failover_durability_required_key, fork_binding_key,
+    gc_object_key, gc_queue_prefix, inode_key, inode_prefix, object_gc_claim_key,
+    object_gc_quarantine_key, object_gc_scan_cursor_key, path_index_catalog_key, path_index_key,
+    path_index_prefix, path_index_row_key, path_index_row_prefix, snapshot_pin_key,
     snapshot_pin_prefix, watch_log_key, watch_log_prefix, xattr_key, xattr_prefix,
     PathIndexCatalogRecord, PathIndexFieldRecord, PathIndexRowRecord, PathIndexValueRecord,
     PATH_INDEX_DELIMITER,
@@ -72,7 +78,7 @@ use nokv_object::{
 };
 use nokv_types::{
     parse_absolute_path, AdvisoryLock, BlockDescriptor, BodyDescriptor, ChunkManifest, DentryName,
-    DentryProjection, DentryRecord, FileType, InodeAttr, InodeId, ModelError, MountId,
+    DentryProjection, DentryRecord, FileType, ForkBinding, InodeAttr, InodeId, ModelError, MountId,
     ObjectGcRecord, PathError, PathMetadata, ReadLease, RecordFamily, SliceManifest, SnapshotPin,
     SpecialNodeSpec, WatchCursor, WatchEvent, WatchEventKind, WatchRecord,
 };
@@ -109,6 +115,231 @@ const PATH_INDEX_LOOKUP_CACHE_MAX_ENTRIES_PER_SHARD: usize =
 const PATH_INDEX_VALIDATION_CACHE_MAX_ENTRIES_PER_SHARD: usize =
     PATH_INDEX_VALIDATION_CACHE_MAX_ENTRIES / PATH_CACHE_SHARD_COUNT;
 pub(crate) const DEFAULT_READ_LEASE_MS: u64 = 3_600_000;
+const FAILOVER_DURABILITY_REQUIRED_MARKER: &[u8] = &[1];
+
+fn decode_failover_durability_required_marker(bytes: &[u8]) -> Result<(), MetadError> {
+    if bytes == FAILOVER_DURABILITY_REQUIRED_MARKER {
+        Ok(())
+    } else {
+        Err(MetadError::Codec(
+            "invalid failover durability requirement marker".to_owned(),
+        ))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ObjectGcClaim {
+    Open,
+    Deleting {
+        owner_epoch: u64,
+        operation_token: u64,
+        gc_record_key: Vec<u8>,
+        gc_record_version: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ObjectGcRecordKey {
+    enqueue_version: u64,
+    inode: InodeId,
+    generation: u64,
+    chunk_index: u64,
+    block_index: u64,
+}
+
+fn decode_canonical_block_object_owner(
+    object_key: &str,
+) -> Result<(u64, u64, u64, u64, u64), MetadError> {
+    fn number(parts: &mut std::str::Split<'_, char>) -> Result<u64, MetadError> {
+        let raw = parts
+            .next()
+            .ok_or_else(|| MetadError::Codec("block object key is truncated".to_owned()))?;
+        let value = raw.parse::<u64>().map_err(|_| {
+            MetadError::Codec("block object key contains an invalid number".to_owned())
+        })?;
+        if value.to_string() != raw {
+            return Err(MetadError::Codec(
+                "block object key is not canonical".to_owned(),
+            ));
+        }
+        Ok(value)
+    }
+
+    let mut parts = object_key.split('/');
+    if parts.next() != Some("blocks") {
+        return Err(MetadError::Codec(
+            "object does not name a canonical block".to_owned(),
+        ));
+    }
+    let mount = number(&mut parts)?;
+    let inode = number(&mut parts)?;
+    let generation = number(&mut parts)?;
+    let chunk_index = number(&mut parts)?;
+    let block_index = number(&mut parts)?;
+    if parts.next().is_some() {
+        return Err(MetadError::Codec(
+            "block object key has trailing components".to_owned(),
+        ));
+    }
+    Ok((mount, inode, generation, chunk_index, block_index))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ObjectReferenceMutation {
+    claim_version: Version,
+}
+
+impl ObjectReferenceMutation {
+    pub(super) fn from_version(claim_version: Version) -> Self {
+        Self { claim_version }
+    }
+
+    pub(super) fn version(self) -> Version {
+        self.claim_version
+    }
+
+    pub(super) fn predicate(self, mount: MountId) -> PredicateRef {
+        PredicateRef {
+            family: RecordFamily::System,
+            key: object_gc_claim_key(mount),
+            predicate: Predicate::VersionEquals(self.claim_version),
+        }
+    }
+}
+
+fn encode_object_gc_claim(claim: &ObjectGcClaim) -> Result<Vec<u8>, MetadError> {
+    match claim {
+        ObjectGcClaim::Open => Ok(vec![1]),
+        ObjectGcClaim::Deleting {
+            owner_epoch,
+            operation_token,
+            gc_record_key,
+            gc_record_version,
+        } => {
+            let key_len = u32::try_from(gc_record_key.len())
+                .map_err(|_| MetadError::Codec("object GC record key is too long".to_owned()))?;
+            let mut out = Vec::with_capacity(29 + gc_record_key.len());
+            out.push(2);
+            out.extend_from_slice(&owner_epoch.to_be_bytes());
+            out.extend_from_slice(&operation_token.to_be_bytes());
+            out.extend_from_slice(&gc_record_version.to_be_bytes());
+            out.extend_from_slice(&key_len.to_be_bytes());
+            out.extend_from_slice(gc_record_key);
+            Ok(out)
+        }
+    }
+}
+
+fn decode_object_gc_claim(mount: MountId, bytes: &[u8]) -> Result<ObjectGcClaim, MetadError> {
+    match bytes {
+        [1] => Ok(ObjectGcClaim::Open),
+        [2, rest @ ..] if rest.len() >= 28 => {
+            let owner_epoch = u64::from_be_bytes(rest[..8].try_into().expect("u64 width"));
+            let operation_token = u64::from_be_bytes(rest[8..16].try_into().expect("u64 width"));
+            let gc_record_version = u64::from_be_bytes(rest[16..24].try_into().expect("u64 width"));
+            let key_len = u32::from_be_bytes(rest[24..28].try_into().expect("u32 width")) as usize;
+            if rest.len() != 28 + key_len {
+                return Err(MetadError::Codec(
+                    "object GC claim record length mismatch".to_owned(),
+                ));
+            }
+            if owner_epoch == 0 {
+                return Err(MetadError::Codec(
+                    "object GC claim owner epoch must be non-zero".to_owned(),
+                ));
+            }
+            if operation_token == 0 {
+                return Err(MetadError::Codec(
+                    "object GC claim operation token must be non-zero".to_owned(),
+                ));
+            }
+            if gc_record_version == 0 {
+                return Err(MetadError::Codec(
+                    "object GC claim record version must be non-zero".to_owned(),
+                ));
+            }
+            let gc_record_key = &rest[28..];
+            decode_object_gc_record_key(mount, gc_record_key)?;
+            Ok(ObjectGcClaim::Deleting {
+                owner_epoch,
+                operation_token,
+                gc_record_key: gc_record_key.to_vec(),
+                gc_record_version,
+            })
+        }
+        _ => Err(MetadError::Codec(
+            "invalid durable object GC claim record".to_owned(),
+        )),
+    }
+}
+
+fn decode_object_gc_record_key(
+    mount: MountId,
+    gc_record_key: &[u8],
+) -> Result<ObjectGcRecordKey, MetadError> {
+    const OBJECT_GC_KEY_FIELDS: usize = 6;
+    const U64_BYTES: usize = std::mem::size_of::<u64>();
+    const OBJECT_GC_KEY_BYTES: usize = OBJECT_GC_KEY_FIELDS * U64_BYTES;
+
+    if gc_record_key.len() != OBJECT_GC_KEY_BYTES {
+        return Err(MetadError::Codec(
+            "object GC claim record key has an invalid shape".to_owned(),
+        ));
+    }
+
+    let field = |index: usize| {
+        let offset = index * U64_BYTES;
+        u64::from_be_bytes(
+            gc_record_key[offset..offset + U64_BYTES]
+                .try_into()
+                .expect("validated object GC key field width"),
+        )
+    };
+    let encoded_mount = field(0);
+    let enqueue_version = field(1);
+    let inode = field(2);
+    let generation = field(3);
+    let chunk_index = field(4);
+    let block_index = field(5);
+
+    if encoded_mount != mount.get() {
+        return Err(MetadError::Codec(
+            "object GC claim record key belongs to another mount".to_owned(),
+        ));
+    }
+    if enqueue_version == 0 {
+        return Err(MetadError::Codec(
+            "object GC claim enqueue version must be non-zero".to_owned(),
+        ));
+    }
+    let inode = InodeId::new(inode)
+        .map_err(|err| MetadError::Codec(format!("invalid object GC claim inode: {err}")))?;
+    if generation == 0 {
+        return Err(MetadError::Codec(
+            "object GC claim generation must be non-zero".to_owned(),
+        ));
+    }
+    if gc_object_key(
+        mount,
+        enqueue_version,
+        inode,
+        generation,
+        chunk_index,
+        block_index,
+    ) != gc_record_key
+    {
+        return Err(MetadError::Codec(
+            "object GC claim record key is not canonical".to_owned(),
+        ));
+    }
+    Ok(ObjectGcRecordKey {
+        enqueue_version,
+        inode,
+        generation,
+        chunk_index,
+        block_index,
+    })
+}
 
 // Families folded into the fallback allocator rebuild when the durable
 // `allocator_key` System record is absent. Each row contributes its commit
@@ -131,7 +362,7 @@ pub(crate) const DEFAULT_READ_LEASE_MS: u64 = 3_600_000;
 // `CommandDedupe` is the ONLY family with a non-standard value encoding; every
 // other family below writes through `encode_current_value`, so the scan can
 // decode them and recovery stays correct.
-const ALLOCATOR_RECOVERY_FAMILIES: [RecordFamily; 12] = [
+const ALLOCATOR_RECOVERY_FAMILIES: [RecordFamily; 13] = [
     RecordFamily::System,
     RecordFamily::Mount,
     RecordFamily::Inode,
@@ -143,6 +374,7 @@ const ALLOCATOR_RECOVERY_FAMILIES: [RecordFamily; 12] = [
     RecordFamily::PathIndex,
     RecordFamily::Watch,
     RecordFamily::Snapshot,
+    RecordFamily::ForkBinding,
     RecordFamily::Gc,
 ];
 
@@ -201,6 +433,7 @@ struct ReplaceProjectionCommit<'a> {
     old_generation: Option<u64>,
     version: Version,
     path_index: Option<Vec<u8>>,
+    object_reference: Option<ObjectReferenceMutation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,6 +542,10 @@ pub struct PreparedArtifact {
     pub replace: bool,
     pub dentry_version: Option<u64>,
     pub old_generation: Option<u64>,
+    /// Durable object-GC Open epoch captured before upload/planning. Publish
+    /// must CAS this exact version so an intervening delete cycle cannot make a
+    /// newly committed manifest point at an object that GC already removed.
+    pub object_gc_claim_version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,6 +618,7 @@ pub struct PendingObjectCleanupOutcome {
     pub scanned: usize,
     pub blocked_by_snapshots: usize,
     pub blocked_by_read_leases: usize,
+    pub blocked_by_failover_durability: usize,
     pub attempted: usize,
     pub deleted: usize,
     pub missing: usize,
@@ -438,11 +676,11 @@ pub struct RenameReplaceResult {
 ///
 /// `root` is the new namespace root: it sees every file and directory the source
 /// subtree had at clone time and shares the source's object blocks (no data copy)
-/// until the fork diverges on write. `snapshot_id` is a retained snapshot pin on
-/// the source that holds the GC retention floor down so the shared base blocks are
-/// protected while the fork references them. Retire it with
-/// [`NoKvFs::retire_snapshot`] once the fork's own divergent state no longer needs
-/// the source's base objects (typically when the fork is deleted).
+/// until the fork diverges on write. `snapshot_id` identifies the durable
+/// fork-retention binding that holds the GC retention floor after the temporary
+/// construction snapshot expires. Retire it with [`NoKvFs::retire_snapshot`]
+/// only after no fork reference can reach borrowed source blocks, including
+/// hardlinks moved outside the original fork root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CloneHandle {
     pub root: InodeId,
@@ -499,6 +737,26 @@ pub enum MetadError {
         bytes: u64,
     },
     InvalidPreparedArtifact(String),
+    /// A prepared upload crossed an object-GC delete epoch. The caller may
+    /// refresh the prepared upload identity, but must mint a new generation and
+    /// fully restage the body before retrying the metadata publish.
+    StalePreparedArtifactObjectGcEpoch {
+        expected: u64,
+        current: u64,
+    },
+    /// A crash interrupted a claimed external object deletion in a mode where
+    /// metadata alone cannot prove whether the delete took effect. Serving must
+    /// remain fenced until an operator completes controlled recovery.
+    ObjectGcRecoveryRequiresIntervention {
+        owner_epoch: u64,
+        operation_token: u64,
+    },
+    /// The selected metadata checkpoint predates the durable object-GC
+    /// failover fence. It may reference objects deleted after that image was
+    /// produced, so installing it as a recovery source is unsafe.
+    MetadataArchiveMissingObjectGcFence {
+        checkpoint_key: String,
+    },
     InvalidQuery(String),
     StaleBodyGeneration {
         expected: u64,
@@ -563,6 +821,15 @@ pub enum MetadError {
     SnapshotBindingChanged {
         root_path: String,
     },
+    /// The mount still has at least one current file whose effective manifest
+    /// borrows object blocks minted by another inode. Because history retention
+    /// uses one mount-global floor, no fork binding can be released until that
+    /// borrower is removed or rewritten onto self-owned blocks.
+    ForkRetentionActive {
+        snapshot_id: u64,
+        fork_root: InodeId,
+        borrower: InodeId,
+    },
     SnapshotRenewContended {
         snapshot_id: u64,
         attempts: usize,
@@ -587,12 +854,33 @@ pub struct NoKvFs<M, O> {
     objects: O,
     allocator_gate: Mutex<()>,
     backup_gate: Mutex<()>,
+    /// Prevents a live worker/manual GC call from mistaking another in-process
+    /// worker's durable Deleting claim for crash recovery.
+    object_gc_gate: Mutex<()>,
+    /// Fail-closed process-local hint that an interrupted clone/rollback
+    /// materialization may have left an unbound inode tree. `link`/`rename`
+    /// perform the expensive mount-wide reachability proof only while this is
+    /// set. It is raised before the first materialization write and cleared only
+    /// after a proof sees every current inode/dentry under the mount root or a
+    /// live ForkBinding root. Reopen/restore reconstruct it from one such scan.
+    materialization_orphan_possible: AtomicBool,
+    #[cfg(test)]
+    namespace_reachability_scans: AtomicU64,
     /// Serializes owner-epoch installs/observes against in-flight commits.
     /// Commits hold a read guard across their fence check + durable apply;
     /// epoch changes take the write guard. This closes the TOCTOU where a
     /// failover epoch bump could land between a commit's check and its apply,
     /// letting a stale owner commit one more time.
     epoch_fence: RwLock<()>,
+    /// Lets ordinary commits run concurrently while sync logging is disabled,
+    /// but gives log enable/disable an exclusive linearization boundary against
+    /// every in-flight commit.
+    metadata_log_enable_fence: RwLock<()>,
+    /// While sync logging is enabled, preserves one total order from metadata
+    /// apply through archival. Without this gate, a thread paused after applying
+    /// command A can be overtaken by B, archiving B at LSN N and A at LSN N+1;
+    /// failover replay would then differ from the live metadata engine.
+    metadata_commit_log_gate: Mutex<()>,
     path_resolution_cache: Vec<Mutex<BTreeMap<PathResolutionCacheKey, InodeId>>>,
     path_index_lookup_cache:
         Vec<Mutex<BTreeMap<PathIndexLookupCacheKey, PathIndexLookupCacheValue>>>,
@@ -941,10 +1229,16 @@ fn create_watch_kind(kind: CommandKind) -> WatchEventKind {
 }
 
 fn validate_prepared_artifact(
+    mount: MountId,
     prepared: &PreparedArtifact,
     body: &BodyDescriptor,
     chunks: &[ChunkManifest],
 ) -> Result<(), MetadError> {
+    if prepared.object_gc_claim_version == 0 {
+        return Err(MetadError::InvalidPreparedArtifact(
+            "prepared artifact is missing a durable mutation epoch".to_owned(),
+        ));
+    }
     if body.generation != prepared.generation {
         return Err(MetadError::InvalidPreparedArtifact(format!(
             "body generation {} does not match prepared generation {}",
@@ -1028,7 +1322,71 @@ fn validate_prepared_artifact(
                     "slice descriptor is outside chunk range".to_owned(),
                 ));
             }
+            for block in &slice.blocks {
+                let (block_mount, _, _, block_chunk_index, _) =
+                    decode_canonical_block_object_owner(&block.object_key).map_err(|err| {
+                        MetadError::InvalidPreparedArtifact(format!(
+                            "invalid block object key {}: {err}",
+                            block.object_key
+                        ))
+                    })?;
+                if block_mount != mount.get() {
+                    return Err(MetadError::InvalidPreparedArtifact(format!(
+                        "block object {} belongs to mount {block_mount}, expected {}",
+                        block.object_key,
+                        mount.get()
+                    )));
+                }
+                if block_chunk_index != chunk_index {
+                    return Err(MetadError::InvalidPreparedArtifact(format!(
+                        "block object {} belongs to chunk {block_chunk_index}, expected {chunk_index}",
+                        block.object_key
+                    )));
+                }
+            }
             validate_slice_block_coverage(chunk.chunk_index, body.block_size, slice, slice_end)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_prepared_block_identities(
+    mount: MountId,
+    prepared: &PreparedArtifact,
+    chunks: &[ChunkManifest],
+) -> Result<(), MetadError> {
+    let mut seen_objects = HashSet::new();
+    for chunk in chunks {
+        for slice in &chunk.slices {
+            for block in &slice.blocks {
+                let (block_mount, block_inode, block_generation, block_chunk_index, _) =
+                    decode_canonical_block_object_owner(&block.object_key).map_err(|err| {
+                        MetadError::InvalidPreparedArtifact(format!(
+                            "invalid staged block object key {}: {err}",
+                            block.object_key
+                        ))
+                    })?;
+                if block_mount != mount.get()
+                    || block_inode != prepared.inode.get()
+                    || block_generation != prepared.generation
+                    || block_chunk_index != chunk.chunk_index
+                {
+                    return Err(MetadError::InvalidPreparedArtifact(format!(
+                        "staged block object {} does not match prepared mount/inode/generation/chunk {}/{}/{}/{}",
+                        block.object_key,
+                        mount.get(),
+                        prepared.inode.get(),
+                        prepared.generation,
+                        chunk.chunk_index
+                    )));
+                }
+                if !seen_objects.insert(block.object_key.as_str()) {
+                    return Err(MetadError::InvalidPreparedArtifact(format!(
+                        "duplicate staged block object {}",
+                        block.object_key
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -1498,6 +1856,21 @@ impl fmt::Display for MetadError {
             Self::InvalidPreparedArtifact(err) => {
                 write!(f, "invalid prepared artifact: {err}")
             }
+            Self::StalePreparedArtifactObjectGcEpoch { expected, current } => write!(
+                f,
+                "prepared artifact object-GC epoch {expected} is stale; current epoch is {current}"
+            ),
+            Self::ObjectGcRecoveryRequiresIntervention {
+                owner_epoch,
+                operation_token,
+            } => write!(
+                f,
+                "object GC deletion from owner epoch {owner_epoch} with operation token {operation_token} has an uncertain outcome and requires controlled recovery"
+            ),
+            Self::MetadataArchiveMissingObjectGcFence { checkpoint_key } => write!(
+                f,
+                "metadata checkpoint {checkpoint_key} predates the durable object-GC failover fence and cannot be restored safely"
+            ),
             Self::InvalidQuery(err) => write!(f, "invalid namespace query: {err}"),
             Self::StaleBodyGeneration { expected, current } => write!(
                 f,
@@ -1582,6 +1955,16 @@ impl fmt::Display for MetadError {
             Self::SnapshotBindingChanged { root_path } => {
                 write!(f, "snapshot root binding changed while resolving {root_path}")
             }
+            Self::ForkRetentionActive {
+                snapshot_id,
+                fork_root,
+                borrower,
+            } => write!(
+                f,
+                "fork retention {snapshot_id} for root inode {} is still required by borrower inode {}",
+                fork_root.get(),
+                borrower.get()
+            ),
             Self::SnapshotRenewContended {
                 snapshot_id,
                 attempts,

@@ -52,6 +52,7 @@ where
                 "checkpoint requires at least one shard".to_owned(),
             ));
         }
+        let object_reference = self.begin_object_reference_mutation()?;
 
         // Stage every shard's objects + build its (projection, chunks). Track the
         // staged object sets so a mid-stage failure reclaims them instead of
@@ -70,6 +71,10 @@ where
                 }
             };
             let version = Version::new(prepared.generation)?;
+            if prepared.object_gc_claim_version != object_reference.version().get() {
+                self.abort_staged_checkpoint(&staged_sets);
+                return Err(MetadError::Metadata(MetadataError::PredicateFailed));
+            }
             let request = PublishArtifact {
                 parent,
                 name: shard.name.clone(),
@@ -116,8 +121,29 @@ where
 
         // One atomic commit makes every shard visible together.
         let commit_version = self.next_version()?;
-        if let Err(err) = self.commit_checkpoint_shards(parent, &staged_artifacts, commit_version) {
-            self.abort_staged_checkpoint(&staged_sets);
+        if let Err(err) = self.commit_checkpoint_shards(
+            parent,
+            &staged_artifacts,
+            commit_version,
+            object_reference,
+        ) {
+            // A synchronous-log failure with `committed=true` happens after the
+            // atomic metadata command made every staged object reachable. A
+            // backend error may likewise be an apply-then-journal-ACK failure.
+            // In either uncertain case the objects are no longer abortable:
+            // deleting them could corrupt a now-visible checkpoint. Propagate
+            // the acknowledgement failure while preserving referenced data (or
+            // a safe orphan when the backend ultimately did not apply).
+            let commit_may_have_applied = matches!(
+                &err,
+                MetadError::SyncLogArchiveFailed {
+                    committed: true,
+                    ..
+                } | MetadError::Metadata(MetadataError::Backend(_))
+            );
+            if !commit_may_have_applied {
+                self.abort_staged_checkpoint(&staged_sets);
+            }
             return Err(err);
         }
         Ok(CheckpointHandle {
@@ -137,12 +163,14 @@ where
         parent: InodeId,
         shards: &[(DentryProjection, Vec<ChunkManifest>)],
         commit_version: Version,
+        object_reference: ObjectReferenceMutation,
     ) -> Result<(), MetadError> {
         let mut predicates = vec![PredicateRef {
             family: RecordFamily::Inode,
             key: inode_key(self.mount, parent),
             predicate: Predicate::Exists,
         }];
+        predicates.push(object_reference.predicate(self.mount));
         let mut mutations = Vec::new();
         for (proj, chunks) in shards {
             let inode = proj.attr.inode;

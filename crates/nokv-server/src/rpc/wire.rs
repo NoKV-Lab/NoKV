@@ -134,6 +134,12 @@ fn wire_metad_error(err: &MetadError) -> WireMetadataError {
             dest_shard: *dest_shard,
         },
         MetadError::GraftPoint => WireMetadataError::GraftPoint,
+        MetadError::StalePreparedArtifactObjectGcEpoch { expected, current } => {
+            WireMetadataError::StalePreparedArtifactObjectGcEpoch {
+                expected: *expected,
+                current: *current,
+            }
+        }
         MetadError::SnapshotLeaseExpired {
             snapshot_id,
             lease_expires_unix_ms,
@@ -159,6 +165,15 @@ fn wire_metad_error(err: &MetadError) -> WireMetadataError {
                 root_path: root_path.clone(),
             }
         }
+        MetadError::ForkRetentionActive {
+            snapshot_id,
+            fork_root,
+            borrower,
+        } => WireMetadataError::ForkRetentionActive {
+            snapshot_id: *snapshot_id,
+            fork_root: fork_root.get(),
+            borrower: borrower.get(),
+        },
         MetadError::SnapshotRenewContended {
             snapshot_id,
             attempts,
@@ -240,6 +255,7 @@ pub(super) fn wire_prepared_artifact(
         replace: prepared.replace,
         dentry_version: prepared.dentry_version,
         old_generation: prepared.old_generation,
+        object_gc_claim_version: prepared.object_gc_claim_version,
     }
 }
 
@@ -258,6 +274,7 @@ pub(super) fn prepared_artifact(
         replace: prepared.replace,
         dentry_version: prepared.dentry_version,
         old_generation: prepared.old_generation,
+        object_gc_claim_version: prepared.object_gc_claim_version,
     })
 }
 

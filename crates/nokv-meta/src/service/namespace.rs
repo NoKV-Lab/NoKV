@@ -22,12 +22,20 @@ struct LinkedDentryProjection {
     version: Version,
 }
 
+#[derive(Default)]
+struct NamespaceReachability {
+    directories: HashSet<InodeId>,
+    inodes: HashSet<InodeId>,
+    dentries: HashSet<Vec<u8>>,
+}
+
 impl<M, O> NoKvFs<M, O>
 where
     M: MetadataStore,
     O: ObjectStore,
 {
     pub fn bootstrap_root(&self, mode: u32, uid: u32, gid: u32) -> Result<InodeAttr, MetadError> {
+        self.ensure_object_gc_claim_record()?;
         let version = self.next_version()?;
         let root = directory_attr(InodeId::root(), mode, uid, gid, version.get());
         let command = MetadataCommand {
@@ -51,7 +59,13 @@ where
             watch: Vec::new(),
         };
         match self.commit_metadata(command) {
-            Ok(_) | Err(MetadError::Metadata(MetadataError::PredicateFailed)) => Ok(root),
+            Ok(_) | Err(MetadError::Metadata(MetadataError::PredicateFailed)) => {
+                // `new` starts fail-closed because callers may hand it a
+                // pre-populated store. Once a root exists, one recovery proof
+                // establishes the healthy fast-path or keeps slow checking on.
+                self.recover_materialization_orphan_state()?;
+                Ok(root)
+            }
             Err(err) => Err(err),
         }
     }
@@ -259,6 +273,7 @@ where
                 "symlink target must be non-empty and must not contain NUL".to_owned(),
             ));
         }
+        let object_reference = self.begin_object_reference_mutation()?;
         let version = self.next_version()?;
         let inode = self.next_inode()?;
         let digest_uri = body_digest_uri(&target);
@@ -300,6 +315,7 @@ where
             &projection,
             &chunks,
             version,
+            object_reference,
         ) {
             return Err(MetadError::PublishArtifactFailed {
                 source: Box::new(err),
@@ -353,6 +369,15 @@ where
         // `ensure_same_shard`). A hardlink across shards would name an inode from a
         // foreign namespace, which this shard cannot own or GC.
         self.ensure_same_shard(inode, new_parent)?;
+        // A hardlink can turn a previously unreachable borrowed body into a live
+        // object reference. Serialize its reachability proof + commit with fork
+        // retirement and local object GC, and join the exact durable Open claim
+        // so a remote/failover GC transition cannot race the exposure.
+        let _object_gc_gate = self
+            .object_gc_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let object_reference = self.begin_object_reference_mutation()?;
         let version = self.next_version()?;
         let read_version = predecessor(version)?;
         let source_inode_key = inode_key(self.mount, inode);
@@ -381,8 +406,22 @@ where
         if parent_attr.file_type != FileType::Directory {
             return Err(MetadError::NotDirectory);
         }
+        let reachable = self.namespace_reachability_for_exposure(read_version)?;
+        if reachable.as_ref().is_some_and(|reachable| {
+            !reachable.directories.contains(&new_parent) || !reachable.inodes.contains(&inode)
+        }) {
+            // Inode-addressed APIs must not provide an escape hatch for partial
+            // clone/rollback materializations which have no durable binding.
+            return Err(MetadError::NotFound);
+        }
         let linked = self.linked_dentry_projections_for_inode(inode, read_version)?;
-        let Some(first_link) = linked.first() else {
+        let first_link = match &reachable {
+            Some(reachable) => linked
+                .iter()
+                .find(|linked| reachable.dentries.contains(&linked.key)),
+            None => linked.first(),
+        };
+        let Some(first_link) = first_link else {
             return Err(MetadError::NotFound);
         };
         attr.nlink = attr
@@ -415,6 +454,7 @@ where
                 key: destination_key.clone(),
                 predicate: Predicate::NotExists,
             },
+            object_reference.predicate(self.mount),
         ];
         let mut mutations = vec![Mutation {
             family: RecordFamily::Inode,
@@ -480,6 +520,10 @@ where
         if changes.is_empty() {
             return Ok(entry);
         }
+        let object_reference = changes
+            .size
+            .map(|_| self.begin_object_reference_mutation())
+            .transpose()?;
         let version = self.next_version()?;
         let mut attr = entry.attr.clone();
         if let Some(mode) = changes.mode {
@@ -568,6 +612,7 @@ where
             old_generation,
             version,
             path_index: None,
+            object_reference,
         })?;
         Ok(projection.into())
     }
@@ -1399,6 +1444,14 @@ where
         // `ensure_same_shard`): `parent`/`new_parent` are the source and
         // destination directory inodes.
         self.ensure_same_shard(parent, new_parent)?;
+        // Rename can expose a dentry that was left behind by a failed detached
+        // materialization. Hold the same gate as fork retirement from the
+        // reachability proof through the commit; the durable Open-claim CAS
+        // below also fences object GC on another owner.
+        let _object_gc_gate = self
+            .object_gc_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let (source, source_version) = self
             .lookup_plus_for_write_plan(parent, name)?
             .ok_or(MetadError::NotFound)?;
@@ -1438,9 +1491,19 @@ where
             }
         }
 
+        let object_reference = self.begin_object_reference_mutation()?;
         let version = self.next_version()?;
+        let read_version = predecessor(version)?;
         let source_key = dentry_key(self.mount, parent, name);
         let destination_key = dentry_key(self.mount, new_parent, &new_name);
+        let reachable = self.namespace_reachability_for_exposure(read_version)?;
+        if reachable.as_ref().is_some_and(|reachable| {
+            !reachable.directories.contains(&parent)
+                || !reachable.directories.contains(&new_parent)
+                || !reachable.dentries.contains(&source_key)
+        }) {
+            return Err(MetadError::NotFound);
+        }
         let projection = projection(
             new_parent,
             new_name,
@@ -1458,6 +1521,7 @@ where
                 key: source_key.clone(),
                 predicate: Predicate::VersionEquals(source_version),
             },
+            object_reference.predicate(self.mount),
         ];
         let replaced = if let Some((entry, destination_version)) = destination {
             predicates.push(PredicateRef {
@@ -1510,7 +1574,7 @@ where
             let Some(replaced_inode_item) = self.metadata.get_versioned(
                 RecordFamily::Inode,
                 &replaced_inode_key,
-                predecessor(version)?,
+                read_version,
                 ReadPurpose::WritePlanLocal,
             )?
             else {
@@ -1548,10 +1612,9 @@ where
                     op: MutationOp::Put,
                     value: Some(Value(encode_inode_attr(&replaced_attr))),
                 });
-                for linked in self.linked_dentry_projections_for_inode(
-                    replaced.attr.inode,
-                    predecessor(version)?,
-                )? {
+                for linked in
+                    self.linked_dentry_projections_for_inode(replaced.attr.inode, read_version)?
+                {
                     if linked.key == destination_key {
                         continue;
                     }
@@ -1627,7 +1690,7 @@ where
             } else {
                 CommandKind::Rename
             },
-            read_version: predecessor(version)?,
+            read_version,
             commit_version: version,
             primary_family: RecordFamily::Dentry,
             primary_key: destination_key,
@@ -1701,13 +1764,267 @@ where
         Ok(linked)
     }
 
+    /// Enter fail-closed mode before the first metadata write of a detached
+    /// materialization. Callers hold `object_gc_gate`, so a link/rename cannot
+    /// observe the old healthy state and then race the first orphan-producing
+    /// commit.
+    pub(super) fn mark_materialization_orphan_possible_under_gc_gate(&self) {
+        self.materialization_orphan_possible
+            .store(true, Ordering::Release);
+    }
+
+    /// Reconstruct the process-local fast-path state after bootstrap, reopen, or
+    /// checkpoint installation. An error leaves the marker set, so callers never
+    /// mistake an unproven namespace for the healthy state.
+    pub(super) fn recover_materialization_orphan_state(&self) -> Result<(), MetadError> {
+        let _object_gc_gate = self
+            .object_gc_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        self.mark_materialization_orphan_possible_under_gc_gate();
+
+        // `open_existing` is also the server's construction path for a brand-new
+        // shard: it opens an empty store first and bootstraps the mount root only
+        // after the service exists. Keep that pristine case fail-closed until
+        // `bootstrap_root` creates the root and runs the full proof. A missing
+        // root in any non-empty namespace is different: serving it would hide
+        // corruption (including a detached materialization whose binding was
+        // never committed), so startup must fail.
+        let version = self.read_version()?;
+        if self
+            .get_attr_at_version_for_purpose(InodeId::root(), version, ReadPurpose::WritePlanLocal)?
+            .is_none()
+        {
+            if self.root_dependent_namespace_records_exist_at(version)? {
+                return Err(MetadError::Codec(
+                    "mount root is missing while namespace records still exist".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+
+        self.reconcile_materialization_orphan_state_under_gc_gate()?;
+        Ok(())
+    }
+
+    /// Return whether the mount has any current record whose existence depends
+    /// on a bootstrapped namespace. System/Mount state, command dedupe, and GC
+    /// control records are deliberately excluded: those can be written before
+    /// the root commit and must not make a retryable bootstrap look corrupt.
+    fn root_dependent_namespace_records_exist_at(
+        &self,
+        version: Version,
+    ) -> Result<bool, MetadError> {
+        const ROOT_DEPENDENT_FAMILIES: [RecordFamily; 11] = [
+            RecordFamily::Inode,
+            RecordFamily::Dentry,
+            RecordFamily::Parent,
+            RecordFamily::Xattr,
+            RecordFamily::ChunkManifest,
+            RecordFamily::Session,
+            RecordFamily::PathIndex,
+            RecordFamily::Watch,
+            RecordFamily::Snapshot,
+            RecordFamily::ForkBinding,
+            RecordFamily::ForkShadow,
+        ];
+        let mount_prefix = inode_prefix(self.mount);
+        for family in ROOT_DEPENDENT_FAMILIES {
+            if !self
+                .metadata
+                .scan(ScanRequest {
+                    family,
+                    prefix: mount_prefix.clone(),
+                    start_after: None,
+                    version,
+                    limit: 1,
+                    purpose: ReadPurpose::WritePlanLocal,
+                })?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Clear the slow-path marker only after proving that every current inode
+    /// and dentry belongs to the mount-root/ForkBinding-root reachability graph.
+    /// Callers hold `object_gc_gate`; failures leave the marker unchanged.
+    pub(super) fn reconcile_materialization_orphan_state_under_gc_gate(
+        &self,
+    ) -> Result<bool, MetadError> {
+        let version = self.read_version()?;
+        let reachable = self.namespace_reachability_at(version)?;
+        let proven_safe = self.all_current_namespace_records_reachable(&reachable, version)?;
+        self.materialization_orphan_possible
+            .store(!proven_safe, Ordering::Release);
+        Ok(proven_safe)
+    }
+
+    /// Healthy services skip the mount-wide scan entirely. The slow path is
+    /// entered only after materialization began or startup/restore has not yet
+    /// proved the installed state. A harmless failed preflight can self-heal:
+    /// when the slow scan finds no unbound records it clears the marker for later
+    /// operations, while this operation still uses the proof it just computed.
+    fn namespace_reachability_for_exposure(
+        &self,
+        version: Version,
+    ) -> Result<Option<NamespaceReachability>, MetadError> {
+        if !self.materialization_orphan_possible.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let reachable = self.namespace_reachability_at(version)?;
+        if self.all_current_namespace_records_reachable(&reachable, version)? {
+            self.materialization_orphan_possible
+                .store(false, Ordering::Release);
+        }
+        Ok(Some(reachable))
+    }
+
+    fn all_current_namespace_records_reachable(
+        &self,
+        reachable: &NamespaceReachability,
+        version: Version,
+    ) -> Result<bool, MetadError> {
+        let purpose = ReadPurpose::WritePlanLocal;
+        let dentry_rows = self.metadata.scan(ScanRequest {
+            family: RecordFamily::Dentry,
+            prefix: dentry_mount_prefix(self.mount),
+            start_after: None,
+            version,
+            limit: 0,
+            purpose,
+        })?;
+        if dentry_rows
+            .iter()
+            .any(|row| !reachable.dentries.contains(&row.key))
+        {
+            return Ok(false);
+        }
+
+        for row in self.metadata.scan(ScanRequest {
+            family: RecordFamily::Inode,
+            prefix: inode_prefix(self.mount),
+            start_after: None,
+            version,
+            limit: 0,
+            purpose,
+        })? {
+            let attr = decode_inode_attr(&row.value.0)
+                .map_err(|err| MetadError::Codec(err.to_string()))?;
+            if row.key != inode_key(self.mount, attr.inode) {
+                return Err(MetadError::Codec(format!(
+                    "inode row key does not match inode {} during materialization recovery",
+                    attr.inode.get()
+                )));
+            }
+            if !reachable.inodes.contains(&attr.inode) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn materialization_orphan_slow_path_enabled(&self) -> bool {
+        self.materialization_orphan_possible.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn namespace_reachability_scan_count(&self) -> u64 {
+        self.namespace_reachability_scans.load(Ordering::Relaxed)
+    }
+
+    /// Enumerate the namespace roots from which an inode-addressed mutation may
+    /// expose a dentry. Besides the mount root, a detached clone root is legal
+    /// only while its validated durable ForkBinding exists and its root inode is
+    /// still present. Rollback bindings deliberately survive deletion of their
+    /// materialization root; those missing roots are not reachability anchors.
+    ///
+    /// Callers hold `object_gc_gate` across this walk and their metadata commit.
+    /// Fork retirement holds the same gate across its mount-wide proof and CAS,
+    /// so neither side can change whether an unbound orphan is reachable in the
+    /// middle of the other's decision.
+    fn namespace_reachability_at(
+        &self,
+        version: Version,
+    ) -> Result<NamespaceReachability, MetadError> {
+        #[cfg(test)]
+        self.namespace_reachability_scans
+            .fetch_add(1, Ordering::Relaxed);
+        let purpose = ReadPurpose::WritePlanLocal;
+        let Some(root_attr) =
+            self.get_attr_at_version_for_purpose(InodeId::root(), version, purpose)?
+        else {
+            return Err(MetadError::Codec(
+                "mount root is missing during namespace reachability proof".to_owned(),
+            ));
+        };
+        if root_attr.file_type != FileType::Directory {
+            return Err(MetadError::Codec(
+                "mount root is not a directory during namespace reachability proof".to_owned(),
+            ));
+        }
+
+        let mut pending = vec![InodeId::root()];
+        for versioned in self.versioned_fork_bindings_at(version, purpose)? {
+            let root = versioned.binding.fork_root;
+            let Some(attr) = self.get_attr_at_version_for_purpose(root, version, purpose)? else {
+                continue;
+            };
+            if attr.file_type != FileType::Directory {
+                return Err(MetadError::Codec(format!(
+                    "fork binding root {} is not a directory",
+                    root.get()
+                )));
+            }
+            pending.push(root);
+        }
+
+        let mut reachable = NamespaceReachability::default();
+        while let Some(parent) = pending.pop() {
+            if !reachable.directories.insert(parent) {
+                continue;
+            }
+            reachable.inodes.insert(parent);
+            for row in self.metadata.scan(ScanRequest {
+                family: RecordFamily::Dentry,
+                prefix: dentry_prefix(self.mount, parent),
+                start_after: None,
+                version,
+                limit: 0,
+                purpose,
+            })? {
+                let projection = decode_dentry_projection(&row.value.0)
+                    .map_err(|err| MetadError::Codec(err.to_string()))?;
+                self.validate_current_dentry_projection(&row.key, &projection, version)?;
+                reachable.dentries.insert(row.key);
+                reachable.inodes.insert(projection.attr.inode);
+                if projection.attr.inode.shard_index() == self.shard_index()
+                    && projection.attr.file_type == FileType::Directory
+                {
+                    pending.push(projection.attr.inode);
+                }
+            }
+        }
+        Ok(reachable)
+    }
+
     pub(super) fn commit_create_projection(
         &self,
         kind: CommandKind,
         projection: &DentryProjection,
         version: Version,
     ) -> Result<(), MetadError> {
-        self.commit_create_projection_with_chunks(kind, projection, &[], version)
+        self.commit_create_projection_with_chunks_and_path_index(
+            kind,
+            projection,
+            &[],
+            version,
+            None,
+            None,
+        )
     }
 
     pub(super) fn commit_create_projections_with_path_indexes(
@@ -1877,12 +2194,19 @@ where
         projection: &DentryProjection,
         chunks: &[ChunkManifest],
         version: Version,
+        object_reference: ObjectReferenceMutation,
     ) -> Result<(), MetadError> {
         self.commit_create_projection_with_chunks_and_path_index(
-            kind, projection, chunks, version, None,
+            kind,
+            projection,
+            chunks,
+            version,
+            None,
+            Some(object_reference),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn commit_create_projection_with_chunks_and_path_index(
         &self,
         kind: CommandKind,
@@ -1890,6 +2214,7 @@ where
         chunks: &[ChunkManifest],
         version: Version,
         path_index: Option<Vec<u8>>,
+        object_reference: Option<ObjectReferenceMutation>,
     ) -> Result<(), MetadError> {
         let inode = projection.attr.inode;
         let dentry = dentry_key(
@@ -1934,6 +2259,21 @@ where
                 });
             }
         }
+        let mut predicates = vec![
+            PredicateRef {
+                family: RecordFamily::Inode,
+                key: inode_key(self.mount, projection.dentry.parent),
+                predicate: Predicate::Exists,
+            },
+            PredicateRef {
+                family: RecordFamily::Dentry,
+                key: dentry.clone(),
+                predicate: Predicate::NotExists,
+            },
+        ];
+        if let Some(object_reference) = object_reference {
+            predicates.push(object_reference.predicate(self.mount));
+        }
         self.commit_metadata(MetadataCommand {
             request_id: request_id(kind_name(kind), self.mount, inode, version),
             kind,
@@ -1941,18 +2281,7 @@ where
             commit_version: version,
             primary_family: RecordFamily::Dentry,
             primary_key: dentry.clone(),
-            predicates: vec![
-                PredicateRef {
-                    family: RecordFamily::Inode,
-                    key: inode_key(self.mount, projection.dentry.parent),
-                    predicate: Predicate::Exists,
-                },
-                PredicateRef {
-                    family: RecordFamily::Dentry,
-                    key: dentry,
-                    predicate: Predicate::NotExists,
-                },
-            ],
+            predicates,
             mutations,
             watch: self
                 .watch_projection(
@@ -1984,6 +2313,7 @@ where
             old_generation,
             version,
             path_index,
+            object_reference,
         } = commit;
         let inode = projection.attr.inode;
         let dentry = dentry_key(
@@ -2013,6 +2343,9 @@ where
                 predicate: Predicate::Exists,
             },
         ];
+        if let Some(object_reference) = object_reference {
+            predicates.push(object_reference.predicate(self.mount));
+        }
         let mut mutations = vec![Mutation {
             family: RecordFamily::Inode,
             key: inode_key(self.mount, inode),

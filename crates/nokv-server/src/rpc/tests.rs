@@ -1,11 +1,10 @@
 use super::*;
-use crate::server::tests::{test_options, test_server};
-use crate::{ServerShardOwnerOptions, ServerSharedLogOptions};
-use nokv_control::{ControlStore, InMemoryControlStore, ShardId};
-use nokv_object::{
-    ConfiguredObjectStore, HotFillMode, LocalObjectStoreOptions, MemoryObjectStore,
-    ObjectStoreConfig, S3ObjectStoreOptions, TieredObjectStoreOptions, TieredPutPolicy,
+use crate::server::tests::{
+    test_options, test_server, BlockingServingControl, FailingCheckpointPublishControl,
 };
+use crate::{ServerShardOwnerOptions, ServerShardOwnerRenewalOptions, ServerSharedLogOptions};
+use nokv_control::{ControlStore, InMemoryControlStore, ShardId};
+use nokv_object::{ConfiguredObjectStore, MemoryObjectStore, S3ObjectStoreOptions};
 use nokv_protocol::{
     decode_envelope, encode_request, WireBlockDescriptor, WireBodyDescriptor, WireChunkManifest,
     WireDentryWithAttr, WireMetadataError, WireOpenPathReadPlanRequest, WireSliceManifest,
@@ -15,8 +14,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn request_envelope(server: &Server, request: MetadataRpcRequest) -> MetadataRpcEnvelope {
@@ -55,19 +55,6 @@ fn fake_s3_options() -> S3ObjectStoreOptions {
     }
 }
 
-fn shared_tiered_object_config(root: &Path) -> ObjectStoreConfig {
-    ObjectStoreConfig::tiered_local_with_options(
-        LocalObjectStoreOptions::new(root.join("hot")),
-        fake_s3_options(),
-        TieredObjectStoreOptions {
-            put_policy: TieredPutPolicy::HotThenBackgroundCold,
-            populate_hot_on_get: true,
-            hot_fill_mode: HotFillMode::Inline,
-            pending_cold_put_root: Some(root.join("pending-cold")),
-        },
-    )
-}
-
 #[test]
 fn rpc_creates_and_lists_directory() {
     let server = test_server();
@@ -96,14 +83,17 @@ fn rpc_creates_and_lists_directory() {
 fn rpc_write_publishes_sync_shared_log_before_ack() {
     let dir = tempdir().unwrap();
     let mut options = test_options(dir.path());
-    options.object = shared_tiered_object_config(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/rpc-sync-checkpoint".to_owned());
     let control = Arc::new(InMemoryControlStore::new());
-    let server = Server::open_with_control(
+    let server = Server::open_with_objects(
         options,
-        control.clone(),
-        vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
-            .with_renewal(None)
-            .with_shared_log(Some(ServerSharedLogOptions::new("meta/rpc-sync-log")))],
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control.clone(),
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(None)
+                .with_shared_log(Some(ServerSharedLogOptions::new("meta/rpc-sync-log")))],
+        )),
     )
     .unwrap();
 
@@ -131,6 +121,446 @@ fn rpc_write_publishes_sync_shared_log_before_ack() {
         .segment_key
         .starts_with("meta/rpc-sync-log/mount_1__/log/"));
     assert_eq!(log.digest.len(), 64);
+}
+
+#[test]
+fn rpc_prepare_with_an_empty_log_tail_preserves_the_checkpoint_publication() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/rpc-empty-tail-checkpoint".to_owned());
+    let control = Arc::new(InMemoryControlStore::new());
+    let server = Server::open_with_objects(
+        options,
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control.clone(),
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(None)
+                .with_shared_log(Some(ServerSharedLogOptions::new("meta/rpc-empty-tail-log")))],
+        )),
+    )
+    .unwrap();
+
+    let initial_log = server.service().sync_metadata_log_snapshot().unwrap();
+    assert!(
+        initial_log.segments.is_empty(),
+        "startup checkpoint must cover and prune the complete live log chain"
+    );
+    let before = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+    let checkpoint = before
+        .checkpoint
+        .clone()
+        .expect("controlled startup must publish a checkpoint");
+    assert_eq!(before.durable_lsn, initial_log.durable_lsn);
+    assert_eq!(checkpoint.lsn, initial_log.durable_lsn);
+    assert!(before.log.is_none());
+
+    let prepared = request_envelope(
+        &server,
+        MetadataRpcRequest::PrepareArtifact {
+            parent: 1,
+            name: "prepared-only.bin".to_owned(),
+            replace: false,
+        },
+    );
+    assert!(prepared.ok, "unexpected prepare RPC error: {prepared:?}");
+
+    let after_prepare = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+    assert_eq!(after_prepare.durable_lsn, before.durable_lsn);
+    assert_eq!(after_prepare.checkpoint, Some(checkpoint.clone()));
+    assert!(
+        after_prepare.log.is_none(),
+        "an empty live tail must not publish an invalid empty LogRef"
+    );
+
+    let committed = request_envelope(
+        &server,
+        MetadataRpcRequest::CreateDirPath {
+            path: "/after-prepare".to_owned(),
+            mode: 0o755,
+            uid: 1000,
+            gid: 1000,
+        },
+    );
+    assert!(
+        committed.ok,
+        "unexpected committing RPC error: {committed:?}"
+    );
+    let after_commit = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+    let log = after_commit
+        .log
+        .expect("a real commit above the checkpoint must publish a LogRef");
+    assert_eq!(log.segments[0].first_lsn, checkpoint.lsn + 1);
+    assert_eq!(log.durable_lsn, after_commit.durable_lsn);
+}
+
+#[test]
+fn rpc_publish_control_failure_does_not_hide_committed_metadata_or_local_log() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/rpc-phase-checkpoint".to_owned());
+    let control = Arc::new(FailingCheckpointPublishControl::new());
+    let server = Server::open_with_objects(
+        options,
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control.clone(),
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(None)
+                .with_shared_log(Some(ServerSharedLogOptions::new("meta/rpc-phase-log")))],
+        )),
+    )
+    .unwrap();
+
+    let prepared = match request_envelope(
+        &server,
+        MetadataRpcRequest::PrepareArtifact {
+            parent: 1,
+            name: "phase.bin".to_owned(),
+            replace: false,
+        },
+    )
+    .result
+    .unwrap()
+    {
+        MetadataRpcResult::PreparedArtifact { prepared } => prepared,
+        other => panic!("unexpected prepare result: {other:?}"),
+    };
+    let control_before = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+    let local_before = server
+        .service()
+        .sync_metadata_log_snapshot()
+        .unwrap()
+        .durable_lsn;
+    assert_eq!(control_before.durable_lsn, local_before);
+
+    control.fail_next_marks(2);
+    let envelope = request_envelope(
+        &server,
+        MetadataRpcRequest::PublishPreparedArtifact {
+            body: Box::new(WireBodyDescriptor {
+                producer: "unit-test".to_owned(),
+                digest_uri: "sha256:empty".to_owned(),
+                size: 0,
+                content_type: "application/octet-stream".to_owned(),
+                manifest_id: "phase.bin".to_owned(),
+                generation: prepared.generation,
+                base_generation: 0,
+                chunk_size: 64 * 1024 * 1024,
+                block_size: 4 * 1024 * 1024,
+            }),
+            chunks: Vec::new(),
+            prepared,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+        },
+    );
+    assert!(!envelope.ok, "control publication must gate the RPC ACK");
+    assert!(matches!(
+        envelope.error_kind,
+        Some(WireMetadataError::Metadata { message })
+            if message.contains("injected checkpoint publish failure")
+    ));
+
+    let committed = server
+        .service()
+        .lookup_path("/phase.bin")
+        .unwrap()
+        .expect("metadata apply must remain visible after the phase-3 control error");
+    assert!(
+        committed.body.is_some(),
+        "the committed manifest must remain visible"
+    );
+    let local_after = server.service().sync_metadata_log_snapshot().unwrap();
+    assert!(local_after.durable_lsn > local_before);
+    let control_after = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+    assert_eq!(
+        control_after.durable_lsn, control_before.durable_lsn,
+        "failed control publication must not advance the authoritative tail"
+    );
+    assert_eq!(control_after.log, control_before.log);
+}
+
+#[test]
+fn controlled_read_waits_for_inflight_write_control_publication() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/read-visibility-checkpoint".to_owned());
+    let control = Arc::new(BlockingServingControl::new());
+    let server = Arc::new(
+        Server::open_with_objects(
+            options,
+            ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+            Some((
+                control.clone(),
+                vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                    .with_renewal(None)
+                    .with_shared_log(Some(ServerSharedLogOptions::new(
+                        "meta/read-visibility-log",
+                    )))],
+            )),
+        )
+        .unwrap(),
+    );
+
+    control.arm_mark();
+    let writer_server = Arc::clone(&server);
+    let writer = thread::spawn(move || {
+        request_envelope(
+            &writer_server,
+            MetadataRpcRequest::CreateDirPath {
+                path: "/published-before-read".to_owned(),
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+    });
+    control.wait_until_mark_reached();
+
+    let (read_tx, read_rx) = mpsc::channel();
+    let reader_server = Arc::clone(&server);
+    let reader = thread::spawn(move || {
+        let result = request_envelope(
+            &reader_server,
+            MetadataRpcRequest::StatPath {
+                path: "/published-before-read".to_owned(),
+            },
+        );
+        read_tx.send(result).unwrap();
+    });
+    assert!(
+        read_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "strong read must remain blocked while the write owns publication"
+    );
+
+    control.release_mark();
+    let write = writer.join().unwrap();
+    assert!(
+        write.ok,
+        "write should ACK after control publication: {write:?}"
+    );
+    let read = read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(read.ok, "read should run after publication: {read:?}");
+    reader.join().unwrap();
+}
+
+#[test]
+fn controlled_read_rejects_local_only_write_while_control_publication_fails() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/read-fail-checkpoint".to_owned());
+    let control = Arc::new(FailingCheckpointPublishControl::new());
+    let server = Server::open_with_objects(
+        options,
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control.clone(),
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(None)
+                .with_shared_log(Some(ServerSharedLogOptions::new("meta/read-fail-log")))],
+        )),
+    )
+    .unwrap();
+    let before = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+
+    // Each repair gets two mark attempts (initial + authoritative retry).
+    // Keep write, read, readyz, and stats persistently failed.
+    control.fail_next_marks(8);
+    let write = request_envelope(
+        &server,
+        MetadataRpcRequest::CreateDirPath {
+            path: "/local-only".to_owned(),
+            mode: 0o755,
+            uid: 1000,
+            gid: 1000,
+        },
+    );
+    assert!(!write.ok);
+    assert!(server
+        .service()
+        .lookup_path("/local-only")
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        control.get_shard(&ShardId::new("mount-1:/")).unwrap(),
+        before
+    );
+
+    let read = request_envelope(
+        &server,
+        MetadataRpcRequest::StatPath {
+            path: "/local-only".to_owned(),
+        },
+    );
+    assert!(
+        !read.ok,
+        "dirty local state must never escape in a read ACK"
+    );
+    assert!(read.result.is_none());
+    assert_eq!(
+        control.get_shard(&ShardId::new("mount-1:/")).unwrap(),
+        before
+    );
+
+    let not_ready = crate::http::handle_parts(&server, "GET /readyz HTTP/1.1", &[]);
+    assert_eq!(not_ready.status, "503 Service Unavailable");
+    assert!(server.stats_json().contains("\"ready\":false"));
+
+    control.fail_next_marks(0);
+    let ready = crate::http::handle_parts(&server, "GET /readyz HTTP/1.1", &[]);
+    assert_eq!(ready.status, "200 OK");
+    assert!(server.stats_json().contains("\"ready\":true"));
+    let repaired = request_envelope(
+        &server,
+        MetadataRpcRequest::StatPath {
+            path: "/local-only".to_owned(),
+        },
+    );
+    assert!(repaired.ok, "readiness repair must make the write visible");
+}
+
+#[test]
+fn transient_control_publication_failure_is_repaired_before_write_ack() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/transient-mark-checkpoint".to_owned());
+    let control = Arc::new(FailingCheckpointPublishControl::new());
+    let server = Server::open_with_objects(
+        options,
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control.clone(),
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(None)
+                .with_shared_log(Some(ServerSharedLogOptions::new("meta/transient-mark-log")))],
+        )),
+    )
+    .unwrap();
+    let before = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+
+    control.fail_next_marks(1);
+    let write = request_envelope(
+        &server,
+        MetadataRpcRequest::CreateDirPath {
+            path: "/transient".to_owned(),
+            mode: 0o755,
+            uid: 1000,
+            gid: 1000,
+        },
+    );
+    assert!(
+        write.ok,
+        "one transient mark failure should repair: {write:?}"
+    );
+    assert!(
+        control
+            .get_shard(&ShardId::new("mount-1:/"))
+            .unwrap()
+            .durable_lsn
+            > before.durable_lsn
+    );
+}
+
+#[test]
+fn controlled_clean_read_fails_at_local_lease_deadline() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/read-deadline-checkpoint".to_owned());
+    let control = Arc::new(InMemoryControlStore::new());
+    let renewal = ServerShardOwnerRenewalOptions {
+        interval: Duration::from_secs(3600),
+        run_immediately: false,
+        lease_ttl: Duration::from_secs(10),
+    };
+    let server = Server::open_with_objects(
+        options,
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control,
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(Some(renewal))
+                .with_shared_log(Some(ServerSharedLogOptions::new("meta/read-deadline-log")))],
+        )),
+    )
+    .unwrap();
+    let deadline = server.service().lease_deadline_ms();
+    assert!(deadline > 0);
+    server.service().set_clock_override_ms(deadline);
+
+    let read = request_envelope(&server, MetadataRpcRequest::GetAttr { inode: 1 });
+    assert!(!read.ok);
+    assert!(read
+        .error
+        .as_deref()
+        .is_some_and(|message| message.contains("lease expired")));
+}
+
+#[test]
+fn no_renew_controlled_read_requires_live_control_session() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/read-session-checkpoint".to_owned());
+    let control = Arc::new(FailingCheckpointPublishControl::new());
+    let server = Server::open_with_objects(
+        options,
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control.clone(),
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(None)
+                .with_shared_log(Some(ServerSharedLogOptions::new("meta/read-session-log")))],
+        )),
+    )
+    .unwrap();
+    control.fail_next_renews(1);
+
+    let read = request_envelope(&server, MetadataRpcRequest::GetAttr { inode: 1 });
+    assert!(!read.ok);
+    assert!(read
+        .error
+        .as_deref()
+        .is_some_and(|message| message.contains("injected owner renew failure")));
+}
+
+#[test]
+fn controlled_read_rejects_an_observed_successor_epoch() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/read-epoch-checkpoint".to_owned());
+    let control = Arc::new(InMemoryControlStore::new());
+    let server = Server::open_with_objects(
+        options,
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control.clone(),
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(None)
+                .with_shared_log(Some(ServerSharedLogOptions::new("meta/read-epoch-log")))],
+        )),
+    )
+    .unwrap();
+    let epoch = control.get_shard(&ShardId::new("mount-1:/")).unwrap().epoch;
+    server
+        .service()
+        .observe_required_owner_epoch(epoch + 1)
+        .unwrap();
+    assert_eq!(server.service().required_owner_epoch(), epoch + 1);
+    assert!(matches!(
+        server.service().verify_owner_lease(),
+        Err(nokv_meta::MetadError::StaleOwnerEpoch { .. })
+    ));
+
+    let read = request_envelope(&server, MetadataRpcRequest::GetAttr { inode: 1 });
+    assert!(!read.ok);
+    assert!(matches!(
+        read.error_kind,
+        Some(WireMetadataError::StaleOwnerEpoch {
+            owner_epoch,
+            required_epoch,
+        }) if owner_epoch == epoch && required_epoch == epoch + 1
+    ));
 }
 
 #[test]
@@ -171,15 +601,34 @@ fn controlled_failover_restores_checkpoint_and_replays_shared_log() {
         .checkpoint
         .expect("manual backup should publish checkpoint ref");
 
-    expect_dentry(request_envelope(
+    let partial_batch = request_envelope(
         &first,
-        MetadataRpcRequest::CreateDirPath {
-            path: "/after".to_owned(),
-            mode: 0o755,
-            uid: 1000,
-            gid: 1000,
+        MetadataRpcRequest::Batch {
+            requests: vec![
+                MetadataRpcRequest::CreateDirPath {
+                    path: "/after".to_owned(),
+                    mode: 0o755,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                MetadataRpcRequest::CreateDirPath {
+                    path: "/before".to_owned(),
+                    mode: 0o755,
+                    uid: 1000,
+                    gid: 1000,
+                },
+            ],
         },
-    ));
+    );
+    assert!(
+        partial_batch.ok,
+        "unexpected batch error: {partial_batch:?}"
+    );
+    let MetadataRpcResult::Batch { results } = partial_batch.result.unwrap() else {
+        panic!("unexpected partial batch result")
+    };
+    assert!(results[0].ok, "the first batch entry must commit");
+    assert!(!results[1].ok, "the duplicate batch entry must fail");
     let after_record = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
     assert!(after_record.durable_lsn > checkpoint_record.lsn);
     assert!(after_record.log.is_some());
@@ -203,8 +652,36 @@ fn controlled_failover_restores_checkpoint_and_replays_shared_log() {
     assert_eq!(state.epoch, 2);
     assert_eq!(state.state, nokv_control::ShardState::Serving);
     assert_eq!(state.durable_lsn, after_record.durable_lsn);
-    assert_eq!(state.checkpoint, after_record.checkpoint);
-    assert_eq!(state.log, after_record.log);
+    let refreshed_checkpoint = state
+        .checkpoint
+        .as_ref()
+        .expect("failover startup must publish a fresh fenced checkpoint");
+    assert_ne!(
+        refreshed_checkpoint.object_key, checkpoint_record.object_key,
+        "serving must not retain the historical checkpoint ref"
+    );
+    assert_eq!(refreshed_checkpoint.lsn, after_record.durable_lsn);
+    assert!(refreshed_checkpoint
+        .object_key
+        .starts_with("meta/failover-ck/mount_1__/controlled/sha256/"));
+    assert!(
+        state.log.is_none(),
+        "the fresh checkpoint covers and clears the replayed log chain"
+    );
+
+    // Startup checkpoint publication pruned every shared-log segment it now
+    // covers. A second checkpoint with no intervening write must still publish
+    // the durable tail from the log allocator, not regress to LSN zero merely
+    // because the live segment list is empty.
+    second.run_manual_backup().unwrap();
+    let no_write_state = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+    let no_write_checkpoint = no_write_state
+        .checkpoint
+        .as_ref()
+        .expect("no-write backup should retain a checkpoint ref");
+    assert_eq!(no_write_state.durable_lsn, after_record.durable_lsn);
+    assert_eq!(no_write_checkpoint.lsn, after_record.durable_lsn);
+    assert_eq!(no_write_checkpoint.digest, refreshed_checkpoint.digest);
 
     expect_dentry(request_envelope(
         &second,
@@ -806,7 +1283,10 @@ fn rpc_lists_indexed_path_pages_without_plain_namespace_entries() {
                     logical_offset: 0,
                     len: 2,
                     blocks: vec![WireBlockDescriptor {
-                        object_key: format!("blocks/1/{}/{}", prepared.inode, prepared.generation),
+                        object_key: format!(
+                            "blocks/1/{}/{}/0/0",
+                            prepared.inode, prepared.generation
+                        ),
                         logical_offset: 0,
                         object_offset: 0,
                         len: 2,
@@ -1469,7 +1949,7 @@ fn rpc_prepares_and_publishes_artifact_manifest() {
                 logical_offset: 0,
                 len: 4,
                 blocks: vec![WireBlockDescriptor {
-                    object_key: format!("blocks/1/{}/{}", prepared.inode, prepared.generation),
+                    object_key: format!("blocks/1/{}/{}/0/0", prepared.inode, prepared.generation),
                     logical_offset: 0,
                     object_offset: 0,
                     len: 4,
@@ -1492,6 +1972,73 @@ fn rpc_prepares_and_publishes_artifact_manifest() {
 }
 
 #[test]
+fn rpc_refreshes_stale_prepared_object_gc_epoch_and_preserves_typed_error() {
+    let server = test_server();
+    let prepared = match request_envelope(
+        &server,
+        MetadataRpcRequest::PrepareArtifact {
+            parent: 1,
+            name: "refresh.bin".to_owned(),
+            replace: false,
+        },
+    )
+    .result
+    .unwrap()
+    {
+        MetadataRpcResult::PreparedArtifact { prepared } => prepared,
+        other => panic!("unexpected prepare result: {other:?}"),
+    };
+    assert_ne!(prepared.object_gc_claim_version, 0);
+
+    let mut stale = prepared.clone();
+    stale.object_gc_claim_version = prepared.object_gc_claim_version.saturating_add(1000);
+    let stale_publish = request_envelope(
+        &server,
+        MetadataRpcRequest::PublishPreparedArtifact {
+            prepared: stale.clone(),
+            body: Box::new(WireBodyDescriptor {
+                producer: "unit-test".to_owned(),
+                digest_uri: "sha256:empty".to_owned(),
+                size: 0,
+                content_type: "application/octet-stream".to_owned(),
+                manifest_id: "refresh.bin".to_owned(),
+                generation: stale.generation,
+                base_generation: 0,
+                chunk_size: 64 * 1024 * 1024,
+                block_size: 4 * 1024 * 1024,
+            }),
+            chunks: Vec::new(),
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+        },
+    );
+    assert!(!stale_publish.ok);
+    assert_eq!(
+        stale_publish.error_kind,
+        Some(WireMetadataError::StalePreparedArtifactObjectGcEpoch {
+            expected: stale.object_gc_claim_version,
+            current: prepared.object_gc_claim_version,
+        })
+    );
+
+    let refreshed = request_envelope(
+        &server,
+        MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared: stale },
+    );
+    assert!(refreshed.ok, "refresh failed: {refreshed:?}");
+    let refreshed = match refreshed.result.unwrap() {
+        MetadataRpcResult::PreparedArtifact { prepared } => prepared,
+        other => panic!("unexpected refresh result: {other:?}"),
+    };
+    assert!(refreshed.generation > prepared.generation);
+    assert_eq!(
+        refreshed.object_gc_claim_version,
+        prepared.object_gc_claim_version
+    );
+}
+
+#[test]
 fn rpc_staged_session_publish_preserves_old_prefix_on_shrink() {
     let server = test_server();
     let prepared = match request_envelope(
@@ -1508,7 +2055,7 @@ fn rpc_staged_session_publish_preserves_old_prefix_on_shrink() {
         MetadataRpcResult::PreparedArtifact { prepared } => prepared,
         other => panic!("unexpected prepare result: {other:?}"),
     };
-    let old_object_key = format!("blocks/1/{}/{}", prepared.inode, prepared.generation);
+    let old_object_key = format!("blocks/1/{}/{}/0/0", prepared.inode, prepared.generation);
     let envelope = request_envelope(
         &server,
         MetadataRpcRequest::PublishPreparedArtifact {
@@ -1643,7 +2190,12 @@ fn publish_synthetic_file(server: &Server, path: &str, manifest_id: &str, replac
                     logical_offset: 0,
                     len: 4,
                     blocks: vec![nokv_types::BlockDescriptor {
-                        object_key: format!("blocks/{manifest_id}"),
+                        object_key: format!(
+                            "blocks/{}/{}/{}/0/0",
+                            server.service().mount_id().get(),
+                            prepared.inode.get(),
+                            prepared.generation
+                        ),
                         logical_offset: 0,
                         object_offset: 0,
                         len: 4,
@@ -1712,7 +2264,7 @@ fn rpc_clone_subtree_links_navigable_fork_and_diff_tracks_divergence() {
         other => panic!("unexpected clone result: {other:?}"),
     };
     assert!(fork_root > base.attr.inode, "fork gets a fresh root inode");
-    assert!(snapshot_id > 0, "clone retains a snapshot pin");
+    assert!(snapshot_id > 0, "clone retains a durable source binding");
 
     // The fork is a real, navigable directory at /fork: listing it through the
     // path RPC surfaces the base's entries under fresh inodes.
@@ -2030,13 +2582,22 @@ mod multi_shard {
             DATASET_INDEX,
         )
         .unwrap();
-        let server = Server::open_with_control(
-            test_options(dir.path()),
-            control.clone(),
-            vec![
-                ServerShardOwnerOptions::fresh("mount-1:/", "node-a").with_renewal(None),
-                ServerShardOwnerOptions::fresh("mount-1:/dataset", "node-a").with_renewal(None),
-            ],
+        let mut options = test_options(dir.path());
+        options.metadata_checkpoint_archive_prefix = Some("meta/multi-shard-checkpoint".to_owned());
+        let server = Server::open_with_objects(
+            options,
+            ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+            Some((
+                control.clone(),
+                vec![
+                    ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                        .with_renewal(None)
+                        .with_shared_log(Some(ServerSharedLogOptions::new("meta/multi-shard-log"))),
+                    ServerShardOwnerOptions::fresh("mount-1:/dataset", "node-a")
+                        .with_renewal(None)
+                        .with_shared_log(Some(ServerSharedLogOptions::new("meta/multi-shard-log"))),
+                ],
+            )),
         )
         .unwrap();
         (server, control, dir)
@@ -2107,7 +2668,7 @@ mod multi_shard {
         );
 
         // Reconcile heals it locally.
-        server.reconcile_local_grafts();
+        server.reconcile_local_grafts().unwrap();
 
         let after = expect_dentry(request_envelope(
             &server,
@@ -2123,7 +2684,7 @@ mod multi_shard {
         );
 
         // Idempotent: a second reconcile is a no-op (the dentry already exists).
-        server.reconcile_local_grafts();
+        server.reconcile_local_grafts().unwrap();
         let still = expect_dentry(request_envelope(
             &server,
             MetadataRpcRequest::LookupPlus {
@@ -2747,14 +3308,24 @@ mod fleet_e2e {
         make_owner: impl FnOnce(SocketAddr) -> ServerShardOwnerOptions + Send + 'static,
     ) -> RunningServer {
         let meta_root = meta_root.to_path_buf();
-        let prefix = checkpoint_prefix.map(ToOwned::to_owned);
+        let prefix = Some(
+            checkpoint_prefix
+                .unwrap_or("meta/fleet-control-checkpoint")
+                .to_owned(),
+        );
         RunningServer::spawn(move |addr| {
             let mut options = fleet_options(&meta_root);
             options.metadata_checkpoint_archive_prefix = prefix;
+            let owner = make_owner(addr);
+            let owner = if owner.shared_log.is_some() {
+                owner
+            } else {
+                owner.with_shared_log(Some(ServerSharedLogOptions::new("meta/fleet-log")))
+            };
             Server::open_with_objects(
                 options,
                 objects,
-                Some((control as Arc<dyn ControlStore>, vec![make_owner(addr)])),
+                Some((control as Arc<dyn ControlStore>, vec![owner])),
             )
             .unwrap()
         })
@@ -2930,9 +3501,9 @@ mod fleet_e2e {
     ///     hitting the still-cached B returns a typed handoff error.
     ///   - The client's next `/dataset` request hits B, gets `StaleOwnerEpoch`,
     ///     refreshes the shard map from control, re-resolves to B', and succeeds —
-    ///     all inside one client call, transparently. With no checkpoint archive
-    ///     configured, B' starts shard 1 fresh (the documented "fresh if nothing
-    ///     was checkpointed" path); the stronger restore variant is the next test.
+    ///     all inside one client call, transparently. B' restores an exact
+    ///     checkpoint because failover never treats an empty local disk as proof
+    ///     of an empty namespace.
     #[test]
     fn fleet_transparently_reresolves_after_owner_handoff() {
         let dir_a = tempdir().unwrap();
@@ -2941,6 +3512,7 @@ mod fleet_e2e {
         let object = memory_object_store();
         let control = Arc::new(InMemoryControlStore::new());
         register_two_shards(&control);
+        let checkpoint_prefix = "meta/fleet-reresolve";
 
         let server_a = spawn_member(
             dir_a.path(),
@@ -2953,7 +3525,7 @@ mod fleet_e2e {
             dir_b.path(),
             object.clone(),
             Arc::clone(&control),
-            None,
+            Some(checkpoint_prefix),
             |addr| {
                 ServerShardOwnerOptions::fresh("mount-1:/dataset", addr.to_string())
                     .with_renewal(None)
@@ -2975,6 +3547,7 @@ mod fleet_e2e {
         // Seed shard 1 through B and confirm the client routes there.
         let pre = metadata.mkdir("/dataset", MODE_DIR, 1000, 1000).unwrap();
         assert_eq!(pre.attr.inode.shard_index(), DATASET_INDEX);
+        server_b.server().run_manual_backup().unwrap();
 
         // Bring up B' as a failover owner of shard 1 on a brand-new port. This
         // bumps the shard epoch (1 -> 2) and rewrites the control endpoint to B'.
@@ -2982,10 +3555,13 @@ mod fleet_e2e {
             dir_b_prime.path(),
             object.clone(),
             Arc::clone(&control),
-            None,
+            Some(checkpoint_prefix),
             move |addr| {
                 ServerShardOwnerOptions::failover("mount-1:/dataset", addr.to_string(), b_epoch)
                     .with_renewal(None)
+                    .with_shared_log(Some(ServerSharedLogOptions::new(
+                        "meta/fleet-reresolve-log",
+                    )))
             },
         );
         assert_ne!(
@@ -3017,16 +3593,8 @@ mod fleet_e2e {
 
         // The first client call after the handoff hits cached B -> StaleOwnerEpoch
         // -> refresh from control -> re-resolve to B' -> served there. The
-        // re-resolve is invisible to the caller; it just sees a successful op.
-        // (B' is a fresh shard with no checkpoint, so its /dataset directory must
-        // be recreated before files land under it — that recreate IS the request
-        // that drives the transparent re-resolve.)
-        let post_dir = metadata.mkdir("/dataset", MODE_DIR, 1000, 1000).unwrap();
-        assert_eq!(
-            post_dir.attr.inode.shard_index(),
-            DATASET_INDEX,
-            "the re-resolved /dataset directory is still a shard-1 inode (served by B')"
-        );
+        // re-resolve is invisible to the caller; it just sees a successful op in
+        // the checkpoint-restored `/dataset` directory.
         let post = metadata
             .create_file("/dataset/after-handoff.bin", MODE_FILE, 1000, 1000)
             .unwrap();

@@ -30,6 +30,40 @@ pub fn allocator_key(mount: MountId) -> Vec<u8> {
     out
 }
 
+pub fn object_gc_claim_key(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 16);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"object-gc-claim\0");
+    out
+}
+
+pub fn object_gc_scan_cursor_key(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 22);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"object-gc-scan-cursor\0");
+    out
+}
+
+pub fn failover_durability_required_key(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 29);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"failover-durability-required\0");
+    out
+}
+
+pub fn object_gc_quarantine_prefix(mount: MountId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(U64_WIDTH + 21);
+    push_u64(&mut out, mount.get());
+    out.extend_from_slice(b"object-gc-quarantine\0");
+    out
+}
+
+pub fn object_gc_quarantine_key(mount: MountId, record_digest: &[u8; 32]) -> Vec<u8> {
+    let mut out = object_gc_quarantine_prefix(mount);
+    out.extend_from_slice(record_digest);
+    out
+}
+
 pub fn inode_key(mount: MountId, inode: InodeId) -> Vec<u8> {
     let mut out = inode_prefix(mount);
     push_u64(&mut out, inode.get());
@@ -415,6 +449,21 @@ mod tests {
         assert!(key.starts_with(&gc_queue_prefix(mount())));
         assert!(!other_mount.starts_with(&gc_queue_prefix(mount())));
         assert!(key < later);
+    }
+
+    #[test]
+    fn object_gc_control_keys_are_mount_scoped_and_distinct() {
+        let claim = object_gc_claim_key(mount());
+        let cursor = object_gc_scan_cursor_key(mount());
+        let failover = failover_durability_required_key(mount());
+        let quarantine = object_gc_quarantine_key(mount(), &[7; 32]);
+        let other_claim = object_gc_claim_key(MountId::new(8).unwrap());
+
+        assert_ne!(claim, cursor);
+        assert_ne!(claim, failover);
+        assert_ne!(cursor, failover);
+        assert_ne!(claim, other_claim);
+        assert!(quarantine.starts_with(&object_gc_quarantine_prefix(mount())));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 use nokv_protocol::{decode_envelope, encode_request, MetadataRpcRequest};
-use nokv_protocol::{decode_request, encode_envelope, MetadataRpcEnvelope, MetadataRpcResult};
+use nokv_protocol::{decode_request, encode_envelope, MetadataRpcEnvelope};
 
 use super::wire::wire_server_error;
 use crate::server::{Server, ServerError};
@@ -244,17 +244,22 @@ fn handle_binary_rpc_frames(
         }
     }
 
-    let Ok(MetadataRpcResult::Batch { results }) = super::execute_batch(server, requests) else {
-        return frames
-            .into_iter()
-            .map(|frame| handle_binary_rpc_frame(server, frame))
-            .collect();
+    let results = match super::batch::try_execute_coalesced_batch(server, requests) {
+        Ok(Some(results)) => results,
+        Ok(None) => {
+            return frames
+                .into_iter()
+                .map(|frame| handle_binary_rpc_frame(server, frame))
+                .collect();
+        }
+        Err(err) => return encode_batch_error_frames(frames, &err),
     };
     if results.len() != frames.len() {
-        return frames
-            .into_iter()
-            .map(|frame| handle_binary_rpc_frame(server, frame))
-            .collect();
+        let err = ServerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "coalesced metadata batch returned an unexpected result count",
+        ));
+        return encode_batch_error_frames(frames, &err);
     }
 
     frames
@@ -273,6 +278,34 @@ fn handle_binary_rpc_frames(
             )
         })
         .collect()
+}
+
+fn encode_batch_error_frames(
+    frames: Vec<RpcFrame>,
+    err: &ServerError,
+) -> Vec<(u64, u32, Result<Vec<u8>, ServerError>)> {
+    match encode_server_error(err) {
+        Ok(encoded) => frames
+            .into_iter()
+            .map(|frame| (frame.request_id, frame.flags, Ok(encoded.clone())))
+            .collect(),
+        Err(encode_err) => {
+            let message = encode_err.to_string();
+            frames
+                .into_iter()
+                .map(|frame| {
+                    (
+                        frame.request_id,
+                        frame.flags,
+                        Err(ServerError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            message.clone(),
+                        ))),
+                    )
+                })
+                .collect()
+        }
+    }
 }
 
 fn handle_binary_rpc_frame(

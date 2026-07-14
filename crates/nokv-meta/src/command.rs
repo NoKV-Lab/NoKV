@@ -304,12 +304,19 @@ pub trait MetadataStore {
             .collect()
     }
 
+    /// Authoritatively read the current atomic-apply marker for `request_id`.
+    ///
+    /// `Some(result)` proves that the command's apply is visible in this
+    /// metadata engine with that exact result. `None` must authoritatively prove
+    /// that the preceding commit call did not make this request id visible. An
+    /// error means the outcome remains unknown; callers must not interpret it
+    /// as absence or allow a later ordered commit to overtake the unresolved
+    /// command. This marker alone does not establish cross-machine durability;
+    /// synchronous log archival provides that separate guarantee.
     fn committed_request_result(
         &self,
-        _request_id: &[u8],
-    ) -> Result<Option<CommitResult>, MetadataError> {
-        Ok(None)
-    }
+        request_id: &[u8],
+    ) -> Result<Option<CommitResult>, MetadataError>;
 
     fn history_retention_epoch(&self) -> Result<u64, MetadataError> {
         Ok(0)
@@ -423,6 +430,16 @@ impl Version {
 }
 
 impl MetadataCommand {
+    /// The only successful result this command is allowed to persist in the
+    /// request-id deduplication record.
+    pub fn expected_commit_result(&self) -> CommitResult {
+        CommitResult {
+            commit_version: self.commit_version,
+            applied_mutations: self.mutations.len(),
+            watch_events: self.watch.len(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), MetadataError> {
         if self.request_id.is_empty() {
             return Err(MetadataError::EmptyRequestId);
@@ -563,6 +580,13 @@ mod tests {
             &self,
             _command: MetadataCommand,
         ) -> Result<CommitResult, MetadataError> {
+            unimplemented!("not needed by scan_delimited tests")
+        }
+
+        fn committed_request_result(
+            &self,
+            _request_id: &[u8],
+        ) -> Result<Option<CommitResult>, MetadataError> {
             unimplemented!("not needed by scan_delimited tests")
         }
 

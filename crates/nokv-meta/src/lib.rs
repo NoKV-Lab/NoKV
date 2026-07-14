@@ -32,7 +32,8 @@ pub use log::{
 pub use service::{
     BodyReadPlan, CheckpointHandle, CheckpointShard, CloneHandle, CreateInDirPathBatch,
     CreatedPreparedArtifact, DanglingBlock, DentryWithAttr, FsckReport, MetadError,
-    MetadataArchiveConfig, MetadataBackupOutcome, MetadataLogArchiveConfig,
+    MetadataArchiveConfig, MetadataBackupOutcome, MetadataCheckpointIdentity,
+    MetadataLogArchiveConfig, MetadataLogPruneOutcome, MetadataLogPublicationState,
     MetadataLogRestoreOutcome, MetadataLogSegmentArchiveOutcome, MetadataLogSegmentPointer,
     MetadataLogSyncConfig, MetadataLogSyncSnapshot, MetadataRestoreOutcome, MetadataServiceStats,
     NamespaceAggregateGroup, NamespaceAggregateMeasure, NamespaceAggregateOp,

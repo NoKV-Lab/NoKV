@@ -76,6 +76,30 @@ fn serve_request_sequence(
     addr
 }
 
+fn serve_request_sequence_then_drop(
+    handlers: Vec<Box<dyn Fn(MetadataRpcRequest) -> Vec<u8> + Send>>,
+    dropped_request: Box<dyn Fn(MetadataRpcRequest) + Send>,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut magic = [0_u8; FRAMED_RPC_MAGIC.len()];
+        stream.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, FRAMED_RPC_MAGIC);
+        for handler in handlers {
+            let (request_id, flags, request) = read_frame(&mut stream).unwrap();
+            let request = decode_request(&request).unwrap();
+            let response = handler(request);
+            write_frame(&mut stream, request_id, flags, &response).unwrap();
+        }
+        let (_, _, request) = read_frame(&mut stream).unwrap();
+        dropped_request(decode_request(&request).unwrap());
+        // Simulate a response lost after the server may have committed.
+    });
+    addr
+}
+
 fn response_body(json: &str) -> Vec<u8> {
     let envelope: MetadataRpcEnvelope = serde_json::from_str(json).unwrap();
     encode_envelope(&envelope).unwrap()
@@ -608,7 +632,7 @@ fn service_create_file_prepared_uses_single_frame() {
             other => panic!("unexpected request: {other:?}"),
         }
         response_body(
-            r#"{"ok":true,"result":{"type":"created_prepared_artifact","entry":{"dentry":{"parent":2,"name_hex":"636865636b706f696e742e62696e","child":40,"child_type":"file","attr_generation":7},"attr":{"inode":40,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":0,"generation":7,"mtime_ms":7,"ctime_ms":7},"body":null},"prepared":{"mount":1,"parent":2,"name":"checkpoint.bin","inode":40,"generation":8,"mtime_ms":8,"ctime_ms":8,"replace":true,"dentry_version":7,"old_generation":null}}}"#,
+            r#"{"ok":true,"result":{"type":"created_prepared_artifact","entry":{"dentry":{"parent":2,"name_hex":"636865636b706f696e742e62696e","child":40,"child_type":"file","attr_generation":7},"attr":{"inode":40,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":0,"generation":7,"mtime_ms":7,"ctime_ms":7},"body":null},"prepared":{"mount":1,"parent":2,"name":"checkpoint.bin","inode":40,"generation":8,"mtime_ms":8,"ctime_ms":8,"replace":true,"dentry_version":7,"old_generation":null,"object_gc_claim_version":12}}}"#,
         )
     });
     let client = MetadataClient::connect(addr);
@@ -625,6 +649,43 @@ fn service_create_file_prepared_uses_single_frame() {
     assert_eq!(created.prepared.inode.get(), 40);
     assert_eq!(created.prepared.generation, 8);
     assert!(created.prepared.replace);
+    assert_eq!(created.prepared.object_gc_claim_version, 12);
+}
+
+#[test]
+fn service_refresh_prepared_upload_mints_generation_and_object_gc_epoch() {
+    let addr = serve_one_request(|request| {
+        match request {
+            MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared } => {
+                assert_eq!(prepared.inode, 42);
+                assert_eq!(prepared.generation, 7);
+                assert_eq!(prepared.object_gc_claim_version, 12);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":2,"name":"artifact.bin","inode":42,"generation":13,"mtime_ms":1700000000001,"ctime_ms":1700000000001,"replace":true,"dentry_version":7,"old_generation":6,"object_gc_claim_version":14}}}"#,
+        )
+    });
+    let client = MetadataClient::connect(addr);
+    let refreshed = client
+        .refresh_prepared_artifact_object_gc_epoch(ClientPreparedArtifact {
+            mount: 1,
+            parent: InodeId::new(2).unwrap(),
+            name: DentryName::new(b"artifact.bin".to_vec()).unwrap(),
+            path: None,
+            inode: InodeId::new(42).unwrap(),
+            generation: 7,
+            mtime_ms: 1_700_000_000_000,
+            ctime_ms: 1_700_000_000_000,
+            replace: true,
+            dentry_version: Some(7),
+            old_generation: Some(6),
+            object_gc_claim_version: 12,
+        })
+        .unwrap();
+    assert_eq!(refreshed.generation, 13);
+    assert_eq!(refreshed.object_gc_claim_version, 14);
 }
 
 #[test]
@@ -2456,7 +2517,7 @@ fn service_file_client_uploads_blocks_then_publishes_metadata() {
     let store = MemoryObjectStore::new();
     let addr = serve_many(vec![
         response_body(
-            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null}}}"#,
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
         ),
         response_body(
             r#"{"ok":true,"result":{"type":"rename_replace","entry":{"dentry":{"parent":1,"name_hex":"61727469666163742e62696e","child":42,"child_type":"file","attr_generation":7},"attr":{"inode":42,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":11,"generation":7,"mtime_ms":7,"ctime_ms":7},"body":{"producer":"unit-test","digest_uri":"sha256:demo","size":11,"content_type":"application/octet-stream","manifest_id":"artifact.bin","generation":7,"base_generation":0,"chunk_size":67108864,"block_size":4194304}},"replaced":null}}"#,
@@ -2481,11 +2542,119 @@ fn service_file_client_uploads_blocks_then_publishes_metadata() {
 }
 
 #[test]
+fn service_file_client_refreshes_and_restages_after_object_gc_epoch_change() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_request_sequence(vec![
+        Box::new(|request| {
+            assert_eq!(
+                request,
+                MetadataRpcRequest::PrepareArtifactPath {
+                    path: "/artifact.bin".to_owned(),
+                    replace: false,
+                }
+            );
+            response_body(
+                r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","path":"/artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+            )
+        }),
+        Box::new(|request| {
+            let MetadataRpcRequest::PublishPreparedArtifact { prepared, body, .. } = request else {
+                panic!("expected initial prepared publish")
+            };
+            assert_eq!(prepared.generation, 7);
+            assert_eq!(prepared.object_gc_claim_version, 12);
+            assert_eq!(body.generation, 7);
+            response_body(
+                r#"{"ok":false,"error":"prepared artifact object-GC epoch 12 is stale; current epoch is 14","error_kind":{"type":"stale_prepared_artifact_object_gc_epoch","expected":12,"current":14}}"#,
+            )
+        }),
+        Box::new(|request| {
+            let MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { prepared } = request
+            else {
+                panic!("expected prepared object-GC refresh")
+            };
+            assert_eq!(prepared.path.as_deref(), Some("/artifact.bin"));
+            assert_eq!(prepared.generation, 7);
+            assert_eq!(prepared.object_gc_claim_version, 12);
+            response_body(
+                r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","path":"/artifact.bin","inode":42,"generation":13,"mtime_ms":1700000000001,"ctime_ms":1700000000001,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":14}}}"#,
+            )
+        }),
+        Box::new(|request| {
+            let MetadataRpcRequest::PublishPreparedArtifact { prepared, body, .. } = request else {
+                panic!("expected refreshed prepared publish")
+            };
+            assert_eq!(prepared.generation, 13);
+            assert_eq!(prepared.object_gc_claim_version, 14);
+            assert_eq!(body.generation, 13);
+            response_body(
+                r#"{"ok":true,"result":{"type":"rename_replace","entry":{"dentry":{"parent":1,"name_hex":"61727469666163742e62696e","child":42,"child_type":"file","attr_generation":13},"attr":{"inode":42,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":11,"generation":13,"mtime_ms":13,"ctime_ms":13},"body":{"producer":"unit-test","digest_uri":"sha256:artifact.bin","size":11,"content_type":"application/octet-stream","manifest_id":"artifact.bin","generation":13,"base_generation":0,"chunk_size":67108864,"block_size":4194304}},"replaced":null}}"#,
+            )
+        }),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+
+    let entry = client
+        .put_artifact(
+            "/artifact.bin",
+            b"hello world".to_vec(),
+            artifact_metadata("artifact.bin"),
+        )
+        .unwrap();
+
+    assert_eq!(entry.attr.generation, 13);
+    assert!(store
+        .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+        .unwrap()
+        .is_none());
+    assert!(store
+        .head(&ObjectKey::new("blocks/1/42/13/0/0").unwrap())
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn service_file_client_replays_seekable_reader_from_initial_position_after_refresh() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_many(vec![
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+        ),
+        response_body(
+            r#"{"ok":false,"error":"prepared artifact object-GC epoch 12 is stale; current epoch is 14","error_kind":{"type":"stale_prepared_artifact_object_gc_epoch","expected":12,"current":14}}"#,
+        ),
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":13,"mtime_ms":1700000000001,"ctime_ms":1700000000001,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":14}}}"#,
+        ),
+        response_body(
+            r#"{"ok":true,"result":{"type":"rename_replace","entry":{"dentry":{"parent":1,"name_hex":"61727469666163742e62696e","child":42,"child_type":"file","attr_generation":13},"attr":{"inode":42,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":11,"generation":13,"mtime_ms":13,"ctime_ms":13},"body":{"producer":"unit-test","digest_uri":"sha256:artifact.bin","size":11,"content_type":"application/octet-stream","manifest_id":"artifact.bin","generation":13,"base_generation":0,"chunk_size":67108864,"block_size":4194304}},"replaced":null}}"#,
+        ),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+    let mut reader = std::io::Cursor::new(b"skip--hello world".to_vec());
+    reader.set_position(6);
+
+    let entry = client
+        .put_artifact_from_reader("/artifact.bin", reader, artifact_metadata("artifact.bin"))
+        .unwrap();
+
+    assert_eq!(entry.attr.size, 11);
+    assert!(store
+        .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+        .unwrap()
+        .is_none());
+    assert!(store
+        .head(&ObjectKey::new("blocks/1/42/13/0/0").unwrap())
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn service_file_client_cleans_staged_blocks_after_publish_failure() {
     let store = MemoryObjectStore::new();
     let addr = serve_many(vec![
         response_body(
-            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null}}}"#,
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
         ),
         response_body(
             r#"{"ok":false,"error":"metadata command predicate failed","error_kind":{"type":"predicate_failed"}}"#,
@@ -2511,6 +2680,327 @@ fn service_file_client_cleans_staged_blocks_after_publish_failure() {
             .unwrap()
             .is_none(),
         "failed metadata publish should clean staged object block"
+    );
+}
+
+#[test]
+fn service_file_client_keeps_bytes_staged_when_publish_reports_committed() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_many(vec![
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+        ),
+        response_body(
+            r#"{"ok":false,"error":"metadata sync log archive failed after commit","error_kind":{"type":"sync_log_archive_failed","committed":true,"message":"injected"}}"#,
+        ),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+
+    let err = client
+        .put_artifact(
+            "/artifact.bin",
+            b"hello world".to_vec(),
+            artifact_metadata("artifact.bin"),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientError::Metadata(nokv_meta::MetadError::SyncLogArchiveFailed {
+            committed: true,
+            ..
+        })
+    ));
+    assert!(
+        store
+            .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+            .unwrap()
+            .is_some(),
+        "a committed publish may already reference the staged object"
+    );
+}
+
+#[test]
+fn service_file_client_keeps_bytes_staged_when_metadata_backend_publish_is_uncertain() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_many(vec![
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+        ),
+        response_body(
+            r#"{"ok":false,"error":"metadata backend unavailable after publish attempt","error_kind":{"type":"metadata","message":"metadata backend unavailable after publish attempt"}}"#,
+        ),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+
+    let err = client
+        .put_artifact(
+            "/artifact.bin",
+            b"hello world".to_vec(),
+            artifact_metadata("artifact.bin"),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientError::Metadata(nokv_meta::MetadError::Metadata(
+            nokv_meta::MetadataError::Backend(_)
+        ))
+    ));
+    assert!(
+        store
+            .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+            .unwrap()
+            .is_some(),
+        "a metadata backend failure does not prove the publish was rejected"
+    );
+}
+
+#[test]
+fn service_file_client_keeps_bytes_staged_for_ownership_errors_with_unknown_commit_phase() {
+    let ownership_errors = [
+        (
+            r#"{"ok":false,"error":"owner epoch 7 is stale; required owner epoch is 8","error_kind":{"type":"stale_owner_epoch","owner_epoch":7,"required_epoch":8}}"#,
+            "stale owner epoch",
+        ),
+        (
+            r#"{"ok":false,"error":"owner lease expired","error_kind":{"type":"lease_expired","now_ms":101,"deadline_ms":100}}"#,
+            "expired owner lease",
+        ),
+        (
+            r#"{"ok":false,"error":"not owner","error_kind":{"type":"not_owner","shard_id":"mount-1:/","endpoint":null}}"#,
+            "owner handoff",
+        ),
+    ];
+
+    for (wire_error, context) in ownership_errors {
+        let store = MemoryObjectStore::new();
+        let addr = serve_many(vec![
+            response_body(
+                r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+            ),
+            response_body(wire_error),
+        ]);
+        let client = NoKvFsClient::connect(addr, store.clone());
+
+        let err = client
+            .put_artifact(
+                "/artifact.bin",
+                b"hello world".to_vec(),
+                artifact_metadata("artifact.bin"),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ClientError::Metadata(
+                nokv_meta::MetadError::StaleOwnerEpoch { .. }
+                    | nokv_meta::MetadError::LeaseExpired { .. }
+                    | nokv_meta::MetadError::NotOwner { .. }
+            )
+        ));
+        assert!(
+            store
+                .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+                .unwrap()
+                .is_some(),
+            "{context} does not prove the publish was rejected before commit"
+        );
+    }
+}
+
+#[test]
+fn service_file_client_keeps_reader_staged_when_publish_response_is_lost() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_request_sequence_then_drop(
+        vec![Box::new(|request| {
+            assert_eq!(
+                request,
+                MetadataRpcRequest::PrepareArtifactPath {
+                    path: "/artifact.bin".to_owned(),
+                    replace: false,
+                }
+            );
+            response_body(
+                r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+            )
+        })],
+        Box::new(|request| {
+            let MetadataRpcRequest::PublishPreparedArtifact { prepared, body, .. } = request else {
+                panic!("expected prepared artifact publish")
+            };
+            assert_eq!(prepared.generation, 7);
+            assert_eq!(body.generation, 7);
+        }),
+    );
+    let client = NoKvFsClient::connect(addr, store.clone());
+
+    let err = client
+        .put_artifact_from_reader(
+            "/artifact.bin",
+            std::io::Cursor::new(b"hello world".to_vec()),
+            artifact_metadata("artifact.bin"),
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, ClientError::Io(_)));
+    assert!(
+        store
+            .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+            .unwrap()
+            .is_some(),
+        "a lost response leaves the publish outcome unknown"
+    );
+}
+
+#[test]
+fn service_file_client_keeps_reader_staged_when_metadata_backend_publish_is_uncertain() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_many(vec![
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"artifact.bin","inode":42,"generation":7,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":false,"dentry_version":null,"old_generation":null,"object_gc_claim_version":12}}}"#,
+        ),
+        response_body(
+            r#"{"ok":false,"error":"metadata backend unavailable after publish attempt","error_kind":{"type":"metadata","message":"metadata backend unavailable after publish attempt"}}"#,
+        ),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+
+    let err = client
+        .put_artifact_from_reader(
+            "/artifact.bin",
+            std::io::Cursor::new(b"hello world".to_vec()),
+            artifact_metadata("artifact.bin"),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientError::Metadata(nokv_meta::MetadError::Metadata(
+            nokv_meta::MetadataError::Backend(_)
+        ))
+    ));
+    assert!(
+        store
+            .head(&ObjectKey::new("blocks/1/42/7/0/0").unwrap())
+            .unwrap()
+            .is_some(),
+        "a metadata backend failure does not prove the reader publish was rejected"
+    );
+}
+
+#[test]
+fn service_file_client_keeps_append_staged_when_publish_reports_committed() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_request_sequence(vec![
+        Box::new(|request| {
+            assert_eq!(
+                request,
+                MetadataRpcRequest::LookupPath {
+                    path: "/log.txt".to_owned(),
+                }
+            );
+            response_body(
+                r#"{"ok":true,"result":{"type":"dentry","entry":{"dentry":{"parent":1,"name_hex":"6c6f672e747874","child":42,"child_type":"file","attr_generation":7},"attr":{"inode":42,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":5,"generation":7,"mtime_ms":7,"ctime_ms":7},"body":{"producer":"unit-test","digest_uri":"sha256:base","size":5,"content_type":"application/octet-stream","manifest_id":"base.log","generation":7,"base_generation":0,"chunk_size":67108864,"block_size":4194304}}}}"#,
+            )
+        }),
+        Box::new(|request| {
+            assert_eq!(
+                request,
+                MetadataRpcRequest::PrepareArtifactPath {
+                    path: "/log.txt".to_owned(),
+                    replace: true,
+                }
+            );
+            response_body(
+                r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"log.txt","inode":42,"generation":9,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":true,"dentry_version":7,"old_generation":7,"object_gc_claim_version":12}}}"#,
+            )
+        }),
+        Box::new(|request| {
+            let MetadataRpcRequest::PublishPreparedArtifactStagedSession {
+                prepared,
+                size,
+                chunks,
+                staged,
+                ..
+            } = request
+            else {
+                panic!("expected staged-session artifact publish")
+            };
+            assert_eq!(prepared.generation, 9);
+            assert_eq!(prepared.old_generation, Some(7));
+            assert_eq!(size, 11);
+            assert!(!chunks.is_empty());
+            assert!(!staged.objects.is_empty());
+            response_body(
+                r#"{"ok":false,"error":"metadata sync log archive failed after commit","error_kind":{"type":"sync_log_archive_failed","committed":true,"message":"injected"}}"#,
+            )
+        }),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+
+    let err = client
+        .append_artifact(
+            "/log.txt",
+            b" world".to_vec(),
+            artifact_metadata("delta.log"),
+            None,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientError::Metadata(nokv_meta::MetadError::SyncLogArchiveFailed {
+            committed: true,
+            ..
+        })
+    ));
+    assert!(
+        store
+            .head(&ObjectKey::new("blocks/1/42/9/0/0").unwrap())
+            .unwrap()
+            .is_some(),
+        "a committed append may already reference the staged delta"
+    );
+}
+
+#[test]
+fn service_file_client_keeps_append_staged_when_metadata_backend_publish_is_uncertain() {
+    let store = MemoryObjectStore::new();
+    let addr = serve_many(vec![
+        response_body(
+            r#"{"ok":true,"result":{"type":"dentry","entry":{"dentry":{"parent":1,"name_hex":"6c6f672e747874","child":42,"child_type":"file","attr_generation":7},"attr":{"inode":42,"file_type":"file","mode":420,"uid":1000,"gid":1000,"rdev":0,"nlink":1,"size":5,"generation":7,"mtime_ms":7,"ctime_ms":7},"body":{"producer":"unit-test","digest_uri":"sha256:base","size":5,"content_type":"application/octet-stream","manifest_id":"base.log","generation":7,"base_generation":0,"chunk_size":67108864,"block_size":4194304}}}}"#,
+        ),
+        response_body(
+            r#"{"ok":true,"result":{"type":"prepared_artifact","prepared":{"mount":1,"parent":1,"name":"log.txt","inode":42,"generation":9,"mtime_ms":1700000000000,"ctime_ms":1700000000000,"replace":true,"dentry_version":7,"old_generation":7,"object_gc_claim_version":12}}}"#,
+        ),
+        response_body(
+            r#"{"ok":false,"error":"metadata backend unavailable after publish attempt","error_kind":{"type":"metadata","message":"metadata backend unavailable after publish attempt"}}"#,
+        ),
+    ]);
+    let client = NoKvFsClient::connect(addr, store.clone());
+
+    let err = client
+        .append_artifact(
+            "/log.txt",
+            b" world".to_vec(),
+            artifact_metadata("delta.log"),
+            None,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientError::Metadata(nokv_meta::MetadError::Metadata(
+            nokv_meta::MetadataError::Backend(_)
+        ))
+    ));
+    assert!(
+        store
+            .head(&ObjectKey::new("blocks/1/42/9/0/0").unwrap())
+            .unwrap()
+            .is_some(),
+        "a metadata backend failure does not prove the append was rejected"
     );
 }
 
@@ -2654,6 +3144,7 @@ fn register_owned_shard(
     let lease = store
         .acquire_unassigned(shard_id, NodeId::new(endpoint))
         .unwrap();
+    store.mark_serving(&lease, None, None, 0).unwrap();
     lease.epoch
 }
 
@@ -2703,6 +3194,35 @@ fn fleet_resolves_each_request_to_its_shard_owner_endpoint() {
 }
 
 #[test]
+fn fleet_keeps_recovering_owner_unroutable_until_mark_serving() {
+    let store = Arc::new(InMemoryControlStore::new());
+    let shard_id = ShardId::new("mount-1:/dataset");
+    store
+        .register_shard(shard_id.clone(), "/dataset".to_owned(), 1)
+        .unwrap();
+    let lease = store
+        .acquire_unassigned(shard_id, NodeId::new("127.0.0.1:7002"))
+        .unwrap();
+    let control: Arc<dyn ControlStore> = store.clone();
+    let client = MetadataClient::fleet(control, mount_one()).unwrap();
+    let request = MetadataRpcRequest::StatPath {
+        path: "/dataset/recovering.bin".to_owned(),
+    };
+
+    assert_eq!(client.resolve_target_for_test(&request).unwrap(), None);
+
+    store.mark_serving(&lease, None, None, 0).unwrap();
+    let RoutingMode::Fleet(router) = &client.mode else {
+        panic!("expected fleet router");
+    };
+    router.refresh(&client).unwrap();
+    assert_eq!(
+        client.resolve_target_for_test(&request).unwrap(),
+        Some("127.0.0.1:7002".parse().unwrap())
+    );
+}
+
+#[test]
 fn fleet_refreshes_and_retries_against_new_owner_on_not_owner() {
     // Two tiny one-shot servers: the stale owner replies NotOwner, the new owner
     // replies success. The client must refresh the shard map from control after
@@ -2741,6 +3261,7 @@ fn fleet_refreshes_and_retries_against_new_owner_on_not_owner() {
     let lease = store
         .acquire_unassigned(dataset_id.clone(), NodeId::new(stale_owner.to_string()))
         .unwrap();
+    store.mark_serving(&lease, None, None, 0).unwrap();
 
     // Build the client BEFORE the handoff so it caches the stale endpoint.
     let client = MetadataClient::fleet(Arc::clone(&store), mount_one()).unwrap();
@@ -2755,9 +3276,10 @@ fn fleet_refreshes_and_retries_against_new_owner_on_not_owner() {
 
     // Hand the shard off to the new owner in the control plane (bumps the epoch
     // and rewrites the endpoint). The client's cache is now stale.
-    store
+    let successor = store
         .acquire_after_failure(dataset_id, NodeId::new(new_owner.to_string()), lease.epoch)
         .unwrap();
+    store.mark_serving(&successor, None, None, 0).unwrap();
 
     // The call hits the stale owner (NotOwner), refreshes from control, and
     // retries against the new owner, which succeeds.

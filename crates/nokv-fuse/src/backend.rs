@@ -1321,6 +1321,10 @@ where
             replace: fields.replace,
             dentry_version: fields.dentry_version,
             old_generation: fields.old_generation,
+            // The legacy FUSE journal has no durable object-GC token. Keep
+            // recovery fail-closed until FUSE can refresh and fully restage a
+            // new generation in its own scoped change.
+            object_gc_claim_version: 0,
         }
     }
 
@@ -1455,6 +1459,7 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
+            object_gc_claim_version: 2,
         };
 
         let pending = backend
@@ -1520,6 +1525,7 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
+            object_gc_claim_version: 2,
         };
 
         let pending = backend
@@ -1583,6 +1589,7 @@ mod tests {
             replace: true,
             dentry_version: Some(1),
             old_generation: None,
+            object_gc_claim_version: 2,
         };
 
         let err = backend
