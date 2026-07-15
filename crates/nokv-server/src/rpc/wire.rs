@@ -792,6 +792,61 @@ pub(super) fn namespace_find_request(
     })
 }
 
+fn namespace_index_value(
+    value: WireNamespaceIndexValue,
+) -> NamespaceIndexValue {
+    NamespaceIndexValue {
+        field: namespace_find_field(value.field),
+        value: namespace_predicate_value(value.value),
+    }
+}
+
+fn namespace_index_row(
+    row: WireNamespaceIndexRow,
+) -> NamespaceIndexRow {
+    NamespaceIndexRow {
+        path: row.path,
+        values: row
+            .values
+            .into_iter()
+            .map(namespace_index_value)
+            .collect(),
+    }
+}
+
+fn namespace_index_field(
+    field: WireNamespaceIndexField,
+) -> NamespaceIndexField {
+    NamespaceIndexField {
+        field: namespace_find_field(field.field),
+        operators: field
+            .operators
+            .into_iter()
+            .map(namespace_predicate_op)
+            .collect(),
+        sortable: field.sortable,
+        facetable: field.facetable,
+    }
+}
+
+pub(super) fn namespace_index_registration(
+    registration: WireNamespaceIndexRegistration,
+) -> NamespaceIndexRegistration {
+    NamespaceIndexRegistration {
+        path: registration.path,
+        fields: registration
+            .fields
+            .into_iter()
+            .map(namespace_index_field)
+            .collect(),
+        rows: registration
+            .rows
+            .into_iter()
+            .map(namespace_index_row)
+            .collect(),
+    }
+}
+
 pub(super) fn namespace_aggregate_request(
     request: WireNamespaceAggregateRequest,
 ) -> Result<NamespaceAggregateRequest, ServerError> {

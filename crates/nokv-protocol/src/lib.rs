@@ -121,6 +121,9 @@ pub enum MetadataRpcRequest {
         path: String,
         options: Box<WireNamespaceReadOptions>,
     },
+    RegisterNamespaceIndex {
+        registration: Box<WireNamespaceIndexRegistration>,
+    },
     CreateDir {
         parent: u64,
         name: String,
@@ -867,6 +870,27 @@ pub struct WireNamespaceSortField {
 pub struct WireNamespaceIndexValue {
     pub field: WireNamespaceFindField,
     pub value: WireNamespacePredicateValue,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceIndexField {
+    pub field: WireNamespaceFindField,
+    pub operators: Vec<WireNamespacePredicateOp>,
+    pub sortable: bool,
+    pub facetable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceIndexRow {
+    pub path: String,
+    pub values: Vec<WireNamespaceIndexValue>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WireNamespaceIndexRegistration {
+    pub path: String,
+    pub fields: Vec<WireNamespaceIndexField>,
+    pub rows: Vec<WireNamespaceIndexRow>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
