@@ -1,4 +1,7 @@
 use super::*;
+use std::collections::HashMap;
+
+const NAMESPACE_PROOF_PAGE_ROWS: usize = 256;
 
 struct PreparedCreateBatch {
     entries: Vec<DentryWithAttr>,
@@ -13,13 +16,20 @@ struct PreparedRemoveFile {
 struct PreparedRemoveEmptyDir {
     entry: DentryWithAttr,
     command: MetadataCommand,
+    starts_restore_release: bool,
+}
+
+#[derive(Default)]
+struct FinalBodyCleanupPlan {
+    predicates: Vec<PredicateRef>,
+    mutations: Vec<Mutation>,
 }
 
 #[derive(Clone, Debug)]
-struct LinkedDentryProjection {
-    key: Vec<u8>,
-    projection: DentryProjection,
-    version: Version,
+pub(super) struct LinkedDentryProjection {
+    pub(super) key: Vec<u8>,
+    pub(super) projection: DentryProjection,
+    pub(super) version: Version,
 }
 
 #[derive(Default)]
@@ -63,6 +73,7 @@ where
                 // `new` starts fail-closed because callers may hand it a
                 // pre-populated store. Once a root exists, one recovery proof
                 // establishes the healthy fast-path or keeps slow checking on.
+                self.recover_restore_staging_visibility()?;
                 self.recover_materialization_orphan_state()?;
                 Ok(root)
             }
@@ -168,22 +179,25 @@ where
             ));
         }
         let version = self.next_version()?;
+        let read_version = predecessor(version)?;
         let key = dentry_key(self.mount, parent, name);
+        let mut predicates = vec![PredicateRef {
+            family: RecordFamily::Dentry,
+            key: key.clone(),
+            predicate: Predicate::VersionEquals(dentry_version),
+        }];
+        predicates.extend(self.restore_namespace_write_predicates(&[parent], read_version)?);
         let commit = self.commit_metadata(MetadataCommand {
             request_id: request_id(b"remove-graft", self.mount, entry.attr.inode, version),
             kind: CommandKind::RemoveEmptyDir,
-            read_version: predecessor(version)?,
+            read_version,
             commit_version: version,
             primary_family: RecordFamily::Dentry,
             primary_key: key.clone(),
             // Only the dentry version is guarded: there is no Inode record and no
             // local subtree to assert empty (the child's contents live on the
             // owning shard).
-            predicates: vec![PredicateRef {
-                family: RecordFamily::Dentry,
-                key: key.clone(),
-                predicate: Predicate::VersionEquals(dentry_version),
-            }],
+            predicates,
             mutations: vec![delete_mutation(RecordFamily::Dentry, key)],
             watch: self
                 .watch_projection(
@@ -456,12 +470,24 @@ where
             },
             object_reference.predicate(self.mount),
         ];
+        let restore_write_predicates =
+            self.restore_namespace_write_predicates(&[inode, new_parent], read_version)?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
+        let enrollment = self.restore_namespace_enrollment_plan(
+            new_parent,
+            std::slice::from_ref(&new_projection),
+            read_version,
+        )?;
+        predicates.extend(enrollment.predicates);
         let mut mutations = vec![Mutation {
             family: RecordFamily::Inode,
             key: source_inode_key,
             op: MutationOp::Put,
             value: Some(Value(encode_inode_attr(&attr))),
         }];
+        let mut updated_existing_links = Vec::with_capacity(linked.len());
         for linked in &linked {
             predicates.push(PredicateRef {
                 family: RecordFamily::Dentry,
@@ -471,6 +497,7 @@ where
             let mut projection = linked.projection.clone();
             projection.attr = attr.clone();
             projection.dentry.attr_generation = attr.generation;
+            updated_existing_links.push((linked.projection.clone(), projection.clone()));
             mutations.push(put_projection_mutation(
                 RecordFamily::Dentry,
                 linked.key.clone(),
@@ -482,7 +509,11 @@ where
             destination_key.clone(),
             &new_projection,
         ));
-        self.commit_metadata(MetadataCommand {
+        mutations.extend(enrollment.mutations);
+        let restore_index = self.restore_index_link_plan(&updated_existing_links, version)?;
+        predicates.extend(restore_index.predicates);
+        mutations.extend(restore_index.mutations);
+        let command = MetadataCommand {
             request_id: request_id(b"link", self.mount, inode, version),
             kind: CommandKind::Link,
             read_version,
@@ -504,7 +535,11 @@ where
                 )
                 .into_iter()
                 .collect(),
-        })?;
+        };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(&command, "restore namespace link")?;
+        }
+        self.commit_metadata(command)?;
         Ok(new_projection.into())
     }
 
@@ -604,6 +639,7 @@ where
 
         let projection = projection(parent, name.clone(), attr, body);
         self.commit_replace_projection_with_chunks(ReplaceProjectionCommit {
+            request_id: None,
             kind: CommandKind::UpdateAttr,
             projection: &projection,
             chunks: &chunks,
@@ -1024,6 +1060,7 @@ where
         let mut canonical_attr = decode_inode_attr(&inode_item.value.0)
             .map_err(|err| MetadError::Codec(err.to_string()))?;
         let key = dentry_key(self.mount, parent, name);
+        let mut predicates = Vec::new();
         let mut mutations = vec![delete_mutation(RecordFamily::Dentry, key.clone())];
         if let Some(path_index) =
             self.live_path_index_key_for_entry(path_components, parent, name, &entry, version)?
@@ -1036,9 +1073,9 @@ where
             ));
         }
         let final_link = canonical_attr.nlink == 1;
-        let linked = if final_link {
+        let (linked, updated_remaining) = if final_link {
             mutations.push(delete_mutation(RecordFamily::Inode, inode_key.clone()));
-            Vec::new()
+            (Vec::new(), Vec::new())
         } else {
             let linked =
                 self.linked_dentry_projections_for_inode(entry.attr.inode, predecessor(version)?)?;
@@ -1051,6 +1088,7 @@ where
                 op: MutationOp::Put,
                 value: Some(Value(encode_inode_attr(&canonical_attr))),
             });
+            let mut updated_remaining = Vec::with_capacity(linked.len().saturating_sub(1));
             for linked in &linked {
                 if linked.key == key {
                     continue;
@@ -1058,25 +1096,28 @@ where
                 let mut projection = linked.projection.clone();
                 projection.attr = canonical_attr.clone();
                 projection.dentry.attr_generation = canonical_attr.generation;
+                updated_remaining.push((linked.projection.clone(), projection.clone()));
                 mutations.push(put_projection_mutation(
                     RecordFamily::Dentry,
                     linked.key.clone(),
                     &projection,
                 ));
             }
-            linked
+            (linked, updated_remaining)
         };
         if final_link {
             if let Some(body) = &entry.body {
-                mutations.extend(self.chunk_manifest_delete_and_gc_mutations(
+                let cleanup = self.final_body_cleanup_plan(
                     entry.attr.inode,
-                    body.generation,
+                    body,
+                    predecessor(version)?,
                     version,
-                    &HashSet::new(),
-                )?);
+                )?;
+                predicates.extend(cleanup.predicates);
+                mutations.extend(cleanup.mutations);
             }
         }
-        let mut predicates = vec![
+        predicates.extend([
             PredicateRef {
                 family: RecordFamily::Dentry,
                 key: key.clone(),
@@ -1087,7 +1128,14 @@ where
                 key: inode_key,
                 predicate: Predicate::VersionEquals(inode_item.version),
             },
-        ];
+        ]);
+        let restore_write_predicates = self.restore_namespace_write_predicates(
+            &[parent, entry.attr.inode],
+            predecessor(version)?,
+        )?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
         for linked in linked {
             if linked.key == dentry_key(self.mount, parent, name) {
                 continue;
@@ -1098,6 +1146,15 @@ where
                 predicate: Predicate::VersionEquals(linked.version),
             });
         }
+        let removed_projection = DentryProjection {
+            dentry: entry.dentry.clone(),
+            attr: entry.attr.clone(),
+            body: entry.body.clone(),
+        };
+        let restore_index =
+            self.restore_index_remove_plan(&removed_projection, &updated_remaining, version)?;
+        predicates.extend(restore_index.predicates);
+        mutations.extend(restore_index.mutations);
         let command = MetadataCommand {
             request_id: request_id(b"remove-file", self.mount, entry.attr.inode, version),
             kind: CommandKind::RemoveFile,
@@ -1121,7 +1178,149 @@ where
                 .into_iter()
                 .collect(),
         };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(
+                &command,
+                "restore namespace remove file",
+            )?;
+        }
         Ok(PreparedRemoveFile { entry, command })
+    }
+
+    /// Build the atomic metadata closure for deleting the last namespace link
+    /// to a file body. An append or sparse publish stores only its dirty chunks
+    /// in the top generation and falls through `base_generation`; deleting the
+    /// top rows alone strands the older summaries/manifests and leaves their
+    /// objects without a fresh GC candidate.
+    ///
+    /// Every physical row in the reachable generation chain is version-fenced
+    /// and deleted by the caller's namespace transaction. Every canonical block
+    /// minted by this inode is enqueued using the generation encoded in its
+    /// object key. That distinction matters after chain compaction: a new
+    /// self-contained manifest can retain an unchanged block from an older
+    /// generation whose physical manifest row was already deleted. Cloned
+    /// manifests contain keys owned by another inode; those borrowed keys stay
+    /// protected by their source plus snapshot/exact-reference policy.
+    fn final_body_cleanup_plan(
+        &self,
+        inode: InodeId,
+        body: &BodyDescriptor,
+        read_version: Version,
+        enqueue_version: Version,
+    ) -> Result<FinalBodyCleanupPlan, MetadError> {
+        let generations =
+            self.resolve_generation_chain(inode, body, read_version, ReadPurpose::WritePlanLocal)?;
+        let enqueue_unix_ms = current_time_ms();
+        let mut queued_objects: HashMap<String, (u64, String)> = HashMap::new();
+        let mut plan = FinalBodyCleanupPlan::default();
+
+        for generation in generations {
+            let prefix = chunk_manifest_prefix(self.mount, inode, generation);
+            let rows = self.metadata.scan(ScanRequest {
+                family: RecordFamily::ChunkManifest,
+                prefix: prefix.clone(),
+                start_after: None,
+                version: read_version,
+                limit: 0,
+                purpose: ReadPurpose::WritePlanLocal,
+            })?;
+            let mut saw_summary = false;
+
+            for row in rows {
+                if row.key.len() != prefix.len() + std::mem::size_of::<u64>()
+                    || !row.key.starts_with(&prefix)
+                {
+                    return Err(MetadError::Codec(
+                        "chunk manifest scan returned a key outside its generation prefix"
+                            .to_owned(),
+                    ));
+                }
+                let chunk_index = chunk_index_from_manifest_key(&row.key)?;
+                plan.predicates.push(PredicateRef {
+                    family: RecordFamily::ChunkManifest,
+                    key: row.key.clone(),
+                    predicate: Predicate::VersionEquals(row.version),
+                });
+                plan.mutations
+                    .push(delete_mutation(RecordFamily::ChunkManifest, row.key));
+
+                if chunk_index == BODY_SUMMARY_CHUNK_INDEX {
+                    let summary = decode_body_descriptor(&row.value.0)
+                        .map_err(|err| MetadError::Codec(err.to_string()))?;
+                    if summary.generation != generation {
+                        return Err(MetadError::Codec(
+                            "body summary generation does not match its manifest key".to_owned(),
+                        ));
+                    }
+                    saw_summary = true;
+                    continue;
+                }
+
+                let manifest = decode_chunk_manifest(&row.value.0)
+                    .map_err(|err| MetadError::Codec(err.to_string()))?;
+                if manifest.chunk_index != chunk_index {
+                    return Err(MetadError::Codec(
+                        "chunk manifest index does not match its manifest key".to_owned(),
+                    ));
+                }
+                for block in manifest.slices.iter().flat_map(|slice| &slice.blocks) {
+                    if !self.block_object_is_owned_by_inode(inode, &block.object_key)? {
+                        continue;
+                    }
+                    let (owner, object_generation, object_chunk, block_index) =
+                        self.canonical_block_object_identity(&block.object_key)?;
+                    if owner != inode || object_chunk != chunk_index {
+                        return Err(MetadError::Codec(
+                            "owned block object identity does not match its manifest".to_owned(),
+                        ));
+                    }
+
+                    match queued_objects.get(&block.object_key) {
+                        Some((_, digest_uri)) if digest_uri != &block.digest_uri => {
+                            return Err(MetadError::Codec(
+                                "one block object key has inconsistent manifest identity"
+                                    .to_owned(),
+                            ));
+                        }
+                        Some(_) => continue,
+                        None => {
+                            queued_objects.insert(
+                                block.object_key.clone(),
+                                (block.len, block.digest_uri.clone()),
+                            );
+                        }
+                    }
+                    let record = ObjectGcRecord {
+                        inode: owner,
+                        generation: object_generation,
+                        object_key: block.object_key.clone(),
+                        size: block.len,
+                        digest_uri: block.digest_uri.clone(),
+                        enqueue_version: enqueue_version.get(),
+                        enqueue_unix_ms,
+                    };
+                    plan.mutations.push(Mutation {
+                        family: RecordFamily::Gc,
+                        key: gc_object_key(
+                            self.mount,
+                            enqueue_version.get(),
+                            owner,
+                            object_generation,
+                            object_chunk,
+                            block_index,
+                        ),
+                        op: MutationOp::Put,
+                        value: Some(Value(encode_object_gc_record(&record))),
+                    });
+                }
+            }
+
+            if !saw_summary {
+                return Err(MetadError::MissingBodyDescriptor);
+            }
+        }
+
+        Ok(plan)
     }
 
     pub fn remove_file_path(&self, path: &str) -> Result<DentryWithAttr, MetadError> {
@@ -1195,7 +1394,12 @@ where
     ) -> Result<DentryWithAttr, MetadError> {
         let version = self.next_version()?;
         let prepared = self.prepare_remove_empty_dir(parent, name, path_components, version)?;
-        map_remove_empty_dir_commit(self.commit_metadata(prepared.command))?;
+        map_remove_empty_dir_commit(
+            self.commit_restore_release_transition(
+                prepared.command,
+                prepared.starts_restore_release,
+            ),
+        )?;
         Ok(prepared.entry)
     }
 
@@ -1233,6 +1437,40 @@ where
         {
             mutations.push(delete_mutation(RecordFamily::PathIndex, path_index));
         }
+        let mut predicates = vec![
+            PredicateRef {
+                family: RecordFamily::Dentry,
+                key: source_key.clone(),
+                predicate: Predicate::VersionEquals(dentry_version),
+            },
+            PredicateRef {
+                family: RecordFamily::Dentry,
+                key: child_prefix,
+                predicate: Predicate::PrefixEmpty,
+            },
+        ];
+        let restore_write_predicates = self.restore_namespace_write_predicates(
+            &[parent, entry.attr.inode],
+            predecessor(version)?,
+        )?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
+        let restore_release = self.prepare_restore_root_release(entry.attr.inode, version)?;
+        if let Some(release) = restore_release.as_ref() {
+            predicates.extend(release.predicates.clone());
+            mutations.extend(release.mutations.clone());
+        }
+        let restore_index = self.restore_index_unlink_plan(
+            &DentryProjection {
+                dentry: entry.dentry.clone(),
+                attr: entry.attr.clone(),
+                body: entry.body.clone(),
+            },
+            version,
+        )?;
+        predicates.extend(restore_index.predicates);
+        mutations.extend(restore_index.mutations);
         let command = MetadataCommand {
             request_id: request_id(b"remove-empty-dir", self.mount, entry.attr.inode, version),
             kind: CommandKind::RemoveEmptyDir,
@@ -1240,18 +1478,7 @@ where
             commit_version: version,
             primary_family: RecordFamily::Dentry,
             primary_key: source_key.clone(),
-            predicates: vec![
-                PredicateRef {
-                    family: RecordFamily::Dentry,
-                    key: source_key.clone(),
-                    predicate: Predicate::VersionEquals(dentry_version),
-                },
-                PredicateRef {
-                    family: RecordFamily::Dentry,
-                    key: child_prefix,
-                    predicate: Predicate::PrefixEmpty,
-                },
-            ],
+            predicates,
             mutations,
             watch: self
                 .watch_projection(
@@ -1267,7 +1494,17 @@ where
                 .into_iter()
                 .collect(),
         };
-        Ok(PreparedRemoveEmptyDir { entry, command })
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(
+                &command,
+                "restore namespace remove directory",
+            )?;
+        }
+        Ok(PreparedRemoveEmptyDir {
+            entry,
+            command,
+            starts_restore_release: restore_release.is_some(),
+        })
     }
 
     pub fn remove_empty_dir_path(&self, path: &str) -> Result<DentryWithAttr, MetadError> {
@@ -1303,11 +1540,26 @@ where
             }
         }
 
-        let commands = prepared
+        let committed = if prepared
             .iter()
-            .map(|(_, remove)| remove.command.clone())
-            .collect::<Vec<_>>();
-        let committed = self.commit_independent_metadata_batch(&commands);
+            .any(|(_, remove)| remove.starts_restore_release)
+        {
+            prepared
+                .iter()
+                .map(|(_, remove)| {
+                    self.commit_restore_release_transition(
+                        remove.command.clone(),
+                        remove.starts_restore_release,
+                    )
+                })
+                .collect()
+        } else {
+            let commands = prepared
+                .iter()
+                .map(|(_, remove)| remove.command.clone())
+                .collect::<Vec<_>>();
+            self.commit_independent_metadata_batch(&commands)
+        };
         for ((index, remove), result) in prepared.into_iter().zip(committed) {
             results[index] = Some(map_remove_empty_dir_commit(result).map(|_| remove.entry));
         }
@@ -1480,20 +1732,61 @@ where
                 return Err(MetadError::GraftPoint);
             }
         }
-        if replace {
-            if source.attr.file_type == FileType::Directory {
-                return Err(MetadError::NotFile);
-            }
-            if let Some((entry, _)) = &destination {
-                if entry.attr.file_type == FileType::Directory {
-                    return Err(MetadError::NotFile);
-                }
-            }
+        let replacing_complete_restore_directory = if replace
+            && source.attr.file_type == FileType::Directory
+            && destination
+                .as_ref()
+                .is_some_and(|(entry, _)| entry.attr.file_type == FileType::Directory)
+        {
+            self.is_complete_restore_root(
+                destination
+                    .as_ref()
+                    .expect("checked destination")
+                    .0
+                    .attr
+                    .inode,
+            )?
+        } else {
+            false
+        };
+        let moving_complete_restore_directory = if replace
+            && source.attr.file_type == FileType::Directory
+            && destination
+                .as_ref()
+                .is_some_and(|(entry, _)| entry.attr.file_type == FileType::Directory)
+        {
+            self.is_complete_restore_root(source.attr.inode)?
+        } else {
+            false
+        };
+        if replace
+            && (source.attr.file_type == FileType::Directory
+                || destination
+                    .as_ref()
+                    .is_some_and(|(entry, _)| entry.attr.file_type == FileType::Directory))
+            && !replacing_complete_restore_directory
+            && !moving_complete_restore_directory
+        {
+            return Err(MetadError::NotFile);
         }
 
         let object_reference = self.begin_object_reference_mutation()?;
         let version = self.next_version()?;
         let read_version = predecessor(version)?;
+        let restore_release = if replacing_complete_restore_directory {
+            let victim = destination
+                .as_ref()
+                .expect("checked restore victim")
+                .0
+                .attr
+                .inode;
+            Some(
+                self.prepare_restore_root_release(victim, version)?
+                    .ok_or(MetadError::RestoreRootChanged { root: victim })?,
+            )
+        } else {
+            None
+        };
         let source_key = dentry_key(self.mount, parent, name);
         let destination_key = dentry_key(self.mount, new_parent, &new_name);
         let reachable = self.namespace_reachability_for_exposure(read_version)?;
@@ -1523,6 +1816,21 @@ where
             },
             object_reference.predicate(self.mount),
         ];
+        let mut guarded_inodes = vec![parent, new_parent, source.attr.inode];
+        if let Some((entry, _)) = &destination {
+            guarded_inodes.push(entry.attr.inode);
+        }
+        let restore_write_predicates =
+            self.restore_namespace_write_predicates(&guarded_inodes, read_version)?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
+        let enrollment = self.restore_namespace_enrollment_plan(
+            new_parent,
+            std::slice::from_ref(&projection),
+            read_version,
+        )?;
+        predicates.extend(enrollment.predicates);
         let replaced = if let Some((entry, destination_version)) = destination {
             predicates.push(PredicateRef {
                 family: RecordFamily::Dentry,
@@ -1548,6 +1856,8 @@ where
                 value: Some(Value(encode_dentry_projection(&projection))),
             },
         ];
+        mutations.extend(enrollment.mutations);
+        let mut replaced_link_updates = Vec::new();
         if let Some(source_path) = self.live_path_index_key_for_entry(
             path_index.map(|(source, _)| source),
             parent,
@@ -1592,15 +1902,35 @@ where
                 key: replaced_inode_key.clone(),
                 predicate: Predicate::VersionEquals(replaced_inode_item.version),
             });
-            if replaced_attr.nlink == 1 {
+            if moving_complete_restore_directory && !replacing_complete_restore_directory {
+                // POSIX directory replacement requires an empty ordinary
+                // victim. The restored source stays Complete and merely moves;
+                // the victim is removed with explicit Dentry/Xattr closure so
+                // it cannot leave a hidden namespace tail behind.
+                predicates.extend([
+                    PredicateRef {
+                        family: RecordFamily::Dentry,
+                        key: dentry_prefix(self.mount, replaced.attr.inode),
+                        predicate: Predicate::PrefixEmpty,
+                    },
+                    PredicateRef {
+                        family: RecordFamily::Xattr,
+                        key: xattr_prefix(self.mount, replaced.attr.inode),
+                        predicate: Predicate::PrefixEmpty,
+                    },
+                ]);
+                mutations.push(delete_mutation(RecordFamily::Inode, replaced_inode_key));
+            } else if replaced_attr.nlink == 1 {
                 mutations.push(delete_mutation(RecordFamily::Inode, replaced_inode_key));
                 if let Some(body) = &replaced.body {
-                    mutations.extend(self.chunk_manifest_delete_and_gc_mutations(
+                    let cleanup = self.final_body_cleanup_plan(
                         replaced.attr.inode,
-                        body.generation,
+                        body,
+                        read_version,
                         version,
-                        &HashSet::new(),
-                    )?);
+                    )?;
+                    predicates.extend(cleanup.predicates);
+                    mutations.extend(cleanup.mutations);
                 }
             } else {
                 replaced_attr.nlink -= 1;
@@ -1623,17 +1953,42 @@ where
                         key: linked.key.clone(),
                         predicate: Predicate::VersionEquals(linked.version),
                     });
-                    let mut projection = linked.projection;
-                    projection.attr = replaced_attr.clone();
-                    projection.dentry.attr_generation = replaced_attr.generation;
+                    let old_projection = linked.projection;
+                    let mut updated_projection = old_projection.clone();
+                    updated_projection.attr = replaced_attr.clone();
+                    updated_projection.dentry.attr_generation = replaced_attr.generation;
+                    replaced_link_updates.push((old_projection, updated_projection.clone()));
                     mutations.push(put_projection_mutation(
                         RecordFamily::Dentry,
                         linked.key,
-                        &projection,
+                        &updated_projection,
                     ));
                 }
             }
         }
+        if let Some(release) = restore_release {
+            predicates.extend(release.predicates);
+            mutations.extend(release.mutations);
+        }
+        let source_projection = DentryProjection {
+            dentry: source.dentry.clone(),
+            attr: source.attr.clone(),
+            body: source.body.clone(),
+        };
+        let replaced_projection = replaced.as_ref().map(|entry| DentryProjection {
+            dentry: entry.dentry.clone(),
+            attr: entry.attr.clone(),
+            body: entry.body.clone(),
+        });
+        let mut restore_index = self.restore_index_rename_plan(
+            &source_projection,
+            &projection,
+            replaced_projection.as_ref(),
+            version,
+        )?;
+        restore_index.extend(self.restore_index_link_plan(&replaced_link_updates, version)?)?;
+        predicates.extend(restore_index.predicates);
+        mutations.extend(restore_index.mutations);
         let mut watch = Vec::new();
         if let Some(replaced) = &replaced {
             if let Some(event) = self.watch_projection(
@@ -1674,7 +2029,7 @@ where
             watch.push(event);
         }
 
-        self.commit_metadata(MetadataCommand {
+        let command = MetadataCommand {
             request_id: request_id(
                 if replace {
                     b"rename-replace"
@@ -1697,7 +2052,11 @@ where
             predicates,
             mutations,
             watch,
-        })?;
+        };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(&command, "restore namespace rename")?;
+        }
+        self.commit_restore_release_transition(command, replacing_complete_restore_directory)?;
         Ok(RenameReplaceResult {
             entry: projection.into(),
             replaced,
@@ -1736,32 +2095,133 @@ where
         Ok(matches_canonical.then_some(key))
     }
 
-    fn linked_dentry_projections_for_inode(
+    pub(super) fn linked_dentry_projections_for_inode(
         &self,
         inode: InodeId,
         version: Version,
     ) -> Result<Vec<LinkedDentryProjection>, MetadError> {
-        let rows = self.metadata.scan(ScanRequest {
-            family: RecordFamily::Dentry,
-            prefix: dentry_mount_prefix(self.mount),
-            start_after: None,
-            version,
-            limit: 0,
-            purpose: ReadPurpose::WritePlanLocal,
-        })?;
         let mut linked = Vec::new();
-        for row in rows {
-            let projection = decode_dentry_projection(&row.value.0)
-                .map_err(|err| MetadError::Codec(err.to_string()))?;
-            if projection.attr.inode == inode {
+        self.visit_linked_dentry_projections_for_inode(inode, version, |projection| {
+            linked.push(projection);
+            Ok(false)
+        })?;
+        Ok(linked)
+    }
+
+    /// Return at most `limit` current links for restore cleanup. The physical
+    /// mount scan is always paged and stops as soon as the requested number of
+    /// matching links is found; callers never materialize an unbounded hardlink
+    /// fanout merely to delete one bounded release batch.
+    pub(super) fn restore_linked_dentry_projection_page(
+        &self,
+        inode: InodeId,
+        version: Version,
+        limit: usize,
+    ) -> Result<Vec<LinkedDentryProjection>, MetadError> {
+        let limit = limit.clamp(1, NAMESPACE_PROOF_PAGE_ROWS);
+        let mut linked = Vec::with_capacity(limit);
+        let prefix = dentry_mount_prefix(self.mount);
+        let mut start_after = None;
+        'pages: loop {
+            let rows = self.metadata.scan(ScanRequest {
+                family: RecordFamily::Dentry,
+                prefix: prefix.clone(),
+                start_after: start_after.clone(),
+                version,
+                limit: NAMESPACE_PROOF_PAGE_ROWS,
+                purpose: ReadPurpose::RestoreStaging,
+            })?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let projection = decode_dentry_projection(&row.value.0)
+                    .map_err(|err| MetadError::Codec(err.to_string()))?;
+                if projection.attr.inode != inode {
+                    continue;
+                }
+                let expected_key = dentry_key(
+                    self.mount,
+                    projection.dentry.parent,
+                    &projection.dentry.name,
+                );
+                if row.key != expected_key
+                    || projection.dentry.child != projection.attr.inode
+                    || projection.dentry.child_type != projection.attr.file_type
+                    || projection.dentry.attr_generation != projection.attr.generation
+                    || projection.body.as_ref().is_some_and(|body| {
+                        body.size != projection.attr.size
+                            || body.generation == 0
+                            || body.generation > projection.attr.generation
+                    })
+                {
+                    return Err(MetadError::Codec(format!(
+                        "restore release dentry changed identity for inode {}",
+                        inode.get()
+                    )));
+                }
                 linked.push(LinkedDentryProjection {
-                    key: row.key,
+                    key: row.key.clone(),
                     projection,
                     version: row.version,
                 });
+                if linked.len() >= limit {
+                    break 'pages;
+                }
+            }
+            let reached_tail = rows.len() < NAMESPACE_PROOF_PAGE_ROWS;
+            start_after = rows.last().map(|row| row.key.clone());
+            if reached_tail {
+                break;
             }
         }
         Ok(linked)
+    }
+
+    fn visit_linked_dentry_projections_for_inode<F>(
+        &self,
+        inode: InodeId,
+        version: Version,
+        mut visit: F,
+    ) -> Result<bool, MetadError>
+    where
+        F: FnMut(LinkedDentryProjection) -> Result<bool, MetadError>,
+    {
+        let prefix = dentry_mount_prefix(self.mount);
+        let mut start_after = None;
+        loop {
+            let rows = self.metadata.scan(ScanRequest {
+                family: RecordFamily::Dentry,
+                prefix: prefix.clone(),
+                start_after: start_after.clone(),
+                version,
+                limit: NAMESPACE_PROOF_PAGE_ROWS,
+                purpose: ReadPurpose::WritePlanLocal,
+            })?;
+            if rows.is_empty() {
+                return Ok(false);
+            }
+            for row in &rows {
+                let projection = decode_dentry_projection(&row.value.0)
+                    .map_err(|err| MetadError::Codec(err.to_string()))?;
+                if projection.attr.inode != inode {
+                    continue;
+                }
+                self.validate_current_dentry_projection(&row.key, &projection, version)?;
+                if visit(LinkedDentryProjection {
+                    key: row.key.clone(),
+                    projection,
+                    version: row.version,
+                })? {
+                    return Ok(true);
+                }
+            }
+            let reached_tail = rows.len() < NAMESPACE_PROOF_PAGE_ROWS;
+            start_after = rows.last().map(|row| row.key.clone());
+            if reached_tail {
+                return Ok(false);
+            }
+        }
     }
 
     /// Enter fail-closed mode before the first metadata write of a detached
@@ -1888,39 +2348,58 @@ where
         version: Version,
     ) -> Result<bool, MetadError> {
         let purpose = ReadPurpose::WritePlanLocal;
-        let dentry_rows = self.metadata.scan(ScanRequest {
-            family: RecordFamily::Dentry,
-            prefix: dentry_mount_prefix(self.mount),
-            start_after: None,
-            version,
-            limit: 0,
-            purpose,
-        })?;
-        if dentry_rows
-            .iter()
-            .any(|row| !reachable.dentries.contains(&row.key))
-        {
-            return Ok(false);
+        let dentry_prefix = dentry_mount_prefix(self.mount);
+        let mut start_after = None;
+        loop {
+            let rows = self.metadata.scan(ScanRequest {
+                family: RecordFamily::Dentry,
+                prefix: dentry_prefix.clone(),
+                start_after: start_after.clone(),
+                version,
+                limit: NAMESPACE_PROOF_PAGE_ROWS,
+                purpose,
+            })?;
+            if rows
+                .iter()
+                .any(|row| !reachable.dentries.contains(&row.key))
+            {
+                return Ok(false);
+            }
+            let reached_tail = rows.len() < NAMESPACE_PROOF_PAGE_ROWS;
+            start_after = rows.last().map(|row| row.key.clone());
+            if reached_tail {
+                break;
+            }
         }
 
-        for row in self.metadata.scan(ScanRequest {
-            family: RecordFamily::Inode,
-            prefix: inode_prefix(self.mount),
-            start_after: None,
-            version,
-            limit: 0,
-            purpose,
-        })? {
-            let attr = decode_inode_attr(&row.value.0)
-                .map_err(|err| MetadError::Codec(err.to_string()))?;
-            if row.key != inode_key(self.mount, attr.inode) {
-                return Err(MetadError::Codec(format!(
-                    "inode row key does not match inode {} during materialization recovery",
-                    attr.inode.get()
-                )));
+        let inode_prefix = inode_prefix(self.mount);
+        let mut start_after = None;
+        loop {
+            let rows = self.metadata.scan(ScanRequest {
+                family: RecordFamily::Inode,
+                prefix: inode_prefix.clone(),
+                start_after: start_after.clone(),
+                version,
+                limit: NAMESPACE_PROOF_PAGE_ROWS,
+                purpose,
+            })?;
+            for row in &rows {
+                let attr = decode_inode_attr(&row.value.0)
+                    .map_err(|err| MetadError::Codec(err.to_string()))?;
+                if row.key != inode_key(self.mount, attr.inode) {
+                    return Err(MetadError::Codec(format!(
+                        "inode row key does not match inode {} during materialization recovery",
+                        attr.inode.get()
+                    )));
+                }
+                if !reachable.inodes.contains(&attr.inode) {
+                    return Ok(false);
+                }
             }
-            if !reachable.inodes.contains(&attr.inode) {
-                return Ok(false);
+            let reached_tail = rows.len() < NAMESPACE_PROOF_PAGE_ROWS;
+            start_after = rows.last().map(|row| row.key.clone());
+            if reached_tail {
+                break;
             }
         }
         Ok(true)
@@ -1950,12 +2429,79 @@ where
         &self,
         version: Version,
     ) -> Result<NamespaceReachability, MetadError> {
+        let mut reachable = NamespaceReachability::default();
+        self.visit_namespace_reachable_entries_at(version, |key, attr, _| {
+            reachable.inodes.insert(attr.inode);
+            if attr.inode.shard_index() == self.shard_index()
+                && attr.file_type == FileType::Directory
+            {
+                reachable.directories.insert(attr.inode);
+            }
+            if let Some(key) = key {
+                reachable.dentries.insert(key.to_vec());
+            }
+            Ok(false)
+        })?;
+        Ok(reachable)
+    }
+
+    /// Prove a batch of inode reachability with one namespace walk. The walk
+    /// stops as soon as every candidate is found; an unreachable candidate
+    /// requires a complete but physically paged traversal at one stable MVCC
+    /// version.
+    pub(super) fn restore_reachable_inodes_at(
+        &self,
+        candidates: &HashSet<InodeId>,
+        version: Version,
+    ) -> Result<HashSet<InodeId>, MetadError> {
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut found = HashSet::with_capacity(candidates.len());
+        self.visit_namespace_reachable_entries_at(version, |_, attr, _| {
+            if candidates.contains(&attr.inode) {
+                found.insert(attr.inode);
+            }
+            Ok(found.len() == candidates.len())
+        })?;
+        Ok(found)
+    }
+
+    /// Return one reachable body descriptor per candidate inode in one walk.
+    /// A reachable body-less inode is represented by `None`; an absent map key
+    /// means the inode is not reachable from any namespace anchor.
+    pub(super) fn restore_reachable_inode_bodies_at(
+        &self,
+        candidates: &HashSet<InodeId>,
+        version: Version,
+    ) -> Result<HashMap<InodeId, Option<BodyDescriptor>>, MetadError> {
+        if candidates.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut found = HashMap::with_capacity(candidates.len());
+        self.visit_namespace_reachable_entries_at(version, |_, attr, body| {
+            if candidates.contains(&attr.inode) {
+                found.entry(attr.inode).or_insert_with(|| body.cloned());
+            }
+            Ok(found.len() == candidates.len())
+        })?;
+        Ok(found)
+    }
+
+    fn visit_namespace_reachable_entries_at<F>(
+        &self,
+        version: Version,
+        mut visit: F,
+    ) -> Result<bool, MetadError>
+    where
+        F: FnMut(Option<&[u8]>, &InodeAttr, Option<&BodyDescriptor>) -> Result<bool, MetadError>,
+    {
         #[cfg(test)]
         self.namespace_reachability_scans
             .fetch_add(1, Ordering::Relaxed);
         let purpose = ReadPurpose::WritePlanLocal;
         let Some(root_attr) =
-            self.get_attr_at_version_for_purpose(InodeId::root(), version, purpose)?
+            self.namespace_reachability_inode_attr_at(InodeId::root(), version, purpose)?
         else {
             return Err(MetadError::Codec(
                 "mount root is missing during namespace reachability proof".to_owned(),
@@ -1966,12 +2512,19 @@ where
                 "mount root is not a directory during namespace reachability proof".to_owned(),
             ));
         }
+        if visit(None, &root_attr, None)? {
+            return Ok(true);
+        }
 
         let mut pending = vec![InodeId::root()];
-        for versioned in self.versioned_fork_bindings_at(version, purpose)? {
+        if self.visit_versioned_fork_bindings_at(version, purpose, |versioned| {
+            if !self.restore_fork_binding_is_namespace_anchor(&versioned.binding, version)? {
+                return Ok(false);
+            }
             let root = versioned.binding.fork_root;
-            let Some(attr) = self.get_attr_at_version_for_purpose(root, version, purpose)? else {
-                continue;
+            let Some(attr) = self.namespace_reachability_inode_attr_at(root, version, purpose)?
+            else {
+                return Ok(false);
             };
             if attr.file_type != FileType::Directory {
                 return Err(MetadError::Codec(format!(
@@ -1980,35 +2533,88 @@ where
                 )));
             }
             pending.push(root);
+            visit(None, &attr, None)
+        })? {
+            return Ok(true);
         }
 
-        let mut reachable = NamespaceReachability::default();
+        let mut visited_directories = HashSet::new();
         while let Some(parent) = pending.pop() {
-            if !reachable.directories.insert(parent) {
+            if !visited_directories.insert(parent) {
                 continue;
             }
-            reachable.inodes.insert(parent);
-            for row in self.metadata.scan(ScanRequest {
-                family: RecordFamily::Dentry,
-                prefix: dentry_prefix(self.mount, parent),
-                start_after: None,
-                version,
-                limit: 0,
-                purpose,
-            })? {
-                let projection = decode_dentry_projection(&row.value.0)
-                    .map_err(|err| MetadError::Codec(err.to_string()))?;
-                self.validate_current_dentry_projection(&row.key, &projection, version)?;
-                reachable.dentries.insert(row.key);
-                reachable.inodes.insert(projection.attr.inode);
-                if projection.attr.inode.shard_index() == self.shard_index()
-                    && projection.attr.file_type == FileType::Directory
-                {
-                    pending.push(projection.attr.inode);
+            let prefix = dentry_prefix(self.mount, parent);
+            let mut start_after = None;
+            loop {
+                let rows = self.metadata.scan(ScanRequest {
+                    family: RecordFamily::Dentry,
+                    prefix: prefix.clone(),
+                    start_after: start_after.clone(),
+                    version,
+                    limit: NAMESPACE_PROOF_PAGE_ROWS,
+                    purpose,
+                })?;
+                for row in &rows {
+                    let projection = decode_dentry_projection(&row.value.0)
+                        .map_err(|err| MetadError::Codec(err.to_string()))?;
+                    self.validate_current_dentry_projection(&row.key, &projection, version)?;
+                    if visit(Some(&row.key), &projection.attr, projection.body.as_ref())? {
+                        return Ok(true);
+                    }
+                    if projection.attr.inode.shard_index() == self.shard_index()
+                        && projection.attr.file_type == FileType::Directory
+                    {
+                        pending.push(projection.attr.inode);
+                    }
+                }
+                let reached_tail = rows.len() < NAMESPACE_PROOF_PAGE_ROWS;
+                start_after = rows.last().map(|row| row.key.clone());
+                if reached_tail {
+                    break;
                 }
             }
         }
-        Ok(reachable)
+        Ok(false)
+    }
+
+    /// Read an inode for the internal reachability graph without re-entering
+    /// restore visibility. The graph itself is the visibility proof, and it is
+    /// also called while the restore visibility fence may already be held.
+    fn namespace_reachability_inode_attr_at(
+        &self,
+        inode: InodeId,
+        version: Version,
+        purpose: ReadPurpose,
+    ) -> Result<Option<InodeAttr>, MetadError> {
+        let Some(value) = self.metadata.get(
+            RecordFamily::Inode,
+            &inode_key(self.mount, inode),
+            version,
+            purpose,
+        )?
+        else {
+            return Ok(None);
+        };
+        let attr =
+            decode_inode_attr(&value.0).map_err(|error| MetadError::Codec(error.to_string()))?;
+        if attr.inode != inode {
+            return Err(MetadError::Codec(format!(
+                "inode row key does not match inode {} during namespace reachability proof",
+                inode.get()
+            )));
+        }
+        Ok(Some(attr))
+    }
+
+    pub(super) fn restore_inode_reachable_from_mount(
+        &self,
+        inode: InodeId,
+        version: Version,
+    ) -> Result<bool, MetadError> {
+        let candidates = HashSet::from([inode]);
+        Ok(self
+            .restore_reachable_inodes_at(&candidates, version)?
+            .contains(&inode))
     }
 
     pub(super) fn commit_create_projection(
@@ -2022,6 +2628,7 @@ where
             projection,
             &[],
             version,
+            None,
             None,
             None,
         )
@@ -2064,6 +2671,11 @@ where
             key: inode_key(self.mount, parent),
             predicate: Predicate::Exists,
         }];
+        let restore_write_predicates =
+            self.restore_namespace_write_predicates(&[parent], predecessor(version)?)?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
         let mut mutations =
             Vec::with_capacity(projections.len() * if path_indexes.is_some() { 3 } else { 2 });
         let mut watch = Vec::with_capacity(projections.len());
@@ -2115,7 +2727,11 @@ where
                 watch.push(event);
             }
         }
-        Ok(MetadataCommand {
+        let enrollment =
+            self.restore_namespace_enrollment_plan(parent, projections, predecessor(version)?)?;
+        predicates.extend(enrollment.predicates);
+        mutations.extend(enrollment.mutations);
+        let command = MetadataCommand {
             request_id: request_id(kind_name(kind), self.mount, parent, version),
             kind,
             read_version: predecessor(version)?,
@@ -2125,7 +2741,14 @@ where
             predicates,
             mutations,
             watch,
-        })
+        };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(
+                &command,
+                "restore namespace create batch",
+            )?;
+        }
+        Ok(command)
     }
 
     /// Build the cross-shard graft command. Unlike every other create path this
@@ -2141,7 +2764,36 @@ where
     ) -> Result<MetadataCommand, MetadError> {
         let parent = projection.dentry.parent;
         let dentry = dentry_key(self.mount, parent, &projection.dentry.name);
-        Ok(MetadataCommand {
+        let mut predicates = vec![
+            PredicateRef {
+                family: RecordFamily::Inode,
+                key: inode_key(self.mount, parent),
+                predicate: Predicate::Exists,
+            },
+            PredicateRef {
+                family: RecordFamily::Dentry,
+                key: dentry.clone(),
+                predicate: Predicate::NotExists,
+            },
+        ];
+        let restore_write_predicates =
+            self.restore_namespace_write_predicates(&[parent], predecessor(version)?)?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
+        let enrollment = self.restore_namespace_enrollment_plan(
+            parent,
+            std::slice::from_ref(projection),
+            predecessor(version)?,
+        )?;
+        predicates.extend(enrollment.predicates);
+        let mut mutations = vec![put_projection_mutation(
+            RecordFamily::Dentry,
+            dentry.clone(),
+            projection,
+        )];
+        mutations.extend(enrollment.mutations);
+        let command = MetadataCommand {
             request_id: request_id(
                 kind_name(CommandKind::CreateDir),
                 self.mount,
@@ -2153,25 +2805,10 @@ where
             commit_version: version,
             primary_family: RecordFamily::Dentry,
             primary_key: dentry.clone(),
-            predicates: vec![
-                PredicateRef {
-                    family: RecordFamily::Inode,
-                    key: inode_key(self.mount, parent),
-                    predicate: Predicate::Exists,
-                },
-                PredicateRef {
-                    family: RecordFamily::Dentry,
-                    key: dentry.clone(),
-                    predicate: Predicate::NotExists,
-                },
-            ],
+            predicates,
             // Exactly one mutation: the dentry projection. No Inode record for the
             // foreign child — that is the allocator-safety invariant of a graft.
-            mutations: vec![put_projection_mutation(
-                RecordFamily::Dentry,
-                dentry,
-                projection,
-            )],
+            mutations,
             watch: self
                 .watch_projection(
                     parent,
@@ -2185,7 +2822,14 @@ where
                 )
                 .into_iter()
                 .collect(),
-        })
+        };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(
+                &command,
+                "restore namespace create graft",
+            )?;
+        }
+        Ok(command)
     }
 
     pub(super) fn commit_create_projection_with_chunks(
@@ -2203,6 +2847,7 @@ where
             version,
             None,
             Some(object_reference),
+            None,
         )
     }
 
@@ -2215,6 +2860,7 @@ where
         version: Version,
         path_index: Option<Vec<u8>>,
         object_reference: Option<ObjectReferenceMutation>,
+        request_id_override: Option<Vec<u8>>,
     ) -> Result<(), MetadError> {
         let inode = projection.attr.inode;
         let dentry = dentry_key(
@@ -2271,11 +2917,26 @@ where
                 predicate: Predicate::NotExists,
             },
         ];
+        let restore_write_predicates = self.restore_namespace_write_predicates(
+            &[projection.dentry.parent],
+            predecessor(version)?,
+        )?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
+        let enrollment = self.restore_namespace_enrollment_plan(
+            projection.dentry.parent,
+            std::slice::from_ref(projection),
+            predecessor(version)?,
+        )?;
+        predicates.extend(enrollment.predicates);
+        mutations.extend(enrollment.mutations);
         if let Some(object_reference) = object_reference {
             predicates.push(object_reference.predicate(self.mount));
         }
-        self.commit_metadata(MetadataCommand {
-            request_id: request_id(kind_name(kind), self.mount, inode, version),
+        let command = MetadataCommand {
+            request_id: request_id_override
+                .unwrap_or_else(|| request_id(kind_name(kind), self.mount, inode, version)),
             kind,
             read_version: predecessor(version)?,
             commit_version: version,
@@ -2296,7 +2957,14 @@ where
                 )
                 .into_iter()
                 .collect(),
-        })?;
+        };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(
+                &command,
+                "restore namespace publish create",
+            )?;
+        }
+        self.commit_metadata(command)?;
         Ok(())
     }
 
@@ -2305,6 +2973,7 @@ where
         commit: ReplaceProjectionCommit<'_>,
     ) -> Result<(), MetadError> {
         let ReplaceProjectionCommit {
+            request_id: request_id_override,
             kind,
             projection,
             chunks,
@@ -2322,10 +2991,37 @@ where
             &projection.dentry.name,
         );
         let read_version = predecessor(version)?;
+        let restore_write_predicates = self
+            .restore_namespace_write_predicates(&[projection.dentry.parent, inode], read_version)?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
         let linked = if projection.attr.nlink <= 1 {
+            let old_projection = if restore_guarded {
+                let old = self
+                    .metadata
+                    .get_versioned(
+                        RecordFamily::Dentry,
+                        &dentry,
+                        read_version,
+                        ReadPurpose::WritePlanLocal,
+                    )?
+                    .ok_or(MetadError::NotFound)?;
+                if old.version != dentry_version {
+                    return Err(MetadError::Metadata(MetadataError::PredicateFailed));
+                }
+                decode_dentry_projection(&old.value.0)
+                    .map_err(|error| MetadError::Codec(error.to_string()))?
+            } else {
+                // Preserve the original prepared-publish contract outside a
+                // completed restore. In particular, do not require historical
+                // dentry state which may already have been pruned: the exact
+                // VersionEquals CAS below reports a stale plan, and Holt's
+                // request-id dedupe makes an identical retry idempotent.
+                projection.clone()
+            };
             vec![LinkedDentryProjection {
                 key: dentry.clone(),
-                projection: projection.clone(),
+                projection: old_projection,
                 version: dentry_version,
             }]
         } else {
@@ -2343,6 +3039,20 @@ where
                 predicate: Predicate::Exists,
             },
         ];
+        predicates.extend(restore_write_predicates);
+        let primary_overlay_managed = if restore_guarded && path_index.is_some() {
+            let primary = linked
+                .iter()
+                .find(|linked| linked.key == dentry)
+                .ok_or_else(|| {
+                    MetadError::Codec(
+                        "restore publish primary dentry is missing from its inode links".to_owned(),
+                    )
+                })?;
+            self.restore_index_manages_projection_location(&primary.projection, read_version)?
+        } else {
+            false
+        };
         if let Some(object_reference) = object_reference {
             predicates.push(object_reference.predicate(self.mount));
         }
@@ -2353,6 +3063,7 @@ where
             value: Some(Value(encode_inode_attr(&projection.attr))),
         }];
         let mut primary_projection_updated = false;
+        let mut updated_link_projections = Vec::with_capacity(linked.len());
         for linked in linked {
             if linked.key != dentry {
                 predicates.push(PredicateRef {
@@ -2363,10 +3074,12 @@ where
             } else {
                 primary_projection_updated = true;
             }
-            let mut updated = linked.projection;
+            let old = linked.projection;
+            let mut updated = old.clone();
             updated.attr = projection.attr.clone();
             updated.dentry.attr_generation = projection.attr.generation;
             updated.body = projection.body.clone();
+            updated_link_projections.push((old, updated.clone()));
             mutations.push(put_projection_mutation(
                 RecordFamily::Dentry,
                 linked.key,
@@ -2380,7 +3093,10 @@ where
                 projection,
             ));
         }
-        if let Some(path_index) = path_index {
+        let restore_index = self.restore_index_link_plan(&updated_link_projections, version)?;
+        predicates.extend(restore_index.predicates);
+        mutations.extend(restore_index.mutations);
+        if let Some(path_index) = path_index.filter(|_| !primary_overlay_managed) {
             mutations.push(put_projection_mutation(
                 RecordFamily::PathIndex,
                 path_index,
@@ -2425,8 +3141,9 @@ where
                 });
             }
         }
-        self.commit_metadata(MetadataCommand {
-            request_id: request_id(kind_name(kind), self.mount, inode, version),
+        let command = MetadataCommand {
+            request_id: request_id_override
+                .unwrap_or_else(|| request_id(kind_name(kind), self.mount, inode, version)),
             kind,
             read_version,
             commit_version: version,
@@ -2447,7 +3164,14 @@ where
                 )
                 .into_iter()
                 .collect(),
-        })?;
+        };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(
+                &command,
+                "restore namespace publish replace",
+            )?;
+        }
+        self.commit_metadata(command)?;
         Ok(())
     }
 }

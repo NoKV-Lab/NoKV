@@ -190,18 +190,42 @@ objective is the worker interval; the bodies were always safe in the object stor
 
 ## Consistency Checking
 
-`nokv fsck` verifies the live namespace against the object store: it walks every
-live file at its current body generation and confirms each referenced block
-still exists (`head`). This is the read-side complement to the object-first write
-ordering — the ordering guarantees metadata never references a missing object,
-and fsck detects any drift after the fact (an out-of-band deletion, an
-eventual-consistency anomaly in external storage, or a latent bug), reporting
-each dangling reference as `(inode, generation, object_key)`. Superseded and
-snapshot-pinned generations are not mistaken for drift (the scan uses each
-inode's current body generation), and a clone's borrowed block keys resolve
-against the source objects that still exist. Reclaiming the opposite drift —
-orphan objects written but never referenced — is a planned extension that needs
-an object-store `list`.
+`nokv fsck` performs the explicit, full consistency scan. It walks current file
+and object-backed symlink bodies plus every body reachable from an unexpired
+snapshot pin or durable `ForkBinding`. Sparse/append bodies are resolved through
+their complete `base_generation` chain. Every referenced block is checked with
+`head` for both existence and exact length, so the report catches out-of-band
+deletion, truncated replacement, object-store anomalies, and latent metadata
+bugs without treating retained history as orphaned.
+
+Durable workbench restore adds a second graph to this check. Fsck validates the
+operation/claim/root graph, temporary history binding, staging member inverses,
+exact object owner/inverse/seal rows, initialization tombstones, cleanup and
+release jobs, quarantine envelopes, and the private index overlay (including
+its physical MVCC envelope and owner/inverse closure). Optional object
+verification confirms each exact borrowed reference still has both a backing
+object and an effective borrower manifest. A metadata write concurrent with
+either scan invalidates the report instead of returning a mixed-version result;
+the operator retries.
+
+Full fsck is intentionally expensive. `/stats` does not run it: restore gauges
+count private keyspaces in bounded pages, strictly decode only operation rows,
+and cache the last exact, version-labelled sample briefly at the server. This
+keeps monitoring memory bounded without presenting a sampled count as exact.
+Process-local metadata-service counters separately expose restore request,
+success/failure, total elapsed nanoseconds, and maximum elapsed nanoseconds;
+they include lock wait and exact terminal retries but reset on owner restart.
+Reclaiming the opposite drift—objects written but never referenced and absent
+from a restore initialization tombstone—still requires an object-store `list`
+and remains a separate extension.
+
+The `restore_to_fork_v1` downgrade fence may be removed only through the typed
+drain API after deployment routing has disabled the capability and every restore
+writer has been globally stopped or fenced. The drain re-deletes and CAS-removes
+late-PUT tombstones, requires every registered restore control/index prefix to
+be empty, then atomically rewrites allocator v2 to v1, removes the active marker,
+and rotates the open object-GC claim. A clean full fsck and a fresh metadata
+checkpoint are still mandatory before starting a pre-restore metadata binary.
 
 ## Distributed Direction
 

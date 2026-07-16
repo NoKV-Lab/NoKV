@@ -7,6 +7,7 @@ use super::*;
 /// [`MetadError`] (which is not `Clone`), keeping the check logic single-sourced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OwnerLeaseFault {
+    CheckpointInstallUncertain,
     StaleEpoch {
         owner_epoch: u64,
         required_epoch: u64,
@@ -20,6 +21,9 @@ pub(super) enum OwnerLeaseFault {
 impl OwnerLeaseFault {
     fn into_error(self) -> MetadError {
         match self {
+            OwnerLeaseFault::CheckpointInstallUncertain => {
+                MetadError::MetadataCheckpointInstallUncertain
+            }
             OwnerLeaseFault::StaleEpoch {
                 owner_epoch,
                 required_epoch,
@@ -38,27 +42,120 @@ impl OwnerLeaseFault {
     }
 }
 
+/// Brackets one authoritative restore-graph metadata apply. The paired
+/// sequence increments make an overlapping reader reject its mixed System
+/// view; the active count closes the windows on either side of those bumps.
+pub(super) struct RestoreGraphWriteGuard<'a> {
+    sequence: &'a AtomicU64,
+    writers: &'a AtomicUsize,
+}
+
+impl<'a> RestoreGraphWriteGuard<'a> {
+    fn new(sequence: &'a AtomicU64, writers: &'a AtomicUsize) -> Self {
+        writers.fetch_add(1, Ordering::SeqCst);
+        sequence.fetch_add(1, Ordering::SeqCst);
+        Self { sequence, writers }
+    }
+}
+
+impl Drop for RestoreGraphWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+        self.writers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl<M, O> NoKvFs<M, O>
 where
     M: MetadataStore,
     O: ObjectStore,
 {
+    pub(super) fn begin_restore_graph_write(&self) -> RestoreGraphWriteGuard<'_> {
+        RestoreGraphWriteGuard::new(&self.restore_graph_sequence, &self.restore_graph_writers)
+    }
+
+    fn restore_graph_write_for_command(
+        &self,
+        command: &MetadataCommand,
+    ) -> Option<RestoreGraphWriteGuard<'_>> {
+        super::restore::command_mutates_restore_graph(self.mount, command)
+            .then(|| self.begin_restore_graph_write())
+    }
+
+    fn restore_graph_write_for_batch(
+        &self,
+        commands: &[MetadataCommand],
+    ) -> Option<RestoreGraphWriteGuard<'_>> {
+        commands
+            .iter()
+            .any(|command| super::restore::command_mutates_restore_graph(self.mount, command))
+            .then(|| self.begin_restore_graph_write())
+    }
+
+    /// Capture a quiescent restore-graph sequence. Writers register before
+    /// their durable apply, so observing either an active writer or a later
+    /// sequence change invalidates a current-only System scan.
+    pub(super) fn restore_graph_read_sequence(&self) -> Option<u64> {
+        if self.restore_graph_writers.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let sequence = self.restore_graph_sequence.load(Ordering::SeqCst);
+        (self.restore_graph_writers.load(Ordering::SeqCst) == 0).then_some(sequence)
+    }
+
+    pub(super) fn restore_graph_read_is_stable(&self, sequence: u64) -> bool {
+        self.restore_graph_writers.load(Ordering::SeqCst) == 0
+            && self.restore_graph_sequence.load(Ordering::SeqCst) == sequence
+            && self.restore_graph_writers.load(Ordering::SeqCst) == 0
+    }
+
     pub fn install_owner_epoch(&self, epoch: u64) -> Result<(), MetadError> {
         validate_owner_epoch(epoch)?;
+        let _restore_graph_write = self.begin_restore_graph_write();
+        // Fail closed while ownership changes. The startup path rebuilds the
+        // optimization after bootstrap or checkpoint/log recovery.
+        self.mark_restore_staging_possible();
         // Write guard: wait for in-flight commits to finish, then raise both
         // epochs together so no commit ever observes a torn (epoch, required)
         // pair or applies under a superseded epoch.
-        let _fence = self
-            .epoch_fence
-            .write()
-            .unwrap_or_else(|err| err.into_inner());
-        self.epoch.fetch_max(epoch, Ordering::Relaxed);
-        self.required_owner_epoch
-            .fetch_max(epoch, Ordering::Relaxed);
+        {
+            let _fence = self
+                .epoch_fence
+                .write()
+                .unwrap_or_else(|err| err.into_inner());
+            self.epoch.fetch_max(epoch, Ordering::Relaxed);
+            self.required_owner_epoch
+                .fetch_max(epoch, Ordering::Relaxed);
+        }
+        // Controlled failover installs the owner epoch before installing a
+        // checkpoint into a pristine Holt store. Do not scan in that state: a
+        // read would create trees and make wholesale image install fail. An
+        // already-open/bootstrap-complete shard, however, must reconstruct the
+        // fast-path hint after this fail-closed epoch boundary.
+        if self
+            .restore_visibility_recovery_ready
+            .load(Ordering::Acquire)
+        {
+            self.recover_restore_staging_visibility()?;
+        }
         Ok(())
     }
 
     pub fn observe_required_owner_epoch(&self, epoch: u64) -> Result<(), MetadError> {
+        validate_owner_epoch(epoch)?;
+        let _restore_graph_write = self.begin_restore_graph_write();
+        self.mark_restore_staging_possible();
+        self.fence_required_owner_epoch(epoch)?;
+        self.recover_restore_staging_visibility()
+    }
+
+    /// Raise only the commit fence after observing a newer control-plane epoch.
+    /// Publication callbacks use this form because they can run while the
+    /// current restore command still owns the restore-visibility fence; trying
+    /// to rebuild that process-local hint on the same thread would deadlock.
+    /// The stale owner cannot serve through the recovery publication gate, and
+    /// the successor reconstructs restore visibility from durable state.
+    pub fn fence_required_owner_epoch(&self, epoch: u64) -> Result<(), MetadError> {
         validate_owner_epoch(epoch)?;
         // Write guard: a failover bump waits for in-flight commits, then raises
         // the required epoch so every subsequent commit is fenced.
@@ -120,6 +217,12 @@ where
     /// Single source of truth for "may this owner commit?": epoch fence first,
     /// then the wall-clock lease deadline (the partition-safe self-fence).
     pub(super) fn check_owner_lease(&self) -> Result<(), OwnerLeaseFault> {
+        if self
+            .metadata_checkpoint_install_uncertain
+            .load(Ordering::Acquire)
+        {
+            return Err(OwnerLeaseFault::CheckpointInstallUncertain);
+        }
         let owner_epoch = self.epoch.load(Ordering::Relaxed);
         let required_epoch = self.required_owner_epoch.load(Ordering::Relaxed);
         if owner_epoch < required_epoch {
@@ -210,6 +313,7 @@ where
                         message: err.to_string(),
                     })?;
             }
+            let _restore_graph_write = self.restore_graph_write_for_command(&command);
             match self.metadata.commit_metadata(command.clone()) {
                 Ok(result) => {
                     self.purge_path_caches_after_write();
@@ -262,6 +366,7 @@ where
             .read()
             .unwrap_or_else(|err| err.into_inner());
         self.ensure_owner_epoch_current()?;
+        let _restore_graph_write = self.restore_graph_write_for_command(&command);
         let result = self.metadata.commit_metadata(command)?;
         self.purge_path_caches_after_write();
         Ok(result)
@@ -315,6 +420,7 @@ where
             if let Err(fault) = self.check_owner_lease() {
                 return commands.iter().map(|_| Err(fault.into_error())).collect();
             }
+            let _restore_graph_write = self.restore_graph_write_for_batch(commands);
             self.metadata.commit_independent_batch(commands)
         };
 

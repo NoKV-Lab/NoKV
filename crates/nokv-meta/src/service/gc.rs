@@ -667,6 +667,13 @@ where
     }
 
     fn object_delete_is_protected(&self, record: &ObjectGcRecord) -> Result<bool, MetadError> {
+        // Completed restore forks release their mount-global history floor. Their
+        // exact inverse rows are therefore the first durable protection check
+        // for every candidate object. A malformed row returns an error and the
+        // caller quarantines the GC candidate instead of issuing DELETE.
+        if self.restore_object_is_borrowed(&record.object_key)? {
+            return Ok(true);
+        }
         if self
             .history_retention_floor()?
             .is_some_and(|floor| floor.get() < record.enqueue_version)
@@ -841,6 +848,25 @@ where
             return Ok(outcome);
         }
         let page_size = limit.max(1);
+        let failover_durability_required = self.failover_durability_required()?;
+        // Release-to-fork teardown owns exact borrowed-object rows and may
+        // enqueue ordinary GC candidates. Advance one bounded page while this
+        // worker already holds object_gc_gate, then let the regular queue consume
+        // only the resulting durable state. Calling the public wrapper here
+        // would acquire the same non-reentrant gate twice.
+        // A failover-durability marker blocks those metadata mutations too, but
+        // still scan the ordinary GC page below so the pre-existing outcome
+        // contract reports how much work was held back.
+        if !failover_durability_required {
+            outcome.restore_init_tombstones_scanned =
+                self.cleanup_restore_init_upload_tombstones_locked(page_size)?;
+            outcome.restore_release_jobs_processed =
+                self.cleanup_restore_releases_locked(page_size)?;
+        }
+        let (backlog, quarantine, mount_wide_quarantine) = self.restore_release_backlog()?;
+        outcome.restore_release_backlog = backlog;
+        outcome.restore_release_quarantine = quarantine;
+        outcome.restore_release_mount_wide_quarantine = mount_wide_quarantine;
         let cursor_key = object_gc_scan_cursor_key(self.mount);
         let read_version = self.read_version()?;
         let cursor = self.metadata.get_versioned(
@@ -866,9 +892,11 @@ where
             purpose: ReadPurpose::UserStrong,
         })?;
         outcome.scanned += rows.len();
-        if self.failover_durability_required()? {
-            outcome.blocked_by_failover_durability =
-                outcome.blocked_by_failover_durability.max(rows.len());
+        if failover_durability_required || self.failover_durability_required()? {
+            outcome.blocked_by_failover_durability = outcome
+                .blocked_by_failover_durability
+                .max(rows.len())
+                .max(1);
             return Ok(outcome);
         }
         // Reap expired snapshot pins only after the failover marker check, so

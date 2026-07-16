@@ -1986,7 +1986,28 @@ where
                                                     nokv_agent::agent_tool_definitions()
                                                 }
                                                 McpProfile::Workbench => {
-                                                    workbench_mcp::tool_definitions()
+                                                    // tools/list has no destination arguments, so
+                                                    // fleet advertisement must cover every owner
+                                                    // that can win below the configured root. Any
+                                                    // enumeration or probe failure is unsupported.
+                                                    let restore_to_fork_v1 = workbench_options
+                                                        .as_ref()
+                                                        .and_then(|workbench| {
+                                                            client
+                                                                .metadata()
+                                                                .metadata_capabilities_for_subtree_owners(
+                                                                    &workbench.root,
+                                                                )
+                                                                .ok()
+                                                        })
+                                                        .is_some_and(|owners| {
+                                                            owners.iter().all(|capabilities| {
+                                                                capabilities.restore_to_fork_v1
+                                                            })
+                                                        });
+                                                    workbench_mcp::tool_definitions_for_capabilities(
+                                                        restore_to_fork_v1,
+                                                    )
                                                 }
                                             };
                                             let tools: Vec<serde_json::Value> = definitions
@@ -2217,9 +2238,11 @@ impl Error for CliError {}
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::Arc;
     use std::thread;
 
     use nokv_client::NoKvFsClient;
+    use nokv_control::{ControlStore, InMemoryControlStore, NodeId, ShardId};
     use nokv_object::{LocalObjectStore, MemoryObjectStore, ObjectKey, ObjectStore};
     use tempfile::tempdir;
 
@@ -2280,6 +2303,22 @@ mod tests {
             let _ = server.serve(listener);
         });
         bind
+    }
+
+    fn register_test_fleet_shard(
+        store: &dyn ControlStore,
+        prefix: &str,
+        shard_index: u16,
+        endpoint: &str,
+    ) {
+        let shard_id = ShardId::new(format!("mount-1:{prefix}"));
+        store
+            .register_shard(shard_id.clone(), prefix.to_owned(), shard_index)
+            .unwrap();
+        let lease = store
+            .acquire_unassigned(shard_id, NodeId::new(endpoint))
+            .unwrap();
+        store.mark_serving(&lease, None, None, 0).unwrap();
     }
 
     #[test]
@@ -3195,6 +3234,46 @@ mod tests {
         run_workbench_mcp_requests_on_client(client, workbench_mcp_options(), requests)
     }
 
+    /// Restore initialization is uploaded by the metadata owner, unlike the
+    /// ordinary MCP write path where the client stages blocks. Keep a local
+    /// hot tier for this contract test so it does not depend on an external S3
+    /// service while still exercising the real server-side object PUT path.
+    fn restore_workbench_mcp_server() -> &'static (SocketAddr, PathBuf) {
+        static SERVER: std::sync::OnceLock<(SocketAddr, PathBuf)> = std::sync::OnceLock::new();
+        SERVER.get_or_init(|| {
+            let object_dir = tempdir().unwrap();
+            let object_root = object_dir.path().join("objects");
+            let object = ObjectStoreConfig::tiered_local_with_options(
+                LocalObjectStoreOptions::new(object_root.clone()),
+                fake_s3_options(),
+                TieredObjectStoreOptions {
+                    put_policy: nokv_object::TieredPutPolicy::HotThenBackgroundCold,
+                    ..TieredObjectStoreOptions::default()
+                },
+            );
+            let addr = spawn_test_server_with_object_config(object);
+            std::mem::forget(object_dir);
+            (addr, object_root)
+        })
+    }
+
+    fn run_restore_workbench_mcp_requests(
+        requests: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        let (addr, object_root) = restore_workbench_mcp_server();
+        let store =
+            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+        let client = NoKvFsClient::connect(*addr, store);
+        run_workbench_mcp_requests_on_client(client, workbench_mcp_options(), requests)
+    }
+
+    fn restore_direct_client() -> NoKvFsClient<LocalObjectStore> {
+        let (addr, object_root) = restore_workbench_mcp_server();
+        let store =
+            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+        NoKvFsClient::connect(*addr, store)
+    }
+
     fn run_workbench_mcp_requests_on_client(
         client: NoKvFsClient<LocalObjectStore>,
         options: McpCliOptions,
@@ -3297,12 +3376,48 @@ mod tests {
                 "workbench_snapshot",
                 "workbench_snapshot_renew",
                 "workbench_snapshot_list",
+                "workbench_restore",
             ]
         );
         assert!(names.iter().all(|name| name.starts_with("workbench_")));
         assert!(names.iter().all(|name| !name.starts_with("nokv_")));
         assert!(!names.contains(&"read"));
         assert!(!names.contains(&"grep"));
+    }
+
+    #[test]
+    fn workbench_mcp_omits_restore_when_a_descendant_owner_cannot_confirm_capability() {
+        let fallback_owner = spawn_test_server();
+        let control: Arc<dyn ControlStore> = Arc::new(InMemoryControlStore::new());
+        register_test_fleet_shard(control.as_ref(), "/", 0, &fallback_owner.to_string());
+        control
+            .register_shard(
+                ShardId::new("mount-1:/workbenches/special/deep"),
+                "/workbenches/special/deep".to_owned(),
+                1,
+            )
+            .unwrap();
+
+        let object_dir = tempdir().unwrap();
+        let object_store = LocalObjectStore::new(LocalObjectStoreOptions::new(
+            object_dir.path().join("objects"),
+        ))
+        .unwrap();
+        let client =
+            NoKvFsClient::connect_fleet(control, MountId::new(1).unwrap(), object_store).unwrap();
+        let responses = run_workbench_mcp_requests_on_client(
+            client,
+            workbench_mcp_options(),
+            vec![serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list"
+            })],
+        );
+
+        let tools = responses[0]["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "workbench_create"));
+        assert!(tools.iter().all(|tool| tool["name"] != "workbench_restore"));
     }
 
     #[test]
@@ -3318,6 +3433,28 @@ mod tests {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             assert!(tool["inputSchema"]["properties"].is_object());
         }
+        let restore = tools
+            .iter()
+            .find(|tool| tool["name"] == "workbench_restore")
+            .expect("restore-capable owner must advertise workbench_restore");
+        assert_eq!(
+            restore["inputSchema"],
+            serde_json::json!({
+                "type": "object",
+                "required": ["id", "at_snapshot", "destination_id"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "at_snapshot": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 0},
+                            {"type": "string", "minLength": 1}
+                        ]
+                    },
+                    "destination_id": {"type": "string", "minLength": 1}
+                },
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]
@@ -5259,6 +5396,103 @@ mod tests {
             assert_eq!(error["retryable"], false, "error: {error}");
             assert_eq!(error["details"]["snapshot_id"], snapshot_id);
         }
+    }
+
+    #[test]
+    fn workbench_mcp_restore_returns_only_terminal_state_and_writes_manifest() {
+        let source_id = "restore-contract-source-001";
+        let destination_id = "restore-contract-destination-001";
+        let mut source_requests = commit_snapshot_prelude(source_id);
+        source_requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": source_id, "name": "durable", "ttl_days": 7}),
+        ));
+        let source = run_restore_workbench_mcp_requests(source_requests);
+        let snapshot_id = source[3]["result"]["structuredContent"]["snapshot_id"]
+            .as_u64()
+            .unwrap();
+
+        let responses = run_restore_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_restore",
+                serde_json::json!({
+                    "id": source_id,
+                    "at_snapshot": snapshot_id,
+                    "destination_id": destination_id,
+                }),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_restore",
+                serde_json::json!({
+                    "id": source_id,
+                    "at_snapshot": snapshot_id,
+                    "destination_id": destination_id,
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_snapshot_list",
+                serde_json::json!({"id": destination_id}),
+            ),
+        ]);
+        for response in &responses[..2] {
+            assert_ne!(response["result"]["isError"], true, "response: {response}");
+            let outcome = &response["result"]["structuredContent"];
+            assert_eq!(outcome["status"], "success");
+            assert_eq!(outcome["state"], "complete");
+            assert_eq!(outcome["snapshot_id"], snapshot_id);
+            assert_eq!(outcome["source_workbench_id"], source_id);
+            assert_eq!(outcome["destination_workbench_id"], destination_id);
+            assert_eq!(outcome["cleanup_pending"], false);
+            assert!(outcome["operation_id"]
+                .as_str()
+                .is_some_and(|operation_id| operation_id.starts_with("restore-")));
+            assert_eq!(
+                outcome["restore_manifest"],
+                format!("/workbenches/{destination_id}/metadata/restore_manifest.json")
+            );
+        }
+        assert_eq!(
+            responses[0]["result"]["structuredContent"]["operation_id"],
+            responses[1]["result"]["structuredContent"]["operation_id"]
+        );
+        assert_eq!(
+            responses[0]["result"]["structuredContent"]["destination_root"],
+            responses[1]["result"]["structuredContent"]["destination_root"]
+        );
+
+        let destination_checkpoints = &responses[2]["result"]["structuredContent"];
+        assert_ne!(responses[2]["result"]["isError"], true);
+        assert_eq!(destination_checkpoints["checkpoint_count"], 0);
+        assert_eq!(
+            destination_checkpoints["checkpoints"],
+            serde_json::json!([])
+        );
+
+        let client = restore_direct_client();
+        let manifest_bytes = client
+            .cat(&format!(
+                "/workbenches/{destination_id}/metadata/restore_manifest.json"
+            ))
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest["schema"], "nokv.workbench.restore_manifest.v1");
+        assert_eq!(manifest["source_workbench_id"], source_id);
+        assert_eq!(manifest["destination_workbench_id"], destination_id);
+        assert_eq!(manifest["snapshot_id"], snapshot_id);
+        assert_eq!(
+            manifest["operation_id"],
+            responses[0]["result"]["structuredContent"]["operation_id"]
+        );
+        assert_eq!(
+            client
+                .cat(&format!("/workbenches/{destination_id}/outputs/result.txt"))
+                .unwrap(),
+            b"done\n"
+        );
     }
 
     #[test]

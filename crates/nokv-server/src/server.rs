@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nokv_control::{CheckpointRef, ControlError, ControlStore, LogRef, LogSegmentRef, ShardId};
 use nokv_meta::holtstore::HoltMetadataStore;
@@ -36,8 +36,15 @@ const DEFAULT_ROOT_MODE: u32 = 0o755;
 const SERVER_CONNECTION_WORKERS: usize = 256;
 const SERVER_CONNECTION_QUEUE: usize = 1024;
 const DEFAULT_ARCHIVE_KEEP_LAST: usize = 8;
+const RESTORE_METRICS_CACHE_TTL: Duration = Duration::from_secs(15);
 
 type OpenedControlStore = (Arc<dyn ControlStore>, Vec<ServerShardOwnerOptions>);
+
+#[derive(Clone)]
+struct RestoreMetricsCache {
+    sampled_at: Instant,
+    metrics: nokv_meta::RestoreMetrics,
+}
 
 enum ServerMetadataBackupWorker {
     Standalone(MetadataBackupWorker),
@@ -107,6 +114,10 @@ pub struct Server {
     /// single-node dev path (no control plane, no cross-shard grafts).
     control: Option<Arc<dyn ControlStore>>,
     framed_rpc_workers: rpc::RpcWorkerPool,
+    /// Restore gauges are exact but O(private rows). Cache the exact snapshot
+    /// briefly; its embedded read_version makes staleness explicit while
+    /// preventing every monitoring scrape from walking a million-row restore.
+    restore_metrics_cache: Mutex<Option<RestoreMetricsCache>>,
     #[cfg(test)]
     _test_meta_dir: Option<tempfile::TempDir>,
 }
@@ -289,6 +300,7 @@ impl Server {
             mount: options.mount,
             control: control_handle,
             framed_rpc_workers,
+            restore_metrics_cache: Mutex::new(None),
             #[cfg(test)]
             _test_meta_dir: None,
         })
@@ -567,15 +579,35 @@ impl Server {
 
         if commits_metadata {
             let _visibility = owner.lock_recovery_publication();
+            let before = slot.service().sync_metadata_log_publication_state();
             // Set before raw execution so a partial commit, returned error, or
             // panic cannot release the gate looking clean.
             owner.mark_recovery_dirty();
             let result = execute();
+            let after = slot.service().sync_metadata_log_publication_state();
+            let request_may_have_committed =
+                metadata_publication_advanced(before.as_ref(), after.as_ref());
             // A clone/rollback or any other multi-stage mutator may have
             // committed even when its final business result is an error. The
             // publication barrier therefore runs on both result paths and its
             // failure takes precedence, keeping later reads fail-closed.
-            Self::publish_owner_latest_log_ref_locked(slot.service(), owner)?;
+            if let Err(publication_error) =
+                Self::publish_owner_latest_log_ref_locked(slot.service(), owner)
+            {
+                if result
+                    .as_ref()
+                    .is_err_and(preserve_mutation_error_over_publication)
+                {
+                    return result;
+                }
+                if !request_may_have_committed && result.is_err() {
+                    return result;
+                }
+                return Err(mutation_publication_error(
+                    publication_error,
+                    request_may_have_committed,
+                ));
+            }
             return result;
         }
 
@@ -627,7 +659,7 @@ impl Server {
         };
 
         if let Some(cached) = owner.published_recovery_state() {
-            prune_control_covered_log_segments(service, &publication, &cached)?;
+            prune_control_covered_log_segments(service, &cached)?;
             publication = service
                 .sync_metadata_log_publication_state()
                 .expect("enabled metadata log remains enabled under publication gate");
@@ -645,7 +677,7 @@ impl Server {
                 // authoritative checkpoint while local covered pointers remain.
                 // Dirty repair alone may perform this remote validation.
                 let authoritative = owner.renew(service)?;
-                prune_control_covered_log_segments(service, &publication, &authoritative)?;
+                prune_control_covered_log_segments(service, &authoritative)?;
                 let repaired = service
                     .sync_metadata_log_publication_state()
                     .expect("enabled metadata log remains enabled under publication gate");
@@ -691,6 +723,29 @@ impl Server {
         Ok(())
     }
 
+    fn cached_restore_metrics(
+        &self,
+        service: &NoKvFs<ServerMetadataStore, ConfiguredObjectStore>,
+    ) -> Result<nokv_meta::RestoreMetrics, MetadError> {
+        let mut cache = self
+            .restore_metrics_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(cached) = cache.as_ref() {
+            if cached.sampled_at.elapsed() < RESTORE_METRICS_CACHE_TTL {
+                return Ok(cached.metrics.clone());
+            }
+        }
+        // Keep the cache gate through collection: concurrent scrapes share one
+        // bounded exact scan instead of multiplying its I/O and CPU cost.
+        let metrics = service.restore_metrics()?;
+        *cache = Some(RestoreMetricsCache {
+            sampled_at: Instant::now(),
+            metrics: metrics.clone(),
+        });
+        Ok(metrics)
+    }
+
     pub fn stats_json(&self) -> String {
         let ready = self.check_readiness().is_ok();
         let slot = self.default_slot();
@@ -700,13 +755,14 @@ impl Server {
         let metadata_service = service.metadata_service_stats();
         let object_gc = slot.object_gc.state();
         let history_gc = slot.history_gc.state();
+        let restore = self.cached_restore_metrics(service);
         // Stats are an operational safety surface. If the persisted marker
         // cannot be read or decoded, report the failover requirement as active
         // rather than presenting an unsafe deployment as unconstrained.
         let failover_durability_required =
             service.failover_durability_is_required().unwrap_or(true);
         format!(
-            "{{\"ready\":{},\"block_cache_enabled\":{},\"object_puts\":{},\"object_put_bytes\":{},\"object_gets\":{},\"object_get_bytes\":{},\"coalesced_gets\":{},\"coalesced_get_bytes\":{},\"cache_hits\":{},\"cache_hit_bytes\":{},\"prefetch_enqueued\":{},\"prefetch_dropped\":{},\"prefetch_completed\":{},\"prefetch_failed\":{},\"prefetch_object_gets\":{},\"prefetch_object_get_bytes\":{},\"prefetch_cache_hits\":{},\"prefetch_cache_hit_bytes\":{},\"read_plan_cache_hits\":{},\"read_plan_cache_misses\":{},\"object_writeback_enqueued\":{},\"object_writeback_inline\":{},\"object_writeback_completed\":{},\"object_writeback_failed\":{},\"object_writeback_staged_bytes\":{},\"object_writeback_uploaded_bytes\":{},\"object_writeback_queue_wait_ns\":{},\"object_writeback_queue_max_wait_ns\":{},\"object_writeback_upload_ns\":{},\"object_writeback_upload_max_ns\":{},\"object_writeback_collect_ns\":{},\"object_writeback_digest_ns\":{},\"object_writeback_store_put_ns\":{},\"object_writeback_cache_put_ns\":{},\"manifest_chunks\":{},\"manifest_blocks\":{},\"metadata_store\":{},\"metadata_service\":{},\"shard_owner\":{},\"object_gc\":{},\"history_gc\":{},\"metadata_backup\":{}}}\n",
+            "{{\"ready\":{},\"block_cache_enabled\":{},\"object_puts\":{},\"object_put_bytes\":{},\"object_gets\":{},\"object_get_bytes\":{},\"coalesced_gets\":{},\"coalesced_get_bytes\":{},\"cache_hits\":{},\"cache_hit_bytes\":{},\"prefetch_enqueued\":{},\"prefetch_dropped\":{},\"prefetch_completed\":{},\"prefetch_failed\":{},\"prefetch_object_gets\":{},\"prefetch_object_get_bytes\":{},\"prefetch_cache_hits\":{},\"prefetch_cache_hit_bytes\":{},\"read_plan_cache_hits\":{},\"read_plan_cache_misses\":{},\"object_writeback_enqueued\":{},\"object_writeback_inline\":{},\"object_writeback_completed\":{},\"object_writeback_failed\":{},\"object_writeback_staged_bytes\":{},\"object_writeback_uploaded_bytes\":{},\"object_writeback_queue_wait_ns\":{},\"object_writeback_queue_max_wait_ns\":{},\"object_writeback_upload_ns\":{},\"object_writeback_upload_max_ns\":{},\"object_writeback_collect_ns\":{},\"object_writeback_digest_ns\":{},\"object_writeback_store_put_ns\":{},\"object_writeback_cache_put_ns\":{},\"manifest_chunks\":{},\"manifest_blocks\":{},\"metadata_store\":{},\"metadata_service\":{},\"restore\":{},\"shard_owner\":{},\"object_gc\":{},\"history_gc\":{},\"metadata_backup\":{}}}\n",
             ready,
             service.block_cache_enabled(),
             objects.object_puts,
@@ -745,6 +801,7 @@ impl Server {
             objects.manifest_blocks,
             metadata_store_json(&metadata),
             metadata_service_json(&metadata_service),
+            restore_metrics_result_json(restore.as_ref()),
             self.shard_owner_json(),
             object_gc_json(&object_gc, failover_durability_required),
             history_gc_json(&history_gc),
@@ -760,6 +817,13 @@ impl Server {
             let service = slot.service();
             let object_outcome = service.cleanup_pending_objects(limit)?;
             let history_outcome = service.cleanup_history(limit)?;
+            object.restore_release_jobs_processed += object_outcome.restore_release_jobs_processed;
+            object.restore_release_backlog += object_outcome.restore_release_backlog;
+            object.restore_release_quarantine += object_outcome.restore_release_quarantine;
+            object.restore_release_mount_wide_quarantine +=
+                object_outcome.restore_release_mount_wide_quarantine;
+            object.restore_init_tombstones_scanned +=
+                object_outcome.restore_init_tombstones_scanned;
             object.scanned += object_outcome.scanned;
             object.blocked_by_snapshots += object_outcome.blocked_by_snapshots;
             object.blocked_by_read_leases += object_outcome.blocked_by_read_leases;
@@ -778,8 +842,13 @@ impl Server {
             history.retained_by_snapshots += history_outcome.retained_by_snapshots;
         }
         Ok(format!(
-            r#"{{"object_gc":{{"scanned":{},"blocked_by_snapshots":{},"blocked_by_read_leases":{},"blocked_by_failover_durability":{},"attempted":{},"deleted":{},"missing":{},"records_removed":{},"snapshot_reap":{{"scanned":{},"expired_candidates":{},"reaped":{},"conflicted":{}}}}},"history_gc":{{"scanned":{},"removed":{},"retained_by_snapshots":{}}}}}
+            r#"{{"object_gc":{{"restore_release_jobs_processed":{},"restore_release_backlog":{},"restore_release_quarantine":{},"restore_release_mount_wide_quarantine":{},"restore_init_tombstones_scanned":{},"scanned":{},"blocked_by_snapshots":{},"blocked_by_read_leases":{},"blocked_by_failover_durability":{},"attempted":{},"deleted":{},"missing":{},"records_removed":{},"snapshot_reap":{{"scanned":{},"expired_candidates":{},"reaped":{},"conflicted":{}}}}},"history_gc":{{"scanned":{},"removed":{},"retained_by_snapshots":{}}}}}
 "#,
+            object.restore_release_jobs_processed,
+            object.restore_release_backlog,
+            object.restore_release_quarantine,
+            object.restore_release_mount_wide_quarantine,
+            object.restore_init_tombstones_scanned,
             object.scanned,
             object.blocked_by_snapshots,
             object.blocked_by_read_leases,
@@ -842,13 +911,30 @@ impl Server {
     pub fn run_fsck(&self) -> Result<String, ServerError> {
         let mut inodes_scanned = 0_usize;
         let mut files_scanned = 0_usize;
+        let mut symlinks_scanned = 0_usize;
+        let mut snapshot_pins_scanned = 0_usize;
+        let mut fork_bindings_scanned = 0_usize;
+        let mut historical_bodies_scanned = 0_usize;
         let mut blocks_checked = 0_usize;
+        let mut consistent = true;
         let mut dangling_entries = Vec::new();
+        let mut size_mismatch_entries = Vec::new();
+        let mut restore_reports = Vec::new();
         for slot in self.shards.values() {
-            let report = slot.service().fsck_dangling_blocks(0)?;
-            inodes_scanned += report.inodes_scanned;
-            files_scanned += report.files_scanned;
-            blocks_checked += report.blocks_checked;
+            let report = slot
+                .service()
+                .fsck_object_references(nokv_meta::FsckMode::Full, 0)?;
+            inodes_scanned = inodes_scanned.saturating_add(report.inodes_scanned);
+            files_scanned = files_scanned.saturating_add(report.files_scanned);
+            symlinks_scanned = symlinks_scanned.saturating_add(report.symlinks_scanned);
+            snapshot_pins_scanned =
+                snapshot_pins_scanned.saturating_add(report.snapshot_pins_scanned);
+            fork_bindings_scanned =
+                fork_bindings_scanned.saturating_add(report.fork_bindings_scanned);
+            historical_bodies_scanned =
+                historical_bodies_scanned.saturating_add(report.historical_bodies_scanned);
+            blocks_checked = blocks_checked.saturating_add(report.blocks_checked);
+            consistent &= report.is_consistent();
             for entry in &report.dangling {
                 dangling_entries.push(format!(
                     "{{\"inode\":{},\"generation\":{},\"object_key\":\"{}\"}}",
@@ -857,13 +943,45 @@ impl Server {
                     escape_json_string(&entry.object_key)
                 ));
             }
+            for entry in &report.size_mismatches {
+                size_mismatch_entries.push(format!(
+                    "{{\"inode\":{},\"generation\":{},\"object_key\":\"{}\",\"expected_size\":{},\"actual_size\":{}}}",
+                    entry.inode,
+                    entry.generation,
+                    escape_json_string(&entry.object_key),
+                    entry.expected_size,
+                    entry.actual_size,
+                ));
+            }
+            let restore = slot.service().fsck_restore_state(true)?;
+            consistent &= restore.is_consistent();
+            restore_reports.push(format!(
+                "{{\"mount_id\":{},\"report\":{}}}",
+                slot.service().mount_id().get(),
+                restore_fsck_json(&restore),
+            ));
         }
         let dangling_count = dangling_entries.len();
         let dangling = dangling_entries.join(",");
+        let size_mismatch_count = size_mismatch_entries.len();
+        let size_mismatches = size_mismatch_entries.join(",");
+        let restore_reports = restore_reports.join(",");
         Ok(format!(
-            r#"{{"inodes_scanned":{},"files_scanned":{},"blocks_checked":{},"dangling_count":{},"dangling":[{}]}}
+            r#"{{"consistent":{},"inodes_scanned":{},"files_scanned":{},"symlinks_scanned":{},"snapshot_pins_scanned":{},"fork_bindings_scanned":{},"historical_bodies_scanned":{},"blocks_checked":{},"dangling_count":{},"dangling":[{}],"size_mismatch_count":{},"size_mismatches":[{}],"restore_shards":[{}]}}
 "#,
-            inodes_scanned, files_scanned, blocks_checked, dangling_count, dangling,
+            consistent,
+            inodes_scanned,
+            files_scanned,
+            symlinks_scanned,
+            snapshot_pins_scanned,
+            fork_bindings_scanned,
+            historical_bodies_scanned,
+            blocks_checked,
+            dangling_count,
+            dangling,
+            size_mismatch_count,
+            size_mismatches,
+            restore_reports,
         ))
     }
 
@@ -932,6 +1050,118 @@ fn metadata_log_ref(snapshot: &nokv_meta::MetadataLogSyncSnapshot) -> Option<Log
         durable_lsn: snapshot.durable_lsn,
         digest: hex_digest(&snapshot.last_digest),
     })
+}
+
+/// Install the control-owned shard's synchronous post-commit publication
+/// callback. The weak service reference avoids a service -> callback -> service
+/// ownership cycle; loss of the service is a hard publication failure rather
+/// than permission to acknowledge a locally applied command.
+fn install_owner_sync_log_publication_hook<M, O>(
+    service: &Arc<NoKvFs<M, O>>,
+    owner: &ServerShardOwner,
+) -> Result<(), ServerError>
+where
+    M: nokv_meta::MetadataStore + Send + Sync + 'static,
+    O: nokv_object::ObjectStore + Send + Sync + 'static,
+{
+    let weak_service = Arc::downgrade(service);
+    let owner = owner.clone();
+    service.install_sync_metadata_log_publication_hook(move |snapshot| {
+        let service = weak_service
+            .upgrade()
+            .ok_or_else(|| "metadata service was dropped before log publication".to_owned())?;
+        publish_archived_metadata_log_snapshot(service.as_ref(), &owner, snapshot)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })?;
+    Ok(())
+}
+
+/// Publish one already-archived tail without re-entering the outer namespace
+/// visibility gate or the metadata commit/log gate. `ServerShardOwner` still
+/// serializes the CAS with renewal and performs the final lease/epoch fence.
+fn publish_archived_metadata_log_snapshot<M, O>(
+    service: &NoKvFs<M, O>,
+    owner: &ServerShardOwner,
+    snapshot: &nokv_meta::MetadataLogSyncSnapshot,
+) -> Result<ServerShardOwnerState, ServerError>
+where
+    M: nokv_meta::MetadataStore,
+    O: nokv_object::ObjectStore,
+{
+    let expected_log = metadata_log_ref(snapshot);
+    owner.mark_recovery_dirty();
+    let state = owner.mark_serving_with_recovery_refs_locked(
+        service,
+        None,
+        expected_log.clone(),
+        snapshot.durable_lsn,
+    )?;
+    if state.durable_lsn != snapshot.durable_lsn || state.log != expected_log {
+        return Err(ServerError::Metadata(MetadError::Codec(
+            "post-commit control publication changed the exact metadata log tail".to_owned(),
+        )));
+    }
+    owner.mark_recovery_clean();
+    Ok(state)
+}
+
+fn preserve_mutation_error_over_publication(error: &ServerError) -> bool {
+    match error {
+        ServerError::NotOwner { .. } => true,
+        ServerError::Control(
+            ControlError::NotOwner { .. }
+            | ControlError::StaleEpoch { .. }
+            | ControlError::StaleLease { .. },
+        ) => true,
+        ServerError::Metadata(error) => preserve_metad_error_over_publication(error),
+        ServerError::Io(_) | ServerError::Control(_) | ServerError::Object(_) => false,
+    }
+}
+
+fn metadata_publication_advanced(
+    before: Option<&MetadataLogPublicationState>,
+    after: Option<&MetadataLogPublicationState>,
+) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            after.snapshot.durable_lsn > before.snapshot.durable_lsn
+                || (!before.has_pending_segment && after.has_pending_segment)
+                || (!before.has_unresolved_commit_group && after.has_unresolved_commit_group)
+        }
+        (None, Some(after)) => {
+            after.snapshot.durable_lsn > 0
+                || after.has_pending_segment
+                || after.has_unresolved_commit_group
+        }
+        (Some(_), None) | (None, None) => false,
+    }
+}
+
+fn preserve_metad_error_over_publication(error: &MetadError) -> bool {
+    match error {
+        MetadError::PublishArtifactFailed { source, .. } => {
+            preserve_metad_error_over_publication(source)
+        }
+        MetadError::SyncLogArchiveFailed { .. }
+        | MetadError::MetadataCheckpointInstallUncertain
+        | MetadError::StaleOwnerEpoch { .. }
+        | MetadError::LeaseExpired { .. }
+        | MetadError::NotOwner { .. } => true,
+        _ => false,
+    }
+}
+
+fn mutation_publication_error(error: ServerError, committed: bool) -> ServerError {
+    match error {
+        ServerError::Control(ControlError::Backend(message)) => {
+            ServerError::Metadata(MetadError::SyncLogArchiveFailed {
+                committed,
+                message: format!("metadata control publication failed: {message}"),
+            })
+        }
+        error => error,
+    }
 }
 
 fn metadata_log_publication_matches_control(
@@ -1008,7 +1238,6 @@ where
 
 fn prune_control_covered_log_segments<M, O>(
     service: &NoKvFs<M, O>,
-    publication: &MetadataLogPublicationState,
     control: &ServerShardOwnerState,
 ) -> Result<(), ServerError>
 where
@@ -1018,22 +1247,12 @@ where
     let Some(checkpoint) = control.checkpoint.as_ref() else {
         return Ok(());
     };
-    let Some(last_covered) = publication
-        .snapshot
-        .segments
-        .iter()
-        .take_while(|segment| segment.last_lsn <= checkpoint.lsn)
-        .last()
-    else {
-        return Ok(());
-    };
     let expected_digest = parse_hex_digest(&checkpoint.digest)?;
-    if last_covered.last_lsn != checkpoint.lsn || last_covered.last_digest != expected_digest {
-        return Err(ServerError::Metadata(MetadError::Codec(format!(
-            "authoritative checkpoint tail {}:{} does not match the local covered log boundary",
-            checkpoint.lsn, checkpoint.digest
-        ))));
-    }
+    // The control checkpoint may have won its publication CAS while the local
+    // acknowledgement was lost. Advance the meta-side baseline first; only
+    // then can deleting the now-covered active segment objects preserve exact
+    // prepared-terminal retry durability.
+    service.acknowledge_published_metadata_checkpoint(checkpoint.lsn, expected_digest)?;
     let outcome = service.prune_sync_metadata_log_segments(checkpoint.lsn);
     if outcome.delete_failures > 0 {
         eprintln!(
@@ -1053,14 +1272,7 @@ where
     M: nokv_meta::MetadataStore,
     O: nokv_object::ObjectStore,
 {
-    let publication = service
-        .sync_metadata_log_publication_state()
-        .ok_or_else(|| {
-            ServerError::Metadata(MetadError::Codec(
-                "synchronous metadata log disappeared during publication".to_owned(),
-            ))
-        })?;
-    prune_control_covered_log_segments(service, &publication, &control)?;
+    prune_control_covered_log_segments(service, &control)?;
     let final_publication = service
         .sync_metadata_log_publication_state()
         .expect("enabled metadata log remains enabled under publication gate");
@@ -1223,6 +1435,7 @@ where
         None,
         outcome.log_lsn,
     )?;
+    service.acknowledge_published_metadata_checkpoint(outcome.log_lsn, outcome.log_digest)?;
     let log_prune = service.prune_sync_metadata_log_segments(outcome.log_lsn);
     outcome.log_segments_pruned = log_prune.pointers_pruned;
     outcome.log_segment_objects_deleted = log_prune.objects_deleted;
@@ -1431,16 +1644,29 @@ fn open_shard_slot(
         let last_digest = control_recovery_digest(&state)?;
         let inherited_segments = inherited_log_segments(&state)?;
         // Isolate each shard's shared-log archive under its own prefix.
-        service.enable_sync_metadata_log(
-            MetadataLogSyncConfig::new(
-                shared_log_archive.prefix.clone(),
-                state.shard_id.as_str(),
-                state.epoch,
-                state.durable_lsn,
-                last_digest,
-            )
-            .with_segments(inherited_segments),
-        )?;
+        let mut log_config = MetadataLogSyncConfig::new(
+            shared_log_archive.prefix.clone(),
+            state.shard_id.as_str(),
+            state.epoch,
+            state.durable_lsn,
+            last_digest,
+        )
+        .with_segments(inherited_segments);
+        if restored_from_control {
+            let checkpoint = state.checkpoint.as_ref().ok_or_else(|| {
+                ServerError::Metadata(MetadError::Codec(
+                    "restored control state lost its checkpoint baseline".to_owned(),
+                ))
+            })?;
+            log_config = log_config
+                .with_durable_recovery_baseline(
+                    checkpoint.lsn,
+                    parse_hex_digest(&checkpoint.digest)?,
+                )
+                .with_authoritative_recovery_baseline();
+        }
+        service.enable_sync_metadata_log(log_config)?;
+        install_owner_sync_log_publication_hook(&service, &owner)?;
         // A fresh archive supersedes any historical CURRENT that could retain
         // object references from before the deletion fence. The immutable image
         // is prepared first; only the owner-lease CAS makes it authoritative.
@@ -1792,7 +2018,7 @@ fn metadata_store_json(stats: &nokv_meta::MetadataStoreStats) -> String {
 
 fn metadata_service_json(stats: &nokv_meta::MetadataServiceStats) -> String {
     format!(
-        "{{\"path_index_lookup_total\":{},\"path_index_hit_total\":{},\"path_index_miss_total\":{},\"path_index_stale_total\":{},\"path_index_scan_stale_total\":{},\"path_index_fallback_total\":{},\"create_files_batch_total\":{},\"create_files_entry_total\":{},\"create_dirs_batch_total\":{},\"create_dirs_entry_total\":{},\"read_dir_plus_total\":{},\"read_dir_plus_entry_total\":{},\"read_dir_plus_projection_hit_total\":{},\"metadata_log_segments_archived_total\":{},\"metadata_log_entries_archived_total\":{},\"metadata_log_archive_bytes_total\":{}}}",
+        "{{\"path_index_lookup_total\":{},\"path_index_hit_total\":{},\"path_index_miss_total\":{},\"path_index_stale_total\":{},\"path_index_scan_stale_total\":{},\"path_index_fallback_total\":{},\"create_files_batch_total\":{},\"create_files_entry_total\":{},\"create_dirs_batch_total\":{},\"create_dirs_entry_total\":{},\"read_dir_plus_total\":{},\"read_dir_plus_entry_total\":{},\"read_dir_plus_projection_hit_total\":{},\"metadata_log_segments_archived_total\":{},\"metadata_log_entries_archived_total\":{},\"metadata_log_archive_bytes_total\":{},\"restore_to_fork_requests_total\":{},\"restore_to_fork_success_total\":{},\"restore_to_fork_failure_total\":{},\"restore_to_fork_elapsed_ns_total\":{},\"restore_to_fork_elapsed_ns_max\":{}}}",
         stats.path_index_lookup_total,
         stats.path_index_hit_total,
         stats.path_index_miss_total,
@@ -1809,6 +2035,11 @@ fn metadata_service_json(stats: &nokv_meta::MetadataServiceStats) -> String {
         stats.metadata_log_segments_archived_total,
         stats.metadata_log_entries_archived_total,
         stats.metadata_log_archive_bytes_total,
+        stats.restore_to_fork_requests_total,
+        stats.restore_to_fork_success_total,
+        stats.restore_to_fork_failure_total,
+        stats.restore_to_fork_elapsed_ns_total,
+        stats.restore_to_fork_elapsed_ns_max,
     )
 }
 
@@ -1898,12 +2129,119 @@ fn validate_control_log_segment_identity(
     Ok(())
 }
 
+fn restore_metrics_result_json(result: Result<&nokv_meta::RestoreMetrics, &MetadError>) -> String {
+    match result {
+        Ok(metrics) => format!(
+            "{{\"available\":true,{}}}",
+            restore_metrics_fields_json(metrics)
+        ),
+        Err(error) => format!(
+            "{{\"available\":false,\"error\":\"{}\"}}",
+            escape_json_string(&error.to_string())
+        ),
+    }
+}
+
+fn restore_metrics_fields_json(metrics: &nokv_meta::RestoreMetrics) -> String {
+    let control_rows = metrics
+        .control_rows
+        .iter()
+        .map(|(name, count)| format!("\"{}\":{}", escape_json_string(name), count))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "\"read_version\":{},\"active_marker\":{},\"allocator_v2_fenced\":{},\"operations\":{{\"preparing\":{},\"ready_to_attach\":{},\"complete\":{},\"cleaning\":{},\"discarding\":{},\"releasing\":{}}},\"max_preparing_version_age\":{},\"max_releasing_version_age\":{},\"staging_rows\":{},\"exact_reference_rows\":{},\"index_rows\":{},\"cleanup_backlog\":{},\"release_backlog\":{},\"quarantine_rows\":{},\"control_rows\":{{{}}}",
+        metrics.read_version,
+        metrics.active_marker,
+        metrics.allocator_v2_fenced,
+        metrics.preparing,
+        metrics.ready_to_attach,
+        metrics.complete,
+        metrics.cleaning,
+        metrics.discarding,
+        metrics.releasing,
+        metrics.max_preparing_version_age,
+        metrics.max_releasing_version_age,
+        metrics.staging_rows,
+        metrics.exact_reference_rows,
+        metrics.index_rows,
+        metrics.cleanup_backlog,
+        metrics.release_backlog,
+        metrics.quarantine_rows,
+        control_rows,
+    )
+}
+
+fn restore_fsck_json(report: &nokv_meta::RestoreFsckReport) -> String {
+    let issues = report
+        .issues
+        .iter()
+        .map(|issue| {
+            format!(
+                "{{\"code\":\"{}\",\"message\":\"{}\",\"operation_id\":{},\"ref_set_id\":{}}}",
+                escape_json_string(&issue.code),
+                escape_json_string(&issue.message),
+                issue.operation_id.as_ref().map_or_else(
+                    || "null".to_owned(),
+                    |operation_id| format!("\"{}\"", escape_json_string(operation_id)),
+                ),
+                issue
+                    .ref_set_id
+                    .map_or_else(|| "null".to_owned(), |ref_set_id| ref_set_id.to_string()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let dangling = report
+        .dangling_borrowed_objects
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{\"inode\":{},\"generation\":{},\"object_key\":\"{}\"}}",
+                entry.inode,
+                entry.generation,
+                escape_json_string(&entry.object_key),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mismatches = report
+        .borrowed_object_size_mismatches
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{\"inode\":{},\"generation\":{},\"object_key\":\"{}\",\"expected_size\":{},\"actual_size\":{}}}",
+                entry.inode,
+                entry.generation,
+                escape_json_string(&entry.object_key),
+                entry.expected_size,
+                entry.actual_size,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"consistent\":{},\"metrics\":{{{}}},\"borrowed_objects_checked\":{},\"dangling_borrowed_objects\":[{}],\"borrowed_object_size_mismatches\":[{}],\"issues\":[{}]}}",
+        report.is_consistent(),
+        restore_metrics_fields_json(&report.metrics),
+        report.borrowed_objects_checked,
+        dangling,
+        mismatches,
+        issues,
+    )
+}
+
 fn object_gc_json(state: &ObjectGcWorkerState, failover_durability_required: bool) -> String {
     let outcome = state.last_outcome.map_or_else(
         || "null".to_owned(),
         |outcome| {
             format!(
-                "{{\"scanned\":{},\"blocked_by_snapshots\":{},\"blocked_by_read_leases\":{},\"blocked_by_failover_durability\":{},\"attempted\":{},\"deleted\":{},\"missing\":{},\"records_removed\":{},\"snapshot_reap\":{{\"scanned\":{},\"expired_candidates\":{},\"reaped\":{},\"conflicted\":{}}}}}",
+                "{{\"restore_release_jobs_processed\":{},\"restore_release_backlog\":{},\"restore_release_quarantine\":{},\"restore_release_mount_wide_quarantine\":{},\"restore_init_tombstones_scanned\":{},\"scanned\":{},\"blocked_by_snapshots\":{},\"blocked_by_read_leases\":{},\"blocked_by_failover_durability\":{},\"attempted\":{},\"deleted\":{},\"missing\":{},\"records_removed\":{},\"snapshot_reap\":{{\"scanned\":{},\"expired_candidates\":{},\"reaped\":{},\"conflicted\":{}}}}}",
+                outcome.restore_release_jobs_processed,
+                outcome.restore_release_backlog,
+                outcome.restore_release_quarantine,
+                outcome.restore_release_mount_wide_quarantine,
+                outcome.restore_init_tombstones_scanned,
                 outcome.scanned,
                 outcome.blocked_by_snapshots,
                 outcome.blocked_by_read_leases,
@@ -2138,8 +2476,8 @@ pub(crate) mod tests {
     };
     use nokv_meta::{
         CommandKind, CommitResult, HistoryGcOptions, MetadataCommand, MetadataLogEntry,
-        MetadataStore, Mutation, MutationOp, ObjectGcOptions, Predicate, PredicateRef, ReadPurpose,
-        ScanRequest, Value, Version,
+        MetadataStore, Mutation, MutationOp, ObjectGcOptions, Predicate, PredicateRef,
+        PublishArtifactRange, PublishArtifactSession, ReadPurpose, ScanRequest, Value, Version,
     };
     use nokv_object::{
         MemoryObjectStore, ObjectKey, ObjectStore, ObjectStoreConfig, S3ObjectStoreOptions,
@@ -2218,6 +2556,7 @@ pub(crate) mod tests {
     pub(crate) struct FailingCheckpointPublishControl {
         inner: InMemoryControlStore,
         fail_marks: AtomicUsize,
+        lose_mark_acks: AtomicUsize,
         fail_renews: AtomicUsize,
         mark_calls: AtomicUsize,
         fail_on_call: AtomicUsize,
@@ -2228,6 +2567,7 @@ pub(crate) mod tests {
             Self {
                 inner: InMemoryControlStore::new(),
                 fail_marks: AtomicUsize::new(0),
+                lose_mark_acks: AtomicUsize::new(0),
                 fail_renews: AtomicUsize::new(0),
                 mark_calls: AtomicUsize::new(0),
                 fail_on_call: AtomicUsize::new(0),
@@ -2236,6 +2576,10 @@ pub(crate) mod tests {
 
         pub(crate) fn fail_next_marks(&self, count: usize) {
             self.fail_marks.store(count, AtomicOrdering::SeqCst);
+        }
+
+        fn lose_next_mark_acks(&self, count: usize) {
+            self.lose_mark_acks.store(count, AtomicOrdering::SeqCst);
         }
 
         pub(crate) fn fail_next_renews(&self, count: usize) {
@@ -2338,6 +2682,21 @@ pub(crate) mod tests {
             {
                 return Err(ControlError::Backend(
                     "injected checkpoint publish failure".to_owned(),
+                ));
+            }
+            if self
+                .lose_mark_acks
+                .fetch_update(
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                self.inner
+                    .mark_serving(lease, checkpoint, log, durable_lsn)?;
+                return Err(ControlError::Backend(
+                    "injected mark-serving acknowledgement loss".to_owned(),
                 ));
             }
             self.inner.mark_serving(lease, checkpoint, log, durable_lsn)
@@ -2898,6 +3257,237 @@ pub(crate) mod tests {
                 .unwrap()
                 .checkpoint,
             prior.checkpoint
+        );
+        owner.release().unwrap();
+    }
+
+    #[test]
+    fn immediate_log_publication_blocks_command_return_until_control_cas() {
+        let objects = BlockingPutStore::new();
+        let control = Arc::new(BlockingServingControl::new());
+        let (service, owner, _archive, _initial) = controlled_sync_log_backup_fixture(
+            Arc::clone(&control) as Arc<dyn ControlStore>,
+            objects,
+            "metadata/immediate-log-publication",
+        );
+        install_owner_sync_log_publication_hook(&service, &owner).unwrap();
+        let before = control
+            .get_shard(&ShardId::new("mount-1:/"))
+            .unwrap()
+            .durable_lsn;
+
+        control.arm_mark();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker_service = Arc::clone(&service);
+        let worker = thread::spawn(move || {
+            let result = worker_service.with_immediate_sync_metadata_log_publication(|| {
+                worker_service.create_dir_path("/in-flight", 0o755, 1000, 1000)
+            });
+            sent.send(result).unwrap();
+        });
+        control.wait_until_mark_reached();
+
+        let local = service.sync_metadata_log_snapshot().unwrap();
+        assert!(local.durable_lsn > before);
+        assert_eq!(
+            control
+                .get_shard(&ShardId::new("mount-1:/"))
+                .unwrap()
+                .durable_lsn,
+            before,
+            "the blocked control CAS has not made the archived tail recoverable yet"
+        );
+        assert!(
+            received.recv_timeout(Duration::from_millis(100)).is_err(),
+            "an applied metadata command returned before its control LogRef CAS"
+        );
+
+        control.release_mark();
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("metadata command should return after publication")
+            .unwrap();
+        worker.join().unwrap();
+        let durable = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+        assert_eq!(durable.durable_lsn, local.durable_lsn);
+        assert_eq!(durable.log.unwrap().durable_lsn, local.durable_lsn);
+        owner.release().unwrap();
+    }
+
+    #[test]
+    fn immediate_log_publication_failure_reports_committed_and_repairs_exact_tail() {
+        let objects = BlockingPutStore::new();
+        let control = Arc::new(FailingCheckpointPublishControl::new());
+        let (service, owner, _archive, _initial) = controlled_sync_log_backup_fixture(
+            Arc::clone(&control) as Arc<dyn ControlStore>,
+            objects,
+            "metadata/immediate-log-publication-failure",
+        );
+        install_owner_sync_log_publication_hook(&service, &owner).unwrap();
+        let before = control
+            .get_shard(&ShardId::new("mount-1:/"))
+            .unwrap()
+            .durable_lsn;
+
+        control.fail_next_marks(1);
+        let error = service
+            .with_immediate_sync_metadata_log_publication(|| {
+                service.create_dir_path("/committed-before-control", 0o755, 1000, 1000)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MetadError::SyncLogArchiveFailed {
+                committed: true,
+                message,
+            } if message.contains("injected checkpoint publish failure")
+        ));
+        assert!(service
+            .lookup_path("/committed-before-control")
+            .unwrap()
+            .is_some());
+        let local = service.sync_metadata_log_snapshot().unwrap();
+        assert!(local.durable_lsn > before);
+        assert_eq!(
+            control
+                .get_shard(&ShardId::new("mount-1:/"))
+                .unwrap()
+                .durable_lsn,
+            before
+        );
+
+        let repaired = Server::publish_owner_latest_log_ref(service.as_ref(), &owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.durable_lsn, local.durable_lsn);
+        assert_eq!(repaired.log, metadata_log_ref(&local));
+        owner.release().unwrap();
+    }
+
+    #[test]
+    fn immediate_log_publication_accepts_exact_lost_ack_readback() {
+        let objects = BlockingPutStore::new();
+        let control = Arc::new(FailingCheckpointPublishControl::new());
+        let (service, owner, _archive, _initial) = controlled_sync_log_backup_fixture(
+            Arc::clone(&control) as Arc<dyn ControlStore>,
+            objects,
+            "metadata/immediate-log-publication-lost-ack",
+        );
+        install_owner_sync_log_publication_hook(&service, &owner).unwrap();
+
+        control.lose_next_mark_acks(1);
+        service
+            .with_immediate_sync_metadata_log_publication(|| {
+                service.create_dir_path("/lost-ack", 0o755, 1000, 1000)
+            })
+            .unwrap();
+        let local = service.sync_metadata_log_snapshot().unwrap();
+        let durable = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+        assert_eq!(durable.durable_lsn, local.durable_lsn);
+        assert_eq!(durable.log, metadata_log_ref(&local));
+        assert!(!owner.recovery_is_dirty());
+        owner.release().unwrap();
+    }
+
+    #[test]
+    fn mutation_publication_error_preserves_committed_and_owner_retry_identity() {
+        let committed = ServerError::Metadata(MetadError::SyncLogArchiveFailed {
+            committed: true,
+            message: "inner publication failed".to_owned(),
+        });
+        assert!(preserve_mutation_error_over_publication(&committed));
+
+        let stale_owner = ServerError::Control(ControlError::StaleEpoch {
+            shard_id: ShardId::new("mount-1:/"),
+            expected: 1,
+            actual: 2,
+        });
+        assert!(preserve_mutation_error_over_publication(&stale_owner));
+
+        let mapped = mutation_publication_error(
+            ServerError::Control(ControlError::Backend("etcd unavailable".to_owned())),
+            true,
+        );
+        assert!(matches!(
+            mapped,
+            ServerError::Metadata(MetadError::SyncLogArchiveFailed {
+                committed: true,
+                message,
+            }) if message.contains("etcd unavailable")
+        ));
+    }
+
+    #[test]
+    fn checkpoint_publication_repair_acks_prepared_baseline_before_pruning_log() {
+        let objects = BlockingPutStore::new();
+        let control = Arc::new(InMemoryControlStore::new());
+        let (service, owner, archive, _initial) = controlled_sync_log_backup_fixture(
+            Arc::clone(&control) as Arc<dyn ControlStore>,
+            objects.clone(),
+            "metadata/prepared-checkpoint-ack-repair",
+        );
+        let prepared = service
+            .prepare_artifact_create_path("/prepared.bin")
+            .unwrap();
+        let bytes = b"prepared checkpoint repair";
+        let session = PublishArtifactSession {
+            parent: prepared.parent,
+            name: prepared.name.clone(),
+            producer: "unit-test".to_owned(),
+            digest_uri: "sha256:prepared-checkpoint-repair".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            manifest_id: "prepared-checkpoint-repair".to_owned(),
+            size: bytes.len() as u64,
+            ranges: vec![PublishArtifactRange {
+                offset: 0,
+                bytes: bytes.to_vec(),
+            }],
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+        };
+        let first = service
+            .publish_prepared_artifact_session(prepared.clone(), session.clone())
+            .unwrap();
+        let before_checkpoint = service.sync_metadata_log_snapshot().unwrap();
+        assert_eq!(before_checkpoint.segments.len(), 1);
+        let prepared_log_key =
+            ObjectKey::new(before_checkpoint.segments[0].segment_key.clone()).unwrap();
+
+        // Simulate cancellation immediately after the control checkpoint CAS:
+        // the checkpoint is authoritative, but the caller never executes the
+        // local baseline acknowledgement or segment pruning.
+        let checkpoint = service.prepare_immutable_metadata_backup(&archive).unwrap();
+        owner
+            .mark_serving_with_recovery_refs(
+                service.as_ref(),
+                Some(checkpoint_ref_for_backup(&checkpoint)),
+                None,
+                checkpoint.log_lsn,
+            )
+            .unwrap();
+        assert_eq!(
+            service.sync_metadata_log_snapshot().unwrap().segments.len(),
+            1
+        );
+        assert!(objects.head(&prepared_log_key).unwrap().is_some());
+
+        let repaired = Server::publish_owner_latest_log_ref(service.as_ref(), &owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.checkpoint.unwrap().lsn, checkpoint.log_lsn);
+        assert!(service
+            .sync_metadata_log_snapshot()
+            .unwrap()
+            .segments
+            .is_empty());
+        assert!(objects.head(&prepared_log_key).unwrap().is_none());
+        assert_eq!(
+            service
+                .publish_prepared_artifact_session(prepared, session)
+                .unwrap()
+                .entry,
+            first.entry
         );
         owner.release().unwrap();
     }
@@ -3646,6 +4236,33 @@ pub(crate) mod tests {
         let body = server.run_manual_gc(128).unwrap();
         assert!(body.contains("\"object_gc\""));
         assert!(body.contains("\"history_gc\""));
+    }
+
+    #[test]
+    fn stats_cache_shares_one_exact_restore_metrics_scan() {
+        let server = test_server();
+        let before = server.service().metadata_store_stats().scan_total;
+        assert!(server
+            .stats_json()
+            .contains("\"restore\":{\"available\":true"));
+        let after_first = server.service().metadata_store_stats().scan_total;
+        assert!(after_first > before);
+
+        assert!(server
+            .stats_json()
+            .contains("\"restore\":{\"available\":true"));
+        let after_second = server.service().metadata_store_stats().scan_total;
+        assert_eq!(after_second, after_first);
+    }
+
+    #[test]
+    fn manual_fsck_reports_object_and_restore_consistency() {
+        let server = test_server();
+        let report = server.run_fsck().unwrap();
+        assert!(report.contains("\"consistent\":true"));
+        assert!(report.contains("\"snapshot_pins_scanned\":0"));
+        assert!(report.contains("\"restore_shards\":[{"));
+        assert!(report.contains("\"borrowed_objects_checked\":0"));
     }
 
     #[test]

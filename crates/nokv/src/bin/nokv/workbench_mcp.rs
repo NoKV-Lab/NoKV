@@ -5,10 +5,13 @@ use base64::Engine;
 use nokv_agent::AgentToolDefinition;
 use nokv_client::{
     decode_name_cursor, encode_name_cursor, is_artifact_write_conflict, is_metadata_not_found,
-    ArtifactMetadata, ClientError, NoKvFsClient,
+    ArtifactMetadata, ClientError, NoKvFsClient, RestoreState,
 };
-use nokv_meta::MetadError;
+use nokv_meta::{
+    restore_operation_id, MetadError, RestoreInitialization, RestoreInitializationFile,
+};
 use nokv_object::ObjectStore;
+use nokv_protocol::RESTORE_TO_FORK_V1_CAPABILITY;
 use nokv_types::{FileType, PathMetadata};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -118,6 +121,7 @@ impl WorkbenchToolError {
 
     pub fn as_value(&self) -> Value {
         json!({
+            "status": "error",
             "code": self.code,
             "message": self.message,
             "retryable": self.retryable,
@@ -142,8 +146,11 @@ pub fn normalize_workbench_root(raw: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-pub fn tool_definitions() -> Vec<AgentToolDefinition> {
-    vec![
+/// Build the workbench surface after capability probing. Restore is omitted,
+/// rather than advertised optimistically, unless the caller confirms the
+/// durable v1 contract for every metadata owner that can own a target.
+pub fn tool_definitions_for_capabilities(restore_to_fork_v1: bool) -> Vec<AgentToolDefinition> {
+    let mut tools = vec![
         AgentToolDefinition {
             name: "workbench_create",
             description:
@@ -440,7 +447,25 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
                 "additionalProperties": false
             }),
         },
-    ]
+    ];
+    if restore_to_fork_v1 {
+        tools.push(AgentToolDefinition {
+            name: "workbench_restore",
+            description:
+                "Restore a live checkpoint into a new workbench using a durable COW fork. The source remains unchanged, the destination must be absent, and exact retries are idempotent.",
+            parameters: json!({
+                "type": "object",
+                "required": ["id", "at_snapshot", "destination_id"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "at_snapshot": restore_at_snapshot_parameter_schema(),
+                    "destination_id": {"type": "string", "minLength": 1}
+                },
+                "additionalProperties": false
+            }),
+        });
+    }
+    tools
 }
 
 /// Shared schema for the `at_snapshot` argument: either a numeric snapshot id or
@@ -454,6 +479,15 @@ fn at_snapshot_parameter_schema() -> Value {
             {"type": "null"}
         ],
         "description": "Read at a checkpoint: a snapshot id (integer) or a checkpoint name (string) from workbench_snapshot."
+    })
+}
+
+fn restore_at_snapshot_parameter_schema() -> Value {
+    json!({
+        "anyOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "string", "minLength": 1}
+        ]
     })
 }
 
@@ -531,6 +565,7 @@ where
         "workbench_snapshot" => snapshot_workbench(client, options, args),
         "workbench_snapshot_renew" => renew_snapshot_workbench(client, options, args),
         "workbench_snapshot_list" => list_snapshots_workbench(client, options, args),
+        "workbench_restore" => restore_workbench(client, options, args),
         other => Err(WorkbenchToolError::new(format!(
             "unknown workbench tool {other}"
         ))),
@@ -1558,6 +1593,128 @@ where
         "workbench_id": id,
         "checkpoint_count": checkpoints.len(),
         "checkpoints": checkpoints,
+    }))
+}
+
+fn restore_workbench<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    validate_exact_arguments(args, &["id", "at_snapshot", "destination_id"])?;
+    let id = required_workbench_id(args)?;
+    let destination_id = required_string(args, "destination_id")?.to_owned();
+    validate_workbench_id(&destination_id)?;
+    if destination_id == id {
+        return Err(WorkbenchToolError::new(
+            "destination_id must differ from the source workbench id",
+        ));
+    }
+    let at_snapshot = args
+        .get("at_snapshot")
+        .ok_or_else(|| WorkbenchToolError::new("missing required argument at_snapshot"))?;
+    let snapshot_id = resolve_at_snapshot(client, options, &id, at_snapshot)?;
+
+    let source_path = workbench_path(options, &id);
+    let destination_path = workbench_path(options, &destination_id);
+    let manifest_path = section_path(
+        options,
+        &destination_id,
+        "metadata",
+        Some("restore_manifest.json"),
+    );
+    // The destination owner is the authority that must understand and retain
+    // the private restore state. Probing only the source can advertise a tool
+    // across a rolling-upgrade shard boundary that the attach owner cannot
+    // safely execute.
+    let capabilities = match client.metadata().metadata_capabilities(&destination_path) {
+        Ok(capabilities) => capabilities,
+        Err(ClientError::Protocol(_)) => {
+            return Err(restore_capability_mismatch(&destination_path));
+        }
+        Err(err) => return Err(client_error(err)),
+    };
+    if !capabilities.restore_to_fork_v1 {
+        return Err(restore_capability_mismatch(&destination_path));
+    }
+    let expected_operation_id = restore_operation_id(
+        capabilities.mount_id,
+        &source_path,
+        snapshot_id,
+        &destination_path,
+    )
+    .map_err(|err| WorkbenchToolError::new(err.to_string()))?;
+    let manifest = json!({
+        "schema": "nokv.workbench.restore_manifest.v1",
+        "operation_id": expected_operation_id,
+        "restored_from": {
+            "workbench_id": id,
+            "path": source_path,
+            "snapshot_id": snapshot_id,
+        },
+        "source_workbench_id": id,
+        "source_path": source_path,
+        "destination_workbench_id": destination_id,
+        "destination_path": destination_path,
+        "snapshot_id": snapshot_id,
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|err| {
+        WorkbenchToolError::new(format!("failed to encode restore manifest: {err}"))
+    })?;
+    let outcome = client
+        .metadata()
+        .restore_subtree_path_to_fork_initialized(
+            &source_path,
+            snapshot_id,
+            &destination_path,
+            RestoreInitialization {
+                remove_relative_paths: vec![format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}")],
+                files: vec![RestoreInitializationFile {
+                    relative_path: "metadata/restore_manifest.json".to_owned(),
+                    bytes: manifest_bytes,
+                    content_type: "application/json".to_owned(),
+                    mode: DEFAULT_MODE_FILE,
+                    uid: options.uid,
+                    gid: options.gid,
+                }],
+            },
+        )
+        .map_err(|err| restore_client_error(snapshot_id, &destination_path, err))?;
+
+    if outcome.state != RestoreState::Complete
+        || outcome.operation_id != expected_operation_id
+        || outcome.snapshot_id != snapshot_id
+        || outcome.cleanup_pending
+    {
+        return Err(WorkbenchToolError::typed(
+            "RestoreProtocolMismatch",
+            "metadata owner returned a restore outcome that does not match the durable request",
+            true,
+            json!({
+                "expected_operation_id": expected_operation_id,
+                "actual_operation_id": outcome.operation_id,
+                "expected_snapshot_id": snapshot_id,
+                "actual_snapshot_id": outcome.snapshot_id,
+                "cleanup_pending": outcome.cleanup_pending,
+            }),
+        ));
+    }
+
+    Ok(json!({
+        "status": "success",
+        "state": "complete",
+        "operation_id": outcome.operation_id,
+        "source_workbench_id": id,
+        "destination_workbench_id": destination_id,
+        "snapshot_id": outcome.snapshot_id,
+        "read_version": outcome.read_version,
+        "source_root": outcome.source_root.get(),
+        "destination_root": outcome.destination_root.get(),
+        "cleanup_pending": false,
+        "restore_manifest": manifest_path,
     }))
 }
 
@@ -2759,6 +2916,29 @@ fn required_string<'a>(args: &'a Value, name: &'static str) -> Result<&'a str, W
         .ok_or_else(|| WorkbenchToolError::new(format!("missing required string argument {name}")))
 }
 
+fn validate_exact_arguments(args: &Value, required: &[&str]) -> Result<(), WorkbenchToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| WorkbenchToolError::new("tool arguments must be a JSON object"))?;
+    for field in required {
+        if !object.contains_key(*field) {
+            return Err(WorkbenchToolError::new(format!(
+                "missing required argument {field}"
+            )));
+        }
+    }
+    if let Some(field) = object
+        .keys()
+        .find(|field| !required.contains(&field.as_str()))
+    {
+        return Err(WorkbenchToolError::new(format!(
+            "unknown argument {field}; expected exactly {}",
+            required.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn optional_string<'a>(
     args: &'a Value,
     name: &'static str,
@@ -2805,6 +2985,35 @@ fn optional_usize(args: &Value, name: &'static str) -> Result<Option<usize>, Wor
 
 fn client_error(err: ClientError) -> WorkbenchToolError {
     match &err {
+        ClientError::Metadata(MetadError::NotOwner { shard_id, endpoint }) => {
+            WorkbenchToolError::typed(
+                "NotOwner",
+                err.to_string(),
+                true,
+                json!({"shard_id": shard_id, "endpoint": endpoint}),
+            )
+        }
+        ClientError::Metadata(MetadError::StaleOwnerEpoch {
+            owner_epoch,
+            required_epoch,
+        }) => WorkbenchToolError::typed(
+            "StaleOwnerEpoch",
+            err.to_string(),
+            true,
+            json!({"owner_epoch": owner_epoch, "required_epoch": required_epoch}),
+        ),
+        ClientError::Metadata(MetadError::InvalidOwnerEpoch) => {
+            WorkbenchToolError::typed("InvalidOwnerEpoch", err.to_string(), false, json!({}))
+        }
+        ClientError::Metadata(MetadError::LeaseExpired {
+            now_ms,
+            deadline_ms,
+        }) => WorkbenchToolError::typed(
+            "LeaseExpired",
+            err.to_string(),
+            true,
+            json!({"now_ms": now_ms, "deadline_ms": deadline_ms}),
+        ),
         ClientError::Metadata(MetadError::SnapshotLeaseExpired {
             snapshot_id,
             lease_expires_unix_ms,
@@ -2866,8 +3075,126 @@ fn client_error(err: ClientError) -> WorkbenchToolError {
             true,
             json!({"snapshot_id": snapshot_id, "attempts": attempts}),
         ),
+        ClientError::Metadata(MetadError::RestoreInProgress) => {
+            WorkbenchToolError::typed("RestoreInProgress", err.to_string(), true, json!({}))
+        }
+        ClientError::Metadata(MetadError::RestoreRootChanged { root }) => {
+            WorkbenchToolError::typed(
+                "RestoreRootChanged",
+                err.to_string(),
+                false,
+                json!({"root": root.get()}),
+            )
+        }
+        ClientError::Metadata(MetadError::RestoreBindingChanged { root }) => {
+            WorkbenchToolError::typed(
+                "RestoreBindingChanged",
+                err.to_string(),
+                false,
+                json!({"root": root.get()}),
+            )
+        }
+        ClientError::Metadata(MetadError::RestoreDestinationConflict { destination }) => {
+            WorkbenchToolError::typed(
+                "RestoreDestinationConflict",
+                err.to_string(),
+                false,
+                json!({"destination": destination}),
+            )
+        }
+        ClientError::Metadata(MetadError::RestoreResourceLimit {
+            resource,
+            limit,
+            actual,
+        }) => WorkbenchToolError::typed(
+            "RestoreResourceLimit",
+            err.to_string(),
+            false,
+            json!({"resource": resource, "limit": limit, "actual": actual}),
+        ),
+        ClientError::Metadata(MetadError::RestoreHardlinkUnsupported { inode }) => {
+            WorkbenchToolError::typed(
+                "RestoreHardlinkUnsupported",
+                err.to_string(),
+                false,
+                json!({"inode": inode.get()}),
+            )
+        }
+        ClientError::Metadata(MetadError::RestoreCrossShardUnsupported { inode }) => {
+            WorkbenchToolError::typed(
+                "RestoreCrossShardUnsupported",
+                err.to_string(),
+                false,
+                json!({"inode": inode.get()}),
+            )
+        }
+        ClientError::Metadata(MetadError::StalePreparedArtifactObjectGcEpoch {
+            expected,
+            current,
+        }) => WorkbenchToolError::typed(
+            "StalePreparedArtifactObjectGcEpoch",
+            err.to_string(),
+            true,
+            json!({"expected": expected, "current": current}),
+        ),
+        ClientError::Metadata(MetadError::SyncLogArchiveFailed { committed, message }) => {
+            WorkbenchToolError::typed(
+                "SyncLogArchiveFailed",
+                err.to_string(),
+                true,
+                json!({"committed": committed, "archive_error": message}),
+            )
+        }
         _ => WorkbenchToolError::typed("NoKvClientError", err.to_string(), false, json!({})),
     }
+}
+
+fn restore_client_error(
+    snapshot_id: u64,
+    owner_path: &str,
+    err: ClientError,
+) -> WorkbenchToolError {
+    if let ClientError::Io(message) = &err {
+        return WorkbenchToolError::typed(
+            "RestoreTransportUnavailable",
+            err.to_string(),
+            true,
+            json!({
+                "snapshot_id": snapshot_id,
+                "owner_path": owner_path,
+                "transport_error": message,
+            }),
+        );
+    }
+    if matches!(&err, ClientError::Protocol(message)
+        if message.contains(RESTORE_TO_FORK_V1_CAPABILITY))
+    {
+        return restore_capability_mismatch(owner_path);
+    }
+    if let ClientError::Metadata(MetadError::CrossShard {
+        source_shard,
+        dest_shard,
+    }) = &err
+    {
+        return WorkbenchToolError::typed(
+            "RestoreCrossShardUnsupported",
+            err.to_string(),
+            false,
+            json!({"source_shard": source_shard, "dest_shard": dest_shard}),
+        );
+    }
+    snapshot_client_error(snapshot_id, err)
+}
+
+fn restore_capability_mismatch(path: &str) -> WorkbenchToolError {
+    WorkbenchToolError::typed(
+        "CapabilityMismatch",
+        format!(
+            "metadata owner for {path} does not advertise required capability {RESTORE_TO_FORK_V1_CAPABILITY}"
+        ),
+        false,
+        json!({"capability": RESTORE_TO_FORK_V1_CAPABILITY, "path": path}),
+    )
 }
 
 fn snapshot_client_error(snapshot_id: u64, err: ClientError) -> WorkbenchToolError {
@@ -2885,6 +3212,157 @@ fn snapshot_client_error(snapshot_id: u64, err: ClientError) -> WorkbenchToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn disconnected_client() -> NoKvFsClient<nokv_object::MemoryObjectStore> {
+        NoKvFsClient::connect(
+            "127.0.0.1:1".parse().unwrap(),
+            nokv_object::MemoryObjectStore::new(),
+        )
+    }
+
+    fn workbench_options() -> WorkbenchMcpOptions {
+        WorkbenchMcpOptions {
+            root: "/workbenches".to_owned(),
+            max_bytes: DEFAULT_WORKBENCH_MAX_BYTES,
+            uid: 1000,
+            gid: 1000,
+        }
+    }
+
+    #[test]
+    fn restore_schema_is_exact_and_capability_gated() {
+        let enabled = tool_definitions_for_capabilities(true);
+        let restore = enabled
+            .iter()
+            .find(|tool| tool.name == "workbench_restore")
+            .expect("restore capability should advertise the tool");
+        assert_eq!(
+            restore.parameters,
+            json!({
+                "type": "object",
+                "required": ["id", "at_snapshot", "destination_id"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "at_snapshot": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 0},
+                            {"type": "string", "minLength": 1}
+                        ]
+                    },
+                    "destination_id": {"type": "string", "minLength": 1}
+                },
+                "additionalProperties": false
+            })
+        );
+        assert!(tool_definitions_for_capabilities(false)
+            .iter()
+            .all(|tool| tool.name != "workbench_restore"));
+    }
+
+    #[test]
+    fn restore_rejects_null_negative_empty_extra_and_same_id_before_rpc() {
+        let client = disconnected_client();
+        let options = workbench_options();
+        for args in [
+            json!({"id": "source", "at_snapshot": null, "destination_id": "target"}),
+            json!({"id": "source", "at_snapshot": -1, "destination_id": "target"}),
+            json!({"id": "source", "at_snapshot": "", "destination_id": "target"}),
+            json!({"id": "source", "at_snapshot": 1, "destination_id": "target", "extra": true}),
+            json!({"id": "same", "at_snapshot": 1, "destination_id": "same"}),
+        ] {
+            let error = restore_workbench(&client, &options, &args).unwrap_err();
+            assert_eq!(error.as_value()["status"], "error");
+            assert_eq!(error.as_value()["retryable"], false);
+            assert!(
+                !error.to_string().contains("Connection refused"),
+                "validation must fail before capability/RPC: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_mismatch_is_a_structured_fail_closed_error() {
+        let error = restore_capability_mismatch("/workbenches/source");
+        let value = error.as_value();
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["code"], "CapabilityMismatch");
+        assert_eq!(value["retryable"], false);
+        assert_eq!(
+            value["details"]["capability"],
+            RESTORE_TO_FORK_V1_CAPABILITY
+        );
+        assert_eq!(value["details"]["path"], "/workbenches/source");
+    }
+
+    #[test]
+    fn restore_retry_boundaries_are_preserved_as_structured_errors() {
+        let transport = restore_client_error(
+            41,
+            "/workbenches/destination",
+            ClientError::Io("metadata rpc response timed out".to_owned()),
+        )
+        .as_value();
+        assert_eq!(transport["code"], "RestoreTransportUnavailable");
+        assert_eq!(transport["retryable"], true);
+        assert_eq!(transport["details"]["snapshot_id"], 41);
+        assert_eq!(
+            transport["details"]["owner_path"],
+            "/workbenches/destination"
+        );
+        assert_eq!(
+            transport["details"]["transport_error"],
+            "metadata rpc response timed out"
+        );
+
+        let not_owner = client_error(ClientError::Metadata(MetadError::NotOwner {
+            shard_id: "mount-1:/workbenches".to_owned(),
+            endpoint: Some("127.0.0.1:7731".to_owned()),
+        }))
+        .as_value();
+        assert_eq!(not_owner["code"], "NotOwner");
+        assert_eq!(not_owner["retryable"], true);
+        assert_eq!(not_owner["details"]["shard_id"], "mount-1:/workbenches");
+        assert_eq!(not_owner["details"]["endpoint"], "127.0.0.1:7731");
+
+        let stale_epoch = client_error(ClientError::Metadata(MetadError::StaleOwnerEpoch {
+            owner_epoch: 7,
+            required_epoch: 8,
+        }))
+        .as_value();
+        assert_eq!(stale_epoch["code"], "StaleOwnerEpoch");
+        assert_eq!(stale_epoch["retryable"], true);
+        assert_eq!(stale_epoch["details"]["owner_epoch"], 7);
+        assert_eq!(stale_epoch["details"]["required_epoch"], 8);
+
+        let invalid_epoch =
+            client_error(ClientError::Metadata(MetadError::InvalidOwnerEpoch)).as_value();
+        assert_eq!(invalid_epoch["code"], "InvalidOwnerEpoch");
+        assert_eq!(invalid_epoch["retryable"], false);
+
+        let object_epoch = client_error(ClientError::Metadata(
+            MetadError::StalePreparedArtifactObjectGcEpoch {
+                expected: 11,
+                current: 12,
+            },
+        ))
+        .as_value();
+        assert_eq!(object_epoch["code"], "StalePreparedArtifactObjectGcEpoch");
+        assert_eq!(object_epoch["retryable"], true);
+        assert_eq!(object_epoch["details"]["expected"], 11);
+        assert_eq!(object_epoch["details"]["current"], 12);
+
+        for committed in [false, true] {
+            let archive = client_error(ClientError::Metadata(MetadError::SyncLogArchiveFailed {
+                committed,
+                message: "archive unavailable".to_owned(),
+            }))
+            .as_value();
+            assert_eq!(archive["code"], "SyncLogArchiveFailed");
+            assert_eq!(archive["retryable"], true);
+            assert_eq!(archive["details"]["committed"], committed);
+            assert_eq!(archive["details"]["archive_error"], "archive unavailable");
+        }
+    }
 
     #[test]
     fn normalizes_workbench_root() {

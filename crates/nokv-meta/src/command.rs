@@ -27,6 +27,9 @@ pub enum ReadPurpose {
     UserStrong,
     WritePlanLocal,
     Snapshot,
+    /// Internal access to detached restore staging. No ordinary read or write
+    /// planning path may use this purpose.
+    RestoreStaging,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

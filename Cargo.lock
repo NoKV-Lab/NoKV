@@ -811,9 +811,8 @@ dependencies = [
 
 [[package]]
 name = "holt"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f7180148389fd08f76cdd05ad47640acd1b72b6a5cd2379d1496de96af32e01"
+version = "0.8.1"
+source = "git+https://github.com/NoKV-Lab/holt.git?rev=6f80b53ed66dccfa1778a0dcc15a7e1b656c2d7e#6f80b53ed66dccfa1778a0dcc15a7e1b656c2d7e"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
@@ -1383,6 +1382,7 @@ dependencies = [
  "nokv-fuse",
  "nokv-meta",
  "nokv-object",
+ "nokv-protocol",
  "nokv-server",
  "nokv-types",
  "serde",

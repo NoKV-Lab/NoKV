@@ -80,6 +80,25 @@ fn rpc_creates_and_lists_directory() {
 }
 
 #[test]
+fn rpc_capability_probe_is_path_routed_and_advertises_restore_v1() {
+    let server = test_server();
+    let envelope = request_envelope(
+        &server,
+        MetadataRpcRequest::MetadataCapabilities {
+            path: "/workbenches/not-yet-created".to_owned(),
+        },
+    );
+    assert!(envelope.ok, "unexpected capability error: {envelope:?}");
+    match envelope.result.unwrap() {
+        MetadataRpcResult::MetadataCapabilities { capabilities } => {
+            assert_eq!(capabilities.mount_id, server.service().mount_id().get());
+            assert!(capabilities.restore_to_fork_v1);
+        }
+        other => panic!("unexpected capability result: {other:?}"),
+    }
+}
+
+#[test]
 fn rpc_write_publishes_sync_shared_log_before_ack() {
     let dir = tempdir().unwrap();
     let mut options = test_options(dir.path());
@@ -259,8 +278,10 @@ fn rpc_publish_control_failure_does_not_hide_committed_metadata_or_local_log() {
     assert!(!envelope.ok, "control publication must gate the RPC ACK");
     assert!(matches!(
         envelope.error_kind,
-        Some(WireMetadataError::Metadata { message })
-            if message.contains("injected checkpoint publish failure")
+        Some(WireMetadataError::SyncLogArchiveFailed {
+            committed: true,
+            message,
+        }) if message.contains("injected checkpoint publish failure")
     ));
 
     let committed = server
@@ -280,6 +301,79 @@ fn rpc_publish_control_failure_does_not_hide_committed_metadata_or_local_log() {
         "failed control publication must not advance the authoritative tail"
     );
     assert_eq!(control_after.log, control_before.log);
+}
+
+#[test]
+fn prior_dirty_tail_does_not_mark_a_later_rejected_mutation_committed() {
+    let dir = tempdir().unwrap();
+    let mut options = test_options(dir.path());
+    options.metadata_checkpoint_archive_prefix = Some("meta/rpc-prior-dirty-checkpoint".to_owned());
+    let control = Arc::new(FailingCheckpointPublishControl::new());
+    let server = Server::open_with_objects(
+        options,
+        ConfiguredObjectStore::Memory(Arc::new(MemoryObjectStore::new())),
+        Some((
+            control.clone(),
+            vec![ServerShardOwnerOptions::fresh("mount-1:/", "node-a")
+                .with_renewal(None)
+                .with_shared_log(Some(ServerSharedLogOptions::new(
+                    "meta/rpc-prior-dirty-log",
+                )))],
+        )),
+    )
+    .unwrap();
+    let control_before = control.get_shard(&ShardId::new("mount-1:/")).unwrap();
+
+    control.fail_next_marks(2);
+    let committed = request_envelope(
+        &server,
+        MetadataRpcRequest::CreateDirPath {
+            path: "/prior-dirty".to_owned(),
+            mode: 0o755,
+            uid: 1000,
+            gid: 1000,
+        },
+    );
+    assert!(matches!(
+        committed.error_kind,
+        Some(WireMetadataError::SyncLogArchiveFailed {
+            committed: true,
+            ..
+        })
+    ));
+    let dirty_lsn = server
+        .service()
+        .sync_metadata_log_snapshot()
+        .unwrap()
+        .durable_lsn;
+    assert!(dirty_lsn > control_before.durable_lsn);
+
+    control.fail_next_marks(2);
+    let rejected = request_envelope(
+        &server,
+        MetadataRpcRequest::RemoveFilePath {
+            path: "/prior-dirty".to_owned(),
+        },
+    );
+    assert!(!rejected.ok);
+    assert!(matches!(
+        rejected.error_kind,
+        Some(WireMetadataError::NotFile)
+    ));
+    assert_eq!(
+        server
+            .service()
+            .sync_metadata_log_snapshot()
+            .unwrap()
+            .durable_lsn,
+        dirty_lsn,
+        "the rejected request must not advance the local recovery tail"
+    );
+    assert_eq!(
+        control.get_shard(&ShardId::new("mount-1:/")).unwrap(),
+        control_before,
+        "the prior dirty tail must remain unpublished while control fails"
+    );
 }
 
 #[test]

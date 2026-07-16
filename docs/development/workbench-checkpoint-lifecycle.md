@@ -130,16 +130,19 @@ Replace the bare "cite snapshot_id" instruction with "cite name +
 snapshot_id and state the expiry". Keep the four test-pinned anchor
 strings; bump to v0.3.0.
 
-## 4. Phase 2/3 (follow-up PRs, designed now, not built)
+## 4. Phase 2 durable restore and later follow-ups
 
 - **L1 named refs as GC roots**: named checkpoints move from registry-file
   convention to pinned records the retention floor respects without a
   lease; explicit delete only; `min-checkpoints-to-keep` guard.
-- **Restore = fork**: `workbench_restore {snapshot, to_workbench}` built on
-  `materialize_subtree_at` (pub(super), clone.rs:88) + `link_clone_root`;
-  verified feasible (~40 service lines + one RPC). In-place rollback stays
-  CLI-only behind an explicit flag (`rollback_subtree` already enforces
-  same-root).
+- **Durable restore-to-fork**: `workbench_restore` is not a thin wrapper around
+  generic clone. It owns a private, replayable operation/claim/root graph,
+  detached materialization, deterministic initialization, exact borrowed-object
+  references, a Complete-gated index overlay, and bounded cleanup/release jobs.
+  The temporary existing-format `ForkBinding` protects history only until the
+  exact-reference seal and final attach CAS; `Complete` does not retain a global
+  history floor. Generic clone/rollback encodings and behavior remain unchanged,
+  and in-place rollback stays CLI-only behind its existing explicit flag.
 - Touch-on-use renewal, structured at-snapshot reads, first-class
   `SnapshotExpired` error, 14-day reflog trail for reaped anonymous pins,
   expiry watch events, L2 archival export.

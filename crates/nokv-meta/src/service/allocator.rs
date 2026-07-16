@@ -67,6 +67,34 @@ where
         )?;
         let key = allocator_key(self.mount);
         let reservation = self.commit_metadata_from_factory(|| {
+            let read_version = predecessor(commit_version)?;
+            let active_key = super::restore::restore_active_key(self.mount);
+            let active = self.metadata.get_versioned(
+                RecordFamily::System,
+                &active_key,
+                read_version,
+                ReadPurpose::WritePlanLocal,
+            )?;
+            if let Some(active) = &active {
+                if active.value.0 != [super::restore::RESTORE_FORMAT_VERSION] {
+                    return Err(MetadError::Codec(
+                        "invalid restore-to-fork active marker".to_owned(),
+                    ));
+                }
+            }
+            let allocator_value = if active.is_some() {
+                encode_allocator_state_with_restore_fence(
+                    reserved_version,
+                    reserved_next_inode,
+                    self.epoch.load(Ordering::Relaxed),
+                )
+            } else {
+                encode_allocator_state(
+                    reserved_version,
+                    reserved_next_inode,
+                    self.epoch.load(Ordering::Relaxed),
+                )
+            };
             Ok(MetadataCommand {
                 request_id: allocator_reservation_request_id(
                     self.mount,
@@ -75,22 +103,22 @@ where
                     reserved_next_inode,
                 ),
                 kind: CommandKind::ReserveAllocator,
-                read_version: predecessor(commit_version)?,
+                read_version,
                 commit_version,
                 primary_family: RecordFamily::System,
                 primary_key: key.clone(),
-                predicates: Vec::new(),
+                predicates: vec![PredicateRef {
+                    family: RecordFamily::System,
+                    key: active_key,
+                    predicate: active
+                        .map(|item| Predicate::VersionEquals(item.version))
+                        .unwrap_or(Predicate::NotExists),
+                }],
                 mutations: vec![Mutation {
                     family: RecordFamily::System,
                     key,
                     op: MutationOp::Put,
-                    value: Some(Value(encode_allocator_state(
-                        reserved_version,
-                        reserved_next_inode,
-                        // The factory executes under the epoch read fence held
-                        // through metadata apply.
-                        self.epoch.load(Ordering::Relaxed),
-                    ))),
+                    value: Some(Value(allocator_value)),
                 }],
                 watch: Vec::new(),
             })
@@ -120,6 +148,71 @@ where
         }
     }
 
+    /// Build the allocator half of the first durable restore hold. The caller
+    /// holds `allocator_gate` through apply and installs the active marker in
+    /// the same metadata command, so no reservation can reintroduce a v1 row
+    /// between the marker CAS and the fenced allocator write.
+    pub(super) fn restore_allocator_fence_plan(
+        &self,
+        read_version: Version,
+    ) -> Result<(PredicateRef, Mutation), MetadError> {
+        let key = allocator_key(self.mount);
+        let item = self
+            .metadata
+            .get_versioned(
+                RecordFamily::System,
+                &key,
+                read_version,
+                ReadPurpose::WritePlanLocal,
+            )?
+            .ok_or_else(|| {
+                MetadError::Codec(
+                    "allocator record is missing while installing restore fence".to_owned(),
+                )
+            })?;
+        let (last_commit_version, next_inode, epoch, restore_fenced) =
+            decode_allocator_state_with_restore_fence(&item.value.0)?;
+        let active = self.metadata.get_versioned(
+            RecordFamily::System,
+            &super::restore::restore_active_key(self.mount),
+            read_version,
+            ReadPurpose::WritePlanLocal,
+        )?;
+        if let Some(active) = &active {
+            if active.value.0 != [super::restore::RESTORE_FORMAT_VERSION] {
+                return Err(MetadError::Codec(
+                    "invalid restore-to-fork active marker".to_owned(),
+                ));
+            }
+        }
+        if active.is_some() != restore_fenced {
+            return Err(MetadError::Codec(
+                "restore active marker and allocator downgrade fence disagree".to_owned(),
+            ));
+        }
+        let last_commit_version =
+            last_commit_version.max(self.reserved_version.load(Ordering::Relaxed));
+        let next_inode = next_inode.max(self.reserved_next_inode.load(Ordering::Relaxed));
+        let epoch = epoch.max(self.epoch.load(Ordering::Relaxed));
+        Ok((
+            PredicateRef {
+                family: RecordFamily::System,
+                key: key.clone(),
+                predicate: Predicate::VersionEquals(item.version),
+            },
+            Mutation {
+                family: RecordFamily::System,
+                key,
+                op: MutationOp::Put,
+                value: Some(Value(encode_allocator_state_with_restore_fence(
+                    last_commit_version,
+                    next_inode,
+                    epoch,
+                ))),
+            },
+        ))
+    }
+
     pub(super) fn next_version(&self) -> Result<Version, MetadError> {
         let raw = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
         self.ensure_allocator_reservation(raw, self.next_inode.load(Ordering::Relaxed))?;
@@ -127,6 +220,7 @@ where
     }
 
     pub(super) fn read_version(&self) -> Result<Version, MetadError> {
+        self.ensure_metadata_checkpoint_install_stable()?;
         Version::new(self.clock.load(Ordering::Relaxed)).map_err(Into::into)
     }
 

@@ -5,9 +5,10 @@
 //! Raft replication, FUSE, or protobuf types.
 
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use crate::command::{
@@ -34,12 +35,22 @@ const HISTORY_INDEX_PROGRESS_KEY: &[u8] = b"\0history-key-index-v1-progress";
 const HISTORY_INDEX_COMPLETE_VALUE: &[u8] = b"1";
 const HISTORY_INDEX_BACKFILL_BATCH_SIZE: usize = 1_024;
 const HISTORY_PRUNE_CONFLICT_RETRIES: usize = 4;
+const KEY_VISIBILITY_STRIPE_COUNT: usize = 256;
 
 #[derive(Clone)]
 pub struct HoltMetadataStore {
     db: DB,
     stats: Arc<HoltMetadataStoreCounters>,
     history_retention: Arc<HistoryRetentionState>,
+    /// Holt's exact-key absence assertion is represented as a create/delete
+    /// sentinel inside one atomic batch. Point gets are intentionally
+    /// optimistic and can otherwise observe the live sentinel between those
+    /// two internal operations. Commands lock their exact-key access set from
+    /// planning through apply; read-only absence guards take the exclusive side
+    /// only for the affected family/key stripes.
+    key_visibility_stripes: Arc<[RwLock<()>; KEY_VISIBILITY_STRIPE_COUNT]>,
+    #[cfg(test)]
+    before_atomic_apply: Arc<std::sync::Mutex<Option<TestHook>>>,
 }
 
 #[derive(Default)]
@@ -144,11 +155,38 @@ struct PrefixEmptyGuard {
     prefix: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+enum AbsentKeyState {
+    Missing,
+    Tombstone(RecordVersion),
+}
+
+#[derive(Clone, Debug)]
+struct AbsentKeyGuard {
+    family: RecordFamily,
+    key: Vec<u8>,
+    state: AbsentKeyState,
+}
+
+enum KeyVisibilityGuard<'a> {
+    Read { _guard: RwLockReadGuard<'a, ()> },
+    Write { _guard: RwLockWriteGuard<'a, ()> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyVisibilityLockMode {
+    Read,
+    Write,
+}
+
+type KeyVisibilityLockPlan = [Option<KeyVisibilityLockMode>; KEY_VISIBILITY_STRIPE_COUNT];
+
 struct CommandPlan {
     mutations: Vec<PlannedMutation>,
     history_records: Vec<(RecordFamily, Vec<u8>, Vec<u8>)>,
     version_guards: Vec<VersionGuard>,
     prefix_empty_guards: Vec<PrefixEmptyGuard>,
+    absent_key_guards: Vec<AbsentKeyGuard>,
     retain_history: bool,
     history_retention_delta: HistoryRetentionDelta,
     adds_history_retention: bool,
@@ -296,12 +334,26 @@ impl HoltMetadataStore {
     }
 
     pub fn open_file(path: impl AsRef<Path>) -> Result<Self, MetadataError> {
-        let mut config = TreeConfig::new(path.as_ref());
+        let path = path.as_ref();
+        let recover_existing_store = file_store_has_prior_state(path);
+        let mut config = TreeConfig::new(path);
         // A successful metadata RPC is a durability promise. Holt's default
         // async WAL mode leaves a small ACK-to-flusher window in which SIGKILL
         // can discard a committed namespace change or restore journal state.
         config.durability = Durability::Wal { sync: true };
-        Self::open(config)
+        // NoKV runs logical reachability GC on reopen and checkpoint. Keep
+        // Holt's physical vacuum disabled: reclaimed slots remain reusable,
+        // while the packed files may retain their high-water allocation.
+        config.checkpoint.auto_vacuum = false;
+        let store = Self::open(config)?;
+        if recover_existing_store {
+            // WAL replay and NoKV's family migrations above establish the
+            // authoritative roots. A process crash can lose Holt's in-memory
+            // COW orphan queue, so sweep that durable root closure before the
+            // reopened metadata store becomes externally visible.
+            store.reclaim_unreachable_storage()?;
+        }
+        Ok(store)
     }
 
     pub fn open(config: TreeConfig) -> Result<Self, MetadataError> {
@@ -311,6 +363,9 @@ impl HoltMetadataStore {
             db,
             stats: Arc::new(HoltMetadataStoreCounters::default()),
             history_retention: Arc::new(HistoryRetentionState::new(recovered)),
+            key_visibility_stripes: Arc::new(std::array::from_fn(|_| RwLock::new(()))),
+            #[cfg(test)]
+            before_atomic_apply: Arc::new(std::sync::Mutex::new(None)),
         };
         // Do not create trees in a brand-new database: checkpoint installation
         // requires a pristine DB. Existing stores, however, are migrated before
@@ -321,6 +376,66 @@ impl HoltMetadataStore {
             Err(err) => return Err(to_backend_error(err)),
         }
         Ok(store)
+    }
+
+    fn acquire_key_visibility_guards(
+        &self,
+        plan: &KeyVisibilityLockPlan,
+    ) -> Vec<KeyVisibilityGuard<'_>> {
+        plan.iter()
+            .enumerate()
+            .filter_map(|(stripe, mode)| match mode {
+                Some(KeyVisibilityLockMode::Read) => Some(KeyVisibilityGuard::Read {
+                    _guard: self.key_visibility_stripes[stripe]
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner()),
+                }),
+                Some(KeyVisibilityLockMode::Write) => Some(KeyVisibilityGuard::Write {
+                    _guard: self.key_visibility_stripes[stripe]
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner()),
+                }),
+                None => None,
+            })
+            .collect()
+    }
+
+    fn acquire_key_visibility_read(
+        &self,
+        family: RecordFamily,
+        key: &[u8],
+    ) -> RwLockReadGuard<'_, ()> {
+        self.key_visibility_stripes[key_visibility_stripe(family, key)]
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[cfg(test)]
+    fn set_before_atomic_apply_hook(&self, hook: TestHook) {
+        *self
+            .before_atomic_apply
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn clear_before_atomic_apply_hook(&self) {
+        self.before_atomic_apply
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
+    #[cfg(test)]
+    fn run_before_atomic_apply_hook(&self) {
+        let hook = self
+            .before_atomic_apply
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub fn checkpoint(&self) -> Result<(), MetadataError> {
@@ -648,6 +763,7 @@ impl MetadataStore for HoltMetadataStore {
         version: Version,
         purpose: ReadPurpose,
     ) -> Result<Option<ReadItem>, MetadataError> {
+        let _key_visibility = self.acquire_key_visibility_read(family, key);
         self.stats.get_total.fetch_add(1, Ordering::Relaxed);
         self.stats.record_get_purpose(purpose);
         read_visible(
@@ -851,6 +967,8 @@ impl MetadataStore for HoltMetadataStore {
         &self,
         commands: &[MetadataCommand],
     ) -> Vec<Result<CommitResult, MetadataError>> {
+        let visibility_plan = key_visibility_lock_plan(commands);
+        let _key_visibility = self.acquire_key_visibility_guards(&visibility_plan);
         if commands.iter().any(command_mutates_history_retention) {
             let _fence = self
                 .history_retention
@@ -868,6 +986,8 @@ impl MetadataStore for HoltMetadataStore {
     }
 
     fn commit_metadata(&self, command: MetadataCommand) -> Result<CommitResult, MetadataError> {
+        let visibility_plan = key_visibility_lock_plan(std::slice::from_ref(&command));
+        let _key_visibility = self.acquire_key_visibility_guards(&visibility_plan);
         if command_mutates_history_retention(&command) {
             let _fence = self
                 .history_retention
@@ -891,6 +1011,8 @@ impl MetadataStore for HoltMetadataStore {
         &self,
         request_id: &[u8],
     ) -> Result<Option<CommitResult>, MetadataError> {
+        let _key_visibility =
+            self.acquire_key_visibility_read(RecordFamily::CommandDedupe, request_id);
         self.current_tree(RecordFamily::CommandDedupe)?
             .get(request_id)
             .map_err(to_backend_error)?
@@ -938,7 +1060,7 @@ impl HoltMetadataStore {
         let mut pending = Vec::new();
         for (index, command) in commands.iter().cloned().enumerate() {
             if pending.iter().any(|pending: &PendingPlannedCommand| {
-                metadata_commands_conflict(&pending.command, &command)
+                holt_commands_conflict(&pending.command, &command)
             }) {
                 self.commit_pending_batch(&mut pending, &mut results);
             }
@@ -1106,6 +1228,8 @@ impl HoltMetadataStore {
             .map(|item| planned_command_stats(&item.command, &item.plan))
             .collect::<Vec<_>>();
         let atomic_start = Instant::now();
+        #[cfg(test)]
+        self.run_before_atomic_apply_hook();
         let committed = self
             .db
             .atomic(|batch| {
@@ -1138,6 +1262,7 @@ impl HoltMetadataStore {
             .collect::<Vec<_>>();
         let mut version_guards = Vec::new();
         let mut prefix_empty_guards = Vec::new();
+        let mut absent_key_guards = Vec::new();
 
         for predicate in &command.predicates {
             match predicate.predicate {
@@ -1154,22 +1279,36 @@ impl HoltMetadataStore {
                     )?;
                 }
                 Predicate::NotExists => {
-                    let index = mutation_index(&mutations, predicate.family, &predicate.key)
-                        .ok_or(MetadataError::PredicateFailed)?;
-                    if mutations[index].mutation.op != MutationOp::Put {
-                        return Err(MetadataError::PredicateFailed);
-                    }
-                    match self.current_record(predicate.family, &predicate.key)? {
-                        None => {
-                            set_mutation_guard(&mut mutations[index], MutationGuard::PutIfAbsent)?;
+                    if let Some(index) =
+                        mutation_index(&mutations, predicate.family, &predicate.key)
+                    {
+                        if mutations[index].mutation.op != MutationOp::Put {
+                            return Err(MetadataError::PredicateFailed);
                         }
-                        Some(record) if record.value.is_none() => {
-                            set_mutation_guard(
+                        match self.current_record(predicate.family, &predicate.key)? {
+                            None => set_mutation_guard(
+                                &mut mutations[index],
+                                MutationGuard::PutIfAbsent,
+                            )?,
+                            Some(record) if record.value.is_none() => set_mutation_guard(
                                 &mut mutations[index],
                                 MutationGuard::CompareAndPut(record.record_version),
-                            )?;
+                            )?,
+                            Some(_) => return Err(MetadataError::PredicateFailed),
                         }
-                        Some(_) => return Err(MetadataError::PredicateFailed),
+                    } else {
+                        let state = match self.current_record(predicate.family, &predicate.key)? {
+                            None => AbsentKeyState::Missing,
+                            Some(record) if record.value.is_none() => {
+                                AbsentKeyState::Tombstone(record.record_version)
+                            }
+                            Some(_) => return Err(MetadataError::PredicateFailed),
+                        };
+                        absent_key_guards.push(AbsentKeyGuard {
+                            family: predicate.family,
+                            key: predicate.key.clone(),
+                            state,
+                        });
                     }
                 }
                 Predicate::PrefixEmpty => {
@@ -1235,6 +1374,7 @@ impl HoltMetadataStore {
             history_records,
             version_guards,
             prefix_empty_guards,
+            absent_key_guards,
             retain_history,
             history_retention_delta,
             adds_history_retention,
@@ -1259,6 +1399,8 @@ impl HoltMetadataStore {
         self.ensure_history_key_index()?;
         let stats = planned_command_stats(&command, &plan);
         let atomic_start = Instant::now();
+        #[cfg(test)]
+        self.run_before_atomic_apply_hook();
         let committed = self
             .db
             .atomic(|batch| {
@@ -1464,7 +1606,9 @@ impl HoltMetadataStoreCounters {
     fn record_get_purpose(&self, purpose: ReadPurpose) {
         match purpose {
             ReadPurpose::UserStrong => &self.get_user_strong_total,
-            ReadPurpose::WritePlanLocal => &self.get_write_plan_local_total,
+            ReadPurpose::WritePlanLocal | ReadPurpose::RestoreStaging => {
+                &self.get_write_plan_local_total
+            }
             ReadPurpose::Snapshot => &self.get_snapshot_total,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -1473,7 +1617,9 @@ impl HoltMetadataStoreCounters {
     fn record_scan_purpose(&self, purpose: ReadPurpose) {
         match purpose {
             ReadPurpose::UserStrong => &self.scan_user_strong_total,
-            ReadPurpose::WritePlanLocal => &self.scan_write_plan_local_total,
+            ReadPurpose::WritePlanLocal | ReadPurpose::RestoreStaging => {
+                &self.scan_write_plan_local_total
+            }
             ReadPurpose::Snapshot => &self.scan_snapshot_total,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -1572,6 +1718,80 @@ fn command_mutates_history_retention(command: &MetadataCommand) -> bool {
         .mutations
         .iter()
         .any(|mutation| is_history_retention_family(mutation.family))
+}
+
+fn holt_commands_conflict(left: &MetadataCommand, right: &MetadataCommand) -> bool {
+    metadata_commands_conflict(left, right)
+        || left.predicates.iter().any(|left_predicate| {
+            is_read_only_absence_guard(left, left_predicate)
+                && right.predicates.iter().any(|right_predicate| {
+                    is_read_only_absence_guard(right, right_predicate)
+                        && left_predicate.family == right_predicate.family
+                        && left_predicate.key == right_predicate.key
+                })
+        })
+}
+
+fn is_read_only_absence_guard(
+    command: &MetadataCommand,
+    predicate: &crate::command::PredicateRef,
+) -> bool {
+    matches!(predicate.predicate, Predicate::NotExists)
+        && !command
+            .mutations
+            .iter()
+            .any(|mutation| mutation.family == predicate.family && mutation.key == predicate.key)
+}
+
+fn key_visibility_lock_plan(commands: &[MetadataCommand]) -> KeyVisibilityLockPlan {
+    let mut plan = [None; KEY_VISIBILITY_STRIPE_COUNT];
+    for command in commands {
+        add_key_visibility_lock(
+            &mut plan,
+            RecordFamily::CommandDedupe,
+            &command.request_id,
+            KeyVisibilityLockMode::Read,
+        );
+        for mutation in &command.mutations {
+            add_key_visibility_lock(
+                &mut plan,
+                mutation.family,
+                &mutation.key,
+                KeyVisibilityLockMode::Read,
+            );
+        }
+        for predicate in &command.predicates {
+            if matches!(predicate.predicate, Predicate::PrefixEmpty) {
+                continue;
+            }
+            let mode = if is_read_only_absence_guard(command, predicate) {
+                KeyVisibilityLockMode::Write
+            } else {
+                KeyVisibilityLockMode::Read
+            };
+            add_key_visibility_lock(&mut plan, predicate.family, &predicate.key, mode);
+        }
+    }
+    plan
+}
+
+fn add_key_visibility_lock(
+    plan: &mut KeyVisibilityLockPlan,
+    family: RecordFamily,
+    key: &[u8],
+    mode: KeyVisibilityLockMode,
+) {
+    let slot = &mut plan[key_visibility_stripe(family, key)];
+    if *slot != Some(KeyVisibilityLockMode::Write) {
+        *slot = Some(mode);
+    }
+}
+
+fn key_visibility_stripe(family: RecordFamily, key: &[u8]) -> usize {
+    let mut hasher = DefaultHasher::new();
+    (family as u8).hash(&mut hasher);
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) & (KEY_VISIBILITY_STRIPE_COUNT - 1)
 }
 
 fn command_advances_history_version(command: &MetadataCommand) -> bool {
@@ -1693,6 +1913,26 @@ fn enqueue_planned_command(
     }
     for guard in &plan.prefix_empty_guards {
         batch.assert_prefix_empty(current_tree_name(guard.family), &guard.prefix);
+    }
+    // Holt does not expose a read-only exact-key absence assertion. Project a
+    // sentinel create/delete pair inside the same atomic batch instead. It is
+    // never externally visible, while a concurrent create makes the guard fail
+    // and aborts the whole command. Tombstones use their physical record
+    // version as the compare token.
+    for guard in &plan.absent_key_guards {
+        let sentinel = encode_current_value(command.commit_version, &[]);
+        match guard.state {
+            AbsentKeyState::Missing => {
+                batch.put_if_absent(current_tree_name(guard.family), &guard.key, &sentinel)
+            }
+            AbsentKeyState::Tombstone(version) => batch.compare_and_put(
+                current_tree_name(guard.family),
+                &guard.key,
+                version,
+                &sentinel,
+            ),
+        }
+        batch.delete(current_tree_name(guard.family), &guard.key);
     }
     for planned in &plan.mutations {
         match (planned.mutation.op, planned.guard) {
@@ -1917,6 +2157,12 @@ fn next_current_candidate(
         }
     }
     Ok(None)
+}
+
+fn file_store_has_prior_state(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 fn next_history_index_candidate(

@@ -29,11 +29,12 @@ pub use file_client::{
     is_artifact_write_conflict, is_artifact_write_retryable, AppendOutcome, NoKvFsClient,
     PathRangeReadRequest, PathReadRange, PreparedPathRangeBatch,
 };
+pub use nokv_meta::{RestoreOutcome, RestoreState};
 pub use nokv_object::{DataFabricReadStats, ObjectReadPlan};
 pub use nokv_protocol::{decode_name_cursor, encode_name_cursor};
 pub use service::{
-    ClientPreparedArtifact, ClientPreparedArtifactRecovery, CloneOutcome, MetadataClient,
-    MetadataClientOptions, PathLayoutOpen, PathLayoutOpenRequest, SnapshotOutcome,
+    ClientPreparedArtifact, ClientPreparedArtifactRecovery, CloneOutcome, MetadataCapabilities,
+    MetadataClient, MetadataClientOptions, PathLayoutOpen, PathLayoutOpenRequest, SnapshotOutcome,
     SnapshotPinStatus,
 };
 
