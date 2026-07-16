@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 
 const BINARY_CODEC_LIMIT: u64 = 16 * 1024 * 1024;
 
+/// Capability name advertised by metadata owners that implement the durable
+/// restore-to-fork contract. Keep this string stable: deployment preflight
+/// treats it as a wire-level feature gate during rolling upgrades.
+pub const RESTORE_TO_FORK_V1_CAPABILITY: &str = "restore_to_fork_v1";
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WireOpenPathReadPlanRequest {
     pub path: String,
@@ -285,6 +290,17 @@ pub enum MetadataRpcRequest {
         src_path: String,
         dst_path: String,
     },
+    /// Query capabilities from the owner selected by `path`. The path is a
+    /// routing key only; it need not exist in the namespace.
+    MetadataCapabilities {
+        path: String,
+    },
+    RestoreSubtreePathToFork {
+        source_path: String,
+        snapshot_id: u64,
+        destination_path: String,
+        initialization: WireRestoreInitialization,
+    },
     DiffSubtrees {
         a_path: String,
         b_path: String,
@@ -452,6 +468,7 @@ pub enum WireMetadataError {
         owner_epoch: u64,
         required_epoch: u64,
     },
+    InvalidOwnerEpoch,
     LeaseExpired {
         now_ms: u64,
         deadline_ms: u64,
@@ -472,6 +489,18 @@ pub enum WireMetadataError {
     /// The target dentry is a cross-shard graft point; remove/rename of it must
     /// go through the graft lifecycle. The client maps this to `EBUSY`.
     GraftPoint,
+    RestoreInProgress,
+    RestoreRootChanged {
+        root: u64,
+    },
+    RestoreBindingChanged {
+        root: u64,
+    },
+    RestoreResourceLimit {
+        resource: String,
+        limit: u64,
+        actual: u64,
+    },
     StalePreparedArtifactObjectGcEpoch {
         expected: u64,
         current: u64,
@@ -498,6 +527,15 @@ pub enum WireMetadataError {
     SnapshotRenewContended {
         snapshot_id: u64,
         attempts: usize,
+    },
+    RestoreHardlinkUnsupported {
+        inode: u64,
+    },
+    RestoreCrossShardUnsupported {
+        inode: u64,
+    },
+    RestoreDestinationConflict {
+        destination: String,
     },
     SyncLogArchiveFailed {
         committed: bool,
@@ -598,6 +636,12 @@ pub enum MetadataRpcResult {
     CloneSubtree {
         root: u64,
         snapshot_id: u64,
+    },
+    MetadataCapabilities {
+        capabilities: WireMetadataCapabilities,
+    },
+    Restore {
+        outcome: WireRestoreOutcome,
     },
     SubtreeDeltas {
         deltas: Vec<WireSubtreeDelta>,
@@ -1144,6 +1188,32 @@ pub struct WirePreparedArtifact {
     pub object_gc_claim_version: u64,
 }
 
+/// Capabilities of the metadata owner that handled a path-routed probe.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WireMetadataCapabilities {
+    pub mount_id: u64,
+    pub restore_to_fork_v1: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WireRestoreInitialization {
+    pub remove_relative_paths: Vec<String>,
+    pub files: Vec<WireRestoreInitializationFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WireRestoreInitializationFile {
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WireChunkManifest {
     pub chunk_index: u64,
@@ -1203,6 +1273,24 @@ pub struct WireSnapshotPin {
     pub read_version: u64,
     pub created_version: u64,
     pub lease_expires_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireRestoreState {
+    Complete,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WireRestoreOutcome {
+    pub operation_id: String,
+    pub state: WireRestoreState,
+    pub source_root: u64,
+    pub destination_root: u64,
+    pub snapshot_id: u64,
+    pub read_version: u64,
+    pub cleanup_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1696,6 +1784,13 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         MetadataRpcRequest::RenamePath { source, .. } => RoutingKey::Path(source),
         MetadataRpcRequest::RenameReplacePath { source, .. } => RoutingKey::Path(source),
         MetadataRpcRequest::CloneSubtreePath { src_path, .. } => RoutingKey::Path(src_path),
+        MetadataRpcRequest::MetadataCapabilities { path } => RoutingKey::Path(path),
+        // Durable restore state is owned by the destination shard. The client
+        // rejects cross-shard pairs before sending, while destination routing
+        // keeps rolling-upgrade capability and private-state ownership aligned.
+        MetadataRpcRequest::RestoreSubtreePathToFork {
+            destination_path, ..
+        } => RoutingKey::Path(destination_path),
         MetadataRpcRequest::DiffSubtrees { a_path, .. } => RoutingKey::Path(a_path),
         MetadataRpcRequest::RollbackSubtreePath { target_path, .. } => {
             RoutingKey::Path(target_path)
@@ -1749,6 +1844,117 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_request_and_outcome_codec_are_typed_and_path_routed() {
+        let request = MetadataRpcRequest::RestoreSubtreePathToFork {
+            source_path: "/workbenches/source".to_owned(),
+            snapshot_id: 17,
+            destination_path: "/workbenches/restored".to_owned(),
+            initialization: WireRestoreInitialization {
+                remove_relative_paths: vec!["metadata/checkpoints.jsonl".to_owned()],
+                files: vec![WireRestoreInitializationFile {
+                    relative_path: "metadata/restore_manifest.json".to_owned(),
+                    bytes: br#"{"schema":"nokv.workbench.restore_manifest.v1"}"#.to_vec(),
+                    content_type: "application/json".to_owned(),
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                }],
+            },
+        };
+        assert!(matches!(
+            request_routing_key(&request),
+            RoutingKey::Path("/workbenches/restored")
+        ));
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+
+        let envelope = MetadataRpcEnvelope {
+            ok: true,
+            result: Some(MetadataRpcResult::Restore {
+                outcome: WireRestoreOutcome {
+                    operation_id: "restore-17".to_owned(),
+                    state: WireRestoreState::Complete,
+                    source_root: 7,
+                    destination_root: 8,
+                    snapshot_id: 17,
+                    read_version: 42,
+                    cleanup_pending: false,
+                },
+            }),
+            error: None,
+            error_kind: None,
+        };
+        assert_eq!(
+            decode_envelope(&encode_envelope(&envelope).unwrap()).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn capability_probe_routes_on_its_owner_path() {
+        let request = MetadataRpcRequest::MetadataCapabilities {
+            path: "/agents/a/workbenches".to_owned(),
+        };
+        assert!(matches!(
+            request_routing_key(&request),
+            RoutingKey::Path("/agents/a/workbenches")
+        ));
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn legacy_wire_bytes_remain_stable() {
+        fn hex(bytes: &[u8]) -> String {
+            use std::fmt::Write as _;
+            bytes.iter().fold(String::new(), |mut out, byte| {
+                write!(&mut out, "{byte:02x}").unwrap();
+                out
+            })
+        }
+
+        let request = MetadataRpcRequest::DiffSubtrees {
+            a_path: "/a".to_owned(),
+            b_path: "/b".to_owned(),
+        };
+        let result = MetadataRpcEnvelope {
+            ok: true,
+            result: Some(MetadataRpcResult::CloneSubtree {
+                root: 99,
+                snapshot_id: 7,
+            }),
+            error: None,
+            error_kind: None,
+        };
+        let error = MetadataRpcEnvelope {
+            ok: false,
+            result: None,
+            error: Some("expired".to_owned()),
+            error_kind: Some(WireMetadataError::SnapshotLeaseExpired {
+                snapshot_id: 7,
+                lease_expires_unix_ms: 11,
+                now_ms: 12,
+            }),
+        };
+        assert_eq!(
+            hex(&encode_request(&request).unwrap()),
+            "83a26f70ad646966665f7375627472656573a6615f70617468a22f61a6625f70617468a22f62"
+        );
+        assert_eq!(
+            hex(&encode_envelope(&result).unwrap()),
+            "82a26f6bc3a6726573756c7483a474797065ad636c6f6e655f73756274726565a4726f6f7463ab736e617073686f745f696407"
+        );
+        assert_eq!(
+            hex(&encode_envelope(&error).unwrap()),
+            "83a26f6bc2a56572726f72a765787069726564aa6572726f725f6b696e6484a474797065b6736e617073686f745f6c656173655f65787069726564ab736e617073686f745f696407b56c656173655f657870697265735f756e69785f6d730ba66e6f775f6d730c"
+        );
+    }
 
     #[test]
     fn prepared_artifact_object_gc_epoch_round_trips() {
@@ -2203,6 +2409,18 @@ mod tests {
             }),
             error: None,
             error_kind: None,
+        };
+        let encoded = encode_envelope(&envelope).unwrap();
+        assert_eq!(decode_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn binary_codec_preserves_invalid_owner_epoch_error_kind() {
+        let envelope = MetadataRpcEnvelope {
+            ok: false,
+            result: None,
+            error: Some("owner epoch must be non-zero".to_owned()),
+            error_kind: Some(WireMetadataError::InvalidOwnerEpoch),
         };
         let encoded = encode_envelope(&envelope).unwrap();
         assert_eq!(decode_envelope(&encoded).unwrap(), envelope);

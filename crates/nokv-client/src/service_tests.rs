@@ -16,6 +16,18 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[test]
+fn durable_restore_uses_a_long_rpc_deadline_without_shortening_custom_timeouts() {
+    assert_eq!(
+        restore_rpc_timeout(Duration::from_secs(10)),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        restore_rpc_timeout(Duration::from_secs(600)),
+        Duration::from_secs(600)
+    );
+}
+
 fn serve_one(body: &'static str) -> SocketAddr {
     serve_many(vec![response_body(body)])
 }
@@ -3025,6 +3037,111 @@ fn service_clone_subtree_path_sends_typed_rpc_and_maps_outcome() {
 }
 
 #[test]
+fn service_restore_probes_owner_capability_and_maps_typed_outcome() {
+    let addr = serve_request_sequence(vec![
+        Box::new(|request| {
+            assert_eq!(
+                request,
+                MetadataRpcRequest::MetadataCapabilities {
+                    path: "/workbenches/restored".to_owned(),
+                }
+            );
+            response_body(
+                r#"{"ok":true,"result":{"type":"metadata_capabilities","capabilities":{"mount_id":1,"restore_to_fork_v1":true}}}"#,
+            )
+        }),
+        Box::new(|request| {
+            assert_eq!(
+                request,
+                MetadataRpcRequest::RestoreSubtreePathToFork {
+                    source_path: "/workbenches/source".to_owned(),
+                    snapshot_id: 17,
+                    destination_path: "/workbenches/restored".to_owned(),
+                    initialization: nokv_protocol::WireRestoreInitialization {
+                        remove_relative_paths: vec!["metadata/checkpoints.jsonl".to_owned()],
+                        files: vec![nokv_protocol::WireRestoreInitializationFile {
+                            relative_path: "metadata/restore_manifest.json".to_owned(),
+                            bytes: b"manifest".to_vec(),
+                            content_type: "application/json".to_owned(),
+                            mode: 0o644,
+                            uid: 1000,
+                            gid: 1000,
+                        }],
+                    },
+                }
+            );
+            let operation_id = nokv_meta::restore_operation_id(
+                nokv_types::MountId::new(1).unwrap(),
+                "/workbenches/source",
+                17,
+                "/workbenches/restored",
+            )
+            .unwrap();
+            response_body(&format!(
+                r#"{{"ok":true,"result":{{"type":"restore","outcome":{{"operation_id":"{operation_id}","state":"complete","source_root":7,"destination_root":8,"snapshot_id":17,"read_version":42,"cleanup_pending":false}}}}}}"#,
+            ))
+        }),
+    ]);
+    let client = MetadataClient::connect(addr);
+    let outcome = client
+        .restore_subtree_path_to_fork_initialized(
+            "/workbenches/source",
+            17,
+            "/workbenches/restored",
+            nokv_meta::RestoreInitialization {
+                remove_relative_paths: vec!["metadata/checkpoints.jsonl".to_owned()],
+                files: vec![nokv_meta::RestoreInitializationFile {
+                    relative_path: "metadata/restore_manifest.json".to_owned(),
+                    bytes: b"manifest".to_vec(),
+                    content_type: "application/json".to_owned(),
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                }],
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        outcome.operation_id,
+        nokv_meta::restore_operation_id(
+            nokv_types::MountId::new(1).unwrap(),
+            "/workbenches/source",
+            17,
+            "/workbenches/restored",
+        )
+        .unwrap()
+    );
+    assert_eq!(outcome.state, nokv_meta::RestoreState::Complete);
+    assert_eq!(outcome.source_root.get(), 7);
+    assert_eq!(outcome.destination_root.get(), 8);
+    assert_eq!(outcome.snapshot_id, 17);
+    assert_eq!(outcome.read_version, 42);
+    assert!(!outcome.cleanup_pending);
+}
+
+#[test]
+fn service_restore_fails_closed_when_owner_lacks_capability() {
+    let addr = serve_one_request(|request| {
+        assert_eq!(
+            request,
+            MetadataRpcRequest::MetadataCapabilities {
+                path: "/workbenches/restored".to_owned(),
+            }
+        );
+        response_body(
+            r#"{"ok":true,"result":{"type":"metadata_capabilities","capabilities":{"mount_id":1,"restore_to_fork_v1":false}}}"#,
+        )
+    });
+    let client = MetadataClient::connect(addr);
+    let error = client
+        .restore_subtree_path_to_fork("/workbenches/source", 17, "/workbenches/restored")
+        .unwrap_err();
+    assert!(matches!(error, ClientError::Protocol(ref message)
+        if message.contains(nokv_protocol::RESTORE_TO_FORK_V1_CAPABILITY)
+            && message.contains("/workbenches/restored")));
+}
+
+#[test]
 fn service_diff_subtrees_sends_typed_rpc_and_maps_deltas() {
     let addr = serve_one_request(|request| {
         assert_eq!(
@@ -3191,6 +3308,94 @@ fn fleet_resolves_each_request_to_its_shard_owner_endpoint() {
         client.resolve_target_for_test(&inode_request).unwrap(),
         Some(endpoint_b),
     );
+}
+
+#[test]
+fn fleet_subtree_capabilities_probe_fallback_and_every_descendant_owner() {
+    let fallback = serve_one_request(|request| {
+        assert_eq!(
+            request,
+            MetadataRpcRequest::MetadataCapabilities {
+                path: "/workbenches".to_owned(),
+            }
+        );
+        response_body(
+            r#"{"ok":true,"result":{"type":"metadata_capabilities","capabilities":{"mount_id":1,"restore_to_fork_v1":true}}}"#,
+        )
+    });
+    let nested = serve_one_request(|request| {
+        assert_eq!(
+            request,
+            MetadataRpcRequest::MetadataCapabilities {
+                path: "/workbenches/special".to_owned(),
+            }
+        );
+        response_body(
+            r#"{"ok":true,"result":{"type":"metadata_capabilities","capabilities":{"mount_id":1,"restore_to_fork_v1":false}}}"#,
+        )
+    });
+    let deep = serve_one_request(|request| {
+        assert_eq!(
+            request,
+            MetadataRpcRequest::MetadataCapabilities {
+                path: "/workbenches/special/deep".to_owned(),
+            }
+        );
+        response_body(
+            r#"{"ok":true,"result":{"type":"metadata_capabilities","capabilities":{"mount_id":1,"restore_to_fork_v1":true}}}"#,
+        )
+    });
+    let outside = serve_one_request(|request| {
+        assert_eq!(
+            request,
+            MetadataRpcRequest::MetadataCapabilities {
+                path: "/workbenches-other".to_owned(),
+            }
+        );
+        response_body(
+            r#"{"ok":true,"result":{"type":"metadata_capabilities","capabilities":{"mount_id":1,"restore_to_fork_v1":true}}}"#,
+        )
+    });
+
+    let store: Arc<dyn ControlStore> = Arc::new(InMemoryControlStore::new());
+    register_owned_shard(store.as_ref(), "/", 0, &fallback.to_string());
+    register_owned_shard(
+        store.as_ref(),
+        "/workbenches/special",
+        1,
+        &nested.to_string(),
+    );
+    register_owned_shard(
+        store.as_ref(),
+        "/workbenches/special/deep",
+        2,
+        &deep.to_string(),
+    );
+    // These component-boundary neighbours are outside the requested subtree.
+    // An accidental broad starts_with match would add a fourth capability.
+    register_owned_shard(
+        store.as_ref(),
+        "/workbenches-other",
+        3,
+        &outside.to_string(),
+    );
+
+    let client = MetadataClient::fleet(store, mount_one()).unwrap();
+    let capabilities = client
+        .metadata_capabilities_for_subtree_owners("/workbenches")
+        .unwrap();
+
+    assert_eq!(capabilities.len(), 3);
+    assert_eq!(
+        capabilities
+            .iter()
+            .filter(|capabilities| capabilities.restore_to_fork_v1)
+            .count(),
+        2
+    );
+    assert!(capabilities
+        .iter()
+        .any(|capabilities| !capabilities.restore_to_fork_v1));
 }
 
 #[test]

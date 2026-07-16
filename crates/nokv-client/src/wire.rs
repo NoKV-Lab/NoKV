@@ -246,6 +246,9 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
             owner_epoch,
             required_epoch,
         }),
+        WireMetadataError::InvalidOwnerEpoch => {
+            ClientError::Metadata(nokv_meta::MetadError::InvalidOwnerEpoch)
+        }
         WireMetadataError::LeaseExpired {
             now_ms,
             deadline_ms,
@@ -264,6 +267,28 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
             dest_shard,
         }),
         WireMetadataError::GraftPoint => ClientError::Metadata(nokv_meta::MetadError::GraftPoint),
+        WireMetadataError::RestoreInProgress => {
+            ClientError::Metadata(nokv_meta::MetadError::RestoreInProgress)
+        }
+        WireMetadataError::RestoreRootChanged { root } => match inode_id(root) {
+            Ok(root) => ClientError::Metadata(nokv_meta::MetadError::RestoreRootChanged { root }),
+            Err(err) => err,
+        },
+        WireMetadataError::RestoreBindingChanged { root } => match inode_id(root) {
+            Ok(root) => {
+                ClientError::Metadata(nokv_meta::MetadError::RestoreBindingChanged { root })
+            }
+            Err(err) => err,
+        },
+        WireMetadataError::RestoreResourceLimit {
+            resource,
+            limit,
+            actual,
+        } => ClientError::Metadata(nokv_meta::MetadError::RestoreResourceLimit {
+            resource,
+            limit,
+            actual,
+        }),
         WireMetadataError::StalePreparedArtifactObjectGcEpoch { expected, current } => {
             ClientError::Metadata(nokv_meta::MetadError::StalePreparedArtifactObjectGcEpoch {
                 expected,
@@ -322,6 +347,21 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
             snapshot_id,
             attempts,
         }),
+        WireMetadataError::RestoreHardlinkUnsupported { inode } => match inode_id(inode) {
+            Ok(inode) => {
+                ClientError::Metadata(nokv_meta::MetadError::RestoreHardlinkUnsupported { inode })
+            }
+            Err(err) => err,
+        },
+        WireMetadataError::RestoreCrossShardUnsupported { inode } => match inode_id(inode) {
+            Ok(inode) => {
+                ClientError::Metadata(nokv_meta::MetadError::RestoreCrossShardUnsupported { inode })
+            }
+            Err(err) => err,
+        },
+        WireMetadataError::RestoreDestinationConflict { destination } => {
+            ClientError::Metadata(nokv_meta::MetadError::RestoreDestinationConflict { destination })
+        }
         WireMetadataError::SyncLogArchiveFailed { committed, message } => {
             ClientError::Metadata(nokv_meta::MetadError::SyncLogArchiveFailed {
                 committed,
@@ -351,4 +391,17 @@ pub(crate) fn client_error_from_wire_error(error: WireMetadataError) -> ClientEr
 
 pub(crate) fn unexpected_result(result: nokv_protocol::MetadataRpcResult) -> ClientError {
     ClientError::Protocol(format!("unexpected metadata rpc result {result:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_owner_epoch_stays_typed_after_wire_decode() {
+        assert!(matches!(
+            client_error_from_wire_error(WireMetadataError::InvalidOwnerEpoch),
+            ClientError::Metadata(nokv_meta::MetadError::InvalidOwnerEpoch)
+        ));
+    }
 }

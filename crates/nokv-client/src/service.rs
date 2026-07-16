@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -6,39 +6,42 @@ use std::time::Duration;
 
 use nokv_control::{ControlStore, ShardId, ShardRecord, ShardState};
 use nokv_meta::{
-    DentryWithAttr, NamespaceAggregateGroup, NamespaceAggregateMeasure, NamespaceAggregateOp,
-    NamespaceAggregateOutputMeasure, NamespaceAggregateRequest, NamespaceAggregateResult,
-    NamespaceAggregateSample, NamespaceAggregateSort, NamespaceAggregateValue,
-    NamespaceBodyDescriptor, NamespaceCard, NamespaceCardKind, NamespaceFacetSummary,
-    NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind, NamespaceFieldValue,
-    NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest, NamespaceFindResult,
-    NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult, NamespaceInclude,
-    NamespaceIndexValue, NamespaceListOptions, NamespaceListPage, NamespacePredicate,
-    NamespacePredicateOp, NamespacePredicateValue, NamespaceQueryCatalog, NamespaceReadFormat,
-    NamespaceReadItem, NamespaceReadOptions, NamespaceReadPage, NamespaceRecordCount,
-    NamespaceRecordType, NamespaceSchema, NamespaceSort, NamespaceSortDirection,
-    NamespaceSortField, PublishArtifactStagedSession, RecordCountProvenance, RenameReplaceResult,
-    SnapshotRenewOutcome, SubtreeDelta, UpdateAttr, XattrSetMode,
+    restore_operation_id, DentryWithAttr, NamespaceAggregateGroup, NamespaceAggregateMeasure,
+    NamespaceAggregateOp, NamespaceAggregateOutputMeasure, NamespaceAggregateRequest,
+    NamespaceAggregateResult, NamespaceAggregateSample, NamespaceAggregateSort,
+    NamespaceAggregateValue, NamespaceBodyDescriptor, NamespaceCard, NamespaceCardKind,
+    NamespaceFacetSummary, NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind,
+    NamespaceFieldValue, NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest,
+    NamespaceFindResult, NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult,
+    NamespaceInclude, NamespaceIndexValue, NamespaceListOptions, NamespaceListPage,
+    NamespacePredicate, NamespacePredicateOp, NamespacePredicateValue, NamespaceQueryCatalog,
+    NamespaceReadFormat, NamespaceReadItem, NamespaceReadOptions, NamespaceReadPage,
+    NamespaceRecordCount, NamespaceRecordType, NamespaceSchema, NamespaceSort,
+    NamespaceSortDirection, NamespaceSortField, PublishArtifactStagedSession,
+    RecordCountProvenance, RenameReplaceResult, RestoreInitialization, RestoreOutcome,
+    RestoreState, SnapshotRenewOutcome, SubtreeDelta, UpdateAttr, XattrSetMode,
 };
 use nokv_object::ObjectReadPlan;
 use nokv_protocol::{
     decode_envelope, decode_name_cursor, decode_xattr_name, encode_advisory_lock_kind,
     encode_file_type, encode_name_cursor, encode_request, encode_xattr_name, request_routing_key,
-    MetadataRpcRequest, MetadataRpcResult, RoutingKey, WireNamespaceAggregateGroup,
-    WireNamespaceAggregateMeasure, WireNamespaceAggregateOp, WireNamespaceAggregateOutputMeasure,
-    WireNamespaceAggregateRequest, WireNamespaceAggregateResult, WireNamespaceAggregateSample,
-    WireNamespaceAggregateSort, WireNamespaceAggregateValue, WireNamespaceCard,
-    WireNamespaceCardKind, WireNamespaceFacetSummary, WireNamespaceFacetValue,
-    WireNamespaceFieldSource, WireNamespaceFieldSourceKind, WireNamespaceFieldValue,
-    WireNamespaceFilterCapability, WireNamespaceFindField, WireNamespaceFindRequest,
-    WireNamespaceFindResult, WireNamespaceGrepMatch, WireNamespaceGrepRequest,
-    WireNamespaceGrepResult, WireNamespaceInclude, WireNamespaceIndexValue, WireNamespaceListPage,
-    WireNamespacePredicate, WireNamespacePredicateOp, WireNamespacePredicateValue,
-    WireNamespaceQueryCatalog, WireNamespaceReadFormat, WireNamespaceReadItem,
-    WireNamespaceReadOptions, WireNamespaceReadPage, WireNamespaceRecordCount,
-    WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort, WireNamespaceSortDirection,
-    WireNamespaceSortField, WireOpenPathReadPlanRequest, WireRecordCountProvenance,
-    WireSnapshotRenewOutcome,
+    MetadataRpcRequest, MetadataRpcResult, RoutingKey, WireMetadataCapabilities,
+    WireNamespaceAggregateGroup, WireNamespaceAggregateMeasure, WireNamespaceAggregateOp,
+    WireNamespaceAggregateOutputMeasure, WireNamespaceAggregateRequest,
+    WireNamespaceAggregateResult, WireNamespaceAggregateSample, WireNamespaceAggregateSort,
+    WireNamespaceAggregateValue, WireNamespaceCard, WireNamespaceCardKind,
+    WireNamespaceFacetSummary, WireNamespaceFacetValue, WireNamespaceFieldSource,
+    WireNamespaceFieldSourceKind, WireNamespaceFieldValue, WireNamespaceFilterCapability,
+    WireNamespaceFindField, WireNamespaceFindRequest, WireNamespaceFindResult,
+    WireNamespaceGrepMatch, WireNamespaceGrepRequest, WireNamespaceGrepResult,
+    WireNamespaceInclude, WireNamespaceIndexValue, WireNamespaceListPage, WireNamespacePredicate,
+    WireNamespacePredicateOp, WireNamespacePredicateValue, WireNamespaceQueryCatalog,
+    WireNamespaceReadFormat, WireNamespaceReadItem, WireNamespaceReadOptions,
+    WireNamespaceReadPage, WireNamespaceRecordCount, WireNamespaceRecordType, WireNamespaceSchema,
+    WireNamespaceSort, WireNamespaceSortDirection, WireNamespaceSortField,
+    WireOpenPathReadPlanRequest, WireRecordCountProvenance, WireRestoreInitialization,
+    WireRestoreInitializationFile, WireRestoreState, WireSnapshotRenewOutcome,
+    RESTORE_TO_FORK_V1_CAPABILITY,
 };
 use nokv_types::{
     AdvisoryLock, AdvisoryLockRequest, BodyDescriptor, ChunkManifest, DentryName, FileType,
@@ -54,6 +57,15 @@ use crate::framed::{read_frame, write_frame, FRAMED_RPC_MAGIC};
 use crate::wire::*;
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+// A durable restore may legitimately outlive an ordinary metadata RPC while it
+// materializes bounded pages or waits for a release/GC safety fence. The public
+// operation remains idempotent, but a healthy default client must not abandon
+// it at the ordinary ten-second request deadline.
+const DEFAULT_RESTORE_RPC_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn restore_rpc_timeout(configured: Duration) -> Duration {
+    configured.max(DEFAULT_RESTORE_RPC_TIMEOUT)
+}
 const MAX_BATCH_RPC_REQUESTS: usize = 128;
 
 fn snapshot_inode_api_disabled() -> ClientError {
@@ -197,6 +209,14 @@ pub struct PathLayoutOpenRequest {
 pub struct CloneOutcome {
     pub root: InodeId,
     pub snapshot_id: u64,
+}
+
+/// Feature bits reported by the metadata owner selected for a path. A path is
+/// only a routing key for this probe and does not need to exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCapabilities {
+    pub mount_id: MountId,
+    pub restore_to_fork_v1: bool,
 }
 
 /// Result of pinning a subtree snapshot: the durable `snapshot_id` to pass to a
@@ -1575,6 +1595,131 @@ impl MetadataClient {
         }
     }
 
+    pub fn metadata_capabilities(&self, path: &str) -> Result<MetadataCapabilities, ClientError> {
+        match self.call(MetadataRpcRequest::MetadataCapabilities {
+            path: path.to_owned(),
+        })? {
+            MetadataRpcResult::MetadataCapabilities { capabilities } => {
+                metadata_capabilities(capabilities)
+            }
+            other => Err(unexpected_result(other)),
+        }
+    }
+
+    /// Query every metadata owner that can win longest-prefix routing at or
+    /// below `root`. The root probe covers the fallback owner (including an
+    /// ancestor route); each registered descendant prefix is itself a routing
+    /// key for the owner that can override that fallback.
+    ///
+    /// Fleet routes are refreshed from the control plane before enumeration so
+    /// capability-gated surfaces fail closed during rolling deployment. In
+    /// single-shard mode the one root probe covers the only possible owner.
+    pub fn metadata_capabilities_for_subtree_owners(
+        &self,
+        root: &str,
+    ) -> Result<Vec<MetadataCapabilities>, ClientError> {
+        let probe_paths = match &self.mode {
+            RoutingMode::SingleShard { .. } => vec![root.to_owned()],
+            RoutingMode::Fleet(router) => {
+                router.refresh(self)?;
+                router.subtree_owner_probe_paths(root)
+            }
+        };
+        probe_paths
+            .into_iter()
+            .map(|path| self.metadata_capabilities(&path))
+            .collect()
+    }
+
+    pub fn restore_subtree_path_to_fork(
+        &self,
+        source: &str,
+        snapshot_id: u64,
+        destination: &str,
+    ) -> Result<RestoreOutcome, ClientError> {
+        self.restore_subtree_path_to_fork_initialized(
+            source,
+            snapshot_id,
+            destination,
+            RestoreInitialization::default(),
+        )
+    }
+
+    pub fn restore_subtree_path_to_fork_initialized(
+        &self,
+        source: &str,
+        snapshot_id: u64,
+        destination: &str,
+        initialization: RestoreInitialization,
+    ) -> Result<RestoreOutcome, ClientError> {
+        self.ensure_same_shard_paths(source, destination)?;
+        let capabilities = match self.metadata_capabilities(destination) {
+            Ok(capabilities) => capabilities,
+            // A pre-v1 owner cannot decode the capability request. Treat that
+            // as an unavailable capability instead of leaking a generic wire
+            // error to callers during a rolling deployment.
+            Err(ClientError::Protocol(_)) => {
+                return Err(restore_capability_unavailable(destination));
+            }
+            Err(err) => return Err(err),
+        };
+        if !capabilities.restore_to_fork_v1 {
+            return Err(restore_capability_unavailable(destination));
+        }
+        let expected_operation_id =
+            restore_operation_id(capabilities.mount_id, source, snapshot_id, destination)?;
+        match self.call_with_timeout(
+            MetadataRpcRequest::RestoreSubtreePathToFork {
+                source_path: source.to_owned(),
+                snapshot_id,
+                destination_path: destination.to_owned(),
+                initialization: WireRestoreInitialization {
+                    remove_relative_paths: initialization.remove_relative_paths,
+                    files: initialization
+                        .files
+                        .into_iter()
+                        .map(|file| WireRestoreInitializationFile {
+                            relative_path: file.relative_path,
+                            bytes: file.bytes,
+                            content_type: file.content_type,
+                            mode: file.mode,
+                            uid: file.uid,
+                            gid: file.gid,
+                        })
+                        .collect(),
+                },
+            },
+            restore_rpc_timeout(self.timeout),
+        )? {
+            MetadataRpcResult::Restore { outcome }
+                if outcome.operation_id == expected_operation_id
+                    && outcome.snapshot_id == snapshot_id
+                    && !outcome.cleanup_pending =>
+            {
+                Ok(RestoreOutcome {
+                    operation_id: outcome.operation_id,
+                    state: match outcome.state {
+                        WireRestoreState::Complete => RestoreState::Complete,
+                    },
+                    source_root: inode_id(outcome.source_root)?,
+                    destination_root: inode_id(outcome.destination_root)?,
+                    snapshot_id: outcome.snapshot_id,
+                    read_version: outcome.read_version,
+                    cleanup_pending: false,
+                })
+            }
+            MetadataRpcResult::Restore { outcome } => Err(ClientError::Protocol(format!(
+                "restore outcome mismatch: expected operation {} snapshot {} with no pending cleanup, got operation {} snapshot {} cleanup_pending={}",
+                expected_operation_id,
+                snapshot_id,
+                outcome.operation_id,
+                outcome.snapshot_id,
+                outcome.cleanup_pending
+            ))),
+            other => Err(unexpected_result(other)),
+        }
+    }
+
     pub fn diff_subtrees(&self, a: &str, b: &str) -> Result<Vec<SubtreeDelta>, ClientError> {
         self.ensure_same_shard_paths(a, b)?;
         match self.call(MetadataRpcRequest::DiffSubtrees {
@@ -2078,11 +2223,19 @@ impl MetadataClient {
     /// shard endpoint, sends the request, and — in fleet mode — re-resolves the
     /// routing map and retries on an owner handoff (`NotOwner`/stale owner).
     fn call(&self, request: MetadataRpcRequest) -> Result<MetadataRpcResult, ClientError> {
+        self.call_with_timeout(request, self.timeout)
+    }
+
+    fn call_with_timeout(
+        &self,
+        request: MetadataRpcRequest,
+        timeout: Duration,
+    ) -> Result<MetadataRpcResult, ClientError> {
         let body =
             encode_request(&request).map_err(|err| ClientError::Protocol(err.to_string()))?;
         match &self.mode {
-            RoutingMode::SingleShard { address } => self.call_endpoint(*address, &body),
-            RoutingMode::Fleet(router) => self.call_fleet(router, &request, &body),
+            RoutingMode::SingleShard { address } => self.call_endpoint(*address, &body, timeout),
+            RoutingMode::Fleet(router) => self.call_fleet(router, &request, &body, timeout),
         }
     }
 
@@ -2117,6 +2270,7 @@ impl MetadataClient {
         router: &FleetRouter,
         request: &MetadataRpcRequest,
         body: &[u8],
+        timeout: Duration,
     ) -> Result<MetadataRpcResult, ClientError> {
         let mut last_resolve_err: Option<ClientError> = None;
         for attempt in 0..FLEET_MAX_ATTEMPTS {
@@ -2138,7 +2292,7 @@ impl MetadataClient {
                     continue;
                 }
             };
-            match self.call_endpoint(address, body) {
+            match self.call_endpoint(address, body, timeout) {
                 Ok(result) => return Ok(result),
                 Err(err) if attempt + 1 < FLEET_MAX_ATTEMPTS && is_owner_handoff(&err) => {
                     // Owner moved: loop to refresh + re-resolve against the new owner.
@@ -2161,10 +2315,11 @@ impl MetadataClient {
         &self,
         address: SocketAddr,
         body: &[u8],
+        timeout: Duration,
     ) -> Result<MetadataRpcResult, ClientError> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let connection = self.connection(address)?;
-        let body = match connection.call(request_id, body, self.timeout) {
+        let body = match connection.call(request_id, body, timeout) {
             Ok(body) => body,
             Err(err @ ClientError::Io(_)) => {
                 self.drop_connection(address);
@@ -2222,6 +2377,24 @@ impl FleetRouter {
             .route(self.mount, path)
     }
 
+    /// Return one routing key for the subtree fallback owner plus every
+    /// registered descendant route. Do not hold the route-map lock while the
+    /// probes run: a probe may observe an owner handoff and refresh the map.
+    fn subtree_owner_probe_paths(&self, root: &str) -> Vec<String> {
+        let map = self.shard_map.read().expect("fleet shard map");
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        seen.insert(root.to_owned());
+        paths.push(root.to_owned());
+        for route in map.routes() {
+            let path = &route.prefix.path;
+            if path_is_strict_descendant(path, root) && seen.insert(path.clone()) {
+                paths.push(path.clone());
+            }
+        }
+        paths
+    }
+
     /// The endpoint currently mapped to `shard_index`, if the cache knows it.
     fn endpoint(&self, shard_index: u16) -> Option<SocketAddr> {
         self.endpoints
@@ -2238,7 +2411,7 @@ impl FleetRouter {
         let (shard_map, endpoints) = resolve_fleet_routes(self.control.as_ref(), self.mount)?;
         // Drop pooled connections to endpoints that are no longer current so a
         // handed-off owner's stale socket is not reused.
-        let live: std::collections::HashSet<SocketAddr> = endpoints.values().copied().collect();
+        let live: HashSet<SocketAddr> = endpoints.values().copied().collect();
         {
             let mut pool = client.connections.lock().expect("metadata rpc connections");
             pool.retain(|address, _| live.contains(address));
@@ -2294,6 +2467,14 @@ fn resolve_fleet_routes(
         }
     }
     Ok((ShardMap::from_routes(routes), endpoints))
+}
+
+fn path_is_strict_descendant(path: &str, root: &str) -> bool {
+    if root == "/" {
+        return path != "/" && path.starts_with('/');
+    }
+    path.strip_prefix(root)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Whether an error means "the owner moved" — re-resolve the shard map and retry
@@ -2420,6 +2601,22 @@ fn namespace_record_count(
             WireRecordCountProvenance::Approximate => RecordCountProvenance::Approximate,
         },
     })
+}
+
+fn metadata_capabilities(
+    capabilities: WireMetadataCapabilities,
+) -> Result<MetadataCapabilities, ClientError> {
+    Ok(MetadataCapabilities {
+        mount_id: MountId::new(capabilities.mount_id)
+            .map_err(|err| ClientError::Protocol(err.to_string()))?,
+        restore_to_fork_v1: capabilities.restore_to_fork_v1,
+    })
+}
+
+fn restore_capability_unavailable(path: &str) -> ClientError {
+    ClientError::Protocol(format!(
+        "required metadata capability {RESTORE_TO_FORK_V1_CAPABILITY} is unavailable for owner of {path}"
+    ))
 }
 
 fn namespace_schema(schema: WireNamespaceSchema) -> NamespaceSchema {

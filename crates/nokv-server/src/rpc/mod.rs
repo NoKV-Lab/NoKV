@@ -17,12 +17,16 @@ pub(crate) use transport::{
     read_frame, write_frame, MAX_FRAMED_RPC_WORKERS, MIN_FRAMED_RPC_WORKERS,
 };
 
-use nokv_meta::{MetadError, OpenPathReadPlanRequest, PublishArtifactStagedSession};
+use nokv_meta::{
+    MetadError, OpenPathReadPlanRequest, PublishArtifactStagedSession, RestoreInitialization,
+    RestoreInitializationFile, RestoreState,
+};
 use nokv_protocol::{
     decode_advisory_lock_kind, decode_file_type, decode_name_cursor, decode_request,
     decode_xattr_name, encode_envelope, encode_name_cursor, encode_xattr_name, MetadataRpcEnvelope,
-    MetadataRpcRequest, MetadataRpcResult, WireAdvisoryLock, WireMetadataError,
-    WireOpenPathReadPlanRequest, WirePathMetadata,
+    MetadataRpcRequest, MetadataRpcResult, WireAdvisoryLock, WireMetadataCapabilities,
+    WireMetadataError, WireOpenPathReadPlanRequest, WirePathMetadata, WireRestoreOutcome,
+    WireRestoreState,
 };
 use nokv_types::{AdvisoryLockRequest, SpecialNodeSpec};
 
@@ -689,6 +693,58 @@ fn execute_unfenced(
                 snapshot_id: handle.snapshot_id,
             })
         }
+        MetadataRpcRequest::MetadataCapabilities { .. } => {
+            Ok(MetadataRpcResult::MetadataCapabilities {
+                capabilities: WireMetadataCapabilities {
+                    mount_id: slot.service().mount_id().get(),
+                    restore_to_fork_v1: true,
+                },
+            })
+        }
+        MetadataRpcRequest::RestoreSubtreePathToFork {
+            source_path,
+            snapshot_id,
+            destination_path,
+            initialization,
+        } => {
+            let outcome = slot
+                .service()
+                .with_immediate_sync_metadata_log_publication(|| {
+                    slot.service().restore_subtree_path_to_fork_initialized(
+                        &source_path,
+                        snapshot_id,
+                        &destination_path,
+                        RestoreInitialization {
+                            remove_relative_paths: initialization.remove_relative_paths,
+                            files: initialization
+                                .files
+                                .into_iter()
+                                .map(|file| RestoreInitializationFile {
+                                    relative_path: file.relative_path,
+                                    bytes: file.bytes,
+                                    content_type: file.content_type,
+                                    mode: file.mode,
+                                    uid: file.uid,
+                                    gid: file.gid,
+                                })
+                                .collect(),
+                        },
+                    )
+                })?;
+            Ok(MetadataRpcResult::Restore {
+                outcome: WireRestoreOutcome {
+                    operation_id: outcome.operation_id,
+                    state: match outcome.state {
+                        RestoreState::Complete => WireRestoreState::Complete,
+                    },
+                    source_root: outcome.source_root.get(),
+                    destination_root: outcome.destination_root.get(),
+                    snapshot_id: outcome.snapshot_id,
+                    read_version: outcome.read_version,
+                    cleanup_pending: outcome.cleanup_pending,
+                },
+            })
+        }
         MetadataRpcRequest::DiffSubtrees { a_path, b_path } => {
             let deltas = slot.service().diff_subtrees_path(&a_path, &b_path)?;
             Ok(MetadataRpcResult::SubtreeDeltas {
@@ -1083,6 +1139,7 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::ReadArtifactPathAtSnapshot { .. }
         | MetadataRpcRequest::DiffSubtrees { .. }
         | MetadataRpcRequest::SnapshotPin { .. } => true,
+        MetadataRpcRequest::MetadataCapabilities { .. } => true,
         MetadataRpcRequest::BootstrapRoot { .. }
         | MetadataRpcRequest::CreateDir { .. }
         | MetadataRpcRequest::CreateGraft { .. }
@@ -1111,6 +1168,7 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::RenameReplacePath { .. }
         | MetadataRpcRequest::SnapshotSubtreePath { .. }
         | MetadataRpcRequest::CloneSubtreePath { .. }
+        | MetadataRpcRequest::RestoreSubtreePathToFork { .. }
         | MetadataRpcRequest::RollbackSubtreePath { .. }
         | MetadataRpcRequest::RetireSnapshot { .. }
         | MetadataRpcRequest::RenewSnapshot { .. }

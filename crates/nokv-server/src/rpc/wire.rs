@@ -1,3 +1,4 @@
+use nokv_control::ControlError;
 use nokv_meta::{
     DentryWithAttr, MetadError, NamespaceAggregateGroup, NamespaceAggregateMeasure,
     NamespaceAggregateOp, NamespaceAggregateOutputMeasure, NamespaceAggregateRequest,
@@ -63,6 +64,14 @@ pub(super) fn wire_server_error(err: &ServerError) -> WireMetadataError {
         ServerError::Object(err) => WireMetadataError::Object {
             message: err.to_string(),
         },
+        ServerError::Control(ControlError::NotOwner { shard_id })
+        | ServerError::Control(ControlError::StaleEpoch { shard_id, .. })
+        | ServerError::Control(ControlError::StaleLease { shard_id, .. }) => {
+            WireMetadataError::NotOwner {
+                shard_id: shard_id.as_str().to_owned(),
+                endpoint: None,
+            }
+        }
         ServerError::Control(err) => WireMetadataError::Metadata {
             message: err.to_string(),
         },
@@ -99,12 +108,17 @@ fn wire_metad_error(err: &MetadError) -> WireMetadataError {
             owner_epoch: *owner_epoch,
             required_epoch: *required_epoch,
         },
+        MetadError::InvalidOwnerEpoch => WireMetadataError::InvalidOwnerEpoch,
         MetadError::LeaseExpired {
             now_ms,
             deadline_ms,
         } => WireMetadataError::LeaseExpired {
             now_ms: *now_ms,
             deadline_ms: *deadline_ms,
+        },
+        MetadError::NotOwner { shard_id, endpoint } => WireMetadataError::NotOwner {
+            shard_id: shard_id.clone(),
+            endpoint: endpoint.clone(),
         },
         MetadError::SyncLogArchiveFailed { committed, message } => {
             WireMetadataError::SyncLogArchiveFailed {
@@ -134,6 +148,22 @@ fn wire_metad_error(err: &MetadError) -> WireMetadataError {
             dest_shard: *dest_shard,
         },
         MetadError::GraftPoint => WireMetadataError::GraftPoint,
+        MetadError::RestoreInProgress => WireMetadataError::RestoreInProgress,
+        MetadError::RestoreRootChanged { root } => {
+            WireMetadataError::RestoreRootChanged { root: root.get() }
+        }
+        MetadError::RestoreBindingChanged { root } => {
+            WireMetadataError::RestoreBindingChanged { root: root.get() }
+        }
+        MetadError::RestoreResourceLimit {
+            resource,
+            limit,
+            actual,
+        } => WireMetadataError::RestoreResourceLimit {
+            resource: resource.clone(),
+            limit: *limit,
+            actual: *actual,
+        },
         MetadError::StalePreparedArtifactObjectGcEpoch { expected, current } => {
             WireMetadataError::StalePreparedArtifactObjectGcEpoch {
                 expected: *expected,
@@ -181,6 +211,17 @@ fn wire_metad_error(err: &MetadError) -> WireMetadataError {
             snapshot_id: *snapshot_id,
             attempts: *attempts,
         },
+        MetadError::RestoreHardlinkUnsupported { inode } => {
+            WireMetadataError::RestoreHardlinkUnsupported { inode: inode.get() }
+        }
+        MetadError::RestoreCrossShardUnsupported { inode } => {
+            WireMetadataError::RestoreCrossShardUnsupported { inode: inode.get() }
+        }
+        MetadError::RestoreDestinationConflict { destination } => {
+            WireMetadataError::RestoreDestinationConflict {
+                destination: destination.clone(),
+            }
+        }
         other => WireMetadataError::Metadata {
             message: other.to_string(),
         },
@@ -946,4 +987,69 @@ fn wire_object_read_block(block: &ObjectReadBlock) -> WireObjectReadBlock {
 
 pub(super) fn protocol_error(err: MetadataProtocolError) -> MetadError {
     MetadError::Codec(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nokv_control::ShardId;
+
+    fn assert_control_owner_error_is_typed(error: ControlError, shard: &str) {
+        assert_eq!(
+            wire_server_error(&ServerError::Control(error)),
+            WireMetadataError::NotOwner {
+                shard_id: shard.to_owned(),
+                endpoint: None,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_owner_epoch_stays_typed_on_the_wire() {
+        assert_eq!(
+            wire_metad_error(&MetadError::InvalidOwnerEpoch),
+            WireMetadataError::InvalidOwnerEpoch
+        );
+    }
+
+    #[test]
+    fn control_owner_errors_stay_typed_on_the_wire() {
+        let shard = ShardId::new("mount-1:/");
+        assert_control_owner_error_is_typed(
+            ControlError::NotOwner {
+                shard_id: shard.clone(),
+            },
+            shard.as_str(),
+        );
+        assert_control_owner_error_is_typed(
+            ControlError::StaleEpoch {
+                shard_id: shard.clone(),
+                expected: 2,
+                actual: 3,
+            },
+            shard.as_str(),
+        );
+        assert_control_owner_error_is_typed(
+            ControlError::StaleLease {
+                shard_id: shard.clone(),
+                epoch: 2,
+                lease_id: 7,
+            },
+            shard.as_str(),
+        );
+    }
+
+    #[test]
+    fn metadata_not_owner_stays_typed_on_the_wire() {
+        assert_eq!(
+            wire_metad_error(&MetadError::NotOwner {
+                shard_id: "mount-1:/workbenches".to_owned(),
+                endpoint: Some("127.0.0.1:7731".to_owned()),
+            }),
+            WireMetadataError::NotOwner {
+                shard_id: "mount-1:/workbenches".to_owned(),
+                endpoint: Some("127.0.0.1:7731".to_owned()),
+            }
+        );
+    }
 }
