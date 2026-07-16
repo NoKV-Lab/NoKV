@@ -14,6 +14,7 @@ where
     ) -> Result<(), MetadError> {
         validate_xattr_name(name)?;
         let version = self.next_version()?;
+        let read_version = predecessor(version)?;
         let key = xattr_key(self.mount, inode, name);
         let mut predicates = vec![PredicateRef {
             family: RecordFamily::Inode,
@@ -33,10 +34,11 @@ where
                 predicate: Predicate::Exists,
             }),
         }
+        predicates.extend(self.restore_namespace_write_predicates(&[inode], read_version)?);
         self.commit_metadata(MetadataCommand {
             request_id: request_id(b"set-xattr", self.mount, inode, version),
             kind: CommandKind::SetXattr,
-            read_version: predecessor(version)?,
+            read_version,
             commit_version: version,
             primary_family: RecordFamily::Xattr,
             primary_key: key.clone(),
@@ -90,26 +92,29 @@ where
     pub fn remove_xattr(&self, inode: InodeId, name: &[u8]) -> Result<(), MetadError> {
         validate_xattr_name(name)?;
         let version = self.next_version()?;
+        let read_version = predecessor(version)?;
         let key = xattr_key(self.mount, inode, name);
+        let mut predicates = vec![
+            PredicateRef {
+                family: RecordFamily::Inode,
+                key: inode_key(self.mount, inode),
+                predicate: Predicate::Exists,
+            },
+            PredicateRef {
+                family: RecordFamily::Xattr,
+                key: key.clone(),
+                predicate: Predicate::Exists,
+            },
+        ];
+        predicates.extend(self.restore_namespace_write_predicates(&[inode], read_version)?);
         self.commit_metadata(MetadataCommand {
             request_id: request_id(b"remove-xattr", self.mount, inode, version),
             kind: CommandKind::RemoveXattr,
-            read_version: predecessor(version)?,
+            read_version,
             commit_version: version,
             primary_family: RecordFamily::Xattr,
             primary_key: key.clone(),
-            predicates: vec![
-                PredicateRef {
-                    family: RecordFamily::Inode,
-                    key: inode_key(self.mount, inode),
-                    predicate: Predicate::Exists,
-                },
-                PredicateRef {
-                    family: RecordFamily::Xattr,
-                    key: key.clone(),
-                    predicate: Predicate::Exists,
-                },
-            ],
+            predicates,
             mutations: vec![Mutation {
                 family: RecordFamily::Xattr,
                 key,

@@ -16,6 +16,7 @@ where
     O: ObjectStore,
 {
     pub fn publish_artifact(&self, request: PublishArtifact) -> Result<DentryWithAttr, MetadError> {
+        self.restore_namespace_write_predicates(&[request.parent], self.read_version()?)?;
         let object_reference = self.begin_object_reference_mutation()?;
         let version = self.next_version()?;
         let inode = self.next_inode()?;
@@ -66,6 +67,10 @@ where
         if existing.attr.file_type != FileType::File {
             return Err(MetadError::NotFile);
         }
+        self.restore_namespace_write_predicates(
+            &[request.parent, existing.attr.inode],
+            self.read_version()?,
+        )?;
         let version = self.next_version()?;
         let StagedArtifactBody {
             body,
@@ -90,6 +95,7 @@ where
         let projection = projection(request.parent, request.name, attr, Some(body));
         let old_generation = existing.body.as_ref().map(|body| body.generation);
         if let Err(err) = self.commit_replace_projection_with_chunks(ReplaceProjectionCommit {
+            request_id: None,
             kind: CommandKind::ReplaceArtifact,
             projection: &projection,
             chunks: &chunks,
@@ -126,9 +132,11 @@ where
         name: DentryName,
         object_reference: ObjectReferenceMutation,
     ) -> Result<PreparedArtifact, MetadError> {
+        let read_version = self.read_version()?;
+        self.restore_namespace_write_predicates(&[parent], read_version)?;
         let Some(parent_attr) = self.get_attr_at_version_for_purpose(
             parent,
-            self.read_version()?,
+            read_version,
             ReadPurpose::WritePlanLocal,
         )?
         else {
@@ -189,6 +197,10 @@ where
         if existing.attr.file_type != FileType::File {
             return Err(MetadError::NotFile);
         }
+        self.restore_namespace_write_predicates(
+            &[parent, existing.attr.inode],
+            self.read_version()?,
+        )?;
         let generation = self.next_version()?;
         let now_ms = current_time_ms();
         Ok(PreparedArtifact {
@@ -228,6 +240,10 @@ where
         &self,
         mut prepared: PreparedArtifact,
     ) -> Result<PreparedArtifact, MetadError> {
+        self.restore_namespace_write_predicates(
+            &[prepared.parent, prepared.inode],
+            self.read_version()?,
+        )?;
         if let Some(path) = prepared.path.as_deref() {
             let components = parse_absolute_path(path)?;
             let Some((name, parent_components)) = components.split_last() else {
@@ -303,21 +319,33 @@ where
         gid: u32,
     ) -> Result<RenameReplaceResult, MetadError> {
         validate_new_prepared_block_identities(self.mount, &prepared, &chunks)?;
-        self.publish_prepared_artifact_impl(PreparedArtifactPublish {
-            prepared,
-            body,
-            chunks,
-            old_chunks: &[],
-            mode,
-            uid,
-            gid,
-        })
+        self.publish_prepared_artifact_impl(
+            PreparedArtifactPublish {
+                prepared,
+                body,
+                chunks,
+                old_chunks: &[],
+                mode,
+                uid,
+                gid,
+            },
+            None,
+        )
     }
 
     fn publish_prepared_artifact_impl(
         &self,
         request: PreparedArtifactPublish<'_>,
+        request_id_override: Option<Vec<u8>>,
     ) -> Result<RenameReplaceResult, MetadError> {
+        validate_prepared_artifact(
+            self.mount,
+            &request.prepared,
+            &request.body,
+            &request.chunks,
+        )?;
+        let request_id = request_id_override
+            .unwrap_or_else(|| prepared_artifact_request_id(self.mount, &request));
         let PreparedArtifactPublish {
             prepared,
             body,
@@ -327,9 +355,28 @@ where
             uid,
             gid,
         } = request;
-        validate_prepared_artifact(self.mount, &prepared, &body, &chunks)?;
-        self.ensure_prepared_object_gc_epoch(prepared.object_gc_claim_version)?;
         let version = Version::new(prepared.generation)?;
+        let path_index = prepared
+            .path
+            .as_deref()
+            .map(|path| {
+                parse_absolute_path(path).map(|components| path_index_key(self.mount, &components))
+            })
+            .transpose()?;
+        let expected_dentry_version = if prepared.replace {
+            Some(Version::new(prepared.dentry_version.ok_or_else(|| {
+                MetadError::InvalidPreparedArtifact(
+                    "replace artifact is missing dentry version".to_owned(),
+                )
+            })?)?)
+        } else {
+            if prepared.dentry_version.is_some() || prepared.old_generation.is_some() {
+                return Err(MetadError::InvalidPreparedArtifact(
+                    "create artifact must not carry replace state".to_owned(),
+                ));
+            }
+            None
+        };
         let mut attr = InodeAttr {
             inode: prepared.inode,
             file_type: FileType::File,
@@ -351,79 +398,143 @@ where
             }
         }
         let projection = projection(prepared.parent, prepared.name.clone(), attr, Some(body));
-        if prepared.replace {
-            let expected_dentry_version =
-                Version::new(prepared.dentry_version.ok_or_else(|| {
-                    MetadError::InvalidPreparedArtifact(
-                        "replace artifact is missing dentry version".to_owned(),
-                    )
-                })?)?;
-            let replaced = self
-                .lookup_plus_for_write_plan(prepared.parent, &prepared.name)?
-                .and_then(|(existing, current_dentry_version)| {
-                    (existing.attr.file_type == FileType::File
-                        && existing.attr.inode == prepared.inode
-                        && current_dentry_version == expected_dentry_version)
-                        .then_some(existing)
-                });
-            self.commit_replace_projection_with_chunks(ReplaceProjectionCommit {
-                kind: CommandKind::ReplaceArtifact,
-                projection: &projection,
-                chunks: &chunks,
-                old_chunks,
-                dentry_version: expected_dentry_version,
-                old_generation: prepared.old_generation,
-                version,
-                path_index: prepared
-                    .path
-                    .as_deref()
-                    .map(|path| {
-                        parse_absolute_path(path)
-                            .map(|components| path_index_key(self.mount, &components))
+        let terminal_result = || {
+            self.prepared_terminal_commit_result(&request_id, version)
+                .map(|terminal| {
+                    terminal.map(|_| RenameReplaceResult {
+                        entry: projection.clone().into(),
+                        replaced: None,
                     })
-                    .transpose()?,
-                object_reference: Some(ObjectReferenceMutation::from_version(Version::new(
-                    prepared.object_gc_claim_version,
-                )?)),
-            })
-            .map_err(|err| {
-                self.classify_prepared_object_gc_epoch_error(err, prepared.object_gc_claim_version)
-            })?;
-            Ok(RenameReplaceResult {
-                entry: projection.into(),
-                replaced,
-            })
-        } else {
-            if prepared.dentry_version.is_some() || prepared.old_generation.is_some() {
-                return Err(MetadError::InvalidPreparedArtifact(
-                    "create artifact must not carry replace state".to_owned(),
-                ));
-            }
-            self.commit_create_projection_with_chunks_and_path_index(
-                CommandKind::PublishArtifact,
-                &projection,
-                &chunks,
-                version,
-                prepared
-                    .path
-                    .as_deref()
-                    .map(|path| {
-                        parse_absolute_path(path)
-                            .map(|components| path_index_key(self.mount, &components))
-                    })
-                    .transpose()?,
-                Some(ObjectReferenceMutation::from_version(Version::new(
-                    prepared.object_gc_claim_version,
-                )?)),
-            )
-            .map_err(|err| {
-                self.classify_prepared_object_gc_epoch_error(err, prepared.object_gc_claim_version)
-            })?;
-            Ok(RenameReplaceResult {
-                entry: projection.into(),
-                replaced: None,
-            })
+                })
+        };
+        if let Some(result) = terminal_result()? {
+            return Ok(result);
         }
+
+        let publish = (|| {
+            self.ensure_prepared_object_gc_epoch(prepared.object_gc_claim_version)?;
+            if let Some(expected_dentry_version) = expected_dentry_version {
+                let replaced = self
+                    .lookup_plus_for_write_plan(prepared.parent, &prepared.name)?
+                    .and_then(|(existing, current_dentry_version)| {
+                        (existing.attr.file_type == FileType::File
+                            && existing.attr.inode == prepared.inode
+                            && current_dentry_version == expected_dentry_version)
+                            .then_some(existing)
+                    });
+                self.commit_replace_projection_with_chunks(ReplaceProjectionCommit {
+                    request_id: Some(request_id.clone()),
+                    kind: CommandKind::ReplaceArtifact,
+                    projection: &projection,
+                    chunks: &chunks,
+                    old_chunks,
+                    dentry_version: expected_dentry_version,
+                    old_generation: prepared.old_generation,
+                    version,
+                    path_index,
+                    object_reference: Some(ObjectReferenceMutation::from_version(Version::new(
+                        prepared.object_gc_claim_version,
+                    )?)),
+                })
+                .map_err(|err| {
+                    self.classify_prepared_object_gc_epoch_error(
+                        err,
+                        prepared.object_gc_claim_version,
+                    )
+                })?;
+                Ok(RenameReplaceResult {
+                    entry: projection.clone().into(),
+                    replaced,
+                })
+            } else {
+                self.commit_create_projection_with_chunks_and_path_index(
+                    CommandKind::PublishArtifact,
+                    &projection,
+                    &chunks,
+                    version,
+                    path_index,
+                    Some(ObjectReferenceMutation::from_version(Version::new(
+                        prepared.object_gc_claim_version,
+                    )?)),
+                    Some(request_id.clone()),
+                )
+                .map_err(|err| {
+                    self.classify_prepared_object_gc_epoch_error(
+                        err,
+                        prepared.object_gc_claim_version,
+                    )
+                })?;
+                Ok(RenameReplaceResult {
+                    entry: projection.clone().into(),
+                    replaced: None,
+                })
+            }
+        })();
+        match publish {
+            Ok(result) => Ok(result),
+            Err(error) => terminal_result()?.ok_or(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepared_terminal_rename_result(
+        &self,
+        request_id: &[u8],
+        version: Version,
+        prepared: &PreparedArtifact,
+        body: &BodyDescriptor,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Option<RenameReplaceResult>, MetadError> {
+        if self
+            .prepared_terminal_commit_result(request_id, version)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        if let Some((current, _)) =
+            self.lookup_plus_for_write_plan(prepared.parent, &prepared.name)?
+        {
+            if current.attr.inode == prepared.inode
+                && current.attr.generation == prepared.generation
+            {
+                return Ok(Some(RenameReplaceResult {
+                    entry: current,
+                    replaced: None,
+                }));
+            }
+        }
+        let nlink = if prepared.replace {
+            self.lookup_plus_for_write_plan(prepared.parent, &prepared.name)?
+                .map(|(entry, _)| entry.attr.nlink)
+                .unwrap_or_else(|| FileType::File.initial_link_count())
+        } else {
+            FileType::File.initial_link_count()
+        };
+        let attr = InodeAttr {
+            inode: prepared.inode,
+            file_type: FileType::File,
+            mode,
+            uid,
+            gid,
+            rdev: 0,
+            nlink,
+            size: body.size,
+            generation: prepared.generation,
+            mtime_ms: prepared.mtime_ms,
+            ctime_ms: prepared.ctime_ms,
+        };
+        Ok(Some(RenameReplaceResult {
+            entry: projection(
+                prepared.parent,
+                prepared.name.clone(),
+                attr,
+                Some(body.clone()),
+            )
+            .into(),
+            replaced: None,
+        }))
     }
 
     fn ensure_prepared_object_gc_epoch(&self, expected: u64) -> Result<(), MetadError> {
@@ -482,22 +593,52 @@ where
                 "prepared artifact target does not match publish session".to_owned(),
             ));
         }
+        let request_id = prepared_artifact_session_request_id(self.mount, &prepared, &request);
         let version = Version::new(prepared.generation)?;
+        let terminal_body = BodyDescriptor {
+            producer: request.producer.clone(),
+            digest_uri: request.digest_uri.clone(),
+            size: request.size,
+            content_type: request.content_type.clone(),
+            manifest_id: request.manifest_id.clone(),
+            generation: version.get(),
+            base_generation: 0,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            block_size: DEFAULT_BLOCK_SIZE as u64,
+        };
+        if let Some(result) = self.prepared_terminal_rename_result(
+            &request_id,
+            version,
+            &prepared,
+            &terminal_body,
+            request.mode,
+            request.uid,
+            request.gid,
+        )? {
+            return Ok(result);
+        }
+        self.restore_namespace_write_predicates(
+            &[prepared.parent, prepared.inode],
+            self.read_version()?,
+        )?;
         let StagedArtifactBody {
             body,
             chunks,
             old_chunks,
             staged,
         } = self.stage_artifact_session(&request, &prepared, version)?;
-        self.publish_prepared_artifact_impl(PreparedArtifactPublish {
-            prepared,
-            body,
-            chunks,
-            old_chunks: &old_chunks,
-            mode: request.mode,
-            uid: request.uid,
-            gid: request.gid,
-        })
+        self.publish_prepared_artifact_impl(
+            PreparedArtifactPublish {
+                prepared,
+                body,
+                chunks,
+                old_chunks: &old_chunks,
+                mode: request.mode,
+                uid: request.uid,
+                gid: request.gid,
+            },
+            Some(request_id),
+        )
         .map_err(|err| MetadError::PublishArtifactFailed {
             source: Box::new(err),
             staged,
@@ -511,6 +652,10 @@ where
         ranges: &[PublishArtifactRange],
         block_index_base: u64,
     ) -> Result<ChunkedWrite, MetadError> {
+        self.restore_namespace_write_predicates(
+            &[prepared.parent, prepared.inode],
+            self.read_version()?,
+        )?;
         let dirty_ranges = ranges
             .iter()
             .filter(|range| !range.bytes.is_empty())
@@ -557,8 +702,32 @@ where
                 "prepared artifact target does not match staged publish session".to_owned(),
             ));
         }
-        validate_new_prepared_block_identities(self.mount, &prepared, &request.chunks)?;
+        let request_id =
+            prepared_artifact_staged_session_request_id(self.mount, &prepared, &request);
         let version = Version::new(prepared.generation)?;
+        let terminal_body = BodyDescriptor {
+            producer: request.producer.clone(),
+            digest_uri: request.digest_uri.clone(),
+            size: request.size,
+            content_type: request.content_type.clone(),
+            manifest_id: request.manifest_id.clone(),
+            generation: version.get(),
+            base_generation: prepared.old_generation.unwrap_or(0),
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            block_size: DEFAULT_BLOCK_SIZE as u64,
+        };
+        if let Some(result) = self.prepared_terminal_rename_result(
+            &request_id,
+            version,
+            &prepared,
+            &terminal_body,
+            request.mode,
+            request.uid,
+            request.gid,
+        )? {
+            return Ok(result);
+        }
+        validate_new_prepared_block_identities(self.mount, &prepared, &request.chunks)?;
         let (chunks, base_generation) =
             self.resolve_session_chunks(&prepared, request.size, request.chunks)?;
         self.manifest_chunks
@@ -579,15 +748,18 @@ where
         // A delta publish preserves its base generation; the prior generation's
         // blocks are reclaimed later at chain collapse (compaction), not here.
         let old_chunks: Vec<ChunkManifest> = Vec::new();
-        self.publish_prepared_artifact_impl(PreparedArtifactPublish {
-            prepared,
-            body,
-            chunks,
-            old_chunks: &old_chunks,
-            mode: request.mode,
-            uid: request.uid,
-            gid: request.gid,
-        })
+        self.publish_prepared_artifact_impl(
+            PreparedArtifactPublish {
+                prepared,
+                body,
+                chunks,
+                old_chunks: &old_chunks,
+                mode: request.mode,
+                uid: request.uid,
+                gid: request.gid,
+            },
+            Some(request_id),
+        )
         .map_err(|err| MetadError::PublishArtifactFailed {
             source: Box::new(err),
             staged: request.staged,
@@ -861,4 +1033,194 @@ where
         }
         Ok(chunks.into_values().collect())
     }
+}
+
+fn prepared_artifact_request_id(mount: MountId, request: &PreparedArtifactPublish<'_>) -> Vec<u8> {
+    let PreparedArtifactPublish {
+        prepared,
+        body,
+        chunks,
+        old_chunks,
+        mode,
+        uid,
+        gid,
+    } = request;
+    let (kind, mut hasher) =
+        prepared_request_hasher(mount, prepared, b"nokv.prepared-artifact.request.v1");
+    hash_prepared_field(&mut hasher, b"body", &encode_body_descriptor(body));
+    hash_prepared_field(
+        &mut hasher,
+        b"chunk_count",
+        &(chunks.len() as u64).to_be_bytes(),
+    );
+    for chunk in chunks {
+        hash_prepared_field(&mut hasher, b"chunk", &encode_chunk_manifest(chunk));
+    }
+    hash_prepared_field(
+        &mut hasher,
+        b"old_chunk_count",
+        &(old_chunks.len() as u64).to_be_bytes(),
+    );
+    for chunk in *old_chunks {
+        hash_prepared_field(&mut hasher, b"old_chunk", &encode_chunk_manifest(chunk));
+    }
+    hash_prepared_field(&mut hasher, b"mode", &mode.to_be_bytes());
+    hash_prepared_field(&mut hasher, b"uid", &uid.to_be_bytes());
+    hash_prepared_field(&mut hasher, b"gid", &gid.to_be_bytes());
+
+    finish_prepared_request_id(kind, hasher)
+}
+
+fn prepared_artifact_session_request_id(
+    mount: MountId,
+    prepared: &PreparedArtifact,
+    request: &PublishArtifactSession,
+) -> Vec<u8> {
+    let (kind, mut hasher) = prepared_request_hasher(
+        mount,
+        prepared,
+        b"nokv.prepared-artifact.session.request.v1",
+    );
+    hash_prepared_field(&mut hasher, b"producer", request.producer.as_bytes());
+    hash_prepared_field(&mut hasher, b"digest_uri", request.digest_uri.as_bytes());
+    hash_prepared_field(
+        &mut hasher,
+        b"content_type",
+        request.content_type.as_bytes(),
+    );
+    hash_prepared_field(&mut hasher, b"manifest_id", request.manifest_id.as_bytes());
+    hash_prepared_field(&mut hasher, b"size", &request.size.to_be_bytes());
+    hash_prepared_field(
+        &mut hasher,
+        b"range_count",
+        &(request.ranges.len() as u64).to_be_bytes(),
+    );
+    for range in &request.ranges {
+        hash_prepared_field(&mut hasher, b"range_offset", &range.offset.to_be_bytes());
+        hash_prepared_field(&mut hasher, b"range_bytes", &range.bytes);
+    }
+    hash_prepared_field(&mut hasher, b"mode", &request.mode.to_be_bytes());
+    hash_prepared_field(&mut hasher, b"uid", &request.uid.to_be_bytes());
+    hash_prepared_field(&mut hasher, b"gid", &request.gid.to_be_bytes());
+    finish_prepared_request_id(kind, hasher)
+}
+
+fn prepared_artifact_staged_session_request_id(
+    mount: MountId,
+    prepared: &PreparedArtifact,
+    request: &PublishArtifactStagedSession,
+) -> Vec<u8> {
+    let (kind, mut hasher) = prepared_request_hasher(
+        mount,
+        prepared,
+        b"nokv.prepared-artifact.staged-session.request.v1",
+    );
+    hash_prepared_field(&mut hasher, b"producer", request.producer.as_bytes());
+    hash_prepared_field(&mut hasher, b"digest_uri", request.digest_uri.as_bytes());
+    hash_prepared_field(
+        &mut hasher,
+        b"content_type",
+        request.content_type.as_bytes(),
+    );
+    hash_prepared_field(&mut hasher, b"manifest_id", request.manifest_id.as_bytes());
+    hash_prepared_field(&mut hasher, b"size", &request.size.to_be_bytes());
+    hash_prepared_field(
+        &mut hasher,
+        b"chunk_count",
+        &(request.chunks.len() as u64).to_be_bytes(),
+    );
+    for chunk in &request.chunks {
+        hash_prepared_field(&mut hasher, b"chunk", &encode_chunk_manifest(chunk));
+    }
+    hash_prepared_field(
+        &mut hasher,
+        b"staged_count",
+        &(request.staged.len() as u64).to_be_bytes(),
+    );
+    for object in request.staged.objects() {
+        hash_prepared_field(&mut hasher, b"staged_key", object.key.as_str().as_bytes());
+        hash_prepared_field(&mut hasher, b"staged_size", &object.size.to_be_bytes());
+    }
+    hash_prepared_field(&mut hasher, b"mode", &request.mode.to_be_bytes());
+    hash_prepared_field(&mut hasher, b"uid", &request.uid.to_be_bytes());
+    hash_prepared_field(&mut hasher, b"gid", &request.gid.to_be_bytes());
+    finish_prepared_request_id(kind, hasher)
+}
+
+fn prepared_request_hasher(
+    mount: MountId,
+    prepared: &PreparedArtifact,
+    domain: &[u8],
+) -> (CommandKind, Sha256) {
+    let kind = if prepared.replace {
+        CommandKind::ReplaceArtifact
+    } else {
+        CommandKind::PublishArtifact
+    };
+    let mut hasher = Sha256::new();
+    hash_prepared_field(&mut hasher, b"domain", domain);
+    hash_prepared_field(&mut hasher, b"kind", kind_name(kind));
+    hash_prepared_field(&mut hasher, b"mount", &mount.get().to_be_bytes());
+    hash_prepared_field(&mut hasher, b"parent", &prepared.parent.get().to_be_bytes());
+    hash_prepared_field(&mut hasher, b"name", prepared.name.as_bytes());
+    hash_prepared_optional_bytes(
+        &mut hasher,
+        b"path",
+        prepared.path.as_deref().map(str::as_bytes),
+    );
+    hash_prepared_field(&mut hasher, b"inode", &prepared.inode.get().to_be_bytes());
+    hash_prepared_field(
+        &mut hasher,
+        b"generation",
+        &prepared.generation.to_be_bytes(),
+    );
+    hash_prepared_field(&mut hasher, b"mtime_ms", &prepared.mtime_ms.to_be_bytes());
+    hash_prepared_field(&mut hasher, b"ctime_ms", &prepared.ctime_ms.to_be_bytes());
+    hash_prepared_field(&mut hasher, b"replace", &[u8::from(prepared.replace)]);
+    hash_prepared_optional_u64(&mut hasher, b"dentry_version", prepared.dentry_version);
+    hash_prepared_optional_u64(&mut hasher, b"old_generation", prepared.old_generation);
+    hash_prepared_field(
+        &mut hasher,
+        b"object_gc_claim_version",
+        &prepared.object_gc_claim_version.to_be_bytes(),
+    );
+    (kind, hasher)
+}
+
+fn finish_prepared_request_id(kind: CommandKind, hasher: Sha256) -> Vec<u8> {
+    let prefix = kind_name(kind);
+    let digest = hasher.finalize();
+    let mut out =
+        Vec::with_capacity(prefix.len() + PREPARED_ARTIFACT_REQUEST_ID_DOMAIN.len() + digest.len());
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(PREPARED_ARTIFACT_REQUEST_ID_DOMAIN);
+    out.extend_from_slice(&digest);
+    out
+}
+
+fn hash_prepared_optional_u64(hasher: &mut Sha256, name: &[u8], value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hash_prepared_field(hasher, name, &[1]);
+            hash_prepared_field(hasher, name, &value.to_be_bytes());
+        }
+        None => hash_prepared_field(hasher, name, &[0]),
+    }
+}
+
+fn hash_prepared_optional_bytes(hasher: &mut Sha256, name: &[u8], value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            hash_prepared_field(hasher, name, &[1]);
+            hash_prepared_field(hasher, name, value);
+        }
+        None => hash_prepared_field(hasher, name, &[0]),
+    }
+}
+
+fn hash_prepared_field(hasher: &mut Sha256, name: &[u8], value: &[u8]) {
+    hasher.update((name.len() as u64).to_be_bytes());
+    hasher.update(name);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }

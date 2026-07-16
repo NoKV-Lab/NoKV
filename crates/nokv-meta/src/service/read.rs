@@ -24,6 +24,13 @@ where
         version: Version,
         purpose: ReadPurpose,
     ) -> Result<Option<InodeAttr>, MetadError> {
+        let _visibility = self
+            .restore_visibility_fence
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.restore_inode_visible_at(inode, version, purpose)? {
+            return Ok(None);
+        }
         let Some(value) = self.metadata.get(
             RecordFamily::Inode,
             &inode_key(self.mount, inode),
@@ -106,6 +113,13 @@ where
         version: Version,
         purpose: ReadPurpose,
     ) -> Result<Option<(DentryWithAttr, Version)>, MetadError> {
+        let _visibility = self
+            .restore_visibility_fence
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.restore_inode_visible_at(parent, version, purpose)? {
+            return Ok(None);
+        }
         let key = dentry_key(self.mount, parent, name);
         let Some(item) =
             self.metadata
@@ -181,6 +195,13 @@ where
         version: Version,
         purpose: ReadPurpose,
     ) -> Result<Vec<DentryWithAttr>, MetadError> {
+        let _visibility = self
+            .restore_visibility_fence
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.restore_inode_visible_at(parent, version, purpose)? {
+            return Ok(Vec::new());
+        }
         let rows = self.metadata.scan(ScanRequest {
             family: RecordFamily::Dentry,
             prefix: dentry_prefix(self.mount, parent),
@@ -229,6 +250,16 @@ where
         version: Version,
         purpose: ReadPurpose,
     ) -> Result<ReadDirPlusPage, MetadError> {
+        let _visibility = self
+            .restore_visibility_fence
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.restore_inode_visible_at(parent, version, purpose)? {
+            return Ok(ReadDirPlusPage {
+                entries: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let requested = limit.max(1);
         let rows = self.metadata.scan(ScanRequest {
             family: RecordFamily::Dentry,
@@ -273,6 +304,75 @@ where
         version: Version,
     ) -> Result<ReadDirPlusPage, MetadError> {
         let requested = limit.max(1);
+        let overlay_inverse_prefix =
+            super::restore_index::restore_index_parent_inverse_prefix_for_read(self.mount, parent);
+        let has_overlay = !self
+            .metadata
+            .scan(ScanRequest {
+                family: RecordFamily::System,
+                prefix: overlay_inverse_prefix,
+                start_after: None,
+                version,
+                limit: 1,
+                purpose: ReadPurpose::UserStrong,
+            })?
+            .is_empty()
+            || self.restore_index_parent_has_fork_source(parent)?;
+        if !has_overlay {
+            return self.list_canonical_indexed_components_page(
+                parent, components, after, requested, version,
+            );
+        }
+        let keep = requested.saturating_add(1);
+        let (canonical, stale_rows) =
+            self.scan_canonical_indexed_components_page(parent, components, after, keep, version)?;
+        let mut entries = BTreeMap::<Vec<u8>, DentryWithAttr>::new();
+        for entry in canonical.entries {
+            entries.insert(entry.dentry.name.as_bytes().to_vec(), entry);
+        }
+        let inherited = self.restore_indexed_children_page(
+            parent,
+            after,
+            keep,
+            version,
+            ReadPurpose::UserStrong,
+        )?;
+        for entry in inherited.entries {
+            // A canonical PathIndex row is authoritative for the same child;
+            // inherited overlay only fills names that have not subsequently
+            // been published into the canonical index.
+            entries
+                .entry(entry.dentry.name.as_bytes().to_vec())
+                .or_insert(entry);
+        }
+        let has_more = entries.len() > requested;
+        let entries = entries.into_values().take(requested).collect::<Vec<_>>();
+        let next_cursor = if has_more {
+            entries.last().map(|entry| entry.dentry.name.clone())
+        } else {
+            None
+        };
+        self.read_dir_plus_total.fetch_add(1, Ordering::Relaxed);
+        self.read_dir_plus_entry_total
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        self.read_dir_plus_projection_hit_total
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        self.path_index_scan_stale_total
+            .fetch_add(stale_rows, Ordering::Relaxed);
+        Ok(ReadDirPlusPage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    fn scan_canonical_indexed_components_page(
+        &self,
+        parent: InodeId,
+        components: &[DentryName],
+        after: Option<&DentryName>,
+        requested: usize,
+        version: Version,
+    ) -> Result<(ReadDirPlusPage, u64), MetadError> {
         let prefix = path_index_prefix(self.mount, components);
         let mut start_after = after.map(|name| {
             let mut marker = components.to_vec();
@@ -325,17 +425,34 @@ where
         } else {
             None
         };
+        Ok((
+            ReadDirPlusPage {
+                entries,
+                next_cursor,
+            },
+            stale_rows,
+        ))
+    }
+
+    fn list_canonical_indexed_components_page(
+        &self,
+        parent: InodeId,
+        components: &[DentryName],
+        after: Option<&DentryName>,
+        requested: usize,
+        version: Version,
+    ) -> Result<ReadDirPlusPage, MetadError> {
+        let (page, stale_rows) = self.scan_canonical_indexed_components_page(
+            parent, components, after, requested, version,
+        )?;
         self.read_dir_plus_total.fetch_add(1, Ordering::Relaxed);
         self.read_dir_plus_entry_total
-            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+            .fetch_add(page.entries.len() as u64, Ordering::Relaxed);
         self.read_dir_plus_projection_hit_total
-            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+            .fetch_add(page.entries.len() as u64, Ordering::Relaxed);
         self.path_index_scan_stale_total
             .fetch_add(stale_rows, Ordering::Relaxed);
-        Ok(ReadDirPlusPage {
-            entries,
-            next_cursor,
-        })
+        Ok(page)
     }
 
     fn indexed_path_child(

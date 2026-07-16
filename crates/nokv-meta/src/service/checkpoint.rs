@@ -165,12 +165,18 @@ where
         commit_version: Version,
         object_reference: ObjectReferenceMutation,
     ) -> Result<(), MetadError> {
+        let read_version = predecessor(commit_version)?;
         let mut predicates = vec![PredicateRef {
             family: RecordFamily::Inode,
             key: inode_key(self.mount, parent),
             predicate: Predicate::Exists,
         }];
         predicates.push(object_reference.predicate(self.mount));
+        let restore_write_predicates =
+            self.restore_namespace_write_predicates(&[parent], read_version)?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
         let mut mutations = Vec::new();
         for (proj, chunks) in shards {
             let inode = proj.attr.inode;
@@ -214,17 +220,32 @@ where
                 }
             }
         }
-        self.commit_metadata(MetadataCommand {
+        let projections = shards
+            .iter()
+            .map(|(projection, _)| projection.clone())
+            .collect::<Vec<_>>();
+        let enrollment =
+            self.restore_namespace_enrollment_plan(parent, &projections, read_version)?;
+        predicates.extend(enrollment.predicates);
+        mutations.extend(enrollment.mutations);
+        let command = MetadataCommand {
             request_id: request_id(b"publish-checkpoint", self.mount, parent, commit_version),
             kind: CommandKind::PublishArtifact,
-            read_version: predecessor(commit_version)?,
+            read_version,
             commit_version,
             primary_family: RecordFamily::Dentry,
             primary_key: dentry_prefix(self.mount, parent),
             predicates,
             mutations,
             watch: Vec::new(),
-        })?;
+        };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(
+                &command,
+                "restore checkpoint publish",
+            )?;
+        }
+        self.commit_metadata(command)?;
         Ok(())
     }
 }

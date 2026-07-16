@@ -21,6 +21,9 @@ mod log_sync;
 mod namespace;
 mod publish;
 mod read;
+mod restore;
+mod restore_gc;
+mod restore_index;
 mod rollback;
 mod snapshot;
 mod watch;
@@ -31,7 +34,11 @@ pub use self::backup::{
     MetadataRestoreOutcome,
 };
 pub use self::checkpoint::{CheckpointHandle, CheckpointShard};
-pub use self::fsck::{DanglingBlock, FsckReport};
+pub use self::fsck::{
+    DanglingBlock, FsckMode, FsckReport, MismatchedBlock, RestoreCapabilityDisabled,
+    RestoreDowngradeError, RestoreDowngradeOutcome, RestoreFsckIssue, RestoreFsckReport,
+    RestoreMetrics, RestoreWritersQuiesced,
+};
 pub use self::log_archive::{
     MetadataLogArchiveConfig, MetadataLogRestoreOutcome, MetadataLogSegmentArchiveOutcome,
 };
@@ -39,15 +46,19 @@ pub use self::log_sync::{
     MetadataLogPruneOutcome, MetadataLogPublicationState, MetadataLogSegmentPointer,
     MetadataLogSyncConfig, MetadataLogSyncSnapshot,
 };
+pub use self::restore::{
+    restore_operation_id, RestoreInitialization, RestoreInitializationFile, RestoreOutcome,
+    RestoreState,
+};
 pub use self::snapshot::DEFAULT_SNAPSHOT_LEASE_MS;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use self::lock::AdvisoryLockTable;
 use crate::command::{
@@ -116,6 +127,11 @@ const PATH_INDEX_VALIDATION_CACHE_MAX_ENTRIES_PER_SHARD: usize =
     PATH_INDEX_VALIDATION_CACHE_MAX_ENTRIES / PATH_CACHE_SHARD_COUNT;
 pub(crate) const DEFAULT_READ_LEASE_MS: u64 = 3_600_000;
 const FAILOVER_DURABILITY_REQUIRED_MARKER: &[u8] = &[1];
+// Appended to the otherwise-stable 24-byte allocator record once durable
+// restore-to-fork state has ever been installed. Pre-restore binaries reject
+// trailing allocator bytes, so a cold downgrade fails closed instead of
+// silently ignoring private restore references and visibility overlays.
+const RESTORE_ALLOCATOR_FENCE_MAGIC: &[u8; 8] = b"NKRALV2\0";
 
 fn decode_failover_durability_required_marker(bytes: &[u8]) -> Result<(), MetadError> {
     if bytes == FAILOVER_DURABILITY_REQUIRED_MARKER {
@@ -425,6 +441,7 @@ struct StagedArtifactBody {
 }
 
 struct ReplaceProjectionCommit<'a> {
+    request_id: Option<Vec<u8>>,
     kind: CommandKind,
     projection: &'a DentryProjection,
     chunks: &'a [ChunkManifest],
@@ -610,11 +627,21 @@ pub struct MetadataServiceStats {
     pub metadata_log_segments_archived_total: u64,
     pub metadata_log_entries_archived_total: u64,
     pub metadata_log_archive_bytes_total: u64,
+    pub restore_to_fork_requests_total: u64,
+    pub restore_to_fork_success_total: u64,
+    pub restore_to_fork_failure_total: u64,
+    pub restore_to_fork_elapsed_ns_total: u64,
+    pub restore_to_fork_elapsed_ns_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PendingObjectCleanupOutcome {
     pub snapshot_reap: SnapshotReapOutcome,
+    pub restore_release_jobs_processed: usize,
+    pub restore_release_backlog: usize,
+    pub restore_release_quarantine: usize,
+    pub restore_release_mount_wide_quarantine: usize,
+    pub restore_init_tombstones_scanned: usize,
     pub scanned: usize,
     pub blocked_by_snapshots: usize,
     pub blocked_by_read_leases: usize,
@@ -751,6 +778,10 @@ pub enum MetadError {
         owner_epoch: u64,
         operation_token: u64,
     },
+    /// Holt checkpoint installation may fail after partially replacing the
+    /// current database. The service instance is permanently poisoned and must
+    /// be discarded; reopening a clean store is the only safe recovery.
+    MetadataCheckpointInstallUncertain,
     /// The selected metadata checkpoint predates the durable object-GC
     /// failover fence. It may reference objects deleted after that image was
     /// produced, so installing it as a recovery source is unsafe.
@@ -807,6 +838,33 @@ pub enum MetadError {
     /// point), NOT `EXDEV` — there is no copy+unlink fallback that would be
     /// correct here.
     GraftPoint,
+    /// The destination is occupied or is durably claimed by another restore.
+    RestoreDestinationConflict {
+        destination: String,
+    },
+    /// An identical durable operation is preparing, cleaning, or releasing.
+    RestoreInProgress,
+    /// A detached restore inode/root no longer has the operation-scoped
+    /// membership proof installed before materialization.
+    RestoreRootChanged {
+        root: InodeId,
+    },
+    /// The temporary history-retention binding is missing or no longer names
+    /// the durable restore operation being resumed.
+    RestoreBindingChanged {
+        root: InodeId,
+    },
+    RestoreResourceLimit {
+        resource: String,
+        limit: u64,
+        actual: u64,
+    },
+    RestoreHardlinkUnsupported {
+        inode: InodeId,
+    },
+    RestoreCrossShardUnsupported {
+        inode: InodeId,
+    },
     SnapshotLeaseExpired {
         snapshot_id: u64,
         lease_expires_unix_ms: u64,
@@ -844,6 +902,30 @@ pub enum MetadError {
     },
 }
 
+/// Poison a service if checkpoint installation or its post-install recovery
+/// exits early. Holt explicitly does not promise atomic installation on error,
+/// so a failed instance must never resume serving or accept another repair
+/// attempt in place.
+struct MetadataCheckpointInstallGuard<'a> {
+    uncertain: &'a AtomicBool,
+    complete: bool,
+}
+
+impl MetadataCheckpointInstallGuard<'_> {
+    fn complete(mut self) {
+        self.complete = true;
+        self.uncertain.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for MetadataCheckpointInstallGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.uncertain.store(true, Ordering::Release);
+        }
+    }
+}
+
 pub struct NoKvFs<M, O> {
     mount: MountId,
     /// Stable index of the shard this service owns. Encoded into the high bits
@@ -854,6 +936,43 @@ pub struct NoKvFs<M, O> {
     objects: O,
     allocator_gate: Mutex<()>,
     backup_gate: Mutex<()>,
+    metadata_checkpoint_install_uncertain: AtomicBool,
+    /// Process-local serialization only. Durable operation and destination
+    /// claims remain the authority across owner failover and process restart.
+    restore_gate: Mutex<()>,
+    /// Linearizes the no-staging fast path with the first durable restore hold.
+    /// Readers hold a shared guard through their inode/dentry metadata read;
+    /// restore/failover recovery takes the exclusive guard before changing the
+    /// process-local hint below. Durable operation rows remain authoritative.
+    restore_visibility_fence: RwLock<()>,
+    /// Fail-closed process-local hint. False is installed only after a durable
+    /// scan proves that no Preparing/ReadyToAttach/Cleaning/Discarding restore
+    /// exists. It avoids a System lookup on every ordinary namespace read.
+    restore_staging_possible: AtomicBool,
+    /// False only while `new` may still wrap a pristine Holt store awaiting a
+    /// checkpoint image. Once bootstrap/open/image recovery has explicitly
+    /// entered restore visibility recovery, owner-epoch installs may safely
+    /// rebuild the fast-path hint instead of leaving it fail closed forever.
+    restore_visibility_recovery_ready: AtomicBool,
+    /// Process-local request counters. Durable restore state remains the source
+    /// of truth; these metrics expose latency and terminal retry behavior.
+    restore_to_fork_requests_total: AtomicU64,
+    restore_to_fork_success_total: AtomicU64,
+    restore_to_fork_failure_total: AtomicU64,
+    restore_to_fork_elapsed_ns_total: AtomicU64,
+    restore_to_fork_elapsed_ns_max: AtomicU64,
+    /// Process-local seqlock for the current-only restore graph in the System
+    /// family. Restore fsck/metrics sample this sequence so unrelated namespace
+    /// writes and scheduler-only cursor movement cannot starve a long scan,
+    /// while every authoritative restore mutation still invalidates a mixed
+    /// view. Writers register before metadata apply and leave only after the
+    /// apply result is known, including lost-ack outcomes.
+    restore_graph_sequence: AtomicU64,
+    restore_graph_writers: AtomicUsize,
+    /// Serializes snapshot publication against restore exact-reference
+    /// release. Ordinary object GC is fenced by the durable claim-version
+    /// predicate instead and must remain able to race a paused snapshot commit.
+    restore_snapshot_gate: RwLock<()>,
     /// Prevents a live worker/manual GC call from mistaking another in-process
     /// worker's durable Deleting claim for crash recovery.
     object_gc_gate: Mutex<()>,
@@ -915,6 +1034,12 @@ pub struct NoKvFs<M, O> {
     /// clock. Lets lease-deadline fencing be exercised deterministically.
     clock_override_ms: AtomicU64,
     metadata_log_sync: Mutex<Option<log_sync::MetadataLogSyncState>>,
+    /// Optional control-plane publication callback installed by a controlled
+    /// server. Restore RPCs temporarily require this callback after each
+    /// archived command so a crash at an applied-phase barrier cannot strand
+    /// an unreferenced shared-log tail.
+    metadata_log_publication_hook: RwLock<Option<MetadataLogPublicationHook>>,
+    metadata_log_immediate_publication_depth: AtomicUsize,
     metadata_log_segments_archived_total: AtomicU64,
     metadata_log_entries_archived_total: AtomicU64,
     metadata_log_archive_bytes_total: AtomicU64,
@@ -945,6 +1070,9 @@ pub struct NoKvFs<M, O> {
     read_dir_plus_entry_total: AtomicU64,
     read_dir_plus_projection_hit_total: AtomicU64,
 }
+
+type MetadataLogPublicationHook =
+    Arc<dyn Fn(&log_sync::MetadataLogSyncSnapshot) -> Result<(), String> + Send + Sync + 'static>;
 
 fn new_path_resolution_cache_shards() -> Vec<Mutex<BTreeMap<PathResolutionCacheKey, InodeId>>> {
     (0..PATH_CACHE_SHARD_COUNT)
@@ -977,6 +1105,26 @@ where
     M: MetadataStore,
     O: ObjectStore,
 {
+    fn ensure_metadata_checkpoint_install_stable(&self) -> Result<(), MetadError> {
+        if self
+            .metadata_checkpoint_install_uncertain
+            .load(Ordering::Acquire)
+        {
+            return Err(MetadError::MetadataCheckpointInstallUncertain);
+        }
+        Ok(())
+    }
+
+    fn begin_metadata_checkpoint_install(
+        &self,
+    ) -> Result<MetadataCheckpointInstallGuard<'_>, MetadError> {
+        self.ensure_metadata_checkpoint_install_stable()?;
+        Ok(MetadataCheckpointInstallGuard {
+            uncertain: &self.metadata_checkpoint_install_uncertain,
+            complete: false,
+        })
+    }
+
     fn resized_body_digest_uri(
         &self,
         inode: InodeId,
@@ -1052,14 +1200,32 @@ fn recover_allocator_state<M: MetadataStore>(
     shard_index: u16,
 ) -> Result<AllocatorState, MetadError> {
     let max_read = Version::new(u64::MAX)?;
+    let restore_active = metadata.get(
+        RecordFamily::System,
+        &restore::restore_active_key(mount),
+        max_read,
+        ReadPurpose::UserStrong,
+    )?;
+    if let Some(marker) = &restore_active {
+        if marker.0 != [restore::RESTORE_FORMAT_VERSION] {
+            return Err(MetadError::Codec(
+                "invalid restore-to-fork active marker".to_owned(),
+            ));
+        }
+    }
     if let Some(value) = metadata.get(
         RecordFamily::System,
         &allocator_key(mount),
         max_read,
         ReadPurpose::UserStrong,
     )? {
-        let (last_commit_version, next_inode, epoch) =
-            decode_allocator_state(&value.0).map_err(|err| MetadError::Codec(err.to_string()))?;
+        let (last_commit_version, next_inode, epoch, restore_fenced) =
+            decode_allocator_state_with_restore_fence(&value.0)?;
+        if restore_active.is_some() != restore_fenced {
+            return Err(MetadError::Codec(
+                "restore active marker and allocator downgrade fence disagree".to_owned(),
+            ));
+        }
         Version::new(last_commit_version)?;
         InodeId::new(next_inode)?;
         return Ok(AllocatorState {
@@ -1067,6 +1233,12 @@ fn recover_allocator_state<M: MetadataStore>(
             next_inode,
             epoch,
         });
+    }
+
+    if restore_active.is_some() {
+        return Err(MetadError::Codec(
+            "restore active marker exists without an allocator downgrade fence".to_owned(),
+        ));
     }
 
     let mut last_commit_version = 1_u64;
@@ -1128,6 +1300,40 @@ fn recover_allocator_state<M: MetadataStore>(
         // No durable record: bootstrap the single-owner epoch.
         epoch: 1,
     })
+}
+
+fn encode_allocator_state_with_restore_fence(
+    last_commit_version: u64,
+    next_inode: u64,
+    epoch: u64,
+) -> Vec<u8> {
+    let mut encoded = encode_allocator_state(last_commit_version, next_inode, epoch);
+    encoded.extend_from_slice(RESTORE_ALLOCATOR_FENCE_MAGIC);
+    encoded
+}
+
+fn decode_allocator_state_with_restore_fence(
+    bytes: &[u8],
+) -> Result<(u64, u64, u64, bool), MetadError> {
+    let allocator_bytes = if bytes.len() == 24 {
+        bytes
+    } else if bytes.len() == 24 + RESTORE_ALLOCATOR_FENCE_MAGIC.len()
+        && &bytes[24..] == RESTORE_ALLOCATOR_FENCE_MAGIC
+    {
+        &bytes[..24]
+    } else {
+        return Err(MetadError::Codec(
+            "invalid allocator state or restore downgrade fence".to_owned(),
+        ));
+    };
+    let (last_commit_version, next_inode, epoch) = decode_allocator_state(allocator_bytes)
+        .map_err(|err| MetadError::Codec(err.to_string()))?;
+    Ok((
+        last_commit_version,
+        next_inode,
+        epoch,
+        bytes.len() != allocator_bytes.len(),
+    ))
 }
 
 fn reservation_upper_bound(required: u64, reservation: u64) -> u64 {
@@ -1750,6 +1956,21 @@ fn request_id(prefix: &[u8], mount: MountId, inode: InodeId, version: Version) -
     out
 }
 
+const PREPARED_ARTIFACT_REQUEST_ID_DOMAIN: &[u8] = b":prepared:v1:";
+
+fn is_prepared_artifact_request_id(kind: CommandKind, request_id: &[u8]) -> bool {
+    if !matches!(
+        kind,
+        CommandKind::PublishArtifact | CommandKind::ReplaceArtifact
+    ) {
+        return false;
+    }
+    let prefix = kind_name(kind);
+    request_id.len() == prefix.len() + PREPARED_ARTIFACT_REQUEST_ID_DOMAIN.len() + 32
+        && request_id.starts_with(prefix)
+        && request_id[prefix.len()..].starts_with(PREPARED_ARTIFACT_REQUEST_ID_DOMAIN)
+}
+
 fn allocator_reservation_request_id(
     mount: MountId,
     commit_version: Version,
@@ -1867,6 +2088,10 @@ impl fmt::Display for MetadError {
                 f,
                 "object GC deletion from owner epoch {owner_epoch} with operation token {operation_token} has an uncertain outcome and requires controlled recovery"
             ),
+            Self::MetadataCheckpointInstallUncertain => write!(
+                f,
+                "metadata checkpoint installation had an uncertain partial outcome; discard this service instance and reopen a clean store"
+            ),
             Self::MetadataArchiveMissingObjectGcFence { checkpoint_key } => write!(
                 f,
                 "metadata checkpoint {checkpoint_key} predates the durable object-GC failover fence and cannot be restored safely"
@@ -1925,6 +2150,39 @@ impl fmt::Display for MetadError {
             Self::GraftPoint => write!(
                 f,
                 "path is a cross-shard graft point; use unregister-graft"
+            ),
+            Self::RestoreDestinationConflict { destination } => write!(
+                f,
+                "restore destination is occupied or claimed by another operation: {destination}"
+            ),
+            Self::RestoreInProgress => write!(f, "restore operation is still in progress"),
+            Self::RestoreRootChanged { root } => write!(
+                f,
+                "restore staging root or member inode {} changed identity",
+                root.get()
+            ),
+            Self::RestoreBindingChanged { root } => write!(
+                f,
+                "restore temporary binding for root inode {} changed identity",
+                root.get()
+            ),
+            Self::RestoreResourceLimit {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                f,
+                "restore resource {resource} exceeds limit {limit} (actual {actual})"
+            ),
+            Self::RestoreHardlinkUnsupported { inode } => write!(
+                f,
+                "restore does not support hard-linked inode {}",
+                inode.get()
+            ),
+            Self::RestoreCrossShardUnsupported { inode } => write!(
+                f,
+                "restore does not support cross-shard inode {}",
+                inode.get()
             ),
             Self::SnapshotLeaseExpired {
                 snapshot_id,

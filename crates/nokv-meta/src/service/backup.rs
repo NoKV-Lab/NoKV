@@ -187,6 +187,13 @@ where
             serialize_archive_manifest(&manifest).into_bytes(),
         )?;
 
+        // CURRENT is now the authoritative recovery pointer. Acknowledge its
+        // exact log boundary before pruning either per-request archive proofs
+        // or checkpoint objects; a failure here leaves safe retained data and
+        // never advances local durability coverage ahead of the published
+        // pointer.
+        self.acknowledge_published_metadata_checkpoint(exported.log_lsn, exported.log_digest)?;
+
         // Retention deletes happen only after the manifest stops referencing
         // them; a crash here leaks orphans (reclaimable), never a live pointer.
         let mut pruned = 0;
@@ -336,16 +343,31 @@ where
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         self.mark_materialization_orphan_possible_under_gc_gate();
+        let restore_visibility = self
+            .restore_visibility_fence
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
+        let checkpoint_install = self.begin_metadata_checkpoint_install()?;
+        let _restore_graph_write = self.begin_restore_graph_write();
+        self.restore_staging_possible.store(true, Ordering::Release);
         self.metadata.install_checkpoint_image(&image)?;
         self.purge_path_caches_after_write();
         self.refresh_allocator_state()?;
         self.verify_failover_durability_required()?;
+        // Readers that enter after this point still take the restore slow path
+        // because the hint remains fail closed. Release the write fence before
+        // either recovery proof: both proofs perform ordinary namespace reads
+        // that acquire the shared side of this same fence.
+        drop(restore_visibility);
+        self.recover_restore_staging_visibility()?;
         self.reconcile_materialization_orphan_state_under_gc_gate()?;
-        Ok(MetadataRestoreOutcome {
+        let outcome = MetadataRestoreOutcome {
             checkpoint_key: identity.checkpoint_key.clone(),
             image_bytes: identity.image_bytes,
             commit_version: self.clock.load(Ordering::SeqCst),
-        })
+        };
+        checkpoint_install.complete();
+        Ok(outcome)
     }
 
     fn export_metadata_checkpoint(&self) -> Result<ExportedMetadataCheckpoint, MetadError> {
@@ -415,6 +437,13 @@ where
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         self.mark_materialization_orphan_possible_under_gc_gate();
+        let restore_visibility = self
+            .restore_visibility_fence
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
+        let checkpoint_install = self.begin_metadata_checkpoint_install()?;
+        let _restore_graph_write = self.begin_restore_graph_write();
+        self.restore_staging_possible.store(true, Ordering::Release);
         self.metadata.install_checkpoint_image(&image)?;
         // The image replaced the engine state wholesale, bypassing the commit
         // funnel; entries cached before the install may not exist in it at all.
@@ -424,12 +453,16 @@ where
         // verify the installed state as defense against a mismatched/corrupt
         // archive assembled outside the supported backup path.
         self.verify_failover_durability_required()?;
+        drop(restore_visibility);
+        self.recover_restore_staging_visibility()?;
         self.reconcile_materialization_orphan_state_under_gc_gate()?;
-        Ok(Some(MetadataRestoreOutcome {
+        let outcome = MetadataRestoreOutcome {
             checkpoint_key: manifest.current,
             image_bytes: image.len() as u64,
             commit_version: manifest.version,
-        }))
+        };
+        checkpoint_install.complete();
+        Ok(Some(outcome))
     }
 
     fn read_archive_manifest(

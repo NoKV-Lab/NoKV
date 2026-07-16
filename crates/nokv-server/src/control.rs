@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use nokv_control::{
@@ -72,6 +72,11 @@ pub(crate) struct ServerShardOwner {
     store: Arc<dyn ControlStore>,
     lease: ShardLease,
     recovery_publish_gate: Arc<RwLock<()>>,
+    /// Serializes exact recovery-reference CAS operations with lease renewal.
+    /// The visibility gate may be held across a multi-command RPC, while this
+    /// narrower gate is intentionally re-acquired by each post-commit log-tail
+    /// publication from inside that RPC.
+    recovery_control_gate: Arc<Mutex<()>>,
     published_recovery_state: Arc<RwLock<Option<ServerShardOwnerState>>>,
     recovery_dirty: Arc<AtomicBool>,
     /// Lease TTL (ms) for the wall-clock self-fence; `None` when auto-renewal is
@@ -223,6 +228,7 @@ impl ServerShardOwner {
             store,
             lease,
             recovery_publish_gate: Arc::new(RwLock::new(())),
+            recovery_control_gate: Arc::new(Mutex::new(())),
             published_recovery_state: Arc::new(RwLock::new(None)),
             recovery_dirty: Arc::new(AtomicBool::new(false)),
             lease_ttl_ms,
@@ -329,9 +335,11 @@ impl ServerShardOwner {
         self.mark_serving_with_recovery_refs_locked(service, checkpoint, log, durable_lsn)
     }
 
-    /// Publish while the caller already holds `recovery_publish_gate`. This is
-    /// used when the protected operation begins before the control CAS (for
-    /// example, snapshotting the sync-log tail or preparing a checkpoint).
+    /// Publish an exact recovery identity while serializing on the narrower
+    /// control gate. Ordinary callers also hold `recovery_publish_gate` to
+    /// protect namespace visibility; synchronous post-commit publication from
+    /// a multi-command RPC already runs inside that outer critical section and
+    /// deliberately acquires only the control gate here.
     pub(crate) fn mark_serving_with_recovery_refs_locked<M, O>(
         &self,
         service: &NoKvFs<M, O>,
@@ -343,6 +351,10 @@ impl ServerShardOwner {
         M: MetadataStore,
         O: ObjectStore,
     {
+        let _control = self
+            .recovery_control_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // Local deadline/epoch fencing is checked immediately before the
         // control-plane lease CAS. An owner that self-fenced must not revive
         // itself by publishing a recovery reference.
@@ -369,13 +381,16 @@ impl ServerShardOwner {
                     record
                 }
                 Ok(record) => {
-                    service.observe_required_owner_epoch(record.epoch)?;
+                    service.fence_required_owner_epoch(record.epoch)?;
                     return Err(mark_err.into());
                 }
                 Err(_) => return Err(mark_err.into()),
             },
         };
-        service.install_owner_epoch(record.epoch)?;
+        // `validate_record_lease` guarantees this is the same immutable epoch
+        // installed during acquisition. Re-installing it here would attempt
+        // restore-visibility recovery while a restore commit still owns that
+        // fence, deadlocking synchronous post-commit publication.
         // `mark_serving` is a control-record CAS, not a lease keepalive. Never
         // extend the local deadline here: only a successful `renew` round trip
         // proves that the control plane extended the real lease.
@@ -392,12 +407,18 @@ impl ServerShardOwner {
         M: MetadataStore,
         O: ObjectStore,
     {
+        let _control = self
+            .recovery_control_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // Capture the deadline basis BEFORE the round-trip so a slow renew never
         // pushes the local deadline past the control plane's real lease expiry.
         let basis_ms = service.now_ms();
         match self.store.renew(&self.lease) {
             Ok(record) => {
-                service.install_owner_epoch(record.epoch)?;
+                // The lease epoch is immutable and was installed by acquire.
+                // Avoid re-entering restore visibility while a post-commit
+                // publication is waiting on this control gate.
                 if let Some(ttl) = self.lease_ttl_ms {
                     service.set_lease_deadline(basis_ms.saturating_add(ttl));
                 }
@@ -411,7 +432,7 @@ impl ServerShardOwner {
                 // the last successful renew still fences this owner once it
                 // passes, so a partitioned owner cannot keep committing.
                 if let Ok(record) = self.store.get_shard(&self.lease.shard_id) {
-                    service.observe_required_owner_epoch(record.epoch)?;
+                    service.fence_required_owner_epoch(record.epoch)?;
                 }
                 Err(err.into())
             }
@@ -426,6 +447,10 @@ impl ServerShardOwner {
     /// Relinquish ownership so a standby can acquire immediately instead of
     /// waiting out the lease TTL. Used on graceful shutdown.
     pub(crate) fn release(&self) -> Result<(), ServerError> {
+        let _control = self
+            .recovery_control_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.store.release(&self.lease)?;
         Ok(())
     }

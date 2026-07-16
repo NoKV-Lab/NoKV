@@ -6,6 +6,11 @@ where
     O: ObjectStore,
 {
     pub fn new(mount: MountId, metadata: M, objects: O) -> Self {
+        // Keep the metadata engine pristine here. Checkpoint restore constructs
+        // a service around an empty store before installing the image, and even
+        // a read-only scan would create Holt trees that make wholesale image
+        // installation fail. Bootstrap/open-existing perform the durable
+        // restore-visibility proof once creating trees is safe.
         Self {
             mount,
             shard_index: 0,
@@ -13,6 +18,19 @@ where
             objects,
             allocator_gate: Mutex::new(()),
             backup_gate: Mutex::new(()),
+            metadata_checkpoint_install_uncertain: AtomicBool::new(false),
+            restore_gate: Mutex::new(()),
+            restore_visibility_fence: RwLock::new(()),
+            restore_staging_possible: AtomicBool::new(true),
+            restore_visibility_recovery_ready: AtomicBool::new(false),
+            restore_to_fork_requests_total: AtomicU64::new(0),
+            restore_to_fork_success_total: AtomicU64::new(0),
+            restore_to_fork_failure_total: AtomicU64::new(0),
+            restore_to_fork_elapsed_ns_total: AtomicU64::new(0),
+            restore_to_fork_elapsed_ns_max: AtomicU64::new(0),
+            restore_graph_sequence: AtomicU64::new(0),
+            restore_graph_writers: AtomicUsize::new(0),
+            restore_snapshot_gate: RwLock::new(()),
             object_gc_gate: Mutex::new(()),
             materialization_orphan_possible: AtomicBool::new(true),
             #[cfg(test)]
@@ -34,6 +52,8 @@ where
             lease_deadline_ms: AtomicU64::new(0),
             clock_override_ms: AtomicU64::new(0),
             metadata_log_sync: Mutex::new(None),
+            metadata_log_publication_hook: RwLock::new(None),
+            metadata_log_immediate_publication_depth: AtomicUsize::new(0),
             metadata_log_segments_archived_total: AtomicU64::new(0),
             metadata_log_entries_archived_total: AtomicU64::new(0),
             metadata_log_archive_bytes_total: AtomicU64::new(0),
@@ -120,6 +140,19 @@ where
             objects,
             allocator_gate: Mutex::new(()),
             backup_gate: Mutex::new(()),
+            metadata_checkpoint_install_uncertain: AtomicBool::new(false),
+            restore_gate: Mutex::new(()),
+            restore_visibility_fence: RwLock::new(()),
+            restore_staging_possible: AtomicBool::new(true),
+            restore_visibility_recovery_ready: AtomicBool::new(false),
+            restore_to_fork_requests_total: AtomicU64::new(0),
+            restore_to_fork_success_total: AtomicU64::new(0),
+            restore_to_fork_failure_total: AtomicU64::new(0),
+            restore_to_fork_elapsed_ns_total: AtomicU64::new(0),
+            restore_to_fork_elapsed_ns_max: AtomicU64::new(0),
+            restore_graph_sequence: AtomicU64::new(0),
+            restore_graph_writers: AtomicUsize::new(0),
+            restore_snapshot_gate: RwLock::new(()),
             object_gc_gate: Mutex::new(()),
             materialization_orphan_possible: AtomicBool::new(true),
             #[cfg(test)]
@@ -141,6 +174,8 @@ where
             lease_deadline_ms: AtomicU64::new(0),
             clock_override_ms: AtomicU64::new(0),
             metadata_log_sync: Mutex::new(None),
+            metadata_log_publication_hook: RwLock::new(None),
+            metadata_log_immediate_publication_depth: AtomicUsize::new(0),
             metadata_log_segments_archived_total: AtomicU64::new(0),
             metadata_log_entries_archived_total: AtomicU64::new(0),
             metadata_log_archive_bytes_total: AtomicU64::new(0),
@@ -171,6 +206,10 @@ where
             read_dir_plus_entry_total: AtomicU64::new(0),
             read_dir_plus_projection_hit_total: AtomicU64::new(0),
         };
+        // Prove the restore visibility fast path before namespace orphan
+        // recovery performs ordinary inode reads. Both reconstructions are
+        // durable-state based and leave their hints fail closed on error.
+        service.recover_restore_staging_visibility()?;
         service.recover_materialization_orphan_state()?;
         Ok(service)
     }
@@ -240,11 +279,33 @@ where
             metadata_log_archive_bytes_total: self
                 .metadata_log_archive_bytes_total
                 .load(Ordering::Relaxed),
+            restore_to_fork_requests_total: self
+                .restore_to_fork_requests_total
+                .load(Ordering::Relaxed),
+            restore_to_fork_success_total: self
+                .restore_to_fork_success_total
+                .load(Ordering::Relaxed),
+            restore_to_fork_failure_total: self
+                .restore_to_fork_failure_total
+                .load(Ordering::Relaxed),
+            restore_to_fork_elapsed_ns_total: self
+                .restore_to_fork_elapsed_ns_total
+                .load(Ordering::Relaxed),
+            restore_to_fork_elapsed_ns_max: self
+                .restore_to_fork_elapsed_ns_max
+                .load(Ordering::Relaxed),
         }
     }
 
     pub fn mount_id(&self) -> MountId {
         self.mount
+    }
+
+    /// Highest metadata commit version currently installed in this service.
+    /// Server recovery uses it to bind an authoritative checkpoint/log image
+    /// to terminal request markers restored from that same image.
+    pub fn metadata_version(&self) -> Result<u64, MetadError> {
+        self.read_version().map(Version::get)
     }
 
     pub fn metadata_store(&self) -> &M {

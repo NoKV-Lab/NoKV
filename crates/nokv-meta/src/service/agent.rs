@@ -653,7 +653,8 @@ where
         let metadata = self.stat_path_from_at_version(InodeId::root(), &path, version)?;
         metadata
             .map(|metadata| {
-                let indexes = self.load_namespace_indexes_for_path(&path, version)?;
+                let indexes =
+                    self.load_namespace_indexes_for_path(&path, metadata.attr.inode, version)?;
                 self.card_for_metadata(
                     path_name_for_card(&path),
                     &path,
@@ -730,7 +731,7 @@ where
         let offset = parse_cursor(request.cursor.as_deref())?;
         let version = self.read_version()?;
         let root_inode = self.resolve_directory_path_at_version(&root, version)?;
-        let indexes = self.load_namespace_indexes_for_path(&root, version)?;
+        let indexes = self.load_namespace_indexes_for_path(&root, root_inode, version)?;
         let mut entries = Vec::new();
         self.collect_entries(&root, root_inode, version, &mut entries)?;
         let scanned_entries = entries.len();
@@ -798,7 +799,7 @@ where
         let limit = bounded_limit(request.limit)?;
         let version = self.read_version()?;
         let root_inode = self.resolve_directory_path_at_version(&root, version)?;
-        let indexes = self.load_namespace_indexes_for_path(&root, version)?;
+        let indexes = self.load_namespace_indexes_for_path(&root, root_inode, version)?;
         let mut entries = Vec::new();
         self.collect_entries(&root, root_inode, version, &mut entries)?;
         let scanned_entries = entries.len();
@@ -1057,6 +1058,7 @@ where
         let path = normalize_card_path(&registration.path)?;
         let version = self.next_version()?;
         let read_version = predecessor(version)?;
+        let catalog_root = self.resolve_directory_path_at_version(&path, read_version)?;
         let mut mutations = Vec::new();
         let catalog_key = path_index_catalog_key(self.mount, &path);
         let catalog_item = self.metadata.get_versioned(
@@ -1065,7 +1067,7 @@ where
             read_version,
             ReadPurpose::UserStrong,
         )?;
-        let predicates = vec![PredicateRef {
+        let mut predicates = vec![PredicateRef {
             family: RecordFamily::PathIndex,
             key: catalog_key.clone(),
             predicate: catalog_item
@@ -1110,7 +1112,16 @@ where
             });
         }
 
-        self.commit_metadata(MetadataCommand {
+        let restore_write_predicates =
+            self.restore_namespace_write_predicates(&[catalog_root], read_version)?;
+        let restore_guarded =
+            super::restore::restore_write_predicates_include_owner(&restore_write_predicates);
+        predicates.extend(restore_write_predicates);
+        let inherited = self.restore_index_replace_catalog_plan(catalog_root, version)?;
+        predicates.extend(inherited.predicates);
+        mutations.extend(inherited.mutations);
+
+        let command = MetadataCommand {
             request_id: request_id(
                 b"register-namespace-index",
                 self.mount,
@@ -1125,7 +1136,14 @@ where
             predicates,
             mutations,
             watch: Vec::new(),
-        })?;
+        };
+        if restore_guarded {
+            super::restore::validate_restore_command_bounds(
+                &command,
+                "restore namespace index registration",
+            )?;
+        }
+        self.commit_metadata(command)?;
         Ok(())
     }
 
@@ -1357,31 +1375,16 @@ where
     fn load_namespace_indexes_for_path(
         &self,
         path: &str,
+        root: InodeId,
         version: Version,
     ) -> Result<LoadedNamespaceIndex, MetadError> {
-        let Some(catalog) = self.metadata.get(
-            RecordFamily::PathIndex,
-            &path_index_catalog_key(self.mount, path),
-            version,
-            ReadPurpose::UserStrong,
-        )?
+        let Some(index) =
+            self.restore_custom_index_at_path(path, root, version, ReadPurpose::UserStrong)?
         else {
             return Ok(LoadedNamespaceIndex::default());
         };
-        let catalog = decode_path_index_catalog(&catalog.0)
-            .map_err(|err| MetadError::Codec(err.to_string()))?;
-        let rows = self.metadata.scan(ScanRequest {
-            family: RecordFamily::PathIndex,
-            prefix: path_index_row_prefix(self.mount, path),
-            start_after: None,
-            version,
-            limit: 0,
-            purpose: ReadPurpose::UserStrong,
-        })?;
         let mut indexed_rows = BTreeMap::new();
-        for row in rows {
-            let row = decode_path_index_row(&row.value.0)
-                .map_err(|err| MetadError::Codec(err.to_string()))?;
+        for row in index.rows {
             indexed_rows.insert(
                 row.path,
                 row.values
@@ -1394,7 +1397,8 @@ where
             );
         }
         Ok(LoadedNamespaceIndex {
-            fields: catalog
+            fields: index
+                .catalog
                 .fields
                 .into_iter()
                 .map(namespace_index_field_from_record)

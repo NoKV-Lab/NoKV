@@ -3157,6 +3157,29 @@ fn stats_delta(before: BenchStats, after: BenchStats) -> BenchStats {
                 .metadata_service
                 .metadata_log_archive_bytes_total
                 .saturating_sub(before.metadata_service.metadata_log_archive_bytes_total),
+            restore_to_fork_requests_total: after
+                .metadata_service
+                .restore_to_fork_requests_total
+                .saturating_sub(before.metadata_service.restore_to_fork_requests_total),
+            restore_to_fork_success_total: after
+                .metadata_service
+                .restore_to_fork_success_total
+                .saturating_sub(before.metadata_service.restore_to_fork_success_total),
+            restore_to_fork_failure_total: after
+                .metadata_service
+                .restore_to_fork_failure_total
+                .saturating_sub(before.metadata_service.restore_to_fork_failure_total),
+            restore_to_fork_elapsed_ns_total: after
+                .metadata_service
+                .restore_to_fork_elapsed_ns_total
+                .saturating_sub(before.metadata_service.restore_to_fork_elapsed_ns_total),
+            restore_to_fork_elapsed_ns_max: if after.metadata_service.restore_to_fork_requests_total
+                == before.metadata_service.restore_to_fork_requests_total
+            {
+                0
+            } else {
+                after.metadata_service.restore_to_fork_elapsed_ns_max
+            },
         },
     }
 }
@@ -3404,6 +3427,11 @@ fn fetch_server_stats(address: SocketAddr) -> Result<BenchStats, BenchError> {
                 "metadata_log_entries_archived_total",
             )?,
             metadata_log_archive_bytes_total: json_u64(body, "metadata_log_archive_bytes_total")?,
+            restore_to_fork_requests_total: json_u64(body, "restore_to_fork_requests_total")?,
+            restore_to_fork_success_total: json_u64(body, "restore_to_fork_success_total")?,
+            restore_to_fork_failure_total: json_u64(body, "restore_to_fork_failure_total")?,
+            restore_to_fork_elapsed_ns_total: json_u64(body, "restore_to_fork_elapsed_ns_total")?,
+            restore_to_fork_elapsed_ns_max: json_u64(body, "restore_to_fork_elapsed_ns_max")?,
         },
     })
 }
@@ -4147,7 +4175,7 @@ mod tests {
 
     #[test]
     fn stats_json_parser_reads_metadata_fields() {
-        let body = r#"{"object_puts":41,"object_put_bytes":42,"object_gets":43,"object_get_bytes":44,"coalesced_gets":45,"coalesced_get_bytes":46,"cache_hits":47,"cache_hit_bytes":48,"prefetch_enqueued":49,"prefetch_dropped":50,"prefetch_completed":51,"prefetch_failed":52,"prefetch_object_gets":53,"prefetch_object_get_bytes":54,"prefetch_cache_hits":55,"prefetch_cache_hit_bytes":56,"read_plan_cache_hits":57,"read_plan_cache_misses":58,"object_writeback_enqueued":59,"object_writeback_inline":60,"object_writeback_completed":62,"object_writeback_failed":63,"object_writeback_staged_bytes":64,"object_writeback_uploaded_bytes":65,"object_writeback_queue_wait_ns":66,"object_writeback_queue_max_wait_ns":67,"object_writeback_upload_ns":68,"object_writeback_upload_max_ns":69,"object_writeback_collect_ns":70,"object_writeback_digest_ns":71,"object_writeback_store_put_ns":72,"object_writeback_cache_put_ns":73,"manifest_chunks":74,"manifest_blocks":75,"tiered_hot_put_ns":76,"tiered_pending_cold_put_ns":77,"tiered_cold_put_enqueue_ns":78,"local_hot_puts":79,"local_hot_put_bytes":80,"local_hot_put_total_ns":81,"local_hot_put_prepare_ns":82,"local_hot_put_write_ns":83,"local_hot_put_sync_ns":84,"local_hot_put_rename_ns":85,"local_hot_put_record_ns":86,"metadata_store":{"get_total":2,"get_user_strong_total":32,"get_write_plan_local_total":33,"get_snapshot_total":34,"scan_total":3,"scan_user_strong_total":35,"scan_write_plan_local_total":36,"scan_snapshot_total":37,"scan_key_visited_total":4,"scan_key_returned_total":5,"history_lookup_total":40,"active_snapshot_pin_total":0,"commit_total":6,"dedupe_hit_total":7,"predicate_total":8,"prefix_empty_predicate_total":9,"current_put_total":10,"current_delete_total":11,"history_write_total":12,"watch_write_total":13,"dedupe_write_total":14,"commit_prepare_ns_total":15,"atomic_apply_total":16,"atomic_apply_command_total":17,"atomic_apply_max_batch":18,"atomic_apply_ns_total":19},"metadata_service":{"path_index_lookup_total":30,"path_index_hit_total":31,"path_index_miss_total":32,"path_index_stale_total":33,"path_index_scan_stale_total":34,"path_index_fallback_total":35,"create_files_batch_total":36,"create_files_entry_total":37,"create_dirs_batch_total":38,"create_dirs_entry_total":39,"read_dir_plus_total":40,"read_dir_plus_entry_total":41,"read_dir_plus_projection_hit_total":42,"metadata_log_segments_archived_total":43,"metadata_log_entries_archived_total":44,"metadata_log_archive_bytes_total":45}}"#;
+        let body = r#"{"object_puts":41,"object_put_bytes":42,"object_gets":43,"object_get_bytes":44,"coalesced_gets":45,"coalesced_get_bytes":46,"cache_hits":47,"cache_hit_bytes":48,"prefetch_enqueued":49,"prefetch_dropped":50,"prefetch_completed":51,"prefetch_failed":52,"prefetch_object_gets":53,"prefetch_object_get_bytes":54,"prefetch_cache_hits":55,"prefetch_cache_hit_bytes":56,"read_plan_cache_hits":57,"read_plan_cache_misses":58,"object_writeback_enqueued":59,"object_writeback_inline":60,"object_writeback_completed":62,"object_writeback_failed":63,"object_writeback_staged_bytes":64,"object_writeback_uploaded_bytes":65,"object_writeback_queue_wait_ns":66,"object_writeback_queue_max_wait_ns":67,"object_writeback_upload_ns":68,"object_writeback_upload_max_ns":69,"object_writeback_collect_ns":70,"object_writeback_digest_ns":71,"object_writeback_store_put_ns":72,"object_writeback_cache_put_ns":73,"manifest_chunks":74,"manifest_blocks":75,"tiered_hot_put_ns":76,"tiered_pending_cold_put_ns":77,"tiered_cold_put_enqueue_ns":78,"local_hot_puts":79,"local_hot_put_bytes":80,"local_hot_put_total_ns":81,"local_hot_put_prepare_ns":82,"local_hot_put_write_ns":83,"local_hot_put_sync_ns":84,"local_hot_put_rename_ns":85,"local_hot_put_record_ns":86,"metadata_store":{"get_total":2,"get_user_strong_total":32,"get_write_plan_local_total":33,"get_snapshot_total":34,"scan_total":3,"scan_user_strong_total":35,"scan_write_plan_local_total":36,"scan_snapshot_total":37,"scan_key_visited_total":4,"scan_key_returned_total":5,"history_lookup_total":40,"active_snapshot_pin_total":0,"commit_total":6,"dedupe_hit_total":7,"predicate_total":8,"prefix_empty_predicate_total":9,"current_put_total":10,"current_delete_total":11,"history_write_total":12,"watch_write_total":13,"dedupe_write_total":14,"commit_prepare_ns_total":15,"atomic_apply_total":16,"atomic_apply_command_total":17,"atomic_apply_max_batch":18,"atomic_apply_ns_total":19},"metadata_service":{"path_index_lookup_total":30,"path_index_hit_total":31,"path_index_miss_total":32,"path_index_stale_total":33,"path_index_scan_stale_total":34,"path_index_fallback_total":35,"create_files_batch_total":36,"create_files_entry_total":37,"create_dirs_batch_total":38,"create_dirs_entry_total":39,"read_dir_plus_total":40,"read_dir_plus_entry_total":41,"read_dir_plus_projection_hit_total":42,"metadata_log_segments_archived_total":43,"metadata_log_entries_archived_total":44,"metadata_log_archive_bytes_total":45,"restore_to_fork_requests_total":46,"restore_to_fork_success_total":47,"restore_to_fork_failure_total":48,"restore_to_fork_elapsed_ns_total":49,"restore_to_fork_elapsed_ns_max":50}}"#;
 
         assert_eq!(json_u64(body, "object_put_bytes").unwrap(), 42);
         assert_eq!(json_u64(body, "object_get_bytes").unwrap(), 44);
@@ -4219,6 +4247,20 @@ mod tests {
         assert_eq!(
             json_u64(body, "metadata_log_archive_bytes_total").unwrap(),
             45
+        );
+        assert_eq!(
+            json_u64(body, "restore_to_fork_requests_total").unwrap(),
+            46
+        );
+        assert_eq!(json_u64(body, "restore_to_fork_success_total").unwrap(), 47);
+        assert_eq!(json_u64(body, "restore_to_fork_failure_total").unwrap(), 48);
+        assert_eq!(
+            json_u64(body, "restore_to_fork_elapsed_ns_total").unwrap(),
+            49
+        );
+        assert_eq!(
+            json_u64(body, "restore_to_fork_elapsed_ns_max").unwrap(),
+            50
         );
         assert!(json_u64(body, "missing_total").is_err());
     }

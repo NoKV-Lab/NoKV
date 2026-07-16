@@ -3,9 +3,31 @@ use crate::command::{
     CommandKind, DelimitedScanItem, DelimitedScanRequest, HistoryPruneRequest, MetadataCommand,
     Mutation, PredicateRef, ScanRequest, Value,
 };
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::tempdir;
+
+const FILE_REOPEN_GC_DIR_ENV: &str = "NOKV_HOLT_FILE_REOPEN_GC_DIR";
+const FILE_REOPEN_GC_ENTRY_COUNT: u32 = 1_200;
+
+fn file_reopen_gc_config(path: &std::path::Path) -> TreeConfig {
+    let mut config = TreeConfig::new(path);
+    config.checkpoint.enabled = false;
+    config.durability = Durability::Wal { sync: false };
+    config
+}
+
+fn run_file_reopen_gc_crash_session(path: &std::path::Path) {
+    let executable = std::env::current_exe().unwrap();
+    let child_test = "holtstore::tests::file_reopen_gc_crash_session";
+    let status = std::process::Command::new(executable)
+        .args([child_test, "--exact", "--ignored", "--nocapture"])
+        .env(FILE_REOPEN_GC_DIR_ENV, path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "crash-session child test failed");
+}
 
 fn version(raw: u64) -> Version {
     Version::new(raw).unwrap()
@@ -81,6 +103,35 @@ fn delete_command(key: &[u8], request_id: &[u8], read: u64, commit: u64) -> Meta
             key: key.to_vec(),
             op: MutationOp::Delete,
             value: None,
+        }],
+        watch: Vec::new(),
+    }
+}
+
+fn put_with_read_only_absence_guard(
+    guard_key: &[u8],
+    output_key: &[u8],
+    request_id: &[u8],
+    value: &[u8],
+    commit: u64,
+) -> MetadataCommand {
+    MetadataCommand {
+        request_id: request_id.to_vec(),
+        kind: CommandKind::CreateFile,
+        read_version: version(commit - 1),
+        commit_version: version(commit),
+        primary_family: RecordFamily::Dentry,
+        primary_key: output_key.to_vec(),
+        predicates: vec![PredicateRef {
+            family: RecordFamily::Dentry,
+            key: guard_key.to_vec(),
+            predicate: Predicate::NotExists,
+        }],
+        mutations: vec![Mutation {
+            family: RecordFamily::Dentry,
+            key: output_key.to_vec(),
+            op: MutationOp::Put,
+            value: Some(Value(value.to_vec())),
         }],
         watch: Vec::new(),
     }
@@ -387,6 +438,106 @@ fn independent_batch_commits_disjoint_commands() {
                 b"dir/b",
                 version(3),
                 ReadPurpose::UserStrong
+            )
+            .unwrap(),
+        Some(Value(b"value-b".to_vec()))
+    );
+    let stats = store.metadata_store_stats();
+    assert_eq!(stats.commit_total, 2);
+    assert_eq!(stats.atomic_apply_total, 1);
+    assert_eq!(stats.atomic_apply_command_total, 2);
+    assert_eq!(stats.atomic_apply_max_batch, 2);
+}
+
+#[test]
+fn independent_batch_splits_commands_with_the_same_read_only_absence_guard() {
+    let store = HoltMetadataStore::open_memory().unwrap();
+    let results = store.commit_independent_batch(&[
+        put_with_read_only_absence_guard(b"guard", b"dir/a", b"req-1", b"value-a", 2),
+        put_with_read_only_absence_guard(b"guard", b"dir/b", b"req-2", b"value-b", 3),
+    ]);
+
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(
+        store
+            .get(
+                RecordFamily::Dentry,
+                b"guard",
+                version(3),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .get(
+                RecordFamily::Dentry,
+                b"dir/a",
+                version(3),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap(),
+        Some(Value(b"value-a".to_vec()))
+    );
+    assert_eq!(
+        store
+            .get(
+                RecordFamily::Dentry,
+                b"dir/b",
+                version(3),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap(),
+        Some(Value(b"value-b".to_vec()))
+    );
+    let stats = store.metadata_store_stats();
+    assert_eq!(stats.commit_total, 2);
+    assert_eq!(stats.atomic_apply_total, 2);
+    assert_eq!(stats.atomic_apply_command_total, 2);
+    assert_eq!(stats.atomic_apply_max_batch, 1);
+}
+
+#[test]
+fn independent_batch_keeps_different_read_only_absence_guards_together() {
+    let store = HoltMetadataStore::open_memory().unwrap();
+    let results = store.commit_independent_batch(&[
+        put_with_read_only_absence_guard(b"guard-a", b"dir/a", b"req-1", b"value-a", 2),
+        put_with_read_only_absence_guard(b"guard-b", b"dir/b", b"req-2", b"value-b", 3),
+    ]);
+
+    assert!(results.iter().all(Result::is_ok));
+    for guard in [b"guard-a".as_slice(), b"guard-b".as_slice()] {
+        assert_eq!(
+            store
+                .get(
+                    RecordFamily::Dentry,
+                    guard,
+                    version(3),
+                    ReadPurpose::UserStrong,
+                )
+                .unwrap(),
+            None
+        );
+    }
+    assert_eq!(
+        store
+            .get(
+                RecordFamily::Dentry,
+                b"dir/a",
+                version(3),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap(),
+        Some(Value(b"value-a".to_vec()))
+    );
+    assert_eq!(
+        store
+            .get(
+                RecordFamily::Dentry,
+                b"dir/b",
+                version(3),
+                ReadPurpose::UserStrong,
             )
             .unwrap(),
         Some(Value(b"value-b".to_vec()))
@@ -1031,6 +1182,163 @@ fn storage_reclaim_is_idempotent_after_checkpoint() {
 }
 
 #[test]
+fn file_store_prior_state_detection_ignores_new_empty_directories() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("metadata");
+
+    assert!(!file_store_has_prior_state(&path));
+    std::fs::create_dir(&path).unwrap();
+    assert!(!file_store_has_prior_state(&path));
+
+    drop(HoltMetadataStore::open_file(&path).unwrap());
+    assert!(file_store_has_prior_state(&path));
+}
+
+#[test]
+fn metadata_apply_preserves_holt_snapshot_children() {
+    let store = HoltMetadataStore::open_memory().unwrap();
+    let tree = store.current_tree(RecordFamily::Dentry).unwrap();
+    let original = vec![0xA5; 512];
+    let encoded_original = encode_current_value(version(1), &original);
+    for index in 0..FILE_REOPEN_GC_ENTRY_COUNT {
+        tree.put(format!("key/{index:08}").as_bytes(), &encoded_original)
+            .unwrap();
+    }
+    assert!(
+        tree.stats().unwrap().blob_count > 1,
+        "snapshot fixture must spill beyond the root frame",
+    );
+
+    let snapshot = tree.snapshot(b"").unwrap();
+    for index in 0..FILE_REOPEN_GC_ENTRY_COUNT {
+        let key = format!("key/{index:08}");
+        let request_id = format!("snapshot-update/{index:08}");
+        store
+            .commit_metadata(replace_command(
+                key.as_bytes(),
+                request_id.as_bytes(),
+                b"current",
+                index as u64 + 1,
+                index as u64 + 2,
+            ))
+            .unwrap();
+    }
+
+    assert!(
+        store.db.stats().bm_gc_orphan_backlog_count > 0,
+        "NoKV metadata apply must fork snapshot-shared Holt children",
+    );
+    for index in 0..FILE_REOPEN_GC_ENTRY_COUNT {
+        let key = format!("key/{index:08}");
+        assert_eq!(
+            snapshot.view().get(key.as_bytes()).unwrap().as_deref(),
+            Some(encoded_original.as_slice()),
+            "snapshot child changed at {key}",
+        );
+    }
+    let final_key = format!("key/{:08}", FILE_REOPEN_GC_ENTRY_COUNT - 1);
+    let encoded_live = tree.get(final_key.as_bytes()).unwrap().unwrap();
+    assert_eq!(
+        decode_current_value(&encoded_live).unwrap().1.as_deref(),
+        Some(&b"current"[..]),
+    );
+}
+
+#[test]
+#[ignore = "child-process body for file_reopen_reclaims_crash_lost_cow_orphans"]
+fn file_reopen_gc_crash_session() {
+    let Some(path) = std::env::var_os(FILE_REOPEN_GC_DIR_ENV) else {
+        return;
+    };
+    let store =
+        HoltMetadataStore::open(file_reopen_gc_config(std::path::Path::new(&path))).unwrap();
+    let tree = store.current_tree(RecordFamily::Dentry).unwrap();
+    let original = vec![0xAB; 512];
+    for index in 0..FILE_REOPEN_GC_ENTRY_COUNT {
+        tree.put(format!("key/{index:08}").as_bytes(), &original)
+            .unwrap();
+    }
+    store.db.checkpoint().unwrap();
+    assert!(
+        tree.stats().unwrap().blob_count > 1,
+        "crash fixture must spill beyond the root frame",
+    );
+
+    let snapshot = tree.snapshot(b"").unwrap();
+    for index in 0..FILE_REOPEN_GC_ENTRY_COUNT {
+        tree.put(format!("key/{index:08}").as_bytes(), b"current")
+            .unwrap();
+    }
+    store.db.checkpoint().unwrap();
+    assert!(
+        store.db.stats().bm_gc_orphan_backlog_count > 0,
+        "writes under the leaked snapshot must create COW orphan debt",
+    );
+
+    // A real crash drops this process-local snapshot lease without retiring
+    // its old COW frames through Holt's in-memory orphan queue.
+    std::mem::forget(snapshot);
+}
+
+#[test]
+fn file_reopen_reclaims_crash_lost_cow_orphans() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("metadata");
+    run_file_reopen_gc_crash_session(&path);
+    assert!(file_store_has_prior_state(&path));
+    let data_file = path.join("blobs.dat");
+    let data_file_bytes_before = std::fs::metadata(&data_file).unwrap().len();
+
+    let store = HoltMetadataStore::open_file(&path).unwrap();
+    let stats = store.db.stats();
+    let followup_reclaimed = store.reclaim_unreachable_storage().unwrap();
+    assert!(
+        stats.bm_gc_reclaimed_count > 0,
+        "NoKV file reopen must reclaim crash-lost COW frames (follow-up reclaimed {followup_reclaimed})",
+    );
+    assert!(
+        stats.store.reusable_slots > 0,
+        "logical GC must publish reclaimed slots for reuse",
+    );
+    assert_eq!(
+        stats.store.data_file_bytes, data_file_bytes_before,
+        "auto-vacuum is disabled, so reopen GC must not shrink packed files",
+    );
+    assert_eq!(followup_reclaimed, 0);
+    assert_eq!(
+        store
+            .current_tree(RecordFamily::Dentry)
+            .unwrap()
+            .get(b"key/00000000")
+            .unwrap()
+            .as_deref(),
+        Some(&b"current"[..]),
+    );
+    drop(store);
+
+    let reopened = HoltMetadataStore::open_file(&path).unwrap();
+    assert_eq!(
+        reopened.db.stats().bm_gc_reclaimed_count,
+        0,
+        "repeated reopen must find no residual unreachable frames",
+    );
+    let final_key = format!("key/{:08}", FILE_REOPEN_GC_ENTRY_COUNT - 1);
+    assert_eq!(
+        reopened
+            .current_tree(RecordFamily::Dentry)
+            .unwrap()
+            .get(final_key.as_bytes())
+            .unwrap()
+            .as_deref(),
+        Some(&b"current"[..]),
+    );
+    assert_eq!(
+        std::fs::metadata(data_file).unwrap().len(),
+        data_file_bytes_before
+    );
+}
+
+#[test]
 fn checkpoint_image_rejects_malformed_bytes() {
     let store = HoltMetadataStore::open_memory().unwrap();
     assert!(store.install_checkpoint_image(b"not-a-checkpoint").is_err());
@@ -1343,6 +1651,343 @@ fn not_exists_allows_recreate_after_tombstone() {
             .unwrap(),
         Some(Value(b"value-b".to_vec()))
     );
+}
+
+#[test]
+fn read_only_not_exists_guard_is_atomic_and_leaves_no_sentinel() {
+    let store = HoltMetadataStore::open_memory().unwrap();
+    store
+        .commit_metadata(put_with_read_only_absence_guard(
+            b"guard/missing",
+            b"result/first",
+            b"guard-missing",
+            b"committed",
+            2,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get(
+                RecordFamily::Dentry,
+                b"guard/missing",
+                version(2),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap(),
+        None,
+        "the internal create/delete sentinel must never become a live record",
+    );
+    assert_eq!(
+        store
+            .get(
+                RecordFamily::Dentry,
+                b"result/first",
+                version(2),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap(),
+        Some(Value(b"committed".to_vec())),
+    );
+
+    store
+        .commit_metadata(put_command(b"guard/existing", b"create-guard", b"value", 3))
+        .unwrap();
+    assert_eq!(
+        store.commit_metadata(put_with_read_only_absence_guard(
+            b"guard/existing",
+            b"result/must-not-exist",
+            b"guard-existing",
+            b"wrong",
+            4,
+        )),
+        Err(MetadataError::PredicateFailed),
+    );
+    assert!(store
+        .get(
+            RecordFamily::Dentry,
+            b"result/must-not-exist",
+            version(4),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn point_reads_never_observe_read_only_absence_guard_sentinels() {
+    const GUARD_KEYS: usize = 256;
+    const COMMITS: u64 = 64;
+
+    let store = HoltMetadataStore::open_memory().unwrap();
+    let guard_keys = Arc::new(
+        (0..GUARD_KEYS)
+            .map(|index| format!("guard/transient/{index:04}").into_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let start = Arc::new(Barrier::new(2));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let reader_store = store.clone();
+    let reader_keys = Arc::clone(&guard_keys);
+    let reader_start = Arc::clone(&start);
+    let reader_done = Arc::clone(&done);
+    let reader = thread::spawn(move || {
+        reader_start.wait();
+        while !reader_done.load(Ordering::Acquire) {
+            for key in reader_keys.iter() {
+                assert_eq!(
+                    reader_store
+                        .get(
+                            RecordFamily::Dentry,
+                            key,
+                            version(u64::MAX),
+                            ReadPurpose::UserStrong,
+                        )
+                        .unwrap(),
+                    None,
+                    "a point read observed an atomic absence-guard sentinel",
+                );
+            }
+        }
+    });
+
+    start.wait();
+    for offset in 0..COMMITS {
+        let commit = offset + 2;
+        store
+            .commit_metadata(MetadataCommand {
+                request_id: format!("absence-visibility-{offset}").into_bytes(),
+                kind: CommandKind::SetXattr,
+                read_version: version(commit - 1),
+                commit_version: version(commit),
+                primary_family: RecordFamily::Dentry,
+                primary_key: b"result/absence-visibility".to_vec(),
+                predicates: guard_keys
+                    .iter()
+                    .map(|key| PredicateRef {
+                        family: RecordFamily::Dentry,
+                        key: key.clone(),
+                        predicate: Predicate::NotExists,
+                    })
+                    .collect(),
+                mutations: vec![Mutation {
+                    family: RecordFamily::Dentry,
+                    key: b"result/absence-visibility".to_vec(),
+                    op: MutationOp::Put,
+                    value: Some(Value(offset.to_be_bytes().to_vec())),
+                }],
+                watch: Vec::new(),
+            })
+            .unwrap();
+    }
+    done.store(true, Ordering::Release);
+    reader.join().unwrap();
+
+    for key in guard_keys.iter() {
+        assert!(store
+            .get(
+                RecordFamily::Dentry,
+                key,
+                version(COMMITS + 1),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn different_absence_guard_stripes_can_enter_atomic_apply_concurrently() {
+    let left = put_with_read_only_absence_guard(
+        b"guard/concurrent/left",
+        b"result/concurrent/left",
+        b"concurrent-left",
+        b"left",
+        2,
+    );
+    let left_plan = key_visibility_lock_plan(std::slice::from_ref(&left));
+    let right = (0..10_000)
+        .map(|index| {
+            put_with_read_only_absence_guard(
+                format!("guard/concurrent/right/{index}").as_bytes(),
+                format!("result/concurrent/right/{index}").as_bytes(),
+                format!("concurrent-right-{index}").as_bytes(),
+                b"right",
+                3,
+            )
+        })
+        .find(|candidate| {
+            let right_plan = key_visibility_lock_plan(std::slice::from_ref(candidate));
+            left_plan
+                .iter()
+                .zip(right_plan.iter())
+                .all(|(left_mode, right_mode)| {
+                    !matches!(
+                        (left_mode, right_mode),
+                        (Some(KeyVisibilityLockMode::Write), Some(_))
+                            | (Some(_), Some(KeyVisibilityLockMode::Write))
+                    )
+                })
+        })
+        .expect("the 256 stripes must provide a disjoint command access set");
+    assert_ne!(left.predicates[0].key, right.predicates[0].key);
+    assert_ne!(
+        key_visibility_stripe(left.predicates[0].family, &left.predicates[0].key),
+        key_visibility_stripe(right.predicates[0].family, &right.predicates[0].key),
+    );
+
+    let store = HoltMetadataStore::open_memory().unwrap();
+    let apply_barrier = Arc::new(Barrier::new(2));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    store.set_before_atomic_apply_hook(Arc::new({
+        let apply_barrier = Arc::clone(&apply_barrier);
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        move || {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now_active, Ordering::SeqCst);
+            apply_barrier.wait();
+            active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }));
+
+    let left_store = store.clone();
+    let left_commit = thread::spawn(move || left_store.commit_metadata(left));
+    let right_store = store.clone();
+    let right_commit = thread::spawn(move || right_store.commit_metadata(right));
+
+    assert!(left_commit.join().unwrap().is_ok());
+    assert!(right_commit.join().unwrap().is_ok());
+    store.clear_before_atomic_apply_hook();
+    assert_eq!(
+        max_active.load(Ordering::SeqCst),
+        2,
+        "different absence-guard stripes must not serialize at the visibility fence",
+    );
+}
+
+#[test]
+fn read_only_not_exists_guard_accepts_tombstone_and_survives_checkpoint_reopen() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("metadata.holt");
+    {
+        let store = HoltMetadataStore::open_file(&path).unwrap();
+        store
+            .commit_metadata(put_command(b"guard/reused", b"create", b"value", 2))
+            .unwrap();
+        store
+            .commit_metadata(delete_command(b"guard/reused", b"delete", 2, 3))
+            .unwrap();
+        let first = store
+            .commit_metadata(put_with_read_only_absence_guard(
+                b"guard/reused",
+                b"result/tombstone",
+                b"guard-tombstone",
+                b"safe",
+                4,
+            ))
+            .unwrap();
+        let duplicate = store
+            .commit_metadata(put_with_read_only_absence_guard(
+                b"guard/reused",
+                b"result/ignored-duplicate",
+                b"guard-tombstone",
+                b"different",
+                5,
+            ))
+            .unwrap();
+        assert_eq!(duplicate, first, "lost-ACK replay must deduplicate");
+        assert!(store
+            .get(
+                RecordFamily::Dentry,
+                b"result/ignored-duplicate",
+                version(5),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap()
+            .is_none());
+        store.checkpoint().unwrap();
+    }
+
+    let reopened = HoltMetadataStore::open_file(&path).unwrap();
+    assert!(reopened
+        .get(
+            RecordFamily::Dentry,
+            b"guard/reused",
+            version(5),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        reopened
+            .get(
+                RecordFamily::Dentry,
+                b"result/tombstone",
+                version(5),
+                ReadPurpose::UserStrong,
+            )
+            .unwrap(),
+        Some(Value(b"safe".to_vec())),
+    );
+}
+
+#[test]
+fn concurrent_cross_absence_guards_commit_exactly_one_command() {
+    let store = HoltMetadataStore::open_memory().unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let left_store = store.clone();
+    let left_barrier = Arc::clone(&barrier);
+    let left = thread::spawn(move || {
+        left_barrier.wait();
+        left_store.commit_metadata(put_with_read_only_absence_guard(
+            b"winner/right",
+            b"winner/left",
+            b"cross-left",
+            b"left",
+            2,
+        ))
+    });
+    let right_store = store.clone();
+    let right = thread::spawn(move || {
+        barrier.wait();
+        right_store.commit_metadata(put_with_read_only_absence_guard(
+            b"winner/left",
+            b"winner/right",
+            b"cross-right",
+            b"right",
+            3,
+        ))
+    });
+
+    let outcomes = [left.join().unwrap(), right.join().unwrap()];
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(MetadataError::PredicateFailed)))
+            .count(),
+        1,
+    );
+    let left = store
+        .get(
+            RecordFamily::Dentry,
+            b"winner/left",
+            version(3),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap();
+    let right = store
+        .get(
+            RecordFamily::Dentry,
+            b"winner/right",
+            version(3),
+            ReadPurpose::UserStrong,
+        )
+        .unwrap();
+    assert_ne!(left.is_some(), right.is_some());
 }
 
 #[test]

@@ -200,6 +200,12 @@ where
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         self.mark_materialization_orphan_possible_under_gc_gate();
+        let restore_visibility = self
+            .restore_visibility_fence
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
+        let checkpoint_replay = self.begin_metadata_checkpoint_install()?;
+        self.restore_staging_possible.store(true, Ordering::Release);
         let mut durable_lsn = checkpoint_lsn;
         let mut last_digest = checkpoint_digest;
         let mut replay_next_inode = None;
@@ -226,14 +232,21 @@ where
                 .fetch_max(next_inode, Ordering::Relaxed);
         }
         self.refresh_allocator_state()?;
+        // Keep the slow-path hint set while releasing the exclusive fence.
+        // Both recovery proofs perform namespace reads and would deadlock if
+        // invoked while this thread still owned the write side.
+        drop(restore_visibility);
+        self.recover_restore_staging_visibility()?;
         self.reconcile_materialization_orphan_state_under_gc_gate()?;
 
-        Ok(MetadataLogRestoreOutcome {
+        let outcome = MetadataLogRestoreOutcome {
             checkpoint,
             replayed_entries: entries.len(),
             durable_lsn,
             last_digest,
-        })
+        };
+        checkpoint_replay.complete();
+        Ok(outcome)
     }
 }
 

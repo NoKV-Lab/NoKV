@@ -4,6 +4,42 @@ use super::log_archive::archive_metadata_log_segment_to_store;
 use super::*;
 use crate::{MetadataLogEntry, MetadataLogSegment};
 
+const PREPARED_TERMINAL_PROOF_CACHE_LIMIT: usize = 4_096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArchivedPreparedRequestResult {
+    result: CommitResult,
+    lsn: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedArchiveProofSnapshot {
+    archive: MetadataLogArchiveConfig,
+    shard_id: String,
+    segments: Vec<MetadataLogSegmentPointer>,
+    baseline_lsn: u64,
+    baseline_digest: [u8; 32],
+    durable_tail_lsn: u64,
+    durable_tail_digest: [u8; 32],
+}
+
+fn trim_prepared_terminal_proof_cache(
+    proofs: &mut BTreeMap<Vec<u8>, ArchivedPreparedRequestResult>,
+) {
+    while proofs.len() > PREPARED_TERMINAL_PROOF_CACHE_LIMIT {
+        let Some(oldest_request_id) = proofs
+            .iter()
+            .min_by(|(left_id, left), (right_id, right)| {
+                left.lsn.cmp(&right.lsn).then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(request_id, _)| request_id.clone())
+        else {
+            break;
+        };
+        proofs.remove(&oldest_request_id);
+    }
+}
+
 /// A pointer to one archived logical-log segment in the live chain.
 ///
 /// The sync state keeps the ordered chain of every segment archived above the
@@ -24,9 +60,18 @@ pub struct MetadataLogSyncConfig {
     pub epoch: u64,
     pub durable_lsn: u64,
     pub last_digest: [u8; 32],
+    /// Exact checkpoint boundary below the inherited active segment chain.
+    /// This differs from `durable_lsn` after failover, where `durable_lsn`
+    /// names the tail and the baseline names the checkpoint before replay.
+    pub durable_recovery_baseline_lsn: u64,
+    pub durable_recovery_baseline_digest: [u8; 32],
     /// Segment chain inherited from the control record (e.g. after failover),
     /// so the new owner's future `LogRef` publishes keep the full chain.
     pub segments: Vec<MetadataLogSegmentPointer>,
+    /// Whether `durable_recovery_baseline_*` names an externally authoritative
+    /// checkpoint. Prepared terminal durability never relies on metadata
+    /// versions; it uses this baseline plus the exact active LSN chain.
+    pub has_authoritative_recovery_baseline: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +82,7 @@ pub struct MetadataLogSyncSnapshot {
     pub last_digest: [u8; 32],
     /// Ordered (oldest first) segment chain above the latest checkpoint.
     pub segments: Vec<MetadataLogSegmentPointer>,
+    pub has_authoritative_recovery_baseline: bool,
 }
 
 /// Atomic local state used to decide whether a control-published recovery tail
@@ -72,6 +118,12 @@ pub(super) struct MetadataLogSyncState {
     next_lsn: u64,
     prev_digest: [u8; 32],
     segments: Vec<MetadataLogSegmentPointer>,
+    has_authoritative_recovery_baseline: bool,
+    durable_recovery_covered_lsn: u64,
+    durable_recovery_covered_digest: [u8; 32],
+    /// Prepared-publish terminal results whose exact commands are present in
+    /// an archived segment above the latest authoritative checkpoint.
+    archived_prepared_request_results: BTreeMap<Vec<u8>, ArchivedPreparedRequestResult>,
     /// A locally committed segment whose object-store archive has not yet
     /// completed. No later metadata command may apply until this exact segment
     /// is durably retried, otherwise its LSN could be reused and recovery would
@@ -124,6 +176,7 @@ impl MetadataLogSyncState {
             durable_lsn: self.next_lsn - 1,
             last_digest: self.prev_digest,
             segments: self.segments.clone(),
+            has_authoritative_recovery_baseline: self.has_authoritative_recovery_baseline,
         }
     }
 }
@@ -142,7 +195,10 @@ impl MetadataLogSyncConfig {
             epoch,
             durable_lsn,
             last_digest,
+            durable_recovery_baseline_lsn: durable_lsn,
+            durable_recovery_baseline_digest: last_digest,
             segments: Vec::new(),
+            has_authoritative_recovery_baseline: false,
         }
     }
 
@@ -152,6 +208,31 @@ impl MetadataLogSyncConfig {
         self.segments = segments;
         self
     }
+
+    /// Set the authoritative checkpoint boundary below an inherited log tail.
+    /// The active segment chain must connect this digest to `durable_lsn`.
+    pub fn with_durable_recovery_baseline(mut self, lsn: u64, digest: [u8; 32]) -> Self {
+        self.durable_recovery_baseline_lsn = lsn;
+        self.durable_recovery_baseline_digest = digest;
+        self
+    }
+
+    /// Mark the configured recovery baseline as externally authoritative.
+    pub fn with_authoritative_recovery_baseline(mut self) -> Self {
+        self.has_authoritative_recovery_baseline = true;
+        self
+    }
+}
+
+struct ImmediateMetadataLogPublication<'a> {
+    depth: &'a AtomicUsize,
+}
+
+impl Drop for ImmediateMetadataLogPublication<'_> {
+    fn drop(&mut self) {
+        let previous = self.depth.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "metadata log publication scope underflow");
+    }
 }
 
 impl<M, O> NoKvFs<M, O>
@@ -159,6 +240,86 @@ where
     M: MetadataStore,
     O: ObjectStore,
 {
+    /// Install the owner-fenced callback used to publish an exact archived log
+    /// tail to the external control plane. A controlled server installs this
+    /// once, after enabling synchronous logging and before accepting requests.
+    pub fn install_sync_metadata_log_publication_hook<F>(&self, hook: F) -> Result<(), MetadError>
+    where
+        F: Fn(&MetadataLogSyncSnapshot) -> Result<(), String> + Send + Sync + 'static,
+    {
+        if self
+            .metadata_log_sync
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none()
+        {
+            return Err(MetadError::Codec(
+                "cannot install metadata log publication hook before enabling the log".to_owned(),
+            ));
+        }
+        let mut installed = self
+            .metadata_log_publication_hook
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if installed.is_some() {
+            return Err(MetadError::Codec(
+                "metadata log publication hook is already installed".to_owned(),
+            ));
+        }
+        *installed = Some(Arc::new(hook));
+        Ok(())
+    }
+
+    /// Run a multi-command operation with a control publication barrier after
+    /// every command whose shared-log segment archived successfully. The
+    /// callback is invoked before the metadata API reports that command as
+    /// applied, so an applied-phase crash point is always reachable from the
+    /// control record rather than only from an unreferenced object.
+    pub fn with_immediate_sync_metadata_log_publication<T>(
+        &self,
+        execute: impl FnOnce() -> Result<T, MetadError>,
+    ) -> Result<T, MetadError> {
+        self.metadata_log_immediate_publication_depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                depth.checked_add(1)
+            })
+            .map_err(|_| {
+                MetadError::Codec("metadata log publication scope depth is exhausted".to_owned())
+            })?;
+        let _publication = ImmediateMetadataLogPublication {
+            depth: &self.metadata_log_immediate_publication_depth,
+        };
+        execute()
+    }
+
+    fn publish_archived_metadata_log_tail_immediately(
+        &self,
+        snapshot: &MetadataLogSyncSnapshot,
+    ) -> Result<(), MetadError> {
+        if self
+            .metadata_log_immediate_publication_depth
+            .load(Ordering::Acquire)
+            == 0
+        {
+            return Ok(());
+        }
+        let hook = self
+            .metadata_log_publication_hook
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                MetadError::Codec(
+                    "immediate metadata log publication has no control-plane hook".to_owned(),
+                )
+            })?;
+        hook(snapshot).map_err(|message| {
+            MetadError::Codec(format!(
+                "immediate metadata log control publication failed: {message}"
+            ))
+        })
+    }
+
     /// Verify that an installed/restored metadata image already carries the
     /// failover fence. This never creates or repairs the marker: callers use it
     /// to reject checkpoints produced before failover-safe object GC existed.
@@ -202,6 +363,53 @@ where
         if config.epoch == 0 {
             return Err(MetadError::InvalidOwnerEpoch);
         }
+        if config.durable_recovery_baseline_lsn > config.durable_lsn {
+            return Err(MetadError::Codec(
+                "metadata recovery baseline is above the durable log tail".to_owned(),
+            ));
+        }
+        if config.durable_recovery_baseline_lsn == config.durable_lsn
+            && config.durable_recovery_baseline_digest != config.last_digest
+        {
+            return Err(MetadError::Codec(
+                "metadata recovery baseline digest differs from the durable log tail".to_owned(),
+            ));
+        }
+        if config.durable_recovery_baseline_lsn < config.durable_lsn {
+            let mut expected_lsn = config
+                .durable_recovery_baseline_lsn
+                .checked_add(1)
+                .ok_or_else(|| MetadError::Codec("metadata log LSN is exhausted".to_owned()))?;
+            let mut observed_tail_digest = None;
+            for pointer in config
+                .segments
+                .iter()
+                .filter(|pointer| pointer.last_lsn > config.durable_recovery_baseline_lsn)
+            {
+                if pointer.first_lsn <= config.durable_recovery_baseline_lsn
+                    || pointer.first_lsn > pointer.last_lsn
+                    || pointer.first_lsn != expected_lsn
+                {
+                    return Err(MetadError::Codec(
+                        "metadata recovery segment pointers do not form a continuous LSN chain"
+                            .to_owned(),
+                    ));
+                }
+                expected_lsn = pointer
+                    .last_lsn
+                    .checked_add(1)
+                    .ok_or_else(|| MetadError::Codec("metadata log LSN is exhausted".to_owned()))?;
+                observed_tail_digest = Some(pointer.last_digest);
+            }
+            if expected_lsn - 1 != config.durable_lsn
+                || observed_tail_digest != Some(config.last_digest)
+            {
+                return Err(MetadError::Codec(
+                    "metadata recovery segment pointers do not reach the durable log tail"
+                        .to_owned(),
+                ));
+            }
+        }
         let next_lsn = config
             .durable_lsn
             .checked_add(1)
@@ -227,6 +435,10 @@ where
             next_lsn,
             prev_digest: config.last_digest,
             segments: config.segments,
+            has_authoritative_recovery_baseline: config.has_authoritative_recovery_baseline,
+            durable_recovery_covered_lsn: config.durable_recovery_baseline_lsn,
+            durable_recovery_covered_digest: config.durable_recovery_baseline_digest,
+            archived_prepared_request_results: BTreeMap::new(),
             pending_segment: None,
             unresolved_commit_group: None,
         };
@@ -413,6 +625,10 @@ where
             .metadata_log_sync
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = None;
+        *self
+            .metadata_log_publication_hook
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = None;
         Ok(())
     }
 
@@ -422,6 +638,15 @@ where
             .unwrap_or_else(|err| err.into_inner())
             .as_ref()
             .map(MetadataLogSyncState::snapshot)
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepared_terminal_proof_cache_len(&self) -> Option<usize> {
+        self.metadata_log_sync
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .map(|state| state.archived_prepared_request_results.len())
     }
 
     /// Read the logical tail and its unpublishable local states under one lock.
@@ -437,6 +662,272 @@ where
                 has_pending_segment: state.pending_segment.is_some(),
                 has_unresolved_commit_group: state.unresolved_commit_group.is_some(),
             })
+    }
+
+    /// Return an already-committed prepared publish only when its local Holt
+    /// apply marker also has a cross-machine durability proof. This is kept out
+    /// of the generic commit funnel: ordinary request ids do not bind the full
+    /// prepared payload and a raw local marker is not a shared-log proof.
+    pub(super) fn prepared_terminal_commit_result(
+        &self,
+        request_id: &[u8],
+        expected_commit_version: Version,
+    ) -> Result<Option<CommitResult>, MetadError> {
+        let _log_enable_fence = self
+            .metadata_log_enable_fence
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        let log_enabled = self
+            .metadata_log_sync
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .is_some();
+        let _commit_log_guard = log_enabled.then(|| {
+            self.metadata_commit_log_gate
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+        });
+        if log_enabled {
+            self.resolve_unresolved_metadata_commit_group_locked()?;
+            self.flush_pending_metadata_log_segment_locked()
+                .map_err(|err| MetadError::SyncLogArchiveFailed {
+                    committed: true,
+                    message: err.to_string(),
+                })?;
+        }
+
+        {
+            let _epoch_fence = self
+                .epoch_fence
+                .read()
+                .unwrap_or_else(|err| err.into_inner());
+            self.ensure_owner_epoch_current()?;
+        }
+        let Some(result) = self.metadata.committed_request_result(request_id)? else {
+            return Ok(None);
+        };
+        if result.commit_version != expected_commit_version {
+            return Err(MetadError::Codec(format!(
+                "prepared publish terminal version mismatch: expected {}, got {}",
+                expected_commit_version.get(),
+                result.commit_version.get()
+            )));
+        }
+        if log_enabled {
+            let guard = self
+                .metadata_log_sync
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let state = guard.as_ref().ok_or_else(|| {
+                MetadError::Codec(
+                    "synchronous metadata log was disabled during prepared terminal lookup"
+                        .to_owned(),
+                )
+            })?;
+            let cached_lsn = state
+                .archived_prepared_request_results
+                .get(request_id)
+                .map(|archived| {
+                    if archived.result != result {
+                        return Err(MetadError::Codec(
+                            "prepared publish cached archive result changed identity".to_owned(),
+                        ));
+                    }
+                    Ok(archived.lsn)
+                })
+                .transpose()?;
+            let proof = PreparedArchiveProofSnapshot {
+                archive: state.config.clone(),
+                shard_id: state.shard_id.clone(),
+                segments: state.segments.clone(),
+                baseline_lsn: state.durable_recovery_covered_lsn,
+                baseline_digest: state.durable_recovery_covered_digest,
+                durable_tail_lsn: state.next_lsn - 1,
+                durable_tail_digest: state.prev_digest,
+            };
+            let has_authoritative_baseline = state.has_authoritative_recovery_baseline;
+            drop(guard);
+            if !self
+                .prepared_request_is_in_archived_segments(request_id, &result, cached_lsn, &proof)?
+                && !has_authoritative_baseline
+            {
+                return Ok(None);
+            }
+        }
+        // Object-store proof can be slow, so it deliberately runs without the
+        // owner-epoch read fence. Reacquire the fence afterwards, re-read the
+        // immutable local terminal marker, and perform the lease/epoch check
+        // last so failover or lease expiry during proof cannot return success
+        // from a stale owner.
+        let _epoch_fence = self
+            .epoch_fence
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        let final_result = self.metadata.committed_request_result(request_id)?;
+        if final_result.as_ref() != Some(&result) {
+            return Err(MetadError::Codec(
+                "prepared publish terminal marker changed during archive proof".to_owned(),
+            ));
+        }
+        self.ensure_owner_epoch_current()?;
+        Ok(Some(result))
+    }
+
+    /// Record that a checkpoint became authoritative in the external control
+    /// plane. The exact logical-log boundary is validated before archived
+    /// per-request proofs covered by the checkpoint are compacted away.
+    pub fn acknowledge_published_metadata_checkpoint(
+        &self,
+        log_lsn: u64,
+        log_digest: [u8; 32],
+    ) -> Result<(), MetadError> {
+        let _log_enable_fence = self
+            .metadata_log_enable_fence
+            .read()
+            .unwrap_or_else(|err| err.into_inner());
+        let log_enabled = self
+            .metadata_log_sync
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .is_some();
+        if !log_enabled {
+            return Ok(());
+        }
+        let _commit_log_guard = self
+            .metadata_commit_log_gate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        self.resolve_unresolved_metadata_commit_group_locked()?;
+        self.flush_pending_metadata_log_segment_locked()
+            .map_err(|err| MetadError::SyncLogArchiveFailed {
+                committed: true,
+                message: err.to_string(),
+            })?;
+        self.ensure_owner_epoch_current()?;
+        let mut guard = self
+            .metadata_log_sync
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let state = guard.as_mut().ok_or_else(|| {
+            MetadError::Codec(
+                "synchronous metadata log was disabled during checkpoint acknowledgement"
+                    .to_owned(),
+            )
+        })?;
+        if log_lsn < state.durable_recovery_covered_lsn {
+            return Err(MetadError::Codec(
+                "published checkpoint regresses durable recovery coverage".to_owned(),
+            ));
+        }
+        let current_lsn = state.next_lsn - 1;
+        let boundary_matches = if log_lsn == state.durable_recovery_covered_lsn {
+            log_digest == state.durable_recovery_covered_digest
+        } else if log_lsn == current_lsn {
+            log_digest == state.prev_digest
+        } else {
+            state
+                .segments
+                .iter()
+                .any(|segment| segment.last_lsn == log_lsn && segment.last_digest == log_digest)
+        };
+        if !boundary_matches {
+            return Err(MetadError::Codec(format!(
+                "published checkpoint log boundary {log_lsn} does not match the durable local chain"
+            )));
+        }
+
+        state.has_authoritative_recovery_baseline = true;
+        state.durable_recovery_covered_lsn = log_lsn;
+        state.durable_recovery_covered_digest = log_digest;
+        state
+            .archived_prepared_request_results
+            .retain(|_, proof| proof.lsn > log_lsn);
+        Ok(())
+    }
+
+    fn prepared_request_is_in_archived_segments(
+        &self,
+        request_id: &[u8],
+        expected: &CommitResult,
+        cached_lsn: Option<u64>,
+        proof: &PreparedArchiveProofSnapshot,
+    ) -> Result<bool, MetadError> {
+        if cached_lsn.is_some_and(|lsn| lsn <= proof.baseline_lsn) {
+            return Err(MetadError::Codec(
+                "prepared publish cache retained a checkpoint-covered LSN".to_owned(),
+            ));
+        }
+        let mut expected_first_lsn = proof.baseline_lsn.checked_add(1);
+        let mut expected_prev_digest = proof.baseline_digest;
+        let mut found = false;
+        for pointer in &proof.segments {
+            if pointer.last_lsn <= proof.baseline_lsn {
+                continue;
+            }
+            let Some(first_lsn) = expected_first_lsn else {
+                return Err(MetadError::Codec(
+                    "prepared publish archive LSN is exhausted".to_owned(),
+                ));
+            };
+            if pointer.first_lsn <= proof.baseline_lsn
+                || pointer.first_lsn > pointer.last_lsn
+                || pointer.first_lsn != first_lsn
+            {
+                return Err(MetadError::Codec(
+                    "prepared publish archive chain has an LSN gap".to_owned(),
+                ));
+            }
+            proof.archive.validate_segment_key(&pointer.segment_key)?;
+            let segment = self.load_metadata_log_segment(&pointer.segment_key)?;
+            if segment.first_lsn != pointer.first_lsn
+                || segment.last_lsn != pointer.last_lsn
+                || segment.last_digest != pointer.last_digest
+                || segment.prev_digest != expected_prev_digest
+                || segment.shard_id != proof.shard_id
+            {
+                return Err(MetadError::Codec(
+                    "prepared publish archive pointer changed segment identity".to_owned(),
+                ));
+            }
+            for entry in &segment.entries {
+                if entry.request_id != request_id {
+                    continue;
+                }
+                if !is_prepared_artifact_request_id(entry.command.kind, &entry.request_id)
+                    || entry.result != *expected
+                    || cached_lsn.is_some_and(|lsn| entry.lsn != lsn)
+                    || found
+                {
+                    return Err(MetadError::Codec(
+                        "prepared publish archived result changed identity".to_owned(),
+                    ));
+                }
+                found = true;
+            }
+            if !found && cached_lsn.is_some_and(|lsn| lsn <= pointer.last_lsn) {
+                return Err(MetadError::Codec(
+                    "prepared publish cached archive locator is missing".to_owned(),
+                ));
+            }
+            expected_first_lsn = pointer.last_lsn.checked_add(1);
+            expected_prev_digest = pointer.last_digest;
+        }
+        if cached_lsn.is_some() && !found {
+            return Err(MetadError::Codec(
+                "prepared publish cached archive segment is missing".to_owned(),
+            ));
+        }
+        let observed_tail_lsn = expected_first_lsn
+            .map(|next_lsn| next_lsn - 1)
+            .unwrap_or(u64::MAX);
+        if observed_tail_lsn != proof.durable_tail_lsn
+            || expected_prev_digest != proof.durable_tail_digest
+        {
+            return Err(MetadError::Codec(
+                "prepared publish archive chain does not reach the durable log tail".to_owned(),
+            ));
+        }
+        Ok(found)
     }
 
     /// Resolve every ambiguous apply and flush the exact committed segment
@@ -714,6 +1205,32 @@ where
             .last_lsn
             .checked_add(1)
             .ok_or_else(|| MetadError::Codec("metadata log LSN is exhausted".to_owned()))?;
+        let mut prepared_results: BTreeMap<Vec<u8>, ArchivedPreparedRequestResult> =
+            BTreeMap::new();
+        for entry in &segment.entries {
+            if !is_prepared_artifact_request_id(entry.command.kind, &entry.request_id) {
+                continue;
+            }
+            if let Some(existing) = state
+                .archived_prepared_request_results
+                .get(&entry.request_id)
+                .or_else(|| prepared_results.get(&entry.request_id))
+            {
+                if existing.result != entry.result {
+                    return Err(MetadError::Codec(
+                        "prepared publish request id has conflicting archived results".to_owned(),
+                    ));
+                }
+            } else {
+                prepared_results.insert(
+                    entry.request_id.clone(),
+                    ArchivedPreparedRequestResult {
+                        result: entry.result.clone(),
+                        lsn: entry.lsn,
+                    },
+                );
+            }
+        }
         let archived =
             archive_metadata_log_segment_to_store(&self.objects, &state.config, segment)?;
         self.metadata_log_segments_archived_total
@@ -730,6 +1247,10 @@ where
             last_lsn: segment.last_lsn,
             last_digest: segment.last_digest,
         });
+        state
+            .archived_prepared_request_results
+            .extend(prepared_results);
+        trim_prepared_terminal_proof_cache(&mut state.archived_prepared_request_results);
         Ok(())
     }
 
@@ -795,6 +1316,39 @@ where
         state.pending_segment = Some(segment.clone());
         self.archive_and_advance_metadata_log_state(state, &segment)?;
         state.pending_segment = None;
-        Ok(Some(state.snapshot()))
+        let snapshot = state.snapshot();
+        drop(guard);
+        self.publish_archived_metadata_log_tail_immediately(&snapshot)?;
+        Ok(Some(snapshot))
+    }
+}
+
+#[cfg(test)]
+mod prepared_terminal_proof_cache_tests {
+    use super::*;
+
+    #[test]
+    fn proof_cache_is_bounded_and_evicts_oldest_lsn_first() {
+        let mut proofs = BTreeMap::new();
+        for index in 0..(PREPARED_TERMINAL_PROOF_CACHE_LIMIT + 2) {
+            proofs.insert(
+                (index as u64).to_be_bytes().to_vec(),
+                ArchivedPreparedRequestResult {
+                    result: CommitResult {
+                        commit_version: Version::new(1).unwrap(),
+                        applied_mutations: 1,
+                        watch_events: 0,
+                    },
+                    lsn: index as u64 + 1,
+                },
+            );
+        }
+
+        trim_prepared_terminal_proof_cache(&mut proofs);
+
+        assert_eq!(proofs.len(), PREPARED_TERMINAL_PROOF_CACHE_LIMIT);
+        assert!(!proofs.contains_key(0_u64.to_be_bytes().as_slice()));
+        assert!(!proofs.contains_key(1_u64.to_be_bytes().as_slice()));
+        assert_eq!(proofs.values().map(|proof| proof.lsn).min(), Some(3));
     }
 }

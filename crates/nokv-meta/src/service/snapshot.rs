@@ -6,6 +6,7 @@ use crate::layout::{decode_fork_binding, fork_binding_prefix};
 pub const DEFAULT_SNAPSHOT_LEASE_MS: u64 = 3_600_000;
 const SNAPSHOT_MINT_MAX_ATTEMPTS: usize = 8;
 const SNAPSHOT_RENEW_MAX_ATTEMPTS: usize = 8;
+const FORK_BINDING_SCAN_PAGE: usize = 64;
 const SNAPSHOT_ID_SHARD_BITS: u32 = 16;
 const SNAPSHOT_ID_LOCAL_BITS: u32 = u64::BITS - SNAPSHOT_ID_SHARD_BITS;
 const SNAPSHOT_ID_LOCAL_MASK: u64 = (1_u64 << SNAPSHOT_ID_LOCAL_BITS) - 1;
@@ -37,6 +38,15 @@ where
         root: InodeId,
         lease_ms: u64,
     ) -> Result<SnapshotPin, MetadError> {
+        // Release-to-fork proves every current and historical borrower while
+        // holding this gate before it drops an exact object reference. Keep
+        // snapshot minting in the same critical section so a new pin cannot
+        // commit after that proof but before the exact-reference CAS. Ordinary
+        // object GC remains concurrent and is fenced by its durable claim CAS.
+        let _restore_snapshot_gate = self
+            .restore_snapshot_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         for attempt in 0..SNAPSHOT_MINT_MAX_ATTEMPTS {
             let object_reference = self.begin_object_reference_mutation()?;
             let Some(attr) = self.get_attr_at_version_for_purpose(
@@ -109,6 +119,10 @@ where
         path: &str,
         lease_ms: u64,
     ) -> Result<SnapshotPin, MetadError> {
+        let _restore_snapshot_gate = self
+            .restore_snapshot_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         for attempt in 0..SNAPSHOT_MINT_MAX_ATTEMPTS {
             let object_reference = self.begin_object_reference_mutation()?;
             let binding_version = self.read_version()?;
@@ -186,6 +200,7 @@ where
             return Ok(false);
         }
         self.validate_snapshot_retention_roots(snapshot_id, pin.as_ref(), &bindings, None)?;
+        self.ensure_restore_snapshot_retirable(snapshot_id, &bindings, read_version)?;
         self.ensure_fork_bindings_releasable(&bindings, read_version)?;
 
         let pin_key = snapshot_pin_key(self.mount, snapshot_id);
@@ -285,6 +300,7 @@ where
             &bindings,
             Some(expected_root),
         )?;
+        self.ensure_restore_snapshot_retirable(snapshot_id, &bindings, read_version)?;
         self.ensure_fork_bindings_releasable(&bindings, read_version)?;
 
         let pin_key = snapshot_pin_key(self.mount, snapshot_id);
@@ -386,6 +402,16 @@ where
         snapshot_id: u64,
         lease_ms: u64,
     ) -> Result<SnapshotRenewOutcome, MetadError> {
+        // A renewal that read a live pin immediately before its old lease
+        // deadline may commit after the deadline. Serialize that whole proof
+        // and CAS with restore release, which treats an expired pin as no
+        // longer retaining its private ref-set. Otherwise release could prove
+        // the old lease dead, remove the operation/overlay, and then let this
+        // call acknowledge an extension of the now-incomplete snapshot.
+        let _restore_snapshot_gate = self
+            .restore_snapshot_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         let requested_expiry = self.now_ms().saturating_add(lease_ms);
         let key = snapshot_pin_key(self.mount, snapshot_id);
         for _attempt in 0..SNAPSHOT_RENEW_MAX_ATTEMPTS {
@@ -767,17 +793,41 @@ where
         version: Version,
         purpose: ReadPurpose,
     ) -> Result<Vec<VersionedForkBinding>, MetadError> {
-        self.metadata
-            .scan(ScanRequest {
+        let mut bindings = Vec::new();
+        self.visit_versioned_fork_bindings_at(version, purpose, |binding| {
+            bindings.push(binding);
+            Ok(false)
+        })?;
+        Ok(bindings)
+    }
+
+    /// Visit fork bindings at one stable version in bounded pages. Returning
+    /// `true` from the visitor stops the scan, which lets retention proofs keep
+    /// O(page) memory and avoid reading bindings after the first live holder.
+    pub(super) fn visit_versioned_fork_bindings_at<F>(
+        &self,
+        version: Version,
+        purpose: ReadPurpose,
+        mut visit: F,
+    ) -> Result<bool, MetadError>
+    where
+        F: FnMut(VersionedForkBinding) -> Result<bool, MetadError>,
+    {
+        let prefix = fork_binding_prefix(self.mount);
+        let mut start_after = None;
+        loop {
+            let rows = self.metadata.scan(ScanRequest {
                 family: RecordFamily::ForkBinding,
-                prefix: fork_binding_prefix(self.mount),
-                start_after: None,
+                prefix: prefix.clone(),
+                start_after: start_after.clone(),
                 version,
-                limit: 0,
+                limit: FORK_BINDING_SCAN_PAGE,
                 purpose,
-            })?
-            .into_iter()
-            .map(|row| {
+            })?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
                 let binding = decode_fork_binding(&row.value.0)
                     .map_err(|err| MetadError::Codec(err.to_string()))?;
                 let expected_key = fork_binding_key(self.mount, binding.fork_root);
@@ -807,13 +857,20 @@ where
                         binding.snapshot_id
                     )));
                 }
-                Ok(VersionedForkBinding {
+                if visit(VersionedForkBinding {
                     binding,
-                    key: row.key,
+                    key: row.key.clone(),
                     version: row.version,
-                })
-            })
-            .collect()
+                })? {
+                    return Ok(true);
+                }
+            }
+            start_after = rows.last().map(|row| row.key.clone());
+            if rows.len() < FORK_BINDING_SCAN_PAGE {
+                break;
+            }
+        }
+        Ok(false)
     }
 
     fn fork_bindings_for_snapshot_at(
@@ -953,7 +1010,7 @@ where
         Ok((u64::from(self.shard_index()) << SNAPSHOT_ID_LOCAL_BITS) | local)
     }
 
-    fn ensure_snapshot_id_shard(
+    pub(super) fn ensure_snapshot_id_shard(
         &self,
         snapshot_id: u64,
         expected_root: InodeId,
