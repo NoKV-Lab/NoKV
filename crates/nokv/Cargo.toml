@@ -20,6 +20,7 @@ nokv-control.workspace = true
 nokv-fuse.workspace = true
 nokv-meta.workspace = true
 nokv-object.workspace = true
+nokv-protocol.workspace = true
 nokv-server.workspace = true
 nokv-agent.workspace = true
 nokv-types.workspace = true
