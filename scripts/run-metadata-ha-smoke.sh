@@ -598,7 +598,7 @@ mcp_call "$OWNER_A_BIND" workbench_create \
 mcp_call "$OWNER_A_BIND" workbench_put_file \
     '{"id":"ha-restore-source","section":"outputs","path":"result.txt","text":"ha-restore-source\n"}' >/dev/null
 mcp_call "$OWNER_A_BIND" workbench_commit \
-    '{"id":"ha-restore-source","manifest":{"test":"metadata-ha-smoke"}}' >/dev/null
+    '{"id":"ha-restore-source","content_digest_uri":"sha256:457152c0c77b8850358191962e10634532c3c778a9fd535405139d20ebc693d1","manifest":{"test":"metadata-ha-smoke"}}' >/dev/null
 RESTORE_SNAPSHOT_JSON="$(mcp_call "$OWNER_A_BIND" workbench_snapshot \
     '{"id":"ha-restore-source","name":"failover","ttl_days":7}')"
 RESTORE_SNAPSHOT_ID="$(printf '%s\n' "$RESTORE_SNAPSHOT_JSON" | json_field snapshot_id)"
