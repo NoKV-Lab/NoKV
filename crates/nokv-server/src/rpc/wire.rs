@@ -7,13 +7,16 @@ use nokv_meta::{
     NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind, NamespaceFieldValue,
     NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest, NamespaceFindResult,
     NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult, NamespaceInclude,
+    NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow,
     NamespaceIndexValue, NamespaceListPage, NamespacePredicate, NamespacePredicateOp,
     NamespacePredicateValue, NamespaceQueryCatalog, NamespaceReadFormat, NamespaceReadOptions,
     NamespaceReadPage, NamespaceRecordCount, NamespaceRecordType, NamespaceSchema, NamespaceSort,
     NamespaceSortDirection, NamespaceSortField, PreparedArtifact, RecordCountProvenance,
     SubtreeDelta, SubtreeDeltaKind, UpdateAttr, XattrSetMode,
 };
+
 use nokv_object::{ObjectKey, ObjectReadBlock, StagedObject, StagedObjectSet};
+
 use nokv_protocol::{
     MetadataProtocolError, MetadataRpcEnvelope, MetadataRpcResult, WireAdvisoryLock,
     WireBodyReadPlan, WireDentryWithAttr, WireMetadataError, WireNamespaceAggregateGroup,
@@ -24,14 +27,17 @@ use nokv_protocol::{
     WireNamespaceFieldSource, WireNamespaceFieldSourceKind, WireNamespaceFieldValue,
     WireNamespaceFilterCapability, WireNamespaceFindField, WireNamespaceFindRequest,
     WireNamespaceFindResult, WireNamespaceGrepMatch, WireNamespaceGrepRequest,
-    WireNamespaceGrepResult, WireNamespaceInclude, WireNamespaceIndexValue, WireNamespaceListPage,
+    WireNamespaceGrepResult, WireNamespaceInclude,
+    WireNamespaceIndexField, WireNamespaceIndexRegistration, WireNamespaceIndexRow,
+    WireNamespaceIndexValue, WireNamespaceListPage,
     WireNamespacePredicate, WireNamespacePredicateOp, WireNamespacePredicateValue,
     WireNamespaceQueryCatalog, WireNamespaceReadFormat, WireNamespaceReadItem,
     WireNamespaceReadOptions, WireNamespaceReadPage, WireNamespaceRecordCount,
-    WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort, WireNamespaceSortDirection,
-    WireNamespaceSortField, WireObjectReadBlock, WireOpenPathReadPlan, WirePathMetadata,
-    WirePreparedArtifact, WireReadLease, WireRecordCountProvenance, WireStagedObjectSet,
-    WireSubtreeDelta, WireSubtreeDeltaKind, WireUpdateAttr, WireXattrSetMode,
+    WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort,
+    WireNamespaceSortDirection, WireNamespaceSortField, WireObjectReadBlock,
+    WireOpenPathReadPlan, WirePathMetadata, WirePreparedArtifact, WireReadLease,
+    WireRecordCountProvenance, WireStagedObjectSet, WireSubtreeDelta,
+    WireSubtreeDeltaKind, WireUpdateAttr, WireXattrSetMode,
 };
 use nokv_types::{DentryName, InodeId, MountId};
 

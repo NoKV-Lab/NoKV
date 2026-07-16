@@ -1182,6 +1182,7 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::PrepareArtifactPath { .. }
         | MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { .. }
         | MetadataRpcRequest::PublishPreparedArtifact { .. }
+        | MetadataRpcRequest::RegisterNamespaceIndex { .. }
         | MetadataRpcRequest::PublishPreparedArtifactStagedSession { .. } => false,
     }
 }
