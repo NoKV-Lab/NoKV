@@ -3224,18 +3224,59 @@ mod tests {
         })
     }
 
+    struct SharedWorkbenchMcpSession {
+        _access: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SharedWorkbenchMcpSession {
+        fn acquire() -> Self {
+            static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+            // This fixture saves process resources by sharing one metadata
+            // server and local object root. Serialise access because
+            // concurrent clients have produced transient body-descriptor
+            // visibility failures. Dedicated concurrency tests must use their
+            // own fixture.
+            let access = ACCESS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self { _access: access }
+        }
+
+        fn direct_client(&self) -> NoKvFsClient<LocalObjectStore> {
+            let (addr, object_root) = shared_workbench_mcp_server();
+            let store =
+                LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+            NoKvFsClient::connect(*addr, store)
+        }
+
+        fn run_requests(
+            &self,
+            options: McpCliOptions,
+            requests: Vec<serde_json::Value>,
+        ) -> Vec<serde_json::Value> {
+            run_workbench_mcp_requests_on_client(self.direct_client(), options, requests)
+        }
+    }
+
+    fn with_shared_workbench_client<T>(
+        action: impl FnOnce(NoKvFsClient<LocalObjectStore>) -> T,
+    ) -> T {
+        let session = SharedWorkbenchMcpSession::acquire();
+        action(session.direct_client())
+    }
+
     fn run_shared_workbench_mcp_requests(
         requests: Vec<serde_json::Value>,
     ) -> Vec<serde_json::Value> {
-        let client = shared_workbench_direct_client();
-        run_workbench_mcp_requests_on_client(client, workbench_mcp_options(), requests)
+        run_shared_workbench_mcp_requests_with_options(workbench_mcp_options(), requests)
     }
 
-    fn shared_workbench_direct_client() -> NoKvFsClient<LocalObjectStore> {
-        let (addr, object_root) = shared_workbench_mcp_server();
-        let store =
-            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
-        NoKvFsClient::connect(*addr, store)
+    fn run_shared_workbench_mcp_requests_with_options(
+        options: McpCliOptions,
+        requests: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        SharedWorkbenchMcpSession::acquire().run_requests(options, requests)
     }
 
     /// Restore initialization is uploaded by the metadata owner, unlike the
@@ -5855,17 +5896,18 @@ mod tests {
             assert_ne!(response["result"]["isError"], true, "setup: {response}");
         }
 
-        let client = shared_workbench_direct_client();
         let workbench_path = format!("/workbenches/{id}");
-        client
-            .metadata()
-            .mkdir(
-                &format!("{workbench_path}/metadata/checkpoints.jsonl"),
-                DEFAULT_MODE_DIR,
-                DEFAULT_UID,
-                DEFAULT_GID,
-            )
-            .unwrap();
+        with_shared_workbench_client(|client| {
+            client
+                .metadata()
+                .mkdir(
+                    &format!("{workbench_path}/metadata/checkpoints.jsonl"),
+                    DEFAULT_MODE_DIR,
+                    DEFAULT_UID,
+                    DEFAULT_GID,
+                )
+                .unwrap();
+        });
 
         let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
             4,
@@ -5904,18 +5946,20 @@ mod tests {
             "job-013"
         );
 
-        let status = client
-            .metadata()
-            .snapshot_pin_status(&workbench_path, snapshot_id)
-            .unwrap();
-        assert!(
-            status.pin.is_some(),
-            "partial error must identify the live pin"
-        );
-        assert!(client
-            .metadata()
-            .retire_snapshot(&workbench_path, snapshot_id)
-            .unwrap());
+        with_shared_workbench_client(|client| {
+            let status = client
+                .metadata()
+                .snapshot_pin_status(&workbench_path, snapshot_id)
+                .unwrap();
+            assert!(
+                status.pin.is_some(),
+                "partial error must identify the live pin"
+            );
+            assert!(client
+                .metadata()
+                .retire_snapshot(&workbench_path, snapshot_id)
+                .unwrap());
+        });
     }
 
     #[test]
@@ -6505,10 +6549,12 @@ mod tests {
     }
 
     fn shared_workbench_snapshot(id: &str, lease_ms: u64) -> nokv_client::SnapshotOutcome {
-        shared_workbench_direct_client()
-            .metadata()
-            .snapshot_subtree_path_with_lease(&format!("/workbenches/{id}"), lease_ms)
-            .unwrap()
+        with_shared_workbench_client(|client| {
+            client
+                .metadata()
+                .snapshot_subtree_path_with_lease(&format!("/workbenches/{id}"), lease_ms)
+                .unwrap()
+        })
     }
 
     fn assert_snapshot_read_page_contract(page: &serde_json::Value) {
@@ -6808,8 +6854,7 @@ mod tests {
         let snapshot_id = shared_workbench_snapshot(id, TEST_MS_PER_DAY).snapshot_id;
         let mut options = workbench_mcp_options();
         options.workbench_max_bytes = 0;
-        let responses = run_workbench_mcp_requests_on_client(
-            shared_workbench_direct_client(),
+        let responses = run_shared_workbench_mcp_requests_with_options(
             options,
             vec![workbench_tool_call(
                 3,
@@ -6830,28 +6875,41 @@ mod tests {
     #[test]
     fn workbench_mcp_at_snapshot_cursor_fails_after_lease_expires() {
         let id = "ckpt-read-expiry-015";
-        let setup = run_shared_workbench_mcp_requests(vec![
-            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
-            workbench_tool_call(
-                2,
-                "workbench_put_file",
-                serde_json::json!({
-                    "id": id, "section": "outputs", "path": "data.bin", "text": "abcdef"
-                }),
-            ),
-        ]);
+        // Hold one fixture session across the short lease so unrelated test
+        // batches cannot consume the lease while this test waits for the lock.
+        let session = SharedWorkbenchMcpSession::acquire();
+        let setup = session.run_requests(
+            workbench_mcp_options(),
+            vec![
+                workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+                workbench_tool_call(
+                    2,
+                    "workbench_put_file",
+                    serde_json::json!({
+                        "id": id, "section": "outputs", "path": "data.bin", "text": "abcdef"
+                    }),
+                ),
+            ],
+        );
         for response in &setup {
             assert_ne!(response["result"]["isError"], true, "setup: {response}");
         }
-        let snapshot = shared_workbench_snapshot(id, 1_000);
-        let first = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
-            3,
-            "workbench_read",
-            serde_json::json!({
-                "id": id, "section": "outputs", "path": "data.bin", "format": "bytes",
-                "at_snapshot": snapshot.snapshot_id, "limit": 2
-            }),
-        )]);
+        let snapshot = session
+            .direct_client()
+            .metadata()
+            .snapshot_subtree_path_with_lease(&format!("/workbenches/{id}"), 1_000)
+            .unwrap();
+        let first = session.run_requests(
+            workbench_mcp_options(),
+            vec![workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.bin", "format": "bytes",
+                    "at_snapshot": snapshot.snapshot_id, "limit": 2
+                }),
+            )],
+        );
         let first_page = &first[0]["result"]["structuredContent"];
         assert_ne!(first[0]["result"]["isError"], true, "first: {first_page}");
         let cursor = first_page["next_cursor"].as_str().unwrap().to_owned();
@@ -6861,14 +6919,17 @@ mod tests {
             .saturating_add(25);
         thread::sleep(Duration::from_millis(wait_ms));
 
-        let second = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
-            4,
-            "workbench_read",
-            serde_json::json!({
-                "id": id, "section": "outputs", "path": "data.bin", "format": "bytes",
-                "at_snapshot": snapshot.snapshot_id, "cursor": cursor, "limit": 2
-            }),
-        )]);
+        let second = session.run_requests(
+            workbench_mcp_options(),
+            vec![workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.bin", "format": "bytes",
+                    "at_snapshot": snapshot.snapshot_id, "cursor": cursor, "limit": 2
+                }),
+            )],
+        );
         let error = &second[0]["result"]["structuredContent"];
         assert_eq!(second[0]["result"]["isError"], true, "error: {error}");
         assert_eq!(error["code"], "SnapshotLeaseExpired", "error: {error}");
@@ -7251,13 +7312,6 @@ mod tests {
         response["result"]["structuredContent"].clone()
     }
 
-    fn attack_direct_client() -> NoKvFsClient<LocalObjectStore> {
-        let (addr, object_root) = shared_workbench_mcp_server();
-        let store =
-            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
-        NoKvFsClient::connect(*addr, store)
-    }
-
     // ---------- append ----------
 
     #[test]
@@ -7284,11 +7338,10 @@ mod tests {
         assert_eq!(second["appended_bytes"], 4);
         assert_eq!(second["size_bytes"], 4);
         assert_eq!(second["created"], false);
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-append-empty/logs/run.log")
-                .unwrap(),
+                .unwrap()),
             b"data"
         );
     }
@@ -7380,22 +7433,23 @@ mod tests {
         attack_tool_ok(&responses[0]);
         // Another NoKV client drops a file directly under the workbench root,
         // outside every section.
-        let direct = attack_direct_client();
-        direct
-            .put_artifact(
-                "/workbenches/attack-append-oob/oob.txt",
-                b"out-of-band".to_vec(),
-                ArtifactMetadata {
-                    producer: "outside-writer".to_owned(),
-                    digest_uri: "sha256:demo".to_owned(),
-                    content_type: "text/plain".to_owned(),
-                    manifest_id: "oob.txt".to_owned(),
-                    mode: DEFAULT_MODE_FILE,
-                    uid: DEFAULT_UID,
-                    gid: DEFAULT_GID,
-                },
-            )
-            .unwrap();
+        with_shared_workbench_client(|client| {
+            client
+                .put_artifact(
+                    "/workbenches/attack-append-oob/oob.txt",
+                    b"out-of-band".to_vec(),
+                    ArtifactMetadata {
+                        producer: "outside-writer".to_owned(),
+                        digest_uri: "sha256:demo".to_owned(),
+                        content_type: "text/plain".to_owned(),
+                        manifest_id: "oob.txt".to_owned(),
+                        mode: DEFAULT_MODE_FILE,
+                        uid: DEFAULT_UID,
+                        gid: DEFAULT_GID,
+                    },
+                )
+                .unwrap();
+        });
         let attempts = run_shared_workbench_mcp_requests(vec![
             // Escape through '..' must be rejected.
             workbench_tool_call(
@@ -7422,9 +7476,9 @@ mod tests {
         );
         // The out-of-band file must be untouched.
         assert_eq!(
-            direct
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-append-oob/oob.txt")
-                .unwrap(),
+                .unwrap()),
             b"out-of-band"
         );
     }
@@ -7458,11 +7512,10 @@ mod tests {
                 "append response: {appended}"
             );
         }
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-append-thirty/logs/run.log")
-                .unwrap(),
+                .unwrap()),
             expected.as_bytes()
         );
     }
@@ -7497,11 +7550,10 @@ mod tests {
                 && replaced["generation"].as_u64().unwrap() > first["generation"].as_u64().unwrap(),
             "generations must be monotonic: {first} / {replaced} / {second}"
         );
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-append-interleave/outputs/f.txt")
-                .unwrap(),
+                .unwrap()),
             b"RESETb"
         );
     }
@@ -7546,11 +7598,10 @@ mod tests {
             put["generation"].as_u64().unwrap(),
             "stat after no-op edit: {stat}"
         );
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-edit-noop/scripts/s.py")
-                .unwrap(),
+                .unwrap()),
             b"hello world"
         );
     }
@@ -7603,11 +7654,10 @@ mod tests {
         assert_eq!(edit["size_bytes"], 0, "edit: {edit}");
         let stat = attack_tool_ok(&responses[3]);
         assert_eq!(stat["card"]["size_bytes"], 0, "stat: {stat}");
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-edit-toempty/outputs/f.txt")
-                .unwrap(),
+                .unwrap()),
             b""
         );
     }
@@ -7669,11 +7719,10 @@ mod tests {
         );
         let edit = attack_tool_ok(&responses[3]);
         assert_eq!(edit["replacements"], 100, "edit: {edit}");
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-edit-hundred/outputs/many.txt")
-                .unwrap(),
+                .unwrap()),
             expected.as_bytes()
         );
     }
