@@ -58,6 +58,7 @@ BASE_WORKBENCH_TOOLS = {
     "workbench_commit",
     "workbench_snapshot",
     "workbench_snapshot_renew",
+    "workbench_snapshot_retire",
     "workbench_snapshot_list",
 }
 HOP_BY_HOP_HEADERS = {
@@ -177,6 +178,12 @@ def sha256_file(path: Path) -> str:
         while chunk := source.read(8 << 20):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_uri(payload: bytes) -> str:
+    """Return the strict caller-known identity required by workbench_commit."""
+
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -404,7 +411,7 @@ def assert_tool_error(result: dict[str, Any], context: str) -> None:
 
 
 def validate_tool_contract(tools: list[dict[str, Any]]) -> None:
-    """Validate the capability-gated 17-tool surface and raw restore schema."""
+    """Validate the capability-gated 18-tool surface and raw lifecycle schemas."""
     by_name = {tool.get("name"): tool for tool in tools}
     expected = BASE_WORKBENCH_TOOLS | {RESTORE_TOOL}
     if set(by_name) != expected:
@@ -413,6 +420,36 @@ def validate_tool_contract(tools: list[dict[str, Any]]) -> None:
             f"missing={sorted(expected - set(by_name))}, "
             f"extra={sorted(set(by_name) - expected)}"
         )
+    retire_schema = by_name["workbench_snapshot_retire"].get("schema")
+    if not isinstance(retire_schema, dict):
+        raise AcceptanceError("workbench_snapshot_retire lacks inputSchema")
+    retire_fields = {"id", "snapshot_id", "name", "reason"}
+    if retire_schema.get("type") != "object":
+        raise AcceptanceError("workbench_snapshot_retire schema must be an object")
+    if set(retire_schema.get("required", [])) != {"id"}:
+        raise AcceptanceError("workbench_snapshot_retire must require id")
+    retire_properties = retire_schema.get("properties")
+    if not isinstance(retire_properties, dict) or set(retire_properties) != retire_fields:
+        raise AcceptanceError("workbench_snapshot_retire schema contains wrong properties")
+    if retire_schema.get("additionalProperties") is not False:
+        raise AcceptanceError(
+            "workbench_snapshot_retire must reject additional properties"
+        )
+    if retire_schema.get("oneOf") != [
+        {"required": ["snapshot_id"]},
+        {"required": ["name"]},
+    ]:
+        raise AcceptanceError(
+            "workbench_snapshot_retire must require exactly one target"
+        )
+    if retire_properties["snapshot_id"].get("type") != "integer":
+        raise AcceptanceError("snapshot retire id must be an integer")
+    if retire_properties["snapshot_id"].get("minimum") != 0:
+        raise AcceptanceError("snapshot retire id must be non-negative")
+    if retire_properties["name"].get("type") != "string":
+        raise AcceptanceError("snapshot retire name must be a string")
+    if retire_properties["name"].get("minLength") != 1:
+        raise AcceptanceError("snapshot retire name must be non-empty")
     schema = by_name[RESTORE_TOOL].get("schema")
     if not isinstance(schema, dict):
         raise AcceptanceError("workbench_restore lacks inputSchema")
@@ -2058,7 +2095,21 @@ class AcceptanceSuite:
             )
         self.client_a.call(
             "workbench_commit",
-            {"id": self.source, "manifest": {"acceptance": "durable-restore"}},
+            {
+                "id": self.source,
+                "manifest": {"acceptance": "durable-restore"},
+                "content_digest_uri": sha256_uri(
+                    json.dumps(
+                        {
+                            "fixture_sha256": self.expected_digest,
+                            "fixture_marker_digest": self.fixture_marker_digest,
+                            "indexed_files": self.env.config.profile.indexed_files,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ),
+            },
         )
         after_source = self.env.inventory()
         self.fork_owned_keys = set(after_source) - set(before_source)
@@ -2404,7 +2455,11 @@ class AcceptanceSuite:
         self.put_text(replacement, "replacement.txt", "replacement survived\n")
         self.client_a.call(
             "workbench_commit",
-            {"id": replacement, "manifest": {"release_crash": True}},
+            {
+                "id": replacement,
+                "manifest": {"release_crash": True},
+                "content_digest_uri": sha256_uri(b"replacement survived\n"),
+            },
         )
         replacement_keys = set(self.env.inventory()) - set(replacement_inventory_before)
         if not replacement_keys:
@@ -2783,11 +2838,18 @@ class AcceptanceSuite:
         )
         if conflict.code != "RestoreDestinationConflict":
             raise AcceptanceError(f"wrong destination conflict: {conflict!r}")
-        self.env.cli(
-            "retire-snapshot",
-            self.absolute(self.source),
-            str(conflict_snapshot_id),
+        retired_conflict = self.client_a.call(
+            "workbench_snapshot_retire",
+            {
+                "id": self.source,
+                "snapshot_id": conflict_snapshot_id,
+                "reason": "destination-conflict-cleanup",
+            },
         )
+        if retired_conflict.get("retired") is not True:
+            raise AcceptanceError(
+                f"conflict snapshot was not retired through MCP: {retired_conflict!r}"
+            )
         return {
             "operation_id": self.operation_id,
             "concurrent_calls": len(outcomes),
@@ -2873,11 +2935,21 @@ class AcceptanceSuite:
                 f"changed={sorted(nested_changed)!r}, puts={nested_puts!r}"
             )
         self.restore_manifest_keys.update(nested_changed)
-        self.env.cli(
-            "retire-snapshot",
-            self.absolute(self.destination),
-            str(self.nested_snapshot_id),
+        retired_nested = self.client_a.call(
+            "workbench_snapshot_retire",
+            {
+                "id": self.destination,
+                "name": "nested-point",
+                "reason": "nested-restore-complete",
+            },
         )
+        if (
+            retired_nested.get("retired") is not True
+            or retired_nested.get("snapshot_id") != self.nested_snapshot_id
+        ):
+            raise AcceptanceError(
+                f"named nested snapshot was not retired through MCP: {retired_nested!r}"
+            )
         return {
             "server_restart": "SIGKILL",
             "agent_reconnected": True,
@@ -3275,9 +3347,21 @@ class AcceptanceSuite:
                     "concurrent GC did not start before pin retirement"
                 )
             post_retirement_gc_start = len(gc_outcomes)
-            self.env.cli(
-                "retire-snapshot", self.absolute(self.source), str(self.snapshot_id)
+            retired_source = self.client_a.call(
+                "workbench_snapshot_retire",
+                {
+                    "id": self.source,
+                    "name": "durable-point",
+                    "reason": "source-retention-floor-release",
+                },
             )
+            if (
+                retired_source.get("retired") is not True
+                or retired_source.get("snapshot_id") != self.snapshot_id
+            ):
+                raise AcceptanceError(
+                    f"source snapshot was not retired through MCP: {retired_source!r}"
+                )
             self.env.cli(
                 "rename", self.absolute(self.destination), self.absolute(self.moved)
             )

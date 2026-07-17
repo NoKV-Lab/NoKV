@@ -81,19 +81,32 @@ defaulted.
 
 ### 3.2 Checkpoint registry file (discoverability, L1 seed)
 
-Every mint appends one JSON line to `metadata/checkpoints.jsonl` in the
-workbench (via the existing append path — dogfooding #392):
-`{name, snapshot_id, read_version, lease_expires_unix_ms, created_at,
-reason?}`. This makes checkpoints listable after the tool response is long
-gone and seeds the Phase-2 named-ref migration.
+Every mint and renew, plus each attributable retirement outcome not already
+recorded, appends one v1 lifecycle event to `metadata/checkpoints.jsonl` in the
+workbench (via the existing append path — dogfooding #392). An exact retirement
+retry reuses its recorded outcome, while an unknown numeric id that is already
+absent is not added to the registry. `event_kind` is the internal
+`mint | renew | retire` verb; user intent is kept separately in the bounded
+`annotation.reason` and `annotation.metadata` fields. A retire event records
+the authoritative `retired` boolean returned by metadata: only `retired=true`
+attributes a missing pin to explicit retirement. An already-absent retry
+remains `retired=false` and must not be presented as a deletion. This makes
+checkpoints listable after the tool response is long gone and seeds the Phase-2
+named-ref migration.
 
 ### 3.3 New tools
 
 - `workbench_snapshot_renew {id, snapshot_id|name, ttl_days}` — resolves
   name via the registry, renews, echoes new `lease_expires_at`. Reaped pin
   → explicit "reaped after lease expiry; re-mint from current state".
+- `workbench_snapshot_retire {id, snapshot_id|name, reason?}` — requires
+  exactly one target, invokes the path-bound metadata retirement operation,
+  and is idempotent. A missing retry succeeds with `retired=false`; root and
+  active-borrower errors remain typed failures. The registry records successful
+  retirement separately from an already-reaped snapshot.
 - `workbench_snapshot_list {id}` — registry entries joined with live pin
-  state: `alive | expired (reap pending) | reaped`.
+  state: `alive | expired (reap pending) | retired | reaped`. `retired` is used
+  only when the registry contains an acknowledged `retired=true` event.
 - At-snapshot reads: `workbench_stat` / `workbench_list` /
   `workbench_read` gain optional `at_snapshot` (id or name).
   stat/list route to the existing `stat_path_at_snapshot` /
@@ -181,7 +194,7 @@ replace / 15% reads) at a configurable rate.
 | S3 | At-snapshot correctness under churn (core): pin, then hammer the subtree (appends across compaction depth 8, edits, replaces) | every at-snapshot read byte-identical to mint-time content, for the full lease |
 | S4 | History write amplification: N∈{0,1,10,100} live pins vs churn | meta growth measured and reported per N; expired pins stop amplifying within one GC round |
 | S5 | Scale: 300 snapshots across 30 workbenches, sustained GC | GC round time bounded; retention floor correct (oldest live pin wins); `snapshot_list` consistent with pin truth |
-| S6 | Registry integrity: mint/renew/expire/reap cycles | `checkpoints.jsonl` never references a state `snapshot_list` disagrees with; no ghost entries (LangGraph #6686 class) |
+| S6 | Registry integrity: mint/renew/retire/expire/reap cycles | `checkpoints.jsonl` never references a state `snapshot_list` disagrees with; an already-absent retirement never becomes a fabricated deletion; no ghost entries (LangGraph #6686 class) |
 | S7 | Crash durability: `kill -9` serve mid-churn with live pins | pins survive restart; at-snapshot reads still byte-correct; lease clock unaffected |
 | S8 | Soak: hours-compressed churn+mint+renew loop | RSS/disk bounded (minus the #393 known leak, tracked separately); zero tool errors outside designed expiry errors |
 

@@ -5,7 +5,7 @@ use base64::Engine;
 use nokv_agent::AgentToolDefinition;
 use nokv_client::{
     decode_name_cursor, encode_name_cursor, is_artifact_write_conflict, is_metadata_not_found,
-    ArtifactMetadata, ClientError, NoKvFsClient, RestoreState,
+    ArtifactMetadata, ClientError, NoKvFsClient, RestoreState, SnapshotOutcome,
 };
 use nokv_meta::{
     restore_operation_id, MetadError, RestoreInitialization, RestoreInitializationFile,
@@ -40,10 +40,19 @@ const DEFAULT_SNAPSHOT_TTL_DAYS: u64 = 7;
 /// with that guidance so a lease never masquerades as durable retention.
 const MAX_SNAPSHOT_TTL_DAYS: u64 = 90;
 const MS_PER_DAY: u64 = 86_400_000;
+/// User snapshot annotations are registry metadata, not namespace payloads.
+/// Keep them small enough that one append remains cheap and bounded even when
+/// the registry is replayed in full by list/name-resolution operations.
+const MAX_SNAPSHOT_REASON_CHARS: usize = 256;
+const MAX_SNAPSHOT_REASON_BYTES: usize = 1_024;
+const MAX_SNAPSHOT_METADATA_BYTES: usize = 4 * 1_024;
+const MAX_SNAPSHOT_METADATA_DEPTH: usize = 8;
+const MAX_SNAPSHOT_METADATA_KEYS: usize = 64;
 /// Checkpoint registry file, relative to a workbench's `metadata` section.
 /// Every mint/renew appends one JSON line here so checkpoints stay discoverable
 /// after the tool response is gone (Phase-1 seed for L1 named refs).
 const CHECKPOINT_REGISTRY_RELPATH: &str = "checkpoints.jsonl";
+const CHECKPOINT_REGISTRY_EVENT_V1_SCHEMA: &str = "nokv.workbench.checkpoint_event.v1";
 /// Retries after a lost artifact-write CAS; every attempt re-reads current state.
 const WRITE_CONFLICT_RETRIES: usize = 5;
 /// Linear backoff step between conflict retries. Zero-interval retries make N
@@ -167,7 +176,7 @@ pub fn tool_definitions_for_capabilities(restore_to_fork_v1: bool) -> Vec<AgentT
         AgentToolDefinition {
             name: "workbench_put_file",
             description:
-                "Publish one file into a jailed workbench section. Paths are relative to the section; overwrite requires replace=true.",
+                "Publish one file into a jailed workbench section. Paths are relative to the section. replace=false (the default) is create-only and fails when the target exists; replace=true is replace-only and fails when the target is missing. workbench_put_file is not an upsert operation.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "section", "path"],
@@ -178,7 +187,7 @@ pub fn tool_definitions_for_capabilities(restore_to_fork_v1: bool) -> Vec<AgentT
                     "text": {"type": "string"},
                     "base64": {"type": "string"},
                     "content_type": {"type": "string"},
-                    "replace": {"type": "boolean"}
+                    "replace": {"type": "boolean", "description": "Select create-only (false, the default) or replace-only (true) behavior. This is not upsert; replace=true fails when the target is missing."}
                 },
                 "additionalProperties": false
             }),
@@ -256,7 +265,7 @@ pub fn tool_definitions_for_capabilities(restore_to_fork_v1: bool) -> Vec<AgentT
         AgentToolDefinition {
             name: "workbench_read",
             description:
-                "Read one workbench file through the NoKV namespace. Structured mode returns JSON, YAML, or text records; bytes mode returns byte ranges as a base64 string in bytes (bytes_encoding is \"base64\"). Pass if_none_match with a previously returned generation to skip the body when the file is unchanged. Pass at_snapshot (a snapshot id or a checkpoint name from workbench_snapshot) to read the file as it was at that checkpoint: bytes mode reads a byte range, any other mode returns text_lines for UTF-8 text (offset and limit count lines) and errors for non-text content (structured record reads at a snapshot are not yet supported); an expired or reaped snapshot fails loudly.",
+                "Read one workbench file through the NoKV namespace. Live structured mode parses JSON, YAML, or UTF-8 text records. It does not parse application/x-ndjson: a .jsonl file is returned as text_lines only when stored with a text/* content type; otherwise use bytes. NDJSON record pagination is not supported. Bytes mode returns byte ranges as a base64 string in bytes (bytes_encoding is \"base64\"). Pass if_none_match with a previously returned generation to skip the body when the file is unchanged. Pass at_snapshot (a snapshot id or a checkpoint name from workbench_snapshot) to read the file as it was at that checkpoint: bytes mode reads a byte range, any other mode returns raw text_lines for UTF-8 text (offset and limit count lines) and errors for non-text content; this snapshot-specific text mode is not an NDJSON record parser. An expired or reaped snapshot fails loudly.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "section", "path"],
@@ -391,14 +400,19 @@ pub fn tool_definitions_for_capabilities(restore_to_fork_v1: bool) -> Vec<AgentT
         AgentToolDefinition {
             name: "workbench_commit",
             description:
-                "Mark a workbench complete by publishing metadata/run_manifest.json. This is the v0 commit point.",
+                "Mark a workbench complete by publishing a v1 metadata/run_manifest.json. content_digest_uri is a caller-known, stable sha256 identity for the committed content; the server separately hashes the canonical manifest and derives commit_identity. Replaying the same identity is idempotent, while a different identity conflicts unless replace=true is explicit.",
             parameters: json!({
                 "type": "object",
-                "required": ["id", "manifest"],
+                "required": ["id", "manifest", "content_digest_uri"],
                 "properties": {
                     "id": {"type": "string"},
                     "manifest": {"type": "object"},
-                    "replace": {"type": "boolean"}
+                    "content_digest_uri": {
+                        "type": "string",
+                        "pattern": "^sha256:[0-9a-f]{64}$",
+                        "description": "Stable caller-computed digest of the committed content. It must be known before this call and exactly match sha256:<64 lowercase hex>."
+                    },
+                    "replace": {"type": "boolean", "description": "Explicitly replace a different or legacy commit. Concurrent identity changes still fail closed. Defaults false."}
                 },
                 "additionalProperties": false
             }),
@@ -406,14 +420,25 @@ pub fn tool_definitions_for_capabilities(restore_to_fork_v1: bool) -> Vec<AgentT
         AgentToolDefinition {
             name: "workbench_snapshot",
             description:
-                "Snapshot a committed workbench subtree and hold it under a lease. Returns the NoKV snapshot id, read version, and lease_expires_at (unix ms). The lease defaults to 7 days (ttl_days), capped at 90; longer holds are not a lease knob (wait for named refs or use the CLI). Pass name ([A-Za-z0-9_-]{1,64}) to alias the checkpoint for later renew/list/at_snapshot reads. A lease expresses liveness, not archival importance: an unrenewed snapshot is reaped after it expires and the point-in-time view is lost (current files remain).",
+                "Snapshot a committed workbench subtree and hold it under a lease. Returns the NoKV snapshot id, read version, lease_expires_at (unix ms), and the optional user annotation. The lease defaults to 7 days (ttl_days), capped at 90; longer holds are not a lease knob (wait for named refs or use the CLI). Pass name ([A-Za-z0-9_-]{1,64}) to alias the checkpoint for later renew/list/at_snapshot reads. reason and metadata are bounded registry annotations carried through list and renew; they are appended after the pin is created, so a registry failure returns SnapshotRegistryWritePartial with explicit compensation instead of success. A lease expresses liveness, not archival importance: an unrenewed snapshot is reaped after it expires and the point-in-time view is lost (current files remain).",
             parameters: json!({
                 "type": "object",
                 "required": ["id"],
                 "properties": {
                     "id": {"type": "string"},
                     "name": {"type": ["string", "null"], "description": "Checkpoint alias matching [A-Za-z0-9_-]{1,64}. Resolves to this snapshot in workbench_snapshot_renew, workbench_snapshot_list, and at_snapshot reads."},
-                    "ttl_days": {"type": "integer", "minimum": 1, "maximum": MAX_SNAPSHOT_TTL_DAYS, "description": "Lease length in days. Defaults to 7; values above 90 are rejected."}
+                    "ttl_days": {"type": "integer", "minimum": 1, "maximum": MAX_SNAPSHOT_TTL_DAYS, "description": "Lease length in days. Defaults to 7; values above 90 are rejected."},
+                    "reason": {
+                        "type": ["string", "null"],
+                        "minLength": 1,
+                        "maxLength": MAX_SNAPSHOT_REASON_CHARS,
+                        "description": "Optional human-readable checkpoint reason. At most 256 Unicode characters and 1024 UTF-8 bytes."
+                    },
+                    "metadata": {
+                        "type": ["object", "null"],
+                        "maxProperties": MAX_SNAPSHOT_METADATA_KEYS,
+                        "description": "Optional JSON annotation object. Canonical encoded size is at most 4096 bytes, with at most 8 container levels and 64 object keys across the complete value."
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -435,9 +460,34 @@ pub fn tool_definitions_for_capabilities(restore_to_fork_v1: bool) -> Vec<AgentT
             }),
         },
         AgentToolDefinition {
+            name: "workbench_snapshot_retire",
+            description:
+                "Explicitly retire one workbench snapshot and release its retention pin. Identify it by snapshot_id or by the checkpoint name established at mint; provide exactly one. An exact retry after the snapshot is already absent succeeds with retired=false and never fabricates a deletion. Root mismatches and active fork retention remain typed errors. An optional bounded reason is recorded on the retire lifecycle event.",
+            parameters: json!({
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "snapshot_id": {"type": "integer", "minimum": 0, "description": "Snapshot id to retire. Provide exactly one of snapshot_id or name."},
+                    "name": {"type": "string", "minLength": 1, "description": "Checkpoint name to retire. Provide exactly one of snapshot_id or name."},
+                    "reason": {
+                        "type": ["string", "null"],
+                        "minLength": 1,
+                        "maxLength": MAX_SNAPSHOT_REASON_CHARS,
+                        "description": "Optional human-readable retirement reason. At most 256 Unicode characters and 1024 UTF-8 bytes."
+                    }
+                },
+                "oneOf": [
+                    {"required": ["snapshot_id"]},
+                    {"required": ["name"]}
+                ],
+                "additionalProperties": false
+            }),
+        },
+        AgentToolDefinition {
             name: "workbench_snapshot_list",
             description:
-                "List a workbench's checkpoints from its registry, each joined with live pin state: alive, expired (reap pending), or reaped. Returns an empty list when the workbench has no registry yet. Use the snapshot ids or names here with workbench_snapshot_renew or the at_snapshot argument of workbench_stat, workbench_list, and workbench_read.",
+                "List a workbench's checkpoints from its registry, each joined with live pin state: alive, expired (reap pending), retired (acknowledged explicit retirement), or reaped. An already-absent retirement attempt remains retired=false and does not fabricate retirement attribution. Returns an empty list when the workbench has no registry yet. Use the snapshot ids or names here with workbench_snapshot_renew, workbench_snapshot_retire, or the at_snapshot argument of workbench_stat, workbench_list, and workbench_read.",
             parameters: json!({
                 "type": "object",
                 "required": ["id"],
@@ -564,6 +614,7 @@ where
         "workbench_commit" => commit_workbench(client, options, args),
         "workbench_snapshot" => snapshot_workbench(client, options, args),
         "workbench_snapshot_renew" => renew_snapshot_workbench(client, options, args),
+        "workbench_snapshot_retire" => retire_snapshot_workbench(client, options, args),
         "workbench_snapshot_list" => list_snapshots_workbench(client, options, args),
         "workbench_restore" => restore_workbench(client, options, args),
         other => Err(WorkbenchToolError::new(format!(
@@ -835,6 +886,9 @@ where
             args,
         );
     }
+    if read_tool == "stat" {
+        return execute_live_stat(client, options, &id, &target);
+    }
     if read_tool == "read" {
         if let Some(expected) = optional_u64(args, "if_none_match")? {
             // A missing ancestor and a missing leaf are the same absence to
@@ -867,7 +921,7 @@ where
     forwarded.remove("id");
     forwarded.remove("section");
     match read_tool {
-        "ls" | "stat" => {
+        "ls" => {
             forwarded.remove("format");
             forwarded.remove("offset");
             forwarded.remove("pattern");
@@ -887,7 +941,7 @@ where
     }
     let result = nokv_agent::execute_agent_tool(client, read_tool, &Value::Object(forwarded))
         .map_err(|err| WorkbenchToolError::new(err.to_string()))?;
-    shape_read_tool_result(client, options, &id, &target, read_tool, result)
+    shape_read_tool_result(options, &id, &target, read_tool, result)
 }
 
 /// `pattern: "a|b"` without an explicit `patterns` array is treated as OR
@@ -928,21 +982,16 @@ fn split_piped_grep_pattern(
     Ok(())
 }
 
-fn shape_read_tool_result<O>(
-    client: &NoKvFsClient<O>,
+fn shape_read_tool_result(
     options: &WorkbenchMcpOptions,
     id: &str,
     target: &str,
     read_tool: &str,
     result: Value,
-) -> Result<Value, WorkbenchToolError>
-where
-    O: ObjectStore + Send + Sync + 'static,
-{
+) -> Result<Value, WorkbenchToolError> {
     let scope = path_scope(options, id, target)?;
     match read_tool {
         "ls" => shape_list_result(options, id, &scope, result),
-        "stat" => shape_stat_result(client, options, id, &scope, result),
         "read" => shape_file_read_result(options, id, &scope, result),
         "grep" => shape_grep_result(options, id, &scope, result),
         other => Err(WorkbenchToolError::new(format!(
@@ -978,24 +1027,22 @@ fn shape_list_result(
     }))
 }
 
-fn shape_stat_result<O>(
+/// Stat the live namespace from one authoritative metadata read. Unlike the
+/// generic agent stat card, this path never reads or parses a file body, so
+/// malformed structured data cannot turn metadata inspection into a query
+/// error and no fields are combined across different read versions.
+fn execute_live_stat<O>(
     client: &NoKvFsClient<O>,
     options: &WorkbenchMcpOptions,
     id: &str,
-    scope: &WorkbenchPathScope,
-    result: Value,
+    target: &str,
 ) -> Result<Value, WorkbenchToolError>
 where
     O: ObjectStore + Send + Sync + 'static,
 {
-    let card = result
-        .get("card")
-        .ok_or_else(|| WorkbenchToolError::new("stat result missing card"))?;
-    let metadata = client
-        .metadata()
-        .stat_path(&scope.path)
-        .map_err(client_error)?
-        .ok_or_else(|| WorkbenchToolError::new(format!("path not found: {}", scope.path)))?;
+    let scope = path_scope(options, id, target)?;
+    let metadata = stat_path_or_absent(client, target)?
+        .ok_or_else(|| WorkbenchToolError::new(format!("path not found: {target}")))?;
     Ok(json!({
         "status": "success",
         "workbench_id": id,
@@ -1003,7 +1050,7 @@ where
         "section": scope.section.clone(),
         "relative_path": scope.relative_path.clone(),
         "path": scope.path.clone(),
-        "card": compact_stat_card(scope, card, &metadata),
+        "card": metadata_stat_card(&scope, &metadata),
     }))
 }
 
@@ -1323,6 +1370,31 @@ where
     }))
 }
 
+const RUN_MANIFEST_V1_SCHEMA: &str = "nokv.workbench.run_manifest.v1";
+const COMMIT_IDENTITY_DOMAIN: &[u8] = b"nokv.workbench.commit_identity.v1\0";
+
+#[derive(Debug)]
+struct RequestedWorkbenchCommit {
+    manifest: Value,
+    content_digest_uri: String,
+    manifest_digest_uri: String,
+    commit_identity: String,
+}
+
+#[derive(Debug)]
+struct StoredWorkbenchCommit {
+    metadata: PathMetadata,
+    envelope: Option<Value>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct VerifiedWorkbenchCommitIdentity {
+    workbench_id: String,
+    content_digest_uri: String,
+    manifest_digest_uri: String,
+    commit_identity: String,
+}
+
 fn commit_workbench<O>(
     client: &NoKvFsClient<O>,
     options: &WorkbenchMcpOptions,
@@ -1339,40 +1411,349 @@ where
     if !manifest.is_object() {
         return Err(WorkbenchToolError::new("manifest must be a JSON object"));
     }
+    let content_digest_uri = required_string(args, "content_digest_uri")?;
+    validate_content_digest_uri(content_digest_uri)?;
+    let manifest_digest_uri = canonical_manifest_digest_uri(&manifest)?;
+    let requested = RequestedWorkbenchCommit {
+        commit_identity: workbench_commit_identity(&id, content_digest_uri, &manifest_digest_uri),
+        manifest,
+        content_digest_uri: content_digest_uri.to_owned(),
+        manifest_digest_uri,
+    };
     let replace = optional_bool(args, "replace")?.unwrap_or(false);
     ensure_standard_dirs(client, options, &id)?;
     let path = section_path(options, &id, "metadata", Some("run_manifest.json"));
+
+    let existing = read_stored_workbench_commit(client, &path)?;
+    let expected_generation = match existing.as_ref() {
+        Some(stored) if stored_commit_matches(stored, &id, &requested) => {
+            return Ok(commit_replay_result(
+                options, &id, &path, stored, &requested, replace,
+            ));
+        }
+        Some(stored) if !replace => {
+            return Err(workbench_commit_conflict(
+                &id, &path, stored, &requested, replace,
+            ));
+        }
+        Some(stored) => Some(
+            stored
+                .metadata
+                .body
+                .as_ref()
+                .ok_or_else(|| workbench_commit_conflict(&id, &path, stored, &requested, replace))?
+                .generation,
+        ),
+        None => None,
+    };
+
     let envelope = json!({
-        "schema": "nokv.workbench.run_manifest.v0",
-        "workbench_id": id,
+        "schema": RUN_MANIFEST_V1_SCHEMA,
+        "workbench_id": id.clone(),
         "workbench_path": workbench_path(options, &id),
+        "content_digest_uri": requested.content_digest_uri.clone(),
+        "manifest_digest_uri": requested.manifest_digest_uri.clone(),
+        "commit_identity": requested.commit_identity.clone(),
         "committed_at_unix_seconds": unix_seconds(),
-        "manifest": manifest,
+        "manifest": requested.manifest.clone(),
     });
     let bytes = serde_json::to_vec_pretty(&envelope)
         .map_err(|err| WorkbenchToolError::new(format!("failed to encode manifest: {err}")))?;
-    let digest_uri = digest_uri(&bytes);
-    let metadata = artifact_metadata(options, &path, &digest_uri, "application/json");
-    let entry = if replace {
+    let envelope_digest_uri = digest_uri(&bytes);
+    let metadata = artifact_metadata(options, &path, &envelope_digest_uri, "application/json");
+    let write = if let Some(expected_generation) = expected_generation {
         client
-            .put_artifact_replace(&path, bytes, metadata)
-            .map_err(client_error)?
-            .entry
+            .put_artifact_replace_if_generation(&path, bytes, metadata, expected_generation)
+            .map(|result| result.entry)
     } else {
-        client
-            .put_artifact(&path, bytes, metadata)
-            .map_err(client_error)?
+        client.put_artifact(&path, bytes, metadata)
+    };
+    let entry = match write {
+        Ok(entry) => entry,
+        Err(write_error) => {
+            return reconcile_workbench_commit_write(
+                client,
+                options,
+                &id,
+                &path,
+                &requested,
+                replace,
+                write_error,
+            );
+        }
     };
     Ok(json!({
         "status": "success",
         "workbench_id": id,
+        "workbench_path": workbench_path(options, &id),
         "path": path,
         "size_bytes": entry.attr.size,
         "inode": entry.attr.inode.get(),
         "generation": entry.attr.generation,
-        "digest_uri": digest_uri,
+        "content_digest_uri": requested.content_digest_uri,
+        "manifest_digest_uri": requested.manifest_digest_uri,
+        "commit_identity": requested.commit_identity,
+        "envelope_digest_uri": envelope_digest_uri,
         "replace": replace,
+        "idempotent_replay": false,
     }))
+}
+
+fn reconcile_workbench_commit_write<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    path: &str,
+    requested: &RequestedWorkbenchCommit,
+    replace: bool,
+    write_error: ClientError,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    match read_stored_workbench_commit(client, path) {
+        Ok(Some(stored)) if stored_commit_matches(&stored, id, requested) => Ok(
+            commit_replay_result(options, id, path, &stored, requested, replace),
+        ),
+        Ok(Some(stored)) => Err(workbench_commit_conflict(
+            id, path, &stored, requested, replace,
+        )),
+        Ok(None) => Err(WorkbenchToolError::typed(
+            "WorkbenchCommitOutcomeUnknown",
+            format!(
+                "workbench commit outcome is unknown after the write failed; retry exactly the same commit identity ({write_error})"
+            ),
+            true,
+            json!({
+                "workbench_id": id,
+                "path": path,
+                "commit_identity": requested.commit_identity,
+                "write_error": write_error.to_string(),
+            }),
+        )),
+        Err(read_error) => Err(WorkbenchToolError::typed(
+            "WorkbenchCommitOutcomeUnknown",
+            "workbench commit could not be reconciled after the write failed; retry exactly the same commit identity",
+            true,
+            json!({
+                "workbench_id": id,
+                "path": path,
+                "commit_identity": requested.commit_identity,
+                "write_error": write_error.to_string(),
+                "reconciliation_error": read_error.as_value(),
+            }),
+        )),
+    }
+}
+
+fn commit_replay_result(
+    options: &WorkbenchMcpOptions,
+    id: &str,
+    path: &str,
+    stored: &StoredWorkbenchCommit,
+    requested: &RequestedWorkbenchCommit,
+    replace: bool,
+) -> Value {
+    let envelope_digest_uri = stored
+        .metadata
+        .body
+        .as_ref()
+        .map(|body| body.digest_uri.clone());
+    json!({
+        "status": "success",
+        "workbench_id": id,
+        "workbench_path": workbench_path(options, id),
+        "path": path,
+        "size_bytes": stored.metadata.attr.size,
+        "inode": stored.metadata.attr.inode.get(),
+        "generation": stored.metadata.attr.generation,
+        "content_digest_uri": requested.content_digest_uri,
+        "manifest_digest_uri": requested.manifest_digest_uri,
+        "commit_identity": requested.commit_identity,
+        "envelope_digest_uri": envelope_digest_uri,
+        "replace": replace,
+        "idempotent_replay": true,
+    })
+}
+
+fn workbench_commit_conflict(
+    id: &str,
+    path: &str,
+    stored: &StoredWorkbenchCommit,
+    requested: &RequestedWorkbenchCommit,
+    replace: bool,
+) -> WorkbenchToolError {
+    let envelope = stored.envelope.as_ref();
+    WorkbenchToolError::typed(
+        "WorkbenchCommitConflict",
+        format!(
+            "workbench {id} already has a different commit identity; pass replace=true only when replacing it is intentional"
+        ),
+        false,
+        json!({
+            "workbench_id": id,
+            "path": path,
+            "requested_commit_identity": requested.commit_identity,
+            "requested_content_digest_uri": requested.content_digest_uri,
+            "requested_manifest_digest_uri": requested.manifest_digest_uri,
+            "current_schema": envelope
+                .and_then(|value| value.get("schema"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "current_commit_identity": envelope
+                .and_then(|value| value.get("commit_identity"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "current_content_digest_uri": envelope
+                .and_then(|value| value.get("content_digest_uri"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "current_manifest_digest_uri": envelope
+                .and_then(|value| value.get("manifest_digest_uri"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "current_envelope_digest_uri": stored
+                .metadata
+                .body
+                .as_ref()
+                .map(|body| body.digest_uri.clone()),
+            "replace_requested": replace,
+        }),
+    )
+}
+
+fn read_stored_workbench_commit<O>(
+    client: &NoKvFsClient<O>,
+    path: &str,
+) -> Result<Option<StoredWorkbenchCommit>, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    for attempt in 0..=WRITE_CONFLICT_RETRIES {
+        let Some(metadata) = stat_path_or_absent(client, path)? else {
+            return Ok(None);
+        };
+        let Some(body) = metadata.body.as_ref() else {
+            return Ok(Some(StoredWorkbenchCommit {
+                metadata,
+                envelope: None,
+            }));
+        };
+        let len = usize::try_from(metadata.attr.size).map_err(|_| {
+            WorkbenchToolError::new(format!(
+                "run manifest is too large to read: {} bytes",
+                metadata.attr.size
+            ))
+        })?;
+        match client.read_path(path, 0, len, Some(body.generation)) {
+            Ok(read) => {
+                let envelope = String::from_utf8(read.bytes)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+                return Ok(Some(StoredWorkbenchCommit {
+                    metadata: read.metadata,
+                    envelope,
+                }));
+            }
+            Err(err)
+                if (is_metadata_not_found(&err)
+                    || matches!(
+                        err,
+                        ClientError::Metadata(MetadError::StaleBodyGeneration { .. })
+                    ))
+                    && attempt < WRITE_CONFLICT_RETRIES =>
+            {
+                write_conflict_backoff(attempt + 1);
+            }
+            Err(err)
+                if is_metadata_not_found(&err)
+                    || matches!(
+                        err,
+                        ClientError::Metadata(MetadError::StaleBodyGeneration { .. })
+                    ) =>
+            {
+                return Err(WorkbenchToolError::typed(
+                    "WorkbenchCommitReadContended",
+                    format!("run manifest changed while it was being read: {err}"),
+                    true,
+                    json!({"path": path, "attempts": attempt + 1}),
+                ));
+            }
+            Err(err) => return Err(client_error(err)),
+        }
+    }
+    unreachable!("bounded commit read loop always returns")
+}
+
+fn stored_commit_matches(
+    stored: &StoredWorkbenchCommit,
+    id: &str,
+    requested: &RequestedWorkbenchCommit,
+) -> bool {
+    stored_commit_envelope_matches(stored.envelope.as_ref(), id, requested)
+}
+
+fn stored_commit_envelope_matches(
+    envelope: Option<&Value>,
+    id: &str,
+    requested: &RequestedWorkbenchCommit,
+) -> bool {
+    let Some(envelope) = envelope else {
+        return false;
+    };
+    verified_workbench_commit_identity(envelope).is_some_and(|verified| {
+        verified.workbench_id == id
+            && verified.content_digest_uri == requested.content_digest_uri
+            && verified.manifest_digest_uri == requested.manifest_digest_uri
+            && verified.commit_identity == requested.commit_identity
+    })
+}
+
+fn verified_workbench_commit_identity(envelope: &Value) -> Option<VerifiedWorkbenchCommitIdentity> {
+    if envelope.get("schema").and_then(Value::as_str) != Some(RUN_MANIFEST_V1_SCHEMA) {
+        return None;
+    }
+    let workbench_id = envelope.get("workbench_id")?.as_str()?;
+    let content_digest_uri = envelope.get("content_digest_uri")?.as_str()?;
+    if validate_content_digest_uri(content_digest_uri).is_err() {
+        return None;
+    }
+    let manifest = envelope.get("manifest")?.as_object()?;
+    let manifest_digest_uri =
+        canonical_manifest_digest_uri(&Value::Object(manifest.clone())).ok()?;
+    if envelope.get("manifest_digest_uri")?.as_str()? != manifest_digest_uri {
+        return None;
+    }
+    let commit_identity =
+        workbench_commit_identity(workbench_id, content_digest_uri, &manifest_digest_uri);
+    if envelope.get("commit_identity")?.as_str()? != commit_identity {
+        return None;
+    }
+    Some(VerifiedWorkbenchCommitIdentity {
+        workbench_id: workbench_id.to_owned(),
+        content_digest_uri: content_digest_uri.to_owned(),
+        manifest_digest_uri,
+        commit_identity,
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SnapshotAnnotation {
+    reason: Option<String>,
+    metadata: Option<Value>,
+}
+
+impl SnapshotAnnotation {
+    fn as_value(&self) -> Value {
+        if self.reason.is_none() && self.metadata.is_none() {
+            Value::Null
+        } else {
+            json!({
+                "reason": self.reason.clone(),
+                "metadata": self.metadata.clone(),
+            })
+        }
+    }
 }
 
 fn snapshot_workbench<O>(
@@ -1391,6 +1772,9 @@ where
         }
         None => None,
     };
+    // Validate before minting: once the pin exists, every failure must return
+    // enough identity for explicit compensation rather than leak it silently.
+    let annotation = parse_snapshot_annotation(args)?.as_value();
     let (ttl_days, ttl_defaulted) = resolve_ttl_days(args)?;
     let manifest_path = section_path(options, &id, "metadata", Some("run_manifest.json"));
     if stat_path_or_absent(client, &manifest_path)?.is_none() {
@@ -1411,19 +1795,29 @@ where
     let read_version = snapshot.read_version;
     let created_at = unix_ms();
     let registry_entry = json!({
+        "schema": CHECKPOINT_REGISTRY_EVENT_V1_SCHEMA,
+        "event_kind": "mint",
         "name": name,
         "snapshot_id": snapshot_id,
         "read_version": read_version,
         "lease_expires_unix_ms": lease_expires_unix_ms,
         "created_at": created_at,
-        "reason": "mint",
+        "annotation": annotation,
     });
-    let registry = registry_write_status(append_checkpoint_registry_line(
-        client,
-        options,
-        &id,
-        &registry_entry,
-    ));
+    let registry = match append_checkpoint_registry_line(client, options, &id, &registry_entry) {
+        Ok(()) => registry_write_status(Ok(())),
+        Err(err) => {
+            return Err(snapshot_registry_write_partial(
+                &id,
+                &path,
+                &snapshot,
+                name.as_deref(),
+                ttl_days,
+                &annotation,
+                err,
+            ));
+        }
+    };
     let mut out = json!({
         "status": "success",
         "workbench_id": id,
@@ -1434,6 +1828,7 @@ where
         "ttl_days": ttl_days,
         "lease_expires_at": lease_expires_unix_ms,
         "lease_expires_unix_ms": lease_expires_unix_ms,
+        "annotation": annotation,
         "registry": registry,
     });
     if ttl_defaulted {
@@ -1454,7 +1849,13 @@ where
 {
     let id = required_workbench_id(args)?;
     let (ttl_days, _ttl_defaulted) = resolve_ttl_days(args)?;
-    let snapshot_id = resolve_renew_target(client, options, &id, args)?;
+    let snapshot_id = resolve_snapshot_target(client, options, &id, args)?;
+    // Resolve the immutable mint annotation before extending the lease. An
+    // unreadable registry therefore fails before mutation; after renewal an
+    // append error is an explicit partial outcome.
+    let registry_entries = read_checkpoint_registry(client, options, &id)?;
+    let name = registry_name_for_snapshot(&registry_entries, snapshot_id);
+    let annotation = registry_annotation_for_snapshot(&registry_entries, snapshot_id);
     let lease_ms = ttl_days.saturating_mul(MS_PER_DAY);
     let path = workbench_path(options, &id);
     let outcome = client
@@ -1476,24 +1877,31 @@ where
     };
     let lease_expires_unix_ms = Some(pin.lease_expires_unix_ms);
     let read_version = Some(pin.read_version);
-    // Carry the name forward from the mint record so the renew row stays joinable
-    // with the checkpoint it extends.
-    let name = registry_name_for_snapshot(client, options, &id, snapshot_id)?;
     let created_at = unix_ms();
     let registry_entry = json!({
+        "schema": CHECKPOINT_REGISTRY_EVENT_V1_SCHEMA,
+        "event_kind": "renew",
         "name": name,
         "snapshot_id": snapshot_id,
         "read_version": read_version,
         "lease_expires_unix_ms": lease_expires_unix_ms,
         "created_at": created_at,
-        "reason": "renew",
+        "annotation": annotation,
     });
-    let registry = registry_write_status(append_checkpoint_registry_line(
-        client,
-        options,
-        &id,
-        &registry_entry,
-    ));
+    let registry = match append_checkpoint_registry_line(client, options, &id, &registry_entry) {
+        Ok(()) => registry_write_status(Ok(())),
+        Err(err) => {
+            return Err(snapshot_renew_registry_write_partial(
+                &id,
+                snapshot_id,
+                pin.read_version,
+                pin.lease_expires_unix_ms,
+                ttl_days,
+                &annotation,
+                err,
+            ));
+        }
+    };
     Ok(json!({
         "status": "success",
         "workbench_id": id,
@@ -1505,8 +1913,173 @@ where
         "read_version": read_version,
         "lease_expires_at": lease_expires_unix_ms,
         "lease_expires_unix_ms": lease_expires_unix_ms,
+        "annotation": annotation,
         "registry": registry,
     }))
+}
+
+fn retire_snapshot_workbench<O>(
+    client: &NoKvFsClient<O>,
+    options: &WorkbenchMcpOptions,
+    args: &Value,
+) -> Result<Value, WorkbenchToolError>
+where
+    O: ObjectStore + Send + Sync + 'static,
+{
+    validate_arguments(args, &["id"], &["id", "snapshot_id", "name", "reason"])?;
+    let id = required_workbench_id(args)?;
+    let snapshot_id = resolve_snapshot_target(client, options, &id, args)?;
+    // Reuse the mint annotation limits and representation while keeping retire
+    // metadata out of the public schema. Validation happens before the
+    // irreversible metadata operation.
+    let retire_annotation = parse_snapshot_annotation(args)?.as_value();
+    let requested_name = optional_string(args, "name")?.map(str::to_owned);
+    let path = workbench_path(options, &id);
+    let retired = client
+        .metadata()
+        .retire_snapshot(&path, snapshot_id)
+        .map_err(client_error)?;
+
+    // Registry state is an audit/discovery projection, never authority for the
+    // retirement itself. In particular, a numeric compensation call must still
+    // work if the registry is missing. Only create a row for an already-absent
+    // id when a prior event proves that id belonged to this registry.
+    let registry_entries = read_checkpoint_registry(client, options, &id);
+    let (name, registered, already_recorded, registry_read_error) = match registry_entries {
+        Ok(entries) => {
+            let registered = entries
+                .iter()
+                .any(|entry| entry.get("snapshot_id").and_then(Value::as_u64) == Some(snapshot_id));
+            let name = requested_name
+                .as_ref()
+                .map(|name| json!(name))
+                .unwrap_or_else(|| registry_name_for_snapshot(&entries, snapshot_id));
+            let already_recorded = entries.iter().any(|entry| {
+                if checkpoint_registry_event_kind(entry) != Some("retire")
+                    || entry.get("snapshot_id").and_then(Value::as_u64) != Some(snapshot_id)
+                {
+                    return false;
+                }
+                let recorded_retired = entry
+                    .get("retired")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                (recorded_retired && !retired)
+                    || (recorded_retired == retired
+                        && entry.get("annotation").unwrap_or(&Value::Null) == &retire_annotation)
+            });
+            (name, registered, already_recorded, None)
+        }
+        Err(err) => (
+            requested_name
+                .as_ref()
+                .map(|name| json!(name))
+                .unwrap_or(Value::Null),
+            requested_name.is_some(),
+            false,
+            Some(err),
+        ),
+    };
+    let should_record = retired || registered;
+    let registry = if already_recorded {
+        json!({
+            "written": false,
+            "already_recorded": true,
+            "path_relative": format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}"),
+        })
+    } else if should_record {
+        let registry_entry = json!({
+            "schema": CHECKPOINT_REGISTRY_EVENT_V1_SCHEMA,
+            "event_kind": "retire",
+            "name": name,
+            "snapshot_id": snapshot_id,
+            "created_at": unix_ms(),
+            "retired": retired,
+            "annotation": retire_annotation,
+        });
+        match append_checkpoint_registry_line(client, options, &id, &registry_entry) {
+            Ok(()) => registry_write_status(Ok(())),
+            Err(err) => {
+                return Err(snapshot_retire_registry_write_partial(
+                    &id,
+                    &path,
+                    snapshot_id,
+                    &name,
+                    retired,
+                    &retire_annotation,
+                    err,
+                ));
+            }
+        }
+    } else if let Some(err) = registry_read_error {
+        json!({
+            "written": false,
+            "skipped": true,
+            "path_relative": format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}"),
+            "reason": "snapshot was already absent and registry ownership could not be established",
+            "error": err.as_value(),
+        })
+    } else {
+        json!({
+            "written": false,
+            "skipped": true,
+            "path_relative": format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}"),
+            "reason": "snapshot was already absent and has no checkpoint registry entry",
+        })
+    };
+
+    Ok(json!({
+        "status": "success",
+        "workbench_id": id,
+        "path": path,
+        "snapshot_id": snapshot_id,
+        "name": name,
+        "retired": retired,
+        "state": if retired { "retired" } else { "already_absent" },
+        "retire_annotation": retire_annotation,
+        "registry": registry,
+    }))
+}
+
+fn snapshot_retire_registry_write_partial(
+    id: &str,
+    path: &str,
+    snapshot_id: u64,
+    name: &Value,
+    retired: bool,
+    annotation: &Value,
+    registry_error: WorkbenchToolError,
+) -> WorkbenchToolError {
+    WorkbenchToolError::typed(
+        "SnapshotRegistryWritePartial",
+        format!(
+            "snapshot {snapshot_id} retirement returned retired={retired}, but its lifecycle event was not written to the checkpoint registry"
+        ),
+        !retired,
+        json!({
+            "operation": "retire",
+            "workbench_id": id,
+            "path": path,
+            "snapshot_id": snapshot_id,
+            "name": name,
+            "retired": retired,
+            "state": if retired { "retired" } else { "already_absent" },
+            "retire_annotation": annotation,
+            "registry": {
+                "written": false,
+                "path_relative": format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}"),
+                "error": registry_error.as_value(),
+            },
+            "retry": if retired {
+                Value::Null
+            } else {
+                json!({
+                    "tool": "workbench_snapshot_retire",
+                    "arguments": {"id": id, "snapshot_id": snapshot_id},
+                })
+            },
+        }),
+    )
 }
 
 #[derive(Default)]
@@ -1515,9 +2088,17 @@ struct CheckpointGroup {
     created_at: Value,
     read_version: Value,
     has_mint: bool,
+    last_event_kind: Value,
     registered_lease: Value,
     renew_count: u64,
     last_renewed_at: Value,
+    annotation: Value,
+    retire_count: u64,
+    last_retire_at: Value,
+    last_retire_outcome: Value,
+    explicitly_retired: bool,
+    retired_at: Value,
+    retire_annotation: Value,
 }
 
 fn list_snapshots_workbench<O>(
@@ -1545,14 +2126,53 @@ where
         if let Some(lease) = entry.get("lease_expires_unix_ms") {
             group.registered_lease = lease.clone();
         }
-        if entry.get("reason").and_then(Value::as_str) == Some("renew") {
-            group.renew_count += 1;
-            group.last_renewed_at = entry.get("created_at").cloned().unwrap_or(Value::Null);
-        } else {
-            group.has_mint = true;
-            group.name = entry.get("name").cloned().unwrap_or(Value::Null);
-            group.created_at = entry.get("created_at").cloned().unwrap_or(Value::Null);
-            group.read_version = entry.get("read_version").cloned().unwrap_or(Value::Null);
+        match checkpoint_registry_event_kind(entry) {
+            Some("renew") => {
+                group.last_event_kind = json!("renew");
+                group.renew_count += 1;
+                group.last_renewed_at = entry.get("created_at").cloned().unwrap_or(Value::Null);
+            }
+            Some("mint") => {
+                group.last_event_kind = json!("mint");
+                group.has_mint = true;
+                group.name = entry.get("name").cloned().unwrap_or(Value::Null);
+                group.created_at = entry.get("created_at").cloned().unwrap_or(Value::Null);
+                group.read_version = entry.get("read_version").cloned().unwrap_or(Value::Null);
+                group.annotation = entry
+                    .get("annotation")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            Some("retire") => {
+                group.last_event_kind = json!("retire");
+                group.retire_count += 1;
+                group.last_retire_at = entry.get("created_at").cloned().unwrap_or(Value::Null);
+                let retired = entry
+                    .get("retired")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                group.last_retire_outcome = if retired {
+                    json!("retired")
+                } else {
+                    json!("already_absent")
+                };
+                if group.name.is_null() {
+                    group.name = entry.get("name").cloned().unwrap_or(Value::Null);
+                }
+                if retired {
+                    group.explicitly_retired = true;
+                    group.retired_at = entry.get("created_at").cloned().unwrap_or(Value::Null);
+                    group.retire_annotation = entry
+                        .get("annotation")
+                        .filter(|value| value.is_object())
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                }
+            }
+            // Unknown future event kinds cannot safely be interpreted as a
+            // lifecycle transition by an older server.
+            _ => {}
         }
         if group.read_version.is_null() {
             group.read_version = entry.get("read_version").cloned().unwrap_or(Value::Null);
@@ -1567,6 +2187,7 @@ where
             .snapshot_pin_status(&root_path, snapshot_id)
             .map_err(client_error)?;
         let (state, live_lease) = match status.pin {
+            None if group.explicitly_retired => ("retired", None),
             None => ("reaped", None),
             Some(pin) if status.server_now_ms >= pin.lease_expires_unix_ms => {
                 ("expired", Some(pin.lease_expires_unix_ms))
@@ -1577,10 +2198,22 @@ where
             "name": group.name.clone(),
             "snapshot_id": snapshot_id,
             "read_version": group.read_version.clone(),
-            "reason": if group.has_mint { "mint" } else { "renew" },
+            "event_kind": if group.has_mint {
+                json!("mint")
+            } else {
+                group.last_event_kind.clone()
+            },
+            "last_event_kind": group.last_event_kind.clone(),
+            "annotation": group.annotation.clone(),
             "created_at": group.created_at.clone(),
             "renew_count": group.renew_count,
             "last_renewed_at": group.last_renewed_at.clone(),
+            "retire_count": group.retire_count,
+            "last_retire_at": group.last_retire_at.clone(),
+            "last_retire_outcome": group.last_retire_outcome.clone(),
+            "explicitly_retired": group.explicitly_retired,
+            "retired_at": group.retired_at.clone(),
+            "retire_annotation": group.retire_annotation.clone(),
             "registered_lease_expires_unix_ms": group.registered_lease.clone(),
             "live_lease_expires_unix_ms": live_lease,
             "lease_expires_at": live_lease,
@@ -1604,7 +2237,11 @@ fn restore_workbench<O>(
 where
     O: ObjectStore + Send + Sync + 'static,
 {
-    validate_exact_arguments(args, &["id", "at_snapshot", "destination_id"])?;
+    validate_arguments(
+        args,
+        &["id", "at_snapshot", "destination_id"],
+        &["id", "at_snapshot", "destination_id"],
+    )?;
     let id = required_workbench_id(args)?;
     let destination_id = required_string(args, "destination_id")?.to_owned();
     validate_workbench_id(&destination_id)?;
@@ -1802,7 +2439,7 @@ where
         "section": scope.section.clone(),
         "relative_path": scope.relative_path.clone(),
         "path": scope.path.clone(),
-        "card": snapshot_stat_card(scope, &metadata),
+        "card": metadata_stat_card(scope, &metadata),
     }))
 }
 
@@ -1887,6 +2524,14 @@ fn at_snapshot_read<O>(
 where
     O: ObjectStore + Send + Sync + 'static,
 {
+    let cursor = optional_string(args, "cursor")?;
+    let offset = optional_u64(args, "offset")?.unwrap_or(0);
+    let limit = optional_usize(args, "limit")?;
+    if limit.is_some_and(|limit| limit == 0 || limit > MAX_WORKBENCH_READ_LIMIT) {
+        return Err(WorkbenchToolError::new(format!(
+            "limit must be between 1 and {MAX_WORKBENCH_READ_LIMIT}"
+        )));
+    }
     let metadata = client
         .metadata()
         .stat_path_at_snapshot(&workbench_path(options, id), snapshot_id, snap_path)
@@ -1905,8 +2550,6 @@ where
     }
     let size = metadata.attr.size;
     let generation = metadata.attr.generation;
-    let offset = optional_u64(args, "offset")?.unwrap_or(0);
-    let limit = optional_usize(args, "limit")?;
     let bytes_mode = optional_string(args, "format")? == Some("bytes");
     let common = json!({
         "status": "success",
@@ -1924,9 +2567,28 @@ where
         .cloned()
         .expect("common read envelope is an object");
     if bytes_mode {
-        // Byte-range read: offset and limit count bytes. The max_bytes guard
+        // A cursor is the next byte offset and takes precedence over the
+        // legacy offset argument. Validate it here rather than relying on the
+        // tool schema: callers can invoke the handler without schema checks.
+        let start = match cursor {
+            Some(cursor) => {
+                let start = cursor.parse::<u64>().map_err(|err| {
+                    WorkbenchToolError::new(format!(
+                        "invalid snapshot bytes cursor {cursor:?}: {err}"
+                    ))
+                })?;
+                if start > size {
+                    return Err(WorkbenchToolError::new(format!(
+                        "snapshot bytes cursor {start} exceeds total size {size}"
+                    )));
+                }
+                start
+            }
+            None => offset,
+        };
+        // Byte-range read: start and limit count bytes. The max_bytes guard
         // bounds a single page directly at the source read.
-        let remaining = size.saturating_sub(offset);
+        let remaining = size.saturating_sub(start);
         let mut len = limit
             .map(|limit| limit as u64)
             .unwrap_or(remaining)
@@ -1934,25 +2596,62 @@ where
         if len > options.max_bytes as u64 {
             len = options.max_bytes as u64;
         }
+        if start < size && len == 0 {
+            return Err(snapshot_pagination_stalled(
+                snapshot_id,
+                scope,
+                "byte",
+                start,
+                size,
+            ));
+        }
         let raw = client
             .read_snapshot(
                 &workbench_path(options, id),
                 snapshot_id,
                 snap_path,
-                offset,
+                start,
                 len as usize,
             )
             .map_err(|err| snapshot_client_error(snapshot_id, err))?;
         let returned = raw.len() as u64;
+        if start < size && returned == 0 {
+            return Err(snapshot_pagination_stalled(
+                snapshot_id,
+                scope,
+                "byte",
+                start,
+                size,
+            ));
+        }
+        if returned > len || returned > remaining {
+            return Err(WorkbenchToolError::typed(
+                "SnapshotPaginationProtocolError",
+                format!(
+                    "snapshot {snapshot_id} byte read returned {returned} bytes for a {len}-byte range"
+                ),
+                false,
+                json!({
+                    "snapshot_id": snapshot_id,
+                    "path": scope.path,
+                    "start": start,
+                    "requested": len,
+                    "returned": returned,
+                    "total": size,
+                }),
+            ));
+        }
+        let next_offset = start
+            .checked_add(returned)
+            .ok_or_else(|| WorkbenchToolError::new("snapshot byte pagination offset overflow"))?;
+        let next_cursor = (next_offset < size).then(|| next_offset.to_string());
+        let truncated = next_cursor.is_some();
         out.insert("format".to_owned(), json!("bytes"));
         out.insert("record_type".to_owned(), Value::Null);
         out.insert("record_count".to_owned(), Value::Null);
-        out.insert("cursor".to_owned(), Value::Null);
-        out.insert("next_cursor".to_owned(), Value::Null);
-        out.insert(
-            "truncated".to_owned(),
-            json!(offset.saturating_add(returned) < size),
-        );
+        out.insert("cursor".to_owned(), json!(cursor));
+        out.insert("next_cursor".to_owned(), json!(next_cursor));
+        out.insert("truncated".to_owned(), json!(truncated));
         out.insert("items".to_owned(), json!([]));
         out.insert(
             "bytes".to_owned(),
@@ -1986,13 +2685,42 @@ where
     })?;
     let lines: Vec<&str> = text.lines().collect();
     let total_lines = lines.len();
-    let start = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(total_lines);
+    // A text cursor is the next line index. Offset remains accepted for
+    // compatibility, but a supplied cursor is authoritative.
+    let start = match cursor {
+        Some(cursor) => {
+            let line = cursor.parse::<u64>().map_err(|err| {
+                WorkbenchToolError::new(format!("invalid snapshot text cursor {cursor:?}: {err}"))
+            })?;
+            let line = usize::try_from(line).map_err(|_| {
+                WorkbenchToolError::new(format!(
+                    "snapshot text cursor {cursor:?} is too large for this platform"
+                ))
+            })?;
+            if line > total_lines {
+                return Err(WorkbenchToolError::new(format!(
+                    "snapshot text cursor {line} exceeds total line count {total_lines}"
+                )));
+            }
+            line
+        }
+        None => usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(total_lines),
+    };
     let end = match limit {
         Some(limit) => start.saturating_add(limit).min(total_lines),
         None => total_lines,
     };
+    if start < total_lines && end == start {
+        return Err(snapshot_pagination_stalled(
+            snapshot_id,
+            scope,
+            "line",
+            start as u64,
+            total_lines as u64,
+        ));
+    }
     let items = lines[start..end]
         .iter()
         .enumerate()
@@ -2003,16 +2731,39 @@ where
             })
         })
         .collect::<Vec<_>>();
+    let next_cursor = (end < total_lines).then(|| end.to_string());
+    let truncated = next_cursor.is_some();
     out.insert("format".to_owned(), json!("structured"));
     out.insert("record_type".to_owned(), json!("text_lines"));
     out.insert("record_count".to_owned(), json!(total_lines));
-    out.insert("cursor".to_owned(), Value::Null);
-    out.insert("next_cursor".to_owned(), Value::Null);
-    out.insert("truncated".to_owned(), json!(end < total_lines));
+    out.insert("cursor".to_owned(), json!(cursor));
+    out.insert("next_cursor".to_owned(), json!(next_cursor));
+    out.insert("truncated".to_owned(), json!(truncated));
     out.insert("items".to_owned(), json!(items));
     out.insert("bytes".to_owned(), Value::Null);
     out.insert("bytes_encoding".to_owned(), Value::Null);
     Ok(Value::Object(out))
+}
+
+fn snapshot_pagination_stalled(
+    snapshot_id: u64,
+    scope: &WorkbenchPathScope,
+    unit: &'static str,
+    cursor: u64,
+    total: u64,
+) -> WorkbenchToolError {
+    WorkbenchToolError::typed(
+        "SnapshotPaginationStalled",
+        format!("snapshot {snapshot_id} {unit} pagination made no progress before end of file"),
+        true,
+        json!({
+            "snapshot_id": snapshot_id,
+            "path": scope.path,
+            "unit": unit,
+            "cursor": cursor,
+            "total": total,
+        }),
+    )
 }
 
 fn file_type_kind(file_type: FileType) -> &'static str {
@@ -2024,10 +2775,10 @@ fn file_type_kind(file_type: FileType) -> &'static str {
     }
 }
 
-/// Compact stat card built from at-snapshot metadata alone (no agent card is
-/// available at a historical version). Directory `entry_count` is left null:
-/// counting children at a snapshot would need a second listing round trip.
-fn snapshot_stat_card(scope: &WorkbenchPathScope, metadata: &PathMetadata) -> Value {
+/// Compact stat card built from one metadata read. Body-derived record counts
+/// and directory entry counts are deliberately null: deriving either would
+/// require reading file bytes or issuing a second namespace request.
+fn metadata_stat_card(scope: &WorkbenchPathScope, metadata: &PathMetadata) -> Value {
     let body = metadata.body.as_ref();
     let is_file = metadata.attr.file_type == FileType::File;
     let name = scope
@@ -2069,6 +2820,159 @@ fn validate_snapshot_name(name: &str) -> Result<(), WorkbenchToolError> {
         ));
     }
     Ok(())
+}
+
+fn parse_snapshot_annotation(args: &Value) -> Result<SnapshotAnnotation, WorkbenchToolError> {
+    let reason = match args.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(reason)) => Some(reason.clone()),
+        Some(_) => {
+            return Err(invalid_snapshot_annotation(
+                "reason",
+                "reason must be a string when provided",
+                json!({"expected_type": "string"}),
+            ));
+        }
+    };
+    if let Some(reason) = reason.as_deref() {
+        let chars = reason.chars().count();
+        let bytes = reason.len();
+        if chars == 0 {
+            return Err(invalid_snapshot_annotation(
+                "reason",
+                "reason must not be empty when provided",
+                json!({"minimum_chars": 1}),
+            ));
+        }
+        if chars > MAX_SNAPSHOT_REASON_CHARS || bytes > MAX_SNAPSHOT_REASON_BYTES {
+            return Err(invalid_snapshot_annotation(
+                "reason",
+                format!(
+                    "reason contains {chars} Unicode characters and {bytes} UTF-8 bytes; limits are {MAX_SNAPSHOT_REASON_CHARS} characters and {MAX_SNAPSHOT_REASON_BYTES} bytes"
+                ),
+                json!({
+                    "actual_chars": chars,
+                    "actual_bytes": bytes,
+                    "maximum_chars": MAX_SNAPSHOT_REASON_CHARS,
+                    "maximum_bytes": MAX_SNAPSHOT_REASON_BYTES,
+                }),
+            ));
+        }
+    }
+
+    let metadata = match args.get("metadata") {
+        None | Some(Value::Null) => None,
+        Some(value) if value.is_object() => {
+            validate_snapshot_metadata(value)?;
+            Some(value.clone())
+        }
+        Some(_) => {
+            return Err(invalid_snapshot_annotation(
+                "metadata",
+                "metadata must be a JSON object when provided",
+                json!({"expected_type": "object"}),
+            ));
+        }
+    };
+
+    Ok(SnapshotAnnotation { reason, metadata })
+}
+
+fn validate_snapshot_metadata(metadata: &Value) -> Result<(), WorkbenchToolError> {
+    let encoded_bytes = serde_json::to_vec(metadata)
+        .map_err(|err| {
+            invalid_snapshot_annotation(
+                "metadata",
+                format!("metadata could not be encoded as JSON: {err}"),
+                json!({}),
+            )
+        })?
+        .len();
+    if encoded_bytes > MAX_SNAPSHOT_METADATA_BYTES {
+        return Err(invalid_snapshot_annotation(
+            "metadata",
+            format!(
+                "metadata encodes to {encoded_bytes} bytes; maximum is {MAX_SNAPSHOT_METADATA_BYTES} bytes"
+            ),
+            json!({
+                "actual_bytes": encoded_bytes,
+                "maximum_bytes": MAX_SNAPSHOT_METADATA_BYTES,
+            }),
+        ));
+    }
+
+    let mut key_count = 0usize;
+    validate_snapshot_metadata_shape(metadata, 1, &mut key_count)?;
+    Ok(())
+}
+
+fn validate_snapshot_metadata_shape(
+    value: &Value,
+    depth: usize,
+    key_count: &mut usize,
+) -> Result<(), WorkbenchToolError> {
+    match value {
+        Value::Object(object) => {
+            if depth > MAX_SNAPSHOT_METADATA_DEPTH {
+                return Err(invalid_snapshot_annotation(
+                    "metadata",
+                    format!(
+                        "metadata container depth {depth} exceeds the maximum of {MAX_SNAPSHOT_METADATA_DEPTH}"
+                    ),
+                    json!({
+                        "actual_depth": depth,
+                        "maximum_depth": MAX_SNAPSHOT_METADATA_DEPTH,
+                    }),
+                ));
+            }
+            *key_count = key_count.saturating_add(object.len());
+            if *key_count > MAX_SNAPSHOT_METADATA_KEYS {
+                return Err(invalid_snapshot_annotation(
+                    "metadata",
+                    format!("metadata contains more than {MAX_SNAPSHOT_METADATA_KEYS} object keys"),
+                    json!({
+                        "actual_keys_at_least": *key_count,
+                        "maximum_keys": MAX_SNAPSHOT_METADATA_KEYS,
+                    }),
+                ));
+            }
+            for child in object.values() {
+                validate_snapshot_metadata_shape(child, depth.saturating_add(1), key_count)?;
+            }
+        }
+        Value::Array(array) => {
+            if depth > MAX_SNAPSHOT_METADATA_DEPTH {
+                return Err(invalid_snapshot_annotation(
+                    "metadata",
+                    format!(
+                        "metadata container depth {depth} exceeds the maximum of {MAX_SNAPSHOT_METADATA_DEPTH}"
+                    ),
+                    json!({
+                        "actual_depth": depth,
+                        "maximum_depth": MAX_SNAPSHOT_METADATA_DEPTH,
+                    }),
+                ));
+            }
+            for child in array {
+                validate_snapshot_metadata_shape(child, depth.saturating_add(1), key_count)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn invalid_snapshot_annotation(
+    field: &'static str,
+    message: impl Into<String>,
+    limits: Value,
+) -> WorkbenchToolError {
+    WorkbenchToolError::typed(
+        "InvalidSnapshotAnnotation",
+        message,
+        false,
+        json!({"field": field, "limits": limits}),
+    )
 }
 
 /// Resolve the requested `ttl_days`, returning the value and whether it was
@@ -2125,9 +3029,9 @@ where
     }
 }
 
-/// Turn a registry-append result into a status object. A failed registry write
-/// must not fail the snapshot itself (the pin already exists); the caller learns
-/// the write did not land so it can retry discovery rather than lose the id.
+/// Turn a registry-append result into a status object. Mutation handlers must
+/// convert `written=false` into a typed partial error; returning success would
+/// falsely claim that the checkpoint annotation is discoverable.
 fn registry_write_status(result: Result<(), WorkbenchToolError>) -> Value {
     match result {
         Ok(()) => {
@@ -2139,6 +3043,107 @@ fn registry_write_status(result: Result<(), WorkbenchToolError>) -> Value {
             "error": err.to_string(),
         }),
     }
+}
+
+fn snapshot_registry_write_partial(
+    id: &str,
+    path: &str,
+    snapshot: &SnapshotOutcome,
+    name: Option<&str>,
+    ttl_days: u64,
+    annotation: &Value,
+    registry_error: WorkbenchToolError,
+) -> WorkbenchToolError {
+    let snapshot_id = snapshot.snapshot_id;
+    let read_version = snapshot.read_version;
+    let lease_expires_unix_ms = snapshot.lease_expires_unix_ms;
+    let mut retry_arguments = serde_json::Map::new();
+    retry_arguments.insert("id".to_owned(), json!(id));
+    retry_arguments.insert("ttl_days".to_owned(), json!(ttl_days));
+    if let Some(name) = name {
+        retry_arguments.insert("name".to_owned(), json!(name));
+    }
+    if let Some(reason) = annotation.get("reason").filter(|value| !value.is_null()) {
+        retry_arguments.insert("reason".to_owned(), reason.clone());
+    }
+    if let Some(metadata) = annotation.get("metadata").filter(|value| !value.is_null()) {
+        retry_arguments.insert("metadata".to_owned(), metadata.clone());
+    }
+
+    WorkbenchToolError::typed(
+        "SnapshotRegistryWritePartial",
+        format!(
+            "snapshot {snapshot_id} was created, but its checkpoint annotation was not written; retire that snapshot before retrying the mint"
+        ),
+        false,
+        json!({
+            "operation": "mint",
+            "workbench_id": id,
+            "path": path,
+            "snapshot_id": snapshot_id,
+            "read_version": read_version,
+            "lease_expires_at": lease_expires_unix_ms,
+            "lease_expires_unix_ms": lease_expires_unix_ms,
+            "annotation": annotation,
+            "registry": {
+                "written": false,
+                "path_relative": format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}"),
+                "error": registry_error.as_value(),
+            },
+            "compensation": {
+                "required_before_retry": true,
+                "retire": {
+                    "tool": "workbench_snapshot_retire",
+                    "arguments": {"id": id, "snapshot_id": snapshot_id},
+                    "cli_argv": ["nokv", "retire-snapshot", path, snapshot_id.to_string()],
+                },
+                "retry_after_retire": {
+                    "tool": "workbench_snapshot",
+                    "arguments": Value::Object(retry_arguments),
+                },
+            },
+        }),
+    )
+}
+
+fn snapshot_renew_registry_write_partial(
+    id: &str,
+    snapshot_id: u64,
+    read_version: u64,
+    lease_expires_unix_ms: u64,
+    ttl_days: u64,
+    annotation: &Value,
+    registry_error: WorkbenchToolError,
+) -> WorkbenchToolError {
+    WorkbenchToolError::typed(
+        "SnapshotRegistryWritePartial",
+        format!(
+            "snapshot {snapshot_id} lease was renewed, but the renewal event was not written to the checkpoint registry; retry the same renewal"
+        ),
+        true,
+        json!({
+            "operation": "renew",
+            "workbench_id": id,
+            "snapshot_id": snapshot_id,
+            "read_version": read_version,
+            "lease_expires_at": lease_expires_unix_ms,
+            "lease_expires_unix_ms": lease_expires_unix_ms,
+            "annotation": annotation,
+            "registry": {
+                "written": false,
+                "path_relative": format!("metadata/{CHECKPOINT_REGISTRY_RELPATH}"),
+                "error": registry_error.as_value(),
+            },
+            "retry": {
+                "tool": "workbench_snapshot_renew",
+                "arguments": {
+                    "id": id,
+                    "snapshot_id": snapshot_id,
+                    "ttl_days": ttl_days,
+                },
+            },
+        }),
+    )
 }
 
 fn read_checkpoint_registry<O>(
@@ -2172,11 +3177,29 @@ where
     Ok(entries)
 }
 
-/// Latest registered `snapshot_id` for a checkpoint name. The registry is
-/// append-only, so a re-minted name yields several rows; the newest wins.
+/// Decode the lifecycle event kind. New writers only emit `event_kind`.
+/// Pre-v1 rows used top-level `reason`; keep this read-only decoder until the
+/// planned metadata-native named refs replace the JSONL registry, which is the
+/// explicit removal condition. New rows never dual-write the legacy shape.
+fn checkpoint_registry_event_kind(entry: &Value) -> Option<&str> {
+    if let Some(event_kind) = entry.get("event_kind").and_then(Value::as_str) {
+        return Some(event_kind);
+    }
+    match entry.get("reason").and_then(Value::as_str) {
+        Some("mint") => Some("mint"),
+        Some("renew") => Some("renew"),
+        _ => None,
+    }
+}
+
+/// Latest mint event for a checkpoint name. Renew/retire rows deliberately do
+/// not participate: a late event for an older snapshot must not steal an alias
+/// after the same name has been re-minted.
 fn resolve_name_to_snapshot_id(entries: &[Value], name: &str) -> Option<u64> {
     entries.iter().rev().find_map(|entry| {
-        if entry.get("name").and_then(Value::as_str) == Some(name) {
+        if checkpoint_registry_event_kind(entry) == Some("mint")
+            && entry.get("name").and_then(Value::as_str) == Some(name)
+        {
             entry.get("snapshot_id").and_then(Value::as_u64)
         } else {
             None
@@ -2184,26 +3207,43 @@ fn resolve_name_to_snapshot_id(entries: &[Value], name: &str) -> Option<u64> {
     })
 }
 
-/// Name most recently registered for a snapshot id, for carrying the alias
-/// forward onto renew rows. Returns null when the snapshot has no named row.
-fn registry_name_for_snapshot<O>(
-    client: &NoKvFsClient<O>,
-    options: &WorkbenchMcpOptions,
-    id: &str,
-    snapshot_id: u64,
-) -> Result<Value, WorkbenchToolError>
-where
-    O: ObjectStore + Send + Sync + 'static,
-{
-    let entries = read_checkpoint_registry(client, options, id)?;
-    let name = entries.iter().rev().find_map(|entry| {
-        if entry.get("snapshot_id").and_then(Value::as_u64) == Some(snapshot_id) {
-            entry.get("name").filter(|value| !value.is_null()).cloned()
-        } else {
-            None
-        }
-    });
-    Ok(name.unwrap_or(Value::Null))
+/// Name from the snapshot's mint event. Returns null for an anonymous or
+/// externally-created pin.
+fn registry_name_for_snapshot(entries: &[Value], snapshot_id: u64) -> Value {
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            if checkpoint_registry_event_kind(entry) == Some("mint")
+                && entry.get("snapshot_id").and_then(Value::as_u64) == Some(snapshot_id)
+            {
+                entry.get("name").filter(|value| !value.is_null()).cloned()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(Value::Null)
+}
+
+/// Immutable user annotation from the snapshot's mint event. Old registry
+/// rows and pins minted outside the workbench surface naturally return null.
+fn registry_annotation_for_snapshot(entries: &[Value], snapshot_id: u64) -> Value {
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            if checkpoint_registry_event_kind(entry) == Some("mint")
+                && entry.get("snapshot_id").and_then(Value::as_u64) == Some(snapshot_id)
+            {
+                entry
+                    .get("annotation")
+                    .filter(|value| value.is_object())
+                    .cloned()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(Value::Null)
 }
 
 /// Resolve the `at_snapshot` argument (a numeric id or a checkpoint name) to a
@@ -2238,9 +3278,9 @@ where
     }
 }
 
-/// Resolve the renew target: exactly one of `snapshot_id` (numeric) or `name`
-/// (registry-resolved) must be given.
-fn resolve_renew_target<O>(
+/// Resolve a lifecycle target: exactly one of `snapshot_id` (numeric) or
+/// `name` (registry-resolved) must be given.
+fn resolve_snapshot_target<O>(
     client: &NoKvFsClient<O>,
     options: &WorkbenchMcpOptions,
     id: &str,
@@ -2300,6 +3340,8 @@ impl WorkbenchManifestSummary {
             .as_ref()
             .and_then(|metadata| metadata.body.as_ref());
         let envelope = self.envelope.unwrap_or(Value::Null);
+        let verified_identity = verified_workbench_commit_identity(&envelope)
+            .filter(|identity| identity.workbench_id == id);
         let manifest = if self.include_manifest {
             envelope.clone()
         } else {
@@ -2312,7 +3354,17 @@ impl WorkbenchManifestSummary {
             "manifest_path": self.manifest_path,
             "manifest_size_bytes": self.manifest_metadata.as_ref().map(|metadata| metadata.attr.size),
             "manifest_generation": self.manifest_metadata.as_ref().map(|metadata| metadata.attr.generation),
-            "manifest_digest_uri": body.map(|body| body.digest_uri.clone()),
+            "content_digest_uri": verified_identity
+                .as_ref()
+                .map(|identity| identity.content_digest_uri.clone()),
+            "manifest_digest_uri": verified_identity
+                .as_ref()
+                .map(|identity| identity.manifest_digest_uri.clone()),
+            "commit_identity": verified_identity
+                .as_ref()
+                .map(|identity| identity.commit_identity.clone()),
+            "commit_identity_verified": verified_identity.is_some(),
+            "envelope_digest_uri": body.map(|body| body.digest_uri.clone()),
             "manifest_summary": manifest_summary_json(&envelope),
             "manifest": manifest,
         })
@@ -2400,26 +3452,6 @@ fn compact_list_entry(
     }))
 }
 
-fn compact_stat_card(scope: &WorkbenchPathScope, card: &Value, metadata: &PathMetadata) -> Value {
-    let body = metadata.body.as_ref();
-    json!({
-        "name": card.get("name").cloned().unwrap_or(Value::Null),
-        "path": scope.path.clone(),
-        "section": scope.section.clone(),
-        "relative_path": scope.relative_path.clone(),
-        "kind": card.get("kind").cloned().unwrap_or(Value::Null),
-        "size_bytes": card.get("size_bytes").cloned().unwrap_or(Value::Null),
-        "entry_count": card.get("entry_count").cloned().unwrap_or(Value::Null),
-        "record_count": card.get("record_count").cloned().unwrap_or(Value::Null),
-        "inode": metadata.attr.inode.get(),
-        "generation": metadata.attr.generation,
-        "content_type": body.map(|body| body.content_type.clone()),
-        "digest_uri": body.map(|body| body.digest_uri.clone()),
-        "producer": body.map(|body| body.producer.clone()),
-        "manifest_id": body.map(|body| body.manifest_id.clone()),
-    })
-}
-
 fn compact_grep_match(
     options: &WorkbenchMcpOptions,
     id: &str,
@@ -2494,6 +3526,18 @@ fn manifest_summary_json(envelope: &Value) -> Value {
     json!({
         "schema": envelope.get("schema").cloned().unwrap_or(Value::Null),
         "workbench_id": envelope.get("workbench_id").cloned().unwrap_or(Value::Null),
+        "content_digest_uri": envelope
+            .get("content_digest_uri")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "manifest_digest_uri": envelope
+            .get("manifest_digest_uri")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "commit_identity": envelope
+            .get("commit_identity")
+            .cloned()
+            .unwrap_or(Value::Null),
         "committed_at_unix_seconds": envelope
             .get("committed_at_unix_seconds")
             .cloned()
@@ -2896,6 +3940,74 @@ fn digest_uri(bytes: &[u8]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
+fn validate_content_digest_uri(value: &str) -> Result<(), WorkbenchToolError> {
+    let valid = value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if valid {
+        return Ok(());
+    }
+    Err(WorkbenchToolError::typed(
+        "InvalidContentDigestUri",
+        "content_digest_uri must exactly match sha256:<64 lowercase hex>",
+        false,
+        json!({
+            "field": "content_digest_uri",
+            "expected_pattern": "^sha256:[0-9a-f]{64}$",
+            "actual": value,
+        }),
+    ))
+}
+
+/// Canonical manifest encoding for v1 commit identity: object keys are sorted
+/// recursively, arrays retain caller order, and serde_json emits compact UTF-8.
+/// This deliberately hashes only the caller manifest, not envelope fields such
+/// as the server timestamp.
+fn canonical_manifest_digest_uri(manifest: &Value) -> Result<String, WorkbenchToolError> {
+    let canonical = canonical_json_value(manifest);
+    let bytes = serde_json::to_vec(&canonical).map_err(|err| {
+        WorkbenchToolError::new(format!("failed to canonically encode manifest: {err}"))
+    })?;
+    Ok(digest_uri(&bytes))
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json_value(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+/// Stable, domain-separated identity of one workbench commit. Each component
+/// is length framed, so no pair of caller-controlled strings can create the
+/// same byte stream by moving delimiters between fields.
+fn workbench_commit_identity(
+    workbench_id: &str,
+    content_digest_uri: &str,
+    manifest_digest_uri: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(COMMIT_IDENTITY_DOMAIN);
+    for component in [workbench_id, content_digest_uri, manifest_digest_uri] {
+        let bytes = component.as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2916,7 +4028,11 @@ fn required_string<'a>(args: &'a Value, name: &'static str) -> Result<&'a str, W
         .ok_or_else(|| WorkbenchToolError::new(format!("missing required string argument {name}")))
 }
 
-fn validate_exact_arguments(args: &Value, required: &[&str]) -> Result<(), WorkbenchToolError> {
+fn validate_arguments(
+    args: &Value,
+    required: &[&str],
+    allowed: &[&str],
+) -> Result<(), WorkbenchToolError> {
     let object = args
         .as_object()
         .ok_or_else(|| WorkbenchToolError::new("tool arguments must be a JSON object"))?;
@@ -2929,11 +4045,11 @@ fn validate_exact_arguments(args: &Value, required: &[&str]) -> Result<(), Workb
     }
     if let Some(field) = object
         .keys()
-        .find(|field| !required.contains(&field.as_str()))
+        .find(|field| !allowed.contains(&field.as_str()))
     {
         return Err(WorkbenchToolError::new(format!(
-            "unknown argument {field}; expected exactly {}",
-            required.join(", ")
+            "unknown argument {field}; expected only {}",
+            allowed.join(", ")
         )));
     }
     Ok(())
@@ -3229,6 +4345,143 @@ mod tests {
         }
     }
 
+    fn requested_commit(
+        id: &str,
+        manifest: Value,
+        content_digest_uri: &str,
+    ) -> RequestedWorkbenchCommit {
+        let manifest_digest_uri = canonical_manifest_digest_uri(&manifest).unwrap();
+        RequestedWorkbenchCommit {
+            commit_identity: workbench_commit_identity(
+                id,
+                content_digest_uri,
+                &manifest_digest_uri,
+            ),
+            manifest,
+            content_digest_uri: content_digest_uri.to_owned(),
+            manifest_digest_uri,
+        }
+    }
+
+    #[test]
+    fn commit_schema_requires_strict_caller_known_content_digest() {
+        let commit = tool_definitions_for_capabilities(true)
+            .into_iter()
+            .find(|tool| tool.name == "workbench_commit")
+            .unwrap();
+        assert_eq!(
+            commit.parameters["required"],
+            json!(["id", "manifest", "content_digest_uri"])
+        );
+        assert_eq!(
+            commit.parameters["properties"]["content_digest_uri"]["pattern"],
+            "^sha256:[0-9a-f]{64}$"
+        );
+
+        for invalid in [
+            "",
+            "sha256:",
+            "sha256:abc",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+        ] {
+            let error = validate_content_digest_uri(invalid).unwrap_err().as_value();
+            assert_eq!(error["code"], "InvalidContentDigestUri", "{invalid}");
+            assert_eq!(error["retryable"], false, "{invalid}");
+        }
+        validate_content_digest_uri(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn commit_identity_is_canonical_stable_and_content_sensitive() {
+        let content = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let left = requested_commit(
+            "wb-identity",
+            json!({"phase": "ready", "nested": {"b": 2, "a": 1}}),
+            content,
+        );
+        let right = requested_commit(
+            "wb-identity",
+            json!({"nested": {"a": 1, "b": 2}, "phase": "ready"}),
+            content,
+        );
+        assert_eq!(left.manifest_digest_uri, right.manifest_digest_uri);
+        assert_eq!(left.commit_identity, right.commit_identity);
+
+        let different_content = requested_commit(
+            "wb-identity",
+            json!({"phase": "ready", "nested": {"a": 1, "b": 2}}),
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        );
+        assert_ne!(left.commit_identity, different_content.commit_identity);
+
+        let different_manifest = requested_commit(
+            "wb-identity",
+            json!({"phase": "ready", "nested": {"a": 1, "b": 3}}),
+            content,
+        );
+        assert_ne!(
+            left.manifest_digest_uri,
+            different_manifest.manifest_digest_uri
+        );
+        assert_ne!(left.commit_identity, different_manifest.commit_identity);
+    }
+
+    #[test]
+    fn commit_reconciliation_adopts_only_a_verified_v1_identity() {
+        let requested = requested_commit(
+            "wb-adopt",
+            json!({"phase": "complete"}),
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        );
+        let exact = json!({
+            "schema": RUN_MANIFEST_V1_SCHEMA,
+            "workbench_id": "wb-adopt",
+            "content_digest_uri": requested.content_digest_uri,
+            "manifest_digest_uri": requested.manifest_digest_uri,
+            "commit_identity": requested.commit_identity,
+            "committed_at_unix_seconds": 1,
+            "manifest": requested.manifest,
+        });
+        assert!(stored_commit_envelope_matches(
+            Some(&exact),
+            "wb-adopt",
+            &requested
+        ));
+
+        let mut different_content = exact.clone();
+        different_content["content_digest_uri"] =
+            json!("sha256:4444444444444444444444444444444444444444444444444444444444444444");
+        assert!(!stored_commit_envelope_matches(
+            Some(&different_content),
+            "wb-adopt",
+            &requested
+        ));
+
+        let legacy = json!({
+            "schema": "nokv.workbench.run_manifest.v0",
+            "workbench_id": "wb-adopt",
+            "manifest": {"phase": "complete"},
+        });
+        assert!(!stored_commit_envelope_matches(
+            Some(&legacy),
+            "wb-adopt",
+            &requested
+        ));
+
+        let mut tampered_manifest = exact;
+        tampered_manifest["manifest"]["phase"] = json!("different-content");
+        assert!(!stored_commit_envelope_matches(
+            Some(&tampered_manifest),
+            "wb-adopt",
+            &requested
+        ));
+    }
+
     #[test]
     fn restore_schema_is_exact_and_capability_gated() {
         let enabled = tool_definitions_for_capabilities(true);
@@ -3397,6 +4650,108 @@ mod tests {
         assert!(validate_workbench_id("spedas-task-001").is_ok());
         assert!(validate_workbench_id("_bad").is_err());
         assert!(validate_workbench_id("bad/path").is_err());
+    }
+
+    #[test]
+    fn snapshot_annotation_schema_and_handler_enforce_bounds() {
+        let tools = tool_definitions_for_capabilities(false);
+        let snapshot = tools
+            .iter()
+            .find(|tool| tool.name == "workbench_snapshot")
+            .unwrap();
+        assert_eq!(
+            snapshot.parameters["properties"]["reason"]["maxLength"],
+            MAX_SNAPSHOT_REASON_CHARS
+        );
+        assert_eq!(
+            snapshot.parameters["properties"]["metadata"]["maxProperties"],
+            MAX_SNAPSHOT_METADATA_KEYS
+        );
+
+        let unicode_boundary = "🚀".repeat(MAX_SNAPSHOT_REASON_CHARS);
+        let accepted = parse_snapshot_annotation(&json!({
+            "reason": unicode_boundary,
+            "metadata": {"job": {"hash": "sha256:abc"}},
+        }))
+        .unwrap();
+        assert_eq!(
+            accepted.reason.as_deref().unwrap().chars().count(),
+            MAX_SNAPSHOT_REASON_CHARS
+        );
+        assert_eq!(
+            accepted.reason.as_deref().unwrap().len(),
+            MAX_SNAPSHOT_REASON_BYTES
+        );
+
+        for args in [
+            json!({"reason": ""}),
+            json!({"reason": 7}),
+            json!({"reason": "🚀".repeat(MAX_SNAPSHOT_REASON_CHARS + 1)}),
+            json!({"metadata": []}),
+        ] {
+            let error = parse_snapshot_annotation(&args).unwrap_err().as_value();
+            assert_eq!(error["code"], "InvalidSnapshotAnnotation");
+            assert_eq!(error["retryable"], false);
+        }
+    }
+
+    #[test]
+    fn snapshot_metadata_accepts_exact_limits_and_rejects_overflow() {
+        let empty_envelope_bytes = serde_json::to_vec(&json!({"payload": ""})).unwrap().len();
+        let boundary = json!({
+            "payload": "x".repeat(MAX_SNAPSHOT_METADATA_BYTES - empty_envelope_bytes)
+        });
+        assert_eq!(
+            serde_json::to_vec(&boundary).unwrap().len(),
+            MAX_SNAPSHOT_METADATA_BYTES
+        );
+        validate_snapshot_metadata(&boundary).unwrap();
+        let oversized = json!({
+            "payload": "x".repeat(MAX_SNAPSHOT_METADATA_BYTES - empty_envelope_bytes + 1)
+        });
+        assert!(validate_snapshot_metadata(&oversized).is_err());
+
+        let keys_at_limit = (0..MAX_SNAPSHOT_METADATA_KEYS)
+            .map(|index| (format!("key-{index}"), json!(index)))
+            .collect::<serde_json::Map<_, _>>();
+        validate_snapshot_metadata(&Value::Object(keys_at_limit.clone())).unwrap();
+        let mut too_many_keys = keys_at_limit;
+        too_many_keys.insert("overflow".to_owned(), Value::Null);
+        assert!(validate_snapshot_metadata(&Value::Object(too_many_keys)).is_err());
+
+        let nested =
+            |depth: usize| (0..depth).fold(Value::Null, |child, _| json!({"child": child}));
+        validate_snapshot_metadata(&nested(MAX_SNAPSHOT_METADATA_DEPTH)).unwrap();
+        assert!(validate_snapshot_metadata(&nested(MAX_SNAPSHOT_METADATA_DEPTH + 1)).is_err());
+    }
+
+    #[test]
+    fn checkpoint_registry_alias_and_annotation_come_only_from_mint() {
+        let annotation = json!({"reason": "handoff", "metadata": {"job": "42"}});
+        let entries = vec![
+            json!({"reason": "mint", "name": "same", "snapshot_id": 1}),
+            json!({
+                "schema": CHECKPOINT_REGISTRY_EVENT_V1_SCHEMA,
+                "event_kind": "mint",
+                "name": "same",
+                "snapshot_id": 2,
+                "annotation": annotation,
+            }),
+            json!({
+                "schema": CHECKPOINT_REGISTRY_EVENT_V1_SCHEMA,
+                "event_kind": "renew",
+                "name": "same",
+                "snapshot_id": 1,
+                "annotation": {"reason": "must-not-steal"},
+            }),
+        ];
+        assert_eq!(resolve_name_to_snapshot_id(&entries, "same"), Some(2));
+        assert_eq!(registry_name_for_snapshot(&entries, 2), "same");
+        assert_eq!(
+            registry_annotation_for_snapshot(&entries, 2),
+            json!({"reason": "handoff", "metadata": {"job": "42"}})
+        );
+        assert_eq!(registry_annotation_for_snapshot(&entries, 1), Value::Null);
     }
 
     #[test]
