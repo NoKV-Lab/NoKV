@@ -30,6 +30,7 @@ BASE_WORKBENCH_TOOLS = {
     "workbench_commit",
     "workbench_snapshot",
     "workbench_snapshot_renew",
+    "workbench_snapshot_retire",
     "workbench_snapshot_list",
 }
 WORKBENCH_TOOLS = BASE_WORKBENCH_TOOLS | {RESTORE_TOOL}
@@ -263,7 +264,7 @@ def contract_evidence(
 
 
 def expected_contract_evidence() -> dict[str, Any]:
-    """Return evidence for the checked-in Rust-owned 17-tool contract."""
+    """Return evidence for the checked-in Rust-owned 18-tool contract."""
     tools = [
         {"name": name, "inputSchema": schema}
         for name, schema in FROZEN_INPUT_SCHEMAS.items()

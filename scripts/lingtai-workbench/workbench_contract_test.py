@@ -46,8 +46,8 @@ def reverse_unordered_arrays(value: object) -> None:
 
 
 class WorkbenchContractTest(unittest.TestCase):
-    def test_frozen_surface_is_the_exact_seventeen_tools(self):
-        self.assertEqual(len(contract.FROZEN_INPUT_SCHEMAS), 17)
+    def test_frozen_surface_is_the_exact_eighteen_tools(self):
+        self.assertEqual(len(contract.FROZEN_INPUT_SCHEMAS), 18)
         self.assertEqual(set(contract.FROZEN_INPUT_SCHEMAS), contract.WORKBENCH_TOOLS)
         contract.validate_tool_contract(frozen_tools())
 

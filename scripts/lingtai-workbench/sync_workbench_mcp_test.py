@@ -162,7 +162,7 @@ class SyncWorkbenchMcpTest(unittest.TestCase):
             self.assertIn(self.source_revision(source), command.parts)
             self.assertEqual(runtime.sha256_file(command), lock["artifact"]["sha256"])
             self.assertEqual(lock["source"]["holt_git_commit"], HOLT_REVISION)
-            self.assertEqual(lock["contract"]["tool_count"], 17)
+            self.assertEqual(lock["contract"]["tool_count"], 18)
             self.assertEqual(lock["launch"]["workbench_root"], "/agents/coordinator/wb")
 
             second = self.run_sync(*self.sync_args(project, source, binary))

@@ -4613,8 +4613,8 @@ mod tests {
 
         assert_eq!(
             tools.len(),
-            17,
-            "capability-enabled surface must have 17 tools"
+            18,
+            "capability-enabled surface must have 18 tools"
         );
         assert_eq!(
             rust_names.len(),

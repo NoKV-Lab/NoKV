@@ -244,6 +244,10 @@
     "workbench_commit": {
       "additionalProperties": false,
       "properties": {
+        "content_digest_uri": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
         "id": {
           "type": "string"
         },
@@ -256,7 +260,8 @@
       },
       "required": [
         "id",
-        "manifest"
+        "manifest",
+        "content_digest_uri"
       ],
       "type": "object"
     },
@@ -747,7 +752,22 @@
         "id": {
           "type": "string"
         },
+        "metadata": {
+          "maxProperties": 64,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
           "type": [
             "string",
             "null"
@@ -798,6 +818,47 @@
         "ttl_days": {
           "maximum": 90,
           "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "workbench_snapshot_retire": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "snapshot_id"
+          ]
+        },
+        {
+          "required": [
+            "name"
+          ]
+        }
+      ],
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshot_id": {
+          "minimum": 0,
           "type": "integer"
         }
       },
