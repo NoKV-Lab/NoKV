@@ -17,12 +17,12 @@ NoKV has two MCP profiles:
 - The generic Agent profile exposes seven read-only namespace tools: `ls`,
   `stat`, `catalog`, `read`, `aggregate`, `find`, and `grep`. It is suitable for
   a general MCP client, but it is not the LingTai workbench integration.
-- The Workbench profile exposes exactly 17 `workbench_*` tools, including
+- The Workbench profile exposes exactly 18 `workbench_*` tools, including
   writes, checkpoints, indexed queries, and durable `workbench_restore`. It is
   jailed below `/agents/{agent_id}/wb` and is registered in LingTai as
   `nokv-workbench`.
 
-The setup below requires the complete 17-tool Workbench profile. Restore is
+The setup below requires the complete 18-tool Workbench profile. Restore is
 advertised only when every metadata owner that can serve the selected Agent
 root supports `restore_to_fork_v1`; the setup fails closed if the fleet is
 mixed or the schema differs.
@@ -93,7 +93,7 @@ variables. It performs the following guarded handoff:
 - builds NoKV with the locked `Cargo.lock` and records the exact Holt revision;
 - stages an immutable binary under the LingTai project by NoKV commit and
   binary SHA-256;
-- probes the candidate's exact 17-tool contract against the current metadata
+- probes the candidate's exact 18-tool contract against the current metadata
   endpoint before replacing a running server, then starts or verifies RustFS
   and the helper-managed NoKV metadata server;
 - rechecks the selected Agent's concrete root after the server handoff;
@@ -152,7 +152,7 @@ python3 ./scripts/lingtai-workbench/sync_workbench_mcp.py \
 ```
 
 The check validates the lock, immutable binary and build identity, LingTai
-registry and `init.json`, launch arguments, and the live 17-tool contract. It
+registry and `init.json`, launch arguments, and the live 18-tool contract. It
 uses the same automatic Agent selection as setup. Add the exact `--agent`
 directory name only when the project is ambiguous:
 

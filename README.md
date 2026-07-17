@@ -183,7 +183,7 @@ embedded-only — see the [contributor handbook](docs/development/nokv-agent.md)
 section 6 for why).
 
 This is the default, general-purpose `agent` profile. LingTai uses the separate
-`workbench` profile: 17 jailed workspace tools covering create, read/write,
+`workbench` profile: 18 jailed workspace tools covering create, read/write,
 query, checkpoint, and durable restore-to-fork. Follow the
 [LingTai Workbench setup and update guide](docs/lingtai-workbench-preflight.md)
 instead of hand-copying the generic MCP example above.
