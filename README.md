@@ -128,6 +128,7 @@ To understand the project first, read [Why filesystems](https://nokv.io/blog/age
 - [Metadata Schema](docs/metadata-schema.md)
 - [Object Layout](docs/object-layout.md)
 - [Checkpointing](docs/checkpointing.md)
+- [LingTai Workbench Setup and Updates](docs/lingtai-workbench-preflight.md)
 - [RustFS Backend](docs/rustfs.md)
 - [Benchmarks](docs/benchmarks.md)
 
@@ -180,6 +181,12 @@ seven existing agent tools only, no write or publish tools; no network
 registration path for `register_namespace_index` (it remains
 embedded-only — see the [contributor handbook](docs/development/nokv-agent.md)
 section 6 for why).
+
+This is the default, general-purpose `agent` profile. LingTai uses the separate
+`workbench` profile: 17 jailed workspace tools covering create, read/write,
+query, checkpoint, and durable restore-to-fork. Follow the
+[LingTai Workbench setup and update guide](docs/lingtai-workbench-preflight.md)
+instead of hand-copying the generic MCP example above.
 
 ## NoKV vs JuiceFS
 
