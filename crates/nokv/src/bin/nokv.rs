@@ -3224,14 +3224,59 @@ mod tests {
         })
     }
 
+    struct SharedWorkbenchMcpSession {
+        _access: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SharedWorkbenchMcpSession {
+        fn acquire() -> Self {
+            static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+            // This fixture saves process resources by sharing one metadata
+            // server and local object root. Serialise access because
+            // concurrent clients have produced transient body-descriptor
+            // visibility failures. Dedicated concurrency tests must use their
+            // own fixture.
+            let access = ACCESS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self { _access: access }
+        }
+
+        fn direct_client(&self) -> NoKvFsClient<LocalObjectStore> {
+            let (addr, object_root) = shared_workbench_mcp_server();
+            let store =
+                LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
+            NoKvFsClient::connect(*addr, store)
+        }
+
+        fn run_requests(
+            &self,
+            options: McpCliOptions,
+            requests: Vec<serde_json::Value>,
+        ) -> Vec<serde_json::Value> {
+            run_workbench_mcp_requests_on_client(self.direct_client(), options, requests)
+        }
+    }
+
+    fn with_shared_workbench_client<T>(
+        action: impl FnOnce(NoKvFsClient<LocalObjectStore>) -> T,
+    ) -> T {
+        let session = SharedWorkbenchMcpSession::acquire();
+        action(session.direct_client())
+    }
+
     fn run_shared_workbench_mcp_requests(
         requests: Vec<serde_json::Value>,
     ) -> Vec<serde_json::Value> {
-        let (addr, object_root) = shared_workbench_mcp_server();
-        let store =
-            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
-        let client = NoKvFsClient::connect(*addr, store);
-        run_workbench_mcp_requests_on_client(client, workbench_mcp_options(), requests)
+        run_shared_workbench_mcp_requests_with_options(workbench_mcp_options(), requests)
+    }
+
+    fn run_shared_workbench_mcp_requests_with_options(
+        options: McpCliOptions,
+        requests: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        SharedWorkbenchMcpSession::acquire().run_requests(options, requests)
     }
 
     /// Restore initialization is uploaded by the metadata owner, unlike the
@@ -3375,14 +3420,46 @@ mod tests {
                 "workbench_commit",
                 "workbench_snapshot",
                 "workbench_snapshot_renew",
+                "workbench_snapshot_retire",
                 "workbench_snapshot_list",
                 "workbench_restore",
             ]
         );
+        assert_eq!(names.len(), 18);
         assert!(names.iter().all(|name| name.starts_with("workbench_")));
         assert!(names.iter().all(|name| !name.starts_with("nokv_")));
         assert!(!names.contains(&"read"));
         assert!(!names.contains(&"grep"));
+    }
+
+    #[test]
+    fn workbench_mcp_tool_descriptions_define_put_and_ndjson_contracts() {
+        let responses = run_shared_workbench_mcp_requests(vec![serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })]);
+        let tools = responses[0]["result"]["tools"].as_array().unwrap();
+        let description = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_else(|| panic!("missing description for {name}"))
+        };
+
+        let put = description("workbench_put_file");
+        assert!(put.contains("replace=false (the default) is create-only"));
+        assert!(put.contains("replace=true is replace-only"));
+        assert!(put.contains("fails when the target is missing"));
+        assert!(put.contains("not an upsert operation"));
+
+        let read = description("workbench_read");
+        assert!(read.contains("does not parse application/x-ndjson"));
+        assert!(read.contains(
+            ".jsonl file is returned as text_lines only when stored with a text/* content type"
+        ));
+        assert!(read.contains("NDJSON record pagination is not supported"));
     }
 
     #[test]
@@ -3416,7 +3493,11 @@ mod tests {
         );
 
         let tools = responses[0]["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 17);
         assert!(tools.iter().any(|tool| tool["name"] == "workbench_create"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "workbench_snapshot_retire"));
         assert!(tools.iter().all(|tool| tool["name"] != "workbench_restore"));
     }
 
@@ -3575,6 +3656,7 @@ mod tests {
                     "name": "workbench_commit",
                     "arguments": {
                         "id": "spedas-task-001",
+                        "content_digest_uri": "sha256:1000000000000000000000000000000000000000000000000000000000000001",
                         "manifest": {
                             "task": "spedas-task-001",
                             "outputs": ["outputs/spectrum.csv"]
@@ -3669,17 +3751,378 @@ mod tests {
         assert!(
             manifest_items.iter().any(|item| {
                 item["value"]["key"] == "schema"
-                    && item["value"]["value"] == "nokv.workbench.run_manifest.v0"
+                    && item["value"]["value"] == "nokv.workbench.run_manifest.v1"
             }),
             "manifest read response: {}",
             responses[9]
         );
+        let commit = &responses[8]["result"]["structuredContent"];
+        assert_eq!(commit["idempotent_replay"], false);
+        assert_eq!(
+            commit["content_digest_uri"],
+            "sha256:1000000000000000000000000000000000000000000000000000000000000001"
+        );
+        assert!(commit["manifest_digest_uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(commit["commit_identity"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
         assert!(
             responses[10]["result"]["structuredContent"]["snapshot_id"]
                 .as_u64()
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn workbench_mcp_commit_identity_replays_and_rejects_same_phase_different_content() {
+        let id = "wb-commit-identity-v1";
+        let first_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second_digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let manifest = serde_json::json!({"phase": "complete"});
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_commit",
+                serde_json::json!({
+                    "id": id,
+                    "manifest": manifest.clone(),
+                    "content_digest_uri": first_digest
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_commit",
+                serde_json::json!({
+                    "id": id,
+                    "manifest": manifest.clone(),
+                    "content_digest_uri": first_digest
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_commit",
+                serde_json::json!({
+                    "id": id,
+                    "manifest": manifest.clone(),
+                    "content_digest_uri": second_digest
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_commit",
+                serde_json::json!({
+                    "id": id,
+                    "manifest": manifest.clone(),
+                    "content_digest_uri": second_digest,
+                    "replace": true
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_commit",
+                serde_json::json!({
+                    "id": id,
+                    "manifest": manifest,
+                    "content_digest_uri": second_digest
+                }),
+            ),
+        ]);
+
+        for index in [0, 1, 2, 4, 5] {
+            assert_ne!(
+                responses[index]["result"]["isError"], true,
+                "response {index}: {}",
+                responses[index]
+            );
+        }
+        let first = &responses[1]["result"]["structuredContent"];
+        let replay = &responses[2]["result"]["structuredContent"];
+        assert_eq!(first["idempotent_replay"], false);
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["commit_identity"], first["commit_identity"]);
+        assert_eq!(replay["generation"], first["generation"]);
+        assert_eq!(replay["envelope_digest_uri"], first["envelope_digest_uri"]);
+
+        let conflict = &responses[3]["result"]["structuredContent"];
+        assert_eq!(responses[3]["result"]["isError"], true);
+        assert_eq!(conflict["code"], "WorkbenchCommitConflict");
+        assert_eq!(conflict["retryable"], false);
+        assert_eq!(
+            conflict["details"]["current_content_digest_uri"],
+            first_digest
+        );
+        assert_eq!(
+            conflict["details"]["requested_content_digest_uri"],
+            second_digest
+        );
+        assert_ne!(
+            conflict["details"]["current_commit_identity"],
+            conflict["details"]["requested_commit_identity"]
+        );
+
+        let replaced = &responses[4]["result"]["structuredContent"];
+        assert_eq!(replaced["replace"], true);
+        assert_eq!(replaced["idempotent_replay"], false);
+        assert_eq!(replaced["content_digest_uri"], second_digest);
+        assert_ne!(replaced["commit_identity"], first["commit_identity"]);
+        let replacement_replay = &responses[5]["result"]["structuredContent"];
+        assert_eq!(replacement_replay["idempotent_replay"], true);
+        assert_eq!(
+            replacement_replay["commit_identity"],
+            replaced["commit_identity"]
+        );
+        assert_eq!(replacement_replay["generation"], replaced["generation"]);
+    }
+
+    #[test]
+    fn workbench_mcp_commit_v0_requires_explicit_upgrade_and_rejects_invalid_digest() {
+        let id = "wb-commit-v0-upgrade";
+        let valid_digest =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let legacy = serde_json::json!({
+            "schema": "nokv.workbench.run_manifest.v0",
+            "workbench_id": id,
+            "manifest": {"phase": "complete", "legacy_marker": "legacy-v0-upgrade"}
+        });
+        let responses = run_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id,
+                    "section": "metadata",
+                    "path": "run_manifest.json",
+                    "text": serde_json::to_string(&legacy).unwrap(),
+                    "content_type": "application/json"
+                }),
+            ),
+            workbench_tool_call(
+                3,
+                "workbench_find",
+                serde_json::json!({
+                    "committed": true,
+                    "manifest_pattern": "legacy-v0-upgrade",
+                    "include_manifest": true
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_commit",
+                serde_json::json!({
+                    "id": id,
+                    "manifest": {"phase": "complete"},
+                    "content_digest_uri": valid_digest
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_commit",
+                serde_json::json!({
+                    "id": id,
+                    "manifest": {"phase": "complete"},
+                    "content_digest_uri": valid_digest,
+                    "replace": true
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id,
+                    "section": "metadata",
+                    "path": "run_manifest.json",
+                    "format": "structured"
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_commit",
+                serde_json::json!({
+                    "id": "wb-invalid-commit-digest",
+                    "manifest": {"phase": "complete"},
+                    "content_digest_uri": "sha256:ABC"
+                }),
+            ),
+        ]);
+
+        assert_ne!(responses[0]["result"]["isError"], true);
+        assert_ne!(responses[1]["result"]["isError"], true);
+        let legacy_find = &responses[2]["result"]["structuredContent"];
+        assert_ne!(responses[2]["result"]["isError"], true, "{legacy_find}");
+        assert_eq!(legacy_find["match_count"], 1);
+        assert_eq!(
+            legacy_find["matches"][0]["manifest"]["schema"],
+            "nokv.workbench.run_manifest.v0"
+        );
+        assert!(legacy_find["matches"][0]["commit_identity"].is_null());
+        assert_eq!(legacy_find["matches"][0]["commit_identity_verified"], false);
+
+        let legacy_conflict = &responses[3]["result"]["structuredContent"];
+        assert_eq!(responses[3]["result"]["isError"], true);
+        assert_eq!(legacy_conflict["code"], "WorkbenchCommitConflict");
+        assert_eq!(
+            legacy_conflict["details"]["current_schema"],
+            "nokv.workbench.run_manifest.v0"
+        );
+        assert!(legacy_conflict["details"]["current_commit_identity"].is_null());
+
+        let upgraded = &responses[4]["result"]["structuredContent"];
+        assert_ne!(responses[4]["result"]["isError"], true, "{upgraded}");
+        assert_eq!(upgraded["replace"], true);
+        assert_eq!(upgraded["idempotent_replay"], false);
+        let manifest_items = responses[5]["result"]["structuredContent"]["items"]
+            .as_array()
+            .unwrap();
+        assert!(manifest_items.iter().any(|item| {
+            item["value"]["key"] == "schema"
+                && item["value"]["value"] == "nokv.workbench.run_manifest.v1"
+        }));
+
+        let invalid = &responses[6]["result"]["structuredContent"];
+        assert_eq!(responses[6]["result"]["isError"], true);
+        assert_eq!(invalid["code"], "InvalidContentDigestUri");
+        assert_eq!(invalid["retryable"], false);
+    }
+
+    #[test]
+    fn workbench_mcp_live_stat_is_metadata_only_and_matches_snapshot_stat() {
+        use base64::Engine as _;
+
+        let workbench_id = "wb-stat-metadata-only";
+        let checkpoint_name = "stat-contract";
+        let files = [
+            serde_json::json!({
+                "path": "malformed.json",
+                "text": "{not-json",
+                "content_type": "application/json",
+            }),
+            serde_json::json!({
+                "path": "scalar.json",
+                "text": "42",
+                "content_type": "application/json",
+            }),
+            serde_json::json!({
+                "path": "sequence.yaml",
+                "text": "- one\n- two\n",
+                "content_type": "application/yaml",
+            }),
+            serde_json::json!({
+                "path": "binary.dat",
+                "base64": base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe, 0x00]),
+                "content_type": "text/plain",
+            }),
+        ];
+
+        let mut next_request_id = 1_u64;
+        let mut requests = vec![workbench_tool_call(
+            next_request_id,
+            "workbench_create",
+            serde_json::json!({"id": workbench_id}),
+        )];
+        next_request_id += 1;
+        for file in &files {
+            let mut arguments = file.as_object().unwrap().clone();
+            arguments.insert("id".to_owned(), serde_json::json!(workbench_id));
+            arguments.insert("section".to_owned(), serde_json::json!("outputs"));
+            requests.push(workbench_tool_call(
+                next_request_id,
+                "workbench_put_file",
+                serde_json::Value::Object(arguments),
+            ));
+            next_request_id += 1;
+        }
+        requests.push(workbench_tool_call(
+            next_request_id,
+            "workbench_commit",
+            serde_json::json!({
+                "id": workbench_id,
+                "manifest": {"phase": "stat-contract"},
+                "content_digest_uri": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+            }),
+        ));
+        next_request_id += 1;
+        requests.push(workbench_tool_call(
+            next_request_id,
+            "workbench_snapshot",
+            serde_json::json!({"id": workbench_id, "name": checkpoint_name}),
+        ));
+        next_request_id += 1;
+        for file in &files {
+            requests.push(workbench_tool_call(
+                next_request_id,
+                "workbench_stat",
+                serde_json::json!({
+                    "id": workbench_id,
+                    "section": "outputs",
+                    "path": file["path"],
+                }),
+            ));
+            next_request_id += 1;
+        }
+        for file in &files {
+            requests.push(workbench_tool_call(
+                next_request_id,
+                "workbench_stat",
+                serde_json::json!({
+                    "id": workbench_id,
+                    "section": "outputs",
+                    "path": file["path"],
+                    "at_snapshot": checkpoint_name,
+                }),
+            ));
+            next_request_id += 1;
+        }
+
+        let responses = run_shared_workbench_mcp_requests(requests);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let live_stats = &responses[7..11];
+        let snapshot_stats = &responses[11..15];
+        for (file, (live, snapshot)) in files
+            .iter()
+            .zip(live_stats.iter().zip(snapshot_stats.iter()))
+        {
+            let live_card = &live["result"]["structuredContent"]["card"];
+            let snapshot_card = &snapshot["result"]["structuredContent"]["card"];
+            assert_eq!(live_card["name"], file["path"]);
+            for field in [
+                "path",
+                "section",
+                "relative_path",
+                "kind",
+                "size_bytes",
+                "inode",
+                "generation",
+                "content_type",
+                "digest_uri",
+                "producer",
+                "manifest_id",
+                "entry_count",
+                "record_count",
+            ] {
+                assert_eq!(
+                    live_card[field], snapshot_card[field],
+                    "field {field} differs for {}: live={live_card}, snapshot={snapshot_card}",
+                    file["path"]
+                );
+            }
+            assert!(live_card["entry_count"].is_null(), "card: {live_card}");
+            assert!(live_card["record_count"].is_null(), "card: {live_card}");
+        }
     }
 
     #[test]
@@ -3711,6 +4154,7 @@ mod tests {
                     "name": "workbench_commit",
                     "arguments": {
                         "id": "spedas-task-010",
+                        "content_digest_uri": "sha256:1000000000000000000000000000000000000000000000000000000000000010",
                         "manifest": {
                             "task": "spedas-task-010",
                             "dataset": "spedas",
@@ -3777,6 +4221,32 @@ mod tests {
             responses[3]["result"]["structuredContent"]["matches"][0]["manifest_summary"]
                 ["manifest_task"],
             "spedas-task-010"
+        );
+        assert_eq!(
+            responses[3]["result"]["structuredContent"]["matches"][0]["content_digest_uri"],
+            "sha256:1000000000000000000000000000000000000000000000000000000000000010"
+        );
+        assert!(
+            responses[3]["result"]["structuredContent"]["matches"][0]["manifest_digest_uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(
+            responses[3]["result"]["structuredContent"]["matches"][0]["commit_identity"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_eq!(
+            responses[3]["result"]["structuredContent"]["matches"][0]["commit_identity_verified"],
+            true
+        );
+        assert!(
+            responses[3]["result"]["structuredContent"]["matches"][0]["envelope_digest_uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
         );
         assert_eq!(
             responses[4]["result"]["structuredContent"]["matches"][0]["workbench_id"],
@@ -4925,6 +5395,140 @@ mod tests {
     }
 
     #[test]
+    fn workbench_mcp_put_replace_and_ndjson_behavior_is_explicit() {
+        let responses = run_shared_workbench_mcp_requests(vec![
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_create",
+                    "arguments": {"id": "write-contract-001"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_put_file",
+                    "arguments": {
+                        "id": "write-contract-001",
+                        "section": "outputs",
+                        "path": "missing.jsonl",
+                        "text": "{\"event\":1}\n",
+                        "content_type": "text/plain; charset=utf-8",
+                        "replace": true
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_put_file",
+                    "arguments": {
+                        "id": "write-contract-001",
+                        "section": "outputs",
+                        "path": "wire.jsonl",
+                        "text": "{\"event\":1}\n{\"event\":2}\n",
+                        "content_type": "application/x-ndjson"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_read",
+                    "arguments": {
+                        "id": "write-contract-001",
+                        "section": "outputs",
+                        "path": "wire.jsonl",
+                        "format": "structured"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_read",
+                    "arguments": {
+                        "id": "write-contract-001",
+                        "section": "outputs",
+                        "path": "wire.jsonl",
+                        "format": "bytes"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_put_file",
+                    "arguments": {
+                        "id": "write-contract-001",
+                        "section": "outputs",
+                        "path": "text.jsonl",
+                        "text": "{\"event\":1}\n{\"event\":2}\n",
+                        "content_type": "text/plain; charset=utf-8"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_read",
+                    "arguments": {
+                        "id": "write-contract-001",
+                        "section": "outputs",
+                        "path": "text.jsonl",
+                        "format": "structured"
+                    }
+                }
+            }),
+        ]);
+
+        assert_ne!(responses[0]["result"]["isError"], true);
+        assert_eq!(responses[1]["result"]["isError"], true);
+        let replace_error = responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            replace_error.to_ascii_lowercase().contains("not found"),
+            "replace error: {replace_error}"
+        );
+        assert_ne!(responses[2]["result"]["isError"], true);
+        assert_eq!(responses[3]["result"]["isError"], true);
+        let ndjson_error = responses[3]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ndjson_error
+                .contains("structured read does not support content type application/x-ndjson"),
+            "structured NDJSON error: {ndjson_error}"
+        );
+        assert_ne!(responses[4]["result"]["isError"], true);
+        assert_eq!(
+            responses[4]["result"]["structuredContent"]["bytes_encoding"],
+            "base64"
+        );
+        assert_ne!(responses[5]["result"]["isError"], true);
+        let text_read = &responses[6]["result"]["structuredContent"];
+        assert_eq!(text_read["record_type"], "text_lines");
+        assert_eq!(text_read["items"].as_array().unwrap().len(), 2);
+        assert_eq!(text_read["items"][0]["value"]["text"], "{\"event\":1}");
+        assert_eq!(text_read["items"][1]["value"]["text"], "{\"event\":2}");
+    }
+
+    #[test]
     fn workbench_mcp_rejects_section_prefixed_paths() {
         let responses = run_shared_workbench_mcp_requests(vec![
             serde_json::json!({
@@ -5054,6 +5658,7 @@ mod tests {
                     "name": "workbench_commit",
                     "arguments": {
                         "id": "spedas-task-004",
+                        "content_digest_uri": "sha256:1000000000000000000000000000000000000000000000000000000000000004",
                         "manifest": "done"
                     }
                 }
@@ -5177,7 +5782,11 @@ mod tests {
             workbench_tool_call(
                 3,
                 "workbench_commit",
-                serde_json::json!({"id": id, "manifest": {"task": id}}),
+                serde_json::json!({
+                    "id": id,
+                    "manifest": {"task": id},
+                    "content_digest_uri": "sha256:2000000000000000000000000000000000000000000000000000000000000001"
+                }),
             ),
         ]
     }
@@ -5190,7 +5799,13 @@ mod tests {
         requests.push(workbench_tool_call(
             4,
             "workbench_snapshot",
-            serde_json::json!({"id": id, "name": "handoff", "ttl_days": 14}),
+            serde_json::json!({
+                "id": id,
+                "name": "handoff",
+                "ttl_days": 14,
+                "reason": "handoff 交接",
+                "metadata": {"job_hash": "sha256:example", "attempt": 2}
+            }),
         ));
         requests.push(workbench_tool_call(
             5,
@@ -5207,6 +5822,13 @@ mod tests {
         let snap = &responses[3]["result"]["structuredContent"];
         assert_eq!(snap["name"], "handoff", "snapshot: {snap}");
         assert_eq!(snap["ttl_days"], 14);
+        assert_eq!(
+            snap["annotation"],
+            serde_json::json!({
+                "reason": "handoff 交接",
+                "metadata": {"job_hash": "sha256:example", "attempt": 2}
+            })
+        );
         assert_eq!(snap["registry"]["written"], true, "snapshot: {snap}");
         assert!(snap["expiry_warning"].is_null(), "snapshot: {snap}");
         let sid = snap["snapshot_id"].as_u64().unwrap();
@@ -5222,7 +5844,8 @@ mod tests {
         assert_eq!(list["checkpoints"][0]["name"], "handoff");
         assert_eq!(list["checkpoints"][0]["snapshot_id"].as_u64().unwrap(), sid);
         assert_eq!(list["checkpoints"][0]["state"], "alive");
-        assert_eq!(list["checkpoints"][0]["reason"], "mint");
+        assert_eq!(list["checkpoints"][0]["event_kind"], "mint");
+        assert_eq!(list["checkpoints"][0]["annotation"], snap["annotation"]);
     }
 
     #[test]
@@ -5266,13 +5889,93 @@ mod tests {
     }
 
     #[test]
+    fn workbench_mcp_snapshot_registry_failure_is_a_compensatable_partial_error() {
+        let id = "ckpt-registry-partial-annotation-013";
+        let setup = run_shared_workbench_mcp_requests(commit_snapshot_prelude(id));
+        for response in &setup {
+            assert_ne!(response["result"]["isError"], true, "setup: {response}");
+        }
+
+        let workbench_path = format!("/workbenches/{id}");
+        with_shared_workbench_client(|client| {
+            client
+                .metadata()
+                .mkdir(
+                    &format!("{workbench_path}/metadata/checkpoints.jsonl"),
+                    DEFAULT_MODE_DIR,
+                    DEFAULT_UID,
+                    DEFAULT_GID,
+                )
+                .unwrap();
+        });
+
+        let responses = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({
+                "id": id,
+                "name": "partial",
+                "ttl_days": 3,
+                "reason": "recovery handoff",
+                "metadata": {"job_hash": "job-013"}
+            }),
+        )]);
+        assert_eq!(responses[0]["result"]["isError"], true);
+        let error = &responses[0]["result"]["structuredContent"];
+        assert_eq!(error["code"], "SnapshotRegistryWritePartial");
+        assert_eq!(error["retryable"], false);
+        assert_eq!(error["details"]["operation"], "mint");
+        assert_eq!(error["details"]["registry"]["written"], false);
+        assert_eq!(
+            error["details"]["annotation"],
+            serde_json::json!({
+                "reason": "recovery handoff",
+                "metadata": {"job_hash": "job-013"}
+            })
+        );
+        let snapshot_id = error["details"]["snapshot_id"].as_u64().unwrap();
+        assert!(snapshot_id > 0);
+        assert!(error["details"]["lease_expires_unix_ms"].as_u64().is_some());
+        assert_eq!(
+            error["details"]["compensation"]["retire"]["arguments"],
+            serde_json::json!({"id": id, "snapshot_id": snapshot_id})
+        );
+        assert_eq!(
+            error["details"]["compensation"]["retry_after_retire"]["arguments"]["metadata"]
+                ["job_hash"],
+            "job-013"
+        );
+
+        with_shared_workbench_client(|client| {
+            let status = client
+                .metadata()
+                .snapshot_pin_status(&workbench_path, snapshot_id)
+                .unwrap();
+            assert!(
+                status.pin.is_some(),
+                "partial error must identify the live pin"
+            );
+            assert!(client
+                .metadata()
+                .retire_snapshot(&workbench_path, snapshot_id)
+                .unwrap());
+        });
+    }
+
+    #[test]
     fn workbench_mcp_snapshot_renew_extends_the_lease() {
         let id = "ckpt-renew-004";
         let mut requests = commit_snapshot_prelude(id);
         requests.push(workbench_tool_call(
             4,
             "workbench_snapshot",
-            serde_json::json!({"id": id, "name": "pre", "ttl_days": 1}),
+            serde_json::json!({
+                "id": id,
+                "name": "pre",
+                "ttl_days": 1,
+                "reason": "pre-flight",
+                "metadata": {"owner": "agent-7"}
+            }),
         ));
         requests.push(workbench_tool_call(
             5,
@@ -5293,6 +5996,7 @@ mod tests {
         assert_eq!(renew["renewed"], true, "renew: {renew}");
         assert_eq!(renew["name"], "pre", "renew: {renew}");
         assert_eq!(renew["ttl_days"], 60);
+        assert_eq!(renew["annotation"], mint["annotation"]);
         assert!(
             lease_after > lease_before,
             "renew lease {lease_after} did not extend {lease_before}"
@@ -5352,6 +6056,186 @@ mod tests {
     }
 
     #[test]
+    fn workbench_mcp_snapshot_retire_by_name_is_idempotent_and_listed() {
+        let id = "ckpt-retire-014";
+        let mut setup_requests = commit_snapshot_prelude(id);
+        setup_requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": id, "name": "handoff", "ttl_days": 7}),
+        ));
+        let setup = run_shared_workbench_mcp_requests(setup_requests);
+        for (index, response) in setup.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "setup response {index}: {response}"
+            );
+        }
+        let snapshot_id = setup[3]["result"]["structuredContent"]["snapshot_id"]
+            .as_u64()
+            .unwrap();
+
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_snapshot_retire",
+                serde_json::json!({
+                    "id": id,
+                    "name": "handoff",
+                    "reason": "handoff consumed"
+                }),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_snapshot_retire",
+                serde_json::json!({
+                    "id": id,
+                    "snapshot_id": snapshot_id,
+                    "reason": "handoff consumed"
+                }),
+            ),
+            workbench_tool_call(3, "workbench_snapshot_list", serde_json::json!({"id": id})),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let retired = &responses[0]["result"]["structuredContent"];
+        assert_eq!(retired["snapshot_id"], snapshot_id, "retire: {retired}");
+        assert_eq!(retired["name"], "handoff", "retire: {retired}");
+        assert_eq!(retired["retired"], true, "retire: {retired}");
+        assert_eq!(retired["state"], "retired", "retire: {retired}");
+        assert_eq!(
+            retired["retire_annotation"],
+            serde_json::json!({"reason": "handoff consumed", "metadata": null}),
+            "retire: {retired}"
+        );
+        assert_eq!(retired["registry"]["written"], true, "retire: {retired}");
+
+        let replay = &responses[1]["result"]["structuredContent"];
+        assert_eq!(replay["snapshot_id"], snapshot_id, "replay: {replay}");
+        assert_eq!(replay["retired"], false, "replay: {replay}");
+        assert_eq!(replay["state"], "already_absent", "replay: {replay}");
+        assert_eq!(
+            replay["registry"]["already_recorded"], true,
+            "replay: {replay}"
+        );
+
+        let list = &responses[2]["result"]["structuredContent"];
+        assert_eq!(list["checkpoint_count"], 1, "list: {list}");
+        let checkpoint = &list["checkpoints"][0];
+        assert_eq!(
+            checkpoint["snapshot_id"], snapshot_id,
+            "checkpoint: {checkpoint}"
+        );
+        assert_eq!(checkpoint["state"], "retired", "checkpoint: {checkpoint}");
+        assert_eq!(
+            checkpoint["explicitly_retired"], true,
+            "checkpoint: {checkpoint}"
+        );
+        assert_eq!(checkpoint["retire_count"], 1, "checkpoint: {checkpoint}");
+        assert_eq!(
+            checkpoint["last_retire_outcome"], "retired",
+            "checkpoint: {checkpoint}"
+        );
+        assert_eq!(
+            checkpoint["retire_annotation"], retired["retire_annotation"],
+            "checkpoint: {checkpoint}"
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_retire_unknown_id_does_not_fabricate_registry_state() {
+        let id = "ckpt-retire-unknown-015";
+        let mut setup_requests = commit_snapshot_prelude(id);
+        setup_requests.push(workbench_tool_call(
+            4,
+            "workbench_snapshot",
+            serde_json::json!({"id": id, "name": "known", "ttl_days": 7}),
+        ));
+        let setup = run_shared_workbench_mcp_requests(setup_requests);
+        for (index, response) in setup.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "setup response {index}: {response}"
+            );
+        }
+        let known_snapshot_id = setup[3]["result"]["structuredContent"]["snapshot_id"]
+            .as_u64()
+            .unwrap();
+        // Snapshot ids reserve their high 16 bits for the metadata shard. Use
+        // a distant local id so this exercises the already-absent path on the
+        // correct shard instead of the intentional cross-shard mismatch path.
+        let unknown_snapshot_id = known_snapshot_id.checked_add(1_000_000).unwrap();
+
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_snapshot_retire",
+                serde_json::json!({"id": id, "snapshot_id": unknown_snapshot_id}),
+            ),
+            workbench_tool_call(2, "workbench_snapshot_list", serde_json::json!({"id": id})),
+        ]);
+        for (index, response) in responses.iter().enumerate() {
+            assert_ne!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+
+        let retire = &responses[0]["result"]["structuredContent"];
+        assert_eq!(
+            retire["snapshot_id"], unknown_snapshot_id,
+            "retire: {retire}"
+        );
+        assert_eq!(retire["retired"], false, "retire: {retire}");
+        assert_eq!(retire["state"], "already_absent", "retire: {retire}");
+        assert_eq!(retire["registry"]["written"], false, "retire: {retire}");
+        assert_eq!(retire["registry"]["skipped"], true, "retire: {retire}");
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["checkpoint_count"], 1,
+            "list: {}",
+            responses[1]
+        );
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["checkpoints"][0]["snapshot_id"],
+            known_snapshot_id,
+            "list: {}",
+            responses[1]
+        );
+    }
+
+    #[test]
+    fn workbench_mcp_snapshot_retire_requires_exactly_one_target() {
+        let id = "ckpt-retire-target-016";
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                1,
+                "workbench_snapshot_retire",
+                serde_json::json!({"id": id}),
+            ),
+            workbench_tool_call(
+                2,
+                "workbench_snapshot_retire",
+                serde_json::json!({"id": id, "snapshot_id": 1, "name": "both"}),
+            ),
+        ]);
+        for response in &responses {
+            assert_eq!(response["result"]["isError"], true, "response: {response}");
+            assert!(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("provide exactly one of snapshot_id or name"),
+                "response: {response}"
+            );
+        }
+    }
+
+    #[test]
     fn workbench_mcp_rejects_foreign_snapshot_ids_with_typed_errors() {
         let source_id = "ckpt-owner-source-012";
         let target_id = "ckpt-owner-target-012";
@@ -5385,6 +6269,14 @@ mod tests {
                     "id": target_id,
                     "snapshot_id": snapshot_id,
                     "ttl_days": 30,
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_snapshot_retire",
+                serde_json::json!({
+                    "id": target_id,
+                    "snapshot_id": snapshot_id,
                 }),
             ),
         ]);
@@ -5527,7 +6419,11 @@ mod tests {
             workbench_tool_call(
                 3,
                 "workbench_commit",
-                serde_json::json!({"id": id, "manifest": {"task": id}}),
+                serde_json::json!({
+                    "id": id,
+                    "manifest": {"task": id},
+                    "content_digest_uri": "sha256:2000000000000000000000000000000000000000000000000000000000000002"
+                }),
             ),
             workbench_tool_call(
                 4,
@@ -5614,7 +6510,11 @@ mod tests {
             workbench_tool_call(
                 3,
                 "workbench_commit",
-                serde_json::json!({"id": id, "manifest": {"task": id}}),
+                serde_json::json!({
+                    "id": id,
+                    "manifest": {"task": id},
+                    "content_digest_uri": "sha256:2000000000000000000000000000000000000000000000000000000000000003"
+                }),
             ),
             workbench_tool_call(4, "workbench_snapshot", serde_json::json!({"id": id})),
         ]);
@@ -5648,6 +6548,394 @@ mod tests {
         assert_eq!(frozen["items"][0]["value"]["text"], "one");
     }
 
+    fn shared_workbench_snapshot(id: &str, lease_ms: u64) -> nokv_client::SnapshotOutcome {
+        with_shared_workbench_client(|client| {
+            client
+                .metadata()
+                .snapshot_subtree_path_with_lease(&format!("/workbenches/{id}"), lease_ms)
+                .unwrap()
+        })
+    }
+
+    fn assert_snapshot_read_page_contract(page: &serde_json::Value) {
+        let truncated = page["truncated"].as_bool().unwrap();
+        let next_cursor = &page["next_cursor"];
+        assert!(
+            next_cursor.is_null() || next_cursor.is_string(),
+            "next_cursor must be a string or null: {page}"
+        );
+        assert_eq!(
+            truncated,
+            next_cursor.is_string(),
+            "truncated must exactly match next_cursor presence: {page}"
+        );
+    }
+
+    fn snapshot_page_bytes(page: &serde_json::Value) -> Vec<u8> {
+        use base64::Engine as _;
+
+        base64::engine::general_purpose::STANDARD
+            .decode(page["bytes"].as_str().unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_bytes_cursor_pages_first_middle_and_last() {
+        let id = "ckpt-bytes-page-011";
+        let setup = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.bin", "text": "abcdef"
+                }),
+            ),
+        ]);
+        for response in &setup {
+            assert_ne!(response["result"]["isError"], true, "setup: {response}");
+        }
+        let snapshot_id = shared_workbench_snapshot(id, TEST_MS_PER_DAY).snapshot_id;
+
+        let first = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            3,
+            "workbench_read",
+            serde_json::json!({
+                "id": id,
+                "section": "outputs",
+                "path": "data.bin",
+                "format": "bytes",
+                "at_snapshot": snapshot_id,
+                "limit": 2,
+            }),
+        )]);
+        assert_ne!(first[0]["result"]["isError"], true, "first: {}", first[0]);
+        let first_page = &first[0]["result"]["structuredContent"];
+        assert_eq!(snapshot_page_bytes(first_page), b"ab");
+        assert!(first_page["cursor"].is_null());
+        assert_eq!(first_page["next_cursor"], "2");
+        assert_snapshot_read_page_contract(first_page);
+
+        let middle_cursor = first_page["next_cursor"].as_str().unwrap();
+        let middle = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            4,
+            "workbench_read",
+            serde_json::json!({
+                "id": id,
+                "section": "outputs",
+                "path": "data.bin",
+                "format": "bytes",
+                "at_snapshot": snapshot_id,
+                "cursor": middle_cursor,
+                "offset": 5,
+                "limit": 2,
+            }),
+        )]);
+        assert_ne!(
+            middle[0]["result"]["isError"], true,
+            "middle: {}",
+            middle[0]
+        );
+        let middle_page = &middle[0]["result"]["structuredContent"];
+        assert_eq!(snapshot_page_bytes(middle_page), b"cd");
+        assert_eq!(middle_page["cursor"], "2");
+        assert_eq!(middle_page["next_cursor"], "4");
+        assert_snapshot_read_page_contract(middle_page);
+
+        let last_cursor = middle_page["next_cursor"].as_str().unwrap();
+        let last = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            5,
+            "workbench_read",
+            serde_json::json!({
+                "id": id,
+                "section": "outputs",
+                "path": "data.bin",
+                "format": "bytes",
+                "at_snapshot": snapshot_id,
+                "cursor": last_cursor,
+                "limit": 2,
+            }),
+        )]);
+        assert_ne!(last[0]["result"]["isError"], true, "last: {}", last[0]);
+        let last_page = &last[0]["result"]["structuredContent"];
+        assert_eq!(snapshot_page_bytes(last_page), b"ef");
+        assert_eq!(last_page["cursor"], "4");
+        assert!(last_page["next_cursor"].is_null());
+        assert_snapshot_read_page_contract(last_page);
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_text_cursor_pages_first_middle_and_last() {
+        let id = "ckpt-text-page-012";
+        let setup = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id,
+                    "section": "outputs",
+                    "path": "data.txt",
+                    "text": "alpha\nbeta\ngamma\n"
+                }),
+            ),
+        ]);
+        for response in &setup {
+            assert_ne!(response["result"]["isError"], true, "setup: {response}");
+        }
+        let snapshot_id = shared_workbench_snapshot(id, TEST_MS_PER_DAY).snapshot_id;
+
+        let first = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            3,
+            "workbench_read",
+            serde_json::json!({
+                "id": id,
+                "section": "outputs",
+                "path": "data.txt",
+                "at_snapshot": snapshot_id,
+                "limit": 1,
+            }),
+        )]);
+        let first_page = &first[0]["result"]["structuredContent"];
+        assert_ne!(first[0]["result"]["isError"], true, "first: {first_page}");
+        assert_eq!(first_page["items"][0]["value"]["text"], "alpha");
+        assert!(first_page["cursor"].is_null());
+        assert_eq!(first_page["next_cursor"], "1");
+        assert_snapshot_read_page_contract(first_page);
+
+        let middle_cursor = first_page["next_cursor"].as_str().unwrap();
+        let middle = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            4,
+            "workbench_read",
+            serde_json::json!({
+                "id": id,
+                "section": "outputs",
+                "path": "data.txt",
+                "at_snapshot": snapshot_id,
+                "cursor": middle_cursor,
+                "offset": 99,
+                "limit": 1,
+            }),
+        )]);
+        let middle_page = &middle[0]["result"]["structuredContent"];
+        assert_ne!(
+            middle[0]["result"]["isError"], true,
+            "middle: {middle_page}"
+        );
+        assert_eq!(middle_page["items"][0]["value"]["text"], "beta");
+        assert_eq!(middle_page["cursor"], "1");
+        assert_eq!(middle_page["next_cursor"], "2");
+        assert_snapshot_read_page_contract(middle_page);
+
+        let last_cursor = middle_page["next_cursor"].as_str().unwrap();
+        let last = run_shared_workbench_mcp_requests(vec![workbench_tool_call(
+            5,
+            "workbench_read",
+            serde_json::json!({
+                "id": id,
+                "section": "outputs",
+                "path": "data.txt",
+                "at_snapshot": snapshot_id,
+                "cursor": last_cursor,
+                "limit": 1,
+            }),
+        )]);
+        let last_page = &last[0]["result"]["structuredContent"];
+        assert_ne!(last[0]["result"]["isError"], true, "last: {last_page}");
+        assert_eq!(last_page["items"][0]["value"]["text"], "gamma");
+        assert_eq!(last_page["cursor"], "2");
+        assert!(last_page["next_cursor"].is_null());
+        assert_snapshot_read_page_contract(last_page);
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_read_validates_cursor_and_limit_in_handler() {
+        let id = "ckpt-read-validation-013";
+        let setup = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt", "text": "a\nb\n"
+                }),
+            ),
+        ]);
+        for response in &setup {
+            assert_ne!(response["result"]["isError"], true, "setup: {response}");
+        }
+        let snapshot_id = shared_workbench_snapshot(id, TEST_MS_PER_DAY).snapshot_id;
+        let responses = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt",
+                    "format": "bytes", "at_snapshot": snapshot_id, "cursor": "not-a-number"
+                }),
+            ),
+            workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt",
+                    "at_snapshot": snapshot_id, "cursor": "-1"
+                }),
+            ),
+            workbench_tool_call(
+                5,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt",
+                    "at_snapshot": snapshot_id, "limit": 0
+                }),
+            ),
+            workbench_tool_call(
+                6,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt",
+                    "at_snapshot": snapshot_id, "limit": 301
+                }),
+            ),
+            workbench_tool_call(
+                7,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt",
+                    "format": "bytes", "at_snapshot": snapshot_id, "cursor": "99"
+                }),
+            ),
+            workbench_tool_call(
+                8,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.txt",
+                    "at_snapshot": snapshot_id, "cursor": "99"
+                }),
+            ),
+        ]);
+        let expected_messages = [
+            "invalid snapshot bytes cursor",
+            "invalid snapshot text cursor",
+            "limit must be between 1 and 300",
+            "limit must be between 1 and 300",
+            "exceeds total size",
+            "exceeds total line count",
+        ];
+        for (response, message) in responses.iter().zip(expected_messages) {
+            assert_eq!(response["result"]["isError"], true, "response: {response}");
+            assert!(
+                response["result"]["structuredContent"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(message),
+                "expected {message:?}: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_bytes_rejects_zero_progress_before_eof() {
+        let id = "ckpt-read-stall-014";
+        let setup = run_shared_workbench_mcp_requests(vec![
+            workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+            workbench_tool_call(
+                2,
+                "workbench_put_file",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.bin", "text": "abc"
+                }),
+            ),
+        ]);
+        for response in &setup {
+            assert_ne!(response["result"]["isError"], true, "setup: {response}");
+        }
+        let snapshot_id = shared_workbench_snapshot(id, TEST_MS_PER_DAY).snapshot_id;
+        let mut options = workbench_mcp_options();
+        options.workbench_max_bytes = 0;
+        let responses = run_shared_workbench_mcp_requests_with_options(
+            options,
+            vec![workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.bin",
+                    "format": "bytes", "at_snapshot": snapshot_id, "limit": 1
+                }),
+            )],
+        );
+        let error = &responses[0]["result"]["structuredContent"];
+        assert_eq!(responses[0]["result"]["isError"], true, "error: {error}");
+        assert_eq!(error["code"], "SnapshotPaginationStalled");
+        assert_eq!(error["details"]["cursor"], 0);
+        assert_eq!(error["details"]["total"], 3);
+    }
+
+    #[test]
+    fn workbench_mcp_at_snapshot_cursor_fails_after_lease_expires() {
+        let id = "ckpt-read-expiry-015";
+        // Hold one fixture session across the short lease so unrelated test
+        // batches cannot consume the lease while this test waits for the lock.
+        let session = SharedWorkbenchMcpSession::acquire();
+        let setup = session.run_requests(
+            workbench_mcp_options(),
+            vec![
+                workbench_tool_call(1, "workbench_create", serde_json::json!({"id": id})),
+                workbench_tool_call(
+                    2,
+                    "workbench_put_file",
+                    serde_json::json!({
+                        "id": id, "section": "outputs", "path": "data.bin", "text": "abcdef"
+                    }),
+                ),
+            ],
+        );
+        for response in &setup {
+            assert_ne!(response["result"]["isError"], true, "setup: {response}");
+        }
+        let snapshot = session
+            .direct_client()
+            .metadata()
+            .snapshot_subtree_path_with_lease(&format!("/workbenches/{id}"), 1_000)
+            .unwrap();
+        let first = session.run_requests(
+            workbench_mcp_options(),
+            vec![workbench_tool_call(
+                3,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.bin", "format": "bytes",
+                    "at_snapshot": snapshot.snapshot_id, "limit": 2
+                }),
+            )],
+        );
+        let first_page = &first[0]["result"]["structuredContent"];
+        assert_ne!(first[0]["result"]["isError"], true, "first: {first_page}");
+        let cursor = first_page["next_cursor"].as_str().unwrap().to_owned();
+        let wait_ms = snapshot
+            .lease_expires_unix_ms
+            .saturating_sub(now_unix_ms())
+            .saturating_add(25);
+        thread::sleep(Duration::from_millis(wait_ms));
+
+        let second = session.run_requests(
+            workbench_mcp_options(),
+            vec![workbench_tool_call(
+                4,
+                "workbench_read",
+                serde_json::json!({
+                    "id": id, "section": "outputs", "path": "data.bin", "format": "bytes",
+                    "at_snapshot": snapshot.snapshot_id, "cursor": cursor, "limit": 2
+                }),
+            )],
+        );
+        let error = &second[0]["result"]["structuredContent"];
+        assert_eq!(second[0]["result"]["isError"], true, "error: {error}");
+        assert_eq!(error["code"], "SnapshotLeaseExpired", "error: {error}");
+        assert_eq!(error["details"]["snapshot_id"], snapshot.snapshot_id);
+    }
+
     #[test]
     fn workbench_mcp_at_snapshot_list_pages_with_opaque_cursor() {
         let id = "ckpt-list-page-010";
@@ -5668,7 +6956,11 @@ mod tests {
         requests.push(workbench_tool_call(
             5,
             "workbench_commit",
-            serde_json::json!({"id": id, "manifest": {"task": id}}),
+            serde_json::json!({
+                "id": id,
+                "manifest": {"task": id},
+                "content_digest_uri": "sha256:2000000000000000000000000000000000000000000000000000000000000004"
+            }),
         ));
         requests.push(workbench_tool_call(
             6,
@@ -5725,7 +7017,11 @@ mod tests {
             workbench_tool_call(
                 3,
                 "workbench_commit",
-                serde_json::json!({"id": id, "manifest": {"task": id}}),
+                serde_json::json!({
+                    "id": id,
+                    "manifest": {"task": id},
+                    "content_digest_uri": "sha256:2000000000000000000000000000000000000000000000000000000000000005"
+                }),
             ),
             workbench_tool_call(
                 4,
@@ -6016,13 +7312,6 @@ mod tests {
         response["result"]["structuredContent"].clone()
     }
 
-    fn attack_direct_client() -> NoKvFsClient<LocalObjectStore> {
-        let (addr, object_root) = shared_workbench_mcp_server();
-        let store =
-            LocalObjectStore::new(LocalObjectStoreOptions::new(object_root.clone())).unwrap();
-        NoKvFsClient::connect(*addr, store)
-    }
-
     // ---------- append ----------
 
     #[test]
@@ -6049,11 +7338,10 @@ mod tests {
         assert_eq!(second["appended_bytes"], 4);
         assert_eq!(second["size_bytes"], 4);
         assert_eq!(second["created"], false);
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-append-empty/logs/run.log")
-                .unwrap(),
+                .unwrap()),
             b"data"
         );
     }
@@ -6145,22 +7433,23 @@ mod tests {
         attack_tool_ok(&responses[0]);
         // Another NoKV client drops a file directly under the workbench root,
         // outside every section.
-        let direct = attack_direct_client();
-        direct
-            .put_artifact(
-                "/workbenches/attack-append-oob/oob.txt",
-                b"out-of-band".to_vec(),
-                ArtifactMetadata {
-                    producer: "outside-writer".to_owned(),
-                    digest_uri: "sha256:demo".to_owned(),
-                    content_type: "text/plain".to_owned(),
-                    manifest_id: "oob.txt".to_owned(),
-                    mode: DEFAULT_MODE_FILE,
-                    uid: DEFAULT_UID,
-                    gid: DEFAULT_GID,
-                },
-            )
-            .unwrap();
+        with_shared_workbench_client(|client| {
+            client
+                .put_artifact(
+                    "/workbenches/attack-append-oob/oob.txt",
+                    b"out-of-band".to_vec(),
+                    ArtifactMetadata {
+                        producer: "outside-writer".to_owned(),
+                        digest_uri: "sha256:demo".to_owned(),
+                        content_type: "text/plain".to_owned(),
+                        manifest_id: "oob.txt".to_owned(),
+                        mode: DEFAULT_MODE_FILE,
+                        uid: DEFAULT_UID,
+                        gid: DEFAULT_GID,
+                    },
+                )
+                .unwrap();
+        });
         let attempts = run_shared_workbench_mcp_requests(vec![
             // Escape through '..' must be rejected.
             workbench_tool_call(
@@ -6187,9 +7476,9 @@ mod tests {
         );
         // The out-of-band file must be untouched.
         assert_eq!(
-            direct
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-append-oob/oob.txt")
-                .unwrap(),
+                .unwrap()),
             b"out-of-band"
         );
     }
@@ -6223,11 +7512,10 @@ mod tests {
                 "append response: {appended}"
             );
         }
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-append-thirty/logs/run.log")
-                .unwrap(),
+                .unwrap()),
             expected.as_bytes()
         );
     }
@@ -6262,11 +7550,10 @@ mod tests {
                 && replaced["generation"].as_u64().unwrap() > first["generation"].as_u64().unwrap(),
             "generations must be monotonic: {first} / {replaced} / {second}"
         );
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-append-interleave/outputs/f.txt")
-                .unwrap(),
+                .unwrap()),
             b"RESETb"
         );
     }
@@ -6311,11 +7598,10 @@ mod tests {
             put["generation"].as_u64().unwrap(),
             "stat after no-op edit: {stat}"
         );
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-edit-noop/scripts/s.py")
-                .unwrap(),
+                .unwrap()),
             b"hello world"
         );
     }
@@ -6368,11 +7654,10 @@ mod tests {
         assert_eq!(edit["size_bytes"], 0, "edit: {edit}");
         let stat = attack_tool_ok(&responses[3]);
         assert_eq!(stat["card"]["size_bytes"], 0, "stat: {stat}");
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-edit-toempty/outputs/f.txt")
-                .unwrap(),
+                .unwrap()),
             b""
         );
     }
@@ -6434,11 +7719,10 @@ mod tests {
         );
         let edit = attack_tool_ok(&responses[3]);
         assert_eq!(edit["replacements"], 100, "edit: {edit}");
-        let client = attack_direct_client();
         assert_eq!(
-            client
+            with_shared_workbench_client(|client| client
                 .cat("/workbenches/attack-edit-hundred/outputs/many.txt")
-                .unwrap(),
+                .unwrap()),
             expected.as_bytes()
         );
     }

@@ -348,8 +348,25 @@ marker.
 
 If port `7799` is occupied, identify the listener first:
 
-```bash
-lsof -nP -iTCP@127.0.0.1:7799 -sTCP:LISTEN
+```text
+workbench_create
+workbench_put_file
+workbench_append
+workbench_edit
+workbench_list
+workbench_stat
+workbench_read
+workbench_grep
+workbench_search
+workbench_aggregate
+workbench_catalog
+workbench_find
+workbench_commit
+workbench_snapshot
+workbench_snapshot_renew
+workbench_snapshot_retire
+workbench_snapshot_list
+workbench_restore
 ```
 
 The helper must not terminate an unverified process. For the default local
@@ -360,6 +377,88 @@ Once `restore_to_fork_v1_active` exists in metadata, never test an older,
 pre-restore metadata server against that directory. The typed global drain,
 full fsck, and post-drain metadata checkpoint are a separate controlled
 downgrade procedure.
+
+## File Publication And Structured Read Contract
+
+`workbench_put_file` has two exclusive modes; it is not upsert:
+
+- `replace=false` (the default) is create-only and fails when the target
+  already exists.
+- `replace=true` is replace-only and fails when the target is missing. Use it
+  only when replacing an existing whole file intentionally.
+
+`workbench_append` is a separate operation and creates its target when missing.
+Do not use `replace=true` as a create fallback after a speculative write: an
+exists/not-found race is a coordination conflict that the caller must observe.
+
+Live `workbench_read` with `format="structured"` parses JSON, YAML, and UTF-8
+text records. It does not natively parse `application/x-ndjson`, and there is
+no NDJSON record-pagination contract. A `.jsonl` suffix alone does not select a
+parser: store the file with a `text/*` content type to receive raw
+`record_type="text_lines"` records and parse each `value.text` yourself. For
+`application/x-ndjson` or any other unsupported content type, use
+`format="bytes"`. At a snapshot, non-bytes reads expose UTF-8 text lines as a
+snapshot-specific raw-text mode; that is still not an NDJSON parser.
+
+## Commit Identity Contract
+
+`workbench_commit` publishes `metadata/run_manifest.json` with schema
+`nokv.workbench.run_manifest.v1`. The call requires `content_digest_uri` in the
+exact form `sha256:<64 lowercase hex>`. LingTai must compute this digest before
+the call from the job outputs or another stable, application-owned content
+description; a phase label alone is not content identity.
+
+NoKV separately hashes the compact canonical JSON manifest (recursively sorted
+object keys, array order preserved) as `manifest_digest_uri`, then derives
+`commit_identity` from the workbench id, content digest, and manifest digest
+under the `nokv.workbench.commit_identity.v1` domain. The server timestamp is
+not part of either identity.
+
+The identity byte stream is unambiguous and portable: start with
+`b"nokv.workbench.commit_identity.v1\0"`, then append the workbench id,
+`content_digest_uri`, and `manifest_digest_uri` in that order, each prefixed by
+its unsigned 64-bit big-endian UTF-8 byte length. `commit_identity` is the
+lowercase `sha256:` URI of that complete stream.
+
+An exact retry returns the existing commit with `idempotent_replay=true`,
+including after a committed response was lost. A different identity returns
+`WorkbenchCommitConflict`, even when both manifests have the same phase.
+Replacing a different commit or upgrading a legacy v0 manifest requires an
+explicit `replace=true`; a concurrent identity change still fails closed.
+Legacy v0 manifests remain readable by `workbench_find`, but they never count
+as an identity match.
+
+## Snapshot Annotation Contract
+
+`workbench_snapshot` accepts optional `reason` and `metadata` fields. `reason`
+is a non-empty human-readable string bounded to 256 Unicode characters and
+1024 UTF-8 bytes. `metadata` is a JSON object bounded to 4096 canonical bytes,
+8 container levels, and 64 object keys across the complete value. The returned
+`annotation` is also preserved by checkpoint list and renew responses; these
+fields are not encoded into the 64-character checkpoint name.
+
+Annotations live in the workbench checkpoint registry, which is appended after
+the authoritative snapshot pin is created. If that append fails, the MCP call
+returns typed `SnapshotRegistryWritePartial` with the created snapshot id,
+lease, annotation, and explicit retry/retire compensation. It does not report a
+success that falsely claims the annotation is discoverable.
+
+## Snapshot Retirement Contract
+
+`workbench_snapshot_retire` is the MCP lifecycle endpoint for releasing a
+checkpoint. Pass `id` and exactly one of `snapshot_id` or `name`; an optional
+bounded `reason` records why retirement was requested. The operation calls the
+existing path-bound metadata retirement API, so a foreign-root snapshot or a
+snapshot whose fork retention is still active remains a typed error.
+
+The operation is idempotent. The call that removes the pin returns
+`retired=true`; an exact retry after the pin is already absent succeeds with
+`retired=false`. NoKV never upgrades that false outcome into a fabricated
+deletion. The checkpoint registry records retire lifecycle events, and
+`workbench_snapshot_list` reports `state=retired` only when it has an
+acknowledged `retired=true` event. An absent pin without that proof remains
+`state=reaped`. The base surface therefore has 17 tools, or 18 when
+`workbench_restore` is capability-enabled.
 
 ## Tests
 

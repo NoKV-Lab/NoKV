@@ -32,13 +32,38 @@ def restore_tool(schema: dict) -> list[dict]:
         {
             "name": name,
             "description": "",
-            "schema": copy.deepcopy(frozen_schema),
+            "schema": (
+                valid_retire_schema()
+                if name == "workbench_snapshot_retire"
+                else {}
+            ),
         }
-        for name, frozen_schema in MODULE.workbench_contract.FROZEN_INPUT_SCHEMAS.items()
-        if name != MODULE.RESTORE_TOOL
+        for name in sorted(MODULE.BASE_WORKBENCH_TOOLS)
     ]
     tools.append({"name": MODULE.RESTORE_TOOL, "description": "", "schema": schema})
     return tools
+
+
+def valid_retire_schema() -> dict:
+    return {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "snapshot_id": {"type": "integer", "minimum": 0},
+            "name": {"type": "string", "minLength": 1},
+            "reason": {
+                "type": ["string", "null"],
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+        "oneOf": [
+            {"required": ["snapshot_id"]},
+            {"required": ["name"]},
+        ],
+        "additionalProperties": False,
+    }
 
 
 def valid_schema() -> dict:
@@ -72,6 +97,17 @@ class ToolContractTests(unittest.TestCase):
     def test_rejects_missing_capability_gated_tool(self):
         tools = restore_tool(valid_schema())[:-1]
         with self.assertRaisesRegex(MODULE.AcceptanceError, "missing"):
+            MODULE.validate_tool_contract(tools)
+
+    def test_rejects_retire_schema_without_exact_target_union(self):
+        tools = restore_tool(valid_schema())
+        retire = next(
+            tool
+            for tool in tools
+            if tool["name"] == "workbench_snapshot_retire"
+        )
+        retire["schema"]["oneOf"] = [{"required": ["snapshot_id", "name"]}]
+        with self.assertRaisesRegex(MODULE.AcceptanceError, "exactly one target"):
             MODULE.validate_tool_contract(tools)
 
 
