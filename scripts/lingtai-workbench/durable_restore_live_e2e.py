@@ -38,28 +38,13 @@ from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import MagicMock
 
+import workbench_contract
+
 
 WORKBENCH_ROOT_TEMPLATE = "/agents/{agent_id}/wb"
-RESTORE_TOOL = "workbench_restore"
+RESTORE_TOOL = workbench_contract.RESTORE_TOOL
+BASE_WORKBENCH_TOOLS = workbench_contract.BASE_WORKBENCH_TOOLS
 SECTIONS = ("input", "scripts", "outputs", "logs", "metadata")
-BASE_WORKBENCH_TOOLS = {
-    "workbench_create",
-    "workbench_put_file",
-    "workbench_append",
-    "workbench_edit",
-    "workbench_list",
-    "workbench_stat",
-    "workbench_read",
-    "workbench_grep",
-    "workbench_search",
-    "workbench_aggregate",
-    "workbench_catalog",
-    "workbench_find",
-    "workbench_commit",
-    "workbench_snapshot",
-    "workbench_snapshot_renew",
-    "workbench_snapshot_list",
-}
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -73,9 +58,7 @@ HOP_BY_HOP_HEADERS = {
 }
 CLEANUP_CRASH_PHASE = "cleanup-batch-000000"
 RELEASE_CRASH_PHASE = "release-batch-000000"
-RETRYABLE_FSCK_CONFLICT = (
-    "object-reference fsck raced a metadata write; retry the scan"
-)
+RETRYABLE_FSCK_CONFLICT = "object-reference fsck raced a metadata write; retry the scan"
 DEFAULT_LIVE_MOUNT_ID = 1
 CONCURRENT_RESTORE_CALLS = 16
 # The public workbench_search schema caps one page at 10. Keep this below the
@@ -405,45 +388,10 @@ def assert_tool_error(result: dict[str, Any], context: str) -> None:
 
 def validate_tool_contract(tools: list[dict[str, Any]]) -> None:
     """Validate the capability-gated 17-tool surface and raw restore schema."""
-    by_name = {tool.get("name"): tool for tool in tools}
-    expected = BASE_WORKBENCH_TOOLS | {RESTORE_TOOL}
-    if set(by_name) != expected:
-        raise AcceptanceError(
-            "unexpected workbench tool surface; "
-            f"missing={sorted(expected - set(by_name))}, "
-            f"extra={sorted(set(by_name) - expected)}"
-        )
-    schema = by_name[RESTORE_TOOL].get("schema")
-    if not isinstance(schema, dict):
-        raise AcceptanceError("workbench_restore lacks inputSchema")
-    expected_fields = {"id", "at_snapshot", "destination_id"}
-    if schema.get("type") != "object":
-        raise AcceptanceError("workbench_restore schema must be an object")
-    if set(schema.get("required", [])) != expected_fields:
-        raise AcceptanceError("workbench_restore must require exactly three fields")
-    properties = schema.get("properties")
-    if not isinstance(properties, dict) or set(properties) != expected_fields:
-        raise AcceptanceError("workbench_restore schema contains wrong properties")
-    if schema.get("additionalProperties") is not False:
-        raise AcceptanceError("workbench_restore must reject additional properties")
-    for field in ("id", "destination_id"):
-        field_schema = properties.get(field)
-        if not isinstance(field_schema, dict) or field_schema.get("type") != "string":
-            raise AcceptanceError(f"workbench_restore {field} must be a string")
-        if field_schema.get("minLength") != 1:
-            raise AcceptanceError(f"workbench_restore {field} must be non-empty")
-    alternatives = properties.get("at_snapshot", {}).get("anyOf")
-    if not isinstance(alternatives, list) or len(alternatives) != 2:
-        raise AcceptanceError("at_snapshot must have exactly two alternatives")
-    by_type = {
-        item.get("type"): item for item in alternatives if isinstance(item, dict)
-    }
-    if set(by_type) != {"integer", "string"}:
-        raise AcceptanceError("at_snapshot accepts a type other than integer/string")
-    if by_type["integer"].get("minimum") != 0:
-        raise AcceptanceError("numeric at_snapshot must be non-negative")
-    if by_type["string"].get("minLength") != 1:
-        raise AcceptanceError("string at_snapshot must be non-empty")
+    try:
+        workbench_contract.validate_tool_contract(tools, schema_key="schema")
+    except workbench_contract.WorkbenchContractError as err:
+        raise AcceptanceError(str(err)) from err
 
 
 def read_json_object(result: dict[str, Any]) -> dict[str, Any]:
@@ -1180,7 +1128,11 @@ class LiveEnvironment:
             ) from error
 
     def manual_gc(self, *, limit: int = 64) -> dict[str, Any]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 4096:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 4096
+        ):
             raise AcceptanceError(f"manual GC limit is invalid: {limit!r}")
         raw = self.http_text(f"/gc?limit={limit}", timeout=60, method="POST")
         value = json.loads(raw)
@@ -3305,9 +3257,7 @@ class AcceptanceSuite:
         for outcome in post_retirement_gc_outcomes:
             history = outcome.get("history_gc")
             if not isinstance(history, dict):
-                raise AcceptanceError(
-                    f"manual GC omitted history outcome: {outcome!r}"
-                )
+                raise AcceptanceError(f"manual GC omitted history outcome: {outcome!r}")
             history_scanned_after_retirement += nonnegative_int(
                 history.get("scanned"), "history_gc.scanned"
             )
@@ -3680,9 +3630,9 @@ def main(argv: list[str] | None = None) -> int:
                 "details"
             ]
             crash = suite.results["durable_create_crash_barrier_matrix"]["details"]
-            cleanup_release = suite.results[
-                "durable_cleanup_release_crash_recovery"
-            ]["details"]
+            cleanup_release = suite.results["durable_cleanup_release_crash_recovery"][
+                "details"
+            ]
             concurrent = suite.results["first_visibility_16way_idempotent_cow_restore"][
                 "details"
             ]
