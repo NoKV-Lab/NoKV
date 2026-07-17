@@ -32,56 +32,19 @@ def restore_tool(schema: dict) -> list[dict]:
         {
             "name": name,
             "description": "",
-            "schema": (
-                valid_retire_schema()
-                if name == "workbench_snapshot_retire"
-                else {}
-            ),
+            "schema": copy.deepcopy(frozen_schema),
         }
-        for name in sorted(MODULE.BASE_WORKBENCH_TOOLS)
+        for name, frozen_schema in MODULE.workbench_contract.FROZEN_INPUT_SCHEMAS.items()
+        if name != MODULE.RESTORE_TOOL
     ]
     tools.append({"name": MODULE.RESTORE_TOOL, "description": "", "schema": schema})
     return tools
 
 
-def valid_retire_schema() -> dict:
-    return {
-        "type": "object",
-        "required": ["id"],
-        "properties": {
-            "id": {"type": "string", "minLength": 1},
-            "snapshot_id": {"type": "integer", "minimum": 0},
-            "name": {"type": "string", "minLength": 1},
-            "reason": {
-                "type": ["string", "null"],
-                "minLength": 1,
-                "maxLength": 256,
-            },
-        },
-        "oneOf": [
-            {"required": ["snapshot_id"]},
-            {"required": ["name"]},
-        ],
-        "additionalProperties": False,
-    }
-
-
 def valid_schema() -> dict:
-    return {
-        "type": "object",
-        "required": ["id", "at_snapshot", "destination_id"],
-        "properties": {
-            "id": {"type": "string", "minLength": 1},
-            "at_snapshot": {
-                "anyOf": [
-                    {"type": "integer", "minimum": 0},
-                    {"type": "string", "minLength": 1},
-                ]
-            },
-            "destination_id": {"type": "string", "minLength": 1},
-        },
-        "additionalProperties": False,
-    }
+    return copy.deepcopy(
+        MODULE.workbench_contract.FROZEN_INPUT_SCHEMAS[MODULE.RESTORE_TOOL]
+    )
 
 
 class ToolContractTests(unittest.TestCase):
@@ -91,19 +54,19 @@ class ToolContractTests(unittest.TestCase):
     def test_rejects_null_restore_snapshot(self):
         schema = valid_schema()
         schema["properties"]["at_snapshot"]["anyOf"].append({"type": "null"})
-        with self.assertRaisesRegex(MODULE.AcceptanceError, "exactly two"):
+        with self.assertRaisesRegex(MODULE.AcceptanceError, "inputSchema differs"):
             MODULE.validate_tool_contract(restore_tool(schema))
 
     def test_rejects_additional_properties(self):
         schema = valid_schema()
         schema["additionalProperties"] = True
-        with self.assertRaisesRegex(MODULE.AcceptanceError, "additional"):
+        with self.assertRaisesRegex(MODULE.AcceptanceError, "inputSchema differs"):
             MODULE.validate_tool_contract(restore_tool(schema))
 
     def test_rejects_empty_destination_identifier_schema(self):
         schema = valid_schema()
         del schema["properties"]["destination_id"]["minLength"]
-        with self.assertRaisesRegex(MODULE.AcceptanceError, "non-empty"):
+        with self.assertRaisesRegex(MODULE.AcceptanceError, "inputSchema differs"):
             MODULE.validate_tool_contract(restore_tool(schema))
 
     def test_rejects_missing_capability_gated_tool(self):
@@ -119,7 +82,7 @@ class ToolContractTests(unittest.TestCase):
             if tool["name"] == "workbench_snapshot_retire"
         )
         retire["schema"]["oneOf"] = [{"required": ["snapshot_id", "name"]}]
-        with self.assertRaisesRegex(MODULE.AcceptanceError, "exactly one target"):
+        with self.assertRaisesRegex(MODULE.AcceptanceError, "inputSchema differs"):
             MODULE.validate_tool_contract(tools)
 
 
@@ -201,9 +164,7 @@ class HelpersTests(unittest.TestCase):
             "retryable": False,
             "details": {"destination": "/workbenches/restored"},
         }
-        error = MODULE.assert_native_tool_error(
-            native, "RestoreDestinationConflict"
-        )
+        error = MODULE.assert_native_tool_error(native, "RestoreDestinationConflict")
         self.assertEqual(error.details["destination"], "/workbenches/restored")
         stringified = {
             "status": "error",
@@ -214,9 +175,7 @@ class HelpersTests(unittest.TestCase):
             ),
         }
         with self.assertRaisesRegex(MODULE.AcceptanceError, "top-level code"):
-            MODULE.assert_native_tool_error(
-                stringified, "RestoreDestinationConflict"
-            )
+            MODULE.assert_native_tool_error(stringified, "RestoreDestinationConflict")
 
     def test_restore_manifest_requires_all_source_and_destination_identity_fields(self):
         manifest = {
@@ -558,9 +517,7 @@ class HelpersTests(unittest.TestCase):
         ]
 
         with self.assertRaisesRegex(MODULE.AcceptanceError, "quarantined"):
-            suite.wait_for_restore_error(
-                "destination", "RestoreDestinationConflict"
-            )
+            suite.wait_for_restore_error("destination", "RestoreDestinationConflict")
 
     def test_released_restore_metrics_allow_only_durable_ledger_rows(self):
         metrics = {

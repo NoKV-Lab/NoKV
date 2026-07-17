@@ -16,6 +16,9 @@ hero:
       text: Quick Start
       link: /rustfs
     - theme: alt
+      text: LingTai Workbench
+      link: /lingtai-workbench-preflight
+    - theme: alt
       text: Benchmarks
       link: /benchmarks
 features:

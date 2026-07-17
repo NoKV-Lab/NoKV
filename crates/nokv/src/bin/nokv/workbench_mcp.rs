@@ -4327,7 +4327,118 @@ fn snapshot_client_error(snapshot_id: u64, err: ClientError) -> WorkbenchToolErr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+
+    const ANNOTATION_KEYWORDS: &[&str] = &[
+        "$comment",
+        "default",
+        "deprecated",
+        "description",
+        "example",
+        "examples",
+        "readOnly",
+        "title",
+        "writeOnly",
+    ];
+    const UNORDERED_SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf"];
+    const UNORDERED_LITERAL_ARRAY_KEYWORDS: &[&str] = &["enum", "required", "type"];
+    const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    ];
+    const SCHEMA_VALUE_KEYWORDS: &[&str] = &[
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ];
+
+    fn canonical_json(value: &Value) -> String {
+        serde_json::to_string(value).expect("JSON Schema values must serialize")
+    }
+
+    fn normalize_literal(value: Value) -> Value {
+        match value {
+            Value::Object(values) => Value::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, normalize_literal(value)))
+                    .collect(),
+            ),
+            Value::Array(values) => {
+                Value::Array(values.into_iter().map(normalize_literal).collect())
+            }
+            value => value,
+        }
+    }
+
+    fn normalize_schema_value(value: Value) -> Value {
+        match value {
+            Value::Array(values) => {
+                Value::Array(values.into_iter().map(normalize_schema).collect())
+            }
+            value => normalize_schema(value),
+        }
+    }
+
+    fn normalize_schema(value: Value) -> Value {
+        let Value::Object(values) = value else {
+            return normalize_literal(value);
+        };
+        let mut normalized = serde_json::Map::new();
+        for (key, value) in values {
+            if ANNOTATION_KEYWORDS.contains(&key.as_str()) {
+                continue;
+            }
+            let value = if UNORDERED_SCHEMA_ARRAY_KEYWORDS.contains(&key.as_str()) {
+                let Value::Array(branches) = value else {
+                    panic!("JSON Schema keyword {key} must contain an array");
+                };
+                let mut branches = branches
+                    .into_iter()
+                    .map(normalize_schema)
+                    .collect::<Vec<_>>();
+                branches.sort_by_cached_key(canonical_json);
+                Value::Array(branches)
+            } else if UNORDERED_LITERAL_ARRAY_KEYWORDS.contains(&key.as_str()) && value.is_array() {
+                let mut values = value
+                    .as_array()
+                    .expect("array checked above")
+                    .iter()
+                    .cloned()
+                    .map(normalize_literal)
+                    .collect::<Vec<_>>();
+                values.sort_by_cached_key(canonical_json);
+                Value::Array(values)
+            } else if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) && value.is_object() {
+                let schemas = value
+                    .as_object()
+                    .expect("object checked above")
+                    .iter()
+                    .map(|(name, schema)| (name.clone(), normalize_schema(schema.clone())))
+                    .collect();
+                Value::Object(schemas)
+            } else if SCHEMA_VALUE_KEYWORDS.contains(&key.as_str()) {
+                normalize_schema_value(value)
+            } else {
+                normalize_literal(value)
+            };
+            normalized.insert(key, value);
+        }
+        Value::Object(normalized)
+    }
 
     fn disconnected_client() -> NoKvFsClient<nokv_object::MemoryObjectStore> {
         NoKvFsClient::connect(
@@ -4480,6 +4591,52 @@ mod tests {
             "wb-adopt",
             &requested
         ));
+    }
+
+    #[test]
+    fn frozen_contract_matches_all_rust_tool_parameters() {
+        let snapshot: Value = serde_json::from_str(include_str!(
+            "../../../../../scripts/lingtai-workbench/workbench_contract_schema.json"
+        ))
+        .expect("frozen workbench contract must be valid JSON");
+        assert_eq!(
+            snapshot.get("schema").and_then(Value::as_str),
+            Some("nokv.workbench.mcp_input_schemas.v1")
+        );
+        let frozen = snapshot
+            .get("inputSchemas")
+            .and_then(Value::as_object)
+            .expect("frozen workbench contract must contain inputSchemas");
+        let tools = tool_definitions_for_capabilities(true);
+        let rust_names = tools.iter().map(|tool| tool.name).collect::<BTreeSet<_>>();
+        let frozen_names = frozen.keys().map(String::as_str).collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            tools.len(),
+            18,
+            "capability-enabled surface must have 18 tools"
+        );
+        assert_eq!(
+            rust_names.len(),
+            tools.len(),
+            "Rust workbench tool names must be unique"
+        );
+        assert_eq!(
+            rust_names, frozen_names,
+            "frozen tool names must match Rust"
+        );
+
+        for tool in tools {
+            let expected = frozen
+                .get(tool.name)
+                .unwrap_or_else(|| panic!("frozen schema missing {}", tool.name));
+            assert_eq!(
+                normalize_schema(tool.parameters),
+                normalize_schema(expected.clone()),
+                "{} parameters differ from the frozen inputSchema",
+                tool.name
+            );
+        }
     }
 
     #[test]

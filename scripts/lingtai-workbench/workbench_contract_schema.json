@@ -1,0 +1,919 @@
+{
+  "inputSchemas": {
+    "workbench_aggregate": {
+      "additionalProperties": false,
+      "properties": {
+        "group_by": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "measures": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "field": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "op": {
+                "enum": [
+                  "count",
+                  "sum",
+                  "avg",
+                  "min",
+                  "max"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "op"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "predicates": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "op": {
+                "enum": [
+                  "eq",
+                  "ne",
+                  "in",
+                  "prefix",
+                  "suffix",
+                  "contains",
+                  "gt",
+                  "gte",
+                  "lt",
+                  "lte",
+                  "exists",
+                  "not_exists"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "items": {
+                      "type": [
+                        "string",
+                        "integer",
+                        "number",
+                        "boolean"
+                      ]
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "field",
+              "op"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sort": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "direction": {
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "type": "string"
+              },
+              "field": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "field"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "measures"
+      ],
+      "type": "object"
+    },
+    "workbench_append": {
+      "additionalProperties": false,
+      "properties": {
+        "base64": {
+          "type": "string"
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata"
+          ],
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "section",
+        "path"
+      ],
+      "type": "object"
+    },
+    "workbench_catalog": {
+      "additionalProperties": false,
+      "properties": {
+        "field_prefix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "include_facets": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "workbench_commit": {
+      "additionalProperties": false,
+      "properties": {
+        "content_digest_uri": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "manifest": {
+          "type": "object"
+        },
+        "replace": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "manifest",
+        "content_digest_uri"
+      ],
+      "type": "object"
+    },
+    "workbench_create": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "workbench_edit": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "new_string": {
+          "type": "string"
+        },
+        "old_string": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "replace_all": {
+          "type": "boolean"
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "section",
+        "path",
+        "old_string",
+        "new_string"
+      ],
+      "type": "object"
+    },
+    "workbench_find": {
+      "additionalProperties": false,
+      "properties": {
+        "committed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "include_manifest": {
+          "type": "boolean"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "manifest_pattern": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "workbench_grep": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "glob": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 300,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "patterns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "recursive": {
+          "type": "boolean"
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "pattern",
+        "recursive"
+      ],
+      "type": "object"
+    },
+    "workbench_list": {
+      "additionalProperties": false,
+      "properties": {
+        "at_snapshot": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "workbench_put_file": {
+      "additionalProperties": false,
+      "properties": {
+        "base64": {
+          "type": "string"
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "replace": {
+          "type": "boolean"
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata"
+          ],
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "section",
+        "path"
+      ],
+      "type": "object"
+    },
+    "workbench_read": {
+      "additionalProperties": false,
+      "properties": {
+        "at_snapshot": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "format": {
+          "enum": [
+            "structured",
+            "bytes"
+          ],
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "if_none_match": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limit": {
+          "maximum": 300,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "offset": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "section",
+        "path"
+      ],
+      "type": "object"
+    },
+    "workbench_restore": {
+      "additionalProperties": false,
+      "properties": {
+        "at_snapshot": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "minLength": 1,
+              "type": "string"
+            }
+          ]
+        },
+        "destination_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "at_snapshot",
+        "destination_id"
+      ],
+      "type": "object"
+    },
+    "workbench_search": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "facets": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "predicates": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "op": {
+                "enum": [
+                  "eq",
+                  "ne",
+                  "in",
+                  "prefix",
+                  "suffix",
+                  "contains",
+                  "gt",
+                  "gte",
+                  "lt",
+                  "lte",
+                  "exists",
+                  "not_exists"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "items": {
+                      "type": [
+                        "string",
+                        "integer",
+                        "number",
+                        "boolean"
+                      ]
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "field",
+              "op"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sort": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "direction": {
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "type": "string"
+              },
+              "field": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "field"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "workbench_snapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "metadata": {
+          "maxProperties": 64,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ttl_days": {
+          "maximum": 90,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "workbench_snapshot_list": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "workbench_snapshot_renew": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshot_id": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "ttl_days": {
+          "maximum": 90,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "workbench_snapshot_retire": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "snapshot_id"
+          ]
+        },
+        {
+          "required": [
+            "name"
+          ]
+        }
+      ],
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshot_id": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "workbench_stat": {
+      "additionalProperties": false,
+      "properties": {
+        "at_snapshot": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "enum": [
+            "input",
+            "scripts",
+            "outputs",
+            "logs",
+            "metadata",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  "schema": "nokv.workbench.mcp_input_schemas.v1",
+  "source": "crates/nokv/src/bin/nokv/workbench_mcp.rs:tool_definitions_for_capabilities(true)"
+}
