@@ -13,6 +13,32 @@ permissions:
   contents: read
 
 jobs:
+  workbench-handoff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check LingTai workbench handoff scripts
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/lingtai-workbench/install_workbench_mcp.py \
+            scripts/lingtai-workbench/workbench_contract.py \
+            scripts/lingtai-workbench/nokv_runtime.py \
+            scripts/lingtai-workbench/generate_nokv_build_info.py \
+            scripts/lingtai-workbench/managed_nokv_server.py \
+            scripts/lingtai-workbench/sync_workbench_mcp.py \
+            scripts/lingtai-workbench/durable_restore_live_e2e.py
+          python3 scripts/lingtai-workbench/workbench_contract_test.py
+          python3 scripts/lingtai-workbench/nokv_runtime_test.py
+          python3 scripts/lingtai-workbench/managed_nokv_server_test.py
+          python3 scripts/lingtai-workbench/install_workbench_mcp_test.py
+          python3 scripts/lingtai-workbench/sync_workbench_mcp_test.py
+          python3 scripts/lingtai-workbench/up_test.py
+          python3 scripts/lingtai-workbench/durable_restore_live_e2e_test.py
+          bash -n scripts/lingtai-workbench/start_rustfs.sh
+          bash -n scripts/lingtai-workbench/up.sh
+
   nokv-fs:
     runs-on: ubuntu-latest
     steps:
