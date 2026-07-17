@@ -32,38 +32,13 @@ def restore_tool(schema: dict) -> list[dict]:
         {
             "name": name,
             "description": "",
-            "schema": (
-                valid_retire_schema()
-                if name == "workbench_snapshot_retire"
-                else {}
-            ),
+            "schema": copy.deepcopy(frozen_schema),
         }
-        for name in sorted(MODULE.BASE_WORKBENCH_TOOLS)
+        for name, frozen_schema in MODULE.workbench_contract.FROZEN_INPUT_SCHEMAS.items()
+        if name != MODULE.RESTORE_TOOL
     ]
     tools.append({"name": MODULE.RESTORE_TOOL, "description": "", "schema": schema})
     return tools
-
-
-def valid_retire_schema() -> dict:
-    return {
-        "type": "object",
-        "required": ["id"],
-        "properties": {
-            "id": {"type": "string", "minLength": 1},
-            "snapshot_id": {"type": "integer", "minimum": 0},
-            "name": {"type": "string", "minLength": 1},
-            "reason": {
-                "type": ["string", "null"],
-                "minLength": 1,
-                "maxLength": 256,
-            },
-        },
-        "oneOf": [
-            {"required": ["snapshot_id"]},
-            {"required": ["name"]},
-        ],
-        "additionalProperties": False,
-    }
 
 
 def valid_schema() -> dict:
@@ -107,7 +82,7 @@ class ToolContractTests(unittest.TestCase):
             if tool["name"] == "workbench_snapshot_retire"
         )
         retire["schema"]["oneOf"] = [{"required": ["snapshot_id", "name"]}]
-        with self.assertRaisesRegex(MODULE.AcceptanceError, "exactly one target"):
+        with self.assertRaisesRegex(MODULE.AcceptanceError, "inputSchema differs"):
             MODULE.validate_tool_contract(tools)
 
 
