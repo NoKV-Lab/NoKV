@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
 import importlib.util
 import json
 import sys
@@ -77,7 +80,9 @@ class InstallWorkbenchMcpTest(unittest.TestCase):
                 json.loads(line)
                 for line in (agent_dir / "mcp_registry.jsonl").read_text().splitlines()
             ]
-            self.assertEqual([record["name"] for record in registry], ["nokv-workbench"])
+            self.assertEqual(
+                [record["name"] for record in registry], ["nokv-workbench"]
+            )
             self.assertEqual(registry[0]["transport"], "stdio")
             self.assertEqual(
                 registry[0]["args"],
@@ -98,7 +103,9 @@ class InstallWorkbenchMcpTest(unittest.TestCase):
                 ],
             )
             init = json.loads((agent_dir / "init.json").read_text())
-            self.assertEqual(init["mcp"]["nokv-workbench"]["command"], "/repo/target/debug/nokv")
+            self.assertEqual(
+                init["mcp"]["nokv-workbench"]["command"], "/repo/target/debug/nokv"
+            )
             self.assertEqual(init["mcp"]["nokv-workbench"]["args"], registry[0]["args"])
 
     def test_install_is_idempotent(self):
@@ -114,7 +121,9 @@ class InstallWorkbenchMcpTest(unittest.TestCase):
             self.assertTrue(first.init_changed)
             self.assertFalse(second.registry_changed)
             self.assertFalse(second.init_changed)
-            self.assertEqual((agent_dir / "mcp_registry.jsonl").read_text(), registry_before)
+            self.assertEqual(
+                (agent_dir / "mcp_registry.jsonl").read_text(), registry_before
+            )
             self.assertEqual((agent_dir / "init.json").read_text(), init_before)
 
     def test_install_replaces_existing_nokv_workbench_entries(self):
@@ -144,7 +153,11 @@ class InstallWorkbenchMcpTest(unittest.TestCase):
                             "command": "/old/nokv",
                             "args": ["mcp"],
                         },
-                        "imap": {"type": "stdio", "command": "python", "args": ["-m", "imap"]},
+                        "imap": {
+                            "type": "stdio",
+                            "command": "python",
+                            "args": ["-m", "imap"],
+                        },
                     }
                 },
                 registry=[old_record, other_record, old_record],
@@ -158,21 +171,49 @@ class InstallWorkbenchMcpTest(unittest.TestCase):
                 json.loads(line)
                 for line in (agent_dir / "mcp_registry.jsonl").read_text().splitlines()
             ]
-            self.assertEqual([record["name"] for record in registry], ["nokv-workbench", "imap"])
+            self.assertEqual(
+                [record["name"] for record in registry], ["nokv-workbench", "imap"]
+            )
             self.assertEqual(registry[0]["command"], "/repo/target/debug/nokv")
             init = json.loads((agent_dir / "init.json").read_text())
-            self.assertEqual(init["mcp"]["nokv-workbench"]["command"], "/repo/target/debug/nokv")
+            self.assertEqual(
+                init["mcp"]["nokv-workbench"]["command"], "/repo/target/debug/nokv"
+            )
             self.assertEqual(init["mcp"]["imap"]["command"], "python")
+
+    def test_invalid_init_fails_before_registry_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent_dir = self.make_agent(
+                root,
+                registry=[
+                    {
+                        "name": "other",
+                        "transport": "stdio",
+                        "command": "other",
+                    }
+                ],
+            )
+            registry = agent_dir / "mcp_registry.jsonl"
+            registry_before = registry.read_bytes()
+            (agent_dir / "init.json").write_text('{"mcp": []}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "mcp must be a JSON object"):
+                self.module.configure_agent(agent_dir, self.config())
+
+            self.assertEqual(registry.read_bytes(), registry_before)
 
     def test_resolve_agent_dir_selects_running_coordinator_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            coordinator = self.make_agent(root, "coordinator(codex-gpt-5.4)", running=True)
+            coordinator = self.make_agent(
+                root, "coordinator(codex-gpt-5.4)", running=True
+            )
             self.make_agent(root, "scribe", running=True)
 
             resolved = self.module.resolve_agent_dir(root, None, None)
 
-            self.assertEqual(resolved, coordinator)
+            self.assertEqual(resolved, coordinator.resolve())
 
     def test_resolve_agent_dir_selects_single_agent_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,7 +222,7 @@ class InstallWorkbenchMcpTest(unittest.TestCase):
 
             resolved = self.module.resolve_agent_dir(root, None, None)
 
-            self.assertEqual(resolved, only_agent)
+            self.assertEqual(resolved, only_agent.resolve())
 
     def test_default_workbench_root_matches_lingtai_per_agent_contract(self):
         # Contract with lingtai-kernel: the kernel expands {agent_id} at MCP
@@ -223,6 +264,22 @@ class InstallWorkbenchMcpTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "multiple LingTai agents"):
                 self.module.resolve_agent_dir(root, None, None)
+
+    def test_named_agent_cannot_escape_project_or_follow_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = self.make_agent(root)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "init.json").write_text("{}\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "one directory name"):
+                self.module.resolve_agent_dir(root, "../outside", None)
+
+            linked = agent.parent / "linked"
+            linked.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                self.module.resolve_agent_dir(root, "linked", None)
 
 
 if __name__ == "__main__":
