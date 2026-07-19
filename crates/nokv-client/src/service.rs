@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use nokv_control::{ControlStore, ShardId, ShardRecord, ShardState};
 use nokv_meta::{
-<<<<<<< HEAD
     restore_operation_id, DentryWithAttr, NamespaceAggregateGroup, NamespaceAggregateMeasure,
     NamespaceAggregateOp, NamespaceAggregateOutputMeasure, NamespaceAggregateRequest,
     NamespaceAggregateResult, NamespaceAggregateSample, NamespaceAggregateSort,
@@ -14,35 +13,20 @@ use nokv_meta::{
     NamespaceFacetSummary, NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind,
     NamespaceFieldValue, NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest,
     NamespaceFindResult, NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult,
-    NamespaceInclude, NamespaceIndexValue, NamespaceListOptions, NamespaceListPage,
-    NamespacePredicate, NamespacePredicateOp, NamespacePredicateValue, NamespaceQueryCatalog,
-    NamespaceReadFormat, NamespaceReadItem, NamespaceReadOptions, NamespaceReadPage,
-    NamespaceRecordCount, NamespaceRecordType, NamespaceSchema, NamespaceSort,
-    NamespaceSortDirection, NamespaceSortField, PublishArtifactStagedSession,
-    RecordCountProvenance, RenameReplaceResult, RestoreInitialization, RestoreOutcome,
-    RestoreState, SnapshotRenewOutcome, SubtreeDelta, UpdateAttr, XattrSetMode,
-=======
-    DentryWithAttr, NamespaceAggregateGroup, NamespaceAggregateMeasure, NamespaceAggregateOp,
-    NamespaceAggregateOutputMeasure, NamespaceAggregateRequest, NamespaceAggregateResult,
-    NamespaceAggregateSample, NamespaceAggregateSort, NamespaceAggregateValue,
-    NamespaceBodyDescriptor, NamespaceCard, NamespaceCardKind, NamespaceFacetSummary,
-    NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind, NamespaceFieldValue,
-    NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest, NamespaceFindResult,
-    NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult, NamespaceInclude,
-    NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow, NamespaceIndexValue,
-    NamespaceListOptions, NamespaceListPage, NamespacePredicate, NamespacePredicateOp,
-    NamespacePredicateValue, NamespaceQueryCatalog, NamespaceReadFormat,
+    NamespaceInclude, NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow,
+    NamespaceIndexValue, NamespaceListOptions, NamespaceListPage, NamespacePredicate,
+    NamespacePredicateOp, NamespacePredicateValue, NamespaceQueryCatalog, NamespaceReadFormat,
     NamespaceReadItem, NamespaceReadOptions, NamespaceReadPage, NamespaceRecordCount,
     NamespaceRecordType, NamespaceSchema, NamespaceSort, NamespaceSortDirection,
     NamespaceSortField, PublishArtifactStagedSession, RecordCountProvenance, RenameReplaceResult,
-    SubtreeDelta, UpdateAttr, XattrSetMode,
->>>>>>> 92f24bfe (Add metadata RPC plumbing for namespace index registration)
+    RestoreInitialization, RestoreOutcome, RestoreState, SnapshotRenewOutcome, SubtreeDelta,
+    UpdateAttr, XattrSetMode,
 };
 use nokv_object::ObjectReadPlan;
+
 use nokv_protocol::{
     decode_envelope, decode_name_cursor, decode_xattr_name, encode_advisory_lock_kind,
     encode_file_type, encode_name_cursor, encode_request, encode_xattr_name, request_routing_key,
-<<<<<<< HEAD
     MetadataRpcRequest, MetadataRpcResult, RoutingKey, WireMetadataCapabilities,
     WireNamespaceAggregateGroup, WireNamespaceAggregateMeasure, WireNamespaceAggregateOp,
     WireNamespaceAggregateOutputMeasure, WireNamespaceAggregateRequest,
@@ -52,7 +36,8 @@ use nokv_protocol::{
     WireNamespaceFieldSourceKind, WireNamespaceFieldValue, WireNamespaceFilterCapability,
     WireNamespaceFindField, WireNamespaceFindRequest, WireNamespaceFindResult,
     WireNamespaceGrepMatch, WireNamespaceGrepRequest, WireNamespaceGrepResult,
-    WireNamespaceInclude, WireNamespaceIndexValue, WireNamespaceListPage, WireNamespacePredicate,
+    WireNamespaceInclude, WireNamespaceIndexField, WireNamespaceIndexRegistration,
+    WireNamespaceIndexRow, WireNamespaceIndexValue, WireNamespaceListPage, WireNamespacePredicate,
     WireNamespacePredicateOp, WireNamespacePredicateValue, WireNamespaceQueryCatalog,
     WireNamespaceReadFormat, WireNamespaceReadItem, WireNamespaceReadOptions,
     WireNamespaceReadPage, WireNamespaceRecordCount, WireNamespaceRecordType, WireNamespaceSchema,
@@ -60,24 +45,6 @@ use nokv_protocol::{
     WireOpenPathReadPlanRequest, WireRecordCountProvenance, WireRestoreInitialization,
     WireRestoreInitializationFile, WireRestoreState, WireSnapshotRenewOutcome,
     RESTORE_TO_FORK_V1_CAPABILITY,
-=======
-    MetadataRpcRequest, MetadataRpcResult, RoutingKey, WireNamespaceAggregateGroup,
-    WireNamespaceAggregateMeasure, WireNamespaceAggregateOp, WireNamespaceAggregateOutputMeasure,
-    WireNamespaceAggregateRequest, WireNamespaceAggregateResult, WireNamespaceAggregateSample,
-    WireNamespaceAggregateSort, WireNamespaceAggregateValue, WireNamespaceCard,
-    WireNamespaceCardKind, WireNamespaceFacetSummary, WireNamespaceFacetValue,
-    WireNamespaceFieldSource, WireNamespaceFieldSourceKind, WireNamespaceFieldValue,
-    WireNamespaceFilterCapability, WireNamespaceFindField, WireNamespaceFindRequest,
-    WireNamespaceFindResult, WireNamespaceGrepMatch, WireNamespaceGrepRequest,
-    WireNamespaceGrepResult, WireNamespaceInclude, WireNamespaceIndexField,
-    WireNamespaceIndexRegistration, WireNamespaceIndexRow, WireNamespaceIndexValue,
-    WireNamespaceListPage, WireNamespacePredicate, WireNamespacePredicateOp,
-    WireNamespacePredicateValue,
-    WireNamespaceQueryCatalog, WireNamespaceReadFormat, WireNamespaceReadItem,
-    WireNamespaceReadOptions, WireNamespaceReadPage, WireNamespaceRecordCount,
-    WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort, WireNamespaceSortDirection,
-    WireNamespaceSortField, WireOpenPathReadPlanRequest, WireRecordCountProvenance,
->>>>>>> 92f24bfe (Add metadata RPC plumbing for namespace index registration)
 };
 use nokv_types::{
     AdvisoryLock, AdvisoryLockRequest, BodyDescriptor, ChunkManifest, DentryName, FileType,
@@ -3107,8 +3074,16 @@ fn wire_namespace_index_registration(
 ) -> Result<WireNamespaceIndexRegistration, ClientError> {
     Ok(WireNamespaceIndexRegistration {
         path: registration.path.clone(),
-        fields: registration.fields.iter().map(wire_namespace_index_field).collect(),
-        rows: registration.rows.iter().map(wire_namespace_index_row).collect(),
+        fields: registration
+            .fields
+            .iter()
+            .map(wire_namespace_index_field)
+            .collect(),
+        rows: registration
+            .rows
+            .iter()
+            .map(wire_namespace_index_row)
+            .collect(),
     })
 }
 
@@ -3121,7 +3096,11 @@ fn wire_namespace_find_field(field: &NamespaceFindField) -> WireNamespaceFindFie
 fn wire_namespace_index_field(field: &NamespaceIndexField) -> WireNamespaceIndexField {
     WireNamespaceIndexField {
         field: wire_namespace_find_field(&field.field),
-        operators: field.operators.iter().map(wire_namespace_predicate_op).collect(),
+        operators: field
+            .operators
+            .iter()
+            .map(wire_namespace_predicate_op)
+            .collect(),
         sortable: field.sortable,
         facetable: field.facetable,
     }

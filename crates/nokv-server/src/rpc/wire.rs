@@ -7,10 +7,10 @@ use nokv_meta::{
     NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind, NamespaceFieldValue,
     NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest, NamespaceFindResult,
     NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult, NamespaceInclude,
-    NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow,
-    NamespaceIndexValue, NamespaceListPage, NamespacePredicate, NamespacePredicateOp,
-    NamespacePredicateValue, NamespaceQueryCatalog, NamespaceReadFormat, NamespaceReadOptions,
-    NamespaceReadPage, NamespaceRecordCount, NamespaceRecordType, NamespaceSchema, NamespaceSort,
+    NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow, NamespaceIndexValue,
+    NamespaceListPage, NamespacePredicate, NamespacePredicateOp, NamespacePredicateValue,
+    NamespaceQueryCatalog, NamespaceReadFormat, NamespaceReadOptions, NamespaceReadPage,
+    NamespaceRecordCount, NamespaceRecordType, NamespaceSchema, NamespaceSort,
     NamespaceSortDirection, NamespaceSortField, PreparedArtifact, RecordCountProvenance,
     SubtreeDelta, SubtreeDeltaKind, UpdateAttr, XattrSetMode,
 };
@@ -27,17 +27,15 @@ use nokv_protocol::{
     WireNamespaceFieldSource, WireNamespaceFieldSourceKind, WireNamespaceFieldValue,
     WireNamespaceFilterCapability, WireNamespaceFindField, WireNamespaceFindRequest,
     WireNamespaceFindResult, WireNamespaceGrepMatch, WireNamespaceGrepRequest,
-    WireNamespaceGrepResult, WireNamespaceInclude,
-    WireNamespaceIndexField, WireNamespaceIndexRegistration, WireNamespaceIndexRow,
-    WireNamespaceIndexValue, WireNamespaceListPage,
-    WireNamespacePredicate, WireNamespacePredicateOp, WireNamespacePredicateValue,
-    WireNamespaceQueryCatalog, WireNamespaceReadFormat, WireNamespaceReadItem,
-    WireNamespaceReadOptions, WireNamespaceReadPage, WireNamespaceRecordCount,
-    WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort,
-    WireNamespaceSortDirection, WireNamespaceSortField, WireObjectReadBlock,
-    WireOpenPathReadPlan, WirePathMetadata, WirePreparedArtifact, WireReadLease,
-    WireRecordCountProvenance, WireStagedObjectSet, WireSubtreeDelta,
-    WireSubtreeDeltaKind, WireUpdateAttr, WireXattrSetMode,
+    WireNamespaceGrepResult, WireNamespaceInclude, WireNamespaceIndexField,
+    WireNamespaceIndexRegistration, WireNamespaceIndexRow, WireNamespaceIndexValue,
+    WireNamespaceListPage, WireNamespacePredicate, WireNamespacePredicateOp,
+    WireNamespacePredicateValue, WireNamespaceQueryCatalog, WireNamespaceReadFormat,
+    WireNamespaceReadItem, WireNamespaceReadOptions, WireNamespaceReadPage,
+    WireNamespaceRecordCount, WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort,
+    WireNamespaceSortDirection, WireNamespaceSortField, WireObjectReadBlock, WireOpenPathReadPlan,
+    WirePathMetadata, WirePreparedArtifact, WireReadLease, WireRecordCountProvenance,
+    WireStagedObjectSet, WireSubtreeDelta, WireSubtreeDeltaKind, WireUpdateAttr, WireXattrSetMode,
 };
 use nokv_types::{DentryName, InodeId, MountId};
 
@@ -798,31 +796,21 @@ pub(super) fn namespace_find_request(
     })
 }
 
-fn namespace_index_value(
-    value: WireNamespaceIndexValue,
-) -> NamespaceIndexValue {
+fn namespace_index_value(value: WireNamespaceIndexValue) -> NamespaceIndexValue {
     NamespaceIndexValue {
         field: namespace_find_field(value.field),
         value: namespace_predicate_value(value.value),
     }
 }
 
-fn namespace_index_row(
-    row: WireNamespaceIndexRow,
-) -> NamespaceIndexRow {
+fn namespace_index_row(row: WireNamespaceIndexRow) -> NamespaceIndexRow {
     NamespaceIndexRow {
         path: row.path,
-        values: row
-            .values
-            .into_iter()
-            .map(namespace_index_value)
-            .collect(),
+        values: row.values.into_iter().map(namespace_index_value).collect(),
     }
 }
 
-fn namespace_index_field(
-    field: WireNamespaceIndexField,
-) -> NamespaceIndexField {
+fn namespace_index_field(field: WireNamespaceIndexField) -> NamespaceIndexField {
     NamespaceIndexField {
         field: namespace_find_field(field.field),
         operators: field

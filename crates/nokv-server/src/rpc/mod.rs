@@ -37,10 +37,9 @@ use wire::{
     dentry_name, err_envelope, inode_id, namespace_aggregate_request, namespace_find_request,
     namespace_grep_request, namespace_index_registration, namespace_read_options,
     prepared_artifact, protocol_error, staged_object_set, update_attr, wire_body_read_plan,
-    wire_dentry, wire_namespace_aggregate_result, wire_namespace_card,
-    wire_namespace_find_result, wire_namespace_grep_result, wire_namespace_list_page,
-    wire_namespace_read_page, wire_open_path_read_plan, wire_prepared_artifact,
-    wire_subtree_delta, xattr_set_mode,
+    wire_dentry, wire_namespace_aggregate_result, wire_namespace_card, wire_namespace_find_result,
+    wire_namespace_grep_result, wire_namespace_list_page, wire_namespace_read_page,
+    wire_open_path_read_plan, wire_prepared_artifact, wire_subtree_delta, xattr_set_mode,
 };
 
 fn handle_binary_rpc(server: &Server, body: &[u8]) -> Result<Vec<u8>, ServerError> {
