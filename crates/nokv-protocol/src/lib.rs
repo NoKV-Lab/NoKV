@@ -1859,10 +1859,10 @@ pub fn request_routing_key(request: &MetadataRpcRequest) -> RoutingKey<'_> {
         }
 
         // No addressable key: target the default/root shard.
-MetadataRpcRequest::Batch { .. }
-| MetadataRpcRequest::BootstrapRoot { .. }
-| MetadataRpcRequest::UpdateRootAttrs { .. }
-| MetadataRpcRequest::RegisterNamespaceIndex { .. } => RoutingKey::Default,
+        MetadataRpcRequest::Batch { .. }
+        | MetadataRpcRequest::BootstrapRoot { .. }
+        | MetadataRpcRequest::UpdateRootAttrs { .. }
+        | MetadataRpcRequest::RegisterNamespaceIndex { .. } => RoutingKey::Default,
     }
 }
 
