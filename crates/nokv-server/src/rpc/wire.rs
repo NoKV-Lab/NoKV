@@ -7,13 +7,16 @@ use nokv_meta::{
     NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind, NamespaceFieldValue,
     NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest, NamespaceFindResult,
     NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult, NamespaceInclude,
-    NamespaceIndexValue, NamespaceListPage, NamespacePredicate, NamespacePredicateOp,
-    NamespacePredicateValue, NamespaceQueryCatalog, NamespaceReadFormat, NamespaceReadOptions,
-    NamespaceReadPage, NamespaceRecordCount, NamespaceRecordType, NamespaceSchema, NamespaceSort,
+    NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow, NamespaceIndexValue,
+    NamespaceListPage, NamespacePredicate, NamespacePredicateOp, NamespacePredicateValue,
+    NamespaceQueryCatalog, NamespaceReadFormat, NamespaceReadOptions, NamespaceReadPage,
+    NamespaceRecordCount, NamespaceRecordType, NamespaceSchema, NamespaceSort,
     NamespaceSortDirection, NamespaceSortField, PreparedArtifact, RecordCountProvenance,
     SubtreeDelta, SubtreeDeltaKind, UpdateAttr, XattrSetMode,
 };
+
 use nokv_object::{ObjectKey, ObjectReadBlock, StagedObject, StagedObjectSet};
+
 use nokv_protocol::{
     MetadataProtocolError, MetadataRpcEnvelope, MetadataRpcResult, WireAdvisoryLock,
     WireBodyReadPlan, WireDentryWithAttr, WireMetadataError, WireNamespaceAggregateGroup,
@@ -24,14 +27,15 @@ use nokv_protocol::{
     WireNamespaceFieldSource, WireNamespaceFieldSourceKind, WireNamespaceFieldValue,
     WireNamespaceFilterCapability, WireNamespaceFindField, WireNamespaceFindRequest,
     WireNamespaceFindResult, WireNamespaceGrepMatch, WireNamespaceGrepRequest,
-    WireNamespaceGrepResult, WireNamespaceInclude, WireNamespaceIndexValue, WireNamespaceListPage,
-    WireNamespacePredicate, WireNamespacePredicateOp, WireNamespacePredicateValue,
-    WireNamespaceQueryCatalog, WireNamespaceReadFormat, WireNamespaceReadItem,
-    WireNamespaceReadOptions, WireNamespaceReadPage, WireNamespaceRecordCount,
-    WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort, WireNamespaceSortDirection,
-    WireNamespaceSortField, WireObjectReadBlock, WireOpenPathReadPlan, WirePathMetadata,
-    WirePreparedArtifact, WireReadLease, WireRecordCountProvenance, WireStagedObjectSet,
-    WireSubtreeDelta, WireSubtreeDeltaKind, WireUpdateAttr, WireXattrSetMode,
+    WireNamespaceGrepResult, WireNamespaceInclude, WireNamespaceIndexField,
+    WireNamespaceIndexRegistration, WireNamespaceIndexRow, WireNamespaceIndexValue,
+    WireNamespaceListPage, WireNamespacePredicate, WireNamespacePredicateOp,
+    WireNamespacePredicateValue, WireNamespaceQueryCatalog, WireNamespaceReadFormat,
+    WireNamespaceReadItem, WireNamespaceReadOptions, WireNamespaceReadPage,
+    WireNamespaceRecordCount, WireNamespaceRecordType, WireNamespaceSchema, WireNamespaceSort,
+    WireNamespaceSortDirection, WireNamespaceSortField, WireObjectReadBlock, WireOpenPathReadPlan,
+    WirePathMetadata, WirePreparedArtifact, WireReadLease, WireRecordCountProvenance,
+    WireStagedObjectSet, WireSubtreeDelta, WireSubtreeDeltaKind, WireUpdateAttr, WireXattrSetMode,
 };
 use nokv_types::{DentryName, InodeId, MountId};
 
@@ -790,6 +794,51 @@ pub(super) fn namespace_find_request(
             ))
         })?,
     })
+}
+
+fn namespace_index_value(value: WireNamespaceIndexValue) -> NamespaceIndexValue {
+    NamespaceIndexValue {
+        field: namespace_find_field(value.field),
+        value: namespace_predicate_value(value.value),
+    }
+}
+
+fn namespace_index_row(row: WireNamespaceIndexRow) -> NamespaceIndexRow {
+    NamespaceIndexRow {
+        path: row.path,
+        values: row.values.into_iter().map(namespace_index_value).collect(),
+    }
+}
+
+fn namespace_index_field(field: WireNamespaceIndexField) -> NamespaceIndexField {
+    NamespaceIndexField {
+        field: namespace_find_field(field.field),
+        operators: field
+            .operators
+            .into_iter()
+            .map(namespace_predicate_op)
+            .collect(),
+        sortable: field.sortable,
+        facetable: field.facetable,
+    }
+}
+
+pub(super) fn namespace_index_registration(
+    registration: WireNamespaceIndexRegistration,
+) -> NamespaceIndexRegistration {
+    NamespaceIndexRegistration {
+        path: registration.path,
+        fields: registration
+            .fields
+            .into_iter()
+            .map(namespace_index_field)
+            .collect(),
+        rows: registration
+            .rows
+            .into_iter()
+            .map(namespace_index_row)
+            .collect(),
+    }
 }
 
 pub(super) fn namespace_aggregate_request(
