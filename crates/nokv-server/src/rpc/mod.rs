@@ -35,9 +35,9 @@ use crate::server::{Server, ServerError};
 use batch::{create_path_batch_envelopes, execute_batch, CreatePathKind};
 use wire::{
     dentry_name, err_envelope, inode_id, namespace_aggregate_request, namespace_find_request,
-    namespace_grep_request, namespace_read_options, prepared_artifact, protocol_error,
-    staged_object_set, update_attr, wire_body_read_plan, wire_dentry,
-    wire_namespace_aggregate_result, wire_namespace_card, wire_namespace_find_result,
+    namespace_grep_request, namespace_index_registration, namespace_read_options,
+    prepared_artifact, protocol_error, staged_object_set, update_attr, wire_body_read_plan,
+    wire_dentry, wire_namespace_aggregate_result, wire_namespace_card, wire_namespace_find_result,
     wire_namespace_grep_result, wire_namespace_list_page, wire_namespace_read_page,
     wire_open_path_read_plan, wire_prepared_artifact, wire_subtree_delta, xattr_set_mode,
 };
@@ -284,6 +284,11 @@ fn execute_unfenced(
             Ok(MetadataRpcResult::NamespaceFindResult {
                 result: Box::new(wire_namespace_find_result(&result)?),
             })
+        }
+        MetadataRpcRequest::RegisterNamespaceIndex { registration } => {
+            slot.service()
+                .register_namespace_index(namespace_index_registration(*registration))?;
+            Ok(MetadataRpcResult::Unit)
         }
         MetadataRpcRequest::AggregatePaths { request } => {
             let result = slot
@@ -1176,6 +1181,7 @@ fn refreshes_metadata_view(request: &MetadataRpcRequest) -> bool {
         | MetadataRpcRequest::PrepareArtifactPath { .. }
         | MetadataRpcRequest::RefreshPreparedArtifactObjectGcEpoch { .. }
         | MetadataRpcRequest::PublishPreparedArtifact { .. }
+        | MetadataRpcRequest::RegisterNamespaceIndex { .. }
         | MetadataRpcRequest::PublishPreparedArtifactStagedSession { .. } => false,
     }
 }

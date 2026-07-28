@@ -13,15 +13,17 @@ use nokv_meta::{
     NamespaceFacetSummary, NamespaceFacetValue, NamespaceFieldSource, NamespaceFieldSourceKind,
     NamespaceFieldValue, NamespaceFilterCapability, NamespaceFindField, NamespaceFindRequest,
     NamespaceFindResult, NamespaceGrepMatch, NamespaceGrepRequest, NamespaceGrepResult,
-    NamespaceInclude, NamespaceIndexValue, NamespaceListOptions, NamespaceListPage,
-    NamespacePredicate, NamespacePredicateOp, NamespacePredicateValue, NamespaceQueryCatalog,
-    NamespaceReadFormat, NamespaceReadItem, NamespaceReadOptions, NamespaceReadPage,
-    NamespaceRecordCount, NamespaceRecordType, NamespaceSchema, NamespaceSort,
-    NamespaceSortDirection, NamespaceSortField, PublishArtifactStagedSession,
-    RecordCountProvenance, RenameReplaceResult, RestoreInitialization, RestoreOutcome,
-    RestoreState, SnapshotRenewOutcome, SubtreeDelta, UpdateAttr, XattrSetMode,
+    NamespaceInclude, NamespaceIndexField, NamespaceIndexRegistration, NamespaceIndexRow,
+    NamespaceIndexValue, NamespaceListOptions, NamespaceListPage, NamespacePredicate,
+    NamespacePredicateOp, NamespacePredicateValue, NamespaceQueryCatalog, NamespaceReadFormat,
+    NamespaceReadItem, NamespaceReadOptions, NamespaceReadPage, NamespaceRecordCount,
+    NamespaceRecordType, NamespaceSchema, NamespaceSort, NamespaceSortDirection,
+    NamespaceSortField, PublishArtifactStagedSession, RecordCountProvenance, RenameReplaceResult,
+    RestoreInitialization, RestoreOutcome, RestoreState, SnapshotRenewOutcome, SubtreeDelta,
+    UpdateAttr, XattrSetMode,
 };
 use nokv_object::ObjectReadPlan;
+
 use nokv_protocol::{
     decode_envelope, decode_name_cursor, decode_xattr_name, encode_advisory_lock_kind,
     encode_file_type, encode_name_cursor, encode_request, encode_xattr_name, request_routing_key,
@@ -34,7 +36,8 @@ use nokv_protocol::{
     WireNamespaceFieldSourceKind, WireNamespaceFieldValue, WireNamespaceFilterCapability,
     WireNamespaceFindField, WireNamespaceFindRequest, WireNamespaceFindResult,
     WireNamespaceGrepMatch, WireNamespaceGrepRequest, WireNamespaceGrepResult,
-    WireNamespaceInclude, WireNamespaceIndexValue, WireNamespaceListPage, WireNamespacePredicate,
+    WireNamespaceInclude, WireNamespaceIndexField, WireNamespaceIndexRegistration,
+    WireNamespaceIndexRow, WireNamespaceIndexValue, WireNamespaceListPage, WireNamespacePredicate,
     WireNamespacePredicateOp, WireNamespacePredicateValue, WireNamespaceQueryCatalog,
     WireNamespaceReadFormat, WireNamespaceReadItem, WireNamespaceReadOptions,
     WireNamespaceReadPage, WireNamespaceRecordCount, WireNamespaceRecordType, WireNamespaceSchema,
@@ -1306,6 +1309,18 @@ impl MetadataClient {
             request: Box::new(wire_namespace_grep_request(&request)?),
         })? {
             MetadataRpcResult::NamespaceGrepResult { result } => namespace_grep_result(*result),
+            other => Err(unexpected_result(other)),
+        }
+    }
+
+    pub fn register_namespace_index(
+        &self,
+        registration: NamespaceIndexRegistration,
+    ) -> Result<(), ClientError> {
+        match self.call(MetadataRpcRequest::RegisterNamespaceIndex {
+            registration: Box::new(wire_namespace_index_registration(&registration)?),
+        })? {
+            MetadataRpcResult::Unit => Ok(()),
             other => Err(unexpected_result(other)),
         }
     }
@@ -3052,6 +3067,57 @@ fn wire_namespace_find_request(
         limit: u64::try_from(request.limit)
             .map_err(|_| ClientError::Protocol("namespace find limit exceeds u64".to_owned()))?,
     })
+}
+
+fn wire_namespace_index_registration(
+    registration: &NamespaceIndexRegistration,
+) -> Result<WireNamespaceIndexRegistration, ClientError> {
+    Ok(WireNamespaceIndexRegistration {
+        path: registration.path.clone(),
+        fields: registration
+            .fields
+            .iter()
+            .map(wire_namespace_index_field)
+            .collect(),
+        rows: registration
+            .rows
+            .iter()
+            .map(wire_namespace_index_row)
+            .collect(),
+    })
+}
+
+fn wire_namespace_find_field(field: &NamespaceFindField) -> WireNamespaceFindField {
+    WireNamespaceFindField {
+        id: field.id.clone(),
+    }
+}
+
+fn wire_namespace_index_field(field: &NamespaceIndexField) -> WireNamespaceIndexField {
+    WireNamespaceIndexField {
+        field: wire_namespace_find_field(&field.field),
+        operators: field
+            .operators
+            .iter()
+            .map(wire_namespace_predicate_op)
+            .collect(),
+        sortable: field.sortable,
+        facetable: field.facetable,
+    }
+}
+
+fn wire_namespace_index_row(row: &NamespaceIndexRow) -> WireNamespaceIndexRow {
+    WireNamespaceIndexRow {
+        path: row.path.clone(),
+        values: row.values.iter().map(wire_namespace_index_value).collect(),
+    }
+}
+
+fn wire_namespace_index_value(value: &NamespaceIndexValue) -> WireNamespaceIndexValue {
+    WireNamespaceIndexValue {
+        field: wire_namespace_find_field(&value.field),
+        value: wire_namespace_predicate_value(&value.value),
+    }
 }
 
 fn wire_namespace_aggregate_request(
