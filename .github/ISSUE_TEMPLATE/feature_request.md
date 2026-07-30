@@ -13,19 +13,28 @@ SPDX-License-Identifier: Apache-2.0
 -->
 
 
-## 🚀 Is your feature request related to a problem?
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+## 🚀 User / Workload
+Who needs this capability, and what workload or deployment topology is involved?
 
-## 💡 Proposed Solution
-A clear and concise description of what you want to happen. Describe the technical approach if possible.
+## 🔎 Current Limitation
+What cannot be done safely or efficiently with the current behavior?
 
-## 🎨 Alternatives Considered
-A clear and concise description of any alternative solutions or features you've considered.
+## 💡 Desired Outcome
+Describe the observable behavior or acceptance criteria. A specific implementation
+is optional.
 
-## 📝 Technical Details / Implementation Plan
-- [ ] Task 1
-- [ ] Task 2
-- [ ] Task 3
+## 📦 Scope and Non-goals
+What should this request include, and what should it explicitly leave out?
+
+## 🔄 Alternatives Considered
+Describe workarounds or alternative designs you considered.
+
+## ⚖️ Compatibility, Durability, and Security Impact
+Note any effect on persisted formats, RPC/CLI behavior, shard-local or
+cross-shard semantics, recovery, authorization, or tenant isolation.
+
+## 🛠 Possible Implementation (Optional)
+If useful, outline an approach without treating it as the required design.
 
 ## 🧐 Additional Context
 Add any other context or screenshots about the feature request here.

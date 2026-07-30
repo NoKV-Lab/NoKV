@@ -39,7 +39,7 @@ For a disposable local RustFS-backed end-to-end run, use the repository script:
 scripts/run-rustfs-e2e.sh
 ```
 
-The script starts RustFS with the AI training buffer profile, creates the
+The script starts RustFS with the training-profile buffer settings, creates the
 default bucket, runs `nokv-bench`, and removes its temporary RustFS data
 directory. Override the workload with environment variables, for example:
 
@@ -50,7 +50,7 @@ NOKV_E2E_OBJECT_CONCURRENCY=8 \
 scripts/run-rustfs-e2e.sh
 ```
 
-For the current AI-training product smoke gate, use:
+For the generated training-profile smoke harness, use:
 
 ```bash
 scripts/run-ai-training-smoke.sh
@@ -117,6 +117,19 @@ metrics JSON adds `stale_owner_detect_after_resume_ms` and
 `stale_owner_fence_after_detect_ms`. This is a local process-stall gate; keep
 real multi-machine network partition tests separate.
 
+For the experimental multi-shard correctness and failover gate, run:
+
+```bash
+scripts/run-multishard-fleet-smoke.sh
+```
+
+This local, multi-process smoke test assigns two path shards to independent
+metadata server processes, routes both through one fleet client, replaces one
+shard owner at the next epoch, restores it from checkpoint-image plus shared
+log, and verifies that the unaffected shard remains available. It validates a
+specific routing/recovery path; it is not an enterprise throughput result, a
+multi-machine partition test, or evidence of consensus replication.
+
 ## The L2 benchmark framework (NoKV vs JuiceFS)
 
 The headline comparison is a **boundary-labeled L2 (mounted FUSE) matrix**. Every
@@ -143,7 +156,7 @@ NOKV_BENCH_PROFILE=standard scripts/run-fs-benchmark.sh --matrix \
 It runs **two co-equal drivers** against each mount:
 
 - `bench/drivers/posix_bench.py` — a self-contained, `juicefs bench`-shaped driver
-  (`bigfile` / `smallfile` / `metadata`-tree, plus the product-thesis
+  (`bigfile` / `smallfile` / `metadata`-tree, plus workload-specific
   `metadata_create_list` / `checkpoint` / `training_read` /
   `ai_shard_range_read`). Metadata/checkpoint/training-read product workloads
   run once at `p=1`; `ai_shard_range_read` and primitive workloads are swept
@@ -439,7 +452,7 @@ scheduling pressure.
 **Latency decomposition** is part of the main entry point for NoKV rows. Pass
 `--decompose` or `--decompose-csv PATH`; the runner snapshots the NoKV
 `/stats` endpoint before and after each measured phase and writes a sidecar CSV
-with metadata commit, Raft proposal, object writeback, object GET/PUT, and
+with metadata commit, object writeback, object GET/PUT, and
 read-plan-cache deltas. Read-path rows also expose object prefetch enqueue,
 drop, completion, failure, cache-hit, and cache-hit-byte deltas, which helps
 separate useful block warmup from accidental read-ahead amplification. The
@@ -554,7 +567,7 @@ data_fabric stats, tiered_object stats, path_index stats, ReadDirPlus projection
 stats, caveat
 ```
 
-Most benchmark workloads start a real single-node `metad` process and run the
+Most benchmark workloads start a real single-node `nokv serve` metadata service and run the
 Rust service client against its framed metadata RPC. Object bytes are still read
 and written directly by the client against the configured S3-compatible object
 store. This keeps benchmark numbers attached to the deployable service boundary
@@ -766,8 +779,17 @@ object-store behavior, or training-cluster readiness.
 
 ## Current Caveats
 
-Workloads run a single-node `metad` process with a configured S3-compatible
-object backend. Multi-node metadata is out of the current benchmark surface.
+Performance workloads currently run a single-node `nokv serve` metadata service with a
+configured S3-compatible object backend. The local multi-process
+`run-multishard-fleet-smoke.sh` adds correctness coverage for path routing,
+per-shard owner replacement, epoch fencing, checkpoint/log recovery, and
+unaffected-shard continuity; it does not add a multi-node throughput result.
+
+Enterprise multi-machine small-file throughput, network-partition chaos,
+online resharding, and sustained mixed-workload operation remain outside the
+published benchmark surface. Sharding is horizontal partitioning with one
+active writer per shard, not consensus replication, and atomic publication is
+currently shard-local rather than a cross-shard transaction.
 
 The harness still does not include FUSE kernel caching, Python DataLoader
 overhead, object-store multipart upload, or a multi-machine training cluster.

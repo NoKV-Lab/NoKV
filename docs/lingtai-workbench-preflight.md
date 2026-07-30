@@ -17,15 +17,23 @@ NoKV has two MCP profiles:
 - The generic Agent profile exposes seven read-only namespace tools: `ls`,
   `stat`, `catalog`, `read`, `aggregate`, `find`, and `grep`. It is suitable for
   a general MCP client, but it is not the LingTai workbench integration.
-- The Workbench profile exposes exactly 18 `workbench_*` tools, including
-  writes, checkpoints, indexed queries, and durable `workbench_restore`. It is
-  jailed below `/agents/{agent_id}/wb` and is registered in LingTai as
-  `nokv-workbench`.
+- The Workbench profile exposes 17 base `workbench_*` tools for writes,
+  checkpoints, and indexed queries. Durable `workbench_restore` is added as the
+  eighteenth tool only when the required owner capability is available. Calls
+  are path-scoped below `/agents/{agent_id}/wb`, and the profile is registered
+  in LingTai as `nokv-workbench`.
 
 The setup below requires the complete 18-tool Workbench profile. Restore is
 advertised only when every metadata owner that can serve the selected Agent
 root supports `restore_to_fork_v1`; the setup fails closed if the fleet is
-mixed or the schema differs.
+mixed or the schema differs. Restore is also same-shard only: its source and
+new destination must route to the same metadata shard.
+
+Path scoping rejects absolute paths, traversal, and paths outside the configured
+Workbench root. It is not authentication, RBAC, or tenant security isolation.
+The metadata endpoint and object-store credentials are the trust boundary, and
+the helper is a guarded local integration path rather than a production identity
+or secret-management system.
 
 ## Before the First Configuration
 
@@ -70,7 +78,8 @@ The guarded one-command path intentionally uses its dedicated local RustFS
 credentials. Custom credential and secret-manager integration is outside this
 helper and requires a separately reviewed deployment; it is not a supported
 `up.sh` override. The metadata directory and object-store identity are durable
-deployment state, so do not silently point an update at a new empty location.
+local integration state, so do not silently point an update at a new empty
+location.
 
 ## First Configuration
 
@@ -119,7 +128,16 @@ After a successful handoff, run this command in the selected LingTai Agent:
 /refresh
 ```
 
-This restarts the MCP stdio child with the newly locked runtime.
+This restarts the MCP stdio child with the newly locked runtime. The resulting
+path is:
+
+```text
+LingTai Agent -> MCP stdio child -> NoKV metadata RPC + object store
+```
+
+The helper registers and verifies that child; it does not install the LingTai
+skill, create a remote authentication layer, or make the local credentials safe
+to share across mutually untrusted tenants.
 
 ## Daily Update
 
@@ -162,6 +180,25 @@ python3 ./scripts/lingtai-workbench/sync_workbench_mcp.py \
   --agent 'coordinator(codex-gpt-5.4)' \
   --check
 ```
+
+## Runtime Semantics to Preserve
+
+- The live Workbench profile may expose 17 or 18 tools. This guarded LingTai
+  handoff intentionally accepts only the capability-enabled 18-tool surface.
+- A Workbench snapshot defaults to a 7-day lease and has a 90-day maximum.
+  Renew extends the lease; retire releases it. A checkpoint name is a registry
+  alias, not a permanent GC root.
+- At-snapshot reads provide a stable historical view. They do not freeze the
+  live workspace or prevent another writer from committing later state.
+- `workbench_restore` creates a different destination, leaves the source
+  unchanged, is idempotent for exact retries, and is limited to one metadata
+  shard.
+- `/agents/{agent_id}/wb` is a path-scoping convention. Authentication, tenant
+  policy, workspace freezing, and metadata high availability require separate
+  deployment mechanisms and are not provided by this helper.
+
+See [Workbench checkpoint lifecycle](development/workbench-checkpoint-lifecycle.md)
+for the full lease, GC, and restore contract.
 
 ## Handle a Failed Update
 

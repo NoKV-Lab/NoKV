@@ -11,18 +11,30 @@ Thanks for contributing. This file is the authoritative contribution guide for t
 
 Welcome, and thanks for your interest in NoKV. Whether this is your first open-source PR or your hundredth, we're glad you're here.
 
-NoKV gives AI agents a filesystem (directories, paths, listing, reading) instead of a database to query. File bodies live as immutable blocks in S3-compatible object storage; NoKV manages the metadata layer on top. The bet: agents burn far fewer tokens walking a directory tree than reasoning over a SQL schema. The agent surface is seven verbs over the namespace: `ls`, `stat`, `find` (navigate), `read`, `grep` (read content), and `catalog`, `aggregate` (summarize). They are exposed to MCP (Model Context Protocol) clients via the `nokv-agent` crate. See the Agent Interface section of the [README](README.md) for the full description of this surface.
+NoKV is an object-backed metadata control plane for durable agent workspaces.
+It provides a filesystem-shaped namespace, atomic metadata publication,
+snapshots, copy-on-write workspace primitives, and experimental horizontal
+path sharding while immutable file bodies remain in S3-compatible object
+storage. The `nokv-agent` crate owns transport-free agent schemas and dispatch;
+the `nokv` CLI exposes them to MCP clients over stdio. See the [README](README.md)
+for the current capability boundary.
 
 ### New here? Read these three first (in order)
 
-1. **Why:** [Agents Want Filesystems: Agent-Friendly Interfaces Are a Token-Efficiency Strategy](https://nokv.io/blog/agents-want-filesystems): the product argument for why a filesystem-shaped interface cuts agent token use (~45% fewer tokens, ~39% lower cost) versus a SQL schema.
-2. **How:** [List a directory in 131 nanoseconds: holt, the metadata engine inside nokv](https://nokv.io/blog/holt-in-nokv): the metadata engine, an adaptive radix tree built for path-shaped keys.
-3. **Evidence:** [Agent Interface Benchmark — NoKV](https://nokv.io/benchmark): 875 Yanex runs, the NoKV namespace vs. raw SQLite, showing 1.83x fewer prompt tokens, 1.63x lower cost, and 4.5/5 vs. 4.4/5 tasks solved.
+1. **Product boundary:** [NoKV README](README.md): current, experimental,
+   and planned capabilities.
+2. **System design:** [Architecture](docs/architecture.md): metadata, object,
+   client, FUSE, control-plane, and sharding boundaries.
+3. **Engineering contract:** [Code contract](docs/development/code_contract.md):
+   package ownership and invariants contributors must preserve.
+
+The [benchmark guide](docs/benchmarks.md) documents performance evidence and
+its limits. Historical agent-interface experiments are retained for
+reproducibility, but token reduction is not NoKV's product definition.
 
 ### Make your first contribution
 
 - Browse [good first issues](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for a scoped starting point.
-- Recommended newcomer track: [#354: MCP server for the agent namespace surface](https://github.com/NoKV-Lab/NoKV/issues/354), which exposes the seven-verb agent surface to MCP clients over stdio.
 - For a new bug or feature, open an issue via the [template chooser](https://github.com/NoKV-Lab/NoKV/issues/new/choose). For broad design, onboarding, or meta topics, open a [Discussion](https://github.com/NoKV-Lab/NoKV/discussions) first.
 
 Before you open a PR, read **[Issues and Proposals](#issues-and-proposals)**, **Branch and Commit Conventions** (including DCO sign-off), and **Pull Request Rules** below. Those sections are the source of truth for branch names, commit format, the local make-gate, and review expectations.
@@ -36,23 +48,23 @@ Do not open a public issue with exploit details. Follow the private reporting pr
 - Repository: `github.com/NoKV-Lab/NoKV`
 - Main branch: `main`
 - Main product line: Rust NoKV under `crates/`
-- Rust toolchain: stable
+- Minimum supported Rust version: 1.88
 
 ## Development Setup
 
 1. Fork on GitHub and clone your fork.
 2. Add the upstream remote to keep your fork up to date.
-3. Install Rust stable and Node.js for documentation builds.
+3. Install Rust 1.88 or newer.
 
 ```bash
-git clone https://github.com/NoKV-Lab/NoKV.git
+git clone https://github.com/YOUR_GITHUB_USER/NoKV.git
 cd NoKV
-git remote rename origin upstream
+git remote add upstream https://github.com/NoKV-Lab/NoKV.git
+git fetch upstream
 cargo fetch
-npm --prefix docs ci
 ```
 
-If you use a fork-based workflow, add your fork as `origin`.
+Your fork remains `origin`; the canonical NoKV repository is `upstream`.
 
 ## Branch and Commit Conventions
 
@@ -75,25 +87,49 @@ If a local commit is missing the trailer, amend or rebase before opening the PR:
 
 ```bash
 git commit --amend -s --no-edit
-git rebase --signoff origin/main
+git rebase --signoff upstream/main
 ```
 
 ## Local Validation
 
-Run these before opening a PR:
+For Rust changes, run the repository gate before opening a PR:
 
 ```bash
 make fmt
 make lint
 make test
-make docs-build
 ```
 
-For benchmark-related changes:
+For documentation-only changes, check formatting, links, and references in the
+files you changed and run:
+
+```bash
+git diff --check
+```
+
+The repository does not currently ship a VitePress package or a documentation
+site build target. Do not report a docs build that a fresh clone cannot run.
+
+For benchmark harness changes, run the relevant package or runner tests and
+record the exact workload, topology, cache state, commands, and results. For
+Rust benchmark changes, this normally includes:
 
 ```bash
 cargo test --workspace --release
 ```
+
+For Python agent-interface runner changes, run its focused test suite from the
+repository root:
+
+```bash
+python -m unittest discover \
+  -s bench/agent-interface/agents_runner \
+  -p 'test_*.py'
+bash bench/agent-interface/scripts/test_run_phase1_batch.sh
+```
+
+Performance claims require raw evidence and a reproducible command; a passing
+test suite alone is not benchmark evidence.
 
 ## Pull Request Rules
 

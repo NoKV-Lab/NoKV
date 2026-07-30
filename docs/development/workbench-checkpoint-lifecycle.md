@@ -3,261 +3,165 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Workbench checkpoint lifecycle — design plan
+# Workbench Checkpoint Lifecycle
 
-Status: plan (branch `feat/workbench-snapshot-lifecycle`). Driven by a real
-downstream report: an agent minted a snapshot through the workbench skill,
-cited its id in a handoff note, and found it unrecoverable two days later.
-The snapshot was in fact unprotected after one hour.
+Status: current contract on `main`.
 
-## 1. Problem statement (verified break chain)
+This document describes the shipped NoKV-side lifecycle for LingTai Workbench
+snapshots and durable restore. It replaces the historical phase plan that
+predated snapshot renewal, typed expiry, and `workbench_restore`.
 
-Every hop below was verified against main (`643ac8b1c3`) and
-lingtai-kernel upstream/main (`efe18de6`):
+## 1. Vocabulary
 
-1. `workbench_snapshot` pins with `DEFAULT_SNAPSHOT_LEASE_MS` = 1h
-   (snapshot.rs:5); the MCP schema has no lease knob and the protocol DTO
-   `SnapshotSubtreePath { path }` carries no lease field.
-2. The skill teaches "cite snapshot_id in handoff notes" and contains zero
-   mentions of lease/renew/expiry. The kernel consumes snapshot_id nowhere.
-3. Metadata GC reaps expired pins at the start of every object-GC round
-   (gc.rs:30, 30s cadence) and the retention floor skips expired pins even
-   before the reap (gc.rs:150-155). Protection ends at T+1h sharp.
-4. Expired-but-unreaped reads are "half dead": no read-path lease check
-   (`snapshot_pin_for_purpose`, `snapshot_read_version`), so unchanged files
-   still resolve while overwritten files silently vanish (history pruned →
-   `Ok(None)`), with no explicit error.
-5. Even a live snapshot is unreadable through MCP: none of the 14 workbench
-   tools accepts a snapshot id (no renew, no at-snapshot read, no restore).
-6. After the reap, the CLI paths (`rollback`, `cat-snapshot`,
-   `renew-snapshot`) all require the pin record and return NotFound/false.
-   There is no recovery surface at all.
+| Term | Meaning | Lifetime |
+| --- | --- | --- |
+| Snapshot pin | A subtree root plus a stable metadata read version | Leased; retired explicitly or expires |
+| Checkpoint name | An alias recorded in `metadata/checkpoints.jsonl` | Discoverability only; not an independent GC root |
+| At-snapshot read | `stat`, `list`, or `read` resolved at the snapshot version | Valid only while the pin is live |
+| Durable restore | Replayable CoW materialization into a different workbench | Survives process restart; exact retries are idempotent |
+| Fork/object retention | A generic clone binding, or sealed exact-reference rows for a completed Workbench restore | Managed with the fork lifecycle, independently of the construction pin |
 
-Additional verified defects folded into this plan:
+A snapshot is a stable historical read view. It does not make the live
+workspace read-only, freeze concurrent writers, or establish an authorization
+or tenant policy boundary.
 
-- `renew_snapshot` unconditionally overwrites the lease
-  (`now + lease_ms`), so a renew can silently *shorten* protection.
-- `count_active_snapshot_pins` ignores `lease_expires_unix_ms`
-  (holtstore.rs:902-918): an expired pin keeps history write-amplification
-  on until the next GC round reaps it.
-- The client `SnapshotOutcome` drops `lease_expires_unix_ms` even though
-  the wire `WireSnapshotPin` carries it.
+## 2. Lease Contract
 
-## 2. Design frame (industry-validated three layers)
+The low-level metadata snapshot API defaults to a one-hour lease. The Workbench
+surface intentionally uses a longer user-facing policy:
 
-Surveyed: Iceberg/Delta (snapshot refs: tags/branches with per-ref
-retention), ZFS holds vs leases, S3 Object Lock, Postgres/FDB long-pin
-costs, K8s/etcd/Chubby leases, LangGraph checkpointers, git reflog. The
-consistent shape:
+- `workbench_snapshot` accepts optional `ttl_days`;
+- the Workbench default is 7 days;
+- the Workbench maximum is 90 days;
+- the response reports the authoritative lease expiry;
+- `workbench_snapshot_renew` is extend-only and cannot shorten protection;
+- an expired snapshot returns the typed `SnapshotLeaseExpired` failure instead
+  of silently serving a partial historical view;
+- `workbench_snapshot_retire` is the explicit way to release a live pin.
 
-| Layer | Meaning | Lifecycle | NoKV mapping |
-|---|---|---|---|
-| L0 ephemeral pin | read consistency | short lease, touch-on-use, reap on expiry with explicit signal | today's `SnapshotPin` |
-| L1 named checkpoint | intent to keep | no lease; explicit delete; survives GC as a root | **new** |
-| L2 archival export | survives the store itself | materialized, retention-locked | future |
+Once a lease expires, the pin stops holding the metadata-history retention
+floor. GC may then reap the pin and history or objects that have no other live
+reference. A generic clone's durable binding or a completed Workbench restore's
+sealed exact-reference rows continue to protect borrowed objects without a
+permanent snapshot lease.
 
-Design rules adopted from the survey: leases express liveness, never
-importance (never carry archival intent on a lease); renew is extend-only;
-expiry must be loud (explicit error naming the expiry time), never silent;
-restore defaults to fork, never in-place; anonymous pins get a bounded
-"reflog" trail so a forgotten id is findable; long pins need a visible cost
-metric (history write amplification) and a ceiling that pushes users to L1.
+Renewal is a liveness mechanism, not archival retention. A checkpoint that must
+outlive the Workbench maximum needs a future durable named-reference or export
+contract rather than an indefinitely refreshed anonymous pin.
 
-## 3. Phase 1 (this branch): stop the bleeding, MCP surface + two service corrections
+## 3. Registry and Discoverability
 
-Zero new RPC ops. The renew/pin/at-snapshot read chains already exist end
-to end in protocol/server/client; they are only unexposed.
+Workbench snapshot mint, renew, and attributable retirement append lifecycle
+events to `metadata/checkpoints.jsonl`. An optional checkpoint `name` resolves
+through this registry. The registry also preserves bounded `reason` and
+`metadata` annotations.
 
-### 3.1 `workbench_snapshot` upgrade
+The name is an alias, not a non-expiring reference. If the underlying lease
+expires, resolving the name does not revive the snapshot or prevent GC.
+`workbench_snapshot_list` joins registry history with live pin state and reports
+states such as `alive`, `expired`, `retired`, or `reaped`.
 
-New optional params: `name` (checkpoint alias, `[A-Za-z0-9_-]{1,64}`),
-`ttl_days` (default **7**, max **90**; values beyond max are rejected with
-guidance to wait for L1 named refs). Implementation: mint via
-`snapshot_subtree_path` → immediately `renew_snapshot(id, ttl)` →
-`snapshot_pin(id)` to read back the authoritative `lease_expires_unix_ms`
-(three low-frequency RPCs; no protocol change). Output gains
-`lease_expires_at`, `name`, and a blunt `expiry_warning` when ttl was
-defaulted.
+The snapshot pin is authoritative and is created before the registry event is
+appended. If registry publication fails after pin creation, the tool returns
+`SnapshotRegistryWritePartial` with the created snapshot id and compensation
+guidance. The caller must retry registry publication or retire the pin; it must
+not assume the snapshot creation was rolled back.
 
-### 3.2 Checkpoint registry file (discoverability, L1 seed)
+Retirement is idempotent. The call that actually removes the pin reports
+`retired=true`; an exact retry after the pin is absent reports `retired=false`.
+The registry does not fabricate an explicit retirement for a pin that merely
+expired and was reaped.
 
-Every mint and renew, plus each attributable retirement outcome not already
-recorded, appends one v1 lifecycle event to `metadata/checkpoints.jsonl` in the
-workbench (via the existing append path — dogfooding #392). An exact retirement
-retry reuses its recorded outcome, while an unknown numeric id that is already
-absent is not added to the registry. `event_kind` is the internal
-`mint | renew | retire` verb; user intent is kept separately in the bounded
-`annotation.reason` and `annotation.metadata` fields. A retire event records
-the authoritative `retired` boolean returned by metadata: only `retired=true`
-attributes a missing pin to explicit retirement. An already-absent retry
-remains `retired=false` and must not be presented as a deletion. This makes
-checkpoints listable after the tool response is long gone and seeds the Phase-2
-named-ref migration.
+## 4. MCP Capability Boundary
 
-### 3.3 New tools
+The Workbench MCP profile has 17 base tools. `workbench_restore` is added as the
+eighteenth tool only when every metadata owner relevant to the configured
+workbench root confirms `restore_to_fork_v1`.
 
-- `workbench_snapshot_renew {id, snapshot_id|name, ttl_days}` — resolves
-  name via the registry, renews, echoes new `lease_expires_at`. Reaped pin
-  → explicit "reaped after lease expiry; re-mint from current state".
-- `workbench_snapshot_retire {id, snapshot_id|name, reason?}` — requires
-  exactly one target, invokes the path-bound metadata retirement operation,
-  and is idempotent. A missing retry succeeds with `retired=false`; root and
-  active-borrower errors remain typed failures. The registry records successful
-  retirement separately from an already-reaped snapshot.
-- `workbench_snapshot_list {id}` — registry entries joined with live pin
-  state: `alive | expired (reap pending) | retired | reaped`. `retired` is used
-  only when the registry contains an acknowledged `retired=true` event.
-- At-snapshot reads: `workbench_stat` / `workbench_list` /
-  `workbench_read` gain optional `at_snapshot` (id or name).
-  stat/list route to the existing `stat_path_at_snapshot` /
-  `list_path_at_snapshot`; read routes to `read_file_path_at_snapshot`
-  (bytes) with bin-layer text-line shaping under the max_bytes guard.
-  Structured JSON record reads at-snapshot stay Phase 2 (needs an
-  at-version entry in the namespace read layer).
-- **Loud expiry at the tool layer**: before any at-snapshot read, check the
-  pin. Expired → error "snapshot {id} lease expired at {ts}; renew within
-  the reap window or re-mint". Missing → "not found; snapshots are reaped
-  after lease expiry". (A first-class `SnapshotExpired` service error needs
-  a wire-error-evolution check and is Phase 2.)
+This yields two valid runtime surfaces:
 
-### 3.4 Service corrections (small, independently testable)
+- 17 tools: base Workbench operations, without durable restore;
+- 18 tools: the same base plus capability-enabled durable restore.
 
-1. `renew_snapshot` becomes extend-only:
-   `lease_expires = max(current, now + lease_ms)`. Shortening protection is
-   expressed by `retire`, not by renew.
-2. `SnapshotOutcome` carries `lease_expires_unix_ms` (client-side, wire
-   already has it).
+The guarded LingTai setup deliberately requires the complete 18-tool surface.
+It fails closed when owner capability is mixed or the canonical schema differs.
+That integration requirement must not be generalized into a claim that the raw
+Workbench profile always has exactly 18 tools.
 
-Deliberately deferred: read-path lease validation in the service (wire
-error compat unproven), `count_active_snapshot_pins` lease awareness (the
-≤30s amplification window after expiry is acceptable; fixing it touches the
-retention hot path).
+The MCP adapter validates the workbench id and confines relative paths beneath
+the configured root, normally `/agents/{agent_id}/wb`. This is namespace and
+path scoping. It is not authentication, RBAC, or a tenant security boundary;
+the configured metadata and object-store credentials define the actual trust
+boundary.
 
-### 3.5 lingtai-kernel skill v0.3.0
+## 5. Stable Historical Reads
 
-Teach: leases exist (default 7d via the tool, hard 1h if minted outside
-it); renew before handoff if the note must outlive the ttl; discover with
-`workbench_snapshot_list`; read history with `at_snapshot`; expired ≠
-data lost (current files remain; the point-in-time view is what expires).
-Replace the bare "cite snapshot_id" instruction with "cite name +
-snapshot_id and state the expiry". Keep the four test-pinned anchor
-strings; bump to v0.3.0.
+`workbench_stat`, `workbench_list`, and `workbench_read` accept
+`at_snapshot`. The tool resolves a numeric id or checkpoint name, verifies the
+pin and its lease, and reads at the pinned metadata version.
 
-## 4. Phase 2 durable restore and later follow-ups
+Use the same snapshot for every file that belongs to one historical view. Reads
+against the live namespace are separate operations and can observe later
+commits. Structured JSON/YAML record parsing is supported for live reads;
+snapshot reads currently expose bytes or snapshot-specific UTF-8 text-line
+shaping rather than a full structured-record parser.
 
-- **L1 named refs as GC roots**: named checkpoints move from registry-file
-  convention to pinned records the retention floor respects without a
-  lease; explicit delete only; `min-checkpoints-to-keep` guard.
-- **Durable restore-to-fork**: `workbench_restore` is not a thin wrapper around
-  generic clone. It owns a private, replayable operation/claim/root graph,
-  detached materialization, deterministic initialization, exact borrowed-object
-  references, a Complete-gated index overlay, and bounded cleanup/release jobs.
-  The temporary existing-format `ForkBinding` protects history only until the
-  exact-reference seal and final attach CAS; `Complete` does not retain a global
-  history floor. Generic clone/rollback encodings and behavior remain unchanged,
-  and in-place rollback stays CLI-only behind its existing explicit flag.
-- Touch-on-use renewal, structured at-snapshot reads, first-class
-  `SnapshotExpired` error, 14-day reflog trail for reaped anonymous pins,
-  expiry watch events, L2 archival export.
+## 6. Durable Restore-to-Fork
 
-## 5. Baseline decision (load-bearing)
+`workbench_restore` is the recommended recovery operation for Agent workspaces:
 
-- **PR #399 must land first** (path-cache purge fix for #398). The stress
-  suite below hammers concurrent read+write and will otherwise measure a
-  known, already-diagnosed data-loss bug instead of checkpoint behavior.
-  This branch rebases onto main once #399 merges; until then stress runs
-  use a local merge of #399 as the test baseline.
-- Local branch `fix/concurrent-stat-write-dataloss` (reader-tear retry) is
-  defense-in-depth; re-evaluate after #399 (keep the regression test, keep
-  or drop the retry by re-running the tear repro).
-- #393 (GC block leak) is orthogonal but must be subtracted from the
-  stress suite's disk-growth accounting.
-- trace-surface-v1 / #394 conflict on files, not semantics; schedule apart.
+1. The source workbench must have a committed run manifest and a live snapshot.
+2. The caller supplies a different destination workbench id.
+3. Source and destination must route to the same metadata shard.
+4. NoKV materializes a detached CoW destination, seals the exact borrowed-object
+   references, publishes the index overlay, and attaches the destination.
+5. The source remains unchanged. Exact retries converge on the same result.
 
-## 6. Acceptance: simulated data root + checkpoint stress suite
+The restore state machine and cleanup/release work are durable across process
+restart and lost responses. Capability is checked before the tool is advertised
+and again when the operation runs. NoKV does not currently provide a
+cross-metadata-shard restore transaction.
 
-The suite is the acceptance gate for Phase 1. Environment: isolated
-RustFS (docker) + `nokv serve` + workbench MCP over stdio, ports/dirs
-disjoint from any dev stack; harness extends the existing MCP driver with
-per-call latency/byte capture.
+Generic `nokv rollback PATH SNAPSHOT_ID` still exists as a low-level in-place
+operation and has no additional confirmation flag. Agent integrations should
+prefer restore-to-fork so the source remains available for inspection and the
+recovered workspace can be validated before use.
 
-**Simulated data root** (distributions from the two real user traces):
-30 workbenches; 5–20 files each; extensions ~60% md / py / json / csv +
-binary png; 20% CJK names; two live append streams per workbench; a churn
-engine issuing a mixed op stream (50% append / 20% edit / 15% put_file
-replace / 15% reads) at a configurable rate.
+## 7. Current and Next
 
-| # | Scenario | Assertion (pass = all) |
-|---|---|---|
-| S1 | Lease precision: mint with short ttl under 30s GC cadence | protection ends within one GC interval of `lease_expires_at`; expired reads fail with the loud-expiry message; **zero silent partial reads** |
-| S2 | Renew vs GC race: renew at T−ε in a loop while GC reaps | no lost live pin, no zombie pin, renew is extend-only (never shortens) |
-| S3 | At-snapshot correctness under churn (core): pin, then hammer the subtree (appends across compaction depth 8, edits, replaces) | every at-snapshot read byte-identical to mint-time content, for the full lease |
-| S4 | History write amplification: N∈{0,1,10,100} live pins vs churn | meta growth measured and reported per N; expired pins stop amplifying within one GC round |
-| S5 | Scale: 300 snapshots across 30 workbenches, sustained GC | GC round time bounded; retention floor correct (oldest live pin wins); `snapshot_list` consistent with pin truth |
-| S6 | Registry integrity: mint/renew/retire/expire/reap cycles | `checkpoints.jsonl` never references a state `snapshot_list` disagrees with; an already-absent retirement never becomes a fabricated deletion; no ghost entries (LangGraph #6686 class) |
-| S7 | Crash durability: `kill -9` serve mid-churn with live pins | pins survive restart; at-snapshot reads still byte-correct; lease clock unaffected |
-| S8 | Soak: hours-compressed churn+mint+renew loop | RSS/disk bounded (minus the #393 known leak, tracked separately); zero tool errors outside designed expiry errors |
+| Current on `main` | Not a current guarantee |
+| --- | --- |
+| Leased snapshot pins with explicit expiry | Non-expiring named checkpoints as independent GC roots |
+| Extend-only renew and idempotent retire | Archival export that survives the metadata store |
+| Registry aliases and bounded annotations | Full structured-record parsing at a snapshot |
+| Typed lease-expiry errors | Live workspace freezing or writer fencing through the snapshot API |
+| 17-tool base and capability-gated eighteenth restore tool | Authentication, RBAC, or tenant policy from path scoping alone |
+| Same-shard durable CoW restore-to-fork | Cross-shard atomic restore or publication |
 
-Concurrency note: S3/S7 run concurrent readers+writers by design and act
-as the #399 regression gate at the same time.
+## 8. Verification
 
-## 6.1 Acceptance results (this branch)
+The canonical schema and exact guarded LingTai contract are checked by:
 
-Environment: isolated RustFS (docker) + `nokv serve` + workbench MCP over
-stdio, ports 39000/39001/37799, `--object-gc-interval-ms 1500`, full profile
-(300 snapshots in S5, 800-op churn budgets in S4, 120s soak in S8). Harness in
-the session scratchpad (`ckpt-stress/`); run with
-`NOKV_BIN=… python3 run_all.py --profile full --scenarios all --gc-ms 1500`.
+```bash
+python3 ./scripts/lingtai-workbench/workbench_contract_test.py
+```
 
-**Result: 8/8 scenarios PASS.** Every Phase-1 product promise is asserted and
-green: live/frozen at-snapshot byte fidelity under churn (S3, and S1's
-overwrite-after-mint), reap-within-one-GC + loud post-reap error (S1),
-extend-only renew with no lost/zombie pins (S2), 300-snapshot scale with a
-correct retention floor (S5), registry integrity with no ghost entries (S6),
-`kill -9` crash durability of pins and bytes (S7), and zero unexpected churn
-errors over the soak (S8).
+The full live acceptance gate runs a real object store and validates LingTai
+registration/reconnect, restore idempotency, CoW object accounting, crash and
+restart barriers, source retirement, borrowed-object lifetime, index overlay,
+cleanup, fsck, and final inventory:
 
-The suite is the acceptance gate, so it was itself adversarially verified.
-Four *harness* defects were found and fixed before acceptance (the product was
-correct in each case):
+```bash
+uv run --project /path/to/lingtai-kernel \
+  python ./scripts/lingtai-workbench/durable_restore_live_e2e.py \
+  --lingtai-kernel-dir /path/to/lingtai-kernel \
+  --profile full \
+  --require-all
+```
 
-1. The capability probe read the tool schema under the wrong JSON key
-   (`parameters` vs the MCP wire key `inputSchema`, nokv.rs maps one onto the
-   other). This false-negative had silently *gated* every new-surface assertion;
-   fixing it makes all eight run for real.
-2. S2/S6 expired pins with a short renew, which A's extend-only fix (correctly)
-   refuses to shorten, so the pins never expired. Switched to `retire` — the
-   design's own "shorten protection with retire, not renew" (§3.4).
-3. A separate in-process MCP smoke (bypassing the harness driver entirely)
-   confirmed 11 load-bearing behaviors end to end. It caught that its own
-   overwrite step needed `replace=true`, without which the frozen-vs-live
-   at-snapshot divergence had been passing vacuously.
-4. `ChurnEngine` counted errors without capturing their text; now it records
-   samples so a nonzero count is explainable rather than a bare number.
+This gate is recovery and lifecycle evidence. It is not an enterprise
+small-file throughput benchmark or proof of metadata high availability.
 
-Reported as observations, not gates (per plan scope):
-
-- History write-amplification recovery (S4) and soak meta-disk growth (S8) are
-  dominated by **#393** (pre-compaction blocks leaked when append chains cross
-  compaction under a pin). §5/§6 track #393 separately, so these are measured
-  and reported (e.g. S8 last-third meta growth ≈ 45–80 MB across runs) rather
-  than gated. The stable directional check — more live pins amplify more
-  metadata (S4) — remains a gate and passes.
-- One transient run showed ~670 churn errors in S8 that did not reproduce in
-  isolation (0 errors) or on re-run (0 errors); attributed to RustFS container
-  pressure under the shared 8-scenario container, not product logic.
-
-Known Phase-1 coverage limit: the *expired-but-not-yet-reaped* loud message
-(`lease expired at {ts}`, the half-dead window that motivated this work) is
-unreachable by any current API — mint defaults the lease, renew is extend-only,
-and there is no short-lease mint RPC — so no live test can construct it. It is
-covered by inspection plus its reaped-sibling message (tested by B's unit tests
-and exercised live in S1); a first-class `SnapshotExpired` error and a way to
-construct the state are Phase 2 (§4).
-
-## 7. Estimated footprint
-
-Phase 1: ~450 production LOC (workbench_mcp.rs + client SnapshotOutcome +
-renew max()) + ~450 test LOC (service lease tests extend the existing
-group at service_tests.rs:5461; MCP e2e on the shared-server harness) +
-~600 LOC python stress harness + skill diff (~60 lines).
+See [Checkpointing](../checkpointing.md),
+[Copy-on-Write Workspaces](../cow-workspaces.md), and the
+[LingTai Workbench preflight guide](../lingtai-workbench-preflight.md).

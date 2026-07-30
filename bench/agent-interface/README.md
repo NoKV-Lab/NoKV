@@ -18,9 +18,16 @@ by the benchmark:
   `read_page`, plus native indexed `aggregate_paths`;
 - `nokv-protocol`: `StatCard`, `ListPage`, `FindPaths`, `AggregatePaths`,
   `GrepPaths`, and `ReadPage` RPC DTOs;
-- `nokv-client`: SDK methods plus the product-native agent adapter exposing
-  `ls`, `stat`, `catalog`, `read`, `find`, `aggregate`, and `grep`;
+- `nokv-agent`: transport-free tool definitions, schemas, validation, and
+  dispatch for `ls`, `stat`, `catalog`, `read`, `find`, `aggregate`, and
+  `grep`;
+- `nokv-client`: remote `AgentNamespace` implementations over the metadata
+  service and object backend;
 - `nokv-server`: framed metadata RPC handlers for the same operations.
+
+The `nokv mcp` command provides an MCP stdio transport for the product agent
+surface. This benchmark invokes the SDK/adapter path directly; it does not
+measure MCP transport startup, framing, or end-to-end client behavior.
 
 Native grep is now implemented through `nokv-meta`, `nokv-protocol`, and
 `nokv-server` as a product-native file-content scan. The current five-task
@@ -29,10 +36,11 @@ and `grep`. Native grep matches a case-insensitive literal substring and
 returns matching lines with line numbers, so log-extraction tasks resolve
 body facts without full file reads.
 
-The benchmark arm named `nokv_native_v1` uses the `nokv-client` agent adapter
-with the Phase 1 tool profile above. The harness translates OpenAI tool calls
-into product API calls, but does not own the measured card, find, index catalog,
-aggregation, pagination, or consistency semantics.
+The benchmark arm named `nokv_native_v1` uses `nokv-agent` schemas and dispatch
+over the `nokv-client` implementation with the Phase 1 tool profile above. The
+harness translates OpenAI tool calls into product API calls, but does not own
+the measured card, find, index catalog, aggregation, pagination, or consistency
+semantics.
 
 The default Phase 1 API surface is `openai_agents_responses_schema_once`. The
 Rust harness still owns batch planning, local judging, telemetry JSONL, and
@@ -73,8 +81,11 @@ bench/data/yanex-demo/
   results/
 ```
 
-The local corpus archive path is intentionally not committed. Pass it with
-`--archive` when preparing data.
+The corpus archive is not committed and this repository does not publish a
+download URL, checksum, or license record for it. Pass an independently
+obtained archive with `--archive` when preparing data. The committed telemetry
+supports auditing and recomputing the published aggregates, but an independent
+end-to-end rerun requires access to the same corpus archive.
 
 ## Arms
 
@@ -187,8 +198,13 @@ Set OpenAI credentials and model:
 
 ```bash
 export OPENAI_API_KEY=...
-export OPENAI_MODEL=gpt-5.5
+export OPENAI_MODEL="your-explicit-model-id"
 ```
+
+Use an explicit model identifier for a published run and record both the
+requested identifier and the resolved model returned in every API response.
+Moving aliases can resolve to a different snapshot over time and are not, by
+themselves, a reproducibility boundary.
 
 Run one task for one arm:
 
@@ -239,8 +255,8 @@ cargo run -p nokv-bench --bin yanex-agent-bench -- nokv-stat \
 
 The `nokv-*` direct commands above remain raw debugging commands. The benchmark
 arm uses the product-native `ls`/`stat`/`catalog`/`read`/`find`/`aggregate`/`grep`
-adapter exposed by `nokv-client`; the harness passes tool calls through
-without owning any namespace semantics.
+surface owned by `nokv-agent`, with remote implementations in `nokv-client`;
+the harness passes tool calls through without owning namespace semantics.
 
 Inspect SQLite schema:
 
@@ -275,3 +291,6 @@ the input rate; completion tokens at the output rate.
   parity for body search.
 - The published benchmark report lives at `bench/agent-interface/BENCHMARK_REPORT.md`;
   its raw telemetry is committed under `bench/agent-interface/results/`.
+- Before publishing new numbers, record the exact NoKV commit, corpus digest,
+  runner dependency lock or resolved versions, requested model identifier,
+  and response-resolved model snapshot.

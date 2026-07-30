@@ -5,107 +5,105 @@ SPDX-License-Identifier: Apache-2.0
 
 # Copy-on-Write Workspaces
 
-NoKV is a **CoW workspace runtime** — "git for live, large, derived state." Where
-git versions small text at dev time, NoKV gives `snapshot` / `clone` / `diff` /
-`rollback` over **live filesystem namespaces** (code + data + model weights) as
-runtime primitives, with the **data shared zero-copy** (clone never copies file
-bodies) and a **native, content-addressed `diff`** of what changed.
+NoKV provides copy-on-write workspace primitives in its durable workspace
+metadata control plane. A fork reuses immutable object bodies from its source,
+copies the namespace metadata needed to materialize the destination, and writes
+new object generations only for data that diverges.
 
-The differentiating capability: spin up 100 agent workspaces from one base — each
-sharing the base's object blocks zero-copy and writing only its own delta — then
-**see exactly what an agent changed** (a content-addressed `diff`, including the
-untracked build/dependency output a `git diff` misses) and **revert** a workspace
-to an earlier point. A pluggable metadata engine (Redis, TiKV) cannot offer the
-diff + rollback + sharing-aware GC as one integrated story — it requires owning
-the copy-on-write metadata engine and the object layout together, which NoKV
-does. (Clone's *metadata* cost is O(entries); the *data* is what stays zero-copy.
-A change-bounded diff and batched/lazy clone are tracked future work.)
+This is useful for long-running agents that need a recoverable workspace rather
+than an in-place mutation history: pin a known-good view, restore it into a new
+workspace, validate the fork, and only then direct work to the recovered copy.
 
-## The operations
+## Operations
 
-All operate on a directory **subtree** (a "workspace") and are atomic + GC-safe.
+| Operation | Service API | Current semantics |
+| --- | --- | --- |
+| **snapshot** | `snapshot_subtree(root) -> SnapshotPin` | Leased, read-only historical MVCC view. It protects the history and object references needed by that view until retirement or lease expiry. It does not freeze the live workspace. |
+| **clone** | `clone_subtree(src) -> CloneHandle` | Writable CoW fork. Object bodies are shared by key; destination metadata is materialized in proportion to the number of entries. Source and destination must route to the same metadata shard. |
+| **diff** | `diff_subtrees(a, b) -> Vec<SubtreeDelta>` | Reports added, removed, and modified paths with digest and size information. The current walk is O(tree), and both paths must route to the same metadata shard. |
+| **rollback** | `rollback_subtree(target, snapshot_id)` | Low-level in-place replacement of a target subtree from a snapshot. It remains available through the service and CLI, but is not the preferred Agent recovery workflow. |
+| **restore to fork** | Workbench `workbench_restore` | Creates a different destination workspace from a source snapshot. The source remains unchanged, exact retries are idempotent, and the operation is capability-gated and same-shard only. |
 
-| Op | Service API | Semantics |
-|----|-------------|-----------|
-| **snapshot** | `snapshot_subtree(root) -> SnapshotPin{root, read_version}` | Read-only, zero-copy MVCC version pin. Pins a stable view and protects its object blocks from GC. |
-| **clone** | `clone_subtree(src) -> CloneHandle{root, snapshot_id}` | **Writable fork.** New root sees all of the source; **shares object blocks zero-copy** (same `generation` → same object keys); diverges on write (CoW). Metadata cost is O(entries) (one record per node); the **data is never copied**. |
-| **diff** | `diff_subtrees(a, b) -> Vec<SubtreeDelta>` | Reports `Added` / `Removed` / `Modified` paths, each with a **content digest + net `size_delta`** (content-addressed, not just nominal). An unchanged shared file (same `generation`) is skipped; a rewrite surfaces as `Modified`. (Today the walk is O(tree); a change-bounded diff is future work.) |
-| **rollback** | `rollback_subtree(target, snapshot_id)` | Revert a workspace to a prior snapshot. Clone-from-snapshot + atomic graft onto the target (keeps its inode identity). The discarded delta's blocks become GC-reclaimable; restored blocks survive. |
+Path variants such as `clone_subtree_path`, `clone_subtree_path_into`,
+`diff_subtrees_path`, and `rollback_subtree_path` accept string paths.
 
-Path variants (`clone_subtree_path`, `clone_subtree_path_into`, `diff_subtrees_path`,
-`rollback_subtree_path`) take string paths.
-
-## The agent workflow
+## Recommended Agent Recovery Flow
 
 ```text
-base workspace  ──snapshot──▶  base@v1   (immutable, shareable)
-       │
-   clone(base) ──▶  /forks/agent-1   (writable, shares base blocks)
-       │
-   agent runs: stat / read / write / rename …  (local hot path, no quorum)
-       │
-   diff(base, /forks/agent-1)  ──▶  what the agent changed
-       │
-   ┌── success: keep / promote the fork
-   └── failure: rollback(/forks/agent-1, base@v1)   or   discard the fork
+committed workspace ──snapshot──▶ source@snapshot       (leased historical view)
+          │
+          └── workbench_restore(new destination) ──▶ recovered fork
+                                                        │
+                                               validate / inspect / diff
+                                                        │
+                                      ┌── accept: route work to the fork
+                                      └── reject: release the fork
 ```
 
-100 agents off one base share the base's files and object blocks; each fork's
-writes get a fresh `generation` → new object keys, so forks never clobber each
-other or the base.
+Restore-to-fork avoids destroying the source and makes validation explicit.
+Generic in-place `rollback` is better treated as a low-level administrative or
+debugging primitive when the caller intentionally accepts that mutation.
 
 ## CLI
 
-```sh
-# Clone a base subtree into a new, navigable workspace
-nokv clone /base /forks/agent-1
-# → cloned /base -> /forks/agent-1 root=N snapshot=M
+The generic workspace primitives are wired into the CLI:
 
-# See what diverged between two subtrees
+```sh
+# Pin a leased historical view. LEASE_MS is optional.
+nokv snapshot /base [LEASE_MS]
+
+# Create a writable fork and compare it with the source.
+nokv mkdir /forks
+nokv clone /base /forks/agent-1
 nokv diff /base /forks/agent-1
-# A    /b          (added in the fork)
-# M    /a          (modified)
-# D    /old        (removed)
+
+# After intentionally changing /base, restore that same root in place.
+# Prefer Workbench restore-to-fork for Agent recovery.
+nokv rollback /base SNAPSHOT_ID
 ```
 
-(`snapshot` and `rollback` are exposed at the service/RPC layer; CLI wiring lands
-with the surrounding workspace-management commands.)
+Workbench recovery is exposed through the capability-gated MCP
+`workbench_restore` tool rather than this generic CLI surface.
 
-## Guarantees
+## Guarantees and Limits
 
-- **Zero-copy sharing.** A clone references the source's object blocks by key
-  (`blocks/{mount}/{inode}/{generation}/…`); only small metadata records are
-  copied. Cloning a 1 TB dataset workspace copies kilobytes of metadata, not the
-  data.
-- **CoW isolation.** A write in any workspace mints a fresh generation under its
-  own inode → new object keys. Forks and the base are fully isolated; neither
-  sees the other's post-clone writes.
-- **GC safety (the `owns_block_object_key` invariant).** An inode's GC reclaims
-  only blocks **it minted** (its `{inode}/{generation}` prefix). A workspace
-  never enqueues another workspace's shared blocks for deletion, and a retained
-  snapshot pin keeps still-shared base blocks protected (`blocked_by_snapshots`).
-- **Leased pins (no permanent GC blocker).** A snapshot pin carries a renewable
-  lease (`renew_snapshot`); an abandoned pin — a crashed holder that never
-  retires it — **expires** and stops holding the GC retention floor down, so a
-  forgotten pin can never block reclamation forever. Expired pins are reaped
-  during GC.
-- **Atomicity.** Clone-link, divergent publish, and the rollback graft each
-  commit in a single predicate-guarded metadata transaction. Crash-in-between
-  leaves orphan objects (GC-able), never a corrupt namespace.
+- **Object-body sharing.** A clone references immutable source object keys and
+  writes a fresh generation when a file diverges. It does not copy the source
+  file bodies merely to create the fork.
+- **Metadata work is not constant.** Clone materialization is O(entries). Large
+  namespace trees can therefore require substantial metadata work even when the
+  object bodies remain zero-copy.
+- **CoW data divergence.** Post-clone writes in one workspace use new object
+  generations and are not observed through the other workspace's namespace.
+  This is data and namespace isolation, not an authentication, RBAC, or tenant
+  security boundary.
+- **Lease-aware GC.** A snapshot lease is renewable and extend-only. An expired
+  pin stops holding the metadata-history retention floor and can be reaped by
+  GC. Generic clones retain borrowed data through a durable fork binding;
+  Workbench restore replaces its temporary construction binding with sealed
+  exact-object references before attach.
+- **Shard-local publication.** Metadata attach, graft, and publication points
+  are predicate-guarded and crash-consistent within one metadata owner. Clone,
+  diff, rollback, and restore do not provide cross-shard transactions.
+- **Recovery is explicit.** `workbench_restore` uses a replayable state machine,
+  a new destination, and idempotent retries. It is exposed only when every
+  relevant owner confirms `restore_to_fork_v1`.
 
-## Why single-node (and how it scales later)
+## Scaling Model
 
-A live workspace has a **single writer-owner**; read-only snapshots are shared by
-many readers. This relaxes POSIX cross-node coherence (a tax AI workloads don't
-need) and avoids consensus-replicated metadata entirely. Cloud scale comes from
-**sharding + lease** (compute disaggregated over durable S3 + a tiny control
-plane that owns only the shard map and owner leases), not from a distributed
-metadata quorum. See `architecture.md`.
+Single-node metadata is the default deployment. NoKV also has experimental
+path-based sharding: independent workspace roots can be routed to independent
+metadata owners while each shard keeps one active writer. Holt remains the
+lightweight embedded metadata engine inside an owner; NoKV does not add a Raft
+quorum to every metadata operation, and consensus-replicated metadata HA is not
+a current guarantee.
 
-## Performance
+This model targets small-file throughput by keeping the metadata hot path local
+and scaling independent workspace shards horizontally. Atomic publication and
+CoW recovery remain shard-local. Any enterprise throughput claim must be backed
+by a reproducible benchmark that states workload, hardware, object store,
+concurrency, build revision, and run artifact; this document intentionally does
+not publish an unsupported headline number.
 
-- Metadata hot path is local (no quorum, no Redis/TiKV round-trip): low-latency
-  `lookup`/`stat`/`readdir`.
-- Writes: ~213 MiB/s sequential (release), durable — `close` drains to S3.
-- `clone` / `snapshot` / `rollback` are O(metadata) pointer/record operations,
-  not data copies.
+See [Architecture](architecture.md) and
+[Checkpointing](checkpointing.md) for the owner and publication boundaries.

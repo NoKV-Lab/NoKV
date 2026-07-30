@@ -3,7 +3,7 @@
 
 NOKV_FS_MANIFEST := Cargo.toml
 
-.PHONY: help build test fmt lint verify clean docs-build
+.PHONY: help build test fmt lint verify clean
 
 help:
 	@echo "NoKV development commands:"
@@ -12,8 +12,7 @@ help:
 	@echo "  make test        - Run the Rust workspace tests"
 	@echo "  make fmt         - Format the Rust workspace"
 	@echo "  make lint        - Run cargo clippy"
-	@echo "  make verify      - Run fmt check, clippy, tests, and docs build"
-	@echo "  make docs-build  - Build the VitePress documentation site"
+	@echo "  make verify      - Run fmt check, clippy, and tests"
 	@echo "  make clean       - Remove build artifacts"
 
 build:
@@ -28,14 +27,10 @@ fmt:
 lint:
 	cargo clippy --manifest-path $(NOKV_FS_MANIFEST) --workspace --all-targets -- -D warnings
 
-docs-build:
-	cd docs && npm run build
-
 verify:
 	cargo fmt --manifest-path $(NOKV_FS_MANIFEST) --all -- --check
 	cargo clippy --manifest-path $(NOKV_FS_MANIFEST) --workspace --all-targets -- -D warnings
 	cargo test --manifest-path $(NOKV_FS_MANIFEST) --workspace
-	cd docs && npm run build
 
 clean:
-	rm -rf target docs/.vitepress/dist
+	rm -rf target

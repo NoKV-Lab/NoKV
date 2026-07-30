@@ -22,7 +22,7 @@ used to configure the Workbench MCP.
 | `sync_workbench_mcp.py` | Lower-level source build or artifact staging, content-addressed runtime selection, offline/live preflight, per-Agent locking, journaled registry update, and read-only lock verification. |
 | `nokv_runtime.py` | NoKV/Holt/Cargo.lock identity, artifact-bound build-info parsing, SHA-256 verification, and symlink-safe immutable runtime staging. |
 | `managed_nokv_server.py` | Records and verifies the helper-owned server PID, process start identity, listener ownership, binary digest, complete argv, metadata path, and object-store configuration before reuse or termination. |
-| `workbench_contract.py` | Semantic validation and evidence for the exact 18-tool Workbench surface. |
+| `workbench_contract.py` | Semantic validation and evidence for the complete 18-tool LingTai contract. The raw Workbench profile has 17 base tools and adds restore only when capability is available. |
 | `workbench_contract_schema.json` | Checked-in canonical `inputSchema` snapshot owned by `workbench_mcp.rs`. |
 | `generate_nokv_build_info.py` | Produces `nokv.build_info.v1` for a Release or future Brew artifact. |
 | `install_workbench_mcp.py` | Raw idempotent registry primitive. It intentionally performs no binary, owner, capability, or schema gate. |
@@ -57,9 +57,9 @@ evidence. A rebuild or package upgrade cannot replace the registered binary in
 place.
 
 The helper's default process state is below
-`<NoKV checkout>/target/lingtai-workbench`. Metadata is durable product state,
-not process scratch: deployments must override `LINGTAI_WORKBENCH_META_DIR` to
-a persistent location and keep that location stable across updates.
+`<NoKV checkout>/target/lingtai-workbench`. Metadata is durable workspace state,
+not process scratch: persistent downstream use must override
+`LINGTAI_WORKBENCH_META_DIR` and keep that location stable across updates.
 
 ## Environment Reference
 
@@ -70,7 +70,7 @@ a persistent location and keep that location stable across updates.
 | `LINGTAI_WORKBENCH_PROJECT` | current project with `.lingtai`, then `~/lingtai-demo` | LingTai project to update. |
 | `LINGTAI_WORKBENCH_AGENT` | automatic selection | Exact directory name below `.lingtai`; set only after an ambiguity error. |
 | `LINGTAI_TUI_PYTHON` | `~/.lingtai-tui/runtime/venv/bin/python` | Python used to verify the intrinsic skill. |
-| `LINGTAI_WORKBENCH_META_DIR` | `target/lingtai-workbench/meta` | Holt metadata directory. Production/downstream use must override this with persistent storage. |
+| `LINGTAI_WORKBENCH_META_DIR` | `target/lingtai-workbench/meta` | Holt metadata directory. Persistent downstream use must override this with stable storage. |
 | `LINGTAI_WORKBENCH_SERVER_BIND` | `127.0.0.1:7799` | Metadata RPC listen/client address. |
 | `LINGTAI_WORKBENCH_SERVER_LOG` | `target/lingtai-workbench/nokv-server.log` | Helper-managed server log. |
 | `LINGTAI_WORKBENCH_SERVER_PID` | `target/lingtai-workbench/nokv-server.pid` | Helper-managed process id. |
@@ -83,6 +83,14 @@ a persistent location and keep that location stable across updates.
 | `LINGTAI_WORKBENCH_S3_SECRET_ACCESS_KEY` | `rustfsadmin` | Lower-level RustFS bootstrap credential. `up.sh` rejects a non-default value because custom credentials are not propagated into the LingTai MCP registration. |
 | `LINGTAI_WORKBENCH_ACCEPT_CONTRACT_SHA256` | unset | Accept exactly one reviewed new canonical schema digest. It is not a Boolean bypass. |
 | `LINGTAI_WORKBENCH_ALLOW_DIRTY` | `0` | Set to `1` only for an explicitly dirty local maintainer build. |
+
+The defaults bind services to localhost and bootstrap a dedicated local RustFS
+with known development credentials. They are suitable for guarded integration
+and acceptance testing, not a production identity or secret-management design.
+Every MCP child receives the configured metadata and object-store access; the
+Workbench root confines tool paths but does not authenticate a tenant or provide
+RBAC. A deployment serving mutually untrusted principals requires a separately
+reviewed authentication, policy, credential, and process-isolation boundary.
 
 Local RustFS-specific controls are:
 
@@ -264,7 +272,10 @@ From another terminal:
   ls /
 ```
 
-Exit status zero proves the client can reach both metadata and object storage.
+Exit status zero proves that the client can reach the metadata RPC. The earlier
+`head-bucket` check verifies object-store access. Use the live preflight or E2E
+round trip to validate publication and reads across both services; `ls /` alone
+does not exercise the object data path.
 
 ### 5. Raw Workbench Contract
 
@@ -281,9 +292,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
     --workbench-root '/agents/coordinator(codex-gpt-5.4)/wb'
 ```
 
-The result must contain exactly 18 tools. Compare `inputSchema` semantically to
-`workbench_contract_schema.json`; descriptions and JSON Schema annotations do
-not affect the contract digest, while missing fields or added restrictions do.
+The raw profile contains 17 base tools and includes `workbench_restore` only
+when all relevant owners advertise `restore_to_fork_v1`. The guarded LingTai
+handoff requires the resulting exact 18-tool surface. Compare `inputSchema`
+semantically to `workbench_contract_schema.json`; descriptions and JSON Schema
+annotations do not affect the contract digest, while missing fields or added
+restrictions do.
 
 ### 6. Gated Registration and Read-Only Verification
 
@@ -348,25 +362,8 @@ marker.
 
 If port `7799` is occupied, identify the listener first:
 
-```text
-workbench_create
-workbench_put_file
-workbench_append
-workbench_edit
-workbench_list
-workbench_stat
-workbench_read
-workbench_grep
-workbench_search
-workbench_aggregate
-workbench_catalog
-workbench_find
-workbench_commit
-workbench_snapshot
-workbench_snapshot_renew
-workbench_snapshot_retire
-workbench_snapshot_list
-workbench_restore
+```bash
+lsof -nP -iTCP@127.0.0.1:7799 -sTCP:LISTEN
 ```
 
 The helper must not terminate an unverified process. For the default local
@@ -437,6 +434,12 @@ is a non-empty human-readable string bounded to 256 Unicode characters and
 `annotation` is also preserved by checkpoint list and renew responses; these
 fields are not encoded into the 64-character checkpoint name.
 
+The snapshot is a leased historical view, not a frozen live workspace. The
+Workbench default lease is 7 days and the maximum is 90 days. A checkpoint name
+is an alias in `metadata/checkpoints.jsonl`, not a non-expiring GC root. Renewal
+is extend-only; after retirement or lease expiry, the pin no longer guarantees
+historical retention.
+
 Annotations live in the workbench checkpoint registry, which is appended after
 the authoritative snapshot pin is created. If that append fails, the MCP call
 returns typed `SnapshotRegistryWritePartial` with the created snapshot id,
@@ -459,6 +462,20 @@ deletion. The checkpoint registry records retire lifecycle events, and
 acknowledged `retired=true` event. An absent pin without that proof remains
 `state=reaped`. The base surface therefore has 17 tools, or 18 when
 `workbench_restore` is capability-enabled.
+
+## Durable Restore Contract
+
+`workbench_restore` creates a new destination workbench from a live snapshot of
+a committed source workbench. The destination id must differ from the source,
+and both roots must route to the same metadata shard. The source remains
+unchanged. Exact retries are idempotent, including after a committed response is
+lost or the process restarts during the durable state machine.
+
+The tool is omitted unless every relevant metadata owner confirms
+`restore_to_fork_v1`. Path confinement beneath `/agents/{agent_id}/wb` remains
+an adapter constraint, not authentication or tenant policy. See
+[`docs/development/workbench-checkpoint-lifecycle.md`](../../docs/development/workbench-checkpoint-lifecycle.md)
+for lease, GC, restore, and generic in-place rollback boundaries.
 
 ## Tests
 
@@ -509,6 +526,10 @@ release cleanup, fsck, and final object inventory. `--require-all` has no skip
 path for missing Docker, AWS CLI, LingTai dependencies, capability, or a stale
 binary.
 
+This is recovery, crash-consistency, and lifecycle acceptance evidence. It does
+not measure enterprise small-file throughput and does not by itself establish a
+production metadata-HA guarantee.
+
 For local iteration only:
 
 ```bash
@@ -522,8 +543,12 @@ uv run --project /path/to/lingtai-kernel \
 The quick profile keeps the non-crash contract, indexing, restart, and object
 lifecycle checks with a smaller fixture; it is not merge evidence.
 
-The metadata HA companion gate remains:
+The separate metadata-HA chaos gate remains available for engineering
+validation:
 
 ```bash
 NOKV_HA_STALE_OWNER_CHAOS=1 ./scripts/run-metadata-ha-smoke.sh
 ```
+
+Passing this smoke test is not a claim that the default Workbench helper provides
+production-grade metadata high availability.

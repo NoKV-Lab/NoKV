@@ -3,7 +3,21 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# NoKV as AI-Infra Storage — Architecture & Design
+# Historical: NoKV as AI-Infra Storage — Architecture & Design
+
+> [!WARNING]
+> **Historical design exploration — archived 2026-07-30.** This document
+> records an earlier AI-training/data-plane direction and is not the current
+> product contract. NoKV is now positioned as an object-backed metadata control
+> plane for durable agent workspaces. Current distributed support is
+> experimental path sharding with one active writer per Holt-backed shard,
+> epoch-fenced failover, and shard-local atomic publication; it is not consensus
+> replication or a cross-shard transaction layer. Enterprise multi-machine
+> throughput and hardening remain work in progress. See the current
+> [README](../../README.md), [architecture](../architecture.md),
+> [product design](../product-design.md),
+> [metadata sharding and recovery](../metadata-sharding-and-recovery.md), and
+> [benchmark boundary](../benchmarks.md).
 
 > **Thesis.** NoKV is an **object-backed, metadata-first file system** for AI
 > infrastructure. Its wedge is **atomic, parallelism-agnostic checkpoint publish +

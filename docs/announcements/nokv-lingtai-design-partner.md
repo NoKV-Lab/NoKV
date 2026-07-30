@@ -4,31 +4,61 @@
 
 # NoKV × Lingtai: a design-partner collaboration
 
-Today we're sharing that **NoKV** and **Lingtai** ([Lingtai-AI/lingtai](https://github.com/Lingtai-AI/lingtai)) have begun a **design-partner collaboration**. What you're reading is just the warm-up announcement. Before there's much to show, we wanted to mark the start.
+Published 23 June 2026. Integration status updated 30 July 2026.
 
-## Two projects, one conviction: agents want filesystems
+**NoKV** and **Lingtai**
+([Lingtai-AI/lingtai](https://github.com/Lingtai-AI/lingtai)) are working together
+as design partners on durable workspaces for long-running agents. This page
+records the collaboration and its technical boundary; it is not a statement of
+production readiness.
 
-- **Lingtai** (灵台) is a local-first agent runtime built on the idea that *"the project organization is the product."* Its agents are long-lived residents with on-disk homes: state, mailboxes, logs, and artifacts all live as plain files you can `ls`, `cat`, and `grep`. State on disk, on purpose. Its name comes from the Zhuangzi (*the heart-mind, the square inch where transformation begins*), and it frames itself as *"an Agent OS that gifts life,"* where *"all things are files" (万物皆文件)*. Today Lingtai already has an active early community of 240+ users.
-- **NoKV** is a metadata control plane for object-backed agent artifacts: run outputs, logs, checkpoints, and citable evidence in one filesystem-shaped namespace, with atomic publish-by-generation, GC-protected snapshots, and immutable versioned blocks underneath.
+## Two projects, one filesystem-shaped workspace
 
-*"All things are files"* on one side, *"agents want filesystems"* on the other: we reach the same conviction from two layers. Lingtai gives agents a filesystem-shaped *home*; NoKV is building the durable *substrate* a home like that can stand on.
+- **Lingtai** is a local-first Agent runtime in which long-lived agents keep
+  state, mailboxes, logs, and artifacts in on-disk project directories that
+  remain inspectable with ordinary file tools. Lingtai reports an active early
+  developer community.
+- **NoKV** is a durable metadata control plane for object-backed multi-agent
+  workspaces. It provides a filesystem-shaped namespace, shard-local atomic
+  publication, leased historical snapshots, and CoW restore-to-fork primitives
+  while leaving planning, semantic memory, and orchestration to the Agent
+  runtime.
 
-## What we're exploring together
+Lingtai gives an Agent a filesystem-shaped home. NoKV provides storage and
+metadata primitives that can make such a workspace durable, recoverable, and
+auditable without replacing plain-file access.
 
-This is design work, not a shipped integration. Abstractly:
+## What we are validating together
 
-- **Workspace checkpoints**: let a long-running agent roll its whole workspace back to a known-good state instead of starting over.
-- **Atomic, crash-consistent publishing**: concurrent agent writes and a mid-run crash never leave a half-written workspace.
-- **Artifact provenance**: versioned blocks with digests, so a derived artifact stays traceable to the run that produced it.
-- **A queryable metadata layer**: ask *"what produced this / what depends on this"* across an agent's outputs.
+- **Workspace checkpoints and recovery:** pin a stable historical view and
+  restore a committed workspace into a new CoW destination instead of mutating
+  the source in place.
+- **Shard-local crash-consistent publication:** publish an artifact or a group
+  of checkpoint files atomically within one metadata owner.
+- **Explicit provenance:** preserve digests and runtime-supplied provenance
+  fields so an artifact can be linked to the run metadata that produced it.
+- **Queryable workspace metadata:** search metadata recorded by the runtime and
+  application. NoKV does not infer a semantic dependency graph on its own.
 
-The constraint we care about most is preserving the plain-file transparency Lingtai is built on. A substrate underneath should *add* durability, snapshots, and provenance, without taking away the `ls`/`cat`/`grep` you can already point at your agents' state.
+The NoKV-side Workbench MCP adapter, guarded 18-tool LingTai contract, leased
+snapshot lifecycle, and durable restore acceptance path now exist. Availability
+inside a particular Lingtai distribution remains release-, capability-, and
+preflight-dependent.
 
-## Where things stand
+## Current boundary
 
-Both projects are pre-1.0 and moving fast, so treat this as a forward-looking partnership. We're sharing it now because the direction is the most interesting part, and because we believe in the power of an open-source community.
+- The raw Workbench profile has 17 base tools; `workbench_restore` is exposed as
+  the eighteenth only when every relevant owner confirms the capability.
+- Snapshot pins are leased. A checkpoint name is a discoverability alias, not a
+  permanent GC root or a freeze of the live workspace.
+- Restore-to-fork is same-shard only and leaves the source unchanged. NoKV does
+  not currently provide a cross-shard atomic restore or publication transaction.
+- Workbench path scoping is not authentication, RBAC, or tenant policy.
+  Production-grade identity boundaries, live workspace freezing, and metadata
+  high availability require separate hardening.
 
-If a stateful, snapshot-able, auditable agent workspace is something you've wanted: ⭐ star NoKV, follow [Lingtai](https://github.com/Lingtai-AI/lingtai), and watch this space. More as the work takes shape.
+Both projects remain pre-1.0 and are evolving quickly. We will publish workload
+evidence and downstream availability separately as they become reproducible.
 
 ## Contact
 

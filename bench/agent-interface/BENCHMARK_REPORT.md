@@ -1,6 +1,23 @@
 # Agent Interface Benchmark Report: Namespace Surface vs Raw SQL
 
-**NoKV agent-interface benchmark — final results, 2026-06-10**
+> [!IMPORTANT]
+> **Frozen historical evidence.** This report preserves an experiment published
+> on 2026-06-10; it is not the current product definition or a storage
+> throughput claim. NoKV is positioned as an object-backed metadata control
+> plane for durable agent workspaces. These results only compare two
+> agent-facing interfaces on the workload and model described below.
+
+**NoKV agent-interface benchmark — published results, 2026-06-10**
+
+Evidence audit (2026-07-30): the two committed telemetry files contain exactly
+100 completed `benchmark_run` records: 50 per arm and 20 per task. All runs
+requested `gpt-5.4-mini`; all 500 recorded API calls resolved to
+`gpt-5.4-mini-2026-03-17`. The raw telemetry was introduced in commit
+[`004f44dc8bd76a366f08d8d6401b1a56bb4eaaa4`](https://github.com/NoKV-Lab/NoKV/commit/004f44dc8bd76a366f08d8d6401b1a56bb4eaaa4).
+The telemetry is sufficient to recompute the tables, but it does not embed the
+NoKV source commit or a corpus digest. The corpus archive is not distributed
+with a public URL, checksum, or license record, so this is auditable historical
+evidence rather than a fully independent rerun package.
 
 ## Executive Summary
 
@@ -178,9 +195,11 @@ export OPENAI_OUTPUT_USD_PER_1M_TOKENS=4.50
 ```
 
 Result telemetry for the published numbers is committed at
-`bench/agent-interface/results/gpt-5.4-mini-5repeats-run1.jsonl`
-and `.../gpt-5.4-mini-5repeats-run2.jsonl` (two 5-repeat batches, 100 runs).
-Locally produced result files under `bench/data/` stay uncommitted.
+[`results/gpt-5.4-mini-5repeats-run1.jsonl`](results/gpt-5.4-mini-5repeats-run1.jsonl)
+and
+[`results/gpt-5.4-mini-5repeats-run2.jsonl`](results/gpt-5.4-mini-5repeats-run2.jsonl)
+(two 5-repeat batches, 100 runs). Locally produced result files under
+`bench/data/` stay uncommitted.
 
 ## Limitations
 
@@ -190,3 +209,11 @@ Locally produced result files under `bench/data/` stay uncommitted.
   exploration because that is the target workload.
 - Token prices are list prices at publication time; ratios, not absolute
   dollars, are the durable result.
+- The source commit and corpus digest are absent from per-run telemetry. The
+  benchmark implementation has evolved since publication, so reruns against
+  current `main` are new measurements rather than replicas of this snapshot.
+- The corpus archive is not publicly packaged with a checksum and license;
+  independent end-to-end reproduction therefore requires separately obtaining
+  the identical archive.
+- The SDK/adapter path is measured directly. MCP transport and end-to-end MCP
+  client behavior are outside this experiment.

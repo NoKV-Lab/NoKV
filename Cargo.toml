@@ -20,7 +20,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["The NoKV Authors"]
-repository = "https://github.com/feichai0017/NoKV"
+repository = "https://github.com/NoKV-Lab/NoKV"
 homepage = "https://nokv.io"
 
 [workspace.dependencies]

@@ -11,15 +11,16 @@ argument validation, result shaping, and the transport-neutral `AgentError`.
 It is deliberately small, deliberately **transport-free**, and deliberately
 **read-only** today.
 
-This handbook is for contributors touching the agent surface. It covers where
-the crate sits in the workspace, the invariants you must preserve, how to add a
-tool, and the roadmap for the verbs we expect to add next.
+This handbook is for contributors touching the generic Agent surface. It covers
+where the crate sits in the workspace, the invariants you must preserve, how to
+add a read tool, and the boundary between this crate and the stateful Workbench
+profile.
 
 ## 1. Why this crate exists
 
 The seven agent verbs used to live inside `nokv-client/src/agent.rs`, which
-forced every consumer of the tool surface (the benchmark harness, future SDKs,
-an MCP server) to depend on the whole client stack — `nokv-protocol`,
+forced every consumer of the tool surface (the benchmark harness, SDKs, and MCP
+adapters) to depend on the whole client stack — `nokv-protocol`,
 `nokv-control`, framed RPC, connection pools — even when running fully
 in-process against an embedded engine.
 
@@ -69,6 +70,21 @@ The two remote trait impls (`for MetadataClient`, `for NoKvFsClient<O>`) live in
 `nokv-client/src/agent.rs`, which now also re-exports the whole surface from
 `nokv-agent` so existing `nokv_client::{execute_agent_tool, …}` call sites keep
 compiling unchanged.
+
+### MCP profiles are a separate layer
+
+The `nokv` binary currently exposes two MCP profiles over JSON-RPC on stdio:
+
+- `nokv mcp --profile agent` wraps this crate's fixed seven-tool, read-only
+  surface.
+- `nokv mcp --profile workbench` exposes a separate stateful workspace contract.
+  It has 17 base tools. `workbench_restore` is added as the eighteenth tool only
+  when every relevant metadata owner confirms `restore_to_fork_v1`.
+
+Do not infer the Workbench contract from the `nokv-agent` trait. Workbench owns
+file publication, commits, leased snapshots, and durable restore semantics in
+the binary adapter. The guarded LingTai integration intentionally requires the
+complete 18-tool capability-enabled surface.
 
 ### Workspace position
 
@@ -120,7 +136,8 @@ exists (`ls`/`stat`/`catalog`), then query and read only what is needed
 2. **Read-only verb surface.** The `AgentNamespace` trait exposes only the six
    read verbs. Writes (e.g. `register_namespace_index`) stay as inherent methods
    on `NoKvFs` in `nokv-meta`, off the trait. Keep the model-facing surface
-   read-only unless a write contract is explicitly designed (see [the roadmap](#6-roadmap-verbs-we-expect-to-add)).
+   read-only unless a write contract is explicitly designed (see
+   [the companion surface](#6-stateful-companion-surface-and-future-work)).
 3. **Orphan-rule placement.** `impl AgentNamespace for NoKvFs<M, O>` lives in
    `nokv-agent` (local trait + foreign type → legal). This is what lets the
    embedded path work **without** `nokv-meta` gaining a dependency on
@@ -156,35 +173,34 @@ The flow crosses two crates because the verb logic stays in `nokv-meta`:
    `nokv-agent` (no engine needed), and confirm the benchmark tool-registry test
    still matches the arm surface.
 
-## 6. Roadmap (verbs we expect to add)
+## 6. Stateful Companion Surface and Future Work
 
-The current surface answers **read** questions over a namespace. NoKV already
-implements the write/stateful semantics below in `nokv-meta`/`nokv-client`; the
-agent work is to give each a model-facing tool contract (idempotency, evidence
-URIs, limits) and, where a verb mutates state, to extend the surface beyond
-read-only with the same care as the read verbs.
+The generic `nokv-agent` surface answers read questions over a namespace. It is
+not the complete NoKV workspace product surface, and stateful operations should
+not be added to this trait merely because the underlying service implements
+them.
 
-- **Workspace checkpoints.** Atomic checkpoint publish already exists
-  (`nokv-meta` publish/checkpoint paths; see [checkpointing](../checkpointing.md)).
-  Expected verbs: publish a checkpoint generation and resolve "latest complete"
-  so an agent can write a run's outputs and read back a crash-consistent view.
-- **Copy-on-write workspaces.** Clone, snapshot, diff, and rollback exist
-  (`nokv-meta` clone/snapshot/rollback; see [cow-workspaces](../cow-workspaces.md)).
-  Expected verbs: `snapshot` (pin a frozen subtree view), `clone` (branch a
-  workspace cheaply), `diff` (what changed between two generations), `rollback`.
-- **Artifacts.** The artifact repository publishes bodies with digests and
-  cleans up failed staged uploads (`nokv-client` artifact path). Expected verbs:
-  publish an artifact and read it (including byte-range reads) with the digest
-  and body manifest as citable evidence.
-- **Events / watch.** Creates, renames, and publishes land as typed, replayable
-  events with a cursor (`nokv-meta` watch). Expected verb: `watch`/`tail` a
-  subtree from a cursor so an agent can react to changes instead of polling.
+The Workbench MCP profile already provides a purpose-built stateful contract:
 
-Design notes for these: most are **stateful or write** operations, so they do
-not slot into today's read-only trait unchanged. Each needs an explicit tool
-contract — argument grammar, idempotency/iflag semantics, evidence URIs, and
-limits — and an answer to "what does the model see on partial failure." Open a
-design issue before adding a write verb to the trait.
+- file creation, replacement, append, edit, and a committed run manifest;
+- a leased snapshot with optional checkpoint name and annotation;
+- snapshot list, extend-only renew, retire, and `stat`/`list`/`read` at a stable
+  historical view;
+- capability-gated, same-shard `workbench_restore` into a new destination. The
+  source remains unchanged and exact retries are idempotent.
+
+These operations carry path scoping, commit identity, lease, partial-failure,
+and retry semantics that do not belong in the six-method read trait. A snapshot
+pins a historical view; it does not freeze the live workspace or create an
+authorization boundary. Atomic publication and restore guarantees are limited
+to one metadata owner.
+
+Potential generic additions such as watch/tail, additional structured reads, or
+an intentionally designed write API still require a design issue covering
+argument grammar, limits, identity and idempotency, evidence URIs, and uncertain
+commit outcomes. See [Checkpointing](../checkpointing.md),
+[Copy-on-Write Workspaces](../cow-workspaces.md), and
+[Workbench checkpoint lifecycle](workbench-checkpoint-lifecycle.md).
 
 ## 7. Where things live
 

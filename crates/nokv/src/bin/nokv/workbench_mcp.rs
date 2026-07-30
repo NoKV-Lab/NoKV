@@ -176,7 +176,7 @@ pub fn tool_definitions_for_capabilities(restore_to_fork_v1: bool) -> Vec<AgentT
         AgentToolDefinition {
             name: "workbench_put_file",
             description:
-                "Publish one file into a jailed workbench section. Paths are relative to the section. replace=false (the default) is create-only and fails when the target exists; replace=true is replace-only and fails when the target is missing. workbench_put_file is not an upsert operation.",
+                "Publish one file into a path-scoped workbench section. Paths are relative to the section; path scoping is not authentication or RBAC. replace=false (the default) is create-only and fails when the target exists; replace=true is replace-only and fails when the target is missing. workbench_put_file is not an upsert operation.",
             parameters: json!({
                 "type": "object",
                 "required": ["id", "section", "path"],
@@ -3620,9 +3620,9 @@ where
 
 /// Ensure `path` exists as a directory, creating any missing ancestors
 /// (mkdir -p). `mkdir` is non-recursive, so a multi-level workbench root such
-/// as `/agents/<agent_id>/wb` (per-agent tenant isolation) requires each
-/// ancestor to be created in turn — otherwise the first create fails with
-/// "metadata entry not found".
+/// as `/agents/<agent_id>/wb` requires each ancestor to be created in turn —
+/// otherwise the first create fails with "metadata entry not found". The root
+/// provides per-Agent namespace scoping, not authentication.
 fn ensure_dir_path<O>(
     client: &NoKvFsClient<O>,
     options: &WorkbenchMcpOptions,

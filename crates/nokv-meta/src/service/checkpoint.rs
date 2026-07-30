@@ -1,19 +1,14 @@
-//! Atomic multi-shard checkpoint publish.
+//! Atomic multi-file checkpoint publication within one metadata owner.
 //!
-//! A large-model training checkpoint is N per-rank shard blobs that must become
-//! visible **all-at-once or not-at-all** — a crash mid-write must never leave a
-//! half-checkpoint a restore would silently load. NoKV already has the pieces a
-//! generic object-backed FS lacks: object-first staging, an atomic metadata
-//! commit, a byte-range index (`BlockDescriptor` maps logical → object ranges, so
-//! **reshard-on-read is just a range read**), and CoW version pins (snapshot the
-//! checkpoint dir = a parallelism-agnostic checkpoint *version*). This module adds
-//! the one missing primitive: committing all N shard files in a **single**
-//! metadata command so the whole checkpoint version is atomic.
+//! A checkpoint can contain N component blobs that must become visible
+//! **all-at-once or not-at-all**. NoKV stages their objects first, then commits
+//! every file in one metadata command. In this module, "shard" means a component
+//! file in the checkpoint; it does not mean a NoKV metadata shard. The parent and
+//! all published files belong to one metadata owner. This primitive does not
+//! provide a cross-metadata-shard transaction.
 //!
-//! This is the storage-backend contract ByteCheckpoint (NSDI'25) / PyTorch DCP
-//! converged on (tmp → atomic visibility behind a barrier); the per-tensor shard
-//! index (FQN → byte range) stays the framework's concern — NoKV serves the
-//! atomic publish, the range reads, and the version pin.
+//! `BlockDescriptor` maps logical ranges to immutable object ranges, while a
+//! leased snapshot can pin a stable checkpoint version for later reads.
 
 use super::*;
 

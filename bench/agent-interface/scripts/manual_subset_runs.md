@@ -10,15 +10,20 @@ All commands assume the repository root is the current directory.
 
 ```bash
 export OPENAI_API_KEY=...
-export OPENAI_MODEL=gpt-5.5
+export OPENAI_MODEL="your-explicit-model-id"
 
-export DATA_ROOT=/Users/wangchanghao/NoKV/bench/data/yanex-demo
+export DATA_ROOT="${PWD}/bench/data/yanex-demo"
 ```
 
 The wrapper script owns model selection. It uses `--model MODEL` when provided,
 then `YANEX_BENCH_MODEL`, then `OPENAI_MODEL`, and finally `gpt-5.5`. The base
 profile does not configure the model name. The script checks the model and API
 key before invoking Cargo.
+
+Treat the final `gpt-5.5` fallback as an exploratory convenience, not a
+reproducibility guarantee. Published runs should pass `--model` explicitly and
+archive both the requested identifier and the response-resolved model snapshot
+from telemetry. A moving alias can resolve differently over time.
 
 The default API surface uses the OpenAI Agents SDK runner. Install its Python
 dependency in the local benchmark virtual environment. The wrapper
