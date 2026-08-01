@@ -15,7 +15,7 @@ SPDX-License-Identifier: Apache-2.0
     <a href="./docs/workbench-contract.md"><strong>Workbench Contract</strong></a> ·
     <a href="./docs/metadata-schema.md"><strong>Metadata Schema</strong></a> ·
     <a href="./docs/development/workspace-acceptance.md"><strong>Acceptance</strong></a> ·
-    <a href="https://github.com/feichai0017/NoKV/discussions"><strong>Discussions</strong></a>
+    <a href="https://github.com/orgs/NoKV-Lab/discussions"><strong>Discussions</strong></a>
   </p>
 </div>
 
@@ -30,6 +30,20 @@ SPDX-License-Identifier: Apache-2.0
 > **NoKV × LingTai** is a design partner collaboration.
 > [English announcement](https://github.com/orgs/NoKV-Lab/discussions/378) ·
 > [中文公告](https://github.com/orgs/NoKV-Lab/discussions/380)
+
+## Building partners
+
+| Partner | Project |
+| --- | --- |
+| **OpenViking** | [Website](https://openviking.ai/) · [GitHub](https://github.com/volcengine/OpenViking) · ![OpenViking stars](https://img.shields.io/github/stars/volcengine/OpenViking?style=flat&label=stars) |
+| **Hermes Agent** | [GitHub](https://github.com/NousResearch/hermes-agent) · ![Hermes Agent stars](https://img.shields.io/github/stars/NousResearch/hermes-agent?style=flat&label=stars) |
+| **LingTai** | [Website](https://lingtai.ai/en/) · [GitHub](https://github.com/Lingtai-AI/lingtai) · ![LingTai stars](https://img.shields.io/github/stars/Lingtai-AI/lingtai?style=flat&label=stars) |
+| **LoopX** | [GitHub](https://github.com/huangruiteng/loopx) · ![LoopX stars](https://img.shields.io/github/stars/huangruiteng/loopx?style=flat&label=stars) |
+| **heima** | [GitHub](https://github.com/litentry/heima) · ![heima stars](https://img.shields.io/github/stars/litentry/heima?style=flat&label=stars) |
+
+Building-partner status denotes an active collaboration. It does not by itself
+imply a production deployment, support SLA, or completed enterprise
+qualification.
 
 ## What is NoKV?
 

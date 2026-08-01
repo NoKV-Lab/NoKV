@@ -45,22 +45,21 @@ Do not open a public issue with exploit details. Follow the private reporting pr
 - Repository: `github.com/NoKV-Lab/NoKV`
 - Main branch: `main`
 - Main product line: Rust NoKV under `crates/`
-- Rust toolchain: stable
+- Minimum supported Rust version: 1.88
 
 ## Development Setup
 
 1. Fork on GitHub and clone your fork.
 2. Add the upstream remote to keep your fork up to date.
-3. Install Rust stable.
+3. Install Rust 1.88 or newer.
 
 ```bash
-git clone https://github.com/NoKV-Lab/NoKV.git
+git clone https://github.com/YOUR_GITHUB_USER/NoKV.git
 cd NoKV
-git remote rename origin upstream
+git remote add upstream https://github.com/NoKV-Lab/NoKV.git
+git fetch upstream
 cargo fetch
 ```
-
-If you use a fork-based workflow, add your fork as `origin`.
 
 ## Branch and Commit Conventions
 
