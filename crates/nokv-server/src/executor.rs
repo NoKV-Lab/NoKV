@@ -1343,7 +1343,7 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let transition_id = derived_request_id(rpc.request_id, b"publish-complete-transition", 0);
-        let _transition = if let Some(outcome) = self.replayed_publish(rpc.route, transition_id)? {
+        let transition = if let Some(outcome) = self.replayed_publish(rpc.route, transition_id)? {
             outcome
         } else {
             let operation = self.heartbeat_publish_operation(
@@ -1372,9 +1372,13 @@ impl MetadataWorkspaceRequestExecutor {
                 true,
             );
         }
+        let finalizing_token = protocol::OperationToken {
+            operation_id: transition.operation.operation_id.into(),
+            state_digest: publish_state_digest(&transition.operation)?,
+        };
         let finalizing_operation = self.heartbeat_publish_operation(
             rpc,
-            request.token,
+            finalizing_token,
             b"publish-heartbeat-complete-finalize",
         )?;
         let context = self.publication_context(rpc.route, finalize_id)?;
@@ -4958,17 +4962,81 @@ mod tests {
     }
 
     #[test]
-    fn search_crosses_the_real_query_facade_and_decodes_typed_indexes() {
-        let (store, executor) = ready_executor();
-        let incarnation = types::WorkspaceIncarnationId::from_bytes([41; types::FIXED_ID_BYTES]);
+    fn published_index_fields_cross_workspace_rpc_and_query_facade() {
+        let (_store, executor) = ready_executor();
         executor
             .execute(&create_request(40, "query-test", 41, 1))
             .unwrap();
-        put_visible_path(&store, incarnation);
+        let operation_id = protocol::OperationIdentity([0x51; types::FIXED_ID_BYTES]);
+        let artifact_revision_id =
+            protocol::ArtifactRevisionIdentity([0x52; types::FIXED_ID_BYTES]);
+        let target = protocol::WorkspacePath {
+            workbench: protocol::WorkbenchName::new("query-test").unwrap(),
+            path: protocol::RelativePath::new("outputs/result.bin").unwrap(),
+        };
+        let index_fields = vec![protocol::FieldValue {
+            field_id: "agent.score".to_owned(),
+            value: protocol::ScalarValue::Unsigned(7),
+        }];
+        let seals = protocol::seal_artifact_publish_plan(artifact_revision_id, &[], &[]).unwrap();
+        let begun = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x53; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::BeginArtifactPublish(
+                    protocol::BeginArtifactPublishRequest {
+                        operation_id,
+                        artifact_revision_id,
+                        target: target.clone(),
+                        authority: protocol::PublicationAuthority::Visible,
+                        condition: protocol::PublishCondition::CreateOnly,
+                        staged_object_count: seals.staged_object_count,
+                        staged_object_seal: seals.staged_object_seal,
+                        manifest_row_count: seals.manifest_row_count,
+                        manifest_seal: seals.manifest_seal,
+                        dependency_owner_revision_ids: Vec::new(),
+                    },
+                ),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(status) = begun.result else {
+            panic!("begin artifact publication returned the wrong result variant");
+        };
+        assert_eq!(status.state, protocol::OperationState::Running);
+        assert_eq!(status.progress.completed_rows, 0);
+        assert_eq!(status.progress.total_rows, Some(0));
+
+        let completed = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x54; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::CompleteArtifactPublish(
+                    protocol::CompleteArtifactPublishRequest {
+                        token: status.token,
+                        artifact: protocol::ArtifactDescriptor {
+                            logical_size: 0,
+                            body_digest: protocol::sha256_digest_uri(protocol::Digest(
+                                Sha256::digest([]).into(),
+                            )),
+                            manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
+                            content_type: protocol::ContentType::new("application/octet-stream")
+                                .unwrap(),
+                            producer: Some("executor-test".to_owned()),
+                            manifest_identity: Some("manifest-1".to_owned()),
+                            index_fields: index_fields.clone(),
+                        },
+                    },
+                ),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Published(published) = completed.result else {
+            panic!("complete artifact publication returned the wrong result variant");
+        };
+        assert_eq!(published.target, target);
 
         let search = protocol::WorkspaceRpcRequest {
             route: route(1),
-            request_id: protocol::RequestIdentity([42; types::FIXED_ID_BYTES]),
+            request_id: protocol::RequestIdentity([0x55; types::FIXED_ID_BYTES]),
             operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
                 scope: protocol::QueryScope::Root { path_prefix: None },
                 predicates: vec![protocol::QueryPredicate {
@@ -4993,12 +5061,10 @@ mod tests {
             panic!("search returned the wrong result variant");
         };
         assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].projection, index_fields);
         assert_eq!(
-            result.hits[0].projection,
-            vec![protocol::FieldValue {
-                field_id: "agent.score".to_owned(),
-                value: protocol::ScalarValue::Unsigned(7),
-            }]
+            result.hits[0].metadata.descriptor.index_fields,
+            index_fields
         );
         assert_eq!(
             result.hits[0].metadata.path.path.as_str(),
@@ -5009,7 +5075,7 @@ mod tests {
 
         let catalog = protocol::WorkspaceRpcRequest {
             route: route(1),
-            request_id: protocol::RequestIdentity([43; types::FIXED_ID_BYTES]),
+            request_id: protocol::RequestIdentity([0x56; types::FIXED_ID_BYTES]),
             operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
                 scope: protocol::QueryScope::Workspace {
                     workbench: protocol::WorkbenchName::new("query-test").unwrap(),
@@ -5032,11 +5098,11 @@ mod tests {
             .expect("one-row catalog page has a continuation");
 
         executor
-            .execute(&create_request(44, "query-version-advance", 45, 1))
+            .execute(&create_request(0x57, "query-version-advance", 0x58, 1))
             .unwrap();
         let stale_catalog = protocol::WorkspaceRpcRequest {
             route: route(1),
-            request_id: protocol::RequestIdentity([46; types::FIXED_ID_BYTES]),
+            request_id: protocol::RequestIdentity([0x59; types::FIXED_ID_BYTES]),
             operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
                 scope: protocol::QueryScope::Workspace {
                     workbench: protocol::WorkbenchName::new("query-test").unwrap(),

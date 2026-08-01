@@ -2802,6 +2802,42 @@ mod tests {
     }
 
     #[test]
+    fn valid_index_fields_cross_the_workspace_rpc_publication_path() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        let index_fields = vec![
+            FieldValue {
+                field_id: "agent.owner".to_owned(),
+                value: ScalarValue::String("planner".to_owned()),
+            },
+            FieldValue {
+                field_id: "agent.score".to_owned(),
+                value: ScalarValue::Unsigned(7),
+            },
+        ];
+
+        client
+            .publish_artifact(
+                &store,
+                publish_options(4).with_index_fields(index_fields.clone()),
+                b"abcdefgh",
+            )
+            .unwrap();
+
+        let state = inspector.state();
+        let metadata = state
+            .path
+            .as_ref()
+            .and_then(|path| path.metadata.as_ref())
+            .expect("publication exposes the visible path metadata");
+        assert_eq!(metadata.descriptor.index_fields, index_fields);
+        assert!(state.attempts.iter().any(|(label, _)| *label == "complete"));
+    }
+
+    #[test]
     fn response_loss_replays_the_exact_stage_request_without_duplicate_apply() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), true);

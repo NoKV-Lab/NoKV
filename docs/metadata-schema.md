@@ -401,6 +401,12 @@ typed index projection
 There is no canonical inode, dentry, parent pointer, link count, directory
 record, or fallback path index.
 
+Clients attach queryable fields to `ArtifactDescriptor.index_fields` on the
+artifact publication request. The workspace executor validates and encodes
+that typed projection, and final publication updates `PathCurrent` and the
+corresponding `SecondaryIndex` rows in the same metadata command. There is no
+separate namespace-index registration RPC or second mutation path.
+
 A cold exact artifact lookup performs one `WorkspaceCurrent` point read and,
 only when its state is `Visible`, one `PathCurrent` point read. `PathEntry`
 atomically retains the immutable revision fields required to shape complete
