@@ -993,6 +993,7 @@ mod tests {
 
     #[test]
     fn public_list_cursor_requires_the_previous_page_read_version() {
+        Python::initialize();
         let error = validate_list_page_fence(Some(b"page-2"), None).unwrap_err();
         assert!(error
             .to_string()
