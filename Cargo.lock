@@ -123,6 +123,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -865,7 +871,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -1266,7 +1272,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 name = "nokv"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "nokv-agent",
  "nokv-client",
  "nokv-control",
@@ -1284,7 +1290,7 @@ dependencies = [
 name = "nokv-agent"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "nokv-types",
  "serde",
  "serde_json",
@@ -1450,7 +1456,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4f8607c90e2c963a91467f50fb49fbc7fb3d573f88cea219ca59ccd3740b309"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "http",
@@ -1477,7 +1483,7 @@ version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "313d46c9f5ae70bca26b7c3e3fbb9b639292625f28af73aa016f47e788af9deb"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "crc32c",
  "http",
@@ -2025,7 +2031,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5fa5cb48808693614d1701fcd3db0b30fa292e0f18e122ae068b6d32eaeed3f"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures",
@@ -2060,7 +2066,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -2699,7 +2705,7 @@ checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "h2",
  "http",
