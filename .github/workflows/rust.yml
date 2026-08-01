@@ -13,13 +13,33 @@ permissions:
   contents: read
 
 jobs:
-  nokv-fs:
+  lingtai-first-client:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Check Workbench and LingTai first-client contracts
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/lingtai-workbench/workbench_contract.py \
+            scripts/lingtai-workbench/live_first_client.py
+          python3 scripts/lingtai-workbench/workbench_contract_test.py
+          python3 scripts/lingtai-workbench/live_first_client_test.py
+          bash -n scripts/lingtai-workbench/start_rustfs.sh
+
+  nokv-workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

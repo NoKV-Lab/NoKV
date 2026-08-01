@@ -39,9 +39,10 @@ Project maintainers may remove content, lock threads, reject participation, or b
 
 ## Reporting
 
-If you experience or witness unacceptable behavior, contact the repository owner privately through GitHub:
+If you experience or witness unacceptable behavior, contact a project
+maintainer through an existing private channel. Do not include personal or
+sensitive details in a public issue.
 
-- [@feichai0017](https://github.com/feichai0017)
-
-Please avoid filing a public issue for personal conduct reports unless there is no reasonable private path available.
-
+If no private maintainer channel is available, open a minimal public issue that
+asks for private follow-up. Do not identify the people involved or describe the
+incident in that issue.

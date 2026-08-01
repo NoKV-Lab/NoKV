@@ -11,21 +11,30 @@ Thanks for contributing. This file is the authoritative contribution guide for t
 
 Welcome, and thanks for your interest in NoKV. Whether this is your first open-source PR or your hundredth, we're glad you're here.
 
-NoKV gives AI agents a filesystem (directories, paths, listing, reading) instead of a database to query. File bodies live as immutable blocks in S3-compatible object storage; NoKV manages the metadata layer on top. The bet: agents burn far fewer tokens walking a directory tree than reasoning over a SQL schema. The agent surface is seven verbs over the namespace: `ls`, `stat`, `find` (navigate), `read`, `grep` (read content), and `catalog`, `aggregate` (summarize). They are exposed to MCP (Model Context Protocol) clients via the `nokv-agent` crate. See the Agent Interface section of the [README](README.md) for the full description of this surface.
+NoKV is a distributed workspace and artifact store built specifically for Agent
+infrastructure. Holt stores one canonical normalized full-path namespace per
+workspace, while immutable revision-owned blocks live in S3-compatible object
+storage. The supported product surfaces are the Rust and Python SDKs, the
+purpose-built `nokv` CLI, and the exact 18-tool Workbench/MCP contract. NoKV
+does not implement a POSIX filesystem, FUSE frontend, or inode/dentry model.
 
-### New here? Read these three first (in order)
+### New here? Read these first (in order)
 
-1. **Why:** [Agents Want Filesystems: Agent-Friendly Interfaces Are a Token-Efficiency Strategy](https://nokv.io/blog/agents-want-filesystems): the product argument for why a filesystem-shaped interface cuts agent token use (~45% fewer tokens, ~39% lower cost) versus a SQL schema.
-2. **How:** [List a directory in 131 nanoseconds: holt, the metadata engine inside nokv](https://nokv.io/blog/holt-in-nokv): the metadata engine, an adaptive radix tree built for path-shaped keys.
-3. **Evidence:** [Agent Interface Benchmark — NoKV](https://nokv.io/benchmark): 875 Yanex runs, the NoKV namespace vs. raw SQLite, showing 1.83x fewer prompt tokens, 1.63x lower cost, and 4.5/5 vs. 4.4/5 tasks solved.
+1. **Product contract:** [Workbench Contract](docs/workbench-contract.md).
+2. **Architecture:** [Product Design](docs/product-design.md) and
+   [Metadata Schema](docs/metadata-schema.md).
+3. **Engineering rules:** [Code Contract](docs/development/code_contract.md)
+   and [PR Review Checklist](docs/development/pr_review_checklist.md).
 
 ### Make your first contribution
 
 - Browse [good first issues](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for a scoped starting point.
-- Recommended newcomer track: [#354: MCP server for the agent namespace surface](https://github.com/NoKV-Lab/NoKV/issues/354), which exposes the seven-verb agent surface to MCP clients over stdio.
 - For a new bug or feature, open an issue via the [template chooser](https://github.com/NoKV-Lab/NoKV/issues/new/choose). For broad design, onboarding, or meta topics, open a [Discussion](https://github.com/NoKV-Lab/NoKV/discussions) first.
 
-Before you open a PR, read **[Issues and Proposals](#issues-and-proposals)**, **Branch and Commit Conventions** (including DCO sign-off), and **Pull Request Rules** below. Those sections are the source of truth for branch names, commit format, the local make-gate, and review expectations.
+Before you open a PR, read **[Issues and Proposals](#issues-and-proposals)**,
+**Branch and Commit Conventions** (including DCO sign-off), and **Pull Request
+Rules** below. Those sections are the source of truth for branch names, commit
+format, validation, and review expectations.
 
 ### Reporting security issues
 
@@ -36,23 +45,21 @@ Do not open a public issue with exploit details. Follow the private reporting pr
 - Repository: `github.com/NoKV-Lab/NoKV`
 - Main branch: `main`
 - Main product line: Rust NoKV under `crates/`
-- Rust toolchain: stable
+- Minimum supported Rust version: 1.88
 
 ## Development Setup
 
 1. Fork on GitHub and clone your fork.
 2. Add the upstream remote to keep your fork up to date.
-3. Install Rust stable and Node.js for documentation builds.
+3. Install Rust 1.88 or newer.
 
 ```bash
-git clone https://github.com/NoKV-Lab/NoKV.git
+git clone https://github.com/YOUR_GITHUB_USER/NoKV.git
 cd NoKV
-git remote rename origin upstream
+git remote add upstream https://github.com/NoKV-Lab/NoKV.git
+git fetch upstream
 cargo fetch
-npm --prefix docs ci
 ```
-
-If you use a fork-based workflow, add your fork as `origin`.
 
 ## Branch and Commit Conventions
 
@@ -80,20 +87,23 @@ git rebase --signoff origin/main
 
 ## Local Validation
 
-Run these before opening a PR:
+Run the repository contract gates before opening a PR:
 
 ```bash
-make fmt
-make lint
-make test
-make docs-build
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+python3 scripts/lingtai-workbench/workbench_contract_test.py
+git diff --check
 ```
 
-For benchmark-related changes:
+For benchmark-related changes, follow
+[`docs/benchmarks.md`](./docs/benchmarks.md). A release-mode unit test is useful
+validation but is not itself a qualified performance result.
 
-```bash
-cargo test --workspace --release
-```
+The repository currently has no checked-in documentation build configuration.
+For documentation or navigation changes, validate local Markdown/image links
+and run `git diff --check`.
 
 ## Pull Request Rules
 
@@ -116,7 +126,8 @@ cargo test --workspace --release
 - Do not mix unrelated refactors with behavior changes in one PR.
 - Add tests for every bug fix or behavior change.
 - Follow the repository code contract in [`docs/development/code_contract.md`](./docs/development/code_contract.md), including package responsibilities, shared-helper reuse, file naming, type/interface/function naming, error placement, metrics/stats ownership, generated-code discipline, and compatibility rules.
-- Prefer breaking changes that remove ambiguity over compatibility wrappers. Add a compatibility shim only when a released RPC, CLI, config, or persisted format requires it, and document the removal condition.
+- Prefer direct breaking replacements that remove ambiguity. Do not add
+  forwarding aliases, fallback layouts, or parallel execution paths.
 
 ## Testing Expectations
 

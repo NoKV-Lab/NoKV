@@ -5,84 +5,102 @@ SPDX-License-Identifier: Apache-2.0
 
 # LingTai Workbench Preflight
 
-This page is the handoff checklist for testing the NoKV workbench MCP with a
-LingTai TUI runtime.
+LingTai is the active NoKV design partner and first Workbench client. It uses
+the normal `nokv mcp` stdio endpoint; there is no partner-specific metadata
+format or compatibility route.
 
-## Start RustFS
+## Required Inputs
 
-Use the LingTai workbench script, not the Yanex benchmark script:
+Before registration, obtain:
 
-```bash
-./scripts/lingtai-workbench/start_rustfs.sh
-```
+- one 16-byte `RootId`;
+- its persisted 16-byte `LogicalShardId` affinity;
+- the current non-zero placement generation and owner epoch;
+- the reachable workspace RPC owner address;
+- an S3-compatible bucket, region, endpoint policy, and credentials;
+- an absolute path to the exact `nokv` binary being registered.
 
-The script defaults the bucket to `nokv-lingtai-workbench`. Override the bucket
-explicitly when needed:
+The metadata owner must have opened a store containing only the exact
+`nokv_workspace` schema and installed the matching active root fence. The
+artifact backend must provide immutable create-if-absent, head, range read, and
+delete semantics.
 
-```bash
-LINGTAI_WORKBENCH_S3_BUCKET=nokv-lingtai-workbench \
-  ./scripts/lingtai-workbench/start_rustfs.sh
-```
+## Offline Gates
 
-## Start NoKV
-
-Build and run the NoKV server against the same metadata address and bucket that
-the LingTai MCP registration will use:
-
-```bash
-cargo build -p nokv --bin nokv
-mkdir -p ~/nokv-workbench-meta
-target/debug/nokv \
-  --server-bind 127.0.0.1:7799 \
-  --object-backend rustfs \
-  --s3-bucket nokv-lingtai-workbench \
-  --meta ~/nokv-workbench-meta \
-  serve
-```
-
-Check client connectivity from a second terminal:
+Run:
 
 ```bash
-target/debug/nokv \
-  --server-bind 127.0.0.1:7799 \
-  --object-backend rustfs \
-  --s3-bucket nokv-lingtai-workbench \
-  ls /
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+python3 scripts/lingtai-workbench/workbench_contract_test.py
+git diff --check
 ```
 
-## Prepare LingTai
+The contract check proves only the exact 18 names and normalized input schemas.
+It does not qualify persistence, object I/O, failover, restore, or latency.
 
-Do not install a source tree that is older than the LingTai package already in
-the TUI runtime. First inspect the runtime version:
+## Live Contract Check
 
-```bash
-~/.lingtai-tui/runtime/venv/bin/python - <<'PY'
-import importlib.metadata as md
-print(md.version("lingtai"))
-PY
-```
+Start `nokv mcp` with the same root, route, owner, and object configuration that
+LingTai will use. Send `initialize`, then `tools/list`, and validate the response
+with `workbench_contract.validate_tool_contract`.
 
-The LingTai workbench branch should be based on the matching or newer upstream
-LingTai release before it is installed into the TUI runtime. Build or install
-that rebased branch, then verify that the runtime has the workbench skill:
+For the complete first-client path, run
+`scripts/lingtai-workbench/live_first_client.py`. It calls `nokv provision`,
+starts `nokv serve` with explicit metadata create/reopen intent, starts
+`nokv mcp --workbench-root /agents/{agent}/wb`, exercises all 18 tools, and
+retains exact requests/responses plus materialize/collect evidence. Run
+`--dry-run` first to inspect the redacted command and normalized-input plan.
+In the current local-WAL profile, `reopen` is a negative qualification run:
+standalone successor admission fails closed until verified checkpoint/log
+recovery and fsck exist. A successful `create` run is not failover evidence.
+The selected `--workbench-root` is durable presentation configuration because
+canonical v1 manifests contain its projected paths. Keep it identical across
+restart/replay; it never replaces `RootId` as the storage or routing identity.
+Before reading MCP stdin or advertising tools, the flat CLI performs the typed
+workspace RPC preflight for every capability required by this 18-tool profile;
+a missing capability or route mismatch stops startup.
 
-```bash
-~/.lingtai-tui/runtime/venv/bin/python - <<'PY'
-from pathlib import Path
-import lingtai.intrinsic_skills as skills
-root = Path(skills.__file__).parent
-print((root / "nokv-workbench" / "SKILL.md").exists())
-PY
-```
+Registration must stop if:
 
-## Register MCP
+- the tool set is not exactly 18 tools;
+- any normalized input schema differs;
+- the root route is stale or belongs to another logical shard;
+- the metadata schema marker differs from `nokv_workspace`;
+- the object backend cannot guarantee immutable creation;
+- a write/read/snapshot/restore probe returns a placeholder or unsupported
+  success.
 
-The MCP registration must include NoKV global connection flags before the `mcp`
-subcommand:
+## Qualification
 
-```json
-{"name":"nokv-workbench","summary":"NoKV workbench.","transport":"stdio","command":"/path/to/nokv","args":["--server-bind","127.0.0.1:7799","--object-backend","rustfs","--s3-endpoint","http://127.0.0.1:9000","--s3-bucket","nokv-lingtai-workbench","mcp","--profile","workbench","--workbench-root","/agents/{agent_id}/wb"],"source":"local-nokv"}
-```
+Report each applicable gate in
+[Workspace Acceptance](./development/workspace-acceptance.md) as `PASS`, `FAIL`,
+or `NOT QUALIFIED`. In particular, a production handoff needs independent
+evidence for:
 
-Use the same command and args in the agent's `init.json` `mcp` block, then
-refresh or restart the agent.
+- metadata reopen and exact request replay;
+- stale-owner rejection and owner failover;
+- immutable object upload, range verification, and ambiguous-provider errors;
+- hidden-then-atomic restore;
+- revision retention and GC fencing;
+- golden Workbench results and errors, not only input schemas.
+
+Keep raw commands, environment profile, logs, and result artifacts with the
+qualification report.
+
+Current source-level/unit evidence does not qualify a production handoff. In
+addition to the unavailable shared recovery path, live qualification must still
+prove or implement all of the following:
+
+- provider-attested upload completion across the direct SDK data path, not a
+  forgeable client assertion alone;
+- production adoption or bounded abort/cleanup for interrupted commit and
+  restore operations, including release of their history/revision holds;
+- a tracked resolution for late direct PUT completion after publication abort;
+- reconciliation that drives ambiguous object deletion out of quarantine;
+- destructive provider operations fenced against control-plane lease transfer,
+  not only a preceding shard-local owner check.
+
+Until those rows have executable fault-injection evidence they are `NOT
+QUALIFIED`, even when the exact 18-tool contract and local happy path pass.

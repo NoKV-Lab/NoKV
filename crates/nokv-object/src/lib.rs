@@ -1,52 +1,38 @@
-//! Object storage boundary for NoKV file bodies.
+//! Immutable Agent artifact storage for NoKV.
 //!
-//! This crate owns body-object keys, an S3-compatible object backend, and an
-//! in-memory object store for package tests. It does not own namespace metadata,
-//! Holt state, Raft replication, FUSE, or wire types.
+//! Permanent keys are owned by an artifact revision and remain independent of
+//! object-provider endpoints and physical shard owners. This crate uploads and
+//! verifies immutable blocks, plans strict range reads, exposes S3-compatible
+//! and in-memory durable stores, and provides local soft caches. Namespace
+//! visibility, revision reachability, metadata transactions, and GC policy live
+//! in `nokv-meta`.
 
+mod artifact;
 mod cache;
-mod chunk;
 mod digest;
-mod fabric;
-mod pipeline;
+mod local_hot;
 mod store;
+mod tiered;
 
+pub use artifact::{
+    cleanup_staged_artifact, plan_artifact_read, plan_artifact_upload, read_artifact,
+    read_artifact_range, read_artifact_window, upload_artifact_from_plan, verify_artifact_bytes,
+    ArtifactBlock, ArtifactBlockRead, ArtifactCleanupFailure, ArtifactCleanupOutcome,
+    ArtifactKeyspace, ArtifactManifest, ArtifactReadOutcome, ArtifactReadPlan, ArtifactReadStats,
+    ArtifactReadWindow, ArtifactUpload, ArtifactUploadFailure, ArtifactUploadOptions,
+    ArtifactUploadPlan, ArtifactUploadStats, StagedArtifactObjects, DEFAULT_ARTIFACT_BLOCK_SIZE,
+};
 pub use cache::{
-    BlockCache, BlockCachePolicy, BlockCacheStats, DiskBlockCache, DiskBlockCacheOptions,
-    MemoryBlockCache, MemoryBlockCacheOptions, ObjectBlockCache, WritebackCache,
-    WritebackCacheOptions, WritebackCacheStats, WritebackTicket,
+    ArtifactBlockCache, ArtifactCacheStats, MemoryArtifactCache, MemoryArtifactCacheOptions,
 };
-pub use chunk::{
-    chunk_manifest_from_stored_chunk, chunk_manifests_from_stored_chunks,
-    chunk_write_ranges_block_count, delete_staged_objects, manifest_digest_uri,
-    plan_chunk_manifest_reads, plan_slice_reads, put_chunked_object, put_chunked_ranges_parallel,
-    put_chunked_ranges_with_block_index_base, put_chunked_reader,
-    read_object_blocks_into_with_cache_options, read_object_blocks_with_cache_options,
-    BlockReadIntoOutcome, BlockReadOptions, BlockReadOutcome, ChunkStore, ChunkWriteOptions,
-    ChunkWriteRange, ChunkedWrite, DirtyChunkExtent, ObjectCleanupOutcome, ObjectReadBlock,
-    ObjectReadCoordinator, ReadCacheFillMode, SliceReadPlan, StagedObject, StagedObjectSet,
-    StoredBlock, StoredChunk, StoredSlice, DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE,
-};
-pub use fabric::{
-    resolve_block_placements, BlockPlacement, DataFabricReadStats, DataTransport, HotFillMode,
-    LayoutReadExecutor, LayoutReadIntoOutcome, LayoutReadOutcome, LayoutReadRequest,
-    LocalObjectStore, LocalObjectStoreOptions, LocalObjectStoreStats, TieredObjectStore,
-    TieredObjectStoreOptions, TieredObjectStoreStats, TieredPutPolicy,
-};
-pub use pipeline::{
-    FileReadIntoOutcome, FileReadOutcome, FileReadPipeline, FileReadPipelineOptions,
-    FileReadPipelineStats, FileReadRequest, FileWritePipeline, FileWriteUpload,
-    ObjectPrefetchOptions, ObjectPrefetchRequest, ObjectPrefetchStats, ObjectPrefetcher,
-    ObjectReadPlan, ObjectReadPlanCache, ObjectReadPlanKey, ObjectSliceWriter,
-    ObjectWritebackOptions, ObjectWritebackRequest, ObjectWritebackStats, ObjectWritebackUploader,
-    PendingChunkedWrite, ReadAheadHint, WritebackUploadRange,
-};
+pub use local_hot::{LocalHotTier, LocalHotTierOptions, LocalHotTierStats};
 pub use store::{
-    ConfiguredObjectStore, MemoryObjectStore, ObjectBytes, ObjectCapabilities, ObjectError,
-    ObjectGetRequest, ObjectInfo, ObjectKey, ObjectRange, ObjectStore, ObjectStoreConfig,
-    S3ObjectStore, S3ObjectStoreOptions, DEFAULT_S3_MULTIPART_CHUNK_SIZE,
-    DEFAULT_S3_MULTIPART_CONCURRENCY,
+    ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, MemoryArtifactStore,
+    MemoryArtifactStoreStats, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange,
+    S3ArtifactStore, S3ArtifactStoreOptions, DEFAULT_S3_MULTIPART_CONCURRENCY,
+    DEFAULT_S3_MULTIPART_PART_SIZE,
 };
+pub use tiered::{TieredArtifactStore, TieredArtifactStoreOptions, TieredArtifactStoreStats};
 
 #[cfg(test)]
 mod tests;

@@ -1,0 +1,466 @@
+{
+  "errors": {
+    "invalid_arguments": {
+      "code": "InvalidArguments",
+      "details": {},
+      "message": "text and base64 are mutually exclusive",
+      "retryable": false,
+      "status": "error"
+    },
+    "restore_protocol_mismatch": {
+      "code": "RestoreProtocolMismatch",
+      "details": {
+        "actual_snapshot_id": 2,
+        "expected_snapshot_id": 1
+      },
+      "message": "restore operation identity did not match the durable request",
+      "retryable": true,
+      "status": "error"
+    },
+    "routing_unavailable": {
+      "code": "RoutingUnavailable",
+      "details": {
+        "retry_after_ms": 25
+      },
+      "message": "owner is moving",
+      "retryable": true,
+      "status": "error"
+    },
+    "snapshot_expired": {
+      "code": "SnapshotExpired",
+      "details": {
+        "source": "fake"
+      },
+      "message": "snapshot is not alive",
+      "retryable": false,
+      "status": "error"
+    },
+    "workbench_commit_conflict": {
+      "code": "WorkbenchCommitConflict",
+      "details": {
+        "requested_replace": false,
+        "stored_generation": 8
+      },
+      "message": "stored run manifest names a different canonical commit",
+      "retryable": false,
+      "status": "error"
+    }
+  },
+  "logical_workbench_root": "/agents/test/wb",
+  "replays": {
+    "workbench_commit": {
+      "commit_identity": "4ee4c2a33b23f7b094d497d8ce284816b0db8cfebfe2cefb6e28ba8893e06df7",
+      "content_digest_uri": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+      "envelope_digest_uri": "sha256:aaf125bff9d023894bf59a1ad028db3dc9110d01b5e848323efcb1a14afba7e0",
+      "generation": 9,
+      "idempotent_replay": true,
+      "manifest_digest_uri": "sha256:e21a213898ee65fadcdea40f435729c5c79afe44f7483ab4d5d3baac2a26de28",
+      "path": "/agents/test/wb/wb-main/metadata/run_manifest.json",
+      "replace": false,
+      "size_bytes": 470,
+      "status": "success",
+      "tree_digest_uri": "sha256:abababababababababababababababababababababababababababababababab",
+      "workbench_id": "wb-main",
+      "workbench_path": "/agents/test/wb/wb-main"
+    },
+    "workbench_create": {
+      "path": "/agents/test/wb/wb-main",
+      "sections": [
+        "input",
+        "scripts",
+        "outputs",
+        "logs",
+        "metadata"
+      ],
+      "status": "success",
+      "workbench_id": "wb-main"
+    }
+  },
+  "schema": "nokv.workbench.result_transcript.v1",
+  "success": {
+    "workbench_aggregate": {
+      "group_count": 1,
+      "groups": [
+        {
+          "key": {
+            "artifact.producer": "agent"
+          },
+          "values": {
+            "artifacts": 1
+          }
+        }
+      ],
+      "input_match_count": 1,
+      "path": "/agents/test/wb/wb-main/outputs",
+      "row_count": 1,
+      "status": "success",
+      "truncated": false
+    },
+    "workbench_append": {
+      "appended_bytes": 6,
+      "created": false,
+      "digest": "sha256:5eef8098ed6ec0a16249fc7c12422027fc9fd75b16130cc9382cf09102014796",
+      "generation": 2,
+      "path": "/agents/test/wb/wb-main/outputs/report.txt",
+      "relative_path": "report.txt",
+      "section": "outputs",
+      "size_bytes": 25,
+      "status": "success",
+      "workbench_id": "wb-main"
+    },
+    "workbench_catalog": {
+      "catalog": {
+        "facetable": [
+          "artifact.producer"
+        ],
+        "facets": [],
+        "filterable": [
+          {
+            "fields": [
+              "artifact.producer"
+            ],
+            "operators": [
+              "eq",
+              "prefix"
+            ]
+          }
+        ],
+        "sortable": [
+          "artifact.producer"
+        ]
+      },
+      "catalog_empty": false,
+      "child_catalogs": [],
+      "path": "/agents/test/wb",
+      "status": "success"
+    },
+    "workbench_commit": {
+      "commit_identity": "4ee4c2a33b23f7b094d497d8ce284816b0db8cfebfe2cefb6e28ba8893e06df7",
+      "content_digest_uri": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+      "envelope_digest_uri": "sha256:aaf125bff9d023894bf59a1ad028db3dc9110d01b5e848323efcb1a14afba7e0",
+      "generation": 9,
+      "idempotent_replay": false,
+      "manifest_digest_uri": "sha256:e21a213898ee65fadcdea40f435729c5c79afe44f7483ab4d5d3baac2a26de28",
+      "path": "/agents/test/wb/wb-main/metadata/run_manifest.json",
+      "replace": false,
+      "size_bytes": 470,
+      "status": "success",
+      "tree_digest_uri": "sha256:abababababababababababababababababababababababababababababababab",
+      "workbench_id": "wb-main",
+      "workbench_path": "/agents/test/wb/wb-main"
+    },
+    "workbench_create": {
+      "path": "/agents/test/wb/wb-main",
+      "sections": [
+        "input",
+        "scripts",
+        "outputs",
+        "logs",
+        "metadata"
+      ],
+      "status": "success",
+      "workbench_id": "wb-main"
+    },
+    "workbench_edit": {
+      "generation": 3,
+      "no_change": false,
+      "path": "/agents/test/wb/wb-main/outputs/report.txt",
+      "relative_path": "report.txt",
+      "replacements": 1,
+      "section": "outputs",
+      "size_bytes": 25,
+      "status": "success",
+      "workbench_id": "wb-main"
+    },
+    "workbench_find": {
+      "entry_count": 1,
+      "match_count": 1,
+      "matches": [
+        {
+          "commit_identity": "9f3a0a156b426292b0791551b05f6d53f53b906cf7327065b92a04a18b834cff",
+          "commit_identity_verified": true,
+          "committed": true,
+          "content_digest_uri": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+          "envelope_digest_uri": "sha256:dd01f7d8664ac3ee857bd5b59a57aa97eb5d8ec1024f5df73fdc1a1f028d1bf7",
+          "manifest": {
+            "commit_identity": "9f3a0a156b426292b0791551b05f6d53f53b906cf7327065b92a04a18b834cff",
+            "committed_at_unix_seconds": 1700000000,
+            "content_digest_uri": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+            "manifest": {
+              "model": "viking",
+              "task": "ptycho"
+            },
+            "manifest_digest_uri": "sha256:23312ff4198ab547af02d6789dc98321be2eb44c088c333a58edd3060ce6c51d",
+            "schema": "nokv.workbench.run_manifest.v1",
+            "workbench_id": "wb-main",
+            "workbench_path": "/agents/test/wb/wb-main"
+          },
+          "manifest_digest_uri": "sha256:23312ff4198ab547af02d6789dc98321be2eb44c088c333a58edd3060ce6c51d",
+          "manifest_generation": 3,
+          "manifest_path": "/agents/test/wb/wb-main/metadata/run_manifest.json",
+          "manifest_size_bytes": 472,
+          "manifest_summary": {
+            "commit_identity": "9f3a0a156b426292b0791551b05f6d53f53b906cf7327065b92a04a18b834cff",
+            "committed_at_unix_seconds": 1700000000,
+            "content_digest_uri": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+            "manifest_digest_uri": "sha256:23312ff4198ab547af02d6789dc98321be2eb44c088c333a58edd3060ce6c51d",
+            "manifest_keys": [
+              "model",
+              "task"
+            ],
+            "manifest_task": "ptycho",
+            "schema": "nokv.workbench.run_manifest.v1",
+            "workbench_id": "wb-main"
+          },
+          "path": "/agents/test/wb/wb-main",
+          "workbench_id": "wb-main"
+        }
+      ],
+      "next_cursor": "find-next",
+      "path": "/agents/test/wb",
+      "status": "success",
+      "truncated": true
+    },
+    "workbench_grep": {
+      "files_scanned": 1,
+      "matches": [
+        {
+          "line_number": 1,
+          "path": "/agents/test/wb/wb-main/outputs/report.txt",
+          "relative_path": "report.txt",
+          "section": "outputs",
+          "snippet": "Hello world"
+        },
+        {
+          "line_number": 2,
+          "path": "/agents/test/wb/wb-main/outputs/report.txt",
+          "relative_path": "report.txt",
+          "section": "outputs",
+          "snippet": "second"
+        }
+      ],
+      "next_cursor": null,
+      "path": "/agents/test/wb/wb-main/outputs",
+      "pattern": "HELLO",
+      "recursive": true,
+      "relative_path": null,
+      "section": "outputs",
+      "status": "success",
+      "truncated": false,
+      "workbench_id": "wb-main",
+      "workbench_path": "/agents/test/wb/wb-main"
+    },
+    "workbench_list": {
+      "at_snapshot": 7,
+      "entries": [
+        {
+          "entry_count": null,
+          "kind": "file",
+          "name": "report.txt",
+          "path": "/agents/test/wb/wb-main/outputs/report.txt",
+          "relative_path": "report.txt",
+          "section": "outputs",
+          "size_bytes": 25
+        }
+      ],
+      "entry_count": 1,
+      "next_cursor": null,
+      "path": "/agents/test/wb/wb-main/outputs",
+      "relative_path": null,
+      "section": "outputs",
+      "status": "success",
+      "truncated": false,
+      "workbench_id": "wb-main",
+      "workbench_path": "/agents/test/wb/wb-main"
+    },
+    "workbench_put_file": {
+      "content_type": "text/plain",
+      "digest_uri": "sha256:370dec1c9ba189bbfe2c658485366e2a893b5dda19bc002618fc5445687cc991",
+      "generation": 1,
+      "path": "/agents/test/wb/wb-main/outputs/report.txt",
+      "relative_path": "report.txt",
+      "replace": false,
+      "section": "outputs",
+      "size_bytes": 19,
+      "status": "success",
+      "workbench_id": "wb-main"
+    },
+    "workbench_read": {
+      "at_snapshot": 7,
+      "bytes": null,
+      "bytes_encoding": null,
+      "cursor": null,
+      "format": "structured",
+      "generation": 3,
+      "items": [
+        {
+          "index": 0,
+          "value": "Hello world"
+        },
+        {
+          "index": 1,
+          "value": "second"
+        },
+        {
+          "index": 2,
+          "value": "third"
+        }
+      ],
+      "next_cursor": null,
+      "path": "/agents/test/wb/wb-main/outputs/report.txt",
+      "record_count": 3,
+      "record_type": "text_lines",
+      "relative_path": "report.txt",
+      "section": "outputs",
+      "status": "success",
+      "total_size_bytes": 25,
+      "truncated": false,
+      "workbench_id": "wb-main",
+      "workbench_path": "/agents/test/wb/wb-main"
+    },
+    "workbench_restore": {
+      "cleanup_pending": false,
+      "destination_generation": 1,
+      "destination_workbench_id": "wb-restored",
+      "idempotent_replay": false,
+      "operation_id": "22222222222222222222222222222222",
+      "read_version": 46,
+      "restore_manifest": "/agents/test/wb/wb-restored/metadata/restore_manifest.json",
+      "snapshot_id": 1,
+      "source_workbench_id": "wb-main",
+      "state": "complete",
+      "status": "success"
+    },
+    "workbench_search": {
+      "facets": [
+        {
+          "distinct_count": 1,
+          "field": "artifact.producer",
+          "truncated": false,
+          "values": [
+            {
+              "count": 1,
+              "value": "agent"
+            }
+          ]
+        }
+      ],
+      "match_count": 1,
+      "matches": [
+        {
+          "path": "/agents/test/wb/wb-main/outputs/report.txt",
+          "relative_path": "report.txt",
+          "section": "outputs",
+          "values": {
+            "artifact.producer": "agent"
+          },
+          "workbench_id": "wb-main"
+        }
+      ],
+      "next_cursor": "search-next",
+      "path": "/agents/test/wb/wb-main/outputs",
+      "status": "success",
+      "truncated": true
+    },
+    "workbench_snapshot": {
+      "annotation": {
+        "metadata": {
+          "suite": "facade"
+        },
+        "reason": "test"
+      },
+      "lease_expires_at": 259200000,
+      "lease_expires_unix_ms": 259200000,
+      "name": "before-edit",
+      "path": "/agents/test/wb/wb-main",
+      "read_version": 46,
+      "snapshot_id": 1,
+      "state": "alive",
+      "status": "success",
+      "ttl_days": 3,
+      "workbench_id": "wb-main"
+    },
+    "workbench_snapshot_list": {
+      "path": "/agents/test/wb/wb-main",
+      "snapshot_count": 1,
+      "snapshots": [
+        {
+          "annotation": {
+            "metadata": {
+              "suite": "facade"
+            },
+            "reason": "test"
+          },
+          "lease_expires_at": 432000000,
+          "lease_expires_unix_ms": 432000000,
+          "name": "before-edit",
+          "read_version": 46,
+          "retire_annotation": {
+            "metadata": null,
+            "reason": "done"
+          },
+          "snapshot_id": 1,
+          "state": "retired"
+        }
+      ],
+      "status": "success",
+      "workbench_id": "wb-main"
+    },
+    "workbench_snapshot_renew": {
+      "annotation": {
+        "metadata": {
+          "suite": "facade"
+        },
+        "reason": "test"
+      },
+      "lease_expires_at": 432000000,
+      "lease_expires_unix_ms": 432000000,
+      "name": "before-edit",
+      "path": "/agents/test/wb/wb-main",
+      "read_version": 46,
+      "renewed": true,
+      "snapshot_id": 1,
+      "state": "alive",
+      "status": "success",
+      "ttl_days": 5,
+      "workbench_id": "wb-main"
+    },
+    "workbench_snapshot_retire": {
+      "name": "before-edit",
+      "path": "/agents/test/wb/wb-main",
+      "retire_annotation": {
+        "metadata": null,
+        "reason": "done"
+      },
+      "retired": true,
+      "snapshot_id": 1,
+      "state": "retired",
+      "status": "success",
+      "workbench_id": "wb-main"
+    },
+    "workbench_stat": {
+      "at_snapshot": "frozen",
+      "card": {
+        "content_type": "text/plain",
+        "digest_uri": "sha256:39bf1d4f770003e2f81ee75759c78615edccb6831dadd4c617d044350d2d73ef",
+        "entry_count": null,
+        "generation": 3,
+        "kind": "file",
+        "manifest_id": null,
+        "name": "report.txt",
+        "path": "/agents/test/wb/wb-main/outputs/report.txt",
+        "producer": "test-agent",
+        "record_count": null,
+        "relative_path": "report.txt",
+        "section": "outputs",
+        "size_bytes": 25
+      },
+      "path": "/agents/test/wb/wb-main/outputs/report.txt",
+      "relative_path": "report.txt",
+      "section": "outputs",
+      "status": "success",
+      "workbench_id": "wb-main",
+      "workbench_path": "/agents/test/wb/wb-main"
+    }
+  }
+}

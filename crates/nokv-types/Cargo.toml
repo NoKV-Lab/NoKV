@@ -1,7 +1,7 @@
 [package]
 name = "nokv-types"
 version = "0.1.0"
-description = "Storage-neutral NoKV filesystem metadata model types."
+description = "Storage-neutral Agent workspace domain types for NoKV."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

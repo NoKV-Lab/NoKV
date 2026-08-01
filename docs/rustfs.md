@@ -1,7 +1,3 @@
----
-title: RustFS Backend
----
-
 <!--
 Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
@@ -9,110 +5,112 @@ SPDX-License-Identifier: Apache-2.0
 
 # RustFS Backend
 
-NoKV can store file bodies in RustFS through the S3-compatible object backend.
-RustFS supports single-node single-disk, single-node multi-disk, and multi-node
-multi-disk deployment modes. The single-node single-disk mode is useful for
-local testing and small non-critical deployments; it is not a high-availability
-production layout.
+Status: optional S3-compatible provider profile, not a metadata or namespace
+architecture.
 
-## Start RustFS
+RustFS is one S3-compatible object provider for NoKV artifact blocks. It does
+not own namespace metadata, root placement, revision reachability, or garbage
+collection policy.
 
-Install the RustFS binary with Homebrew:
+## Boundary
 
-```bash
-brew tap rustfs/homebrew-tap
-brew install rustfs
-rustfs --version
+```text
+Workbench / SDK / CLI
+  -> NoKV metadata and publication service
+  -> S3-compatible object interface
+  -> RustFS
 ```
 
-Start a single-node local RustFS process:
+NoKV sends immutable block puts, ranged gets, integrity checks, and fenced
+deletes through the common object package. Holt remains the authority for
+paths, manifests, references, operations, and deletion eligibility.
 
-```bash
-mkdir -p /tmp/rustfs-data
-RUSTFS_ACCESS_KEY=rustfsadmin \
-RUSTFS_SECRET_KEY=rustfsadmin \
-rustfs server \
-  --address 127.0.0.1:9000 \
-  --console-enable \
-  --console-address 127.0.0.1:9001 \
-  --buffer-profile AiTraining \
-  /tmp/rustfs-data
+## Deployment Identity
+
+Treat these values as one reviewed deployment profile:
+
+```text
+endpoint
+region
+bucket
+access identity
+credential source
+TLS and certificate policy
+path-style or virtual-host addressing
+multipart limits
+request timeout and retry policy
 ```
 
-Create the default NoKV bucket with an S3-compatible client:
+Credentials are supplied by environment or a secret manager and must not be
+written into metadata, manifests, logs, examples, or object keys.
 
-```bash
-AWS_ACCESS_KEY_ID=rustfsadmin \
-AWS_SECRET_ACCESS_KEY=rustfsadmin \
-aws --endpoint-url http://127.0.0.1:9000 \
-  s3api create-bucket --bucket nokv
+The durable block key remains:
+
+```text
+nokv/artifacts/{logical_shard_id}/{root_id}/{artifact_revision_id}/blocks/{object_index}
 ```
 
-For local end-to-end testing, the repository script can do these steps for a
-temporary RustFS directory and then run the NoKV benchmark harness:
+Changing the endpoint or physical RustFS node does not change that identity.
 
-```bash
-scripts/run-rustfs-e2e.sh
-```
+## Required Bucket Behavior
 
-Use `NOKV_E2E_PROFILE`, `NOKV_E2E_WORKLOAD`, and
-`NOKV_E2E_OBJECT_CONCURRENCY` to change the benchmark shape without editing the
-script. Use `NOKV_E2E_CARGO_TARGET_DIR` when a run needs an isolated Cargo
-target directory.
+Before serving writes, verify:
 
-For the packed-shard AI data path, run `scripts/run-ai-shard-range-matrix.sh`.
-It exercises exact sparse reads, gap-coalesced sparse reads, and the MB-scale
-read-ahead admission smoke over disposable RustFS instances. The script writes
-per-case logs plus a combined CSV; use `NOKV_AI_SHARD_MATRIX_OUTPUT_DIR` or
-`NOKV_AI_SHARD_MATRIX_CSV` to choose the artifact location.
+- the configured identity can put, head, range-read, and delete inside the
+  exact NoKV prefix;
+- multipart upload, completion, abort, and completed-object head behave as
+  expected;
+- a repeated immutable put cannot silently replace different bytes;
+- ranged reads return exact byte windows and integrity evidence;
+- timeout and retry settings preserve ambiguous outcomes for reconciliation;
+- lifecycle policies cannot delete reachable NoKV objects independently;
+- bucket listing is not required for metadata recovery or reachability.
 
-## Use RustFS With NoKV
+NoKV should use a dedicated bucket or an exclusive prefix with a policy that
+prevents writes outside that boundary.
 
-```bash
-cargo run --release -p nokv --bin nokv -- \
-  init
-```
+## Local Development
 
-Those are the CLI defaults for the RustFS backend: bucket `nokv`, endpoint
-`http://127.0.0.1:9000`, access key `rustfsadmin`, and secret key
-`rustfsadmin`.
+A local RustFS deployment is suitable for integration tests when the test
+records:
 
-The same object flags work for artifact publish, `cat`, and FUSE mount:
+- exact RustFS image or binary version;
+- endpoint and TLS mode;
+- clean or reused data directory;
+- bucket initialization;
+- NoKV durability profile;
+- injected provider failures.
 
-```bash
-cargo run --release -p nokv --bin nokv -- \
-  --object-backend rustfs \
-  --s3-bucket nokv \
-  --s3-endpoint http://127.0.0.1:9000 \
-  --s3-access-key-id rustfsadmin \
-  --s3-secret-access-key rustfsadmin \
-  put-artifact /runs/1/checkpoint.bin ./checkpoint.bin
-```
+Keep RustFS data and Holt metadata in separate durable directories. Removing
+one does not safely reset the other; create a fresh paired test deployment
+instead of mixing prior metadata with an empty object directory.
 
-## Benchmark Against RustFS
+## Failure Semantics
 
-```bash
-cargo run --release -p nokv-bench --bin nokv-bench -- \
-  --profile smoke \
-  --workload checkpoint-publish \
-  --object-backend rustfs \
-  --object-concurrency 4 \
-  --checkpoint-bytes 1048576 \
-  --s3-bucket nokv \
-  --s3-endpoint http://127.0.0.1:9000 \
-  --s3-access-key-id rustfsadmin \
-  --s3-secret-access-key rustfsadmin
-```
+Publication follows object-first, metadata-last ordering:
 
-`mdtest-easy` and `mdtest-hard` are metadata-only and do not exercise object
-storage. `checkpoint-publish` and `training-read` are the useful object-backed
-workloads for RustFS. `metadata-durability-batch` has metadata-only file bodies,
-but its `sync-shared-log` phase writes grouped metadata log segments to the
-configured object backend. The benchmark harness uses the deployable single-node
-`metad` service boundary by default. Use `--block-cache off` as a control run
-when measuring object backend latency instead of NoKV cache reuse.
+1. upload blocks;
+2. verify completion evidence;
+3. publish metadata;
+4. acknowledge the deterministic result.
 
-References:
+If metadata publication fails, staged-object records drive cleanup. If delete
+completion is uncertain, the operation enters quarantine and reconciliation.
+The system does not infer success from a later bucket listing.
 
-- [RustFS Linux installation](https://docs.rustfs.com/installation/linux/index.html)
-- [RustFS Docker installation](https://docs.rustfs.com/installation/docker/index.html)
+## Qualification
+
+RustFS qualification covers:
+
+- single and multipart publication;
+- exact and ranged reads;
+- checksum and length mismatch;
+- timeout before and after provider completion;
+- abort and staged cleanup;
+- zero-reference deletion;
+- ambiguous-delete reconciliation;
+- process restart and owner replacement;
+- throughput and latency under the declared payload/concurrency matrix.
+
+Retain raw evidence using [Benchmarks](./benchmarks.md) and
+[Workspace Acceptance](./development/workspace-acceptance.md).

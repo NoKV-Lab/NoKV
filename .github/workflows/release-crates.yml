@@ -26,12 +26,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout release ref
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Resolve crate list
         id: crates
@@ -47,7 +52,6 @@ jobs:
             nokv-control
             nokv-server
             nokv-client
-            nokv-fuse
             nokv
           )
           {

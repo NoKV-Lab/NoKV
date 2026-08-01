@@ -5,291 +5,246 @@ SPDX-License-Identifier: Apache-2.0
 
 # Product Design
 
-NoKV is a Rust filesystem for AI training and agent workspaces. It presents a
-file interface, keeps namespace metadata in Holt, and stores file bodies in
-external object storage.
+Status: normative Agent-native product design.
 
-The product is not a generic distributed KV database, a full NAS replacement,
-or a raw S3 mount. It owns filesystem metadata semantics and delegates byte
-durability to local or S3-compatible object storage.
+## Product
 
-## Product Boundary
+NoKV is a distributed workspace and artifact store for Agent infrastructure.
+It gives datasets, scripts, logs, outputs, checkpoints, reports, and provenance
+stable path-shaped addresses while keeping their bytes in object storage.
+
+The supported front doors are:
+
+- Rust and Python Agent SDKs;
+- a purpose-built `nokv` CLI;
+- MCP and Agent tool adapters;
+- the complete 18-tool [Workbench contract](./workbench-contract.md);
+- explicit materialize/collect adapters for executables that require local
+  files.
+
+The Workbench experience stays independent of storage internals. Agents can
+list, stat, read, grep, search, aggregate, commit, snapshot, and restore. They
+do not need to know Holt keys, object keys, revision ids, or shard owners.
+
+## Deliberate Non-Goals
+
+NoKV is not:
+
+- a FUSE mount;
+- a general NAS or POSIX filesystem;
+- a transparent fsspec backend;
+- a raw S3 key browser;
+- a runtime trace database;
+- a globally deduplicated content-addressed store.
+
+It does not implement inode/dentry, uid/gid/mode, hardlink, symlink, xattr,
+locks, special nodes, arbitrary directory rename, empty directory identity, or
+random in-place writes.
+
+This is a product simplification, not merely an omitted frontend. Agent
+workflows primarily need immutable publication, conditional replacement,
+streaming/range I/O, metadata discovery, provenance, recovery points, and
+reproducible outputs. Modeling unused POSIX behavior would add metadata rows,
+round trips, invalidation rules, recovery cases, and compatibility obligations
+to every hot path.
+
+## Stable Workbench Surface
+
+A Workbench has five virtual sections:
 
 ```text
-NoKV
-  owns:
-    namespace truth
-    inode/dentry metadata
-    metadata command atomicity
-    body descriptors
-    checkpoint/artifact publish points
-    layout leases and block read plans
-    watch/snapshot/cache invalidation metadata
-
-  delegates:
-    file body durability
-    object replication
-    object lifecycle storage
-    NVMe residency and transport placement as soft data-plane state
+input
+scripts
+outputs
+logs
+metadata
 ```
 
-This keeps the system focused. Object stores already provide elastic byte
-storage. NoKV adds the metadata layer that object stores do not provide:
-fast directory state, atomic path publication, typed workspace events, and
-mountable namespace views.
+They are logical prefixes, not stored directories. The upper adapter preserves
+all 18 tool names, schemas, generation/digest behavior, commit identity,
+snapshot lifecycle, and restore idempotency.
 
-## HOLT Role
+Workbench-specific result shaping stays above the storage core:
 
-Holt is the metadata storage engine. It is not the whole metadata service.
+- JSON/YAML/text decoding and base64 ranges;
+- exact-string edit behavior;
+- grep matching;
+- section projection;
+- the delta digest returned by append;
+- friendly errors and MCP envelopes;
+- stable `run_manifest.json` and `restore_manifest.json` projections.
+
+Workbench responses do not contain storage-specific node identities. Stable
+result fields change only through an explicit reviewed contract change.
+
+## Core Data Model
 
 ```text
-NoKV metad
-  inode/dentry semantics
-  MetadataCommand validation
-  watch/snapshot/GC policy
-  publish and remove semantics
-  service and client APIs
+Agent root
+  RootId -> one persisted logical-shard placement
+
+Workbench name
+  -> one visible WorkspaceIncarnationId
+
+Artifact path
+  (RootId, WorkspaceIncarnationId, normalized relative path)
+  -> PathEntry
+
+PathEntry
+  -> complete immutable PathMetadata projection
+  -> immutable ArtifactRevisionId for manifest/lifetime ownership
+
+ArtifactRevisionId
+  -> compact Holt manifest
+  -> immutable S3-compatible object blocks
+```
+
+The complete normalized filename is stored in the canonical ordered Holt key.
+Directories are derived from prefixes. The path value atomically projects the
+revision digest, manifest digest, size, dependency bounds, content type, and
+typed index fields needed by stat/list. This makes a cached-marker exact read
+one path point lookup and a child listing one delimiter scan, without
+inode-to-dentry traversal, revision-row fanout, or per-child reads.
+
+A cold request first resolves the Workbench marker. Its never-reused
+incarnation prevents abandoned restore rows from becoming visible under a
+reclaimed name.
+
+## Holt's Role
+
+Holt is the shard-local ordered metadata engine, not the product API.
+
+```text
+NoKV metadata layer
+  path/workspace semantics
+  command validation and idempotency
+  visibility and secondary indexes
+  snapshot/commit/restore lifecycle
+  revision references and GC
+  root/owner fencing
 
 Holt
-  local ordered metadata engine
-  ART prefix/range lookup
-  atomic batch
-  WAL/checkpoint/recovery
+  point reads
+  prefix/delimiter scans
+  atomic multi-tree batches
+  WAL, checkpoints, views, and recovery substrate
 ```
 
-This separation matters because the filesystem semantics must remain above the
-storage engine. The `nokv-meta` crate may bind those semantics to Holt. The
-types, object, client, and FUSE crates must not leak Holt internals.
+NoKV should exploit Holt's ART-shaped point/prefix behavior directly. It should
+not leak Holt layout into SDKs, protocol DTOs, Workbench tools, or object
+providers.
 
-## Reference Shape
+## Immutable Bodies And Publication
 
-NoKV borrows the proven split used by object-backed filesystems: metadata is
-separate from bytes, and clients can access the namespace through FUSE or a
-native SDK.
+The object layout is revision-owned:
 
 ```text
-AI training / agent process
-  -> FUSE, Rust SDK, or Python/fsspec
-  -> NoKV metadata service
-  -> Holt metadata engine
-  -> NoKV data fabric
-  -> local NVMe hot blocks and S3-compatible cold blocks
+nokv/artifacts/{logical_shard_id}/{root_id}/{artifact_revision_id}/blocks/{object_index}
 ```
 
-FUSE is the mounted-file path. Native clients are the performance path for data
-loaders, checkpoint writers, Ray jobs, and agent runtimes that can call a
-library directly.
+Object bytes upload first. One metadata command then publishes the immutable
+revision, manifest, path, workspace revision, indexes, event, reference
+changes, and deterministic replay result.
 
-## Target Architecture
+Readers therefore see the previous complete revision or the new complete
+revision, never a partial body. A response lost after commit is safely replayed
+with the same request id. Failed or abandoned uploads remain invisible and are
+recovered from a durable staged-object ledger.
 
-```mermaid
-flowchart TB
-    App["PyTorch / Ray / Spark / Agent"] --> Fuse["FUSE mount"]
-    App --> Python["Python fsspec"]
-    App --> Rust["Rust native SDK"]
+Whole-artifact replacement is the generic write primitive. Logs use immutable
+append segments plus a conditional stream-head advance. Range reads and
+multipart uploads remain first-class SDK operations.
 
-    Fuse --> Router["metadata router"]
-    Python --> Router
-    Rust --> Router
+## Discovery And Provenance
 
-    Router --> Metad["NoKV metad"]
-    Metad --> Command["MetadataCommand"]
-    Command --> Shard["metadata shard"]
-    Shard --> Fence["owner epoch fence"]
-    Fence --> Holt["single-owner Holt shard"]
+Typed secondary indexes are updated atomically with the path entry. They serve:
 
-    Control["small control plane"] --> Router
-    Control --> Lease["owner leases + shard map"]
+- dataset/version lookup;
+- run and producer lookup;
+- parameter and metric filtering;
+- output-to-input lineage;
+- commit/tag discovery;
+- Workbench search, aggregate, catalog, and find.
 
-    Fuse --> Fabric["data fabric"]
-    Python --> Fabric
-    Rust --> Fabric
-    Fabric --> NVMe["local / peer NVMe hot tier"]
-    Fabric --> Object["S3-compatible cold durable tier"]
-```
+Indexes are derived and repairable. `PathCurrent` remains namespace truth, and
+index results recheck the visible workspace incarnation at the same read
+version.
 
-The current implementation is a client/server `metad` path backed by a
-**single-node** embedded Holt MVCC engine — there is no replication and no
-consensus group. The object-backed metadata archive (backup/restore) is
-implemented; production multi-node operation (subtree sharding, owner-lease +
-epoch fencing) remains the distributed hardening work described under Metadata
-Distribution.
+NoKV is not the source of truth for high-volume runtime events. Traces may live
+in JSONL, SQLite, or a telemetry database; NoKV stores the durable artifacts
+and evidence an Agent needs to find and cite.
 
-## Kubernetes Deployment Target
+## Recovery Products
 
-The cloud-native deployment should grow into these components:
+NoKV exposes three different promises:
+
+| Mechanism | Purpose | Retention |
+| --- | --- | --- |
+| Leased snapshot | Short-term frozen MVCC recovery point | A read-version history hold until retire/reap |
+| Durable commit | Immutable reusable dataset/run/workspace tree | Exact artifact revision references |
+| Durable tag | Mutable human name for a commit | CAS-protected pointer; no implicit commit deletion |
+
+Restore creates a new Workbench. It copies path metadata in bounded batches,
+shares immutable revisions inside one root/shard, and reveals the destination
+with one final marker transition. Normal reads do not pay for a lazy overlay
+chain.
+
+## Safe Object Lifetime
+
+Every visible path and durable commit owns an exact strong revision reference.
+A child revision that reuses blocks owned by older revisions also owns sealed
+dependency references to those block owners. Adding or removing a reference
+atomically changes the target revision's count and epoch. A zero-reference GC
+candidate is valid only for that epoch.
+
+GC claims `Available -> Deleting` against the epoch. New references also
+require `Available`, so restore/commit/publication cannot race with deletion.
+Snapshots and in-progress scans protect older metadata with read-version
+history holds. Ambiguous provider deletes are quarantined rather than guessed.
+
+This reference model intentionally stays root/shard-local.
+
+## Distribution
+
+The control plane persists `RootId -> logical_shard_id` before the first write.
+The shard installs a matching local root fence. Placement is never recomputed
+from filenames or modulo the current shard count.
+
+A populated root stays on its logical shard, which keeps its Workbenches,
+queries, commits, snapshots, restores, references, and object GC local. The
+logical shard may move to another physical owner under a new lease/epoch
+without changing object identity.
+
+Splitting one root and cross-shard transactions are deferred. They require
+version vectors, k-way query/list merge, distributed restore, and explicit
+cross-shard reference ownership.
+
+## First Client Flow
+
+The first client validates the product through a scientific reconstruction
+workflow:
 
 ```text
-nokv-server
-  long-running metadata service, health/control plane, and future router
-
-nokv-csi
-  Kubernetes volume lifecycle and node mount integration
-
-nokv-cache-agent
-  node-local metadata/object cache for GPU and training nodes
-
-nokv-gc-controller
-  staged object cleanup, checkpoint retention, and orphan body GC
-
-nokv-python
-  Python SDK and fsspec binding for training frameworks over native range
-  batches and reusable dataloader epoch readers
+upload input dataset
+  -> seal immutable input commit/tag
+  -> create multiple run Workbenches
+  -> materialize verified inputs/scripts for the local executable
+  -> execute
+  -> collect declared outputs/logs/metadata
+  -> commit each run with lineage to the same input
+  -> query, compare, snapshot, and restore through SDK/CLI/Workbench
 ```
 
-The current repository implements a long-running `nokv-server`, framed
-metadata RPC for the Rust SDK and CLI, an initial Python/fsspec binding for
-native batch range reads, and a FUSE frontend that uses the same metadata
-client/server boundary. CSI, node-local cache, and production multi-node
-metadata operations remain product direction.
+Materialization verifies digests before execution. Collection publishes only
+declared files. The local sandbox can disappear without losing the NoKV
+identity or provenance graph.
 
-## Metadata Distribution
+## Qualification Boundary
 
-The first distributed version shards by subtree (a mount, or a subtree within a
-mount) — one single-owner Holt engine per shard. Shards are *not* consensus-
-replicated: a small control group grants owner-leases and holds the kilobyte
-shard map, and a monotonic epoch fences a deposed owner at the commit boundary.
-Failover restores a shard's Holt checkpoint image from object storage (the same
-mechanism as metadata DR) onto a new owner.
+The supported system has one workspace schema, one path model, one routing
+model, and one implementation for each lifecycle. Startup rejects an unmarked,
+unknown, malformed, incompatible, or mixed store before serving requests.
 
-```text
-client
-  -> metadata router
-  -> shard owner
-  -> owner epoch fence
-  -> Holt atomic batch apply
-  -> watch/cache invalidation event
-  -> response
-```
-
-Later versions may split one mount into subtree or workload shards:
-
-```text
-dataset namespace shard
-checkpoint namespace shard
-large directory shard
-workspace/channel shard
-```
-
-Cross-shard rename and cross-mount atomic transactions are not part of the
-first distributed target. Same-shard rename remains atomic. Cross-shard rename
-can return `EXDEV` until a handoff or transaction protocol exists.
-
-## Data Fabric
-
-NoKV's metadata manifest names immutable block identity and durable object
-location. It does not name a specific NVMe device or cache slot. Those are
-data-plane placements and can change without a metadata commit.
-
-```text
-metadata truth:
-  inode, generation, logical offsets, block digest, S3 object key
-
-soft placement:
-  block digest -> local hot-tier presence / ttl / health
-```
-
-The first data-fabric skeleton is already in `nokv-object`: `LocalObjectStore`
-is the node-local NVMe-shaped hot tier and `TieredObjectStore` fronts it with a
-cold durable object backend. Reads check hot placement first, fall back to
-S3-compatible storage, can refresh the hot tier on full-object reads, and use
-`ObjectStore::get_many` to fetch coalesced read-plan ranges in one object-layer
-batch. The hot tier now has a process-local residency index rebuilt from disk on
-open, optional max-byte admission with LRU eviction, and inline or background
-hot-fill modes with in-flight duplicate-key coalescing. `resolve_block_placements`
-currently marks blocks as `LocalNvmeRead` or `ObjectTcpGet` from local hot-tier
-presence; it is soft placement state, not a metadata record. `LayoutReadExecutor`
-now makes this the SDK read path for layout-open plans and exposes transport,
-tiered-backend, and local-hot residency counters for the native data plane.
-The current transport surface is intentionally small:
-
-```text
-ObjectTcpGet        S3-compatible cold read
-LocalNvmeRead       node-local hot-tier read
-```
-
-The metadata service only returns the layout lease and block descriptors. The
-client-side data fabric chooses the fastest available transport for each block.
-If every hot transport misses or fails, S3 remains the durable fallback.
-
-## Metadata Model
-
-The canonical namespace model is inode/dentry, not full path as the source of
-truth.
-
-```text
-inode:
-  mount | inode -> attributes and body summary
-
-dentry:
-  mount | parent_inode | name -> child inode and projection
-
-manifest:
-  mount | inode | generation | chunk -> block descriptors
-
-watch:
-  mount | scope | sequence -> typed event
-
-snapshot:
-  mount | snapshot_id -> read frontier and retention pin
-
-gc:
-  mount | enqueue_version | inode | generation | chunk | block -> pending cleanup record
-```
-
-Full-path indexes are derived accelerators for artifact and checkpoint lookup.
-They are not namespace truth because subtree rename must not require rewriting
-every descendant path.
-
-## Version Plan
-
-```text
-v0 local:
-  Holt-backed metadata
-  S3-compatible object backend, with RustFS as the local default
-  Rust SDK
-  CLI
-  long-running local server with health, stats, manual GC endpoints, and
-  framed metadata RPC plus HTTP health, stats, and manual GC control endpoints
-  Rust metadata client for path and inode namespace operations
-  Rust file client for direct object upload, metadata publish, body read
-  plans, and direct object range reads
-  native layout-open RPCs, read lease RPC, ordered batched read-plan RPC, and
-  digest-carrying block read plans
-  close-to-open FUSE reads and buffered writes
-  artifact publish
-  durable object GC queue, explicit cleanup API, and background worker
-  durable snapshot pin, snapshot-version artifact read, and history GC
-  remove/rmdir/rename-replace
-  durable typed watch replay
-  FUSE kernel entry/inode invalidation from typed watches
-  read-only FUSE snapshot mounts
-
-v1 usable filesystem:
-  native cache-aware staged direct-write read client over the layout-open
-  boundary, with a Rust-owned staging-memory allocator boundary, explicit
-  system/page-locked host memory reporting, and read-only export guards for
-  Python dataloaders
-  native prepared range-batch/window plans, reusable batch readers, and epoch
-  readers for repeated training reads
-  JuiceFS-style chunk/slice data path with bounded buffers and background flush
-  fuller FUSE semantics beyond buffered write publish
-  FUSE over the metadata server
-  Python/fsspec
-  SDK watch consumer integration
-
-v2 cluster:
-  metadata router
-  subtree-sharded single-owner Holt metadata shards
-  control-plane owner leases and epoch fencing
-  CSI
-  node-local cache
-  watch-driven invalidation
-
-v3 AI platform:
-  tiered NVMe/S3 data fabric
-  checkpoint retention
-  dataset prefetch policy
-  workspace scoped views
-  metrics, audit, lineage, and lifecycle controllers
-```
+Source presence and unit tests do not prove durability, recovery, failover, GC,
+or product behavior. Required boundary-level evidence is defined in
+[Workspace Acceptance](./development/workspace-acceptance.md).

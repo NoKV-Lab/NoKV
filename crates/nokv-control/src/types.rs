@@ -1,45 +1,48 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+pub use nokv_types::{
+    LogicalShardId, OwnerEpoch, PlacementGeneration, RootId, RootPlacementLifecycle,
+};
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ShardId(String);
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+/// Stable identity of one physical metadata-shard process.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShardState {
-    Unassigned,
-    Recovering,
-    Serving,
-    Draining,
-    ReadOnly,
+/// Construction error for a [`NodeId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeIdError {
+    Empty,
+    NonCanonical,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Runtime state of one physical logical-shard owner.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LogicalShardState {
+    Unassigned = 1,
+    Recovering = 2,
+    Serving = 3,
+    Draining = 4,
+    ReadOnly = 5,
+}
+
+/// Fail-closed error for an unknown logical-shard state discriminant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownLogicalShardState(pub u8);
+
+/// Immutable checkpoint image published by a fenced shard owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointRef {
     pub object_key: String,
     pub lsn: u64,
     pub image_bytes: u64,
-    /// SHA-256 identity of the exact checkpoint image. Empty only when decoding
-    /// a pre-fence control record; recovery must reject those legacy refs.
-    #[serde(default)]
     pub image_digest: String,
-    /// Digest of the logical metadata log at `lsn` (not the image digest).
+    /// Digest of the logical metadata state at `lsn`.
     pub digest: String,
 }
 
-/// A single archived logical-log segment in the shared-log chain.
-///
-/// The shared log is a *chain* of segments above the latest checkpoint, not a
-/// single object. Failover replays every segment whose `last_lsn` is above the
-/// checkpoint LSN, in order, so the chain must be enumerable from the control
-/// record — a single pointer would silently drop all but the newest segment.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One immutable segment in the ordered shared-log chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogSegmentRef {
     pub segment_key: String,
     pub first_lsn: u64,
@@ -47,95 +50,69 @@ pub struct LogSegmentRef {
     pub digest: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Complete ordered shared-log chain above the retained checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRef {
-    /// Ordered (oldest first) segment chain above the latest checkpoint.
     pub segments: Vec<LogSegmentRef>,
     pub durable_lsn: u64,
     pub digest: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShardRecord {
-    pub shard_id: ShardId,
-    pub owner: Option<NodeId>,
-    pub epoch: u64,
-    pub lease_id: u64,
-    pub state: ShardState,
+/// One owner-fenced publication of the durable recovery frontier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryPublication {
     pub checkpoint: Option<CheckpointRef>,
     pub log: Option<LogRef>,
     pub durable_lsn: u64,
-    /// Durable proof that this shard has completed `mark_serving` at least once.
-    /// A never-served shard may safely retry Fresh acquisition after a startup
-    /// failure; every legacy record defaults to `true` on decode so historical
-    /// data is never mistaken for an empty, resurrectable shard.
-    #[serde(default = "legacy_record_ever_served")]
-    pub ever_served: bool,
-    /// Reachable endpoint (host:port) of the current owner, so a client can
-    /// route to it. `None` when unowned. (In this deployment the `NodeId` is the
-    /// bind address, so this mirrors `owner` while owned.)
-    #[serde(default)]
+}
+
+/// Durable, immutable root-to-logical-shard affinity plus its CAS fence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootPlacement {
+    pub root_id: RootId,
+    pub logical_shard_id: LogicalShardId,
+    pub placement_generation: PlacementGeneration,
+    pub lifecycle: RootPlacementLifecycle,
+}
+
+/// Durable ownership and recovery state for one logical metadata shard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalShardRecord {
+    pub logical_shard_id: LogicalShardId,
+    pub owner: Option<NodeId>,
+    /// `None` means the shard has never had an owner. Once assigned, the last
+    /// epoch remains present after release and every successor must increment it.
+    pub owner_epoch: Option<OwnerEpoch>,
+    /// Backend lease identity. Zero means there is no current owner session.
+    pub lease_id: u64,
+    pub state: LogicalShardState,
+    /// Reachable endpoint of the current owner. `None` while unowned.
     pub endpoint: Option<String>,
-    /// The absolute path prefix this shard owns (derived from `shard_id`). Lets
-    /// clients build the longest-prefix routing map from `list_shards`.
-    #[serde(default = "default_shard_prefix")]
-    pub prefix: String,
-    /// Stable shard index, encoded in the high bits of every inode this shard
-    /// mints (see `nokv_types::InodeId::shard_index`). The default/root shard is
-    /// index 0.
-    #[serde(default)]
-    pub shard_index: u16,
-    /// For a subtree shard, the inode of its namespace subtree root (the dir
-    /// `mkdir`-ed at the shard's prefix on this shard during graft registration).
-    /// This is the DURABLE graft target: recording it here is the single,
-    /// atomic registration point, from which the parent shard's graft dentry can
-    /// be (re)created idempotently by `reconcile_grafts`. `None` until a graft is
-    /// registered for this shard (and on the default/root shard, which is never a
-    /// graft child).
-    #[serde(default)]
-    pub subtree_root_inode: Option<u64>,
+    pub checkpoint: Option<CheckpointRef>,
+    pub log: Option<LogRef>,
+    pub durable_lsn: u64,
 }
 
-fn default_shard_prefix() -> String {
-    "/".to_owned()
-}
-
-fn legacy_record_ever_served() -> bool {
-    true
-}
-
-/// Derive the path prefix from a `mount-<n>:<path>` shard id, defaulting to `/`.
-fn shard_prefix_from_id(shard_id: &ShardId) -> String {
-    shard_id
-        .as_str()
-        .split_once(':')
-        .map(|(_, path)| path)
-        .filter(|path| path.starts_with('/'))
-        .unwrap_or("/")
-        .to_owned()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShardLease {
-    pub shard_id: ShardId,
+/// Exact owner fence presented to every owner-only mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalShardLease {
+    pub logical_shard_id: LogicalShardId,
     pub owner: NodeId,
-    pub epoch: u64,
+    pub owner_epoch: OwnerEpoch,
     pub lease_id: u64,
 }
 
-impl ShardId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl NodeId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    /// Construct a canonical, non-empty endpoint identity.
+    pub fn new(value: impl Into<String>) -> Result<Self, NodeIdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(NodeIdError::Empty);
+        }
+        if value.trim() != value || value.chars().any(char::is_control) {
+            return Err(NodeIdError::NonCanonical);
+        }
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -143,35 +120,120 @@ impl NodeId {
     }
 }
 
-impl ShardRecord {
-    pub fn unassigned(shard_id: ShardId) -> Self {
-        let prefix = shard_prefix_from_id(&shard_id);
-        Self {
-            shard_id,
-            owner: None,
-            epoch: 0,
-            lease_id: 0,
-            state: ShardState::Unassigned,
-            checkpoint: None,
-            log: None,
-            durable_lsn: 0,
-            ever_served: false,
-            endpoint: None,
-            prefix,
-            shard_index: 0,
-            subtree_root_inode: None,
-        }
+impl TryFrom<String> for NodeId {
+    type Error = NodeIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
     }
 }
 
-impl fmt::Display for ShardId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+impl TryFrom<&str> for NodeId {
+    type Error = NodeIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
     }
 }
 
 impl fmt::Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for NodeIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("node id must not be empty"),
+            Self::NonCanonical => formatter
+                .write_str("node id must not contain surrounding whitespace or control characters"),
+        }
+    }
+}
+
+impl std::error::Error for NodeIdError {}
+
+impl TryFrom<u8> for LogicalShardState {
+    type Error = UnknownLogicalShardState;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Unassigned),
+            2 => Ok(Self::Recovering),
+            3 => Ok(Self::Serving),
+            4 => Ok(Self::Draining),
+            5 => Ok(Self::ReadOnly),
+            value => Err(UnknownLogicalShardState(value)),
+        }
+    }
+}
+
+impl From<LogicalShardState> for u8 {
+    fn from(value: LogicalShardState) -> Self {
+        value as u8
+    }
+}
+
+impl fmt::Display for UnknownLogicalShardState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unknown LogicalShardState durable discriminant {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownLogicalShardState {}
+
+impl LogicalShardRecord {
+    pub fn unassigned(logical_shard_id: LogicalShardId) -> Self {
+        Self {
+            logical_shard_id,
+            owner: None,
+            owner_epoch: None,
+            lease_id: 0,
+            state: LogicalShardState::Unassigned,
+            endpoint: None,
+            checkpoint: None,
+            log: None,
+            durable_lsn: 0,
+        }
+    }
+}
+
+pub(crate) fn endpoint_is_canonical(endpoint: &str) -> bool {
+    !endpoint.is_empty() && endpoint.trim() == endpoint && !endpoint.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_id_rejects_empty_and_noncanonical_identities() {
+        assert_eq!(NodeId::new("").unwrap_err(), NodeIdError::Empty);
+        assert_eq!(
+            NodeId::new(" node-a").unwrap_err(),
+            NodeIdError::NonCanonical
+        );
+        assert_eq!(
+            NodeId::new("node-a\n").unwrap_err(),
+            NodeIdError::NonCanonical
+        );
+        assert_eq!(NodeId::new("node-a").unwrap().as_str(), "node-a");
+    }
+
+    #[test]
+    fn logical_shard_state_rejects_unknown_discriminants() {
+        assert_eq!(
+            LogicalShardState::try_from(0),
+            Err(UnknownLogicalShardState(0))
+        );
+        assert_eq!(
+            LogicalShardState::try_from(6),
+            Err(UnknownLogicalShardState(6))
+        );
     }
 }

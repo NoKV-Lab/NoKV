@@ -1,187 +1,28 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, LazyLock, Mutex};
-use std::thread;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use opendal::blocking::Operator as BlockingOperator;
 use opendal::options::WriteOptions;
 use opendal::services::S3;
 use opendal::{ErrorKind, Operator};
 
-use crate::chunk::{ObjectReadBlock, StagedObjectSet};
-use crate::fabric::{
-    default_pending_cold_put_root, BlockPlacement, DataTransport, LocalObjectStore,
-    LocalObjectStoreOptions, LocalObjectStoreStats, TieredObjectStore, TieredObjectStoreOptions,
-    TieredObjectStoreStats, TieredPutPolicy,
-};
+use crate::digest::{hex, sha256};
 
-pub const DEFAULT_S3_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+pub const DEFAULT_S3_MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
 pub const DEFAULT_S3_MULTIPART_CONCURRENCY: usize = 8;
-pub const DEFAULT_S3_GET_CONCURRENCY: usize = 16;
 
 static OPENDAL_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_name("nokv-object")
+        .thread_name("nokv-artifact-object")
         .build()
-        .expect("create NoKV object runtime")
+        .expect("create NoKV artifact object runtime")
 });
 
-pub trait ObjectStore {
-    fn capabilities(&self) -> ObjectCapabilities {
-        ObjectCapabilities::default()
-    }
-
-    fn put(
-        &self,
-        key: &ObjectKey,
-        bytes: impl Into<ObjectBytes>,
-    ) -> Result<ObjectInfo, ObjectError>;
-    fn get(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError>;
-    fn get_if_present(
-        &self,
-        key: &ObjectKey,
-        range: Option<ObjectRange>,
-    ) -> Result<Option<Vec<u8>>, ObjectError> {
-        if self.head(key)?.is_some() {
-            self.get(key, range).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn get_many_if_present(
-        &self,
-        requests: &[ObjectGetRequest],
-    ) -> Result<Vec<Option<Vec<u8>>>, ObjectError> {
-        requests
-            .iter()
-            .map(|request| self.get_if_present(&request.key, request.range))
-            .collect()
-    }
-
-    fn get_many(&self, requests: &[ObjectGetRequest]) -> Result<Vec<Vec<u8>>, ObjectError> {
-        requests
-            .iter()
-            .map(|request| self.get(&request.key, request.range))
-            .collect()
-    }
-    fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError>;
-    fn delete(&self, key: &ObjectKey) -> Result<bool, ObjectError>;
-    fn resolve_read_placements(
-        &self,
-        blocks: &[ObjectReadBlock],
-    ) -> Result<Vec<BlockPlacement>, ObjectError> {
-        resolve_object_read_placements(blocks)
-    }
-
-    fn tiered_stats(&self) -> Result<Option<TieredObjectStoreStats>, ObjectError> {
-        Ok(None)
-    }
-
-    fn local_hot_stats(&self) -> Result<Option<LocalObjectStoreStats>, ObjectError> {
-        Ok(None)
-    }
-}
-
-fn resolve_object_read_placements(
-    blocks: &[ObjectReadBlock],
-) -> Result<Vec<BlockPlacement>, ObjectError> {
-    blocks
-        .iter()
-        .map(|block| {
-            Ok(BlockPlacement {
-                object_key: ObjectKey::new(block.object_key.clone())?,
-                transport: DataTransport::ObjectTcpGet,
-            })
-        })
-        .collect()
-}
-
-impl<T> ObjectStore for Arc<T>
-where
-    T: ObjectStore + ?Sized,
-{
-    fn capabilities(&self) -> ObjectCapabilities {
-        (**self).capabilities()
-    }
-
-    fn put(
-        &self,
-        key: &ObjectKey,
-        bytes: impl Into<ObjectBytes>,
-    ) -> Result<ObjectInfo, ObjectError> {
-        (**self).put(key, bytes)
-    }
-
-    fn get(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
-        (**self).get(key, range)
-    }
-
-    fn get_if_present(
-        &self,
-        key: &ObjectKey,
-        range: Option<ObjectRange>,
-    ) -> Result<Option<Vec<u8>>, ObjectError> {
-        (**self).get_if_present(key, range)
-    }
-
-    fn get_many_if_present(
-        &self,
-        requests: &[ObjectGetRequest],
-    ) -> Result<Vec<Option<Vec<u8>>>, ObjectError> {
-        (**self).get_many_if_present(requests)
-    }
-
-    fn get_many(&self, requests: &[ObjectGetRequest]) -> Result<Vec<Vec<u8>>, ObjectError> {
-        (**self).get_many(requests)
-    }
-
-    fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
-        (**self).head(key)
-    }
-
-    fn delete(&self, key: &ObjectKey) -> Result<bool, ObjectError> {
-        (**self).delete(key)
-    }
-
-    fn resolve_read_placements(
-        &self,
-        blocks: &[ObjectReadBlock],
-    ) -> Result<Vec<BlockPlacement>, ObjectError> {
-        (**self).resolve_read_placements(blocks)
-    }
-
-    fn tiered_stats(&self) -> Result<Option<TieredObjectStoreStats>, ObjectError> {
-        (**self).tiered_stats()
-    }
-
-    fn local_hot_stats(&self) -> Result<Option<LocalObjectStoreStats>, ObjectError> {
-        (**self).local_hot_stats()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObjectCapabilities {
-    pub range_get: bool,
-    pub multipart_put: bool,
-    pub server_side_copy: bool,
-    pub max_single_put_bytes: Option<u64>,
-    pub multipart_min_part_bytes: Option<u64>,
-    pub multipart_max_part_bytes: Option<u64>,
-    pub multipart_max_parts: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Provider-neutral relative key for one immutable artifact object.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectKey(String);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObjectInfo {
-    pub key: ObjectKey,
-    pub size: u64,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObjectRange {
@@ -190,45 +31,302 @@ pub struct ObjectRange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ObjectBytes {
-    Owned(Vec<u8>),
-    Shared(Arc<[u8]>),
-    SharedVec(Arc<Vec<u8>>),
-    SharedVecSlice {
-        bytes: Arc<Vec<u8>>,
-        offset: usize,
-        len: usize,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObjectGetRequest {
+pub struct ObjectInfo {
     pub key: ObjectKey,
-    pub range: Option<ObjectRange>,
+    pub size: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImmutableCreateOutcome {
+    Created,
+    Replayed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectDeleteOutcome {
+    Deleted,
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactStoreCapabilities {
+    pub range_read: bool,
+    pub multipart_create: bool,
+    pub atomic_create_if_absent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObjectStoreConfig {
-    kind: ObjectStoreConfigKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ObjectStoreConfigKind {
-    S3(S3ObjectStoreOptions),
-    TieredLocal {
-        hot: LocalObjectStoreOptions,
-        cold: S3ObjectStoreOptions,
-        options: TieredObjectStoreOptions,
+pub enum ObjectError {
+    EmptyKey,
+    AbsoluteKey,
+    EmptyKeyComponent,
+    ParentTraversal,
+    CurrentDirectory,
+    BackslashInKey,
+    ContainsNul,
+    InvalidRange {
+        offset: u64,
+        len: usize,
+        object_size: Option<u64>,
     },
+    ObjectNotFound {
+        key: ObjectKey,
+    },
+    ImmutableCollision {
+        key: ObjectKey,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+    DigestMismatch {
+        key: ObjectKey,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+    InvalidManifest(String),
+    MissingBucket,
+    MissingRegion,
+    CreateAmbiguous {
+        key: ObjectKey,
+        detail: String,
+    },
+    DeleteAmbiguous {
+        key: ObjectKey,
+        detail: String,
+    },
+    Backend(String),
 }
 
-#[derive(Clone, Debug)]
-pub struct MemoryObjectStore {
-    objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+/// Immutable durable-object boundary.
+///
+/// `create_immutable` may create a missing key or accept an exact-byte replay.
+/// It must never replace different bytes at an existing key.
+pub trait ArtifactObjectStore {
+    fn capabilities(&self) -> ArtifactStoreCapabilities;
+
+    fn create_immutable(
+        &self,
+        key: &ObjectKey,
+        bytes: &[u8],
+    ) -> Result<ImmutableCreateOutcome, ObjectError>;
+
+    fn read(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError>;
+
+    fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError>;
+
+    /// Delete one immutable object.
+    ///
+    /// A backend error after dispatch must be returned as
+    /// [`ObjectError::DeleteAmbiguous`], never collapsed into absence.
+    fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError>;
+}
+
+impl<T> ArtifactObjectStore for Arc<T>
+where
+    T: ArtifactObjectStore + ?Sized,
+{
+    fn capabilities(&self) -> ArtifactStoreCapabilities {
+        (**self).capabilities()
+    }
+
+    fn create_immutable(
+        &self,
+        key: &ObjectKey,
+        bytes: &[u8],
+    ) -> Result<ImmutableCreateOutcome, ObjectError> {
+        (**self).create_immutable(key, bytes)
+    }
+
+    fn read(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
+        (**self).read(key, range)
+    }
+
+    fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
+        (**self).head(key)
+    }
+
+    fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
+        (**self).delete(key)
+    }
+}
+
+impl ObjectKey {
+    pub fn new(raw: impl Into<String>) -> Result<Self, ObjectError> {
+        let raw = raw.into();
+        validate_key(&raw)?;
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ObjectKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl ObjectRange {
+    pub fn new(offset: u64, len: usize) -> Result<Self, ObjectError> {
+        let range = Self { offset, len };
+        range.end()?;
+        if len == 0 {
+            return Err(ObjectError::InvalidRange {
+                offset,
+                len,
+                object_size: None,
+            });
+        }
+        Ok(range)
+    }
+
+    pub fn end(self) -> Result<u64, ObjectError> {
+        let len = u64::try_from(self.len).map_err(|_| ObjectError::InvalidRange {
+            offset: self.offset,
+            len: self.len,
+            object_size: None,
+        })?;
+        self.offset
+            .checked_add(len)
+            .ok_or(ObjectError::InvalidRange {
+                offset: self.offset,
+                len: self.len,
+                object_size: None,
+            })
+    }
+
+    pub fn validate_within(self, object_size: u64) -> Result<(), ObjectError> {
+        if self.len == 0 || self.end()? > object_size {
+            return Err(ObjectError::InvalidRange {
+                offset: self.offset,
+                len: self.len,
+                object_size: Some(object_size),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for ArtifactStoreCapabilities {
+    fn default() -> Self {
+        Self {
+            range_read: true,
+            multipart_create: false,
+            atomic_create_if_absent: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MemoryArtifactStore {
+    state: Arc<Mutex<MemoryArtifactStoreState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MemoryArtifactStoreState {
+    objects: BTreeMap<ObjectKey, Vec<u8>>,
+    stats: MemoryArtifactStoreStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryArtifactStoreStats {
+    pub resident_objects: u64,
+    pub resident_bytes: u64,
+    pub creates: u64,
+    pub replays: u64,
+    pub collisions: u64,
+    pub reads: u64,
+    pub read_bytes: u64,
+    pub deletes: u64,
+}
+
+impl MemoryArtifactStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn stats(&self) -> Result<MemoryArtifactStoreStats, ObjectError> {
+        self.state
+            .lock()
+            .map(|state| state.stats)
+            .map_err(ObjectError::poisoned)
+    }
+}
+
+impl ArtifactObjectStore for MemoryArtifactStore {
+    fn capabilities(&self) -> ArtifactStoreCapabilities {
+        ArtifactStoreCapabilities::default()
+    }
+
+    fn create_immutable(
+        &self,
+        key: &ObjectKey,
+        bytes: &[u8],
+    ) -> Result<ImmutableCreateOutcome, ObjectError> {
+        let mut state = self.state.lock().map_err(ObjectError::poisoned)?;
+        if let Some(existing) = state.objects.get(key).cloned() {
+            let matches = existing.as_slice() == bytes;
+            if matches {
+                state.stats.replays = state.stats.replays.saturating_add(1);
+                return Ok(ImmutableCreateOutcome::Replayed);
+            }
+            state.stats.collisions = state.stats.collisions.saturating_add(1);
+            return Err(immutable_collision(key, bytes, &existing));
+        }
+        state.objects.insert(key.clone(), bytes.to_vec());
+        state.stats.creates = state.stats.creates.saturating_add(1);
+        state.stats.resident_objects = state.stats.resident_objects.saturating_add(1);
+        state.stats.resident_bytes = state
+            .stats
+            .resident_bytes
+            .saturating_add(bytes.len() as u64);
+        Ok(ImmutableCreateOutcome::Created)
+    }
+
+    fn read(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
+        let mut state = self.state.lock().map_err(ObjectError::poisoned)?;
+        let bytes = state
+            .objects
+            .get(key)
+            .ok_or_else(|| ObjectError::ObjectNotFound { key: key.clone() })?;
+        let result = strict_range(bytes, range)?;
+        let result_len = result.len() as u64;
+        state.stats.reads = state.stats.reads.saturating_add(1);
+        state.stats.read_bytes = state.stats.read_bytes.saturating_add(result_len);
+        Ok(result)
+    }
+
+    fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(ObjectError::poisoned)?
+            .objects
+            .get(key)
+            .map(|bytes| ObjectInfo {
+                key: key.clone(),
+                size: bytes.len() as u64,
+            }))
+    }
+
+    fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
+        let mut state = self.state.lock().map_err(ObjectError::poisoned)?;
+        let Some(bytes) = state.objects.remove(key) else {
+            return Ok(ObjectDeleteOutcome::Absent);
+        };
+        state.stats.deletes = state.stats.deletes.saturating_add(1);
+        state.stats.resident_objects = state.stats.resident_objects.saturating_sub(1);
+        state.stats.resident_bytes = state
+            .stats
+            .resident_bytes
+            .saturating_sub(bytes.len() as u64);
+        Ok(ObjectDeleteOutcome::Deleted)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct S3ObjectStoreOptions {
+pub struct S3ArtifactStoreOptions {
     pub bucket: String,
     pub root: String,
     pub region: String,
@@ -240,339 +338,7 @@ pub struct S3ObjectStoreOptions {
     pub skip_signature: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct S3ObjectStore {
-    operator: BlockingOperator,
-}
-
-#[derive(Clone, Debug)]
-pub enum ConfiguredObjectStore {
-    S3(Arc<S3ObjectStore>),
-    TieredLocal(Arc<TieredObjectStore<LocalObjectStore, S3ObjectStore>>),
-    Memory(Arc<MemoryObjectStore>),
-}
-
-impl ConfiguredObjectStore {
-    pub fn tiered_stats(&self) -> Result<Option<TieredObjectStoreStats>, ObjectError> {
-        match self {
-            Self::S3(_) => Ok(None),
-            Self::TieredLocal(store) => store.stats().map(Some),
-            Self::Memory(_) => Ok(None),
-        }
-    }
-
-    pub fn local_hot_stats(&self) -> Result<Option<LocalObjectStoreStats>, ObjectError> {
-        match self {
-            Self::S3(_) => Ok(None),
-            Self::TieredLocal(store) => store.hot().stats().map(Some),
-            Self::Memory(_) => Ok(None),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ObjectError {
-    EmptyKey,
-    AbsoluteKey,
-    ParentTraversal,
-    CurrentDirectory,
-    ContainsNul,
-    InvalidRange,
-    MissingBucket,
-    MissingRegion,
-    InvalidChunkLayout,
-    Backend(String),
-    StagedWriteFailed {
-        source: String,
-        staged: StagedObjectSet,
-    },
-}
-
-impl ObjectKey {
-    pub fn new(raw: impl Into<String>) -> Result<Self, ObjectError> {
-        let raw = raw.into();
-        validate_key(&raw)?;
-        Ok(Self(raw))
-    }
-
-    pub(crate) fn validate_raw(raw: &str) -> Result<(), ObjectError> {
-        validate_key(raw)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl ObjectRange {
-    pub fn new(offset: u64, len: usize) -> Result<Self, ObjectError> {
-        if len == 0 {
-            return Err(ObjectError::InvalidRange);
-        }
-        Ok(Self { offset, len })
-    }
-}
-
-impl ObjectBytes {
-    pub fn shared(bytes: Arc<[u8]>) -> Self {
-        Self::Shared(bytes)
-    }
-
-    pub fn shared_vec(bytes: Arc<Vec<u8>>) -> Self {
-        Self::SharedVec(bytes)
-    }
-
-    pub fn shared_vec_slice(
-        bytes: Arc<Vec<u8>>,
-        offset: usize,
-        len: usize,
-    ) -> Result<Self, ObjectError> {
-        let end = offset.checked_add(len).ok_or(ObjectError::InvalidRange)?;
-        if end > bytes.len() {
-            return Err(ObjectError::InvalidRange);
-        }
-        if offset == 0 && len == bytes.len() {
-            Ok(Self::SharedVec(bytes))
-        } else {
-            Ok(Self::SharedVecSlice { bytes, offset, len })
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.as_slice().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.as_slice().is_empty()
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Owned(bytes) => bytes,
-            Self::Shared(bytes) => bytes,
-            Self::SharedVec(bytes) => bytes,
-            Self::SharedVecSlice { bytes, offset, len } => {
-                let end = offset
-                    .checked_add(*len)
-                    .expect("shared object byte slice offset overflows");
-                &bytes[*offset..end]
-            }
-        }
-    }
-
-    pub fn as_ptr(&self) -> *const u8 {
-        self.as_slice().as_ptr()
-    }
-
-    pub fn into_vec(self) -> Vec<u8> {
-        match self {
-            Self::Owned(bytes) => bytes,
-            Self::Shared(bytes) => bytes.to_vec(),
-            Self::SharedVec(bytes) => {
-                Arc::try_unwrap(bytes).unwrap_or_else(|bytes| (*bytes).clone())
-            }
-            Self::SharedVecSlice { bytes, offset, len } => {
-                let end = offset
-                    .checked_add(len)
-                    .expect("shared object byte slice offset overflows");
-                bytes[offset..end].to_vec()
-            }
-        }
-    }
-
-    pub(crate) fn into_shared_vec_window(
-        self,
-    ) -> Result<(Arc<Vec<u8>>, usize, usize), ObjectError> {
-        match self {
-            Self::Owned(bytes) => {
-                let len = bytes.len();
-                Ok((Arc::new(bytes), 0, len))
-            }
-            Self::Shared(bytes) => {
-                let len = bytes.len();
-                Ok((Arc::new(bytes.to_vec()), 0, len))
-            }
-            Self::SharedVec(bytes) => {
-                let len = bytes.len();
-                Ok((bytes, 0, len))
-            }
-            Self::SharedVecSlice { bytes, offset, len } => {
-                let end = offset.checked_add(len).ok_or(ObjectError::InvalidRange)?;
-                if end > bytes.len() {
-                    return Err(ObjectError::InvalidRange);
-                }
-                Ok((bytes, offset, len))
-            }
-        }
-    }
-}
-
-impl Default for ObjectBytes {
-    fn default() -> Self {
-        Self::Owned(Vec::new())
-    }
-}
-
-impl From<Vec<u8>> for ObjectBytes {
-    fn from(bytes: Vec<u8>) -> Self {
-        Self::Owned(bytes)
-    }
-}
-
-impl From<Arc<[u8]>> for ObjectBytes {
-    fn from(bytes: Arc<[u8]>) -> Self {
-        Self::Shared(bytes)
-    }
-}
-
-impl From<Arc<Vec<u8>>> for ObjectBytes {
-    fn from(bytes: Arc<Vec<u8>>) -> Self {
-        Self::SharedVec(bytes)
-    }
-}
-
-impl AsRef<[u8]> for ObjectBytes {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl ObjectGetRequest {
-    pub fn new(key: ObjectKey, range: Option<ObjectRange>) -> Self {
-        Self { key, range }
-    }
-}
-
-impl Default for ObjectCapabilities {
-    fn default() -> Self {
-        Self {
-            range_get: true,
-            multipart_put: false,
-            server_side_copy: false,
-            max_single_put_bytes: None,
-            multipart_min_part_bytes: None,
-            multipart_max_part_bytes: None,
-            multipart_max_parts: None,
-        }
-    }
-}
-
-impl ObjectStoreConfig {
-    pub fn s3(options: S3ObjectStoreOptions) -> Self {
-        Self {
-            kind: ObjectStoreConfigKind::S3(options),
-        }
-    }
-
-    pub fn rustfs(
-        bucket: impl Into<String>,
-        endpoint: impl Into<String>,
-        access_key_id: impl Into<String>,
-        secret_access_key: impl Into<String>,
-    ) -> Self {
-        Self {
-            kind: ObjectStoreConfigKind::S3(S3ObjectStoreOptions::rustfs(
-                bucket,
-                endpoint,
-                access_key_id,
-                secret_access_key,
-            )),
-        }
-    }
-
-    pub fn tiered_local(hot_root: impl Into<PathBuf>, cold: S3ObjectStoreOptions) -> Self {
-        Self::tiered_local_with_options(
-            LocalObjectStoreOptions::new(hot_root),
-            cold,
-            TieredObjectStoreOptions::default(),
-        )
-    }
-
-    pub fn tiered_local_with_options(
-        hot: LocalObjectStoreOptions,
-        cold: S3ObjectStoreOptions,
-        options: TieredObjectStoreOptions,
-    ) -> Self {
-        Self {
-            kind: ObjectStoreConfigKind::TieredLocal { hot, cold, options },
-        }
-    }
-
-    pub fn open(&self) -> Result<ConfiguredObjectStore, ObjectError> {
-        match &self.kind {
-            ObjectStoreConfigKind::S3(options) => Ok(ConfiguredObjectStore::S3(Arc::new(
-                S3ObjectStore::new(options.clone())?,
-            ))),
-            ObjectStoreConfigKind::TieredLocal { hot, cold, options } => {
-                let mut options = options.clone();
-                if options.put_policy == TieredPutPolicy::HotThenBackgroundCold
-                    && options.pending_cold_put_root.is_none()
-                {
-                    options.pending_cold_put_root = Some(default_pending_cold_put_root(&hot.root));
-                }
-                let hot = LocalObjectStore::new(hot.clone())?;
-                let cold = S3ObjectStore::new(cold.clone())?;
-                let store = Arc::new(TieredObjectStore::new(hot, cold, options));
-                store.recover_pending_cold_puts()?;
-                Ok(ConfiguredObjectStore::TieredLocal(store))
-            }
-        }
-    }
-
-    pub fn options(&self) -> &S3ObjectStoreOptions {
-        match &self.kind {
-            ObjectStoreConfigKind::S3(options) => options,
-            ObjectStoreConfigKind::TieredLocal { cold, .. } => cold,
-        }
-    }
-
-    pub fn local_hot_root(&self) -> Option<&Path> {
-        match &self.kind {
-            ObjectStoreConfigKind::S3(_) => None,
-            ObjectStoreConfigKind::TieredLocal { hot, .. } => Some(hot.root.as_path()),
-        }
-    }
-
-    pub fn local_hot_options(&self) -> Option<&LocalObjectStoreOptions> {
-        match &self.kind {
-            ObjectStoreConfigKind::S3(_) => None,
-            ObjectStoreConfigKind::TieredLocal { hot, .. } => Some(hot),
-        }
-    }
-
-    pub fn tiered_options(&self) -> Option<TieredObjectStoreOptions> {
-        match &self.kind {
-            ObjectStoreConfigKind::S3(_) => None,
-            ObjectStoreConfigKind::TieredLocal { options, .. } => Some(options.clone()),
-        }
-    }
-}
-
-impl MemoryObjectStore {
-    pub fn new() -> Self {
-        Self {
-            objects: Arc::new(Mutex::new(BTreeMap::new())),
-        }
-    }
-
-    /// Number of objects currently held. Useful for asserting that a
-    /// copy-on-write clone shared blocks (count unchanged) instead of copying
-    /// them.
-    pub fn object_count(&self) -> usize {
-        self.objects
-            .lock()
-            .map(|objects| objects.len())
-            .unwrap_or(0)
-    }
-}
-
-impl Default for MemoryObjectStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl S3ObjectStoreOptions {
+impl S3ArtifactStoreOptions {
     pub fn new(bucket: impl Into<String>) -> Self {
         Self {
             bucket: bucket.into(),
@@ -587,7 +353,7 @@ impl S3ObjectStoreOptions {
         }
     }
 
-    pub fn rustfs(
+    pub fn for_endpoint(
         bucket: impl Into<String>,
         endpoint: impl Into<String>,
         access_key_id: impl Into<String>,
@@ -617,8 +383,13 @@ impl S3ObjectStoreOptions {
     }
 }
 
-impl S3ObjectStore {
-    pub fn new(options: S3ObjectStoreOptions) -> Result<Self, ObjectError> {
+#[derive(Clone, Debug)]
+pub struct S3ArtifactStore {
+    operator: BlockingOperator,
+}
+
+impl S3ArtifactStore {
+    pub fn new(options: S3ArtifactStoreOptions) -> Result<Self, ObjectError> {
         options.validate()?;
         let mut builder = S3::default()
             .bucket(&options.bucket)
@@ -644,434 +415,253 @@ impl S3ObjectStore {
         }
 
         let operator = Operator::new(builder)
-            .map_err(ObjectError::from_backend)?
+            .map_err(ObjectError::backend)?
             .finish();
-        let _guard = OPENDAL_RUNTIME.enter();
-        let operator = BlockingOperator::new(operator).map_err(ObjectError::from_backend)?;
+        let _runtime_guard = OPENDAL_RUNTIME.enter();
+        let operator = BlockingOperator::new(operator).map_err(ObjectError::backend)?;
         Ok(Self { operator })
     }
-}
 
-impl ObjectStore for ConfiguredObjectStore {
-    fn capabilities(&self) -> ObjectCapabilities {
-        match self {
-            Self::S3(store) => store.capabilities(),
-            Self::TieredLocal(store) => store.capabilities(),
-            Self::Memory(store) => store.capabilities(),
-        }
-    }
-
-    fn put(
+    fn read_existing_for_replay(
         &self,
         key: &ObjectKey,
-        bytes: impl Into<ObjectBytes>,
-    ) -> Result<ObjectInfo, ObjectError> {
-        match self {
-            Self::S3(store) => store.put(key, bytes),
-            Self::TieredLocal(store) => store.put(key, bytes),
-            Self::Memory(store) => store.put(key, bytes),
-        }
-    }
-
-    fn get(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
-        match self {
-            Self::S3(store) => store.get(key, range),
-            Self::TieredLocal(store) => store.get(key, range),
-            Self::Memory(store) => store.get(key, range),
-        }
-    }
-
-    fn get_if_present(
-        &self,
-        key: &ObjectKey,
-        range: Option<ObjectRange>,
-    ) -> Result<Option<Vec<u8>>, ObjectError> {
-        match self {
-            Self::S3(store) => store.get_if_present(key, range),
-            Self::TieredLocal(store) => store.get_if_present(key, range),
-            Self::Memory(store) => store.get_if_present(key, range),
-        }
-    }
-
-    fn get_many_if_present(
-        &self,
-        requests: &[ObjectGetRequest],
-    ) -> Result<Vec<Option<Vec<u8>>>, ObjectError> {
-        match self {
-            Self::S3(store) => store.get_many_if_present(requests),
-            Self::TieredLocal(store) => store.get_many_if_present(requests),
-            Self::Memory(store) => store.get_many_if_present(requests),
-        }
-    }
-
-    fn get_many(&self, requests: &[ObjectGetRequest]) -> Result<Vec<Vec<u8>>, ObjectError> {
-        match self {
-            Self::S3(store) => store.get_many(requests),
-            Self::TieredLocal(store) => store.get_many(requests),
-            Self::Memory(store) => store.get_many(requests),
-        }
-    }
-
-    fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
-        match self {
-            Self::S3(store) => store.head(key),
-            Self::TieredLocal(store) => store.head(key),
-            Self::Memory(store) => store.head(key),
-        }
-    }
-
-    fn delete(&self, key: &ObjectKey) -> Result<bool, ObjectError> {
-        match self {
-            Self::S3(store) => store.delete(key),
-            Self::TieredLocal(store) => store.delete(key),
-            Self::Memory(store) => store.delete(key),
-        }
-    }
-
-    fn resolve_read_placements(
-        &self,
-        blocks: &[ObjectReadBlock],
-    ) -> Result<Vec<BlockPlacement>, ObjectError> {
-        match self {
-            Self::S3(store) => store.resolve_read_placements(blocks),
-            Self::TieredLocal(store) => store.resolve_read_placements(blocks),
-            Self::Memory(store) => store.resolve_read_placements(blocks),
-        }
-    }
-
-    fn tiered_stats(&self) -> Result<Option<TieredObjectStoreStats>, ObjectError> {
-        match self {
-            Self::S3(store) => store.tiered_stats(),
-            Self::TieredLocal(store) => store.tiered_stats(),
-            Self::Memory(store) => store.tiered_stats(),
-        }
-    }
-
-    fn local_hot_stats(&self) -> Result<Option<LocalObjectStoreStats>, ObjectError> {
-        match self {
-            Self::S3(store) => store.local_hot_stats(),
-            Self::TieredLocal(store) => store.local_hot_stats(),
-            Self::Memory(store) => store.local_hot_stats(),
+        expected: &[u8],
+        create_error: impl fmt::Display,
+    ) -> Result<ImmutableCreateOutcome, ObjectError> {
+        match self.operator.read(key.as_str()) {
+            Ok(existing) if existing.to_vec() == expected => Ok(ImmutableCreateOutcome::Replayed),
+            Ok(existing) => Err(immutable_collision(key, expected, &existing.to_vec())),
+            Err(read_error) => Err(ObjectError::CreateAmbiguous {
+                key: key.clone(),
+                detail: format!(
+                    "conditional create failed ({create_error}); replay reconciliation failed ({read_error})"
+                ),
+            }),
         }
     }
 }
 
-impl ObjectStore for S3ObjectStore {
-    fn capabilities(&self) -> ObjectCapabilities {
-        ObjectCapabilities {
-            range_get: true,
-            multipart_put: true,
-            server_side_copy: true,
-            max_single_put_bytes: None,
-            multipart_min_part_bytes: Some(5 * 1024 * 1024),
-            multipart_max_part_bytes: Some(5 * 1024 * 1024 * 1024),
-            multipart_max_parts: Some(10_000),
+impl ArtifactObjectStore for S3ArtifactStore {
+    fn capabilities(&self) -> ArtifactStoreCapabilities {
+        ArtifactStoreCapabilities {
+            range_read: true,
+            multipart_create: true,
+            atomic_create_if_absent: true,
         }
     }
 
-    fn put(
+    fn create_immutable(
         &self,
         key: &ObjectKey,
-        bytes: impl Into<ObjectBytes>,
-    ) -> Result<ObjectInfo, ObjectError> {
-        let bytes = bytes.into();
-        let size = bytes.len() as u64;
-        let mut writer = self
-            .operator
-            .writer_options(
-                key.as_str(),
-                WriteOptions {
-                    chunk: Some(DEFAULT_S3_MULTIPART_CHUNK_SIZE),
-                    concurrent: DEFAULT_S3_MULTIPART_CONCURRENCY,
-                    ..WriteOptions::default()
-                },
-            )
-            .map_err(ObjectError::from_backend)?;
-        writer
-            .write(bytes.into_vec())
-            .map_err(ObjectError::from_backend)?;
-        writer.close().map_err(ObjectError::from_backend)?;
-        Ok(ObjectInfo {
-            key: key.clone(),
-            size,
-        })
+        bytes: &[u8],
+    ) -> Result<ImmutableCreateOutcome, ObjectError> {
+        let mut writer = match self.operator.writer_options(
+            key.as_str(),
+            WriteOptions {
+                if_not_exists: true,
+                chunk: Some(DEFAULT_S3_MULTIPART_PART_SIZE),
+                concurrent: DEFAULT_S3_MULTIPART_CONCURRENCY,
+                ..WriteOptions::default()
+            },
+        ) {
+            Ok(writer) => writer,
+            Err(error) => return self.read_existing_for_replay(key, bytes, error),
+        };
+        if let Err(error) = writer.write(bytes.to_vec()) {
+            return self.read_existing_for_replay(key, bytes, error);
+        }
+        match writer.close() {
+            Ok(_) => Ok(ImmutableCreateOutcome::Created),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                ) =>
+            {
+                self.read_existing_for_replay(key, bytes, error)
+            }
+            Err(error) => self.read_existing_for_replay(key, bytes, error),
+        }
     }
 
-    fn get(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
+    fn read(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
         let buffer = match range {
             Some(range) => {
-                let end = range
-                    .offset
-                    .checked_add(range.len as u64)
-                    .ok_or(ObjectError::InvalidRange)?;
+                let end = range.end()?;
                 self.operator
                     .reader(key.as_str())
                     .and_then(|reader| reader.read(range.offset..end))
             }
             None => self.operator.read(key.as_str()),
+        };
+        match buffer {
+            Ok(bytes) => {
+                let bytes = bytes.to_vec();
+                if let Some(range) = range {
+                    if bytes.len() != range.len {
+                        return Err(ObjectError::InvalidRange {
+                            offset: range.offset,
+                            len: range.len,
+                            object_size: None,
+                        });
+                    }
+                }
+                Ok(bytes)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Err(ObjectError::ObjectNotFound { key: key.clone() })
+            }
+            Err(error) => Err(ObjectError::backend(error)),
         }
-        .map_err(ObjectError::from_backend)?;
-        Ok(buffer.to_vec())
-    }
-
-    fn get_many(&self, requests: &[ObjectGetRequest]) -> Result<Vec<Vec<u8>>, ObjectError> {
-        parallel_get_many(requests.len(), DEFAULT_S3_GET_CONCURRENCY, |index| {
-            let request = &requests[index];
-            self.get(&request.key, request.range)
-        })
     }
 
     fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
         match self.operator.stat(key.as_str()) {
-            Ok(meta) => Ok(Some(ObjectInfo {
+            Ok(metadata) => Ok(Some(ObjectInfo {
                 key: key.clone(),
-                size: meta.content_length(),
+                size: metadata.content_length(),
             })),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(ObjectError::from_backend(err)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ObjectError::backend(error)),
         }
     }
 
-    fn delete(&self, key: &ObjectKey) -> Result<bool, ObjectError> {
-        let existed = self.head(key)?.is_some();
-        self.operator
-            .delete(key.as_str())
-            .map_err(ObjectError::from_backend)?;
-        Ok(existed)
-    }
-}
-
-fn parallel_get_many<F>(
-    len: usize,
-    concurrency: usize,
-    fetch: F,
-) -> Result<Vec<Vec<u8>>, ObjectError>
-where
-    F: Fn(usize) -> Result<Vec<u8>, ObjectError> + Sync,
-{
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    if len == 1 || concurrency <= 1 {
-        return (0..len).map(fetch).collect();
-    }
-
-    let workers = concurrency.min(len);
-    let next = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::channel();
-    thread::scope(|scope| {
-        for _ in 0..workers {
-            let tx = tx.clone();
-            let fetch = &fetch;
-            let next = &next;
-            scope.spawn(move || loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= len {
-                    break;
-                }
-                if tx.send((index, fetch(index))).is_err() {
-                    break;
-                }
-            });
-        }
-        drop(tx);
-    });
-
-    let mut results = std::iter::repeat_with(|| None)
-        .take(len)
-        .collect::<Vec<Option<Result<Vec<u8>, ObjectError>>>>();
-    for (index, result) in rx {
-        if index >= len {
-            return Err(ObjectError::Backend(
-                "object store returned out-of-range batch index".to_owned(),
-            ));
-        }
-        results[index] = Some(result);
-    }
-
-    results
-        .into_iter()
-        .enumerate()
-        .map(|(index, result)| {
-            result.ok_or_else(|| {
-                ObjectError::Backend(format!("object store batch read missed index {index}"))
-            })?
-        })
-        .collect()
-}
-
-impl ObjectStore for MemoryObjectStore {
-    fn capabilities(&self) -> ObjectCapabilities {
-        ObjectCapabilities {
-            range_get: true,
-            ..ObjectCapabilities::default()
-        }
-    }
-
-    fn put(
-        &self,
-        key: &ObjectKey,
-        bytes: impl Into<ObjectBytes>,
-    ) -> Result<ObjectInfo, ObjectError> {
-        let bytes = bytes.into();
-        let size = bytes.len() as u64;
-        self.objects
-            .lock()
-            .map_err(ObjectError::from_poisoned_lock)?
-            .insert(key.as_str().to_owned(), bytes.into_vec());
-        Ok(ObjectInfo {
-            key: key.clone(),
-            size,
-        })
-    }
-
-    fn get(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
-        let objects = self
-            .objects
-            .lock()
-            .map_err(ObjectError::from_poisoned_lock)?;
-        let Some(bytes) = objects.get(key.as_str()) else {
-            return Err(ObjectError::Backend("object not found".to_owned()));
+    fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
+        let existed = match self.head(key) {
+            Ok(Some(_)) => true,
+            Ok(None) => return Ok(ObjectDeleteOutcome::Absent),
+            Err(error) => {
+                return Err(ObjectError::DeleteAmbiguous {
+                    key: key.clone(),
+                    detail: format!("pre-delete state could not be established: {error}"),
+                });
+            }
         };
-        match range {
-            Some(range) => slice_range(bytes, range),
-            None => Ok(bytes.clone()),
-        }
-    }
-
-    fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
-        Ok(self
-            .objects
-            .lock()
-            .map_err(ObjectError::from_poisoned_lock)?
-            .get(key.as_str())
-            .map(|bytes| ObjectInfo {
+        match self.operator.delete(key.as_str()) {
+            Ok(()) if existed => Ok(ObjectDeleteOutcome::Deleted),
+            Ok(()) => Ok(ObjectDeleteOutcome::Absent),
+            Err(error) => Err(ObjectError::DeleteAmbiguous {
                 key: key.clone(),
-                size: bytes.len() as u64,
-            }))
-    }
-
-    fn delete(&self, key: &ObjectKey) -> Result<bool, ObjectError> {
-        Ok(self
-            .objects
-            .lock()
-            .map_err(ObjectError::from_poisoned_lock)?
-            .remove(key.as_str())
-            .is_some())
+                detail: error.to_string(),
+            }),
+        }
     }
 }
 
-pub(crate) fn validate_key(raw: &str) -> Result<(), ObjectError> {
+fn validate_key(raw: &str) -> Result<(), ObjectError> {
     if raw.is_empty() {
         return Err(ObjectError::EmptyKey);
+    }
+    if raw.starts_with('/') {
+        return Err(ObjectError::AbsoluteKey);
+    }
+    if raw.contains('\\') {
+        return Err(ObjectError::BackslashInKey);
     }
     if raw.as_bytes().contains(&0) {
         return Err(ObjectError::ContainsNul);
     }
-    let path = Path::new(raw);
-    for component in path.components() {
+    for component in raw.split('/') {
         match component {
-            Component::Prefix(_) | Component::RootDir => return Err(ObjectError::AbsoluteKey),
-            Component::ParentDir => return Err(ObjectError::ParentTraversal),
-            Component::CurDir => return Err(ObjectError::CurrentDirectory),
-            Component::Normal(_) => {}
+            "" => return Err(ObjectError::EmptyKeyComponent),
+            "." => return Err(ObjectError::CurrentDirectory),
+            ".." => return Err(ObjectError::ParentTraversal),
+            _ => {}
         }
     }
     Ok(())
 }
 
-fn slice_range(bytes: &[u8], range: ObjectRange) -> Result<Vec<u8>, ObjectError> {
-    let offset = usize::try_from(range.offset).map_err(|_| ObjectError::InvalidRange)?;
-    if offset >= bytes.len() {
-        return Ok(Vec::new());
-    }
-    let end = offset
+pub(crate) fn strict_range(
+    bytes: &[u8],
+    range: Option<ObjectRange>,
+) -> Result<Vec<u8>, ObjectError> {
+    let Some(range) = range else {
+        return Ok(bytes.to_vec());
+    };
+    range.validate_within(bytes.len() as u64)?;
+    let start = usize::try_from(range.offset).map_err(|_| ObjectError::InvalidRange {
+        offset: range.offset,
+        len: range.len,
+        object_size: Some(bytes.len() as u64),
+    })?;
+    let end = start
         .checked_add(range.len)
-        .ok_or(ObjectError::InvalidRange)?
-        .min(bytes.len());
-    Ok(bytes[offset..end].to_vec())
+        .ok_or(ObjectError::InvalidRange {
+            offset: range.offset,
+            len: range.len,
+            object_size: Some(bytes.len() as u64),
+        })?;
+    Ok(bytes[start..end].to_vec())
+}
+
+fn immutable_collision(key: &ObjectKey, expected: &[u8], actual: &[u8]) -> ObjectError {
+    ObjectError::ImmutableCollision {
+        key: key.clone(),
+        expected_sha256: hex(&sha256(expected)),
+        actual_sha256: hex(&sha256(actual)),
+    }
 }
 
 impl ObjectError {
-    pub(crate) fn from_backend(err: impl fmt::Display) -> Self {
-        Self::Backend(err.to_string())
+    pub(crate) fn backend(error: impl fmt::Display) -> Self {
+        Self::Backend(error.to_string())
     }
 
-    pub(crate) fn from_poisoned_lock(err: impl fmt::Display) -> Self {
-        Self::Backend(format!("object store lock poisoned: {err}"))
+    pub(crate) fn poisoned(error: impl fmt::Display) -> Self {
+        Self::Backend(format!("artifact object lock poisoned: {error}"))
     }
 }
 
 impl fmt::Display for ObjectError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyKey => write!(f, "object key is empty"),
-            Self::AbsoluteKey => write!(f, "object key must be relative"),
-            Self::ParentTraversal => write!(f, "object key contains '..'"),
-            Self::CurrentDirectory => write!(f, "object key contains '.'"),
-            Self::ContainsNul => write!(f, "object key contains NUL"),
-            Self::InvalidRange => write!(f, "object range must have non-zero length"),
-            Self::MissingBucket => write!(f, "S3 object store bucket is required"),
-            Self::MissingRegion => write!(f, "S3 object store region is required"),
-            Self::InvalidChunkLayout => write!(f, "invalid object chunk layout"),
-            Self::Backend(err) => write!(f, "object store backend error: {err}"),
-            Self::StagedWriteFailed { source, staged } => write!(
-                f,
-                "object write failed after staging {} objects: {source}",
-                staged.len()
+            Self::EmptyKey => formatter.write_str("object key is empty"),
+            Self::AbsoluteKey => formatter.write_str("object key must be relative"),
+            Self::EmptyKeyComponent => formatter.write_str("object key contains an empty component"),
+            Self::ParentTraversal => formatter.write_str("object key contains '..'"),
+            Self::CurrentDirectory => formatter.write_str("object key contains '.'"),
+            Self::BackslashInKey => {
+                formatter.write_str("object key must use provider-neutral '/' separators")
+            }
+            Self::ContainsNul => formatter.write_str("object key contains NUL"),
+            Self::InvalidRange {
+                offset,
+                len,
+                object_size,
+            } => write!(
+                formatter,
+                "invalid object range offset={offset} len={len} object_size={object_size:?}"
             ),
+            Self::ObjectNotFound { key } => write!(formatter, "object not found: {key}"),
+            Self::ImmutableCollision {
+                key,
+                expected_sha256,
+                actual_sha256,
+            } => write!(
+                formatter,
+                "immutable object collision at {key}: expected sha256={expected_sha256}, actual sha256={actual_sha256}"
+            ),
+            Self::DigestMismatch {
+                key,
+                expected_sha256,
+                actual_sha256,
+            } => write!(
+                formatter,
+                "artifact block digest mismatch at {key}: expected sha256={expected_sha256}, actual sha256={actual_sha256}"
+            ),
+            Self::InvalidManifest(detail) => write!(formatter, "invalid artifact manifest: {detail}"),
+            Self::MissingBucket => formatter.write_str("S3 bucket is required"),
+            Self::MissingRegion => formatter.write_str("S3 region is required"),
+            Self::CreateAmbiguous { key, detail } => {
+                write!(formatter, "immutable create outcome is ambiguous for {key}: {detail}")
+            }
+            Self::DeleteAmbiguous { key, detail } => {
+                write!(formatter, "delete outcome is ambiguous for {key}: {detail}")
+            }
+            Self::Backend(detail) => write!(formatter, "artifact object backend error: {detail}"),
         }
     }
 }
 
 impl std::error::Error for ObjectError {}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    use super::*;
-
-    #[test]
-    fn parallel_get_many_preserves_order_and_uses_bounded_concurrency() {
-        let active = AtomicUsize::new(0);
-        let max_active = AtomicUsize::new(0);
-
-        let result = parallel_get_many(8, 3, |index| {
-            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-            max_active.fetch_max(now, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(10));
-            active.fetch_sub(1, Ordering::SeqCst);
-            Ok(vec![index as u8])
-        })
-        .unwrap();
-
-        assert_eq!(
-            result,
-            (0_u8..8).map(|index| vec![index]).collect::<Vec<_>>()
-        );
-        assert!(
-            max_active.load(Ordering::SeqCst) > 1,
-            "batch helper should issue concurrent reads"
-        );
-        assert!(
-            max_active.load(Ordering::SeqCst) <= 3,
-            "batch helper must honor the concurrency limit"
-        );
-    }
-
-    #[test]
-    fn parallel_get_many_returns_ordered_error() {
-        let err = parallel_get_many(4, 4, |index| {
-            if index == 2 {
-                Err(ObjectError::Backend("boom".to_owned()))
-            } else {
-                Ok(vec![index as u8])
-            }
-        })
-        .unwrap_err();
-
-        assert_eq!(err, ObjectError::Backend("boom".to_owned()));
-    }
-}

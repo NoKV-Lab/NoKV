@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-  :
-else
-  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [ "$#" -ne 0 ]; then
+  echo "start_rustfs.sh accepts no arguments; use LINGTAI_WORKBENCH_* environment variables" >&2
+  exit 1
 fi
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 data_root="${LINGTAI_WORKBENCH_DATA_ROOT:-${repo_root}/target/lingtai-workbench}"
 container="${LINGTAI_WORKBENCH_RUSTFS_CONTAINER:-lingtai-workbench-rustfs}"
 image="${LINGTAI_WORKBENCH_RUSTFS_IMAGE:-rustfs/rustfs:latest}"
