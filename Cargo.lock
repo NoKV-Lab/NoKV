@@ -1282,7 +1282,7 @@ dependencies = [
  "nokv-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
 ]
 
@@ -1295,7 +1295,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -1314,7 +1314,7 @@ dependencies = [
  "nokv-object",
  "nokv-protocol",
  "nokv-types",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -1334,7 +1334,7 @@ version = "0.1.0"
 dependencies = [
  "holt",
  "nokv-types",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
 ]
 
@@ -1344,7 +1344,7 @@ version = "0.1.0"
 dependencies = [
  "nokv-types",
  "opendal",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
 ]
@@ -1356,7 +1356,7 @@ dependencies = [
  "nokv-types",
  "rmp-serde",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -1379,7 +1379,7 @@ dependencies = [
  "nokv-object",
  "nokv-protocol",
  "nokv-types",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
 ]
 
