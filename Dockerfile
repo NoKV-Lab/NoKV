@@ -13,6 +13,10 @@ ARG NOKV_PACKAGE
 ARG NOKV_BINARY
 WORKDIR /workspace
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bench ./bench
@@ -26,10 +30,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM debian:${DEBIAN_VERSION}-slim
 RUN useradd --system --create-home --home-dir /var/lib/nokv nokv \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates fuse3 \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /var/lib/nokv/.nokv /mnt/nokv \
-    && chown -R nokv:nokv /var/lib/nokv /mnt/nokv
+    && mkdir -p /var/lib/nokv/.nokv \
+    && chown -R nokv:nokv /var/lib/nokv
 
 COPY --from=builder /usr/local/bin/nokv /usr/local/bin/nokv
 

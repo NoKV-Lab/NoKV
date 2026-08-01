@@ -1,0 +1,5537 @@
+/*
+ * Copyright 2024-2026 The NoKV Authors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Durable object-first publication commands for NoKV workspaces.
+//!
+//! This module composes typed publication records into the sole
+//! [`MetadataCommand`] executor and never writes Holt directly.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use nokv_types::{
+    ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitVersion, GcClaimState, Generation,
+    LogicalShardId, OperationKind, OwnerEpoch, PlacementGeneration, PublishPhase, ReadVersion,
+    ReferenceEpoch, RequestId, RestorePhase, RevisionState, RootId, StagedCleanupState,
+    StagedProviderState, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
+};
+use sha2::{Digest, Sha256};
+
+use super::build_commit_records::{
+    BuildCommitOperationRecord, CommitManifestBinding, CommitManifestCondition,
+    CommitOperationRecordError,
+};
+use super::codec::{
+    artifact_manifest_key, artifact_manifest_prefix, artifact_revision_key,
+    commit_revision_ref_key, gc_candidate_key, object_block_key, operation_key, path_current_key,
+    path_revision_ref_key, revision_dependency_ref_key, staged_object_key, staged_object_prefix,
+    workspace_current_key, SCHEMA_ID,
+};
+use super::commit::RUN_MANIFEST_PATH;
+use super::engine::{
+    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
+    HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, RootFenceAction,
+};
+use super::publication_records::{
+    ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
+    RevisionRefRecord, WorkspaceRecord,
+};
+use super::publish_operation_records::{
+    ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim, PublishOperationRecord,
+    PublishRecordError, PublishResult, PublishTerminalError, PublishTransition, StagedObjectRecord,
+    MAX_DEPENDENCY_COUNT, MAX_MANIFEST_ROWS, MAX_STAGED_OBJECTS,
+};
+use super::query::change_event_projection;
+use super::query_records::{
+    secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
+    SecondaryIndexRecord, TypedProjection,
+};
+use super::restore::RESTORE_MANIFEST_PATH;
+use super::restore_records::{RestoreOperationRecord, RestoreRecordError};
+
+const MAX_COMMAND_ITEMS: usize = 256;
+/// Maximum rows admitted by one recoverable publication batch.
+pub const MAX_PUBLICATION_BATCH_ROWS: usize = 192;
+const _: () = assert!(MAX_PUBLICATION_BATCH_ROWS + 2 <= MAX_COMMAND_ITEMS);
+const _: () = assert!(
+    2 * super::query_records::MAX_TYPED_PROJECTION_FIELDS + 2 * MAX_DEPENDENCY_COUNT as usize + 8
+        <= MAX_COMMAND_ITEMS
+);
+
+/// Root-owner and request fence shared by one publication command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationContext {
+    pub root_id: RootId,
+    pub logical_shard_id: LogicalShardId,
+    pub placement_generation: PlacementGeneration,
+    pub owner_epoch: OwnerEpoch,
+    pub request_id: RequestId,
+    /// Exact current metadata clock observed before command construction.
+    pub read_version: ReadVersion,
+}
+
+/// Atomic creation of one empty publish operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeginPublishRequest {
+    pub context: PublicationContext,
+    pub operation: PublishOperationRecord,
+}
+
+/// One exact staged-ledger state change or provider-cleanup proof pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedObjectUpdate {
+    pub expected: StagedObjectRecord,
+    pub next: StagedObjectRecord,
+}
+
+/// Bounded append to the durable staged-object ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageObjectsBatchRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub staged_objects: Vec<StagedObjectRecord>,
+}
+
+/// Bounded contiguous confirmation of uploaded staged objects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkObjectsUploadedBatchRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub staged_object_updates: Vec<StagedObjectUpdate>,
+}
+
+/// CAS transition of one exact observed publish operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionPublishRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub transition: PublishTransition,
+}
+
+/// Initiating-owner, extend-only activity heartbeat for one exact nonterminal
+/// publish operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeartbeatPublishRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub activity_deadline_ms: u64,
+}
+
+/// Fenced takeover of one exact nonterminal publish operation.
+///
+/// A newer owner may abort immediately; the initiating owner must present an
+/// observed clock beyond the durable activity deadline plus skew grace. For
+/// `Finalizing`, this service derives and persists the publication-absence
+/// proof from the exact operation payload that the same metadata command
+/// CASes, so callers cannot manufacture that proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TakeOverOrphanedPublishRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub observed_now_ms: u64,
+    pub maximum_clock_skew_ms: u64,
+    pub terminal_error: PublishTerminalError,
+}
+
+/// One ordered immutable row and its authoritative manifest-key coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestRowInput {
+    pub object_index: u64,
+    pub row: ArtifactManifestRow,
+}
+
+/// Bounded append to the invisible immutable manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageManifestBatchRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub manifest_rows: Vec<ManifestRowInput>,
+    /// Strictly increasing, distinct physical owner revision ids.
+    pub dependency_owner_revision_ids: Vec<ArtifactRevisionId>,
+}
+
+/// Bounded cleanup of aborted publication-owned staging rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupPublishBatchRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    /// Contiguous rows starting at `cleanup_staged_object_cursor`. Each next
+    /// state is durable proof that provider cleanup completed.
+    pub staged_object_updates: Vec<StagedObjectUpdate>,
+}
+
+/// Caller-visible metadata projected into both the revision and path records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedArtifact {
+    pub logical_size: u64,
+    pub body_digest_uri: String,
+    pub manifest_digest_uri: String,
+    pub content_type: String,
+    pub producer: Option<String>,
+    pub manifest_id: Option<String>,
+    pub typed_index_projection: Vec<u8>,
+}
+
+/// Atomic metadata-last publication of one fully-uploaded revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizePublishRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub artifact: PublishedArtifact,
+    /// Strictly increasing, distinct physical owner revision ids.
+    pub dependency_owner_revision_ids: Vec<ArtifactRevisionId>,
+}
+
+/// Decoded durable result of begin or transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishCommandOutcome {
+    pub commit_version: CommitVersion,
+    pub operation: PublishOperationRecord,
+    pub replayed: bool,
+}
+
+/// Decoded durable result of final metadata publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizePublishOutcome {
+    pub commit_version: CommitVersion,
+    pub operation: PublishOperationRecord,
+    pub result: PublishResult,
+    pub replayed: bool,
+}
+
+/// Typed publication-domain failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublicationError {
+    Metadata(AgentMetadataError),
+    OperationCodec(PublishRecordError),
+    RecordCodec(PublicationRecordCodecError),
+    QueryRecord(QueryRecordError),
+    CommitOperationCodec(CommitOperationRecordError),
+    RestoreCodec(RestoreRecordError),
+    InvalidOperationSeal {
+        seal: &'static str,
+    },
+    InvalidOperationPhase {
+        expected: PublishPhase,
+        actual: PublishPhase,
+    },
+    InitiatingOwnerEpochMismatch {
+        expected: OwnerEpoch,
+        actual: OwnerEpoch,
+    },
+    OwnerTakeoverNotAllowed {
+        initiating: OwnerEpoch,
+        current: OwnerEpoch,
+    },
+    HeartbeatOwnerMismatch {
+        initiating: OwnerEpoch,
+        current: OwnerEpoch,
+    },
+    ActivityDeadlineNotExtended {
+        current: u64,
+        requested: u64,
+    },
+    ActivityDeadlineNotFuture {
+        clock: u64,
+        requested: u64,
+    },
+    ActivityLeaseNotExpired {
+        deadline_ms: u64,
+        lease_clock_ms: u64,
+        maximum_clock_skew_ms: u64,
+    },
+    HeartbeatPhase {
+        actual: PublishPhase,
+    },
+    OwnerTakeoverPhase {
+        actual: PublishPhase,
+    },
+    EmptyBatch {
+        batch: &'static str,
+    },
+    BatchTooLarge {
+        batch: &'static str,
+        count: usize,
+        max: usize,
+    },
+    BatchExceedsPlannedCount {
+        batch: &'static str,
+        cursor: u32,
+        count: usize,
+        planned: u32,
+    },
+    StagedObjectCountMismatch {
+        expected: u32,
+        actual: usize,
+    },
+    StagedObjectSequenceMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    StagedObjectRevisionMismatch,
+    StagedObjectKeyMismatch {
+        sequence: u32,
+    },
+    InvalidStagedObjectTransition {
+        sequence: u32,
+    },
+    StagedObjectNotUploaded {
+        sequence: u32,
+    },
+    ManifestCountMismatch {
+        expected: u32,
+        actual: usize,
+    },
+    ManifestOrder,
+    ManifestPositionMismatch,
+    ManifestLogicalOffsetMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    ManifestDigestMismatch,
+    ManifestPhysicalOwnerMissing {
+        owner: ArtifactRevisionId,
+    },
+    ManifestOwnershipMismatch {
+        object_index: u64,
+        reason: &'static str,
+    },
+    DuplicateStagedObjectKey {
+        sequence: u32,
+    },
+    DependencyCountMismatch {
+        expected: u8,
+        actual: usize,
+    },
+    DependencyOrder,
+    DependencyDigestMismatch,
+    DependencyDepthMismatch {
+        expected: u8,
+        actual: u8,
+    },
+    WorkspaceNotFound,
+    WorkspaceUnavailable,
+    WorkspaceIncarnationMismatch,
+    ReservedManifestAuthorityRequired,
+    CommitOperationMissing,
+    CommitAuthorityMismatch,
+    CommitManifestClosureMismatch,
+    RestoreOperationMissing,
+    RestoreAuthorityMismatch,
+    RestoreManifestPathRequired,
+    RestoreManifestClosureMismatch,
+    WorkspaceRevisionOverflow,
+    PathAlreadyExists,
+    PathNotFound,
+    PathGenerationMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    AppendBaseRevisionMismatch,
+    PathGenerationOverflow,
+    RevisionAlreadyExists,
+    RevisionNotFound {
+        revision: ArtifactRevisionId,
+    },
+    RevisionUnavailable {
+        revision: ArtifactRevisionId,
+    },
+    RevisionIdentityCollision,
+    RevisionReferenceMissing,
+    RevisionReferenceEpochAhead,
+    ReferenceCountUnderflow {
+        revision: ArtifactRevisionId,
+    },
+    ReferenceCountOverflow {
+        revision: ArtifactRevisionId,
+    },
+    ReferenceEpochOverflow {
+        revision: ArtifactRevisionId,
+    },
+    CommitVersionOverflow,
+    LengthOverflow {
+        field: &'static str,
+        length: usize,
+    },
+    CommandItemLimit {
+        field: &'static str,
+        count: usize,
+        max: usize,
+    },
+    DuplicateCommandKey {
+        family: MetadataFamily,
+    },
+    OperationInputMismatch,
+    ReplayResultMismatch,
+}
+
+impl fmt::Display for PublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Metadata(error) => error.fmt(formatter),
+            Self::OperationCodec(error) => error.fmt(formatter),
+            Self::RecordCodec(error) => error.fmt(formatter),
+            Self::QueryRecord(error) => error.fmt(formatter),
+            Self::CommitOperationCodec(error) => error.fmt(formatter),
+            Self::RestoreCodec(error) => error.fmt(formatter),
+            Self::InvalidOperationSeal { seal } => {
+                write!(formatter, "publish operation {seal} seal mismatch")
+            }
+            Self::InvalidOperationPhase { expected, actual } => write!(
+                formatter,
+                "publish operation phase must be {expected:?}, found {actual:?}"
+            ),
+            Self::InitiatingOwnerEpochMismatch { expected, actual } => write!(
+                formatter,
+                "publish initiating owner epoch must be {}, found {}",
+                expected.get(),
+                actual.get()
+            ),
+            Self::OwnerTakeoverNotAllowed {
+                initiating,
+                current,
+            } => write!(
+                formatter,
+                "publish owner takeover cannot use epoch {} older than initiating epoch {}",
+                current.get(),
+                initiating.get(),
+            ),
+            Self::HeartbeatOwnerMismatch {
+                initiating,
+                current,
+            } => write!(
+                formatter,
+                "publish heartbeat requires initiating owner epoch {}, found {}",
+                initiating.get(),
+                current.get()
+            ),
+            Self::ActivityDeadlineNotExtended { current, requested } => write!(
+                formatter,
+                "publish activity deadline {requested} does not extend current deadline {current}"
+            ),
+            Self::ActivityDeadlineNotFuture { clock, requested } => write!(
+                formatter,
+                "publish activity deadline {requested} is not newer than lease clock {clock}"
+            ),
+            Self::ActivityLeaseNotExpired {
+                deadline_ms,
+                lease_clock_ms,
+                maximum_clock_skew_ms,
+            } => write!(
+                formatter,
+                "publish activity deadline {deadline_ms} plus clock-skew grace {maximum_clock_skew_ms} is newer than lease clock {lease_clock_ms}"
+            ),
+            Self::HeartbeatPhase { actual } => write!(
+                formatter,
+                "publish phase {actual:?} is not eligible for activity heartbeat"
+            ),
+            Self::OwnerTakeoverPhase { actual } => write!(
+                formatter,
+                "publish phase {actual:?} is not eligible for owner takeover"
+            ),
+            Self::EmptyBatch { batch } => write!(formatter, "{batch} batch must not be empty"),
+            Self::BatchTooLarge { batch, count, max } => {
+                write!(
+                    formatter,
+                    "{batch} batch has {count} rows, maximum is {max}"
+                )
+            }
+            Self::BatchExceedsPlannedCount {
+                batch,
+                cursor,
+                count,
+                planned,
+            } => write!(
+                formatter,
+                "{batch} batch at cursor {cursor} with {count} rows exceeds planned count {planned}"
+            ),
+            Self::StagedObjectCountMismatch { expected, actual } => write!(
+                formatter,
+                "staged-object count mismatch: expected {expected}, found {actual}"
+            ),
+            Self::StagedObjectSequenceMismatch { expected, actual } => write!(
+                formatter,
+                "staged-object sequence mismatch: expected {expected}, found {actual}"
+            ),
+            Self::StagedObjectRevisionMismatch => {
+                formatter.write_str("staged object belongs to a different artifact revision")
+            }
+            Self::StagedObjectKeyMismatch { sequence } => write!(
+                formatter,
+                "staged object {sequence} does not use its canonical shard/root/revision key"
+            ),
+            Self::InvalidStagedObjectTransition { sequence } => {
+                write!(
+                    formatter,
+                    "invalid staged-object transition at sequence {sequence}"
+                )
+            }
+            Self::StagedObjectNotUploaded { sequence } => {
+                write!(
+                    formatter,
+                    "staged object {sequence} is not uploaded and owned"
+                )
+            }
+            Self::ManifestCountMismatch { expected, actual } => write!(
+                formatter,
+                "manifest-row count mismatch: expected {expected}, found {actual}"
+            ),
+            Self::ManifestOrder => {
+                formatter.write_str("manifest rows must be strictly ordered by object index")
+            }
+            Self::ManifestPositionMismatch => formatter
+                .write_str("manifest batch does not continue after the durable manifest position"),
+            Self::ManifestLogicalOffsetMismatch { expected, actual } => write!(
+                formatter,
+                "manifest logical offset mismatch: expected {expected}, found {actual}"
+            ),
+            Self::ManifestDigestMismatch => {
+                formatter.write_str("manifest-row digest does not match operation seal")
+            }
+            Self::ManifestPhysicalOwnerMissing { owner } => write!(
+                formatter,
+                "manifest physical owner {:02x?} is not the new revision or a sealed dependency",
+                owner.as_bytes()
+            ),
+            Self::ManifestOwnershipMismatch {
+                object_index,
+                reason,
+            } => write!(
+                formatter,
+                "manifest row {object_index} does not match its physical object ownership: {reason}"
+            ),
+            Self::DuplicateStagedObjectKey { sequence } => {
+                write!(
+                    formatter,
+                    "staged object {sequence} repeats an object key in its batch"
+                )
+            }
+            Self::DependencyCountMismatch { expected, actual } => write!(
+                formatter,
+                "dependency count mismatch: expected {expected}, found {actual}"
+            ),
+            Self::DependencyOrder => {
+                formatter.write_str("dependency owner revisions must be strictly increasing")
+            }
+            Self::DependencyDigestMismatch => {
+                formatter.write_str("dependency digest does not match operation seal")
+            }
+            Self::DependencyDepthMismatch { expected, actual } => write!(
+                formatter,
+                "dependency depth mismatch: expected {expected}, derived {actual}"
+            ),
+            Self::WorkspaceNotFound => formatter.write_str("workspace marker not found"),
+            Self::WorkspaceUnavailable => formatter.write_str("workspace is not visible"),
+            Self::WorkspaceIncarnationMismatch => {
+                formatter.write_str("workspace marker names a different incarnation")
+            }
+            Self::ReservedManifestAuthorityRequired => formatter.write_str(
+                "canonical Workbench manifests require their lifecycle-owned staging authority",
+            ),
+            Self::CommitOperationMissing => {
+                formatter.write_str("owning commit operation is missing")
+            }
+            Self::CommitAuthorityMismatch => {
+                formatter.write_str("publication does not match its commit staging authority")
+            }
+            Self::CommitManifestClosureMismatch => formatter.write_str(
+                "run manifest artifact does not match the commit-owned staging closure",
+            ),
+            Self::RestoreOperationMissing => {
+                formatter.write_str("owning restore operation is missing")
+            }
+            Self::RestoreAuthorityMismatch => {
+                formatter.write_str("publication does not match the hidden restore authority")
+            }
+            Self::RestoreManifestPathRequired => write!(
+                formatter,
+                "restore-staging publication must create {RESTORE_MANIFEST_PATH}"
+            ),
+            Self::RestoreManifestClosureMismatch => formatter.write_str(
+                "restore manifest artifact does not match the sealed restore member closure",
+            ),
+            Self::WorkspaceRevisionOverflow => formatter.write_str("workspace revision overflow"),
+            Self::PathAlreadyExists => formatter.write_str("path already exists"),
+            Self::PathNotFound => formatter.write_str("path does not exist"),
+            Self::PathGenerationMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "path generation mismatch: expected {expected}, found {actual}"
+                )
+            }
+            Self::AppendBaseRevisionMismatch => {
+                formatter.write_str("append base revision does not match current path")
+            }
+            Self::PathGenerationOverflow => formatter.write_str("path generation overflow"),
+            Self::RevisionAlreadyExists => {
+                formatter.write_str("artifact revision identity already exists")
+            }
+            Self::RevisionNotFound { revision } => {
+                write!(
+                    formatter,
+                    "artifact revision {:02x?} not found",
+                    revision.as_bytes()
+                )
+            }
+            Self::RevisionUnavailable { revision } => write!(
+                formatter,
+                "artifact revision {:02x?} is not Available",
+                revision.as_bytes()
+            ),
+            Self::RevisionIdentityCollision => {
+                formatter.write_str("new revision collides with a referenced revision")
+            }
+            Self::RevisionReferenceMissing => {
+                formatter.write_str("current path strong-reference row is missing")
+            }
+            Self::RevisionReferenceEpochAhead => {
+                formatter.write_str("reference row epoch is newer than its artifact revision")
+            }
+            Self::ReferenceCountUnderflow { revision } => write!(
+                formatter,
+                "artifact revision {:02x?} strong-reference count underflow",
+                revision.as_bytes()
+            ),
+            Self::ReferenceCountOverflow { revision } => write!(
+                formatter,
+                "artifact revision {:02x?} strong-reference count overflow",
+                revision.as_bytes()
+            ),
+            Self::ReferenceEpochOverflow { revision } => write!(
+                formatter,
+                "artifact revision {:02x?} reference epoch overflow",
+                revision.as_bytes()
+            ),
+            Self::CommitVersionOverflow => formatter.write_str("metadata commit version overflow"),
+            Self::LengthOverflow { field, length } => {
+                write!(formatter, "{field} length {length} exceeds u32")
+            }
+            Self::CommandItemLimit { field, count, max } => {
+                write!(formatter, "{field} count {count} exceeds {max}")
+            }
+            Self::DuplicateCommandKey { family } => {
+                write!(formatter, "duplicate command key in {family:?}")
+            }
+            Self::OperationInputMismatch => formatter
+                .write_str("publish operation id was reused with different immutable inputs"),
+            Self::ReplayResultMismatch => {
+                formatter.write_str("stored deterministic publication result is inconsistent")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Loaded<T> {
+    payload: Vec<u8>,
+    record: T,
+}
+
+#[derive(Clone, Debug)]
+struct OwnerRevisionUpdate {
+    loaded: Loaded<ArtifactRevisionRecord>,
+    next: ArtifactRevisionRecord,
+    add_dependency: bool,
+}
+
+#[derive(Default)]
+struct CommandPlan {
+    predicates: Vec<CommandPredicate>,
+    mutations: Vec<CommandMutation>,
+    history: Vec<HistoryProjection>,
+    events: Vec<EventProjection>,
+    exact_keys: BTreeSet<(MetadataFamily, Vec<u8>)>,
+}
+
+impl CommandPlan {
+    fn assert_value(
+        &mut self,
+        family: MetadataFamily,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+    ) -> Result<(), PublicationError> {
+        if !self.exact_keys.insert((family, key.clone())) {
+            return Err(PublicationError::DuplicateCommandKey { family });
+        }
+        self.predicates.push(CommandPredicate::Value {
+            family,
+            key,
+            expected,
+        });
+        Ok(())
+    }
+
+    fn prefix_empty(&mut self, family: MetadataFamily, prefix: Vec<u8>) {
+        self.predicates
+            .push(CommandPredicate::PrefixEmpty { family, prefix });
+    }
+
+    fn put_absent(
+        &mut self,
+        family: MetadataFamily,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), PublicationError> {
+        self.assert_value(family, key.clone(), None)?;
+        self.mutations
+            .push(CommandMutation::Put { family, key, value });
+        Ok(())
+    }
+
+    fn replace(
+        &mut self,
+        family: MetadataFamily,
+        key: Vec<u8>,
+        expected: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), PublicationError> {
+        self.assert_value(family, key.clone(), Some(expected))?;
+        self.mutations.push(CommandMutation::Put {
+            family,
+            key: key.clone(),
+            value,
+        });
+        self.history.push(HistoryProjection { family, key });
+        Ok(())
+    }
+
+    fn delete(
+        &mut self,
+        family: MetadataFamily,
+        key: Vec<u8>,
+        expected: Vec<u8>,
+    ) -> Result<(), PublicationError> {
+        self.assert_value(family, key.clone(), Some(expected))?;
+        self.mutations.push(CommandMutation::Delete {
+            family,
+            key: key.clone(),
+        });
+        self.history.push(HistoryProjection { family, key });
+        Ok(())
+    }
+
+    fn validate_bounds(&self) -> Result<(), PublicationError> {
+        for (field, count) in [
+            ("predicates", self.predicates.len()),
+            ("mutations", self.mutations.len()),
+            ("history projections", self.history.len()),
+            ("event projections", self.events.len()),
+        ] {
+            if count > MAX_COMMAND_ITEMS {
+                return Err(PublicationError::CommandItemLimit {
+                    field,
+                    count,
+                    max: MAX_COMMAND_ITEMS,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn secondary_index_rows(
+    root_id: RootId,
+    workspace_incarnation_id: nokv_types::WorkspaceIncarnationId,
+    path: &nokv_types::NormalizedRelativePath,
+    generation: Generation,
+    projection: &TypedProjection,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, PublicationError> {
+    let value = SecondaryIndexRecord {
+        path_generation: generation,
+        compact_projection: projection.clone(),
+    }
+    .encode()?;
+    Ok(projection
+        .fields()
+        .iter()
+        .map(|(field, scalar)| {
+            (
+                secondary_index_key(root_id, field, scalar, workspace_incarnation_id, path),
+                value.clone(),
+            )
+        })
+        .collect())
+}
+
+fn validate_begin_request(request: &BeginPublishRequest) -> Result<(), PublicationError> {
+    validate_operation_seals(&request.operation)?;
+    if request.operation.initiating_owner_epoch != request.context.owner_epoch {
+        return Err(PublicationError::InitiatingOwnerEpochMismatch {
+            expected: request.context.owner_epoch,
+            actual: request.operation.initiating_owner_epoch,
+        });
+    }
+    if request.operation.phase != PublishPhase::Uploading {
+        return Err(PublicationError::InvalidOperationPhase {
+            expected: PublishPhase::Uploading,
+            actual: request.operation.phase,
+        });
+    }
+    if request.operation.staged_object_cursor != 0
+        || request.operation.uploaded_object_cursor != 0
+        || request.operation.manifest_cursor != 0
+        || request.operation.manifest_last_position.is_some()
+        || request.operation.cleanup_staged_object_cursor != 0
+        || request.operation.cleanup_manifest_cursor != 0
+    {
+        return Err(PublicationError::InvalidOperationSeal {
+            seal: "initial cursor",
+        });
+    }
+    Ok(())
+}
+
+fn require_operation_phase(
+    operation: &PublishOperationRecord,
+    expected: PublishPhase,
+) -> Result<(), PublicationError> {
+    if operation.phase == expected {
+        Ok(())
+    } else {
+        Err(PublicationError::InvalidOperationPhase {
+            expected,
+            actual: operation.phase,
+        })
+    }
+}
+
+fn validate_batch_size(batch: &'static str, count: usize) -> Result<(), PublicationError> {
+    if count == 0 {
+        return Err(PublicationError::EmptyBatch { batch });
+    }
+    if count > MAX_PUBLICATION_BATCH_ROWS {
+        return Err(PublicationError::BatchTooLarge {
+            batch,
+            count,
+            max: MAX_PUBLICATION_BATCH_ROWS,
+        });
+    }
+    Ok(())
+}
+
+fn checked_batch_cursor(
+    batch: &'static str,
+    cursor: u32,
+    count: usize,
+    planned: u32,
+) -> Result<u32, PublicationError> {
+    let count_u32 =
+        u32::try_from(count).map_err(|_| PublicationError::BatchExceedsPlannedCount {
+            batch,
+            cursor,
+            count,
+            planned,
+        })?;
+    let next = cursor
+        .checked_add(count_u32)
+        .ok_or(PublicationError::BatchExceedsPlannedCount {
+            batch,
+            cursor,
+            count,
+            planned,
+        })?;
+    if next > planned {
+        return Err(PublicationError::BatchExceedsPlannedCount {
+            batch,
+            cursor,
+            count,
+            planned,
+        });
+    }
+    Ok(next)
+}
+
+fn validate_operation_seals(operation: &PublishOperationRecord) -> Result<(), PublicationError> {
+    operation.validate()?;
+    if operation.identity_digest != publish_identity_digest(operation) {
+        return Err(PublicationError::InvalidOperationSeal { seal: "identity" });
+    }
+    if operation.initialization_digest != publish_initialization_digest(operation) {
+        return Err(PublicationError::InvalidOperationSeal {
+            seal: "initialization",
+        });
+    }
+    Ok(())
+}
+
+fn validate_cleanup_update(
+    expected: &StagedObjectRecord,
+    next: &StagedObjectRecord,
+) -> Result<(), PublicationError> {
+    expected.validate()?;
+    next.validate()?;
+    if expected.artifact_revision_id != next.artifact_revision_id
+        || expected.object_sequence != next.object_sequence
+        || expected.object_key != next.object_key
+        || expected.multipart_upload_id != next.multipart_upload_id
+        || expected.expected_length != next.expected_length
+        || expected.expected_digest_uri != next.expected_digest_uri
+        || next.provider_state != StagedProviderState::Aborted
+        || next.cleanup_state != StagedCleanupState::Deleted
+    {
+        return Err(PublicationError::InvalidStagedObjectTransition {
+            sequence: expected.object_sequence,
+        });
+    }
+    Ok(())
+}
+
+fn validate_staged_update(
+    expected: &StagedObjectRecord,
+    next: &StagedObjectRecord,
+) -> Result<(), PublicationError> {
+    expected.validate()?;
+    next.validate()?;
+    if expected == next
+        || expected.artifact_revision_id != next.artifact_revision_id
+        || expected.object_sequence != next.object_sequence
+        || expected.object_key != next.object_key
+        || expected.expected_length != next.expected_length
+        || expected.expected_digest_uri != next.expected_digest_uri
+        || expected
+            .multipart_upload_id
+            .as_ref()
+            .is_some_and(|id| next.multipart_upload_id.as_ref() != Some(id))
+        || !valid_provider_transition(expected.provider_state, next.provider_state)
+        || !valid_cleanup_transition(expected.cleanup_state, next.cleanup_state)
+    {
+        return Err(PublicationError::InvalidStagedObjectTransition {
+            sequence: expected.object_sequence,
+        });
+    }
+    Ok(())
+}
+
+fn valid_provider_transition(expected: StagedProviderState, next: StagedProviderState) -> bool {
+    expected == next
+        || matches!(
+            (expected, next),
+            (
+                StagedProviderState::Planned,
+                StagedProviderState::Uploading
+                    | StagedProviderState::Uploaded
+                    | StagedProviderState::AbortPending
+                    | StagedProviderState::Ambiguous
+            ) | (
+                StagedProviderState::Uploading,
+                StagedProviderState::Uploaded
+                    | StagedProviderState::AbortPending
+                    | StagedProviderState::Ambiguous
+            ) | (
+                StagedProviderState::Uploaded,
+                StagedProviderState::AbortPending
+                    | StagedProviderState::Aborted
+                    | StagedProviderState::Ambiguous
+            ) | (
+                StagedProviderState::AbortPending,
+                StagedProviderState::Aborted | StagedProviderState::Ambiguous
+            )
+        )
+}
+
+fn valid_cleanup_transition(expected: StagedCleanupState, next: StagedCleanupState) -> bool {
+    expected == next
+        || matches!(
+            (expected, next),
+            (
+                StagedCleanupState::Owned,
+                StagedCleanupState::DeletePending | StagedCleanupState::Quarantined
+            ) | (
+                StagedCleanupState::DeletePending,
+                StagedCleanupState::Deleted | StagedCleanupState::Quarantined
+            )
+        )
+}
+
+fn validate_manifest_order(rows: &[ManifestRowInput]) -> Result<(), PublicationError> {
+    if rows.len() > MAX_MANIFEST_ROWS as usize {
+        return Err(PublicationError::ManifestCountMismatch {
+            expected: MAX_MANIFEST_ROWS,
+            actual: rows.len(),
+        });
+    }
+    for input in rows {
+        input.row.validate()?;
+    }
+    for pair in rows.windows(2) {
+        if pair[0].object_index >= pair[1].object_index {
+            return Err(PublicationError::ManifestOrder);
+        }
+        let expected = pair[0]
+            .row
+            .logical_offset
+            .checked_add(pair[0].row.length)
+            .expect("validated manifest logical range cannot overflow");
+        if pair[1].row.logical_offset != expected {
+            return Err(PublicationError::ManifestLogicalOffsetMismatch {
+                expected,
+                actual: pair[1].row.logical_offset,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_dependency_seal(
+    operation: &PublishOperationRecord,
+    owners: &[ArtifactRevisionId],
+) -> Result<(), PublicationError> {
+    let actual =
+        u8::try_from(owners.len()).map_err(|_| PublicationError::DependencyCountMismatch {
+            expected: operation.dependency_count,
+            actual: owners.len(),
+        })?;
+    if actual != operation.dependency_count {
+        return Err(PublicationError::DependencyCountMismatch {
+            expected: operation.dependency_count,
+            actual: owners.len(),
+        });
+    }
+    if dependency_owner_digest(owners)? != operation.dependency_digest {
+        return Err(PublicationError::DependencyDigestMismatch);
+    }
+    Ok(())
+}
+
+fn validate_dependency_order(owners: &[ArtifactRevisionId]) -> Result<(), PublicationError> {
+    if owners.len() > usize::from(MAX_DEPENDENCY_COUNT) {
+        return Err(PublicationError::DependencyCountMismatch {
+            expected: MAX_DEPENDENCY_COUNT,
+            actual: owners.len(),
+        });
+    }
+    if owners.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(PublicationError::DependencyOrder);
+    }
+    Ok(())
+}
+
+fn commit_manifest_claim_matches(expected: CommitManifestCondition, actual: &PublishClaim) -> bool {
+    match (expected, actual) {
+        (CommitManifestCondition::CreateOnly, PublishClaim::CreateOnly) => true,
+        (
+            CommitManifestCondition::ReplaceOnly {
+                expected_generation,
+            },
+            PublishClaim::ReplaceOnly {
+                expected_generation: actual_generation,
+            },
+        ) => expected_generation == *actual_generation,
+        _ => false,
+    }
+}
+
+fn validate_path_claim(
+    claim: &PublishClaim,
+    current: Option<&Loaded<PathEntry>>,
+) -> Result<Generation, PublicationError> {
+    match (claim, current) {
+        (PublishClaim::CreateOnly, None) => {
+            Generation::new(1).map_err(|_| PublicationError::PathGenerationOverflow)
+        }
+        (PublishClaim::CreateOnly, Some(_)) => Err(PublicationError::PathAlreadyExists),
+        (PublishClaim::ReplaceOnly { .. } | PublishClaim::Append { .. }, None) => {
+            Err(PublicationError::PathNotFound)
+        }
+        (
+            PublishClaim::ReplaceOnly {
+                expected_generation,
+            },
+            Some(current),
+        ) => next_generation(*expected_generation, &current.record),
+        (
+            PublishClaim::Append {
+                expected_generation,
+                base_revision_id,
+                ..
+            },
+            Some(current),
+        ) => {
+            let generation = next_generation(*expected_generation, &current.record)?;
+            if current.record.artifact_revision_id != *base_revision_id {
+                return Err(PublicationError::AppendBaseRevisionMismatch);
+            }
+            Ok(generation)
+        }
+    }
+}
+
+fn next_generation(
+    expected: Generation,
+    current: &PathEntry,
+) -> Result<Generation, PublicationError> {
+    if current.generation != expected {
+        return Err(PublicationError::PathGenerationMismatch {
+            expected: expected.get(),
+            actual: current.generation.get(),
+        });
+    }
+    Generation::new(
+        expected
+            .get()
+            .checked_add(1)
+            .ok_or(PublicationError::PathGenerationOverflow)?,
+    )
+    .map_err(|_| PublicationError::PathGenerationOverflow)
+}
+
+fn publish_identity_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.publish.operation.identity.v3\0");
+    hasher.update(operation.operation_id.as_bytes());
+    hasher.update(operation.initiating_owner_epoch.get().to_be_bytes());
+    match operation.authority {
+        PublishAuthority::Visible => hasher.update([1]),
+        PublishAuthority::CommitStaging {
+            commit_operation_id,
+        } => {
+            hasher.update([3]);
+            hasher.update(commit_operation_id.as_bytes());
+        }
+        PublishAuthority::RestoreStaging {
+            restore_operation_id,
+        } => {
+            hasher.update([2]);
+            hasher.update(restore_operation_id.as_bytes());
+        }
+    }
+    hasher.update(
+        u32::try_from(operation.workbench_id.as_bytes().len())
+            .expect("workbench id length fits u32")
+            .to_be_bytes(),
+    );
+    hasher.update(operation.workbench_id.as_bytes());
+    hasher.update(operation.workspace_incarnation_id.as_bytes());
+    let path = operation.path.as_str().as_bytes();
+    hasher.update(
+        u32::try_from(path.len())
+            .expect("normalized path length fits u32")
+            .to_be_bytes(),
+    );
+    hasher.update(path);
+    hasher.update(operation.artifact_revision_id.as_bytes());
+    match &operation.claim {
+        PublishClaim::CreateOnly => hasher.update([1]),
+        PublishClaim::ReplaceOnly {
+            expected_generation,
+        } => {
+            hasher.update([2]);
+            hasher.update(expected_generation.get().to_be_bytes());
+        }
+        PublishClaim::Append {
+            expected_generation,
+            base_revision_id,
+            append_offset,
+        } => {
+            hasher.update([3]);
+            hasher.update(expected_generation.get().to_be_bytes());
+            hasher.update(base_revision_id.as_bytes());
+            hasher.update(append_offset.to_be_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn publish_initialization_digest(operation: &PublishOperationRecord) -> [u8; SHA256_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.publish.operation.initialization.v3\0");
+    hasher.update(operation.initiating_owner_epoch.get().to_be_bytes());
+    match operation.authority {
+        PublishAuthority::Visible => hasher.update([1]),
+        PublishAuthority::CommitStaging {
+            commit_operation_id,
+        } => {
+            hasher.update([3]);
+            hasher.update(commit_operation_id.as_bytes());
+        }
+        PublishAuthority::RestoreStaging {
+            restore_operation_id,
+        } => {
+            hasher.update([2]);
+            hasher.update(restore_operation_id.as_bytes());
+        }
+    }
+    hasher.update(
+        u32::try_from(operation.workbench_id.as_bytes().len())
+            .expect("workbench id length fits u32")
+            .to_be_bytes(),
+    );
+    hasher.update(operation.workbench_id.as_bytes());
+    hasher.update(operation.staged_object_count.to_be_bytes());
+    hasher.update(operation.staged_object_seal);
+    hasher.update(operation.manifest_row_count.to_be_bytes());
+    hasher.update(operation.manifest_seal);
+    hasher.update([operation.dependency_count, operation.dependency_depth]);
+    hasher.update(operation.dependency_digest);
+    hasher.finalize().into()
+}
+
+fn sha256_digest_uri(digest: [u8; SHA256_BYTES]) -> String {
+    let mut value = String::with_capacity(7 + SHA256_BYTES * 2);
+    value.push_str("sha256:");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        value.push(HEX[usize::from(byte >> 4)] as char);
+        value.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    value
+}
+
+fn hash_count(hasher: &mut Sha256, count: usize) -> Result<(), PublicationError> {
+    let count = u32::try_from(count).map_err(|_| PublicationError::LengthOverflow {
+        field: "canonical collection",
+        length: count,
+    })?;
+    hasher.update(count.to_be_bytes());
+    Ok(())
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), PublicationError> {
+    let length = u32::try_from(bytes.len()).map_err(|_| PublicationError::LengthOverflow {
+        field: "canonical bytes",
+        length: bytes.len(),
+    })?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn finalization_takeover_absence_proof(
+    context: PublicationContext,
+    finalizing_payload: &[u8],
+) -> Result<[u8; SHA256_BYTES], PublicationError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.publish.finalization-takeover-absence.v1\0");
+    hasher.update(context.root_id.as_bytes());
+    hasher.update(context.logical_shard_id.as_bytes());
+    hasher.update(context.placement_generation.get().to_be_bytes());
+    hasher.update(context.owner_epoch.get().to_be_bytes());
+    hasher.update(context.request_id.as_bytes());
+    hasher.update(context.read_version.get().to_be_bytes());
+    hash_bytes(&mut hasher, finalizing_payload)?;
+    Ok(hasher.finalize().into())
+}
+
+fn decode_operation_outcome(
+    result: MetadataCommandResult,
+    operation_id: nokv_types::OperationId,
+) -> Result<PublishCommandOutcome, PublicationError> {
+    let operation = PublishOperationRecord::decode(&result.deterministic_result)?;
+    if operation.operation_id != operation_id {
+        return Err(PublicationError::ReplayResultMismatch);
+    }
+    Ok(PublishCommandOutcome {
+        commit_version: result.commit_version,
+        operation,
+        replayed: result.replayed,
+    })
+}
+
+impl std::error::Error for PublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Metadata(source) => Some(source),
+            Self::OperationCodec(source) => Some(source),
+            Self::RecordCodec(source) => Some(source),
+            Self::QueryRecord(source) => Some(source),
+            Self::CommitOperationCodec(source) => Some(source),
+            Self::RestoreCodec(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<AgentMetadataError> for PublicationError {
+    fn from(error: AgentMetadataError) -> Self {
+        Self::Metadata(error)
+    }
+}
+
+impl From<PublishRecordError> for PublicationError {
+    fn from(error: PublishRecordError) -> Self {
+        Self::OperationCodec(error)
+    }
+}
+
+impl From<PublicationRecordCodecError> for PublicationError {
+    fn from(error: PublicationRecordCodecError) -> Self {
+        Self::RecordCodec(error)
+    }
+}
+
+impl From<QueryRecordError> for PublicationError {
+    fn from(error: QueryRecordError) -> Self {
+        Self::QueryRecord(error)
+    }
+}
+
+impl From<CommitOperationRecordError> for PublicationError {
+    fn from(error: CommitOperationRecordError) -> Self {
+        Self::CommitOperationCodec(error)
+    }
+}
+
+impl From<RestoreRecordError> for PublicationError {
+    fn from(error: RestoreRecordError) -> Self {
+        Self::RestoreCodec(error)
+    }
+}
+
+/// Publication command facade over the authoritative metadata executor.
+#[derive(Clone, Copy)]
+pub struct PublicationService<'a> {
+    store: &'a AgentMetadataStore,
+}
+
+impl<'a> PublicationService<'a> {
+    pub const fn new(store: &'a AgentMetadataStore) -> Self {
+        Self { store }
+    }
+}
+
+/// Seals identity and initialization digests after immutable operation inputs
+/// and row/dependency seals have been assigned.
+pub fn seal_publish_operation(operation: &mut PublishOperationRecord) {
+    operation.identity_digest = publish_identity_digest(operation);
+    operation.initialization_digest = publish_initialization_digest(operation);
+}
+
+/// Canonical digest of immutable staged-object ownership fields.
+pub fn staged_object_ledger_digest(
+    staged_objects: &[StagedObjectRecord],
+) -> Result<[u8; SHA256_BYTES], PublicationError> {
+    let mut digest = [0; SHA256_BYTES];
+    for (index, staged) in staged_objects.iter().enumerate() {
+        let expected_sequence =
+            u32::try_from(index).map_err(|_| PublicationError::StagedObjectCountMismatch {
+                expected: MAX_STAGED_OBJECTS,
+                actual: staged_objects.len(),
+            })?;
+        if staged.object_sequence != expected_sequence {
+            return Err(PublicationError::StagedObjectSequenceMismatch {
+                expected: expected_sequence,
+                actual: staged.object_sequence,
+            });
+        }
+        digest = advance_staged_object_rolling_digest(digest, staged)?;
+    }
+    Ok(digest)
+}
+
+/// Advances the staged-ledger closure by one canonical immutable row.
+pub fn advance_staged_object_rolling_digest(
+    previous: [u8; SHA256_BYTES],
+    staged: &StagedObjectRecord,
+) -> Result<[u8; SHA256_BYTES], PublicationError> {
+    staged.validate()?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.publish.staged-row.v1\0");
+    hasher.update(previous);
+    hasher.update(staged.artifact_revision_id.as_bytes());
+    hasher.update(staged.object_sequence.to_be_bytes());
+    hash_bytes(&mut hasher, staged.object_key.as_bytes())?;
+    hasher.update(staged.expected_length.to_be_bytes());
+    hash_bytes(&mut hasher, staged.expected_digest_uri.as_bytes())?;
+    Ok(hasher.finalize().into())
+}
+
+/// Canonical digest of ordered manifest keys and strict row payloads.
+pub fn manifest_rows_digest(
+    rows: &[ManifestRowInput],
+) -> Result<[u8; SHA256_BYTES], PublicationError> {
+    validate_manifest_order(rows)?;
+    if let Some(first) = rows.first() {
+        if first.row.logical_offset != 0 {
+            return Err(PublicationError::ManifestLogicalOffsetMismatch {
+                expected: 0,
+                actual: first.row.logical_offset,
+            });
+        }
+    }
+    let mut digest = [0; SHA256_BYTES];
+    for input in rows {
+        digest = advance_manifest_rolling_digest(digest, input)?;
+    }
+    Ok(digest)
+}
+
+/// Advances the manifest closure by one ordered key and strict row payload.
+pub fn advance_manifest_rolling_digest(
+    previous: [u8; SHA256_BYTES],
+    input: &ManifestRowInput,
+) -> Result<[u8; SHA256_BYTES], PublicationError> {
+    input.row.validate()?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.publish.manifest-row.v2\0");
+    hasher.update(previous);
+    hasher.update(input.object_index.to_be_bytes());
+    let encoded = input.row.encode()?;
+    hash_bytes(&mut hasher, &encoded)?;
+    Ok(hasher.finalize().into())
+}
+
+/// Canonical digest of the sorted, distinct dependency owner set.
+pub fn dependency_owner_digest(
+    owners: &[ArtifactRevisionId],
+) -> Result<[u8; SHA256_BYTES], PublicationError> {
+    validate_dependency_order(owners)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.publish.dependencies.v1\0");
+    hash_count(&mut hasher, owners.len())?;
+    for owner in owners {
+        hasher.update(owner.as_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
+impl PublicationService<'_> {
+    pub fn begin_publish(
+        &self,
+        request: BeginPublishRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_begin_request(&request)?;
+        let operation_key = operation_key(
+            request.context.root_id,
+            OperationKind::Publish,
+            request.operation.operation_id,
+        );
+        if let Some(payload) =
+            self.read_payload(request.context, MetadataFamily::Operation, &operation_key)?
+        {
+            let operation = PublishOperationRecord::decode(&payload)?;
+            validate_operation_seals(&operation)?;
+            if operation.operation_id != request.operation.operation_id
+                || operation.identity_digest != request.operation.identity_digest
+                || operation.initialization_digest != request.operation.initialization_digest
+            {
+                return Err(PublicationError::OperationInputMismatch);
+            }
+            return Ok(PublishCommandOutcome {
+                commit_version: CommitVersion::new(request.context.read_version.get())
+                    .expect("publication contexts always have a non-zero read version"),
+                operation,
+                replayed: true,
+            });
+        }
+        let lease_clock = self.store.lease_clock_high_water()?;
+        if request.operation.activity_deadline_ms <= lease_clock {
+            return Err(PublicationError::ActivityDeadlineNotFuture {
+                clock: lease_clock,
+                requested: request.operation.activity_deadline_ms,
+            });
+        }
+        let operation_payload = request.operation.encode()?;
+        let mut plan = CommandPlan::default();
+        plan.put_absent(
+            MetadataFamily::Operation,
+            operation_key,
+            operation_payload.clone(),
+        )?;
+        plan.prefix_empty(
+            MetadataFamily::StagedObject,
+            staged_object_prefix(request.context.root_id, request.operation.operation_id),
+        );
+        plan.prefix_empty(
+            MetadataFamily::ArtifactManifest,
+            artifact_manifest_prefix(
+                request.context.root_id,
+                request.operation.artifact_revision_id,
+            ),
+        );
+        plan.assert_value(
+            MetadataFamily::ArtifactRevision,
+            artifact_revision_key(
+                request.context.root_id,
+                request.operation.artifact_revision_id,
+            ),
+            None,
+        )?;
+
+        let result = self.execute_plan_before_lease_deadline(
+            request.context,
+            plan,
+            operation_payload,
+            request.operation.activity_deadline_ms,
+        )?;
+        decode_operation_outcome(result, request.operation.operation_id)
+    }
+
+    pub fn stage_objects_batch(
+        &self,
+        request: StageObjectsBatchRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        require_operation_phase(&request.expected_operation, PublishPhase::Uploading)?;
+        validate_batch_size("stage objects", request.staged_objects.len())?;
+        let next_cursor = checked_batch_cursor(
+            "stage objects",
+            request.expected_operation.staged_object_cursor,
+            request.staged_objects.len(),
+            request.expected_operation.staged_object_count,
+        )?;
+
+        let mut next_operation = request.expected_operation.clone();
+        let mut rolling_digest = next_operation.staged_object_rolling_digest;
+        let mut keys = BTreeSet::new();
+        for (offset, staged) in request.staged_objects.iter().enumerate() {
+            let sequence = next_operation
+                .staged_object_cursor
+                .checked_add(u32::try_from(offset).map_err(|_| {
+                    PublicationError::BatchTooLarge {
+                        batch: "stage objects",
+                        count: request.staged_objects.len(),
+                        max: MAX_PUBLICATION_BATCH_ROWS,
+                    }
+                })?)
+                .ok_or(PublicationError::BatchExceedsPlannedCount {
+                    batch: "stage objects",
+                    cursor: next_operation.staged_object_cursor,
+                    count: request.staged_objects.len(),
+                    planned: next_operation.staged_object_count,
+                })?;
+            if staged.object_sequence != sequence {
+                return Err(PublicationError::StagedObjectSequenceMismatch {
+                    expected: sequence,
+                    actual: staged.object_sequence,
+                });
+            }
+            if staged.artifact_revision_id != next_operation.artifact_revision_id {
+                return Err(PublicationError::StagedObjectRevisionMismatch);
+            }
+            let expected_object_key = object_block_key(
+                request.context.logical_shard_id,
+                request.context.root_id,
+                next_operation.artifact_revision_id,
+                u64::from(sequence),
+            );
+            if staged.object_key != expected_object_key {
+                return Err(PublicationError::StagedObjectKeyMismatch { sequence });
+            }
+            if staged.provider_state != StagedProviderState::Planned
+                || staged.cleanup_state != StagedCleanupState::Owned
+            {
+                return Err(PublicationError::InvalidStagedObjectTransition { sequence });
+            }
+            if !keys.insert(staged.object_key.as_str()) {
+                return Err(PublicationError::DuplicateStagedObjectKey { sequence });
+            }
+            rolling_digest = advance_staged_object_rolling_digest(rolling_digest, staged)?;
+        }
+        next_operation.staged_object_cursor = next_cursor;
+        next_operation.staged_object_rolling_digest = rolling_digest;
+        let expected_payload = request.expected_operation.encode()?;
+        let next_payload = next_operation.encode()?;
+
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                next_operation.operation_id,
+            ),
+            expected_payload,
+            next_payload.clone(),
+        )?;
+        for staged in &request.staged_objects {
+            plan.put_absent(
+                MetadataFamily::StagedObject,
+                staged_object_key(
+                    request.context.root_id,
+                    next_operation.operation_id,
+                    u64::from(staged.object_sequence),
+                ),
+                staged.encode()?,
+            )?;
+        }
+        let result = self.execute_plan(request.context, plan, next_payload)?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    pub fn mark_objects_uploaded_batch(
+        &self,
+        request: MarkObjectsUploadedBatchRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        require_operation_phase(&request.expected_operation, PublishPhase::Uploading)?;
+        validate_batch_size("mark objects uploaded", request.staged_object_updates.len())?;
+        let next_cursor = checked_batch_cursor(
+            "mark objects uploaded",
+            request.expected_operation.uploaded_object_cursor,
+            request.staged_object_updates.len(),
+            request.expected_operation.staged_object_cursor,
+        )?;
+
+        let mut next_operation = request.expected_operation.clone();
+        let mut rolling_digest = next_operation.uploaded_object_rolling_digest;
+        let mut plan = CommandPlan::default();
+        for (offset, update) in request.staged_object_updates.iter().enumerate() {
+            let sequence = next_operation
+                .uploaded_object_cursor
+                .checked_add(u32::try_from(offset).map_err(|_| {
+                    PublicationError::BatchTooLarge {
+                        batch: "mark objects uploaded",
+                        count: request.staged_object_updates.len(),
+                        max: MAX_PUBLICATION_BATCH_ROWS,
+                    }
+                })?)
+                .ok_or(PublicationError::BatchExceedsPlannedCount {
+                    batch: "mark objects uploaded",
+                    cursor: next_operation.uploaded_object_cursor,
+                    count: request.staged_object_updates.len(),
+                    planned: next_operation.staged_object_cursor,
+                })?;
+            validate_staged_update(&update.expected, &update.next)?;
+            if update.expected.object_sequence != sequence {
+                return Err(PublicationError::StagedObjectSequenceMismatch {
+                    expected: sequence,
+                    actual: update.expected.object_sequence,
+                });
+            }
+            if update.expected.artifact_revision_id != next_operation.artifact_revision_id {
+                return Err(PublicationError::StagedObjectRevisionMismatch);
+            }
+            if update.next.provider_state != StagedProviderState::Uploaded
+                || update.next.cleanup_state != StagedCleanupState::Owned
+            {
+                return Err(PublicationError::StagedObjectNotUploaded { sequence });
+            }
+            rolling_digest = advance_staged_object_rolling_digest(rolling_digest, &update.next)?;
+            plan.replace(
+                MetadataFamily::StagedObject,
+                staged_object_key(
+                    request.context.root_id,
+                    next_operation.operation_id,
+                    u64::from(sequence),
+                ),
+                update.expected.encode()?,
+                update.next.encode()?,
+            )?;
+        }
+        next_operation.uploaded_object_cursor = next_cursor;
+        next_operation.uploaded_object_rolling_digest = rolling_digest;
+        let expected_payload = request.expected_operation.encode()?;
+        let next_payload = next_operation.encode()?;
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                next_operation.operation_id,
+            ),
+            expected_payload,
+            next_payload.clone(),
+        )?;
+        let result = self.execute_plan(request.context, plan, next_payload)?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    pub fn stage_manifest_batch(
+        &self,
+        request: StageManifestBatchRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        require_operation_phase(&request.expected_operation, PublishPhase::Uploading)?;
+        validate_batch_size("stage manifest", request.manifest_rows.len())?;
+        if request.expected_operation.staged_object_cursor
+            != request.expected_operation.staged_object_count
+            || request.expected_operation.staged_object_rolling_digest
+                != request.expected_operation.staged_object_seal
+            || request.expected_operation.uploaded_object_cursor
+                != request.expected_operation.staged_object_count
+            || request.expected_operation.uploaded_object_rolling_digest
+                != request.expected_operation.staged_object_seal
+        {
+            return Err(PublicationError::InvalidOperationSeal {
+                seal: "uploaded-object closure",
+            });
+        }
+        validate_dependency_seal(
+            &request.expected_operation,
+            &request.dependency_owner_revision_ids,
+        )?;
+        for (offset, input) in request.manifest_rows.iter().enumerate() {
+            let expected_object_index = u64::from(request.expected_operation.manifest_cursor)
+                .checked_add(
+                    u64::try_from(offset)
+                        .expect("publication batches are bounded below the u64 range"),
+                )
+                .ok_or(PublicationError::ManifestPositionMismatch)?;
+            if input.object_index != expected_object_index {
+                return Err(PublicationError::ManifestPositionMismatch);
+            }
+            let expected_object_key = object_block_key(
+                request.context.logical_shard_id,
+                request.context.root_id,
+                input.row.physical_owner_revision_id,
+                input.row.physical_object_index,
+            );
+            if input.row.object_key != expected_object_key {
+                return Err(PublicationError::ManifestOwnershipMismatch {
+                    object_index: input.object_index,
+                    reason: "object key does not match the canonical physical owner coordinates",
+                });
+            }
+        }
+        validate_manifest_order(&request.manifest_rows)?;
+        let next_cursor = checked_batch_cursor(
+            "stage manifest",
+            request.expected_operation.manifest_cursor,
+            request.manifest_rows.len(),
+            request.expected_operation.manifest_row_count,
+        )?;
+        let first = request
+            .manifest_rows
+            .first()
+            .expect("non-empty batch was validated");
+        if request
+            .expected_operation
+            .manifest_last_position
+            .is_some_and(|last| first.object_index <= last.object_index)
+        {
+            return Err(PublicationError::ManifestPositionMismatch);
+        }
+        let previous_row = if let Some(last) = request.expected_operation.manifest_last_position {
+            let key = artifact_manifest_key(
+                request.context.root_id,
+                request.expected_operation.artifact_revision_id,
+                last.object_index,
+            );
+            let payload = self
+                .read_payload(request.context, MetadataFamily::ArtifactManifest, &key)?
+                .ok_or(PublicationError::ManifestPositionMismatch)?;
+            Some(ArtifactManifestRow::decode(&payload)?)
+        } else {
+            None
+        };
+        let expected_logical_offset = previous_row.as_ref().map_or(0, |row| {
+            row.logical_offset
+                .checked_add(row.length)
+                .expect("validated manifest logical range cannot overflow")
+        });
+        if first.row.logical_offset != expected_logical_offset {
+            return Err(PublicationError::ManifestLogicalOffsetMismatch {
+                expected: expected_logical_offset,
+                actual: first.row.logical_offset,
+            });
+        }
+        let dependencies = request
+            .dependency_owner_revision_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut next_operation = request.expected_operation.clone();
+        let mut rolling_digest = next_operation.manifest_rolling_digest;
+        let mut previous_row = previous_row;
+        for input in &request.manifest_rows {
+            let owner = input.row.physical_owner_revision_id;
+            if owner != next_operation.artifact_revision_id && !dependencies.contains(&owner) {
+                return Err(PublicationError::ManifestPhysicalOwnerMissing { owner });
+            }
+            if input.row.offset != 0 {
+                return Err(PublicationError::ManifestOwnershipMismatch {
+                    object_index: input.object_index,
+                    reason: "packed object ranges are unsupported",
+                });
+            }
+            let target_owned = owner == next_operation.artifact_revision_id;
+            let previous_target_owned = previous_row.as_ref().is_some_and(|row| {
+                row.physical_owner_revision_id == next_operation.artifact_revision_id
+            });
+            if !target_owned && previous_target_owned {
+                return Err(PublicationError::ManifestOwnershipMismatch {
+                    object_index: input.object_index,
+                    reason: "borrowed rows cannot follow child-owned rows",
+                });
+            }
+            if target_owned {
+                let expected_physical_index = if previous_target_owned {
+                    previous_row
+                        .as_ref()
+                        .expect("the previous target-owned row is present")
+                        .physical_object_index
+                        .checked_add(1)
+                        .ok_or(PublicationError::ManifestOwnershipMismatch {
+                            object_index: input.object_index,
+                            reason: "physical object index overflows u64",
+                        })?
+                } else {
+                    0
+                };
+                if input.row.physical_object_index != expected_physical_index {
+                    return Err(PublicationError::ManifestOwnershipMismatch {
+                        object_index: input.object_index,
+                        reason: "child-owned physical object indexes must be contiguous from zero",
+                    });
+                }
+                let sequence = u32::try_from(input.row.physical_object_index).map_err(|_| {
+                    PublicationError::ManifestOwnershipMismatch {
+                        object_index: input.object_index,
+                        reason: "physical object index exceeds the staged-object sequence range",
+                    }
+                })?;
+                if sequence >= next_operation.staged_object_count {
+                    return Err(PublicationError::ManifestOwnershipMismatch {
+                        object_index: input.object_index,
+                        reason: "child-owned row has no staged object",
+                    });
+                }
+                let staged_key = staged_object_key(
+                    request.context.root_id,
+                    next_operation.operation_id,
+                    u64::from(sequence),
+                );
+                let staged_payload = self
+                    .read_payload(request.context, MetadataFamily::StagedObject, &staged_key)?
+                    .ok_or(PublicationError::ManifestOwnershipMismatch {
+                        object_index: input.object_index,
+                        reason: "child-owned row has no durable staged object",
+                    })?;
+                let staged = StagedObjectRecord::decode(&staged_payload)?;
+                let expected_object_key = object_block_key(
+                    request.context.logical_shard_id,
+                    request.context.root_id,
+                    input.row.physical_owner_revision_id,
+                    input.row.physical_object_index,
+                );
+                let mismatch_reason = if staged.artifact_revision_id
+                    != next_operation.artifact_revision_id
+                    || staged.object_sequence != sequence
+                {
+                    Some("staged object identity differs from the child-owned row")
+                } else if staged.object_key != expected_object_key {
+                    Some("staged object key does not match the canonical child-owned coordinates")
+                } else if staged.object_key != input.row.object_key {
+                    Some("staged object key differs from the child-owned row")
+                } else if staged.expected_length != input.row.length {
+                    Some("staged object length differs from the child-owned row")
+                } else if staged.expected_digest_uri != input.row.digest_uri {
+                    Some("staged object digest differs from the child-owned row")
+                } else if staged.provider_state != StagedProviderState::Uploaded
+                    || staged.cleanup_state != StagedCleanupState::Owned
+                {
+                    Some("staged object is not durably uploaded and owned")
+                } else {
+                    None
+                };
+                if let Some(reason) = mismatch_reason {
+                    return Err(PublicationError::ManifestOwnershipMismatch {
+                        object_index: input.object_index,
+                        reason,
+                    });
+                }
+            }
+            rolling_digest = advance_manifest_rolling_digest(rolling_digest, input)?;
+            previous_row = Some(input.row.clone());
+        }
+        if next_cursor == next_operation.manifest_row_count {
+            let target_owned_count = match previous_row.as_ref() {
+                Some(row)
+                    if row.physical_owner_revision_id == next_operation.artifact_revision_id =>
+                {
+                    row.physical_object_index.checked_add(1).ok_or(
+                        PublicationError::ManifestOwnershipMismatch {
+                            object_index: request
+                                .manifest_rows
+                                .last()
+                                .expect("non-empty batch was validated")
+                                .object_index,
+                            reason: "physical object count overflows u64",
+                        },
+                    )?
+                }
+                _ => 0,
+            };
+            if target_owned_count != u64::from(next_operation.staged_object_count) {
+                return Err(PublicationError::ManifestOwnershipMismatch {
+                    object_index: request
+                        .manifest_rows
+                        .last()
+                        .expect("non-empty batch was validated")
+                        .object_index,
+                    reason: "child-owned row count differs from staged-object count",
+                });
+            }
+        }
+        let last = request
+            .manifest_rows
+            .last()
+            .expect("non-empty batch was validated");
+        next_operation.manifest_cursor = next_cursor;
+        next_operation.manifest_rolling_digest = rolling_digest;
+        next_operation.manifest_last_position = Some(ManifestPosition {
+            object_index: last.object_index,
+        });
+        let expected_payload = request.expected_operation.encode()?;
+        let next_payload = next_operation.encode()?;
+
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                next_operation.operation_id,
+            ),
+            expected_payload,
+            next_payload.clone(),
+        )?;
+        plan.assert_value(
+            MetadataFamily::ArtifactRevision,
+            artifact_revision_key(request.context.root_id, next_operation.artifact_revision_id),
+            None,
+        )?;
+        for input in &request.manifest_rows {
+            plan.put_absent(
+                MetadataFamily::ArtifactManifest,
+                artifact_manifest_key(
+                    request.context.root_id,
+                    next_operation.artifact_revision_id,
+                    input.object_index,
+                ),
+                input.row.encode()?,
+            )?;
+        }
+        let result = self.execute_plan(request.context, plan, next_payload)?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    pub fn transition_publish(
+        &self,
+        request: TransitionPublishRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        let operation_key = operation_key(
+            request.context.root_id,
+            OperationKind::Publish,
+            request.expected_operation.operation_id,
+        );
+        let expected_operation_payload = request.expected_operation.encode()?;
+        let mut next_operation = request.expected_operation.clone();
+
+        next_operation
+            .apply_transition(request.expected_operation.phase, request.transition.clone())?;
+
+        let next_operation_payload = next_operation.encode()?;
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key,
+            expected_operation_payload,
+            next_operation_payload.clone(),
+        )?;
+
+        let result = self.execute_plan(request.context, plan, next_operation_payload)?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    /// Extend one nonterminal publish lease. Only the owner epoch that began
+    /// the operation may heartbeat, and the deadline is strictly monotonic.
+    pub fn heartbeat_publish(
+        &self,
+        request: HeartbeatPublishRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        if request.context.owner_epoch != request.expected_operation.initiating_owner_epoch {
+            return Err(PublicationError::HeartbeatOwnerMismatch {
+                initiating: request.expected_operation.initiating_owner_epoch,
+                current: request.context.owner_epoch,
+            });
+        }
+        if !matches!(
+            request.expected_operation.phase,
+            PublishPhase::Uploading | PublishPhase::Finalizing
+        ) {
+            return Err(PublicationError::HeartbeatPhase {
+                actual: request.expected_operation.phase,
+            });
+        }
+        if request.activity_deadline_ms <= request.expected_operation.activity_deadline_ms {
+            return Err(PublicationError::ActivityDeadlineNotExtended {
+                current: request.expected_operation.activity_deadline_ms,
+                requested: request.activity_deadline_ms,
+            });
+        }
+        let lease_clock = self.store.lease_clock_high_water()?;
+        if request.activity_deadline_ms <= lease_clock {
+            return Err(PublicationError::ActivityDeadlineNotFuture {
+                clock: lease_clock,
+                requested: request.activity_deadline_ms,
+            });
+        }
+
+        let expected_payload = request.expected_operation.encode()?;
+        let mut next_operation = request.expected_operation;
+        next_operation.activity_deadline_ms = request.activity_deadline_ms;
+        let next_payload = next_operation.encode()?;
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                next_operation.operation_id,
+            ),
+            expected_payload,
+            next_payload.clone(),
+        )?;
+        let result = self.execute_plan_before_lease_deadline(
+            request.context,
+            plan,
+            next_payload,
+            request.activity_deadline_ms,
+        )?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    /// Atomically aborts an orphaned publish. A newer owner may take over
+    /// immediately; the initiating owner must first durably observe the
+    /// extend-only activity lease expired. A `Finalizing` operation is safe to
+    /// take over because final publication and its `Published` operation
+    /// transition are one metadata command; the exact `Finalizing` CAS
+    /// performed here cannot win if publication already committed.
+    pub fn take_over_orphaned_publish(
+        &self,
+        request: TakeOverOrphanedPublishRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        if !matches!(
+            request.expected_operation.phase,
+            PublishPhase::Uploading | PublishPhase::Finalizing
+        ) {
+            return Err(PublicationError::OwnerTakeoverPhase {
+                actual: request.expected_operation.phase,
+            });
+        }
+        if request.context.owner_epoch.get()
+            < request.expected_operation.initiating_owner_epoch.get()
+        {
+            return Err(PublicationError::OwnerTakeoverNotAllowed {
+                initiating: request.expected_operation.initiating_owner_epoch,
+                current: request.context.owner_epoch,
+            });
+        }
+        if request.context.owner_epoch == request.expected_operation.initiating_owner_epoch {
+            let lease_clock = self.store.observe_lease_clock(
+                request.context.root_id,
+                request.context.placement_generation,
+                request.context.owner_epoch,
+                request.observed_now_ms,
+            )?;
+            let expiry_threshold = request
+                .expected_operation
+                .activity_deadline_ms
+                .saturating_add(request.maximum_clock_skew_ms);
+            if lease_clock < expiry_threshold {
+                return Err(PublicationError::ActivityLeaseNotExpired {
+                    deadline_ms: request.expected_operation.activity_deadline_ms,
+                    lease_clock_ms: lease_clock,
+                    maximum_clock_skew_ms: request.maximum_clock_skew_ms,
+                });
+            }
+        }
+
+        let expected_payload = request.expected_operation.encode()?;
+        let mut next_operation = request.expected_operation.clone();
+        match request.expected_operation.phase {
+            PublishPhase::Uploading => next_operation.apply_transition(
+                PublishPhase::Uploading,
+                PublishTransition::BeginAbort {
+                    terminal_error: request.terminal_error,
+                },
+            )?,
+            PublishPhase::Finalizing => {
+                let proof =
+                    finalization_takeover_absence_proof(request.context, &expected_payload)?;
+                next_operation.take_over_finalization(proof, request.terminal_error)?;
+            }
+            actual => return Err(PublicationError::OwnerTakeoverPhase { actual }),
+        }
+
+        let next_payload = next_operation.encode()?;
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                next_operation.operation_id,
+            ),
+            expected_payload,
+            next_payload.clone(),
+        )?;
+        let result = self.execute_plan(request.context, plan, next_payload)?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    pub fn cleanup_publish_batch(
+        &self,
+        request: CleanupPublishBatchRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        require_operation_phase(&request.expected_operation, PublishPhase::Cleaning)?;
+
+        let mut next_operation = request.expected_operation.clone();
+        let mut plan = CommandPlan::default();
+        if next_operation.cleanup_staged_object_cursor < next_operation.staged_object_cursor {
+            validate_batch_size(
+                "cleanup staged objects",
+                request.staged_object_updates.len(),
+            )?;
+            let next_cursor = checked_batch_cursor(
+                "cleanup staged objects",
+                next_operation.cleanup_staged_object_cursor,
+                request.staged_object_updates.len(),
+                next_operation.staged_object_cursor,
+            )?;
+            for (offset, update) in request.staged_object_updates.iter().enumerate() {
+                let sequence = next_operation
+                    .cleanup_staged_object_cursor
+                    .checked_add(u32::try_from(offset).map_err(|_| {
+                        PublicationError::BatchTooLarge {
+                            batch: "cleanup staged objects",
+                            count: request.staged_object_updates.len(),
+                            max: MAX_PUBLICATION_BATCH_ROWS,
+                        }
+                    })?)
+                    .ok_or(PublicationError::BatchExceedsPlannedCount {
+                        batch: "cleanup staged objects",
+                        cursor: next_operation.cleanup_staged_object_cursor,
+                        count: request.staged_object_updates.len(),
+                        planned: next_operation.staged_object_cursor,
+                    })?;
+                validate_cleanup_update(&update.expected, &update.next)?;
+                if update.expected.object_sequence != sequence {
+                    return Err(PublicationError::StagedObjectSequenceMismatch {
+                        expected: sequence,
+                        actual: update.expected.object_sequence,
+                    });
+                }
+                if update.expected.artifact_revision_id != next_operation.artifact_revision_id {
+                    return Err(PublicationError::StagedObjectRevisionMismatch);
+                }
+                plan.delete(
+                    MetadataFamily::StagedObject,
+                    staged_object_key(
+                        request.context.root_id,
+                        next_operation.operation_id,
+                        u64::from(sequence),
+                    ),
+                    update.expected.encode()?,
+                )?;
+            }
+            next_operation.cleanup_staged_object_cursor = next_cursor;
+        } else {
+            if !request.staged_object_updates.is_empty() {
+                return Err(PublicationError::BatchExceedsPlannedCount {
+                    batch: "cleanup staged objects",
+                    cursor: next_operation.cleanup_staged_object_cursor,
+                    count: request.staged_object_updates.len(),
+                    planned: next_operation.staged_object_cursor,
+                });
+            }
+            let remaining = next_operation
+                .manifest_cursor
+                .checked_sub(next_operation.cleanup_manifest_cursor)
+                .expect("operation validation orders manifest cleanup cursors");
+            if remaining == 0 {
+                return Err(PublicationError::EmptyBatch {
+                    batch: "cleanup manifest",
+                });
+            }
+            let limit = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(MAX_PUBLICATION_BATCH_ROWS);
+            let prefix = artifact_manifest_prefix(
+                request.context.root_id,
+                next_operation.artifact_revision_id,
+            );
+            let rows = self.store.scan_prefix_at(
+                request.context.root_id,
+                request.context.placement_generation,
+                request.context.owner_epoch,
+                MetadataFamily::ArtifactManifest,
+                &prefix,
+                request.context.read_version,
+                None,
+                limit,
+            )?;
+            if rows.is_empty() {
+                return Err(PublicationError::ManifestCountMismatch {
+                    expected: next_operation.manifest_cursor,
+                    actual: usize::try_from(next_operation.cleanup_manifest_cursor)
+                        .unwrap_or(usize::MAX),
+                });
+            }
+            for row in &rows {
+                plan.delete(
+                    MetadataFamily::ArtifactManifest,
+                    row.key.clone(),
+                    row.value.clone(),
+                )?;
+            }
+            next_operation.cleanup_manifest_cursor = next_operation
+                .cleanup_manifest_cursor
+                .checked_add(u32::try_from(rows.len()).map_err(|_| {
+                    PublicationError::BatchTooLarge {
+                        batch: "cleanup manifest",
+                        count: rows.len(),
+                        max: MAX_PUBLICATION_BATCH_ROWS,
+                    }
+                })?)
+                .ok_or(PublicationError::BatchExceedsPlannedCount {
+                    batch: "cleanup manifest",
+                    cursor: next_operation.cleanup_manifest_cursor,
+                    count: rows.len(),
+                    planned: next_operation.manifest_cursor,
+                })?;
+        }
+
+        let expected_payload = request.expected_operation.encode()?;
+        let next_payload = next_operation.encode()?;
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                next_operation.operation_id,
+            ),
+            expected_payload,
+            next_payload.clone(),
+        )?;
+        let result = self.execute_plan(request.context, plan, next_payload)?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    fn predicate_publication_authority(
+        &self,
+        context: PublicationContext,
+        operation: &PublishOperationRecord,
+        plan: &mut CommandPlan,
+    ) -> Result<(), PublicationError> {
+        let workspace_key = workspace_current_key(context.root_id, &operation.workbench_id);
+        let workspace = self
+            .read_publication_record(
+                context,
+                MetadataFamily::WorkspaceCurrent,
+                &workspace_key,
+                WorkspaceRecord::decode,
+            )?
+            .ok_or(PublicationError::WorkspaceNotFound)?;
+        if workspace.record.incarnation_id != operation.workspace_incarnation_id {
+            return Err(PublicationError::WorkspaceIncarnationMismatch);
+        }
+        match operation.authority {
+            PublishAuthority::Visible => {
+                if matches!(
+                    operation.path.as_str(),
+                    RUN_MANIFEST_PATH | RESTORE_MANIFEST_PATH
+                ) {
+                    return Err(PublicationError::ReservedManifestAuthorityRequired);
+                }
+                if workspace.record.state != WorkspaceState::Visible
+                    || workspace.record.owning_operation_id.is_some()
+                {
+                    return Err(PublicationError::WorkspaceUnavailable);
+                }
+            }
+            PublishAuthority::CommitStaging {
+                commit_operation_id,
+            } => {
+                if operation.path.as_str() != RUN_MANIFEST_PATH
+                    || matches!(operation.claim, PublishClaim::Append { .. })
+                    || operation.dependency_count != 0
+                    || operation.dependency_depth != 0
+                {
+                    return Err(PublicationError::CommitAuthorityMismatch);
+                }
+                if workspace.record.state != WorkspaceState::Visible
+                    || workspace.record.owning_operation_id.is_some()
+                {
+                    return Err(PublicationError::WorkspaceUnavailable);
+                }
+                let commit_key = operation_key(
+                    context.root_id,
+                    OperationKind::BuildCommit,
+                    commit_operation_id,
+                );
+                let commit_payload = self
+                    .store
+                    .read_at(
+                        context.root_id,
+                        context.placement_generation,
+                        context.owner_epoch,
+                        MetadataFamily::Operation,
+                        &commit_key,
+                        context.read_version,
+                    )?
+                    .ok_or(PublicationError::CommitOperationMissing)?;
+                let commit = BuildCommitOperationRecord::decode(&commit_payload)?;
+                if commit.phase != BuildCommitPhase::Building
+                    || commit.operation_id != commit_operation_id
+                    || commit.workbench_id != operation.workbench_id
+                    || commit.source_workspace_incarnation_id != operation.workspace_incarnation_id
+                    || commit.tree_manifest_revision_id != operation.artifact_revision_id
+                    || commit.commit_staged_run_manifest.is_some()
+                    || !commit_manifest_claim_matches(
+                        commit.run_manifest_condition,
+                        &operation.claim,
+                    )
+                    || commit.member_count != 0
+                    || commit.member_cursor.is_some()
+                {
+                    return Err(PublicationError::CommitAuthorityMismatch);
+                }
+                if !plan
+                    .exact_keys
+                    .contains(&(MetadataFamily::Operation, commit_key.clone()))
+                {
+                    plan.assert_value(MetadataFamily::Operation, commit_key, Some(commit_payload))?;
+                }
+            }
+            PublishAuthority::RestoreStaging {
+                restore_operation_id,
+            } => {
+                if operation.path.as_str() != RESTORE_MANIFEST_PATH
+                    || !matches!(operation.claim, PublishClaim::CreateOnly)
+                {
+                    return Err(PublicationError::RestoreManifestPathRequired);
+                }
+                if workspace.record.state != WorkspaceState::Staging
+                    || workspace.record.owning_operation_id != Some(restore_operation_id)
+                {
+                    return Err(PublicationError::RestoreAuthorityMismatch);
+                }
+                let restore_key = operation_key(
+                    context.root_id,
+                    OperationKind::Restore,
+                    restore_operation_id,
+                );
+                let restore_payload = self
+                    .store
+                    .read_at(
+                        context.root_id,
+                        context.placement_generation,
+                        context.owner_epoch,
+                        MetadataFamily::Operation,
+                        &restore_key,
+                        context.read_version,
+                    )?
+                    .ok_or(PublicationError::RestoreOperationMissing)?;
+                let restore = RestoreOperationRecord::decode(&restore_payload)?;
+                if restore.phase != RestorePhase::SourceSealed
+                    || restore.operation_id != restore_operation_id
+                    || restore.destination_workbench_id != operation.workbench_id
+                    || restore.destination_workspace_incarnation_id
+                        != operation.workspace_incarnation_id
+                {
+                    return Err(PublicationError::RestoreAuthorityMismatch);
+                }
+                if !plan
+                    .exact_keys
+                    .contains(&(MetadataFamily::Operation, restore_key.clone()))
+                {
+                    plan.assert_value(
+                        MetadataFamily::Operation,
+                        restore_key,
+                        Some(restore_payload),
+                    )?;
+                }
+            }
+        }
+        if !plan
+            .exact_keys
+            .contains(&(MetadataFamily::WorkspaceCurrent, workspace_key.clone()))
+        {
+            plan.assert_value(
+                MetadataFamily::WorkspaceCurrent,
+                workspace_key,
+                Some(workspace.payload),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn execute_plan(
+        &self,
+        context: PublicationContext,
+        plan: CommandPlan,
+        deterministic_result: Vec<u8>,
+    ) -> Result<MetadataCommandResult, PublicationError> {
+        let command = self.seal_plan(context, plan, deterministic_result)?;
+        self.store.execute(&command).map_err(Into::into)
+    }
+
+    fn execute_plan_before_lease_deadline(
+        &self,
+        context: PublicationContext,
+        plan: CommandPlan,
+        deterministic_result: Vec<u8>,
+        activity_deadline_ms: u64,
+    ) -> Result<MetadataCommandResult, PublicationError> {
+        let command = self.seal_plan(context, plan, deterministic_result)?;
+        match self
+            .store
+            .execute_before_lease_deadline(&command, activity_deadline_ms)
+        {
+            Ok(result) => Ok(result),
+            Err(AgentMetadataError::LeaseDeadlineReached {
+                lease_clock_ms,
+                requested_deadline_ms,
+            }) => Err(PublicationError::ActivityDeadlineNotFuture {
+                clock: lease_clock_ms,
+                requested: requested_deadline_ms,
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn seal_plan(
+        &self,
+        context: PublicationContext,
+        mut plan: CommandPlan,
+        deterministic_result: Vec<u8>,
+    ) -> Result<MetadataCommand, PublicationError> {
+        let operation = PublishOperationRecord::decode(&deterministic_result)?;
+        self.predicate_publication_authority(context, &operation, &mut plan)?;
+        plan.validate_bounds()?;
+        Ok(MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: context.root_id,
+            logical_shard_id: context.logical_shard_id,
+            placement_generation: context.placement_generation,
+            owner_epoch: context.owner_epoch,
+            request_id: context.request_id,
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: context.read_version,
+            root_fence_action: RootFenceAction::RequireActive,
+            predicates: plan.predicates,
+            mutations: plan.mutations,
+            history_projection: plan.history,
+            event_projection: plan.events,
+            deterministic_result,
+        }
+        .seal())
+    }
+
+    fn read_publication_record<T>(
+        &self,
+        context: PublicationContext,
+        family: MetadataFamily,
+        key: &[u8],
+        decode: impl Fn(&[u8]) -> Result<T, PublicationRecordCodecError>,
+    ) -> Result<Option<Loaded<T>>, PublicationError> {
+        self.store
+            .read_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                family,
+                key,
+                context.read_version,
+            )?
+            .map(|payload| {
+                let record = decode(&payload)?;
+                Ok(Loaded { payload, record })
+            })
+            .transpose()
+    }
+
+    pub fn finalize_publish(
+        &self,
+        request: FinalizePublishRequest,
+    ) -> Result<FinalizePublishOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        if request.expected_operation.phase != PublishPhase::Finalizing {
+            return Err(PublicationError::InvalidOperationPhase {
+                expected: PublishPhase::Finalizing,
+                actual: request.expected_operation.phase,
+            });
+        }
+        let expected_commit_version = CommitVersion::new(
+            request
+                .context
+                .read_version
+                .get()
+                .checked_add(1)
+                .ok_or(PublicationError::CommitVersionOverflow)?,
+        )
+        .map_err(|_| PublicationError::CommitVersionOverflow)?;
+
+        validate_dependency_seal(
+            &request.expected_operation,
+            &request.dependency_owner_revision_ids,
+        )?;
+        if request
+            .dependency_owner_revision_ids
+            .binary_search(&request.expected_operation.artifact_revision_id)
+            .is_ok()
+        {
+            return Err(PublicationError::RevisionIdentityCollision);
+        }
+        let expected_manifest_uri = sha256_digest_uri(request.expected_operation.manifest_seal);
+        if request.artifact.manifest_digest_uri != expected_manifest_uri {
+            return Err(PublicationError::ManifestDigestMismatch);
+        }
+        let sealed_logical_size =
+            if let Some(last) = request.expected_operation.manifest_last_position {
+                let key = artifact_manifest_key(
+                    request.context.root_id,
+                    request.expected_operation.artifact_revision_id,
+                    last.object_index,
+                );
+                let payload = self
+                    .read_payload(request.context, MetadataFamily::ArtifactManifest, &key)?
+                    .ok_or(PublicationError::ManifestPositionMismatch)?;
+                let last_row = ArtifactManifestRow::decode(&payload)?;
+                last_row
+                    .logical_offset
+                    .checked_add(last_row.length)
+                    .expect("validated manifest logical range cannot overflow")
+            } else {
+                0
+            };
+        if request.artifact.logical_size != sealed_logical_size {
+            return Err(PublicationError::ManifestLogicalOffsetMismatch {
+                expected: sealed_logical_size,
+                actual: request.artifact.logical_size,
+            });
+        }
+        let next_projection = TypedProjection::decode(&request.artifact.typed_index_projection)?;
+        if let PublishAuthority::RestoreStaging {
+            restore_operation_id,
+        } = request.expected_operation.authority
+        {
+            let restore_payload = self
+                .read_payload(
+                    request.context,
+                    MetadataFamily::Operation,
+                    &operation_key(
+                        request.context.root_id,
+                        OperationKind::Restore,
+                        restore_operation_id,
+                    ),
+                )?
+                .ok_or(PublicationError::RestoreOperationMissing)?;
+            let restore = RestoreOperationRecord::decode(&restore_payload)?;
+            if restore.phase != RestorePhase::SourceSealed
+                || request.expected_operation.staged_object_count != 1
+                || request.expected_operation.manifest_row_count != 1
+                || request.expected_operation.dependency_count != 0
+                || request.artifact.logical_size != restore.restore_manifest.logical_size
+                || request.artifact.body_digest_uri != restore.restore_manifest.body_digest_uri
+                || request.artifact.content_type != restore.restore_manifest.content_type
+                || !next_projection.fields().is_empty()
+            {
+                return Err(PublicationError::RestoreManifestClosureMismatch);
+            }
+            let row_payload = self
+                .read_payload(
+                    request.context,
+                    MetadataFamily::ArtifactManifest,
+                    &artifact_manifest_key(
+                        request.context.root_id,
+                        request.expected_operation.artifact_revision_id,
+                        0,
+                    ),
+                )?
+                .ok_or(PublicationError::RestoreManifestClosureMismatch)?;
+            let row = ArtifactManifestRow::decode(&row_payload)?;
+            let staged_payload = self
+                .read_payload(
+                    request.context,
+                    MetadataFamily::StagedObject,
+                    &staged_object_key(
+                        request.context.root_id,
+                        request.expected_operation.operation_id,
+                        0,
+                    ),
+                )?
+                .ok_or(PublicationError::RestoreManifestClosureMismatch)?;
+            let staged = StagedObjectRecord::decode(&staged_payload)?;
+            if row.physical_owner_revision_id != request.expected_operation.artifact_revision_id
+                || row.physical_object_index != 0
+                || row.logical_offset != 0
+                || row.offset != 0
+                || row.length != restore.restore_manifest.logical_size
+                || row.digest_uri != restore.restore_manifest.body_digest_uri
+                || row.append_segment.is_some()
+                || staged.object_sequence != 0
+                || staged.artifact_revision_id != request.expected_operation.artifact_revision_id
+                || staged.object_key != row.object_key
+                || staged.expected_length != restore.restore_manifest.logical_size
+                || staged.expected_digest_uri != restore.restore_manifest.body_digest_uri
+                || staged.provider_state != StagedProviderState::Uploaded
+                || staged.cleanup_state != StagedCleanupState::Owned
+            {
+                return Err(PublicationError::RestoreManifestClosureMismatch);
+            }
+        }
+        if matches!(
+            request.expected_operation.authority,
+            PublishAuthority::CommitStaging { .. }
+        ) {
+            return self.finalize_commit_staging_publish(request, next_projection);
+        }
+
+        let operation_key = operation_key(
+            request.context.root_id,
+            OperationKind::Publish,
+            request.expected_operation.operation_id,
+        );
+        let expected_operation_payload = request.expected_operation.encode()?;
+        let workspace_key = workspace_current_key(
+            request.context.root_id,
+            &request.expected_operation.workbench_id,
+        );
+        let workspace = self
+            .read_publication_record(
+                request.context,
+                MetadataFamily::WorkspaceCurrent,
+                &workspace_key,
+                WorkspaceRecord::decode,
+            )?
+            .ok_or(PublicationError::WorkspaceNotFound)?;
+        if workspace.record.incarnation_id != request.expected_operation.workspace_incarnation_id {
+            return Err(PublicationError::WorkspaceIncarnationMismatch);
+        }
+        let (next_workspace_revision, next_workspace) = match request.expected_operation.authority {
+            PublishAuthority::Visible => {
+                if workspace.record.state != WorkspaceState::Visible
+                    || workspace.record.owning_operation_id.is_some()
+                {
+                    return Err(PublicationError::WorkspaceUnavailable);
+                }
+                let revision = WorkspaceRevision::new(
+                    workspace
+                        .record
+                        .workspace_revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(PublicationError::WorkspaceRevisionOverflow)?,
+                );
+                (
+                    revision,
+                    Some(WorkspaceRecord {
+                        workspace_revision: revision,
+                        ..workspace.record
+                    }),
+                )
+            }
+            PublishAuthority::CommitStaging { .. } => {
+                unreachable!("commit staging returns before visible path planning")
+            }
+            PublishAuthority::RestoreStaging {
+                restore_operation_id,
+            } => {
+                if workspace.record.state != WorkspaceState::Staging
+                    || workspace.record.owning_operation_id != Some(restore_operation_id)
+                {
+                    return Err(PublicationError::RestoreAuthorityMismatch);
+                }
+                (workspace.record.workspace_revision, None)
+            }
+        };
+
+        let path_key = path_current_key(
+            request.context.root_id,
+            request.expected_operation.workspace_incarnation_id,
+            &request.expected_operation.path,
+        );
+        let current_path = self.read_publication_record(
+            request.context,
+            MetadataFamily::PathCurrent,
+            &path_key,
+            PathEntry::decode,
+        )?;
+        let current_projection = current_path
+            .as_ref()
+            .map(|current| TypedProjection::decode(&current.record.typed_index_projection))
+            .transpose()?;
+        let next_path_generation =
+            validate_path_claim(&request.expected_operation.claim, current_path.as_ref())?;
+        let mut current_index_rows = match (&current_path, &current_projection) {
+            (Some(current), Some(projection)) => secondary_index_rows(
+                request.context.root_id,
+                request.expected_operation.workspace_incarnation_id,
+                &request.expected_operation.path,
+                current.record.generation,
+                projection,
+            )?,
+            (None, None) => BTreeMap::new(),
+            _ => unreachable!("path and decoded projection presence agree"),
+        };
+        let mut next_index_rows = secondary_index_rows(
+            request.context.root_id,
+            request.expected_operation.workspace_incarnation_id,
+            &request.expected_operation.path,
+            next_path_generation,
+            &next_projection,
+        )?;
+
+        let revision_key = artifact_revision_key(
+            request.context.root_id,
+            request.expected_operation.artifact_revision_id,
+        );
+        if self
+            .read_payload(
+                request.context,
+                MetadataFamily::ArtifactRevision,
+                &revision_key,
+            )?
+            .is_some()
+        {
+            return Err(PublicationError::RevisionAlreadyExists);
+        }
+
+        let mut owner_records =
+            BTreeMap::<ArtifactRevisionId, Loaded<ArtifactRevisionRecord>>::new();
+        for owner in &request.dependency_owner_revision_ids {
+            let loaded = self.load_available_revision(request.context, *owner)?;
+            owner_records.insert(*owner, loaded);
+        }
+        let derived_dependency_depth = if owner_records.is_empty() {
+            0
+        } else {
+            owner_records
+                .values()
+                .map(|loaded| loaded.record.dependency_depth)
+                .max()
+                .expect("nonempty dependency set has a maximum")
+                .checked_add(1)
+                .ok_or(PublicationError::DependencyDepthMismatch {
+                    expected: request.expected_operation.dependency_depth,
+                    actual: u8::MAX,
+                })?
+        };
+        if derived_dependency_depth != request.expected_operation.dependency_depth {
+            return Err(PublicationError::DependencyDepthMismatch {
+                expected: request.expected_operation.dependency_depth,
+                actual: derived_dependency_depth,
+            });
+        }
+        let old_path_revision = current_path
+            .as_ref()
+            .map(|loaded| loaded.record.artifact_revision_id);
+        if old_path_revision == Some(request.expected_operation.artifact_revision_id) {
+            return Err(PublicationError::RevisionIdentityCollision);
+        }
+        if let Some(old_revision) = old_path_revision {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                owner_records.entry(old_revision)
+            {
+                entry.insert(self.load_available_revision(request.context, old_revision)?);
+            }
+        }
+
+        let mut old_path_ref = None;
+        if let Some(old_revision) = old_path_revision {
+            let key = path_revision_ref_key(
+                request.context.root_id,
+                request.expected_operation.workspace_incarnation_id,
+                &request.expected_operation.path,
+                old_revision,
+            );
+            let loaded = self
+                .read_publication_record(
+                    request.context,
+                    MetadataFamily::RevisionRef,
+                    &key,
+                    RevisionRefRecord::decode,
+                )?
+                .ok_or(PublicationError::RevisionReferenceMissing)?;
+            let owner = owner_records
+                .get(&old_revision)
+                .expect("old path revision was loaded");
+            if loaded.record.reference_epoch_at_add > owner.record.reference_epoch {
+                return Err(PublicationError::RevisionReferenceEpochAhead);
+            }
+            old_path_ref = Some((key, loaded));
+        }
+
+        let mut owner_updates = BTreeMap::<ArtifactRevisionId, OwnerRevisionUpdate>::new();
+        for (revision, loaded) in owner_records {
+            let add_dependency = request
+                .dependency_owner_revision_ids
+                .binary_search(&revision)
+                .is_ok();
+            let remove_path = old_path_revision == Some(revision);
+            let new_epoch_raw = loaded
+                .record
+                .reference_epoch
+                .get()
+                .checked_add(1)
+                .ok_or(PublicationError::ReferenceEpochOverflow { revision })?;
+            let new_epoch = ReferenceEpoch::new(new_epoch_raw);
+            let with_add = if add_dependency {
+                loaded
+                    .record
+                    .strong_reference_count
+                    .checked_add(1)
+                    .ok_or(PublicationError::ReferenceCountOverflow { revision })?
+            } else {
+                loaded.record.strong_reference_count
+            };
+            let new_count = if remove_path {
+                with_add
+                    .checked_sub(1)
+                    .ok_or(PublicationError::ReferenceCountUnderflow { revision })?
+            } else {
+                with_add
+            };
+            let mut next = loaded.record.clone();
+            next.reference_epoch = new_epoch;
+            next.strong_reference_count = new_count;
+            next.last_zero_ref_version = (new_count == 0).then_some(expected_commit_version);
+            owner_updates.insert(
+                revision,
+                OwnerRevisionUpdate {
+                    loaded,
+                    next,
+                    add_dependency,
+                },
+            );
+        }
+
+        let new_revision = ArtifactRevisionRecord {
+            logical_size: request.artifact.logical_size,
+            body_digest_uri: request.artifact.body_digest_uri.clone(),
+            manifest_digest_uri: request.artifact.manifest_digest_uri.clone(),
+            block_count: u64::from(request.expected_operation.manifest_row_count),
+            dependency_count: u32::from(request.expected_operation.dependency_count),
+            dependency_depth: request.expected_operation.dependency_depth,
+            dependency_digest: request.expected_operation.dependency_digest,
+            content_type: request.artifact.content_type.clone(),
+            state: RevisionState::Available,
+            reference_epoch: ReferenceEpoch::new(1),
+            strong_reference_count: 1,
+            last_zero_ref_version: None,
+        };
+        let next_path = PathEntry {
+            generation: next_path_generation,
+            artifact_revision_id: request.expected_operation.artifact_revision_id,
+            body_digest_uri: request.artifact.body_digest_uri.clone(),
+            manifest_digest_uri: request.artifact.manifest_digest_uri.clone(),
+            logical_size: request.artifact.logical_size,
+            dependency_count: u32::from(request.expected_operation.dependency_count),
+            dependency_depth: request.expected_operation.dependency_depth,
+            content_type: request.artifact.content_type.clone(),
+            producer: request.artifact.producer.clone(),
+            manifest_id: request.artifact.manifest_id.clone(),
+            typed_index_projection: request.artifact.typed_index_projection.clone(),
+        };
+        let publish_result = PublishResult {
+            path_generation: next_path_generation,
+            workspace_revision: next_workspace_revision,
+            logical_size: request.artifact.logical_size,
+            body_digest_uri: request.artifact.body_digest_uri.clone(),
+        };
+        let mut published_operation = request.expected_operation.clone();
+        published_operation.apply_transition(
+            PublishPhase::Finalizing,
+            PublishTransition::Publish {
+                result: publish_result.clone(),
+            },
+        )?;
+        let published_operation_payload = published_operation.encode()?;
+
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key,
+            expected_operation_payload,
+            published_operation_payload.clone(),
+        )?;
+        if let Some(next_workspace) = next_workspace {
+            plan.replace(
+                MetadataFamily::WorkspaceCurrent,
+                workspace_key,
+                workspace.payload,
+                next_workspace.encode()?,
+            )?;
+        }
+        match current_path {
+            None => plan.put_absent(MetadataFamily::PathCurrent, path_key, next_path.encode()?)?,
+            Some(current) => plan.replace(
+                MetadataFamily::PathCurrent,
+                path_key,
+                current.payload,
+                next_path.encode()?,
+            )?,
+        }
+        let index_keys = current_index_rows
+            .keys()
+            .chain(next_index_rows.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for key in index_keys {
+            match (
+                current_index_rows.remove(&key),
+                next_index_rows.remove(&key),
+            ) {
+                (Some(expected), Some(next)) if expected == next => {
+                    plan.assert_value(MetadataFamily::SecondaryIndex, key, Some(expected))?;
+                }
+                (Some(expected), Some(next)) => {
+                    plan.replace(MetadataFamily::SecondaryIndex, key, expected, next)?;
+                }
+                (Some(expected), None) => {
+                    plan.delete(MetadataFamily::SecondaryIndex, key, expected)?;
+                }
+                (None, Some(next)) => {
+                    plan.put_absent(MetadataFamily::SecondaryIndex, key, next)?;
+                }
+                (None, None) => unreachable!("secondary-index union key has one value"),
+            }
+        }
+        plan.put_absent(
+            MetadataFamily::ArtifactRevision,
+            revision_key,
+            new_revision.encode()?,
+        )?;
+        let new_path_ref_key = path_revision_ref_key(
+            request.context.root_id,
+            request.expected_operation.workspace_incarnation_id,
+            &request.expected_operation.path,
+            request.expected_operation.artifact_revision_id,
+        );
+        plan.put_absent(
+            MetadataFamily::RevisionRef,
+            new_path_ref_key,
+            RevisionRefRecord {
+                reference_epoch_at_add: ReferenceEpoch::new(1),
+            }
+            .encode()?,
+        )?;
+        if let Some((key, loaded)) = old_path_ref {
+            plan.delete(MetadataFamily::RevisionRef, key, loaded.payload)?;
+        }
+        for (revision, update) in owner_updates {
+            let revision_key = artifact_revision_key(request.context.root_id, revision);
+            plan.replace(
+                MetadataFamily::ArtifactRevision,
+                revision_key,
+                update.loaded.payload,
+                update.next.encode()?,
+            )?;
+            if update.add_dependency {
+                plan.put_absent(
+                    MetadataFamily::RevisionRef,
+                    revision_dependency_ref_key(
+                        request.context.root_id,
+                        request.expected_operation.artifact_revision_id,
+                        revision,
+                    ),
+                    RevisionRefRecord {
+                        reference_epoch_at_add: update.next.reference_epoch,
+                    }
+                    .encode()?,
+                )?;
+            }
+            if update.next.strong_reference_count == 0 {
+                plan.put_absent(
+                    MetadataFamily::GcCandidate,
+                    gc_candidate_key(
+                        request.context.root_id,
+                        revision,
+                        update.next.reference_epoch,
+                    ),
+                    GcCandidateRecord {
+                        last_zero_ref_version: expected_commit_version,
+                        claim_state: GcClaimState::Candidate,
+                        retry_count: 0,
+                        quarantine_evidence: None,
+                    }
+                    .encode()?,
+                )?;
+            }
+        }
+        if matches!(
+            request.expected_operation.authority,
+            PublishAuthority::Visible
+        ) {
+            plan.events
+                .push(change_event_projection(&ChangeEventRecord {
+                    workspace_incarnation_id: request.expected_operation.workspace_incarnation_id,
+                    kind: ChangeEventKind::ArtifactPublished,
+                    artifact_revision_id: Some(request.expected_operation.artifact_revision_id),
+                    commit_id: None,
+                    operation_id: Some(request.expected_operation.operation_id),
+                    path: Some(request.expected_operation.path.clone()),
+                    before: current_projection.unwrap_or_default(),
+                    after: next_projection,
+                })?);
+        }
+
+        let result = self.execute_plan(request.context, plan, published_operation_payload)?;
+        let outcome = decode_operation_outcome(result, published_operation.operation_id)?;
+        let result = outcome
+            .operation
+            .result
+            .clone()
+            .ok_or(PublicationError::ReplayResultMismatch)?;
+        if outcome.operation.phase != PublishPhase::Published || result != publish_result {
+            return Err(PublicationError::ReplayResultMismatch);
+        }
+        Ok(FinalizePublishOutcome {
+            commit_version: outcome.commit_version,
+            operation: outcome.operation,
+            result,
+            replayed: outcome.replayed,
+        })
+    }
+
+    /// Finalize a run-manifest upload without publishing its canonical path.
+    ///
+    /// The immutable revision and its commit-owned strong ref are created in
+    /// the same command that marks the publish operation successful and sets
+    /// the build's durable manifest binding. `CommitService::finalize_build` later
+    /// consumes this exact state and installs the path with the typed head.
+    fn finalize_commit_staging_publish(
+        &self,
+        request: FinalizePublishRequest,
+        projection: TypedProjection,
+    ) -> Result<FinalizePublishOutcome, PublicationError> {
+        let PublishAuthority::CommitStaging {
+            commit_operation_id,
+        } = request.expected_operation.authority
+        else {
+            unreachable!("commit staging helper is called only for commit authority")
+        };
+        if request.expected_operation.path.as_str() != RUN_MANIFEST_PATH
+            || request.expected_operation.staged_object_count != 1
+            || request.expected_operation.manifest_row_count != 1
+            || request.expected_operation.dependency_count != 0
+            || request.expected_operation.dependency_depth != 0
+            || !request.dependency_owner_revision_ids.is_empty()
+            || request.artifact.content_type != "application/json"
+            || request.artifact.producer.is_some()
+            || request.artifact.manifest_id.is_some()
+            || !projection.fields().is_empty()
+        {
+            return Err(PublicationError::CommitManifestClosureMismatch);
+        }
+
+        let manifest_payload = self
+            .read_payload(
+                request.context,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_key(
+                    request.context.root_id,
+                    request.expected_operation.artifact_revision_id,
+                    0,
+                ),
+            )?
+            .ok_or(PublicationError::CommitManifestClosureMismatch)?;
+        let manifest = ArtifactManifestRow::decode(&manifest_payload)?;
+        let staged_payload = self
+            .read_payload(
+                request.context,
+                MetadataFamily::StagedObject,
+                &staged_object_key(
+                    request.context.root_id,
+                    request.expected_operation.operation_id,
+                    0,
+                ),
+            )?
+            .ok_or(PublicationError::CommitManifestClosureMismatch)?;
+        let staged = StagedObjectRecord::decode(&staged_payload)?;
+        if manifest.physical_owner_revision_id != request.expected_operation.artifact_revision_id
+            || manifest.physical_object_index != 0
+            || manifest.logical_offset != 0
+            || manifest.offset != 0
+            || manifest.length != request.artifact.logical_size
+            || manifest.digest_uri != request.artifact.body_digest_uri
+            || manifest.append_segment.is_some()
+            || staged.object_sequence != 0
+            || staged.artifact_revision_id != request.expected_operation.artifact_revision_id
+            || staged.object_key != manifest.object_key
+            || staged.expected_length != request.artifact.logical_size
+            || staged.expected_digest_uri != request.artifact.body_digest_uri
+            || staged.provider_state != StagedProviderState::Uploaded
+            || staged.cleanup_state != StagedCleanupState::Owned
+        {
+            return Err(PublicationError::CommitManifestClosureMismatch);
+        }
+
+        let workspace_key = workspace_current_key(
+            request.context.root_id,
+            &request.expected_operation.workbench_id,
+        );
+        let workspace = self
+            .read_publication_record(
+                request.context,
+                MetadataFamily::WorkspaceCurrent,
+                &workspace_key,
+                WorkspaceRecord::decode,
+            )?
+            .ok_or(PublicationError::WorkspaceNotFound)?;
+        if workspace.record.incarnation_id != request.expected_operation.workspace_incarnation_id
+            || workspace.record.state != WorkspaceState::Visible
+            || workspace.record.owning_operation_id.is_some()
+        {
+            return Err(PublicationError::CommitAuthorityMismatch);
+        }
+
+        let path_key = path_current_key(
+            request.context.root_id,
+            request.expected_operation.workspace_incarnation_id,
+            &request.expected_operation.path,
+        );
+        let current_path = self.read_publication_record(
+            request.context,
+            MetadataFamily::PathCurrent,
+            &path_key,
+            PathEntry::decode,
+        )?;
+        let path_generation =
+            validate_path_claim(&request.expected_operation.claim, current_path.as_ref())?;
+
+        let commit_key = operation_key(
+            request.context.root_id,
+            OperationKind::BuildCommit,
+            commit_operation_id,
+        );
+        let commit_payload = self
+            .read_payload(request.context, MetadataFamily::Operation, &commit_key)?
+            .ok_or(PublicationError::CommitOperationMissing)?;
+        let mut commit = BuildCommitOperationRecord::decode(&commit_payload)?;
+        if commit.phase != BuildCommitPhase::Building
+            || commit.operation_id != commit_operation_id
+            || commit.workbench_id != request.expected_operation.workbench_id
+            || commit.source_workspace_incarnation_id
+                != request.expected_operation.workspace_incarnation_id
+            || commit.tree_manifest_revision_id != request.expected_operation.artifact_revision_id
+            || commit.commit_staged_run_manifest.is_some()
+            || !commit_manifest_claim_matches(
+                commit.run_manifest_condition,
+                &request.expected_operation.claim,
+            )
+            || commit.member_count != 0
+            || commit.member_cursor.is_some()
+        {
+            return Err(PublicationError::CommitAuthorityMismatch);
+        }
+        commit.commit_staged_run_manifest = Some(CommitManifestBinding {
+            logical_size: request.artifact.logical_size,
+            body_digest_uri: request.artifact.body_digest_uri.clone(),
+            manifest_digest_uri: request.artifact.manifest_digest_uri.clone(),
+            content_type: request.artifact.content_type.clone(),
+        });
+        commit.revision_ref_count = commit.revision_ref_count.checked_add(1).ok_or(
+            PublicationError::ReferenceCountOverflow {
+                revision: request.expected_operation.artifact_revision_id,
+            },
+        )?;
+
+        let revision = ArtifactRevisionRecord {
+            logical_size: request.artifact.logical_size,
+            body_digest_uri: request.artifact.body_digest_uri.clone(),
+            manifest_digest_uri: request.artifact.manifest_digest_uri.clone(),
+            block_count: 1,
+            dependency_count: 0,
+            dependency_depth: 0,
+            dependency_digest: [0; SHA256_BYTES],
+            content_type: request.artifact.content_type.clone(),
+            state: RevisionState::Available,
+            reference_epoch: ReferenceEpoch::new(1),
+            strong_reference_count: 1,
+            last_zero_ref_version: None,
+        };
+        let publish_result = PublishResult {
+            path_generation,
+            // Commit staging does not mutate WorkspaceCurrent. Persist the
+            // exact revision that the later atomic path/head switch will
+            // install so the terminal publish result remains both non-zero
+            // and replay-stable.
+            workspace_revision: WorkspaceRevision::new(
+                workspace
+                    .record
+                    .workspace_revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(PublicationError::WorkspaceRevisionOverflow)?,
+            ),
+            logical_size: request.artifact.logical_size,
+            body_digest_uri: request.artifact.body_digest_uri.clone(),
+        };
+        let mut published_operation = request.expected_operation.clone();
+        published_operation.apply_transition(
+            PublishPhase::Finalizing,
+            PublishTransition::Publish {
+                result: publish_result.clone(),
+            },
+        )?;
+        let published_payload = published_operation.encode()?;
+        let expected_publish_payload = request.expected_operation.encode()?;
+
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                request.expected_operation.operation_id,
+            ),
+            expected_publish_payload,
+            published_payload.clone(),
+        )?;
+        plan.replace(
+            MetadataFamily::Operation,
+            commit_key,
+            commit_payload,
+            commit.encode()?,
+        )?;
+        plan.assert_value(
+            MetadataFamily::PathCurrent,
+            path_key,
+            current_path.map(|loaded| loaded.payload),
+        )?;
+        plan.put_absent(
+            MetadataFamily::ArtifactRevision,
+            artifact_revision_key(
+                request.context.root_id,
+                request.expected_operation.artifact_revision_id,
+            ),
+            revision.encode()?,
+        )?;
+        plan.put_absent(
+            MetadataFamily::RevisionRef,
+            commit_revision_ref_key(
+                request.context.root_id,
+                commit.commit_id,
+                request.expected_operation.artifact_revision_id,
+            ),
+            RevisionRefRecord {
+                reference_epoch_at_add: ReferenceEpoch::new(1),
+            }
+            .encode()?,
+        )?;
+
+        let result = self.execute_plan(request.context, plan, published_payload)?;
+        let outcome = decode_operation_outcome(result, published_operation.operation_id)?;
+        let result = outcome
+            .operation
+            .result
+            .clone()
+            .ok_or(PublicationError::ReplayResultMismatch)?;
+        if outcome.operation.phase != PublishPhase::Published || result != publish_result {
+            return Err(PublicationError::ReplayResultMismatch);
+        }
+        Ok(FinalizePublishOutcome {
+            commit_version: outcome.commit_version,
+            operation: outcome.operation,
+            result,
+            replayed: outcome.replayed,
+        })
+    }
+
+    fn read_payload(
+        &self,
+        context: PublicationContext,
+        family: MetadataFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, PublicationError> {
+        self.store
+            .read_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                family,
+                key,
+                context.read_version,
+            )
+            .map_err(Into::into)
+    }
+
+    fn load_available_revision(
+        &self,
+        context: PublicationContext,
+        revision: ArtifactRevisionId,
+    ) -> Result<Loaded<ArtifactRevisionRecord>, PublicationError> {
+        let key = artifact_revision_key(context.root_id, revision);
+        let loaded = self
+            .read_publication_record(
+                context,
+                MetadataFamily::ArtifactRevision,
+                &key,
+                ArtifactRevisionRecord::decode,
+            )?
+            .ok_or(PublicationError::RevisionNotFound { revision })?;
+        if loaded.record.state != RevisionState::Available {
+            return Err(PublicationError::RevisionUnavailable { revision });
+        }
+        Ok(loaded)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use nokv_types::{
+        CommitId, NormalizedRelativePath, OperationId, RootActivationState, WorkbenchId,
+        WorkspaceIncarnationId, FIXED_ID_BYTES,
+    };
+
+    use super::super::codec::{commit_key, workbench_commit_head_key};
+    use super::super::commit::{BeginBuildCommitRequest, BuildCommitStepRequest, CommitService};
+    use super::super::commit_records::{CommitRecord, WorkbenchCommitHeadRecord};
+    use super::super::namespace::{
+        create_visible_workspace, get_visible_path_at, RootReadContext, RootWriteContext,
+    };
+    use super::super::object_block_key;
+    use super::super::publish_operation_records::{
+        AppendSegment, PublishTerminalError, PublishTerminalErrorKind,
+    };
+    use super::super::query_records::{QueryFieldId, QueryScalar};
+    use super::*;
+
+    const TEST_BATCH_ROWS: usize = 300;
+
+    fn shard() -> LogicalShardId {
+        LogicalShardId::from_bytes([1; FIXED_ID_BYTES])
+    }
+
+    fn root() -> RootId {
+        RootId::from_bytes([2; FIXED_ID_BYTES])
+    }
+
+    fn placement() -> PlacementGeneration {
+        PlacementGeneration::new(7).unwrap()
+    }
+
+    fn owner() -> OwnerEpoch {
+        OwnerEpoch::new(1).unwrap()
+    }
+
+    fn successor_owner() -> OwnerEpoch {
+        OwnerEpoch::new(2).unwrap()
+    }
+
+    fn request(value: u128) -> RequestId {
+        RequestId::from_bytes(value.to_be_bytes())
+    }
+
+    fn operation_id(value: u128) -> OperationId {
+        OperationId::from_bytes(value.to_be_bytes())
+    }
+
+    fn revision(value: u128) -> ArtifactRevisionId {
+        ArtifactRevisionId::from_bytes(value.to_be_bytes())
+    }
+
+    fn incarnation(value: u128) -> WorkspaceIncarnationId {
+        WorkspaceIncarnationId::from_bytes(value.to_be_bytes())
+    }
+
+    fn path(value: &str) -> NormalizedRelativePath {
+        NormalizedRelativePath::new(value).unwrap()
+    }
+
+    fn workbench() -> WorkbenchId {
+        WorkbenchId::new("publication-tests").unwrap()
+    }
+
+    fn next_request(counter: &mut u128) -> RequestId {
+        let value = *counter;
+        *counter += 1;
+        request(value)
+    }
+
+    fn fence_command(
+        store: &AgentMetadataStore,
+        request_id: RequestId,
+        action: RootFenceAction,
+    ) -> MetadataCommand {
+        MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: root(),
+            logical_shard_id: shard(),
+            placement_generation: placement(),
+            owner_epoch: owner(),
+            request_id,
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: store.current_read_version().unwrap(),
+            root_fence_action: action,
+            predicates: Vec::new(),
+            mutations: Vec::new(),
+            history_projection: Vec::new(),
+            event_projection: Vec::new(),
+            deterministic_result: Vec::new(),
+        }
+        .seal()
+    }
+
+    fn ready_store(counter: &mut u128) -> AgentMetadataStore {
+        prepare_store(AgentMetadataStore::open_memory(shard()).unwrap(), counter)
+    }
+
+    fn ready_file_store(path: &std::path::Path, counter: &mut u128) -> AgentMetadataStore {
+        prepare_store(
+            AgentMetadataStore::create_file(path, shard()).unwrap(),
+            counter,
+        )
+    }
+
+    fn prepare_store(store: AgentMetadataStore, counter: &mut u128) -> AgentMetadataStore {
+        store.advance_owner_epoch(None, owner()).unwrap();
+        store
+            .execute(&fence_command(
+                &store,
+                next_request(counter),
+                RootFenceAction::Install,
+            ))
+            .unwrap();
+        store
+            .execute(&fence_command(
+                &store,
+                next_request(counter),
+                RootFenceAction::Transition {
+                    expected: RootActivationState::Installing,
+                    next: RootActivationState::Active,
+                },
+            ))
+            .unwrap();
+        create_visible_workspace(
+            &store,
+            RootWriteContext::current(
+                &store,
+                root(),
+                shard(),
+                placement(),
+                owner(),
+                next_request(counter),
+            )
+            .unwrap(),
+            &workbench(),
+            incarnation(9),
+        )
+        .unwrap();
+        store
+    }
+
+    fn publication_context(store: &AgentMetadataStore, counter: &mut u128) -> PublicationContext {
+        publication_context_for_owner(store, counter, owner())
+    }
+
+    fn commit_context(store: &AgentMetadataStore, counter: &mut u128) -> RootWriteContext {
+        RootWriteContext::current(
+            store,
+            root(),
+            shard(),
+            placement(),
+            owner(),
+            next_request(counter),
+        )
+        .unwrap()
+    }
+
+    fn publication_context_for_owner(
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+    ) -> PublicationContext {
+        PublicationContext {
+            root_id: root(),
+            logical_shard_id: shard(),
+            placement_generation: placement(),
+            owner_epoch,
+            request_id: next_request(counter),
+            read_version: store.current_read_version().unwrap(),
+        }
+    }
+
+    fn publication_context_at(
+        owner_epoch: OwnerEpoch,
+        request_id: RequestId,
+        read_version: ReadVersion,
+    ) -> PublicationContext {
+        PublicationContext {
+            root_id: root(),
+            logical_shard_id: shard(),
+            placement_generation: placement(),
+            owner_epoch,
+            request_id,
+            read_version,
+        }
+    }
+
+    fn staged_rows(
+        artifact_revision_id: ArtifactRevisionId,
+        count: usize,
+    ) -> Vec<StagedObjectRecord> {
+        (0..count)
+            .map(|index| {
+                let sequence = u32::try_from(index).unwrap();
+                StagedObjectRecord {
+                    artifact_revision_id,
+                    object_sequence: sequence,
+                    object_key: object_block_key(
+                        shard(),
+                        root(),
+                        artifact_revision_id,
+                        u64::from(sequence),
+                    ),
+                    multipart_upload_id: None,
+                    expected_length: 1,
+                    expected_digest_uri: format!("sha256:{sequence:064x}"),
+                    provider_state: StagedProviderState::Planned,
+                    cleanup_state: StagedCleanupState::Owned,
+                }
+            })
+            .collect()
+    }
+
+    fn uploaded_rows(staged: &[StagedObjectRecord]) -> Vec<StagedObjectRecord> {
+        staged
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.provider_state = StagedProviderState::Uploaded;
+                row
+            })
+            .collect()
+    }
+
+    fn manifest_rows(staged: &[StagedObjectRecord]) -> Vec<ManifestRowInput> {
+        let mut logical_offset = 0_u64;
+        staged
+            .iter()
+            .map(|staged| {
+                let row = ManifestRowInput {
+                    object_index: u64::from(staged.object_sequence),
+                    row: ArtifactManifestRow {
+                        physical_owner_revision_id: staged.artifact_revision_id,
+                        physical_object_index: u64::from(staged.object_sequence),
+                        object_key: staged.object_key.clone(),
+                        logical_offset,
+                        offset: 0,
+                        length: staged.expected_length,
+                        digest_uri: staged.expected_digest_uri.clone(),
+                        append_segment: None,
+                    },
+                };
+                logical_offset = logical_offset
+                    .checked_add(staged.expected_length)
+                    .expect("test manifest logical length fits u64");
+                row
+            })
+            .collect()
+    }
+
+    fn publish_operation(
+        operation_id: OperationId,
+        artifact_revision_id: ArtifactRevisionId,
+        path: NormalizedRelativePath,
+        claim: PublishClaim,
+        staged: &[StagedObjectRecord],
+        manifest: &[ManifestRowInput],
+    ) -> PublishOperationRecord {
+        let dependencies = Vec::new();
+        let mut operation = PublishOperationRecord {
+            operation_id,
+            identity_digest: [0; SHA256_BYTES],
+            initialization_digest: [0; SHA256_BYTES],
+            initiating_owner_epoch: owner(),
+            activity_deadline_ms: 1_000_000,
+            authority: PublishAuthority::Visible,
+            workbench_id: workbench(),
+            workspace_incarnation_id: incarnation(9),
+            path,
+            artifact_revision_id,
+            claim,
+            phase: PublishPhase::Uploading,
+            staged_object_count: u32::try_from(staged.len()).unwrap(),
+            staged_object_seal: staged_object_ledger_digest(staged).unwrap(),
+            staged_object_cursor: 0,
+            staged_object_rolling_digest: [0; SHA256_BYTES],
+            uploaded_object_cursor: 0,
+            uploaded_object_rolling_digest: [0; SHA256_BYTES],
+            manifest_row_count: u32::try_from(manifest.len()).unwrap(),
+            manifest_seal: manifest_rows_digest(manifest).unwrap(),
+            manifest_cursor: 0,
+            manifest_rolling_digest: [0; SHA256_BYTES],
+            manifest_last_position: None,
+            dependency_count: 0,
+            dependency_depth: 0,
+            dependency_digest: dependency_owner_digest(&dependencies).unwrap(),
+            cleanup_staged_object_cursor: 0,
+            cleanup_manifest_cursor: 0,
+            publication_absence_proof: None,
+            result: None,
+            terminal_error: None,
+        };
+        seal_publish_operation(&mut operation);
+        operation
+    }
+
+    fn published_artifact(operation: &PublishOperationRecord) -> PublishedArtifact {
+        PublishedArtifact {
+            logical_size: u64::from(operation.manifest_row_count),
+            body_digest_uri: format!(
+                "sha256:body-{:032x}",
+                u128::from_be_bytes(*operation.artifact_revision_id.as_bytes())
+            ),
+            manifest_digest_uri: sha256_digest_uri(operation.manifest_seal),
+            content_type: "application/octet-stream".to_owned(),
+            producer: Some("publication-test".to_owned()),
+            manifest_id: Some("manifest-test".to_owned()),
+            typed_index_projection: TypedProjection::empty().encode().unwrap(),
+        }
+    }
+
+    fn begin_operation(
+        service: &PublicationService<'_>,
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        operation: PublishOperationRecord,
+    ) -> PublishOperationRecord {
+        service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(store, counter),
+                operation,
+            })
+            .unwrap()
+            .operation
+    }
+
+    fn stage_all(
+        service: &PublicationService<'_>,
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        mut operation: PublishOperationRecord,
+        staged: &[StagedObjectRecord],
+        manifest: &[ManifestRowInput],
+    ) -> PublishOperationRecord {
+        operation = stage_uploaded_objects(service, store, counter, operation, staged);
+        for batch in manifest.chunks(MAX_PUBLICATION_BATCH_ROWS) {
+            operation = service
+                .stage_manifest_batch(StageManifestBatchRequest {
+                    context: publication_context(store, counter),
+                    expected_operation: operation,
+                    manifest_rows: batch.to_vec(),
+                    dependency_owner_revision_ids: Vec::new(),
+                })
+                .unwrap()
+                .operation;
+        }
+        operation
+    }
+
+    fn stage_uploaded_objects(
+        service: &PublicationService<'_>,
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        mut operation: PublishOperationRecord,
+        staged: &[StagedObjectRecord],
+    ) -> PublishOperationRecord {
+        for batch in staged.chunks(MAX_PUBLICATION_BATCH_ROWS) {
+            operation = service
+                .stage_objects_batch(StageObjectsBatchRequest {
+                    context: publication_context(store, counter),
+                    expected_operation: operation,
+                    staged_objects: batch.to_vec(),
+                })
+                .unwrap()
+                .operation;
+        }
+        let uploaded = uploaded_rows(staged);
+        for (expected, next) in staged
+            .chunks(MAX_PUBLICATION_BATCH_ROWS)
+            .zip(uploaded.chunks(MAX_PUBLICATION_BATCH_ROWS))
+        {
+            let updates = expected
+                .iter()
+                .cloned()
+                .zip(next.iter().cloned())
+                .map(|(expected, next)| StagedObjectUpdate { expected, next })
+                .collect();
+            operation = service
+                .mark_objects_uploaded_batch(MarkObjectsUploadedBatchRequest {
+                    context: publication_context(store, counter),
+                    expected_operation: operation,
+                    staged_object_updates: updates,
+                })
+                .unwrap()
+                .operation;
+        }
+        operation
+    }
+
+    fn rejected_manifest_join(
+        staged: Vec<StagedObjectRecord>,
+        manifest: Vec<ManifestRowInput>,
+    ) -> PublicationError {
+        rejected_manifest_join_with_plan(staged, manifest.clone(), manifest)
+    }
+
+    fn rejected_manifest_join_with_plan(
+        staged: Vec<StagedObjectRecord>,
+        planned_manifest: Vec<ManifestRowInput>,
+        manifest: Vec<ManifestRowInput>,
+    ) -> PublicationError {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = staged
+            .first()
+            .expect("join rejection fixture has staged rows")
+            .artifact_revision_id;
+        let operation = publish_operation(
+            operation_id(700),
+            revision_id,
+            path("outputs/rejected-manifest.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &planned_manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let operation = stage_uploaded_objects(&service, &store, &mut counter, operation, &staged);
+        let before = store.current_read_version().unwrap();
+        let error = service
+            .stage_manifest_batch(StageManifestBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                manifest_rows: manifest,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap_err();
+        assert_eq!(store.current_read_version().unwrap(), before);
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), revision_id),
+            ),
+            0,
+        );
+        error
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_full(
+        service: &PublicationService<'_>,
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        operation_id: OperationId,
+        artifact_revision_id: ArtifactRevisionId,
+        path: NormalizedRelativePath,
+        claim: PublishClaim,
+        row_count: usize,
+    ) -> FinalizePublishOutcome {
+        publish_full_with_projection(
+            service,
+            store,
+            counter,
+            operation_id,
+            artifact_revision_id,
+            path,
+            claim,
+            row_count,
+            TypedProjection::empty(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_full_with_projection(
+        service: &PublicationService<'_>,
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        operation_id: OperationId,
+        artifact_revision_id: ArtifactRevisionId,
+        path: NormalizedRelativePath,
+        claim: PublishClaim,
+        row_count: usize,
+        projection: TypedProjection,
+    ) -> FinalizePublishOutcome {
+        let staged = staged_rows(artifact_revision_id, row_count);
+        let manifest = manifest_rows(&staged);
+        let operation = publish_operation(
+            operation_id,
+            artifact_revision_id,
+            path,
+            claim,
+            &staged,
+            &manifest,
+        );
+        let operation = begin_operation(service, store, counter, operation);
+        let operation = stage_all(service, store, counter, operation, &staged, &manifest);
+        let operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(store, counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let mut artifact = published_artifact(&operation);
+        artifact.typed_index_projection = projection.encode().unwrap();
+        service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(store, counter),
+                artifact,
+                expected_operation: operation,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap()
+    }
+
+    fn count_prefix(store: &AgentMetadataStore, family: MetadataFamily, prefix: &[u8]) -> usize {
+        let version = store.current_read_version().unwrap();
+        let mut start_after = None;
+        let mut count = 0;
+        loop {
+            let page = store
+                .scan_prefix_at(
+                    root(),
+                    placement(),
+                    owner(),
+                    family,
+                    prefix,
+                    version,
+                    start_after.as_deref(),
+                    MAX_COMMAND_ITEMS,
+                )
+                .unwrap();
+            if page.is_empty() {
+                return count;
+            }
+            count += page.len();
+            start_after = page.last().map(|row| row.key.clone());
+            if page.len() < MAX_COMMAND_ITEMS {
+                return count;
+            }
+        }
+    }
+
+    fn payload_at(
+        store: &AgentMetadataStore,
+        family: MetadataFamily,
+        key: &[u8],
+        read_version: ReadVersion,
+    ) -> Option<Vec<u8>> {
+        store
+            .read_at(root(), placement(), owner(), family, key, read_version)
+            .unwrap()
+    }
+
+    #[test]
+    fn begin_publish_resumes_exact_operation_identity_and_rejects_reuse() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(650);
+        let staged = staged_rows(revision_id, 2);
+        let manifest = manifest_rows(&staged);
+        let initial = publish_operation(
+            operation_id(650),
+            revision_id,
+            path("outputs/resume.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let begun = begin_operation(&service, &store, &mut counter, initial.clone());
+        let progressed = service
+            .stage_objects_batch(StageObjectsBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: begun,
+                staged_objects: staged[..1].to_vec(),
+            })
+            .unwrap()
+            .operation;
+
+        let resumed = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: initial.clone(),
+            })
+            .unwrap();
+        assert!(resumed.replayed);
+        assert_eq!(resumed.operation, progressed);
+
+        let mut mismatched = initial;
+        mismatched.artifact_revision_id = revision(651);
+        seal_publish_operation(&mut mismatched);
+        assert_eq!(
+            service.begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: mismatched,
+            }),
+            Err(PublicationError::OperationInputMismatch)
+        );
+    }
+
+    #[test]
+    fn staged_admission_rejects_noncanonical_object_coordinates_atomically() {
+        let revision_id = revision(705);
+        let canonical_staged = staged_rows(revision_id, 1);
+        let canonical_manifest = manifest_rows(&canonical_staged);
+        let malformed_keys = [
+            object_block_key(
+                LogicalShardId::from_bytes([0x55; FIXED_ID_BYTES]),
+                root(),
+                revision_id,
+                0,
+            ),
+            object_block_key(
+                shard(),
+                RootId::from_bytes([0x66; FIXED_ID_BYTES]),
+                revision_id,
+                0,
+            ),
+            object_block_key(shard(), root(), revision(706), 0),
+            object_block_key(shard(), root(), revision_id, 1),
+        ];
+
+        for (case, malformed_key) in malformed_keys.into_iter().enumerate() {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let operation = publish_operation(
+                operation_id(705 + u128::try_from(case).unwrap()),
+                revision_id,
+                path("outputs/noncanonical-staged.bin"),
+                PublishClaim::CreateOnly,
+                &canonical_staged,
+                &canonical_manifest,
+            );
+            let operation = begin_operation(&service, &store, &mut counter, operation);
+            let mut malformed_staged = canonical_staged.clone();
+            malformed_staged[0].object_key.clone_from(&malformed_key);
+            let mut agreeing_manifest = canonical_manifest.clone();
+            agreeing_manifest[0]
+                .row
+                .object_key
+                .clone_from(&malformed_key);
+            assert_eq!(
+                malformed_staged[0].object_key, agreeing_manifest[0].row.object_key,
+                "fixture {case} must model a staged/manifest pair that agrees on the bad key"
+            );
+
+            let before = store.current_read_version().unwrap();
+            assert_eq!(
+                service
+                    .stage_objects_batch(StageObjectsBatchRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: operation.clone(),
+                        staged_objects: malformed_staged,
+                    })
+                    .unwrap_err(),
+                PublicationError::StagedObjectKeyMismatch { sequence: 0 },
+                "malformed coordinate case {case}"
+            );
+            assert_eq!(store.current_read_version().unwrap(), before);
+            assert_eq!(
+                count_prefix(
+                    &store,
+                    MetadataFamily::StagedObject,
+                    &staged_object_prefix(root(), operation.operation_id),
+                ),
+                0
+            );
+            let persisted = payload_at(
+                &store,
+                MetadataFamily::Operation,
+                &operation_key(root(), OperationKind::Publish, operation.operation_id),
+                before,
+            )
+            .expect("publish operation remains durable");
+            assert_eq!(
+                PublishOperationRecord::decode(&persisted).unwrap(),
+                operation
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_batches_require_cursor_contiguous_object_indexes_atomically() {
+        let revision_id = revision(707);
+        let staged = staged_rows(revision_id, 3);
+        let manifest = manifest_rows(&staged);
+
+        {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let operation = publish_operation(
+                operation_id(707),
+                revision_id,
+                path("outputs/starting-gap.bin"),
+                PublishClaim::CreateOnly,
+                &staged,
+                &manifest,
+            );
+            let operation = begin_operation(&service, &store, &mut counter, operation);
+            let operation =
+                stage_uploaded_objects(&service, &store, &mut counter, operation, &staged);
+            let mut starting_gap = manifest.clone();
+            for input in &mut starting_gap {
+                input.object_index += 1;
+            }
+
+            let before = store.current_read_version().unwrap();
+            assert_eq!(
+                service
+                    .stage_manifest_batch(StageManifestBatchRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: operation.clone(),
+                        manifest_rows: starting_gap,
+                        dependency_owner_revision_ids: Vec::new(),
+                    })
+                    .unwrap_err(),
+                PublicationError::ManifestPositionMismatch
+            );
+            assert_eq!(store.current_read_version().unwrap(), before);
+            assert_eq!(
+                count_prefix(
+                    &store,
+                    MetadataFamily::ArtifactManifest,
+                    &artifact_manifest_prefix(root(), revision_id),
+                ),
+                0
+            );
+            let persisted = payload_at(
+                &store,
+                MetadataFamily::Operation,
+                &operation_key(root(), OperationKind::Publish, operation.operation_id),
+                before,
+            )
+            .expect("publish operation remains durable");
+            assert_eq!(
+                PublishOperationRecord::decode(&persisted).unwrap(),
+                operation
+            );
+        }
+
+        {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let operation = publish_operation(
+                operation_id(708),
+                revision_id,
+                path("outputs/middle-gap.bin"),
+                PublishClaim::CreateOnly,
+                &staged,
+                &manifest,
+            );
+            let operation = begin_operation(&service, &store, &mut counter, operation);
+            let operation =
+                stage_uploaded_objects(&service, &store, &mut counter, operation, &staged);
+            let operation = service
+                .stage_manifest_batch(StageManifestBatchRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: operation,
+                    manifest_rows: manifest[..1].to_vec(),
+                    dependency_owner_revision_ids: Vec::new(),
+                })
+                .unwrap()
+                .operation;
+            let mut middle_gap = manifest[1..].to_vec();
+            middle_gap[1].object_index += 1;
+
+            let before = store.current_read_version().unwrap();
+            assert_eq!(
+                service
+                    .stage_manifest_batch(StageManifestBatchRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: operation.clone(),
+                        manifest_rows: middle_gap,
+                        dependency_owner_revision_ids: Vec::new(),
+                    })
+                    .unwrap_err(),
+                PublicationError::ManifestPositionMismatch
+            );
+            assert_eq!(store.current_read_version().unwrap(), before);
+            assert_eq!(
+                count_prefix(
+                    &store,
+                    MetadataFamily::ArtifactManifest,
+                    &artifact_manifest_prefix(root(), revision_id),
+                ),
+                1
+            );
+            let persisted = payload_at(
+                &store,
+                MetadataFamily::Operation,
+                &operation_key(root(), OperationKind::Publish, operation.operation_id),
+                before,
+            )
+            .expect("publish operation remains durable");
+            assert_eq!(
+                PublishOperationRecord::decode(&persisted).unwrap(),
+                operation
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_join_rejects_unmatched_child_owned_rows_atomically() {
+        let revision_id = revision(710);
+
+        let staged = staged_rows(revision_id, 1);
+        let planned_manifest = manifest_rows(&staged);
+        for wrong_key in [
+            object_block_key(
+                LogicalShardId::from_bytes([0x55; FIXED_ID_BYTES]),
+                root(),
+                revision_id,
+                0,
+            ),
+            object_block_key(
+                shard(),
+                RootId::from_bytes([0x66; FIXED_ID_BYTES]),
+                revision_id,
+                0,
+            ),
+            object_block_key(shard(), root(), revision(711), 0),
+            object_block_key(shard(), root(), revision_id, 1),
+        ] {
+            let mut wrong_manifest = manifest_rows(&staged);
+            wrong_manifest[0].row.object_key = wrong_key;
+            assert_eq!(
+                rejected_manifest_join_with_plan(
+                    staged.clone(),
+                    planned_manifest.clone(),
+                    wrong_manifest,
+                ),
+                PublicationError::ManifestOwnershipMismatch {
+                    object_index: 0,
+                    reason: "object key does not match the canonical physical owner coordinates",
+                }
+            );
+        }
+
+        let mut wrong_digest = manifest_rows(&staged);
+        wrong_digest[0].row.digest_uri = format!("sha256:{:064x}", 99);
+        assert_eq!(
+            rejected_manifest_join(staged.clone(), wrong_digest),
+            PublicationError::ManifestOwnershipMismatch {
+                object_index: 0,
+                reason: "staged object digest differs from the child-owned row",
+            }
+        );
+
+        let mut wrong_length = manifest_rows(&staged);
+        wrong_length[0].row.length = 2;
+        assert_eq!(
+            rejected_manifest_join(staged.clone(), wrong_length),
+            PublicationError::ManifestOwnershipMismatch {
+                object_index: 0,
+                reason: "staged object length differs from the child-owned row",
+            }
+        );
+
+        let mut packed_range = manifest_rows(&staged);
+        packed_range[0].row.offset = 1;
+        assert_eq!(
+            rejected_manifest_join(staged.clone(), packed_range),
+            PublicationError::ManifestOwnershipMismatch {
+                object_index: 0,
+                reason: "packed object ranges are unsupported",
+            }
+        );
+
+        let staged = staged_rows(revision_id, 2);
+        let mut duplicate_physical_index = manifest_rows(&staged);
+        duplicate_physical_index[1].row.physical_object_index = 0;
+        duplicate_physical_index[1].row.object_key = staged[0].object_key.clone();
+        assert_eq!(
+            rejected_manifest_join(staged.clone(), duplicate_physical_index),
+            PublicationError::ManifestOwnershipMismatch {
+                object_index: 1,
+                reason: "child-owned physical object indexes must be contiguous from zero",
+            }
+        );
+
+        let incomplete_manifest = manifest_rows(&staged[..1]);
+        assert_eq!(
+            rejected_manifest_join(staged, incomplete_manifest),
+            PublicationError::ManifestOwnershipMismatch {
+                object_index: 0,
+                reason: "child-owned row count differs from staged-object count",
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_join_requires_each_durable_staged_row_to_remain_uploaded_and_owned() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(711);
+        let staged = staged_rows(revision_id, 1);
+        let manifest = manifest_rows(&staged);
+        let operation = publish_operation(
+            operation_id(711),
+            revision_id,
+            path("outputs/staged-state-mismatch.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let operation = stage_uploaded_objects(&service, &store, &mut counter, operation, &staged);
+        let staged_key = staged_object_key(root(), operation.operation_id, 0);
+        let mut persisted = uploaded_rows(&staged)[0].clone();
+
+        for next in [
+            StagedObjectRecord {
+                provider_state: StagedProviderState::Uploading,
+                ..persisted.clone()
+            },
+            StagedObjectRecord {
+                provider_state: StagedProviderState::Uploaded,
+                cleanup_state: StagedCleanupState::DeletePending,
+                ..persisted.clone()
+            },
+        ] {
+            store
+                .execute(
+                    &MetadataCommand {
+                        schema_id: SCHEMA_ID.to_owned(),
+                        root_id: root(),
+                        logical_shard_id: shard(),
+                        placement_generation: placement(),
+                        owner_epoch: owner(),
+                        request_id: next_request(&mut counter),
+                        command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                        read_version: store.current_read_version().unwrap(),
+                        root_fence_action: RootFenceAction::RequireActive,
+                        predicates: vec![CommandPredicate::Value {
+                            family: MetadataFamily::StagedObject,
+                            key: staged_key.clone(),
+                            expected: Some(persisted.encode().unwrap()),
+                        }],
+                        mutations: vec![CommandMutation::Put {
+                            family: MetadataFamily::StagedObject,
+                            key: staged_key.clone(),
+                            value: next.encode().unwrap(),
+                        }],
+                        history_projection: vec![HistoryProjection {
+                            family: MetadataFamily::StagedObject,
+                            key: staged_key.clone(),
+                        }],
+                        event_projection: Vec::new(),
+                        deterministic_result: Vec::new(),
+                    }
+                    .seal(),
+                )
+                .unwrap();
+            persisted = next;
+
+            let before = store.current_read_version().unwrap();
+            assert_eq!(
+                service
+                    .stage_manifest_batch(StageManifestBatchRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: operation.clone(),
+                        manifest_rows: manifest.clone(),
+                        dependency_owner_revision_ids: Vec::new(),
+                    })
+                    .unwrap_err(),
+                PublicationError::ManifestOwnershipMismatch {
+                    object_index: 0,
+                    reason: "staged object is not durably uploaded and owned",
+                }
+            );
+            assert_eq!(store.current_read_version().unwrap(), before);
+            assert_eq!(
+                count_prefix(
+                    &store,
+                    MetadataFamily::ArtifactManifest,
+                    &artifact_manifest_prefix(root(), revision_id),
+                ),
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn append_manifest_join_accepts_borrowed_prefix_and_child_owned_tail_across_batches() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let base_revision_id = revision(720);
+        let child_revision_id = revision(721);
+        let staged = staged_rows(child_revision_id, 2);
+        let mut manifest = (0_u64..2)
+            .map(|index| ManifestRowInput {
+                object_index: index,
+                row: ArtifactManifestRow {
+                    physical_owner_revision_id: base_revision_id,
+                    physical_object_index: index,
+                    object_key: object_block_key(shard(), root(), base_revision_id, index),
+                    logical_offset: index,
+                    offset: 0,
+                    length: 1,
+                    digest_uri: format!("sha256:{:064x}", index + 100),
+                    append_segment: None,
+                },
+            })
+            .collect::<Vec<_>>();
+        manifest.extend(manifest_rows(&staged).into_iter().enumerate().map(
+            |(index, mut input)| {
+                input.object_index += 2;
+                input.row.logical_offset += 2;
+                input.row.append_segment = Some(AppendSegment {
+                    segment_sequence: 0,
+                    segment_offset: u64::try_from(index).unwrap(),
+                });
+                input
+            },
+        ));
+        let dependencies = vec![base_revision_id];
+        let mut operation = publish_operation(
+            operation_id(721),
+            child_revision_id,
+            path("outputs/cross-batch-append.bin"),
+            PublishClaim::Append {
+                expected_generation: Generation::new(1).unwrap(),
+                base_revision_id,
+                append_offset: 2,
+            },
+            &staged,
+            &manifest,
+        );
+        operation.dependency_count = 1;
+        operation.dependency_depth = 1;
+        operation.dependency_digest = dependency_owner_digest(&dependencies).unwrap();
+        seal_publish_operation(&mut operation);
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let operation = stage_uploaded_objects(&service, &store, &mut counter, operation, &staged);
+        let operation = service
+            .stage_manifest_batch(StageManifestBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                manifest_rows: manifest[..2].to_vec(),
+                dependency_owner_revision_ids: dependencies.clone(),
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(operation.manifest_cursor, 2);
+        let operation = service
+            .stage_manifest_batch(StageManifestBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                manifest_rows: manifest[2..].to_vec(),
+                dependency_owner_revision_ids: dependencies,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(operation.manifest_cursor, 4);
+        assert_eq!(operation.manifest_rolling_digest, operation.manifest_seal);
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), child_revision_id),
+            ),
+            4,
+        );
+    }
+
+    #[test]
+    fn commit_staging_keeps_manifest_hidden_until_path_and_head_switch_atomically() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let publication = PublicationService::new(&store);
+        let commits = CommitService::new(&store);
+        let commit_operation_id = operation_id(700);
+        let publish_operation_id = operation_id(701);
+        let manifest_revision_id = revision(700);
+        let commit_id = CommitId::from_bytes([7; SHA256_BYTES]);
+        let run_manifest_path = path(RUN_MANIFEST_PATH);
+
+        let begun = commits
+            .begin_build(BeginBuildCommitRequest {
+                context: commit_context(&store, &mut counter),
+                operation_id: commit_operation_id,
+                workbench_id: workbench(),
+                expected_source_workspace_incarnation_id: incarnation(9),
+                commit_id,
+                content_digest_uri: format!("sha256:{:064x}", 1),
+                manifest_digest_uri: format!("sha256:{:064x}", 2),
+                projection_input_digest: [0x18; SHA256_BYTES],
+                tree_manifest_revision_id: manifest_revision_id,
+                replace: false,
+                run_manifest_condition: CommitManifestCondition::CreateOnly,
+                committed_at_unix_seconds: 1_700_000_000,
+                expected_head_generation: None,
+                producer: None,
+                lineage_projection: Vec::new(),
+                parent_commits: Vec::new(),
+            })
+            .unwrap();
+        assert!(begun.operation.commit_staged_run_manifest.is_none());
+
+        let staged = staged_rows(manifest_revision_id, 1);
+        let manifest = manifest_rows(&staged);
+        let mut operation = publish_operation(
+            publish_operation_id,
+            manifest_revision_id,
+            run_manifest_path.clone(),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        operation.authority = PublishAuthority::CommitStaging {
+            commit_operation_id,
+        };
+        seal_publish_operation(&mut operation);
+        let operation = begin_operation(&publication, &store, &mut counter, operation);
+        let operation = stage_all(
+            &publication,
+            &store,
+            &mut counter,
+            operation,
+            &staged,
+            &manifest,
+        );
+        let operation = publication
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let staged_manifest = PublishedArtifact {
+            logical_size: staged[0].expected_length,
+            body_digest_uri: staged[0].expected_digest_uri.clone(),
+            manifest_digest_uri: sha256_digest_uri(operation.manifest_seal),
+            content_type: "application/json".to_owned(),
+            producer: None,
+            manifest_id: None,
+            typed_index_projection: TypedProjection::empty().encode().unwrap(),
+        };
+        let staged_outcome = publication
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                artifact: staged_manifest,
+                expected_operation: operation,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(staged_outcome.operation.phase, PublishPhase::Published);
+
+        let staged_version = store.current_read_version().unwrap();
+        assert!(get_visible_path_at(
+            &store,
+            RootReadContext::current(&store, root(), placement(), owner()).unwrap(),
+            &workbench(),
+            &run_manifest_path,
+        )
+        .unwrap()
+        .is_none());
+        let head_key = workbench_commit_head_key(root(), incarnation(9));
+        assert!(payload_at(
+            &store,
+            MetadataFamily::WorkbenchCommitHead,
+            &head_key,
+            staged_version,
+        )
+        .is_none());
+        let staged_revision = ArtifactRevisionRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), manifest_revision_id),
+                staged_version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staged_revision.strong_reference_count, 1);
+        let build = BuildCommitOperationRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::Operation,
+                &operation_key(root(), OperationKind::BuildCommit, commit_operation_id),
+                staged_version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(build.commit_staged_run_manifest.is_some());
+        assert_eq!(build.revision_ref_count, 1);
+
+        loop {
+            let outcome = commits
+                .build_members(BuildCommitStepRequest {
+                    context: commit_context(&store, &mut counter),
+                    operation_id: commit_operation_id,
+                    limit: 7,
+                })
+                .unwrap();
+            if outcome.operation.members_complete {
+                break;
+            }
+        }
+        loop {
+            let outcome = commits
+                .seal_revisions(BuildCommitStepRequest {
+                    context: commit_context(&store, &mut counter),
+                    operation_id: commit_operation_id,
+                    limit: 7,
+                })
+                .unwrap();
+            if outcome.operation.revisions_complete {
+                break;
+            }
+        }
+        commits
+            .attach_parents(BuildCommitStepRequest {
+                context: commit_context(&store, &mut counter),
+                operation_id: commit_operation_id,
+                limit: 7,
+            })
+            .unwrap();
+        commits
+            .begin_sealing(commit_context(&store, &mut counter), commit_operation_id)
+            .unwrap();
+
+        let before_switch = store.current_read_version().unwrap();
+        let path_key = path_current_key(root(), incarnation(9), &run_manifest_path);
+        let commit_key = commit_key(root(), commit_id);
+        assert!(payload_at(
+            &store,
+            MetadataFamily::PathCurrent,
+            &path_key,
+            before_switch,
+        )
+        .is_none());
+        assert!(payload_at(
+            &store,
+            MetadataFamily::WorkbenchCommitHead,
+            &head_key,
+            before_switch,
+        )
+        .is_none());
+        assert!(payload_at(&store, MetadataFamily::Commit, &commit_key, before_switch,).is_none());
+
+        let completed = commits
+            .finalize_build(commit_context(&store, &mut counter), commit_operation_id)
+            .unwrap();
+        assert_eq!(completed.operation.phase, BuildCommitPhase::Complete);
+        let switch_version = store.current_read_version().unwrap();
+        assert_eq!(switch_version.get(), completed.commit_version.get());
+        assert!(payload_at(
+            &store,
+            MetadataFamily::PathCurrent,
+            &path_key,
+            before_switch,
+        )
+        .is_none());
+        assert!(payload_at(
+            &store,
+            MetadataFamily::WorkbenchCommitHead,
+            &head_key,
+            before_switch,
+        )
+        .is_none());
+
+        let visible = PathEntry::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::PathCurrent,
+                &path_key,
+                switch_version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(visible.generation, Generation::new(1).unwrap());
+        assert_eq!(visible.artifact_revision_id, manifest_revision_id);
+        let head = WorkbenchCommitHeadRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::WorkbenchCommitHead,
+                &head_key,
+                switch_version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.commit_id, commit_id);
+        assert_eq!(head.head_generation, Generation::new(1).unwrap());
+        let sealed = CommitRecord::decode(
+            &payload_at(&store, MetadataFamily::Commit, &commit_key, switch_version).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sealed.tree_manifest_revision_id, manifest_revision_id);
+        assert_eq!(sealed.member_count, 1);
+        assert_eq!(sealed.unique_revision_count, 1);
+        let visible_revision = ArtifactRevisionRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), manifest_revision_id),
+                switch_version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(visible_revision.strong_reference_count, 2);
+    }
+
+    #[test]
+    fn large_publication_batches_resume_and_create_atomically() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(100);
+        let staged = staged_rows(revision_id, TEST_BATCH_ROWS);
+        let manifest = manifest_rows(&staged);
+        let initial = publish_operation(
+            operation_id(100),
+            revision_id,
+            path("outputs/large.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let mut operation = begin_operation(&service, &store, &mut counter, initial);
+
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::StagedObject,
+                &staged_object_prefix(root(), operation.operation_id),
+            ),
+            0
+        );
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), revision_id),
+            ),
+            0
+        );
+
+        let replay_context = publication_context(&store, &mut counter);
+        let replay_request = StageObjectsBatchRequest {
+            context: replay_context,
+            expected_operation: operation.clone(),
+            staged_objects: staged[..MAX_PUBLICATION_BATCH_ROWS].to_vec(),
+        };
+        let first = service.stage_objects_batch(replay_request.clone()).unwrap();
+        let replay = service.stage_objects_batch(replay_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, first.commit_version);
+        assert_eq!(replay.operation, first.operation);
+        operation = first.operation;
+
+        operation = service
+            .stage_objects_batch(StageObjectsBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                staged_objects: staged[MAX_PUBLICATION_BATCH_ROWS..].to_vec(),
+            })
+            .unwrap()
+            .operation;
+        assert!(matches!(
+            service.transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation.clone(),
+                transition: PublishTransition::BeginFinalization,
+            }),
+            Err(PublicationError::OperationCodec(
+                PublishRecordError::InvalidPhasePayload { .. }
+            ))
+        ));
+
+        let uploaded = uploaded_rows(&staged);
+        for (expected, next) in staged
+            .chunks(MAX_PUBLICATION_BATCH_ROWS)
+            .zip(uploaded.chunks(MAX_PUBLICATION_BATCH_ROWS))
+        {
+            operation = service
+                .mark_objects_uploaded_batch(MarkObjectsUploadedBatchRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: operation,
+                    staged_object_updates: expected
+                        .iter()
+                        .cloned()
+                        .zip(next.iter().cloned())
+                        .map(|(expected, next)| StagedObjectUpdate { expected, next })
+                        .collect(),
+                })
+                .unwrap()
+                .operation;
+        }
+
+        operation = service
+            .stage_manifest_batch(StageManifestBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                manifest_rows: manifest[..MAX_PUBLICATION_BATCH_ROWS].to_vec(),
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap()
+            .operation;
+        assert!(matches!(
+            service.transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation.clone(),
+                transition: PublishTransition::BeginFinalization,
+            }),
+            Err(PublicationError::OperationCodec(
+                PublishRecordError::InvalidPhasePayload { .. }
+            ))
+        ));
+        operation = service
+            .stage_manifest_batch(StageManifestBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                manifest_rows: manifest[MAX_PUBLICATION_BATCH_ROWS..].to_vec(),
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap()
+            .operation;
+        assert!(operation.has_complete_publication_closure());
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::StagedObject,
+                &staged_object_prefix(root(), operation.operation_id),
+            ),
+            TEST_BATCH_ROWS
+        );
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), revision_id),
+            ),
+            TEST_BATCH_ROWS
+        );
+
+        operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let finalized = service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                artifact: published_artifact(&operation),
+                expected_operation: operation,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(finalized.operation.phase, PublishPhase::Published);
+        assert_eq!(
+            finalized.result.path_generation,
+            Generation::new(1).unwrap()
+        );
+        let visible = get_visible_path_at(
+            &store,
+            RootReadContext::current(&store, root(), placement(), owner()).unwrap(),
+            &workbench(),
+            &path("outputs/large.bin"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(visible.artifact_revision_id, revision_id);
+        assert_eq!(visible.logical_size, TEST_BATCH_ROWS as u64);
+    }
+
+    #[test]
+    fn replace_creates_zero_reference_gc_candidate() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let artifact_path = path("outputs/replace.bin");
+        let old_revision = revision(200);
+        publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(200),
+            old_revision,
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+        );
+        let new_revision = revision(201);
+        let replaced = publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(201),
+            new_revision,
+            artifact_path.clone(),
+            PublishClaim::ReplaceOnly {
+                expected_generation: Generation::new(1).unwrap(),
+            },
+            1,
+        );
+        let version = store.current_read_version().unwrap();
+        let old = store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), old_revision),
+                version,
+            )
+            .unwrap()
+            .map(|payload| ArtifactRevisionRecord::decode(&payload).unwrap())
+            .unwrap();
+        assert_eq!(old.strong_reference_count, 0);
+        assert_eq!(old.reference_epoch, ReferenceEpoch::new(2));
+        assert_eq!(old.last_zero_ref_version, Some(replaced.commit_version));
+        let candidate = store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::GcCandidate,
+                &gc_candidate_key(root(), old_revision, ReferenceEpoch::new(2)),
+                version,
+            )
+            .unwrap()
+            .map(|payload| GcCandidateRecord::decode(&payload).unwrap())
+            .unwrap();
+        assert_eq!(candidate.last_zero_ref_version, replaced.commit_version);
+        assert_eq!(candidate.claim_state, GcClaimState::Candidate);
+        let visible = get_visible_path_at(
+            &store,
+            RootReadContext::current(&store, root(), placement(), owner()).unwrap(),
+            &workbench(),
+            &artifact_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(visible.generation, Generation::new(2).unwrap());
+        assert_eq!(visible.artifact_revision_id, new_revision);
+    }
+
+    #[test]
+    fn dependency_free_append_rematerialization_releases_old_head_for_gc() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let artifact_path = path("outputs/rematerialized-append.bin");
+        let base_revision = revision(205);
+        publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(205),
+            base_revision,
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+        );
+
+        let squashed_revision = revision(206);
+        let appended = publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(206),
+            squashed_revision,
+            artifact_path.clone(),
+            PublishClaim::Append {
+                expected_generation: Generation::new(1).unwrap(),
+                base_revision_id: base_revision,
+                append_offset: 1,
+            },
+            2,
+        );
+        let version = store.current_read_version().unwrap();
+        let base = ArtifactRevisionRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), base_revision),
+                version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(base.strong_reference_count, 0);
+        assert_eq!(base.reference_epoch, ReferenceEpoch::new(2));
+        assert_eq!(base.last_zero_ref_version, Some(appended.commit_version));
+        let candidate = GcCandidateRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::GcCandidate,
+                &gc_candidate_key(root(), base_revision, ReferenceEpoch::new(2)),
+                version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(candidate.claim_state, GcClaimState::Candidate);
+
+        let squashed = ArtifactRevisionRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), squashed_revision),
+                version,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(squashed.dependency_count, 0);
+        assert_eq!(squashed.dependency_depth, 0);
+        assert_eq!(
+            squashed.dependency_digest,
+            dependency_owner_digest(&[]).unwrap()
+        );
+        for object_index in 0..2 {
+            let row = ArtifactManifestRow::decode(
+                &payload_at(
+                    &store,
+                    MetadataFamily::ArtifactManifest,
+                    &artifact_manifest_key(root(), squashed_revision, object_index),
+                    version,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(row.physical_owner_revision_id, squashed_revision);
+            assert_eq!(row.physical_object_index, object_index);
+            assert!(row.append_segment.is_none());
+        }
+        let visible = get_visible_path_at(
+            &store,
+            RootReadContext::current(&store, root(), placement(), owner()).unwrap(),
+            &workbench(),
+            &artifact_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(visible.generation, Generation::new(2).unwrap());
+        assert_eq!(visible.artifact_revision_id, squashed_revision);
+    }
+
+    #[test]
+    fn secondary_indexes_switch_atomically_and_survive_reopen() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("metadata");
+        let mut counter = 1;
+        let store = ready_file_store(&database_path, &mut counter);
+        let service = PublicationService::new(&store);
+        let artifact_path = path("outputs/indexed.bin");
+        let stage_field = QueryFieldId::new("run.stage").unwrap();
+        let owner_field = QueryFieldId::new("run.owner").unwrap();
+        let old_projection = TypedProjection::new(BTreeMap::from([
+            (stage_field.clone(), QueryScalar::Unsigned(1)),
+            (owner_field.clone(), QueryScalar::String("alpha".to_owned())),
+        ]))
+        .unwrap();
+        let created = publish_full_with_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(220),
+            revision(220),
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+            old_projection.clone(),
+        );
+        let old_stage_key = secondary_index_key(
+            root(),
+            &stage_field,
+            &QueryScalar::Unsigned(1),
+            incarnation(9),
+            &artifact_path,
+        );
+        let old_owner_key = secondary_index_key(
+            root(),
+            &owner_field,
+            &QueryScalar::String("alpha".to_owned()),
+            incarnation(9),
+            &artifact_path,
+        );
+        let old_read = ReadVersion::new(created.commit_version.get()).unwrap();
+        assert!(store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::SecondaryIndex,
+                &old_stage_key,
+                old_read,
+            )
+            .unwrap()
+            .is_some());
+
+        let new_projection = TypedProjection::new(BTreeMap::from([(
+            stage_field.clone(),
+            QueryScalar::Unsigned(2),
+        )]))
+        .unwrap();
+        let replaced = publish_full_with_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(221),
+            revision(221),
+            artifact_path.clone(),
+            PublishClaim::ReplaceOnly {
+                expected_generation: Generation::new(1).unwrap(),
+            },
+            1,
+            new_projection.clone(),
+        );
+        let new_stage_key = secondary_index_key(
+            root(),
+            &stage_field,
+            &QueryScalar::Unsigned(2),
+            incarnation(9),
+            &artifact_path,
+        );
+        let current_read = ReadVersion::new(replaced.commit_version.get()).unwrap();
+        assert!(store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::SecondaryIndex,
+                &old_stage_key,
+                current_read,
+            )
+            .unwrap()
+            .is_none());
+        assert!(store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::SecondaryIndex,
+                &old_owner_key,
+                current_read,
+            )
+            .unwrap()
+            .is_none());
+        let current_payload = store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::SecondaryIndex,
+                &new_stage_key,
+                current_read,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SecondaryIndexRecord::decode(&current_payload).unwrap(),
+            SecondaryIndexRecord {
+                path_generation: Generation::new(2).unwrap(),
+                compact_projection: new_projection,
+            }
+        );
+        assert!(store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::SecondaryIndex,
+                &old_stage_key,
+                old_read,
+            )
+            .unwrap()
+            .is_some());
+        drop(store);
+
+        let reopened = AgentMetadataStore::reopen_file(&database_path, shard()).unwrap();
+        assert_eq!(
+            reopened
+                .read_at(
+                    root(),
+                    placement(),
+                    owner(),
+                    MetadataFamily::SecondaryIndex,
+                    &new_stage_key,
+                    current_read,
+                )
+                .unwrap(),
+            Some(current_payload)
+        );
+    }
+
+    #[test]
+    fn append_base_mismatch_fails_without_changing_the_path() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let artifact_path = path("outputs/append.bin");
+        let base_revision = revision(300);
+        publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(300),
+            base_revision,
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+        );
+        let staged = Vec::new();
+        let manifest = Vec::new();
+        let operation = publish_operation(
+            operation_id(301),
+            revision(301),
+            artifact_path.clone(),
+            PublishClaim::Append {
+                expected_generation: Generation::new(1).unwrap(),
+                base_revision_id: revision(999),
+                append_offset: 1,
+            },
+            &staged,
+            &manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(
+            service.finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                artifact: published_artifact(&operation),
+                expected_operation: operation,
+                dependency_owner_revision_ids: Vec::new(),
+            }),
+            Err(PublicationError::AppendBaseRevisionMismatch)
+        );
+        let visible = get_visible_path_at(
+            &store,
+            RootReadContext::current(&store, root(), placement(), owner()).unwrap(),
+            &workbench(),
+            &artifact_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(visible.generation, Generation::new(1).unwrap());
+        assert_eq!(visible.artifact_revision_id, base_revision);
+    }
+
+    #[test]
+    fn newer_owner_takeover_and_finalize_have_one_durable_winner() {
+        let staged = Vec::new();
+        let manifest = Vec::new();
+
+        {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let operation = publish_operation(
+                operation_id(400),
+                revision(400),
+                path("outputs/race.bin"),
+                PublishClaim::CreateOnly,
+                &staged,
+                &manifest,
+            );
+            let operation = begin_operation(&service, &store, &mut counter, operation);
+            let operation = service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: operation,
+                    transition: PublishTransition::BeginFinalization,
+                })
+                .unwrap()
+                .operation;
+            let finalized = service
+                .finalize_publish(FinalizePublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    artifact: published_artifact(&operation),
+                    expected_operation: operation.clone(),
+                    dependency_owner_revision_ids: Vec::new(),
+                })
+                .unwrap();
+            assert_eq!(finalized.operation.phase, PublishPhase::Published);
+
+            store
+                .advance_owner_epoch(Some(owner()), successor_owner())
+                .unwrap();
+            let takeover = service.take_over_orphaned_publish(TakeOverOrphanedPublishRequest {
+                context: publication_context_for_owner(&store, &mut counter, successor_owner()),
+                expected_operation: operation,
+                observed_now_ms: 0,
+                maximum_clock_skew_ms: 30_000,
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::AbortedByCaller,
+                    message: "prior owner was fenced".to_owned(),
+                    evidence_digest: None,
+                },
+            });
+            assert!(matches!(
+                takeover,
+                Err(PublicationError::Metadata(
+                    AgentMetadataError::PredicateFailed
+                ))
+            ));
+            assert!(get_visible_path_at(
+                &store,
+                RootReadContext::current(&store, root(), placement(), successor_owner()).unwrap(),
+                &workbench(),
+                &path("outputs/race.bin"),
+            )
+            .unwrap()
+            .is_some());
+        }
+
+        {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let operation = publish_operation(
+                operation_id(401),
+                revision(401),
+                path("outputs/race-abort.bin"),
+                PublishClaim::CreateOnly,
+                &staged,
+                &manifest,
+            );
+            let operation = begin_operation(&service, &store, &mut counter, operation);
+            let operation = service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: operation,
+                    transition: PublishTransition::BeginFinalization,
+                })
+                .unwrap()
+                .operation;
+            let same_owner = service.take_over_orphaned_publish(TakeOverOrphanedPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation.clone(),
+                observed_now_ms: 999_999,
+                maximum_clock_skew_ms: 30_000,
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::AbortedByCaller,
+                    message: "not durably expired".to_owned(),
+                    evidence_digest: None,
+                },
+            });
+            assert_eq!(
+                same_owner,
+                Err(PublicationError::ActivityLeaseNotExpired {
+                    deadline_ms: 1_000_000,
+                    lease_clock_ms: 999_999,
+                    maximum_clock_skew_ms: 30_000,
+                })
+            );
+
+            store
+                .advance_owner_epoch(Some(owner()), successor_owner())
+                .unwrap();
+            let shared_version = store.current_read_version().unwrap();
+            let takeover_context = publication_context_at(
+                successor_owner(),
+                next_request(&mut counter),
+                shared_version,
+            );
+            let finalize_context = publication_context_at(
+                successor_owner(),
+                next_request(&mut counter),
+                shared_version,
+            );
+            let abort_winner = service
+                .take_over_orphaned_publish(TakeOverOrphanedPublishRequest {
+                    context: takeover_context,
+                    expected_operation: operation.clone(),
+                    observed_now_ms: 0,
+                    maximum_clock_skew_ms: 30_000,
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::AbortedByCaller,
+                        message: "prior owner was fenced".to_owned(),
+                        evidence_digest: None,
+                    },
+                })
+                .unwrap();
+            assert_eq!(abort_winner.operation.phase, PublishPhase::Aborting);
+            assert!(abort_winner.operation.publication_absence_proof.is_some());
+            let finalize_loser = service.finalize_publish(FinalizePublishRequest {
+                context: finalize_context,
+                artifact: published_artifact(&operation),
+                expected_operation: operation,
+                dependency_owner_revision_ids: Vec::new(),
+            });
+            assert!(matches!(
+                finalize_loser,
+                Err(PublicationError::Metadata(
+                    AgentMetadataError::WriteReadVersionMismatch { .. }
+                ))
+            ));
+            assert_eq!(
+                get_visible_path_at(
+                    &store,
+                    RootReadContext::current(&store, root(), placement(), successor_owner(),)
+                        .unwrap(),
+                    &workbench(),
+                    &path("outputs/race-abort.bin"),
+                )
+                .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn begin_publish_binds_operation_to_admitting_owner_epoch() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let mut operation = publish_operation(
+            operation_id(402),
+            revision(402),
+            path("outputs/wrong-owner.bin"),
+            PublishClaim::CreateOnly,
+            &[],
+            &[],
+        );
+        operation.initiating_owner_epoch = successor_owner();
+        seal_publish_operation(&mut operation);
+
+        assert_eq!(
+            service.begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation,
+            }),
+            Err(PublicationError::InitiatingOwnerEpochMismatch {
+                expected: owner(),
+                actual: successor_owner(),
+            })
+        );
+    }
+
+    #[test]
+    fn activity_heartbeat_is_initiator_only_extend_only_and_fences_expiry() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let operation = begin_operation(
+            &service,
+            &store,
+            &mut counter,
+            publish_operation(
+                operation_id(403),
+                revision(403),
+                path("outputs/leased-upload.bin"),
+                PublishClaim::CreateOnly,
+                &[],
+                &[],
+            ),
+        );
+
+        let heartbeated = service
+            .heartbeat_publish(HeartbeatPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                activity_deadline_ms: 2_000_000,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(heartbeated.activity_deadline_ms, 2_000_000);
+        assert_eq!(heartbeated.phase, PublishPhase::Uploading);
+
+        assert_eq!(
+            service.heartbeat_publish(HeartbeatPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: heartbeated.clone(),
+                activity_deadline_ms: 2_000_000,
+            }),
+            Err(PublicationError::ActivityDeadlineNotExtended {
+                current: 2_000_000,
+                requested: 2_000_000,
+            })
+        );
+        assert_eq!(
+            service.heartbeat_publish(HeartbeatPublishRequest {
+                context: publication_context_for_owner(&store, &mut counter, successor_owner(),),
+                expected_operation: heartbeated.clone(),
+                activity_deadline_ms: 3_000_000,
+            }),
+            Err(PublicationError::HeartbeatOwnerMismatch {
+                initiating: owner(),
+                current: successor_owner(),
+            })
+        );
+
+        assert_eq!(
+            service.take_over_orphaned_publish(TakeOverOrphanedPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: heartbeated.clone(),
+                observed_now_ms: 2_029_999,
+                maximum_clock_skew_ms: 30_000,
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::ActivityLeaseExpired,
+                    message: "durable activity lease expired".to_owned(),
+                    evidence_digest: None,
+                },
+            }),
+            Err(PublicationError::ActivityLeaseNotExpired {
+                deadline_ms: 2_000_000,
+                lease_clock_ms: 2_029_999,
+                maximum_clock_skew_ms: 30_000,
+            })
+        );
+        let taken_over = service
+            .take_over_orphaned_publish(TakeOverOrphanedPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: heartbeated,
+                observed_now_ms: 2_030_000,
+                maximum_clock_skew_ms: 30_000,
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::ActivityLeaseExpired,
+                    message: "durable activity lease expired".to_owned(),
+                    evidence_digest: None,
+                },
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(taken_over.phase, PublishPhase::Aborting);
+        assert_eq!(
+            taken_over.terminal_error.unwrap().kind,
+            PublishTerminalErrorKind::ActivityLeaseExpired
+        );
+    }
+
+    #[test]
+    fn aborted_cleanup_removes_staged_and_manifest_rows_in_order() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(500);
+        let staged = staged_rows(revision_id, 3);
+        let uploaded = uploaded_rows(&staged);
+        let manifest = manifest_rows(&staged);
+        let operation = publish_operation(
+            operation_id(500),
+            revision_id,
+            path("outputs/cleanup.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let operation = stage_all(
+            &service,
+            &store,
+            &mut counter,
+            operation,
+            &staged,
+            &manifest,
+        );
+        let operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginAbort {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::AbortedByCaller,
+                        message: "caller cancelled".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            })
+            .unwrap()
+            .operation;
+        let mut operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginCleaning,
+            })
+            .unwrap()
+            .operation;
+        let cleanup_updates = uploaded
+            .iter()
+            .cloned()
+            .map(|expected| {
+                let mut next = expected.clone();
+                next.provider_state = StagedProviderState::Aborted;
+                next.cleanup_state = StagedCleanupState::Deleted;
+                StagedObjectUpdate { expected, next }
+            })
+            .collect();
+        operation = service
+            .cleanup_publish_batch(CleanupPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                staged_object_updates: cleanup_updates,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(operation.cleanup_staged_object_cursor, 3);
+        assert_eq!(operation.cleanup_manifest_cursor, 0);
+        operation = service
+            .cleanup_publish_batch(CleanupPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                staged_object_updates: Vec::new(),
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(operation.cleanup_manifest_cursor, 3);
+        operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::FinishCleanup,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(operation.phase, PublishPhase::Cleaned);
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::StagedObject,
+                &staged_object_prefix(root(), operation.operation_id),
+            ),
+            0
+        );
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), revision_id),
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn append_segment_rows_remain_strictly_ordered_across_batches() {
+        let revision_id = revision(600);
+        let staged = staged_rows(revision_id, 2);
+        let mut rows = manifest_rows(&staged);
+        rows[0].row.append_segment = Some(AppendSegment {
+            segment_sequence: 0,
+            segment_offset: 0,
+        });
+        rows[1].row.append_segment = Some(AppendSegment {
+            segment_sequence: 1,
+            segment_offset: 1,
+        });
+        assert_ne!(manifest_rows_digest(&rows).unwrap(), [0; SHA256_BYTES]);
+        rows.swap(0, 1);
+        assert_eq!(
+            manifest_rows_digest(&rows),
+            Err(PublicationError::ManifestOrder)
+        );
+    }
+}

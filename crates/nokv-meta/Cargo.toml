@@ -1,7 +1,7 @@
 [package]
 name = "nokv-meta"
 version = "0.1.0"
-description = "Holt-backed inode/dentry metadata service core for NoKV."
+description = "Holt-backed metadata service core for NoKV."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,10 +11,7 @@ homepage.workspace = true
 
 [dependencies]
 holt.workspace = true
-nokv-object.workspace = true
 nokv-types.workspace = true
-serde_json.workspace = true
-serde_yaml.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
