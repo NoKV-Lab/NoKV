@@ -3,8 +3,8 @@ title: NoKV
 layout: home
 hero:
   name: NoKV
-  text: A Rust filesystem for AI training and agent workspaces.
-  tagline: Holt-backed metadata, S3-compatible immutable object bodies, FUSE and SDK paths — a self-contained filesystem with no separate database to run.
+  text: Agent-native distributed workspace and artifact storage.
+  tagline: A stable Workbench, SDK, CLI, and MCP surface over path-primary Holt metadata and immutable object-backed revisions.
   image:
     src: /img/logo.png
     alt: NoKV
@@ -13,23 +13,23 @@ hero:
       text: Architecture
       link: /architecture
     - theme: alt
-      text: Quick Start
-      link: /rustfs
+      text: Workbench Contract
+      link: /workbench-contract
     - theme: alt
-      text: LingTai Workbench
-      link: /lingtai-workbench-preflight
+      text: Metadata Schema
+      link: /metadata-schema
     - theme: alt
-      text: Benchmarks
-      link: /benchmarks
+      text: Acceptance Plan
+      link: /development/workspace-acceptance
 features:
-  - title: Self-contained metadata
-    details: A path-native metadata engine (Holt) built in. No Redis, TiKV, or external database to operate — you run a filesystem, not a filesystem plus a database.
-  - title: Atomic checkpoints
-    details: Object bytes land first, then metadata publishes atomically as a new generation. Readers see a complete checkpoint or the previous one — never a half-written one.
-  - title: Built for AI training
-    details: ~127K metadata ops/s, single-scan directory listing, immutable cacheable blocks, dataset snapshots, and typed watch events — shaped around datasets, checkpoints, and agent workspaces.
-  - title: Object-backed bodies
-    details: File bytes are immutable blocks in S3, RustFS, MinIO, or Ceph RGW. Elastic, cheap, zero-ops byte durability — NoKV owns the namespace.
+  - title: Stable Agent surface
+    details: Preserve the complete 18-tool LingTai Workbench contract and expose the same semantics through SDK, custom CLI, and MCP adapters.
+  - title: Path-primary Holt metadata
+    details: One normalized full path is namespace truth. Exact artifacts use point reads; child listing uses component-safe delimiter scans.
+  - title: Immutable revisions
+    details: Stream bytes to S3-compatible storage first, then atomically publish a revision, path, indexes, event, and deterministic replay result.
+  - title: Root-local distribution
+    details: Persist each Agent root on one logical shard, fence physical owners by epoch, and keep commit, restore, and GC reference ownership local.
 ---
 
 <!--
@@ -39,101 +39,91 @@ SPDX-License-Identifier: Apache-2.0
 
 <div class="nokv-section">
   <div class="nokv-section-head nokv-section-head--center">
-    <p class="nokv-eyebrow">How it works</p>
-    <h2 class="nokv-h2">A filesystem — not a filesystem plus a database</h2>
-    <p class="nokv-lead">NoKV owns namespace truth, metadata transactions, snapshots, watches, and object-reference GC. The object store owns byte durability. The metadata engine is built in — no separate Redis, MySQL, or TiKV cluster to run.</p>
+    <p class="nokv-eyebrow">Product boundary</p>
+    <h2 class="nokv-h2">Artifact semantics for Agents, without POSIX baggage</h2>
+    <p class="nokv-lead">NoKV gives datasets, scripts, logs, outputs, reports,
+    checkpoints, and provenance stable path-shaped identities. It intentionally
+    does not target FUSE, complete POSIX, CSI, or transparent fsspec access.</p>
   </div>
   <div class="nokv-grid-3">
     <div class="nokv-card">
       <div class="nokv-card-kicker">Application surface</div>
-      <h3>FUSE · SDK · CLI</h3>
-      <p>Mount it, call the Rust SDK, or drive it from <code>nokv</code>. One namespace, three front doors.</p>
+      <h3>Workbench · SDK · CLI · MCP</h3>
+      <p>Agents keep familiar list/read/search/commit/snapshot/restore behavior
+      while storage internals change underneath.</p>
     </div>
     <div class="nokv-card">
       <div class="nokv-card-kicker">Metadata layer</div>
-      <h3>Holt engine</h3>
-      <p>Path-native inode &amp; dentry metadata in a built-in ART engine — <code>MetadataCommand</code> transactions, snapshots, and typed watches.</p>
+      <h3>Canonical paths in Holt</h3>
+      <p>Workspace incarnations gate visibility. Full relative paths are
+      authoritative ordered keys; indexes remain derived.</p>
     </div>
     <div class="nokv-card">
-      <div class="nokv-card-kicker">Body storage</div>
-      <h3>S3-compatible objects</h3>
-      <p>File bytes are immutable blocks in RustFS, MinIO, Ceph RGW, or AWS S3 — elastic, cheap, zero-ops durability.</p>
+      <div class="nokv-card-kicker">Body layer</div>
+      <h3>Revision-owned objects</h3>
+      <p>Immutable blocks live in S3-compatible storage. Strong references,
+      epochs, and fenced GC make sharing and restore safe.</p>
     </div>
   </div>
-  <div class="nokv-callout"><strong>Atomic checkpoint publish.</strong> Object bytes upload first, then one metadata commit publishes the dentry, inode, and body manifest as a new generation. A crash in between leaves orphan objects for GC — never a corrupt namespace.</div>
 </div>
 
 <div class="nokv-section nokv-section--tight">
   <div class="nokv-section-head nokv-section-head--center">
-    <p class="nokv-eyebrow">Benchmarks</p>
-    <h2 class="nokv-h2">Single-node, measured end to end</h2>
-    <p class="nokv-lead">Release build, full server + RPC + Holt path, local RustFS backend. Distributed numbers need separate runs.</p>
+    <p class="nokv-eyebrow">Core flow</p>
+    <h2 class="nokv-h2">Upload bytes first; publish identity last</h2>
   </div>
-  <div class="nokv-stats">
-    <div class="nokv-stat"><span class="nokv-stat-num">~127K</span><span class="nokv-stat-label">metadata ops/s — create, batched</span></div>
-    <div class="nokv-stat"><span class="nokv-stat-num">~1.1 GB/s</span><span class="nokv-stat-label">checkpoint publish — 1 MiB blocks, conc 16</span></div>
-    <div class="nokv-stat"><span class="nokv-stat-num">~3,000</span><span class="nokv-stat-label">dataset samples/s — 16 KiB, conc 16</span></div>
-    <div class="nokv-stat"><span class="nokv-stat-num">~1.5 KB</span><span class="nokv-stat-label">resident metadata per file</span></div>
-  </div>
-  <p class="nokv-fine" style="text-align: center; margin-top: 20px;">A single directory of 65k entries holds the same throughput — the path-native ART doesn't degrade on big directories.</p>
+  <pre class="nokv-code"><code>Agent SDK
+  -&gt; route RootId to one logical shard
+  -&gt; allocate publish operation + immutable revision
+  -&gt; stream and verify object blocks
+  -&gt; one fenced Holt command publishes:
+       path + revision + references + indexes + event + replay result</code></pre>
+  <div class="nokv-callout"><strong>Recovery is explicit.</strong>
+  Leased snapshots pin MVCC history. Durable commits retain exact revisions.
+  Restore stages a new Workbench incarnation and reveals it only after a
+  verified member seal.</div>
 </div>
+
+## Documentation Map
+
+- Product and interface: [Product Design](./product-design.md),
+  [Architecture](./architecture.md), and
+  [Workbench Contract](./workbench-contract.md).
+- Storage and distribution: [Metadata Schema](./metadata-schema.md),
+  [Object Layout](./object-layout.md), and
+  [RustFS Provider Profile](./rustfs.md).
+- Workloads and evidence: [AI Training Workload](./ai-training.md),
+  [Benchmarks](./benchmarks.md),
+  [LingTai Workbench Preflight](./lingtai-workbench-preflight.md), and
+  [Workspace Acceptance](./development/workspace-acceptance.md).
+- Development: [Code Contract](./development/code_contract.md),
+  [`nokv-agent` Handbook](./development/nokv-agent.md),
+  [PR Review Checklist](./development/pr_review_checklist.md), and
+  [Path-Native Metadata Comparison](./development/path-native-metadata-comparison.md).
+- Collaboration record: [NoKV x LingTai](./announcements/nokv-lingtai-design-partner.md)
+  and [Chinese version](./announcements/nokv-lingtai-design-partner.zh-CN.md).
 
 <div class="nokv-section nokv-section--tight">
   <div class="nokv-section-head nokv-section-head--center">
-    <p class="nokv-eyebrow">Comparison</p>
-    <h2 class="nokv-h2">Same skeleton as JuiceFS — different metadata</h2>
-    <p class="nokv-lead">Object-backed, metadata/data split, FUSE and SDK paths. The difference is the metadata layer and the semantics.</p>
-  </div>
-  <table class="nokv-table">
-    <thead><tr><th>&nbsp;</th><th>JuiceFS</th><th>NoKV</th></tr></thead>
-    <tbody>
-      <tr><td>Metadata engine</td><td>rents a general DB (Redis / MySQL / TiKV)</td><td><strong>built-in, path-native</strong> (Holt)</td></tr>
-      <tr><td>Checkpoint publish</td><td>general POSIX</td><td><strong>first-class atomic primitive</strong></td></tr>
-      <tr><td>Block model</td><td>slice + compaction</td><td>immutable + new-generation</td></tr>
-      <tr><td>AI-native primitives</td><td>bolted on</td><td>snapshots, typed watch, GC floor</td></tr>
-      <tr><td>POSIX completeness</td><td>full</td><td>partial (single-node)</td></tr>
-      <tr><td>Maturity</td><td>production, billions of files</td><td>young — single-node, no HA yet</td></tr>
-    </tbody>
-  </table>
-</div>
-
-<div class="nokv-section nokv-section--tight">
-  <div class="nokv-section-head nokv-section-head--center">
-    <p class="nokv-eyebrow">Quick start</p>
-    <h2 class="nokv-h2">Running in a handful of commands</h2>
-  </div>
-  <pre class="nokv-code"><code><span class="c"># Build the CLI</span>
-cargo build --release -p nokv --bin nokv
-<span class="c"># A local S3 endpoint (RustFS) — bucket `nokv`, dev creds rustfsadmin</span>
-rustfs server --address 127.0.0.1:9000 \
-  --access-key rustfsadmin --secret-key rustfsadmin ./rustfs-data &amp;
-<span class="c"># Initialize, publish an artifact, read it back</span>
-nokv --object-backend rustfs init
-nokv --object-backend rustfs put-artifact /runs/1/ckpt.bin ./ckpt.bin
-nokv --object-backend rustfs cat /runs/1/ckpt.bin &gt; restored.bin
-<span class="c"># Mount with FUSE (macOS needs macFUSE)</span>
-nokv --object-backend rustfs mount /tmp/nokv-mount</code></pre>
-</div>
-
-<div class="recognition">
-  <p class="recognition-label">Recognized in the AI-native storage ecosystem</p>
-  <div class="recognition-logos">
-    <a href="https://landscape.cncf.io/?group=projects-and-products&amp;item=runtime--cloud-native-storage--nokv" target="_blank" rel="noreferrer">
-      <img src="/img/recognition/cncf.svg" alt="CNCF Landscape" />
-    </a>
-    <a href="https://dbdb.io/db/nokv" target="_blank" rel="noreferrer">
-      <img src="/img/recognition/dbdb.svg" alt="DBDB.io Database of Databases" />
-    </a>
+    <p class="nokv-eyebrow">First client</p>
+    <h2 class="nokv-h2">Reproducible reconstruction runs</h2>
+    <p class="nokv-lead">Seal one immutable input dataset, materialize verified
+    files for the local scientific executable, collect declared outputs, and
+    compare multiple runs through shared lineage and metadata queries.</p>
   </div>
 </div>
 
 <div class="nokv-section nokv-section--tight nokv-cta">
   <div class="nokv-section-head nokv-section-head--center">
-    <h2 class="nokv-h2">Build on a self-contained filesystem</h2>
-    <p class="nokv-lead">Apache-2.0. A usable single-node object-backed filesystem today — a distributed metadata layer with Holt as the shard-local state machine next.</p>
+    <h2 class="nokv-h2">Read the contracts before the code</h2>
+    <p class="nokv-lead">The Workbench contract fixes the upper behavior. The
+    metadata schema fixes storage safety, and the acceptance plan defines the
+    evidence required for release.</p>
   </div>
   <div class="nokv-actions">
-    <a class="nokv-btn nokv-btn--primary" href="/architecture">Read the architecture <span class="arrow">→</span></a>
-    <a class="nokv-btn nokv-btn--ghost" href="https://github.com/feichai0017/NoKV">View on GitHub</a>
+    <a class="nokv-btn nokv-btn--primary" href="/workbench-contract">Workbench contract <span class="arrow">→</span></a>
+    <a class="nokv-btn nokv-btn--ghost" href="/metadata-schema">Metadata schema</a>
+    <a class="nokv-btn nokv-btn--ghost" href="/development/workspace-acceptance">Acceptance plan</a>
+    <a class="nokv-btn nokv-btn--ghost" href="/development/path-native-metadata-comparison">Path model comparison</a>
   </div>
 </div>

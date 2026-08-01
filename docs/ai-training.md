@@ -5,93 +5,115 @@ SPDX-License-Identifier: Apache-2.0
 
 # AI Training
 
-NoKV targets training clusters where file bodies live in object storage and
-metadata needs to be fast, typed, and easy to mount.
+Status: optional Agent SDK workload profile, not a separate product
+architecture or namespace.
 
-## Target Workloads
+NoKV serves training data, checkpoints, experiment outputs, and provenance
+through the Agent SDK and explicit local adapters. Canonical identity remains a
+root, Workbench, and normalized path; a materialized local path is disposable.
 
-- immutable training datasets;
-- manifest-heavy dataset directories;
-- checkpoint publish and resume;
-- experiment artifacts;
-- agent workspace inputs and outputs.
+## Workloads
+
+- immutable dataset shards and manifests;
+- repeatable script and configuration inputs;
+- ranged and batched sample reads;
+- checkpoint publication and resume;
+- logs, metrics, reports, and model artifacts;
+- comparison and lineage across runs.
 
 ## Access Paths
 
-FUSE is the mounted-file frontend for tools that expect paths. The Rust SDK and
-Python/fsspec binding are the lower-overhead paths for native jobs.
-
 ```text
-PyTorch / training process
-  -> FUSE, Rust SDK, or Python/fsspec
-  -> nokv-meta
-  -> Holt metadata
-  -> S3-compatible object store
+training process
+  -> Rust or Python SDK
+  -> root router and fenced shard owner
+  -> full-path Holt metadata
+  -> immutable S3-compatible object blocks
 ```
 
-The current FUSE frontend maps inode operations to metadata lookups plus object
-range reads, and uses buffered write-on-close publishing for writes. Read-only
-snapshot mounts expose pinned input subtrees without allowing mutation.
-
-FUSE should not be the only high-performance path. Training frameworks that can
-use a native client should bypass kernel/FUSE overhead and call the Rust or
-Python API directly:
+Native jobs use point reads and ranged object reads. Programs that require
+local files use:
 
 ```text
-mounted-file path:
-  existing tool -> FUSE -> metadata/object service
-
-performance path:
-  dataloader/checkpoint writer -> SDK/fsspec -> metadata/object service
+materialize verified inputs
+  -> execute inside a disposable sandbox
+  -> collect declared outputs
+  -> publish immutable revisions
+  -> commit run metadata and lineage
 ```
 
-The Python binding exposes the Rust SDK's batch range primitive instead of
-rebuilding range planning above POSIX. A dataloader can submit many shard sample
-ranges in one call, and the client batch-opens read plans before object reads.
-For callers that own a reusable CPU staging buffer, `read_ranges_batch_into`
-fills a caller bytearray and returns per-shard `(offset, len)` windows. For
-callers that want NoKV-owned staging memory, `ReadBuffer` and
-`read_ranges_batch_buffer` reuse a Rust-owned buffer and run the SDK read while
-the Python GIL is released. `RangeBatchPlan` lets a Python dataloader prepare
-the native range-batch layout once: normalized requests, packed output windows,
-coalesced read windows, and the ordered metadata batch-open request. Repeated
-reads reuse that static layout for `ReadBuffer` fills, but still batch-open
-metadata read plans on every read, so path visibility and generation fences are
-unchanged. The prepared executor borrows the static plan during each read; it
-does not rebuild or clone the path, range-offset, or coalesced-window layout in
-the hot loop. `RangeBatchReader` packages that plan with a reusable
-NoKV-owned staging buffer so a dataloader can prepare the batch once and call
-`read()` for each training step. `RangeBatchEpochReader` groups multiple
-prepared readers into a resettable round-robin epoch iterator, matching a
-long-lived DataLoader worker that cycles through preplanned shard batches
-without rebuilding Python request objects. Workers can step one batch at a time
-with `read_next()` or fill every prepared batch with one GIL-released
-`read_all()` call; `read_all()` runs prepared batch readers through persistent
-bounded native workers so shard batches can overlap metadata batch-open and
-object reads without opening all object-store responses at once or respawning
-threads for every epoch.
-Exact single-range windows already write through the object executor into the
-staging buffer; multi-range coalesced windows use guarded scatter direct-write
-only when that does not expand the physical block plan.
-Gap-coalesced cold reads stay coalesced; warm gap windows scatter directly from
-the local block cache only when every semantic range is already cached. This
-should still be described as staged direct-write rather than
-zero-copy: `ReadBuffer` now sits behind an explicit staging-memory boundary and
-supports `memory_kind="system"` plus Unix `memory_kind="page_locked"`.
-`page_locked` uses host `mlock` to keep CPU staging pages resident; it is not
-CUDA `cudaHostAlloc`, RDMA memory registration, or HBM-backed storage. It
-exposes a read-only `ReadBufferView` export token that pins the logical buffer
-contents against resize/refill while the view is alive. The current Python
-package keeps `abi3-py39`, so this is not a PEP 3118 memoryview; a true
-memoryview should be added behind a Python 3.11+ or non-abi3 build once that
-compatibility tradeoff is acceptable.
+The adapter never turns the sandbox into namespace truth. Changes become
+visible only after explicit collection and metadata publication.
 
-## Cache Direction
+## Dataset Publication
 
-Training jobs should cache attributes, dentries, negative lookups, and object
-range reads locally. Cache invalidation should come from typed watch events
-rather than raw key notifications.
+A dataset publisher:
 
-The target cluster deployment should run a node-local cache agent on GPU or
-training nodes. It can prefetch dataset shards, keep hot object ranges on local
-NVMe, and subscribe to metadata watch events for invalidation.
+1. creates or selects a Workbench;
+2. uploads immutable blocks for each artifact revision;
+3. verifies size and digest evidence;
+4. atomically publishes paths, references, indexes, and events;
+5. seals an immutable commit and optional durable tag.
+
+Training jobs consume the commit or tag rather than a mutable collection of
+object keys. This preserves exact revision membership and allows multiple runs
+to share object bodies safely.
+
+## Batched Read Qualification Target
+
+A qualified batched reader should:
+
+1. resolve all requested paths at one declared live or snapshot context;
+2. obtain immutable revision and range plans;
+3. coalesce compatible physical reads without changing semantic ranges;
+4. check the local soft cache;
+5. read and verify the remaining object blocks;
+6. return results in request order with per-item errors.
+
+Prepared range layouts may be reused across steps, but metadata visibility and
+generation checks still run for each live read. Snapshot reads retain their
+fixed read version. The current source tree does not qualify metadata batch-open
+or cross-artifact read coalescing performance; those require an executable
+product path and workload-matched evidence.
+
+## Checkpoints
+
+Checkpoint writers publish immutable model, optimizer, scheduler, and run-state
+artifacts under normalized paths, then seal a commit only after every required
+artifact is visible and verified.
+
+Resume uses:
+
+- a leased snapshot for short operational recovery;
+- an immutable commit or durable tag for long-lived reuse.
+
+The run manifest records model/framework versions, source dataset commit,
+training configuration, producer identity, and content digests. It does not
+embed physical owner addresses or provider credentials.
+
+## Cache
+
+A node-local cache is soft state keyed by immutable revision and block
+identity. It may prefetch dataset shards or checkpoint ranges, but loss of the
+cache cannot affect correctness or reachability.
+
+Any future metadata cache must be bounded by read version, generation, and
+typed change events. A Workbench marker is the only safely cacheable part of
+the exact namespace lookup; canonical path entries remain authoritative at the
+selected read context.
+
+## Qualification
+
+Training claims include:
+
+- dataset and sample-size distributions;
+- range shape and batch size;
+- cold/warm cache state;
+- metadata and object latency separately;
+- throughput and p50/p95/p99/maximum latency;
+- retries, conflicts, integrity failures, and per-item errors;
+- worker count, host memory, local cache device, network, and object provider;
+- exact NoKV commit and durability profile.
+
+See [Benchmarks](./benchmarks.md) and
+[Workspace Acceptance](./development/workspace-acceptance.md).

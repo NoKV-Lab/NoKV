@@ -5,71 +5,130 @@ SPDX-License-Identifier: Apache-2.0
 
 # NoKV Code Contract
 
-This repository is the Rust NoKV product line: an AI-training and
-agent-workspace filesystem with Holt-backed metadata and S3-compatible object
-storage.
+NoKV is an Agent-native distributed workspace and artifact store. Its supported
+product surfaces are SDKs, a custom CLI, MCP/Agent adapters, and the stable
+[Workbench contract](../workbench-contract.md). Holt is the ordered metadata
+engine; S3-compatible storage owns durable artifact bytes.
 
-NoKV accepts breaking internal changes when they reduce ambiguity or remove old
-migration paths. Do not add forwarding wrappers, aliases, or dual execution
-paths unless the PR states the operational need and removal condition.
+The lower-layer architecture is the
+[workspace metadata schema](../metadata-schema.md). It is the only supported
+namespace, metadata, routing, and object-lifetime contract. Code, tests, and
+documentation must describe that architecture directly.
+
+NoKV accepts breaking internal changes when they remove ambiguity or reduce
+long-term maintenance. Delete superseded interfaces and schemas instead of
+adding forwarding wrappers, aliases, fallback layouts, or parallel execution
+paths.
 
 ## Package Boundaries
 
+These are the package boundaries:
+
 | Package | Owns | Must Not Do |
 | --- | --- | --- |
-| `crates/nokv-types/` | Storage-neutral namespace model: mount ids, inode ids, dentry names, inode attrs, body descriptors, record families, and typed watch events. | Import metadata layout, Holt, Raft, object-store clients, FUSE, protobuf, or service packages. |
-| `crates/nokv-protocol/` | Storage-neutral metadata RPC DTOs shared by server and service clients. | Execute metadata commands, own path resolution, import Holt, object-store clients, FUSE, metadata layout, or server/client implementations. |
-| `crates/nokv-meta/` | Metadata schema, Holt-friendly layout, `MetadataCommand`, Holt-backed metastore, in-process metadata service, snapshot retention pins, object-reference GC queue policy, history pruning, and service-level GC workers. | Own provider-specific object behavior, FUSE/kernel cache policy, Python bindings, CSI behavior, or wire-protocol migration behavior. |
-| `crates/nokv-control/` | Shard map, owner leases, shard epochs, routing metadata, checkpoint/log pointers, and failover coordination. | Own inode/dentry semantics, chunk manifests, object GC policy, Holt internals, data-plane cache placement, FUSE behavior, or provider-specific object-store behavior. |
-| `crates/nokv-object/` | Object-store boundary, S3-compatible backend, batch object reads, local hot-tier object store, tiered data-fabric helpers, soft placement resolution, and in-memory test object store for file bodies. | Own namespace metadata, import Holt/FUSE/protobuf, implement metadata transactions, or expose filesystem-directory object storage as a product backend. |
-| `crates/nokv-client/` | Path-oriented Rust SDK over the metadata service and object backend. | Own metadata layout, bypass `nokv-meta`, expose object-store internals, implement FUSE/kernel cache semantics, depend on `nokv-fuse`, or define metadata wire formats. |
-| `crates/nokv-fuse/` | FUSE low-level frontend, inode mapping, kernel-facing attr conversion, range reads, and close-to-open buffered writes through the metadata client/server boundary. | Resolve paths through the path SDK hot path, own metadata layout, import Holt directly, open a production metadata store, or implement object-provider-specific behavior. |
-| `crates/nokv-python/` | Python SDK and fsspec binding for training workflows over `nokv-client`. | Own metadata layout, bypass `nokv-client`, implement object-provider-specific behavior, import FUSE, or reimplement Rust SDK range planning in Python. |
-| `crates/nokv-server/` | Long-running metadata service process, startup config, background GC ownership, health/status/control HTTP, framed metadata RPC, and future network service boundary. | Own metadata semantics, durable layout, object provider internals, FUSE/kernel cache policy, or hidden migration behavior. |
-| `crates/nokv/` | `nokv` CLI binary, command parsing, local service startup, and CLI wiring across client, FUSE, metadata, and object config. | Own metadata semantics, durable layout, object backend internals, or FUSE filesystem implementation. |
-| `bench/` | System workload harnesses for metadata smoke, MLPerf Storage/DLIO-style generated training reads, checkpoint publish/read, and demo dataset shapes. | Own product APIs, metadata layout, object backend implementation, FUSE/kernel cache policy, or hidden benchmark-only behavior in product crates. |
+| `crates/nokv-types/` | Storage-neutral Agent root/workbench ids, normalized paths, generations, artifact revisions, commits, snapshots, holds, operations, errors, and typed events. | Import metadata layout, Holt, Raft, object clients, FUSE, protobuf, server, or provider packages. |
+| `crates/nokv-protocol/` | Versioned, storage-neutral metadata and lifecycle RPC DTOs shared by clients and servers. | Execute commands, normalize paths independently, own metadata layout, or import Holt, object providers, FUSE, or server/client implementations. |
+| `crates/nokv-meta/` | `nokv_workspace` schema and codec, `MetadataCommand`, Holt binding, workspace visibility, history, indexes, commits, snapshots, holds, operations, change events, GC policy, and recovery/fsck semantics. | Own provider-specific object I/O, client routing, Workbench result shaping, Python bindings, FUSE, or wire fallback schemas. |
+| `crates/nokv-control/` | Persisted root placement, shard map, owner leases and epochs, checkpoint/log pointers, movement, and failover coordination. | Own path/artifact semantics, Holt records, object GC policy, query behavior, data-cache placement, or filename-based shard routing. |
+| `crates/nokv-object/` | Immutable object upload/read, multipart and range planning, S3-compatible providers, local hot-tier soft cache, integrity verification, and in-memory test backend. | Own namespace metadata, revision reachability, metadata transactions, root placement, Holt, protobuf, FUSE, or Workbench semantics. |
+| `crates/nokv-client/` | Rust Agent SDK, routing, conditional path operations, lifecycle APIs, retries, and the direct immutable-object data path. | Depend on `nokv-meta` or `nokv-server`, know Holt keys, expose provider internals, implement FUSE semantics, or define wire DTOs. |
+| `crates/nokv-agent/` | Transport-free Workbench/Agent tool schemas, the 18-tool facade, stable result shaping, and adapters over SDK traits. | Import Holt/layout, object providers, server implementations, FUSE, or duplicate SDK state machines. |
+| `crates/nokv-python/` | Direct Python SDK plus explicit materialize/collect adapters for local executables. | Own metadata layout, bypass `nokv-client`, reimplement range/retry planning, promise fsspec/POSIX semantics, or import FUSE. |
+| `crates/nokv-server/` | Shard-owner process, versioned RPC, startup/schema gates, health, backup/log sync, and background lifecycle workers. | Own domain semantics outside `nokv-meta`, leak provider internals into RPC, or silently migrate/fallback between schemas. |
+| `crates/nokv/` | Thin `nokv` CLI and MCP wiring over client and Agent interfaces. | Own metadata semantics, durable layout, object-provider behavior, or embed a second implementation of the SDK. |
+| `bench/` | Contract, recovery, and performance workloads with explicit environment and workload profiles. | Own product APIs, add benchmark-only product behavior, or compare results from materially different profiles as equivalent. |
 
-Planned package owners:
+FUSE, POSIX emulation, CSI, and generic fsspec integration are outside the NoKV
+product architecture. They must not appear in package APIs, production routes,
+tests presented as product acceptance, or Workbench behavior.
 
-| Package | Owns |
-| --- | --- |
-| `crates/nokv-csi/` | Kubernetes CSI integration and mount lifecycle. |
+## Architecture Discipline
+
+Every production path uses the workspace schema. Startup rejects an unmarked,
+unknown, or mixed store. There is one writable schema, one authoritative path
+model, and one routing model. A change must not introduce an inode/dentry
+namespace, filesystem semantics, an alternative durable layout, or a second
+implementation of publication, retention, recovery, or routing.
+
+The 18 Workbench tools, their normalized input schemas, and the observable
+semantics in the Workbench contract are stable. Adapter result shaping cannot
+become canonical metadata or introduce fields outside that contract.
+
+The Agent adapter owns canonical Workbench projections. It must recompute any
+projection commitment from typed facade inputs for every fresh request and
+recovery attempt; a caller cannot provide that commitment. Protocol and server
+code treat the commitment as opaque and exact-bind it to the durable operation,
+but cannot claim to validate facade-only inputs that the wire request does not
+carry. Direct construction of a raw protocol commit request is an internal
+trusted boundary, not a second public Agent contract.
 
 ## File Layout
 
-Use responsibility-based file names. Avoid `utils.rs`, `helpers.rs`,
-`common.rs`, and `misc.rs` unless the package is tiny and the file has one
-clear responsibility.
-
-Recommended package layout:
+Use responsibility-based names. Avoid `utils.rs`, `helpers.rs`, `common.rs`,
+and `misc.rs` unless a tiny package has one genuinely shared responsibility.
 
 | File | Contents |
 | --- | --- |
 | `lib.rs` | Package contract and public exports. |
-| `types.rs` | Core domain types and interfaces. |
+| `types.rs` | Package-owned domain types and interfaces. |
 | `options.rs` | Construction options and validation. |
 | `errors.rs` | Package error enum and conversions. |
-| `codec.rs` | Durable encoding and decoding. |
+| `codec.rs` | Durable encoding/decoding owned by the storage package. |
 | `store.rs` | Authoritative store object. |
 | `service.rs` | Service boundary. |
 | `tests.rs` / `*_test.rs` | Focused behavior tests. |
 
-## Rules
+Errors, validation, metrics, stats, recovery, and encoding live with the domain
+that owns them. Do not move domain-specific or single-use logic into a generic
+`utils` module.
 
-- Keep filesystem semantics above storage engine bindings.
-- Keep object bytes out of metadata values except compact descriptors.
-- Keep local hot-tier placement and cache slots out of metadata values; they
-  are data-path soft state keyed by immutable blocks.
-- Use inode/dentry as canonical truth; path indexes are derived acceleration.
-- Use `MetadataCommand` predicates as the atomicity fence.
-- Do not leak Holt internals into types, object, client, or FUSE.
-- Do not introduce provider-specific RustFS metadata semantics; RustFS uses the
-  S3-compatible object backend.
+## Storage Rules
+
+- `PathCurrent(root_id, workspace_incarnation_id,
+  normalized_relative_path)` is workspace namespace truth. Workbench names resolve
+  through `WorkspaceCurrent`; directories are implicit prefixes.
+- All path identities use the one storage-neutral normalizer and
+  component-safe key codec.
+- `WorkspaceCurrent` is the visibility marker; staging must be absent from
+  every query surface until marker publication.
+- Keep object bytes out of Holt except compact immutable descriptors.
+- Publish objects first and metadata last. Metadata failure leaves no
+  user-visible path.
+- Every published body has a never-reused immutable
+  `ArtifactRevisionId`; physical object keys are revision-owned and
+  shard-local.
+- Every path/commit reference is a strong `RevisionRef`; add/remove updates the
+  revision count and epoch in the same command, and GC claims
+  `Available -> Deleting` against that epoch.
+- A child revision that reuses older blocks holds a sealed strong dependency
+  reference to every distinct physical owner revision until the child is
+  deleted.
+- Manifest row position and `physical_object_index` are distinct. Object-key
+  validation and GC use the physical owner's local index, never the child's
+  ordered row position.
+- Content digests prove identity/integrity but do not imply global physical
+  deduplication.
+- Use bounded `MetadataCommand` predicates as the atomicity and idempotency
+  fence.
+- Snapshots are leased MVCC read versions. Durable commits/tags retain exact
+  revisions and do not pin the global history floor.
+- GC must account for current paths, retained history, commits, build/restore/
+  fork/publish holds, operations, and the current fenced shard owner.
+- Persist control-plane root placement and install the matching shard-local
+  `RootFence` before the first write. Never derive placement from a filename or
+  modulo the current shard count; a populated root does not change logical
+  shard.
+- Keep local hot-tier placement and cache slots as soft state keyed by
+  immutable revisions/blocks.
+- Do not leak Holt internals into types, protocol, object, client, Agent
+  adapter, Python, or CLI packages.
+- Do not introduce provider-specific RustFS metadata; RustFS uses the common
+  S3-compatible boundary.
 - Prefer explicit invariants and local reasoning over manager-style wrappers.
 
 ## Validation
 
-Before pushing substantial changes:
+Before pushing substantial code changes:
 
 ```bash
 cargo fmt --all -- --check
@@ -78,8 +137,17 @@ cargo test --workspace
 git diff --check
 ```
 
-Run the docs build when docs or navigation changes:
+For Workbench-facing changes also run:
 
 ```bash
-cd docs && npm run build
+python3 scripts/lingtai-workbench/workbench_contract_test.py
 ```
+
+When a checked-in documentation build exists, run it for documentation or
+navigation changes. Until then, validate Markdown links and run
+`git diff --check`.
+
+System acceptance follows
+[`workspace-acceptance.md`](./workspace-acceptance.md). Every applicable
+gate reports `PASS`, `FAIL`, or `NOT QUALIFIED`; passing unit tests alone is not
+evidence for durability, failover, GC, or performance claims.
