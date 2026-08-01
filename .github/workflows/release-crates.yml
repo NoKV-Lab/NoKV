@@ -33,6 +33,11 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Resolve crate list
         id: crates
         shell: bash
@@ -47,7 +52,6 @@ jobs:
             nokv-control
             nokv-server
             nokv-client
-            nokv-fuse
             nokv
           )
           {

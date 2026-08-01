@@ -2,7 +2,7 @@
 name = "nokv-bench"
 version = "0.1.0"
 publish = false
-description = "NoKV system benchmark harness for metadata and AI training workloads."
+description = "NoKV Agent workspace contract and performance workloads."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,28 +11,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-flate2 = "1"
-nokv-agent.workspace = true
-nokv-client.workspace = true
-nokv-control.workspace = true
-nokv-meta.workspace = true
-nokv-object.workspace = true
-nokv-server.workspace = true
-nokv-types.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-rusqlite = { version = "0.37", features = ["hooks"] }
-serde.workspace = true
+nokv-protocol.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
-sha2.workspace = true
-tar = "0.4"
-tempfile.workspace = true
-walkdir = "2"
 
 [[bin]]
-name = "nokv-bench"
-path = "src/bin/nokv-bench.rs"
-
-[[bin]]
-name = "yanex-agent-bench"
-path = "src/bin/yanex-agent-bench.rs"
+name = "nokv-workspace-bench"
+path = "src/bin/nokv-workspace-bench.rs"

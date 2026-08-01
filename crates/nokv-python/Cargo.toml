@@ -2,7 +2,7 @@
 name = "nokv-python"
 version = "0.1.0"
 publish = false
-description = "Python SDK and fsspec binding for NoKV AI training workflows."
+description = "Python SDK for NoKV Agent workspaces and immutable artifacts."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,9 +19,10 @@ default = []
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-libc.workspace = true
-nokv-client.workspace = true
-nokv-meta.workspace = true
+nokv-client = { workspace = true, features = ["etcd"] }
 nokv-object.workspace = true
-nokv-types.workspace = true
+nokv-protocol.workspace = true
 pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
+
+[dev-dependencies]
+tempfile.workspace = true

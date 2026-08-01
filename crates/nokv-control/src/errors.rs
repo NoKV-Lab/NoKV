@@ -1,126 +1,158 @@
 use std::fmt;
 
-use crate::{NodeId, ShardId};
+use crate::{LogicalShardId, LogicalShardLease, NodeId, OwnerEpoch, RootId, RootPlacement};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlError {
-    ShardAlreadyOwned {
-        shard_id: ShardId,
-        owner: NodeId,
-        epoch: u64,
+    InvalidEndpoint(String),
+    RootPlacementNotFound(RootId),
+    RootPlacementAlreadyExists(RootId),
+    ImmutableShardAffinity {
+        root_id: RootId,
+        existing: LogicalShardId,
+        requested: LogicalShardId,
     },
-    ShardNotFound(ShardId),
-    StaleEpoch {
-        shard_id: ShardId,
-        expected: u64,
-        actual: u64,
+    RootPlacementCasConflict {
+        expected: RootPlacement,
+        actual: Option<RootPlacement>,
     },
-    NotOwner {
-        shard_id: ShardId,
-    },
-    /// A `register_shard` tried to change a shard's stable identity (`prefix` or
-    /// `shard_index`) after it had already taken a lease (epoch > 0). Identity is
-    /// baked into inode high bits and client routing, so it is frozen once the
-    /// shard has ever served.
-    ShardIdentityLocked {
-        shard_id: ShardId,
-    },
-    /// A non-default shard was acquired without first being registered. The
-    /// stable shard index must be seeded by `register_shard` before acquisition
-    /// so it does not silently default to 0 and collide with the root shard.
-    ShardNotRegistered {
-        shard_id: ShardId,
-    },
-    /// A server requested a fresh start for a shard that has already held an
-    /// owner epoch. Its local disk cannot be assumed authoritative; recovery
-    /// must use the explicit failover path and a checkpoint archive.
-    FreshAcquireRequiresFailover {
-        shard_id: ShardId,
-        epoch: u64,
-    },
-    StaleLease {
-        shard_id: ShardId,
-        epoch: u64,
-        lease_id: u64,
-    },
-    /// A checkpoint/log publication would make the durable recovery identity
-    /// ambiguous or move one of its references behind the recorded durable
-    /// boundary. Reject it instead of allowing the last writer to win.
-    RecoveryPublicationConflict {
-        shard_id: ShardId,
+    InvalidPlacementMutation {
+        root_id: RootId,
         reason: String,
     },
+    LogicalShardNotFound(LogicalShardId),
+    LogicalShardAlreadyExists(LogicalShardId),
+    RootPlacementRequired(LogicalShardId),
+    LogicalShardAlreadyOwned {
+        logical_shard_id: LogicalShardId,
+        owner: NodeId,
+        owner_epoch: OwnerEpoch,
+    },
+    PreviousOwnerSessionLive {
+        logical_shard_id: LogicalShardId,
+        owner_epoch: OwnerEpoch,
+    },
+    StaleOwnerEpoch {
+        logical_shard_id: LogicalShardId,
+        expected: Option<OwnerEpoch>,
+        actual: Option<OwnerEpoch>,
+    },
+    NotOwner {
+        logical_shard_id: LogicalShardId,
+    },
+    StaleLease(LogicalShardLease),
+    OwnerEpochExhausted(LogicalShardId),
+    LeaseIdExhausted(LogicalShardId),
+    RecoveryPublicationConflict {
+        logical_shard_id: LogicalShardId,
+        reason: String,
+    },
+    InvalidRecord(String),
     InvalidOptions(String),
     Codec(String),
     Backend(String),
 }
 
 impl fmt::Display for ControlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ShardAlreadyOwned {
-                shard_id,
-                owner,
-                epoch,
+            Self::InvalidEndpoint(endpoint) => {
+                write!(formatter, "invalid logical-shard endpoint {endpoint:?}")
+            }
+            Self::RootPlacementNotFound(root_id) => {
+                write!(formatter, "root placement {root_id:?} was not found")
+            }
+            Self::RootPlacementAlreadyExists(root_id) => {
+                write!(formatter, "root placement {root_id:?} already exists")
+            }
+            Self::ImmutableShardAffinity {
+                root_id,
+                existing,
+                requested,
             } => write!(
-                f,
-                "shard {} is already owned by {} at epoch {}",
-                shard_id.as_str(),
-                owner.as_str(),
-                epoch
+                formatter,
+                "root {root_id:?} is permanently bound to logical shard {existing:?}, not {requested:?}"
             ),
-            Self::ShardNotFound(shard_id) => write!(f, "shard {} was not found", shard_id.as_str()),
-            Self::StaleEpoch {
-                shard_id,
+            Self::RootPlacementCasConflict { expected, actual } => write!(
+                formatter,
+                "root placement CAS conflict: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::InvalidPlacementMutation { root_id, reason } => {
+                write!(formatter, "invalid root placement mutation for {root_id:?}: {reason}")
+            }
+            Self::LogicalShardNotFound(logical_shard_id) => {
+                write!(formatter, "logical shard {logical_shard_id:?} was not found")
+            }
+            Self::LogicalShardAlreadyExists(logical_shard_id) => {
+                write!(formatter, "logical shard {logical_shard_id:?} already exists")
+            }
+            Self::RootPlacementRequired(logical_shard_id) => write!(
+                formatter,
+                "logical shard {logical_shard_id:?} needs a non-retired root placement before owner acquisition"
+            ),
+            Self::LogicalShardAlreadyOwned {
+                logical_shard_id,
+                owner,
+                owner_epoch,
+            } => write!(
+                formatter,
+                "logical shard {logical_shard_id:?} is owned by {owner} at epoch {owner_epoch}"
+            ),
+            Self::PreviousOwnerSessionLive {
+                logical_shard_id,
+                owner_epoch,
+            } => write!(
+                formatter,
+                "logical shard {logical_shard_id:?} still has a live owner session at epoch {owner_epoch}"
+            ),
+            Self::StaleOwnerEpoch {
+                logical_shard_id,
                 expected,
                 actual,
             } => write!(
-                f,
-                "shard {} expected epoch {}, actual epoch {}",
-                shard_id.as_str(),
-                expected,
-                actual
+                formatter,
+                "logical shard {logical_shard_id:?} expected owner epoch {}, actual {}",
+                display_epoch(*expected),
+                display_epoch(*actual)
             ),
-            Self::NotOwner { shard_id } => {
-                write!(f, "lease holder does not own shard {}", shard_id.as_str())
-            }
-            Self::ShardIdentityLocked { shard_id } => write!(
-                f,
-                "shard {} identity is locked after its first lease",
-                shard_id.as_str()
+            Self::NotOwner { logical_shard_id } => write!(
+                formatter,
+                "lease holder does not own logical shard {logical_shard_id:?}"
             ),
-            Self::ShardNotRegistered { shard_id } => write!(
-                f,
-                "shard {} must be registered before it can be acquired",
-                shard_id.as_str()
+            Self::StaleLease(lease) => write!(
+                formatter,
+                "stale lease for logical shard {:?} at epoch {} lease {}",
+                lease.logical_shard_id, lease.owner_epoch, lease.lease_id
             ),
-            Self::FreshAcquireRequiresFailover { shard_id, epoch } => write!(
-                f,
-                "shard {} has prior owner epoch {}; use explicit failover recovery",
-                shard_id.as_str(),
-                epoch
+            Self::OwnerEpochExhausted(logical_shard_id) => write!(
+                formatter,
+                "logical shard {logical_shard_id:?} owner epoch is exhausted"
             ),
-            Self::StaleLease {
-                shard_id,
-                epoch,
-                lease_id,
+            Self::LeaseIdExhausted(logical_shard_id) => write!(
+                formatter,
+                "logical shard {logical_shard_id:?} lease id allocator is exhausted"
+            ),
+            Self::RecoveryPublicationConflict {
+                logical_shard_id,
+                reason,
             } => write!(
-                f,
-                "stale lease for shard {} at epoch {} lease {}",
-                shard_id.as_str(),
-                epoch,
-                lease_id
+                formatter,
+                "recovery publication for logical shard {logical_shard_id:?} conflicts with durable state: {reason}"
             ),
-            Self::RecoveryPublicationConflict { shard_id, reason } => write!(
-                f,
-                "recovery publication for shard {} conflicts with durable state: {reason}",
-                shard_id.as_str()
-            ),
-            Self::InvalidOptions(err) => write!(f, "invalid control store options: {err}"),
-            Self::Codec(err) => write!(f, "control store codec error: {err}"),
-            Self::Backend(err) => write!(f, "control store backend error: {err}"),
+            Self::InvalidRecord(reason) => {
+                write!(formatter, "invalid control record: {reason}")
+            }
+            Self::InvalidOptions(reason) => {
+                write!(formatter, "invalid control store options: {reason}")
+            }
+            Self::Codec(reason) => write!(formatter, "control store codec error: {reason}"),
+            Self::Backend(reason) => write!(formatter, "control store backend error: {reason}"),
         }
     }
 }
 
 impl std::error::Error for ControlError {}
+
+fn display_epoch(epoch: Option<OwnerEpoch>) -> String {
+    epoch.map_or_else(|| "never-owned".to_owned(), |epoch| epoch.get().to_string())
+}

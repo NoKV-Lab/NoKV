@@ -13,3 +13,4 @@ homepage.workspace = true
 nokv-types.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
+sha2.workspace = true
