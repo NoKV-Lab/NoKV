@@ -3,267 +3,104 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Configure and Update NoKV for LingTai Workbench
+# LingTai Workbench Preflight
 
-This is the user guide for connecting one existing LingTai Agent to NoKV and
-keeping that connection current. The supported user path is a clean NoKV source
-checkout plus `scripts/lingtai-workbench/up.sh`. Brew distribution is not yet
-available.
+LingTai is the active NoKV design partner and first Workbench client. It uses
+the normal `nokv mcp` stdio endpoint; there is no partner-specific metadata
+format or compatibility route.
 
-## Know Which MCP Surface You Need
+## Required Inputs
 
-NoKV has two MCP profiles:
+Before registration, obtain:
 
-- The generic Agent profile exposes seven read-only namespace tools: `ls`,
-  `stat`, `catalog`, `read`, `aggregate`, `find`, and `grep`. It is suitable for
-  a general MCP client, but it is not the LingTai workbench integration.
-- The Workbench profile exposes 17 base `workbench_*` tools for writes,
-  checkpoints, and indexed queries. Durable `workbench_restore` is added as the
-  eighteenth tool only when the required owner capability is available. Calls
-  are path-scoped below `/agents/{agent_id}/wb`, and the profile is registered
-  in LingTai as `nokv-workbench`.
+- one 16-byte `RootId`;
+- its persisted 16-byte `LogicalShardId` affinity;
+- the current non-zero placement generation and owner epoch;
+- the reachable workspace RPC owner address;
+- an S3-compatible bucket, region, endpoint policy, and credentials;
+- an absolute path to the exact `nokv` binary being registered.
 
-The setup below requires the complete 18-tool Workbench profile. Restore is
-advertised only when every metadata owner that can serve the selected Agent
-root supports `restore_to_fork_v1`; the setup fails closed if the fleet is
-mixed or the schema differs. Restore is also same-shard only: its source and
-new destination must route to the same metadata shard.
+The metadata owner must have opened a store containing only the exact
+`nokv_workspace` schema and installed the matching active root fence. The
+artifact backend must provide immutable create-if-absent, head, range read, and
+delete semantics.
 
-Path scoping rejects absolute paths, traversal, and paths outside the configured
-Workbench root. It is not authentication, RBAC, or tenant security isolation.
-The metadata endpoint and object-store credentials are the trust boundary, and
-the helper is a guarded local integration path rather than a production identity
-or secret-management system.
+## Offline Gates
 
-## Before the First Configuration
-
-Prepare all of the following:
-
-1. A LingTai project that already contains at least one Agent directory and
-   `init.json` below `/path/to/project/.lingtai/`. The NoKV helper registers MCP
-   for an Agent; it does not create the Agent.
-2. A LingTai TUI runtime that already contains the `nokv-workbench` intrinsic
-   skill.
-3. A clean NoKV source checkout on the revision you intend to deploy.
-4. `python3`, `git`, Cargo/Rust, `lsof`, and the AWS CLI. Docker is also needed
-   when the configured RustFS endpoint is not already running.
-5. A persistent metadata directory. Do not use a disposable checkout, `/tmp`,
-   or a directory removed by `cargo clean`. Keep using the same directory on
-   every update.
-
-Verify the LingTai skill before changing NoKV:
+Run:
 
 ```bash
-~/.lingtai-tui/runtime/venv/bin/python - <<'PY'
-from pathlib import Path
-import lingtai.intrinsic_skills as skills
-
-root = Path(skills.__file__).parent
-print((root / "nokv-workbench" / "SKILL.md").exists())
-PY
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+python3 scripts/lingtai-workbench/workbench_contract_test.py
+git diff --check
 ```
 
-The command must print `True`. Install a workbench-enabled LingTai release
-before continuing if it does not.
+The contract check proves only the exact 18 names and normalized input schemas.
+It does not qualify persistence, object I/O, failover, restore, or latency.
 
-Choose stable local storage once. This example keeps both Holt metadata and
-local RustFS objects outside the source checkout:
+## Live Contract Check
 
-```bash
-export LINGTAI_WORKBENCH_META_DIR="$HOME/.local/share/nokv/lingtai-workbench/meta"
-export LINGTAI_WORKBENCH_RUSTFS_DATA_DIR="$HOME/.local/share/nokv/lingtai-workbench/rustfs"
-```
+Start `nokv mcp` with the same root, route, owner, and object configuration that
+LingTai will use. Send `initialize`, then `tools/list`, and validate the response
+with `workbench_contract.validate_tool_contract`.
 
-The guarded one-command path intentionally uses its dedicated local RustFS
-credentials. Custom credential and secret-manager integration is outside this
-helper and requires a separately reviewed deployment; it is not a supported
-`up.sh` override. The metadata directory and object-store identity are durable
-local integration state, so do not silently point an update at a new empty
-location.
+For the complete first-client path, run
+`scripts/lingtai-workbench/live_first_client.py`. It calls `nokv provision`,
+starts `nokv serve` with explicit metadata create/reopen intent, starts
+`nokv mcp --workbench-root /agents/{agent}/wb`, exercises all 18 tools, and
+retains exact requests/responses plus materialize/collect evidence. Run
+`--dry-run` first to inspect the redacted command and normalized-input plan.
+In the current local-WAL profile, `reopen` is a negative qualification run:
+standalone successor admission fails closed until verified checkpoint/log
+recovery and fsck exist. A successful `create` run is not failover evidence.
+The selected `--workbench-root` is durable presentation configuration because
+canonical v1 manifests contain its projected paths. Keep it identical across
+restart/replay; it never replaces `RootId` as the storage or routing identity.
+Before reading MCP stdin or advertising tools, the flat CLI performs the typed
+workspace RPC preflight for every capability required by this 18-tool profile;
+a missing capability or route mismatch stops startup.
 
-## First Configuration
+Registration must stop if:
 
-From the NoKV checkout:
+- the tool set is not exactly 18 tools;
+- any normalized input schema differs;
+- the root route is stale or belongs to another logical shard;
+- the metadata schema marker differs from `nokv_workspace`;
+- the object backend cannot guarantee immutable creation;
+- a write/read/snapshot/restore probe returns a placeholder or unsupported
+  success.
 
-```bash
-git switch main
-git pull --ff-only
+## Qualification
 
-LINGTAI_WORKBENCH_PROJECT=/path/to/lingtai-project \
-LINGTAI_WORKBENCH_META_DIR="$HOME/.local/share/nokv/lingtai-workbench/meta" \
-LINGTAI_WORKBENCH_RUSTFS_DATA_DIR="$HOME/.local/share/nokv/lingtai-workbench/rustfs" \
-./scripts/lingtai-workbench/up.sh
-```
+Report each applicable gate in
+[Workspace Acceptance](./development/workspace-acceptance.md) as `PASS`, `FAIL`,
+or `NOT QUALIFIED`. In particular, a production handoff needs independent
+evidence for:
 
-`up.sh` accepts no command-line arguments. Configure it only with environment
-variables. It performs the following guarded handoff:
+- metadata reopen and exact request replay;
+- stale-owner rejection and owner failover;
+- immutable object upload, range verification, and ambiguous-provider errors;
+- hidden-then-atomic restore;
+- revision retention and GC fencing;
+- golden Workbench results and errors, not only input schemas.
 
-- validates the existing LingTai Agent files and Workbench skill;
-- builds NoKV with the locked `Cargo.lock` and records the exact Holt revision;
-- stages an immutable binary under the LingTai project by NoKV commit and
-  binary SHA-256;
-- probes the candidate's exact 18-tool contract against the current metadata
-  endpoint before replacing a running server, then starts or verifies RustFS
-  and the helper-managed NoKV metadata server;
-- rechecks the selected Agent's concrete root after the server handoff;
-- updates `mcp_registry.jsonl`, `init.json`, and the NoKV lock under a per-Agent
-  lock and recovery journal.
+Keep raw commands, environment profile, logs, and result artifacts with the
+qualification report.
 
-By default the helper selects, in order, the only running coordinator, the only
-coordinator, or the only Agent. Do not set an Agent name unless selection is
-ambiguous. If the error lists multiple candidates, rerun with the complete
-directory name exactly as printed:
+Current source-level/unit evidence does not qualify a production handoff. In
+addition to the unavailable shared recovery path, live qualification must still
+prove or implement all of the following:
 
-```bash
-LINGTAI_WORKBENCH_PROJECT=/path/to/lingtai-project \
-LINGTAI_WORKBENCH_AGENT='coordinator(codex-gpt-5.4)' \
-LINGTAI_WORKBENCH_META_DIR="$HOME/.local/share/nokv/lingtai-workbench/meta" \
-LINGTAI_WORKBENCH_RUSTFS_DATA_DIR="$HOME/.local/share/nokv/lingtai-workbench/rustfs" \
-./scripts/lingtai-workbench/up.sh
-```
+- provider-attested upload completion across the direct SDK data path, not a
+  forgeable client assertion alone;
+- production adoption or bounded abort/cleanup for interrupted commit and
+  restore operations, including release of their history/revision holds;
+- a tracked resolution for late direct PUT completion after publication abort;
+- reconciliation that drives ambiguous object deletion out of quarantine;
+- destructive provider operations fenced against control-plane lease transfer,
+  not only a preceding shard-local owner check.
 
-After a successful handoff, run this command in the selected LingTai Agent:
-
-```text
-/refresh
-```
-
-This restarts the MCP stdio child with the newly locked runtime. The resulting
-path is:
-
-```text
-LingTai Agent -> MCP stdio child -> NoKV metadata RPC + object store
-```
-
-The helper registers and verifies that child; it does not install the LingTai
-skill, create a remote authentication layer, or make the local credentials safe
-to share across mutually untrusted tenants.
-
-## Daily Update
-
-Use the same path for every NoKV update. Preserve the metadata directory,
-object store, project, and Agent selection used during the first configuration:
-
-```bash
-cd /path/to/NoKV
-git switch main
-git pull --ff-only
-
-LINGTAI_WORKBENCH_PROJECT=/path/to/lingtai-project \
-LINGTAI_WORKBENCH_META_DIR="$HOME/.local/share/nokv/lingtai-workbench/meta" \
-LINGTAI_WORKBENCH_RUSTFS_DATA_DIR="$HOME/.local/share/nokv/lingtai-workbench/rustfs" \
-./scripts/lingtai-workbench/up.sh
-```
-
-Run `/refresh` only after the script reports success. The Agent registration
-uses the immutable staged copy, not mutable `target/release/nokv`, so a later
-Cargo build cannot silently change the launched executable.
-
-## Read-Only Check
-
-Check the installed state without writing any file:
-
-```bash
-python3 ./scripts/lingtai-workbench/sync_workbench_mcp.py \
-  --project /path/to/lingtai-project \
-  --check
-```
-
-The check validates the lock, immutable binary and build identity, LingTai
-registry and `init.json`, launch arguments, and the live 18-tool contract. It
-uses the same automatic Agent selection as setup. Add the exact `--agent`
-directory name only when the project is ambiguous:
-
-```bash
-python3 ./scripts/lingtai-workbench/sync_workbench_mcp.py \
-  --project /path/to/lingtai-project \
-  --agent 'coordinator(codex-gpt-5.4)' \
-  --check
-```
-
-## Runtime Semantics to Preserve
-
-- The live Workbench profile may expose 17 or 18 tools. This guarded LingTai
-  handoff intentionally accepts only the capability-enabled 18-tool surface.
-- A Workbench snapshot defaults to a 7-day lease and has a 90-day maximum.
-  Renew extends the lease; retire releases it. A checkpoint name is a registry
-  alias, not a permanent GC root.
-- At-snapshot reads provide a stable historical view. They do not freeze the
-  live workspace or prevent another writer from committing later state.
-- `workbench_restore` creates a different destination, leaves the source
-  unchanged, is idempotent for exact retries, and is limited to one metadata
-  shard.
-- `/agents/{agent_id}/wb` is a path-scoping convention. Authentication, tenant
-  policy, workspace freezing, and metadata high availability require separate
-  deployment mechanisms and are not provided by this helper.
-
-See [Workbench checkpoint lifecycle](development/workbench-checkpoint-lifecycle.md)
-for the full lease, GC, and restore contract.
-
-## Handle a Failed Update
-
-Do not hand-edit the LingTai MCP files and do not run `/refresh` after a failed
-handoff. Fix the reported cause and rerun the same `up.sh` command. The sync
-transaction recovers an interrupted Agent-file update on the next normal run.
-
-Common failures:
-
-- **No Agent or ambiguous Agent:** create the Agent first, or set
-  `LINGTAI_WORKBENCH_AGENT` to one complete directory name from the error.
-- **Missing `nokv-workbench` skill:** update the LingTai runtime; registering
-  NoKV cannot install or patch the skill.
-- **Dirty NoKV checkout:** commit or stash the changes. Dirty builds are for
-  explicit maintainer testing, not a downstream update.
-- **Port already owned by an unknown process:** inspect it with
-  `lsof -nP -iTCP@127.0.0.1:7799 -sTCP:LISTEN`. The helper deliberately refuses
-  to stop a server it cannot prove it owns.
-- **macOS reports that exact process argv cannot be proved:** keep the NoKV,
-  LingTai project, metadata, and local RustFS paths free of whitespace. The
-  managed-server gate fails closed when `ps` cannot represent an argument
-  unambiguously.
-- **RustFS or bucket failure:** verify the configured endpoint with the AWS CLI
-  and inspect `docker logs lingtai-workbench-rustfs` for the default local
-  container.
-- **Workbench schema changed:** review the reported canonical contract change.
-  The error prints the exact new SHA-256. Accept only that reviewed digest:
-
-  ```bash
-  LINGTAI_WORKBENCH_ACCEPT_CONTRACT_SHA256=<new-digest-from-error> \
-  LINGTAI_WORKBENCH_PROJECT=/path/to/lingtai-project \
-  LINGTAI_WORKBENCH_META_DIR="$HOME/.local/share/nokv/lingtai-workbench/meta" \
-  LINGTAI_WORKBENCH_RUSTFS_DATA_DIR="$HOME/.local/share/nokv/lingtai-workbench/rustfs" \
-  ./scripts/lingtai-workbench/up.sh
-  ```
-
-  This is not a Boolean bypass: any other or later digest still fails.
-
-Use these files when diagnosing a failure:
-
-- server log, by default:
-  `/path/to/NoKV/target/lingtai-workbench/nokv-server.log`;
-- selected Agent lock:
-  `/path/to/lingtai-project/.lingtai/<agent>/nokv-workbench.lock.json`;
-- interrupted transaction marker, when present:
-  `/path/to/lingtai-project/.lingtai/<agent>/.nokv-workbench.transaction.json`.
-
-Do not delete an interrupted transaction marker by hand; rerun the normal
-update so the helper can recover it.
-
-## Downgrade and Recovery Boundary
-
-The immutable runtime directory and lock protect identity; they are not a
-general rollback manager. Prefer fixing the issue and moving forward to a
-known-good NoKV main revision.
-
-After the first durable restore operation activates `restore_to_fork_v1`, the
-persistent metadata contains an active marker and allocator downgrade fence.
-Never start a pre-restore NoKV metadata binary against that metadata directory.
-A safe downgrade requires disabling restore routing, globally stopping or
-fencing restore writers, using the typed drain procedure, running a clean full
-fsck, and creating a fresh metadata checkpoint. This is an operator procedure,
-not a normal LingTai update; see [Architecture](architecture.md) and involve the
-NoKV maintainers.
-
-For script internals, Release artifact identity, and manual layer-by-layer
-diagnostics, use the
-[LingTai Workbench maintainer reference](../scripts/lingtai-workbench/README.md).
+Until those rows have executable fault-injection evidence they are `NOT
+QUALIFIED`, even when the exact 18-tool contract and local happy path pass.

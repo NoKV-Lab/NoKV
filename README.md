@@ -6,236 +6,195 @@ SPDX-License-Identifier: Apache-2.0
 <div align="center">
   <img src="./docs/public/img/logo.png" width="320" alt="NoKV" />
 
-  <h3>Durable agent workspaces.</h3>
-
   <p>
-    NoKV is a metadata control plane for agent workspaces. It publishes
-    crash-consistent, versioned workspace state over object storage, with
-    path-sharded metadata for small-file scale-out.
+    <strong>Agent-native distributed workspace and artifact storage.</strong>
   </p>
 
   <p>
-    <a href="https://nokv.io/"><strong>Website</strong></a> ·
-    <a href="./docs/index.md"><strong>Documentation</strong></a> ·
-    <a href="#quick-start"><strong>Quick Start</strong></a> ·
-    <a href="https://github.com/orgs/NoKV-Lab/discussions"><strong>Discussions</strong></a> ·
-    <a href="#contributing"><strong>Contributing</strong></a>
+    <a href="https://nokv.io/architecture"><strong>Architecture</strong></a> ·
+    <a href="./docs/workbench-contract.md"><strong>Workbench Contract</strong></a> ·
+    <a href="./docs/metadata-schema.md"><strong>Metadata Schema</strong></a> ·
+    <a href="./docs/development/workspace-acceptance.md"><strong>Acceptance</strong></a> ·
+    <a href="https://github.com/orgs/NoKV-Lab/discussions"><strong>Discussions</strong></a>
   </p>
 </div>
 
-## Our building partners include:
+## Latest update
+
+<div align="center">
+  <a href="https://github.com/orgs/NoKV-Lab/discussions/378">
+    <img src="docs/public/img/community/nokv-lingtai-banner-en.png" alt="NoKV × LingTai — Design Partner Collaboration" width="100%" />
+  </a>
+</div>
+
+> **NoKV × LingTai** is a design partner collaboration.
+> [English announcement](https://github.com/orgs/NoKV-Lab/discussions/378) ·
+> [中文公告](https://github.com/orgs/NoKV-Lab/discussions/380)
+
+## Building partners
 
 | Partner | Project |
 | --- | --- |
 | **OpenViking** | [Website](https://openviking.ai/) · [GitHub](https://github.com/volcengine/OpenViking) · ![OpenViking stars](https://img.shields.io/github/stars/volcengine/OpenViking?style=flat&label=stars) |
 | **Hermes Agent** | [GitHub](https://github.com/NousResearch/hermes-agent) · ![Hermes Agent stars](https://img.shields.io/github/stars/NousResearch/hermes-agent?style=flat&label=stars) |
-| **Lingtai AI** | [Website](https://lingtai.ai/en/) · [GitHub](https://github.com/Lingtai-AI/lingtai) · ![Lingtai stars](https://img.shields.io/github/stars/Lingtai-AI/lingtai?style=flat&label=stars) |
+| **LingTai** | [Website](https://lingtai.ai/en/) · [GitHub](https://github.com/Lingtai-AI/lingtai) · ![LingTai stars](https://img.shields.io/github/stars/Lingtai-AI/lingtai?style=flat&label=stars) |
 | **LoopX** | [GitHub](https://github.com/huangruiteng/loopx) · ![LoopX stars](https://img.shields.io/github/stars/huangruiteng/loopx?style=flat&label=stars) |
 | **heima** | [GitHub](https://github.com/litentry/heima) · ![heima stars](https://img.shields.io/github/stars/litentry/heima?style=flat&label=stars) |
 
 Building-partner status denotes an active collaboration. It does not by itself
-imply a production deployment, support SLA, or completed enterprise qualification.
+imply a production deployment, support SLA, or completed enterprise
+qualification.
 
-## Recognition
+## What is NoKV?
 
-<table>
-  <tr>
-    <td align="center" width="120">
-      <a href="https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv">
-        <img src="./docs/public/img/recognition/cncf.svg" width="56" alt="CNCF Landscape" />
-      </a>
-    </td>
-    <td>
-      <strong>CNCF Landscape</strong><br/>
-      Listed under AI Native Infra / Storage and Cloud Native Storage.
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="https://dbdb.io/db/nokv">
-        <img src="./docs/public/img/recognition/dbdb.svg" width="56" alt="DBDB.io Database of Databases" />
-      </a>
-    </td>
-    <td>
-      <strong>DBDB.io</strong><br/>
-      Catalogued by the CMU Database Group. The profile is historical; this
-      repository is the current Rust product line.
-    </td>
-  </tr>
-</table>
+NoKV is a distributed workspace and artifact store designed specifically
+for Agent infrastructure. It gives datasets, scripts, logs, outputs,
+checkpoints, reports, and provenance one path-shaped namespace while keeping
+artifact bytes as immutable objects in S3-compatible storage.
 
-## What NoKV Owns
+Its product surfaces are:
 
-Agent runs produce configs, logs, checkpoints, reports, and evidence across
-many files and object keys. NoKV gives that state one filesystem-shaped address
-and owns the metadata required to publish, inspect, snapshot, fork, and recover
-it.
+- the complete 18-tool LingTai Workbench facade;
+- Rust and Python Agent SDKs;
+- a custom `nokv` CLI;
+- MCP/Agent adapters;
+- explicit materialize/collect adapters for local executables.
+
+NoKV does **not** provide FUSE, POSIX, CSI, transparent fsspec access, or a
+general NAS replacement.
+
+## Architecture
 
 ```text
-Agents / RAGFS / SDK / CLI / FUSE / Python
-                    |
-                    v
-          NoKV metadata service
-  namespace, versions, snapshots, watches,
-      CoW bindings, provenance metadata, GC
-                    |
-          +---------+---------+
-          |                   |
-          v                   v
-  embedded Holt         S3-compatible store
-  metadata truth        immutable file bodies
+Workbench / SDK / custom CLI / MCP
+  -> route one RootId to one logical metadata shard
+  -> resolve a visible Workbench incarnation
+  -> point-read or delimiter-scan canonical full-path keys in Holt
+  -> stream immutable revision-owned blocks from S3-compatible storage
 ```
 
-NoKV owns namespace truth, shard-local metadata transactions, versioned body
-descriptors, snapshots, typed watches, CoW workspace bindings, and
-object-reference GC policy. The object provider owns the physical durability,
-replication, availability, and access policy of file bodies.
+The lower design uses:
 
-NoKV is not a semantic-memory database or an agent orchestrator. Context
-retrieval, ranking, planning, validation, and runtime policy stay above the
-storage layer.
+- `PathCurrent(root, workspace_incarnation, normalized_relative_path)` as the
+  only namespace truth;
+- implicit directories and five virtual Workbench sections;
+- immutable `ArtifactRevisionId` bodies and whole-body digests;
+- object keys owned by logical shard, root, and revision;
+- atomic object-first, metadata-last publication;
+- exact strong revision references with an epoch-fenced GC state machine;
+- leased MVCC snapshots for short recovery;
+- sealed commits/tags with exact revision retention for long-lived reuse;
+- same-root restore into a fresh hidden incarnation;
+- persisted root-affinity placement and physical-owner epoch fencing.
 
-## Workspace Guarantees
+Holt is the ordered shard-local metadata engine. It provides point reads,
+component-safe delimiter scans, atomic named-tree batches, WAL, checkpoints,
+and recovery primitives. The current runtime acknowledges only after a
+synchronous shard-local Holt WAL write; NoKV checkpoint export/install,
+remote outbox consumption/replay, shared-log acknowledgement, and fsck are not
+yet wired. Each local mutation does atomically append canonical hash-chained
+replay material inside the same Holt store, but that is not shared durability.
+A non-empty Control recovery frontier therefore fails startup
+closed instead of being advertised as recovered. The local-WAL profile admits
+only a first-owner create or an exact current-lease resume against the existing
+store; successor acquisition is refused until verified checkpoint/log recovery
+exists. Holt layout never leaks into the SDK or Workbench contract.
 
-- **Crash-consistent publication.** One owning shard publishes a new artifact
-  generation as one durable metadata command.
-- **Stable historical reads.** Reuse a pinned snapshot when a workflow needs a
-  consistent view across multiple reads.
-- **CoW fork-to-restore.** Restore into a new same-shard workspace, validate it,
-  then switch consumers without mutating the source workspace.
-- **Typed change streams.** Namespace changes are recorded as replayable events
-  with cursors and retention rules.
-- **Immutable body generations.** Published metadata references immutable
-  object blocks; local placement can change without changing namespace truth.
+## Stable Workbench
 
-These guarantees are shard-local. NoKV does not currently provide cross-shard
-transactions. Snapshot protection is leased, and path/CoW scoping is not an
-authentication or RBAC boundary.
+NoKV exposes exactly these 18 Workbench tools:
 
-## Distributed Status
-
-| Status | Capabilities |
-| --- | --- |
-| **Current default** | One `nokv-server`, embedded Holt, S3-compatible bodies, Rust SDK, CLI, FUSE, Python/fsspec, snapshots, watches, same-shard CoW, object-reference GC |
-| **Experimental on `main`** | Longest-prefix path sharding, fleet-aware Rust/CLI/FUSE routing, one active Holt-backed owner per shard, etcd lease/epoch fencing, checkpoint and logical shared-log recovery |
-| **Next / hardening** | Multi-machine fault qualification, enterprise small-file throughput validation, online resharding, Python fleet routing, production metadata HA, tenant identity/policy, live-workspace freeze, broader POSIX coverage |
-
-Holt stays embedded and shard-local. NoKV owns horizontal routing above it. The
-experimental fleet is not consensus replication and is not yet a
-JuiceFS/3FS-class production-HA filesystem.
-
-Read the [architecture](docs/architecture.md),
-[product boundary](docs/product-design.md), and
-[experimental fleet runbook](docs/multishard-fleet-runbook.md) for the exact
-contracts and known limits.
-
-## Interfaces
-
-- Rust path/file SDK through `nokv-client`.
-- Low-level FUSE frontend through `nokv-fuse`.
-- Python/fsspec binding over one metadata endpoint.
-- `nokv` CLI for local operation and fleet-aware Rust paths.
-- Native MCP over stdio:
-  - generic `agent` profile: seven read-only namespace tools;
-  - Workbench profile: 17 base tools and a conditional restore tool when the
-    configured owners advertise that capability.
-
-The Agent tool contracts are transport-free and documented in
-[docs/development/nokv-agent.md](docs/development/nokv-agent.md). LingTai users
-should follow the
-[Workbench setup and preflight guide](docs/lingtai-workbench-preflight.md).
-
-## Quick Start
-
-Prerequisites for the commands below: Rust 1.88+, the RustFS binary, AWS CLI,
-and `curl`. Mounting on macOS additionally requires macFUSE.
-
-Build NoKV:
-
-```bash
-cargo build --release -p nokv --bin nokv
+```text
+workbench_create
+workbench_put_file
+workbench_append
+workbench_edit
+workbench_list
+workbench_stat
+workbench_read
+workbench_grep
+workbench_search
+workbench_aggregate
+workbench_catalog
+workbench_find
+workbench_commit
+workbench_snapshot
+workbench_snapshot_renew
+workbench_snapshot_retire
+workbench_snapshot_list
+workbench_restore
 ```
 
-Start a local RustFS endpoint and create the default bucket:
+Tool names, normalized input schemas, create/replace semantics, generation and
+digest relationships, commit identity, snapshot lifecycle, and restore
+idempotency form the stable contract. Workbench result shaping remains an
+adapter concern and does not dictate durable metadata families.
 
-```bash
-mkdir -p /tmp/rustfs-data
-RUSTFS_ACCESS_KEY=rustfsadmin \
-RUSTFS_SECRET_KEY=rustfsadmin \
-rustfs server --address 127.0.0.1:9000 /tmp/rustfs-data &
+See [Workbench Contract](docs/workbench-contract.md).
 
-until AWS_ACCESS_KEY_ID=rustfsadmin \
-  AWS_SECRET_ACCESS_KEY=rustfsadmin \
-  aws --endpoint-url http://127.0.0.1:9000 \
-    s3api list-buckets >/dev/null 2>&1; do sleep 1; done
+## First client
 
-AWS_ACCESS_KEY_ID=rustfsadmin \
-AWS_SECRET_ACCESS_KEY=rustfsadmin \
-aws --endpoint-url http://127.0.0.1:9000 \
-  s3api create-bucket --bucket nokv
+The first client validates a scientific reconstruction workflow:
+
+```text
+upload dataset
+  -> seal immutable input commit/tag
+  -> run multiple Workbenches against the same input
+  -> materialize verified files for the local executable
+  -> collect declared outputs/logs/run metadata
+  -> commit lineage
+  -> query, compare, snapshot, and restore
 ```
 
-Start the metadata service and initialize the namespace:
+Materialization creates a disposable local sandbox; it is not a NoKV namespace
+or host-filesystem access path.
 
-```bash
-cargo run --release -p nokv --bin nokv -- serve &
-until curl -fsS http://127.0.0.1:7777/readyz >/dev/null 2>&1; do sleep 1; done
-cargo run --release -p nokv --bin nokv -- init
-cargo run --release -p nokv --bin nokv -- mkdir /runs
-cargo run --release -p nokv --bin nokv -- mkdir /runs/1
-```
+## Architecture contract
 
-Publish and read an artifact:
+The workspace architecture is NoKV's only namespace, metadata, routing, and
+object-lifetime contract. Every supported route uses the `nokv_workspace`
+schema marker, full-path namespace, revision-owned objects, persisted root
+placement, and owner fencing. Startup rejects an unmarked, unknown, or mixed
+store.
 
-```bash
-cargo run --release -p nokv --bin nokv -- \
-  put-artifact /runs/1/checkpoint.bin ./checkpoint.bin
-
-cargo run --release -p nokv --bin nokv -- \
-  cat /runs/1/checkpoint.bin > restored.bin
-```
-
-The default RustFS credentials above are for localhost development only. See
-[docs/rustfs.md](docs/rustfs.md) for configuration details.
+Filesystem frontends, inode/dentry namespace models, path-prefix shard routing,
+and historical benchmark/demo profiles are outside the NoKV product contract
+and must not drive behavior.
 
 ## Documentation
 
-- [Documentation Index](docs/index.md)
-- [Architecture](docs/architecture.md)
 - [Product Design](docs/product-design.md)
-- [Metadata Sharding and Recovery](docs/metadata-sharding-and-recovery.md)
+- [Architecture](docs/architecture.md)
+- [Workbench Contract](docs/workbench-contract.md)
 - [Metadata Schema](docs/metadata-schema.md)
 - [Object Layout](docs/object-layout.md)
-- [Checkpointing](docs/checkpointing.md)
-- [CoW Workspaces](docs/cow-workspaces.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Workspace Acceptance](docs/development/workspace-acceptance.md)
+- [Path-Native Metadata Comparison](docs/development/path-native-metadata-comparison.md)
+- [Code Contract](docs/development/code_contract.md)
+- [PR Review Checklist](docs/development/pr_review_checklist.md)
 - [LingTai Workbench Setup](docs/lingtai-workbench-preflight.md)
-- [Benchmarks and Evidence](docs/benchmarks.md)
 
-## Contributing
+## Development
+
+Before substantial changes:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+python3 scripts/lingtai-workbench/workbench_contract_test.py
+git diff --check
+```
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[code contract](docs/development/code_contract.md) before changing package
-boundaries or storage semantics. Open work suitable for newcomers is listed
-under the dynamic
-[good first issue query](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22).
+[code contract](docs/development/code_contract.md) before editing package
+boundaries or durable storage.
 
-All commits must include a DCO `Signed-off-by` trailer.
+## Recognition
 
-## Crates
-
-| Crate | Role |
-| --- | --- |
-| [`nokv-types`](https://crates.io/crates/nokv-types) | Storage-neutral namespace and shard types |
-| [`nokv-protocol`](https://crates.io/crates/nokv-protocol) | Framed metadata RPC DTOs and codec |
-| [`nokv-meta`](https://crates.io/crates/nokv-meta) | Schema, commands, Holt store, snapshots, CoW, and GC |
-| [`nokv-control`](https://crates.io/crates/nokv-control) | Shard map, leases, epochs, and recovery pointers |
-| [`nokv-object`](https://crates.io/crates/nokv-object) | S3-compatible immutable body storage and local hot tier |
-| [`nokv-agent`](https://crates.io/crates/nokv-agent) | Transport-free read-only agent tool contracts |
-| [`nokv-client`](https://crates.io/crates/nokv-client) | Rust path/file SDK and fleet routing |
-| [`nokv-fuse`](https://crates.io/crates/nokv-fuse) | Low-level FUSE frontend |
-| [`nokv-python`](https://crates.io/crates/nokv-python) | Python SDK and fsspec binding |
-| [`nokv-server`](https://crates.io/crates/nokv-server) | Long-running metadata service and shard owners |
-| [`nokv`](https://crates.io/crates/nokv) | CLI and MCP/workbench transport wiring |
+- [CNCF Landscape](https://landscape.cncf.io/?group=projects-and-products&item=runtime--cloud-native-storage--nokv)
+- [DBDB.io](https://dbdb.io/db/nokv)
 
 ## License
 

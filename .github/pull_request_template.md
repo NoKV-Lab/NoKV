@@ -45,19 +45,21 @@ Closes | Fixes | Relates to #
 - [ ] New types, interfaces, structs, fields, and functions use domain-specific names.
 - [ ] New errors are in the owning package's `errors.rs` and carry stable error kinds when crossing package boundaries.
 - [ ] New metrics/stats are owned by the package that reports or serves them.
-- [ ] Metadata changes document durability, atomicity, object-reference lifetime,
-      snapshot/watch retention, CoW/GC epochs, and fallback boundaries.
-- [ ] Sharding changes preserve one active writer per shard, epoch fencing, and
-      explicit shard-local atomicity; no cross-shard transaction is implied.
-- [ ] Agent-interface changes keep transport-free schemas/dispatch in
-      `nokv-agent`, remote implementations in `nokv-client`, and MCP transport
-      in the `nokv` CLI.
+- [ ] Metadata changes document durability, atomicity, revision-reference
+      lifetime, snapshot/commit/event retention, GC epochs, and fail-closed
+      recovery boundaries.
+- [ ] Placement or routing changes preserve persisted `RootId -> LogicalShardId`
+      affinity, one active writer per shard, owner-epoch fencing, and explicit
+      shard-local atomicity; no split root or cross-shard transaction is implied.
+- [ ] Agent-interface changes keep the transport-free facade and schemas in
+      `nokv-agent`, routing and workflows in `nokv-client`, and the concrete
+      backend plus MCP wiring in the `nokv` CLI.
 
 ## Claims and Evidence
 
 - [ ] User-facing documentation distinguishes current, experimental, and
       planned capabilities.
-- [ ] Security claims do not treat a path/workbench jail as tenant
+- [ ] Security claims do not treat a Workbench root or Agent scope as tenant
       authentication or authorization.
 - [ ] Performance claims state the topology, comparison boundary, cache state,
       run count, and raw-evidence location.

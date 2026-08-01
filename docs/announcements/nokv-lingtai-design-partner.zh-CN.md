@@ -1,61 +1,44 @@
 <p align="center">
-  <img src="../public/img/community/nokv-lingtai-banner-zh.png" alt="NoKV × Lingtai — 设计共建伙伴合作" width="100%" />
+  <img src="../public/img/community/nokv-lingtai-banner-zh.png" alt="NoKV × LingTai — 设计共建伙伴合作" width="100%" />
 </p>
 
-# NoKV × Lingtai：design-partner 合作
+# NoKV × LingTai：design-partner 合作正式启动
 
-发布于 2026 年 6 月 23 日；集成状态更新于 2026 年 7 月 30 日。
+> 状态说明：本文记录合作启动时的背景。当前集成以完整的
+> [Workbench 契约](../workbench-contract.md)为边界，
+> 通过 SDK、自定义 CLI 与 MCP 使用 NoKV 的现行 workspace 格式，
+> 不把 NoKV 作为 FUSE/POSIX mount；参见[产品设计](../product-design.md)。
 
-**NoKV** 与 **Lingtai**
-（[Lingtai-AI/lingtai](https://github.com/Lingtai-AI/lingtai)）正以
-design partner（设计共建伙伴）的关系，共同探索长时间运行 Agent 的持久化工作区。
-本文记录合作关系和技术边界，不代表生产就绪声明。
+本文记录 **NoKV** 与 **LingTai**（[Lingtai-AI/lingtai](https://github.com/Lingtai-AI/lingtai)）启动 **design-partner（设计共建伙伴）合作**的起点。
 
-## 两个项目，一个文件系统形态的工作区
+## 两个项目，一个共同工作流
 
-- **Lingtai（灵台）** 是一个 local-first 的 Agent 运行时。长期存在的
-  Agent 把状态、信箱、日志和工件保存在磁盘项目目录中，并且仍可使用普通文件
-  工具直接检查。Lingtai 表示其已有一个活跃的早期开发者社区。
-- **NoKV** 是面向对象存储、多 Agent 工作区的持久化元数据控制面。它提供文件
-  系统形态的命名空间、shard-local 原子发布、带租约的历史快照，以及 CoW
-  fork-to-restore 原语；规划、语义记忆和编排仍由 Agent 运行时负责。
+- **LingTai（灵台）** 是 local-first 的 Agent 运行时，以路径形态的本地文件组织状态、信箱、日志与产物。
+- **NoKV** 是分布式 Agent workspace 与 artifact store，通过 Workbench、SDK、自定义 CLI 和 MCP 暴露路径形态的身份，使用 Holt 保存规范化元数据，并把不可变内容存入 S3 兼容对象存储。
 
-Lingtai 为 Agent 提供文件系统形态的“家”。NoKV 提供存储和元数据原语，使这类
-工作区在保留普通文件访问方式的同时，具备持久化、恢复和审计基础。
+双方的集成点是 Workbench 契约，而不是共享 host-filesystem namespace。LingTai 负责本地运行时布局；NoKV 负责分布式 artifact 身份、发布、发现与恢复语义。
 
-## 我们正在共同验证什么
+## 我们正在一起构建什么
 
-- **工作区检查点与恢复：** 固定一个稳定的历史视图，把已提交工作区恢复到新的
-  CoW 目标工作区，而不是原地修改源工作区。
-- **shard-local 崩溃一致发布：** 在同一个 metadata owner 内原子发布单个工件，
-  或一组 checkpoint 文件。
-- **显式溯源：** 保存摘要以及运行时主动写入的 provenance 字段，使工件能够关联
-  到产生它的运行元数据。
-- **可查询的工作区元数据：** 查询运行时和应用显式记录的元数据。NoKV 不会自行
-  推断语义依赖图。
+合作重点包括：
 
-NoKV 侧的 Workbench MCP 适配器、受保护的 Lingtai 18 工具契约、快照租约生命周期，
-以及持久化恢复验收路径现已存在。具体 Lingtai 发行版是否可用，仍取决于发行版本、
-能力探测和 preflight 检查。
+- **恢复与长期复用**：leased snapshot 用于短期恢复，immutable commit/tag 用于长期保留，restore 创建新的 Workbench。
+- **原子、崩溃一致的发布**：并发的 agent 写入，或运行中途崩溃，都不会留下写到一半的工作区。
+- **工件溯源（artifact provenance）**：带摘要（digest）的版本化数据块，让每一个派生工件都能追溯到产生它的那次运行。
+- **可查询的元数据层**：在 agent 的产物之间提问 *“这是什么产生的 / 什么依赖了它”*。
 
-## 当前边界
+上层路径语义保持稳定，同时明确存储边界。需要本地文件的可执行程序通过 materialize/collect adapter 交互；临时 sandbox 不是 NoKV namespace truth。
 
-- 原始 Workbench profile 有 17 个基础工具；只有所有相关 owner 都确认能力后，
-  才会把 `workbench_restore` 作为第 18 个工具暴露。
-- 快照 pin 带租约。checkpoint 名称只是用于发现的别名，不是永久 GC root，也不会
-  冻结实时工作区。
-- fork-to-restore 仅支持 same-shard，并保持源工作区不变。NoKV 当前不提供跨 shard
-  的原子恢复或发布事务。
-- Workbench 路径约束不等于鉴权、RBAC 或租户策略。生产级身份边界、实时工作区冻结
-  和 metadata 高可用仍需要单独完成工程硬化。
+## 当前方向
 
-两个项目都仍处于 pre-1.0 阶段并在快速迭代。可复现的工作负载证据和下游可用状态
-会在具备条件后另行发布。
+稳定边界是完整的 18-tool Workbench 契约。NoKV 保留面向 Agent 的路径形态语义，以 Holt 中的规范化全路径元数据和 S3 兼容对象存储中的不可变工件 revision 作为底层实现。LingTai 是当前活跃的 design partner 与首个 client 集成。
+
+如果“一个有状态、可快照、可审计的 Agent 工作区”正是你一直想要的：给 NoKV 点个星，关注 [LingTai](https://github.com/Lingtai-AI/lingtai)，留意后续。
 
 ## 联系方式
 
 - NoKV：hello@nokv.io
-- Lingtai：lingtai2026@gmail.com
+- LingTai：lingtai2026@gmail.com
 
 ## 加入社群
 
@@ -63,4 +46,4 @@ NoKV 侧的 Workbench MCP 适配器、受保护的 Lingtai 18 工具契约、快
 
 - Discord（NoKV）：https://discord.gg/c5PZapnwPh
 - Slack（NoKV）：CNCF 社区 Slack 中的 NoKV 频道（先在 https://slack.cncf.io 加入，再进频道 https://cloud-native.slack.com/archives/C0BBDBYE3H6 ）
-- 微信群（Lingtai）：请发送邮件到 `lingtai2026@gmail.com` 获取社群信息
+- 微信群（LingTai）：请发送邮件到 `lingtai2026@gmail.com` 获取社群信息

@@ -1,137 +1,651 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use crate::types::endpoint_is_canonical;
 use crate::{
-    CheckpointRef, ControlError, LogRef, NodeId, ShardId, ShardLease, ShardRecord, ShardState,
+    CheckpointRef, ControlError, LogRef, LogicalShardId, LogicalShardLease, LogicalShardRecord,
+    LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication, RootId, RootPlacement,
+    RootPlacementLifecycle,
 };
 
+/// Durable control-plane operations, split between immutable root placement
+/// and physical logical-shard ownership.
 pub trait ControlStore: Send + Sync {
-    fn ensure_shard(&self, shard_id: ShardId) -> Result<ShardRecord, ControlError>;
-    /// Register a shard's stable identity (prefix + index) before it is acquired.
-    /// Idempotent; identity is only set while the shard is unowned so a live
-    /// owner's routing cannot change underneath it.
-    fn register_shard(
+    fn create_root_placement(
         &self,
-        shard_id: ShardId,
-        prefix: String,
-        shard_index: u16,
-    ) -> Result<ShardRecord, ControlError>;
-    /// Record (or, with `None`, clear) the durable subtree-root inode for a
-    /// subtree shard — the atomic registration point of a cross-shard graft.
-    /// Idempotent and not lease-gated: it is a topology fact about the shard's
-    /// own namespace, set by `register_graft` before the (reconcilable) parent
-    /// graft dentry is written, and cleared by `unregister_graft` after the
-    /// graft is torn down. Returns the updated record.
-    fn set_subtree_root_inode(
+        placement: RootPlacement,
+    ) -> Result<RootPlacement, ControlError>;
+    fn get_root_placement(&self, root_id: &RootId) -> Result<Option<RootPlacement>, ControlError>;
+    fn list_root_placements(&self) -> Result<Vec<RootPlacement>, ControlError>;
+    fn compare_and_set_root_placement(
         &self,
-        shard_id: &ShardId,
-        subtree_root_inode: Option<u64>,
-    ) -> Result<ShardRecord, ControlError>;
-    /// Enumerate every known shard record so clients can build the routing map
-    /// and placement can find unowned/owned shards.
-    fn list_shards(&self) -> Result<Vec<ShardRecord>, ControlError>;
-    fn get_shard(&self, shard_id: &ShardId) -> Result<ShardRecord, ControlError>;
-    fn acquire_unassigned(
+        expected: &RootPlacement,
+        next: RootPlacement,
+    ) -> Result<RootPlacement, ControlError>;
+
+    fn create_logical_shard(
         &self,
-        shard_id: ShardId,
+        logical_shard_id: LogicalShardId,
+    ) -> Result<LogicalShardRecord, ControlError>;
+    fn get_logical_shard(
+        &self,
+        logical_shard_id: &LogicalShardId,
+    ) -> Result<Option<LogicalShardRecord>, ControlError>;
+    fn list_logical_shards(&self) -> Result<Vec<LogicalShardRecord>, ControlError>;
+
+    /// Install the first owner epoch. This succeeds only for a never-owned
+    /// logical shard with at least one non-retired root placement.
+    fn acquire_owner(
+        &self,
+        logical_shard_id: &LogicalShardId,
         owner: NodeId,
-    ) -> Result<ShardLease, ControlError>;
-    fn acquire_after_failure(
+        endpoint: String,
+    ) -> Result<LogicalShardLease, ControlError>;
+
+    /// Install a successor owner by exact comparison with the last durable
+    /// owner epoch. A backend must also prove that the previous session is gone.
+    fn acquire_successor(
         &self,
-        shard_id: ShardId,
+        logical_shard_id: &LogicalShardId,
+        expected_owner_epoch: OwnerEpoch,
         owner: NodeId,
-        previous_epoch: u64,
-    ) -> Result<ShardLease, ControlError>;
-    fn renew(&self, lease: &ShardLease) -> Result<ShardRecord, ControlError>;
-    /// Publish recovery references for the current lease.
-    ///
-    /// This API is owner-fenced but deliberately does not infer capture order
-    /// between concurrent calls made with the same lease. A caller that can
-    /// publish from multiple tasks must provide one single-writer critical
-    /// section spanning capture/prepare, this CAS, and pruning of the superseded
-    /// object(s). The server's recovery-publication gate is the production
-    /// implementation of that contract. Pruning before a successful CAS, or
-    /// allowing a later capture to overtake an earlier one, is unsafe.
+        endpoint: String,
+    ) -> Result<LogicalShardLease, ControlError>;
+
+    fn renew_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError>;
+
+    /// Publish a caller-serialized recovery frontier and make the exact owner
+    /// generation routable.
     fn mark_serving(
         &self,
-        lease: &ShardLease,
-        checkpoint: Option<CheckpointRef>,
-        log: Option<LogRef>,
-        durable_lsn: u64,
-    ) -> Result<ShardRecord, ControlError>;
-    fn release(&self, lease: &ShardLease) -> Result<ShardRecord, ControlError>;
+        lease: &LogicalShardLease,
+        publication: RecoveryPublication,
+    ) -> Result<LogicalShardRecord, ControlError>;
+
+    fn release_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError>;
 }
 
-/// Apply a `register_shard` to a record in place, enforcing that a shard's stable
-/// identity (`prefix`, `shard_index`) can only be set while the record is pristine
-/// — never leased (`epoch == 0`). Once a shard has taken a lease its identity is
-/// frozen: it is encoded in inode high bits and the client routing map, so a drift
-/// after a release would misroute existing data. Idempotent: re-registering the
-/// same identity always succeeds. Shared by both control-store backends.
-pub(crate) fn register_shard_identity(
-    record: &mut ShardRecord,
-    prefix: String,
-    shard_index: u16,
+#[derive(Default)]
+struct InMemoryState {
+    root_placements: BTreeMap<RootId, RootPlacement>,
+    logical_shards: BTreeMap<LogicalShardId, LogicalShardRecord>,
+    next_lease_id: u64,
+}
+
+#[derive(Default)]
+pub struct InMemoryControlStore {
+    state: Mutex<InMemoryState>,
+}
+
+impl InMemoryControlStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ControlStore for InMemoryControlStore {
+    fn create_root_placement(
+        &self,
+        placement: RootPlacement,
+    ) -> Result<RootPlacement, ControlError> {
+        validate_new_root_placement(&placement)?;
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        if !state
+            .logical_shards
+            .contains_key(&placement.logical_shard_id)
+        {
+            return Err(ControlError::LogicalShardNotFound(
+                placement.logical_shard_id,
+            ));
+        }
+        if let Some(current) = state.root_placements.get(&placement.root_id) {
+            if current == &placement {
+                return Ok(current.clone());
+            }
+            if current.logical_shard_id != placement.logical_shard_id {
+                return Err(ControlError::ImmutableShardAffinity {
+                    root_id: placement.root_id,
+                    existing: current.logical_shard_id,
+                    requested: placement.logical_shard_id,
+                });
+            }
+            return Err(ControlError::RootPlacementAlreadyExists(placement.root_id));
+        }
+        state
+            .root_placements
+            .insert(placement.root_id, placement.clone());
+        Ok(placement)
+    }
+
+    fn get_root_placement(&self, root_id: &RootId) -> Result<Option<RootPlacement>, ControlError> {
+        let state = self.state.lock().expect("control store mutex poisoned");
+        Ok(state.root_placements.get(root_id).cloned())
+    }
+
+    fn list_root_placements(&self) -> Result<Vec<RootPlacement>, ControlError> {
+        let state = self.state.lock().expect("control store mutex poisoned");
+        Ok(state.root_placements.values().cloned().collect())
+    }
+
+    fn compare_and_set_root_placement(
+        &self,
+        expected: &RootPlacement,
+        next: RootPlacement,
+    ) -> Result<RootPlacement, ControlError> {
+        validate_root_placement_update(expected, &next)?;
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        let actual = state.root_placements.get(&expected.root_id).cloned();
+        if actual.as_ref() == Some(&next) {
+            return Ok(next);
+        }
+        if actual.as_ref() != Some(expected) {
+            return Err(ControlError::RootPlacementCasConflict {
+                expected: expected.clone(),
+                actual,
+            });
+        }
+        state.root_placements.insert(next.root_id, next.clone());
+        Ok(next)
+    }
+
+    fn create_logical_shard(
+        &self,
+        logical_shard_id: LogicalShardId,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let desired = LogicalShardRecord::unassigned(logical_shard_id);
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        if let Some(current) = state.logical_shards.get(&logical_shard_id) {
+            if current == &desired {
+                return Ok(current.clone());
+            }
+            return Err(ControlError::LogicalShardAlreadyExists(logical_shard_id));
+        }
+        state
+            .logical_shards
+            .insert(logical_shard_id, desired.clone());
+        Ok(desired)
+    }
+
+    fn get_logical_shard(
+        &self,
+        logical_shard_id: &LogicalShardId,
+    ) -> Result<Option<LogicalShardRecord>, ControlError> {
+        let state = self.state.lock().expect("control store mutex poisoned");
+        Ok(state.logical_shards.get(logical_shard_id).cloned())
+    }
+
+    fn list_logical_shards(&self) -> Result<Vec<LogicalShardRecord>, ControlError> {
+        let state = self.state.lock().expect("control store mutex poisoned");
+        Ok(state.logical_shards.values().cloned().collect())
+    }
+
+    fn acquire_owner(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        owner: NodeId,
+        endpoint: String,
+    ) -> Result<LogicalShardLease, ControlError> {
+        validate_endpoint(&endpoint)?;
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        ensure_root_placement(&state, logical_shard_id)?;
+        let current = state
+            .logical_shards
+            .get(logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(*logical_shard_id))?;
+        if let (Some(current_owner), Some(owner_epoch)) =
+            (current.owner.clone(), current.owner_epoch)
+        {
+            return Err(ControlError::LogicalShardAlreadyOwned {
+                logical_shard_id: *logical_shard_id,
+                owner: current_owner,
+                owner_epoch,
+            });
+        }
+        let lease_id = allocate_lease_id(&mut state, *logical_shard_id)?;
+        let (next, lease) = prepare_owner_acquisition(&current, None, owner, endpoint, lease_id)?;
+        state.logical_shards.insert(*logical_shard_id, next);
+        Ok(lease)
+    }
+
+    fn acquire_successor(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        expected_owner_epoch: OwnerEpoch,
+        owner: NodeId,
+        endpoint: String,
+    ) -> Result<LogicalShardLease, ControlError> {
+        validate_endpoint(&endpoint)?;
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        ensure_root_placement(&state, logical_shard_id)?;
+        let current = state
+            .logical_shards
+            .get(logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(*logical_shard_id))?;
+        if current.owner_epoch != Some(expected_owner_epoch) {
+            return Err(ControlError::StaleOwnerEpoch {
+                logical_shard_id: *logical_shard_id,
+                expected: Some(expected_owner_epoch),
+                actual: current.owner_epoch,
+            });
+        }
+        if current.owner.is_some() {
+            return Err(ControlError::PreviousOwnerSessionLive {
+                logical_shard_id: *logical_shard_id,
+                owner_epoch: expected_owner_epoch,
+            });
+        }
+        let lease_id = allocate_lease_id(&mut state, *logical_shard_id)?;
+        let (next, lease) = prepare_owner_acquisition(
+            &current,
+            Some(expected_owner_epoch),
+            owner,
+            endpoint,
+            lease_id,
+        )?;
+        state.logical_shards.insert(*logical_shard_id, next);
+        Ok(lease)
+    }
+
+    fn renew_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError> {
+        let state = self.state.lock().expect("control store mutex poisoned");
+        let record = state
+            .logical_shards
+            .get(&lease.logical_shard_id)
+            .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        validate_record_lease(record, lease)?;
+        Ok(record.clone())
+    }
+
+    fn mark_serving(
+        &self,
+        lease: &LogicalShardLease,
+        publication: RecoveryPublication,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        let current = state
+            .logical_shards
+            .get(&lease.logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        let next = prepare_mark_serving(&current, lease, publication)?;
+        state
+            .logical_shards
+            .insert(lease.logical_shard_id, next.clone());
+        Ok(next)
+    }
+
+    fn release_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError> {
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        let current = state
+            .logical_shards
+            .get(&lease.logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        let next = prepare_owner_release(&current, lease)?;
+        state
+            .logical_shards
+            .insert(lease.logical_shard_id, next.clone());
+        Ok(next)
+    }
+}
+
+fn ensure_root_placement(
+    state: &InMemoryState,
+    logical_shard_id: &LogicalShardId,
 ) -> Result<(), ControlError> {
-    if record.prefix == prefix && record.shard_index == shard_index {
-        return Ok(());
+    if state.root_placements.values().any(|placement| {
+        placement.logical_shard_id == *logical_shard_id
+            && placement.lifecycle != RootPlacementLifecycle::Retired
+    }) {
+        Ok(())
+    } else {
+        Err(ControlError::RootPlacementRequired(*logical_shard_id))
     }
-    // Pristine == never owned and never leased. `epoch == 0` is the durable
-    // marker (acquire bumps it to >= 1 and release does not reset it).
-    if record.epoch == 0 && record.owner.is_none() {
-        record.prefix = prefix;
-        record.shard_index = shard_index;
-        return Ok(());
-    }
-    Err(ControlError::ShardIdentityLocked {
-        shard_id: record.shard_id.clone(),
-    })
 }
 
-/// Whether a shard id denotes the default/root shard (prefix `/`), which is the
-/// single shard allowed to be acquired without a prior `register_shard` — its
-/// identity (prefix `/`, index 0) is the unambiguous bootstrap default. Every
-/// non-root shard must be registered first so its index cannot silently be 0.
-pub(crate) fn is_default_shard(shard_id: &ShardId) -> bool {
-    shard_id
-        .as_str()
-        .split_once(':')
-        .map(|(_, path)| path)
-        .unwrap_or("/")
-        == "/"
+fn allocate_lease_id(
+    state: &mut InMemoryState,
+    logical_shard_id: LogicalShardId,
+) -> Result<u64, ControlError> {
+    state.next_lease_id = state
+        .next_lease_id
+        .checked_add(1)
+        .ok_or(ControlError::LeaseIdExhausted(logical_shard_id))?;
+    Ok(state.next_lease_id)
+}
+
+pub(crate) fn validate_new_root_placement(placement: &RootPlacement) -> Result<(), ControlError> {
+    if placement.placement_generation.get() != 1 {
+        return Err(ControlError::InvalidPlacementMutation {
+            root_id: placement.root_id,
+            reason: "initial placement generation must be 1".to_owned(),
+        });
+    }
+    if placement.lifecycle != RootPlacementLifecycle::Provisioning {
+        return Err(ControlError::InvalidPlacementMutation {
+            root_id: placement.root_id,
+            reason: "initial placement lifecycle must be Provisioning".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_root_placement_update(
+    expected: &RootPlacement,
+    next: &RootPlacement,
+) -> Result<(), ControlError> {
+    if next.root_id != expected.root_id {
+        return Err(ControlError::InvalidPlacementMutation {
+            root_id: expected.root_id,
+            reason: "root id is immutable".to_owned(),
+        });
+    }
+    if next.logical_shard_id != expected.logical_shard_id {
+        return Err(ControlError::ImmutableShardAffinity {
+            root_id: expected.root_id,
+            existing: expected.logical_shard_id,
+            requested: next.logical_shard_id,
+        });
+    }
+    let expected_generation = expected
+        .placement_generation
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| ControlError::InvalidPlacementMutation {
+            root_id: expected.root_id,
+            reason: "placement generation is exhausted".to_owned(),
+        })?;
+    if next.placement_generation.get() != expected_generation {
+        return Err(ControlError::InvalidPlacementMutation {
+            root_id: expected.root_id,
+            reason: format!(
+                "next placement generation must be {expected_generation}, got {}",
+                next.placement_generation
+            ),
+        });
+    }
+    validate_placement_transition(expected.root_id, expected.lifecycle, next.lifecycle)
+}
+
+fn validate_placement_transition(
+    root_id: RootId,
+    current: RootPlacementLifecycle,
+    next: RootPlacementLifecycle,
+) -> Result<(), ControlError> {
+    let valid = matches!(
+        (current, next),
+        (
+            RootPlacementLifecycle::Provisioning,
+            RootPlacementLifecycle::Active
+        ) | (
+            RootPlacementLifecycle::Provisioning,
+            RootPlacementLifecycle::Retired
+        ) | (
+            RootPlacementLifecycle::Active,
+            RootPlacementLifecycle::Draining
+        ) | (
+            RootPlacementLifecycle::Draining,
+            RootPlacementLifecycle::Active
+        ) | (
+            RootPlacementLifecycle::Draining,
+            RootPlacementLifecycle::Retired
+        )
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(ControlError::InvalidPlacementMutation {
+            root_id,
+            reason: format!("lifecycle transition {current:?} -> {next:?} is not allowed"),
+        })
+    }
+}
+
+pub(crate) fn prepare_owner_acquisition(
+    current: &LogicalShardRecord,
+    expected_owner_epoch: Option<OwnerEpoch>,
+    owner: NodeId,
+    endpoint: String,
+    lease_id: u64,
+) -> Result<(LogicalShardRecord, LogicalShardLease), ControlError> {
+    validate_logical_shard_record(current)?;
+    validate_endpoint(&endpoint)?;
+    if lease_id == 0 {
+        return Err(ControlError::InvalidRecord(
+            "active owner lease id must be non-zero".to_owned(),
+        ));
+    }
+    if current.owner_epoch != expected_owner_epoch {
+        return Err(ControlError::StaleOwnerEpoch {
+            logical_shard_id: current.logical_shard_id,
+            expected: expected_owner_epoch,
+            actual: current.owner_epoch,
+        });
+    }
+    if expected_owner_epoch.is_none() {
+        if let (Some(current_owner), Some(owner_epoch)) =
+            (current.owner.clone(), current.owner_epoch)
+        {
+            return Err(ControlError::LogicalShardAlreadyOwned {
+                logical_shard_id: current.logical_shard_id,
+                owner: current_owner,
+                owner_epoch,
+            });
+        }
+        if current.owner.is_some() {
+            return Err(ControlError::InvalidRecord(
+                "owned shard is missing its owner epoch".to_owned(),
+            ));
+        }
+    }
+    let next_epoch = match expected_owner_epoch {
+        None => OwnerEpoch::new(1).expect("one is a valid owner epoch"),
+        Some(current_epoch) => {
+            let next = current_epoch
+                .get()
+                .checked_add(1)
+                .ok_or(ControlError::OwnerEpochExhausted(current.logical_shard_id))?;
+            OwnerEpoch::new(next)
+                .map_err(|_| ControlError::OwnerEpochExhausted(current.logical_shard_id))?
+        }
+    };
+    let lease = LogicalShardLease {
+        logical_shard_id: current.logical_shard_id,
+        owner: owner.clone(),
+        owner_epoch: next_epoch,
+        lease_id,
+    };
+    let mut next = current.clone();
+    next.owner = Some(owner);
+    next.owner_epoch = Some(next_epoch);
+    next.lease_id = lease_id;
+    next.state = LogicalShardState::Recovering;
+    next.endpoint = Some(endpoint);
+    validate_logical_shard_record(&next)?;
+    Ok((next, lease))
+}
+
+pub(crate) fn prepare_mark_serving(
+    current: &LogicalShardRecord,
+    lease: &LogicalShardLease,
+    publication: RecoveryPublication,
+) -> Result<LogicalShardRecord, ControlError> {
+    validate_record_lease(current, lease)?;
+    let mut next = current.clone();
+    apply_recovery_publication(&mut next, publication)?;
+    next.state = LogicalShardState::Serving;
+    validate_logical_shard_record(&next)?;
+    Ok(next)
+}
+
+pub(crate) fn prepare_owner_release(
+    current: &LogicalShardRecord,
+    lease: &LogicalShardLease,
+) -> Result<LogicalShardRecord, ControlError> {
+    validate_record_lease(current, lease)?;
+    let mut next = current.clone();
+    next.owner = None;
+    next.lease_id = 0;
+    next.state = LogicalShardState::Unassigned;
+    next.endpoint = None;
+    validate_logical_shard_record(&next)?;
+    Ok(next)
+}
+
+pub(crate) fn validate_record_lease(
+    record: &LogicalShardRecord,
+    lease: &LogicalShardLease,
+) -> Result<(), ControlError> {
+    if record.owner.as_ref() != Some(&lease.owner) {
+        return Err(ControlError::NotOwner {
+            logical_shard_id: lease.logical_shard_id,
+        });
+    }
+    if record.logical_shard_id != lease.logical_shard_id
+        || record.owner_epoch != Some(lease.owner_epoch)
+        || record.lease_id != lease.lease_id
+    {
+        return Err(ControlError::StaleLease(lease.clone()));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_logical_shard_record(
+    record: &LogicalShardRecord,
+) -> Result<(), ControlError> {
+    if record.owner_epoch.is_none()
+        && (record.checkpoint.is_some() || record.log.is_some() || record.durable_lsn != 0)
+    {
+        return Err(ControlError::InvalidRecord(
+            "never-owned logical shard cannot have recovery state".to_owned(),
+        ));
+    }
+    match record.owner.as_ref() {
+        None => {
+            if record.endpoint.is_some() {
+                return Err(ControlError::InvalidRecord(
+                    "unowned logical shard must not have an endpoint".to_owned(),
+                ));
+            }
+            if record.lease_id != 0 {
+                return Err(ControlError::InvalidRecord(
+                    "unowned logical shard must have lease id zero".to_owned(),
+                ));
+            }
+            if record.state != LogicalShardState::Unassigned {
+                return Err(ControlError::InvalidRecord(
+                    "unowned logical shard must be Unassigned".to_owned(),
+                ));
+            }
+        }
+        Some(_) => {
+            if record.owner_epoch.is_none() {
+                return Err(ControlError::InvalidRecord(
+                    "owned logical shard must have an owner epoch".to_owned(),
+                ));
+            }
+            if record.lease_id == 0 {
+                return Err(ControlError::InvalidRecord(
+                    "owned logical shard must have a non-zero lease id".to_owned(),
+                ));
+            }
+            let endpoint = record.endpoint.as_deref().ok_or_else(|| {
+                ControlError::InvalidRecord(
+                    "owned logical shard must have a reachable endpoint".to_owned(),
+                )
+            })?;
+            if !endpoint_is_canonical(endpoint) {
+                return Err(ControlError::InvalidRecord(
+                    "logical-shard endpoint is empty or non-canonical".to_owned(),
+                ));
+            }
+            if record.state == LogicalShardState::Unassigned {
+                return Err(ControlError::InvalidRecord(
+                    "owned logical shard cannot be Unassigned".to_owned(),
+                ));
+            }
+        }
+    }
+
+    if let Some(checkpoint) = record.checkpoint.as_ref() {
+        validate_checkpoint_ref(checkpoint).map_err(ControlError::InvalidRecord)?;
+    }
+    if let Some(log) = record.log.as_ref() {
+        validate_log_ref(record, None, log).map_err(ControlError::InvalidRecord)?;
+    }
+    let reference_lsn = match (record.checkpoint.as_ref(), record.log.as_ref()) {
+        (Some(checkpoint), Some(log)) => checkpoint.lsn.max(log.durable_lsn),
+        (Some(checkpoint), None) => checkpoint.lsn,
+        (None, Some(log)) => log.durable_lsn,
+        (None, None) => 0,
+    };
+    if record.durable_lsn != reference_lsn {
+        return Err(ControlError::InvalidRecord(format!(
+            "durable LSN {} does not match recovery reference tail {reference_lsn}",
+            record.durable_lsn
+        )));
+    }
+    durable_tail_digest(record).map_err(ControlError::InvalidRecord)?;
+    Ok(())
+}
+
+fn validate_endpoint(endpoint: &str) -> Result<(), ControlError> {
+    if endpoint_is_canonical(endpoint) {
+        Ok(())
+    } else {
+        Err(ControlError::InvalidEndpoint(endpoint.to_owned()))
+    }
+}
+
+fn validate_checkpoint_ref(checkpoint: &CheckpointRef) -> Result<(), String> {
+    if checkpoint.object_key.is_empty() {
+        return Err("checkpoint object key must not be empty".to_owned());
+    }
+    if checkpoint.image_bytes == 0 {
+        return Err("checkpoint image size must be non-zero".to_owned());
+    }
+    if checkpoint.image_digest.is_empty() {
+        return Err("checkpoint image digest must not be empty".to_owned());
+    }
+    if checkpoint.digest.is_empty() {
+        return Err("checkpoint state digest must not be empty".to_owned());
+    }
+    Ok(())
 }
 
 /// Merge one caller-serialized, owner-fenced recovery publication.
 ///
-/// This rejects durable-LSN rollback and conflicting comparable log identities,
-/// but it is not a concurrency sequencer: in particular, checkpoint-only images
-/// at LSN zero may legitimately replace one another. Capture order must already
-/// be serialized by the `mark_serving` caller as documented on [`ControlStore`].
-///
-/// Checkpoints dominate logs they fully cover: once a checkpoint at the
-/// durable tail is published, its covered log chain can be pruned and must not
-/// be reattached by a delayed same-LSN log publication. A later log may advance
-/// beyond that checkpoint and retains it as its replay base.
+/// Checkpoints dominate logs they fully cover. A later log may advance beyond
+/// that checkpoint only by preserving the full durable segment chain.
 pub(crate) fn apply_recovery_publication(
-    record: &mut ShardRecord,
-    checkpoint: Option<CheckpointRef>,
-    log: Option<LogRef>,
-    durable_lsn: u64,
+    record: &mut LogicalShardRecord,
+    publication: RecoveryPublication,
 ) -> Result<(), ControlError> {
-    let shard_id = record.shard_id.clone();
+    let RecoveryPublication {
+        checkpoint,
+        log,
+        durable_lsn,
+    } = publication;
+    let logical_shard_id = record.logical_shard_id;
     let conflict = |reason: String| ControlError::RecoveryPublicationConflict {
-        shard_id: shard_id.clone(),
+        logical_shard_id,
         reason,
     };
 
+    if let Some(checkpoint) = checkpoint.as_ref() {
+        validate_checkpoint_ref(checkpoint).map_err(&conflict)?;
+    }
     let reference_lsn = match (checkpoint.as_ref(), log.as_ref()) {
         (Some(checkpoint), Some(log)) => checkpoint.lsn.max(log.durable_lsn),
         (Some(checkpoint), None) => checkpoint.lsn,
         (None, Some(log)) => log.durable_lsn,
         (None, None) => {
-            if durable_lsn > record.durable_lsn {
+            if durable_lsn != record.durable_lsn {
                 return Err(conflict(format!(
-                    "durable LSN {durable_lsn} has no checkpoint or log identity"
+                    "empty publication durable LSN {durable_lsn} does not confirm current durable LSN {}",
+                    record.durable_lsn
                 )));
             }
             return Ok(());
@@ -150,10 +664,6 @@ pub(crate) fn apply_recovery_publication(
                 checkpoint.lsn, record.durable_lsn
             )));
         }
-        // Checkpoint-only deployments have no logical log allocator, so every
-        // image legitimately carries LSN 0 and the zero digest even as metadata
-        // changes. The owner publication gate serializes those images; at the
-        // durable-store boundary only their logical tail digest is comparable.
     }
     if let Some(log) = log.as_ref() {
         if log.durable_lsn < record.durable_lsn {
@@ -162,7 +672,7 @@ pub(crate) fn apply_recovery_publication(
                 log.durable_lsn, record.durable_lsn
             )));
         }
-        validate_log_ref(record, checkpoint.as_ref(), log).map_err(conflict)?;
+        validate_log_ref(record, checkpoint.as_ref(), log).map_err(&conflict)?;
         if let Some(current) = record
             .log
             .as_ref()
@@ -186,7 +696,7 @@ pub(crate) fn apply_recovery_publication(
         }
     }
 
-    let current_tail_digest = durable_tail_digest(record).map_err(conflict)?;
+    let current_tail_digest = durable_tail_digest(record).map_err(&conflict)?;
     if let Some(expected) = current_tail_digest.as_deref() {
         if let Some(checkpoint) = checkpoint
             .as_ref()
@@ -232,12 +742,15 @@ pub(crate) fn apply_recovery_publication(
 }
 
 fn validate_log_ref(
-    record: &ShardRecord,
+    record: &LogicalShardRecord,
     incoming_checkpoint: Option<&CheckpointRef>,
     log: &LogRef,
 ) -> Result<(), String> {
     if log.segments.is_empty() {
         return Err("log segment chain is empty".to_owned());
+    }
+    if log.digest.is_empty() {
+        return Err("log tail digest must not be empty".to_owned());
     }
 
     let checkpoint_lsn = incoming_checkpoint
@@ -263,7 +776,7 @@ fn validate_log_ref(
                 segment.first_lsn, segment.last_lsn
             ));
         }
-        if let Some(previous) = index.checked_sub(1).map(|previous| &log.segments[previous]) {
+        if let Some(previous) = index.checked_sub(1).map(|index| &log.segments[index]) {
             let expected = previous
                 .last_lsn
                 .checked_add(1)
@@ -281,9 +794,6 @@ fn validate_log_ref(
         .segments
         .first()
         .expect("non-empty segment chain has a first segment");
-    // A log at the checkpoint tail is a delayed, fully-covered publication. It
-    // is still validated internally and then discarded by the checkpoint-cover
-    // rule, but its historical first LSN need not follow the new checkpoint.
     if log.durable_lsn > checkpoint_lsn {
         let expected_first = checkpoint_lsn
             .checked_add(1)
@@ -324,7 +834,7 @@ fn validate_log_ref(
     Ok(())
 }
 
-fn durable_tail_digest(record: &ShardRecord) -> Result<Option<String>, String> {
+fn durable_tail_digest(record: &LogicalShardRecord) -> Result<Option<String>, String> {
     let checkpoint = record
         .checkpoint
         .as_ref()
@@ -346,241 +856,64 @@ fn durable_tail_digest(record: &ShardRecord) -> Result<Option<String>, String> {
         .or_else(|| checkpoint.map(|checkpoint| checkpoint.digest.clone())))
 }
 
-#[derive(Default)]
-pub struct InMemoryControlStore {
-    shards: Mutex<BTreeMap<ShardId, ShardRecord>>,
-}
-
-impl InMemoryControlStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn next_lease(record: &ShardRecord) -> u64 {
-        record.lease_id.saturating_add(1).max(1)
-    }
-
-    fn validate_lease(record: &ShardRecord, lease: &ShardLease) -> Result<(), ControlError> {
-        if record.owner.as_ref() != Some(&lease.owner) {
-            return Err(ControlError::NotOwner {
-                shard_id: lease.shard_id.clone(),
-            });
-        }
-        if record.epoch != lease.epoch || record.lease_id != lease.lease_id {
-            return Err(ControlError::StaleLease {
-                shard_id: lease.shard_id.clone(),
-                epoch: lease.epoch,
-                lease_id: lease.lease_id,
-            });
-        }
-        Ok(())
-    }
-}
-
-impl ControlStore for InMemoryControlStore {
-    fn ensure_shard(&self, shard_id: ShardId) -> Result<ShardRecord, ControlError> {
-        let mut shards = self.shards.lock().expect("control store mutex poisoned");
-        let record = shards
-            .entry(shard_id.clone())
-            .or_insert_with(|| ShardRecord::unassigned(shard_id));
-        Ok(record.clone())
-    }
-
-    fn register_shard(
-        &self,
-        shard_id: ShardId,
-        prefix: String,
-        shard_index: u16,
-    ) -> Result<ShardRecord, ControlError> {
-        let mut shards = self.shards.lock().expect("control store mutex poisoned");
-        let record = shards
-            .entry(shard_id.clone())
-            .or_insert_with(|| ShardRecord::unassigned(shard_id));
-        register_shard_identity(record, prefix, shard_index)?;
-        Ok(record.clone())
-    }
-
-    fn set_subtree_root_inode(
-        &self,
-        shard_id: &ShardId,
-        subtree_root_inode: Option<u64>,
-    ) -> Result<ShardRecord, ControlError> {
-        let mut shards = self.shards.lock().expect("control store mutex poisoned");
-        let record = shards
-            .get_mut(shard_id)
-            .ok_or_else(|| ControlError::ShardNotFound(shard_id.clone()))?;
-        record.subtree_root_inode = subtree_root_inode;
-        Ok(record.clone())
-    }
-
-    fn list_shards(&self) -> Result<Vec<ShardRecord>, ControlError> {
-        let shards = self.shards.lock().expect("control store mutex poisoned");
-        Ok(shards.values().cloned().collect())
-    }
-
-    fn get_shard(&self, shard_id: &ShardId) -> Result<ShardRecord, ControlError> {
-        let shards = self.shards.lock().expect("control store mutex poisoned");
-        shards
-            .get(shard_id)
-            .cloned()
-            .ok_or_else(|| ControlError::ShardNotFound(shard_id.clone()))
-    }
-
-    fn acquire_unassigned(
-        &self,
-        shard_id: ShardId,
-        owner: NodeId,
-    ) -> Result<ShardLease, ControlError> {
-        let mut shards = self.shards.lock().expect("control store mutex poisoned");
-        // A non-default shard MUST be registered first: auto-creating it here via
-        // `unassigned` would default its `shard_index` to 0 and collide with the
-        // root shard, breaking shard-index uniqueness and inode routing. The
-        // default/root shard keeps its bootstrap path (auto-create with index 0).
-        let record = match shards.get_mut(&shard_id) {
-            Some(record) => record,
-            None if is_default_shard(&shard_id) => shards
-                .entry(shard_id.clone())
-                .or_insert_with(|| ShardRecord::unassigned(shard_id.clone())),
-            None => {
-                return Err(ControlError::ShardNotRegistered { shard_id });
-            }
-        };
-        if let Some(existing_owner) = record.owner.clone() {
-            return Err(ControlError::ShardAlreadyOwned {
-                shard_id,
-                owner: existing_owner,
-                epoch: record.epoch,
-            });
-        }
-        record.owner = Some(owner.clone());
-        record.endpoint = Some(owner.as_str().to_owned());
-        record.epoch = record.epoch.saturating_add(1).max(1);
-        record.lease_id = Self::next_lease(record);
-        // Acquisition only establishes exclusive recovery ownership. The shard
-        // must remain unroutable until the owner has restored local metadata,
-        // installed its durability fences, and published an exact recovery
-        // checkpoint through `mark_serving`.
-        record.state = ShardState::Recovering;
-        Ok(ShardLease {
-            shard_id,
-            owner,
-            epoch: record.epoch,
-            lease_id: record.lease_id,
-        })
-    }
-
-    fn acquire_after_failure(
-        &self,
-        shard_id: ShardId,
-        owner: NodeId,
-        previous_epoch: u64,
-    ) -> Result<ShardLease, ControlError> {
-        let mut shards = self.shards.lock().expect("control store mutex poisoned");
-        let record = shards
-            .get_mut(&shard_id)
-            .ok_or_else(|| ControlError::ShardNotFound(shard_id.clone()))?;
-        if record.epoch != previous_epoch {
-            return Err(ControlError::StaleEpoch {
-                shard_id,
-                expected: previous_epoch,
-                actual: record.epoch,
-            });
-        }
-        record.owner = Some(owner.clone());
-        record.endpoint = Some(owner.as_str().to_owned());
-        record.epoch = record.epoch.saturating_add(1);
-        record.lease_id = Self::next_lease(record);
-        record.state = ShardState::Recovering;
-        Ok(ShardLease {
-            shard_id,
-            owner,
-            epoch: record.epoch,
-            lease_id: record.lease_id,
-        })
-    }
-
-    fn renew(&self, lease: &ShardLease) -> Result<ShardRecord, ControlError> {
-        let shards = self.shards.lock().expect("control store mutex poisoned");
-        let record = shards
-            .get(&lease.shard_id)
-            .ok_or_else(|| ControlError::ShardNotFound(lease.shard_id.clone()))?;
-        Self::validate_lease(record, lease)?;
-        Ok(record.clone())
-    }
-
-    fn mark_serving(
-        &self,
-        lease: &ShardLease,
-        checkpoint: Option<CheckpointRef>,
-        log: Option<LogRef>,
-        durable_lsn: u64,
-    ) -> Result<ShardRecord, ControlError> {
-        let mut shards = self.shards.lock().expect("control store mutex poisoned");
-        let record = shards
-            .get_mut(&lease.shard_id)
-            .ok_or_else(|| ControlError::ShardNotFound(lease.shard_id.clone()))?;
-        Self::validate_lease(record, lease)?;
-        apply_recovery_publication(record, checkpoint, log, durable_lsn)?;
-        record.state = ShardState::Serving;
-        record.ever_served = true;
-        Ok(record.clone())
-    }
-
-    fn release(&self, lease: &ShardLease) -> Result<ShardRecord, ControlError> {
-        let mut shards = self.shards.lock().expect("control store mutex poisoned");
-        let record = shards
-            .get_mut(&lease.shard_id)
-            .ok_or_else(|| ControlError::ShardNotFound(lease.shard_id.clone()))?;
-        Self::validate_lease(record, lease)?;
-        record.owner = None;
-        record.endpoint = None;
-        record.state = ShardState::Unassigned;
-        Ok(record.clone())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LogSegmentRef;
+    use crate::{LogSegmentRef, PlacementGeneration};
 
-    fn shard() -> ShardId {
-        ShardId::new("mount-1:/runs")
+    fn root_id(value: u8) -> RootId {
+        RootId::from_bytes([value; 16])
     }
 
-    fn node(raw: &str) -> NodeId {
-        NodeId::new(raw)
+    fn shard_id(value: u8) -> LogicalShardId {
+        LogicalShardId::from_bytes([value; 16])
     }
 
-    /// A store with the non-default test shard already registered, matching the
-    /// production precondition that every non-root shard is registered before it
-    /// is acquired.
-    fn registered_store() -> InMemoryControlStore {
-        let store = InMemoryControlStore::new();
-        store
-            .register_shard(shard(), "/runs".to_owned(), 2)
-            .unwrap();
-        store
+    fn node(value: &str) -> NodeId {
+        NodeId::new(value).unwrap()
     }
 
-    fn checkpoint_ref(lsn: u64, digest: &str, identity: &str) -> CheckpointRef {
-        CheckpointRef {
-            object_key: format!("meta/checkpoints/{identity}"),
-            lsn,
-            image_bytes: 1024,
-            image_digest: format!("sha256:{identity}"),
-            digest: digest.to_owned(),
+    fn initial_placement(root: u8, shard: u8) -> RootPlacement {
+        RootPlacement {
+            root_id: root_id(root),
+            logical_shard_id: shard_id(shard),
+            placement_generation: PlacementGeneration::new(1).unwrap(),
+            lifecycle: RootPlacementLifecycle::Provisioning,
         }
     }
 
-    fn log_ref(lsn: u64, digest: &str, identity: &str) -> LogRef {
-        log_ref_range(1, lsn, digest, identity)
+    fn next_placement(current: &RootPlacement, lifecycle: RootPlacementLifecycle) -> RootPlacement {
+        RootPlacement {
+            root_id: current.root_id,
+            logical_shard_id: current.logical_shard_id,
+            placement_generation: PlacementGeneration::new(current.placement_generation.get() + 1)
+                .unwrap(),
+            lifecycle,
+        }
     }
 
-    fn log_ref_range(first_lsn: u64, last_lsn: u64, digest: &str, identity: &str) -> LogRef {
+    fn create_placed_shard(store: &InMemoryControlStore, root: u8, shard: u8) -> RootPlacement {
+        store.create_logical_shard(shard_id(shard)).unwrap();
+        let placement = initial_placement(root, shard);
+        store.create_root_placement(placement.clone()).unwrap();
+        placement
+    }
+
+    fn acquire_placed_shard(
+        store: &InMemoryControlStore,
+        root: u8,
+        shard: u8,
+    ) -> LogicalShardLease {
+        create_placed_shard(store, root, shard);
+        store
+            .acquire_owner(&shard_id(shard), node("node-a"), "node-a:7000".to_owned())
+            .unwrap()
+    }
+
+    fn log_ref(first_lsn: u64, last_lsn: u64, digest: &str) -> LogRef {
         LogRef {
             segments: vec![LogSegmentRef {
-                segment_key: format!("meta/log/{identity}"),
+                segment_key: format!("logs/{first_lsn}-{last_lsn}"),
                 first_lsn,
                 last_lsn,
                 digest: digest.to_owned(),
@@ -590,374 +923,332 @@ mod tests {
         }
     }
 
-    fn extend_log_ref(current: &LogRef, lsn: u64, digest: &str, identity: &str) -> LogRef {
-        let mut segments = current.segments.clone();
-        segments.push(LogSegmentRef {
-            segment_key: format!("meta/log/{identity}"),
-            first_lsn: current.durable_lsn + 1,
-            last_lsn: lsn,
-            digest: digest.to_owned(),
-        });
-        LogRef {
-            segments,
-            durable_lsn: lsn,
-            digest: digest.to_owned(),
-        }
-    }
-
     #[test]
-    fn fresh_acquire_sets_owner_epoch_and_lease() {
-        let store = registered_store();
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-
-        assert_eq!(lease.epoch, 1);
-        assert_eq!(lease.lease_id, 1);
-
-        let record = store.get_shard(&lease.shard_id).unwrap();
-        assert_eq!(record.owner, Some(node("node-a")));
-        assert_eq!(record.state, ShardState::Recovering);
-        assert!(!record.ever_served);
-        // Registered identity survives acquisition.
-        assert_eq!(record.shard_index, 2);
-        assert_eq!(record.prefix, "/runs");
-    }
-
-    #[test]
-    fn second_fresh_owner_is_rejected() {
-        let store = registered_store();
-        let _lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-
-        let err = store
-            .acquire_unassigned(shard(), node("node-b"))
-            .unwrap_err();
+    fn root_placement_must_exist_before_owner_write_authority() {
+        let store = InMemoryControlStore::new();
+        let logical_shard_id = shard_id(1);
+        store.create_logical_shard(logical_shard_id).unwrap();
 
         assert!(matches!(
-            err,
-            ControlError::ShardAlreadyOwned {
-                owner,
-                epoch: 1,
-                ..
-            } if owner == node("node-a")
+            store.acquire_owner(
+                &logical_shard_id,
+                node("node-a"),
+                "node-a:7000".to_owned()
+            ),
+            Err(ControlError::RootPlacementRequired(id)) if id == logical_shard_id
         ));
-    }
 
-    #[test]
-    fn failover_bumps_epoch_and_fences_old_lease() {
-        let store = registered_store();
-        let old = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let new = store
-            .acquire_after_failure(shard(), node("node-b"), old.epoch)
-            .unwrap();
-
-        assert_eq!(new.epoch, 2);
-        assert_eq!(new.lease_id, 2);
-        assert_eq!(store.renew(&new).unwrap().state, ShardState::Recovering);
-        assert!(matches!(
-            store.renew(&old).unwrap_err(),
-            ControlError::NotOwner { .. }
-        ));
-    }
-
-    #[test]
-    fn mark_serving_requires_current_lease() {
-        let store = registered_store();
-        let old = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let new = store
-            .acquire_after_failure(shard(), node("node-b"), old.epoch)
-            .unwrap();
-
-        assert!(store.mark_serving(&old, None, None, 0).is_err());
-
-        let record = store.mark_serving(&new, None, None, 0).unwrap();
-        assert_eq!(record.state, ShardState::Serving);
-        assert_eq!(record.durable_lsn, 0);
-        assert!(record.ever_served);
-    }
-
-    #[test]
-    fn mark_serving_preserves_recovery_refs_when_not_replaced() {
-        let store = registered_store();
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let checkpoint = checkpoint_ref(9, "abc123", "ckpt-9");
-        let log = log_ref_range(10, 10, "def456", "segment-10");
         store
-            .mark_serving(&lease, Some(checkpoint.clone()), None, 9)
+            .create_root_placement(initial_placement(1, 1))
             .unwrap();
-        store
-            .mark_serving(&lease, None, Some(log.clone()), 10)
-            .unwrap();
-
-        let record = store.mark_serving(&lease, None, None, 0).unwrap();
-
-        assert_eq!(record.checkpoint, Some(checkpoint));
-        assert_eq!(record.log, Some(log));
-        assert_eq!(record.durable_lsn, 10);
-    }
-
-    #[test]
-    fn mark_serving_rejects_a_log_behind_the_durable_tail() {
-        let store = registered_store();
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let older = log_ref(9, "digest-9", "segment-9");
-        let newer = extend_log_ref(&older, 10, "digest-10", "segment-10");
-        store
-            .mark_serving(&lease, None, Some(older.clone()), 9)
-            .unwrap();
-        store
-            .mark_serving(&lease, None, Some(newer.clone()), 10)
-            .unwrap();
-
-        let err = store
-            .mark_serving(&lease, None, Some(older), 9)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ControlError::RecoveryPublicationConflict { .. }
-        ));
-        let record = store.get_shard(&lease.shard_id).unwrap();
-        assert_eq!(record.durable_lsn, 10);
-        assert_eq!(record.log, Some(newer));
-    }
-
-    #[test]
-    fn mark_serving_rejects_conflicting_log_identity_at_the_same_lsn() {
-        let store = registered_store();
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let published = log_ref(9, "digest-9", "segment-a");
-        store
-            .mark_serving(&lease, None, Some(published.clone()), 9)
-            .unwrap();
-
-        for conflicting in [
-            log_ref(9, "digest-9", "segment-b"),
-            log_ref(9, "different-digest", "segment-a"),
-        ] {
-            assert!(matches!(
-                store.mark_serving(&lease, None, Some(conflicting), 9),
-                Err(ControlError::RecoveryPublicationConflict { .. })
-            ));
-        }
         assert_eq!(
-            store.get_shard(&lease.shard_id).unwrap().log,
-            Some(published)
+            store
+                .acquire_owner(&logical_shard_id, node("node-a"), "node-a:7000".to_owned())
+                .unwrap()
+                .owner_epoch
+                .get(),
+            1
         );
     }
 
     #[test]
-    fn malformed_log_publication_cannot_replace_the_durable_chain() {
-        let store = registered_store();
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let durable = log_ref(2, "digest-2", "segment-1-2");
-        store
-            .mark_serving(&lease, None, Some(durable.clone()), 2)
+    fn populated_root_placement_never_changes_logical_shard_affinity() {
+        let store = InMemoryControlStore::new();
+        store.create_logical_shard(shard_id(1)).unwrap();
+        store.create_logical_shard(shard_id(2)).unwrap();
+        let placement = initial_placement(1, 1);
+        store.create_root_placement(placement.clone()).unwrap();
+
+        let conflicting = initial_placement(1, 2);
+        assert!(matches!(
+            store.create_root_placement(conflicting),
+            Err(ControlError::ImmutableShardAffinity { .. })
+        ));
+
+        let mut mutated = next_placement(&placement, RootPlacementLifecycle::Active);
+        mutated.logical_shard_id = shard_id(2);
+        assert!(matches!(
+            store.compare_and_set_root_placement(&placement, mutated),
+            Err(ControlError::ImmutableShardAffinity { .. })
+        ));
+    }
+
+    #[test]
+    fn root_generation_cas_fences_concurrent_lifecycle_updates() {
+        let store = InMemoryControlStore::new();
+        let initial = create_placed_shard(&store, 1, 1);
+        let active = next_placement(&initial, RootPlacementLifecycle::Active);
+        assert_eq!(
+            store
+                .compare_and_set_root_placement(&initial, active.clone())
+                .unwrap(),
+            active
+        );
+        assert_eq!(
+            store
+                .compare_and_set_root_placement(&initial, active.clone())
+                .unwrap(),
+            active,
+            "response replay is idempotent"
+        );
+
+        let retired = next_placement(&initial, RootPlacementLifecycle::Retired);
+        assert!(matches!(
+            store.compare_and_set_root_placement(&initial, retired),
+            Err(ControlError::RootPlacementCasConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn owner_epoch_cas_is_monotonic_and_fences_races() {
+        let store = InMemoryControlStore::new();
+        let first = acquire_placed_shard(&store, 1, 1);
+        assert_eq!(first.owner_epoch.get(), 1);
+        let released = store.release_owner(&first).unwrap();
+        assert_eq!(released.owner_epoch, Some(first.owner_epoch));
+        assert!(released.owner.is_none());
+        assert!(matches!(
+            store.release_owner(&first),
+            Err(ControlError::NotOwner { .. })
+        ));
+
+        let second = store
+            .acquire_successor(
+                &shard_id(1),
+                first.owner_epoch,
+                node("node-b"),
+                "node-b:7000".to_owned(),
+            )
             .unwrap();
+        assert_eq!(second.owner_epoch.get(), 2);
+        assert!(matches!(
+            store.acquire_successor(
+                &shard_id(1),
+                first.owner_epoch,
+                node("node-c"),
+                "node-c:7000".to_owned()
+            ),
+            Err(ControlError::StaleOwnerEpoch { .. })
+        ));
+        assert!(matches!(
+            store.renew_owner(&first),
+            Err(ControlError::NotOwner { .. }) | Err(ControlError::StaleLease(_))
+        ));
+    }
 
-        let truncated = log_ref_range(3, 3, "digest-3", "segment-3");
-        let mut gap = durable.clone();
-        gap.segments.push(LogSegmentRef {
-            segment_key: "meta/log/segment-4".to_owned(),
-            first_lsn: 4,
-            last_lsn: 4,
-            digest: "digest-4".to_owned(),
-        });
-        gap.durable_lsn = 4;
-        gap.digest = "digest-4".to_owned();
-        let mut tail_mismatch = extend_log_ref(&durable, 3, "digest-3", "segment-3");
-        tail_mismatch.durable_lsn = 4;
-        let mut digest_mismatch = extend_log_ref(&durable, 3, "digest-3", "segment-3");
-        digest_mismatch.digest = "different-tail-digest".to_owned();
-
-        for malformed in [
-            LogRef {
-                segments: Vec::new(),
-                durable_lsn: 3,
-                digest: "digest-3".to_owned(),
-            },
-            truncated,
-            gap,
-            tail_mismatch,
-            digest_mismatch,
-        ] {
-            assert!(matches!(
-                store.mark_serving(&lease, None, Some(malformed.clone()), malformed.durable_lsn,),
-                Err(ControlError::RecoveryPublicationConflict { .. })
-            ));
-            let record = store.get_shard(&lease.shard_id).unwrap();
-            assert_eq!(record.log, Some(durable.clone()));
-            assert_eq!(record.durable_lsn, 2);
+    #[test]
+    fn list_operations_are_stably_sorted_by_typed_identity() {
+        let store = InMemoryControlStore::new();
+        for value in [3, 1, 2] {
+            store.create_logical_shard(shard_id(value)).unwrap();
+            store
+                .create_root_placement(initial_placement(value, value))
+                .unwrap();
         }
+        let shards = store.list_logical_shards().unwrap();
+        assert_eq!(
+            shards
+                .iter()
+                .map(|record| record.logical_shard_id)
+                .collect::<Vec<_>>(),
+            vec![shard_id(1), shard_id(2), shard_id(3)]
+        );
+        let roots = store.list_root_placements().unwrap();
+        assert_eq!(
+            roots
+                .iter()
+                .map(|placement| placement.root_id)
+                .collect::<Vec<_>>(),
+            vec![root_id(1), root_id(2), root_id(3)]
+        );
     }
 
     #[test]
-    fn checkpoint_covers_log_and_only_a_newer_log_reopens_the_chain() {
-        let store = registered_store();
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let covered_log = log_ref(9, "digest-9", "segment-9");
-        store
-            .mark_serving(&lease, None, Some(covered_log.clone()), 9)
+    fn checkpoint_and_log_publication_merge_is_monotonic() {
+        let store = InMemoryControlStore::new();
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let first_log = log_ref(1, 2, "state-2");
+        let first = store
+            .mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: Some(first_log.clone()),
+                    durable_lsn: 2,
+                },
+            )
             .unwrap();
-        let checkpoint = checkpoint_ref(9, "digest-9", "ckpt-9");
-        let covered = store
-            .mark_serving(&lease, Some(checkpoint.clone()), None, 9)
-            .unwrap();
-        assert_eq!(covered.checkpoint, Some(checkpoint.clone()));
-        assert_eq!(covered.log, None);
-
-        let delayed = store
-            .mark_serving(&lease, None, Some(covered_log), 9)
-            .unwrap();
-        assert_eq!(delayed.checkpoint, Some(checkpoint.clone()));
-        assert_eq!(delayed.log, None);
-
-        let advanced_log = log_ref_range(10, 10, "digest-10", "segment-10");
-        let advanced = store
-            .mark_serving(&lease, None, Some(advanced_log.clone()), 10)
-            .unwrap();
-        assert_eq!(advanced.checkpoint, Some(checkpoint));
-        assert_eq!(advanced.log, Some(advanced_log));
-        assert_eq!(advanced.durable_lsn, 10);
-    }
-
-    #[test]
-    fn checkpoint_only_publication_allows_a_new_image_at_lsn_zero() {
-        let store = registered_store();
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let first = checkpoint_ref(0, "zero-digest", "image-a");
-        let second = checkpoint_ref(0, "zero-digest", "image-b");
-        store.mark_serving(&lease, Some(first), None, 0).unwrap();
-
-        let record = store
-            .mark_serving(&lease, Some(second.clone()), None, 0)
-            .unwrap();
-        assert_eq!(record.checkpoint, Some(second));
-        assert_eq!(record.durable_lsn, 0);
-    }
-
-    #[test]
-    fn mark_serving_cannot_advance_without_a_recovery_identity() {
-        let store = registered_store();
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
+        assert_eq!(first.log, Some(first_log));
+        assert_eq!(first.durable_lsn, 2);
 
         assert!(matches!(
-            store.mark_serving(&lease, None, None, 1),
+            store.mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: Some(log_ref(1, 1, "state-1")),
+                    durable_lsn: 1,
+                }
+            ),
             Err(ControlError::RecoveryPublicationConflict { .. })
         ));
-        let record = store.get_shard(&lease.shard_id).unwrap();
-        assert_eq!(record.durable_lsn, 0);
-        assert_eq!(record.state, ShardState::Recovering);
+
+        let checkpoint = CheckpointRef {
+            object_key: "checkpoints/2".to_owned(),
+            lsn: 2,
+            image_bytes: 4096,
+            image_digest: "image-2".to_owned(),
+            digest: "state-2".to_owned(),
+        };
+        let checkpointed = store
+            .mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: Some(checkpoint.clone()),
+                    log: None,
+                    durable_lsn: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(checkpointed.checkpoint, Some(checkpoint));
+        assert!(checkpointed.log.is_none(), "checkpoint prunes covered log");
+
+        let advanced = store
+            .mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: Some(log_ref(3, 4, "state-4")),
+                    durable_lsn: 4,
+                },
+            )
+            .unwrap();
+        assert_eq!(advanced.durable_lsn, 4);
+        assert_eq!(advanced.log.unwrap().durable_lsn, 4);
     }
 
     #[test]
-    fn set_subtree_root_inode_records_and_clears() {
+    fn same_tail_log_identity_conflict_does_not_overwrite_durable_state() {
         let store = InMemoryControlStore::new();
-        store.ensure_shard(shard()).unwrap();
-
-        // Set, then read back through the durable record.
-        let updated = store
-            .set_subtree_root_inode(&shard(), Some(0x0001_0000_0000_0002))
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let durable = log_ref(1, 2, "state-2");
+        store
+            .mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: Some(durable.clone()),
+                    durable_lsn: 2,
+                },
+            )
             .unwrap();
-        assert_eq!(updated.subtree_root_inode, Some(0x0001_0000_0000_0002));
+
+        let mut conflict = durable.clone();
+        conflict.segments[0].segment_key = "logs/other".to_owned();
+        assert!(matches!(
+            store.mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: Some(conflict),
+                    durable_lsn: 2,
+                }
+            ),
+            Err(ControlError::RecoveryPublicationConflict { .. })
+        ));
         assert_eq!(
-            store.get_shard(&shard()).unwrap().subtree_root_inode,
-            Some(0x0001_0000_0000_0002)
+            store.get_logical_shard(&shard_id(1)).unwrap().unwrap().log,
+            Some(durable)
         );
+    }
 
-        // Idempotent re-set to the same value.
+    #[test]
+    fn empty_publication_must_confirm_current_durable_frontier() {
+        let store = InMemoryControlStore::new();
+        let first = acquire_placed_shard(&store, 1, 1);
+        let durable = log_ref(1, 2, "state-2");
         store
-            .set_subtree_root_inode(&shard(), Some(0x0001_0000_0000_0002))
+            .mark_serving(
+                &first,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: Some(durable.clone()),
+                    durable_lsn: 2,
+                },
+            )
+            .unwrap();
+        store.release_owner(&first).unwrap();
+        let successor = store
+            .acquire_successor(
+                &shard_id(1),
+                first.owner_epoch,
+                node("node-b"),
+                "node-b:7000".to_owned(),
+            )
             .unwrap();
 
-        // Clearing (unregister) returns to None.
-        let cleared = store.set_subtree_root_inode(&shard(), None).unwrap();
-        assert_eq!(cleared.subtree_root_inode, None);
-        assert_eq!(store.get_shard(&shard()).unwrap().subtree_root_inode, None);
+        assert!(matches!(
+            store.mark_serving(
+                &successor,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 0,
+                }
+            ),
+            Err(ControlError::RecoveryPublicationConflict { .. })
+        ));
+        let serving = store
+            .mark_serving(
+                &successor,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(serving.log, Some(durable));
+        assert_eq!(serving.durable_lsn, 2);
+        assert_eq!(serving.state, LogicalShardState::Serving);
     }
 
     #[test]
-    fn set_subtree_root_inode_on_missing_shard_is_not_found() {
+    fn malformed_log_chain_is_rejected() {
         let store = InMemoryControlStore::new();
-        let err = store
-            .set_subtree_root_inode(&ShardId::new("mount-1:/absent"), Some(7))
-            .unwrap_err();
-        assert!(matches!(err, ControlError::ShardNotFound(_)));
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let malformed = LogRef {
+            segments: Vec::new(),
+            durable_lsn: 1,
+            digest: "state-1".to_owned(),
+        };
+        assert!(matches!(
+            store.mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: Some(malformed),
+                    durable_lsn: 1,
+                }
+            ),
+            Err(ControlError::RecoveryPublicationConflict { .. })
+        ));
     }
 
     #[test]
-    fn release_requires_current_lease() {
-        let store = registered_store();
-        let old = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        let new = store
-            .acquire_after_failure(shard(), node("node-b"), old.epoch)
-            .unwrap();
+    fn never_owned_record_cannot_claim_recovery_state() {
+        let mut record = LogicalShardRecord::unassigned(shard_id(1));
+        record.checkpoint = Some(CheckpointRef {
+            object_key: "checkpoints/0".to_owned(),
+            lsn: 0,
+            image_bytes: 1,
+            image_digest: "image-0".to_owned(),
+            digest: "state-0".to_owned(),
+        });
 
-        assert!(store.release(&old).is_err());
-
-        let released = store.release(&new).unwrap();
-        assert_eq!(released.owner, None);
-        assert_eq!(released.state, ShardState::Unassigned);
-        assert_eq!(released.epoch, new.epoch);
-    }
-
-    #[test]
-    fn register_shard_freezes_identity_after_first_lease() {
-        let store = registered_store();
-        // Re-registering the SAME identity is idempotent, even while owned.
-        let lease = store.acquire_unassigned(shard(), node("node-a")).unwrap();
-        store
-            .register_shard(shard(), "/runs".to_owned(), 2)
-            .unwrap();
-
-        // Releasing leaves epoch > 0; identity must stay frozen so a later
-        // re-register cannot drift the index a live client routes by.
-        store.release(&lease).unwrap();
-        let record = store.get_shard(&shard()).unwrap();
-        assert!(record.owner.is_none());
-        assert!(record.epoch > 0);
-
-        let err = store
-            .register_shard(shard(), "/runs".to_owned(), 9)
-            .unwrap_err();
-        assert!(matches!(err, ControlError::ShardIdentityLocked { .. }));
-        // The original index is unchanged.
-        assert_eq!(store.get_shard(&shard()).unwrap().shard_index, 2);
-    }
-
-    #[test]
-    fn register_shard_assigns_identity_while_pristine() {
-        let store = InMemoryControlStore::new();
-        // Before any lease, identity is freely (re)assignable.
-        store
-            .register_shard(shard(), "/runs".to_owned(), 2)
-            .unwrap();
-        let record = store
-            .register_shard(shard(), "/runs".to_owned(), 5)
-            .unwrap();
-        assert_eq!(record.shard_index, 5);
-        assert_eq!(record.epoch, 0);
-    }
-
-    #[test]
-    fn acquire_unassigned_requires_registration_for_non_default_shard() {
-        let store = InMemoryControlStore::new();
-        // No register_shard: a non-default shard cannot be acquired (would
-        // otherwise auto-create with shard_index 0 and collide with root).
-        let err = store
-            .acquire_unassigned(shard(), node("node-a"))
-            .unwrap_err();
-        assert!(matches!(err, ControlError::ShardNotRegistered { .. }));
-        assert!(store.get_shard(&shard()).is_err());
-    }
-
-    #[test]
-    fn acquire_unassigned_bootstraps_default_shard_without_registration() {
-        let store = InMemoryControlStore::new();
-        let default_shard = ShardId::new("mount-1:/");
-        let lease = store
-            .acquire_unassigned(default_shard.clone(), node("node-a"))
-            .unwrap();
-        assert_eq!(lease.epoch, 1);
-        let record = store.get_shard(&default_shard).unwrap();
-        assert_eq!(record.shard_index, 0);
-        assert_eq!(record.prefix, "/");
+        assert!(matches!(
+            validate_logical_shard_record(&record),
+            Err(ControlError::InvalidRecord(_))
+        ));
     }
 }

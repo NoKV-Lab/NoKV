@@ -21,16 +21,16 @@ are explicitly named in a security advisory or release note.
 
 ## Current Security Boundary
 
-NoKV's metadata service and control endpoints currently assume a trusted
+NoKV's metadata service and control-plane endpoints currently assume a trusted
 deployment environment. The current `main` branch does not enforce tenant
 identity, role-based access control, or a live workspace-freeze policy at the
-service boundary. Path and workbench-root jails constrain namespace access;
-they are not a substitute for tenant authentication or authorization.
+service boundary. Workbench-root and Agent-scope checks constrain namespace
+access; they are not a substitute for tenant authentication or authorization.
 
 Deployments must provide network isolation and transport security, protect
 service credentials, and configure object-store IAM and encryption appropriate
-to their environment. Do not expose NoKV control or metadata endpoints directly
-to untrusted networks.
+to their environment. Do not expose NoKV server or control-plane endpoints
+directly to untrusted networks.
 
 ## Reporting a Vulnerability
 

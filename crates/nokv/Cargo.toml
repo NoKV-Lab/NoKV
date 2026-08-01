@@ -1,7 +1,7 @@
 [package]
 name = "nokv"
 version = "0.1.0"
-description = "Command line interface for NoKV filesystem metadata and FUSE operations."
+description = "Custom CLI and MCP wiring for NoKV Agent workspaces."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,15 +10,13 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = []
-etcd = ["nokv-control/etcd", "nokv-server/etcd"]
+default = ["etcd"]
+etcd = ["nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd"]
 
 [dependencies]
 base64.workspace = true
 nokv-client.workspace = true
 nokv-control.workspace = true
-nokv-fuse.workspace = true
-nokv-meta.workspace = true
 nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-server.workspace = true
@@ -30,7 +28,7 @@ serde_json.workspace = true
 
 [[bin]]
 name = "nokv"
-path = "src/bin/nokv.rs"
+path = "src/main.rs"
 
 [dev-dependencies]
 tempfile.workspace = true

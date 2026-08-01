@@ -19,6 +19,7 @@ etcd = ["dep:etcd-client", "dep:tokio"]
 
 [dependencies]
 etcd-client = { workspace = true, optional = true }
+nokv-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, optional = true }

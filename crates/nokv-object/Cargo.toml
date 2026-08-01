@@ -1,7 +1,7 @@
 [package]
 name = "nokv-object"
 version = "0.1.0"
-description = "S3-compatible object body storage helpers for NoKV."
+description = "Immutable S3-compatible Agent artifact storage for NoKV."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,7 +14,6 @@ nokv-types.workspace = true
 opendal.workspace = true
 sha2.workspace = true
 tokio.workspace = true
-xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

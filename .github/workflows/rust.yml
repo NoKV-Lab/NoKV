@@ -13,39 +13,33 @@ permissions:
   contents: read
 
 jobs:
-  workbench-handoff:
+  lingtai-first-client:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Check LingTai workbench handoff scripts
+      - name: Check Workbench and LingTai first-client contracts
         run: |
           set -euo pipefail
           python3 -m py_compile \
-            scripts/lingtai-workbench/install_workbench_mcp.py \
             scripts/lingtai-workbench/workbench_contract.py \
-            scripts/lingtai-workbench/nokv_runtime.py \
-            scripts/lingtai-workbench/generate_nokv_build_info.py \
-            scripts/lingtai-workbench/managed_nokv_server.py \
-            scripts/lingtai-workbench/sync_workbench_mcp.py \
-            scripts/lingtai-workbench/durable_restore_live_e2e.py
+            scripts/lingtai-workbench/live_first_client.py
           python3 scripts/lingtai-workbench/workbench_contract_test.py
-          python3 scripts/lingtai-workbench/nokv_runtime_test.py
-          python3 scripts/lingtai-workbench/managed_nokv_server_test.py
-          python3 scripts/lingtai-workbench/install_workbench_mcp_test.py
-          python3 scripts/lingtai-workbench/sync_workbench_mcp_test.py
-          python3 scripts/lingtai-workbench/up_test.py
-          python3 scripts/lingtai-workbench/durable_restore_live_e2e_test.py
+          python3 scripts/lingtai-workbench/live_first_client_test.py
           bash -n scripts/lingtai-workbench/start_rustfs.sh
-          bash -n scripts/lingtai-workbench/up.sh
 
-  nokv-fs:
+  nokv-workspace:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

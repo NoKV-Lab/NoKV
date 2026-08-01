@@ -1,23 +1,34 @@
-//! Long-running NoKV metadata service process.
+/*
+ * Copyright 2024-2026 The NoKV Authors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Root-affine shard-owner RPC process for Agent workspaces.
 //!
-//! This crate owns process wiring and a small health/control endpoint around
-//! the in-process metadata service. It does not own namespace semantics,
-//! metadata layout, object provider internals, FUSE policy, or wire protocol
-//! migration behavior.
+//! The server validates the exact installed root route, frames the sole
+//! workspace protocol, and delegates domain execution. Metadata semantics stay
+//! in `nokv-meta`.
 
-mod control;
-mod http;
-mod metadata;
-mod options;
-mod rpc;
+mod bootstrap;
+mod error;
+mod executor;
+mod lifecycle;
+mod registry;
 mod server;
+mod service;
 
-pub use control::{
-    ServerShardAcquisition, ServerShardOwnerOptions, ServerShardOwnerRenewalOptions,
-    ServerShardOwnerState, ServerSharedLogOptions,
+pub use bootstrap::{
+    bootstrap_root_owner, BootstrappedRootOwner, ControlBackedRootOwner, MetadataStoreOpen,
+    OwnerAdmission, RootOwnerBootstrapRequest,
 };
-pub use options::{
-    ServerControlOptions, ServerControlStoreOptions, ServerOptions,
-    DEFAULT_METADATA_CHECKPOINT_ARCHIVE_PREFIX, DEFAULT_SERVER_BIND,
+pub use error::ServerError;
+pub use executor::MetadataWorkspaceRequestExecutor;
+pub use lifecycle::{
+    ArtifactLifecycleDeleter, LifecycleAbsenceProof, LifecycleCycleReport,
+    LifecycleDeleteDisposition, LifecycleDeleteError, LifecycleDeletePurpose,
+    LifecycleDeleteRequest, LifecycleError, LifecycleObjectDeleter, LifecycleRunner,
+    LifecycleRunnerOptions,
 };
-pub use server::{restore, run, Server, ServerError};
+pub use registry::RootOwnerRegistry;
+pub use server::{OwnerLossSignal, ServerHealth, ServerOptions, WorkspaceServer};
+pub use service::{ExecutedRequest, WorkspaceRequestExecutor};

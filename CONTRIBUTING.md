@@ -11,33 +11,30 @@ Thanks for contributing. This file is the authoritative contribution guide for t
 
 Welcome, and thanks for your interest in NoKV. Whether this is your first open-source PR or your hundredth, we're glad you're here.
 
-NoKV is an object-backed metadata control plane for durable agent workspaces.
-It provides a filesystem-shaped namespace, atomic metadata publication,
-snapshots, copy-on-write workspace primitives, and experimental horizontal
-path sharding while immutable file bodies remain in S3-compatible object
-storage. The `nokv-agent` crate owns transport-free agent schemas and dispatch;
-the `nokv` CLI exposes them to MCP clients over stdio. See the [README](README.md)
-for the current capability boundary.
+NoKV is a distributed workspace and artifact store built specifically for Agent
+infrastructure. Holt stores one canonical normalized full-path namespace per
+workspace, while immutable revision-owned blocks live in S3-compatible object
+storage. The supported product surfaces are the Rust and Python SDKs, the
+purpose-built `nokv` CLI, and the exact 18-tool Workbench/MCP contract. NoKV
+does not implement a POSIX filesystem, FUSE frontend, or inode/dentry model.
 
-### New here? Read these three first (in order)
+### New here? Read these first (in order)
 
-1. **Product boundary:** [NoKV README](README.md): current, experimental,
-   and planned capabilities.
-2. **System design:** [Architecture](docs/architecture.md): metadata, object,
-   client, FUSE, control-plane, and sharding boundaries.
-3. **Engineering contract:** [Code contract](docs/development/code_contract.md):
-   package ownership and invariants contributors must preserve.
-
-The [benchmark guide](docs/benchmarks.md) documents performance evidence and
-its limits. Historical agent-interface experiments are retained for
-reproducibility, but token reduction is not NoKV's product definition.
+1. **Product contract:** [Workbench Contract](docs/workbench-contract.md).
+2. **Architecture:** [Product Design](docs/product-design.md) and
+   [Metadata Schema](docs/metadata-schema.md).
+3. **Engineering rules:** [Code Contract](docs/development/code_contract.md)
+   and [PR Review Checklist](docs/development/pr_review_checklist.md).
 
 ### Make your first contribution
 
 - Browse [good first issues](https://github.com/NoKV-Lab/NoKV/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for a scoped starting point.
 - For a new bug or feature, open an issue via the [template chooser](https://github.com/NoKV-Lab/NoKV/issues/new/choose). For broad design, onboarding, or meta topics, open a [Discussion](https://github.com/NoKV-Lab/NoKV/discussions) first.
 
-Before you open a PR, read **[Issues and Proposals](#issues-and-proposals)**, **Branch and Commit Conventions** (including DCO sign-off), and **Pull Request Rules** below. Those sections are the source of truth for branch names, commit format, the local make-gate, and review expectations.
+Before you open a PR, read **[Issues and Proposals](#issues-and-proposals)**,
+**Branch and Commit Conventions** (including DCO sign-off), and **Pull Request
+Rules** below. Those sections are the source of truth for branch names, commit
+format, validation, and review expectations.
 
 ### Reporting security issues
 
@@ -64,8 +61,6 @@ git fetch upstream
 cargo fetch
 ```
 
-Your fork remains `origin`; the canonical NoKV repository is `upstream`.
-
 ## Branch and Commit Conventions
 
 Use these branch prefixes:
@@ -87,49 +82,28 @@ If a local commit is missing the trailer, amend or rebase before opening the PR:
 
 ```bash
 git commit --amend -s --no-edit
-git rebase --signoff upstream/main
+git rebase --signoff origin/main
 ```
 
 ## Local Validation
 
-For Rust changes, run the repository gate before opening a PR:
+Run the repository contract gates before opening a PR:
 
 ```bash
-make fmt
-make lint
-make test
-```
-
-For documentation-only changes, check formatting, links, and references in the
-files you changed and run:
-
-```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+python3 scripts/lingtai-workbench/workbench_contract_test.py
 git diff --check
 ```
 
-The repository does not currently ship a VitePress package or a documentation
-site build target. Do not report a docs build that a fresh clone cannot run.
+For benchmark-related changes, follow
+[`docs/benchmarks.md`](./docs/benchmarks.md). A release-mode unit test is useful
+validation but is not itself a qualified performance result.
 
-For benchmark harness changes, run the relevant package or runner tests and
-record the exact workload, topology, cache state, commands, and results. For
-Rust benchmark changes, this normally includes:
-
-```bash
-cargo test --workspace --release
-```
-
-For Python agent-interface runner changes, run its focused test suite from the
-repository root:
-
-```bash
-python -m unittest discover \
-  -s bench/agent-interface/agents_runner \
-  -p 'test_*.py'
-bash bench/agent-interface/scripts/test_run_phase1_batch.sh
-```
-
-Performance claims require raw evidence and a reproducible command; a passing
-test suite alone is not benchmark evidence.
+The repository currently has no checked-in documentation build configuration.
+For documentation or navigation changes, validate local Markdown/image links
+and run `git diff --check`.
 
 ## Pull Request Rules
 
@@ -152,7 +126,8 @@ test suite alone is not benchmark evidence.
 - Do not mix unrelated refactors with behavior changes in one PR.
 - Add tests for every bug fix or behavior change.
 - Follow the repository code contract in [`docs/development/code_contract.md`](./docs/development/code_contract.md), including package responsibilities, shared-helper reuse, file naming, type/interface/function naming, error placement, metrics/stats ownership, generated-code discipline, and compatibility rules.
-- Prefer breaking changes that remove ambiguity over compatibility wrappers. Add a compatibility shim only when a released RPC, CLI, config, or persisted format requires it, and document the removal condition.
+- Prefer direct breaking replacements that remove ambiguity. Do not add
+  forwarding aliases, fallback layouts, or parallel execution paths.
 
 ## Testing Expectations
 

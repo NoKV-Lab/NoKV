@@ -1,7 +1,7 @@
 [package]
 name = "nokv-server"
 version = "0.1.0"
-description = "Long-running NoKV metadata server and framed RPC service."
+description = "Root-affine shard-owner RPC server for NoKV Agent workspaces."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -22,7 +22,4 @@ nokv-types.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-# Path-only (no version) so cargo strips this dev-dep when packaging;
-# a versioned entry would recreate the server <-> client publish cycle.
-nokv-client = { path = "../nokv-client" }
 tempfile.workspace = true

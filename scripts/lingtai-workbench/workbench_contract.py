@@ -13,7 +13,6 @@ from typing import Any
 
 
 RESTORE_TOOL = "workbench_restore"
-REQUIRED_CAPABILITY = "restore_to_fork_v1"
 BASE_WORKBENCH_TOOLS = {
     "workbench_create",
     "workbench_put_file",
@@ -35,7 +34,12 @@ BASE_WORKBENCH_TOOLS = {
 }
 WORKBENCH_TOOLS = BASE_WORKBENCH_TOOLS | {RESTORE_TOOL}
 CONTRACT_SNAPSHOT_SCHEMA = "nokv.workbench.mcp_input_schemas.v1"
-CONTRACT_SNAPSHOT_PATH = Path(__file__).with_name("workbench_contract_schema.json")
+CONTRACT_SNAPSHOT_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "crates"
+    / "nokv-agent"
+    / "workbench_contract_schema.json"
+)
 
 # JSON Schema annotations never change which tool arguments are accepted. Keep
 # them out of the deployment digest so wording-only releases do not require a
@@ -255,7 +259,7 @@ def contract_evidence(
     payload = contract_payload(tools, schema_key=schema_key)
     restore = next(item for item in payload if item["name"] == RESTORE_TOOL)
     return {
-        "required_capabilities": [REQUIRED_CAPABILITY],
+        "required_capabilities": [],
         "tool_count": len(payload),
         "tool_names": [item["name"] for item in payload],
         "tools_schema_sha256": json_sha256(payload),

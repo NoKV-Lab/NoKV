@@ -1,69 +1,66 @@
 <p align="center">
-  <img src="../public/img/community/nokv-lingtai-banner-en.png" alt="NoKV × Lingtai — Design Partner Collaboration" width="100%" />
+  <img src="../public/img/community/nokv-lingtai-banner-en.png" alt="NoKV × LingTai — Design Partner Collaboration" width="100%" />
 </p>
 
-# NoKV × Lingtai: a design-partner collaboration
+# NoKV × LingTai: a design-partner collaboration
 
-Published 23 June 2026. Integration status updated 30 July 2026.
+> Status: this page records the start of the collaboration. The active
+> integration uses the complete
+> [Workbench contract](../workbench-contract.md) over SDK, custom CLI, and MCP,
+> backed by NoKV's path-native workspace format. It does not use NoKV as a
+> FUSE/POSIX mount.
+> See [Product Design](../product-design.md).
 
-**NoKV** and **Lingtai**
-([Lingtai-AI/lingtai](https://github.com/Lingtai-AI/lingtai)) are working together
-as design partners on durable workspaces for long-running agents. This page
-records the collaboration and its technical boundary; it is not a statement of
-production readiness.
+This announcement marks the start of the design-partner collaboration between
+**NoKV** and **LingTai**
+([Lingtai-AI/lingtai](https://github.com/Lingtai-AI/lingtai)).
 
-## Two projects, one filesystem-shaped workspace
+## Two projects, one shared workflow
 
-- **Lingtai** is a local-first Agent runtime in which long-lived agents keep
-  state, mailboxes, logs, and artifacts in on-disk project directories that
-  remain inspectable with ordinary file tools. Lingtai reports an active early
-  developer community.
-- **NoKV** is a durable metadata control plane for object-backed multi-agent
-  workspaces. It provides a filesystem-shaped namespace, shard-local atomic
-  publication, leased historical snapshots, and CoW restore-to-fork primitives
-  while leaving planning, semantic memory, and orchestration to the Agent
-  runtime.
+- **LingTai** is a local-first Agent runtime whose projects organize state,
+  mailboxes, logs, and artifacts through path-shaped local files.
+- **NoKV** is a distributed Agent workspace and artifact store. It exposes
+  path-shaped identities through Workbench, SDK, custom CLI, and MCP while
+  storing canonical metadata in Holt and immutable bodies in S3-compatible
+  storage.
 
-Lingtai gives an Agent a filesystem-shaped home. NoKV provides storage and
-metadata primitives that can make such a workspace durable, recoverable, and
-auditable without replacing plain-file access.
+The integration point is the Workbench contract, not a shared host-filesystem
+namespace. LingTai owns its local runtime layout; NoKV owns distributed
+artifact identity, publication, discovery, and recovery semantics.
 
-## What we are validating together
+## What we're building together
 
-- **Workspace checkpoints and recovery:** pin a stable historical view and
-  restore a committed workspace into a new CoW destination instead of mutating
-  the source in place.
-- **Shard-local crash-consistent publication:** publish an artifact or a group
-  of checkpoint files atomically within one metadata owner.
-- **Explicit provenance:** preserve digests and runtime-supplied provenance
-  fields so an artifact can be linked to the run metadata that produced it.
-- **Queryable workspace metadata:** search metadata recorded by the runtime and
-  application. NoKV does not infer a semantic dependency graph on its own.
+The collaboration focuses on:
 
-The NoKV-side Workbench MCP adapter, guarded 18-tool LingTai contract, leased
-snapshot lifecycle, and durable restore acceptance path now exist. Availability
-inside a particular Lingtai distribution remains release-, capability-, and
-preflight-dependent.
+- **Recovery and durable reuse**: leased snapshots provide short recovery,
+  while immutable commits/tags retain long-lived artifact sets and restore
+  creates a new Workbench.
+- **Atomic, crash-consistent publishing**: concurrent Agent writes and a
+  mid-run crash never leave a half-written workspace.
+- **Artifact provenance**: versioned blocks with digests keep a derived
+  artifact traceable to the run that produced it.
+- **A queryable metadata layer**: ask *"what produced this / what depends on
+  this"* across an Agent's outputs.
 
-## Current boundary
+The upper path-shaped behavior remains stable while the storage boundary stays
+explicit. Executables that require local files use materialize/collect adapters;
+that sandbox is not NoKV namespace truth.
 
-- The raw Workbench profile has 17 base tools; `workbench_restore` is exposed as
-  the eighteenth only when every relevant owner confirms the capability.
-- Snapshot pins are leased. A checkpoint name is a discoverability alias, not a
-  permanent GC root or a freeze of the live workspace.
-- Restore-to-fork is same-shard only and leaves the source unchanged. NoKV does
-  not currently provide a cross-shard atomic restore or publication transaction.
-- Workbench path scoping is not authentication, RBAC, or tenant policy.
-  Production-grade identity boundaries, live workspace freezing, and metadata
-  high availability require separate hardening.
+## Current direction
 
-Both projects remain pre-1.0 and are evolving quickly. We will publish workload
-evidence and downstream availability separately as they become reproducible.
+The stable boundary is the 18-tool Workbench contract. NoKV keeps path-shaped
+Agent semantics while storing canonical full-path metadata in Holt and
+immutable artifact revisions in S3-compatible storage. LingTai remains the
+active design partner and first-client integration.
+
+If a stateful, snapshot-able, auditable Agent workspace is something you've
+wanted: star NoKV, follow [LingTai](https://github.com/Lingtai-AI/lingtai), and
+watch this space.
 
 ## Contact
 
 - NoKV: hello@nokv.io
-- Lingtai: lingtai2026@gmail.com
+- LingTai: lingtai2026@gmail.com
 
 ## Join the community
 
@@ -71,4 +68,4 @@ evidence and downstream availability separately as they become reproducible.
 
 - Discord (NoKV): https://discord.gg/c5PZapnwPh
 - Slack (NoKV): the NoKV channel in the CNCF community Slack (join at https://slack.cncf.io, then open https://cloud-native.slack.com/archives/C0BBDBYE3H6 )
-- WeChat group (Lingtai): email lingtai2026@gmail.com for community details
+- WeChat group (LingTai): email lingtai2026@gmail.com for community details

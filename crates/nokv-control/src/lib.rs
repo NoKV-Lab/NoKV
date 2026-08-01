@@ -1,25 +1,29 @@
-//! Control-plane state for NoKV metadata shards.
+//! Durable NoKV root placement, logical-shard ownership fencing, and recovery
+//! publication.
 //!
-//! This crate owns shard ownership, lease epochs, and checkpoint/log pointers.
-//! It must not own namespace semantics, chunk manifests, object GC policy, Holt
-//! internals, FUSE behavior, or provider-specific object-store behavior.
+//! This crate owns only control-plane state. Namespace metadata, artifact
+//! lifecycle, storage-engine details, and client routing policy stay in their
+//! respective packages.
 
 mod codec;
 mod errors;
 #[cfg(feature = "etcd")]
 mod etcd;
 mod options;
-mod placement;
 mod store;
 mod types;
 
-pub use codec::{decode_shard_record, encode_shard_record};
+pub use codec::{
+    decode_logical_shard_record, decode_root_placement, encode_logical_shard_record,
+    encode_root_placement,
+};
 pub use errors::ControlError;
 #[cfg(feature = "etcd")]
 pub use etcd::EtcdControlStore;
 pub use options::EtcdControlStoreOptions;
-pub use placement::{assign, handoff, register_shard, shards_owned_by, unowned_shards};
 pub use store::{ControlStore, InMemoryControlStore};
 pub use types::{
-    CheckpointRef, LogRef, LogSegmentRef, NodeId, ShardId, ShardLease, ShardRecord, ShardState,
+    CheckpointRef, LogRef, LogSegmentRef, LogicalShardId, LogicalShardLease, LogicalShardRecord,
+    LogicalShardState, NodeId, NodeIdError, OwnerEpoch, PlacementGeneration, RecoveryPublication,
+    RootId, RootPlacement, RootPlacementLifecycle, UnknownLogicalShardState,
 };

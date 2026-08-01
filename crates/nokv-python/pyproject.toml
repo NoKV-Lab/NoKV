@@ -5,13 +5,13 @@ build-backend = "maturin"
 [project]
 name = "nokv"
 version = "0.1.0"
-description = "NoKV Python SDK and fsspec binding for AI training workflows."
+description = "NoKV Python SDK for Agent workspaces and immutable artifacts."
 requires-python = ">=3.9"
-dependencies = ["fsspec>=2024.0.0"]
+dependencies = []
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
-    "Topic :: System :: Filesystems",
+    "Topic :: System :: Distributed Computing",
 ]
 
 [tool.maturin]

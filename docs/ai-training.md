@@ -3,157 +3,117 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Native Batch And Range Reads
+# AI Training
 
-NoKV exposes batch and range-read primitives for workloads that keep immutable
-file bodies in object storage but need filesystem-shaped metadata. Agent
-workspaces and RAGFS integrations are the primary product context; scientific
-pipelines, packed indexes, model artifacts, datasets, and checkpoints can use
-the same data path.
+Status: optional Agent SDK workload profile, not a separate product
+architecture or namespace.
 
-The feature is not specific to AI training, despite historical benchmark and
-script names that still use `training-read` or `ai-shard`.
+NoKV serves training data, checkpoints, experiment outputs, and provenance
+through the Agent SDK and explicit local adapters. Canonical identity remains a
+root, Workbench, and normalized path; a materialized local path is disposable.
+
+## Workloads
+
+- immutable dataset shards and manifests;
+- repeatable script and configuration inputs;
+- ranged and batched sample reads;
+- checkpoint publication and resume;
+- logs, metrics, reports, and model artifacts;
+- comparison and lineage across runs.
 
 ## Access Paths
 
 ```text
-agent runtime / RAGFS / data process
-  -> FUSE, Rust SDK, or Python/fsspec binding
-  -> NoKV metadata service
-  -> shard-local Holt metadata
-  -> S3-compatible object provider
+training process
+  -> Rust or Python SDK
+  -> root router and fenced shard owner
+  -> full-path Holt metadata
+  -> immutable S3-compatible object blocks
 ```
 
-FUSE is the compatibility path for programs that require mounted files. It maps
-inode operations to metadata requests and object range reads, and publishes
-buffered writes on close. Read-only snapshot mounts expose a pinned subtree and
-reject mutation.
-
-Native clients bypass kernel/FUSE crossings when an integration can call NoKV
-directly:
+Native jobs use point reads and ranged object reads. Programs that require
+local files use:
 
 ```text
-compatibility path
-  existing program -> FUSE -> metadata + object data
-
-native path
-  agent/RAGFS/reader -> Rust or Python client -> metadata + object data
+materialize verified inputs
+  -> execute inside a disposable sandbox
+  -> collect declared outputs
+  -> publish immutable revisions
+  -> commit run metadata and lineage
 ```
 
-The Rust SDK, CLI, and FUSE frontend can use the experimental control-plane
-fleet router. The current Python binding accepts one `metadata_addr`; it does
-not yet construct a multi-shard fleet client from etcd.
+The adapter never turns the sandbox into namespace truth. Changes become
+visible only after explicit collection and metadata publication.
 
-In fleet mode, a high-level Rust range batch may contain paths from different
-shards. The client groups its metadata opens into shard-local batch RPCs and
-re-scatters the results into caller order. That is parallel request routing, not
-a cross-shard transaction or snapshot.
+## Dataset Publication
 
-## Rust Batch Primitives
+A dataset publisher:
 
-The Rust file client exposes:
+1. creates or selects a Workbench;
+2. uploads immutable blocks for each artifact revision;
+3. verifies size and digest evidence;
+4. atomically publishes paths, references, indexes, and events;
+5. seals an immutable commit and optional durable tag.
 
-- `read_path_ranges_batch` for multiple paths with multiple logical ranges;
-- `read_path_ranges_batch_packed` for one packed result per path request;
-- `read_path_ranges_batch_into` for caller-provided staging memory;
-- `prepare_path_ranges_batch` plus
-  `read_prepared_path_ranges_batch_into` when request geometry is reused.
+Training jobs consume the commit or tag rather than a mutable collection of
+object keys. This preserves exact revision membership and allows multiple runs
+to share object bodies safely.
 
-Each execution batch-opens the metadata read plans, then resolves the immutable
-generation's manifests into object ranges. Compatible nearby ranges can be
-coalesced to reduce object requests, while the returned logical windows preserve
-the caller's requested order.
+## Batched Read Qualification Target
 
-Prepared batches cache request geometry and output layout, not namespace truth.
-They still open metadata plans when a read executes, so current visibility and
-generation checks are not silently bypassed.
+A qualified batched reader should:
 
-## Python Batch Primitives
+1. resolve all requested paths at one declared live or snapshot context;
+2. obtain immutable revision and range plans;
+3. coalesce compatible physical reads without changing semantic ranges;
+4. check the local soft cache;
+5. read and verify the remaining object blocks;
+6. return results in request order with per-item errors.
 
-The Python binding exposes the same native pipeline rather than rebuilding
-range planning over POSIX calls:
+Prepared range layouts may be reused across steps, but metadata visibility and
+generation checks still run for each live read. Snapshot reads retain their
+fixed read version. The current source tree does not qualify metadata batch-open
+or cross-artifact read coalescing performance; those require an executable
+product path and workload-matched evidence.
 
-- `read_ranges_batch` returns individual requested byte ranges;
-- `read_ranges_batch_packed` returns packed bytes per path request;
-- `read_ranges_batch_into` fills a caller-provided `bytearray`;
-- `prepare_range_batch` reuses normalized request and output geometry;
-- `prepare_range_batch_reader` combines a prepared plan with reusable NoKV-owned
-  staging memory;
-- `prepare_range_batch_epoch` cycles through multiple prepared readers and can
-  execute them through a bounded persistent worker pool;
-- `read_ranges_batch_buffer` fills a reusable `ReadBuffer`.
+## Checkpoints
 
-The blocking Rust read is released from the Python GIL where the binding can do
-so safely. A caller-owned `bytearray` remains under the GIL while its raw storage
-is mutated.
+Checkpoint writers publish immutable model, optimizer, scheduler, and run-state
+artifacts under normalized paths, then seal a commit only after every required
+artifact is visible and verified.
 
-`ReadBuffer` supports `memory_kind="system"` and, on Unix,
-`memory_kind="page_locked"`. Page-locked mode uses host `mlock` for resident CPU
-staging pages. It is not CUDA pinned allocation, RDMA registration, HBM storage,
-or a zero-copy path to an accelerator.
+Resume uses:
 
-A `ReadBufferView` token prevents resize/refill while an exported logical view
-is live. With the current `abi3-py39` package boundary this is not a general PEP
-3118 `memoryview`; callers should treat it as NoKV-owned staging memory.
+- a leased snapshot for short operational recovery;
+- an immutable commit or durable tag for long-lived reuse.
 
-## Consistency Boundary
+The run manifest records model/framework versions, source dataset commit,
+training configuration, producer identity, and content digests. It does not
+embed physical owner addresses or provider credentials.
 
-Opening a file produces a read plan for one immutable `(inode, generation)`.
-Range reads validate that generation against current metadata and fail rather
-than silently reading a different body after replacement.
+## Cache
 
-Important limits:
+A node-local cache is soft state keyed by immutable revision and block
+identity. It may prefetch dataset shards or checkpoint ranges, but loss of the
+cache cannot affect correctness or reachability.
 
-- each underlying batch RPC routes to one metadata shard, even when the Rust
-  fleet client groups a high-level request across several shards;
-- separate unpinned opens do not form a cross-path or cross-shard transaction;
-- use a snapshot pin for a stable historical subtree view;
-- a prepared range layout does not pin a generation by itself;
-- object-provider durability and availability remain provider responsibilities.
+Any future metadata cache must be bounded by read version, generation, and
+typed change events. A Workbench marker is the only safely cacheable part of
+the exact namespace lookup; canonical path entries remain authoritative at the
+selected read context.
 
-## Current Cache Layers
+## Qualification
 
-The client and object pipeline currently provide library-local acceleration,
-including object block caches, read-plan/read-window reuse, range coalescing, and
-prefetch. Memory and disk-backed block-cache policies are available in the
-object layer, and the FUSE path exposes related cache metrics.
+Training claims include:
 
-Cache placement is not stored in metadata and is never authoritative. A cache
-hit must still correspond to the object key/range selected by the validated
-metadata plan.
+- dataset and sample-size distributions;
+- range shape and batch size;
+- cold/warm cache state;
+- metadata and object latency separately;
+- throughput and p50/p95/p99/maximum latency;
+- retries, conflicts, integrity failures, and per-item errors;
+- worker count, host memory, local cache device, network, and object provider;
+- exact NoKV commit and durability profile.
 
-A separate node-local cache daemon that coordinates all agents or processes on
-a machine is a possible future deployment component. It is not part of the
-current implementation and should not be described as a shipped NoKV service.
-
-## Workload Examples
-
-- an agent runtime batch-reading workspace artifacts after metadata retrieval;
-- an OpenViking/RAGFS storage integration reading many small immutable files or
-  ranges from packed resources;
-- a scientific agent reading selected ranges from large observation products;
-- a checkpoint or artifact consumer resuming with a different read
-  parallelism;
-- an ML data loader reusing prepared packed-range geometry across iterations.
-
-These are applications of the same storage primitives, not separate consistency
-models.
-
-## Performance Qualification
-
-Batching reduces per-request overhead only when the workload, shard placement,
-range geometry, and object provider permit it. Coalescing can also read extra
-bytes, and hot prefixes can still saturate one single-owner shard.
-
-Before making an enterprise-throughput claim, measure:
-
-- metadata batch-open latency and operations per second per shard;
-- object request count, useful bytes, and coalescing amplification;
-- cold and warm cache behavior;
-- packed versus small-object layouts;
-- scaling across independent shard owners;
-- p95/p99 latency under concurrent publication, snapshot, and GC activity.
-
-The repository's current single-node and local matrix workloads are development
-evidence. They are not a published enterprise small-file or multi-machine fleet
-qualification.
+See [Benchmarks](./benchmarks.md) and
+[Workspace Acceptance](./development/workspace-acceptance.md).
