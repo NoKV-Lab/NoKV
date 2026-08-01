@@ -13,6 +13,19 @@ permissions:
   contents: read
 
 jobs:
+  directional-similar-runs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+
+      - name: Check the experimental directional-search contract
+        run: make experimental-test
+
   lingtai-first-client:
     runs-on: ubuntu-latest
     steps:
