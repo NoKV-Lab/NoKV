@@ -9,6 +9,9 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+metadata-read-stats = []
+
 [dependencies]
 holt.workspace = true
 nokv-types.workspace = true

@@ -53,6 +53,8 @@ boundaries, or Workbench behavior.
 - Are directories implicit and the five Workbench sections virtual?
 - Does `WorkspaceCurrent` gate point, list, search, aggregate, catalog, watch,
   restore, and GC visibility consistently?
+- Do direct create and restore staging atomically create one permanent
+  `WorkspaceIncarnationClaim`, preventing two names from sharing PathCurrent?
 - Can any staging row leak through a secondary index or root-wide query?
 - Does startup reject any store without the exact supported marker, including
   unmarked nonempty, unknown, or mixed schemas?
@@ -112,8 +114,9 @@ boundaries, or Workbench behavior.
 
 - Is cold exact get exactly one workspace-marker point read plus one
   authoritative path point read, with only the marker safely cacheable?
-- Is non-recursive list one marker check plus one delimiter scan without
-  per-entry fanout?
+- Does non-recursive list seek only the targeted prefix through bounded
+  delimiter-aware cursor scans, defer any exact-prefix point read until
+  descendant EOF, and avoid per-entry fanout?
 - Does ordinary put/replace/remove avoid prefix scans and stay within its
   documented predicate/mutation bound?
 - Are index updates bounded and atomic with the authoritative entry?

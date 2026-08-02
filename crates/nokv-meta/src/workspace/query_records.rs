@@ -16,13 +16,15 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, CommitId, Generation, NormalizedRelativePath, OperationId, RootId,
-    WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
+    WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
 };
 
-use super::codec::{PATH_COMPONENT_DELIMITER, PATH_EXACT_TERMINATOR};
+use super::codec::{push_ordered_path_components, PATH_EXACT_TERMINATOR};
 
 /// Only supported typed-query payload format.
 pub const QUERY_RECORD_VALUE_FORMAT_VERSION: u8 = 1;
+/// Only supported durable change-event payload format.
+pub const CHANGE_EVENT_VALUE_FORMAT_VERSION: u8 = 2;
 /// Maximum number of fields in one path projection.
 pub const MAX_TYPED_PROJECTION_FIELDS: usize = 60;
 /// Maximum encoded path projection size.
@@ -272,7 +274,7 @@ impl TypedProjection {
             });
         }
         let mut decoder = Decoder::new(encoded);
-        decoder.require_version()?;
+        decoder.require_version(QUERY_RECORD_VALUE_FORMAT_VERSION)?;
         let count = usize::from(decoder.u16("field_count")?);
         if count > MAX_TYPED_PROJECTION_FIELDS {
             return Err(QueryRecordError::FieldCountLimit {
@@ -343,7 +345,7 @@ impl SecondaryIndexRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, QueryRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_version()?;
+        decoder.require_version(QUERY_RECORD_VALUE_FORMAT_VERSION)?;
         let generation = decoder.u64("path_generation")?;
         let path_generation =
             Generation::new(generation).map_err(|_| QueryRecordError::ZeroScalar {
@@ -411,10 +413,12 @@ impl TryFrom<u8> for ChangeEventKind {
 
 /// Canonical `ChangeEvent` payload.
 ///
-/// The workspace incarnation is mandatory so reads can re-evaluate the
-/// visibility marker at the event's commit version without trusting an index.
+/// Both stable workbench id and incarnation are mandatory so readers can
+/// point-read and re-evaluate the exact visibility marker at the event's
+/// commit version without a root-wide marker scan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeEventRecord {
+    pub workbench_id: WorkbenchId,
     pub workspace_incarnation_id: WorkspaceIncarnationId,
     pub kind: ChangeEventKind,
     pub artifact_revision_id: Option<ArtifactRevisionId>,
@@ -430,7 +434,8 @@ impl ChangeEventRecord {
         let before = self.before.encode()?;
         let after = self.after.encode()?;
         let mut encoded = Vec::new();
-        encoded.push(QUERY_RECORD_VALUE_FORMAT_VERSION);
+        encoded.push(CHANGE_EVENT_VALUE_FORMAT_VERSION);
+        put_bytes(&mut encoded, "workbench_id", self.workbench_id.as_bytes())?;
         encoded.extend_from_slice(self.workspace_incarnation_id.as_bytes());
         encoded.push(self.kind as u8);
         put_optional_fixed(
@@ -461,7 +466,17 @@ impl ChangeEventRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, QueryRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_version()?;
+        decoder.require_version(CHANGE_EVENT_VALUE_FORMAT_VERSION)?;
+        let workbench_bytes = decoder.bytes("workbench_id", WorkbenchId::MAX_BYTES)?;
+        let workbench_value =
+            std::str::from_utf8(workbench_bytes).map_err(|_| QueryRecordError::InvalidUtf8 {
+                field: "workbench_id",
+            })?;
+        let workbench_id = WorkbenchId::new(workbench_value).map_err(|error| {
+            QueryRecordError::InvalidWorkbenchId {
+                reason: error.to_string(),
+            }
+        })?;
         let workspace_incarnation_id =
             WorkspaceIncarnationId::from_bytes(decoder.fixed("workspace_incarnation_id")?);
         let kind = ChangeEventKind::try_from(decoder.u8("kind")?)?;
@@ -499,6 +514,7 @@ impl ChangeEventRecord {
         let after = TypedProjection::decode(decoder.bytes("after", MAX_TYPED_PROJECTION_BYTES)?)?;
         decoder.finish()?;
         let record = Self {
+            workbench_id,
             workspace_incarnation_id,
             kind,
             artifact_revision_id,
@@ -572,12 +588,7 @@ pub fn secondary_index_key(
     let mut key = secondary_index_field_prefix(root, field);
     key.extend_from_slice(&encode_ordered_index_scalar(value));
     key.extend_from_slice(workspace.as_bytes());
-    for (index, component) in path.components().enumerate() {
-        if index != 0 {
-            key.push(PATH_COMPONENT_DELIMITER);
-        }
-        key.extend_from_slice(component.as_bytes());
-    }
+    push_ordered_path_components(&mut key, path);
     key.push(PATH_EXACT_TERMINATOR);
     key
 }
@@ -626,6 +637,9 @@ pub enum QueryRecordError {
         value: u8,
     },
     InvalidPath {
+        reason: String,
+    },
+    InvalidWorkbenchId {
         reason: String,
     },
     NonCanonicalFieldOrder,
@@ -683,6 +697,9 @@ impl fmt::Display for QueryRecordError {
                 write!(formatter, "invalid optional tag {value} for {field}")
             }
             Self::InvalidPath { reason } => write!(formatter, "invalid event path: {reason}"),
+            Self::InvalidWorkbenchId { reason } => {
+                write!(formatter, "invalid event workbench id: {reason}")
+            }
             Self::NonCanonicalFieldOrder => {
                 formatter.write_str("typed projection fields are not strictly ordered")
             }
@@ -849,13 +866,10 @@ impl<'a> Decoder<'a> {
         Self { remaining: encoded }
     }
 
-    fn require_version(&mut self) -> Result<(), QueryRecordError> {
+    fn require_version(&mut self, expected: u8) -> Result<(), QueryRecordError> {
         let actual = self.u8("value_format_version")?;
-        if actual != QUERY_RECORD_VALUE_FORMAT_VERSION {
-            return Err(QueryRecordError::UnsupportedValueVersion {
-                actual,
-                expected: QUERY_RECORD_VALUE_FORMAT_VERSION,
-            });
+        if actual != expected {
+            return Err(QueryRecordError::UnsupportedValueVersion { actual, expected });
         }
         Ok(())
     }
@@ -1065,23 +1079,36 @@ mod tests {
         let workspace = WorkspaceIncarnationId::from_bytes([2; FIXED_ID_BYTES]);
         let field = field("run.label");
         let prefix = secondary_index_field_prefix(root, &field);
+        let scalar = QueryScalar::String("same".to_owned());
         let key_a = secondary_index_key(
             root,
             &field,
-            &QueryScalar::String("a".to_owned()),
+            &scalar,
             workspace,
             &NormalizedRelativePath::new("a").unwrap(),
+        );
+        let key_a_control = secondary_index_key(
+            root,
+            &field,
+            &scalar,
+            workspace,
+            &NormalizedRelativePath::new("a\u{1}").unwrap(),
         );
         let key_ab = secondary_index_key(
             root,
             &field,
-            &QueryScalar::String("ab".to_owned()),
+            &scalar,
             workspace,
             &NormalizedRelativePath::new("ab").unwrap(),
         );
         assert!(key_a.starts_with(&prefix));
+        assert!(key_a_control.starts_with(&prefix));
         assert!(key_ab.starts_with(&prefix));
         assert_ne!(key_a, key_ab);
+        assert!(!key_a_control.starts_with(&key_a));
+        assert!(!key_ab.starts_with(&key_a));
+        assert!(key_a < key_a_control);
+        assert!(key_a_control < key_ab);
         assert!(key_a < key_ab);
     }
 
@@ -1099,7 +1126,49 @@ mod tests {
         let index_bytes = index.encode().unwrap();
         assert_eq!(SecondaryIndexRecord::decode(&index_bytes).unwrap(), index);
 
+        let golden_event = ChangeEventRecord {
+            workbench_id: WorkbenchId::new("wb").unwrap(),
+            workspace_incarnation_id: WorkspaceIncarnationId::from_bytes([7; FIXED_ID_BYTES]),
+            kind: ChangeEventKind::WorkspaceCreated,
+            artifact_revision_id: None,
+            commit_id: None,
+            operation_id: None,
+            path: None,
+            before: TypedProjection::empty(),
+            after: TypedProjection::empty(),
+        };
+        let golden = [
+            &[CHANGE_EVENT_VALUE_FORMAT_VERSION][..],
+            &2_u32.to_be_bytes(),
+            b"wb",
+            &[7; FIXED_ID_BYTES],
+            &[1, 0, 0, 0, 0],
+            &3_u32.to_be_bytes(),
+            &[QUERY_RECORD_VALUE_FORMAT_VERSION, 0, 0],
+            &3_u32.to_be_bytes(),
+            &[QUERY_RECORD_VALUE_FORMAT_VERSION, 0, 0],
+        ]
+        .concat();
+        assert_eq!(golden_event.encode().unwrap(), golden);
+        assert_eq!(ChangeEventRecord::decode(&golden).unwrap(), golden_event);
+
+        let mut invalid_utf8 = golden.clone();
+        invalid_utf8[5] = 0xff;
+        assert!(matches!(
+            ChangeEventRecord::decode(&invalid_utf8),
+            Err(QueryRecordError::InvalidUtf8 {
+                field: "workbench_id"
+            })
+        ));
+        let mut invalid_id = golden;
+        invalid_id[5] = b'!';
+        assert!(matches!(
+            ChangeEventRecord::decode(&invalid_id),
+            Err(QueryRecordError::InvalidWorkbenchId { .. })
+        ));
+
         let event = ChangeEventRecord {
+            workbench_id: WorkbenchId::new("agent-run").unwrap(),
             workspace_incarnation_id: WorkspaceIncarnationId::from_bytes([7; FIXED_ID_BYTES]),
             kind: ChangeEventKind::ArtifactPublished,
             artifact_revision_id: Some(ArtifactRevisionId::from_bytes([8; FIXED_ID_BYTES])),
@@ -1111,6 +1180,16 @@ mod tests {
         };
         let event_bytes = event.encode().unwrap();
         assert_eq!(ChangeEventRecord::decode(&event_bytes).unwrap(), event);
+
+        let mut legacy = event_bytes.clone();
+        legacy[0] = QUERY_RECORD_VALUE_FORMAT_VERSION;
+        assert_eq!(
+            ChangeEventRecord::decode(&legacy),
+            Err(QueryRecordError::UnsupportedValueVersion {
+                actual: QUERY_RECORD_VALUE_FORMAT_VERSION,
+                expected: CHANGE_EVENT_VALUE_FORMAT_VERSION,
+            })
+        );
 
         let mut trailing = event_bytes;
         trailing.push(0);

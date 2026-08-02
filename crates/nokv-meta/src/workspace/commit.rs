@@ -39,6 +39,7 @@ use super::engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
     HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, RootFenceAction,
 };
+use super::event_projection::change_event_projection;
 use super::namespace::{
     get_visible_path_at, get_visible_workspace_at, scan_visible_paths_at, NamespaceError,
     RootReadContext, RootWriteContext,
@@ -47,7 +48,6 @@ use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
     RevisionRefRecord, WorkspaceRecord,
 };
-use super::query::change_event_projection;
 use super::query_records::{ChangeEventKind, ChangeEventRecord, QueryRecordError, TypedProjection};
 use super::snapshot_records::{HistoryHoldRecord, SnapshotRecordError};
 
@@ -1450,6 +1450,7 @@ impl<'a> CommitService<'a> {
 
         plan.events
             .push(change_event_projection(&ChangeEventRecord {
+                workbench_id: operation.workbench_id.clone(),
                 workspace_incarnation_id: operation.source_workspace_incarnation_id,
                 kind: ChangeEventKind::CommitAdvanced,
                 artifact_revision_id: Some(operation.tree_manifest_revision_id),

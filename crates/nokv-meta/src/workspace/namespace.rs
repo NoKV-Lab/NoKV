@@ -20,14 +20,17 @@ use nokv_types::{
 };
 
 use super::codec::{
-    decode_path_current_key, path_child_prefix, path_current_key, workspace_current_key, SCHEMA_ID,
+    decode_path_common_prefix, decode_path_current_key, path_child_prefix, path_current_key,
+    workspace_current_key, workspace_incarnation_claim_key, PATH_COMPONENT_DELIMITER, SCHEMA_ID,
 };
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, MetadataCommand,
-    MetadataFamily, RootFenceAction,
+    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate,
+    DelimitedMetadataScanItem, MetadataCommand, MetadataFamily, RootFenceAction,
 };
-use super::publication_records::{PathEntry, PublicationRecordCodecError, WorkspaceRecord};
-use super::query::change_event_projection;
+use super::event_projection::change_event_projection;
+use super::publication_records::{
+    PathEntry, PublicationRecordCodecError, WorkspaceIncarnationClaimRecord, WorkspaceRecord,
+};
 use super::query_records::{
     ChangeEventKind, ChangeEventRecord, QueryFieldId, QueryRecordError, QueryScalar,
     TypedProjection,
@@ -35,9 +38,16 @@ use super::query_records::{
 
 /// Maximum number of visible paths returned by one namespace page.
 ///
-/// One additional engine item is reserved to determine whether another page
-/// exists while staying within the engine's 256-item scan bound.
-pub const MAX_VISIBLE_PATH_PAGE_SIZE: usize = 255;
+/// One additional logical item is reserved to determine whether another page
+/// exists. A direct-child scan may consume two adjacent raw items per logical
+/// child: one common prefix and one exact artifact row.
+pub(super) const MAX_VISIBLE_PATH_PAGE_SIZE: usize = 255;
+
+/// Maximum number of logical entries returned by one namespace listing.
+///
+/// Larger logical pages are assembled from bounded Holt scans so callers do
+/// not need to know the engine's raw scan bound.
+pub const MAX_VISIBLE_PATH_LIST_PAGE_SIZE: usize = 1_000;
 
 /// Fenced root context for one exact MVCC namespace read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,14 +121,65 @@ pub struct CreateVisibleWorkspaceResult {
 
 /// One normalized full path and its authoritative current entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VisiblePath {
+pub(super) struct VisiblePath {
     pub path: NormalizedRelativePath,
     pub entry: PathEntry,
 }
 
+/// One direct child, represented either by an exact artifact or an implicit
+/// descendant prefix. An artifact wins when both exist at the same path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisiblePathChild {
+    pub path: NormalizedRelativePath,
+    pub entry: Option<PathEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct VisiblePathChildPage {
+    pub entries: Vec<VisiblePathChild>,
+    pub next_marker: Option<NormalizedRelativePath>,
+}
+
+impl VisiblePathChildPage {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_marker: None,
+        }
+    }
+}
+
+/// One stable logical listing page for a visible workspace.
+///
+/// Entries may be exact artifacts or implicit direct-child prefixes. The
+/// marker is always the last returned full path and is exclusive on resume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisiblePathListPage {
+    pub entries: Vec<VisiblePathChild>,
+    pub next_marker: Option<NormalizedRelativePath>,
+}
+
+impl VisiblePathListPage {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_marker: None,
+        }
+    }
+}
+
+/// One visible workspace marker and the optional exact path resolved under the
+/// same fenced point-read session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleWorkspacePathRead {
+    pub context: RootReadContext,
+    pub workspace: WorkspaceRecord,
+    pub entry: Option<PathEntry>,
+}
+
 /// One stable ordered page of visible paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VisiblePathPage {
+pub(super) struct VisiblePathPage {
     pub entries: Vec<VisiblePath>,
     /// Pass this full path as `start_after` to obtain the next page.
     pub next_marker: Option<NormalizedRelativePath>,
@@ -139,10 +200,15 @@ pub enum NamespaceError {
     AlreadyExists {
         workbench_id: WorkbenchId,
     },
+    IncarnationAlreadyClaimed {
+        incarnation_id: WorkspaceIncarnationId,
+        workbench_id: WorkbenchId,
+    },
     InvalidPageLimit {
         requested: usize,
         max: usize,
     },
+    InvalidListMarker,
     CorruptKey {
         family: &'static str,
         reason: String,
@@ -164,9 +230,21 @@ impl fmt::Display for NamespaceError {
             Self::AlreadyExists { workbench_id } => {
                 write!(formatter, "workbench {workbench_id} already exists")
             }
+            Self::IncarnationAlreadyClaimed {
+                incarnation_id,
+                workbench_id,
+            } => write!(
+                formatter,
+                "workspace incarnation {:02x?} is permanently claimed by workbench {workbench_id}",
+                incarnation_id.as_bytes()
+            ),
             Self::InvalidPageLimit { requested, max } => write!(
                 formatter,
                 "visible path page limit {requested} is outside 1..={max}"
+            ),
+            Self::InvalidListMarker => write!(
+                formatter,
+                "list_paths cursor does not belong to the requested listing level"
             ),
             Self::CorruptKey { family, reason } => {
                 write!(formatter, "corrupt {family} key: {reason}")
@@ -208,8 +286,9 @@ impl From<QueryRecordError> for NamespaceError {
 
 /// Create one workbench name as an immediately-visible, empty workspace.
 ///
-/// The name is guarded by an exact absence predicate. An exact request replay
-/// returns and validates the originally persisted typed result.
+/// Both the name and never-reused incarnation are guarded by exact absence
+/// predicates. An exact request replay returns and validates the originally
+/// persisted typed result.
 pub fn create_visible_workspace(
     store: &AgentMetadataStore,
     context: RootWriteContext,
@@ -226,7 +305,14 @@ pub fn create_visible_workspace(
         .encode()
         .map_err(|source| codec_error("WorkspaceCurrent", source))?;
     let key = workspace_current_key(context.root_id, workbench_id);
+    let claim_key = workspace_incarnation_claim_key(context.root_id, incarnation_id);
+    let claim_payload = WorkspaceIncarnationClaimRecord {
+        workbench_id: workbench_id.clone(),
+    }
+    .encode()
+    .map_err(|source| codec_error("WorkspaceIncarnationClaim", source))?;
     let event = change_event_projection(&ChangeEventRecord {
+        workbench_id: workbench_id.clone(),
         workspace_incarnation_id: incarnation_id,
         kind: ChangeEventKind::WorkspaceCreated,
         artifact_revision_id: None,
@@ -249,16 +335,30 @@ pub fn create_visible_workspace(
         command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
         read_version: context.read_version,
         root_fence_action: RootFenceAction::RequireActive,
-        predicates: vec![CommandPredicate::Value {
-            family: MetadataFamily::WorkspaceCurrent,
-            key: key.clone(),
-            expected: None,
-        }],
-        mutations: vec![CommandMutation::Put {
-            family: MetadataFamily::WorkspaceCurrent,
-            key,
-            value: payload.clone(),
-        }],
+        predicates: vec![
+            CommandPredicate::Value {
+                family: MetadataFamily::WorkspaceCurrent,
+                key: key.clone(),
+                expected: None,
+            },
+            CommandPredicate::Value {
+                family: MetadataFamily::WorkspaceIncarnationClaim,
+                key: claim_key.clone(),
+                expected: None,
+            },
+        ],
+        mutations: vec![
+            CommandMutation::Put {
+                family: MetadataFamily::WorkspaceCurrent,
+                key: key.clone(),
+                value: payload.clone(),
+            },
+            CommandMutation::Put {
+                family: MetadataFamily::WorkspaceIncarnationClaim,
+                key: claim_key.clone(),
+                value: claim_payload,
+            },
+        ],
         history_projection: Vec::new(),
         event_projection: vec![event],
         deterministic_result: payload,
@@ -268,9 +368,42 @@ pub fn create_visible_workspace(
     let result = match store.execute(&command) {
         Ok(result) => result,
         Err(AgentMetadataError::PredicateFailed) => {
-            return Err(NamespaceError::AlreadyExists {
-                workbench_id: workbench_id.clone(),
-            })
+            if store
+                .read_at(
+                    context.root_id,
+                    context.placement_generation,
+                    context.owner_epoch,
+                    MetadataFamily::WorkspaceCurrent,
+                    &key,
+                    context.read_version,
+                )?
+                .is_some()
+            {
+                return Err(NamespaceError::AlreadyExists {
+                    workbench_id: workbench_id.clone(),
+                });
+            }
+
+            let Some(claim_payload) = store.read_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                MetadataFamily::WorkspaceIncarnationClaim,
+                &claim_key,
+                context.read_version,
+            )?
+            else {
+                // The command has only the two exact absence predicates above.
+                // If neither key existed at its exact MVCC read version, keep
+                // the engine failure instead of inventing a domain conflict.
+                return Err(NamespaceError::Engine(AgentMetadataError::PredicateFailed));
+            };
+            let claim = WorkspaceIncarnationClaimRecord::decode(&claim_payload)
+                .map_err(|source| codec_error("WorkspaceIncarnationClaim", source))?;
+            return Err(NamespaceError::IncarnationAlreadyClaimed {
+                incarnation_id,
+                workbench_id: claim.workbench_id,
+            });
         }
         Err(source) => return Err(NamespaceError::Engine(source)),
     };
@@ -326,10 +459,98 @@ pub fn get_visible_path_at(
     workbench_id: &WorkbenchId,
     path: &NormalizedRelativePath,
 ) -> Result<Option<PathEntry>, NamespaceError> {
-    let Some(workspace) = get_visible_workspace_at(store, context, workbench_id)? else {
-        return Ok(None);
-    };
-    get_path_at_visible_workspace(store, context, &workspace, path)
+    Ok(
+        get_visible_workspace_path_at(store, context, workbench_id, path)?
+            .and_then(|read| read.entry),
+    )
+}
+
+/// Resolve a live workspace marker and one dependent path while capturing the
+/// current read version inside the same fenced point-read session.
+pub fn get_current_visible_workspace_path(
+    store: &AgentMetadataStore,
+    root_id: RootId,
+    placement_generation: PlacementGeneration,
+    owner_epoch: OwnerEpoch,
+    workbench_id: &WorkbenchId,
+    path: &NormalizedRelativePath,
+) -> Result<Option<VisibleWorkspacePathRead>, NamespaceError> {
+    get_visible_workspace_path(
+        store,
+        root_id,
+        placement_generation,
+        owner_epoch,
+        None,
+        workbench_id,
+        path,
+    )
+}
+
+/// Resolve a workspace marker and one dependent path at an exact read version
+/// under one ownership/fence validation.
+pub fn get_visible_workspace_path_at(
+    store: &AgentMetadataStore,
+    context: RootReadContext,
+    workbench_id: &WorkbenchId,
+    path: &NormalizedRelativePath,
+) -> Result<Option<VisibleWorkspacePathRead>, NamespaceError> {
+    get_visible_workspace_path(
+        store,
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        Some(context.read_version),
+        workbench_id,
+        path,
+    )
+}
+
+fn get_visible_workspace_path(
+    store: &AgentMetadataStore,
+    root_id: RootId,
+    placement_generation: PlacementGeneration,
+    owner_epoch: OwnerEpoch,
+    requested_version: Option<ReadVersion>,
+    workbench_id: &WorkbenchId,
+    path: &NormalizedRelativePath,
+) -> Result<Option<VisibleWorkspacePathRead>, NamespaceError> {
+    store.with_fenced_point_reads(
+        root_id,
+        placement_generation,
+        owner_epoch,
+        requested_version,
+        |read_version, reader| {
+            let context = RootReadContext {
+                root_id,
+                placement_generation,
+                owner_epoch,
+                read_version,
+            };
+            let workspace_key = workspace_current_key(root_id, workbench_id);
+            let Some(payload) = reader.get(MetadataFamily::WorkspaceCurrent, &workspace_key)?
+            else {
+                return Ok(None);
+            };
+            let workspace = WorkspaceRecord::decode(&payload)
+                .map_err(|source| codec_error("WorkspaceCurrent", source))?;
+            if workspace.state != WorkspaceState::Visible {
+                return Ok(None);
+            }
+
+            let path_key = path_current_key(root_id, workspace.incarnation_id, path);
+            let entry = reader
+                .get(MetadataFamily::PathCurrent, &path_key)?
+                .map(|payload| {
+                    PathEntry::decode(&payload).map_err(|source| codec_error("PathCurrent", source))
+                })
+                .transpose()?;
+            Ok(Some(VisibleWorkspacePathRead {
+                context,
+                workspace,
+                entry,
+            }))
+        },
+    )
 }
 
 /// Read one exact path after the caller resolved `WorkspaceCurrent` at the
@@ -365,12 +586,129 @@ pub fn get_path_at_visible_workspace(
         .map_err(|source| codec_error("PathCurrent", source))
 }
 
+/// List one logical page below an optional normalized prefix after the caller
+/// has resolved `WorkspaceCurrent` at the same read context.
+///
+/// Recursive listings return authoritative artifact rows. Direct listings
+/// coalesce deeper descendants into implicit prefix entries. When `prefix`
+/// itself names an artifact it follows all descendants, matching the encoded
+/// full-path key order. `start_after` must be the exact full-path marker
+/// returned by a preceding page at the same listing level.
+pub fn list_paths_at_visible_workspace(
+    store: &AgentMetadataStore,
+    context: RootReadContext,
+    workspace: &WorkspaceRecord,
+    prefix: Option<&NormalizedRelativePath>,
+    recursive: bool,
+    start_after: Option<&NormalizedRelativePath>,
+    limit: usize,
+) -> Result<VisiblePathListPage, NamespaceError> {
+    if workspace.state != WorkspaceState::Visible {
+        return Ok(VisiblePathListPage::empty());
+    }
+    if !(1..=MAX_VISIBLE_PATH_LIST_PAGE_SIZE).contains(&limit) {
+        return Err(NamespaceError::InvalidPageLimit {
+            requested: limit,
+            max: MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
+        });
+    }
+    if start_after.is_some_and(|marker| !list_marker_is_valid(prefix, recursive, marker)) {
+        return Err(NamespaceError::InvalidListMarker);
+    }
+
+    let mut marker = start_after.cloned();
+    let mut selected = Vec::with_capacity(limit.saturating_add(1));
+    // A marker equal to an explicit prefix means the exact-prefix row was the
+    // final entry on the preceding page. A root listing has no exact-prefix
+    // row, so `(None, None)` must still enter the descendant scan.
+    if prefix.is_none() || prefix != marker.as_ref() {
+        'scan: loop {
+            let remaining = limit.saturating_add(1).saturating_sub(selected.len());
+            if remaining == 0 {
+                break;
+            }
+            let scan_limit = remaining.min(MAX_VISIBLE_PATH_PAGE_SIZE);
+            let page = if recursive {
+                let page = scan_paths_at_visible_workspace(
+                    store,
+                    context,
+                    workspace,
+                    prefix,
+                    marker.as_ref(),
+                    scan_limit,
+                )?;
+                VisiblePathChildPage {
+                    entries: page
+                        .entries
+                        .into_iter()
+                        .map(|visible| VisiblePathChild {
+                            path: visible.path,
+                            entry: Some(visible.entry),
+                        })
+                        .collect(),
+                    next_marker: page.next_marker,
+                }
+            } else {
+                scan_direct_path_children_at_visible_workspace(
+                    store,
+                    context,
+                    workspace,
+                    prefix,
+                    marker.as_ref(),
+                    scan_limit,
+                )?
+            };
+            for visible in page.entries {
+                selected.push(visible);
+                if selected.len() > limit {
+                    break 'scan;
+                }
+            }
+            let Some(next) = page.next_marker else {
+                break;
+            };
+            marker = Some(next);
+        }
+    }
+
+    if selected.len() <= limit {
+        let exact_prefix = match prefix {
+            Some(prefix) if marker.as_ref() != Some(prefix) => {
+                get_path_at_visible_workspace(store, context, workspace, prefix)?.map(|entry| {
+                    VisiblePathChild {
+                        path: prefix.clone(),
+                        entry: Some(entry),
+                    }
+                })
+            }
+            _ => None,
+        };
+        selected.extend(exact_prefix);
+    }
+
+    let has_more = selected.len() > limit;
+    if has_more {
+        selected.truncate(limit);
+    }
+    let next_marker = has_more.then(|| {
+        selected
+            .last()
+            .expect("a listing page with lookahead has one returned entry")
+            .path
+            .clone()
+    });
+    Ok(VisiblePathListPage {
+        entries: selected,
+        next_marker,
+    })
+}
+
 /// Scan all normalized full paths in one visible workspace incarnation.
 ///
 /// `start_after` is exclusive. A returned `next_marker` is the last entry in
 /// the current page and is safe to pass to the next call at the same read
 /// version.
-pub fn scan_visible_paths_at(
+pub(super) fn scan_visible_paths_at(
     store: &AgentMetadataStore,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
@@ -397,7 +735,7 @@ pub fn scan_visible_paths_at(
 /// at `path`; callers that expose "exact prefix or descendants" semantics must
 /// merge the exact point read after the descendant scan because the exact key
 /// sorts after its descendants.
-pub fn scan_paths_at_visible_workspace(
+pub(super) fn scan_paths_at_visible_workspace(
     store: &AgentMetadataStore,
     context: RootReadContext,
     workspace: &WorkspaceRecord,
@@ -456,6 +794,115 @@ pub fn scan_paths_at_visible_workspace(
     })
 }
 
+/// Scan direct logical children below an optional normalized parent.
+///
+/// Holt common-prefix rollups are retained as implicit children. If an exact
+/// artifact exists at the same path, it replaces the implicit prefix in the
+/// returned logical item. The exclusive marker skips both representations.
+pub(super) fn scan_direct_path_children_at_visible_workspace(
+    store: &AgentMetadataStore,
+    context: RootReadContext,
+    workspace: &WorkspaceRecord,
+    path_prefix: Option<&NormalizedRelativePath>,
+    start_after: Option<&NormalizedRelativePath>,
+    limit: usize,
+) -> Result<VisiblePathChildPage, NamespaceError> {
+    if workspace.state != WorkspaceState::Visible {
+        return Ok(VisiblePathChildPage::empty());
+    }
+    if !(1..=MAX_VISIBLE_PATH_PAGE_SIZE).contains(&limit) {
+        return Err(NamespaceError::InvalidPageLimit {
+            requested: limit,
+            max: MAX_VISIBLE_PATH_PAGE_SIZE,
+        });
+    }
+    let prefix = path_child_prefix(context.root_id, workspace.incarnation_id, path_prefix);
+    let marker_key =
+        start_after.map(|path| path_current_key(context.root_id, workspace.incarnation_id, path));
+    let logical_with_lookahead = limit + 1;
+    let raw_limit = logical_with_lookahead * 2;
+    let scanned = store.scan_delimited_prefix_at(
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        MetadataFamily::PathCurrent,
+        &prefix,
+        PATH_COMPONENT_DELIMITER,
+        context.read_version,
+        marker_key.as_deref(),
+        raw_limit,
+    )?;
+
+    let mut children = BTreeMap::<NormalizedRelativePath, Option<PathEntry>>::new();
+    for item in scanned {
+        match item {
+            DelimitedMetadataScanItem::Record(item) => {
+                let path =
+                    decode_path_current_key(context.root_id, workspace.incarnation_id, &item.key)
+                        .ok_or_else(|| NamespaceError::CorruptKey {
+                        family: "PathCurrent",
+                        reason: "key is not the canonical root/workspace/path encoding".to_owned(),
+                    })?;
+                let entry = PathEntry::decode(&item.value)
+                    .map_err(|source| codec_error("PathCurrent", source))?;
+                children.insert(path, Some(entry));
+            }
+            DelimitedMetadataScanItem::CommonPrefix(key) => {
+                let path =
+                    decode_path_common_prefix(context.root_id, workspace.incarnation_id, &key)
+                        .ok_or_else(|| NamespaceError::CorruptKey {
+                            family: "PathCurrent",
+                            reason: "common prefix is not a canonical root/workspace/path prefix"
+                                .to_owned(),
+                        })?;
+                children.entry(path).or_insert(None);
+            }
+        }
+    }
+
+    let has_more = children.len() > limit;
+    let entries = children
+        .into_iter()
+        .take(limit)
+        .map(|(path, entry)| VisiblePathChild { path, entry })
+        .collect::<Vec<_>>();
+    let next_marker = has_more.then(|| {
+        entries
+            .last()
+            .expect("a page with a lookahead item has one returned child")
+            .path
+            .clone()
+    });
+    Ok(VisiblePathChildPage {
+        entries,
+        next_marker,
+    })
+}
+
+fn list_marker_is_valid(
+    prefix: Option<&NormalizedRelativePath>,
+    recursive: bool,
+    marker: &NormalizedRelativePath,
+) -> bool {
+    match (prefix, recursive) {
+        (None, true) => true,
+        (None, false) => marker.component_count() == 1,
+        (Some(prefix), true) => marker == prefix || descendant_suffix(marker, prefix).is_some(),
+        (Some(prefix), false) if marker == prefix => true,
+        (Some(prefix), false) => descendant_suffix(marker, prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('/')),
+    }
+}
+
+fn descendant_suffix<'a>(
+    path: &'a NormalizedRelativePath,
+    prefix: &NormalizedRelativePath,
+) -> Option<&'a str> {
+    path.as_str()
+        .strip_prefix(prefix.as_str())
+        .and_then(|suffix| suffix.strip_prefix('/'))
+}
+
 fn codec_error(record: &'static str, source: PublicationRecordCodecError) -> NamespaceError {
     NamespaceError::Codec { record, source }
 }
@@ -467,6 +914,7 @@ mod tests {
     };
 
     use super::super::codec::PATH_EXACT_TERMINATOR;
+    use super::super::engine::HistoryProjection;
 
     use super::*;
 
@@ -681,6 +1129,57 @@ mod tests {
     }
 
     #[test]
+    fn incarnation_claim_conflict_does_not_report_an_absent_workbench_as_existing() {
+        let store = ready_store();
+        let existing_name = workbench("wb-create");
+        let absent_name = workbench("wb-create-other");
+        let claimed_incarnation = incarnation(3);
+        create_visible_workspace(
+            &store,
+            write_context(&store, 3),
+            &existing_name,
+            claimed_incarnation,
+        )
+        .unwrap();
+
+        assert_eq!(
+            create_visible_workspace(
+                &store,
+                write_context(&store, 4),
+                &absent_name,
+                claimed_incarnation,
+            ),
+            Err(NamespaceError::IncarnationAlreadyClaimed {
+                incarnation_id: claimed_incarnation,
+                workbench_id: existing_name.clone(),
+            })
+        );
+        assert_eq!(
+            get_visible_workspace_at(&store, read_context(&store), &absent_name).unwrap(),
+            None
+        );
+
+        let claim_key = workspace_incarnation_claim_key(root(2), claimed_incarnation);
+        let claim = store
+            .read_at(
+                root(2),
+                placement(),
+                owner(),
+                MetadataFamily::WorkspaceIncarnationClaim,
+                &claim_key,
+                read_context(&store).read_version,
+            )
+            .unwrap()
+            .expect("created incarnation has a permanent claim");
+        assert_eq!(
+            WorkspaceIncarnationClaimRecord::decode(&claim).unwrap(),
+            WorkspaceIncarnationClaimRecord {
+                workbench_id: existing_name,
+            }
+        );
+    }
+
+    #[test]
     fn staging_and_retired_workspaces_hide_all_paths() {
         let store = ready_store();
         let staging_name = workbench("wb-staging");
@@ -757,7 +1256,7 @@ mod tests {
         let neighbor = path("outputs/ab");
         let exact_entry = path_entry(12, 1);
         let neighbor_entry = path_entry(13, 2);
-        put_absent(
+        let path_created_version = put_absent(
             &store,
             4,
             vec![
@@ -786,7 +1285,7 @@ mod tests {
         );
         assert_eq!(
             get_visible_path_at(&store, read_context(&store), &name, &exact).unwrap(),
-            Some(exact_entry)
+            Some(exact_entry.clone())
         );
         assert_eq!(
             get_visible_path_at(
@@ -797,6 +1296,95 @@ mod tests {
             )
             .unwrap(),
             None
+        );
+
+        let current = get_current_visible_workspace_path(
+            &store,
+            root(2),
+            placement(),
+            owner(),
+            &name,
+            &exact,
+        )
+        .unwrap()
+        .expect("visible workspace resolves in the fused point-read session");
+        assert_eq!(current.workspace, created.workspace);
+        assert_eq!(current.entry, Some(exact_entry.clone()));
+        assert_eq!(
+            current.context.read_version,
+            read_context(&store).read_version
+        );
+
+        let missing = get_current_visible_workspace_path(
+            &store,
+            root(2),
+            placement(),
+            owner(),
+            &name,
+            &path("outputs/missing"),
+        )
+        .unwrap()
+        .expect("visible workspace remains distinguishable from a missing path");
+        assert!(missing.entry.is_none());
+        assert!(get_current_visible_workspace_path(
+            &store,
+            root(2),
+            placement(),
+            owner(),
+            &workbench("missing-workbench"),
+            &exact,
+        )
+        .unwrap()
+        .is_none());
+
+        let context = write_context(&store, 5);
+        let exact_key = path_current_key(root(2), incarnation(12), &exact);
+        store
+            .execute(
+                &MetadataCommand {
+                    schema_id: SCHEMA_ID.to_owned(),
+                    root_id: context.root_id,
+                    logical_shard_id: context.logical_shard_id,
+                    placement_generation: context.placement_generation,
+                    owner_epoch: context.owner_epoch,
+                    request_id: context.request_id,
+                    command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                    read_version: context.read_version,
+                    root_fence_action: RootFenceAction::RequireActive,
+                    predicates: vec![CommandPredicate::Value {
+                        family: MetadataFamily::PathCurrent,
+                        key: exact_key.clone(),
+                        expected: Some(exact_entry.encode().unwrap()),
+                    }],
+                    mutations: vec![CommandMutation::Delete {
+                        family: MetadataFamily::PathCurrent,
+                        key: exact_key.clone(),
+                    }],
+                    history_projection: vec![HistoryProjection {
+                        family: MetadataFamily::PathCurrent,
+                        key: exact_key,
+                    }],
+                    event_projection: Vec::new(),
+                    deterministic_result: b"delete-exact-path".to_vec(),
+                }
+                .seal(),
+            )
+            .unwrap();
+        let live_after_delete = get_current_visible_workspace_path(
+            &store,
+            root(2),
+            placement(),
+            owner(),
+            &name,
+            &exact,
+        )
+        .unwrap()
+        .expect("workspace remains visible after deleting one path");
+        assert_eq!(live_after_delete.entry, None);
+        assert_eq!(
+            get_visible_path_at(&store, read_context_at(path_created_version), &name, &exact,)
+                .unwrap(),
+            Some(exact_entry)
         );
     }
 
@@ -890,6 +1478,340 @@ mod tests {
                 .unwrap(),
             VisiblePathPage::empty()
         );
+    }
+
+    #[test]
+    fn logical_listing_composes_prefix_order_pagination_and_marker_validation() {
+        let store = ready_store();
+        let name = workbench("wb-logical-list");
+        let created = create_workspace(&store, 3, &name, 16);
+        let paths = [
+            "outputs",
+            "outputs/a/deep.bin",
+            "outputs/a",
+            "outputs/b",
+            "outputs2/outside.bin",
+        ];
+        put_absent(
+            &store,
+            4,
+            paths
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| {
+                    let path = path(raw);
+                    (
+                        MetadataFamily::PathCurrent,
+                        path_current_key(root(2), incarnation(16), &path),
+                        path_entry(index as u8 + 1, index as u64 + 1)
+                            .encode()
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        );
+        let context = read_context(&store);
+        let prefix = path("outputs");
+
+        let first = list_paths_at_visible_workspace(
+            &store,
+            context,
+            &created.workspace,
+            Some(&prefix),
+            true,
+            None,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|visible| visible.path.as_str())
+                .collect::<Vec<_>>(),
+            ["outputs/a/deep.bin", "outputs/a"]
+        );
+        assert_eq!(first.next_marker, Some(path("outputs/a")));
+
+        let second = list_paths_at_visible_workspace(
+            &store,
+            context,
+            &created.workspace,
+            Some(&prefix),
+            true,
+            first.next_marker.as_ref(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|visible| visible.path.as_str())
+                .collect::<Vec<_>>(),
+            ["outputs/b", "outputs"]
+        );
+        assert!(second.entries.iter().all(|visible| visible.entry.is_some()));
+        assert!(second.next_marker.is_none());
+
+        let direct = list_paths_at_visible_workspace(
+            &store,
+            context,
+            &created.workspace,
+            Some(&prefix),
+            false,
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            direct
+                .entries
+                .iter()
+                .map(|visible| visible.path.as_str())
+                .collect::<Vec<_>>(),
+            ["outputs/a", "outputs/b", "outputs"]
+        );
+        assert!(direct.entries.iter().all(|visible| visible.entry.is_some()));
+
+        assert_eq!(
+            list_paths_at_visible_workspace(
+                &store,
+                context,
+                &created.workspace,
+                Some(&prefix),
+                true,
+                Some(&path("outputs2/outside.bin")),
+                2,
+            ),
+            Err(NamespaceError::InvalidListMarker)
+        );
+        assert_eq!(
+            list_paths_at_visible_workspace(
+                &store,
+                context,
+                &created.workspace,
+                Some(&prefix),
+                false,
+                Some(&path("outputs/a/deep.bin")),
+                2,
+            ),
+            Err(NamespaceError::InvalidListMarker)
+        );
+        assert_eq!(
+            list_paths_at_visible_workspace(
+                &store,
+                context,
+                &created.workspace,
+                None,
+                false,
+                Some(&path("outputs/a")),
+                2,
+            ),
+            Err(NamespaceError::InvalidListMarker)
+        );
+    }
+
+    #[test]
+    fn logical_listing_assembles_pages_larger_than_one_engine_scan() {
+        let store = ready_store();
+        let name = workbench("wb-wide-list");
+        let created = create_workspace(&store, 3, &name, 17);
+        let records = (0..260)
+            .map(|index| {
+                let path = path(&format!("items/{index:04}"));
+                (
+                    MetadataFamily::PathCurrent,
+                    path_current_key(root(2), incarnation(17), &path),
+                    path_entry((index % 250 + 1) as u8, index as u64 + 1)
+                        .encode()
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        put_absent(&store, 4, records[..255].to_vec());
+        put_absent(&store, 5, records[255..].to_vec());
+        let context = read_context(&store);
+        let prefix = path("items");
+
+        let page = list_paths_at_visible_workspace(
+            &store,
+            context,
+            &created.workspace,
+            Some(&prefix),
+            true,
+            None,
+            300,
+        )
+        .unwrap();
+        assert_eq!(page.entries.len(), 260);
+        assert_eq!(page.entries.first().unwrap().path, path("items/0000"));
+        assert_eq!(page.entries.last().unwrap().path, path("items/0259"));
+        assert!(page.next_marker.is_none());
+
+        assert_eq!(
+            list_paths_at_visible_workspace(
+                &store,
+                context,
+                &created.workspace,
+                Some(&prefix),
+                true,
+                None,
+                MAX_VISIBLE_PATH_LIST_PAGE_SIZE + 1,
+            ),
+            Err(NamespaceError::InvalidPageLimit {
+                requested: MAX_VISIBLE_PATH_LIST_PAGE_SIZE + 1,
+                max: MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn direct_child_scan_coalesces_prefix_and_artifact_without_skipping_a_sibling() {
+        let store = ready_store();
+        let name = workbench("wb-direct-pages");
+        let created = create_workspace(&store, 3, &name, 15);
+        let paths = ["parent/a/deep", "parent/a", "parent/ab", "parent/b/deep"];
+        let historical_version = put_absent(
+            &store,
+            4,
+            paths
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| {
+                    let path = path(raw);
+                    (
+                        MetadataFamily::PathCurrent,
+                        path_current_key(root(2), incarnation(15), &path),
+                        path_entry(index as u8 + 1, index as u64 + 1)
+                            .encode()
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        );
+        let context = read_context(&store);
+        let parent = path("parent");
+
+        let first = scan_direct_path_children_at_visible_workspace(
+            &store,
+            context,
+            &created.workspace,
+            Some(&parent),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].path, path("parent/a"));
+        assert!(first.entries[0].entry.is_some());
+        assert_eq!(first.next_marker, Some(path("parent/a")));
+
+        let second = scan_direct_path_children_at_visible_workspace(
+            &store,
+            context,
+            &created.workspace,
+            Some(&parent),
+            first.next_marker.as_ref(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(second.entries[0].path, path("parent/ab"));
+        assert!(second.entries[0].entry.is_some());
+        assert_eq!(second.next_marker, Some(path("parent/ab")));
+
+        let third = scan_direct_path_children_at_visible_workspace(
+            &store,
+            context,
+            &created.workspace,
+            Some(&parent),
+            second.next_marker.as_ref(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(third.entries[0].path, path("parent/b"));
+        assert!(third.entries[0].entry.is_none());
+        assert!(third.next_marker.is_none());
+
+        let deleted = [
+            ("parent/a", path_entry(2, 2)),
+            ("parent/ab", path_entry(3, 3)),
+            ("parent/b/deep", path_entry(4, 4)),
+        ];
+        let added_path = path("parent/aa");
+        let added_payload = path_entry(5, 5).encode().unwrap();
+        let context = write_context(&store, 5);
+        let mut command = MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: context.root_id,
+            logical_shard_id: context.logical_shard_id,
+            placement_generation: context.placement_generation,
+            owner_epoch: context.owner_epoch,
+            request_id: context.request_id,
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: context.read_version,
+            root_fence_action: RootFenceAction::RequireActive,
+            predicates: Vec::new(),
+            mutations: Vec::new(),
+            history_projection: Vec::new(),
+            event_projection: Vec::new(),
+            deterministic_result: b"mutated-direct-children".to_vec(),
+        };
+        for (raw, entry) in deleted {
+            let key = path_current_key(root(2), incarnation(15), &path(raw));
+            command.predicates.push(CommandPredicate::Value {
+                family: MetadataFamily::PathCurrent,
+                key: key.clone(),
+                expected: Some(entry.encode().unwrap()),
+            });
+            command.mutations.push(CommandMutation::Delete {
+                family: MetadataFamily::PathCurrent,
+                key: key.clone(),
+            });
+            command.history_projection.push(HistoryProjection {
+                family: MetadataFamily::PathCurrent,
+                key,
+            });
+        }
+        let added_key = path_current_key(root(2), incarnation(15), &added_path);
+        command.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::PathCurrent,
+            key: added_key.clone(),
+            expected: None,
+        });
+        command.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::PathCurrent,
+            key: added_key,
+            value: added_payload,
+        });
+        store.execute(&command.seal()).unwrap();
+
+        let historical_context = read_context_at(historical_version);
+        let mut marker = None;
+        let mut historical_paths = Vec::new();
+        let mut historical_kinds = Vec::new();
+        loop {
+            let page = scan_direct_path_children_at_visible_workspace(
+                &store,
+                historical_context,
+                &created.workspace,
+                Some(&parent),
+                marker.as_ref(),
+                1,
+            )
+            .unwrap();
+            historical_paths.extend(page.entries.iter().map(|entry| entry.path.clone()));
+            historical_kinds.extend(page.entries.iter().map(|entry| entry.entry.is_some()));
+            let Some(next) = page.next_marker else {
+                break;
+            };
+            marker = Some(next);
+        }
+        assert_eq!(
+            historical_paths,
+            [path("parent/a"), path("parent/ab"), path("parent/b")]
+        );
+        assert_eq!(historical_kinds, [true, true, false]);
     }
 
     #[test]
@@ -1018,7 +1940,7 @@ mod tests {
         let corrupt_key = workbench("wb-corrupt-key");
         create_workspace(&store, 6, &corrupt_key, 21);
         let mut malformed_key = path_child_prefix(root(2), incarnation(21), None);
-        malformed_key.extend_from_slice(b"outputs/bad/name");
+        malformed_key.extend_from_slice(b"b\x01c");
         malformed_key.push(PATH_EXACT_TERMINATOR);
         put_absent(
             &store,

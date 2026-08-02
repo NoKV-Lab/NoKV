@@ -23,12 +23,12 @@ use super::engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, HistoryProjection,
     MetadataCommand, MetadataFamily, RootFenceAction,
 };
+use super::event_projection::change_event_projection;
 use super::namespace::RootWriteContext;
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
     RevisionRefRecord, WorkspaceRecord,
 };
-use super::query::change_event_projection;
 use super::query_records::{
     secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
     SecondaryIndexRecord, TypedProjection,
@@ -386,6 +386,7 @@ pub fn remove_path(
     }
 
     let event = change_event_projection(&ChangeEventRecord {
+        workbench_id: request.workbench_id.clone(),
         workspace_incarnation_id: workspace.incarnation_id,
         kind: ChangeEventKind::PathRemoved,
         artifact_revision_id: Some(path.artifact_revision_id),

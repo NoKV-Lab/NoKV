@@ -23,9 +23,9 @@ use super::engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
     HistoryProjection, MetadataCommand, MetadataFamily, RootFenceAction,
 };
+use super::event_projection::change_event_projection;
 use super::namespace::{RootReadContext, RootWriteContext};
 use super::publication_records::{PublicationRecordCodecError, WorkspaceRecord};
-use super::query::change_event_projection;
 use super::query_records::{
     ChangeEventKind, ChangeEventRecord, QueryFieldId, QueryRecordError, QueryScalar,
     TypedProjection,
@@ -401,6 +401,7 @@ pub fn mint_snapshot(
         );
     }
     command.event_projection.push(snapshot_change_event(
+        &request.workbench_id,
         workspace.record.incarnation_id,
         ChangeEventKind::SnapshotMinted,
         None,
@@ -473,6 +474,7 @@ pub fn renew_snapshot(
     );
     predicate_alias_without_mutation(&mut command, loaded.alias_plan.as_ref());
     command.event_projection.push(snapshot_change_event(
+        &request.workbench_id,
         workspace.record.incarnation_id,
         ChangeEventKind::SnapshotRenewed,
         Some(&loaded.resolved),
@@ -612,6 +614,7 @@ pub fn finish_snapshot_reap(
     );
     apply_alias_replacement(&mut command, loaded.alias_plan, next.alias_record.as_ref());
     command.event_projection.push(snapshot_change_event(
+        &request.workbench_id,
         workspace.record.incarnation_id,
         ChangeEventKind::SnapshotReaped,
         Some(&loaded.resolved),
@@ -681,6 +684,7 @@ pub fn attach_snapshot_consumer(
         hold.encode(),
     );
     command.event_projection.push(snapshot_change_event(
+        &request.workbench_id,
         workspace.record.incarnation_id,
         ChangeEventKind::SnapshotConsumerAttached,
         Some(&loaded.resolved),
@@ -752,6 +756,7 @@ pub fn release_snapshot_consumer(
         hold_payload,
     );
     command.event_projection.push(snapshot_change_event(
+        &request.workbench_id,
         workspace.record.incarnation_id,
         ChangeEventKind::SnapshotConsumerReleased,
         Some(&loaded.resolved),
@@ -819,6 +824,7 @@ fn terminalize_snapshot(
     );
     apply_alias_replacement(&mut command, loaded.alias_plan, next.alias_record.as_ref());
     command.event_projection.push(snapshot_change_event(
+        &workspace.workbench_id,
         workspace.record.incarnation_id,
         event_kind,
         Some(&loaded.resolved),
@@ -860,6 +866,7 @@ fn increment_consumer_epoch(epoch: ConsumerEpoch) -> Result<ConsumerEpoch, Snaps
 
 #[derive(Clone)]
 struct LoadedWorkspace {
+    workbench_id: WorkbenchId,
     key: Vec<u8>,
     payload: Vec<u8>,
     record: WorkspaceRecord,
@@ -895,6 +902,7 @@ fn load_visible_workspace(
         });
     }
     Ok(LoadedWorkspace {
+        workbench_id: workbench_id.clone(),
         key,
         payload,
         record,
@@ -1550,6 +1558,7 @@ fn hash_bytes(hasher: &mut Sha256, value: &[u8]) {
 }
 
 fn snapshot_change_event(
+    workbench_id: &WorkbenchId,
     workspace_incarnation_id: WorkspaceIncarnationId,
     kind: ChangeEventKind,
     before: Option<&ResolvedSnapshot>,
@@ -1557,6 +1566,7 @@ fn snapshot_change_event(
     restore_operation_id: Option<OperationId>,
 ) -> Result<EventProjection, SnapshotError> {
     Ok(change_event_projection(&ChangeEventRecord {
+        workbench_id: workbench_id.clone(),
         workspace_incarnation_id,
         kind,
         artifact_revision_id: None,

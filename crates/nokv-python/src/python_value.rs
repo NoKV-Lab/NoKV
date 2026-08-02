@@ -6,9 +6,9 @@
 use nokv_client::{ArtifactPublishOutcome, ArtifactReadOutcome};
 use nokv_protocol::{
     AggregateFunction, AggregateResult, AggregateSpec, CatalogResult, CommitResult, FacetResult,
-    FieldValue, FindWorkspacesResult, PathMetadata, PathPage, PublishResult, QueryOperand,
-    QueryOperator, QueryPredicate, ScalarValue, SearchResult, SortDirection, SortField,
-    WorkspaceSummary,
+    FieldValue, FindWorkspacesResult, PathListEntry, PathMetadata, PathPage, PublishResult,
+    QueryOperand, QueryOperator, QueryPredicate, ScalarValue, SearchResult, SortDirection,
+    SortField, WorkspaceSummary,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -310,7 +310,21 @@ pub(crate) fn path_page_to_py<'py>(
     let dict = PyDict::new(py);
     let entries = PyList::empty(py);
     for entry in &page.entries {
-        entries.append(path_metadata_to_py(py, entry)?)?;
+        let item = match entry {
+            PathListEntry::Artifact(metadata) => {
+                let item = path_metadata_to_py(py, metadata)?;
+                item.set_item("kind", "artifact")?;
+                item
+            }
+            PathListEntry::Prefix(path) => {
+                let item = PyDict::new(py);
+                item.set_item("kind", "prefix")?;
+                item.set_item("workbench", path.workbench.as_str())?;
+                item.set_item("path", path.path.as_str())?;
+                item
+            }
+        };
+        entries.append(item)?;
     }
     dict.set_item("entries", entries)?;
     set_optional_bytes(py, &dict, "next_cursor", page.next_cursor.as_deref())?;
@@ -603,6 +617,16 @@ fn set_optional_u64(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nokv_protocol::{
+        ArtifactDescriptor, ArtifactRevisionIdentity, ContentType, DigestUri, RelativePath,
+        WorkbenchName, WorkspaceIdentity, WorkspacePath,
+    };
+
+    fn dict_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> Bound<'py, PyAny> {
+        dict.get_item(key)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing Python dictionary key {key:?}"))
+    }
 
     #[test]
     fn fixed_identity_requires_canonical_lower_hex() {
@@ -652,5 +676,133 @@ mod tests {
             QueryOperand::Scalar(ScalarValue::String("done".to_owned()))
         );
         assert_eq!(predicates[1].operand, QueryOperand::None);
+    }
+
+    #[test]
+    fn path_page_conversion_preserves_artifact_and_prefix_abi() {
+        let workbench = WorkbenchName::new("run-42").unwrap();
+        let path = |value: &str| WorkspacePath {
+            workbench: workbench.clone(),
+            path: RelativePath::new(value).unwrap(),
+        };
+        let page = PathPage {
+            entries: vec![
+                PathListEntry::Artifact(PathMetadata {
+                    path: path("outputs/result.json"),
+                    workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                    workspace_revision: 7,
+                    generation: 3,
+                    artifact_revision_id: ArtifactRevisionIdentity([5; 16]),
+                    dependency_count: 2,
+                    dependency_depth: 1,
+                    descriptor: ArtifactDescriptor {
+                        logical_size: 42,
+                        body_digest: DigestUri::new(format!("sha256:{}", "06".repeat(32))).unwrap(),
+                        manifest_digest: DigestUri::new(format!("sha256:{}", "07".repeat(32)))
+                            .unwrap(),
+                        content_type: ContentType::new("application/json").unwrap(),
+                        producer: Some("agent-runner".to_owned()),
+                        manifest_identity: Some("manifest-42".to_owned()),
+                        index_fields: vec![FieldValue {
+                            field_id: "run.score".to_owned(),
+                            value: ScalarValue::Unsigned(9),
+                        }],
+                    },
+                }),
+                PathListEntry::Prefix(path("outputs/nested")),
+            ],
+            next_cursor: Some(vec![0, 255, b'/']),
+            read_version: 19,
+        };
+
+        Python::initialize();
+        Python::attach(|py| {
+            let converted = path_page_to_py(py, &page).unwrap();
+            let entries = dict_item(&converted, "entries")
+                .cast_into::<PyList>()
+                .unwrap();
+            assert_eq!(entries.len(), 2);
+
+            let artifact = entries.get_item(0).unwrap().cast_into::<PyDict>().unwrap();
+            for (key, expected) in [
+                ("kind", "artifact".to_owned()),
+                ("workbench", "run-42".to_owned()),
+                ("path", "outputs/result.json".to_owned()),
+                ("workspace_incarnation_id", "04".repeat(16)),
+                ("artifact_revision_id", "05".repeat(16)),
+                ("body_digest", format!("sha256:{}", "06".repeat(32))),
+                ("manifest_digest", format!("sha256:{}", "07".repeat(32))),
+                ("content_type", "application/json".to_owned()),
+                ("producer", "agent-runner".to_owned()),
+                ("manifest_identity", "manifest-42".to_owned()),
+            ] {
+                assert_eq!(
+                    dict_item(&artifact, key).extract::<String>().unwrap(),
+                    expected,
+                    "Python artifact field {key:?} changed"
+                );
+            }
+            for (key, expected) in [
+                ("workspace_revision", 7_u64),
+                ("generation", 3),
+                ("dependency_count", 2),
+                ("dependency_depth", 1),
+                ("logical_size", 42),
+            ] {
+                assert_eq!(
+                    dict_item(&artifact, key).extract::<u64>().unwrap(),
+                    expected,
+                    "Python artifact field {key:?} changed"
+                );
+            }
+            let index_fields = dict_item(&artifact, "index_fields")
+                .cast_into::<PyList>()
+                .unwrap();
+            let index_field = index_fields
+                .get_item(0)
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            assert_eq!(
+                dict_item(&index_field, "field_id")
+                    .extract::<String>()
+                    .unwrap(),
+                "run.score"
+            );
+            assert_eq!(
+                dict_item(&index_field, "kind").extract::<String>().unwrap(),
+                "unsigned"
+            );
+            assert_eq!(
+                dict_item(&index_field, "value").extract::<u64>().unwrap(),
+                9
+            );
+
+            let prefix = entries.get_item(1).unwrap().cast_into::<PyDict>().unwrap();
+            for (key, expected) in [
+                ("kind", "prefix"),
+                ("workbench", "run-42"),
+                ("path", "outputs/nested"),
+            ] {
+                assert_eq!(
+                    dict_item(&prefix, key).extract::<String>().unwrap(),
+                    expected,
+                    "Python prefix field {key:?} changed"
+                );
+            }
+
+            assert_eq!(
+                dict_item(&converted, "next_cursor")
+                    .extract::<Vec<u8>>()
+                    .unwrap(),
+                vec![0, 255, b'/']
+            );
+            assert_eq!(
+                dict_item(&converted, "read_version")
+                    .extract::<u64>()
+                    .unwrap(),
+                19
+            );
+        });
     }
 }

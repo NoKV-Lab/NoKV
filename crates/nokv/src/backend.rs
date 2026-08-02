@@ -5,7 +5,7 @@
 
 //! Production Workbench facade backed by the typed workspace SDK.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,7 +33,7 @@ const RUN_MANIFEST_PATH: &str = "metadata/run_manifest.json";
 const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const CURSOR_VERSION: &[u8] = b"nokv.workspace.cursor\0";
-const LIST_CURSOR_VERSION: &[u8] = b"nokv.workspace.list-cursor.v2\0";
+const LIST_CURSOR_VERSION: &[u8] = b"nokv.workspace.list-cursor.v3\0";
 const SERVER_PAGE_LIMIT: u32 = wire::PageRequest::MAX_LIMIT;
 const CONSISTENT_READ_MAX_ATTEMPTS: u32 = 3;
 
@@ -105,17 +105,24 @@ impl CliWorkbenchBackend {
     ) -> Result<Option<wire::PathMetadata>, agent::BackendError> {
         let target = workspace_path(path)?;
         match self.client.get_path(wire::GetPathRequest {
-            target,
+            target: target.clone(),
             view,
             range: None,
             plan_page: None,
             if_none_match: None,
         }) {
-            Ok(call) => call
-                .value
-                .metadata
-                .ok_or_else(|| protocol_mismatch("path stat omitted metadata"))
-                .map(Some),
+            Ok(call) => {
+                let metadata = call
+                    .value
+                    .metadata
+                    .ok_or_else(|| protocol_mismatch("path stat omitted metadata"))?;
+                if metadata.path != target {
+                    return Err(protocol_mismatch(
+                        "get_path returned metadata for a different path",
+                    ));
+                }
+                Ok(Some(metadata))
+            }
             Err(error) if rpc_code(&error) == Some(wire::ErrorCode::NotFound) => Ok(None),
             Err(error) => Err(map_client_error(error)),
         }
@@ -239,13 +246,14 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 artifact: Some(artifact_metadata(&metadata)),
             }));
         }
-        let prefix = relative_path(&full_path(path)?)?;
+        let prefix_path = full_path(path)?;
+        let prefix = relative_path(&prefix_path)?;
         let page = self
             .client
             .list_paths(wire::ListPathsRequest {
                 workbench: workbench_name(&path.workbench_id)?,
                 prefix: Some(prefix),
-                recursive: true,
+                recursive: false,
                 view: resolved_view,
                 expected_read_version: None,
                 page: wire::PageRequest {
@@ -254,15 +262,36 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 },
             })
             .map_err(map_client_error)?;
-        Ok((!page.value.entries.is_empty()).then(|| agent::StatRecord {
-            path: path.clone(),
-            kind: agent::ArtifactKind::Directory,
-            artifact: None,
-        }))
+        let mut entries = page.value.entries.into_iter();
+        let Some(entry) = entries.next() else {
+            return Ok(None);
+        };
+        if entries.next().is_some() {
+            return Err(protocol_mismatch(
+                "list_paths returned more rows than the requested stat probe limit",
+            ));
+        }
+        validate_response_workbench(entry.path(), &path.workbench_id)?;
+        let source = NormalizedRelativePath::new(entry.path().path.as_str().to_owned())
+            .map_err(domain_input)?;
+        match (direct_list_child(Some(&prefix_path), source)?, entry) {
+            (Some(_), _) => Ok(Some(agent::StatRecord {
+                path: path.clone(),
+                kind: agent::ArtifactKind::Directory,
+                artifact: None,
+            })),
+            (None, wire::PathListEntry::Artifact(metadata)) => Ok(Some(agent::StatRecord {
+                path: path.clone(),
+                kind: agent::ArtifactKind::Artifact,
+                artifact: Some(artifact_metadata(&metadata)),
+            })),
+            (None, wire::PathListEntry::Prefix(_)) => Err(protocol_mismatch(
+                "list_paths returned an exact implicit prefix",
+            )),
+        }
     }
 
     fn list(&self, request: agent::ListRequest) -> Result<agent::ListPage, agent::BackendError> {
-        self.workspace(&request.path.workbench_id)?;
         let limit = request
             .limit
             .max(1)
@@ -309,18 +338,24 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
 
             let mut read_version = decoded_cursor.as_ref().map(|cursor| cursor.read_version);
             let mut scan_cursor = after.map(|path| path.as_str().as_bytes().to_vec());
-            let mut exhausted = false;
-            let mut called = false;
-            while !called || (candidates.len() <= limit && !exhausted) {
+            let mut seen_server_cursors = BTreeSet::new();
+            let mut first_server_page = true;
+            if let Some(cursor) = scan_cursor.clone() {
+                seen_server_cursors.insert(cursor);
+            }
+            loop {
+                let requested_cursor = scan_cursor.clone();
+                let requested_limit =
+                    list_server_page_limit(limit, candidates.len(), first_server_page);
                 let call = match self.client.list_paths(wire::ListPathsRequest {
                     workbench: workbench_name(&request.path.workbench_id)?,
                     prefix: prefix.as_ref().map(relative_path).transpose()?,
-                    recursive: true,
+                    recursive: false,
                     view: view.clone(),
                     expected_read_version: read_version,
                     page: wire::PageRequest {
-                        cursor: scan_cursor.clone(),
-                        limit: SERVER_PAGE_LIMIT,
+                        cursor: requested_cursor.clone(),
+                        limit: requested_limit,
                     },
                 }) {
                     Ok(call) => call,
@@ -333,42 +368,75 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                     }
                     Err(error) => return Err(map_client_error(error)),
                 };
-                called = true;
+                first_server_page = false;
                 if read_version.is_some_and(|expected| expected != call.value.read_version) {
                     return Err(protocol_mismatch(
                         "list_paths returned a page outside the requested read-version fence",
                     ));
                 }
                 read_version.get_or_insert(call.value.read_version);
+                if call.value.entries.len()
+                    > usize::try_from(requested_limit)
+                        .expect("protocol page limit always fits usize")
+                {
+                    return Err(protocol_mismatch(
+                        "list_paths returned more rows than the requested page limit",
+                    ));
+                }
                 let next_server_cursor = call.value.next_cursor;
-                exhausted = next_server_cursor.is_none();
-                for metadata in call.value.entries {
-                    scan_cursor = Some(metadata.path.path.as_str().as_bytes().to_vec());
-                    let source =
-                        NormalizedRelativePath::new(metadata.path.path.as_str().to_owned())
-                            .map_err(domain_input)?;
-                    let child = direct_child(prefix.as_ref(), &source)?;
+                if next_server_cursor.is_some() && call.value.entries.is_empty() {
+                    return Err(protocol_mismatch(
+                        "list_paths returned an empty non-terminal page",
+                    ));
+                }
+                if let Some(next) = next_server_cursor.as_ref() {
+                    if !seen_server_cursors.insert(next.clone()) {
+                        return Err(protocol_mismatch("list_paths returned a repeated cursor"));
+                    }
+                }
+                let exhausted = next_server_cursor.is_none();
+                let mut last_authoritative_path = None;
+                for listing in call.value.entries {
+                    let (source_path, metadata) = match listing {
+                        wire::PathListEntry::Artifact(metadata) => {
+                            validate_response_workbench(
+                                &metadata.path,
+                                &request.path.workbench_id,
+                            )?;
+                            (metadata.path.path.as_str().to_owned(), Some(metadata))
+                        }
+                        wire::PathListEntry::Prefix(path) => {
+                            validate_response_workbench(&path, &request.path.workbench_id)?;
+                            (path.path.as_str().to_owned(), None)
+                        }
+                    };
+                    let source = NormalizedRelativePath::new(source_path).map_err(domain_input)?;
+                    last_authoritative_path = Some(source.clone());
+                    let Some(child) = direct_list_child(prefix.as_ref(), source)? else {
+                        continue;
+                    };
                     if after.is_some_and(|after| child <= *after) {
                         continue;
                     }
                     merge_list_candidate(
                         &mut candidates,
                         child,
-                        source,
                         metadata,
                         &request.path.workbench_id,
                         prefix.is_none(),
                     )?;
-                    if candidates.len() > limit {
-                        break;
-                    }
                 }
-                if candidates.len() > limit {
+                let covered_union_cutoff = candidates.len() > limit
+                    && last_authoritative_path.as_ref().is_some_and(|last| {
+                        candidates
+                            .keys()
+                            .nth(limit)
+                            .is_some_and(|cutoff| last >= cutoff)
+                    });
+                if exhausted || covered_union_cutoff {
                     break;
                 }
-                if !exhausted {
-                    scan_cursor = next_server_cursor;
-                }
+                scan_cursor = next_server_cursor;
             }
 
             let read_version = read_version.expect("every list attempt performs one RPC");
@@ -560,7 +628,6 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
         &self,
         request: agent::GrepCandidateRequest,
     ) -> Result<agent::GrepCandidatePage, agent::BackendError> {
-        self.workspace(&request.scope.workbench_id)?;
         let prefix = full_path_optional(&request.scope)?;
         let cursor = request
             .cursor
@@ -581,18 +648,24 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 },
             })
             .map_err(map_client_error)?;
-        let candidates = call
-            .value
-            .entries
-            .into_iter()
-            .map(|metadata| {
-                let cursor_after = encode_cursor("grep", metadata.path.path.as_str().as_bytes());
-                Ok(agent::GrepCandidate {
-                    path: scoped_path(&metadata.path)?,
-                    cursor_after,
-                })
-            })
-            .collect::<Result<Vec<_>, agent::BackendError>>()?;
+        let mut candidates = Vec::new();
+        for entry in call.value.entries {
+            validate_response_workbench(entry.path(), &request.scope.workbench_id)?;
+            let metadata = match entry {
+                wire::PathListEntry::Artifact(metadata) => metadata,
+                wire::PathListEntry::Prefix(_) if !request.recursive => continue,
+                wire::PathListEntry::Prefix(_) => {
+                    return Err(protocol_mismatch(
+                        "recursive list_paths returned an implicit prefix",
+                    ));
+                }
+            };
+            let cursor_after = encode_cursor("grep", metadata.path.path.as_str().as_bytes());
+            candidates.push(agent::GrepCandidate {
+                path: scoped_path(&metadata.path)?,
+                cursor_after,
+            });
+        }
         Ok(agent::GrepCandidatePage {
             candidates,
             next_cursor: call
@@ -1365,6 +1438,18 @@ fn workspace_path(path: &agent::ScopedPath) -> Result<wire::WorkspacePath, agent
     })
 }
 
+fn validate_response_workbench(
+    path: &wire::WorkspacePath,
+    expected: &WorkbenchId,
+) -> Result<(), agent::BackendError> {
+    if path.workbench.as_str() != expected.as_str() {
+        return Err(protocol_mismatch(
+            "list_paths returned an entry for a different workbench",
+        ));
+    }
+    Ok(())
+}
+
 fn full_path(path: &agent::ScopedPath) -> Result<NormalizedRelativePath, agent::BackendError> {
     let value = path.logical_path();
     if value.is_empty() {
@@ -1456,39 +1541,10 @@ fn artifact_metadata(metadata: &wire::PathMetadata) -> agent::ArtifactMetadata {
     }
 }
 
-fn direct_child(
-    prefix: Option<&NormalizedRelativePath>,
-    source: &NormalizedRelativePath,
-) -> Result<NormalizedRelativePath, agent::BackendError> {
-    let child = match prefix {
-        None => source
-            .as_str()
-            .split('/')
-            .next()
-            .expect("normalized path has one component")
-            .to_owned(),
-        Some(prefix) if prefix == source => source.as_str().to_owned(),
-        Some(prefix) => {
-            let remainder = source
-                .as_str()
-                .strip_prefix(prefix.as_str())
-                .and_then(|value| value.strip_prefix('/'))
-                .ok_or_else(|| protocol_mismatch("path scan returned a row outside its prefix"))?;
-            let component = remainder
-                .split('/')
-                .next()
-                .expect("prefix descendant has one remaining component");
-            format!("{}/{component}", prefix.as_str())
-        }
-    };
-    NormalizedRelativePath::new(child).map_err(domain_input)
-}
-
 fn merge_list_candidate(
     candidates: &mut BTreeMap<NormalizedRelativePath, agent::ListEntry>,
     child: NormalizedRelativePath,
-    source: NormalizedRelativePath,
-    metadata: wire::PathMetadata,
+    metadata: Option<wire::PathMetadata>,
     workbench_id: &WorkbenchId,
     root_scope: bool,
 ) -> Result<(), agent::BackendError> {
@@ -1497,10 +1553,10 @@ fn merge_list_candidate(
         .flatten();
     let (kind, artifact) = if root_section.is_some() {
         (agent::ArtifactKind::Section, None)
-    } else if child == source {
+    } else if let Some(metadata) = metadata.as_ref() {
         (
             agent::ArtifactKind::Artifact,
-            Some(artifact_metadata(&metadata)),
+            Some(artifact_metadata(metadata)),
         )
     } else {
         (agent::ArtifactKind::Directory, None)
@@ -1518,6 +1574,34 @@ fn merge_list_candidate(
         }
     }
     Ok(())
+}
+
+fn direct_list_child(
+    prefix: Option<&NormalizedRelativePath>,
+    source: NormalizedRelativePath,
+) -> Result<Option<NormalizedRelativePath>, agent::BackendError> {
+    match prefix {
+        None if source.component_count() == 1 => Ok(Some(source)),
+        None => Err(protocol_mismatch(
+            "non-recursive root listing returned a nested path",
+        )),
+        Some(prefix) if &source == prefix => Ok(None),
+        Some(prefix) => {
+            let remainder = source
+                .as_str()
+                .strip_prefix(prefix.as_str())
+                .and_then(|value| value.strip_prefix('/'))
+                .ok_or_else(|| {
+                    protocol_mismatch("non-recursive listing returned a path outside its prefix")
+                })?;
+            if remainder.is_empty() || remainder.contains('/') {
+                return Err(protocol_mismatch(
+                    "non-recursive listing returned a non-direct descendant",
+                ));
+            }
+            Ok(Some(source))
+        }
+    }
 }
 
 fn list_kind_priority(kind: &agent::ArtifactKind) -> u8 {
@@ -1878,6 +1962,17 @@ fn page_limit(limit: usize) -> Result<u32, agent::BackendError> {
     Ok(limit)
 }
 
+fn list_server_page_limit(limit: usize, candidate_count: usize, first_page: bool) -> u32 {
+    let union_target = limit.saturating_add(1);
+    let requested = if first_page {
+        union_target
+    } else {
+        union_target.saturating_sub(candidate_count).max(1)
+    };
+    u32::try_from(requested.min(wire::PageRequest::MAX_LIMIT as usize))
+        .expect("protocol page limit fits u32")
+}
+
 fn json_contains_literal(value: &Value, pattern: &str) -> bool {
     if pattern.is_empty() {
         return true;
@@ -2133,22 +2228,23 @@ mod tests {
         }
     }
 
-    fn workspace_result() -> wire::WorkspaceResult {
-        wire::WorkspaceResult::Workspace(wire::WorkspaceSummary {
-            workbench: wire::WorkbenchName::new("run-42").unwrap(),
-            workspace_incarnation_id: wire::WorkspaceIdentity([5; 16]),
-            workspace_revision: 0,
-            commit_head: None,
-            commit_head_generation: None,
-        })
-    }
-
     fn read_version_failure() -> wire::WorkspaceRpcOutcome {
         wire::WorkspaceRpcOutcome::Failure(wire::RpcFailure {
             code: wire::ErrorCode::PreconditionFailed,
             message: "read version changed".to_owned(),
             retryable: false,
             conflict: Some(wire::ConflictKind::ReadVersion),
+            current_generation: None,
+            route_hint: None,
+        })
+    }
+
+    fn not_found_failure() -> wire::WorkspaceRpcOutcome {
+        wire::WorkspaceRpcOutcome::Failure(wire::RpcFailure {
+            code: wire::ErrorCode::NotFound,
+            message: "missing".to_owned(),
+            retryable: false,
+            conflict: None,
             current_generation: None,
             route_hint: None,
         })
@@ -2241,6 +2337,42 @@ mod tests {
             section: Some(agent::Section::Outputs),
             relative_path: None,
         }
+    }
+
+    fn wire_prefix(path: &str) -> wire::PathListEntry {
+        wire_prefix_for("run-42", path)
+    }
+
+    fn wire_prefix_for(workbench: &str, path: &str) -> wire::PathListEntry {
+        wire::PathListEntry::Prefix(wire::WorkspacePath {
+            workbench: wire::WorkbenchName::new(workbench).unwrap(),
+            path: wire::RelativePath::new(path).unwrap(),
+        })
+    }
+
+    fn wire_artifact(path: &str) -> wire::PathListEntry {
+        wire::PathListEntry::Artifact(wire::PathMetadata {
+            path: wire::WorkspacePath {
+                workbench: wire::WorkbenchName::new("run-42").unwrap(),
+                path: wire::RelativePath::new(path).unwrap(),
+            },
+            workspace_incarnation_id: wire::WorkspaceIdentity([5; 16]),
+            workspace_revision: 1,
+            generation: 1,
+            artifact_revision_id: wire::ArtifactRevisionIdentity([6; 16]),
+            dependency_count: 0,
+            dependency_depth: 0,
+            descriptor: wire::ArtifactDescriptor {
+                logical_size: 1,
+                body_digest: wire::DigestUri::new(format!("sha256:{}", "07".repeat(32))).unwrap(),
+                manifest_digest: wire::DigestUri::new(format!("sha256:{}", "08".repeat(32)))
+                    .unwrap(),
+                content_type: wire::ContentType::new("application/octet-stream").unwrap(),
+                producer: None,
+                manifest_identity: None,
+                index_fields: Vec::new(),
+            },
+        })
     }
 
     fn catalog_field(field_id: &str) -> wire::CatalogField {
@@ -2443,15 +2575,23 @@ mod tests {
     }
 
     #[test]
+    fn list_server_pages_track_only_the_union_lookahead() {
+        assert_eq!(list_server_page_limit(1, 0, true), 2);
+        assert_eq!(list_server_page_limit(10, 5, true), 11);
+        assert_eq!(list_server_page_limit(1_000, 0, true), 1_000);
+        assert_eq!(list_server_page_limit(1_000, 1_000, false), 1);
+        assert_eq!(list_server_page_limit(10, 4, false), 7);
+    }
+
+    #[test]
     fn virtual_only_list_still_performs_one_authoritative_path_read() {
-        let (backend, requests, server) = scripted_backend(vec![
-            success(workspace_result()),
-            success(wire::WorkspaceResult::Paths(wire::PathPage {
+        let (backend, requests, server) = scripted_backend(vec![success(
+            wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: Vec::new(),
                 next_cursor: None,
                 read_version: 41,
-            })),
-        ]);
+            }),
+        )]);
         let page =
             agent::WorkbenchBackend::list(&backend, list_request(scoped_root(), None)).unwrap();
         server.join().unwrap();
@@ -2460,19 +2600,107 @@ mod tests {
         assert_eq!(page.entries.len(), 1);
         assert!(page.next_cursor.is_some());
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let wire::WorkspaceRequest::ListPaths(list) = &requests[1].operation else {
-            panic!("second request must be list_paths");
+        assert_eq!(requests.len(), 1);
+        let wire::WorkspaceRequest::ListPaths(list) = &requests[0].operation else {
+            panic!("only request must be list_paths");
         };
         assert_eq!(list.expected_read_version, None);
+        assert!(!list.recursive);
+        assert_eq!(list.page.limit, 2);
+    }
+
+    #[test]
+    fn root_list_merges_authoritative_children_with_virtual_sections_without_skipping() {
+        let (backend, requests, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: ["a", "b", "c"].map(wire_prefix).to_vec(),
+                next_cursor: Some(b"c".to_vec()),
+                read_version: 41,
+            })),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: ["c", "z"].map(wire_prefix).to_vec(),
+                next_cursor: None,
+                read_version: 41,
+            })),
+        ]);
+
+        let mut request = list_request(scoped_root(), None);
+        request.limit = 2;
+        let first = agent::WorkbenchBackend::list(&backend, request.clone()).unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.path.relative_path.as_ref().map(|path| path.as_str()))
+                .collect::<Vec<_>>(),
+            [Some("a"), Some("b")]
+        );
+        request.cursor = first.next_cursor;
+        let second = agent::WorkbenchBackend::list(&backend, request).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .path
+                        .relative_path
+                        .as_ref()
+                        .map(|path| path.as_str())
+                        .or_else(|| entry.path.section.map(agent::Section::as_str))
+                })
+                .collect::<Vec<_>>(),
+            [Some("c"), Some("input")]
+        );
+        let requests = requests.lock().unwrap();
+        let lists = requests
+            .iter()
+            .filter_map(|request| match &request.operation {
+                wire::WorkspaceRequest::ListPaths(list) => Some(list),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lists.len(), 2);
+        assert!(!lists[0].recursive);
+        assert_eq!(lists[0].page.limit, 3);
+        assert_eq!(lists[1].page.cursor.as_deref(), Some(b"b".as_slice()));
+        assert_eq!(lists[1].page.limit, 3);
+        assert_eq!(lists[1].expected_read_version, Some(41));
+    }
+
+    #[test]
+    fn prefixed_list_exposes_direct_children_but_not_the_exact_prefix_artifact() {
+        let (backend, _, server) = scripted_backend(vec![success(wire::WorkspaceResult::Paths(
+            wire::PathPage {
+                entries: vec![wire_prefix("outputs/child"), wire_artifact("outputs")],
+                next_cursor: None,
+                read_version: 41,
+            },
+        ))]);
+        let mut request = list_request(scoped_outputs(), None);
+        request.limit = 10;
+        let page = agent::WorkbenchBackend::list(&backend, request).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].kind, agent::ArtifactKind::Directory);
+        assert_eq!(
+            page.entries[0]
+                .path
+                .relative_path
+                .as_ref()
+                .map(NormalizedRelativePath::as_str),
+            Some("child")
+        );
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]
     fn live_list_discards_a_drifted_attempt_and_restarts_from_page_one() {
         let (backend, requests, server) = scripted_backend(vec![
-            success(workspace_result()),
             success(wire::WorkspaceResult::Paths(wire::PathPage {
-                entries: Vec::new(),
+                entries: vec![wire_prefix("outputs/a")],
                 next_cursor: Some(b"page-2".to_vec()),
                 read_version: 7,
             })),
@@ -2506,6 +2734,57 @@ mod tests {
     }
 
     #[test]
+    fn list_rejects_a_server_cursor_cycle() {
+        let (backend, _, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: vec![wire_prefix("outputs/a")],
+                next_cursor: Some(b"cursor-a".to_vec()),
+                read_version: 7,
+            })),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: vec![wire_prefix("outputs/b")],
+                next_cursor: Some(b"cursor-b".to_vec()),
+                read_version: 7,
+            })),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: vec![wire_prefix("outputs/c")],
+                next_cursor: Some(b"cursor-a".to_vec()),
+                read_version: 7,
+            })),
+        ]);
+        let mut request = list_request(scoped_outputs(), None);
+        request.limit = 10;
+        let error = agent::WorkbenchBackend::list(&backend, request).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.kind, agent::BackendErrorKind::InvalidState);
+        assert!(error.message.contains("repeated cursor"));
+    }
+
+    #[test]
+    fn implicit_directory_stat_rejects_a_foreign_workbench_entry() {
+        let (backend, _, server) = scripted_backend(vec![
+            not_found_failure(),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: vec![wire_prefix_for("other-run", "outputs/missing/child")],
+                next_cursor: None,
+                read_version: 7,
+            })),
+        ]);
+        let path = agent::ScopedPath {
+            workbench_id: WorkbenchId::new("run-42").unwrap(),
+            section: Some(agent::Section::Outputs),
+            relative_path: Some(NormalizedRelativePath::new("missing").unwrap()),
+        };
+        let error =
+            agent::WorkbenchBackend::stat(&backend, &path, &agent::ReadView::Live).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.kind, agent::BackendErrorKind::InvalidState);
+        assert!(error.message.contains("different workbench"));
+    }
+
+    #[test]
     fn user_list_cursor_staleness_fails_without_an_automatic_restart() {
         let path = scoped_outputs();
         let prefix = full_path_optional(&path).unwrap().unwrap();
@@ -2515,17 +2794,16 @@ mod tests {
             scope,
             &NormalizedRelativePath::new("outputs/old".to_owned()).unwrap(),
         );
-        let (backend, requests, server) =
-            scripted_backend(vec![success(workspace_result()), read_version_failure()]);
+        let (backend, requests, server) = scripted_backend(vec![read_version_failure()]);
         let error =
             agent::WorkbenchBackend::list(&backend, list_request(path, Some(cursor))).unwrap_err();
         server.join().unwrap();
 
         assert_eq!(error.kind, agent::BackendErrorKind::InvalidState);
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let wire::WorkspaceRequest::ListPaths(list) = &requests[1].operation else {
-            panic!("second request must be list_paths");
+        assert_eq!(requests.len(), 1);
+        let wire::WorkspaceRequest::ListPaths(list) = &requests[0].operation else {
+            panic!("only request must be list_paths");
         };
         assert_eq!(list.expected_read_version, Some(7));
         assert_eq!(list.page.cursor.as_deref(), Some(b"outputs/old".as_slice()));

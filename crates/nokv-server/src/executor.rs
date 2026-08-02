@@ -17,12 +17,13 @@ use crate::{ExecutedRequest, WorkspaceRequestExecutor};
 const MANIFEST_SCAN_ROWS: usize = 256;
 const MANIFEST_PLAN_CURSOR_VERSION: u8 = 1;
 const MANIFEST_PLAN_CURSOR_BYTES: usize = 1 + types::FIXED_ID_BYTES * 2 + 8 * 3;
-const PATH_SCAN_ROWS: usize = meta::MAX_VISIBLE_PATH_PAGE_SIZE;
 const PUBLISH_ACTIVITY_LEASE_MS: u64 = 30 * 60 * 1_000;
 const RUN_MANIFEST_PATH: &str = "metadata/run_manifest.json";
 const _: () = assert!(protocol::MAX_ARTIFACT_DEPENDENCY_OWNERS == meta::MAX_REVISION_DEPENDENCIES);
 const _: () =
     assert!(protocol::MAX_ARTIFACT_DEPENDENCY_DEPTH == meta::MAX_REVISION_DEPENDENCY_DEPTH);
+const _: () =
+    assert!(protocol::PageRequest::MAX_LIMIT as usize == meta::MAX_VISIBLE_PATH_LIST_PAGE_SIZE);
 const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 9] = [
     protocol::WorkspaceCapability::ArtifactPublishV1,
     protocol::WorkspaceCapability::ArtifactRangeReadV1,
@@ -198,17 +199,28 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::GetPathRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let workbench = workbench_id(&request.target.workbench)?;
-        let context = self.workspace_read_context(rpc.route, &workbench, &request.view)?;
-        let workspace = meta::get_visible_workspace_at(&self.store, context, &workbench)
-            .map_err(namespace_failure)?
-            .ok_or_else(|| not_found("workbench does not exist"))?;
         let path = relative_path(&request.target.path)?;
-        let Some(entry) =
-            meta::get_path_at_visible_workspace(&self.store, context, &workspace, &path)
-                .map_err(namespace_failure)?
-        else {
+        let resolved = if matches!(&request.view, protocol::WorkspaceReadView::Live) {
+            let route = route_parts(rpc.route)?;
+            meta::get_current_visible_workspace_path(
+                &self.store,
+                route.root_id,
+                route.placement_generation,
+                route.owner_epoch,
+                &workbench,
+                &path,
+            )
+        } else {
+            let context = self.workspace_read_context(rpc.route, &workbench, &request.view)?;
+            meta::get_visible_workspace_path_at(&self.store, context, &workbench, &path)
+        }
+        .map_err(namespace_failure)?
+        .ok_or_else(|| not_found("workbench does not exist"))?;
+        let Some(entry) = resolved.entry else {
             return Err(not_found("path does not exist"));
         };
+        let context = resolved.context;
+        let workspace = resolved.workspace;
         if request.if_none_match == Some(entry.generation.get()) {
             return Ok(ExecutedRequest {
                 result: protocol::WorkspaceResult::Path(protocol::PathReadResult {
@@ -285,82 +297,42 @@ impl MetadataWorkspaceRequestExecutor {
             .map_err(namespace_failure)?
             .ok_or_else(|| not_found("workbench does not exist"))?;
         let prefix = request.prefix.as_ref().map(relative_path).transpose()?;
-        let mut marker = request
+        let marker = request
             .page
             .cursor
             .as_deref()
             .map(decode_path_cursor)
             .transpose()?;
-        if let (Some(prefix), Some(marker)) = (prefix.as_ref(), marker.as_ref()) {
-            if marker != prefix && !path_is_descendant_of(marker, prefix) {
-                return Err(invalid_argument(
-                    "list_paths cursor does not belong to the requested prefix",
-                ));
-            }
-        }
-        let exact_prefix = match prefix.as_ref() {
-            Some(prefix) if marker.as_ref() != Some(prefix) => {
-                meta::get_path_at_visible_workspace(&self.store, context, &workspace, prefix)
-                    .map_err(namespace_failure)?
-                    .map(|entry| meta::VisiblePath {
-                        path: prefix.clone(),
-                        entry,
-                    })
-            }
-            _ => None,
-        };
         let wanted =
             usize::try_from(request.page.limit).expect("protocol page limit always fits usize");
-        let mut selected = Vec::with_capacity(wanted.saturating_add(1));
-        if prefix.as_ref() != marker.as_ref() {
-            'scan: loop {
-                let page = meta::scan_paths_at_visible_workspace(
-                    &self.store,
-                    context,
-                    &workspace,
-                    prefix.as_ref(),
-                    marker.as_ref(),
-                    PATH_SCAN_ROWS,
-                )
-                .map_err(namespace_failure)?;
-                for visible in page.entries {
-                    if path_matches_prefix(&visible.path, prefix.as_ref(), request.recursive) {
-                        selected.push(visible);
-                        if selected.len() > wanted {
-                            break 'scan;
-                        }
-                    }
-                }
-                let Some(next) = page.next_marker else {
-                    break;
-                };
-                marker = Some(next);
-            }
-        }
-        if selected.len() <= wanted {
-            selected.extend(exact_prefix);
-        }
-        let has_more = selected.len() > wanted;
-        if has_more {
-            selected.truncate(wanted);
-        }
-        let next_cursor = has_more.then(|| {
-            selected
-                .last()
-                .expect("a lookahead result has one returned row")
-                .path
-                .as_str()
-                .as_bytes()
-                .to_vec()
-        });
-        let mut entries = Vec::with_capacity(selected.len());
-        for visible in selected {
-            entries.push(Self::path_metadata(
-                &request.workbench,
-                workspace,
-                visible.path,
-                visible.entry,
-            )?);
+        let page = meta::list_paths_at_visible_workspace(
+            &self.store,
+            context,
+            &workspace,
+            prefix.as_ref(),
+            request.recursive,
+            marker.as_ref(),
+            wanted,
+        )
+        .map_err(namespace_failure)?;
+        let next_cursor = page
+            .next_marker
+            .map(|marker| marker.as_str().as_bytes().to_vec());
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for visible in page.entries {
+            entries.push(match visible.entry {
+                Some(entry) => protocol::PathListEntry::Artifact(Self::path_metadata(
+                    &request.workbench,
+                    workspace,
+                    visible.path,
+                    entry,
+                )?),
+                None => protocol::PathListEntry::Prefix(protocol::WorkspacePath {
+                    workbench: request.workbench.clone(),
+                    path: protocol::RelativePath::new(visible.path.as_str())
+                        .map_err(|error| internal(error.to_string()))?,
+                }),
+            });
         }
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Paths(protocol::PathPage {
@@ -2655,39 +2627,6 @@ fn decode_manifest_plan_cursor(
     ))
 }
 
-fn path_matches_prefix(
-    path: &types::NormalizedRelativePath,
-    prefix: Option<&types::NormalizedRelativePath>,
-    recursive: bool,
-) -> bool {
-    let Some(prefix) = prefix else {
-        return recursive || !path.as_str().contains('/');
-    };
-    if path == prefix {
-        return true;
-    }
-    let Some(remainder) = descendant_suffix(path, prefix) else {
-        return false;
-    };
-    recursive || !remainder.contains('/')
-}
-
-fn path_is_descendant_of(
-    path: &types::NormalizedRelativePath,
-    prefix: &types::NormalizedRelativePath,
-) -> bool {
-    descendant_suffix(path, prefix).is_some()
-}
-
-fn descendant_suffix<'a>(
-    path: &'a types::NormalizedRelativePath,
-    prefix: &types::NormalizedRelativePath,
-) -> Option<&'a str> {
-    path.as_str()
-        .strip_prefix(prefix.as_str())
-        .and_then(|suffix| suffix.strip_prefix('/'))
-}
-
 fn publish_activity_deadline_ms(
     store: &meta::AgentMetadataStore,
 ) -> Result<u64, protocol::RpcFailure> {
@@ -3298,13 +3237,16 @@ fn workspace_path(
 
 fn namespace_failure(error: meta::NamespaceError) -> protocol::RpcFailure {
     match error {
-        meta::NamespaceError::AlreadyExists { .. } => failure(
+        meta::NamespaceError::AlreadyExists { .. }
+        | meta::NamespaceError::IncarnationAlreadyClaimed { .. } => failure(
             protocol::ErrorCode::AlreadyExists,
             error.to_string(),
             false,
             Some(protocol::ConflictKind::Workspace),
         ),
-        meta::NamespaceError::InvalidPageLimit { .. } => invalid_argument(error.to_string()),
+        meta::NamespaceError::InvalidPageLimit { .. } | meta::NamespaceError::InvalidListMarker => {
+            invalid_argument(error.to_string())
+        }
         meta::NamespaceError::Engine(source) => engine_failure(source),
         _ => internal(error.to_string()),
     }
@@ -3501,6 +3443,7 @@ fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
             Some(protocol::ConflictKind::OperationState),
         ),
         meta::RestoreError::DestinationExists { .. }
+        | meta::RestoreError::DestinationIncarnationClaimed { .. }
         | meta::RestoreError::OperationIdentityCollision { .. } => failure(
             protocol::ErrorCode::AlreadyExists,
             error.to_string(),
@@ -4496,18 +4439,6 @@ mod tests {
     }
 
     #[test]
-    fn prefix_filter_obeys_recursive_boundary() {
-        let prefix = types::NormalizedRelativePath::new("data").unwrap();
-        let direct = types::NormalizedRelativePath::new("data/a.bin").unwrap();
-        let nested = types::NormalizedRelativePath::new("data/nested/a.bin").unwrap();
-        let sibling = types::NormalizedRelativePath::new("database/a.bin").unwrap();
-        assert!(path_matches_prefix(&direct, Some(&prefix), false));
-        assert!(!path_matches_prefix(&nested, Some(&prefix), false));
-        assert!(path_matches_prefix(&nested, Some(&prefix), true));
-        assert!(!path_matches_prefix(&sibling, Some(&prefix), true));
-    }
-
-    #[test]
     fn sealed_restore_preparation_is_stable_through_ready_and_complete() {
         let destination_incarnation =
             types::WorkspaceIncarnationId::from_bytes([0x52; types::FIXED_ID_BYTES]);
@@ -4586,6 +4517,14 @@ mod tests {
             operation.conflict,
             Some(protocol::ConflictKind::OperationState)
         );
+
+        let claimed = restore_failure(meta::RestoreError::DestinationIncarnationClaimed {
+            incarnation_id: types::WorkspaceIncarnationId::from_bytes([9; types::FIXED_ID_BYTES]),
+            workbench_id: types::WorkbenchId::new("existing").unwrap(),
+        });
+        assert_eq!(claimed.code, protocol::ErrorCode::AlreadyExists);
+        assert_eq!(claimed.conflict, Some(protocol::ConflictKind::Workspace));
+        assert!(!claimed.retryable);
     }
 
     #[test]
@@ -4603,6 +4542,23 @@ mod tests {
         let reused = create_request(10, "run-b", 12, 1);
         let failure = executor.execute(&reused).unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
+    }
+
+    #[test]
+    fn create_incarnation_conflict_keeps_rpc_identity_and_message_provenance() {
+        let (_store, executor) = ready_executor();
+        executor
+            .execute(&create_request(10, "run-a", 11, 1))
+            .unwrap();
+        let claimed_incarnation = create_request(11, "run-b", 11, 1);
+        let failure = executor.execute(&claimed_incarnation).unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::AlreadyExists);
+        assert_eq!(failure.conflict, Some(protocol::ConflictKind::Workspace));
+        assert!(!failure.retryable);
+        assert!(failure
+            .message
+            .contains("permanently claimed by workbench run-a"));
+        assert!(!failure.message.contains("workbench run-b already exists"));
     }
 
     #[test]
@@ -4863,7 +4819,10 @@ mod tests {
         let protocol::WorkspaceResult::Paths(paths) = listed.result else {
             panic!("list_paths returned the wrong result variant");
         };
-        assert_eq!(paths.entries, vec![metadata]);
+        assert_eq!(
+            paths.entries,
+            vec![protocol::PathListEntry::Artifact(metadata)]
+        );
         assert!(paths.next_cursor.is_none());
 
         let stale_list = protocol::WorkspaceRpcRequest {
@@ -4905,7 +4864,11 @@ mod tests {
             ],
         );
 
-        let list = |request_fill: u8, cursor: Option<Vec<u8>>, limit, recursive| {
+        let list = |request_fill: u8,
+                    cursor: Option<Vec<u8>>,
+                    expected_read_version,
+                    limit,
+                    recursive| {
             executor
                 .execute(&protocol::WorkspaceRpcRequest {
                     route: route(1),
@@ -4915,7 +4878,7 @@ mod tests {
                         prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
                         recursive,
                         view: protocol::WorkspaceReadView::Live,
-                        expected_read_version: None,
+                        expected_read_version,
                         page: protocol::PageRequest { cursor, limit },
                     }),
                 })
@@ -4928,37 +4891,208 @@ mod tests {
             page
         };
 
-        let first = paths(list(36, None, 2, true));
+        let first = paths(list(36, None, None, 2, true));
         assert_eq!(
             first
                 .entries
                 .iter()
-                .map(|entry| entry.path.path.as_str())
+                .map(|entry| entry.path().path.as_str())
                 .collect::<Vec<_>>(),
             ["outputs/a/deep.bin", "outputs/a"]
         );
-        let second = paths(list(37, first.next_cursor.clone(), 2, true));
+        let unfenced_continuation = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xf0; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
+                    workbench: protocol::WorkbenchName::new("prefix-test").unwrap(),
+                    prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
+                    recursive: true,
+                    view: protocol::WorkspaceReadView::Live,
+                    expected_read_version: None,
+                    page: protocol::PageRequest {
+                        cursor: first.next_cursor.clone(),
+                        limit: 2,
+                    },
+                }),
+            })
+            .unwrap_err();
+        assert_eq!(
+            unfenced_continuation.code,
+            protocol::ErrorCode::InvalidArgument
+        );
+        assert!(unfenced_continuation
+            .message
+            .contains("expected_read_version"));
+
+        let second = paths(list(
+            37,
+            first.next_cursor.clone(),
+            Some(first.read_version),
+            2,
+            true,
+        ));
         assert_eq!(
             second
                 .entries
                 .iter()
-                .map(|entry| entry.path.path.as_str())
+                .map(|entry| entry.path().path.as_str())
                 .collect::<Vec<_>>(),
             ["outputs/b", "outputs"]
         );
         assert!(second.next_cursor.is_none());
         assert_eq!(second.read_version, first.read_version);
 
-        let non_recursive = paths(list(38, None, 10, false));
+        let non_recursive = paths(list(38, None, None, 10, false));
         assert_eq!(
             non_recursive
                 .entries
                 .iter()
-                .map(|entry| entry.path.path.as_str())
+                .map(|entry| entry.path().path.as_str())
                 .collect::<Vec<_>>(),
             ["outputs/a", "outputs/b", "outputs"]
         );
         assert!(non_recursive.next_cursor.is_none());
+
+        let invalid_level = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([39; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
+                    workbench: protocol::WorkbenchName::new("prefix-test").unwrap(),
+                    prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
+                    recursive: false,
+                    view: protocol::WorkspaceReadView::Live,
+                    expected_read_version: Some(first.read_version),
+                    page: protocol::PageRequest {
+                        cursor: Some(b"outputs/a/deep.bin".to_vec()),
+                        limit: 2,
+                    },
+                }),
+            })
+            .unwrap_err();
+        assert_eq!(invalid_level.code, protocol::ErrorCode::InvalidArgument);
+        assert_eq!(
+            invalid_level.message,
+            "list_paths cursor does not belong to the requested listing level"
+        );
+    }
+
+    #[test]
+    fn non_recursive_limit_one_pages_coalesced_children_and_exact_prefix() {
+        let (store, executor) = ready_executor();
+        let incarnation = types::WorkspaceIncarnationId::from_bytes([36; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&create_request(60, "direct-page-test", 36, 1))
+            .unwrap();
+        put_path_projection_rows(
+            &store,
+            incarnation,
+            &[
+                "parent",
+                "parent/a/deep",
+                "parent/a",
+                "parent/ab",
+                "parent/b/deep",
+            ],
+        );
+
+        let mut cursor = None;
+        let mut listed = Vec::new();
+        let mut kinds = Vec::new();
+        let mut read_version = None;
+        for request_fill in 61..=64 {
+            let result = executor
+                .execute(&protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
+                        workbench: protocol::WorkbenchName::new("direct-page-test").unwrap(),
+                        prefix: Some(protocol::RelativePath::new("parent").unwrap()),
+                        recursive: false,
+                        view: protocol::WorkspaceReadView::Live,
+                        expected_read_version: read_version,
+                        page: protocol::PageRequest { cursor, limit: 1 },
+                    }),
+                })
+                .unwrap();
+            let protocol::WorkspaceResult::Paths(page) = result.result else {
+                panic!("list_paths returned the wrong result variant");
+            };
+            read_version.get_or_insert(page.read_version);
+            assert_eq!(Some(page.read_version), read_version);
+            assert_eq!(page.entries.len(), 1);
+            let entry = &page.entries[0];
+            listed.push(entry.path().path.as_str().to_owned());
+            kinds.push(matches!(entry, protocol::PathListEntry::Artifact(_)));
+            cursor = page.next_cursor;
+        }
+
+        assert_eq!(listed, ["parent/a", "parent/ab", "parent/b", "parent"]);
+        assert_eq!(kinds, [true, true, false, true]);
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn root_list_without_a_cursor_scans_the_visible_workspace() {
+        let (store, executor) = ready_executor();
+        let incarnation = types::WorkspaceIncarnationId::from_bytes([39; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&create_request(39, "root-list-test", 39, 1))
+            .unwrap();
+        put_path_projection_rows(&store, incarnation, &["alpha", "nested/value", "omega"]);
+
+        let list = |request_fill: u8, recursive| {
+            executor
+                .execute(&protocol::WorkspaceRpcRequest {
+                    route: route(1),
+                    request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+                    operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
+                        workbench: protocol::WorkbenchName::new("root-list-test").unwrap(),
+                        prefix: None,
+                        recursive,
+                        view: protocol::WorkspaceReadView::Live,
+                        expected_read_version: None,
+                        page: protocol::PageRequest {
+                            cursor: None,
+                            limit: 10,
+                        },
+                    }),
+                })
+                .unwrap()
+        };
+        let paths = |result: ExecutedRequest| {
+            let protocol::WorkspaceResult::Paths(page) = result.result else {
+                panic!("list_paths returned the wrong result variant");
+            };
+            page
+        };
+
+        let recursive = paths(list(40, true));
+        assert_eq!(
+            recursive
+                .entries
+                .iter()
+                .map(|entry| entry.path().path.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "nested/value", "omega"]
+        );
+        assert!(recursive.next_cursor.is_none());
+
+        let direct = paths(list(41, false));
+        assert_eq!(
+            direct
+                .entries
+                .iter()
+                .map(|entry| entry.path().path.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "nested", "omega"]
+        );
+        assert!(matches!(
+            direct.entries[1],
+            protocol::PathListEntry::Prefix(_)
+        ));
+        assert!(direct.next_cursor.is_none());
     }
 
     #[test]

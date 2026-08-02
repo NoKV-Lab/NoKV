@@ -10,7 +10,7 @@ use crate::request::WorkspaceRpcRequest;
 use crate::response::WorkspaceRpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv_workspace";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v2";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -85,11 +85,12 @@ fn decode_payload<T: DeserializeOwned>(encoded: &[u8]) -> Result<T, ProtocolErro
 mod tests {
     use super::*;
     use crate::{
-        ArtifactRevisionIdentity, CommitIdentity, CommitPreparation, CommitRequest,
-        CreateWorkspaceRequest, Digest, DigestUri, GetSnapshotRequest, LogicalShardIdentity,
-        OperationIdentity, OperationKind, OperationProgress, OperationState, OperationStatus,
-        OperationToken, PublishCondition, RequestIdentity, RootIdentity, RootRoute, SnapshotAlias,
-        SnapshotSelector, WorkbenchName, WorkspaceCapability, WorkspaceIdentity,
+        ArtifactDescriptor, ArtifactRevisionIdentity, CommitIdentity, CommitPreparation,
+        CommitRequest, ContentType, CreateWorkspaceRequest, Digest, DigestUri, GetSnapshotRequest,
+        LogicalShardIdentity, OperationIdentity, OperationKind, OperationProgress, OperationState,
+        OperationStatus, OperationToken, PathListEntry, PathMetadata, PathPage, PublishCondition,
+        RelativePath, RequestIdentity, RootIdentity, RootRoute, SnapshotAlias, SnapshotSelector,
+        WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
         WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceRequest, WorkspaceResult,
         WorkspaceRpcOutcome, WorkspaceSummary,
     };
@@ -226,9 +227,56 @@ mod tests {
     }
 
     #[test]
+    fn path_page_round_trips_artifact_and_implicit_prefix_variants() {
+        let workbench = WorkbenchName::new("run-42").unwrap();
+        let path = |value: &str| WorkspacePath {
+            workbench: workbench.clone(),
+            path: RelativePath::new(value).unwrap(),
+        };
+        let expected = WorkspaceRpcResponse {
+            route: route(),
+            request_id: RequestIdentity([3; 16]),
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Paths(PathPage {
+                entries: vec![
+                    PathListEntry::Prefix(path("outputs/nested")),
+                    PathListEntry::Artifact(PathMetadata {
+                        path: path("outputs/result.json"),
+                        workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                        workspace_revision: 2,
+                        generation: 1,
+                        artifact_revision_id: ArtifactRevisionIdentity([5; 16]),
+                        dependency_count: 0,
+                        dependency_depth: 0,
+                        descriptor: ArtifactDescriptor {
+                            logical_size: 7,
+                            body_digest: DigestUri::new(format!("sha256:{}", "06".repeat(32)))
+                                .unwrap(),
+                            manifest_digest: DigestUri::new(format!("sha256:{}", "07".repeat(32)))
+                                .unwrap(),
+                            content_type: ContentType::new("application/json").unwrap(),
+                            producer: None,
+                            manifest_identity: None,
+                            index_fields: Vec::new(),
+                        },
+                    }),
+                ],
+                next_cursor: Some(b"outputs/result.json".to_vec()),
+                read_version: 9,
+            }))),
+        };
+
+        assert_eq!(
+            decode_response(&encode_response(&expected).unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn schema_mismatch_fails_closed() {
         let encoded = rmp_serde::to_vec_named(&Frame {
-            schema: "another_schema".to_owned(),
+            schema: "nokv.workspace.rpc.v1".to_owned(),
             payload: request(),
         })
         .unwrap();

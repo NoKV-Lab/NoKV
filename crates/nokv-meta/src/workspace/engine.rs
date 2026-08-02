@@ -1,5 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "metadata-read-stats")]
+use std::marker::PhantomData;
 use std::path::Path;
+#[cfg(feature = "metadata-read-stats")]
+use std::rc::Rc;
+#[cfg(feature = "metadata-read-stats")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use holt::{Durability, Record, RecordVersion, Tree, TreeConfig, DB};
@@ -10,14 +16,16 @@ use nokv_types::{
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    encode_schema_marker, validate_schema_marker, ARTIFACT_MANIFEST_TREE, ARTIFACT_REVISION_TREE,
-    CHANGE_EVENT_TREE, COMMAND_DEDUPE_TREE, COMMIT_CONSUMER_TREE, COMMIT_MEMBER_TREE, COMMIT_TREE,
-    GC_BARRIER_TREE, GC_CANDIDATE_TREE, HISTORY_HOLD_TREE, HISTORY_TREE, OPERATION_TREE,
-    PATH_CURRENT_TREE, RECOVERY_OUTBOX_TREE, RESTORE_MEMBER_TREE, REVISION_REF_TREE,
-    ROOT_FENCE_TREE, SCHEMA_ID, SCHEMA_TREES, SECONDARY_INDEX_TREE, SNAPSHOT_ALIAS_TREE,
-    SNAPSHOT_REF_TREE, STAGED_OBJECT_TREE, SYSTEM_SCHEMA_KEY, SYSTEM_TREE, TAG_TREE,
-    WORKBENCH_COMMIT_HEAD_TREE, WORKSPACE_CURRENT_TREE,
+    change_event_key, encode_schema_marker, validate_schema_marker, ARTIFACT_MANIFEST_TREE,
+    ARTIFACT_REVISION_TREE, CHANGE_EVENT_TREE, COMMAND_DEDUPE_TREE, COMMIT_CONSUMER_TREE,
+    COMMIT_MEMBER_TREE, COMMIT_TREE, GC_BARRIER_TREE, GC_CANDIDATE_TREE, HISTORY_HOLD_TREE,
+    HISTORY_TREE, OPERATION_TREE, PATH_CURRENT_TREE, RECOVERY_OUTBOX_TREE, RESTORE_MEMBER_TREE,
+    REVISION_REF_TREE, ROOT_FENCE_TREE, SCHEMA_ID, SCHEMA_TREES, SECONDARY_INDEX_TREE,
+    SNAPSHOT_ALIAS_TREE, SNAPSHOT_REF_TREE, STAGED_OBJECT_TREE, SYSTEM_SCHEMA_KEY, SYSTEM_TREE,
+    TAG_TREE, WORKBENCH_COMMIT_HEAD_TREE, WORKSPACE_CURRENT_TREE, WORKSPACE_INCARNATION_CLAIM_TREE,
 };
+#[cfg(feature = "metadata-read-stats")]
+use super::read_stats::{self, MetadataReadStats, MetadataReadStatsSessionError};
 use super::records::{CommandDedupeRecord, CurrentValue, HistoryValue, RootFence};
 use super::recovery::{
     assemble_recovery_storage, decode_recovery_outbox_key, recovery_chunk_key,
@@ -37,6 +45,7 @@ const SYSTEM_VALUE_FORMAT_VERSION: u8 = 1;
 const INITIAL_COMMIT_VERSION: u64 = 1;
 
 const MAX_COMMAND_ITEMS: usize = 256;
+const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
 const MAX_COMMAND_KEY_BYTES: usize = 8 * 1024;
 // Holt limits one stored value to u16::MAX bytes. Domain payloads are wrapped
 // in CurrentValue, HistoryValue, or CommandDedupeRecord before insertion, so
@@ -45,6 +54,15 @@ const MAX_HOLT_RECORD_PAYLOAD_BYTES: usize = 60 * 1024;
 const MAX_COMMAND_VALUE_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
 const MAX_DETERMINISTIC_RESULT_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
 const MAX_EVENT_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
+
+#[derive(Clone, Copy)]
+pub(super) enum MetadataPointReadSource {
+    System,
+    RootFence,
+    WorkspaceCurrent,
+    PathCurrent,
+    Other,
+}
 
 /// Durable metadata families that domain commands may mutate.
 ///
@@ -72,6 +90,7 @@ pub enum MetadataFamily {
     StagedObject = 0x13,
     GcCandidate = 0x15,
     GcBarrier = 0x16,
+    WorkspaceIncarnationClaim = 0x17,
 }
 
 impl MetadataFamily {
@@ -96,6 +115,7 @@ impl MetadataFamily {
             Self::StagedObject => STAGED_OBJECT_TREE,
             Self::GcCandidate => GC_CANDIDATE_TREE,
             Self::GcBarrier => GC_BARRIER_TREE,
+            Self::WorkspaceIncarnationClaim => WORKSPACE_INCARNATION_CLAIM_TREE,
         }
     }
 
@@ -103,7 +123,7 @@ impl MetadataFamily {
         self as u8
     }
 
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::WorkspaceCurrent,
         Self::PathCurrent,
         Self::ArtifactRevision,
@@ -123,6 +143,7 @@ impl MetadataFamily {
         Self::StagedObject,
         Self::GcCandidate,
         Self::GcBarrier,
+        Self::WorkspaceIncarnationClaim,
     ];
 }
 
@@ -303,6 +324,12 @@ pub struct MetadataScanItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DelimitedMetadataScanItem {
+    Record(MetadataScanItem),
+    CommonPrefix(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentMetadataError {
     Backend {
         operation: &'static str,
@@ -427,6 +454,8 @@ pub struct AgentMetadataStore {
     db: DB,
     logical_shard_id: LogicalShardId,
     command_gate: Arc<RwLock<()>>,
+    #[cfg(feature = "metadata-read-stats")]
+    read_stats_identity: Arc<MetadataReadStatsIdentity>,
     system: Tree,
     root_fence: Tree,
     command_dedupe: Tree,
@@ -434,6 +463,92 @@ pub struct AgentMetadataStore {
     history: Tree,
     recovery_outbox: Tree,
     families: BTreeMap<MetadataFamily, Tree>,
+}
+
+#[cfg(feature = "metadata-read-stats")]
+#[derive(Default)]
+struct MetadataReadStatsIdentity {
+    active: AtomicBool,
+}
+
+/// Short-lived point reader bound to one validated root and read version.
+///
+/// The owning store keeps the shard read gate for the reader's complete
+/// lifetime. This type stays inside the workspace package so callers cannot
+/// retain the gate across scans, object I/O, or RPC work.
+pub(super) struct FencedPointReader<'a> {
+    store: &'a AgentMetadataStore,
+    root_id: RootId,
+    version: ReadVersion,
+    current_version: ReadVersion,
+}
+
+/// Thread-bound logical read counters plus a dedicated store's Holt telemetry.
+///
+/// This diagnostic API is available only with the `metadata-read-stats`
+/// feature. Reads through clones of `store` are included when they execute on
+/// the thread that owns the session. Holt's physical counters remain
+/// store-wide, so callers must exclude concurrent store activity before
+/// attributing them to the measured workload.
+#[cfg(feature = "metadata-read-stats")]
+#[must_use = "finish the session to obtain counters, or drop it to cancel collection"]
+pub struct MetadataReadStatsSession<'a> {
+    store: &'a AgentMetadataStore,
+    store_key: usize,
+    storage_before: MetadataReadStats,
+    active: bool,
+    not_send: PhantomData<Rc<()>>,
+}
+
+#[cfg(feature = "metadata-read-stats")]
+impl MetadataReadStatsSession<'_> {
+    pub fn finish(mut self) -> Result<MetadataReadStats, MetadataReadStatsSessionError> {
+        let logical = read_stats::finish_session(self.store_key)?;
+        let storage_after = read_stats::storage_snapshot(&self.store.db.stats());
+        let result = storage_after
+            .delta_since(&self.storage_before)
+            .map(|mut combined| {
+                read_stats::merge_logical_counters(&mut combined, logical);
+                combined
+            })
+            .map_err(MetadataReadStatsSessionError::from);
+        self.release();
+        result
+    }
+
+    fn release(&mut self) {
+        self.active = false;
+        self.store
+            .read_stats_identity
+            .active
+            .store(false, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "metadata-read-stats")]
+impl Drop for MetadataReadStatsSession<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            read_stats::cancel_session(self.store_key);
+            self.release();
+        }
+    }
+}
+
+impl FencedPointReader<'_> {
+    pub(super) fn get(
+        &self,
+        family: MetadataFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
+        validate_root_scoped_bytes(self.root_id, key, "point-read key")?;
+        if self.version == self.current_version {
+            self.store
+                .read_current_at_unfenced(family, key, self.current_version)
+        } else {
+            self.store.read_at_unfenced(family, key, self.version)
+        }
+    }
 }
 
 impl AgentMetadataStore {
@@ -601,6 +716,8 @@ impl AgentMetadataStore {
             db,
             logical_shard_id,
             command_gate: Arc::new(RwLock::new(())),
+            #[cfg(feature = "metadata-read-stats")]
+            read_stats_identity: Arc::new(MetadataReadStatsIdentity::default()),
             system,
             root_fence,
             command_dedupe,
@@ -614,7 +731,7 @@ impl AgentMetadataStore {
     }
 
     pub fn current_read_version(&self) -> Result<ReadVersion, AgentMetadataError> {
-        let record = required_record(
+        let record = self.required_system_record(
             &self.system,
             SYSTEM_COMMIT_CLOCK_KEY,
             "System(commit_clock)",
@@ -628,10 +745,48 @@ impl AgentMetadataStore {
         self.logical_shard_id
     }
 
+    /// Start an explicit metadata read-statistics diagnostic session.
+    ///
+    /// Only one session may be active on a thread. The returned guard is not
+    /// sendable and must be finished on that thread. Session setup and finish
+    /// can be placed outside a benchmark's timed interval.
+    #[cfg(feature = "metadata-read-stats")]
+    pub fn begin_read_stats_session(
+        &self,
+    ) -> Result<MetadataReadStatsSession<'_>, MetadataReadStatsSessionError> {
+        if self
+            .read_stats_identity
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(MetadataReadStatsSessionError::StoreSessionAlreadyActive);
+        }
+        let store_key = self.read_stats_store_key();
+        let storage_before = read_stats::storage_snapshot(&self.db.stats());
+        if let Err(error) = read_stats::begin_session(store_key) {
+            self.read_stats_identity
+                .active
+                .store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(MetadataReadStatsSession {
+            store: self,
+            store_key,
+            storage_before,
+            active: true,
+            not_send: PhantomData,
+        })
+    }
+
     /// Return the persisted physical-owner epoch. `None` is the fresh epoch-zero
     /// sentinel before the first owner is admitted.
     pub fn current_owner_epoch(&self) -> Result<Option<OwnerEpoch>, AgentMetadataError> {
-        let record = required_record(&self.system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
+        let record = self.required_system_record(
+            &self.system,
+            SYSTEM_OWNER_FENCE_KEY,
+            "System(owner_fence)",
+        )?;
         let value = decode_system_u64(&record.value, "System(owner_fence)")?;
         if value == 0 {
             Ok(None)
@@ -650,16 +805,19 @@ impl AgentMetadataStore {
             .command_gate
             .read()
             .map_err(|error| backend("lock read gate", error))?;
-        self.root_fence
-            .get(root_id.as_bytes())
-            .map_err(|error| backend("read RootFence", error))?
-            .map(|value| RootFence::decode(&value).map_err(|error| corrupt("RootFence", error)))
-            .transpose()
+        self.read_tree_value(
+            &self.root_fence,
+            root_id.as_bytes(),
+            MetadataPointReadSource::RootFence,
+            "read RootFence",
+        )?
+        .map(|value| RootFence::decode(&value).map_err(|error| corrupt("RootFence", error)))
+        .transpose()
     }
 
     /// Return the persisted monotonic lease clock used by snapshot expiry.
     pub fn lease_clock_high_water(&self) -> Result<u64, AgentMetadataError> {
-        let record = required_record(
+        let record = self.required_system_record(
             &self.system,
             SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
             "System(lease_clock_high_water)",
@@ -1103,6 +1261,8 @@ impl AgentMetadataStore {
                     }
                 }
                 for (sequence, projection) in command.event_projection.iter().enumerate() {
+                    let sequence = u32::try_from(sequence)
+                        .expect("validated event count fits the event-key sequence width");
                     let key = change_event_key(command.root_id, next_version, sequence);
                     let value = CurrentValue {
                         created_version: next_version,
@@ -1147,6 +1307,46 @@ impl AgentMetadataStore {
         self.read_at_unfenced(family, key, version)
     }
 
+    /// Run dependent point reads under one ownership/fence validation.
+    ///
+    /// `requested_version = None` captures the current version inside the
+    /// guarded window. A supplied historical version is rejected if it is
+    /// newer than the same captured current version. The callback must remain
+    /// limited to metadata point reads and local decoding.
+    pub(super) fn with_fenced_point_reads<R, E>(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        requested_version: Option<ReadVersion>,
+        read: impl FnOnce(ReadVersion, &FencedPointReader<'_>) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<AgentMetadataError>,
+    {
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| E::from(backend("lock read gate", error)))?;
+        let current_version = self
+            .validate_read_context(root_id, placement_generation, owner_epoch)
+            .map_err(E::from)?;
+        let version = requested_version.unwrap_or(current_version);
+        if version > current_version {
+            return Err(E::from(AgentMetadataError::ReadVersionInFuture {
+                requested: version.get(),
+                current: current_version.get(),
+            }));
+        }
+        let reader = FencedPointReader {
+            store: self,
+            root_id,
+            version,
+            current_version,
+        };
+        read(version, &reader)
+    }
+
     /// Read one exact request replay record through the same ownership fences
     /// as ordinary metadata reads.
     ///
@@ -1173,13 +1373,16 @@ impl AgentMetadataStore {
             &key,
             current_version,
         )?;
-        self.command_dedupe
-            .get(&key)
-            .map_err(|error| backend("read CommandDedupe", error))?
-            .map(|value| {
-                CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))
-            })
-            .transpose()
+        self.read_tree_value(
+            &self.command_dedupe,
+            &key,
+            MetadataPointReadSource::Other,
+            "read CommandDedupe",
+        )?
+        .map(|value| {
+            CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))
+        })
+        .transpose()
     }
 
     /// Stable ordered prefix scan at one fenced read version.
@@ -1198,11 +1401,85 @@ impl AgentMetadataStore {
         start_after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<MetadataScanItem>, AgentMetadataError> {
+        self.scan_prefix_at_impl(
+            root_id,
+            placement_generation,
+            owner_epoch,
+            family,
+            prefix,
+            None,
+            version,
+            start_after,
+            limit,
+            MAX_COMMAND_ITEMS,
+        )
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| match item {
+                    DelimitedMetadataScanItem::Record(record) => record,
+                    DelimitedMetadataScanItem::CommonPrefix(_) => {
+                        unreachable!("a scan without a delimiter cannot emit a common prefix")
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Stable ordered prefix scan that folds deeper keys at `delimiter` and
+    /// returns concrete records and implicit common prefixes at that level.
+    ///
+    /// Every returned record or common prefix counts against `limit`. The
+    /// prefix byte string includes the delimiter and is a valid exclusive
+    /// cursor for the next raw page.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn scan_delimited_prefix_at(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        family: MetadataFamily,
+        prefix: &[u8],
+        delimiter: u8,
+        version: ReadVersion,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<DelimitedMetadataScanItem>, AgentMetadataError> {
+        self.scan_prefix_at_impl(
+            root_id,
+            placement_generation,
+            owner_epoch,
+            family,
+            prefix,
+            Some(delimiter),
+            version,
+            start_after,
+            limit,
+            MAX_DELIMITED_SCAN_ITEMS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_prefix_at_impl(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        family: MetadataFamily,
+        prefix: &[u8],
+        delimiter: Option<u8>,
+        version: ReadVersion,
+        start_after: Option<&[u8]>,
+        limit: usize,
+        max_items: usize,
+    ) -> Result<Vec<DelimitedMetadataScanItem>, AgentMetadataError> {
         let effective_limit = if limit == 0 {
-            MAX_COMMAND_ITEMS
+            max_items
         } else {
-            limit.min(MAX_COMMAND_ITEMS)
+            limit.min(max_items)
         };
+        #[cfg(feature = "metadata-read-stats")]
+        self.record_scan_call();
         // Fence and capture one immutable cross-tree view while writes are
         // excluded, then release the NoKV read gate before walking or decoding
         // the page. Holt's captured views keep current and History consistent
@@ -1253,52 +1530,132 @@ impl AgentMetadataStore {
             if let Some(marker) = start_after {
                 range = range.start_after(marker);
             }
+            if let Some(delimiter) = delimiter {
+                range = range.delimiter(delimiter);
+            }
 
             let mut visible = Vec::with_capacity(effective_limit);
-            for entry in range {
-                let holt::RangeEntry::Key { key, value, .. } =
-                    entry.map_err(|error| backend("scan current metadata", error))?
-                else {
-                    continue;
+            #[cfg(feature = "metadata-read-stats")]
+            let mut key_bytes = 0_u64;
+            #[cfg(feature = "metadata-read-stats")]
+            let mut value_bytes = 0_u64;
+            #[cfg(feature = "metadata-read-stats")]
+            let mut stopped_at_limit = false;
+            let mut iterator = range.into_iter();
+            for entry in iterator.by_ref() {
+                let item = match entry.map_err(|error| backend("scan current metadata", error))? {
+                    holt::RangeEntry::Key { key, value, .. } => {
+                        #[cfg(feature = "metadata-read-stats")]
+                        {
+                            key_bytes = key_bytes.saturating_add(byte_len(&key));
+                            value_bytes = value_bytes.saturating_add(byte_len(&value));
+                        }
+                        let current = CurrentValue::decode(&value)
+                            .map_err(|error| corrupt(family.tree_name(), error))?;
+                        if current.modified_version.get() > version.get() {
+                            return Err(AgentMetadataError::CorruptRecord {
+                                record: family.tree_name(),
+                                reason: format!(
+                                    "current row version {} exceeds captured version {}",
+                                    current.modified_version.get(),
+                                    version.get()
+                                ),
+                            });
+                        }
+                        DelimitedMetadataScanItem::Record(MetadataScanItem {
+                            key,
+                            value: current.payload,
+                        })
+                    }
+                    holt::RangeEntry::CommonPrefix(prefix) => {
+                        #[cfg(feature = "metadata-read-stats")]
+                        {
+                            key_bytes = key_bytes.saturating_add(byte_len(&prefix));
+                        }
+                        DelimitedMetadataScanItem::CommonPrefix(prefix)
+                    }
+                    _ => continue,
                 };
-                let current = CurrentValue::decode(&value)
-                    .map_err(|error| corrupt(family.tree_name(), error))?;
-                if current.modified_version.get() > version.get() {
-                    continue;
-                }
-                visible.push(MetadataScanItem {
-                    key,
-                    value: current.payload,
-                });
+                visible.push(item);
                 if visible.len() == effective_limit {
+                    #[cfg(feature = "metadata-read-stats")]
+                    {
+                        stopped_at_limit = true;
+                    }
                     break;
                 }
+            }
+            #[cfg(feature = "metadata-read-stats")]
+            {
+                let stats = iterator.stats();
+                self.record_scan_cursor(
+                    stats.visited,
+                    stats.returned,
+                    stats.rollup,
+                    stats.restarts,
+                    key_bytes,
+                    value_bytes,
+                    stopped_at_limit,
+                );
             }
             return Ok(visible);
         }
 
         let mut visible = BTreeMap::<Vec<u8>, Vec<u8>>::new();
-        for entry in current_view.range() {
+        #[cfg(feature = "metadata-read-stats")]
+        let mut current_key_bytes = 0_u64;
+        #[cfg(feature = "metadata-read-stats")]
+        let mut current_value_bytes = 0_u64;
+        let mut current_iterator = current_view.range().into_iter();
+        for entry in current_iterator.by_ref() {
             let holt::RangeEntry::Key { key, value, .. } =
                 entry.map_err(|error| backend("scan current metadata", error))?
             else {
                 continue;
             };
+            #[cfg(feature = "metadata-read-stats")]
+            {
+                current_key_bytes = current_key_bytes.saturating_add(byte_len(&key));
+                current_value_bytes = current_value_bytes.saturating_add(byte_len(&value));
+            }
             let current =
                 CurrentValue::decode(&value).map_err(|error| corrupt(family.tree_name(), error))?;
             if current.modified_version.get() <= version.get() {
                 visible.insert(key, current.payload);
             }
         }
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let current_stats = current_iterator.stats();
+            self.record_scan_cursor(
+                current_stats.visited,
+                current_stats.returned,
+                current_stats.rollup,
+                current_stats.restarts,
+                current_key_bytes,
+                current_value_bytes,
+                false,
+            );
+        }
 
         let history_view = history_view
             .expect("historical metadata scan captures the matching History family view");
-        for entry in history_view.range() {
+        #[cfg(feature = "metadata-read-stats")]
+        let mut history_key_bytes = 0_u64;
+        #[cfg(feature = "metadata-read-stats")]
+        let mut history_value_bytes = 0_u64;
+        let mut history_iterator = history_view.range().into_iter();
+        for entry in history_iterator.by_ref() {
             let holt::RangeEntry::Key { key, value, .. } =
                 entry.map_err(|error| backend("scan metadata history", error))?
             else {
                 continue;
             };
+            #[cfg(feature = "metadata-read-stats")]
+            {
+                history_key_bytes = history_key_bytes.saturating_add(byte_len(&key));
+                history_value_bytes = history_value_bytes.saturating_add(byte_len(&value));
+            }
             let user_key = history_user_key(&key)?;
             if !user_key.starts_with(prefix) || visible.contains_key(user_key) {
                 continue;
@@ -1313,13 +1670,80 @@ impl AgentMetadataStore {
                 }
             }
         }
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let history_stats = history_iterator.stats();
+            self.record_scan_cursor(
+                history_stats.visited,
+                history_stats.returned,
+                history_stats.rollup,
+                history_stats.restarts,
+                history_key_bytes,
+                history_value_bytes,
+                false,
+            );
+        }
 
-        Ok(visible
-            .into_iter()
-            .filter(|(key, _)| start_after.is_none_or(|marker| key.as_slice() > marker))
-            .take(effective_limit)
-            .map(|(key, value)| MetadataScanItem { key, value })
-            .collect())
+        let mut page = Vec::with_capacity(effective_limit);
+        let mut last_common_prefix = None;
+        for (key, value) in visible {
+            let item = match delimiter.and_then(|delimiter| {
+                key.get(prefix.len()..)?
+                    .iter()
+                    .position(|byte| *byte == delimiter)
+                    .map(|offset| key[..prefix.len() + offset + 1].to_vec())
+            }) {
+                Some(common_prefix) => {
+                    if last_common_prefix.as_ref() == Some(&common_prefix) {
+                        continue;
+                    }
+                    last_common_prefix = Some(common_prefix.clone());
+                    DelimitedMetadataScanItem::CommonPrefix(common_prefix)
+                }
+                None => DelimitedMetadataScanItem::Record(MetadataScanItem { key, value }),
+            };
+            let item_key = match &item {
+                DelimitedMetadataScanItem::Record(record) => record.key.as_slice(),
+                DelimitedMetadataScanItem::CommonPrefix(prefix) => prefix.as_slice(),
+            };
+            if start_after.is_some_and(|marker| item_key <= marker) {
+                continue;
+            }
+            page.push(item);
+            if page.len() == effective_limit {
+                break;
+            }
+        }
+        Ok(page)
+    }
+
+    /// Read one immutable change event through the ordinary ownership fences.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn read_change_event_at(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        key: &[u8],
+        version: ReadVersion,
+    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| backend("lock read gate", error))?;
+        self.validate_read_fence(root_id, placement_generation, owner_epoch, key, version)?;
+        let Some(record) = self.read_tree_value(
+            &self.change_event,
+            key,
+            MetadataPointReadSource::Other,
+            "read ChangeEvent",
+        )?
+        else {
+            return Ok(None);
+        };
+        let current =
+            CurrentValue::decode(&record).map_err(|error| corrupt("ChangeEvent", error))?;
+        Ok((current.modified_version.get() <= version.get()).then_some(current.payload))
     }
 
     /// Stable ordered scan of immutable typed change events.
@@ -1349,15 +1773,30 @@ impl AgentMetadataStore {
         } else {
             limit.min(MAX_COMMAND_ITEMS)
         };
+        #[cfg(feature = "metadata-read-stats")]
+        self.record_scan_call();
         let mut events = Vec::with_capacity(effective_limit);
-        for entry in self.change_event.range().prefix(prefix) {
+        let mut range = self.change_event.range().prefix(prefix);
+        if let Some(marker) = start_after {
+            range = range.start_after(marker);
+        }
+        #[cfg(feature = "metadata-read-stats")]
+        let mut key_bytes = 0_u64;
+        #[cfg(feature = "metadata-read-stats")]
+        let mut value_bytes = 0_u64;
+        #[cfg(feature = "metadata-read-stats")]
+        let mut stopped_at_limit = false;
+        let mut iterator = range.into_iter();
+        for entry in iterator.by_ref() {
             let holt::RangeEntry::Key { key, value, .. } =
                 entry.map_err(|error| backend("scan ChangeEvent", error))?
             else {
                 continue;
             };
-            if start_after.is_some_and(|marker| key.as_slice() <= marker) {
-                continue;
+            #[cfg(feature = "metadata-read-stats")]
+            {
+                key_bytes = key_bytes.saturating_add(byte_len(&key));
+                value_bytes = value_bytes.saturating_add(byte_len(&value));
             }
             let current =
                 CurrentValue::decode(&value).map_err(|error| corrupt("ChangeEvent", error))?;
@@ -1369,8 +1808,25 @@ impl AgentMetadataStore {
                 value: current.payload,
             });
             if events.len() == effective_limit {
+                #[cfg(feature = "metadata-read-stats")]
+                {
+                    stopped_at_limit = true;
+                }
                 break;
             }
+        }
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let stats = iterator.stats();
+            self.record_scan_cursor(
+                stats.visited,
+                stats.returned,
+                stats.rollup,
+                stats.restarts,
+                key_bytes,
+                value_bytes,
+                stopped_at_limit,
+            );
         }
         Ok(events)
     }
@@ -1384,7 +1840,28 @@ impl AgentMetadataStore {
         version: ReadVersion,
     ) -> Result<ReadVersion, AgentMetadataError> {
         validate_root_scoped_bytes(root_id, key_or_prefix, "read key or prefix")?;
-        let owner = required_record(&self.system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
+        let current_version =
+            self.validate_read_context(root_id, placement_generation, owner_epoch)?;
+        if version > current_version {
+            return Err(AgentMetadataError::ReadVersionInFuture {
+                requested: version.get(),
+                current: current_version.get(),
+            });
+        }
+        Ok(current_version)
+    }
+
+    fn validate_read_context(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+    ) -> Result<ReadVersion, AgentMetadataError> {
+        let owner = self.required_system_record(
+            &self.system,
+            SYSTEM_OWNER_FENCE_KEY,
+            "System(owner_fence)",
+        )?;
         let actual_owner = decode_system_u64(&owner.value, "System(owner_fence)")?;
         if actual_owner != owner_epoch.get() {
             return Err(AgentMetadataError::OwnerEpochMismatch {
@@ -1393,9 +1870,12 @@ impl AgentMetadataStore {
             });
         }
         let fence = self
-            .root_fence
-            .get(root_id.as_bytes())
-            .map_err(|error| backend("read RootFence", error))?
+            .read_tree_value(
+                &self.root_fence,
+                root_id.as_bytes(),
+                MetadataPointReadSource::RootFence,
+                "read RootFence",
+            )?
             .ok_or(AgentMetadataError::RootFenceMissing)?;
         let fence = RootFence::decode(&fence).map_err(|error| corrupt("RootFence", error))?;
         if fence.logical_shard_id != self.logical_shard_id
@@ -1410,12 +1890,6 @@ impl AgentMetadataStore {
             });
         }
         let current_version = self.current_read_version()?;
-        if version > current_version {
-            return Err(AgentMetadataError::ReadVersionInFuture {
-                requested: version.get(),
-                current: current_version.get(),
-            });
-        }
         Ok(current_version)
     }
 
@@ -1425,11 +1899,7 @@ impl AgentMetadataStore {
         key: &[u8],
         version: ReadVersion,
     ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
-        let tree = self.family(family);
-        if let Some(record) = tree
-            .get(key)
-            .map_err(|error| backend("read current metadata", error))?
-        {
+        if let Some(record) = self.read_family_value(family, key, "read current metadata")? {
             let current = CurrentValue::decode(&record)
                 .map_err(|error| corrupt(family.tree_name(), error))?;
             if current.modified_version.get() <= version.get() {
@@ -1437,21 +1907,78 @@ impl AgentMetadataStore {
             }
         }
         let prefix = history_prefix(family, key);
-        for entry in self.history.range().prefix(&prefix) {
-            let holt::RangeEntry::Key { value, .. } =
-                entry.map_err(|error| backend("read metadata history", error))?
+        #[cfg(feature = "metadata-read-stats")]
+        self.record_scan_call();
+        #[cfg(feature = "metadata-read-stats")]
+        let mut key_bytes = 0_u64;
+        #[cfg(feature = "metadata-read-stats")]
+        let mut value_bytes = 0_u64;
+        let mut previous_payload = None;
+        let mut iterator = self.history.range().prefix(&prefix).into_iter();
+        for entry in iterator.by_ref() {
+            let entry = entry.map_err(|error| backend("read metadata history", error))?;
+            #[cfg(feature = "metadata-read-stats")]
+            let holt::RangeEntry::Key { key, value, .. } = entry
             else {
                 continue;
             };
+            #[cfg(not(feature = "metadata-read-stats"))]
+            let holt::RangeEntry::Key { value, .. } = entry
+            else {
+                continue;
+            };
+            #[cfg(feature = "metadata-read-stats")]
+            {
+                key_bytes = key_bytes.saturating_add(byte_len(&key));
+                value_bytes = value_bytes.saturating_add(byte_len(&value));
+            }
             let history =
                 HistoryValue::decode(&value).map_err(|error| corrupt("History", error))?;
             if history.previous_modified_version.get() <= version.get()
                 && version.get() < history.transition_version.get()
             {
-                return Ok(history.previous_payload);
+                previous_payload = Some(history.previous_payload);
+                break;
             }
         }
-        Ok(None)
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let stats = iterator.stats();
+            self.record_scan_cursor(
+                stats.visited,
+                stats.returned,
+                stats.rollup,
+                stats.restarts,
+                key_bytes,
+                value_bytes,
+                false,
+            );
+        }
+        Ok(previous_payload.flatten())
+    }
+
+    fn read_current_at_unfenced(
+        &self,
+        family: MetadataFamily,
+        key: &[u8],
+        current_version: ReadVersion,
+    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
+        let Some(record) = self.read_family_value(family, key, "read current metadata")? else {
+            return Ok(None);
+        };
+        let current =
+            CurrentValue::decode(&record).map_err(|error| corrupt(family.tree_name(), error))?;
+        if current.modified_version.get() > current_version.get() {
+            return Err(corrupt(
+                family.tree_name(),
+                format!(
+                    "record version {} is newer than the captured commit clock {}",
+                    current.modified_version.get(),
+                    current_version.get()
+                ),
+            ));
+        }
+        Ok(Some(current.payload))
     }
 
     fn validate_command(&self, command: &MetadataCommand) -> Result<(), AgentMetadataError> {
@@ -1652,20 +2179,23 @@ impl AgentMetadataStore {
             }
         }
         for mutation in &command.mutations {
-            if !plan
+            let Some(predicate) = plan
                 .exact
-                .contains_key(&(mutation.family(), mutation.key().to_vec()))
-            {
+                .get(&(mutation.family(), mutation.key().to_vec()))
+            else {
                 return Err(invalid(
                     "every mutation requires one exact value/absence predicate",
                 ));
-            }
-            if matches!(mutation, CommandMutation::Delete { .. })
-                && plan
-                    .exact
-                    .get(&(mutation.family(), mutation.key().to_vec()))
-                    .is_some_and(|predicate| predicate.current.is_none())
+            };
+            if mutation.family() == MetadataFamily::WorkspaceIncarnationClaim
+                && (matches!(mutation, CommandMutation::Delete { .. })
+                    || predicate.current.is_some())
             {
+                return Err(invalid(
+                    "workspace incarnation claims are append-only and permanent",
+                ));
+            }
+            if matches!(mutation, CommandMutation::Delete { .. }) && predicate.current.is_none() {
                 return Err(invalid("delete mutation requires an existing value"));
             }
         }
@@ -1898,6 +2428,108 @@ impl AgentMetadataStore {
             .get(&family)
             .expect("every MetadataFamily is opened at startup")
     }
+
+    #[cfg(feature = "metadata-read-stats")]
+    #[inline]
+    fn read_stats_store_key(&self) -> usize {
+        Arc::as_ptr(&self.read_stats_identity) as usize
+    }
+
+    #[cfg(feature = "metadata-read-stats")]
+    #[inline]
+    fn record_point(&self, source: MetadataPointReadSource, value_bytes: Option<usize>) {
+        read_stats::record_point(self.read_stats_store_key(), source, value_bytes);
+    }
+
+    #[cfg(feature = "metadata-read-stats")]
+    #[inline]
+    fn record_scan_call(&self) {
+        read_stats::record_scan_call(self.read_stats_store_key());
+    }
+
+    #[cfg(feature = "metadata-read-stats")]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn record_scan_cursor(
+        &self,
+        visited_units: u64,
+        returned_keys: u64,
+        common_prefixes: u64,
+        restarts: u64,
+        key_bytes: u64,
+        value_bytes: u64,
+        stopped_at_limit: bool,
+    ) {
+        read_stats::record_scan_cursor(
+            self.read_stats_store_key(),
+            visited_units,
+            returned_keys,
+            common_prefixes,
+            restarts,
+            key_bytes,
+            value_bytes,
+            stopped_at_limit,
+        );
+    }
+
+    fn read_family_value(
+        &self,
+        family: MetadataFamily,
+        key: &[u8],
+        operation: &'static str,
+    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
+        self.read_tree_value(self.family(family), key, point_source(family), operation)
+    }
+
+    fn read_tree_value(
+        &self,
+        tree: &Tree,
+        key: &[u8],
+        source: MetadataPointReadSource,
+        operation: &'static str,
+    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
+        let value = tree.get(key).map_err(|error| backend(operation, error))?;
+        #[cfg(feature = "metadata-read-stats")]
+        self.record_point(source, value.as_ref().map(Vec::len));
+        #[cfg(not(feature = "metadata-read-stats"))]
+        let _ = source;
+        Ok(value)
+    }
+
+    fn read_tree_record(
+        &self,
+        tree: &Tree,
+        key: &[u8],
+        source: MetadataPointReadSource,
+        operation: &'static str,
+    ) -> Result<Option<Record>, AgentMetadataError> {
+        let record = tree
+            .get_record(key)
+            .map_err(|error| backend(operation, error))?;
+        #[cfg(feature = "metadata-read-stats")]
+        self.record_point(source, record.as_ref().map(|record| record.value.len()));
+        #[cfg(not(feature = "metadata-read-stats"))]
+        let _ = source;
+        Ok(record)
+    }
+
+    fn required_system_record(
+        &self,
+        tree: &Tree,
+        key: &[u8],
+        record: &'static str,
+    ) -> Result<Record, AgentMetadataError> {
+        self.read_tree_record(
+            tree,
+            key,
+            MetadataPointReadSource::System,
+            "read required record",
+        )?
+        .ok_or_else(|| AgentMetadataError::CorruptRecord {
+            record,
+            reason: "record is missing".to_owned(),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -2062,6 +2694,19 @@ fn required_record(
         })
 }
 
+fn point_source(family: MetadataFamily) -> MetadataPointReadSource {
+    match family {
+        MetadataFamily::WorkspaceCurrent => MetadataPointReadSource::WorkspaceCurrent,
+        MetadataFamily::PathCurrent => MetadataPointReadSource::PathCurrent,
+        _ => MetadataPointReadSource::Other,
+    }
+}
+
+#[cfg(feature = "metadata-read-stats")]
+fn byte_len(value: &[u8]) -> u64 {
+    u64::try_from(value.len()).unwrap_or(u64::MAX)
+}
+
 fn encode_shard_identity(shard: LogicalShardId) -> Vec<u8> {
     let mut value = Vec::with_capacity(1 + LogicalShardId::BYTE_WIDTH);
     value.push(SYSTEM_VALUE_FORMAT_VERSION);
@@ -2174,18 +2819,6 @@ fn history_user_key(encoded: &[u8]) -> Result<&[u8], AgentMetadataError> {
         });
     }
     Ok(&encoded[HEADER_BYTES..HEADER_BYTES + user_key_bytes])
-}
-
-fn change_event_key(root: RootId, version: CommitVersion, sequence: usize) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16 + 8 + 4);
-    key.extend_from_slice(root.as_bytes());
-    key.extend_from_slice(&version.get().to_be_bytes());
-    key.extend_from_slice(
-        &u32::try_from(sequence)
-            .expect("validated event count fits u32")
-            .to_be_bytes(),
-    );
-    key
 }
 
 fn validate_root_scoped_bytes(
@@ -2393,6 +3026,7 @@ mod tests {
         command.deterministic_result = b"created".to_vec();
         command.event_projection.push(EventProjection {
             payload: ChangeEventRecord {
+                workbench_id: nokv_types::WorkbenchId::new("engine-event").unwrap(),
                 workspace_incarnation_id: nokv_types::WorkspaceIncarnationId::from_bytes([3; 16]),
                 kind: ChangeEventKind::WorkspaceCreated,
                 artifact_revision_id: None,
@@ -2537,6 +3171,74 @@ mod tests {
     }
 
     #[test]
+    fn fenced_point_reader_rejects_a_foreign_root_key() {
+        let store = ready_store();
+        let result =
+            store.with_fenced_point_reads(root(2), generation(7), epoch(1), None, |_, reader| {
+                reader.get(MetadataFamily::Operation, &scoped_key(root(3), b"foreign"))
+            });
+        assert!(matches!(
+            result,
+            Err(AgentMetadataError::InvalidCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn current_fenced_point_miss_does_not_consult_history() {
+        let store = ready_store();
+        let key = scoped_key(root(2), b"missing-current");
+        let history_key = history_key(
+            MetadataFamily::Operation,
+            &key,
+            CommitVersion::new(2).unwrap(),
+        );
+        store.history.put(&history_key, b"corrupt-history").unwrap();
+
+        let value = store
+            .with_fenced_point_reads(root(2), generation(7), epoch(1), None, |_, reader| {
+                reader.get(MetadataFamily::Operation, &key)
+            })
+            .unwrap();
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn current_prefix_scan_rejects_a_row_from_a_future_version() {
+        let store = ready_store();
+        let key = scoped_key(root(2), b"future-current");
+        let current = store.current_read_version().unwrap();
+        let future = CommitVersion::new(current.get() + 1).unwrap();
+        let encoded = CurrentValue {
+            created_version: future,
+            modified_version: future,
+            payload: b"impossible".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        store
+            .family(MetadataFamily::Operation)
+            .put(&key, &encoded)
+            .unwrap();
+
+        assert!(matches!(
+            store.scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                root(2).as_bytes(),
+                current,
+                None,
+                1,
+            ),
+            Err(AgentMetadataError::CorruptRecord {
+                record: OPERATION_TREE,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn replacement_and_delete_retain_exact_historical_values() {
         let store = ready_store();
         let key = scoped_key(root(2), b"history");
@@ -2661,6 +3363,9 @@ mod tests {
             .put(&after_limit, b"corrupt-after-limit")
             .unwrap();
 
+        let version = store.current_read_version().unwrap();
+        #[cfg(feature = "metadata-read-stats")]
+        let stats_session = store.begin_read_stats_session().unwrap();
         let page = store
             .scan_prefix_at(
                 root(2),
@@ -2668,7 +3373,7 @@ mod tests {
                 epoch(1),
                 MetadataFamily::Operation,
                 &prefix,
-                store.current_read_version().unwrap(),
+                version,
                 Some(&before_cursor),
                 2,
             )
@@ -2686,6 +3391,268 @@ mod tests {
                 },
             ]
         );
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let stats = stats_session.finish().unwrap();
+            assert_eq!(stats.scan_calls, 1);
+            assert_eq!(stats.scan_cursors, 1);
+            assert_eq!(stats.holt_scan_returned_keys, 2);
+            assert!(stats.holt_scan_visited_units >= 2);
+            assert_eq!(stats.scan_raw_limit_stops, 1);
+            assert!(stats.scan_key_bytes > 0);
+            assert!(stats.scan_value_bytes > 0);
+        }
+    }
+
+    #[cfg(feature = "metadata-read-stats")]
+    #[test]
+    fn read_stats_session_is_store_exclusive_and_drop_releases_it() {
+        let store = ready_store();
+        let clone = store.clone();
+        let other_store = ready_store();
+        let session = store.begin_read_stats_session().unwrap();
+
+        clone.current_read_version().unwrap();
+        other_store.current_read_version().unwrap();
+        let contender = store.clone();
+        let error = std::thread::spawn(move || match contender.begin_read_stats_session() {
+            Ok(_) => panic!("a second session for one store must be rejected"),
+            Err(error) => error,
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            error,
+            MetadataReadStatsSessionError::StoreSessionAlreadyActive
+        );
+
+        let stats = session.finish().unwrap();
+        assert_eq!(stats.point_reads_system, 1);
+        assert_eq!(stats.point_reads_total(), 1);
+
+        let cancelled = clone.begin_read_stats_session().unwrap();
+        drop(cancelled);
+        let replacement = store.begin_read_stats_session().unwrap();
+        replacement.finish().unwrap();
+    }
+
+    #[test]
+    fn reopened_delimited_scan_skips_nested_values_and_counts_common_prefixes() {
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join("delimited-scan");
+        let store = ready_file_store(&database);
+        let prefix = scoped_key(root(2), b"delimited/");
+        // The path codec shifts each UTF-8 byte by one. Bytes 0 and 1 are
+        // therefore reserved for the component delimiter and exact marker.
+        let common_a = [prefix.as_slice(), b"b\0"].concat();
+        let direct_a = [prefix.as_slice(), b"b\x01"].concat();
+        let direct_a_control = [prefix.as_slice(), b"b\x02\x01"].concat();
+        let nested_a = [prefix.as_slice(), b"b\0effq\x01"].concat();
+        let direct_b = [prefix.as_slice(), b"c\x01"].concat();
+
+        store
+            .execute(&create_command(
+                &store,
+                request(3),
+                direct_a.clone(),
+                b"direct-a",
+            ))
+            .unwrap();
+        store
+            .execute(&create_command(
+                &store,
+                request(4),
+                direct_a_control.clone(),
+                b"direct-a-control",
+            ))
+            .unwrap();
+        store
+            .execute(&create_command(
+                &store,
+                request(5),
+                direct_b.clone(),
+                b"direct-b",
+            ))
+            .unwrap();
+        // A delimiter rollup must skip this nested subtree without decoding
+        // its value. A recursive scan would fail closed on this envelope.
+        store
+            .family(MetadataFamily::Operation)
+            .put(&nested_a, b"corrupt-nested-value")
+            .unwrap();
+        drop(store);
+        let store = AgentMetadataStore::reopen_file(&database, shard(1)).unwrap();
+        #[cfg(feature = "metadata-read-stats")]
+        let stats_session = store.begin_read_stats_session().unwrap();
+
+        let page = store
+            .scan_delimited_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                0,
+                store.current_read_version().unwrap(),
+                None,
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            page,
+            vec![
+                DelimitedMetadataScanItem::CommonPrefix(common_a),
+                DelimitedMetadataScanItem::Record(MetadataScanItem {
+                    key: direct_a.clone(),
+                    value: b"direct-a".to_vec(),
+                }),
+                DelimitedMetadataScanItem::Record(MetadataScanItem {
+                    key: direct_a_control.clone(),
+                    value: b"direct-a-control".to_vec(),
+                }),
+                DelimitedMetadataScanItem::Record(MetadataScanItem {
+                    key: direct_b.clone(),
+                    value: b"direct-b".to_vec(),
+                }),
+            ]
+        );
+
+        let continuation = store
+            .scan_delimited_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                0,
+                store.current_read_version().unwrap(),
+                Some(&direct_a),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            continuation,
+            vec![DelimitedMetadataScanItem::Record(MetadataScanItem {
+                key: direct_a_control,
+                value: b"direct-a-control".to_vec(),
+            })]
+        );
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let stats = stats_session.finish().unwrap();
+            assert_eq!(stats.scan_calls, 2);
+            assert_eq!(stats.scan_cursors, 2);
+            assert!(stats.holt_scan_common_prefixes >= 1);
+            assert!(
+                stats.holt_cache_hits
+                    + stats.holt_cache_misses
+                    + stats.holt_full_blob_reads
+                    + stats.holt_read_page_hits
+                    + stats.holt_read_page_misses
+                    + stats.holt_read_index_cache_hits
+                    + stats.holt_read_index_cache_misses
+                    > 0,
+                "file-backed read session should expose Holt read activity"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_delimited_scan_filters_after_mvcc_reconstruction() {
+        let store = ready_store();
+        let prefix = scoped_key(root(2), b"historical-delimited/");
+        let direct = [prefix.as_slice(), b"a\xff"].concat();
+        let nested = [prefix.as_slice(), b"b\0deep\xff"].concat();
+        let created = store
+            .execute(&create_command(
+                &store,
+                request(3),
+                direct.clone(),
+                b"historical-direct",
+            ))
+            .unwrap();
+
+        let mut remove = base_command(&store, request(4), RootFenceAction::RequireActive);
+        remove.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::Operation,
+            key: direct.clone(),
+            expected: Some(b"historical-direct".to_vec()),
+        });
+        remove.mutations.push(CommandMutation::Delete {
+            family: MetadataFamily::Operation,
+            key: direct.clone(),
+        });
+        remove.history_projection.push(HistoryProjection {
+            family: MetadataFamily::Operation,
+            key: direct.clone(),
+        });
+        store.execute(&remove.seal()).unwrap();
+        store
+            .execute(&create_command(
+                &store,
+                request(5),
+                nested,
+                b"new-nested-value",
+            ))
+            .unwrap();
+
+        let historical = store
+            .scan_delimited_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                0,
+                ReadVersion::new(created.commit_version.get()).unwrap(),
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            historical,
+            vec![DelimitedMetadataScanItem::Record(MetadataScanItem {
+                key: direct,
+                value: b"historical-direct".to_vec(),
+            })]
+        );
+    }
+
+    #[test]
+    fn change_event_scan_uses_an_exclusive_cursor_and_page_limit() {
+        let store = ready_store();
+        let first = store
+            .execute(&create_command(
+                &store,
+                request(3),
+                scoped_key(root(2), b"event/first"),
+                b"first",
+            ))
+            .unwrap();
+        let second = store
+            .execute(&create_command(
+                &store,
+                request(4),
+                scoped_key(root(2), b"event/second"),
+                b"second",
+            ))
+            .unwrap();
+        let first_key = change_event_key(root(2), first.commit_version, 0);
+        let second_key = change_event_key(root(2), second.commit_version, 0);
+
+        let page = store
+            .scan_change_events_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                root(2).as_bytes(),
+                store.current_read_version().unwrap(),
+                Some(&first_key),
+                1,
+            )
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].key, second_key);
     }
 
     #[test]
@@ -2907,6 +3874,56 @@ mod tests {
         });
         assert!(matches!(
             store.execute(&replace.seal()),
+            Err(AgentMetadataError::InvalidCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn workspace_incarnation_claims_are_append_only_and_permanent() {
+        let store = ready_store();
+        let key = scoped_key(root(2), b"incarnation-claim");
+
+        let mut create = base_command(&store, request(30), RootFenceAction::RequireActive);
+        create.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::WorkspaceIncarnationClaim,
+            key: key.clone(),
+            expected: None,
+        });
+        create.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::WorkspaceIncarnationClaim,
+            key: key.clone(),
+            value: b"owner-a".to_vec(),
+        });
+        store.execute(&create.seal()).unwrap();
+
+        let mut replace = base_command(&store, request(31), RootFenceAction::RequireActive);
+        replace.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::WorkspaceIncarnationClaim,
+            key: key.clone(),
+            expected: Some(b"owner-a".to_vec()),
+        });
+        replace.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::WorkspaceIncarnationClaim,
+            key: key.clone(),
+            value: b"owner-b".to_vec(),
+        });
+        assert!(matches!(
+            store.execute(&replace.seal()),
+            Err(AgentMetadataError::InvalidCommand { .. })
+        ));
+
+        let mut delete = base_command(&store, request(32), RootFenceAction::RequireActive);
+        delete.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::WorkspaceIncarnationClaim,
+            key: key.clone(),
+            expected: Some(b"owner-a".to_vec()),
+        });
+        delete.mutations.push(CommandMutation::Delete {
+            family: MetadataFamily::WorkspaceIncarnationClaim,
+            key,
+        });
+        assert!(matches!(
+            store.execute(&delete.seal()),
             Err(AgentMetadataError::InvalidCommand { .. })
         ));
     }

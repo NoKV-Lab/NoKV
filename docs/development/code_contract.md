@@ -87,6 +87,9 @@ that owns them. Do not move domain-specific or single-use logic into a generic
 - `PathCurrent(root_id, workspace_incarnation_id,
   normalized_relative_path)` is workspace namespace truth. Workbench names resolve
   through `WorkspaceCurrent`; directories are implicit prefixes.
+- `WorkspaceIncarnationClaim(root_id, workspace_incarnation_id)` permanently
+  binds each never-reused incarnation to one Workbench id. Direct create and
+  restore staging claim it atomically with the visibility marker.
 - All path identities use the one storage-neutral normalizer and
   component-safe key codec.
 - `WorkspaceCurrent` is the visibility marker; staging must be absent from
