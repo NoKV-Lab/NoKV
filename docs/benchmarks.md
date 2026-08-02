@@ -60,6 +60,114 @@ The two durability profiles remain separate:
 
 Do not merge or average rows across those profiles.
 
+## Executable Metadata Read Workload
+
+`nokv-bench metadata` exercises the production protocol DTO executor over one
+real `AgentMetadataStore`. It creates one root, one owner, one visible
+workbench, and a deterministic path tree. Untimed setup uses bounded metadata
+commands to install each zero-length `PathCurrent` artifact together with its
+available `ArtifactRevision` and strong path `RevisionRef`; it does not pretend
+to measure publication or object upload. The timed interval then measures:
+
+- existing and missing exact reads at shallow and deep paths;
+- a small first page from a recursive prefix;
+- first, middle, and final cursor pages from a non-recursive prefix.
+
+Every direct child in the non-recursive workload is both an exact artifact and
+the parent of a deep subtree. This keeps old and new logical results equivalent
+while exposing whether listing can skip the subtree.
+
+Use a new, nonexistent metadata directory for every run:
+
+```bash
+cargo run --release --locked -p nokv-bench --features metadata-read-stats \
+  --bin nokv-bench -- \
+  metadata \
+  --metadata-dir /absolute/path/to/new-metadata-dir \
+  --iterations 1000 \
+  --warmup 100 \
+  --direct-children 96 \
+  --leaves-per-child 64 \
+  --page-limit 32 \
+  --seed 42 \
+  --revision <commit-or-patch-label> \
+  --harness-revision <benchmark-tree-digest> \
+  --dirty-worktree
+```
+
+Omit `--metadata-dir` for an in-memory diagnostic run. The v3 JSON report records
+the dataset, source and harness labels, dirty state, durability, warmup,
+latency distribution, throughput, result checksum, pre/post correctness
+assertions, a normalized logical-result digest, per-workload metadata read
+amplification, and the qualification boundary.
+Set `NOKV_BENCH_MACHINE` and `NOKV_BENCH_METADATA_DEVICE` to reviewed machine
+and physical-device labels when retaining a file-backed comparison; missing
+device information is reported as `unknown` rather than inferred from the store
+directory.
+
+This runner measures metadata-domain behavior through
+`MetadataWorkspaceRequestExecutor`; it does not frame bytes, open a network
+connection, access object storage, invoke the SDK, or invoke the OpenViking
+facade. Every workload performs warmup first, starts an explicit thread-bound
+read-stat session, runs only the timed iterations, stops the timer, and finishes
+the session. Setup, warmup, correctness checks, and session setup/finish are
+therefore excluded from latency. The session's lightweight thread-local logical
+counter updates do execute inside the measured path and are declared in the
+report. The non-default `nokv-meta/metadata-read-stats` feature removes these
+hooks from ordinary production builds. The benchmark exposes that dependency
+feature through its own explicit `nokv-bench/metadata-read-stats` feature, so a
+normal `cargo build --workspace` does not enable instrumentation through Cargo
+feature unification.
+
+With `--warmup > 0`, each row is labelled `same_request_warmup`: the exact same
+request runs before that row, but this is not a claim that the operating-system
+page cache was controlled. With `--warmup 0`, the runner reports
+`cache_state = uncontrolled`; it never labels that profile cold.
+
+The report separates three different quantities:
+
+- thread-local NoKV logical point reads, split into system/fence reads and
+  authoritative `WorkspaceCurrent`, `PathCurrent`, and other metadata-family
+  reads;
+- cursor-local Holt scan work (`visited` work units, returned keys, common
+  prefixes, and restarts) plus emitted key/value bytes;
+- store-wide Holt cache, full-blob, page, and read-index counter deltas.
+
+`visited` is a Holt cursor work unit, not a physical row or device read.
+Emitted value bytes are materialized bytes, not device bytes or a claim about
+decoder CPU cost. Holt 0.8.2 does not expose an exact internal seek count, so
+the report leaves that metric unavailable rather than inferring it from scan
+calls. Logical counters exclude reads performed concurrently on other threads
+and by other stores. Their coverage is the fenced query paths used by these
+read workloads, not write-transaction or recovery-internal reads. The runner
+emits no report after a failed operation, because cursor work on a failing range
+may be incomplete. Store-wide physical deltas are exactly attributable only for
+this runner's dedicated store and `concurrency = 1` profile; background Holt
+work may still contribute and must not be described as request-local device
+I/O. Accordingly, each workload labels its scope as successful logical
+operations plus the surrounding physical-counter time interval.
+
+For an old/new comparison, build both revisions in release mode with separate
+target directories and create separate metadata stores from the same seed. If
+the baseline predates this binary or its read-stat instrumentation, export
+declared baseline and candidate instrumentation patches that implement the same
+named counter semantics without changing either product read algorithm. Keep
+the runner and its implementation-invariant tests byte-identical. Retain both
+patches, record their SHA-256 values, record a deterministic manifest of the
+shared runner files as `--harness-revision`, and review the implementation-
+specific hooks before comparing results. `dirty_worktree` describes the
+product source under test after excluding the declared harness and
+instrumentation patches.
+Never open one revision's store with another schema. Compare only matching
+profile fields and normalized semantic digests, and retain each raw JSON
+report. The runner aborts without emitting a report on the first operation or
+correctness failure.
+
+This workload is explicitly a diagnostic and reports Workspace Acceptance Gate
+8 as `NOT QUALIFIED`: it omits the product boundary, cold-cache and concurrent
+matrices, host utilization, exact Holt seek accounting, and failure/recovery
+matrices required for a release performance record.
+
 ## Core Metadata Workloads
 
 ### Exact read

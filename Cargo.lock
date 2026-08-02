@@ -1302,7 +1302,11 @@ dependencies = [
 name = "nokv-bench"
 version = "0.1.0"
 dependencies = [
+ "nokv-meta",
  "nokv-protocol",
+ "nokv-server",
+ "nokv-types",
+ "serde",
  "serde_json",
 ]
 
