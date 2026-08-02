@@ -25,7 +25,8 @@ use super::codec::{
     artifact_revision_key, commit_key, commit_member_prefix, decode_commit_member_key,
     decode_path_current_key, gc_candidate_key, lease_commit_consumer_key, operation_key,
     path_child_prefix, path_current_key, path_revision_ref_key, restore_history_hold_key,
-    restore_member_key, restore_member_prefix, snapshot_ref_key, workspace_current_key, SCHEMA_ID,
+    restore_member_key, restore_member_prefix, snapshot_ref_key, workspace_current_key,
+    workspace_incarnation_claim_key, SCHEMA_ID,
 };
 use super::commit_records::{
     advance_commit_member_rolling_digest, commit_member_row_digest, CommitConsumerRecord,
@@ -35,12 +36,12 @@ use super::engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
     HistoryProjection, MetadataCommand, MetadataFamily, MetadataScanItem, RootFenceAction,
 };
+use super::event_projection::change_event_projection;
 use super::namespace::RootWriteContext;
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
-    RevisionRefRecord, WorkspaceRecord,
+    RevisionRefRecord, WorkspaceIncarnationClaimRecord, WorkspaceRecord,
 };
-use super::query::change_event_projection;
 use super::query_records::{
     secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryFieldId, QueryRecordError,
     QueryScalar, SecondaryIndexRecord, TypedProjection,
@@ -136,6 +137,10 @@ pub enum RestoreError {
     },
     SourceWorkspaceMismatch,
     DestinationExists {
+        workbench_id: WorkbenchId,
+    },
+    DestinationIncarnationClaimed {
+        incarnation_id: WorkspaceIncarnationId,
         workbench_id: WorkbenchId,
     },
     DestinationMarkerMismatch,
@@ -243,6 +248,14 @@ impl fmt::Display for RestoreError {
             Self::DestinationExists { workbench_id } => {
                 write!(formatter, "destination workbench {workbench_id} already exists")
             }
+            Self::DestinationIncarnationClaimed {
+                incarnation_id,
+                workbench_id,
+            } => write!(
+                formatter,
+                "destination workspace incarnation {:02x?} is permanently claimed by workbench {workbench_id}",
+                incarnation_id.as_bytes()
+            ),
             Self::DestinationMarkerMismatch => {
                 formatter.write_str("destination workspace marker does not match the restore")
             }
@@ -684,6 +697,22 @@ pub fn begin_restore(
             return Err(RestoreError::DestinationMarkerMismatch);
         }
     }
+    let destination_claim_key = workspace_incarnation_claim_key(
+        context.root_id,
+        request.destination_workspace_incarnation_id,
+    );
+    if let Some(claim) = read_record(
+        store,
+        context,
+        MetadataFamily::WorkspaceIncarnationClaim,
+        &destination_claim_key,
+        WorkspaceIncarnationClaimRecord::decode,
+    )? {
+        return Err(RestoreError::DestinationIncarnationClaimed {
+            incarnation_id: request.destination_workspace_incarnation_id,
+            workbench_id: claim.record.workbench_id,
+        });
+    }
     let operation = RestoreOperationRecord {
         operation_id,
         identity_digest,
@@ -712,6 +741,14 @@ pub fn begin_restore(
         owning_operation_id: Some(operation_id),
     };
     let mut plan = CommandPlan::default();
+    plan.put_absent(
+        MetadataFamily::WorkspaceIncarnationClaim,
+        destination_claim_key,
+        WorkspaceIncarnationClaimRecord {
+            workbench_id: request.destination_workbench_id.clone(),
+        }
+        .encode()?,
+    )?;
     plan.put_absent(
         MetadataFamily::Operation,
         operation_key,
@@ -1277,6 +1314,7 @@ pub fn complete_restore(
     release_source_retention(store, context, &loaded.record, &mut plan)?;
     plan.events
         .push(change_event_projection(&ChangeEventRecord {
+            workbench_id: next.destination_workbench_id.clone(),
             workspace_incarnation_id: result.destination_workspace_incarnation_id,
             kind: ChangeEventKind::WorkspaceRestored,
             artifact_revision_id: None,
@@ -3392,6 +3430,41 @@ mod tests {
             RestoreOperationRequest { operation_id },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn restore_cannot_reuse_an_existing_workspace_incarnation() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 0);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let destination = workbench("duplicate-incarnation-destination");
+
+        assert_eq!(
+            begin_restore(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                &BeginRestoreRequest {
+                    source_workbench_id: source.source_workbench.clone(),
+                    expected_source_workspace_incarnation_id: source.source_incarnation,
+                    source: RestoreSourceSelector::Snapshot(snapshot_id),
+                    destination_workbench_id: destination.clone(),
+                    destination_workspace_incarnation_id: source.source_incarnation,
+                    restore_manifest: restore_manifest_descriptor(&source.initialization),
+                },
+            ),
+            Err(RestoreError::DestinationIncarnationClaimed {
+                incarnation_id: source.source_incarnation,
+                workbench_id: source.source_workbench.clone(),
+            })
+        );
+        assert_eq!(
+            get_visible_workspace_at(&store, read_context(&store, owner_epoch), &destination)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

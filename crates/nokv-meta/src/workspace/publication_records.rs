@@ -13,8 +13,8 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, CommitVersion, GcClaimState, Generation, OperationId, ReferenceEpoch,
-    RevisionState, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState, FIXED_ID_BYTES,
-    SHA256_BYTES,
+    RevisionState, WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState,
+    FIXED_ID_BYTES, SHA256_BYTES,
 };
 
 /// Only supported value format for publication payload records.
@@ -47,6 +47,12 @@ pub struct WorkspaceRecord {
     pub workspace_revision: WorkspaceRevision,
     pub state: WorkspaceState,
     pub owning_operation_id: Option<OperationId>,
+}
+
+/// Permanent owner of one never-reused workspace incarnation identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceIncarnationClaimRecord {
+    pub workbench_id: WorkbenchId,
 }
 
 /// Current authoritative value for one normalized path.
@@ -133,6 +139,9 @@ pub enum PublicationRecordCodecError {
     InvalidUtf8 {
         field: &'static str,
     },
+    InvalidWorkbenchId {
+        reason: String,
+    },
     EmptyString {
         field: &'static str,
     },
@@ -177,6 +186,9 @@ impl fmt::Display for PublicationRecordCodecError {
                 write!(formatter, "{field} length {length} exceeds maximum {max}")
             }
             Self::InvalidUtf8 { field } => write!(formatter, "{field} is not valid UTF-8"),
+            Self::InvalidWorkbenchId { reason } => {
+                write!(formatter, "invalid claimed workbench id: {reason}")
+            }
             Self::EmptyString { field } => write!(formatter, "{field} must not be empty"),
             Self::ContainsNul { field, index } => {
                 write!(formatter, "{field} contains NUL at byte offset {index}")
@@ -237,6 +249,37 @@ impl WorkspaceRecord {
             state,
             owning_operation_id,
         })
+    }
+}
+
+impl WorkspaceIncarnationClaimRecord {
+    pub fn encode(&self) -> Result<Vec<u8>, PublicationRecordCodecError> {
+        let mut encoded = Vec::with_capacity(1 + 4 + self.workbench_id.as_bytes().len());
+        encoded.push(PUBLICATION_VALUE_FORMAT_VERSION);
+        put_bounded_bytes(
+            &mut encoded,
+            "workbench_id",
+            self.workbench_id.as_bytes(),
+            WorkbenchId::MAX_BYTES,
+        )?;
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, PublicationRecordCodecError> {
+        let mut decoder = Decoder::new(encoded);
+        decoder.require_value_version()?;
+        let bytes = decoder.bounded_bytes("workbench_id", WorkbenchId::MAX_BYTES)?;
+        let value =
+            String::from_utf8(bytes).map_err(|_| PublicationRecordCodecError::InvalidUtf8 {
+                field: "workbench_id",
+            })?;
+        let workbench_id = WorkbenchId::new(value).map_err(|error| {
+            PublicationRecordCodecError::InvalidWorkbenchId {
+                reason: error.to_string(),
+            }
+        })?;
+        decoder.finish()?;
+        Ok(Self { workbench_id })
     }
 }
 
@@ -908,6 +951,38 @@ mod tests {
     }
 
     #[test]
+    fn workspace_incarnation_claim_has_frozen_golden_bytes() {
+        let record = WorkspaceIncarnationClaimRecord {
+            workbench_id: WorkbenchId::new("run-42").unwrap(),
+        };
+        let expected = [
+            &[PUBLICATION_VALUE_FORMAT_VERSION][..],
+            &6_u32.to_be_bytes(),
+            b"run-42",
+        ]
+        .concat();
+
+        assert_eq!(record.encode().unwrap(), expected);
+        assert_eq!(
+            WorkspaceIncarnationClaimRecord::decode(&expected).unwrap(),
+            record
+        );
+        assert_every_proper_prefix_is_truncated(&expected, WorkspaceIncarnationClaimRecord::decode);
+        assert_trailing_byte_is_rejected(expected, WorkspaceIncarnationClaimRecord::decode);
+
+        let invalid = [
+            &[PUBLICATION_VALUE_FORMAT_VERSION][..],
+            &4_u32.to_be_bytes(),
+            b"bad!",
+        ]
+        .concat();
+        assert!(matches!(
+            WorkspaceIncarnationClaimRecord::decode(&invalid),
+            Err(PublicationRecordCodecError::InvalidWorkbenchId { .. })
+        ));
+    }
+
+    #[test]
     fn path_entry_codec_has_frozen_golden_bytes() {
         let record = path_entry();
         let expected = [
@@ -1010,8 +1085,12 @@ mod tests {
         let revision_ref = RevisionRefRecord {
             reference_epoch_at_add: ReferenceEpoch::new(1),
         };
+        let claim = WorkspaceIncarnationClaimRecord {
+            workbench_id: WorkbenchId::new("claim").unwrap(),
+        };
         let mut encoded = [
             workspace_record().encode().unwrap(),
+            claim.encode().unwrap(),
             path_entry().encode().unwrap(),
             artifact_revision_record().encode().unwrap(),
             revision_ref.encode().unwrap(),
@@ -1026,19 +1105,23 @@ mod tests {
             Err(PublicationRecordCodecError::UnsupportedValueVersion { .. })
         ));
         assert!(matches!(
-            PathEntry::decode(&encoded[1]),
+            WorkspaceIncarnationClaimRecord::decode(&encoded[1]),
             Err(PublicationRecordCodecError::UnsupportedValueVersion { .. })
         ));
         assert!(matches!(
-            ArtifactRevisionRecord::decode(&encoded[2]),
+            PathEntry::decode(&encoded[2]),
             Err(PublicationRecordCodecError::UnsupportedValueVersion { .. })
         ));
         assert!(matches!(
-            RevisionRefRecord::decode(&encoded[3]),
+            ArtifactRevisionRecord::decode(&encoded[3]),
             Err(PublicationRecordCodecError::UnsupportedValueVersion { .. })
         ));
         assert!(matches!(
-            GcCandidateRecord::decode(&encoded[4]),
+            RevisionRefRecord::decode(&encoded[4]),
+            Err(PublicationRecordCodecError::UnsupportedValueVersion { .. })
+        ));
+        assert!(matches!(
+            GcCandidateRecord::decode(&encoded[5]),
             Err(PublicationRecordCodecError::UnsupportedValueVersion { .. })
         ));
 

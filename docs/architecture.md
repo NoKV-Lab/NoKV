@@ -79,6 +79,9 @@ RootFence(root_id)                        installed shard-local fence
 WorkspaceCurrent(root_id, workbench_id)
   -> incarnation, revision, lifecycle
 
+WorkspaceIncarnationClaim(root_id, incarnation)
+  -> stable workbench_id; permanent and never reused
+
 PathCurrent(root_id, incarnation, path)
   -> generation, immutable revision, body/manifest digests, size,
      dependency bounds, content type, typed projection
@@ -88,11 +91,13 @@ PathCurrent(root_id, incarnation, path)
 path keys by a never-reused incarnation. This prevents a failed restore or
 retired Workbench's rows from appearing under a later claim.
 
-Paths are exact case-sensitive UTF-8 components separated in physical keys by
-NUL. The exact key ends in reserved byte `0xff`, which valid UTF-8 cannot
-contain; child/subtree prefixes omit it and add NUL. The same normalizer/codec
-owns storage keys, request identities, index identities, and restore member
-ids.
+Paths are exact case-sensitive UTF-8. The physical codec adds one to each UTF-8
+byte, separates components with NUL, and ends an exact key with marker `0x01`.
+This reserves both markers, places a child's delimiter rollup before its exact
+artifact and both before longer siblings, and prevents an exact key from being
+a strict prefix of another valid path key. The same normalizer/codec owns
+storage keys, request identities, index identities, and restore member ids.
+System format version 8 gates this layout.
 
 Directories are implicit. The Workbench root and five standard sections are
 virtual. A file stat is a point read; an implicit-directory stat is a prefix
@@ -123,12 +128,21 @@ sequenceDiagram
 A valid cached Workbench marker can avoid its routing/lookup work, but the
 client still uses generation/version validation. The authoritative artifact
 lookup is one Holt point read and does not follow the revision-lifetime row.
-A list replaces the path lookup with one delimiter scan; when the prefix can
-itself be a file it merges one exact-prefix point read after the descendants.
+For a live exact get, the owner, root fence, and current version are validated
+once around the dependent marker and path reads. A direct-child list replaces
+the path lookup with one ordered prefix-scan path whose common-prefix rollups
+are first-class implicit-prefix page items; a recursive list uses the same
+prefix without delimiter rollup. One protocol page may use multiple bounded
+Holt cursor scans of at most 255 logical items each when its requested limit is
+larger. The metadata listing may merge an exact-prefix point read only after
+descendant EOF, while the Workbench adapter exposes only direct children and
+drops that self row.
 There is no per-entry metadata fanout. The returned cursor is bound to the
 workbench scope, read view, read version, and child anchor. Resuming after
 live-state drift fails closed;
 an initial bounded collection may restart in full but never merges versions.
+The breaking ordered-list response is gated by protocol schema
+`nokv.workspace.rpc.v2`; there is no legacy response decoder.
 
 Secondary-index queries run at one read version and filter every result by the
 matching visible incarnation. Object bodies are read only when the selected

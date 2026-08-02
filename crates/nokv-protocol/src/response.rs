@@ -305,10 +305,40 @@ impl PathReadResult {
     }
 }
 
+/// One item in an ordered path listing.
+///
+/// `Prefix` identifies an implicit direct-child grouping. It carries no
+/// durable directory identity or artifact metadata.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+// Artifact rows dominate recursive pages. Keeping them inline avoids one heap
+// allocation per hot-path row; direct-prefix pages accept the larger slot.
+#[allow(clippy::large_enum_variant)]
+pub enum PathListEntry {
+    Artifact(PathMetadata),
+    Prefix(WorkspacePath),
+}
+
+impl PathListEntry {
+    pub fn path(&self) -> &WorkspacePath {
+        match self {
+            Self::Artifact(metadata) => &metadata.path,
+            Self::Prefix(path) => path,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Artifact(metadata) => metadata.validate(),
+            Self::Prefix(_) => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PathPage {
-    pub entries: Vec<PathMetadata>,
+    pub entries: Vec<PathListEntry>,
     pub next_cursor: Option<Vec<u8>>,
     pub read_version: u64,
 }

@@ -34,6 +34,7 @@ use super::engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
     HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, RootFenceAction,
 };
+use super::event_projection::change_event_projection;
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
     RevisionRefRecord, WorkspaceRecord,
@@ -43,7 +44,6 @@ use super::publish_operation_records::{
     PublishRecordError, PublishResult, PublishTerminalError, PublishTransition, StagedObjectRecord,
     MAX_DEPENDENCY_COUNT, MAX_MANIFEST_ROWS, MAX_STAGED_OBJECTS,
 };
-use super::query::change_event_projection;
 use super::query_records::{
     secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
     SecondaryIndexRecord, TypedProjection,
@@ -2954,6 +2954,7 @@ impl PublicationService<'_> {
         ) {
             plan.events
                 .push(change_event_projection(&ChangeEventRecord {
+                    workbench_id: request.expected_operation.workbench_id.clone(),
                     workspace_incarnation_id: request.expected_operation.workspace_incarnation_id,
                     kind: ChangeEventKind::ArtifactPublished,
                     artifact_revision_id: Some(request.expected_operation.artifact_revision_id),

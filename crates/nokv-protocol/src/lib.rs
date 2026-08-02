@@ -47,10 +47,10 @@ pub use response::{
     AggregateGroup, AggregateResult, CatalogField, CatalogResult, ChangeEvent, ChangeKind,
     ChangePage, CommitManifestBinding, CommitPreparation, CommitResult, FacetBucket, FacetResult,
     FindWorkspacesResult, OperationProgress, OperationResult, OperationState, OperationStatus,
-    PathPage, PathReadResult, PublishResult, RemovePathResult, RestoreOperationPreparation,
-    RestorePreparation, RestoreResult, SearchHit, SearchResult, SnapshotPage, SnapshotResult,
-    SnapshotStatus, WorkspacePreflightResult, WorkspaceResult, WorkspaceRpcOutcome,
-    WorkspaceRpcResponse, WorkspaceSummary, WorkspaceSummaryWithCommit,
+    PathListEntry, PathPage, PathReadResult, PublishResult, RemovePathResult,
+    RestoreOperationPreparation, RestorePreparation, RestoreResult, SearchHit, SearchResult,
+    SnapshotPage, SnapshotResult, SnapshotStatus, WorkspacePreflightResult, WorkspaceResult,
+    WorkspaceRpcOutcome, WorkspaceRpcResponse, WorkspaceSummary, WorkspaceSummaryWithCommit,
 };
 pub use types::{
     AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,

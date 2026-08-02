@@ -19,7 +19,7 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 7
+     format_version = 8
 ```
 
 Startup is fail-closed:
@@ -66,16 +66,19 @@ canonical path key is:
 PathCurrent key =
   root_id
   | workspace_incarnation_id
-  | component_0 | NUL | ... | component_n | 0xff
+  | ordered(component_0) | NUL | ... | ordered(component_n) | 0x01
 ```
 
-`0xff` is the exact-key terminator and cannot occur in valid UTF-8. A
-child/subtree prefix encodes the same components without `0xff` and appends
-NUL, so no exact key is a strict prefix of a descendant key and `a` cannot
-match `ab`. This also lets Holt represent an artifact head and descendants at
-the same logical child without an ART inner-node collision. The empty path has
-no `PathCurrent` record; the workspace root is synthesized from
-`WorkspaceCurrent`.
+`ordered(component)` adds one to each valid UTF-8 byte. Valid UTF-8 never uses
+`0xff`, so the transform is length-preserving, reversible, and preserves byte
+order while reserving `0x00` and `0x01`. NUL is the physical component
+delimiter; `0x01` terminates an exact row. The resulting order is `a/NUL
+subtree`, exact `a`, then longer siblings such as `a\u{1}` and `ab`, and no
+exact key is a strict prefix of another valid path key. A child/subtree prefix
+appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
+record; the workspace root is synthesized from `WorkspaceCurrent`. This
+key-layout cutover is gated by system format version 8; older stores are
+rejected rather than dual-read.
 
 The one shared normalizer enforces:
 
@@ -96,11 +99,12 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `7`. Durable codecs are independently versioned:
+`System.format_version` is `8`. Durable codecs are independently versioned:
 publication-owned workspace/path/revision records and immutable commit records
-use value version `2`; other ordinary workspace records and recovery-outbox
-logical/header/chunk records currently use value version `1`; `CommandDedupe`
-uses version `2` to bind its
+use value version `2`; `ChangeEvent` and the logical recovery-outbox record use
+value version `2`; other ordinary workspace records and the recovery storage
+header/chunk records currently use value version `1`; `CommandDedupe` uses
+version `2` to bind its
 exact result to a recovery LSN; `BuildCommitOperation` uses version `5` to
 retain the complete exact commit request, opaque Agent projection-input digest,
 first owner-observed commit time, run-manifest publication condition, and
@@ -136,6 +140,7 @@ The exact Holt tree names and `History` source-family tags are:
 | `command_dedupe` | `0x14` |
 | `gc_candidate` | `0x15` |
 | `gc_barrier` | `0x16` |
+| `workspace_incarnation_claim` | `0x17` |
 
 `system`, `history`, and `recovery_outbox` are reserved engine trees and are
 not themselves history sources. `recovery_outbox` has no `MetadataFamily` tag:
@@ -181,7 +186,7 @@ reopen, and unknown-value rejection tests.
 
 ```text
 Path:
-  workspace_incarnation_id | u32(path_bytes) | NUL-separated path bytes
+  workspace_incarnation_id | u32(path_bytes) | ordered, NUL-separated path bytes
 Commit:
   commit_id
 RevisionDependency:
@@ -261,6 +266,14 @@ WorkspaceCurrent
        Staging | Visible | Retired, owning operation,
        created_version, modified_version
 
+WorkspaceIncarnationClaim
+  key: root_id | workspace_incarnation_id
+  val: stable workbench_id
+
+  The claim is created atomically with a direct Workbench create or restore
+  staging marker and is never deleted. It prevents two names from sharing the
+  same PathCurrent namespace and enforces never-reused incarnation identities.
+
 PathCurrent
   key: root_id | workspace_incarnation_id | normalized_relative_path
   val: PathEntry: generation, artifact_revision_id, logical_size,
@@ -331,12 +344,13 @@ CommitConsumer
 
 SecondaryIndex
   key: root_id | index_id | encoded_value
-       | workspace_incarnation_id | normalized_relative_path
+       | workspace_incarnation_id | ordered(normalized_relative_path)
   val: path_generation, compact projection
 
 ChangeEvent
   key: root_id | commit_version | event_sequence
-  val: workspace_incarnation_id, typed event, compact before/after projection
+  val: stable workbench_id, workspace_incarnation_id,
+       typed event, compact before/after projection
 
 Operation
   key: root_id | operation_kind | operation_id
@@ -370,6 +384,31 @@ History
        | inverted_commit_version
   val: previous versioned value or tombstone
 ```
+
+`ReadChanges` treats `(commit_version, event_sequence)` as an append-only log
+position. Its opaque cursor is bound to the root, query scope, and optional
+`after_commit_version`; unlike frozen search and catalog cursors, it may resume
+against a later root read version. The engine seeks strictly after that event
+key and streams until one visible-page lookahead is found. A version-only
+`after_commit_version` excludes every sequence in that commit. Workspace
+visibility is still re-evaluated at each event's own commit version, so staging
+incarnations do not leak through the feed. Each event stores its stable
+Workbench id, so root- and workspace-scoped feeds point-read that exact marker
+and verify its incarnation instead of scanning every marker at each event
+version. Repeated events for one Workbench in one commit share the marker
+result. An `after_commit_version` newer than the fenced root version fails
+closed.
+
+Both scopes currently seek the root-wide `ChangeEvent` keyspace. A
+workspace-scoped feed filters on the embedded stable Workbench id after that
+seek, so a sparse Workbench on a hot Root still does work proportional to the
+intervening root events. A future per-Workbench event index must be an atomic,
+repairable projection before that workload can claim Workbench-local seek.
+
+The current format does not truncate `ChangeEvent` or the visibility History
+needed to interpret it. A cursor is therefore not a retention lease. Any future
+event/history GC must first define one shared consumer frontier and a typed
+expired-position failure.
 
 The outbox covers the three real shard-local write entrypoints: metadata
 commands, monotonic lease-clock observations, and physical-owner epoch
@@ -414,11 +453,16 @@ atomically retains the immutable revision fields required to shape complete
 A client/router
 may cache the incarnation because `Visible` is immutable; every request
 still passes the active `RootFence` and owner-epoch fence. The authoritative
-artifact lookup itself remains one Holt point read. Listing performs the same
-marker check followed by one delimiter-aware ordered scan. When the requested
-prefix can itself be a published file, listing also performs one exact prefix
-point read and merges that row after its descendants to preserve canonical key
-order; it never performs per-entry revision reads.
+artifact lookup itself remains one Holt point read. A live direct-child listing
+performs the same marker check followed by one delimiter-aware ordered prefix
+scan path. Each engine call returns at most 255 logical items; a protocol page
+with a larger limit advances the exclusive marker through multiple bounded
+calls. Each Holt common-prefix rollup becomes one storage-neutral `Prefix` page
+item; an exact artifact at the same logical child wins. Recursive listing emits
+only artifact items. When the requested prefix can itself be a published file,
+the metadata listing also performs one exact-prefix point read after descendant
+EOF; the Workbench direct-child adapter does not expose the requested path as
+its own child. No listing performs per-entry revision reads.
 
 Each list page reports the exact `RootReadContext.read_version`. Continuations
 must send that version as an expected fence; an owner that has advanced returns

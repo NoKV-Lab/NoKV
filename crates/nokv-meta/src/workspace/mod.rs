@@ -7,6 +7,7 @@ mod codec;
 mod commit;
 mod commit_records;
 mod engine;
+mod event_projection;
 mod gc;
 mod gc_records;
 mod namespace;
@@ -15,6 +16,8 @@ mod publication_records;
 mod publish_operation_records;
 mod query;
 mod query_records;
+#[cfg(feature = "metadata-read-stats")]
+mod read_stats;
 mod records;
 mod recovery;
 mod remove;
@@ -67,6 +70,8 @@ pub use commit_records::{
     COMMIT_VALUE_FORMAT_VERSION, MAX_COMMIT_DIGEST_URI_BYTES, MAX_COMMIT_LINEAGE_BYTES,
     MAX_COMMIT_MEMBER_PROJECTION_BYTES, MAX_COMMIT_PRODUCER_BYTES, MAX_PARENT_COMMITS,
 };
+#[cfg(feature = "metadata-read-stats")]
+pub use engine::MetadataReadStatsSession;
 pub use engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
     HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, MetadataScanItem,
@@ -84,10 +89,11 @@ pub use gc_records::{
     GC_VALUE_FORMAT_VERSION, MAX_GC_EVIDENCE_BYTES,
 };
 pub use namespace::{
-    create_visible_workspace, get_path_at_visible_workspace, get_visible_path_at,
-    get_visible_workspace_at, scan_paths_at_visible_workspace, scan_visible_paths_at,
-    CreateVisibleWorkspaceResult, NamespaceError, RootReadContext, RootWriteContext, VisiblePath,
-    VisiblePathPage, MAX_VISIBLE_PATH_PAGE_SIZE,
+    create_visible_workspace, get_current_visible_workspace_path, get_path_at_visible_workspace,
+    get_visible_path_at, get_visible_workspace_at, get_visible_workspace_path_at,
+    list_paths_at_visible_workspace, CreateVisibleWorkspaceResult, NamespaceError, RootReadContext,
+    RootWriteContext, VisiblePathChild, VisiblePathListPage, VisibleWorkspacePathRead,
+    MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
 };
 pub use publication::{
     advance_manifest_rolling_digest, advance_staged_object_rolling_digest, dependency_owner_digest,
@@ -100,7 +106,7 @@ pub use publication::{
 };
 pub use publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
-    RevisionRefRecord, WorkspaceRecord, MAX_CONTENT_TYPE_BYTES,
+    RevisionRefRecord, WorkspaceIncarnationClaimRecord, WorkspaceRecord, MAX_CONTENT_TYPE_BYTES,
     MAX_DEPENDENCY_COUNT as MAX_REVISION_DEPENDENCIES,
     MAX_DEPENDENCY_DEPTH as MAX_REVISION_DEPENDENCY_DEPTH, MAX_DIGEST_URI_BYTES,
     MAX_INDEX_PROJECTION_BYTES, MAX_MANIFEST_ID_BYTES, MAX_PRODUCER_BYTES,
@@ -114,22 +120,26 @@ pub use publish_operation_records::{
     PUBLISH_VALUE_FORMAT_VERSION,
 };
 pub use query::{
-    aggregate_paths_at, catalog_fields_at, change_event_projection, find_workspaces_at,
-    get_workspace_at, read_changes_at, search_paths_at, AggregateFunction, AggregateGroup,
-    AggregatePage, AggregateRequest, AggregateSpec, CatalogField, CatalogPage, CatalogRequest,
-    ChangeEvent, ChangePage, ChangePageRequest, CommittedFilter, FacetBucket, FacetResult,
-    FindWorkspacesPage, FindWorkspacesRequest, QueryError, QueryOperand, QueryOperator,
-    QueryPredicate, QueryScope, QuerySort, QuerySortDirection, SearchHit, SearchPage,
-    SearchRequest, WorkspaceDiscovery, MAX_FACET_BUCKETS_PER_FIELD, MAX_QUERY_AGGREGATES,
-    MAX_QUERY_CURSOR_BYTES, MAX_QUERY_FACET_FIELDS, MAX_QUERY_GROUP_FIELDS, MAX_QUERY_IN_VALUES,
-    MAX_QUERY_PAGE_SIZE, MAX_QUERY_PREDICATES, MAX_QUERY_PROJECTION_FIELDS, MAX_QUERY_SORT_FIELDS,
+    aggregate_paths_at, catalog_fields_at, find_workspaces_at, get_workspace_at, read_changes_at,
+    search_paths_at, AggregateFunction, AggregateGroup, AggregatePage, AggregateRequest,
+    AggregateSpec, CatalogField, CatalogPage, CatalogRequest, ChangeEvent, ChangePage,
+    ChangePageRequest, CommittedFilter, FacetBucket, FacetResult, FindWorkspacesPage,
+    FindWorkspacesRequest, QueryError, QueryOperand, QueryOperator, QueryPredicate, QueryScope,
+    QuerySort, QuerySortDirection, SearchHit, SearchPage, SearchRequest, WorkspaceDiscovery,
+    MAX_FACET_BUCKETS_PER_FIELD, MAX_QUERY_AGGREGATES, MAX_QUERY_CURSOR_BYTES,
+    MAX_QUERY_FACET_FIELDS, MAX_QUERY_GROUP_FIELDS, MAX_QUERY_IN_VALUES, MAX_QUERY_PAGE_SIZE,
+    MAX_QUERY_PREDICATES, MAX_QUERY_PROJECTION_FIELDS, MAX_QUERY_SORT_FIELDS,
 };
 pub use query_records::{
     encode_ordered_index_scalar, secondary_index_field_prefix, secondary_index_key,
     ChangeEventKind, ChangeEventRecord, FiniteFloat, QueryFieldId, QueryRecordError, QueryScalar,
-    QueryScalarType, SecondaryIndexRecord, TypedProjection, MAX_QUERY_FIELD_ID_BYTES,
-    MAX_QUERY_SCALAR_BYTES, MAX_TYPED_PROJECTION_BYTES, MAX_TYPED_PROJECTION_FIELDS,
-    QUERY_RECORD_VALUE_FORMAT_VERSION,
+    QueryScalarType, SecondaryIndexRecord, TypedProjection, CHANGE_EVENT_VALUE_FORMAT_VERSION,
+    MAX_QUERY_FIELD_ID_BYTES, MAX_QUERY_SCALAR_BYTES, MAX_TYPED_PROJECTION_BYTES,
+    MAX_TYPED_PROJECTION_FIELDS, QUERY_RECORD_VALUE_FORMAT_VERSION,
+};
+#[cfg(feature = "metadata-read-stats")]
+pub use read_stats::{
+    MetadataReadStats, MetadataReadStatsDeltaError, MetadataReadStatsSessionError,
 };
 pub use records::{CommandDedupeRecord, CurrentValue, HistoryValue, RecordCodecError, RootFence};
 pub use recovery::{

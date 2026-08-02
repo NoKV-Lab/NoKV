@@ -21,12 +21,12 @@ use nokv_types::{
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    decode_path_current_key, path_child_prefix, workbench_commit_head_key, workspace_current_key,
+    change_event_key, decode_change_event_key as decode_change_event_key_bytes,
+    decode_path_current_key, decode_workspace_current_key, path_child_prefix,
+    workbench_commit_head_key,
 };
 use super::commit_records::{CommitRecordError, WorkbenchCommitHeadRecord};
-use super::engine::{
-    AgentMetadataError, AgentMetadataStore, EventProjection, MetadataFamily, MetadataScanItem,
-};
+use super::engine::{AgentMetadataError, AgentMetadataStore, MetadataFamily, MetadataScanItem};
 use super::namespace::{get_visible_workspace_at, NamespaceError, RootReadContext};
 use super::publication_records::{PathEntry, PublicationRecordCodecError, WorkspaceRecord};
 use super::query_records::{
@@ -303,7 +303,8 @@ pub struct ChangeEvent {
     pub event: ChangeEventRecord,
 }
 
-/// One stable change-event page.
+/// One append-only change-event page. Its cursor is a durable event position
+/// and may resume against a later root read version.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangePage {
     pub events: Vec<ChangeEvent>,
@@ -822,27 +823,67 @@ pub fn get_workspace_at(
     }))
 }
 
-/// Encode one canonical durable change event for a metadata command.
-pub fn change_event_projection(
-    event: &ChangeEventRecord,
-) -> Result<EventProjection, QueryRecordError> {
-    Ok(EventProjection {
-        payload: event.encode()?,
-    })
-}
-
-/// Page strict typed events, rechecking workspace visibility at each event's
-/// commit version.
+/// Page strict typed events from an append-only durable position, rechecking
+/// workspace visibility at each event's commit version.
 pub fn read_changes_at(
     store: &AgentMetadataStore,
     context: RootReadContext,
     request: &ChangePageRequest,
 ) -> Result<ChangePage, QueryError> {
     validate_page(request.limit)?;
+    if request
+        .after_commit_version
+        .is_some_and(|version| version.get() > context.read_version.get())
+    {
+        return Err(QueryError::Engine(
+            AgentMetadataError::ReadVersionInFuture {
+                requested: request
+                    .after_commit_version
+                    .expect("checked as present")
+                    .get(),
+                current: context.read_version.get(),
+            },
+        ));
+    }
     let prefix = context.root_id.as_bytes();
-    let mut marker = None;
-    let mut raw_events = Vec::new();
-    loop {
+    let digest = change_digest(context.root_id, request);
+    let mut visible_cache = None;
+    let mut marker = match request.cursor.as_deref() {
+        Some(cursor) => {
+            let (commit_version, sequence) =
+                decode_change_cursor(cursor, context, digest, request.after_commit_version)?;
+            let marker = change_event_key(context.root_id, commit_version, sequence);
+            let payload = store
+                .read_change_event_at(
+                    context.root_id,
+                    context.placement_generation,
+                    context.owner_epoch,
+                    &marker,
+                    context.read_version,
+                )?
+                .ok_or(QueryError::CursorAnchorMissing)?;
+            let anchor = visible_change_event(
+                store,
+                context,
+                &request.scope,
+                MetadataScanItem {
+                    key: marker.clone(),
+                    value: payload,
+                },
+                &mut visible_cache,
+            )?;
+            if anchor.is_none() {
+                return Err(QueryError::CursorAnchorMissing);
+            }
+            Some(marker)
+        }
+        None => request
+            .after_commit_version
+            .map(|version| change_event_key(context.root_id, version, u32::MAX)),
+    };
+
+    let mut events = Vec::with_capacity(request.limit.saturating_add(1));
+    'scan: loop {
         let batch = store.scan_change_events_at(
             context.root_id,
             context.placement_generation,
@@ -855,83 +896,98 @@ pub fn read_changes_at(
         if batch.is_empty() {
             break;
         }
-        marker = batch.last().map(|item| item.key.clone());
         let short = batch.len() < ENGINE_SCAN_BATCH;
-        raw_events.extend(batch);
+        for item in batch {
+            marker = Some(item.key.clone());
+            if let Some(event) =
+                visible_change_event(store, context, &request.scope, item, &mut visible_cache)?
+            {
+                events.push(event);
+                if events.len() > request.limit {
+                    break 'scan;
+                }
+            }
+        }
         if short {
             break;
         }
     }
 
-    let mut visible_cache =
-        BTreeMap::<CommitVersion, BTreeMap<WorkspaceIncarnationId, WorkbenchId>>::new();
-    let mut events = Vec::new();
-    for item in raw_events {
-        let (commit_version, sequence) = decode_change_event_key(context.root_id, &item.key)?;
-        if request
-            .after_commit_version
-            .is_some_and(|after| commit_version <= after)
-        {
-            continue;
-        }
-        let event = ChangeEventRecord::decode(&item.value)?;
-        let visible = if let Some(visible) = visible_cache.get(&commit_version) {
-            visible
-        } else {
-            let event_context = RootReadContext {
-                read_version: ReadVersion::new(commit_version.get())
-                    .expect("commit version is a readable version"),
-                ..context
-            };
-            let by_incarnation = scan_visible_workspaces(store, event_context)?
-                .into_iter()
-                .map(|(name, marker)| (marker.incarnation_id, name))
-                .collect();
-            visible_cache.insert(commit_version, by_incarnation);
-            visible_cache
-                .get(&commit_version)
-                .expect("inserted event visibility cache")
-        };
-        let Some(workbench_id) = visible.get(&event.workspace_incarnation_id).cloned() else {
-            continue;
-        };
-        if matches!(
-            &request.scope,
-            QueryScope::Workspace(expected) if expected != &workbench_id
-        ) {
-            continue;
-        }
-        events.push(ChangeEvent {
-            workbench_id,
-            commit_version,
-            sequence,
-            event,
-        });
+    let has_more = events.len() > request.limit;
+    if has_more {
+        events.truncate(request.limit);
     }
-    events.sort_by_key(|event| (event.commit_version, event.sequence));
-
-    let digest = change_digest(request);
-    let start = cursor_start(
-        request.cursor.as_deref(),
-        CursorKind::Changes,
-        context.read_version,
-        digest,
-        events.iter().map(change_event_identity),
-    )?;
-    let end = start.saturating_add(request.limit).min(events.len());
-    let next_cursor = (end < events.len()).then(|| {
+    let next_cursor = has_more.then(|| {
         encode_cursor(
             CursorKind::Changes,
             context.read_version,
             digest,
-            &change_event_identity(&events[end - 1]),
+            &change_event_identity(
+                events
+                    .last()
+                    .expect("a change page with lookahead returns one event"),
+            ),
         )
     });
     Ok(ChangePage {
-        events: events[start..end].to_vec(),
+        events,
         next_cursor,
         read_version: context.read_version,
     })
+}
+
+fn visible_change_event(
+    store: &AgentMetadataStore,
+    context: RootReadContext,
+    scope: &QueryScope,
+    item: MetadataScanItem,
+    visible_cache: &mut Option<(
+        CommitVersion,
+        BTreeMap<WorkbenchId, Option<WorkspaceIncarnationId>>,
+    )>,
+) -> Result<Option<ChangeEvent>, QueryError> {
+    let (commit_version, sequence) = decode_change_event_key(context.root_id, &item.key)?;
+    let event = ChangeEventRecord::decode(&item.value)?;
+    if matches!(scope, QueryScope::Workspace(expected) if expected != &event.workbench_id) {
+        return Ok(None);
+    }
+    if visible_cache
+        .as_ref()
+        .is_none_or(|(cached_version, _)| *cached_version != commit_version)
+    {
+        *visible_cache = Some((commit_version, BTreeMap::new()));
+    }
+    let visible = &mut visible_cache
+        .as_mut()
+        .expect("event visibility was cached for the current commit")
+        .1;
+    if !visible.contains_key(&event.workbench_id) {
+        let event_context = RootReadContext {
+            read_version: ReadVersion::new(commit_version.get())
+                .expect("commit version is a readable version"),
+            ..context
+        };
+        let incarnation = get_visible_workspace_at(store, event_context, &event.workbench_id)?
+            .map(|marker| marker.incarnation_id);
+        visible.insert(event.workbench_id.clone(), incarnation);
+    }
+    if visible.get(&event.workbench_id).copied().flatten() != Some(event.workspace_incarnation_id) {
+        return Ok(None);
+    }
+    let workbench_id = event.workbench_id.clone();
+    debug_assert_eq!(
+        visible_cache
+            .as_ref()
+            .expect("event visibility was cached for the current commit")
+            .0,
+        commit_version
+    );
+    Ok(Some(ChangeEvent {
+        workbench_id,
+        commit_version,
+        sequence,
+        event,
+    }))
 }
 
 fn collect_rows(
@@ -1004,7 +1060,13 @@ fn scan_visible_workspaces(
     let mut visible = Vec::new();
     let mut incarnations = BTreeSet::new();
     for item in items {
-        let workbench_id = decode_workspace_current_key(context.root_id, &item.key)?;
+        let workbench_id =
+            decode_workspace_current_key(context.root_id, &item.key).ok_or_else(|| {
+                QueryError::CorruptKey {
+                    family: "WorkspaceCurrent",
+                    reason: "key is not the canonical root/workbench encoding".to_owned(),
+                }
+            })?;
         let workspace = WorkspaceRecord::decode(&item.value)
             .map_err(|source| QueryError::WorkspaceCodec { source })?;
         if workspace.state != WorkspaceState::Visible {
@@ -1089,67 +1151,11 @@ fn scan_all_prefix(
     Ok(items)
 }
 
-fn decode_workspace_current_key(root: RootId, key: &[u8]) -> Result<WorkbenchId, QueryError> {
-    const HEADER: usize = FIXED_ID_BYTES + 4;
-    if key.len() < HEADER || !key.starts_with(root.as_bytes()) {
-        return Err(QueryError::CorruptKey {
-            family: "WorkspaceCurrent",
-            reason: "key is truncated or outside the root".to_owned(),
-        });
-    }
-    let length = u32::from_be_bytes(
-        key[FIXED_ID_BYTES..HEADER]
-            .try_into()
-            .expect("validated length width"),
-    ) as usize;
-    if key.len() != HEADER + length {
-        return Err(QueryError::CorruptKey {
-            family: "WorkspaceCurrent",
-            reason: "workbench length does not consume the exact key".to_owned(),
-        });
-    }
-    let name = std::str::from_utf8(&key[HEADER..]).map_err(|error| QueryError::CorruptKey {
-        family: "WorkspaceCurrent",
-        reason: format!("workbench id is not UTF-8: {error}"),
-    })?;
-    let workbench_id =
-        WorkbenchId::new(name.to_owned()).map_err(|error| QueryError::CorruptKey {
-            family: "WorkspaceCurrent",
-            reason: format!("invalid workbench id: {error}"),
-        })?;
-    if workspace_current_key(root, &workbench_id) != key {
-        return Err(QueryError::CorruptKey {
-            family: "WorkspaceCurrent",
-            reason: "workbench key is not canonical".to_owned(),
-        });
-    }
-    Ok(workbench_id)
-}
-
 fn decode_change_event_key(root: RootId, key: &[u8]) -> Result<(CommitVersion, u32), QueryError> {
-    const EXPECTED: usize = FIXED_ID_BYTES + 8 + 4;
-    if key.len() != EXPECTED || !key.starts_with(root.as_bytes()) {
-        return Err(QueryError::CorruptKey {
-            family: "ChangeEvent",
-            reason: "key has a noncanonical root/version/sequence width".to_owned(),
-        });
-    }
-    let commit_version = u64::from_be_bytes(
-        key[FIXED_ID_BYTES..FIXED_ID_BYTES + 8]
-            .try_into()
-            .expect("validated commit-version width"),
-    );
-    let commit_version =
-        CommitVersion::new(commit_version).map_err(|_| QueryError::CorruptKey {
-            family: "ChangeEvent",
-            reason: "commit version is zero".to_owned(),
-        })?;
-    let sequence = u32::from_be_bytes(
-        key[FIXED_ID_BYTES + 8..]
-            .try_into()
-            .expect("validated event-sequence width"),
-    );
-    Ok((commit_version, sequence))
+    decode_change_event_key_bytes(root, key).ok_or_else(|| QueryError::CorruptKey {
+        family: "ChangeEvent",
+        reason: "key has a noncanonical root/version/sequence encoding".to_owned(),
+    })
 }
 
 fn path_is_at_or_below(
@@ -1894,6 +1900,63 @@ fn decode_cursor(encoded: &[u8]) -> Result<DecodedCursor, QueryError> {
     })
 }
 
+fn decode_change_cursor(
+    encoded: &[u8],
+    context: RootReadContext,
+    request_digest: [u8; SHA256_BYTES],
+    after_commit_version: Option<CommitVersion>,
+) -> Result<(CommitVersion, u32), QueryError> {
+    let cursor = decode_cursor(encoded)?;
+    if cursor.kind != CursorKind::Changes {
+        return Err(QueryError::InvalidCursor {
+            reason: "cursor kind does not match operation",
+        });
+    }
+    if cursor.read_version == 0 {
+        return Err(QueryError::InvalidCursor {
+            reason: "change cursor read version is zero",
+        });
+    }
+    if cursor.read_version > context.read_version.get() {
+        return Err(QueryError::CursorReadVersionMismatch {
+            cursor: cursor.read_version,
+            request: context.read_version.get(),
+        });
+    }
+    if cursor.request_digest != request_digest {
+        return Err(QueryError::CursorQueryMismatch);
+    }
+    if cursor.anchor.len() != 8 + 4 {
+        return Err(QueryError::InvalidCursor {
+            reason: "change cursor anchor must contain one version and sequence",
+        });
+    }
+    let commit_version = CommitVersion::new(u64::from_be_bytes(
+        cursor.anchor[..8]
+            .try_into()
+            .expect("validated change cursor version width"),
+    ))
+    .map_err(|_| QueryError::InvalidCursor {
+        reason: "change cursor anchor version is zero",
+    })?;
+    let sequence = u32::from_be_bytes(
+        cursor.anchor[8..]
+            .try_into()
+            .expect("validated change cursor sequence width"),
+    );
+    if commit_version.get() > cursor.read_version {
+        return Err(QueryError::InvalidCursor {
+            reason: "change cursor anchor is newer than its read version",
+        });
+    }
+    if after_commit_version.is_some_and(|after| commit_version <= after) {
+        return Err(QueryError::InvalidCursor {
+            reason: "change cursor anchor does not follow after_commit_version",
+        });
+    }
+    Ok((commit_version, sequence))
+}
+
 fn cursor_start(
     cursor: Option<&[u8]>,
     expected_kind: CursorKind,
@@ -1996,9 +2059,10 @@ fn find_digest(request: &FindWorkspacesRequest) -> [u8; SHA256_BYTES] {
     hasher.finalize().into()
 }
 
-fn change_digest(request: &ChangePageRequest) -> [u8; SHA256_BYTES] {
+fn change_digest(root_id: RootId, request: &ChangePageRequest) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.query.changes.v1\0");
+    hasher.update(b"nokv.query.changes.v2\0");
+    hasher.update(root_id.as_bytes());
     hash_scope(&mut hasher, &request.scope);
     match request.after_commit_version {
         None => hasher.update([0]),
@@ -3292,6 +3356,7 @@ mod tests {
             ],
         );
         let visible_event = ChangeEventRecord {
+            workbench_id: visible.clone(),
             workspace_incarnation_id: visible_incarnation,
             kind: super::super::query_records::ChangeEventKind::ArtifactPublished,
             artifact_revision_id: None,
@@ -3306,6 +3371,7 @@ mod tests {
             .unwrap(),
         };
         let hidden_event = ChangeEventRecord {
+            workbench_id: hidden.clone(),
             workspace_incarnation_id: hidden_incarnation,
             kind: super::super::query_records::ChangeEventKind::WorkspaceRestored,
             artifact_revision_id: None,
@@ -3315,13 +3381,24 @@ mod tests {
             before: TypedProjection::empty(),
             after: TypedProjection::empty(),
         };
+        let mismatched_name_event = ChangeEventRecord {
+            workbench_id: workbench("forged-events"),
+            workspace_incarnation_id: visible_incarnation,
+            kind: super::super::query_records::ChangeEventKind::ArtifactPublished,
+            artifact_revision_id: None,
+            commit_id: None,
+            operation_id: None,
+            path: Some(path("outputs/forged")),
+            before: TypedProjection::empty(),
+            after: TypedProjection::empty(),
+        };
         let event_version = execute(
             &store,
             4,
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            vec![visible_event.clone(), hidden_event],
+            vec![visible_event.clone(), hidden_event, mismatched_name_event],
         );
 
         let page = read_changes_at(
@@ -3367,6 +3444,273 @@ mod tests {
         .unwrap()
         .events
         .is_empty());
+
+        let current = context(&store);
+        let future = CommitVersion::new(current.read_version.get() + 1).unwrap();
+        assert_eq!(
+            read_changes_at(
+                &store,
+                current,
+                &ChangePageRequest {
+                    scope: QueryScope::Root,
+                    after_commit_version: Some(future),
+                    cursor: None,
+                    limit: 10,
+                },
+            ),
+            Err(QueryError::Engine(
+                AgentMetadataError::ReadVersionInFuture {
+                    requested: future.get(),
+                    current: current.read_version.get(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn change_cursor_resumes_mid_commit_after_the_root_advances() {
+        let store = ready_store();
+        let name = workbench("cursor-events");
+        let incarnation_id = incarnation(14);
+        put_records(
+            &store,
+            3,
+            vec![workspace_row(
+                &name,
+                incarnation_id,
+                WorkspaceState::Visible,
+            )],
+        );
+        let event = |path_value: &str| ChangeEventRecord {
+            workbench_id: name.clone(),
+            workspace_incarnation_id: incarnation_id,
+            kind: super::super::query_records::ChangeEventKind::ArtifactPublished,
+            artifact_revision_id: None,
+            commit_id: None,
+            operation_id: None,
+            path: Some(path(path_value)),
+            before: TypedProjection::empty(),
+            after: TypedProjection::empty(),
+        };
+        let first_commit = execute(
+            &store,
+            4,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![event("outputs/first"), event("outputs/second")],
+        );
+        let request = ChangePageRequest {
+            scope: QueryScope::Root,
+            after_commit_version: None,
+            cursor: None,
+            limit: 1,
+        };
+        let first = read_changes_at(&store, context(&store), &request).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].commit_version, first_commit);
+        assert_eq!(first.events[0].sequence, 0);
+        let first_cursor = first.next_cursor.expect("second event is lookahead");
+
+        let later_commit = execute(
+            &store,
+            5,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![event("outputs/later")],
+        );
+        let second = read_changes_at(
+            &store,
+            context(&store),
+            &ChangePageRequest {
+                cursor: Some(first_cursor.clone()),
+                ..request.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].commit_version, first_commit);
+        assert_eq!(second.events[0].sequence, 1);
+        let second_cursor = second.next_cursor.expect("later commit is lookahead");
+
+        let third = read_changes_at(
+            &store,
+            context(&store),
+            &ChangePageRequest {
+                cursor: Some(second_cursor),
+                ..request.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(third.events.len(), 1);
+        assert_eq!(third.events[0].commit_version, later_commit);
+        assert_eq!(third.events[0].sequence, 0);
+        assert!(third.next_cursor.is_none());
+
+        let after_first_commit = read_changes_at(
+            &store,
+            context(&store),
+            &ChangePageRequest {
+                scope: QueryScope::Root,
+                after_commit_version: Some(first_commit),
+                cursor: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(after_first_commit.events.len(), 1);
+        assert_eq!(after_first_commit.events[0].commit_version, later_commit);
+
+        let workspace_request = ChangePageRequest {
+            scope: QueryScope::Workspace(name.clone()),
+            cursor: Some(first_cursor.clone()),
+            ..request.clone()
+        };
+        assert_eq!(
+            read_changes_at(&store, context(&store), &workspace_request),
+            Err(QueryError::CursorQueryMismatch)
+        );
+
+        let workspace_first = read_changes_at(
+            &store,
+            context(&store),
+            &ChangePageRequest {
+                scope: QueryScope::Workspace(name.clone()),
+                cursor: None,
+                ..request.clone()
+            },
+        )
+        .unwrap();
+        let workspace_cursor = workspace_first
+            .next_cursor
+            .expect("workspace scope has additional events");
+        assert_eq!(
+            read_changes_at(
+                &store,
+                context(&store),
+                &ChangePageRequest {
+                    scope: QueryScope::Workspace(workbench("other-workspace")),
+                    cursor: Some(workspace_cursor),
+                    ..request.clone()
+                },
+            ),
+            Err(QueryError::CursorQueryMismatch)
+        );
+
+        let mut legacy_hasher = Sha256::new();
+        legacy_hasher.update(b"nokv.query.changes.v1\0");
+        hash_scope(&mut legacy_hasher, &request.scope);
+        legacy_hasher.update([0]);
+        let legacy_cursor = encode_cursor(
+            CursorKind::Changes,
+            first.read_version,
+            legacy_hasher.finalize().into(),
+            &change_event_identity(&first.events[0]),
+        );
+        assert_eq!(
+            read_changes_at(
+                &store,
+                context(&store),
+                &ChangePageRequest {
+                    cursor: Some(legacy_cursor),
+                    ..request.clone()
+                },
+            ),
+            Err(QueryError::CursorQueryMismatch)
+        );
+
+        let foreign_context = RootReadContext {
+            root_id: RootId::from_bytes([9; FIXED_ID_BYTES]),
+            ..context(&store)
+        };
+        assert_eq!(
+            decode_change_cursor(
+                &first_cursor,
+                foreign_context,
+                change_digest(foreign_context.root_id, &request),
+                None,
+            ),
+            Err(QueryError::CursorQueryMismatch)
+        );
+    }
+
+    #[test]
+    fn change_page_stops_after_visible_lookahead_before_decoding_later_events() {
+        let store = ready_store();
+        let name = workbench("bounded-events");
+        let incarnation_id = incarnation(15);
+        put_records(
+            &store,
+            3,
+            vec![workspace_row(
+                &name,
+                incarnation_id,
+                WorkspaceState::Visible,
+            )],
+        );
+        let valid_event = ChangeEventRecord {
+            workbench_id: name.clone(),
+            workspace_incarnation_id: incarnation_id,
+            kind: super::super::query_records::ChangeEventKind::ArtifactPublished,
+            artifact_revision_id: None,
+            commit_id: None,
+            operation_id: None,
+            path: Some(path("outputs/valid")),
+            before: TypedProjection::empty(),
+            after: TypedProjection::empty(),
+        };
+        execute(
+            &store,
+            4,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![valid_event.clone()],
+        );
+        execute(
+            &store,
+            5,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![valid_event],
+        );
+
+        let mut corrupt = MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: root(),
+            logical_shard_id: shard(),
+            placement_generation: placement(),
+            owner_epoch: owner(),
+            request_id: request(6),
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: store.current_read_version().unwrap(),
+            root_fence_action: RootFenceAction::RequireActive,
+            predicates: Vec::new(),
+            mutations: Vec::new(),
+            history_projection: Vec::new(),
+            event_projection: vec![EventProjection {
+                payload: b"invalid-change-event-envelope".to_vec(),
+            }],
+            deterministic_result: Vec::new(),
+        };
+        corrupt = corrupt.seal();
+        store.execute(&corrupt).unwrap();
+
+        let page = read_changes_at(
+            &store,
+            context(&store),
+            &ChangePageRequest {
+                scope: QueryScope::Root,
+                after_commit_version: None,
+                cursor: None,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert!(page.next_cursor.is_some());
     }
 
     #[test]

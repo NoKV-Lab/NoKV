@@ -1,19 +1,26 @@
 use nokv_types::{
-    ArtifactRevisionId, CommitConsumerKind, CommitId, HistoryHoldKind, LogicalShardId,
-    NormalizedRelativePath, OperationId, OperationKind, ReferenceEpoch, ReferenceKind, RootId,
-    SnapshotAliasName, SnapshotId, TagName, WorkbenchId, WorkspaceIncarnationId,
+    ArtifactRevisionId, CommitConsumerKind, CommitId, CommitVersion, HistoryHoldKind,
+    LogicalShardId, NormalizedRelativePath, OperationId, OperationKind, ReferenceEpoch,
+    ReferenceKind, RootId, SnapshotAliasName, SnapshotId, TagName, WorkbenchId,
+    WorkspaceIncarnationId,
 };
 
 pub const SCHEMA_ID: &str = "nokv_workspace";
 pub const VALUE_FORMAT_VERSION: u8 = 1;
 pub const PATH_COMPONENT_DELIMITER: u8 = 0;
-/// Terminates every exact `PathCurrent` key without colliding with valid UTF-8.
-pub const PATH_EXACT_TERMINATOR: u8 = 0xff;
+/// Terminates every exact path key immediately after its descendant range.
+///
+/// Every UTF-8 component byte is shifted by one before storage, reserving both
+/// `0x00` and `0x01`. This keeps one child's delimiter rollup and exact row
+/// adjacent while sorting the exact row before every longer sibling, without
+/// making an exact key a strict prefix of any valid path key.
+pub const PATH_EXACT_TERMINATOR: u8 = 0x01;
 const SNAPSHOT_ID_CLAIM_DISCRIMINATOR: u8 = 0xff;
 
 pub const SYSTEM_TREE: &str = "system";
 pub const ROOT_FENCE_TREE: &str = "root_fence";
 pub const WORKSPACE_CURRENT_TREE: &str = "workspace_current";
+pub const WORKSPACE_INCARNATION_CLAIM_TREE: &str = "workspace_incarnation_claim";
 pub const PATH_CURRENT_TREE: &str = "path_current";
 pub const ARTIFACT_REVISION_TREE: &str = "artifact_revision";
 pub const ARTIFACT_MANIFEST_TREE: &str = "artifact_manifest";
@@ -41,6 +48,7 @@ pub(crate) const SCHEMA_TREES: &[&str] = &[
     SYSTEM_TREE,
     ROOT_FENCE_TREE,
     WORKSPACE_CURRENT_TREE,
+    WORKSPACE_INCARNATION_CLAIM_TREE,
     PATH_CURRENT_TREE,
     ARTIFACT_REVISION_TREE,
     ARTIFACT_MANIFEST_TREE,
@@ -67,7 +75,7 @@ pub(crate) const SCHEMA_TREES: &[&str] = &[
 
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
-const SYSTEM_FORMAT_VERSION: u32 = 7;
+const SYSTEM_FORMAT_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SchemaMarkerError;
@@ -93,6 +101,14 @@ pub fn workspace_current_prefix(root: RootId) -> Vec<u8> {
     root.as_bytes().to_vec()
 }
 
+/// Permanent root-scoped claim for one never-reused workspace incarnation.
+pub fn workspace_incarnation_claim_key(
+    root: RootId,
+    incarnation: WorkspaceIncarnationId,
+) -> Vec<u8> {
+    [root.as_bytes().as_slice(), incarnation.as_bytes()].concat()
+}
+
 /// Decode the workbench identity from one exact current-marker key.
 pub fn decode_workspace_current_key(root: RootId, key: &[u8]) -> Option<WorkbenchId> {
     let prefix = workspace_current_prefix(root);
@@ -115,7 +131,7 @@ pub fn path_current_key(
     let mut key = Vec::with_capacity(FIXED_ID_BYTES * 2 + path.byte_len().saturating_add(1));
     key.extend_from_slice(root.as_bytes());
     key.extend_from_slice(workspace.as_bytes());
-    push_path_components(&mut key, path);
+    push_ordered_path_components(&mut key, path);
     key.push(PATH_EXACT_TERMINATOR);
     key
 }
@@ -135,10 +151,31 @@ pub fn path_child_prefix(
     prefix.extend_from_slice(root.as_bytes());
     prefix.extend_from_slice(workspace.as_bytes());
     if let Some(parent) = parent {
-        push_path_components(&mut prefix, parent);
+        push_ordered_path_components(&mut prefix, parent);
         prefix.push(PATH_COMPONENT_DELIMITER);
     }
     prefix
+}
+
+pub(crate) fn change_event_key(root: RootId, version: CommitVersion, sequence: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(FIXED_ID_BYTES + 8 + 4);
+    key.extend_from_slice(root.as_bytes());
+    key.extend_from_slice(&version.get().to_be_bytes());
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+pub(crate) fn decode_change_event_key(root: RootId, key: &[u8]) -> Option<(CommitVersion, u32)> {
+    const EXPECTED: usize = FIXED_ID_BYTES + 8 + 4;
+    if key.len() != EXPECTED || !key.starts_with(root.as_bytes()) {
+        return None;
+    }
+    let version = CommitVersion::new(u64::from_be_bytes(
+        key[FIXED_ID_BYTES..FIXED_ID_BYTES + 8].try_into().ok()?,
+    ))
+    .ok()?;
+    let sequence = u32::from_be_bytes(key[FIXED_ID_BYTES + 8..].try_into().ok()?);
+    Some((version, sequence))
 }
 
 pub fn decode_path_current_key(
@@ -151,6 +188,22 @@ pub fn decode_path_current_key(
         || &key[..FIXED_ID_BYTES] != root.as_bytes()
         || &key[FIXED_ID_BYTES..prefix_length] != workspace.as_bytes()
         || key.last() != Some(&PATH_EXACT_TERMINATOR)
+    {
+        return None;
+    }
+    decode_path_components(&key[prefix_length..key.len() - 1])
+}
+
+pub fn decode_path_common_prefix(
+    root: RootId,
+    workspace: WorkspaceIncarnationId,
+    key: &[u8],
+) -> Option<NormalizedRelativePath> {
+    let prefix_length = FIXED_ID_BYTES * 2;
+    if key.len() < prefix_length + 2
+        || &key[..FIXED_ID_BYTES] != root.as_bytes()
+        || &key[FIXED_ID_BYTES..prefix_length] != workspace.as_bytes()
+        || key.last() != Some(&PATH_COMPONENT_DELIMITER)
     {
         return None;
     }
@@ -193,7 +246,7 @@ pub fn commit_member_key(root: RootId, commit: CommitId, path: &NormalizedRelati
     let mut key = Vec::with_capacity(FIXED_ID_BYTES + CommitId::BYTE_WIDTH + path.byte_len() + 1);
     key.extend_from_slice(root.as_bytes());
     key.extend_from_slice(commit.as_bytes());
-    push_path_components(&mut key, path);
+    push_ordered_path_components(&mut key, path);
     key.push(PATH_EXACT_TERMINATOR);
     key
 }
@@ -594,23 +647,31 @@ pub(crate) fn validate_schema_marker(value: &[u8]) -> Result<(), SchemaMarkerErr
 
 fn encoded_path(path: &NormalizedRelativePath) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(path.byte_len());
-    push_path_components(&mut encoded, path);
+    push_ordered_path_components(&mut encoded, path);
     encoded
 }
 
-fn push_path_components(target: &mut Vec<u8>, path: &NormalizedRelativePath) {
+/// Append the format-v8 order-preserving physical encoding of a logical path.
+pub(crate) fn push_ordered_path_components(target: &mut Vec<u8>, path: &NormalizedRelativePath) {
     for (index, component) in path.components().enumerate() {
         if index != 0 {
             target.push(PATH_COMPONENT_DELIMITER);
         }
-        target.extend_from_slice(component.as_bytes());
+        target.extend(component.as_bytes().iter().map(|byte| byte + 1));
     }
 }
 
 fn decode_path_components(encoded: &[u8]) -> Option<NormalizedRelativePath> {
-    let encoded = std::str::from_utf8(encoded).ok()?;
-    let path = NormalizedRelativePath::new(encoded.replace('\0', "/")).ok()?;
-    (encoded_path(&path) == encoded.as_bytes()).then_some(path)
+    let mut decoded = Vec::with_capacity(encoded.len());
+    for byte in encoded {
+        match *byte {
+            PATH_COMPONENT_DELIMITER => decoded.push(b'/'),
+            PATH_EXACT_TERMINATOR => return None,
+            byte => decoded.push(byte - 1),
+        }
+    }
+    let path = NormalizedRelativePath::new(std::str::from_utf8(&decoded).ok()?).ok()?;
+    (encoded_path(&path) == encoded).then_some(path)
 }
 
 fn push_len_prefixed(target: &mut Vec<u8>, bytes: &[u8]) {
@@ -661,15 +722,19 @@ mod tests {
         assert_eq!(&key[..16], &[0x11; 16]);
         assert_eq!(&key[16..20], &4_u32.to_be_bytes());
         assert_eq!(&key[20..], b"wb-1");
+
+        let claim = workspace_incarnation_claim_key(root(0x11), workspace(0x22));
+        assert_eq!(&claim[..16], &[0x11; 16]);
+        assert_eq!(&claim[16..], &[0x22; 16]);
     }
 
     #[test]
-    fn exact_path_uses_non_utf8_terminator() {
+    fn exact_path_uses_ordered_terminator() {
         let expected_path = path("outputs/run/file.bin");
         let key = path_current_key(root(1), workspace(2), &expected_path);
         assert_eq!(&key[..16], &[1; 16]);
         assert_eq!(&key[16..32], &[2; 16]);
-        assert_eq!(&key[32..key.len() - 1], b"outputs\0run\0file.bin");
+        assert_eq!(&key[32..key.len() - 1], b"pvuqvut\0svo\0gjmf/cjo");
         assert_eq!(key.last(), Some(&PATH_EXACT_TERMINATOR));
         assert_eq!(
             decode_path_current_key(root(1), workspace(2), &key),
@@ -681,15 +746,28 @@ mod tests {
     fn child_prefix_separates_a_from_ab() {
         let exact_a = path_current_key(root(1), workspace(2), &path("a"));
         let exact_ab = path_current_key(root(1), workspace(2), &path("ab"));
+        let exact_a_control = path_current_key(root(1), workspace(2), &path("a\u{1}"));
         let child_a = path_child_prefix(root(1), workspace(2), Some(&path("a")));
         let key_a_child = path_current_key(root(1), workspace(2), &path("a/file"));
 
-        assert_eq!(&exact_a[32..], b"a\xff");
-        assert_eq!(&child_a[32..], b"a\0");
-        assert_eq!(&exact_ab[32..], b"ab\xff");
+        assert_eq!(&exact_a[32..], b"b\x01");
+        assert_eq!(&child_a[32..], b"b\0");
+        assert_eq!(&exact_ab[32..], b"bc\x01");
+        assert_eq!(&exact_a_control[32..], b"b\x02\x01");
         assert!(!exact_a.starts_with(&child_a));
         assert!(key_a_child.starts_with(&child_a));
         assert!(!exact_ab.starts_with(&child_a));
+        assert!(child_a < exact_a);
+        assert!(exact_a < exact_a_control);
+        assert!(exact_a < exact_ab);
+        assert_eq!(
+            decode_path_current_key(root(1), workspace(2), &exact_a_control),
+            Some(path("a\u{1}"))
+        );
+        assert_eq!(
+            decode_path_common_prefix(root(1), workspace(2), &child_a),
+            Some(path("a"))
+        );
     }
 
     #[test]
@@ -742,10 +820,17 @@ mod tests {
     }
 
     #[test]
-    fn path_codec_preserves_unicode_bytes() {
-        let key = path_current_key(root(0), workspace(0), &path("输出/Å/Å"));
-        assert_eq!(&key[32..key.len() - 1], "输出\0Å\0Å".as_bytes());
+    fn path_codec_round_trips_unicode() {
+        let expected_path = path("输出/Å/Å");
+        let key = path_current_key(root(0), workspace(0), &expected_path);
+        assert!(key[32..key.len() - 1]
+            .iter()
+            .all(|byte| *byte != PATH_EXACT_TERMINATOR));
         assert_eq!(key.last(), Some(&PATH_EXACT_TERMINATOR));
+        assert_eq!(
+            decode_path_current_key(root(0), workspace(0), &key),
+            Some(expected_path)
+        );
     }
 
     #[test]
@@ -844,7 +929,7 @@ mod tests {
         let member = commit_member_key(root, commit, &member_path);
 
         assert_eq!(&member[..48], commit_member_prefix(root, commit).as_slice());
-        assert_eq!(&member[48..], b"outputs\0result.json\xff");
+        assert_eq!(&member[48..], b"pvuqvut\0sftvmu/ktpo\x01");
         assert_eq!(
             decode_commit_member_key(root, commit, &member),
             Some(member_path)
@@ -917,7 +1002,7 @@ mod tests {
 
         let mut previous_layout = marker.clone();
         let version_start = previous_layout.len() - std::mem::size_of::<u32>();
-        previous_layout[version_start..].copy_from_slice(&6_u32.to_be_bytes());
+        previous_layout[version_start..].copy_from_slice(&7_u32.to_be_bytes());
         assert_eq!(
             validate_schema_marker(&previous_layout),
             Err(SchemaMarkerError)

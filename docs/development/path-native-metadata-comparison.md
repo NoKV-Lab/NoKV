@@ -52,8 +52,8 @@ advanced before the page is full, `b` the revision's manifest-block rows, and
 | --- | --- | --- | --- |
 | Get metadata for one artifact path | Cold lookup walks parent components and then reads the final dentry. The optional full-path index still validates the parent chain and canonical dentry on an uncached hit. | Resolve one visible `WorkspaceCurrent`, then point-read one canonical `PathCurrent`. `PathEntry` contains the complete immutable metadata projection returned by this operation, so it does not fan out to `ArtifactRevision`. | Code fact |
 | Complexity of exact get | `O(d)` cold namespace reads; caches can reduce work but do not change the uncached contract. | `O(1)`: exactly one workspace-marker point read plus one path point read. Only the marker is eligible for a validity-bounded cache. | Complexity derivation |
-| List direct children | Resolve the parent inode, then scan the parent-keyed dentry range with cursor and limit. This gives natural direct-child selectivity after parent resolution. | Resolve one marker, optionally point-read the exact requested path on the first page, then seek to the encoded component-safe descendant prefix and stream from the exclusive cursor. Stop after the bounded result plus lookahead; semantic filtering may make `s` greater than `p`, but the scan no longer starts at the workspace root. | Code fact and complexity derivation |
-| List a recursive subtree | Walk discovered directories and issue parent-dentry scans for their children. | One ordered full-path prefix iterator covers the subtree and stops when the page is full. Live work is `O(s)`, not `O(all workspace paths)`. | Complexity derivation |
+| List direct children | Resolve the parent inode, then scan the parent-keyed dentry range with cursor and limit. This gives natural direct-child selectivity after parent resolution. | Resolve one marker, seek to the encoded component-safe descendant prefix, and stream from the exclusive cursor. Stop after the bounded result plus lookahead; only after descendant EOF, optionally point-read the exact requested path. Semantic filtering may make `s` greater than `p`, but the scan no longer starts at the workspace root. | Code fact and complexity derivation |
+| List a recursive subtree | Walk discovered directories and issue parent-dentry scans for their children. | Ordered full-path prefix scans advance one exclusive marker across bounded engine pages and stop when the protocol page is full. Live work is `O(s)`, not `O(all workspace paths)`. | Complexity derivation |
 | Publish or replace an artifact | Maintain mutable inode and dentry projections, optional path index rows, body/chunk descriptors, and filesystem-owned attributes. Parent-path resolution can add depth-dependent reads. | One bounded `MetadataCommand` atomically maintains `PathCurrent`, `WorkspaceCurrent`, immutable revision/manifest rows, strong references, indexes, event, history, recovery, and dedupe state. Namespace work is independent of `d`; total mutation work is operation-specific and approximately `O(b + i + references)`. | Code fact and complexity derivation |
 | Remove an artifact | Update inode/dentry namespace state and its associated filesystem lifetime/index state. | Remove the path reference and atomically update workspace revision, revision lifetime/GC candidacy, event, history, recovery, and dedupe state. | Code fact |
 
@@ -85,22 +85,38 @@ It is achieved by passing the already-resolved visible workspace into the path
 primitive and storing the immutable result projection in `PathCurrent` in the
 same publication command as `ArtifactRevision`. `ArtifactRevision` remains the
 revision-lifetime authority; it is not needed to shape ordinary path metadata.
+The live server path captures the current version, validates the owner and root
+fences once, and performs both dependent point reads inside one short-lived
+NoKV read session. This describes two authoritative metadata payload reads; it
+does not count the once-per-session system and fence records as path rows.
 
 The first listing composition likewise scanned the whole incarnation and
 filtered the requested prefix in server memory, while the engine materialized
 the complete prefix before applying cursor and limit. The accepted live-list
-target is one marker check, an optional exact-path probe on the first page to
-preserve "exact prefix or descendants" semantics, then a Holt seek at the
-encoded descendant prefix, an exclusive cursor, and streaming termination when
-the page is full. The engine captures that scoped Holt view while holding the
-shard read gate, then releases the gate before traversal and record decoding. A
-long page no longer holds the NoKV read gate for its complete iteration.
+target is one marker check, then a Holt seek at the encoded descendant prefix,
+an exclusive cursor, and streaming termination when the page is full. An
+optional exact-path probe is deferred until the descendant iterator reaches
+EOF, preserving "exact prefix or descendants" semantics without paying that
+point read on every hot-directory page. The engine captures that scoped Holt
+view while holding the shard read gate, then releases the gate before traversal
+and record decoding. A long page no longer holds the NoKV read gate for its
+complete iteration.
+Non-recursive pages also pass the encoded component delimiter to Holt. Holt
+folds each deeper subtree into a `CommonPrefix`; NoKV retains that as one
+storage-neutral implicit `Prefix` item, and an exact artifact at the same child
+wins during logical coalescing. Prefixes and artifacts both count toward the
+page limit and can become cursor anchors. Recursive pages retain the ordinary
+ordered prefix iterator and emit artifacts only. System format version 8 uses
+NUL between components and `0x01` at exact keys so a rollup, exact child, and
+longer sibling have one pagination-safe order. Each UTF-8 component byte is
+shifted by one so the delimiter and exact marker cannot occur inside an encoded
+component, while byte order and key length stay unchanged.
 
 Historical MVCC is a distinct path. A key that is absent or newer in current
 state may still be visible at the requested version, so historical listing
 continues to reconstruct a sorted visible set from current rows and `History`
-before pagination. Its work is not bounded by `p`, and this optimization makes
-no historical-scan performance claim.
+before delimiter folding and pagination. Its work is not bounded by `p`; the
+live bounded-work result does not apply to snapshot pages with dense history.
 
 ## Sharding And Write Concurrency
 
@@ -145,8 +161,14 @@ explicitly retained.
 | Path-native publication has lower write amplification | **NOT QUALIFIED** | The two models persist different lifecycle and recovery evidence; no per-family matched counters exist. |
 | Shard write throughput improved | **NOT QUALIFIED** | The shard-wide write gate and global commit clock remain. |
 
-`bench/src/bin/nokv-workspace-bench.rs` currently measures protocol codec
-round trips only. `bench/lingtai-first-client` is correctness and
-interoperability evidence. Neither qualifies an old/new metadata performance
-number, so this document intentionally reports no percentage or headline
-throughput.
+`nokv-workspace-bench` remains a protocol-codec diagnostic.
+`nokv-bench metadata` now provides a matched metadata read workload for exact,
+recursive-list, and direct-list cursor paths, with pre/post semantic assertions
+and explicit qualification boundaries. A baseline that predates the runner
+must receive semantically equivalent, reviewable instrumentation while the
+runner and its implementation-invariant tests remain byte-identical; both
+patches are bound by the harness digest. Published comparisons must retain raw
+old/new reports from matched release builds and profiles. Even then, this
+metadata-domain diagnostic does not qualify Workspace Acceptance Gate 8.
+`bench/lingtai-first-client` remains correctness and interoperability evidence
+rather than a performance result.

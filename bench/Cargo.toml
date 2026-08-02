@@ -10,10 +10,22 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+metadata-read-stats = ["nokv-meta/metadata-read-stats"]
+
 [dependencies]
+nokv-meta.workspace = true
 nokv-protocol.workspace = true
+nokv-server.workspace = true
+nokv-types.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [[bin]]
 name = "nokv-workspace-bench"
 path = "src/bin/nokv-workspace-bench.rs"
+
+[[bin]]
+name = "nokv-bench"
+path = "src/bin/nokv-bench.rs"
+required-features = ["metadata-read-stats"]

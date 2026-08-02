@@ -16,9 +16,9 @@ use nokv_client::{
 use nokv_protocol::{
     AggregateRequest, ArtifactRevisionIdentity, CatalogRequest, ContentType,
     CreateWorkspaceRequest, FindWorkspacesRequest, GetPathRequest, OperationIdentity, PageRequest,
-    PathMetadata, PathPage, PublishCondition, QueryScope, RelativePath, RemovePathRequest,
-    RootIdentity, SearchRequest, WorkbenchName, WorkspaceIdentity, WorkspacePath,
-    WorkspaceReadView,
+    PathListEntry, PathMetadata, PathPage, PublishCondition, QueryScope, RelativePath,
+    RemovePathRequest, RootIdentity, SearchRequest, WorkbenchName, WorkspaceIdentity,
+    WorkspacePath, WorkspaceReadView,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -753,7 +753,17 @@ fn list_all_paths_with(
                 );
             }
             read_version.get_or_insert(page.read_version);
-            entries.extend(page.entries);
+            for entry in page.entries {
+                match entry {
+                    PathListEntry::Artifact(metadata) => entries.push(metadata),
+                    PathListEntry::Prefix(path) => {
+                        return Err(format!(
+                            "recursive workspace listing returned implicit prefix {}",
+                            path.path.as_str()
+                        ));
+                    }
+                }
+            }
             let Some(next_cursor) = page.next_cursor else {
                 return Ok(entries);
             };

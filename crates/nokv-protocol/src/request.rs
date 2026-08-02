@@ -260,6 +260,12 @@ impl ListPathsRequest {
                 "must be greater than zero",
             ));
         }
+        if self.page.cursor.is_some() && self.expected_read_version.is_none() {
+            return Err(ProtocolError::invalid(
+                "list_paths.expected_read_version",
+                "is required when continuing from a page cursor",
+            ));
+        }
         self.page.validate("list_paths.page")
     }
 }
@@ -1160,6 +1166,29 @@ mod tests {
             expected_read_version: Some(0),
             page: PageRequest {
                 cursor: None,
+                limit: 1,
+            },
+        };
+
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "list_paths.expected_read_version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn list_paths_requires_a_read_version_fence_for_continuations() {
+        let request = ListPathsRequest {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            prefix: None,
+            recursive: true,
+            view: WorkspaceReadView::Live,
+            expected_read_version: None,
+            page: PageRequest {
+                cursor: Some(b"next".to_vec()),
                 limit: 1,
             },
         };
