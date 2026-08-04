@@ -23,18 +23,6 @@ SPDX-License-Identifier: Apache-2.0
   </p>
 </div>
 
-## Latest update
-
-<div align="center">
-  <a href="https://github.com/orgs/NoKV-Lab/discussions/378">
-    <img src="docs/public/img/community/nokv-lingtai-banner-en.png" alt="NoKV × LingTai — Design Partner Collaboration" width="100%" />
-  </a>
-</div>
-
-> **NoKV × LingTai** is a design partner collaboration.
-> [English announcement](https://github.com/orgs/NoKV-Lab/discussions/378) ·
-> [中文公告](https://github.com/orgs/NoKV-Lab/discussions/380)
-
 ## Our building partners include:
 
 | Partner | Project |
