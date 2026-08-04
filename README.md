@@ -184,24 +184,6 @@ adapter concern and does not dictate durable metadata families.
 
 See the [Workbench Contract](docs/workbench-contract.md).
 
-## First Client
-
-LingTai is the active design partner and first Workbench client. Its scientific
-reconstruction workflow exercises the product boundary end to end:
-
-```text
-upload dataset
-  -> seal immutable input commit/tag
-  -> run multiple Workbenches against the same input
-  -> materialize verified files for a local executable
-  -> collect declared outputs, logs, and run metadata
-  -> commit lineage
-  -> query, compare, snapshot, and restore
-```
-
-Materialization creates a disposable local sandbox. It is not a NoKV namespace
-or a transparent host-filesystem access path.
-
 ## Quick Start
 
 Build the custom CLI and inspect the checked-in Workbench schema:
