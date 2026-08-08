@@ -5,23 +5,31 @@ SPDX-License-Identifier: Apache-2.0
 
 # Architecture
 
-Status: normative workspace architecture.
+Status: normative workspace architecture with integration-specific placement
+requirements.
+
+This document separates an integration's required architecture from the
+capabilities that the current implementation has qualified. A placement
+profile can be a normative integration requirement while its implementation
+status remains `NOT QUALIFIED`.
 
 ## System Shape
 
 ```mermaid
 flowchart LR
     Workbench["LingTai Workbench adapter"] --> SDK["Agent SDK"]
+    OpenViking["OpenViking RAGFS adapter"] --> SDK
+    Other["Other integration adapters"] --> SDK
     CLI["Custom CLI / MCP"] --> SDK
     Python["Python SDK"] --> SDK
     Local["Materialize / collect"] --> Python
 
     SDK --> Router["Root router"]
-    Router --> Control["Control plane<br/>root placement + owner lease"]
-    Router --> Owner["Fenced logical-shard owner"]
+    Router --> Control["Control plane<br/>root layout + partition placement + owner lease"]
+    Router --> Owner["One or more fenced<br/>logical-shard owners"]
 
     Owner --> Meta["NoKV metadata semantics"]
-    Meta --> Holt["Holt named trees<br/>point + delimiter + atomic batch"]
+    Meta --> Holt["Current Holt backend<br/>point + delimiter + atomic batch"]
 
     SDK --> Data["Direct immutable-object data path"]
     Data --> Cache["Local NVMe soft cache"]
@@ -33,7 +41,12 @@ The metadata and object paths are separate. Small control and namespace records
 go through the shard owner. Clients stream immutable blocks directly through
 the object boundary after receiving a revision/upload plan.
 
-FUSE, POSIX, CSI, and fsspec are not architecture layers.
+The OpenViking node describes its required adapter boundary; it does not claim
+that the adapter is implemented or qualified. RAGFS API types, transport, and
+adapter implementation do not enter the NoKV metadata-engine boundary. Their
+required consistency, ordering, fencing, and recovery semantics are translated
+into NoKV operations and integration-profile contracts. FUSE, POSIX, CSI, and
+fsspec are not NoKV architecture layers.
 
 ## Package Direction
 
@@ -63,8 +76,9 @@ Arrows point from a consumer to its dependency. The
 Key constraints:
 
 - types and protocol are storage-neutral;
-- metadata owns durable semantics and Holt layout;
-- control owns root placement and owner fencing, not path semantics;
+- metadata owns durable semantics and the current Holt layout;
+- control owns the integration-profile-specific root layout, partition
+  placement, and per-shard owner fencing, not path semantics;
 - object owns provider I/O, not reachability;
 - client uses protocol/routing and never imports meta/server;
 - Agent adapters shape tools over SDK traits and remain transport-free;
@@ -73,8 +87,9 @@ Key constraints:
 ## Identity And Namespace
 
 ```text
-RootPlacement(root_id)                    control-plane truth
-RootFence(root_id)                        installed shard-local fence
+RootLayout(root_id)                       placement profile + generation
+RootShardPlacement(root_id, partition)    logical-shard placement
+RootFence(root_id, logical_shard_id)      installed on each serving shard
 
 WorkspaceCurrent(root_id, workbench_id)
   -> incarnation, revision, lifecycle
@@ -86,6 +101,10 @@ PathCurrent(root_id, incarnation, path)
   -> generation, immutable revision, body/manifest digests, size,
      dependency bounds, content type, typed projection
 ```
+
+`RootLayout` and `RootShardPlacement` are architecture concepts. The current
+single-shard implementation realizes them with one `RootPlacement` record;
+the partitioned-root records required by OpenViking are not implemented yet.
 
 `PathCurrent` is the only namespace truth. Workbench names are separated from
 path keys by a never-reused incarnation. This prevents a failed restore or
@@ -148,6 +167,15 @@ Secondary-index queries run at one read version and filter every result by the
 matching visible incarnation. Object bodies are read only when the selected
 tool actually requires them.
 
+The sequence above is one shard-local read. For a partitioned root, the router
+first resolves the persisted layout generation and target partition. A
+root-wide list or secondary-index query additionally requires a verifiable
+root-level consistent read view, deterministic k-way merge ordering, and a
+cursor bound to every participating shard and the layout generation. A
+provider may represent that view with one global read version or a shard
+frontier vector. Those OpenViking-profile operations are required architecture,
+but are not currently implemented or qualified.
+
 ## Publish Path
 
 ```mermaid
@@ -183,6 +211,11 @@ Failed uploads never become visible. Response loss after commit returns the
 same result on retry. Generic random writes are absent; append is immutable
 segment publication plus stream-head CAS.
 
+The command and atomicity described above are shard-local. They do not imply
+that one `MetadataCommand` can atomically publish a root-wide mutation spanning
+multiple logical shards. A partitioned-root profile must use an explicitly
+specified cross-shard protocol for such operations.
+
 Commit replay resolves its deterministic build-operation identity before any
 live workspace lookup. A terminal retry authenticates the complete stored
 request and commit-owned run-manifest binding, then verifies the corresponding
@@ -203,6 +236,10 @@ nokv/artifacts/{logical_shard_id}/{root_id}/{artifact_revision_id}/blocks/{objec
 Revision ids never name a physical owner. A process owner may change while
 logical-shard/root/revision identity stays stable.
 
+Under a partitioned-root profile, each revision still has exactly one owning
+logical shard. Root-wide operations may reference revisions from several
+shards, but cannot erase or infer that ownership boundary.
+
 Every current path and durable commit has an exact `RevisionRef`. A revision
 that reuses older blocks has a sealed dependency reference to each distinct
 owner revision. The child revision stores a strong-reference count and epoch:
@@ -221,7 +258,8 @@ restore/commit-versus-delete race.
 
 ## Snapshot And Commit Reads
 
-Holt's MVCC/view substrate supports two different products:
+For the current single-shard profile, Holt's MVCC/view substrate supports two
+different products:
 
 - a leased snapshot creates a `HistoryHold(read_version)`;
 - a durable commit scans under a temporary `HistoryHold`, writes an ordered
@@ -235,9 +273,19 @@ Commits do not pin global history. Tags are CAS-protected names for commits.
 Commit retirement is explicit and checks all heads, tags, leases, lineage
 children, and restore/fork consumers.
 
+For the OpenViking partitioned-root profile, a root-wide snapshot or commit
+requires a durable, verifiable consistent-read identity across all
+participating logical shards, layout-generation fencing, deterministic
+manifest merge, and retention of every covered shard view. Depending on the
+provider capability, that identity may be one global read version or a shard
+frontier vector. A single shard-local Holt read version is not a root-wide
+snapshot contract for that profile. This capability is currently `NOT
+QUALIFIED`.
+
 ## Restore
 
-Restore uses an operation-owned fresh Workbench incarnation:
+For the LingTai single-shard profile, restore uses an operation-owned fresh
+Workbench incarnation:
 
 ```mermaid
 stateDiagram-v2
@@ -250,36 +298,94 @@ stateDiagram-v2
     Cleaning --> Retired: remove members and refs
 ```
 
-Staged paths have strong references but no visible marker. Root-wide query and
-watch surfaces therefore cannot leak them. The final command verifies the exact
-incarnation and member seal, publishes it, completes the operation, emits one
-event, and releases the source hold.
+For the LingTai single-shard profile, staged paths have strong references but
+no visible marker. Root-wide query and watch surfaces therefore cannot leak
+them. The final shard-local command verifies the exact incarnation and member
+seal, publishes it, completes the operation, emits one event, and releases the
+source hold. Restore copies O(entries) metadata and zero object bytes inside
+that one root/shard. NoKV deliberately avoids a lazy overlay that would tax
+every later read/list.
 
-Restore copies O(entries) metadata and zero object bytes inside one root/shard.
-NoKV deliberately avoids a lazy overlay that would tax every later read/list.
+For the OpenViking partitioned-root profile, restore must coordinate staging,
+seal verification, visibility, abort, and crash recovery across every covered
+logical shard under one fenced layout generation. It cannot reuse the
+single-command visibility step above. The cross-shard restore protocol is a
+required target and is currently `NOT QUALIFIED`.
 
 ## Sharding And Ownership
 
-The control plane persists placement before a root's first write:
+Root layout is an integration-profile requirement, not a universal NoKV
+invariant. Before a root's first write, the control plane persists its placement
+profile, layout generation, and shard mapping:
 
 ```text
-RootId -> immutable LogicalShardId
+RootId -> PlacementProfile + PlacementGeneration
+
+SingleShardRoot:
+  RootId -> exactly one immutable LogicalShardId
+
+PartitionedRoot:
+  (RootId, PartitionId) -> LogicalShardId
+  one RootId may span multiple LogicalShardIds
+
 LogicalShardId -> current physical owner, lease, epoch
 ```
 
-The owner installs/validates `RootFence` locally and checks its lease/epoch at
-the Holt commit boundary. Placement is never inferred from a path or modulo
-the number of owners.
+The integration requirements are:
 
-A hot root's logical shard may be assigned to a dedicated physical process.
-That is owner movement, not a change to logical shard or object keys.
+| Integration | Required root layout | Reason |
+|---|---|---|
+| LingTai kernel | `SingleShardRoot` | Preserve the kernel's current single version-domain and root-atomic workspace contract. |
+| OpenViking through RAGFS | `PartitionedRoot` | Distribute metadata below the `RootId` boundary; one root's namespace must be able to span multiple logical shards. |
+| Other integrations | Explicitly declared from upstream and downstream requirements | NoKV must not inherit LingTai's placement choice as a global product invariant. |
 
-One root is not split across logical shards. Cross-shard operations fail before
-partial work.
+An OpenViking deployment that declares distributed metadata cannot silently
+fall back to `SingleShardRoot`; that layout does not satisfy its integration
+contract.
+
+A partitioned-root contract must also name the authority and update protocol
+for root-scoped singleton state such as `WorkspaceCurrent`, the workspace
+generation/revision, and the root event sequence. Whether those records live on
+a home shard, use provider-global transactions, or use an explicit cross-shard
+protocol remains an OpenViking design decision and is currently `NOT
+QUALIFIED`.
+
+The selected profile is pinned in control-plane state, not chosen per request.
+Changing it requires an explicit, fenced layout migration. A partitioned
+profile may use normalized namespace data as a partition key only through its
+persisted, versioned partition map; placement is never inferred by taking a
+path modulo the current number of owners.
+
+Every serving owner installs and validates the root/layout fence for its shard
+and checks the placement generation, lease, and owner epoch at the metadata
+commit boundary. A stale owner or a request routed with a stale layout
+generation must fail closed.
+
+For `SingleShardRoot`, a hot root may move with its entire logical shard to a
+dedicated physical process. For `PartitionedRoot`, partitions may move or split
+only through a generation-changing control-plane operation with explicit data
+migration and fencing; changing the owner set alone never changes placement.
+
+Cross-shard operations in a partitioned root are part of the profile, not
+unsupported accidents. Root-wide list/watch, snapshot/commit, restore,
+recursive delete, rename/move, and reference/GC ownership must define their
+read frontier, merge order, transaction or durable-operation boundary,
+idempotency, and crash recovery. Until those contracts are implemented and
+qualified, admission for `PartitionedRoot` must fail closed rather than serve a
+partially distributed root.
+
+Current implementation status: only the LingTai-compatible
+`SingleShardRoot` placement records and routing are implemented; its narrower
+executable durability boundary is described below. `PartitionedRoot` is the
+normative OpenViking requirement, but its control records, routing, cross-shard
+operations, and recovery path remain implementation work. The old statement
+that one root is never split across logical shards applies only to the current
+LingTai profile; it is not a global NoKV architecture constraint.
 
 ## Recovery And Durability
 
-Each production profile names its acknowledgement boundary:
+Each durability profile names its acknowledgement boundary independently of
+the root placement profile:
 
 ```text
 local
@@ -293,16 +399,17 @@ The two modes have separate SLOs and benchmark rows. Recovery uses checkpoint
 images plus the logical command log. Owner epoch prevents an old process from
 committing or deleting objects after failover.
 
-Current implementation status: only the `local` boundary is executable, using
-synchronous shard-local Holt WAL plus an in-store atomic, hash-chained recovery
-outbox. Remote outbox consumption/ACK, shared-log replication, checkpoint
-installation/replay, and fsck remain qualification work. Until those are
-implemented and verified, bootstrap rejects any non-zero or referenced Control
-recovery frontier before acquiring an owner or installing a route; it cannot
-mark such a shard `Serving` from an arbitrary local directory. Even while the
-frontier is empty, the local-WAL profile permits only first-owner `Create` and
-exact current-lease `Resume` with `Reopen`; it refuses every successor
-acquisition rather than risk serving a replacement empty Holt store.
+Current implementation status: only the single-shard `local` boundary is
+executable, using synchronous shard-local Holt WAL plus an in-store atomic,
+hash-chained recovery outbox. Remote outbox consumption/ACK, shared-log
+replication, checkpoint installation/replay, partitioned-root recovery, and
+fsck remain qualification work. Until those are implemented and verified,
+bootstrap rejects any non-zero or referenced Control recovery frontier before
+acquiring an owner or installing a route; it cannot mark such a shard `Serving`
+from an arbitrary local directory. Even while the frontier is empty, the
+local-WAL profile permits only first-owner `Create` and exact current-lease
+`Resume` with `Reopen`; it refuses every successor acquisition rather than risk
+serving a replacement empty Holt store.
 
 Durable ledgers, not object listing, recover:
 
@@ -327,5 +434,9 @@ experiments. The required evidence covers:
    the same schema and identity model;
 4. owner failover, checkpoint/log recovery, ambiguous provider outcomes, and
    first-client workflows;
-5. the complete [acceptance plan](./development/workspace-acceptance.md),
+5. the declared integration-placement matrix: LingTai single-shard behavior,
+   plus OpenViking partition routing, consistent-view root-wide list/watch,
+   snapshot/restore, cross-shard failure recovery, owner failover, and layout
+   migration or an explicit prohibition of it;
+6. the complete [acceptance plan](./development/workspace-acceptance.md),
    with each applicable gate reported as `PASS`, `FAIL`, or `NOT QUALIFIED`.
