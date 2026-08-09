@@ -301,7 +301,9 @@ ArtifactRevisionClaim (reserved key inside the artifact_revision tree)
   deleted in the same command that publishes the revision or finishes the
   owning operation's cleanup. A quarantined operation keeps its claim
   fail-closed: its provider-side object state is unresolved, so the revision
-  identity stays unclaimable until operator reconciliation releases it.
+  identity stays unclaimable until `ReconcileQuarantinedArtifactPublish`
+  resolves the operation under an operator verdict and releases the claim in
+  the same command that transitions it to `Cleaned`.
   Exact revision keys are 32 bytes, so the 33-byte discriminated key can
   never collide with one.
 
@@ -614,7 +616,7 @@ The mutually exclusive operation transitions are:
 ```text
 Uploading -> Finalizing -> Published
 Uploading -> Aborting -> Cleaning -> Cleaned
-                                  -> Quarantined
+                                  -> Quarantined -> Cleaned # operator reconcile
 Finalizing -> Aborting # fenced proof of no path/dedupe publication
 ```
 
@@ -631,6 +633,20 @@ A late upload completion must observe the operation state; after abort it joins
 cleanup instead of publishing. Ambiguous multipart completion, late PUT, or
 DELETE remains ledger-owned and `Quarantined` until reconciled. Object listing
 is never used to discover staged ownership.
+
+Reconciliation is operator-driven, never scanner-driven. The operator verifies
+provider-side object state for the operation's staged keys out-of-band and
+presents one of two verdicts through
+`ReconcileQuarantinedArtifactPublish`: every staged key verified absent with
+the revision unpublished, or the revision already published by another
+operation (staged keys are then that revision's live objects and only the
+quarantined operation's private bookkeeping rows are removed). Each durable
+command pins the verdict against the authoritative `ArtifactRevision` row and
+refuses loudly on contradiction; the final command rewrites the terminal error
+to `OperatorReconciled` with an evidence chain binding the original quarantine
+evidence and the operator's verification transcript, transitions
+`Quarantined -> Cleaned`, and releases the revision claim when this operation
+owns it.
 
 The final metadata command creates the `ArtifactRevision` as `Available`, its
 manifest, the first path reference, `PathCurrent`, workspace revision, indexes,
