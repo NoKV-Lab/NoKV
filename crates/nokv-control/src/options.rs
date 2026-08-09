@@ -2,7 +2,7 @@
 use crate::codec::encode_fixed_id;
 use crate::ControlError;
 #[cfg(any(feature = "etcd", test))]
-use crate::{LogicalShardId, RootId};
+use crate::{LogicalShardId, OwnerIncarnationId, RootId};
 
 const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
 const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
@@ -114,6 +114,51 @@ impl EtcdControlStoreOptions {
         .into_bytes()
     }
 
+    /// Shard-singleton durable owner-admission plan.
+    ///
+    /// The plan is deliberately not attached to a lease. Its exact permanent
+    /// claim and lease-attached sentinel distinguish a prepared plan from an
+    /// expired or committed attempt after restart.
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn owner_admission_plan_key(&self, logical_shard_id: &LogicalShardId) -> Vec<u8> {
+        format!(
+            "{}/owner-admission/plans/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(logical_shard_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
+    /// Shard-singleton liveness sentinel for one prepared admission plan.
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn owner_admission_sentinel_key(
+        &self,
+        logical_shard_id: &LogicalShardId,
+    ) -> Vec<u8> {
+        format!(
+            "{}/owner-admission/sentinels/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(logical_shard_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
+    /// Permanent claim for one never-reused shard owner incarnation.
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn owner_incarnation_claim_key(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        owner_incarnation_id: &OwnerIncarnationId,
+    ) -> Vec<u8> {
+        format!(
+            "{}/owner-admission/claims/{}/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(logical_shard_id.as_bytes()),
+            encode_fixed_id(owner_incarnation_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
     fn normalized_key_prefix(&self) -> String {
         self.key_prefix.trim_end_matches('/').to_owned()
     }
@@ -129,6 +174,10 @@ mod tests {
 
     fn shard_id(value: u8) -> LogicalShardId {
         LogicalShardId::from_bytes([value; 16])
+    }
+
+    fn incarnation_id(value: u8) -> OwnerIncarnationId {
+        OwnerIncarnationId::from_bytes([value; 16])
     }
 
     #[test]
@@ -161,6 +210,22 @@ mod tests {
         assert_eq!(
             String::from_utf8(options.logical_shard_session_key(&shard_id(0x02))).unwrap(),
             "/nokv/test/sessions/02020202020202020202020202020202"
+        );
+        assert_eq!(
+            String::from_utf8(options.owner_admission_plan_key(&shard_id(0x02))).unwrap(),
+            "/nokv/test/owner-admission/plans/02020202020202020202020202020202"
+        );
+        assert_eq!(
+            String::from_utf8(options.owner_admission_sentinel_key(&shard_id(0x02))).unwrap(),
+            "/nokv/test/owner-admission/sentinels/02020202020202020202020202020202"
+        );
+        assert_eq!(
+            String::from_utf8(options.owner_incarnation_claim_key(
+                &shard_id(0x02),
+                &incarnation_id(0x03),
+            ))
+            .unwrap(),
+            "/nokv/test/owner-admission/claims/02020202020202020202020202020202/03030303030303030303030303030303"
         );
     }
 }

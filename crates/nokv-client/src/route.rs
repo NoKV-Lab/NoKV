@@ -268,8 +268,11 @@ fn invalid_route(message: impl Into<String>) -> ClientError {
 mod control_tests {
     use super::*;
     use nokv_control::{
-        InMemoryControlStore, LogicalShardId, NodeId, PlacementGeneration, RecoveryPublication,
-        RootPlacement,
+        ConsistencyDomainId, InMemoryControlStore, LogicalShardId, MetadataAuthorityBinding,
+        MetadataAuthorityGeneration, MetadataAuthorityId, MetadataAuthorityRecord,
+        MetadataAuthorityRevision, MetadataContractDigest, MetadataProviderProfileId, NodeId,
+        OwnerIncarnationId, OwnerServingAdmission, PlacementGeneration, RecoveryPublication,
+        RootLayoutGeneration, RootLayoutProfile, RootPartitionId, RootPlacement,
     };
 
     fn id(value: u8) -> [u8; 16] {
@@ -287,9 +290,27 @@ mod control_tests {
         let root_id = RootId::from_bytes(id(1));
         let logical_shard_id = LogicalShardId::from_bytes(id(2));
         store.create_logical_shard(logical_shard_id).unwrap();
+        store
+            .create_metadata_authority(MetadataAuthorityRecord {
+                logical_shard_id,
+                record_revision: MetadataAuthorityRevision::new(1).unwrap(),
+                authority_generation: MetadataAuthorityGeneration::new(1).unwrap(),
+                active: MetadataAuthorityBinding {
+                    authority_id: MetadataAuthorityId::from_bytes(id(3)),
+                    provider_profile_id: MetadataProviderProfileId::new("route-test-v1").unwrap(),
+                    profile_fingerprint: [4; 32],
+                    consistency_domain_id: ConsistencyDomainId::from_bytes(id(5)),
+                    contract_digest: MetadataContractDigest::from_bytes([6; 32]),
+                },
+                migration: None,
+            })
+            .unwrap();
         let provisioning = store
             .create_root_placement(RootPlacement {
                 root_id,
+                layout_profile: RootLayoutProfile::SingleShardRoot,
+                layout_generation: RootLayoutGeneration::new(1).unwrap(),
+                partition_id: RootPartitionId::SINGLE_SHARD,
                 logical_shard_id,
                 placement_generation: PlacementGeneration::new(1).unwrap(),
                 lifecycle: RootPlacementLifecycle::Provisioning,
@@ -301,18 +322,28 @@ mod control_tests {
             ..provisioning.clone()
         };
         store
-            .compare_and_set_root_placement(&provisioning, active)
+            .compare_and_set_root_placement(&provisioning, active.clone())
             .unwrap();
+        let admission = OwnerServingAdmission::stable(
+            active,
+            store
+                .get_metadata_authority(&logical_shard_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         let lease = store
             .acquire_owner(
-                &logical_shard_id,
+                &admission,
                 NodeId::new("node-a").unwrap(),
+                OwnerIncarnationId::from_bytes(id(7)),
                 endpoint.to_owned(),
             )
             .unwrap();
         store
             .mark_serving(
                 &lease,
+                &admission,
                 RecoveryPublication {
                     checkpoint: None,
                     log: None,
@@ -366,19 +397,32 @@ mod control_tests {
                 },
             )
             .unwrap();
+        let admission = OwnerServingAdmission::stable(
+            store
+                .get_root_placement(&RootId::from(root_id))
+                .unwrap()
+                .unwrap(),
+            store
+                .get_metadata_authority(&first.logical_shard_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
 
         store.release_owner(&first).unwrap();
         let second = store
             .acquire_successor(
-                &first.logical_shard_id,
+                &admission,
                 first.owner_epoch,
                 NodeId::new("node-b").unwrap(),
+                OwnerIncarnationId::from_bytes(id(8)),
                 "127.0.0.1:7751".to_owned(),
             )
             .unwrap();
         store
             .mark_serving(
                 &second,
+                &admission,
                 RecoveryPublication {
                     checkpoint: None,
                     log: None,

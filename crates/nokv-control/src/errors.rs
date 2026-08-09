@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::{LogicalShardId, LogicalShardLease, NodeId, OwnerEpoch, RootId, RootPlacement};
+use crate::{
+    LogicalShardId, LogicalShardLease, MetadataAuthorityRecord, NodeId, OwnerEpoch, RootId,
+    RootLayoutProfile, RootPlacement,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlError {
@@ -13,15 +16,46 @@ pub enum ControlError {
         requested: LogicalShardId,
     },
     RootPlacementCasConflict {
-        expected: RootPlacement,
-        actual: Option<RootPlacement>,
+        expected: Box<RootPlacement>,
+        actual: Option<Box<RootPlacement>>,
     },
     InvalidPlacementMutation {
         root_id: RootId,
         reason: String,
     },
+    RootLayoutNotQualified {
+        root_id: RootId,
+        profile: RootLayoutProfile,
+    },
+    InvalidFreshRootProvisioning {
+        root_id: RootId,
+        reason: String,
+    },
+    FreshRootProvisioningConflict {
+        root_id: RootId,
+        logical_shard_id: LogicalShardId,
+        reason: String,
+    },
     LogicalShardNotFound(LogicalShardId),
     LogicalShardAlreadyExists(LogicalShardId),
+    MetadataAuthorityNotFound(LogicalShardId),
+    MetadataAuthorityAlreadyExists(LogicalShardId),
+    MetadataAuthorityAdoptionRejected {
+        logical_shard_id: LogicalShardId,
+        reason: String,
+    },
+    MetadataAuthorityCasConflict {
+        expected: Box<MetadataAuthorityRecord>,
+        actual: Option<Box<MetadataAuthorityRecord>>,
+    },
+    InvalidMetadataAuthorityMutation {
+        logical_shard_id: LogicalShardId,
+        reason: String,
+    },
+    MetadataAuthorityAdmission {
+        logical_shard_id: LogicalShardId,
+        reason: String,
+    },
     RootPlacementRequired(LogicalShardId),
     LogicalShardAlreadyOwned {
         logical_shard_id: LogicalShardId,
@@ -49,6 +83,22 @@ pub enum ControlError {
     },
     InvalidRecord(String),
     InvalidOptions(String),
+    RootPlacementCodecUpgradeRequired {
+        stored_version: u8,
+        required_version: u8,
+    },
+    LogicalShardRecordCodecUpgradeRequired {
+        stored_version: u8,
+        required_version: u8,
+    },
+    MetadataAuthorityCodecUpgradeRequired {
+        stored_version: u8,
+        required_version: u8,
+    },
+    OwnerSessionCodecUpgradeRequired {
+        stored_version: u8,
+        required_version: u8,
+    },
     Codec(String),
     Backend(String),
 }
@@ -80,12 +130,61 @@ impl fmt::Display for ControlError {
             Self::InvalidPlacementMutation { root_id, reason } => {
                 write!(formatter, "invalid root placement mutation for {root_id:?}: {reason}")
             }
+            Self::RootLayoutNotQualified { root_id, profile } => write!(
+                formatter,
+                "root layout {profile:?} for {root_id:?} is NOT QUALIFIED by this runtime"
+            ),
+            Self::InvalidFreshRootProvisioning { root_id, reason } => write!(
+                formatter,
+                "invalid fresh-root provisioning request for {root_id:?}: {reason}"
+            ),
+            Self::FreshRootProvisioningConflict {
+                root_id,
+                logical_shard_id,
+                reason,
+            } => write!(
+                formatter,
+                "fresh-root provisioning for {root_id:?} on logical shard {logical_shard_id:?} conflicts with control state: {reason}"
+            ),
             Self::LogicalShardNotFound(logical_shard_id) => {
                 write!(formatter, "logical shard {logical_shard_id:?} was not found")
             }
             Self::LogicalShardAlreadyExists(logical_shard_id) => {
                 write!(formatter, "logical shard {logical_shard_id:?} already exists")
             }
+            Self::MetadataAuthorityNotFound(logical_shard_id) => write!(
+                formatter,
+                "metadata authority for logical shard {logical_shard_id:?} was not found"
+            ),
+            Self::MetadataAuthorityAlreadyExists(logical_shard_id) => write!(
+                formatter,
+                "metadata authority for logical shard {logical_shard_id:?} already exists"
+            ),
+            Self::MetadataAuthorityAdoptionRejected {
+                logical_shard_id,
+                reason,
+            } => write!(
+                formatter,
+                "metadata authority cannot adopt logical shard {logical_shard_id:?}: {reason}"
+            ),
+            Self::MetadataAuthorityCasConflict { expected, actual } => write!(
+                formatter,
+                "metadata authority CAS conflict: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::InvalidMetadataAuthorityMutation {
+                logical_shard_id,
+                reason,
+            } => write!(
+                formatter,
+                "invalid metadata authority mutation for logical shard {logical_shard_id:?}: {reason}"
+            ),
+            Self::MetadataAuthorityAdmission {
+                logical_shard_id,
+                reason,
+            } => write!(
+                formatter,
+                "metadata authority admission failed for logical shard {logical_shard_id:?}: {reason}"
+            ),
             Self::RootPlacementRequired(logical_shard_id) => write!(
                 formatter,
                 "logical shard {logical_shard_id:?} needs a non-retired root placement before owner acquisition"
@@ -145,6 +244,34 @@ impl fmt::Display for ControlError {
             Self::InvalidOptions(reason) => {
                 write!(formatter, "invalid control store options: {reason}")
             }
+            Self::RootPlacementCodecUpgradeRequired {
+                stored_version,
+                required_version,
+            } => write!(
+                formatter,
+                "root placement codec version {stored_version} requires an explicit upgrade to version {required_version}"
+            ),
+            Self::LogicalShardRecordCodecUpgradeRequired {
+                stored_version,
+                required_version,
+            } => write!(
+                formatter,
+                "logical shard record codec version {stored_version} has no owner incarnation; automatic adoption is forbidden, version {required_version} is required"
+            ),
+            Self::MetadataAuthorityCodecUpgradeRequired {
+                stored_version,
+                required_version,
+            } => write!(
+                formatter,
+                "metadata authority codec version {stored_version} requires an explicit upgrade to version {required_version}"
+            ),
+            Self::OwnerSessionCodecUpgradeRequired {
+                stored_version,
+                required_version,
+            } => write!(
+                formatter,
+                "owner session codec version {stored_version} has no exact owner incarnation; automatic adoption is forbidden, version {required_version} is required"
+            ),
             Self::Codec(reason) => write!(formatter, "control store codec error: {reason}"),
             Self::Backend(reason) => write!(formatter, "control store backend error: {reason}"),
         }
