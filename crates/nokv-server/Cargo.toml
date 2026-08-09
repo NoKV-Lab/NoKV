@@ -12,6 +12,7 @@ homepage.workspace = true
 [features]
 default = []
 etcd = ["nokv-control/etcd"]
+foundationdb-provider = ["nokv-meta/foundationdb-provider"]
 
 [dependencies]
 nokv-control.workspace = true
