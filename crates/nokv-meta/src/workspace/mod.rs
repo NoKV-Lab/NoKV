@@ -1,16 +1,22 @@
-//! Authoritative NoKV workspace metadata schema and Holt binding.
+//! Authoritative NoKV workspace metadata schema and provider facade.
 //!
 //! This is the only supported durable namespace layout.
 
+mod authority;
 mod build_commit_records;
 mod codec;
 mod commit;
+mod commit_receipt;
 mod commit_records;
+mod commit_recovery_fence;
 mod engine;
 mod event_projection;
+mod fsck;
 mod gc;
 mod gc_records;
 mod namespace;
+pub(crate) mod provider;
+mod provider_catalog;
 mod publication;
 mod publication_records;
 mod publish_operation_records;
@@ -27,6 +33,10 @@ mod snapshot;
 mod snapshot_query;
 mod snapshot_records;
 
+pub use authority::{
+    workspace_metadata_contract_digest, AcknowledgedMetadataFrontier, MetadataAuthorityState,
+    MetadataStoreIdentity,
+};
 pub use build_commit_records::{
     BuildCommitOperationRecord, BuildCommitResult, CommitManifestBinding, CommitManifestCondition,
     CommitOperationErrorKind, CommitOperationRecordError, CommitOperationTerminalError,
@@ -64,18 +74,46 @@ pub use commit::{
     MAX_COMMIT_PARENT_BATCH_ROWS, MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
     MAX_COMMIT_REVISION_BATCH_ROWS,
 };
+pub use commit_receipt::{
+    ClaimedMetadataCommitReceiptPersistCommandV1, ClaimedMetadataCommitReceiptPoisonCommandV1,
+    ClaimedMetadataCommitReceiptResolveCommandV1, MetadataAuthorityCommitActionV1,
+    MetadataCommandCommitClassV1, MetadataCommitPurposeV1, MetadataCommitReceiptDirtySourceV1,
+    MetadataCommitReceiptErrorV1, MetadataCommitReceiptMutationBackendResultV1,
+    MetadataCommitReceiptMutationNotDispatchedV1, MetadataCommitReceiptPersistBackendResultV1,
+    MetadataCommitReceiptPersistCommandV1, MetadataCommitReceiptPersistErrorV1,
+    MetadataCommitReceiptPersistNotDispatchedV1, MetadataCommitReceiptPersistOutcomeV1,
+    MetadataCommitReceiptPoisonCommandV1, MetadataCommitReceiptPoisonOutcomeV1,
+    MetadataCommitReceiptPoisonReasonV1, MetadataCommitReceiptQualificationV1,
+    MetadataCommitReceiptResolveCommandV1, MetadataCommitReceiptResolveOutcomeV1,
+    MetadataCommitReceiptStateV1, MetadataCommitReceiptStoreV1, MetadataCommitResolutionBasisV1,
+    MetadataCommitResolutionV1, MetadataFrontierPointV1, MetadataRuntimeCommitBundleV1,
+    PlannedMetadataCommitV1,
+};
 pub use commit_records::{
     advance_commit_member_rolling_digest, commit_member_row_digest, CommitConsumerRecord,
     CommitMemberRecord, CommitRecord, CommitRecordError, TagRecord, WorkbenchCommitHeadRecord,
     COMMIT_VALUE_FORMAT_VERSION, MAX_COMMIT_DIGEST_URI_BYTES, MAX_COMMIT_LINEAGE_BYTES,
     MAX_COMMIT_MEMBER_PROJECTION_BYTES, MAX_COMMIT_PRODUCER_BYTES, MAX_PARENT_COMMITS,
 };
+pub use commit_recovery_fence::{
+    ClaimedMetadataPendingRecoveryOpenCommandV1, MetadataCommitRecoveryFenceFactoryV1,
+    MetadataOldDispatchExcludedProviderV1, MetadataOldDispatchExclusionInstallationV1,
+    MetadataPendingRecoveryOpenBackendResultV1, MetadataPendingRecoveryOpenCommandV1,
+    MetadataPendingRecoveryOpenErrorV1, MetadataPendingRecoveryOpenNotDispatchedV1,
+    MetadataPendingRecoveryOpenOutcomeV1, MetadataPendingRecoveryOpenWitnessV1,
+};
+pub(crate) use engine::canonical_provider_requirement_values;
 #[cfg(feature = "metadata-read-stats")]
 pub use engine::MetadataReadStatsSession;
 pub use engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
-    HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, MetadataScanItem,
-    RootFenceAction,
+    canonical_provider_schema_v1, AgentMetadataError, AgentMetadataStore, CommandMutation,
+    CommandPredicate, EventProjection, HistoryProjection, MetadataCommand, MetadataCommandResult,
+    MetadataFamily, MetadataScanItem, MetadataStoreCreateModeV1, RootFenceAction,
+};
+pub use fsck::{
+    run_metadata_fsck, MetadataFsckFamilyCoverage, MetadataFsckFinding, MetadataFsckFindingKind,
+    MetadataFsckLimits, MetadataFsckReport, MetadataFsckRequest, MetadataFsckStatus,
+    METADATA_FSCK_REPORT_SCHEMA_VERSION,
 };
 pub use gc::{
     gc_operation_id, AdvanceGcDeletionBatchRequest, BeginGcDeletionRequest, ClaimGcRequest,
@@ -94,6 +132,10 @@ pub use namespace::{
     list_paths_at_visible_workspace, CreateVisibleWorkspaceResult, NamespaceError, RootReadContext,
     RootWriteContext, VisiblePathChild, VisiblePathListPage, VisibleWorkspacePathRead,
     MAX_VISIBLE_PATH_LIST_PAGE_SIZE,
+};
+pub use nokv_types::{
+    MetadataMigrationTargetBinding, MetadataRecoveryFrontier, SourceQuiesceReceipt,
+    TargetActivationToken,
 };
 pub use publication::{
     advance_manifest_rolling_digest, advance_staged_object_rolling_digest, dependency_owner_digest,
@@ -141,7 +183,10 @@ pub use query_records::{
 pub use read_stats::{
     MetadataReadStats, MetadataReadStatsDeltaError, MetadataReadStatsSessionError,
 };
-pub use records::{CommandDedupeRecord, CurrentValue, HistoryValue, RecordCodecError, RootFence};
+pub use records::{
+    CommandDedupeRecord, CurrentValue, HistoryValue, RecordCodecError, RootFence,
+    ROOT_FENCE_VALUE_FORMAT_VERSION,
+};
 pub use recovery::{
     RecoveryCodecError, RecoveryMutationV1, RecoveryOutboxRecord, RecoveryResultV1, RecoveryState,
     RECOVERY_CHAIN_DIGEST_BYTES, RECOVERY_OUTBOX_VALUE_FORMAT_VERSION,

@@ -4,25 +4,70 @@ use std::marker::PhantomData;
 use std::path::Path;
 #[cfg(feature = "metadata-read-stats")]
 use std::rc::Rc;
-#[cfg(feature = "metadata-read-stats")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use holt::{Durability, Record, RecordVersion, Tree, TreeConfig, DB};
+#[cfg(test)]
+use nokv_types::TargetActivationToken;
 use nokv_types::{
-    CommandDigest, CommitVersion, LogicalShardId, OwnerEpoch, PlacementGeneration, ReadVersion,
-    RequestId, RootActivationState, RootId,
+    CommandDigest, CommitVersion, LogicalShardId, MetadataMigrationTargetBinding,
+    MetadataRecoveryFrontier, OperationId, OwnerEpoch, PlacementGeneration, ReadVersion, RequestId,
+    RootActivationState, RootId, RootLayoutGeneration, RootLayoutProfile, RootPartitionId,
+    SourceQuiesceReceipt,
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use crate::built_in_holt::HoltRuntimeGuard;
+use crate::built_in_holt::NoopHoltRuntimeGuard;
+
+use super::authority::{
+    decode_authority_marker, decode_store_identity, encode_authority_marker, encode_store_identity,
+    validate_metadata_store_identity, workspace_metadata_contract_digest,
+    AcknowledgedMetadataFrontier, MetadataAuthorityEvidence, MetadataAuthorityMarker,
+    MetadataAuthorityState, MetadataStoreIdentity,
+};
+#[cfg(test)]
+use super::codec::SCHEMA_TREES;
 use super::codec::{
     change_event_key, encode_schema_marker, validate_schema_marker, ARTIFACT_MANIFEST_TREE,
-    ARTIFACT_REVISION_TREE, CHANGE_EVENT_TREE, COMMAND_DEDUPE_TREE, COMMIT_CONSUMER_TREE,
-    COMMIT_MEMBER_TREE, COMMIT_TREE, GC_BARRIER_TREE, GC_CANDIDATE_TREE, HISTORY_HOLD_TREE,
-    HISTORY_TREE, OPERATION_TREE, PATH_CURRENT_TREE, RECOVERY_OUTBOX_TREE, RESTORE_MEMBER_TREE,
-    REVISION_REF_TREE, ROOT_FENCE_TREE, SCHEMA_ID, SCHEMA_TREES, SECONDARY_INDEX_TREE,
-    SNAPSHOT_ALIAS_TREE, SNAPSHOT_REF_TREE, STAGED_OBJECT_TREE, SYSTEM_SCHEMA_KEY, SYSTEM_TREE,
-    TAG_TREE, WORKBENCH_COMMIT_HEAD_TREE, WORKSPACE_CURRENT_TREE, WORKSPACE_INCARNATION_CLAIM_TREE,
+    ARTIFACT_REVISION_TREE, COMMIT_CONSUMER_TREE, COMMIT_MEMBER_TREE, COMMIT_TREE, GC_BARRIER_TREE,
+    GC_CANDIDATE_TREE, HISTORY_HOLD_TREE, OPERATION_TREE, PATH_CURRENT_TREE, RESTORE_MEMBER_TREE,
+    REVISION_REF_TREE, SCHEMA_ID, SECONDARY_INDEX_TREE, SNAPSHOT_ALIAS_TREE, SNAPSHOT_REF_TREE,
+    STAGED_OBJECT_TREE, SYSTEM_SCHEMA_KEY, TAG_TREE, WORKBENCH_COMMIT_HEAD_TREE,
+    WORKSPACE_CURRENT_TREE, WORKSPACE_INCARNATION_CLAIM_TREE,
+};
+use super::commit_receipt::{
+    digest_authority_marker, digest_source_receipt, digest_target_binding, purpose_evidence_digest,
+    MetadataAuthorityCommitActionV1, MetadataCommandCommitClassV1,
+    MetadataCommitLiveResolutionOriginV1, MetadataCommitPurposeV1,
+    MetadataCommitReceiptDirtySourceV1, MetadataCommitReceiptErrorV1,
+    MetadataCommitReceiptMutationBackendResultV1, MetadataCommitReceiptPersistBackendResultV1,
+    MetadataCommitReceiptPersistCommandV1, MetadataCommitReceiptPersistErrorV1,
+    MetadataCommitReceiptPersistOutcomeV1, MetadataCommitReceiptPoisonCommandV1,
+    MetadataCommitReceiptPoisonOutcomeV1, MetadataCommitReceiptPoisonReasonV1,
+    MetadataCommitReceiptQualificationV1, MetadataCommitReceiptResolveCommandV1,
+    MetadataCommitReceiptResolveOutcomeV1, MetadataCommitReceiptStateV1,
+    MetadataCommitReceiptStoreV1, MetadataCommitResolutionV1, MetadataFrontierPointV1,
+    MetadataRuntimeCommitBundleV1, PlannedMetadataCommitV1,
+};
+#[cfg(test)]
+use super::commit_receipt::{
+    digest_target_token, MetadataCommitReceiptMutationNotDispatchedV1,
+    MetadataCommitReceiptPersistNotDispatchedV1, MetadataCommitResolutionBasisV1,
+};
+use super::commit_recovery_fence::{
+    mint_pending_recovery_open_v1, MetadataCommitRecoveryFenceFactoryV1,
+    MetadataOldDispatchExclusionInstallationV1, MetadataPendingRecoveryOpenCommandV1,
+    MetadataPendingRecoveryOpenOutcomeV1,
+};
+#[cfg(test)]
+use super::provider::HoltProvider;
+use super::provider::{
+    all_ordered_spaces, AtomicCommitOutcome, AtomicOp, AtomicPlan, HoltProviderFactory,
+    MetadataProvider, MetadataReadView, MetadataTransaction, OrderedSpaceId, ProviderCapabilities,
+    ProviderError, ProviderErrorKind, ProviderRecord, ProviderScan, ProviderScanItem, ReadScope,
+    ReadWitness,
 };
 #[cfg(feature = "metadata-read-stats")]
 use super::read_stats::{self, MetadataReadStats, MetadataReadStatsSessionError};
@@ -32,28 +77,84 @@ use super::recovery::{
     recovery_genesis_digest, recovery_outbox_key, recovery_storage_chunk_count,
     recovery_storage_logical_length, split_recovery_storage, RecoveryMutationV1,
     RecoveryOutboxRecord, RecoveryResultV1, RecoveryState, MAX_RECOVERY_BYTES,
-    RECOVERY_CHAIN_DIGEST_BYTES,
+    MAX_STORAGE_CHUNK_DATA_BYTES, RECOVERY_CHAIN_DIGEST_BYTES,
+};
+use crate::provider::v1::{
+    CreateRecoveryIntentV1, MetadataProviderFactoryV1, ProviderContractOfferV1,
+    ProviderCreateRequestV1, ProviderDiagnosticsSnapshotV1, ProviderDiagnosticsV1,
+    ProviderOperationV1, ProviderReopenRequestV1, ProviderSchemaV1,
 };
 
-const SYSTEM_SHARD_IDENTITY_KEY: &[u8] = b"shard_identity";
-const SYSTEM_OWNER_FENCE_KEY: &[u8] = b"owner_fence";
-const SYSTEM_COMMIT_CLOCK_KEY: &[u8] = b"commit_clock";
-const SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY: &[u8] = b"lease_clock_high_water";
-const SYSTEM_APPLIED_RECOVERY_LSN_KEY: &[u8] = b"applied_recovery_lsn";
-const SYSTEM_RECOVERY_CHAIN_DIGEST_KEY: &[u8] = b"recovery_chain_digest";
+/// Nominal authority for engine-owned receipt and recovery command minting.
+///
+/// The type is visible to sibling protocol modules only as a constructor
+/// parameter. Its field and production constructor remain private to this
+/// module, so provider bindings and forwarding runtimes cannot manufacture
+/// commit or recovery authority.
+pub(super) struct MetadataCommitEngineMintAuthorityV1 {
+    _private: (),
+}
+
+impl MetadataCommitEngineMintAuthorityV1 {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        Self::new()
+    }
+}
+
+pub(super) const SYSTEM_STORE_IDENTITY_KEY: &[u8] = b"store_identity";
+pub(super) const SYSTEM_METADATA_AUTHORITY_KEY: &[u8] = b"metadata_authority";
+pub(super) const SYSTEM_OWNER_FENCE_KEY: &[u8] = b"owner_fence";
+pub(super) const SYSTEM_COMMIT_CLOCK_KEY: &[u8] = b"commit_clock";
+pub(super) const SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY: &[u8] = b"lease_clock_high_water";
+pub(super) const SYSTEM_APPLIED_RECOVERY_LSN_KEY: &[u8] = b"applied_recovery_lsn";
+pub(super) const SYSTEM_RECOVERY_CHAIN_DIGEST_KEY: &[u8] = b"recovery_chain_digest";
 const SYSTEM_VALUE_FORMAT_VERSION: u8 = 1;
 const INITIAL_COMMIT_VERSION: u64 = 1;
 
-const MAX_COMMAND_ITEMS: usize = 256;
+pub(super) const MAX_COMMAND_ITEMS: usize = 256;
 const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
 const MAX_COMMAND_KEY_BYTES: usize = 8 * 1024;
-// Holt limits one stored value to u16::MAX bytes. Domain payloads are wrapped
-// in CurrentValue, HistoryValue, or CommandDedupeRecord before insertion, so
-// keep explicit headroom for every durable envelope.
-const MAX_HOLT_RECORD_PAYLOAD_BYTES: usize = 60 * 1024;
-const MAX_COMMAND_VALUE_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
-const MAX_DETERMINISTIC_RESULT_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
-const MAX_EVENT_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
+// The default provider limits one stored value to u16::MAX bytes. Domain
+// payloads are wrapped in durable envelopes, so retain explicit headroom.
+const MAX_METADATA_RECORD_PAYLOAD_BYTES: usize = 60 * 1024;
+const MAX_COMMAND_VALUE_BYTES: usize = MAX_METADATA_RECORD_PAYLOAD_BYTES;
+const MAX_DETERMINISTIC_RESULT_BYTES: usize = MAX_METADATA_RECORD_PAYLOAD_BYTES;
+const MAX_EVENT_BYTES: usize = MAX_METADATA_RECORD_PAYLOAD_BYTES;
+
+#[derive(Clone, Copy)]
+pub(crate) struct CanonicalProviderRequirementValues {
+    pub max_key_bytes: usize,
+    pub max_value_bytes: usize,
+    pub max_atomic_operations: usize,
+    pub max_logical_plan_bytes: usize,
+}
+
+pub(crate) const fn canonical_provider_requirement_values() -> CanonicalProviderRequirementValues {
+    const HISTORY_KEY_ENVELOPE_BYTES: usize = 1 + 4 + 8;
+    const COMMAND_DEDUPE_VALUE_ENVELOPE_BYTES: usize = 1 + 32 + 8 + 8 + 4;
+    const FIXED_COMMAND_OPERATIONS: usize = 11;
+    const MAX_RECOVERY_CHUNKS: usize = MAX_RECOVERY_BYTES.div_ceil(MAX_STORAGE_CHUNK_DATA_BYTES);
+    const MAX_ATOMIC_OPERATIONS: usize =
+        FIXED_COMMAND_OPERATIONS + (MAX_COMMAND_ITEMS * 4) + MAX_RECOVERY_CHUNKS;
+    const MAX_KEY_BYTES: usize = MAX_COMMAND_KEY_BYTES + HISTORY_KEY_ENVELOPE_BYTES;
+    const MAX_VALUE_BYTES: usize =
+        MAX_METADATA_RECORD_PAYLOAD_BYTES + COMMAND_DEDUPE_VALUE_ENVELOPE_BYTES;
+    CanonicalProviderRequirementValues {
+        max_key_bytes: MAX_KEY_BYTES,
+        max_value_bytes: MAX_VALUE_BYTES,
+        max_atomic_operations: MAX_ATOMIC_OPERATIONS,
+        // This is a complete, deliberately conservative ceiling: every legal
+        // operation fits one largest engine-emitted key plus one largest
+        // engine-emitted value. It avoids assuming provider-private framing or
+        // correlations between command fields and recovery chunks.
+        max_logical_plan_bytes: MAX_ATOMIC_OPERATIONS * (MAX_KEY_BYTES + MAX_VALUE_BYTES),
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum MetadataPointReadSource {
@@ -94,7 +195,7 @@ pub enum MetadataFamily {
 }
 
 impl MetadataFamily {
-    pub const fn tree_name(self) -> &'static str {
+    pub(super) const fn tree_name(self) -> &'static str {
         match self {
             Self::WorkspaceCurrent => WORKSPACE_CURRENT_TREE,
             Self::PathCurrent => PATH_CURRENT_TREE,
@@ -119,11 +220,11 @@ impl MetadataFamily {
         }
     }
 
-    pub const fn history_tag(self) -> u8 {
+    pub(super) const fn history_tag(self) -> u8 {
         self as u8
     }
 
-    const ALL: [Self; 20] = [
+    pub(super) const ALL: [Self; 20] = [
         Self::WorkspaceCurrent,
         Self::PathCurrent,
         Self::ArtifactRevision,
@@ -149,7 +250,11 @@ impl MetadataFamily {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RootFenceAction {
-    Install,
+    Install {
+        layout_profile: RootLayoutProfile,
+        layout_generation: RootLayoutGeneration,
+        partition_id: RootPartitionId,
+    },
     RequireActive,
     Transition {
         expected: RootActivationState,
@@ -252,7 +357,15 @@ impl MetadataCommand {
         hasher.update(self.request_id.as_bytes());
         hasher.update(self.read_version.get().to_be_bytes());
         match self.root_fence_action {
-            RootFenceAction::Install => hasher.update([1]),
+            RootFenceAction::Install {
+                layout_profile,
+                layout_generation,
+                partition_id,
+            } => {
+                hasher.update([1, layout_profile.into()]);
+                hasher.update(layout_generation.get().to_be_bytes());
+                hasher.update(partition_id.as_bytes());
+            }
             RootFenceAction::RequireActive => hasher.update([2]),
             RootFenceAction::Transition { expected, next } => {
                 hasher.update([3, expected.into(), next.into()]);
@@ -380,6 +493,33 @@ pub enum AgentMetadataError {
     },
     PredicateFailed,
     WriteConflict,
+    CommitReceiptRecoveryRequired,
+    CommitOutcomeUnknown,
+    TransactionTooLarge {
+        affected_bytes: usize,
+        max_bytes: usize,
+    },
+    ProviderUnavailable {
+        operation: &'static str,
+        message: String,
+    },
+    ProviderAuthorityMismatch {
+        operation: &'static str,
+        message: String,
+    },
+    MetadataStoreIdentityMismatch,
+    MetadataAuthorityBindingMismatch,
+    MetadataAuthorityStateMismatch {
+        expected: MetadataAuthorityState,
+        actual: MetadataAuthorityState,
+    },
+    InvalidMetadataAuthorityTransition {
+        from: MetadataAuthorityState,
+        to: MetadataAuthorityState,
+    },
+    MetadataMigrationAdmission {
+        reason: String,
+    },
     VersionOverflow,
 }
 
@@ -387,7 +527,7 @@ impl std::fmt::Display for AgentMetadataError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Backend { operation, message } => {
-                write!(formatter, "Holt {operation} failed: {message}")
+                write!(formatter, "metadata provider {operation} failed: {message}")
             }
             Self::SchemaGate { reason } => write!(formatter, "metadata schema rejected: {reason}"),
             Self::CorruptRecord { record, reason } => {
@@ -442,6 +582,42 @@ impl std::fmt::Display for AgentMetadataError {
             ),
             Self::PredicateFailed => formatter.write_str("metadata command predicate failed"),
             Self::WriteConflict => formatter.write_str("metadata command lost an atomic race"),
+            Self::CommitReceiptRecoveryRequired => {
+                formatter.write_str("metadata commit receipt recovery is required")
+            }
+            Self::CommitOutcomeUnknown => {
+                formatter.write_str("metadata command commit outcome is unknown")
+            }
+            Self::TransactionTooLarge {
+                affected_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "metadata transaction affects {affected_bytes} bytes; provider limit is {max_bytes}"
+            ),
+            Self::ProviderUnavailable { operation, message } => {
+                write!(formatter, "metadata provider unavailable during {operation}: {message}")
+            }
+            Self::ProviderAuthorityMismatch { operation, message } => write!(
+                formatter,
+                "metadata provider authority mismatch during {operation}: {message}"
+            ),
+            Self::MetadataStoreIdentityMismatch => {
+                formatter.write_str("metadata store identity does not match the admitted identity")
+            }
+            Self::MetadataAuthorityBindingMismatch => formatter
+                .write_str("metadata authority marker does not match the immutable store identity"),
+            Self::MetadataAuthorityStateMismatch { expected, actual } => write!(
+                formatter,
+                "metadata authority state mismatch: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::InvalidMetadataAuthorityTransition { from, to } => write!(
+                formatter,
+                "invalid metadata authority transition {from:?} -> {to:?}"
+            ),
+            Self::MetadataMigrationAdmission { reason } => {
+                write!(formatter, "metadata migration admission failed: {reason}")
+            }
             Self::VersionOverflow => formatter.write_str("metadata commit version overflow"),
         }
     }
@@ -449,20 +625,486 @@ impl std::fmt::Display for AgentMetadataError {
 
 impl std::error::Error for AgentMetadataError {}
 
+/// Canonical workspace metadata facade.
+///
+/// An opened facade never exposes the provider or its raw transaction handle:
+///
+/// ```compile_fail
+/// use nokv_meta::provider::v1::MetadataProvider;
+/// use nokv_meta::workspace::AgentMetadataStore;
+///
+/// fn begin_raw_transaction(store: &AgentMetadataStore) {
+///     let _raw_transaction = store.provider.begin_write();
+/// }
+/// ```
+///
+/// Standalone constructors derive their store identity internally. An
+/// arbitrary authority identity cannot be combined with implicit standalone
+/// acknowledgement or runtime guards:
+///
+/// ```compile_fail
+/// use nokv_meta::workspace::{AgentMetadataStore, MetadataStoreIdentity};
+///
+/// let identity: MetadataStoreIdentity = todo!();
+/// let _store = AgentMetadataStore::open_memory_with_identity(identity);
+/// ```
+///
+/// ```compile_fail
+/// use nokv_meta::workspace::{AgentMetadataStore, MetadataStoreIdentity};
+///
+/// let identity: MetadataStoreIdentity = todo!();
+/// let _store = AgentMetadataStore::create_file_with_identity("metadata", identity);
+/// ```
+///
+/// ```compile_fail
+/// use nokv_meta::workspace::{AgentMetadataStore, MetadataStoreIdentity};
+///
+/// let identity: MetadataStoreIdentity = todo!();
+/// let _store = AgentMetadataStore::reopen_file_with_identity("metadata", identity);
+/// ```
+///
+/// Provider A and receipt B cannot be supplied as independent allocations:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use nokv_meta::provider::v1::{CreateRecoveryIntentV1, MetadataProviderFactoryV1};
+/// use nokv_meta::workspace::{
+///     AgentMetadataStore, MetadataCommitReceiptStoreV1, MetadataStoreCreateModeV1,
+///     MetadataStoreIdentity,
+/// };
+///
+/// fn mix_runtime_parts<A, B>(
+///     provider_a: Arc<A>,
+///     receipt_b: Arc<B>,
+///     identity: MetadataStoreIdentity,
+/// ) where
+///     A: MetadataProviderFactoryV1 + 'static,
+///     B: MetadataCommitReceiptStoreV1 + 'static,
+/// {
+///     let _ = AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+///         provider_a,
+///         receipt_b,
+///         identity,
+///         CreateRecoveryIntentV1::Fresh,
+///         MetadataStoreCreateModeV1::Active,
+///     );
+/// }
+/// ```
+///
+/// Migration-target construction remains an internal, not-qualified surface:
+///
+/// ```compile_fail
+/// use nokv_meta::workspace::{
+///     AgentMetadataStore, MetadataMigrationTargetBinding, MetadataStoreIdentity,
+/// };
+///
+/// let identity: MetadataStoreIdentity = todo!();
+/// let binding: MetadataMigrationTargetBinding = todo!();
+/// let _store = AgentMetadataStore::open_migration_target_memory(identity, binding);
+/// ```
+///
+/// ```compile_fail
+/// use nokv_meta::workspace::{
+///     AgentMetadataStore, MetadataMigrationTargetBinding, MetadataStoreIdentity,
+/// };
+///
+/// let identity: MetadataStoreIdentity = todo!();
+/// let binding: MetadataMigrationTargetBinding = todo!();
+/// let _store = AgentMetadataStore::create_migration_target_file(
+///     "metadata",
+///     identity,
+///     binding,
+/// );
+/// ```
 #[derive(Clone)]
 pub struct AgentMetadataStore {
-    db: DB,
-    logical_shard_id: LogicalShardId,
+    provider: Arc<dyn MetadataProvider>,
+    fail_stop: Arc<MetadataStoreFailStop>,
+    identity: MetadataStoreIdentity,
     command_gate: Arc<RwLock<()>>,
+    runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1>,
+    receipt_qualification: MetadataCommitReceiptQualificationV1,
     #[cfg(feature = "metadata-read-stats")]
     read_stats_identity: Arc<MetadataReadStatsIdentity>,
-    system: Tree,
-    root_fence: Tree,
-    command_dedupe: Tree,
-    change_event: Tree,
-    history: Tree,
-    recovery_outbox: Tree,
-    families: BTreeMap<MetadataFamily, Tree>,
+}
+
+pub(super) struct MetadataDiagnosticReadView<'a> {
+    delegate: Box<dyn MetadataReadView>,
+    _command_guard: RwLockReadGuard<'a, ()>,
+}
+
+impl MetadataDiagnosticReadView<'_> {
+    pub(super) fn as_ref(&self) -> &dyn MetadataReadView {
+        self.delegate.as_ref()
+    }
+}
+
+impl std::ops::Deref for MetadataDiagnosticReadView<'_> {
+    type Target = dyn MetadataReadView;
+
+    fn deref(&self) -> &Self::Target {
+        self.delegate.as_ref()
+    }
+}
+
+#[derive(Default)]
+struct MetadataStoreFailStop {
+    tripped: AtomicBool,
+}
+
+impl MetadataStoreFailStop {
+    fn ensure_serving(&self, operation: ProviderOperationV1) -> Result<(), ProviderError> {
+        if self.tripped.load(Ordering::Acquire) {
+            Err(ProviderError::authority_mismatch(operation))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn trip(&self) {
+        self.tripped.store(true, Ordering::Release);
+    }
+}
+
+struct PendingCommitFailStopGuard<'a> {
+    fail_stop: &'a MetadataStoreFailStop,
+    armed: bool,
+}
+
+impl<'a> PendingCommitFailStopGuard<'a> {
+    fn arm(fail_stop: &'a MetadataStoreFailStop) -> Self {
+        Self {
+            fail_stop,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingCommitFailStopGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.fail_stop.trip();
+        }
+    }
+}
+
+struct FailStopMetadataProvider {
+    delegate: Arc<dyn MetadataProvider>,
+    fail_stop: Arc<MetadataStoreFailStop>,
+    logical_shard_id: LogicalShardId,
+    capabilities: ProviderCapabilities,
+    diagnostics: Option<FailStopProviderDiagnostics>,
+}
+
+impl FailStopMetadataProvider {
+    fn new(delegate: Arc<dyn MetadataProvider>, fail_stop: Arc<MetadataStoreFailStop>) -> Self {
+        let logical_shard_id = delegate.logical_shard_id();
+        let capabilities = delegate.capabilities();
+        let diagnostics = delegate
+            .diagnostics()
+            .is_some()
+            .then(|| FailStopProviderDiagnostics {
+                delegate: Arc::clone(&delegate),
+                fail_stop: Arc::clone(&fail_stop),
+            });
+        Self {
+            delegate,
+            fail_stop,
+            logical_shard_id,
+            capabilities,
+            diagnostics,
+        }
+    }
+}
+
+impl MetadataProvider for FailStopMetadataProvider {
+    fn logical_shard_id(&self) -> LogicalShardId {
+        self.logical_shard_id
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities
+    }
+
+    fn validate_runtime(&self) -> Result<(), ProviderError> {
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ValidateRuntime)?;
+        self.delegate.validate_runtime()?;
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ValidateRuntime)
+    }
+
+    fn get(
+        &self,
+        space: OrderedSpaceId,
+        key: &[u8],
+    ) -> Result<Option<ProviderRecord>, ProviderError> {
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ReadRecord)?;
+        let result = self.delegate.get(space, key)?;
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ReadRecord)?;
+        Ok(result)
+    }
+
+    fn begin_read(
+        &self,
+        scopes: &[ReadScope],
+    ) -> Result<Box<dyn MetadataReadView + 'static>, ProviderError> {
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::BeginRead)?;
+        let delegate = self.delegate.begin_read(scopes)?;
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::BeginRead)?;
+        Ok(Box::new(FailStopMetadataReadView {
+            delegate,
+            fail_stop: Arc::clone(&self.fail_stop),
+        }))
+    }
+
+    fn begin_write(&self) -> Result<Box<dyn MetadataTransaction + 'static>, ProviderError> {
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::BeginWrite)?;
+        let delegate = self.delegate.begin_write()?;
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::BeginWrite)?;
+        Ok(Box::new(FailStopMetadataTransaction {
+            delegate,
+            fail_stop: Arc::clone(&self.fail_stop),
+        }))
+    }
+
+    fn diagnostics(&self) -> Option<&dyn ProviderDiagnosticsV1> {
+        self.diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics as &dyn ProviderDiagnosticsV1)
+    }
+}
+
+struct FailStopMetadataReadView {
+    delegate: Box<dyn MetadataReadView>,
+    fail_stop: Arc<MetadataStoreFailStop>,
+}
+
+impl MetadataReadView for FailStopMetadataReadView {
+    fn get(
+        &self,
+        space: OrderedSpaceId,
+        key: &[u8],
+    ) -> Result<Option<ProviderRecord>, ProviderError> {
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ReadRecord)?;
+        let result = self.delegate.get(space, key)?;
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ReadRecord)?;
+        Ok(result)
+    }
+
+    fn scan(
+        &self,
+        request: &ProviderScan,
+    ) -> Result<super::provider::ProviderScanPage, ProviderError> {
+        self.fail_stop.ensure_serving(ProviderOperationV1::Scan)?;
+        let result = self.delegate.scan(request)?;
+        self.fail_stop.ensure_serving(ProviderOperationV1::Scan)?;
+        Ok(result)
+    }
+}
+
+struct FailStopMetadataTransaction {
+    delegate: Box<dyn MetadataTransaction>,
+    fail_stop: Arc<MetadataStoreFailStop>,
+}
+
+impl MetadataReadView for FailStopMetadataTransaction {
+    fn get(
+        &self,
+        space: OrderedSpaceId,
+        key: &[u8],
+    ) -> Result<Option<ProviderRecord>, ProviderError> {
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ReadRecord)?;
+        let result = self.delegate.get(space, key)?;
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ReadRecord)?;
+        Ok(result)
+    }
+
+    fn scan(
+        &self,
+        request: &ProviderScan,
+    ) -> Result<super::provider::ProviderScanPage, ProviderError> {
+        self.fail_stop.ensure_serving(ProviderOperationV1::Scan)?;
+        let result = self.delegate.scan(request)?;
+        self.fail_stop.ensure_serving(ProviderOperationV1::Scan)?;
+        Ok(result)
+    }
+}
+
+impl MetadataTransaction for FailStopMetadataTransaction {
+    fn prefix_is_empty(&self, space: OrderedSpaceId, prefix: &[u8]) -> Result<bool, ProviderError> {
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ValidatePlan)?;
+        let result = self.delegate.prefix_is_empty(space, prefix)?;
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::ValidatePlan)?;
+        Ok(result)
+    }
+
+    fn commit(self: Box<Self>, plan: AtomicPlan) -> Result<AtomicCommitOutcome, ProviderError> {
+        self.fail_stop.ensure_serving(ProviderOperationV1::Commit)?;
+        let result = self.delegate.commit(plan);
+        if self.fail_stop.tripped.load(Ordering::Acquire) {
+            match result {
+                Err(error) if error.kind() == ProviderErrorKind::UnknownCommitUnsettled => {
+                    Err(error)
+                }
+                _ => Err(ProviderError::unknown_commit_settled()),
+            }
+        } else {
+            result
+        }
+    }
+}
+
+struct FailStopProviderDiagnostics {
+    delegate: Arc<dyn MetadataProvider>,
+    fail_stop: Arc<MetadataStoreFailStop>,
+}
+
+impl ProviderDiagnosticsV1 for FailStopProviderDiagnostics {
+    fn snapshot(&self) -> Result<ProviderDiagnosticsSnapshotV1, ProviderError> {
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::Diagnostics)?;
+        let diagnostics = self
+            .delegate
+            .diagnostics()
+            .ok_or_else(|| ProviderError::unavailable(ProviderOperationV1::Diagnostics))?;
+        let result = diagnostics.snapshot()?;
+        self.fail_stop
+            .ensure_serving(ProviderOperationV1::Diagnostics)?;
+        Ok(result)
+    }
+}
+
+struct UntrackedStandaloneRuntimeBundle<F> {
+    factory: F,
+    frozen_digest: [u8; 32],
+}
+
+impl<F> UntrackedStandaloneRuntimeBundle<F> {
+    fn new(factory: F, location_class: u8) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"nokv.metadata.untracked-standalone-runtime.v1\0");
+        hasher.update([location_class]);
+        Self {
+            factory,
+            frozen_digest: hasher.finalize().into(),
+        }
+    }
+}
+
+impl<F> MetadataProviderFactoryV1 for UntrackedStandaloneRuntimeBundle<F>
+where
+    F: MetadataProviderFactoryV1,
+{
+    fn contract_offer(
+        &self,
+        schema: &ProviderSchemaV1,
+    ) -> Result<ProviderContractOfferV1, ProviderError> {
+        self.factory.contract_offer(schema)
+    }
+
+    fn create(
+        &self,
+        request: &ProviderCreateRequestV1,
+    ) -> Result<Arc<dyn MetadataProvider>, ProviderError> {
+        self.factory.create(request)
+    }
+
+    fn reopen(
+        &self,
+        request: &ProviderReopenRequestV1,
+    ) -> Result<Arc<dyn MetadataProvider>, ProviderError> {
+        self.factory.reopen(request)
+    }
+}
+
+impl<F> MetadataCommitRecoveryFenceFactoryV1 for UntrackedStandaloneRuntimeBundle<F>
+where
+    F: MetadataCommitRecoveryFenceFactoryV1,
+{
+    fn old_dispatch_exclusion_installation_v1(&self) -> MetadataOldDispatchExclusionInstallationV1 {
+        self.factory.old_dispatch_exclusion_installation_v1()
+    }
+
+    fn reopen_pending_with_old_dispatch_excluded_v1(
+        &self,
+        command: MetadataPendingRecoveryOpenCommandV1,
+    ) -> MetadataPendingRecoveryOpenOutcomeV1 {
+        self.factory
+            .reopen_pending_with_old_dispatch_excluded_v1(command)
+    }
+}
+
+impl<F> MetadataCommitReceiptStoreV1 for UntrackedStandaloneRuntimeBundle<F>
+where
+    F: MetadataCommitRecoveryFenceFactoryV1 + Send + Sync,
+{
+    fn commit_receipt_qualification_v1(&self) -> MetadataCommitReceiptQualificationV1 {
+        MetadataCommitReceiptQualificationV1::UntrackedStandalone
+    }
+
+    fn frozen_runtime_bundle_digest_v1(&self) -> [u8; 32] {
+        self.frozen_digest
+    }
+
+    fn load_commit_receipt_v1(
+        &self,
+        _store_identity: MetadataStoreIdentity,
+    ) -> Result<MetadataCommitReceiptStateV1, MetadataCommitReceiptErrorV1> {
+        Ok(MetadataCommitReceiptStateV1::UntrackedStandalone)
+    }
+
+    fn persist_pending_commit_v1(
+        &self,
+        command: MetadataCommitReceiptPersistCommandV1,
+    ) -> MetadataCommitReceiptPersistOutcomeV1 {
+        command
+            .claim_execution()
+            .complete(MetadataCommitReceiptPersistBackendResultV1::Persisted)
+    }
+
+    fn resolve_pending_commit_v1(
+        &self,
+        command: MetadataCommitReceiptResolveCommandV1,
+    ) -> MetadataCommitReceiptResolveOutcomeV1 {
+        command
+            .claim_execution()
+            .complete(MetadataCommitReceiptMutationBackendResultV1::Completed)
+    }
+
+    fn poison_commit_receipt_v1(
+        &self,
+        command: MetadataCommitReceiptPoisonCommandV1,
+    ) -> MetadataCommitReceiptPoisonOutcomeV1 {
+        command
+            .claim_execution()
+            .complete(MetadataCommitReceiptMutationBackendResultV1::Completed)
+    }
+}
+
+/// Qualified provider-neutral state installed during public SPI v1 creation.
+///
+/// Migration-target creation is intentionally absent while that path remains
+/// not qualified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataStoreCreateModeV1 {
+    Active,
 }
 
 #[cfg(feature = "metadata-read-stats")]
@@ -483,13 +1125,13 @@ pub(super) struct FencedPointReader<'a> {
     current_version: ReadVersion,
 }
 
-/// Thread-bound logical read counters plus a dedicated store's Holt telemetry.
+/// Thread-bound logical read counters plus optional provider-wide telemetry.
 ///
 /// This diagnostic API is available only with the `metadata-read-stats`
 /// feature. Reads through clones of `store` are included when they execute on
-/// the thread that owns the session. Holt's physical counters remain
-/// store-wide, so callers must exclude concurrent store activity before
-/// attributing them to the measured workload.
+/// the thread that owns the session. Provider physical counters remain
+/// store-wide when supported, so callers must exclude concurrent store activity
+/// before attributing them to the measured workload.
 #[cfg(feature = "metadata-read-stats")]
 #[must_use = "finish the session to obtain counters, or drop it to cancel collection"]
 pub struct MetadataReadStatsSession<'a> {
@@ -504,7 +1146,10 @@ pub struct MetadataReadStatsSession<'a> {
 impl MetadataReadStatsSession<'_> {
     pub fn finish(mut self) -> Result<MetadataReadStats, MetadataReadStatsSessionError> {
         let logical = read_stats::finish_session(self.store_key)?;
-        let storage_after = read_stats::storage_snapshot(&self.store.db.stats());
+        let storage_after = self
+            .store
+            .provider_diagnostics_snapshot()
+            .map_err(|error| MetadataReadStatsSessionError::Provider(error.to_string()))?;
         let result = storage_after
             .delta_since(&self.storage_before)
             .map(|mut combined| {
@@ -552,197 +1197,2085 @@ impl FencedPointReader<'_> {
 }
 
 impl AgentMetadataStore {
-    pub fn open_memory(logical_shard_id: LogicalShardId) -> Result<Self, AgentMetadataError> {
-        Self::initialize_fresh(TreeConfig::memory(), logical_shard_id)
+    /// Create or reconcile one provider installation through public SPI v1.
+    ///
+    /// The facade constructs the canonical workspace schema and durable
+    /// System genesis. Provider-specific configuration is already resolved by
+    /// `factory` and never enters the create request.
+    pub fn create_with_runtime_commit_bundle_v1<B>(
+        runtime_bundle: Arc<B>,
+        identity: MetadataStoreIdentity,
+        recovery_intent: CreateRecoveryIntentV1,
+        mode: MetadataStoreCreateModeV1,
+    ) -> Result<Self, AgentMetadataError>
+    where
+        B: MetadataRuntimeCommitBundleV1 + 'static,
+    {
+        let authority_marker = match mode {
+            MetadataStoreCreateModeV1::Active => {
+                MetadataAuthorityMarker::for_identity(identity, MetadataAuthorityState::Active)
+            }
+        };
+        let runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1> = runtime_bundle;
+        Self::create_with_bundle_and_marker(
+            runtime_bundle,
+            identity,
+            recovery_intent,
+            authority_marker,
+            false,
+        )
     }
 
+    /// Reopen an existing provider installation through public SPI v1.
+    pub fn reopen_with_runtime_commit_bundle_v1<B>(
+        runtime_bundle: Arc<B>,
+        expected_identity: MetadataStoreIdentity,
+    ) -> Result<Self, AgentMetadataError>
+    where
+        B: MetadataRuntimeCommitBundleV1 + 'static,
+    {
+        let runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1> = runtime_bundle;
+        Self::reopen_with_runtime_bundle(runtime_bundle, expected_identity, false)
+    }
+
+    /// Open a standalone in-memory Holt store.
+    ///
+    /// This constructor derives a deterministic identity for tests and
+    /// single-process use. Distributed bootstrap must use the public provider
+    /// facade with one durable runtime commit bundle.
+    pub fn open_memory(logical_shard_id: LogicalShardId) -> Result<Self, AgentMetadataError> {
+        let identity = MetadataStoreIdentity::standalone_holt_memory(logical_shard_id);
+        let runtime_bundle = Arc::new(UntrackedStandaloneRuntimeBundle::new(
+            HoltProviderFactory::memory(),
+            1,
+        ));
+        Self::open_memory_with_marker(
+            runtime_bundle,
+            identity,
+            MetadataAuthorityMarker::for_identity(identity, MetadataAuthorityState::Active),
+        )
+    }
+
+    fn open_memory_with_marker<B>(
+        runtime_bundle: Arc<B>,
+        identity: MetadataStoreIdentity,
+        authority_marker: MetadataAuthorityMarker,
+    ) -> Result<Self, AgentMetadataError>
+    where
+        B: MetadataRuntimeCommitBundleV1 + 'static,
+    {
+        let runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1> = runtime_bundle;
+        Self::create_with_bundle_and_marker(
+            runtime_bundle,
+            identity,
+            CreateRecoveryIntentV1::Fresh,
+            authority_marker,
+            true,
+        )
+    }
+
+    /// Create a standalone file-backed Holt store.
+    ///
+    /// The identity is derived from the logical shard and absolute path.
+    /// Distributed bootstrap must use
+    /// [`Self::create_with_runtime_commit_bundle_v1`].
     pub fn create_file(
         path: impl AsRef<Path>,
         logical_shard_id: LogicalShardId,
     ) -> Result<Self, AgentMetadataError> {
         let path = path.as_ref();
-        require_fresh_location(path)?;
-        let mut config = TreeConfig::new(path);
-        config.durability = Durability::Wal { sync: true };
-        config.checkpoint.auto_vacuum = false;
-        Self::initialize_fresh(config, logical_shard_id)
+        let identity_path = std::path::absolute(path)
+            .map_err(|error| backend("resolve standalone metadata path", error))?;
+        let identity =
+            MetadataStoreIdentity::standalone_holt_file(logical_shard_id, &identity_path);
+        let runtime_bundle = Arc::new(UntrackedStandaloneRuntimeBundle::new(
+            HoltProviderFactory::file(path, Arc::new(NoopHoltRuntimeGuard)),
+            2,
+        ));
+        Self::create_with_bundle_and_marker(
+            runtime_bundle,
+            identity,
+            CreateRecoveryIntentV1::Fresh,
+            MetadataAuthorityMarker::for_identity(identity, MetadataAuthorityState::Active),
+            true,
+        )
     }
 
+    /// Reopen a deterministic standalone file-backed Holt store.
+    ///
+    /// This method never adopts an arbitrary durable identity. A store created
+    /// with an explicit authority must use
+    /// [`Self::reopen_with_runtime_commit_bundle_v1`].
     pub fn reopen_file(
         path: impl AsRef<Path>,
         logical_shard_id: LogicalShardId,
     ) -> Result<Self, AgentMetadataError> {
         let path = path.as_ref();
-        require_existing_location(path)?;
-        let mut config = TreeConfig::new(path);
-        config.durability = Durability::Wal { sync: true };
-        config.checkpoint.auto_vacuum = false;
-        let db = DB::open(config).map_err(|error| backend("open database", error))?;
-        Self::open_marked(db, logical_shard_id)
+        let identity_path = std::path::absolute(path)
+            .map_err(|error| backend("resolve standalone metadata path", error))?;
+        let expected_identity =
+            MetadataStoreIdentity::standalone_holt_file(logical_shard_id, &identity_path);
+        let runtime_bundle = Arc::new(UntrackedStandaloneRuntimeBundle::new(
+            HoltProviderFactory::file(path, Arc::new(NoopHoltRuntimeGuard)),
+            2,
+        ));
+        Self::reopen_with_runtime_bundle(runtime_bundle, expected_identity, true)
+    }
+
+    fn create_with_bundle_and_marker(
+        runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1>,
+        identity: MetadataStoreIdentity,
+        recovery_intent: CreateRecoveryIntentV1,
+        authority_marker: MetadataAuthorityMarker,
+        allow_untracked_standalone: bool,
+    ) -> Result<Self, AgentMetadataError> {
+        validate_store_identity(identity)?;
+        if !authority_marker.matches_identity(identity) {
+            return Err(AgentMetadataError::MetadataAuthorityBindingMismatch);
+        }
+        validate_authority_marker_for_identity(identity, authority_marker)?;
+        let receipt_state = validate_runtime_commit_bundle(
+            runtime_bundle.as_ref(),
+            identity,
+            allow_untracked_standalone,
+        )?;
+        if let Some((source, planned)) = dirty_receipt_source_and_plan(&receipt_state) {
+            if recovery_intent != CreateRecoveryIntentV1::ReconcilePrepared {
+                return Err(AgentMetadataError::CommitReceiptRecoveryRequired);
+            }
+            return Self::recover_dirty_receipt_on_open(
+                runtime_bundle,
+                identity,
+                source,
+                planned,
+                Some(authority_marker),
+            );
+        }
+        validate_create_receipt_preflight(&receipt_state, recovery_intent)?;
+        let schema = canonical_provider_schema_v1();
+        let offer = runtime_bundle
+            .contract_offer(&schema)
+            .map_err(provider_error)?;
+        validate_provider_capabilities(offer.capabilities)?;
+        let request = ProviderCreateRequestV1::mint(schema, identity, recovery_intent);
+        let provider = runtime_bundle.create(&request).map_err(provider_error)?;
+        request.ensure_execution_claimed().map_err(provider_error)?;
+        validate_provider_offer(provider.as_ref(), offer.capabilities)?;
+        if recovery_intent == CreateRecoveryIntentV1::ReconcilePrepared
+            && provider
+                .get(
+                    crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    SYSTEM_SCHEMA_KEY,
+                )
+                .map_err(provider_error)?
+                .is_some()
+        {
+            let store = Self::open_marked(provider, identity, runtime_bundle)?;
+            let durable_marker = decode_authority_marker(
+                &store
+                    .required_system_record(
+                        SYSTEM_METADATA_AUTHORITY_KEY,
+                        "System(metadata_authority)",
+                    )?
+                    .value,
+            )
+            .map_err(|error| corrupt("MetadataAuthorityState", error))?;
+            if durable_marker != authority_marker {
+                return Err(AgentMetadataError::MetadataAuthorityBindingMismatch);
+            }
+            Ok(store)
+        } else {
+            Self::initialize_fresh(provider, identity, authority_marker, runtime_bundle)
+        }
+    }
+
+    fn reopen_with_runtime_bundle(
+        runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1>,
+        expected_identity: MetadataStoreIdentity,
+        allow_untracked_standalone: bool,
+    ) -> Result<Self, AgentMetadataError> {
+        validate_store_identity(expected_identity)?;
+        let receipt_state = validate_runtime_commit_bundle(
+            runtime_bundle.as_ref(),
+            expected_identity,
+            allow_untracked_standalone,
+        )?;
+        if let Some((source, planned)) = dirty_receipt_source_and_plan(&receipt_state) {
+            return Self::recover_dirty_receipt_on_open(
+                runtime_bundle,
+                expected_identity,
+                source,
+                planned,
+                None,
+            );
+        }
+        validate_reopen_receipt_preflight(&receipt_state)?;
+        let schema = canonical_provider_schema_v1();
+        let offer = runtime_bundle
+            .contract_offer(&schema)
+            .map_err(provider_error)?;
+        validate_provider_capabilities(offer.capabilities)?;
+        let request = ProviderReopenRequestV1::mint(schema, expected_identity);
+        let provider = runtime_bundle.reopen(&request).map_err(provider_error)?;
+        request.ensure_execution_claimed().map_err(provider_error)?;
+        validate_provider_offer(provider.as_ref(), offer.capabilities)?;
+        Self::open_marked(provider, expected_identity, runtime_bundle)
+    }
+
+    fn recover_dirty_receipt_on_open(
+        runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1>,
+        expected_identity: MetadataStoreIdentity,
+        source: MetadataCommitReceiptDirtySourceV1,
+        planned: PlannedMetadataCommitV1,
+        expected_authority_marker: Option<MetadataAuthorityMarker>,
+    ) -> Result<Self, AgentMetadataError> {
+        let installation = runtime_bundle.old_dispatch_exclusion_installation_v1();
+        if !installation.is_supported() {
+            return Err(AgentMetadataError::CommitReceiptRecoveryRequired);
+        }
+
+        let mint_authority = MetadataCommitEngineMintAuthorityV1::new();
+        let (command, witness) = mint_pending_recovery_open_v1(
+            &mint_authority,
+            &planned,
+            source,
+            canonical_provider_schema_v1(),
+            installation.clone(),
+        )
+        .map_err(|_| AgentMetadataError::CommitReceiptRecoveryRequired)?;
+        let opened = runtime_bundle
+            .reopen_pending_with_old_dispatch_excluded_v1(command)
+            .into_result_for(witness)
+            .map_err(|_| AgentMetadataError::CommitReceiptRecoveryRequired)?;
+        if opened.planned() != &planned || opened.installation() != &installation {
+            return Err(AgentMetadataError::CommitReceiptRecoveryRequired);
+        }
+
+        let (provider, recovery_allocation) = opened.into_recovery_parts_v1();
+        if validate_provider_contract(provider.as_ref(), expected_identity.logical_shard_id)
+            .is_err()
+        {
+            return Err(AgentMetadataError::CommitReceiptRecoveryRequired);
+        }
+        let store = Self::new_opened(provider, expected_identity, runtime_bundle);
+        if store.validate_opened_marked().is_err() || store.validate_provider_runtime().is_err() {
+            return Err(AgentMetadataError::CommitReceiptRecoveryRequired);
+        }
+        if let Some(expected_marker) = expected_authority_marker {
+            let durable_marker = store
+                .required_system_record(SYSTEM_METADATA_AUTHORITY_KEY, "System(metadata_authority)")
+                .and_then(|record| {
+                    decode_authority_marker(&record.value)
+                        .map_err(|error| corrupt("MetadataAuthorityState", error))
+                });
+            if durable_marker.as_ref() != Ok(&expected_marker) {
+                return Err(AgentMetadataError::CommitReceiptRecoveryRequired);
+            }
+        }
+
+        let observation = store
+            .begin_commit_resolution_view()
+            .and_then(|view| store.observe_planned_from(view.as_ref(), &planned));
+        let resolution = match observation {
+            Ok(PlannedCommitObservation::Applied {
+                purpose_evidence_digest,
+            }) => MetadataCommitResolutionV1::applied(
+                &mint_authority,
+                source,
+                planned.exact_next(),
+                purpose_evidence_digest,
+            ),
+            Ok(PlannedCommitObservation::NotApplied {
+                purpose_evidence_digest,
+            }) if source == MetadataCommitReceiptDirtySourceV1::PoisonedSettled => {
+                MetadataCommitResolutionV1::not_applied_settled(
+                    &mint_authority,
+                    planned.prior(),
+                    purpose_evidence_digest,
+                )
+            }
+            Ok(PlannedCommitObservation::NotApplied { .. })
+            | Ok(PlannedCommitObservation::Foreign)
+            | Err(_) => return Err(AgentMetadataError::CommitReceiptRecoveryRequired),
+        };
+        let (resolve_command, resolve_witness) =
+            MetadataCommitReceiptResolveCommandV1::mint_recovery(
+                &mint_authority,
+                &planned,
+                recovery_allocation,
+                resolution,
+            )
+            .map_err(|_| AgentMetadataError::CommitReceiptRecoveryRequired)?;
+        let _terminal_result = store
+            .runtime_bundle
+            .resolve_pending_commit_v1(resolve_command)
+            .into_result_for(resolve_witness);
+
+        Err(AgentMetadataError::CommitReceiptRecoveryRequired)
     }
 
     fn initialize_fresh(
-        config: TreeConfig,
-        logical_shard_id: LogicalShardId,
+        provider: Arc<dyn MetadataProvider>,
+        identity: MetadataStoreIdentity,
+        authority_marker: MetadataAuthorityMarker,
+        runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1>,
     ) -> Result<Self, AgentMetadataError> {
-        let db = DB::open(config).map_err(|error| backend("create database", error))?;
-        let existing = db
-            .list_trees()
-            .map_err(|error| backend("inspect fresh database", error))?;
-        if !existing.is_empty() {
-            return Err(AgentMetadataError::SchemaGate {
-                reason: format!("fresh store already contains trees {existing:?}"),
+        validate_store_identity(identity)?;
+        if !authority_marker.matches_identity(identity) {
+            return Err(AgentMetadataError::MetadataAuthorityBindingMismatch);
+        }
+        validate_authority_marker_for_identity(identity, authority_marker)?;
+        validate_provider_contract(provider.as_ref(), identity.logical_shard_id)?;
+        let store = Self::new_opened(provider, identity, runtime_bundle);
+        let planning_view = store.begin_commit_resolution_view()?;
+        store.require_canonical_absent_from(planning_view.as_ref())?;
+        let mut plan = AtomicPlan::default();
+        for space in all_ordered_spaces() {
+            plan.operations.push(AtomicOp::AssertPrefixEmpty {
+                space,
+                prefix: Vec::new(),
             });
         }
-        for tree in SCHEMA_TREES {
-            db.create_tree(tree)
-                .map_err(|error| backend("create schema tree", error))?;
+        for (key, value) in [
+            (SYSTEM_SCHEMA_KEY, encode_schema_marker()),
+            (SYSTEM_STORE_IDENTITY_KEY, encode_store_identity(identity)),
+            (
+                SYSTEM_METADATA_AUTHORITY_KEY,
+                encode_authority_marker(authority_marker),
+            ),
+            (SYSTEM_OWNER_FENCE_KEY, encode_system_u64(0).to_vec()),
+            (
+                SYSTEM_COMMIT_CLOCK_KEY,
+                encode_system_u64(INITIAL_COMMIT_VERSION).to_vec(),
+            ),
+            (
+                SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+                encode_system_u64(0).to_vec(),
+            ),
+            (
+                SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+                encode_system_u64(0).to_vec(),
+            ),
+            (
+                SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+                encode_system_digest(recovery_genesis_digest(
+                    identity.logical_shard_id,
+                    identity.contract_digest,
+                )),
+            ),
+        ] {
+            plan.operations.push(AtomicOp::PutIfAbsent {
+                space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                key: key.to_vec(),
+                value,
+            });
         }
-        let initialized = db
-            .atomic(|batch| {
-                batch.put_if_absent(SYSTEM_TREE, SYSTEM_SCHEMA_KEY, &encode_schema_marker());
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_SHARD_IDENTITY_KEY,
-                    &encode_shard_identity(logical_shard_id),
-                );
-                batch.put_if_absent(SYSTEM_TREE, SYSTEM_OWNER_FENCE_KEY, &encode_system_u64(0));
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_COMMIT_CLOCK_KEY,
-                    &encode_system_u64(INITIAL_COMMIT_VERSION),
-                );
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
-                    &encode_system_u64(0),
-                );
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_APPLIED_RECOVERY_LSN_KEY,
-                    &encode_system_u64(0),
-                );
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
-                    &encode_system_digest(recovery_genesis_digest(logical_shard_id)),
-                );
-            })
-            .map_err(|error| backend("initialize system records", error))?;
-        if !initialized {
+        let authority_marker_encoded = encode_authority_marker(authority_marker);
+        let genesis = AcknowledgedMetadataFrontier {
+            write_sequence: authority_marker.write_sequence,
+            commit_version: CommitVersion::new(INITIAL_COMMIT_VERSION)
+                .expect("the initial commit version is non-zero"),
+            recovery_lsn: 0,
+            chain_digest: recovery_genesis_digest(
+                identity.logical_shard_id,
+                identity.contract_digest,
+            ),
+        };
+        let planned = store.plan_exact_commit(
+            MetadataCommitPurposeV1::Genesis {
+                authority_marker_digest: digest_authority_marker(&authority_marker_encoded),
+            },
+            MetadataFrontierPointV1::Absent,
+            genesis,
+        )?;
+        let initialized = store.commit_planned_exact(plan, &planned)?;
+        if initialized != AtomicCommitOutcome::Committed {
             return Err(AgentMetadataError::SchemaGate {
                 reason: "fresh system records collided".to_owned(),
             });
         }
-        Self::open_marked(db, logical_shard_id)
+        store.validate_opened_marked()?;
+        Ok(store)
     }
 
-    fn open_marked(db: DB, logical_shard_id: LogicalShardId) -> Result<Self, AgentMetadataError> {
-        validate_tree_registry(&db)?;
-        let system = db
-            .open_tree(SYSTEM_TREE)
-            .map_err(|error| backend("open System", error))?;
-        let schema = required_record(&system, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+    fn open_marked(
+        provider: Arc<dyn MetadataProvider>,
+        expected_identity: MetadataStoreIdentity,
+        runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1>,
+    ) -> Result<Self, AgentMetadataError> {
+        validate_provider_contract(provider.as_ref(), expected_identity.logical_shard_id)?;
+        let store = Self::new_opened(provider, expected_identity, runtime_bundle);
+        store.validate_opened_marked()?;
+        store.reconcile_receipt_on_open()?;
+        store.validate_provider_runtime()?;
+        Ok(store)
+    }
+
+    fn new_opened(
+        provider: Arc<dyn MetadataProvider>,
+        identity: MetadataStoreIdentity,
+        runtime_bundle: Arc<dyn MetadataRuntimeCommitBundleV1>,
+    ) -> Self {
+        let receipt_qualification = runtime_bundle.commit_receipt_qualification_v1();
+        let fail_stop = Arc::new(MetadataStoreFailStop::default());
+        let provider = Arc::new(FailStopMetadataProvider::new(
+            provider,
+            Arc::clone(&fail_stop),
+        ));
+        Self {
+            provider,
+            fail_stop,
+            identity,
+            command_gate: Arc::new(RwLock::new(())),
+            runtime_bundle,
+            receipt_qualification,
+            #[cfg(feature = "metadata-read-stats")]
+            read_stats_identity: Arc::new(MetadataReadStatsIdentity::default()),
+        }
+    }
+
+    fn validate_opened_marked(&self) -> Result<(), AgentMetadataError> {
+        let schema = self.required_system_record(SYSTEM_SCHEMA_KEY, "System(schema)")?;
         validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
             reason: error.to_string(),
         })?;
-        let shard = required_record(&system, SYSTEM_SHARD_IDENTITY_KEY, "System(shard_identity)")?;
-        if decode_shard_identity(&shard.value)? != logical_shard_id {
-            return Err(AgentMetadataError::SchemaGate {
-                reason: "logical shard identity does not match requested store".to_owned(),
-            });
+        let durable_identity = decode_store_identity(
+            &self
+                .required_system_record(SYSTEM_STORE_IDENTITY_KEY, "System(store_identity)")?
+                .value,
+        )
+        .map_err(|error| corrupt("MetadataStoreIdentity", error))?;
+        if durable_identity != self.identity {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        }
+        let authority = decode_authority_marker(
+            &self
+                .required_system_record(
+                    SYSTEM_METADATA_AUTHORITY_KEY,
+                    "System(metadata_authority)",
+                )?
+                .value,
+        )
+        .map_err(|error| corrupt("MetadataAuthorityState", error))?;
+        if !authority.matches_identity(durable_identity) {
+            return Err(AgentMetadataError::MetadataAuthorityBindingMismatch);
         }
         decode_system_u64(
-            &required_record(&system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?.value,
+            &self
+                .required_system_record(SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?
+                .value,
             "System(owner_fence)",
         )?;
         decode_system_u64(
-            &required_record(
-                &system,
-                SYSTEM_APPLIED_RECOVERY_LSN_KEY,
-                "System(applied_recovery_lsn)",
-            )?
-            .value,
+            &self
+                .required_system_record(
+                    SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+                    "System(applied_recovery_lsn)",
+                )?
+                .value,
             "System(applied_recovery_lsn)",
         )?;
         decode_system_digest(
-            &required_record(
-                &system,
-                SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
-                "System(recovery_chain_digest)",
-            )?
-            .value,
+            &self
+                .required_system_record(
+                    SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+                    "System(recovery_chain_digest)",
+                )?
+                .value,
             "System(recovery_chain_digest)",
         )?;
         let clock = decode_system_u64(
-            &required_record(&system, SYSTEM_COMMIT_CLOCK_KEY, "System(commit_clock)")?.value,
+            &self
+                .required_system_record(SYSTEM_COMMIT_CLOCK_KEY, "System(commit_clock)")?
+                .value,
             "System(commit_clock)",
         )?;
         CommitVersion::new(clock).map_err(|error| corrupt("System(commit_clock)", error))?;
         decode_system_u64(
-            &required_record(
-                &system,
-                SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
-                "System(lease_clock_high_water)",
-            )?
-            .value,
+            &self
+                .required_system_record(
+                    SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+                    "System(lease_clock_high_water)",
+                )?
+                .value,
             "System(lease_clock_high_water)",
         )?;
-
-        let root_fence = db
-            .open_tree(ROOT_FENCE_TREE)
-            .map_err(|error| backend("open RootFence", error))?;
-        let command_dedupe = db
-            .open_tree(COMMAND_DEDUPE_TREE)
-            .map_err(|error| backend("open CommandDedupe", error))?;
-        let change_event = db
-            .open_tree(CHANGE_EVENT_TREE)
-            .map_err(|error| backend("open ChangeEvent", error))?;
-        let history = db
-            .open_tree(HISTORY_TREE)
-            .map_err(|error| backend("open History", error))?;
-        let recovery_outbox = db
-            .open_tree(RECOVERY_OUTBOX_TREE)
-            .map_err(|error| backend("open RecoveryOutbox", error))?;
-        let mut families = BTreeMap::new();
-        for family in MetadataFamily::ALL {
-            families.insert(
-                family,
-                db.open_tree(family.tree_name())
-                    .map_err(|error| backend("open metadata family", error))?,
-            );
-        }
-        let store = Self {
-            db,
-            logical_shard_id,
-            command_gate: Arc::new(RwLock::new(())),
-            #[cfg(feature = "metadata-read-stats")]
-            read_stats_identity: Arc::new(MetadataReadStatsIdentity::default()),
-            system,
-            root_fence,
-            command_dedupe,
-            change_event,
-            history,
-            recovery_outbox,
-            families,
-        };
-        store.verify_recovery_chain_unlocked()?;
-        Ok(store)
+        self.verify_recovery_chain_unlocked()?;
+        Ok(())
     }
 
     pub fn current_read_version(&self) -> Result<ReadVersion, AgentMetadataError> {
-        let record = self.required_system_record(
-            &self.system,
-            SYSTEM_COMMIT_CLOCK_KEY,
-            "System(commit_clock)",
-        )?;
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| backend("lock read gate", error))?;
+        self.current_read_version_unlocked()
+    }
+
+    fn current_read_version_unlocked(&self) -> Result<ReadVersion, AgentMetadataError> {
+        let record =
+            self.required_system_record(SYSTEM_COMMIT_CLOCK_KEY, "System(commit_clock)")?;
         let value = decode_system_u64(&record.value, "System(commit_clock)")?;
         ReadVersion::new(value).map_err(|error| corrupt("System(commit_clock)", error))
     }
 
+    /// Return the commit and recovery frontiers from one provider-consistent
+    /// System-space read view.
+    ///
+    /// This is the diagnostic boundary used to prove that a lifecycle sweep
+    /// did not race a durable metadata write. It must not be decomposed into
+    /// independent point reads because those reads could observe different
+    /// logical commits.
+    pub fn metadata_frontier(&self) -> Result<(ReadVersion, RecoveryState), AgentMetadataError> {
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| backend("lock read gate", error))?;
+        let read_view = self
+            .provider
+            .begin_read(&[ReadScope {
+                space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                prefix: Vec::new(),
+            }])
+            .map_err(provider_error)?;
+        let clock = required_record(
+            read_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_COMMIT_CLOCK_KEY,
+            "System(commit_clock)",
+        )?;
+        let commit_version = decode_system_u64(&clock.value, "System(commit_clock)")?;
+        let read_version = ReadVersion::new(commit_version)
+            .map_err(|error| corrupt("System(commit_clock)", error))?;
+        Ok((read_version, recovery_state_from(read_view.as_ref())?))
+    }
+
+    fn acknowledgement_frontier_from(
+        &self,
+        reader: &dyn MetadataReadView,
+    ) -> Result<AcknowledgedMetadataFrontier, AgentMetadataError> {
+        let authority = required_record(
+            reader,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_METADATA_AUTHORITY_KEY,
+            "System(metadata_authority)",
+        )?;
+        let marker = decode_authority_marker(&authority.value)
+            .map_err(|error| corrupt("MetadataAuthorityState", error))?;
+        if !marker.matches_identity(self.identity) {
+            return Err(AgentMetadataError::MetadataAuthorityBindingMismatch);
+        }
+        let clock = required_record(
+            reader,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_COMMIT_CLOCK_KEY,
+            "System(commit_clock)",
+        )?;
+        let recovery = recovery_state_from(reader)?;
+        Ok(AcknowledgedMetadataFrontier {
+            write_sequence: marker.write_sequence,
+            commit_version: CommitVersion::new(decode_system_u64(
+                &clock.value,
+                "System(commit_clock)",
+            )?)
+            .map_err(|error| corrupt("System(commit_clock)", error))?,
+            recovery_lsn: recovery.applied_recovery_lsn,
+            chain_digest: recovery.chain_digest,
+        })
+    }
+
+    fn begin_commit_resolution_view(
+        &self,
+    ) -> Result<Box<dyn MetadataReadView>, AgentMetadataError> {
+        let scopes = all_ordered_spaces()
+            .into_iter()
+            .map(|space| ReadScope {
+                space,
+                prefix: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        self.provider.begin_read(&scopes).map_err(provider_error)
+    }
+
+    fn frontier_point_from(
+        &self,
+        reader: &dyn MetadataReadView,
+    ) -> Result<MetadataFrontierPointV1, AgentMetadataError> {
+        let schema = reader
+            .get(
+                crate::workspace::provider_catalog::SYSTEM_SPACE,
+                SYSTEM_SCHEMA_KEY,
+            )
+            .map_err(provider_error)?;
+        if schema.is_none() {
+            self.require_canonical_absent_from(reader)?;
+            return Ok(MetadataFrontierPointV1::Absent);
+        }
+        validate_schema_marker(&schema.expect("schema presence was checked").value).map_err(
+            |error| AgentMetadataError::SchemaGate {
+                reason: error.to_string(),
+            },
+        )?;
+        let identity = required_record(
+            reader,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_STORE_IDENTITY_KEY,
+            "System(store_identity)",
+        )?;
+        let durable_identity = decode_store_identity(&identity.value)
+            .map_err(|error| corrupt("MetadataStoreIdentity", error))?;
+        if durable_identity != self.identity {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        }
+        Ok(MetadataFrontierPointV1::Exact(
+            self.acknowledgement_frontier_from(reader)?,
+        ))
+    }
+
+    fn require_canonical_absent_from(
+        &self,
+        reader: &dyn MetadataReadView,
+    ) -> Result<(), AgentMetadataError> {
+        for space in all_ordered_spaces() {
+            let page = reader
+                .scan(&ProviderScan {
+                    space,
+                    prefix: Vec::new(),
+                    start_after: None,
+                    delimiter: None,
+                    limit: 1,
+                })
+                .map_err(provider_error)?;
+            if !page.items.is_empty() {
+                return Err(AgentMetadataError::SchemaGate {
+                    reason: "pre-genesis metadata provider is not canonically empty".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn plan_exact_commit(
+        &self,
+        purpose: MetadataCommitPurposeV1,
+        prior: MetadataFrontierPointV1,
+        exact_next: AcknowledgedMetadataFrontier,
+    ) -> Result<PlannedMetadataCommitV1, AgentMetadataError> {
+        PlannedMetadataCommitV1::plan_exact(
+            self.identity,
+            self.runtime_bundle.frozen_runtime_bundle_digest_v1(),
+            purpose,
+            prior,
+            exact_next,
+        )
+        .map_err(receipt_error)
+    }
+
+    fn ensure_receipt_clean_for(
+        &self,
+        prior: MetadataFrontierPointV1,
+    ) -> Result<(), AgentMetadataError> {
+        if self.receipt_qualification == MetadataCommitReceiptQualificationV1::UntrackedStandalone {
+            return Ok(());
+        }
+        let state = match self.runtime_bundle.load_commit_receipt_v1(self.identity) {
+            Ok(state) => state,
+            Err(error) => {
+                self.fail_stop.trip();
+                return Err(receipt_error(error));
+            }
+        };
+        match state {
+            MetadataCommitReceiptStateV1::Clean {
+                store_identity,
+                frozen_bundle_digest,
+                frontier,
+            } if store_identity == self.identity
+                && frozen_bundle_digest
+                    == self.runtime_bundle.frozen_runtime_bundle_digest_v1()
+                && frontier == prior =>
+            {
+                Ok(())
+            }
+            MetadataCommitReceiptStateV1::Pending(_)
+            | MetadataCommitReceiptStateV1::PoisonedSettled(_)
+            | MetadataCommitReceiptStateV1::PoisonedUnsettled(_) => {
+                self.fail_stop.trip();
+                Err(AgentMetadataError::CommitOutcomeUnknown)
+            }
+            _ => {
+                self.fail_stop.trip();
+                Err(AgentMetadataError::ProviderAuthorityMismatch {
+                    operation: "validate metadata commit receipt",
+                    message:
+                        "durable receipt does not exactly match the provider planning frontier"
+                            .to_owned(),
+                })
+            }
+        }
+    }
+
+    fn poison_receipt_for_resolution(
+        &self,
+        origin: MetadataCommitLiveResolutionOriginV1,
+        reason: MetadataCommitReceiptPoisonReasonV1,
+    ) -> Result<MetadataCommitLiveResolutionOriginV1, AgentMetadataError> {
+        let authority = MetadataCommitEngineMintAuthorityV1::new();
+        let (command, witness) =
+            MetadataCommitReceiptPoisonCommandV1::mint(&authority, origin, reason)
+                .map_err(receipt_error)?;
+        let result = self
+            .runtime_bundle
+            .poison_commit_receipt_v1(command)
+            .into_live_resolution_origin_for(witness);
+        if result.is_err() {
+            self.fail_stop.trip();
+            return Err(AgentMetadataError::CommitOutcomeUnknown);
+        }
+        result.map_err(receipt_error)
+    }
+
+    fn resolve_receipt_after_provider_effect(
+        &self,
+        origin: MetadataCommitLiveResolutionOriginV1,
+        resolution: MetadataCommitResolutionV1,
+    ) -> Result<(), AgentMetadataError> {
+        let authority = MetadataCommitEngineMintAuthorityV1::new();
+        let (command, witness) =
+            MetadataCommitReceiptResolveCommandV1::mint_live(&authority, origin, resolution)
+                .map_err(receipt_error)?;
+        if self
+            .runtime_bundle
+            .resolve_pending_commit_v1(command)
+            .into_result_for(witness)
+            .is_err()
+        {
+            self.fail_stop.trip();
+            return Err(AgentMetadataError::CommitOutcomeUnknown);
+        }
+        Ok(())
+    }
+
+    fn poison_uncertain_commit_and_fail_stop(
+        &self,
+        origin: MetadataCommitLiveResolutionOriginV1,
+        reason: MetadataCommitReceiptPoisonReasonV1,
+    ) -> Result<(), AgentMetadataError> {
+        let authority = MetadataCommitEngineMintAuthorityV1::new();
+        let (command, witness) =
+            MetadataCommitReceiptPoisonCommandV1::mint(&authority, origin, reason)
+                .map_err(receipt_error)?;
+        let poisoned = self
+            .runtime_bundle
+            .poison_commit_receipt_v1(command)
+            .into_live_resolution_origin_for(witness)
+            .is_ok();
+        self.fail_stop.trip();
+        if poisoned {
+            Ok(())
+        } else {
+            Err(AgentMetadataError::CommitOutcomeUnknown)
+        }
+    }
+
+    fn close_uncertain_live_origin(
+        &self,
+        origin: MetadataCommitLiveResolutionOriginV1,
+        poison_reason: Option<MetadataCommitReceiptPoisonReasonV1>,
+    ) -> Result<(), AgentMetadataError> {
+        if origin.source() == MetadataCommitReceiptDirtySourceV1::Pending {
+            if let Some(reason) = poison_reason {
+                return self.poison_uncertain_commit_and_fail_stop(origin, reason);
+            }
+        }
+        drop(origin);
+        self.fail_stop.trip();
+        Ok(())
+    }
+
+    fn commit_planned_exact(
+        &self,
+        plan: AtomicPlan,
+        planned: &PlannedMetadataCommitV1,
+    ) -> Result<AtomicCommitOutcome, AgentMetadataError> {
+        planned
+            .validate_binding(
+                self.identity,
+                self.runtime_bundle.frozen_runtime_bundle_digest_v1(),
+            )
+            .map_err(receipt_error)?;
+        self.ensure_receipt_clean_for(planned.prior())?;
+        let mut pending_fail_stop = PendingCommitFailStopGuard::arm(self.fail_stop.as_ref());
+        let mint_authority = MetadataCommitEngineMintAuthorityV1::new();
+        let (persist_command, persist_witness) =
+            MetadataCommitReceiptPersistCommandV1::mint(&mint_authority, planned);
+        let live_origin = match self
+            .runtime_bundle
+            .persist_pending_commit_v1(persist_command)
+            .into_live_resolution_origin_for(persist_witness)
+        {
+            Ok(origin) => origin,
+            Err(error) => {
+                return match error {
+                    MetadataCommitReceiptPersistErrorV1::UnavailableBeforeEffect => {
+                        pending_fail_stop.disarm();
+                        Err(AgentMetadataError::ProviderUnavailable {
+                            operation: "persist metadata commit receipt",
+                            message: error.to_string(),
+                        })
+                    }
+                    MetadataCommitReceiptPersistErrorV1::InvalidBindingBeforeEffect => {
+                        self.fail_stop.trip();
+                        Err(AgentMetadataError::ProviderAuthorityMismatch {
+                            operation: "persist metadata commit receipt",
+                            message: error.to_string(),
+                        })
+                    }
+                    MetadataCommitReceiptPersistErrorV1::RecoveryRequired => {
+                        self.fail_stop.trip();
+                        Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+                    }
+                };
+            }
+        };
+
+        let transaction = match self.provider.begin_write() {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let resolution = self.resolve_planned_from_provider(
+                    planned,
+                    live_origin,
+                    true,
+                    true,
+                    Some(MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome),
+                )?;
+                if let Some(outcome) = resolution {
+                    pending_fail_stop.disarm();
+                    return match outcome {
+                        AtomicCommitOutcome::Committed => Ok(AtomicCommitOutcome::Committed),
+                        AtomicCommitOutcome::Conflict => Err(provider_error(error)),
+                    };
+                }
+                return Err(AgentMetadataError::CommitOutcomeUnknown);
+            }
+        };
+        match transaction.commit(plan) {
+            Ok(AtomicCommitOutcome::Committed) => {
+                let resolution = self.resolve_planned_from_provider(
+                    planned,
+                    live_origin,
+                    false,
+                    true,
+                    Some(MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome),
+                )?;
+                if resolution == Some(AtomicCommitOutcome::Committed) {
+                    pending_fail_stop.disarm();
+                    Ok(AtomicCommitOutcome::Committed)
+                } else {
+                    Err(AgentMetadataError::CommitOutcomeUnknown)
+                }
+            }
+            Ok(AtomicCommitOutcome::Conflict) => {
+                let resolution = self.resolve_planned_from_provider(
+                    planned,
+                    live_origin,
+                    true,
+                    true,
+                    Some(MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome),
+                )?;
+                if let Some(outcome) = resolution {
+                    pending_fail_stop.disarm();
+                    Ok(outcome)
+                } else {
+                    Err(AgentMetadataError::CommitOutcomeUnknown)
+                }
+            }
+            Err(error) if error.kind() == ProviderErrorKind::UnknownCommitSettled => {
+                let live_origin = self.poison_receipt_for_resolution(
+                    live_origin,
+                    MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome,
+                )?;
+                let resolution = self.resolve_planned_from_provider(
+                    planned,
+                    live_origin,
+                    true,
+                    true,
+                    Some(MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome),
+                );
+                self.fail_stop.trip();
+                resolution?.ok_or(AgentMetadataError::CommitOutcomeUnknown)
+            }
+            Err(error) if error.kind() == ProviderErrorKind::UnknownCommitUnsettled => {
+                let live_origin = self.poison_receipt_for_resolution(
+                    live_origin,
+                    MetadataCommitReceiptPoisonReasonV1::UnsettledCommitOutcome,
+                )?;
+                let resolution = self.resolve_planned_from_provider(
+                    planned,
+                    live_origin,
+                    false,
+                    false,
+                    Some(MetadataCommitReceiptPoisonReasonV1::UnsettledCommitOutcome),
+                );
+                self.fail_stop.trip();
+                resolution?.ok_or(AgentMetadataError::CommitOutcomeUnknown)
+            }
+            Err(error) => {
+                let resolution = self.resolve_planned_from_provider(
+                    planned,
+                    live_origin,
+                    true,
+                    true,
+                    Some(MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome),
+                )?;
+                match resolution {
+                    Some(AtomicCommitOutcome::Committed) => {
+                        pending_fail_stop.disarm();
+                        Ok(AtomicCommitOutcome::Committed)
+                    }
+                    Some(AtomicCommitOutcome::Conflict) => {
+                        pending_fail_stop.disarm();
+                        Err(provider_error(error))
+                    }
+                    None => Err(AgentMetadataError::CommitOutcomeUnknown),
+                }
+            }
+        }
+    }
+
+    fn resolve_planned_from_provider(
+        &self,
+        planned: &PlannedMetadataCommitV1,
+        origin: MetadataCommitLiveResolutionOriginV1,
+        prior_is_terminal: bool,
+        retry_prior_for_causal_settlement: bool,
+        poison_reason_on_uncertain: Option<MetadataCommitReceiptPoisonReasonV1>,
+    ) -> Result<Option<AtomicCommitOutcome>, AgentMetadataError> {
+        let first = match self
+            .begin_commit_resolution_view()
+            .and_then(|view| self.observe_planned_from(view.as_ref(), planned))
+        {
+            Ok(observation) => observation,
+            Err(_) => {
+                self.close_uncertain_live_origin(origin, poison_reason_on_uncertain)?;
+                return Ok(None);
+            }
+        };
+        let observation = if retry_prior_for_causal_settlement
+            && matches!(first, PlannedCommitObservation::NotApplied { .. })
+        {
+            let second = match self
+                .begin_commit_resolution_view()
+                .and_then(|view| self.observe_planned_from(view.as_ref(), planned))
+            {
+                Ok(observation) => observation,
+                Err(_) => {
+                    self.close_uncertain_live_origin(origin, poison_reason_on_uncertain)?;
+                    return Ok(None);
+                }
+            };
+            second
+        } else {
+            first
+        };
+        match observation {
+            PlannedCommitObservation::Applied {
+                purpose_evidence_digest,
+            } => {
+                let authority = MetadataCommitEngineMintAuthorityV1::new();
+                let source = origin.source();
+                self.resolve_receipt_after_provider_effect(
+                    origin,
+                    MetadataCommitResolutionV1::applied(
+                        &authority,
+                        source,
+                        planned.exact_next(),
+                        purpose_evidence_digest,
+                    ),
+                )?;
+                Ok(Some(AtomicCommitOutcome::Committed))
+            }
+            PlannedCommitObservation::NotApplied {
+                purpose_evidence_digest,
+            } if prior_is_terminal => {
+                let origin = match origin.source() {
+                    MetadataCommitReceiptDirtySourceV1::Pending => self
+                        .poison_receipt_for_resolution(
+                            origin,
+                            MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome,
+                        )?,
+                    MetadataCommitReceiptDirtySourceV1::PoisonedSettled => origin,
+                    MetadataCommitReceiptDirtySourceV1::PoisonedUnsettled => {
+                        drop(origin);
+                        self.fail_stop.trip();
+                        return Ok(None);
+                    }
+                };
+                let authority = MetadataCommitEngineMintAuthorityV1::new();
+                self.resolve_receipt_after_provider_effect(
+                    origin,
+                    MetadataCommitResolutionV1::not_applied_settled(
+                        &authority,
+                        planned.prior(),
+                        purpose_evidence_digest,
+                    ),
+                )?;
+                Ok(Some(AtomicCommitOutcome::Conflict))
+            }
+            PlannedCommitObservation::NotApplied { .. } => {
+                drop(origin);
+                self.fail_stop.trip();
+                Ok(None)
+            }
+            PlannedCommitObservation::Foreign => {
+                self.close_uncertain_live_origin(origin, poison_reason_on_uncertain)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn reconcile_receipt_on_open(&self) -> Result<(), AgentMetadataError> {
+        let state = self
+            .runtime_bundle
+            .load_commit_receipt_v1(self.identity)
+            .map_err(receipt_error)?;
+        match state {
+            MetadataCommitReceiptStateV1::UntrackedStandalone
+                if self.receipt_qualification
+                    == MetadataCommitReceiptQualificationV1::UntrackedStandalone =>
+            {
+                Ok(())
+            }
+            MetadataCommitReceiptStateV1::Clean {
+                store_identity,
+                frozen_bundle_digest,
+                frontier,
+            } => {
+                if store_identity != self.identity
+                    || frozen_bundle_digest != self.runtime_bundle.frozen_runtime_bundle_digest_v1()
+                {
+                    return Err(AgentMetadataError::ProviderAuthorityMismatch {
+                        operation: "validate metadata commit receipt binding",
+                        message: "receipt is bound to another store or runtime bundle".to_owned(),
+                    });
+                }
+                let view = self.begin_commit_resolution_view()?;
+                if self.frontier_point_from(view.as_ref())? != frontier {
+                    return Err(AgentMetadataError::ProviderAuthorityMismatch {
+                        operation: "validate metadata commit receipt frontier",
+                        message: "provider frontier differs from the exact clean receipt"
+                            .to_owned(),
+                    });
+                }
+                Ok(())
+            }
+            MetadataCommitReceiptStateV1::Pending(_)
+            | MetadataCommitReceiptStateV1::PoisonedSettled(_)
+            | MetadataCommitReceiptStateV1::PoisonedUnsettled(_) => {
+                Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+            }
+            MetadataCommitReceiptStateV1::UntrackedStandalone => {
+                Err(AgentMetadataError::ProviderAuthorityMismatch {
+                    operation: "validate metadata commit receipt qualification",
+                    message: "distributed runtime cannot use an untracked receipt".to_owned(),
+                })
+            }
+        }
+    }
+
+    fn observe_planned_from(
+        &self,
+        reader: &dyn MetadataReadView,
+        planned: &PlannedMetadataCommitV1,
+    ) -> Result<PlannedCommitObservation, AgentMetadataError> {
+        let current = self.frontier_point_from(reader)?;
+        if current == MetadataFrontierPointV1::Exact(planned.exact_next()) {
+            let evidence = self.verify_applied_purpose_from(reader, planned)?;
+            return Ok(PlannedCommitObservation::Applied {
+                purpose_evidence_digest: purpose_evidence_digest(planned, true, &evidence),
+            });
+        }
+        if current == planned.prior() {
+            let evidence = self.verify_not_applied_purpose_from(reader, planned)?;
+            return Ok(PlannedCommitObservation::NotApplied {
+                purpose_evidence_digest: purpose_evidence_digest(planned, false, &evidence),
+            });
+        }
+        Ok(PlannedCommitObservation::Foreign)
+    }
+
+    fn verify_applied_purpose_from(
+        &self,
+        reader: &dyn MetadataReadView,
+        planned: &PlannedMetadataCommitV1,
+    ) -> Result<Vec<u8>, AgentMetadataError> {
+        match planned.purpose() {
+            MetadataCommitPurposeV1::Genesis {
+                authority_marker_digest,
+            } => {
+                self.verify_canonical_genesis_from(
+                    reader,
+                    planned.exact_next(),
+                    *authority_marker_digest,
+                )?;
+                Ok(b"canonical-genesis-v1".to_vec())
+            }
+            MetadataCommitPurposeV1::AdvanceOwnerEpoch { expected, next } => {
+                let row = self.required_recovery_row_from(reader, planned.exact_next())?;
+                if row.mutation
+                    != (RecoveryMutationV1::AdvanceOwnerEpoch {
+                        expected: *expected,
+                        next: *next,
+                    })
+                    || row.result
+                        != (RecoveryResultV1::OwnerEpoch {
+                            applied_owner_epoch: *next,
+                        })
+                {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "owner-epoch recovery row does not match the planned commit",
+                    ));
+                }
+                let owner = required_record(
+                    reader,
+                    crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    SYSTEM_OWNER_FENCE_KEY,
+                    "System(owner_fence)",
+                )?;
+                if decode_system_u64(&owner.value, "System(owner_fence)")? != next.get() {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "owner fence does not match the planned next epoch",
+                    ));
+                }
+                row.encode()
+                    .map_err(|error| corrupt("RecoveryOutbox", error))
+            }
+            MetadataCommitPurposeV1::ObserveLeaseClock {
+                root_id,
+                placement_generation,
+                owner_epoch,
+                observed_ms,
+            } => {
+                let row = self.required_recovery_row_from(reader, planned.exact_next())?;
+                if row.mutation
+                    != (RecoveryMutationV1::ObserveLeaseClock {
+                        root_id: *root_id,
+                        placement_generation: *placement_generation,
+                        owner_epoch: *owner_epoch,
+                        observed_ms: *observed_ms,
+                    })
+                    || row.result
+                        != (RecoveryResultV1::LeaseClock {
+                            effective_high_water_ms: *observed_ms,
+                        })
+                {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "lease-clock recovery row does not match the planned commit",
+                    ));
+                }
+                let clock = required_record(
+                    reader,
+                    crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+                    "System(lease_clock_high_water)",
+                )?;
+                if decode_system_u64(&clock.value, "System(lease_clock_high_water)")?
+                    != *observed_ms
+                {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "lease clock does not match the planned observation",
+                    ));
+                }
+                row.encode()
+                    .map_err(|error| corrupt("RecoveryOutbox", error))
+            }
+            MetadataCommitPurposeV1::MetadataCommand {
+                class,
+                root_id,
+                request_id,
+                command_digest,
+                lease_deadline_ms,
+            } => {
+                let dedupe_key = command_dedupe_key(*root_id, *request_id);
+                let dedupe = required_record(
+                    reader,
+                    crate::workspace::provider_catalog::COMMAND_DEDUPE_SPACE,
+                    &dedupe_key,
+                    "CommandDedupe",
+                )?;
+                let dedupe_record = CommandDedupeRecord::decode(&dedupe.value)
+                    .map_err(|error| corrupt("CommandDedupe", error))?;
+                if dedupe_record.command_digest != *command_digest
+                    || dedupe_record.commit_version != planned.exact_next().commit_version
+                    || dedupe_record.recovery_lsn != planned.exact_next().recovery_lsn
+                {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "command dedupe does not match the planned commit",
+                    ));
+                }
+                let row = self.required_recovery_row_from(reader, planned.exact_next())?;
+                let RecoveryMutationV1::MetadataCommand {
+                    command,
+                    lease_deadline_ms: durable_deadline,
+                } = &row.mutation
+                else {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "recovery row is not a metadata command",
+                    ));
+                };
+                let durable_class =
+                    if matches!(command.root_fence_action, RootFenceAction::RequireActive) {
+                        MetadataCommandCommitClassV1::Domain
+                    } else {
+                        MetadataCommandCommitClassV1::RootFence
+                    };
+                let RecoveryResultV1::MetadataCommand {
+                    commit_version,
+                    deterministic_result,
+                } = &row.result
+                else {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "recovery result is not a metadata command",
+                    ));
+                };
+                if durable_class != *class
+                    || command.root_id != *root_id
+                    || command.request_id != *request_id
+                    || command.command_digest != *command_digest
+                    || durable_deadline != lease_deadline_ms
+                    || *commit_version != planned.exact_next().commit_version
+                    || *deterministic_result != dedupe_record.deterministic_result
+                {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "metadata command recovery evidence does not match the plan",
+                    ));
+                }
+                let mut evidence = dedupe.value;
+                evidence.extend_from_slice(
+                    &row.encode()
+                        .map_err(|error| corrupt("RecoveryOutbox", error))?,
+                );
+                Ok(evidence)
+            }
+            MetadataCommitPurposeV1::Authority {
+                next_marker_digest, ..
+            } => {
+                let authority = required_record(
+                    reader,
+                    crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    SYSTEM_METADATA_AUTHORITY_KEY,
+                    "System(metadata_authority)",
+                )?;
+                if digest_authority_marker(&authority.value) != *next_marker_digest {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "authority marker does not match the planned next state",
+                    ));
+                }
+                Ok(authority.value)
+            }
+        }
+    }
+
+    fn verify_not_applied_purpose_from(
+        &self,
+        reader: &dyn MetadataReadView,
+        planned: &PlannedMetadataCommitV1,
+    ) -> Result<Vec<u8>, AgentMetadataError> {
+        match planned.purpose() {
+            MetadataCommitPurposeV1::Genesis { .. } => {
+                self.require_canonical_absent_from(reader)?;
+                Ok(b"canonical-absence-v1".to_vec())
+            }
+            MetadataCommitPurposeV1::AdvanceOwnerEpoch { expected, .. } => {
+                self.require_next_recovery_absent_from(reader, planned.exact_next())?;
+                let owner = required_record(
+                    reader,
+                    crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    SYSTEM_OWNER_FENCE_KEY,
+                    "System(owner_fence)",
+                )?;
+                let expected = expected.map(OwnerEpoch::get).unwrap_or(0);
+                if decode_system_u64(&owner.value, "System(owner_fence)")? != expected {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "owner fence does not match the planned predecessor",
+                    ));
+                }
+                Ok(owner.value)
+            }
+            MetadataCommitPurposeV1::ObserveLeaseClock { observed_ms, .. } => {
+                self.require_next_recovery_absent_from(reader, planned.exact_next())?;
+                let clock = required_record(
+                    reader,
+                    crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+                    "System(lease_clock_high_water)",
+                )?;
+                let current = decode_system_u64(&clock.value, "System(lease_clock_high_water)")?;
+                if current >= *observed_ms {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "lease clock no longer matches the planned predecessor",
+                    ));
+                }
+                Ok(clock.value)
+            }
+            MetadataCommitPurposeV1::MetadataCommand {
+                root_id,
+                request_id,
+                ..
+            } => {
+                self.require_next_recovery_absent_from(reader, planned.exact_next())?;
+                if reader
+                    .get(
+                        crate::workspace::provider_catalog::COMMAND_DEDUPE_SPACE,
+                        &command_dedupe_key(*root_id, *request_id),
+                    )
+                    .map_err(provider_error)?
+                    .is_some()
+                {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "command dedupe exists at the planned predecessor frontier",
+                    ));
+                }
+                Ok(b"dedupe-and-recovery-absent-v1".to_vec())
+            }
+            MetadataCommitPurposeV1::Authority {
+                prior_marker_digest,
+                ..
+            } => {
+                let authority = required_record(
+                    reader,
+                    crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    SYSTEM_METADATA_AUTHORITY_KEY,
+                    "System(metadata_authority)",
+                )?;
+                if digest_authority_marker(&authority.value) != *prior_marker_digest {
+                    return Err(corrupt(
+                        "metadata commit purpose evidence",
+                        "authority marker does not match the planned predecessor",
+                    ));
+                }
+                Ok(authority.value)
+            }
+        }
+    }
+
+    fn required_recovery_row_from(
+        &self,
+        reader: &dyn MetadataReadView,
+        next: AcknowledgedMetadataFrontier,
+    ) -> Result<RecoveryOutboxRecord, AgentMetadataError> {
+        let header = required_record(
+            reader,
+            crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+            &recovery_outbox_key(next.recovery_lsn),
+            "RecoveryOutbox",
+        )?;
+        let row = self.read_recovery_record_from(reader, next.recovery_lsn, &header.value)?;
+        if row.recovery_lsn != next.recovery_lsn || row.chain_digest != next.chain_digest {
+            return Err(corrupt(
+                "metadata commit purpose evidence",
+                "recovery row does not match the planned next frontier",
+            ));
+        }
+        Ok(row)
+    }
+
+    fn require_next_recovery_absent_from(
+        &self,
+        reader: &dyn MetadataReadView,
+        next: AcknowledgedMetadataFrontier,
+    ) -> Result<(), AgentMetadataError> {
+        if reader
+            .get(
+                crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                &recovery_outbox_key(next.recovery_lsn),
+            )
+            .map_err(provider_error)?
+            .is_some()
+        {
+            return Err(corrupt(
+                "metadata commit purpose evidence",
+                "planned next recovery row exists at the predecessor frontier",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_canonical_genesis_from(
+        &self,
+        reader: &dyn MetadataReadView,
+        genesis: AcknowledgedMetadataFrontier,
+        authority_marker_digest: [u8; 32],
+    ) -> Result<(), AgentMetadataError> {
+        let page = reader
+            .scan(&ProviderScan {
+                space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                prefix: Vec::new(),
+                start_after: None,
+                delimiter: None,
+                limit: 0,
+            })
+            .map_err(provider_error)?;
+        let rows = page
+            .items
+            .into_iter()
+            .map(|item| match item {
+                ProviderScanItem::Key { key, value } => Ok((key, value)),
+                ProviderScanItem::CommonPrefix(_) => Err(corrupt(
+                    "canonical metadata genesis",
+                    "undelimited System scan returned a common prefix",
+                )),
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        if rows.len() != 8 {
+            return Err(corrupt(
+                "canonical metadata genesis",
+                "System does not contain exactly the eight canonical genesis rows",
+            ));
+        }
+        let required = |key: &[u8]| {
+            rows.get(key)
+                .ok_or_else(|| corrupt("canonical metadata genesis", "required row is missing"))
+        };
+        validate_schema_marker(required(SYSTEM_SCHEMA_KEY)?).map_err(|error| {
+            AgentMetadataError::SchemaGate {
+                reason: error.to_string(),
+            }
+        })?;
+        if decode_store_identity(required(SYSTEM_STORE_IDENTITY_KEY)?)
+            .map_err(|error| corrupt("MetadataStoreIdentity", error))?
+            != self.identity
+            || digest_authority_marker(required(SYSTEM_METADATA_AUTHORITY_KEY)?)
+                != authority_marker_digest
+            || decode_system_u64(required(SYSTEM_OWNER_FENCE_KEY)?, "System(owner_fence)")? != 0
+            || decode_system_u64(required(SYSTEM_COMMIT_CLOCK_KEY)?, "System(commit_clock)")?
+                != INITIAL_COMMIT_VERSION
+            || decode_system_u64(
+                required(SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY)?,
+                "System(lease_clock_high_water)",
+            )? != 0
+            || decode_system_u64(
+                required(SYSTEM_APPLIED_RECOVERY_LSN_KEY)?,
+                "System(applied_recovery_lsn)",
+            )? != 0
+            || decode_system_digest(
+                required(SYSTEM_RECOVERY_CHAIN_DIGEST_KEY)?,
+                "System(recovery_chain_digest)",
+            )? != recovery_genesis_digest(
+                self.identity.logical_shard_id,
+                self.identity.contract_digest,
+            )
+            || genesis.write_sequence != 0
+            || genesis.commit_version.get() != INITIAL_COMMIT_VERSION
+            || genesis.recovery_lsn != 0
+        {
+            return Err(corrupt(
+                "canonical metadata genesis",
+                "one or more canonical genesis values differ",
+            ));
+        }
+        for space in all_ordered_spaces()
+            .into_iter()
+            .filter(|space| *space != crate::workspace::provider_catalog::SYSTEM_SPACE)
+        {
+            let page = reader
+                .scan(&ProviderScan {
+                    space,
+                    prefix: Vec::new(),
+                    start_after: None,
+                    delimiter: None,
+                    limit: 1,
+                })
+                .map_err(provider_error)?;
+            if !page.items.is_empty() {
+                return Err(corrupt(
+                    "canonical metadata genesis",
+                    "a user, root-fence, dedupe, history, event, or recovery row exists",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Return the logical shard identity sealed into this store.
     pub fn logical_shard_id(&self) -> LogicalShardId {
-        self.logical_shard_id
+        self.identity.logical_shard_id
+    }
+
+    /// Return the exact immutable identity admitted when this store was opened.
+    pub fn metadata_store_identity(&self) -> MetadataStoreIdentity {
+        self.identity
+    }
+
+    /// Open one provider-native, cross-space consistent view for metadata
+    /// diagnostics. Callers must honor the provider's declared view lifetime
+    /// and must not replace pagination with independently opened views.
+    pub(super) fn begin_diagnostic_read(
+        &self,
+        scopes: &[ReadScope],
+    ) -> Result<MetadataDiagnosticReadView<'_>, ProviderError> {
+        let command_guard = self.command_gate.read().map_err(|_| {
+            ProviderError::backend(
+                ProviderOperationV1::BeginRead,
+                "metadata command gate is poisoned",
+            )
+        })?;
+        let delegate = self.provider.begin_read(scopes)?;
+        Ok(MetadataDiagnosticReadView {
+            delegate,
+            _command_guard: command_guard,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn delete_diagnostic_row_for_test(
+        &self,
+        space: OrderedSpaceId,
+        key: Vec<u8>,
+    ) -> Result<(), AgentMetadataError> {
+        let transaction = self.provider.begin_write().map_err(provider_error)?;
+        let outcome = transaction
+            .commit(AtomicPlan {
+                operations: vec![AtomicOp::Delete { space, key }],
+            })
+            .map_err(provider_error)?;
+        if outcome == AtomicCommitOutcome::Committed {
+            Ok(())
+        } else {
+            Err(AgentMetadataError::WriteConflict)
+        }
+    }
+
+    pub(super) fn provider_capabilities(&self) -> super::provider::ProviderCapabilities {
+        self.provider.capabilities()
+    }
+
+    /// Revalidate the process-local resources backing this metadata provider.
+    ///
+    /// Owner bootstrap and lease renewal use this storage-neutral cut point in
+    /// addition to their external lifecycle receipt. It performs no logical
+    /// metadata mutation and does not change provider ownership.
+    pub fn validate_provider_runtime(&self) -> Result<(), AgentMetadataError> {
+        self.provider.validate_runtime().map_err(provider_error)
+    }
+
+    /// Return the durable authority state. Reads remain available in every
+    /// state, while ordinary writes require `Active` in their atomic plan.
+    pub fn metadata_authority_state(&self) -> Result<MetadataAuthorityState, AgentMetadataError> {
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| backend("lock read gate", error))?;
+        self.metadata_authority_state_unlocked()
+    }
+
+    fn metadata_authority_state_unlocked(
+        &self,
+    ) -> Result<MetadataAuthorityState, AgentMetadataError> {
+        let marker = self.required_authority_marker()?;
+        Ok(marker.state)
+    }
+
+    /// Atomically stop admitting source writes and return the exact durable
+    /// recovery receipt installed with that barrier.
+    pub fn quiesce_metadata_authority(
+        &self,
+        migration_id: OperationId,
+        owner_epoch: OwnerEpoch,
+    ) -> Result<SourceQuiesceReceipt, AgentMetadataError> {
+        if migration_id.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(migration_admission("migration id must not be all-zero"));
+        }
+        let _command_guard = self
+            .command_gate
+            .write()
+            .map_err(|error| backend("lock command gate", error))?;
+        let planning_view = self.begin_commit_resolution_view()?;
+        let schema = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_SCHEMA_KEY,
+            "System(schema)",
+        )?;
+        validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
+            reason: error.to_string(),
+        })?;
+        let identity = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_STORE_IDENTITY_KEY,
+            "System(store_identity)",
+        )?;
+        let durable_identity = decode_store_identity(&identity.value)
+            .map_err(|error| corrupt("MetadataStoreIdentity", error))?;
+        if durable_identity != self.identity {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        }
+        let authority = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_METADATA_AUTHORITY_KEY,
+            "System(metadata_authority)",
+        )?;
+        let marker = decode_authority_marker(&authority.value)
+            .map_err(|error| corrupt("MetadataAuthorityState", error))?;
+        if !marker.matches_identity(durable_identity) {
+            return Err(AgentMetadataError::MetadataAuthorityBindingMismatch);
+        }
+        if marker.state == MetadataAuthorityState::Quiescing {
+            let MetadataAuthorityEvidence::SourceQuiesceReceipt(receipt) = marker.evidence else {
+                return Err(migration_admission(
+                    "quiescing source is missing its durable receipt",
+                ));
+            };
+            validate_source_receipt_request(self.identity, migration_id, owner_epoch, receipt)?;
+            self.ensure_receipt_clean_for(self.frontier_point_from(planning_view.as_ref())?)?;
+            return Ok(receipt);
+        }
+        if marker.state != MetadataAuthorityState::Active {
+            return Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected: MetadataAuthorityState::Active,
+                actual: marker.state,
+            });
+        }
+        let owner = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_OWNER_FENCE_KEY,
+            "System(owner_fence)",
+        )?;
+        let actual_owner = decode_system_u64(&owner.value, "System(owner_fence)")?;
+        if actual_owner != owner_epoch.get() {
+            return Err(AgentMetadataError::OwnerEpochMismatch {
+                expected: owner_epoch.get(),
+                actual: actual_owner,
+            });
+        }
+        let recovery_lsn = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+            "System(applied_recovery_lsn)",
+        )?;
+        let chain_digest = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+            "System(recovery_chain_digest)",
+        )?;
+        let commit_clock = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_COMMIT_CLOCK_KEY,
+            "System(commit_clock)",
+        )?;
+        let receipt = SourceQuiesceReceipt {
+            logical_shard_id: self.identity.logical_shard_id,
+            migration_id,
+            source_authority_id: self.identity.authority_id,
+            source_authority_generation: self.identity.authority_generation,
+            owner_epoch,
+            frontier: MetadataRecoveryFrontier {
+                recovery_lsn: decode_system_u64(
+                    &recovery_lsn.value,
+                    "System(applied_recovery_lsn)",
+                )?,
+                chain_digest: decode_system_digest(
+                    &chain_digest.value,
+                    "System(recovery_chain_digest)",
+                )?,
+                commit_version: CommitVersion::new(decode_system_u64(
+                    &commit_clock.value,
+                    "System(commit_clock)",
+                )?)
+                .map_err(|error| corrupt("System(commit_clock)", error))?,
+                state_digest: logical_state_digest(planning_view.as_ref())?,
+            },
+            contract_digest: self.identity.contract_digest,
+        };
+        let next_marker = MetadataAuthorityMarker {
+            state: MetadataAuthorityState::Quiescing,
+            evidence: MetadataAuthorityEvidence::SourceQuiesceReceipt(receipt),
+            ..marker
+                .advance_write_sequence()
+                .ok_or(AgentMetadataError::VersionOverflow)?
+        };
+        let prior = self.frontier_point_from(planning_view.as_ref())?;
+        let MetadataFrontierPointV1::Exact(prior_frontier) = prior else {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        };
+        let exact_next = AcknowledgedMetadataFrontier {
+            write_sequence: prior_frontier
+                .write_sequence
+                .checked_add(1)
+                .ok_or(AgentMetadataError::VersionOverflow)?,
+            ..prior_frontier
+        };
+        let planned = self.plan_exact_commit(
+            MetadataCommitPurposeV1::Authority {
+                action: MetadataAuthorityCommitActionV1::Quiesce {
+                    migration_id,
+                    owner_epoch,
+                },
+                prior_marker_digest: digest_authority_marker(&authority.value),
+                next_marker_digest: digest_authority_marker(&encode_authority_marker(next_marker)),
+            },
+            prior,
+            exact_next,
+        )?;
+        let plan = AtomicPlan {
+            operations: vec![
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_SCHEMA_KEY.to_vec(),
+                    witness: schema.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_STORE_IDENTITY_KEY.to_vec(),
+                    witness: identity.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_OWNER_FENCE_KEY.to_vec(),
+                    witness: owner.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_APPLIED_RECOVERY_LSN_KEY.to_vec(),
+                    witness: recovery_lsn.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_RECOVERY_CHAIN_DIGEST_KEY.to_vec(),
+                    witness: chain_digest.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_COMMIT_CLOCK_KEY.to_vec(),
+                    witness: commit_clock.witness,
+                },
+                AtomicOp::CompareAndPut {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_METADATA_AUTHORITY_KEY.to_vec(),
+                    witness: authority.witness,
+                    value: encode_authority_marker(next_marker),
+                },
+            ],
+        };
+        match self.commit_planned_exact(plan, &planned)? {
+            AtomicCommitOutcome::Committed => Ok(receipt),
+            AtomicCommitOutcome::Conflict => Err(AgentMetadataError::WriteConflict),
+        }
+    }
+
+    /// Permanently fence the exact quiesced source after cutover.
+    pub fn fence_quiesced_metadata_authority(
+        &self,
+        receipt: &SourceQuiesceReceipt,
+    ) -> Result<(), AgentMetadataError> {
+        self.transition_with_exact_evidence(
+            MetadataAuthorityState::Quiescing,
+            MetadataAuthorityState::Fenced,
+            MetadataAuthorityEvidence::SourceQuiesceReceipt(*receipt),
+        )
+    }
+
+    /// Activate a target only with the deterministic control token and only
+    /// when its exact local logical frontier matches that token.
+    #[cfg(test)]
+    pub(crate) fn activate_migration_target(
+        &self,
+        token: &TargetActivationToken,
+    ) -> Result<(), AgentMetadataError> {
+        let _command_guard = self
+            .command_gate
+            .write()
+            .map_err(|error| backend("lock command gate", error))?;
+        let planning_view = self.begin_commit_resolution_view()?;
+        let schema = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_SCHEMA_KEY,
+            "System(schema)",
+        )?;
+        validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
+            reason: error.to_string(),
+        })?;
+        let (identity, authority, marker) = self.required_authority_from(planning_view.as_ref())?;
+        let expected_evidence = MetadataAuthorityEvidence::TargetActivationToken(*token);
+        if marker.state == MetadataAuthorityState::Active {
+            if marker.evidence == expected_evidence {
+                self.ensure_receipt_clean_for(self.frontier_point_from(planning_view.as_ref())?)?;
+                return Ok(());
+            }
+            return Err(migration_admission(
+                "active target carries a different activation token",
+            ));
+        }
+        if marker.state != MetadataAuthorityState::MigrationTarget {
+            return Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected: MetadataAuthorityState::MigrationTarget,
+                actual: marker.state,
+            });
+        }
+        let MetadataAuthorityEvidence::MigrationTargetBinding(binding) = marker.evidence else {
+            return Err(migration_admission(
+                "migration target is missing its immutable migration binding",
+            ));
+        };
+        validate_target_token_identity(self.identity, binding, token)?;
+        let recovery_lsn = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+            "System(applied_recovery_lsn)",
+        )?;
+        let chain_digest = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+            "System(recovery_chain_digest)",
+        )?;
+        let commit_clock = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_COMMIT_CLOCK_KEY,
+            "System(commit_clock)",
+        )?;
+        let local_frontier = MetadataRecoveryFrontier {
+            recovery_lsn: decode_system_u64(&recovery_lsn.value, "System(applied_recovery_lsn)")?,
+            chain_digest: decode_system_digest(
+                &chain_digest.value,
+                "System(recovery_chain_digest)",
+            )?,
+            commit_version: CommitVersion::new(decode_system_u64(
+                &commit_clock.value,
+                "System(commit_clock)",
+            )?)
+            .map_err(|error| corrupt("System(commit_clock)", error))?,
+            state_digest: logical_state_digest(planning_view.as_ref())?,
+        };
+        if local_frontier != token.frontier {
+            return Err(migration_admission(
+                "migration target logical frontier does not match the activation token",
+            ));
+        }
+        let next_marker = MetadataAuthorityMarker {
+            state: MetadataAuthorityState::Active,
+            evidence: expected_evidence,
+            ..marker
+                .advance_write_sequence()
+                .ok_or(AgentMetadataError::VersionOverflow)?
+        };
+        let prior = self.frontier_point_from(planning_view.as_ref())?;
+        let MetadataFrontierPointV1::Exact(prior_frontier) = prior else {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        };
+        let exact_next = AcknowledgedMetadataFrontier {
+            write_sequence: prior_frontier
+                .write_sequence
+                .checked_add(1)
+                .ok_or(AgentMetadataError::VersionOverflow)?,
+            ..prior_frontier
+        };
+        let planned = self.plan_exact_commit(
+            MetadataCommitPurposeV1::Authority {
+                action: MetadataAuthorityCommitActionV1::ActivateTarget {
+                    migration_id: token.migration_id,
+                    activation_token_digest: digest_target_token(token),
+                },
+                prior_marker_digest: digest_authority_marker(&authority.value),
+                next_marker_digest: digest_authority_marker(&encode_authority_marker(next_marker)),
+            },
+            prior,
+            exact_next,
+        )?;
+        let plan = AtomicPlan {
+            operations: vec![
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_SCHEMA_KEY.to_vec(),
+                    witness: schema.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_STORE_IDENTITY_KEY.to_vec(),
+                    witness: identity.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_APPLIED_RECOVERY_LSN_KEY.to_vec(),
+                    witness: recovery_lsn.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_RECOVERY_CHAIN_DIGEST_KEY.to_vec(),
+                    witness: chain_digest.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_COMMIT_CLOCK_KEY.to_vec(),
+                    witness: commit_clock.witness,
+                },
+                AtomicOp::CompareAndPut {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_METADATA_AUTHORITY_KEY.to_vec(),
+                    witness: authority.witness,
+                    value: encode_authority_marker(next_marker),
+                },
+            ],
+        };
+        match self.commit_planned_exact(plan, &planned)? {
+            AtomicCommitOutcome::Committed => Ok(()),
+            AtomicCommitOutcome::Conflict => Err(AgentMetadataError::WriteConflict),
+        }
+    }
+
+    /// Permanently abandon a migration target. This does not activate it.
+    #[cfg(test)]
+    pub(crate) fn fence_migration_target(&self) -> Result<(), AgentMetadataError> {
+        let marker = self.required_authority_marker()?;
+        let MetadataAuthorityEvidence::MigrationTargetBinding(binding) = marker.evidence else {
+            return Err(migration_admission(
+                "migration target fence requires its exact durable binding",
+            ));
+        };
+        self.transition_with_exact_evidence(
+            MetadataAuthorityState::MigrationTarget,
+            MetadataAuthorityState::Fenced,
+            MetadataAuthorityEvidence::MigrationTargetBinding(binding),
+        )
+    }
+
+    fn transition_with_exact_evidence(
+        &self,
+        expected: MetadataAuthorityState,
+        next: MetadataAuthorityState,
+        evidence: MetadataAuthorityEvidence,
+    ) -> Result<(), AgentMetadataError> {
+        if !expected.permits_transition_to(next) {
+            return Err(AgentMetadataError::InvalidMetadataAuthorityTransition {
+                from: expected,
+                to: next,
+            });
+        }
+        let _command_guard = self
+            .command_gate
+            .write()
+            .map_err(|error| backend("lock command gate", error))?;
+        let planning_view = self.begin_commit_resolution_view()?;
+        let schema = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_SCHEMA_KEY,
+            "System(schema)",
+        )?;
+        validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
+            reason: error.to_string(),
+        })?;
+        let (identity, authority, marker) = self.required_authority_from(planning_view.as_ref())?;
+        if marker.state == next {
+            if marker.evidence == evidence {
+                self.ensure_receipt_clean_for(self.frontier_point_from(planning_view.as_ref())?)?;
+                return Ok(());
+            }
+            return Err(migration_admission(
+                "authority transition replay carries different durable evidence",
+            ));
+        }
+        if marker.state != expected {
+            return Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected,
+                actual: marker.state,
+            });
+        }
+        if marker.evidence != evidence {
+            return Err(migration_admission(
+                "authority transition evidence does not match the durable marker",
+            ));
+        }
+        let next_marker = MetadataAuthorityMarker {
+            state: next,
+            ..marker
+                .advance_write_sequence()
+                .ok_or(AgentMetadataError::VersionOverflow)?
+        };
+        let action = match evidence {
+            MetadataAuthorityEvidence::SourceQuiesceReceipt(receipt) => {
+                MetadataAuthorityCommitActionV1::FenceQuiescedSource {
+                    migration_id: receipt.migration_id,
+                    source_receipt_digest: digest_source_receipt(&receipt),
+                }
+            }
+            MetadataAuthorityEvidence::MigrationTargetBinding(binding) => {
+                MetadataAuthorityCommitActionV1::FenceTarget {
+                    migration_id: binding.migration_id,
+                    target_binding_digest: digest_target_binding(&binding),
+                }
+            }
+            _ => {
+                return Err(migration_admission(
+                    "authority fence requires exact source or target migration evidence",
+                ));
+            }
+        };
+        let prior = self.frontier_point_from(planning_view.as_ref())?;
+        let MetadataFrontierPointV1::Exact(prior_frontier) = prior else {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        };
+        let exact_next = AcknowledgedMetadataFrontier {
+            write_sequence: prior_frontier
+                .write_sequence
+                .checked_add(1)
+                .ok_or(AgentMetadataError::VersionOverflow)?,
+            ..prior_frontier
+        };
+        let planned = self.plan_exact_commit(
+            MetadataCommitPurposeV1::Authority {
+                action,
+                prior_marker_digest: digest_authority_marker(&authority.value),
+                next_marker_digest: digest_authority_marker(&encode_authority_marker(next_marker)),
+            },
+            prior,
+            exact_next,
+        )?;
+        let plan = AtomicPlan {
+            operations: vec![
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_SCHEMA_KEY.to_vec(),
+                    witness: schema.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_STORE_IDENTITY_KEY.to_vec(),
+                    witness: identity.witness,
+                },
+                AtomicOp::CompareAndPut {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_METADATA_AUTHORITY_KEY.to_vec(),
+                    witness: authority.witness,
+                    value: encode_authority_marker(next_marker),
+                },
+            ],
+        };
+        match self.commit_planned_exact(plan, &planned)? {
+            AtomicCommitOutcome::Committed => Ok(()),
+            AtomicCommitOutcome::Conflict => Err(AgentMetadataError::WriteConflict),
+        }
     }
 
     /// Start an explicit metadata read-statistics diagnostic session.
@@ -763,7 +3296,9 @@ impl AgentMetadataStore {
             return Err(MetadataReadStatsSessionError::StoreSessionAlreadyActive);
         }
         let store_key = self.read_stats_store_key();
-        let storage_before = read_stats::storage_snapshot(&self.db.stats());
+        let storage_before = self
+            .provider_diagnostics_snapshot()
+            .map_err(|error| MetadataReadStatsSessionError::Provider(error.to_string()))?;
         if let Err(error) = read_stats::begin_session(store_key) {
             self.read_stats_identity
                 .active
@@ -779,14 +3314,26 @@ impl AgentMetadataStore {
         })
     }
 
+    #[cfg(feature = "metadata-read-stats")]
+    fn provider_diagnostics_snapshot(&self) -> Result<MetadataReadStats, ProviderError> {
+        let Some(diagnostics) = self.provider.diagnostics() else {
+            return Ok(MetadataReadStats::default());
+        };
+        Ok(diagnostics_snapshot_to_read_stats(diagnostics.snapshot()?))
+    }
+
     /// Return the persisted physical-owner epoch. `None` is the fresh epoch-zero
     /// sentinel before the first owner is admitted.
     pub fn current_owner_epoch(&self) -> Result<Option<OwnerEpoch>, AgentMetadataError> {
-        let record = self.required_system_record(
-            &self.system,
-            SYSTEM_OWNER_FENCE_KEY,
-            "System(owner_fence)",
-        )?;
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| backend("lock read gate", error))?;
+        self.current_owner_epoch_unlocked()
+    }
+
+    fn current_owner_epoch_unlocked(&self) -> Result<Option<OwnerEpoch>, AgentMetadataError> {
+        let record = self.required_system_record(SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
         let value = decode_system_u64(&record.value, "System(owner_fence)")?;
         if value == 0 {
             Ok(None)
@@ -806,7 +3353,7 @@ impl AgentMetadataStore {
             .read()
             .map_err(|error| backend("lock read gate", error))?;
         self.read_tree_value(
-            &self.root_fence,
+            crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
             root_id.as_bytes(),
             MetadataPointReadSource::RootFence,
             "read RootFence",
@@ -817,8 +3364,15 @@ impl AgentMetadataStore {
 
     /// Return the persisted monotonic lease clock used by snapshot expiry.
     pub fn lease_clock_high_water(&self) -> Result<u64, AgentMetadataError> {
+        let _read_guard = self
+            .command_gate
+            .read()
+            .map_err(|error| backend("lock read gate", error))?;
+        self.lease_clock_high_water_unlocked()
+    }
+
+    fn lease_clock_high_water_unlocked(&self) -> Result<u64, AgentMetadataError> {
         let record = self.required_system_record(
-            &self.system,
             SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
             "System(lease_clock_high_water)",
         )?;
@@ -860,17 +3414,26 @@ impl AgentMetadataStore {
             .read()
             .map_err(|error| backend("lock read gate", error))?;
         let start = recovery_outbox_key(start_after_lsn);
+        let read_view = self
+            .provider
+            .begin_read(&[ReadScope {
+                space: crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                prefix: Vec::new(),
+            }])
+            .map_err(provider_error)?;
+        let scan = read_view
+            .scan(&ProviderScan {
+                space: crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                prefix: vec![0],
+                start_after: Some(start.to_vec()),
+                delimiter: None,
+                limit,
+            })
+            .map_err(provider_error)?;
         let mut rows = Vec::with_capacity(limit);
         let mut encoded_bytes = 0_usize;
-        for entry in self
-            .recovery_outbox
-            .range()
-            .prefix(&[0])
-            .start_after(&start)
-        {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan RecoveryOutbox", error))?
-            else {
+        for entry in scan.items {
+            let ProviderScanItem::Key { key, value } = entry else {
                 continue;
             };
             let key_lsn = decode_recovery_outbox_key(&key)
@@ -882,7 +3445,7 @@ impl AgentMetadataStore {
             {
                 break;
             }
-            let row = self.read_recovery_record(key_lsn, &value)?;
+            let row = self.read_recovery_record_from(read_view.as_ref(), key_lsn, &value)?;
             if row.recovery_lsn != key_lsn {
                 return Err(AgentMetadataError::CorruptRecord {
                     record: "RecoveryOutbox",
@@ -922,19 +3485,24 @@ impl AgentMetadataStore {
             .command_gate
             .write()
             .map_err(|error| backend("lock command gate", error))?;
-        let schema = required_record(&self.system, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+        let planning_view = self.begin_commit_resolution_view()?;
+        let schema = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_SCHEMA_KEY,
+            "System(schema)",
+        )?;
         validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
             reason: error.to_string(),
         })?;
-        let shard = required_record(
-            &self.system,
-            SYSTEM_SHARD_IDENTITY_KEY,
-            "System(shard_identity)",
+        let (identity, authority, authority_marker) =
+            self.required_active_authority_from(planning_view.as_ref())?;
+        let owner = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_OWNER_FENCE_KEY,
+            "System(owner_fence)",
         )?;
-        if decode_shard_identity(&shard.value)? != self.logical_shard_id {
-            return Err(AgentMetadataError::PlacementMismatch);
-        }
-        let owner = required_record(&self.system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
         let actual_owner = decode_system_u64(&owner.value, "System(owner_fence)")?;
         if actual_owner != owner_epoch.get() {
             return Err(AgentMetadataError::OwnerEpochMismatch {
@@ -942,14 +3510,16 @@ impl AgentMetadataStore {
                 actual: actual_owner,
             });
         }
-        let root_fence = self
-            .root_fence
-            .get_record(root_id.as_bytes())
-            .map_err(|error| backend("read RootFence", error))?
+        let root_fence = planning_view
+            .get(
+                crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
+                root_id.as_bytes(),
+            )
+            .map_err(provider_error)?
             .ok_or(AgentMetadataError::RootFenceMissing)?;
         let fence =
             RootFence::decode(&root_fence.value).map_err(|error| corrupt("RootFence", error))?;
-        if fence.logical_shard_id != self.logical_shard_id
+        if fence.logical_shard_id != self.identity.logical_shard_id
             || fence.placement_generation != placement_generation
         {
             return Err(AgentMetadataError::PlacementMismatch);
@@ -961,15 +3531,18 @@ impl AgentMetadataStore {
             });
         }
         let clock = required_record(
-            &self.system,
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
             SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
             "System(lease_clock_high_water)",
         )?;
         let current = decode_system_u64(&clock.value, "System(lease_clock_high_water)")?;
         if observed_ms <= current {
+            self.ensure_receipt_clean_for(self.frontier_point_from(planning_view.as_ref())?)?;
             return Ok(current);
         }
         let recovery = self.plan_recovery(
+            planning_view.as_ref(),
             RecoveryMutationV1::ObserveLeaseClock {
                 root_id,
                 placement_generation,
@@ -980,26 +3553,57 @@ impl AgentMetadataStore {
                 effective_high_water_ms: observed_ms,
             },
         )?;
-        let committed = self
-            .db
-            .atomic(|batch| {
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SCHEMA_KEY, schema.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SHARD_IDENTITY_KEY, shard.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_OWNER_FENCE_KEY, owner.version);
-                batch.assert_version(ROOT_FENCE_TREE, root_id.as_bytes(), root_fence.version);
-                batch.compare_and_put(
-                    SYSTEM_TREE,
-                    SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
-                    clock.version,
-                    &encode_system_u64(observed_ms),
-                );
-                enqueue_recovery(batch, &recovery);
-            })
-            .map_err(|error| backend("advance lease clock", error))?;
-        if committed {
-            Ok(observed_ms)
-        } else {
-            Err(AgentMetadataError::WriteConflict)
+        let prior = self.frontier_point_from(planning_view.as_ref())?;
+        let MetadataFrontierPointV1::Exact(prior_frontier) = prior else {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        };
+        let exact_next = AcknowledgedMetadataFrontier {
+            write_sequence: prior_frontier
+                .write_sequence
+                .checked_add(1)
+                .ok_or(AgentMetadataError::VersionOverflow)?,
+            recovery_lsn: recovery.row.recovery_lsn,
+            chain_digest: recovery.row.chain_digest,
+            ..prior_frontier
+        };
+        let planned = self.plan_exact_commit(
+            MetadataCommitPurposeV1::ObserveLeaseClock {
+                root_id,
+                placement_generation,
+                owner_epoch,
+                observed_ms,
+            },
+            prior,
+            exact_next,
+        )?;
+        let mut plan = AtomicPlan::default();
+        for (key, record) in [
+            (SYSTEM_SCHEMA_KEY, &schema),
+            (SYSTEM_STORE_IDENTITY_KEY, &identity),
+            (SYSTEM_OWNER_FENCE_KEY, &owner),
+        ] {
+            plan.operations.push(AtomicOp::AssertUnchanged {
+                space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                key: key.to_vec(),
+                witness: record.witness.clone(),
+            });
+        }
+        enqueue_active_authority_advance(&mut plan, &authority, authority_marker)?;
+        plan.operations.push(AtomicOp::AssertUnchanged {
+            space: crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
+            key: root_id.as_bytes().to_vec(),
+            witness: root_fence.witness,
+        });
+        plan.operations.push(AtomicOp::CompareAndPut {
+            space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+            key: SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY.to_vec(),
+            witness: clock.witness,
+            value: encode_system_u64(observed_ms).to_vec(),
+        });
+        enqueue_recovery(&mut plan, &recovery);
+        match self.commit_planned_exact(plan, &planned)? {
+            AtomicCommitOutcome::Committed => Ok(observed_ms),
+            AtomicCommitOutcome::Conflict => Err(AgentMetadataError::WriteConflict),
         }
     }
 
@@ -1018,21 +3622,27 @@ impl AgentMetadataStore {
             .write()
             .map_err(|error| backend("lock command gate", error))?;
         let expected_raw = expected.map(OwnerEpoch::get).unwrap_or(0);
-        let schema = required_record(&self.system, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+        let planning_view = self.begin_commit_resolution_view()?;
+        let schema = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_SCHEMA_KEY,
+            "System(schema)",
+        )?;
         validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
             reason: error.to_string(),
         })?;
-        let shard = required_record(
-            &self.system,
-            SYSTEM_SHARD_IDENTITY_KEY,
-            "System(shard_identity)",
+        let (identity, authority, authority_marker) =
+            self.required_active_authority_from(planning_view.as_ref())?;
+        let owner = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_OWNER_FENCE_KEY,
+            "System(owner_fence)",
         )?;
-        if decode_shard_identity(&shard.value)? != self.logical_shard_id {
-            return Err(AgentMetadataError::PlacementMismatch);
-        }
-        let owner = required_record(&self.system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
         let current = decode_system_u64(&owner.value, "System(owner_fence)")?;
         if current == next.get() {
+            self.ensure_receipt_clean_for(self.frontier_point_from(planning_view.as_ref())?)?;
             return Ok(());
         }
         if current != expected_raw {
@@ -1048,30 +3658,142 @@ impl AgentMetadataStore {
             });
         }
         let recovery = self.plan_recovery(
+            planning_view.as_ref(),
             RecoveryMutationV1::AdvanceOwnerEpoch { expected, next },
             RecoveryResultV1::OwnerEpoch {
                 applied_owner_epoch: next,
             },
         )?;
-        let committed = self
-            .db
-            .atomic(|batch| {
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SCHEMA_KEY, schema.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SHARD_IDENTITY_KEY, shard.version);
-                batch.compare_and_put(
-                    SYSTEM_TREE,
-                    SYSTEM_OWNER_FENCE_KEY,
-                    owner.version,
-                    &encode_system_u64(next.get()),
-                );
-                enqueue_recovery(batch, &recovery);
-            })
-            .map_err(|error| backend("advance owner epoch", error))?;
-        if committed {
-            Ok(())
-        } else {
-            Err(AgentMetadataError::WriteConflict)
+        let prior = self.frontier_point_from(planning_view.as_ref())?;
+        let MetadataFrontierPointV1::Exact(prior_frontier) = prior else {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        };
+        let exact_next = AcknowledgedMetadataFrontier {
+            write_sequence: prior_frontier
+                .write_sequence
+                .checked_add(1)
+                .ok_or(AgentMetadataError::VersionOverflow)?,
+            recovery_lsn: recovery.row.recovery_lsn,
+            chain_digest: recovery.row.chain_digest,
+            ..prior_frontier
+        };
+        let planned = self.plan_exact_commit(
+            MetadataCommitPurposeV1::AdvanceOwnerEpoch { expected, next },
+            prior,
+            exact_next,
+        )?;
+        let mut plan = AtomicPlan::default();
+        plan.operations.push(AtomicOp::AssertUnchanged {
+            space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+            key: SYSTEM_SCHEMA_KEY.to_vec(),
+            witness: schema.witness,
+        });
+        plan.operations.push(AtomicOp::AssertUnchanged {
+            space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+            key: SYSTEM_STORE_IDENTITY_KEY.to_vec(),
+            witness: identity.witness,
+        });
+        enqueue_active_authority_advance(&mut plan, &authority, authority_marker)?;
+        plan.operations.push(AtomicOp::CompareAndPut {
+            space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+            key: SYSTEM_OWNER_FENCE_KEY.to_vec(),
+            witness: owner.witness,
+            value: encode_system_u64(next.get()).to_vec(),
+        });
+        enqueue_recovery(&mut plan, &recovery);
+        match self.commit_planned_exact(plan, &planned)? {
+            AtomicCommitOutcome::Committed => Ok(()),
+            AtomicCommitOutcome::Conflict => Err(AgentMetadataError::WriteConflict),
         }
+    }
+
+    /// Replay one already-verified recovery row through the same authoritative
+    /// write paths that originally produced it. This is the sole recovery
+    /// dispatcher used by diagnostics and recovery conformance tests.
+    pub(super) fn replay_recovery_record(
+        &self,
+        row: &RecoveryOutboxRecord,
+    ) -> Result<(), AgentMetadataError> {
+        match (&row.mutation, &row.result) {
+            (
+                RecoveryMutationV1::AdvanceOwnerEpoch { expected, next },
+                RecoveryResultV1::OwnerEpoch {
+                    applied_owner_epoch,
+                },
+            ) => {
+                self.advance_owner_epoch(*expected, *next)?;
+                if next != applied_owner_epoch {
+                    return Err(corrupt(
+                        "RecoveryOutbox replay result",
+                        "owner epoch result differs from mutation",
+                    ));
+                }
+            }
+            (
+                RecoveryMutationV1::ObserveLeaseClock {
+                    root_id,
+                    placement_generation,
+                    owner_epoch,
+                    observed_ms,
+                },
+                RecoveryResultV1::LeaseClock {
+                    effective_high_water_ms,
+                },
+            ) => {
+                let actual = self.observe_lease_clock(
+                    *root_id,
+                    *placement_generation,
+                    *owner_epoch,
+                    *observed_ms,
+                )?;
+                if actual != *effective_high_water_ms {
+                    return Err(corrupt(
+                        "RecoveryOutbox replay result",
+                        "lease-clock result differs from authoritative replay",
+                    ));
+                }
+            }
+            (
+                RecoveryMutationV1::MetadataCommand {
+                    command,
+                    lease_deadline_ms,
+                },
+                RecoveryResultV1::MetadataCommand {
+                    commit_version,
+                    deterministic_result,
+                },
+            ) => {
+                let actual = match lease_deadline_ms {
+                    Some(deadline) => self.execute_before_lease_deadline(command, *deadline)?,
+                    None => self.execute(command)?,
+                };
+                if actual.commit_version != *commit_version
+                    || actual.deterministic_result != *deterministic_result
+                    || actual.replayed
+                {
+                    return Err(corrupt(
+                        "RecoveryOutbox replay result",
+                        "metadata command result differs from authoritative replay",
+                    ));
+                }
+            }
+            _ => {
+                return Err(corrupt(
+                    "RecoveryOutbox replay result",
+                    "mutation and result variants are not paired",
+                ));
+            }
+        }
+        let frontier = self.recovery_state()?;
+        if frontier.applied_recovery_lsn != row.recovery_lsn
+            || frontier.chain_digest != row.chain_digest
+        {
+            return Err(corrupt(
+                "RecoveryOutbox replay frontier",
+                "authoritative write path did not consume the exact recovery LSN/digest",
+            ));
+        }
+        Ok(())
     }
 
     pub fn execute(
@@ -1107,23 +3829,37 @@ impl AgentMetadataStore {
             .command_gate
             .write()
             .map_err(|error| backend("lock command gate", error))?;
-        if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
+        let planning_view = self.begin_commit_resolution_view()?;
+        let (identity, authority, authority_marker) =
+            self.required_authority_from(planning_view.as_ref())?;
+        if let Some(result) =
+            self.replayed_result_from(planning_view.as_ref(), &dedupe_key, command.command_digest)?
+        {
+            self.ensure_receipt_clean_for(self.frontier_point_from(planning_view.as_ref())?)?;
             return Ok(result);
         }
+        if authority_marker.state != MetadataAuthorityState::Active {
+            return Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected: MetadataAuthorityState::Active,
+                actual: authority_marker.state,
+            });
+        }
 
-        let schema = required_record(&self.system, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+        let schema = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_SCHEMA_KEY,
+            "System(schema)",
+        )?;
         validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
             reason: error.to_string(),
         })?;
-        let shard = required_record(
-            &self.system,
-            SYSTEM_SHARD_IDENTITY_KEY,
-            "System(shard_identity)",
+        let owner = required_record(
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_OWNER_FENCE_KEY,
+            "System(owner_fence)",
         )?;
-        if decode_shard_identity(&shard.value)? != command.logical_shard_id {
-            return Err(AgentMetadataError::PlacementMismatch);
-        }
-        let owner = required_record(&self.system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
         let actual_owner = decode_system_u64(&owner.value, "System(owner_fence)")?;
         if actual_owner != command.owner_epoch.get() {
             return Err(AgentMetadataError::OwnerEpochMismatch {
@@ -1132,7 +3868,8 @@ impl AgentMetadataStore {
             });
         }
         let clock = required_record(
-            &self.system,
+            planning_view.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
             SYSTEM_COMMIT_CLOCK_KEY,
             "System(commit_clock)",
         )?;
@@ -1149,11 +3886,12 @@ impl AgentMetadataStore {
         let next_version = CommitVersion::new(next_version_raw)
             .map_err(|_| AgentMetadataError::VersionOverflow)?;
 
-        let root_plan = self.plan_root_fence(command)?;
+        let root_plan = self.plan_root_fence(planning_view.as_ref(), command)?;
         let lease_clock = lease_deadline_ms
             .map(|requested_deadline_ms| {
                 let clock = required_record(
-                    &self.system,
+                    planning_view.as_ref(),
+                    crate::workspace::provider_catalog::SYSTEM_SPACE,
                     SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
                     "System(lease_clock_high_water)",
                 )?;
@@ -1168,10 +3906,11 @@ impl AgentMetadataStore {
                 Ok(clock)
             })
             .transpose()?;
-        let predicate_plan = self.plan_predicates(command)?;
+        let predicate_plan = self.plan_predicates(planning_view.as_ref(), command)?;
         self.validate_history_projection(command, &predicate_plan)?;
 
         let recovery = self.plan_recovery(
+            planning_view.as_ref(),
             RecoveryMutationV1::MetadataCommand {
                 command: Box::new(command.clone()),
                 lease_deadline_ms,
@@ -1180,6 +3919,35 @@ impl AgentMetadataStore {
                 commit_version: next_version,
                 deterministic_result: command.deterministic_result.clone(),
             },
+        )?;
+        let prior = self.frontier_point_from(planning_view.as_ref())?;
+        let MetadataFrontierPointV1::Exact(prior_frontier) = prior else {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        };
+        let exact_next = AcknowledgedMetadataFrontier {
+            write_sequence: prior_frontier
+                .write_sequence
+                .checked_add(1)
+                .ok_or(AgentMetadataError::VersionOverflow)?,
+            commit_version: next_version,
+            recovery_lsn: recovery.row.recovery_lsn,
+            chain_digest: recovery.row.chain_digest,
+        };
+        let class = if matches!(command.root_fence_action, RootFenceAction::RequireActive) {
+            MetadataCommandCommitClassV1::Domain
+        } else {
+            MetadataCommandCommitClassV1::RootFence
+        };
+        let planned = self.plan_exact_commit(
+            MetadataCommitPurposeV1::MetadataCommand {
+                class,
+                root_id: command.root_id,
+                request_id: command.request_id,
+                command_digest: command.command_digest,
+                lease_deadline_ms,
+            },
+            prior,
+            exact_next,
         )?;
 
         let dedupe_record = CommandDedupeRecord {
@@ -1191,100 +3959,124 @@ impl AgentMetadataStore {
         .encode()
         .map_err(|error| corrupt("CommandDedupe", error))?;
 
-        let committed = self
-            .db
-            .atomic(|batch| {
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SCHEMA_KEY, schema.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SHARD_IDENTITY_KEY, shard.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_OWNER_FENCE_KEY, owner.version);
-                if let Some(lease_clock) = &lease_clock {
-                    batch.assert_version(
-                        SYSTEM_TREE,
-                        SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
-                        lease_clock.version,
-                    );
-                }
-                batch.compare_and_put(
-                    SYSTEM_TREE,
-                    SYSTEM_COMMIT_CLOCK_KEY,
-                    clock.version,
-                    &encode_system_u64(next_version_raw),
-                );
-                enqueue_root_fence(batch, command, &root_plan);
-                enqueue_predicate_guards(batch, &predicate_plan, next_version);
+        let mut atomic = AtomicPlan::default();
+        for (key, record) in [
+            (SYSTEM_SCHEMA_KEY, &schema),
+            (SYSTEM_STORE_IDENTITY_KEY, &identity),
+            (SYSTEM_OWNER_FENCE_KEY, &owner),
+        ] {
+            atomic.operations.push(AtomicOp::AssertUnchanged {
+                space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                key: key.to_vec(),
+                witness: record.witness.clone(),
+            });
+        }
+        enqueue_active_authority_advance(&mut atomic, &authority, authority_marker)?;
+        if let Some(lease_clock) = &lease_clock {
+            atomic.operations.push(AtomicOp::AssertUnchanged {
+                space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                key: SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY.to_vec(),
+                witness: lease_clock.witness.clone(),
+            });
+        }
+        atomic.operations.push(AtomicOp::CompareAndPut {
+            space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+            key: SYSTEM_COMMIT_CLOCK_KEY.to_vec(),
+            witness: clock.witness,
+            value: encode_system_u64(next_version_raw).to_vec(),
+        });
+        enqueue_root_fence(&mut atomic, command, &root_plan);
+        enqueue_predicate_guards(&mut atomic, &predicate_plan);
 
-                for planned in predicate_plan.exact.values() {
-                    let Some(previous) = &planned.current else {
-                        continue;
-                    };
-                    if !command.history_projection.iter().any(|projection| {
-                        projection.family == planned.family && projection.key == planned.key
-                    }) {
-                        continue;
-                    }
-                    let key = history_key(planned.family, &planned.key, next_version);
-                    let value = HistoryValue {
-                        transition_version: next_version,
-                        previous_created_version: previous.created_version,
-                        previous_modified_version: previous.modified_version,
-                        previous_payload: Some(previous.payload.clone()),
-                    }
-                    .encode()
-                    .expect("validated command history value fits the format envelope");
-                    batch.put(HISTORY_TREE, &key, &value);
-                }
+        for planned in predicate_plan.exact.values() {
+            let Some(previous) = &planned.current else {
+                continue;
+            };
+            if !command.history_projection.iter().any(|projection| {
+                projection.family == planned.family && projection.key == planned.key
+            }) {
+                continue;
+            }
+            let key = history_key(planned.family, &planned.key, next_version);
+            let value = HistoryValue {
+                transition_version: next_version,
+                previous_created_version: previous.created_version,
+                previous_modified_version: previous.modified_version,
+                previous_payload: Some(previous.payload.clone()),
+            }
+            .encode()
+            .expect("validated command history value fits the format envelope");
+            atomic.operations.push(AtomicOp::Put {
+                space: crate::workspace::provider_catalog::HISTORY_SPACE,
+                key,
+                value,
+            });
+        }
 
-                for mutation in &command.mutations {
-                    match mutation {
-                        CommandMutation::Put { family, key, value } => {
-                            let planned = predicate_plan
-                                .exact
-                                .get(&(*family, key.clone()))
-                                .expect("every mutation has one exact predicate");
-                            let created_version = planned
-                                .current
-                                .as_ref()
-                                .map(|current| current.created_version)
-                                .unwrap_or(next_version);
-                            let encoded = CurrentValue {
-                                created_version,
-                                modified_version: next_version,
-                                payload: value.clone(),
-                            }
-                            .encode()
-                            .expect("validated command value fits the format envelope");
-                            batch.put(family.tree_name(), key, &encoded);
-                        }
-                        CommandMutation::Delete { family, key } => {
-                            batch.delete(family.tree_name(), key);
-                        }
-                    }
-                }
-                for (sequence, projection) in command.event_projection.iter().enumerate() {
-                    let sequence = u32::try_from(sequence)
-                        .expect("validated event count fits the event-key sequence width");
-                    let key = change_event_key(command.root_id, next_version, sequence);
-                    let value = CurrentValue {
-                        created_version: next_version,
+        for mutation in &command.mutations {
+            match mutation {
+                CommandMutation::Put { family, key, value } => {
+                    let planned = predicate_plan
+                        .exact
+                        .get(&(*family, key.clone()))
+                        .expect("every mutation has one exact predicate");
+                    let created_version = planned
+                        .current
+                        .as_ref()
+                        .map(|current| current.created_version)
+                        .unwrap_or(next_version);
+                    let encoded = CurrentValue {
+                        created_version,
                         modified_version: next_version,
-                        payload: projection.payload.clone(),
+                        payload: value.clone(),
                     }
                     .encode()
-                    .expect("validated event fits the format envelope");
-                    batch.put_if_absent(CHANGE_EVENT_TREE, &key, &value);
+                    .expect("validated command value fits the format envelope");
+                    atomic.operations.push(AtomicOp::Put {
+                        space: crate::workspace::provider_catalog::domain_space(*family),
+                        key: key.clone(),
+                        value: encoded,
+                    });
                 }
-                batch.put_if_absent(COMMAND_DEDUPE_TREE, &dedupe_key, &dedupe_record);
-                enqueue_recovery(batch, &recovery);
-            })
-            .map_err(|error| backend("execute metadata command", error))?;
-        if committed {
+                CommandMutation::Delete { family, key } => {
+                    atomic.operations.push(AtomicOp::Delete {
+                        space: crate::workspace::provider_catalog::domain_space(*family),
+                        key: key.clone(),
+                    });
+                }
+            }
+        }
+        for (sequence, projection) in command.event_projection.iter().enumerate() {
+            let sequence = u32::try_from(sequence)
+                .expect("validated event count fits the event-key sequence width");
+            let key = change_event_key(command.root_id, next_version, sequence);
+            let value = CurrentValue {
+                created_version: next_version,
+                modified_version: next_version,
+                payload: projection.payload.clone(),
+            }
+            .encode()
+            .expect("validated event fits the format envelope");
+            atomic.operations.push(AtomicOp::PutIfAbsent {
+                space: crate::workspace::provider_catalog::CHANGE_EVENT_SPACE,
+                key,
+                value,
+            });
+        }
+        atomic.operations.push(AtomicOp::PutIfAbsent {
+            space: crate::workspace::provider_catalog::COMMAND_DEDUPE_SPACE,
+            key: dedupe_key.clone(),
+            value: dedupe_record,
+        });
+        enqueue_recovery(&mut atomic, &recovery);
+
+        let outcome = self.commit_planned_exact(atomic, &planned)?;
+        if outcome == AtomicCommitOutcome::Committed {
             Ok(MetadataCommandResult {
                 commit_version: next_version,
                 deterministic_result: command.deterministic_result.clone(),
                 replayed: false,
             })
-        } else if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
-            Ok(result)
         } else {
             Err(AgentMetadataError::WriteConflict)
         }
@@ -1365,7 +4157,7 @@ impl AgentMetadataStore {
             .read()
             .map_err(|error| backend("lock read gate", error))?;
         let key = command_dedupe_key(root_id, request_id);
-        let current_version = self.current_read_version()?;
+        let current_version = self.current_read_version_unlocked()?;
         self.validate_read_fence(
             root_id,
             placement_generation,
@@ -1374,7 +4166,7 @@ impl AgentMetadataStore {
             current_version,
         )?;
         self.read_tree_value(
-            &self.command_dedupe,
+            crate::workspace::provider_catalog::COMMAND_DEDUPE_SPACE,
             &key,
             MetadataPointReadSource::Other,
             "read CommandDedupe",
@@ -1387,7 +4179,7 @@ impl AgentMetadataStore {
 
     /// Stable ordered prefix scan at one fenced read version.
     ///
-    /// The current-version path is one Holt prefix scan. A historical scan also
+    /// The current-version path is one provider prefix scan. A historical scan also
     /// reconstructs keys replaced or deleted after `version` from History.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_prefix_at(
@@ -1480,11 +4272,9 @@ impl AgentMetadataStore {
         };
         #[cfg(feature = "metadata-read-stats")]
         self.record_scan_call();
-        // Fence and capture one immutable cross-tree view while writes are
-        // excluded, then release the NoKV read gate before walking or decoding
-        // the page. Holt's captured views keep current and History consistent
-        // without making a long or historical scan block the write sequencer.
-        let (current_version, current_view, history_view) = {
+        // Fence and capture one immutable provider view while writes are
+        // excluded, then release the NoKV read gate before decoding the page.
+        let (current_version, read_view) = {
             let _read_guard = self
                 .command_gate
                 .read()
@@ -1496,55 +4286,53 @@ impl AgentMetadataStore {
                 prefix,
                 version,
             )?;
-            let history_family_prefix = [family.history_tag()];
             let scopes = if version == current_version {
-                vec![(family.tree_name(), prefix)]
+                vec![ReadScope {
+                    space: crate::workspace::provider_catalog::domain_space(family),
+                    prefix: prefix.to_vec(),
+                }]
             } else {
                 vec![
-                    (family.tree_name(), prefix),
-                    (HISTORY_TREE, history_family_prefix.as_slice()),
+                    ReadScope {
+                        space: crate::workspace::provider_catalog::domain_space(family),
+                        prefix: prefix.to_vec(),
+                    },
+                    ReadScope {
+                        space: crate::workspace::provider_catalog::HISTORY_SPACE,
+                        prefix: vec![family.history_tag()],
+                    },
                 ]
             };
-            let (current_view, history_view) = self
-                .db
-                .view(&scopes, |view| {
-                    let current = view
-                        .tree(family.tree_name())
-                        .expect("requested metadata family is present in the DB view")
-                        .clone();
-                    let history = view.tree(HISTORY_TREE).cloned();
-                    Ok((current, history))
-                })
-                .map_err(|error| backend("capture metadata scan view", error))?;
-            (current_version, current_view, history_view)
+            let read_view = self.provider.begin_read(&scopes).map_err(provider_error)?;
+            (current_version, read_view)
         };
 
         // Current-state rows are already in the exact order required by the
-        // caller. Push the exclusive cursor into Holt and stop advancing the
+        // caller. Push the exclusive cursor into the provider and stop advancing the
         // storage iterator as soon as the bounded page is full. Historical
         // reads cannot use this shortcut: a key absent from current state may
         // still need to be reconstructed from History before ordering and
         // pagination are applied.
         if version == current_version {
-            let mut range = current_view.range();
-            if let Some(marker) = start_after {
-                range = range.start_after(marker);
-            }
-            if let Some(delimiter) = delimiter {
-                range = range.delimiter(delimiter);
-            }
-
+            let scan = read_view
+                .scan(&ProviderScan {
+                    space: crate::workspace::provider_catalog::domain_space(family),
+                    prefix: prefix.to_vec(),
+                    start_after: start_after.map(<[u8]>::to_vec),
+                    delimiter,
+                    limit: effective_limit,
+                })
+                .map_err(provider_error)?;
             let mut visible = Vec::with_capacity(effective_limit);
             #[cfg(feature = "metadata-read-stats")]
             let mut key_bytes = 0_u64;
             #[cfg(feature = "metadata-read-stats")]
             let mut value_bytes = 0_u64;
             #[cfg(feature = "metadata-read-stats")]
-            let mut stopped_at_limit = false;
-            let mut iterator = range.into_iter();
-            for entry in iterator.by_ref() {
-                let item = match entry.map_err(|error| backend("scan current metadata", error))? {
-                    holt::RangeEntry::Key { key, value, .. } => {
+            let stopped_at_limit = scan.items.len() == effective_limit;
+            for entry in scan.items {
+                let item = match entry {
+                    ProviderScanItem::Key { key, value } => {
                         #[cfg(feature = "metadata-read-stats")]
                         {
                             key_bytes = key_bytes.saturating_add(byte_len(&key));
@@ -1567,32 +4355,23 @@ impl AgentMetadataStore {
                             value: current.payload,
                         })
                     }
-                    holt::RangeEntry::CommonPrefix(prefix) => {
+                    ProviderScanItem::CommonPrefix(prefix) => {
                         #[cfg(feature = "metadata-read-stats")]
                         {
                             key_bytes = key_bytes.saturating_add(byte_len(&prefix));
                         }
                         DelimitedMetadataScanItem::CommonPrefix(prefix)
                     }
-                    _ => continue,
                 };
                 visible.push(item);
-                if visible.len() == effective_limit {
-                    #[cfg(feature = "metadata-read-stats")]
-                    {
-                        stopped_at_limit = true;
-                    }
-                    break;
-                }
             }
             #[cfg(feature = "metadata-read-stats")]
             {
-                let stats = iterator.stats();
                 self.record_scan_cursor(
-                    stats.visited,
-                    stats.returned,
-                    stats.rollup,
-                    stats.restarts,
+                    scan.stats.visited,
+                    scan.stats.returned,
+                    scan.stats.common_prefixes,
+                    scan.stats.restarts,
                     key_bytes,
                     value_bytes,
                     stopped_at_limit,
@@ -1606,62 +4385,70 @@ impl AgentMetadataStore {
         let mut current_key_bytes = 0_u64;
         #[cfg(feature = "metadata-read-stats")]
         let mut current_value_bytes = 0_u64;
-        let mut current_iterator = current_view.range().into_iter();
-        for entry in current_iterator.by_ref() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan current metadata", error))?
-            else {
+        let current_scan = read_view
+            .scan(&ProviderScan {
+                space: crate::workspace::provider_catalog::domain_space(family),
+                prefix: prefix.to_vec(),
+                start_after: None,
+                delimiter: None,
+                limit: 0,
+            })
+            .map_err(provider_error)?;
+        for entry in &current_scan.items {
+            let ProviderScanItem::Key { key, value } = entry else {
                 continue;
             };
             #[cfg(feature = "metadata-read-stats")]
             {
-                current_key_bytes = current_key_bytes.saturating_add(byte_len(&key));
-                current_value_bytes = current_value_bytes.saturating_add(byte_len(&value));
+                current_key_bytes = current_key_bytes.saturating_add(byte_len(key));
+                current_value_bytes = current_value_bytes.saturating_add(byte_len(value));
             }
             let current =
-                CurrentValue::decode(&value).map_err(|error| corrupt(family.tree_name(), error))?;
+                CurrentValue::decode(value).map_err(|error| corrupt(family.tree_name(), error))?;
             if current.modified_version.get() <= version.get() {
-                visible.insert(key, current.payload);
+                visible.insert(key.clone(), current.payload);
             }
         }
         #[cfg(feature = "metadata-read-stats")]
         {
-            let current_stats = current_iterator.stats();
             self.record_scan_cursor(
-                current_stats.visited,
-                current_stats.returned,
-                current_stats.rollup,
-                current_stats.restarts,
+                current_scan.stats.visited,
+                current_scan.stats.returned,
+                current_scan.stats.common_prefixes,
+                current_scan.stats.restarts,
                 current_key_bytes,
                 current_value_bytes,
                 false,
             );
         }
 
-        let history_view = history_view
-            .expect("historical metadata scan captures the matching History family view");
         #[cfg(feature = "metadata-read-stats")]
         let mut history_key_bytes = 0_u64;
         #[cfg(feature = "metadata-read-stats")]
         let mut history_value_bytes = 0_u64;
-        let mut history_iterator = history_view.range().into_iter();
-        for entry in history_iterator.by_ref() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan metadata history", error))?
-            else {
+        let history_scan = read_view
+            .scan(&ProviderScan {
+                space: crate::workspace::provider_catalog::HISTORY_SPACE,
+                prefix: vec![family.history_tag()],
+                start_after: None,
+                delimiter: None,
+                limit: 0,
+            })
+            .map_err(provider_error)?;
+        for entry in &history_scan.items {
+            let ProviderScanItem::Key { key, value } = entry else {
                 continue;
             };
             #[cfg(feature = "metadata-read-stats")]
             {
-                history_key_bytes = history_key_bytes.saturating_add(byte_len(&key));
-                history_value_bytes = history_value_bytes.saturating_add(byte_len(&value));
+                history_key_bytes = history_key_bytes.saturating_add(byte_len(key));
+                history_value_bytes = history_value_bytes.saturating_add(byte_len(value));
             }
-            let user_key = history_user_key(&key)?;
+            let user_key = history_user_key(key)?;
             if !user_key.starts_with(prefix) || visible.contains_key(user_key) {
                 continue;
             }
-            let history =
-                HistoryValue::decode(&value).map_err(|error| corrupt("History", error))?;
+            let history = HistoryValue::decode(value).map_err(|error| corrupt("History", error))?;
             if history.previous_modified_version.get() <= version.get()
                 && version.get() < history.transition_version.get()
             {
@@ -1672,12 +4459,11 @@ impl AgentMetadataStore {
         }
         #[cfg(feature = "metadata-read-stats")]
         {
-            let history_stats = history_iterator.stats();
             self.record_scan_cursor(
-                history_stats.visited,
-                history_stats.returned,
-                history_stats.rollup,
-                history_stats.restarts,
+                history_scan.stats.visited,
+                history_scan.stats.returned,
+                history_scan.stats.common_prefixes,
+                history_scan.stats.restarts,
                 history_key_bytes,
                 history_value_bytes,
                 false,
@@ -1733,7 +4519,7 @@ impl AgentMetadataStore {
             .map_err(|error| backend("lock read gate", error))?;
         self.validate_read_fence(root_id, placement_generation, owner_epoch, key, version)?;
         let Some(record) = self.read_tree_value(
-            &self.change_event,
+            crate::workspace::provider_catalog::CHANGE_EVENT_SPACE,
             key,
             MetadataPointReadSource::Other,
             "read ChangeEvent",
@@ -1775,22 +4561,31 @@ impl AgentMetadataStore {
         };
         #[cfg(feature = "metadata-read-stats")]
         self.record_scan_call();
+        let read_view = self
+            .provider
+            .begin_read(&[ReadScope {
+                space: crate::workspace::provider_catalog::CHANGE_EVENT_SPACE,
+                prefix: prefix.to_vec(),
+            }])
+            .map_err(provider_error)?;
+        let scan = read_view
+            .scan(&ProviderScan {
+                space: crate::workspace::provider_catalog::CHANGE_EVENT_SPACE,
+                prefix: prefix.to_vec(),
+                start_after: start_after.map(<[u8]>::to_vec),
+                delimiter: None,
+                limit: effective_limit,
+            })
+            .map_err(provider_error)?;
         let mut events = Vec::with_capacity(effective_limit);
-        let mut range = self.change_event.range().prefix(prefix);
-        if let Some(marker) = start_after {
-            range = range.start_after(marker);
-        }
         #[cfg(feature = "metadata-read-stats")]
         let mut key_bytes = 0_u64;
         #[cfg(feature = "metadata-read-stats")]
         let mut value_bytes = 0_u64;
         #[cfg(feature = "metadata-read-stats")]
         let mut stopped_at_limit = false;
-        let mut iterator = range.into_iter();
-        for entry in iterator.by_ref() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan ChangeEvent", error))?
-            else {
+        for entry in scan.items {
+            let ProviderScanItem::Key { key, value } = entry else {
                 continue;
             };
             #[cfg(feature = "metadata-read-stats")]
@@ -1817,12 +4612,11 @@ impl AgentMetadataStore {
         }
         #[cfg(feature = "metadata-read-stats")]
         {
-            let stats = iterator.stats();
             self.record_scan_cursor(
-                stats.visited,
-                stats.returned,
-                stats.rollup,
-                stats.restarts,
+                scan.stats.visited,
+                scan.stats.returned,
+                scan.stats.common_prefixes,
+                scan.stats.restarts,
                 key_bytes,
                 value_bytes,
                 stopped_at_limit,
@@ -1857,11 +4651,7 @@ impl AgentMetadataStore {
         placement_generation: PlacementGeneration,
         owner_epoch: OwnerEpoch,
     ) -> Result<ReadVersion, AgentMetadataError> {
-        let owner = self.required_system_record(
-            &self.system,
-            SYSTEM_OWNER_FENCE_KEY,
-            "System(owner_fence)",
-        )?;
+        let owner = self.required_system_record(SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
         let actual_owner = decode_system_u64(&owner.value, "System(owner_fence)")?;
         if actual_owner != owner_epoch.get() {
             return Err(AgentMetadataError::OwnerEpochMismatch {
@@ -1871,14 +4661,14 @@ impl AgentMetadataStore {
         }
         let fence = self
             .read_tree_value(
-                &self.root_fence,
+                crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
                 root_id.as_bytes(),
                 MetadataPointReadSource::RootFence,
                 "read RootFence",
             )?
             .ok_or(AgentMetadataError::RootFenceMissing)?;
         let fence = RootFence::decode(&fence).map_err(|error| corrupt("RootFence", error))?;
-        if fence.logical_shard_id != self.logical_shard_id
+        if fence.logical_shard_id != self.identity.logical_shard_id
             || fence.placement_generation != placement_generation
         {
             return Err(AgentMetadataError::PlacementMismatch);
@@ -1889,7 +4679,7 @@ impl AgentMetadataStore {
                 actual: fence.activation_state,
             });
         }
-        let current_version = self.current_read_version()?;
+        let current_version = self.current_read_version_unlocked()?;
         Ok(current_version)
     }
 
@@ -1914,22 +4704,33 @@ impl AgentMetadataStore {
         #[cfg(feature = "metadata-read-stats")]
         let mut value_bytes = 0_u64;
         let mut previous_payload = None;
-        let mut iterator = self.history.range().prefix(&prefix).into_iter();
-        for entry in iterator.by_ref() {
-            let entry = entry.map_err(|error| backend("read metadata history", error))?;
-            #[cfg(feature = "metadata-read-stats")]
-            let holt::RangeEntry::Key { key, value, .. } = entry
-            else {
-                continue;
-            };
-            #[cfg(not(feature = "metadata-read-stats"))]
-            let holt::RangeEntry::Key { value, .. } = entry
+        let read_view = self
+            .provider
+            .begin_read(&[ReadScope {
+                space: crate::workspace::provider_catalog::HISTORY_SPACE,
+                prefix: prefix.clone(),
+            }])
+            .map_err(provider_error)?;
+        let scan = read_view
+            .scan(&ProviderScan {
+                space: crate::workspace::provider_catalog::HISTORY_SPACE,
+                prefix,
+                start_after: None,
+                delimiter: None,
+                limit: 0,
+            })
+            .map_err(provider_error)?;
+        for entry in scan.items {
+            let ProviderScanItem::Key {
+                key: _history_key,
+                value,
+            } = entry
             else {
                 continue;
             };
             #[cfg(feature = "metadata-read-stats")]
             {
-                key_bytes = key_bytes.saturating_add(byte_len(&key));
+                key_bytes = key_bytes.saturating_add(byte_len(&_history_key));
                 value_bytes = value_bytes.saturating_add(byte_len(&value));
             }
             let history =
@@ -1943,12 +4744,11 @@ impl AgentMetadataStore {
         }
         #[cfg(feature = "metadata-read-stats")]
         {
-            let stats = iterator.stats();
             self.record_scan_cursor(
-                stats.visited,
-                stats.returned,
-                stats.rollup,
-                stats.restarts,
+                scan.stats.visited,
+                scan.stats.returned,
+                scan.stats.common_prefixes,
+                scan.stats.restarts,
                 key_bytes,
                 value_bytes,
                 false,
@@ -1987,7 +4787,7 @@ impl AgentMetadataStore {
                 reason: format!("expected schema {SCHEMA_ID}, found {}", command.schema_id),
             });
         }
-        if command.logical_shard_id != self.logical_shard_id {
+        if command.logical_shard_id != self.identity.logical_shard_id {
             return Err(AgentMetadataError::PlacementMismatch);
         }
         for (name, count) in [
@@ -2053,15 +4853,19 @@ impl AgentMetadataStore {
 
     fn plan_root_fence(
         &self,
+        reader: &dyn MetadataReadView,
         command: &MetadataCommand,
     ) -> Result<RootFencePlan, AgentMetadataError> {
         let key = command.root_id.as_bytes();
-        let current = self
-            .root_fence
-            .get_record(key)
-            .map_err(|error| backend("read RootFence", error))?;
+        let current = reader
+            .get(crate::workspace::provider_catalog::ROOT_FENCE_SPACE, key)
+            .map_err(provider_error)?;
         match command.root_fence_action {
-            RootFenceAction::Install => {
+            RootFenceAction::Install {
+                layout_profile,
+                layout_generation,
+                partition_id,
+            } => {
                 if current.is_some() {
                     return Err(AgentMetadataError::RootFenceAlreadyInstalled);
                 }
@@ -2069,6 +4873,9 @@ impl AgentMetadataStore {
                     value: RootFence {
                         logical_shard_id: command.logical_shard_id,
                         placement_generation: command.placement_generation,
+                        layout_profile,
+                        layout_generation,
+                        partition_id,
                         activation_state: RootActivationState::Installing,
                     }
                     .encode()
@@ -2087,7 +4894,7 @@ impl AgentMetadataStore {
                     });
                 }
                 Ok(RootFencePlan::Assert {
-                    version: current.version,
+                    witness: current.witness,
                 })
             }
             RootFenceAction::Transition { expected, next } => {
@@ -2108,7 +4915,7 @@ impl AgentMetadataStore {
                     });
                 }
                 Ok(RootFencePlan::Replace {
-                    version: current.version,
+                    witness: current.witness,
                     value: RootFence {
                         activation_state: next,
                         ..fence
@@ -2122,6 +4929,7 @@ impl AgentMetadataStore {
 
     fn plan_predicates(
         &self,
+        reader: &dyn MetadataReadView,
         command: &MetadataCommand,
     ) -> Result<PredicatePlan, AgentMetadataError> {
         let mut plan = PredicatePlan::default();
@@ -2136,15 +4944,17 @@ impl AgentMetadataStore {
                     if plan.exact.contains_key(&map_key) {
                         return Err(invalid("duplicate exact predicate"));
                     }
-                    let record = self
-                        .family(*family)
-                        .get_record(key)
-                        .map_err(|error| backend("plan exact predicate", error))?;
-                    let (current, version) = match record {
+                    let record = reader
+                        .get(
+                            crate::workspace::provider_catalog::domain_space(*family),
+                            key,
+                        )
+                        .map_err(provider_error)?;
+                    let (current, witness) = match record {
                         Some(record) => {
                             let current = CurrentValue::decode(&record.value)
                                 .map_err(|error| corrupt(family.tree_name(), error))?;
-                            (Some(current), Some(record.version))
+                            (Some(current), Some(record.witness))
                         }
                         None => (None, None),
                     };
@@ -2157,21 +4967,21 @@ impl AgentMetadataStore {
                             family: *family,
                             key: key.clone(),
                             current,
-                            version,
+                            witness,
                         },
                     );
                 }
                 CommandPredicate::PrefixEmpty { family, prefix } => {
-                    if self
-                        .family(*family)
-                        .range()
-                        .prefix(prefix)
-                        .into_iter()
-                        .next()
-                        .transpose()
-                        .map_err(|error| backend("plan prefix-empty predicate", error))?
-                        .is_some()
-                    {
+                    let page = reader
+                        .scan(&ProviderScan {
+                            space: crate::workspace::provider_catalog::domain_space(*family),
+                            prefix: prefix.clone(),
+                            start_after: None,
+                            delimiter: None,
+                            limit: 1,
+                        })
+                        .map_err(provider_error)?;
+                    if !page.items.is_empty() {
                         return Err(AgentMetadataError::PredicateFailed);
                     }
                     plan.prefix_empty.push((*family, prefix.clone()));
@@ -2236,47 +5046,39 @@ impl AgentMetadataStore {
         Ok(())
     }
 
-    fn replayed_result(
+    fn replayed_result_from(
         &self,
+        reader: &dyn MetadataReadView,
         key: &[u8],
         digest: CommandDigest,
     ) -> Result<Option<MetadataCommandResult>, AgentMetadataError> {
-        let Some(value) = self
-            .command_dedupe
-            .get(key)
-            .map_err(|error| backend("read CommandDedupe", error))?
-        else {
-            return Ok(None);
-        };
-        let record =
-            CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))?;
-        if record.command_digest != digest {
-            return Err(AgentMetadataError::RequestIdReused);
-        }
-        Ok(Some(MetadataCommandResult {
-            commit_version: record.commit_version,
-            deterministic_result: record.deterministic_result,
-            replayed: true,
-        }))
+        let value = reader
+            .get(
+                crate::workspace::provider_catalog::COMMAND_DEDUPE_SPACE,
+                key,
+            )
+            .map_err(provider_error)?
+            .map(|record| record.value);
+        decode_replayed_result(value, digest)
     }
 
     fn recovery_state_unlocked(&self) -> Result<RecoveryState, AgentMetadataError> {
         let lsn = decode_system_u64(
-            &required_record(
-                &self.system,
-                SYSTEM_APPLIED_RECOVERY_LSN_KEY,
-                "System(applied_recovery_lsn)",
-            )?
-            .value,
+            &self
+                .required_system_record(
+                    SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+                    "System(applied_recovery_lsn)",
+                )?
+                .value,
             "System(applied_recovery_lsn)",
         )?;
         let chain_digest = decode_system_digest(
-            &required_record(
-                &self.system,
-                SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
-                "System(recovery_chain_digest)",
-            )?
-            .value,
+            &self
+                .required_system_record(
+                    SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+                    "System(recovery_chain_digest)",
+                )?
+                .value,
             "System(recovery_chain_digest)",
         )?;
         Ok(RecoveryState {
@@ -2284,14 +5086,37 @@ impl AgentMetadataStore {
             chain_digest,
         })
     }
+}
 
+fn decode_replayed_result(
+    value: Option<Vec<u8>>,
+    digest: CommandDigest,
+) -> Result<Option<MetadataCommandResult>, AgentMetadataError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let record =
+        CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))?;
+    if record.command_digest != digest {
+        return Err(AgentMetadataError::RequestIdReused);
+    }
+    Ok(Some(MetadataCommandResult {
+        commit_version: record.commit_version,
+        deterministic_result: record.deterministic_result,
+        replayed: true,
+    }))
+}
+
+impl AgentMetadataStore {
     fn plan_recovery(
         &self,
+        reader: &dyn MetadataReadView,
         mutation: RecoveryMutationV1,
         result: RecoveryResultV1,
     ) -> Result<RecoveryPlan, AgentMetadataError> {
         let lsn_record = required_record(
-            &self.system,
+            reader,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
             SYSTEM_APPLIED_RECOVERY_LSN_KEY,
             "System(applied_recovery_lsn)",
         )?;
@@ -2300,7 +5125,8 @@ impl AgentMetadataStore {
             .checked_add(1)
             .ok_or(AgentMetadataError::VersionOverflow)?;
         let digest_record = required_record(
-            &self.system,
+            reader,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
             SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
             "System(recovery_chain_digest)",
         )?;
@@ -2323,14 +5149,37 @@ impl AgentMetadataStore {
     }
 
     fn verify_recovery_chain_unlocked(&self) -> Result<RecoveryState, AgentMetadataError> {
-        let state = self.recovery_state_unlocked()?;
+        let read_view = self
+            .provider
+            .begin_read(&[
+                ReadScope {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    prefix: Vec::new(),
+                },
+                ReadScope {
+                    space: crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                    prefix: Vec::new(),
+                },
+            ])
+            .map_err(provider_error)?;
+        let state = recovery_state_from(read_view.as_ref())?;
+        let scan = read_view
+            .scan(&ProviderScan {
+                space: crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                prefix: Vec::new(),
+                start_after: None,
+                delimiter: None,
+                limit: 0,
+            })
+            .map_err(provider_error)?;
         let mut expected_lsn = 1_u64;
-        let mut previous_chain_digest = recovery_genesis_digest(self.logical_shard_id);
+        let mut previous_chain_digest = recovery_genesis_digest(
+            self.identity.logical_shard_id,
+            self.identity.contract_digest,
+        );
         let mut expected_chunk_keys = BTreeSet::new();
-        for entry in self.recovery_outbox.range() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("verify RecoveryOutbox", error))?
-            else {
+        for entry in scan.items {
+            let ProviderScanItem::Key { key, value } = entry else {
                 continue;
             };
             match key.first().copied() {
@@ -2342,7 +5191,8 @@ impl AgentMetadataStore {
                     for index in 0..chunk_count {
                         expected_chunk_keys.insert(recovery_chunk_key(key_lsn, index).to_vec());
                     }
-                    let row = self.read_recovery_record(key_lsn, &value)?;
+                    let row =
+                        self.read_recovery_record_from(read_view.as_ref(), key_lsn, &value)?;
                     if key_lsn != expected_lsn || row.recovery_lsn != expected_lsn {
                         return Err(AgentMetadataError::CorruptRecord {
                             record: "RecoveryOutbox",
@@ -2399,8 +5249,9 @@ impl AgentMetadataStore {
         Ok(state)
     }
 
-    fn read_recovery_record(
+    pub(super) fn read_recovery_record_from(
         &self,
+        reader: &dyn MetadataReadView,
         recovery_lsn: u64,
         header: &[u8],
     ) -> Result<RecoveryOutboxRecord, AgentMetadataError> {
@@ -2408,10 +5259,13 @@ impl AgentMetadataStore {
             .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
         let mut chunks = Vec::with_capacity(chunk_count as usize);
         for index in 0..chunk_count {
-            let value = self
-                .recovery_outbox
-                .get(&recovery_chunk_key(recovery_lsn, index))
-                .map_err(|error| backend("read RecoveryOutbox chunk", error))?
+            let value = reader
+                .get(
+                    crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                    &recovery_chunk_key(recovery_lsn, index),
+                )
+                .map_err(provider_error)?
+                .map(|record| record.value)
                 .ok_or_else(|| AgentMetadataError::CorruptRecord {
                     record: "RecoveryOutbox chunk",
                     reason: format!("missing LSN {recovery_lsn} chunk {index}"),
@@ -2421,12 +5275,6 @@ impl AgentMetadataStore {
         let logical = assemble_recovery_storage(header, chunks)
             .map_err(|error| corrupt("RecoveryOutbox storage", error))?;
         RecoveryOutboxRecord::decode(&logical).map_err(|error| corrupt("RecoveryOutbox", error))
-    }
-
-    fn family(&self, family: MetadataFamily) -> &Tree {
-        self.families
-            .get(&family)
-            .expect("every MetadataFamily is opened at startup")
     }
 
     #[cfg(feature = "metadata-read-stats")]
@@ -2478,17 +5326,26 @@ impl AgentMetadataStore {
         key: &[u8],
         operation: &'static str,
     ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
-        self.read_tree_value(self.family(family), key, point_source(family), operation)
+        self.read_tree_value(
+            crate::workspace::provider_catalog::domain_space(family),
+            key,
+            point_source(family),
+            operation,
+        )
     }
 
     fn read_tree_value(
         &self,
-        tree: &Tree,
+        space: OrderedSpaceId,
         key: &[u8],
         source: MetadataPointReadSource,
-        operation: &'static str,
+        _operation: &'static str,
     ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
-        let value = tree.get(key).map_err(|error| backend(operation, error))?;
+        let value = self
+            .provider
+            .get(space, key)
+            .map_err(provider_error)?
+            .map(|record| record.value);
         #[cfg(feature = "metadata-read-stats")]
         self.record_point(source, value.as_ref().map(Vec::len));
         #[cfg(not(feature = "metadata-read-stats"))]
@@ -2498,14 +5355,12 @@ impl AgentMetadataStore {
 
     fn read_tree_record(
         &self,
-        tree: &Tree,
+        space: OrderedSpaceId,
         key: &[u8],
         source: MetadataPointReadSource,
-        operation: &'static str,
-    ) -> Result<Option<Record>, AgentMetadataError> {
-        let record = tree
-            .get_record(key)
-            .map_err(|error| backend(operation, error))?;
+        _operation: &'static str,
+    ) -> Result<Option<ProviderRecord>, AgentMetadataError> {
+        let record = self.provider.get(space, key).map_err(provider_error)?;
         #[cfg(feature = "metadata-read-stats")]
         self.record_point(source, record.as_ref().map(|record| record.value.len()));
         #[cfg(not(feature = "metadata-read-stats"))]
@@ -2515,12 +5370,11 @@ impl AgentMetadataStore {
 
     fn required_system_record(
         &self,
-        tree: &Tree,
         key: &[u8],
         record: &'static str,
-    ) -> Result<Record, AgentMetadataError> {
+    ) -> Result<ProviderRecord, AgentMetadataError> {
         self.read_tree_record(
-            tree,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
             key,
             MetadataPointReadSource::System,
             "read required record",
@@ -2529,6 +5383,62 @@ impl AgentMetadataStore {
             record,
             reason: "record is missing".to_owned(),
         })
+    }
+
+    fn required_authority_marker(&self) -> Result<MetadataAuthorityMarker, AgentMetadataError> {
+        let read_view = self
+            .provider
+            .begin_read(&[ReadScope {
+                space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                prefix: Vec::new(),
+            }])
+            .map_err(provider_error)?;
+        let (_, _, marker) = self.required_authority_from(read_view.as_ref())?;
+        Ok(marker)
+    }
+
+    fn required_active_authority_from(
+        &self,
+        reader: &dyn MetadataReadView,
+    ) -> Result<(ProviderRecord, ProviderRecord, MetadataAuthorityMarker), AgentMetadataError> {
+        let (identity, authority, marker) = self.required_authority_from(reader)?;
+        if marker.state != MetadataAuthorityState::Active {
+            return Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected: MetadataAuthorityState::Active,
+                actual: marker.state,
+            });
+        }
+        Ok((identity, authority, marker))
+    }
+
+    fn required_authority_from(
+        &self,
+        reader: &dyn MetadataReadView,
+    ) -> Result<(ProviderRecord, ProviderRecord, MetadataAuthorityMarker), AgentMetadataError> {
+        let identity = required_record(
+            reader,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_STORE_IDENTITY_KEY,
+            "System(store_identity)",
+        )?;
+        let durable_identity = decode_store_identity(&identity.value)
+            .map_err(|error| corrupt("MetadataStoreIdentity", error))?;
+        if durable_identity != self.identity {
+            return Err(AgentMetadataError::MetadataStoreIdentityMismatch);
+        }
+        let authority = required_record(
+            reader,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_METADATA_AUTHORITY_KEY,
+            "System(metadata_authority)",
+        )?;
+        let marker = decode_authority_marker(&authority.value)
+            .map_err(|error| corrupt("MetadataAuthorityState", error))?;
+        if !marker.matches_identity(durable_identity) {
+            return Err(AgentMetadataError::MetadataAuthorityBindingMismatch);
+        }
+        validate_authority_marker_for_identity(durable_identity, marker)?;
+        Ok((identity, authority, marker))
     }
 }
 
@@ -2539,18 +5449,24 @@ struct PredicatePlan {
 }
 
 struct RecoveryPlan {
-    lsn_record: Record,
-    digest_record: Record,
+    lsn_record: ProviderRecord,
+    digest_record: ProviderRecord,
     header: Vec<u8>,
     chunks: Vec<Vec<u8>>,
     row: RecoveryOutboxRecord,
+}
+
+enum PlannedCommitObservation {
+    Applied { purpose_evidence_digest: [u8; 32] },
+    NotApplied { purpose_evidence_digest: [u8; 32] },
+    Foreign,
 }
 
 struct PlannedExactPredicate {
     family: MetadataFamily,
     key: Vec<u8>,
     current: Option<CurrentValue>,
-    version: Option<RecordVersion>,
+    witness: Option<ReadWitness>,
 }
 
 enum RootFencePlan {
@@ -2558,84 +5474,107 @@ enum RootFencePlan {
         value: Vec<u8>,
     },
     Assert {
-        version: RecordVersion,
+        witness: ReadWitness,
     },
     Replace {
-        version: RecordVersion,
+        witness: ReadWitness,
         value: Vec<u8>,
     },
 }
 
 fn enqueue_root_fence(
-    batch: &mut holt::DBAtomicBatch,
+    atomic: &mut AtomicPlan,
     command: &MetadataCommand,
-    plan: &RootFencePlan,
+    root_plan: &RootFencePlan,
 ) {
-    match plan {
-        RootFencePlan::Install { value } => {
-            batch.put_if_absent(ROOT_FENCE_TREE, command.root_id.as_bytes(), value);
-        }
-        RootFencePlan::Assert { version } => {
-            batch.assert_version(ROOT_FENCE_TREE, command.root_id.as_bytes(), *version);
-        }
-        RootFencePlan::Replace { version, value } => {
-            batch.compare_and_put(ROOT_FENCE_TREE, command.root_id.as_bytes(), *version, value);
-        }
+    let operation = match root_plan {
+        RootFencePlan::Install { value } => AtomicOp::PutIfAbsent {
+            space: crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
+            key: command.root_id.as_bytes().to_vec(),
+            value: value.clone(),
+        },
+        RootFencePlan::Assert { witness } => AtomicOp::AssertUnchanged {
+            space: crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
+            key: command.root_id.as_bytes().to_vec(),
+            witness: witness.clone(),
+        },
+        RootFencePlan::Replace { witness, value } => AtomicOp::CompareAndPut {
+            space: crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
+            key: command.root_id.as_bytes().to_vec(),
+            witness: witness.clone(),
+            value: value.clone(),
+        },
+    };
+    atomic.operations.push(operation);
+}
+
+fn enqueue_recovery(atomic: &mut AtomicPlan, recovery: &RecoveryPlan) {
+    atomic.operations.push(AtomicOp::CompareAndPut {
+        space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+        key: SYSTEM_APPLIED_RECOVERY_LSN_KEY.to_vec(),
+        witness: recovery.lsn_record.witness.clone(),
+        value: encode_system_u64(recovery.row.recovery_lsn).to_vec(),
+    });
+    atomic.operations.push(AtomicOp::CompareAndPut {
+        space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+        key: SYSTEM_RECOVERY_CHAIN_DIGEST_KEY.to_vec(),
+        witness: recovery.digest_record.witness.clone(),
+        value: encode_system_digest(recovery.row.chain_digest),
+    });
+    atomic.operations.push(AtomicOp::PutIfAbsent {
+        space: crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+        key: recovery_outbox_key(recovery.row.recovery_lsn).to_vec(),
+        value: recovery.header.clone(),
+    });
+    for (index, chunk) in recovery.chunks.iter().enumerate() {
+        atomic.operations.push(AtomicOp::PutIfAbsent {
+            space: crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+            key: recovery_chunk_key(recovery.row.recovery_lsn, index as u32).to_vec(),
+            value: chunk.clone(),
+        });
     }
 }
 
-fn enqueue_recovery(batch: &mut holt::DBAtomicBatch, plan: &RecoveryPlan) {
-    batch.compare_and_put(
-        SYSTEM_TREE,
-        SYSTEM_APPLIED_RECOVERY_LSN_KEY,
-        plan.lsn_record.version,
-        &encode_system_u64(plan.row.recovery_lsn),
-    );
-    batch.compare_and_put(
-        SYSTEM_TREE,
-        SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
-        plan.digest_record.version,
-        &encode_system_digest(plan.row.chain_digest),
-    );
-    batch.put_if_absent(
-        RECOVERY_OUTBOX_TREE,
-        &recovery_outbox_key(plan.row.recovery_lsn),
-        &plan.header,
-    );
-    for (index, chunk) in plan.chunks.iter().enumerate() {
-        batch.put_if_absent(
-            RECOVERY_OUTBOX_TREE,
-            &recovery_chunk_key(plan.row.recovery_lsn, index as u32),
-            chunk,
-        );
-    }
+fn enqueue_active_authority_advance(
+    atomic: &mut AtomicPlan,
+    authority: &ProviderRecord,
+    marker: MetadataAuthorityMarker,
+) -> Result<(), AgentMetadataError> {
+    let next = marker
+        .advance_active_write()
+        .ok_or(AgentMetadataError::VersionOverflow)?;
+    atomic.operations.push(AtomicOp::CompareAndPut {
+        space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+        key: SYSTEM_METADATA_AUTHORITY_KEY.to_vec(),
+        witness: authority.witness.clone(),
+        value: encode_authority_marker(next),
+    });
+    Ok(())
 }
 
-fn enqueue_predicate_guards(
-    batch: &mut holt::DBAtomicBatch,
-    plan: &PredicatePlan,
-    commit_version: CommitVersion,
-) {
+fn enqueue_predicate_guards(atomic: &mut AtomicPlan, plan: &PredicatePlan) {
     for predicate in plan.exact.values() {
-        match predicate.version {
-            Some(version) => {
-                batch.assert_version(predicate.family.tree_name(), &predicate.key, version);
+        match &predicate.witness {
+            Some(witness) => {
+                atomic.operations.push(AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::domain_space(predicate.family),
+                    key: predicate.key.clone(),
+                    witness: witness.clone(),
+                });
             }
             None => {
-                let sentinel = CurrentValue {
-                    created_version: commit_version,
-                    modified_version: commit_version,
-                    payload: Vec::new(),
-                }
-                .encode()
-                .expect("empty sentinel fits current-value envelope");
-                batch.put_if_absent(predicate.family.tree_name(), &predicate.key, &sentinel);
-                batch.delete(predicate.family.tree_name(), &predicate.key);
+                atomic.operations.push(AtomicOp::AssertAbsent {
+                    space: crate::workspace::provider_catalog::domain_space(predicate.family),
+                    key: predicate.key.clone(),
+                });
             }
         }
     }
     for (family, prefix) in &plan.prefix_empty {
-        batch.assert_prefix_empty(family.tree_name(), prefix);
+        atomic.operations.push(AtomicOp::AssertPrefixEmpty {
+            space: crate::workspace::provider_catalog::domain_space(*family),
+            prefix: prefix.clone(),
+        });
     }
 }
 
@@ -2662,36 +5601,363 @@ fn valid_root_transition(from: RootActivationState, to: RootActivationState) -> 
     )
 }
 
-fn validate_tree_registry(db: &DB) -> Result<(), AgentMetadataError> {
-    let mut actual = db
-        .list_trees()
-        .map_err(|error| backend("inspect schema trees", error))?;
-    actual.sort();
-    let mut expected = SCHEMA_TREES
-        .iter()
-        .map(|tree| (*tree).to_owned())
-        .collect::<Vec<_>>();
-    expected.sort();
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(AgentMetadataError::SchemaGate {
-            reason: format!("expected trees {expected:?}, found {actual:?}"),
-        })
-    }
-}
-
 fn required_record(
-    tree: &Tree,
+    reader: &dyn MetadataReadView,
+    space: OrderedSpaceId,
     key: &[u8],
     record: &'static str,
-) -> Result<Record, AgentMetadataError> {
-    tree.get_record(key)
-        .map_err(|error| backend("read required record", error))?
+) -> Result<ProviderRecord, AgentMetadataError> {
+    reader
+        .get(space, key)
+        .map_err(provider_error)?
         .ok_or_else(|| AgentMetadataError::CorruptRecord {
             record,
             reason: "record is missing".to_owned(),
         })
+}
+
+fn validate_store_identity(identity: MetadataStoreIdentity) -> Result<(), AgentMetadataError> {
+    validate_metadata_store_identity(identity).map_err(|error| AgentMetadataError::SchemaGate {
+        reason: error.to_string(),
+    })
+}
+
+fn validate_source_receipt_request(
+    identity: MetadataStoreIdentity,
+    migration_id: OperationId,
+    owner_epoch: OwnerEpoch,
+    receipt: SourceQuiesceReceipt,
+) -> Result<(), AgentMetadataError> {
+    if receipt.logical_shard_id != identity.logical_shard_id
+        || receipt.migration_id != migration_id
+        || receipt.source_authority_id != identity.authority_id
+        || receipt.source_authority_generation != identity.authority_generation
+        || receipt.owner_epoch != owner_epoch
+        || receipt.contract_digest != identity.contract_digest
+    {
+        return Err(migration_admission(
+            "quiesce replay does not match the durable source receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_migration_target_binding(
+    identity: MetadataStoreIdentity,
+    binding: MetadataMigrationTargetBinding,
+) -> Result<(), AgentMetadataError> {
+    if binding.logical_shard_id != identity.logical_shard_id
+        || binding.target_authority_id != identity.authority_id
+        || binding.target_authority_generation != identity.authority_generation
+        || binding.contract_digest != identity.contract_digest
+        || binding
+            .migration_id
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        || binding
+            .source_authority_id
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        || binding.source_authority_id == binding.target_authority_id
+    {
+        return Err(migration_admission(
+            "migration target binding does not match the target store identity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authority_marker_for_identity(
+    identity: MetadataStoreIdentity,
+    marker: MetadataAuthorityMarker,
+) -> Result<(), AgentMetadataError> {
+    let matches = match marker.evidence {
+        MetadataAuthorityEvidence::None => true,
+        MetadataAuthorityEvidence::MigrationTargetBinding(binding) => {
+            validate_migration_target_binding(identity, binding).is_ok()
+        }
+        MetadataAuthorityEvidence::SourceQuiesceReceipt(receipt) => {
+            receipt.logical_shard_id == identity.logical_shard_id
+                && receipt.source_authority_id == identity.authority_id
+                && receipt.source_authority_generation == identity.authority_generation
+                && receipt.contract_digest == identity.contract_digest
+        }
+        MetadataAuthorityEvidence::TargetActivationToken(token) => {
+            token.logical_shard_id == identity.logical_shard_id
+                && token.target_authority_id == identity.authority_id
+                && token.target_authority_generation == identity.authority_generation
+                && token.contract_digest == identity.contract_digest
+        }
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(AgentMetadataError::MetadataAuthorityBindingMismatch)
+    }
+}
+
+#[cfg(test)]
+fn validate_target_token_identity(
+    identity: MetadataStoreIdentity,
+    binding: MetadataMigrationTargetBinding,
+    token: &TargetActivationToken,
+) -> Result<(), AgentMetadataError> {
+    if token.logical_shard_id != identity.logical_shard_id
+        || token.migration_id != binding.migration_id
+        || token.source_authority_id != binding.source_authority_id
+        || token.source_authority_generation != binding.source_authority_generation
+        || token.target_authority_id != identity.authority_id
+        || token.target_authority_generation != identity.authority_generation
+        || token.contract_digest != identity.contract_digest
+        || token.migration_id.as_bytes().iter().all(|byte| *byte == 0)
+        || token.source_receipt_digest.iter().all(|byte| *byte == 0)
+        || token.frontier.chain_digest.iter().all(|byte| *byte == 0)
+        || token.frontier.state_digest.iter().all(|byte| *byte == 0)
+    {
+        return Err(migration_admission(
+            "target activation token does not match the target store identity",
+        ));
+    }
+    Ok(())
+}
+
+/// Hash only provider-neutral logical metadata. `System` is excluded because
+/// it carries provider-installation identity, local authority evidence, and
+/// physical-owner state; its logical recovery LSN, chain, and commit version
+/// are bound separately in `MetadataRecoveryFrontier`. Root fences, dedupe,
+/// events, history, recovery rows, and every domain space are included.
+fn logical_state_digest(reader: &dyn MetadataReadView) -> Result<[u8; 32], AgentMetadataError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.metadata.logical-state.v1\0");
+    for space in logical_state_spaces() {
+        hash_logical_state_frame(&mut hasher, 1, &logical_state_space_tag(space));
+        let page = reader
+            .scan(&ProviderScan {
+                space,
+                prefix: Vec::new(),
+                start_after: None,
+                delimiter: None,
+                limit: 0,
+            })
+            .map_err(provider_error)?;
+        for item in page.items {
+            let ProviderScanItem::Key { key, value } = item else {
+                return Err(AgentMetadataError::CorruptRecord {
+                    record: "logical metadata state",
+                    reason: "undelimited provider scan returned a common prefix".to_owned(),
+                });
+            };
+            hash_logical_state_frame(&mut hasher, 2, &key);
+            hash_logical_state_frame(&mut hasher, 3, &value);
+        }
+        hash_logical_state_frame(&mut hasher, 4, &[]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+pub(super) fn logical_state_spaces() -> Vec<OrderedSpaceId> {
+    crate::workspace::provider_catalog::logical_state_spaces()
+}
+
+pub(super) fn logical_state_space_tag(space: OrderedSpaceId) -> [u8; 2] {
+    assert_ne!(
+        space,
+        crate::workspace::provider_catalog::SYSTEM_SPACE,
+        "System is not logical migration state"
+    );
+    space.to_be_bytes()
+}
+
+pub(super) fn hash_logical_state_frame(hasher: &mut Sha256, tag: u8, bytes: &[u8]) {
+    hasher.update([tag]);
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn migration_admission(reason: impl Into<String>) -> AgentMetadataError {
+    AgentMetadataError::MetadataMigrationAdmission {
+        reason: reason.into(),
+    }
+}
+
+fn validate_runtime_commit_bundle(
+    runtime_bundle: &dyn MetadataRuntimeCommitBundleV1,
+    identity: MetadataStoreIdentity,
+    allow_untracked_standalone: bool,
+) -> Result<MetadataCommitReceiptStateV1, AgentMetadataError> {
+    let qualification = runtime_bundle.commit_receipt_qualification_v1();
+    let frozen_bundle_digest = runtime_bundle.frozen_runtime_bundle_digest_v1();
+    if frozen_bundle_digest.iter().all(|byte| *byte == 0) {
+        return Err(AgentMetadataError::ProviderAuthorityMismatch {
+            operation: "validate metadata runtime bundle",
+            message: "frozen runtime bundle digest must not be all-zero".to_owned(),
+        });
+    }
+    if qualification == MetadataCommitReceiptQualificationV1::UntrackedStandalone
+        && !allow_untracked_standalone
+    {
+        return Err(AgentMetadataError::ProviderAuthorityMismatch {
+            operation: "validate metadata commit receipt qualification",
+            message: "distributed runtime requires a durable exact commit receipt".to_owned(),
+        });
+    }
+    let state = runtime_bundle
+        .load_commit_receipt_v1(identity)
+        .map_err(receipt_error)?;
+    match &state {
+        MetadataCommitReceiptStateV1::Clean {
+            store_identity,
+            frozen_bundle_digest: durable_digest,
+            ..
+        } if *store_identity == identity && *durable_digest == frozen_bundle_digest => {}
+        MetadataCommitReceiptStateV1::Pending(planned)
+        | MetadataCommitReceiptStateV1::PoisonedSettled(planned)
+        | MetadataCommitReceiptStateV1::PoisonedUnsettled(planned) => planned
+            .validate_binding(identity, frozen_bundle_digest)
+            .map_err(receipt_error)?,
+        MetadataCommitReceiptStateV1::UntrackedStandalone
+            if qualification == MetadataCommitReceiptQualificationV1::UntrackedStandalone
+                && allow_untracked_standalone => {}
+        _ => {
+            return Err(AgentMetadataError::ProviderAuthorityMismatch {
+                operation: "validate metadata commit receipt binding",
+                message: "receipt is bound to another store or runtime bundle".to_owned(),
+            });
+        }
+    }
+    Ok(state)
+}
+
+fn dirty_receipt_source_and_plan(
+    state: &MetadataCommitReceiptStateV1,
+) -> Option<(MetadataCommitReceiptDirtySourceV1, PlannedMetadataCommitV1)> {
+    match state {
+        MetadataCommitReceiptStateV1::Pending(planned) => {
+            Some((MetadataCommitReceiptDirtySourceV1::Pending, planned.clone()))
+        }
+        MetadataCommitReceiptStateV1::PoisonedSettled(planned) => Some((
+            MetadataCommitReceiptDirtySourceV1::PoisonedSettled,
+            planned.clone(),
+        )),
+        MetadataCommitReceiptStateV1::PoisonedUnsettled(planned) => Some((
+            MetadataCommitReceiptDirtySourceV1::PoisonedUnsettled,
+            planned.clone(),
+        )),
+        MetadataCommitReceiptStateV1::Clean { .. }
+        | MetadataCommitReceiptStateV1::UntrackedStandalone => None,
+    }
+}
+
+fn validate_create_receipt_preflight(
+    state: &MetadataCommitReceiptStateV1,
+    recovery_intent: CreateRecoveryIntentV1,
+) -> Result<(), AgentMetadataError> {
+    match (recovery_intent, state) {
+        (_, MetadataCommitReceiptStateV1::UntrackedStandalone)
+        | (
+            CreateRecoveryIntentV1::Fresh,
+            MetadataCommitReceiptStateV1::Clean {
+                frontier: MetadataFrontierPointV1::Absent,
+                ..
+            },
+        )
+        | (CreateRecoveryIntentV1::ReconcilePrepared, MetadataCommitReceiptStateV1::Clean { .. }) => {
+            Ok(())
+        }
+        _ => Err(AgentMetadataError::ProviderAuthorityMismatch {
+            operation: "validate metadata create receipt state",
+            message: "create intent does not match the durable commit receipt state".to_owned(),
+        }),
+    }
+}
+
+fn validate_reopen_receipt_preflight(
+    state: &MetadataCommitReceiptStateV1,
+) -> Result<(), AgentMetadataError> {
+    match state {
+        MetadataCommitReceiptStateV1::UntrackedStandalone
+        | MetadataCommitReceiptStateV1::Clean {
+            frontier: MetadataFrontierPointV1::Exact(_),
+            ..
+        } => Ok(()),
+        MetadataCommitReceiptStateV1::Clean {
+            frontier: MetadataFrontierPointV1::Absent,
+            ..
+        } => Err(AgentMetadataError::ProviderAuthorityMismatch {
+            operation: "validate metadata reopen receipt state",
+            message: "reopen requires an exact durable provider frontier".to_owned(),
+        }),
+        MetadataCommitReceiptStateV1::Pending(_)
+        | MetadataCommitReceiptStateV1::PoisonedSettled(_)
+        | MetadataCommitReceiptStateV1::PoisonedUnsettled(_) => {
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        }
+    }
+}
+
+fn validate_provider_contract(
+    provider: &dyn MetadataProvider,
+    logical_shard_id: LogicalShardId,
+) -> Result<(), AgentMetadataError> {
+    provider.validate_runtime().map_err(provider_error)?;
+    if provider.logical_shard_id() != logical_shard_id {
+        return Err(AgentMetadataError::SchemaGate {
+            reason: "logical shard identity does not match requested provider".to_owned(),
+        });
+    }
+    validate_provider_capabilities(provider.capabilities())
+}
+
+pub fn canonical_provider_schema_v1() -> ProviderSchemaV1 {
+    ProviderSchemaV1::new(workspace_metadata_contract_digest(), all_ordered_spaces())
+        .expect("the frozen workspace provider catalog is nonempty and unique")
+}
+
+fn validate_provider_offer(
+    provider: &dyn MetadataProvider,
+    offered: ProviderCapabilities,
+) -> Result<(), AgentMetadataError> {
+    if provider.capabilities() != offered {
+        return Err(AgentMetadataError::SchemaGate {
+            reason: "opened metadata provider differs from its pre-open contract offer".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_provider_capabilities(
+    capabilities: ProviderCapabilities,
+) -> Result<(), AgentMetadataError> {
+    let schema = canonical_provider_schema_v1();
+    let offer = crate::provider::v1::ProviderContractOfferV1 { capabilities };
+    let report = crate::provider::admission::admit_provider_offer_v1(&schema, &offer);
+    if !report.is_qualified() {
+        return Err(AgentMetadataError::SchemaGate {
+            reason: "metadata provider does not prove the complete NoKV command surface".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn recovery_state_from(reader: &dyn MetadataReadView) -> Result<RecoveryState, AgentMetadataError> {
+    let lsn = required_record(
+        reader,
+        crate::workspace::provider_catalog::SYSTEM_SPACE,
+        SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+        "System(applied_recovery_lsn)",
+    )?;
+    let digest = required_record(
+        reader,
+        crate::workspace::provider_catalog::SYSTEM_SPACE,
+        SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+        "System(recovery_chain_digest)",
+    )?;
+    Ok(RecoveryState {
+        applied_recovery_lsn: decode_system_u64(&lsn.value, "System(applied_recovery_lsn)")?,
+        chain_digest: decode_system_digest(&digest.value, "System(recovery_chain_digest)")?,
+    })
 }
 
 fn point_source(family: MetadataFamily) -> MetadataPointReadSource {
@@ -2707,25 +5973,22 @@ fn byte_len(value: &[u8]) -> u64 {
     u64::try_from(value.len()).unwrap_or(u64::MAX)
 }
 
-fn encode_shard_identity(shard: LogicalShardId) -> Vec<u8> {
-    let mut value = Vec::with_capacity(1 + LogicalShardId::BYTE_WIDTH);
-    value.push(SYSTEM_VALUE_FORMAT_VERSION);
-    value.extend_from_slice(shard.as_bytes());
-    value
-}
-
-fn decode_shard_identity(value: &[u8]) -> Result<LogicalShardId, AgentMetadataError> {
-    if value.len() != 1 + LogicalShardId::BYTE_WIDTH
-        || value.first() != Some(&SYSTEM_VALUE_FORMAT_VERSION)
-    {
-        return Err(AgentMetadataError::CorruptRecord {
-            record: "System(shard_identity)",
-            reason: "invalid version or width".to_owned(),
-        });
+#[cfg(feature = "metadata-read-stats")]
+fn diagnostics_snapshot_to_read_stats(
+    snapshot: ProviderDiagnosticsSnapshotV1,
+) -> MetadataReadStats {
+    MetadataReadStats {
+        provider_cache_hits: snapshot.cache_hits,
+        provider_cache_misses: snapshot.cache_misses,
+        provider_full_read_operations: snapshot.full_read_operations,
+        provider_full_read_bytes: snapshot.full_read_bytes,
+        provider_point_full_read_operations: snapshot.point_full_read_operations,
+        provider_scan_full_read_operations: snapshot.scan_full_read_operations,
+        provider_internal_full_read_operations: snapshot.internal_full_read_operations,
+        provider_partial_read_cache_hits: snapshot.partial_read_cache_hits,
+        provider_partial_read_cache_misses: snapshot.partial_read_cache_misses,
+        ..MetadataReadStats::default()
     }
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&value[1..]);
-    Ok(LogicalShardId::from_bytes(bytes))
 }
 
 fn encode_system_u64(value: u64) -> [u8; 9] {
@@ -2735,7 +5998,10 @@ fn encode_system_u64(value: u64) -> [u8; 9] {
     encoded
 }
 
-fn decode_system_u64(value: &[u8], record: &'static str) -> Result<u64, AgentMetadataError> {
+pub(super) fn decode_system_u64(
+    value: &[u8],
+    record: &'static str,
+) -> Result<u64, AgentMetadataError> {
     if value.len() != 9 || value.first() != Some(&SYSTEM_VALUE_FORMAT_VERSION) {
         return Err(AgentMetadataError::CorruptRecord {
             record,
@@ -2754,7 +6020,7 @@ fn encode_system_digest(value: [u8; RECOVERY_CHAIN_DIGEST_BYTES]) -> Vec<u8> {
     encoded
 }
 
-fn decode_system_digest(
+pub(super) fn decode_system_digest(
     value: &[u8],
     record: &'static str,
 ) -> Result<[u8; RECOVERY_CHAIN_DIGEST_BYTES], AgentMetadataError> {
@@ -2843,54 +6109,6 @@ fn validate_value_bytes(value: &[u8], kind: &'static str) -> Result<(), AgentMet
     }
 }
 
-fn require_fresh_location(path: &Path) -> Result<(), AgentMetadataError> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if !metadata.is_dir() => Err(AgentMetadataError::SchemaGate {
-            reason: format!("{} is not a directory", path.display()),
-        }),
-        Ok(_) => {
-            let mut entries =
-                std::fs::read_dir(path).map_err(|error| AgentMetadataError::Backend {
-                    operation: "inspect store directory",
-                    message: error.to_string(),
-                })?;
-            if entries
-                .next()
-                .transpose()
-                .map_err(|error| AgentMetadataError::Backend {
-                    operation: "inspect store directory",
-                    message: error.to_string(),
-                })?
-                .is_some()
-            {
-                Err(AgentMetadataError::SchemaGate {
-                    reason: format!("{} is not empty", path.display()),
-                })
-            } else {
-                Ok(())
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(AgentMetadataError::Backend {
-            operation: "inspect store path",
-            message: error.to_string(),
-        }),
-    }
-}
-
-fn require_existing_location(path: &Path) -> Result<(), AgentMetadataError> {
-    let metadata = std::fs::metadata(path).map_err(|error| AgentMetadataError::SchemaGate {
-        reason: format!("cannot open {}: {error}", path.display()),
-    })?;
-    if metadata.is_dir() {
-        Ok(())
-    } else {
-        Err(AgentMetadataError::SchemaGate {
-            reason: format!("{} is not a directory", path.display()),
-        })
-    }
-}
-
 fn hash_bytes(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
@@ -2920,15 +6138,543 @@ fn backend(operation: &'static str, error: impl std::fmt::Display) -> AgentMetad
     }
 }
 
+fn provider_error(error: ProviderError) -> AgentMetadataError {
+    let operation = error.operation().as_str();
+    match error.kind() {
+        ProviderErrorKind::Backend => AgentMetadataError::Backend {
+            operation,
+            message: "metadata provider operation failed".to_owned(),
+        },
+        ProviderErrorKind::InvalidPlan => AgentMetadataError::Backend {
+            operation: "validate provider operation",
+            message: "metadata provider rejected the operation plan".to_owned(),
+        },
+        ProviderErrorKind::SchemaGate => AgentMetadataError::SchemaGate {
+            reason: "metadata provider rejected the canonical workspace schema".to_owned(),
+        },
+        ProviderErrorKind::OpenExecutionRejected => AgentMetadataError::SchemaGate {
+            reason: "metadata provider rejected the engine open execution".to_owned(),
+        },
+        ProviderErrorKind::UnknownCommitSettled | ProviderErrorKind::UnknownCommitUnsettled => {
+            AgentMetadataError::CommitOutcomeUnknown
+        }
+        ProviderErrorKind::TransactionTooLarge => {
+            let limit = error
+                .limit()
+                .expect("transaction-too-large errors carry a stable limit");
+            AgentMetadataError::TransactionTooLarge {
+                affected_bytes: limit.affected_bytes,
+                max_bytes: limit.max_bytes,
+            }
+        }
+        ProviderErrorKind::Unavailable => AgentMetadataError::ProviderUnavailable {
+            operation,
+            message: "metadata provider is unavailable".to_owned(),
+        },
+        ProviderErrorKind::AuthorityMismatch => AgentMetadataError::ProviderAuthorityMismatch {
+            operation,
+            message: "metadata provider authority changed".to_owned(),
+        },
+    }
+}
+
+fn receipt_error(error: MetadataCommitReceiptErrorV1) -> AgentMetadataError {
+    match error {
+        MetadataCommitReceiptErrorV1::Poisoned => AgentMetadataError::CommitOutcomeUnknown,
+        MetadataCommitReceiptErrorV1::Unavailable
+        | MetadataCommitReceiptErrorV1::InvalidBinding => {
+            AgentMetadataError::ProviderAuthorityMismatch {
+                operation: "metadata commit receipt",
+                message: error.to_string(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
     use super::super::query_records::{ChangeEventKind, ChangeEventRecord, TypedProjection};
     use super::*;
+    use crate::built_in_holt::{
+        acquire_existing_file_store_reservation_v1, HoltExistingStoreReservation,
+        HoltRuntimeGuardError, HoltStoreObjectIdentity,
+    };
+    use crate::provider::v1::{ProviderScanPage, ProviderScanStats};
+
+    #[derive(Clone, Copy)]
+    enum BarrierCommitResult {
+        Committed,
+        BackendError,
+        UnknownUnsettled,
+    }
+
+    struct BarrierCommitTransaction {
+        barrier: Arc<Barrier>,
+        commit_calls: Arc<std::sync::atomic::AtomicUsize>,
+        read_calls: Arc<std::sync::atomic::AtomicUsize>,
+        result: BarrierCommitResult,
+    }
+
+    impl MetadataReadView for BarrierCommitTransaction {
+        fn get(
+            &self,
+            _space: OrderedSpaceId,
+            _key: &[u8],
+        ) -> Result<Option<ProviderRecord>, ProviderError> {
+            self.read_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(None)
+        }
+
+        fn scan(&self, _request: &ProviderScan) -> Result<ProviderScanPage, ProviderError> {
+            Ok(ProviderScanPage {
+                items: Vec::new(),
+                stats: ProviderScanStats {
+                    visited: 0,
+                    returned: 0,
+                    common_prefixes: 0,
+                    restarts: 0,
+                },
+            })
+        }
+    }
+
+    impl MetadataTransaction for BarrierCommitTransaction {
+        fn prefix_is_empty(
+            &self,
+            _space: OrderedSpaceId,
+            _prefix: &[u8],
+        ) -> Result<bool, ProviderError> {
+            self.read_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(true)
+        }
+
+        fn commit(
+            self: Box<Self>,
+            _plan: AtomicPlan,
+        ) -> Result<AtomicCommitOutcome, ProviderError> {
+            self.commit_calls.fetch_add(1, Ordering::AcqRel);
+            self.barrier.wait();
+            self.barrier.wait();
+            match self.result {
+                BarrierCommitResult::Committed => Ok(AtomicCommitOutcome::Committed),
+                BarrierCommitResult::BackendError => Err(ProviderError::backend(
+                    ProviderOperationV1::Commit,
+                    "injected backend response",
+                )),
+                BarrierCommitResult::UnknownUnsettled => {
+                    Err(ProviderError::unknown_commit_unsettled())
+                }
+            }
+        }
+    }
+
+    struct RecordingRuntimeBundle {
+        factory: Mutex<Option<HoltProviderFactory>>,
+        identity: MetadataStoreIdentity,
+        state: Arc<Mutex<MetadataCommitReceiptStateV1>>,
+        persist_count: Mutex<usize>,
+        resolve_count: Mutex<usize>,
+        contract_offer_calls: AtomicUsize,
+        create_calls: AtomicUsize,
+        reopen_calls: AtomicUsize,
+        recovery_open_calls: AtomicUsize,
+        reject_persist: AtomicBool,
+        reject_resolve: AtomicBool,
+        swap_persist_outcome: AtomicBool,
+        runtime_poisoned: AtomicBool,
+    }
+
+    impl RecordingRuntimeBundle {
+        const FROZEN_DIGEST: [u8; 32] = [0x91; 32];
+
+        fn memory(identity: MetadataStoreIdentity) -> Arc<Self> {
+            let bundle = Self::empty_with_state(
+                identity,
+                Arc::new(Mutex::new(Self::clean(
+                    identity,
+                    MetadataFrontierPointV1::Absent,
+                ))),
+            );
+            *bundle.factory.lock().unwrap() = Some(HoltProviderFactory::memory());
+            bundle
+        }
+
+        fn empty_with_state(
+            identity: MetadataStoreIdentity,
+            state: Arc<Mutex<MetadataCommitReceiptStateV1>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                factory: Mutex::new(None),
+                identity,
+                state,
+                persist_count: Mutex::new(0),
+                resolve_count: Mutex::new(0),
+                contract_offer_calls: AtomicUsize::new(0),
+                create_calls: AtomicUsize::new(0),
+                reopen_calls: AtomicUsize::new(0),
+                recovery_open_calls: AtomicUsize::new(0),
+                reject_persist: AtomicBool::new(false),
+                reject_resolve: AtomicBool::new(false),
+                swap_persist_outcome: AtomicBool::new(false),
+                runtime_poisoned: AtomicBool::new(false),
+            })
+        }
+
+        fn file(path: &Path, identity: MetadataStoreIdentity) -> Arc<Self> {
+            Self::file_with_state(
+                path,
+                identity,
+                Arc::new(Mutex::new(Self::clean(
+                    identity,
+                    MetadataFrontierPointV1::Absent,
+                ))),
+            )
+        }
+
+        fn file_with_state(
+            path: &Path,
+            identity: MetadataStoreIdentity,
+            state: Arc<Mutex<MetadataCommitReceiptStateV1>>,
+        ) -> Arc<Self> {
+            let bundle = Self::empty_with_state(identity, state);
+            let runtime_guard: Arc<dyn HoltRuntimeGuard> = bundle.clone();
+            *bundle.factory.lock().unwrap() = Some(HoltProviderFactory::file(path, runtime_guard));
+            bundle
+        }
+
+        fn reserved_existing_with_state(
+            reservation: HoltExistingStoreReservation,
+            identity: MetadataStoreIdentity,
+            state: Arc<Mutex<MetadataCommitReceiptStateV1>>,
+        ) -> Arc<Self> {
+            let bundle = Self::empty_with_state(identity, state);
+            let runtime_guard: Arc<dyn HoltRuntimeGuard> = bundle.clone();
+            *bundle.factory.lock().unwrap() = Some(HoltProviderFactory::reserved_existing(
+                reservation,
+                runtime_guard,
+            ));
+            bundle
+        }
+
+        fn clean(
+            identity: MetadataStoreIdentity,
+            frontier: MetadataFrontierPointV1,
+        ) -> MetadataCommitReceiptStateV1 {
+            MetadataCommitReceiptStateV1::Clean {
+                store_identity: identity,
+                frozen_bundle_digest: Self::FROZEN_DIGEST,
+                frontier,
+            }
+        }
+
+        fn persist_count(&self) -> usize {
+            *self.persist_count.lock().unwrap()
+        }
+
+        fn resolve_count(&self) -> usize {
+            *self.resolve_count.lock().unwrap()
+        }
+
+        fn reject_persist(&self) {
+            self.reject_persist.store(true, Ordering::Release);
+        }
+
+        fn swap_next_persist_outcome(&self) {
+            self.swap_persist_outcome.store(true, Ordering::Release);
+        }
+
+        fn reject_next_resolve(&self) {
+            self.reject_resolve.store(true, Ordering::Release);
+        }
+
+        fn provider_call_counts(&self) -> (usize, usize, usize, usize) {
+            (
+                self.contract_offer_calls.load(Ordering::Acquire),
+                self.create_calls.load(Ordering::Acquire),
+                self.reopen_calls.load(Ordering::Acquire),
+                self.recovery_open_calls.load(Ordering::Acquire),
+            )
+        }
+    }
+
+    impl MetadataProviderFactoryV1 for RecordingRuntimeBundle {
+        fn contract_offer(
+            &self,
+            schema: &ProviderSchemaV1,
+        ) -> Result<ProviderContractOfferV1, ProviderError> {
+            self.contract_offer_calls.fetch_add(1, Ordering::AcqRel);
+            self.factory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("test runtime factory is installed")
+                .contract_offer(schema)
+        }
+
+        fn create(
+            &self,
+            request: &ProviderCreateRequestV1,
+        ) -> Result<Arc<dyn MetadataProvider>, ProviderError> {
+            self.create_calls.fetch_add(1, Ordering::AcqRel);
+            self.factory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("test runtime factory is installed")
+                .create(request)
+        }
+
+        fn reopen(
+            &self,
+            request: &ProviderReopenRequestV1,
+        ) -> Result<Arc<dyn MetadataProvider>, ProviderError> {
+            self.reopen_calls.fetch_add(1, Ordering::AcqRel);
+            self.factory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("test runtime factory is installed")
+                .reopen(request)
+        }
+    }
+
+    impl MetadataCommitRecoveryFenceFactoryV1 for RecordingRuntimeBundle {
+        fn old_dispatch_exclusion_installation_v1(
+            &self,
+        ) -> MetadataOldDispatchExclusionInstallationV1 {
+            self.factory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("test runtime factory is installed")
+                .old_dispatch_exclusion_installation_v1()
+        }
+
+        fn reopen_pending_with_old_dispatch_excluded_v1(
+            &self,
+            command: MetadataPendingRecoveryOpenCommandV1,
+        ) -> MetadataPendingRecoveryOpenOutcomeV1 {
+            self.recovery_open_calls.fetch_add(1, Ordering::AcqRel);
+            self.factory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("test runtime factory is installed")
+                .reopen_pending_with_old_dispatch_excluded_v1(command)
+        }
+    }
+
+    impl MetadataCommitReceiptStoreV1 for RecordingRuntimeBundle {
+        fn commit_receipt_qualification_v1(&self) -> MetadataCommitReceiptQualificationV1 {
+            MetadataCommitReceiptQualificationV1::Durable
+        }
+
+        fn frozen_runtime_bundle_digest_v1(&self) -> [u8; 32] {
+            Self::FROZEN_DIGEST
+        }
+
+        fn load_commit_receipt_v1(
+            &self,
+            store_identity: MetadataStoreIdentity,
+        ) -> Result<MetadataCommitReceiptStateV1, MetadataCommitReceiptErrorV1> {
+            if store_identity != self.identity {
+                return Err(MetadataCommitReceiptErrorV1::InvalidBinding);
+            }
+            Ok(self.state.lock().unwrap().clone())
+        }
+
+        fn persist_pending_commit_v1(
+            &self,
+            command: MetadataCommitReceiptPersistCommandV1,
+        ) -> MetadataCommitReceiptPersistOutcomeV1 {
+            if self.reject_persist.load(Ordering::Acquire) {
+                return command.reject_before_execution(
+                    MetadataCommitReceiptPersistNotDispatchedV1::Unavailable,
+                );
+            }
+            let command = command.claim_execution();
+            let planned_for_swapped_outcome = command.planned().clone();
+            let result = (|| {
+                let planned = command.planned();
+                planned
+                    .validate_binding(self.identity, Self::FROZEN_DIGEST)
+                    .map_err(|_| MetadataCommitReceiptPersistErrorV1::InvalidBindingBeforeEffect)?;
+                let mut state = self.state.lock().unwrap();
+                let MetadataCommitReceiptStateV1::Clean { frontier, .. } = &*state else {
+                    return Err(MetadataCommitReceiptPersistErrorV1::InvalidBindingBeforeEffect);
+                };
+                if *frontier != planned.prior() {
+                    return Err(MetadataCommitReceiptPersistErrorV1::InvalidBindingBeforeEffect);
+                }
+                *state = MetadataCommitReceiptStateV1::Pending(planned.clone());
+                *self.persist_count.lock().unwrap() += 1;
+                Ok(())
+            })();
+            let outcome = command.complete(match result {
+                Ok(()) => MetadataCommitReceiptPersistBackendResultV1::Persisted,
+                Err(MetadataCommitReceiptPersistErrorV1::UnavailableBeforeEffect) => {
+                    MetadataCommitReceiptPersistBackendResultV1::NotDispatched(
+                        MetadataCommitReceiptPersistNotDispatchedV1::Unavailable,
+                    )
+                }
+                Err(MetadataCommitReceiptPersistErrorV1::InvalidBindingBeforeEffect) => {
+                    MetadataCommitReceiptPersistBackendResultV1::NotDispatched(
+                        MetadataCommitReceiptPersistNotDispatchedV1::InvalidBinding,
+                    )
+                }
+                Err(MetadataCommitReceiptPersistErrorV1::RecoveryRequired) => {
+                    MetadataCommitReceiptPersistBackendResultV1::RecoveryRequired
+                }
+            });
+            if self.swap_persist_outcome.swap(false, Ordering::AcqRel) {
+                let authority = MetadataCommitEngineMintAuthorityV1::for_test();
+                let (foreign, _) = MetadataCommitReceiptPersistCommandV1::mint(
+                    &authority,
+                    &planned_for_swapped_outcome,
+                );
+                foreign
+                    .claim_execution()
+                    .complete(MetadataCommitReceiptPersistBackendResultV1::Persisted)
+            } else {
+                outcome
+            }
+        }
+
+        fn resolve_pending_commit_v1(
+            &self,
+            command: MetadataCommitReceiptResolveCommandV1,
+        ) -> MetadataCommitReceiptResolveOutcomeV1 {
+            if self.reject_resolve.swap(false, Ordering::AcqRel) {
+                return command.reject_before_execution(
+                    MetadataCommitReceiptMutationNotDispatchedV1::Unavailable,
+                );
+            }
+            let command = command.claim_execution();
+            let result = (|| {
+                let planned = command.planned();
+                let mut state = self.state.lock().unwrap();
+                let resolution = command.resolution();
+                if !resolution.source().matches_state(&state, planned) {
+                    return Err(MetadataCommitReceiptErrorV1::InvalidBinding);
+                }
+                let frontier = match resolution.basis() {
+                    MetadataCommitResolutionBasisV1::ExactNextApplied
+                        if resolution.applied_exact_next() == Some(planned.exact_next())
+                            && resolution.not_applied_exact_prior().is_none() =>
+                    {
+                        MetadataFrontierPointV1::Exact(planned.exact_next())
+                    }
+                    MetadataCommitResolutionBasisV1::ExactPriorNotAppliedSettled
+                        if resolution.source()
+                            == MetadataCommitReceiptDirtySourceV1::PoisonedSettled
+                            && resolution.applied_exact_next().is_none()
+                            && resolution.not_applied_exact_prior() == Some(planned.prior()) =>
+                    {
+                        planned.prior()
+                    }
+                    _ => return Err(MetadataCommitReceiptErrorV1::InvalidBinding),
+                };
+                *state = Self::clean(self.identity, frontier);
+                *self.resolve_count.lock().unwrap() += 1;
+                Ok(())
+            })();
+            command.complete(receipt_mutation_backend_result(result))
+        }
+
+        fn poison_commit_receipt_v1(
+            &self,
+            command: MetadataCommitReceiptPoisonCommandV1,
+        ) -> MetadataCommitReceiptPoisonOutcomeV1 {
+            let command = command.claim_execution();
+            let result = {
+                let planned = command.planned();
+                let reason = command.reason();
+                let mut state = self.state.lock().unwrap();
+                match &*state {
+                    MetadataCommitReceiptStateV1::Pending(durable) if durable == planned => {
+                        *state = match reason {
+                            MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome => {
+                                MetadataCommitReceiptStateV1::PoisonedSettled(planned.clone())
+                            }
+                            MetadataCommitReceiptPoisonReasonV1::UnsettledCommitOutcome => {
+                                MetadataCommitReceiptStateV1::PoisonedUnsettled(planned.clone())
+                            }
+                        };
+                        Ok(())
+                    }
+                    MetadataCommitReceiptStateV1::PoisonedSettled(durable)
+                        if durable == planned
+                            && reason
+                                == MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome =>
+                    {
+                        Ok(())
+                    }
+                    MetadataCommitReceiptStateV1::PoisonedUnsettled(durable)
+                        if durable == planned
+                            && reason
+                                == MetadataCommitReceiptPoisonReasonV1::UnsettledCommitOutcome =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(MetadataCommitReceiptErrorV1::InvalidBinding),
+                }
+            };
+            command.complete(receipt_mutation_backend_result(result))
+        }
+    }
+
+    fn receipt_mutation_backend_result(
+        result: Result<(), MetadataCommitReceiptErrorV1>,
+    ) -> MetadataCommitReceiptMutationBackendResultV1 {
+        match result {
+            Ok(()) => MetadataCommitReceiptMutationBackendResultV1::Completed,
+            Err(MetadataCommitReceiptErrorV1::Poisoned) => {
+                MetadataCommitReceiptMutationBackendResultV1::NotDispatched(
+                    MetadataCommitReceiptMutationNotDispatchedV1::Poisoned,
+                )
+            }
+            Err(MetadataCommitReceiptErrorV1::InvalidBinding) => {
+                MetadataCommitReceiptMutationBackendResultV1::NotDispatched(
+                    MetadataCommitReceiptMutationNotDispatchedV1::InvalidBinding,
+                )
+            }
+            Err(MetadataCommitReceiptErrorV1::Unavailable) => {
+                MetadataCommitReceiptMutationBackendResultV1::OutcomeUnknown
+            }
+        }
+    }
+
+    impl HoltRuntimeGuard for RecordingRuntimeBundle {
+        fn bind_store(
+            &self,
+            _identity: &HoltStoreObjectIdentity,
+        ) -> Result<(), HoltRuntimeGuardError> {
+            if self.runtime_poisoned.load(Ordering::Acquire) {
+                Err(HoltRuntimeGuardError::Poisoned)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn validate_runtime(&self) -> Result<(), HoltRuntimeGuardError> {
+            if self.runtime_poisoned.load(Ordering::Acquire) {
+                Err(HoltRuntimeGuardError::Poisoned)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn poison(&self) {
+            self.runtime_poisoned.store(true, Ordering::Release);
+        }
+    }
 
     fn shard(fill: u8) -> LogicalShardId {
         LogicalShardId::from_bytes([fill; 16])
@@ -2950,8 +6696,104 @@ mod tests {
         OwnerEpoch::new(value).unwrap()
     }
 
+    fn single_shard_install() -> RootFenceAction {
+        RootFenceAction::Install {
+            layout_profile: RootLayoutProfile::SingleShardRoot,
+            layout_generation: RootLayoutGeneration::new(1).unwrap(),
+            partition_id: RootPartitionId::SINGLE_SHARD,
+        }
+    }
+
+    fn explicit_identity(shard_fill: u8, authority_fill: u8) -> MetadataStoreIdentity {
+        MetadataStoreIdentity {
+            logical_shard_id: shard(shard_fill),
+            authority_id: nokv_types::MetadataAuthorityId::from_bytes([authority_fill; 16]),
+            authority_generation: nokv_types::MetadataAuthorityGeneration::new(3).unwrap(),
+            consistency_domain_id: nokv_types::ConsistencyDomainId::from_bytes([0x44; 16]),
+            profile_fingerprint: [0x55; 32],
+            contract_digest: workspace_metadata_contract_digest(),
+        }
+    }
+
+    fn persisted_origin_for_test(
+        authority: &MetadataCommitEngineMintAuthorityV1,
+        planned: &PlannedMetadataCommitV1,
+    ) -> MetadataCommitLiveResolutionOriginV1 {
+        let (command, witness) = MetadataCommitReceiptPersistCommandV1::mint(authority, planned);
+        command
+            .claim_execution()
+            .complete(MetadataCommitReceiptPersistBackendResultV1::Persisted)
+            .into_live_resolution_origin_for(witness)
+            .unwrap()
+    }
+
+    fn poisoned_origin_for_test(
+        authority: &MetadataCommitEngineMintAuthorityV1,
+        planned: &PlannedMetadataCommitV1,
+        reason: MetadataCommitReceiptPoisonReasonV1,
+    ) -> MetadataCommitLiveResolutionOriginV1 {
+        let origin = persisted_origin_for_test(authority, planned);
+        let (command, witness) =
+            MetadataCommitReceiptPoisonCommandV1::mint(authority, origin, reason).unwrap();
+        command
+            .claim_execution()
+            .complete(MetadataCommitReceiptMutationBackendResultV1::Completed)
+            .into_live_resolution_origin_for(witness)
+            .unwrap()
+    }
+
+    fn open_explicit_memory(
+        identity: MetadataStoreIdentity,
+    ) -> Result<AgentMetadataStore, AgentMetadataError> {
+        AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+            RecordingRuntimeBundle::memory(identity),
+            identity,
+            CreateRecoveryIntentV1::Fresh,
+            MetadataStoreCreateModeV1::Active,
+        )
+    }
+
     fn scoped_key(root: RootId, suffix: &[u8]) -> Vec<u8> {
         [root.as_bytes().as_slice(), suffix].concat()
+    }
+
+    fn raw_put(store: &AgentMetadataStore, space: OrderedSpaceId, key: &[u8], value: &[u8]) {
+        let transaction = store.provider.begin_write().unwrap();
+        let plan = AtomicPlan {
+            operations: vec![AtomicOp::Put {
+                space,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+        };
+        assert_eq!(
+            transaction.commit(plan).unwrap(),
+            AtomicCommitOutcome::Committed
+        );
+    }
+
+    fn raw_delete(store: &AgentMetadataStore, space: OrderedSpaceId, key: &[u8]) {
+        let transaction = store.provider.begin_write().unwrap();
+        let plan = AtomicPlan {
+            operations: vec![AtomicOp::Delete {
+                space,
+                key: key.to_vec(),
+            }],
+        };
+        assert_eq!(
+            transaction.commit(plan).unwrap(),
+            AtomicCommitOutcome::Committed
+        );
+    }
+
+    fn digest_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").unwrap();
+        }
+        encoded
     }
 
     fn base_command(
@@ -2982,14 +6824,195 @@ mod tests {
         make_store_ready(store)
     }
 
+    fn current_target_activation_token(store: &AgentMetadataStore) -> TargetActivationToken {
+        let transaction = store.provider.begin_write().unwrap();
+        let recovery_lsn = required_record(
+            transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+            "System(applied_recovery_lsn)",
+        )
+        .unwrap();
+        let chain_digest = required_record(
+            transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+            "System(recovery_chain_digest)",
+        )
+        .unwrap();
+        let commit_clock = required_record(
+            transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_COMMIT_CLOCK_KEY,
+            "System(commit_clock)",
+        )
+        .unwrap();
+        let receipt = SourceQuiesceReceipt {
+            logical_shard_id: store.identity.logical_shard_id,
+            migration_id: OperationId::from_bytes([0x33; 16]),
+            source_authority_id: nokv_types::MetadataAuthorityId::from_bytes([0x44; 16]),
+            source_authority_generation: nokv_types::MetadataAuthorityGeneration::new(1).unwrap(),
+            owner_epoch: epoch(1),
+            frontier: MetadataRecoveryFrontier {
+                recovery_lsn: decode_system_u64(
+                    &recovery_lsn.value,
+                    "System(applied_recovery_lsn)",
+                )
+                .unwrap(),
+                chain_digest: decode_system_digest(
+                    &chain_digest.value,
+                    "System(recovery_chain_digest)",
+                )
+                .unwrap(),
+                commit_version: CommitVersion::new(
+                    decode_system_u64(&commit_clock.value, "System(commit_clock)").unwrap(),
+                )
+                .unwrap(),
+                state_digest: logical_state_digest(transaction.as_ref()).unwrap(),
+            },
+            contract_digest: store.identity.contract_digest,
+        };
+        TargetActivationToken::for_cutover(
+            &receipt,
+            store.identity.authority_id,
+            store.identity.authority_generation,
+        )
+    }
+
+    fn migration_target_binding(identity: MetadataStoreIdentity) -> MetadataMigrationTargetBinding {
+        MetadataMigrationTargetBinding {
+            logical_shard_id: identity.logical_shard_id,
+            migration_id: OperationId::from_bytes([0x33; 16]),
+            source_authority_id: nokv_types::MetadataAuthorityId::from_bytes([0x44; 16]),
+            source_authority_generation: nokv_types::MetadataAuthorityGeneration::new(1).unwrap(),
+            target_authority_id: identity.authority_id,
+            target_authority_generation: identity.authority_generation,
+            contract_digest: identity.contract_digest,
+        }
+    }
+
+    fn open_migration_target_memory(
+        identity: MetadataStoreIdentity,
+        binding: MetadataMigrationTargetBinding,
+    ) -> Result<AgentMetadataStore, AgentMetadataError> {
+        validate_migration_target_binding(identity, binding)?;
+        AgentMetadataStore::open_memory_with_marker(
+            RecordingRuntimeBundle::memory(identity),
+            identity,
+            MetadataAuthorityMarker {
+                evidence: MetadataAuthorityEvidence::MigrationTargetBinding(binding),
+                ..MetadataAuthorityMarker::for_identity(
+                    identity,
+                    MetadataAuthorityState::MigrationTarget,
+                )
+            },
+        )
+    }
+
     fn ready_file_store(path: &std::path::Path) -> AgentMetadataStore {
         let store = AgentMetadataStore::create_file(path, shard(1)).unwrap();
         make_store_ready(store)
     }
 
+    #[cfg(unix)]
+    fn held_holt_store_identity(path: &Path) -> HoltStoreObjectIdentity {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let canonical_locator = std::fs::canonicalize(path).unwrap();
+        let directory = std::fs::symlink_metadata(&canonical_locator).unwrap();
+        let lock = std::fs::symlink_metadata(canonical_locator.join("store.lock")).unwrap();
+        HoltStoreObjectIdentity::from_parts(
+            canonical_locator,
+            directory.dev(),
+            directory.ino(),
+            lock.dev(),
+            lock.ino(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn leave_pending_prior_at_path(
+        path: &Path,
+        identity: MetadataStoreIdentity,
+        request_id: RequestId,
+    ) -> (
+        Arc<Mutex<MetadataCommitReceiptStateV1>>,
+        PlannedMetadataCommitV1,
+    ) {
+        let runtime_bundle = RecordingRuntimeBundle::file(path, identity);
+        let store = make_store_ready(
+            AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+                CreateRecoveryIntentV1::Fresh,
+                MetadataStoreCreateModeV1::Active,
+            )
+            .unwrap(),
+        );
+        let command = create_command(
+            &store,
+            request_id,
+            scoped_key(root(2), b"dirty-prior-recovery"),
+            b"value",
+        );
+        runtime_bundle.swap_next_persist_outcome();
+        assert_eq!(
+            store.execute(&command),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        );
+        let planned = match runtime_bundle.state.lock().unwrap().clone() {
+            MetadataCommitReceiptStateV1::Pending(planned) => planned,
+            state => panic!("expected pending receipt, found {state:?}"),
+        };
+        let state = Arc::clone(&runtime_bundle.state);
+        drop(store);
+        drop(runtime_bundle);
+        (state, planned)
+    }
+
+    #[cfg(unix)]
+    fn leave_pending_exact_next_at_path(
+        path: &Path,
+        identity: MetadataStoreIdentity,
+        request_id: RequestId,
+    ) -> (
+        Arc<Mutex<MetadataCommitReceiptStateV1>>,
+        PlannedMetadataCommitV1,
+    ) {
+        let runtime_bundle = RecordingRuntimeBundle::file(path, identity);
+        let store = make_store_ready(
+            AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+                CreateRecoveryIntentV1::Fresh,
+                MetadataStoreCreateModeV1::Active,
+            )
+            .unwrap(),
+        );
+        let command = create_command(
+            &store,
+            request_id,
+            scoped_key(root(2), b"dirty-next-recovery"),
+            b"value",
+        );
+        runtime_bundle.reject_next_resolve();
+        assert_eq!(
+            store.execute(&command),
+            Err(AgentMetadataError::CommitOutcomeUnknown)
+        );
+        let planned = match runtime_bundle.state.lock().unwrap().clone() {
+            MetadataCommitReceiptStateV1::Pending(planned) => planned,
+            state => panic!("expected pending receipt, found {state:?}"),
+        };
+        let state = Arc::clone(&runtime_bundle.state);
+        drop(store);
+        drop(runtime_bundle);
+        (state, planned)
+    }
+
     fn make_store_ready(store: AgentMetadataStore) -> AgentMetadataStore {
         store.advance_owner_epoch(None, epoch(1)).unwrap();
-        let install = base_command(&store, request(1), RootFenceAction::Install).seal();
+        let install = base_command(&store, request(1), single_shard_install()).seal();
         let installed = store.execute(&install).unwrap();
         assert_eq!(installed.commit_version.get(), 2);
         let activate = base_command(
@@ -3060,9 +7083,464 @@ mod tests {
     }
 
     #[test]
+    fn exact_command_replay_does_not_advance_the_durable_receipt() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("metadata");
+        let identity = explicit_identity(1, 2);
+        let runtime_bundle = RecordingRuntimeBundle::file(&path, identity);
+        let store = make_store_ready(
+            AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+                CreateRecoveryIntentV1::Fresh,
+                MetadataStoreCreateModeV1::Active,
+            )
+            .unwrap(),
+        );
+        let command = create_command(
+            &store,
+            request(3),
+            scoped_key(root(2), b"ack-replay"),
+            b"value",
+        );
+        let first = store.execute(&command).unwrap();
+        assert!(!first.replayed);
+        let receipt = runtime_bundle.state.lock().unwrap().clone();
+        let persist_count = runtime_bundle.persist_count();
+        let resolve_count = runtime_bundle.resolve_count();
+
+        let replay = store.execute(&command).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, first.commit_version);
+        assert_eq!(*runtime_bundle.state.lock().unwrap(), receipt);
+        assert_eq!(runtime_bundle.persist_count(), persist_count);
+        assert_eq!(runtime_bundle.resolve_count(), resolve_count);
+    }
+
+    #[test]
+    fn diagnostic_view_holds_the_acknowledgement_gate_for_its_full_lifetime() {
+        let identity = explicit_identity(1, 2);
+        let runtime_bundle = RecordingRuntimeBundle::memory(identity);
+        let store = make_store_ready(
+            AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+                CreateRecoveryIntentV1::Fresh,
+                MetadataStoreCreateModeV1::Active,
+            )
+            .unwrap(),
+        );
+        let command = create_command(
+            &store,
+            request(18),
+            scoped_key(root(2), b"diagnostic-view-gate"),
+            b"value",
+        );
+        let diagnostic = store
+            .begin_diagnostic_read(&[ReadScope {
+                space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                prefix: Vec::new(),
+            }])
+            .unwrap();
+        let persist_before = runtime_bundle.persist_count();
+        let writer_store = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = writer_store.execute(&command);
+            finished_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(runtime_bundle.persist_count(), persist_before);
+
+        drop(diagnostic);
+        assert!(finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+        writer.join().unwrap();
+        assert_eq!(runtime_bundle.persist_count(), persist_before + 1);
+    }
+
+    #[test]
+    fn pending_persist_failure_precedes_the_provider_effect() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("metadata");
+        let identity = explicit_identity(1, 2);
+        let runtime_bundle = RecordingRuntimeBundle::file(&path, identity);
+        let store = make_store_ready(
+            AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+                CreateRecoveryIntentV1::Fresh,
+                MetadataStoreCreateModeV1::Active,
+            )
+            .unwrap(),
+        );
+        let command = create_command(
+            &store,
+            request(3),
+            scoped_key(root(2), b"blocked-before-provider-effect"),
+            b"must-not-apply",
+        );
+        runtime_bundle.reject_persist();
+
+        assert!(matches!(
+            store.execute(&command),
+            Err(AgentMetadataError::ProviderUnavailable { .. })
+        ));
+        assert!(store.current_read_version().is_ok());
+        assert!(matches!(
+            *runtime_bundle.state.lock().unwrap(),
+            MetadataCommitReceiptStateV1::Clean { .. }
+        ));
+    }
+
+    #[test]
+    fn foreign_persist_outcome_after_pending_requires_recovery_and_fail_stops_clones() {
+        let identity = explicit_identity(1, 2);
+        let runtime_bundle = RecordingRuntimeBundle::memory(identity);
+        let store = make_store_ready(
+            AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+                CreateRecoveryIntentV1::Fresh,
+                MetadataStoreCreateModeV1::Active,
+            )
+            .unwrap(),
+        );
+        let clone = store.clone();
+        let command = create_command(
+            &store,
+            request(19),
+            scoped_key(root(2), b"foreign-persist-outcome"),
+            b"value",
+        );
+        runtime_bundle.swap_next_persist_outcome();
+
+        assert_eq!(
+            store.execute(&command),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        );
+        assert!(matches!(
+            &*runtime_bundle.state.lock().unwrap(),
+            MetadataCommitReceiptStateV1::Pending(_)
+        ));
+        assert!(store.current_read_version().is_err());
+        assert!(clone.current_read_version().is_err());
+
+        let calls_before_recovery_attempts = runtime_bundle.provider_call_counts();
+        assert!(matches!(
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+            ),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        ));
+        assert!(matches!(
+            AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+                CreateRecoveryIntentV1::ReconcilePrepared,
+                MetadataStoreCreateModeV1::Active,
+            ),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        ));
+        assert_eq!(
+            runtime_bundle.provider_call_counts(),
+            calls_before_recovery_attempts,
+            "unsupported dirty recovery must not call ordinary or typed provider open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_and_unsettled_exact_prior_stay_dirty_under_reserved_exclusion() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("metadata");
+        let identity = explicit_identity(1, 2);
+        let (state, planned) = leave_pending_prior_at_path(&path, identity, request(21));
+
+        let first_reservation =
+            acquire_existing_file_store_reservation_v1(held_holt_store_identity(&path)).unwrap();
+        let pending_recovery = RecordingRuntimeBundle::reserved_existing_with_state(
+            first_reservation,
+            identity,
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(
+                pending_recovery.clone(),
+                identity,
+            ),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        ));
+        assert_eq!(pending_recovery.provider_call_counts(), (0, 0, 0, 1));
+        assert!(matches!(
+            &*state.lock().unwrap(),
+            MetadataCommitReceiptStateV1::Pending(durable) if durable == &planned
+        ));
+        drop(pending_recovery);
+
+        *state.lock().unwrap() = MetadataCommitReceiptStateV1::PoisonedUnsettled(planned.clone());
+        let second_reservation =
+            acquire_existing_file_store_reservation_v1(held_holt_store_identity(&path)).unwrap();
+        let unsettled_recovery = RecordingRuntimeBundle::reserved_existing_with_state(
+            second_reservation,
+            identity,
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(
+                unsettled_recovery.clone(),
+                identity,
+            ),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        ));
+        assert_eq!(unsettled_recovery.provider_call_counts(), (0, 0, 0, 1));
+        assert!(matches!(
+            &*state.lock().unwrap(),
+            MetadataCommitReceiptStateV1::PoisonedUnsettled(durable) if durable == &planned
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settled_exact_prior_closes_but_only_a_new_allocation_can_serve() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("metadata");
+        let identity = explicit_identity(1, 2);
+        let (state, planned) = leave_pending_prior_at_path(&path, identity, request(22));
+        *state.lock().unwrap() = MetadataCommitReceiptStateV1::PoisonedSettled(planned.clone());
+
+        let reservation =
+            acquire_existing_file_store_reservation_v1(held_holt_store_identity(&path)).unwrap();
+        let recovery_bundle = RecordingRuntimeBundle::reserved_existing_with_state(
+            reservation,
+            identity,
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(
+                recovery_bundle.clone(),
+                identity,
+            ),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        ));
+        assert_eq!(recovery_bundle.provider_call_counts(), (0, 0, 0, 1));
+        assert!(matches!(
+            &*state.lock().unwrap(),
+            MetadataCommitReceiptStateV1::Clean { frontier, .. } if *frontier == planned.prior()
+        ));
+        drop(recovery_bundle);
+
+        let serving_bundle =
+            RecordingRuntimeBundle::file_with_state(&path, identity, Arc::clone(&state));
+        let serving =
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(serving_bundle, identity)
+                .unwrap();
+        assert_eq!(
+            serving.current_read_version().unwrap().get(),
+            planned.prior().exact().unwrap().commit_version.get()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_next_closes_but_dirty_recovery_allocation_never_serves() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("metadata");
+        let identity = explicit_identity(1, 2);
+        let (state, planned) = leave_pending_exact_next_at_path(&path, identity, request(23));
+
+        let reservation =
+            acquire_existing_file_store_reservation_v1(held_holt_store_identity(&path)).unwrap();
+        let recovery_bundle = RecordingRuntimeBundle::reserved_existing_with_state(
+            reservation,
+            identity,
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(
+                recovery_bundle.clone(),
+                identity,
+            ),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        ));
+        assert_eq!(recovery_bundle.provider_call_counts(), (0, 0, 0, 1));
+        assert!(matches!(
+            &*state.lock().unwrap(),
+            MetadataCommitReceiptStateV1::Clean {
+                frontier: MetadataFrontierPointV1::Exact(frontier),
+                ..
+            } if *frontier == planned.exact_next()
+        ));
+        drop(recovery_bundle);
+
+        let serving_bundle =
+            RecordingRuntimeBundle::file_with_state(&path, identity, Arc::clone(&state));
+        let serving =
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(serving_bundle, identity)
+                .unwrap();
+        assert_eq!(
+            serving.current_read_version().unwrap().get(),
+            planned.exact_next().commit_version.get()
+        );
+    }
+
+    #[test]
+    fn unsettled_poison_is_sticky_against_settled_poison_and_prior_resolution() {
+        let identity = explicit_identity(1, 2);
+        let runtime_bundle = RecordingRuntimeBundle::memory(identity);
+        let store = make_store_ready(
+            AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                identity,
+                CreateRecoveryIntentV1::Fresh,
+                MetadataStoreCreateModeV1::Active,
+            )
+            .unwrap(),
+        );
+        let command = create_command(
+            &store,
+            request(20),
+            scoped_key(root(2), b"sticky-unsettled-poison"),
+            b"value",
+        );
+        runtime_bundle.swap_next_persist_outcome();
+        assert_eq!(
+            store.execute(&command),
+            Err(AgentMetadataError::CommitReceiptRecoveryRequired)
+        );
+        let planned = match runtime_bundle.state.lock().unwrap().clone() {
+            MetadataCommitReceiptStateV1::Pending(planned) => planned,
+            state => panic!("expected pending receipt, found {state:?}"),
+        };
+
+        let authority = MetadataCommitEngineMintAuthorityV1::for_test();
+        let pending_origin = persisted_origin_for_test(&authority, &planned);
+        let (unsettled, unsettled_witness) = MetadataCommitReceiptPoisonCommandV1::mint(
+            &authority,
+            pending_origin,
+            MetadataCommitReceiptPoisonReasonV1::UnsettledCommitOutcome,
+        )
+        .unwrap();
+        let unsettled_origin = runtime_bundle
+            .poison_commit_receipt_v1(unsettled)
+            .into_live_resolution_origin_for(unsettled_witness)
+            .unwrap();
+
+        assert!(matches!(
+            MetadataCommitReceiptResolveCommandV1::mint_live(
+                &authority,
+                unsettled_origin,
+                MetadataCommitResolutionV1::not_applied_settled(
+                    &authority,
+                    planned.prior(),
+                    [0x61; 32],
+                ),
+            ),
+            Err(MetadataCommitReceiptErrorV1::InvalidBinding)
+        ));
+        let second_unsettled_origin = poisoned_origin_for_test(
+            &authority,
+            &planned,
+            MetadataCommitReceiptPoisonReasonV1::UnsettledCommitOutcome,
+        );
+        assert!(matches!(
+            MetadataCommitReceiptPoisonCommandV1::mint(
+                &authority,
+                second_unsettled_origin,
+                MetadataCommitReceiptPoisonReasonV1::SettledCommitOutcome,
+            ),
+            Err(MetadataCommitReceiptErrorV1::InvalidBinding)
+        ));
+        assert!(matches!(
+            &*runtime_bundle.state.lock().unwrap(),
+            MetadataCommitReceiptStateV1::PoisonedUnsettled(durable) if durable == &planned
+        ));
+    }
+
+    #[test]
+    fn concurrent_post_commit_fail_stop_preserves_settlement_classification() {
+        for delegate_result in [
+            BarrierCommitResult::Committed,
+            BarrierCommitResult::BackendError,
+            BarrierCommitResult::UnknownUnsettled,
+        ] {
+            let barrier = Arc::new(Barrier::new(2));
+            let fail_stop = Arc::new(MetadataStoreFailStop::default());
+            let commit_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let read_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let transaction = Box::new(FailStopMetadataTransaction {
+                delegate: Box::new(BarrierCommitTransaction {
+                    barrier: Arc::clone(&barrier),
+                    commit_calls: Arc::clone(&commit_calls),
+                    read_calls: Arc::clone(&read_calls),
+                    result: delegate_result,
+                }),
+                fail_stop: Arc::clone(&fail_stop),
+            });
+            let blocked_transaction = Box::new(FailStopMetadataTransaction {
+                delegate: Box::new(BarrierCommitTransaction {
+                    barrier: Arc::clone(&barrier),
+                    commit_calls: Arc::clone(&commit_calls),
+                    read_calls: Arc::clone(&read_calls),
+                    result: delegate_result,
+                }),
+                fail_stop: Arc::clone(&fail_stop),
+            });
+
+            let commit = thread::spawn(move || transaction.commit(AtomicPlan::default()));
+            barrier.wait();
+            fail_stop.trip();
+            barrier.wait();
+
+            let error = commit.join().unwrap().unwrap_err();
+            let expected = match delegate_result {
+                BarrierCommitResult::UnknownUnsettled => ProviderErrorKind::UnknownCommitUnsettled,
+                BarrierCommitResult::Committed | BarrierCommitResult::BackendError => {
+                    ProviderErrorKind::UnknownCommitSettled
+                }
+            };
+            assert_eq!(error.kind(), expected);
+            assert_eq!(commit_calls.load(Ordering::Acquire), 1);
+            assert_eq!(
+                blocked_transaction
+                    .get(OrderedSpaceId::new(1), b"blocked")
+                    .unwrap_err()
+                    .kind(),
+                ProviderErrorKind::AuthorityMismatch
+            );
+            assert_eq!(
+                blocked_transaction
+                    .prefix_is_empty(OrderedSpaceId::new(1), b"blocked")
+                    .unwrap_err()
+                    .kind(),
+                ProviderErrorKind::AuthorityMismatch
+            );
+            assert_eq!(
+                blocked_transaction
+                    .commit(AtomicPlan::default())
+                    .unwrap_err()
+                    .kind(),
+                ProviderErrorKind::AuthorityMismatch
+            );
+            assert_eq!(read_calls.load(Ordering::Acquire), 0);
+            assert_eq!(commit_calls.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
         let store = AgentMetadataStore::open_memory(shard(1)).unwrap();
-        let mut actual = store.db.list_trees().unwrap();
+        let provider = HoltProvider::open_memory(shard(1)).unwrap();
+        let mut actual = provider.tree_names().unwrap();
         actual.sort();
         let mut expected = SCHEMA_TREES
             .iter()
@@ -3086,22 +7564,531 @@ mod tests {
     fn file_reopen_rejects_a_different_logical_shard() {
         let temporary = tempdir().unwrap();
         let database = temporary.path().join("metadata");
+        let absolute_database = std::path::absolute(&database).unwrap();
+        let expected_identity =
+            MetadataStoreIdentity::standalone_holt_file(shard(1), &absolute_database);
         {
             let store = AgentMetadataStore::create_file(&database, shard(1)).unwrap();
+            assert_eq!(store.metadata_store_identity(), expected_identity);
             store.advance_owner_epoch(None, epoch(1)).unwrap();
         }
         assert!(matches!(
             AgentMetadataStore::reopen_file(&database, shard(2)),
-            Err(AgentMetadataError::SchemaGate { .. })
+            Err(AgentMetadataError::MetadataStoreIdentityMismatch)
         ));
         let reopened = AgentMetadataStore::reopen_file(&database, shard(1)).unwrap();
+        assert_eq!(reopened.metadata_store_identity(), expected_identity);
         assert_eq!(reopened.current_read_version().unwrap().get(), 1);
+    }
+
+    #[test]
+    fn explicit_identity_rejects_zero_fields_and_foreign_contract() {
+        let mut identity = explicit_identity(1, 2);
+        identity.authority_id = nokv_types::MetadataAuthorityId::from_bytes([0; 16]);
+        assert!(matches!(
+            open_explicit_memory(identity),
+            Err(AgentMetadataError::SchemaGate { .. })
+        ));
+
+        let mut identity = explicit_identity(1, 2);
+        identity.consistency_domain_id = nokv_types::ConsistencyDomainId::from_bytes([0; 16]);
+        assert!(matches!(
+            open_explicit_memory(identity),
+            Err(AgentMetadataError::SchemaGate { .. })
+        ));
+
+        let mut identity = explicit_identity(1, 2);
+        identity.profile_fingerprint = [0; 32];
+        assert!(matches!(
+            open_explicit_memory(identity),
+            Err(AgentMetadataError::SchemaGate { .. })
+        ));
+
+        let mut identity = explicit_identity(1, 2);
+        identity.contract_digest = nokv_types::MetadataContractDigest::from_bytes([0x99; 32]);
+        assert!(matches!(
+            open_explicit_memory(identity),
+            Err(AgentMetadataError::SchemaGate { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_reopen_requires_every_identity_field_to_match() {
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join("explicit-metadata");
+        let expected = explicit_identity(1, 2);
+        let runtime_bundle = RecordingRuntimeBundle::file(&database, expected);
+        AgentMetadataStore::create_with_runtime_commit_bundle_v1(
+            runtime_bundle.clone(),
+            expected,
+            CreateRecoveryIntentV1::Fresh,
+            MetadataStoreCreateModeV1::Active,
+        )
+        .unwrap();
+
+        let mut wrong_profile = expected;
+        wrong_profile.profile_fingerprint = [0x56; 32];
+        assert!(matches!(
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(
+                runtime_bundle.clone(),
+                wrong_profile,
+            ),
+            Err(AgentMetadataError::ProviderAuthorityMismatch { .. })
+        ));
+        let reopened =
+            AgentMetadataStore::reopen_with_runtime_commit_bundle_v1(runtime_bundle, expected)
+                .unwrap();
+        assert_eq!(reopened.metadata_store_identity(), expected);
+    }
+
+    #[test]
+    fn format_ten_store_is_rejected_without_identity_adoption() {
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join("format-ten");
+        let store = AgentMetadataStore::create_file(&database, shard(1)).unwrap();
+        let mut format_ten = encode_schema_marker();
+        let version_start = format_ten.len() - std::mem::size_of::<u32>();
+        format_ten[version_start..].copy_from_slice(&10_u32.to_be_bytes());
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_SCHEMA_KEY,
+            &format_ten,
+        );
+        drop(store);
+
+        assert!(matches!(
+            AgentMetadataStore::reopen_file(&database, shard(1)),
+            Err(AgentMetadataError::SchemaGate { .. })
+        ));
+    }
+
+    #[test]
+    fn foreign_authority_marker_fails_closed() {
+        let store = open_explicit_memory(explicit_identity(1, 2)).unwrap();
+        let foreign = MetadataAuthorityMarker {
+            authority_id: nokv_types::MetadataAuthorityId::from_bytes([0x77; 16]),
+            authority_generation: store.identity.authority_generation,
+            state: MetadataAuthorityState::Active,
+            write_sequence: 0,
+            evidence: MetadataAuthorityEvidence::None,
+        };
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_METADATA_AUTHORITY_KEY,
+            &encode_authority_marker(foreign),
+        );
+
+        assert_eq!(
+            store.metadata_authority_state(),
+            Err(AgentMetadataError::MetadataAuthorityBindingMismatch)
+        );
+        assert_eq!(
+            store.advance_owner_epoch(None, epoch(1)),
+            Err(AgentMetadataError::MetadataAuthorityBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn logical_state_digest_freezes_space_order_tags_and_key_value_framing() {
+        let store = AgentMetadataStore::open_memory(shard(1)).unwrap();
+        for (space, key, value) in [
+            (
+                crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
+                b"rf".as_slice(),
+                b"one".as_slice(),
+            ),
+            (
+                crate::workspace::provider_catalog::COMMAND_DEDUPE_SPACE,
+                b"dd".as_slice(),
+                b"two".as_slice(),
+            ),
+            (
+                crate::workspace::provider_catalog::HISTORY_SPACE,
+                b"hh".as_slice(),
+                b"three".as_slice(),
+            ),
+            (
+                crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                b"rr".as_slice(),
+                b"four".as_slice(),
+            ),
+            (
+                crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+                b"op".as_slice(),
+                b"five".as_slice(),
+            ),
+        ] {
+            raw_put(&store, space, key, value);
+        }
+        let transaction = store.provider.begin_write().unwrap();
+        let digest = logical_state_digest(transaction.as_ref()).unwrap();
+        assert_eq!(
+            digest_hex(&digest),
+            "f8f8371b3e3c363426287e2ff4a3f0a359c69caf81f63d2bd0acddcd651e9bd5"
+        );
+
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            b"provider-local-test-record",
+            b"ignored",
+        );
+        let transaction = store.provider.begin_write().unwrap();
+        assert_eq!(
+            logical_state_digest(transaction.as_ref()).unwrap(),
+            digest,
+            "provider-local System records are intentionally outside logical migration state"
+        );
+
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+            b"op",
+            b"changed",
+        );
+        let transaction = store.provider.begin_write().unwrap();
+        assert_ne!(logical_state_digest(transaction.as_ref()).unwrap(), digest);
+
+        let tags = logical_state_spaces()
+            .into_iter()
+            .map(logical_state_space_tag)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &tags[..5],
+            &[
+                [0x01, 0x02],
+                [0x01, 0x03],
+                [0x01, 0x04],
+                [0x01, 0x05],
+                [0x01, 0x06]
+            ]
+        );
+        assert_eq!(tags.len(), 5 + MetadataFamily::ALL.len());
+    }
+
+    #[test]
+    fn migration_target_rejects_ordinary_writes_and_can_be_abandoned() {
+        let identity = explicit_identity(1, 2);
+        let target =
+            open_migration_target_memory(identity, migration_target_binding(identity)).unwrap();
+        let command = base_command(&target, request(1), single_shard_install()).seal();
+        let state_error = AgentMetadataError::MetadataAuthorityStateMismatch {
+            expected: MetadataAuthorityState::Active,
+            actual: MetadataAuthorityState::MigrationTarget,
+        };
+        assert_eq!(target.execute(&command), Err(state_error.clone()));
+        assert_eq!(
+            target.advance_owner_epoch(None, epoch(1)),
+            Err(state_error.clone())
+        );
+        assert_eq!(
+            target.observe_lease_clock(root(2), generation(7), epoch(1), 1),
+            Err(state_error)
+        );
+        target.fence_migration_target().unwrap();
+        target.fence_migration_target().unwrap();
+        let token = current_target_activation_token(&target);
+        assert_eq!(
+            target.advance_owner_epoch(None, epoch(1)),
+            Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected: MetadataAuthorityState::Active,
+                actual: MetadataAuthorityState::Fenced,
+            })
+        );
+        assert_eq!(
+            target.activate_migration_target(&token),
+            Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected: MetadataAuthorityState::MigrationTarget,
+                actual: MetadataAuthorityState::Fenced,
+            })
+        );
+
+        let activated =
+            open_migration_target_memory(identity, migration_target_binding(identity)).unwrap();
+        let token = current_target_activation_token(&activated);
+        let mut foreign_migration = token;
+        foreign_migration.migration_id = OperationId::from_bytes([0x34; 16]);
+        assert!(matches!(
+            activated.activate_migration_target(&foreign_migration),
+            Err(AgentMetadataError::MetadataMigrationAdmission { .. })
+        ));
+        let mut stale_source = token;
+        stale_source.source_authority_generation =
+            nokv_types::MetadataAuthorityGeneration::new(2).unwrap();
+        assert!(matches!(
+            activated.activate_migration_target(&stale_source),
+            Err(AgentMetadataError::MetadataMigrationAdmission { .. })
+        ));
+        let mut uncopied_frontier = token;
+        uncopied_frontier.frontier.state_digest = [0xee; 32];
+        assert!(matches!(
+            activated.activate_migration_target(&uncopied_frontier),
+            Err(AgentMetadataError::MetadataMigrationAdmission { .. })
+        ));
+        activated.activate_migration_target(&token).unwrap();
+        activated.activate_migration_target(&token).unwrap();
+        activated.advance_owner_epoch(None, epoch(1)).unwrap();
+    }
+
+    #[test]
+    fn quiesce_rejects_ordinary_writes_and_conflicts_a_stale_plan() {
+        let store = ready_store();
+        let stale_transaction = store.provider.begin_write().unwrap();
+        let authority = required_record(
+            stale_transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_METADATA_AUTHORITY_KEY,
+            "System(metadata_authority)",
+        )
+        .unwrap();
+        let stale_key = scoped_key(root(2), b"stale-authority-plan");
+        let stale_plan = AtomicPlan {
+            operations: vec![
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_METADATA_AUTHORITY_KEY.to_vec(),
+                    witness: authority.witness,
+                },
+                AtomicOp::Put {
+                    space: crate::workspace::provider_catalog::domain_space(
+                        MetadataFamily::Operation,
+                    ),
+                    key: stale_key,
+                    value: CurrentValue {
+                        created_version: CommitVersion::new(4).unwrap(),
+                        modified_version: CommitVersion::new(4).unwrap(),
+                        payload: b"must-not-commit".to_vec(),
+                    }
+                    .encode()
+                    .unwrap(),
+                },
+            ],
+        };
+
+        let receipt = store
+            .quiesce_metadata_authority(OperationId::from_bytes([0x33; 16]), epoch(1))
+            .unwrap();
+        assert_eq!(
+            store
+                .quiesce_metadata_authority(OperationId::from_bytes([0x33; 16]), epoch(1))
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            stale_transaction.commit(stale_plan).unwrap(),
+            AtomicCommitOutcome::Conflict
+        );
+        let command = create_command(
+            &store,
+            request(9),
+            scoped_key(root(2), b"after-quiesce"),
+            b"value",
+        );
+        assert_eq!(
+            store.execute(&command),
+            Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected: MetadataAuthorityState::Active,
+                actual: MetadataAuthorityState::Quiescing,
+            })
+        );
+        assert_eq!(
+            store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
+            Err(AgentMetadataError::MetadataAuthorityStateMismatch {
+                expected: MetadataAuthorityState::Active,
+                actual: MetadataAuthorityState::Quiescing,
+            })
+        );
+        store.fence_quiesced_metadata_authority(&receipt).unwrap();
+        store.fence_quiesced_metadata_authority(&receipt).unwrap();
+        assert_eq!(
+            store.metadata_authority_state().unwrap(),
+            MetadataAuthorityState::Fenced
+        );
+    }
+
+    #[test]
+    fn source_write_between_receipt_scan_and_barrier_forces_quiesce_retry() {
+        let store = ready_store();
+        let migration_id = OperationId::from_bytes([0x35; 16]);
+        let transaction = store.provider.begin_write().unwrap();
+        let schema = required_record(
+            transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_SCHEMA_KEY,
+            "System(schema)",
+        )
+        .unwrap();
+        let (identity, authority, marker) =
+            store.required_authority_from(transaction.as_ref()).unwrap();
+        let owner = required_record(
+            transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_OWNER_FENCE_KEY,
+            "System(owner_fence)",
+        )
+        .unwrap();
+        let recovery_lsn = required_record(
+            transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+            "System(applied_recovery_lsn)",
+        )
+        .unwrap();
+        let chain_digest = required_record(
+            transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+            "System(recovery_chain_digest)",
+        )
+        .unwrap();
+        let commit_clock = required_record(
+            transaction.as_ref(),
+            crate::workspace::provider_catalog::SYSTEM_SPACE,
+            SYSTEM_COMMIT_CLOCK_KEY,
+            "System(commit_clock)",
+        )
+        .unwrap();
+        let stale_receipt = SourceQuiesceReceipt {
+            logical_shard_id: store.identity.logical_shard_id,
+            migration_id,
+            source_authority_id: store.identity.authority_id,
+            source_authority_generation: store.identity.authority_generation,
+            owner_epoch: epoch(1),
+            frontier: MetadataRecoveryFrontier {
+                recovery_lsn: decode_system_u64(
+                    &recovery_lsn.value,
+                    "System(applied_recovery_lsn)",
+                )
+                .unwrap(),
+                chain_digest: decode_system_digest(
+                    &chain_digest.value,
+                    "System(recovery_chain_digest)",
+                )
+                .unwrap(),
+                commit_version: CommitVersion::new(
+                    decode_system_u64(&commit_clock.value, "System(commit_clock)").unwrap(),
+                )
+                .unwrap(),
+                state_digest: logical_state_digest(transaction.as_ref()).unwrap(),
+            },
+            contract_digest: store.identity.contract_digest,
+        };
+        let stale_marker = MetadataAuthorityMarker {
+            state: MetadataAuthorityState::Quiescing,
+            evidence: MetadataAuthorityEvidence::SourceQuiesceReceipt(stale_receipt),
+            ..marker
+        };
+        let stale_plan = AtomicPlan {
+            operations: vec![
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_SCHEMA_KEY.to_vec(),
+                    witness: schema.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_STORE_IDENTITY_KEY.to_vec(),
+                    witness: identity.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_OWNER_FENCE_KEY.to_vec(),
+                    witness: owner.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_APPLIED_RECOVERY_LSN_KEY.to_vec(),
+                    witness: recovery_lsn.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_RECOVERY_CHAIN_DIGEST_KEY.to_vec(),
+                    witness: chain_digest.witness,
+                },
+                AtomicOp::AssertUnchanged {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_COMMIT_CLOCK_KEY.to_vec(),
+                    witness: commit_clock.witness,
+                },
+                AtomicOp::CompareAndPut {
+                    space: crate::workspace::provider_catalog::SYSTEM_SPACE,
+                    key: SYSTEM_METADATA_AUTHORITY_KEY.to_vec(),
+                    witness: authority.witness,
+                    value: encode_authority_marker(stale_marker),
+                },
+            ],
+        };
+
+        let command = create_command(
+            &store,
+            request(0x35),
+            scoped_key(root(2), b"between-receipt-and-barrier"),
+            b"committed-before-quiesce",
+        );
+        let committed = store.execute(&command).unwrap();
+        assert_eq!(
+            committed.commit_version.get(),
+            stale_receipt.frontier.commit_version.get() + 1
+        );
+        let advanced_marker = store.required_authority_marker().unwrap();
+        assert_eq!(advanced_marker.state, MetadataAuthorityState::Active);
+        assert_eq!(advanced_marker.write_sequence, marker.write_sequence + 1);
+        assert_eq!(
+            transaction.commit(stale_plan).unwrap(),
+            AtomicCommitOutcome::Conflict,
+            "the write-sequence CAS makes the formerly unsafe interleaving retry"
+        );
+
+        let receipt = store
+            .quiesce_metadata_authority(migration_id, epoch(1))
+            .unwrap();
+        assert_eq!(receipt.frontier.commit_version, committed.commit_version);
+        assert_ne!(
+            receipt.frontier.state_digest,
+            stale_receipt.frontier.state_digest
+        );
+    }
+
+    #[test]
+    fn durable_dedupe_reconciles_unknown_outcome_after_authority_quiesce() {
+        let store = ready_store();
+        let command = create_command(
+            &store,
+            request(8),
+            scoped_key(root(2), b"authority-replay"),
+            b"value",
+        );
+        let first = store.execute(&command).unwrap();
+        let replay = store.execute(&command).unwrap();
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, first.commit_version);
+
+        store
+            .quiesce_metadata_authority(OperationId::from_bytes([0x33; 16]), epoch(1))
+            .unwrap();
+        let replay = store.execute(&command).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.commit_version, first.commit_version);
+
+        let changed = create_command(
+            &store,
+            command.request_id,
+            scoped_key(root(2), b"authority-replay"),
+            b"different-value",
+        );
+        assert_eq!(
+            store.execute(&changed),
+            Err(AgentMetadataError::RequestIdReused)
+        );
     }
 
     #[test]
     fn root_install_activate_and_stale_fences_fail_closed() {
         let store = ready_store();
-        let duplicate_install = base_command(&store, request(3), RootFenceAction::Install).seal();
+        let duplicate_install = base_command(&store, request(3), single_shard_install()).seal();
         assert_eq!(
             store.execute(&duplicate_install),
             Err(AgentMetadataError::RootFenceAlreadyInstalled)
@@ -3130,6 +8117,46 @@ mod tests {
                 actual: 2,
             })
         );
+    }
+
+    #[test]
+    fn root_layout_change_conflicts_a_stale_require_active_plan() {
+        let store = ready_store();
+        let transaction = store.provider.begin_write().unwrap();
+        let command = base_command(&store, request(90), RootFenceAction::RequireActive).seal();
+        let root_plan = store
+            .plan_root_fence(transaction.as_ref(), &command)
+            .unwrap();
+        let side_effect_key = scoped_key(root(2), b"stale-root-layout-plan");
+        let mut stale_plan = AtomicPlan::default();
+        enqueue_root_fence(&mut stale_plan, &command, &root_plan);
+        stale_plan.operations.push(AtomicOp::Put {
+            space: crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+            key: side_effect_key.clone(),
+            value: b"must-not-commit".to_vec(),
+        });
+
+        let mut changed = store.root_fence(root(2)).unwrap().unwrap();
+        changed.layout_generation = RootLayoutGeneration::new(2).unwrap();
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::ROOT_FENCE_SPACE,
+            root(2).as_bytes(),
+            &changed.encode().unwrap(),
+        );
+
+        assert_eq!(
+            transaction.commit(stale_plan).unwrap(),
+            AtomicCommitOutcome::Conflict
+        );
+        assert!(store
+            .provider
+            .get(
+                crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+                &side_effect_key,
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3192,7 +8219,12 @@ mod tests {
             &key,
             CommitVersion::new(2).unwrap(),
         );
-        store.history.put(&history_key, b"corrupt-history").unwrap();
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::HISTORY_SPACE,
+            &history_key,
+            b"corrupt-history",
+        );
 
         let value = store
             .with_fenced_point_reads(root(2), generation(7), epoch(1), None, |_, reader| {
@@ -3215,10 +8247,12 @@ mod tests {
         }
         .encode()
         .unwrap();
-        store
-            .family(MetadataFamily::Operation)
-            .put(&key, &encoded)
-            .unwrap();
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+            &key,
+            &encoded,
+        );
 
         assert!(matches!(
             store.scan_prefix_at(
@@ -3354,14 +8388,18 @@ mod tests {
         // Deliberately malformed envelopes provide an observable test seam:
         // decoding either row means the cursor or page bound was not pushed
         // into the current-version storage iteration.
-        store
-            .family(MetadataFamily::Operation)
-            .put(&before_cursor, b"corrupt-before-cursor")
-            .unwrap();
-        store
-            .family(MetadataFamily::Operation)
-            .put(&after_limit, b"corrupt-after-limit")
-            .unwrap();
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+            &before_cursor,
+            b"corrupt-before-cursor",
+        );
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+            &after_limit,
+            b"corrupt-after-limit",
+        );
 
         let version = store.current_read_version().unwrap();
         #[cfg(feature = "metadata-read-stats")]
@@ -3396,12 +8434,63 @@ mod tests {
             let stats = stats_session.finish().unwrap();
             assert_eq!(stats.scan_calls, 1);
             assert_eq!(stats.scan_cursors, 1);
-            assert_eq!(stats.holt_scan_returned_keys, 2);
-            assert!(stats.holt_scan_visited_units >= 2);
+            assert_eq!(stats.scan_returned_keys, 2);
+            assert!(stats.scan_visited_units >= 2);
             assert_eq!(stats.scan_raw_limit_stops, 1);
             assert!(stats.scan_key_bytes > 0);
             assert!(stats.scan_value_bytes > 0);
         }
+    }
+
+    #[test]
+    fn fresh_initialization_rejects_a_non_system_row_in_the_authority_namespace() {
+        let identity = explicit_identity(1, 2);
+        let provider = HoltProvider::open_memory(identity.logical_shard_id).unwrap();
+        let retained = provider.clone();
+        let transaction = provider.begin_write().unwrap();
+        let foreign_key = b"preexisting-domain-row".to_vec();
+        assert_eq!(
+            transaction
+                .commit(AtomicPlan {
+                    operations: vec![AtomicOp::Put {
+                        space: crate::workspace::provider_catalog::domain_space(
+                            MetadataFamily::Operation
+                        ),
+                        key: foreign_key.clone(),
+                        value: b"must-survive".to_vec(),
+                    }],
+                })
+                .unwrap(),
+            AtomicCommitOutcome::Committed
+        );
+
+        assert!(matches!(
+            AgentMetadataStore::initialize_fresh(
+                Arc::new(provider),
+                identity,
+                MetadataAuthorityMarker::for_identity(identity, MetadataAuthorityState::Active,),
+                RecordingRuntimeBundle::memory(identity),
+            ),
+            Err(AgentMetadataError::SchemaGate { .. })
+        ));
+        assert_eq!(
+            retained
+                .get(
+                    crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+                    &foreign_key,
+                )
+                .unwrap()
+                .unwrap()
+                .value,
+            b"must-survive"
+        );
+        assert!(retained
+            .get(
+                crate::workspace::provider_catalog::SYSTEM_SPACE,
+                SYSTEM_SCHEMA_KEY
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(feature = "metadata-read-stats")]
@@ -3476,10 +8565,12 @@ mod tests {
             .unwrap();
         // A delimiter rollup must skip this nested subtree without decoding
         // its value. A recursive scan would fail closed on this envelope.
-        store
-            .family(MetadataFamily::Operation)
-            .put(&nested_a, b"corrupt-nested-value")
-            .unwrap();
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+            &nested_a,
+            b"corrupt-nested-value",
+        );
         drop(store);
         let store = AgentMetadataStore::reopen_file(&database, shard(1)).unwrap();
         #[cfg(feature = "metadata-read-stats")]
@@ -3542,17 +8633,20 @@ mod tests {
             let stats = stats_session.finish().unwrap();
             assert_eq!(stats.scan_calls, 2);
             assert_eq!(stats.scan_cursors, 2);
-            assert!(stats.holt_scan_common_prefixes >= 1);
+            assert!(stats.scan_common_prefixes >= 1);
             assert!(
-                stats.holt_cache_hits
-                    + stats.holt_cache_misses
-                    + stats.holt_full_blob_reads
-                    + stats.holt_read_page_hits
-                    + stats.holt_read_page_misses
-                    + stats.holt_read_index_cache_hits
-                    + stats.holt_read_index_cache_misses
+                [
+                    stats.provider_cache_hits,
+                    stats.provider_cache_misses,
+                    stats.provider_full_read_operations,
+                    stats.provider_partial_read_cache_hits,
+                    stats.provider_partial_read_cache_misses,
+                ]
+                .into_iter()
+                .flatten()
+                .sum::<u64>()
                     > 0,
-                "file-backed read session should expose Holt read activity"
+                "file-backed read session should expose provider read activity"
             );
         }
     }
@@ -3672,10 +8766,12 @@ mod tests {
                 b"advance-clock",
             ))
             .unwrap();
-        store
-            .family(MetadataFamily::Operation)
-            .put(&corrupt_tail, b"corrupt-historical-tail")
-            .unwrap();
+        raw_put(
+            &store,
+            crate::workspace::provider_catalog::domain_space(MetadataFamily::Operation),
+            &corrupt_tail,
+            b"corrupt-historical-tail",
+        );
 
         assert!(matches!(
             store.scan_prefix_at(
@@ -3932,7 +9028,7 @@ mod tests {
     fn command_size_bounds_fit_holt_envelopes_and_reject_before_atomic() {
         let store = ready_store();
         let key = scoped_key(root(2), b"holt-value-boundary");
-        let boundary = vec![0x5a; MAX_HOLT_RECORD_PAYLOAD_BYTES];
+        let boundary = vec![0x5a; MAX_METADATA_RECORD_PAYLOAD_BYTES];
 
         let mut create = create_command(&store, request(40), key.clone(), &boundary);
         create.event_projection = vec![EventProjection {
@@ -3945,7 +9041,7 @@ mod tests {
             Some(boundary.clone())
         );
 
-        let replacement = vec![0x6b; MAX_HOLT_RECORD_PAYLOAD_BYTES];
+        let replacement = vec![0x6b; MAX_METADATA_RECORD_PAYLOAD_BYTES];
         let mut replace = base_command(&store, request(41), RootFenceAction::RequireActive);
         replace.predicates.push(CommandPredicate::Value {
             family: MetadataFamily::Operation,
@@ -3973,7 +9069,7 @@ mod tests {
 
         let recovery_before = store.recovery_state().unwrap();
         let version_before = store.current_read_version().unwrap();
-        let oversized = vec![0; MAX_HOLT_RECORD_PAYLOAD_BYTES + 1];
+        let oversized = vec![0; MAX_METADATA_RECORD_PAYLOAD_BYTES + 1];
 
         let oversized_mutation = create_command(
             &store,
@@ -4087,7 +9183,7 @@ mod tests {
             let store = AgentMetadataStore::create_file(&database, shard(1)).unwrap();
             store.advance_owner_epoch(None, epoch(1)).unwrap();
             store
-                .execute(&base_command(&store, request(1), RootFenceAction::Install).seal())
+                .execute(&base_command(&store, request(1), single_shard_install()).seal())
                 .unwrap();
             store
                 .execute(
@@ -4121,10 +9217,12 @@ mod tests {
         let database = temporary.path().join("metadata");
         {
             let store = ready_file_store(&database);
-            store
-                .recovery_outbox
-                .put(&[2, 0, 0, 0, 0], b"unknown recovery row")
-                .unwrap();
+            raw_put(
+                &store,
+                crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                &[2, 0, 0, 0, 0],
+                b"unknown recovery row",
+            );
         }
         assert!(matches!(
             AgentMetadataStore::reopen_file(&database, shard(1)),
@@ -4141,10 +9239,11 @@ mod tests {
         let database = temporary.path().join("metadata");
         {
             let store = ready_file_store(&database);
-            assert!(store
-                .recovery_outbox
-                .delete(&recovery_chunk_key(1, 0))
-                .unwrap());
+            raw_delete(
+                &store,
+                crate::workspace::provider_catalog::RECOVERY_OUTBOX_SPACE,
+                &recovery_chunk_key(1, 0),
+            );
         }
         assert!(matches!(
             AgentMetadataStore::reopen_file(&database, shard(1)),
@@ -4175,59 +9274,7 @@ mod tests {
 
         let target = AgentMetadataStore::open_memory(shard(1)).unwrap();
         for row in &source_rows {
-            match (&row.mutation, &row.result) {
-                (
-                    RecoveryMutationV1::AdvanceOwnerEpoch { expected, next },
-                    RecoveryResultV1::OwnerEpoch {
-                        applied_owner_epoch,
-                    },
-                ) => {
-                    target.advance_owner_epoch(*expected, *next).unwrap();
-                    assert_eq!(next, applied_owner_epoch);
-                }
-                (
-                    RecoveryMutationV1::ObserveLeaseClock {
-                        root_id,
-                        placement_generation,
-                        owner_epoch,
-                        observed_ms,
-                    },
-                    RecoveryResultV1::LeaseClock {
-                        effective_high_water_ms,
-                    },
-                ) => assert_eq!(
-                    target
-                        .observe_lease_clock(
-                            *root_id,
-                            *placement_generation,
-                            *owner_epoch,
-                            *observed_ms,
-                        )
-                        .unwrap(),
-                    *effective_high_water_ms
-                ),
-                (
-                    RecoveryMutationV1::MetadataCommand {
-                        command,
-                        lease_deadline_ms,
-                    },
-                    RecoveryResultV1::MetadataCommand {
-                        commit_version,
-                        deterministic_result,
-                    },
-                ) => {
-                    let replayed = match lease_deadline_ms {
-                        Some(deadline) => target
-                            .execute_before_lease_deadline(command, *deadline)
-                            .unwrap(),
-                        None => target.execute(command).unwrap(),
-                    };
-                    assert_eq!(&replayed.commit_version, commit_version);
-                    assert_eq!(&replayed.deterministic_result, deterministic_result);
-                    assert!(!replayed.replayed);
-                }
-                _ => panic!("strict recovery codec forbids mismatched mutation/result variants"),
-            }
+            target.replay_recovery_record(row).unwrap();
         }
 
         assert_eq!(target.recovery_outbox_after(0, 16).unwrap(), source_rows);

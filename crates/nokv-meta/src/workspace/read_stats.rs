@@ -14,13 +14,14 @@ use super::engine::MetadataPointReadSource;
 /// Metadata read counters captured by one explicit diagnostic session.
 ///
 /// Logical counters are thread-local and include reads through clones of the
-/// store that started the session. The `holt_*` fields are mapped from the
-/// shared database's cumulative counters; no Holt type crosses the `nokv-meta`
-/// package boundary. A physical-counter delta is attributable to one workload
-/// only when the store is dedicated to it and has no concurrent maintenance.
-/// Logical coverage is deliberately limited to fenced query point/range paths;
-/// write-transaction and recovery-internal reads are not counted. A range read
-/// that fails before iterator completion may not contribute final cursor stats.
+/// store that started the session. `provider_*` fields are deltas of
+/// provider-wide cumulative counters. Each optional field is `Some` only when
+/// the active provider defines that dimension; `None` means unsupported, not
+/// zero. A provider-counter delta is attributable to one workload only when the
+/// store is dedicated to it and has no concurrent maintenance. Logical coverage
+/// is deliberately limited to fenced query point/range paths; write-transaction
+/// and recovery-internal reads are not counted. A range read that fails before
+/// iterator completion may not contribute final cursor stats.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetadataReadStats {
     pub point_reads_system: u64,
@@ -30,48 +31,42 @@ pub struct MetadataReadStats {
     pub point_reads_other: u64,
     pub point_hits: u64,
     pub point_misses: u64,
-    /// Value bytes returned by successful Holt point lookups.
+    /// Value bytes returned by successful provider point lookups.
     pub point_value_bytes: u64,
     /// NoKV range-read operations requested by callers.
     pub scan_calls: u64,
-    /// Holt cursors opened by those operations. Historical reads may open two.
+    /// Provider cursors opened by those operations. Historical reads may open two.
     pub scan_cursors: u64,
-    /// Holt cursor work units, not physical rows or device reads.
-    pub holt_scan_visited_units: u64,
-    pub holt_scan_returned_keys: u64,
-    pub holt_scan_common_prefixes: u64,
-    pub holt_scan_restarts: u64,
-    /// Key and value bytes emitted by Holt range cursors.
+    /// Provider-reported cursor work units, not physical rows or device reads.
+    pub scan_visited_units: u64,
+    pub scan_returned_keys: u64,
+    pub scan_common_prefixes: u64,
+    pub scan_restarts: u64,
+    /// Key and value bytes emitted by provider range cursors.
     pub scan_key_bytes: u64,
     pub scan_value_bytes: u64,
     /// Cursors stopped because NoKV filled its raw page budget.
     ///
     /// This does not prove that another storage entry exists.
     pub scan_raw_limit_stops: u64,
-    pub holt_cache_hits: u64,
-    pub holt_cache_misses: u64,
-    pub holt_full_blob_reads: u64,
-    pub holt_full_blob_read_bytes: u64,
-    pub holt_point_full_blob_reads: u64,
-    pub holt_scan_full_blob_reads: u64,
-    pub holt_silent_full_blob_reads: u64,
-    pub holt_read_page_hits: u64,
-    pub holt_read_page_misses: u64,
-    pub holt_read_index_cache_hits: u64,
-    pub holt_read_index_cache_misses: u64,
-    pub holt_read_index_loads: u64,
-    pub holt_read_index_dir_read_bytes: u64,
-    pub holt_read_index_bucket_reads: u64,
-    pub holt_read_index_bucket_read_bytes: u64,
-    pub holt_read_index_inline_hits: u64,
-    pub holt_read_index_value_hits: u64,
-    pub holt_read_index_value_read_bytes: u64,
-    pub holt_read_index_offset_hits: u64,
-    pub holt_read_index_negative_hits: u64,
-    pub holt_read_index_crossing_hits: u64,
-    pub holt_read_index_unknowns: u64,
-    pub holt_optimistic_restarts: u64,
-    pub holt_range_restarts: u64,
+    /// Provider cache lookups served without a backing-store read.
+    pub provider_cache_hits: Option<u64>,
+    /// Provider cache lookups that fell through to the backing store.
+    pub provider_cache_misses: Option<u64>,
+    /// Successful whole-storage-object reads from the backing store.
+    pub provider_full_read_operations: Option<u64>,
+    /// Bytes returned by whole-storage-object reads.
+    pub provider_full_read_bytes: Option<u64>,
+    /// Whole-storage-object reads attributed to point paths.
+    pub provider_point_full_read_operations: Option<u64>,
+    /// Whole-storage-object reads attributed to scan paths.
+    pub provider_scan_full_read_operations: Option<u64>,
+    /// Whole-storage-object reads attributed to provider-internal paths.
+    pub provider_internal_full_read_operations: Option<u64>,
+    /// Partial-read cache hits served without a whole-object read.
+    pub provider_partial_read_cache_hits: Option<u64>,
+    /// Partial-read cache misses that required positional or whole-object reads.
+    pub provider_partial_read_cache_misses: Option<u64>,
 }
 
 impl MetadataReadStats {
@@ -96,6 +91,12 @@ impl MetadataReadStats {
             };
         }
 
+        macro_rules! optional_delta {
+            ($field:ident) => {
+                optional_counter_delta(stringify!($field), self.$field, earlier.$field)?
+            };
+        }
+
         Ok(Self {
             point_reads_system: delta!(point_reads_system),
             point_reads_root_fence: delta!(point_reads_root_fence),
@@ -107,37 +108,26 @@ impl MetadataReadStats {
             point_value_bytes: delta!(point_value_bytes),
             scan_calls: delta!(scan_calls),
             scan_cursors: delta!(scan_cursors),
-            holt_scan_visited_units: delta!(holt_scan_visited_units),
-            holt_scan_returned_keys: delta!(holt_scan_returned_keys),
-            holt_scan_common_prefixes: delta!(holt_scan_common_prefixes),
-            holt_scan_restarts: delta!(holt_scan_restarts),
+            scan_visited_units: delta!(scan_visited_units),
+            scan_returned_keys: delta!(scan_returned_keys),
+            scan_common_prefixes: delta!(scan_common_prefixes),
+            scan_restarts: delta!(scan_restarts),
             scan_key_bytes: delta!(scan_key_bytes),
             scan_value_bytes: delta!(scan_value_bytes),
             scan_raw_limit_stops: delta!(scan_raw_limit_stops),
-            holt_cache_hits: delta!(holt_cache_hits),
-            holt_cache_misses: delta!(holt_cache_misses),
-            holt_full_blob_reads: delta!(holt_full_blob_reads),
-            holt_full_blob_read_bytes: delta!(holt_full_blob_read_bytes),
-            holt_point_full_blob_reads: delta!(holt_point_full_blob_reads),
-            holt_scan_full_blob_reads: delta!(holt_scan_full_blob_reads),
-            holt_silent_full_blob_reads: delta!(holt_silent_full_blob_reads),
-            holt_read_page_hits: delta!(holt_read_page_hits),
-            holt_read_page_misses: delta!(holt_read_page_misses),
-            holt_read_index_cache_hits: delta!(holt_read_index_cache_hits),
-            holt_read_index_cache_misses: delta!(holt_read_index_cache_misses),
-            holt_read_index_loads: delta!(holt_read_index_loads),
-            holt_read_index_dir_read_bytes: delta!(holt_read_index_dir_read_bytes),
-            holt_read_index_bucket_reads: delta!(holt_read_index_bucket_reads),
-            holt_read_index_bucket_read_bytes: delta!(holt_read_index_bucket_read_bytes),
-            holt_read_index_inline_hits: delta!(holt_read_index_inline_hits),
-            holt_read_index_value_hits: delta!(holt_read_index_value_hits),
-            holt_read_index_value_read_bytes: delta!(holt_read_index_value_read_bytes),
-            holt_read_index_offset_hits: delta!(holt_read_index_offset_hits),
-            holt_read_index_negative_hits: delta!(holt_read_index_negative_hits),
-            holt_read_index_crossing_hits: delta!(holt_read_index_crossing_hits),
-            holt_read_index_unknowns: delta!(holt_read_index_unknowns),
-            holt_optimistic_restarts: delta!(holt_optimistic_restarts),
-            holt_range_restarts: delta!(holt_range_restarts),
+            provider_cache_hits: optional_delta!(provider_cache_hits),
+            provider_cache_misses: optional_delta!(provider_cache_misses),
+            provider_full_read_operations: optional_delta!(provider_full_read_operations),
+            provider_full_read_bytes: optional_delta!(provider_full_read_bytes),
+            provider_point_full_read_operations: optional_delta!(
+                provider_point_full_read_operations
+            ),
+            provider_scan_full_read_operations: optional_delta!(provider_scan_full_read_operations),
+            provider_internal_full_read_operations: optional_delta!(
+                provider_internal_full_read_operations
+            ),
+            provider_partial_read_cache_hits: optional_delta!(provider_partial_read_cache_hits),
+            provider_partial_read_cache_misses: optional_delta!(provider_partial_read_cache_misses),
         })
     }
 }
@@ -145,17 +135,26 @@ impl MetadataReadStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetadataReadStatsDeltaError {
     field: &'static str,
-    earlier: u64,
-    later: u64,
+    earlier: Option<u64>,
+    later: Option<u64>,
 }
 
 impl fmt::Display for MetadataReadStatsDeltaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "metadata read counter {} decreased from {} to {}",
-            self.field, self.earlier, self.later
-        )
+        match (self.earlier, self.later) {
+            (Some(earlier), Some(later)) => write!(
+                formatter,
+                "metadata read counter {} decreased from {} to {}",
+                self.field, earlier, later
+            ),
+            (earlier, later) => write!(
+                formatter,
+                "metadata read counter {} availability changed from {} to {}",
+                self.field,
+                counter_availability(earlier),
+                counter_availability(later)
+            ),
+        }
     }
 }
 
@@ -168,6 +167,7 @@ pub enum MetadataReadStatsSessionError {
     ThreadSessionMissing,
     ThreadSessionStoreMismatch,
     StoreSessionAlreadyActive,
+    Provider(String),
     CounterRegression(MetadataReadStatsDeltaError),
 }
 
@@ -183,6 +183,9 @@ impl fmt::Display for MetadataReadStatsSessionError {
                 .write_str("the active metadata read-stats session belongs to another store"),
             Self::StoreSessionAlreadyActive => formatter
                 .write_str("a metadata read-stats session is already active for this store"),
+            Self::Provider(message) => {
+                write!(formatter, "metadata provider stats failed: {message}")
+            }
             Self::CounterRegression(error) => error.fmt(formatter),
         }
     }
@@ -205,9 +208,33 @@ fn counter_delta(
         .checked_sub(earlier)
         .ok_or(MetadataReadStatsDeltaError {
             field,
+            earlier: Some(earlier),
+            later: Some(later),
+        })
+}
+
+fn optional_counter_delta(
+    field: &'static str,
+    later: Option<u64>,
+    earlier: Option<u64>,
+) -> Result<Option<u64>, MetadataReadStatsDeltaError> {
+    match (later, earlier) {
+        (Some(later), Some(earlier)) => counter_delta(field, later, earlier).map(Some),
+        (None, None) => Ok(None),
+        (later, earlier) => Err(MetadataReadStatsDeltaError {
+            field,
             earlier,
             later,
-        })
+        }),
+    }
+}
+
+fn counter_availability(value: Option<u64>) -> &'static str {
+    if value.is_some() {
+        "supported"
+    } else {
+        "unsupported"
+    }
 }
 
 #[cfg(feature = "metadata-read-stats")]
@@ -331,53 +358,18 @@ pub(super) fn record_scan_cursor(
 ) {
     with_active_counters(store_key, |counters| {
         counters.scan_cursors = counters.scan_cursors.saturating_add(1);
-        counters.holt_scan_visited_units = counters
-            .holt_scan_visited_units
-            .saturating_add(visited_units);
-        counters.holt_scan_returned_keys = counters
-            .holt_scan_returned_keys
-            .saturating_add(returned_keys);
-        counters.holt_scan_common_prefixes = counters
-            .holt_scan_common_prefixes
+        counters.scan_visited_units = counters.scan_visited_units.saturating_add(visited_units);
+        counters.scan_returned_keys = counters.scan_returned_keys.saturating_add(returned_keys);
+        counters.scan_common_prefixes = counters
+            .scan_common_prefixes
             .saturating_add(common_prefixes);
-        counters.holt_scan_restarts = counters.holt_scan_restarts.saturating_add(restarts);
+        counters.scan_restarts = counters.scan_restarts.saturating_add(restarts);
         counters.scan_key_bytes = counters.scan_key_bytes.saturating_add(key_bytes);
         counters.scan_value_bytes = counters.scan_value_bytes.saturating_add(value_bytes);
         if stopped_at_limit {
             counters.scan_raw_limit_stops = counters.scan_raw_limit_stops.saturating_add(1);
         }
     });
-}
-
-#[cfg(feature = "metadata-read-stats")]
-pub(super) fn storage_snapshot(storage: &holt::DBStats) -> MetadataReadStats {
-    MetadataReadStats {
-        holt_cache_hits: storage.bm_cache_hits,
-        holt_cache_misses: storage.bm_cache_misses,
-        holt_full_blob_reads: storage.bm_full_blob_reads,
-        holt_full_blob_read_bytes: storage.bm_full_blob_read_bytes,
-        holt_point_full_blob_reads: storage.bm_point_full_blob_reads,
-        holt_scan_full_blob_reads: storage.bm_scan_full_blob_reads,
-        holt_silent_full_blob_reads: storage.bm_silent_full_blob_reads,
-        holt_read_page_hits: storage.bm_read_page_hits,
-        holt_read_page_misses: storage.bm_read_page_misses,
-        holt_read_index_cache_hits: storage.bm_read_index_cache_hits,
-        holt_read_index_cache_misses: storage.bm_read_index_cache_misses,
-        holt_read_index_loads: storage.bm_read_index_loads,
-        holt_read_index_dir_read_bytes: storage.bm_read_index_dir_read_bytes,
-        holt_read_index_bucket_reads: storage.bm_read_index_bucket_reads,
-        holt_read_index_bucket_read_bytes: storage.bm_read_index_bucket_read_bytes,
-        holt_read_index_inline_hits: storage.bm_read_index_inline_hits,
-        holt_read_index_value_hits: storage.bm_read_index_value_hits,
-        holt_read_index_value_read_bytes: storage.bm_read_index_value_read_bytes,
-        holt_read_index_offset_hits: storage.bm_read_index_offset_hits,
-        holt_read_index_negative_hits: storage.bm_read_index_negative_hits,
-        holt_read_index_crossing_hits: storage.bm_read_index_crossing_hits,
-        holt_read_index_unknowns: storage.bm_read_index_unknowns,
-        holt_optimistic_restarts: storage.bm_optimistic_restarts,
-        holt_range_restarts: storage.bm_range_restarts,
-        ..MetadataReadStats::default()
-    }
 }
 
 #[cfg(feature = "metadata-read-stats")]
@@ -392,10 +384,10 @@ pub(super) fn merge_logical_counters(physical: &mut MetadataReadStats, logical: 
     physical.point_value_bytes = logical.point_value_bytes;
     physical.scan_calls = logical.scan_calls;
     physical.scan_cursors = logical.scan_cursors;
-    physical.holt_scan_visited_units = logical.holt_scan_visited_units;
-    physical.holt_scan_returned_keys = logical.holt_scan_returned_keys;
-    physical.holt_scan_common_prefixes = logical.holt_scan_common_prefixes;
-    physical.holt_scan_restarts = logical.holt_scan_restarts;
+    physical.scan_visited_units = logical.scan_visited_units;
+    physical.scan_returned_keys = logical.scan_returned_keys;
+    physical.scan_common_prefixes = logical.scan_common_prefixes;
+    physical.scan_restarts = logical.scan_restarts;
     physical.scan_key_bytes = logical.scan_key_bytes;
     physical.scan_value_bytes = logical.scan_value_bytes;
     physical.scan_raw_limit_stops = logical.scan_raw_limit_stops;
@@ -425,7 +417,18 @@ mod tests {
 
     #[test]
     fn delta_preserves_every_counter_family() {
-        let earlier = MetadataReadStats::default();
+        let earlier = MetadataReadStats {
+            provider_cache_hits: Some(0),
+            provider_cache_misses: Some(0),
+            provider_full_read_operations: Some(0),
+            provider_full_read_bytes: Some(0),
+            provider_point_full_read_operations: Some(0),
+            provider_scan_full_read_operations: Some(0),
+            provider_internal_full_read_operations: Some(0),
+            provider_partial_read_cache_hits: Some(0),
+            provider_partial_read_cache_misses: Some(0),
+            ..MetadataReadStats::default()
+        };
         let later = MetadataReadStats {
             point_reads_system: 1,
             point_reads_root_fence: 2,
@@ -437,41 +440,58 @@ mod tests {
             point_value_bytes: 6,
             scan_calls: 7,
             scan_cursors: 8,
-            holt_scan_visited_units: 9,
-            holt_scan_returned_keys: 10,
-            holt_scan_common_prefixes: 11,
-            holt_scan_restarts: 12,
+            scan_visited_units: 9,
+            scan_returned_keys: 10,
+            scan_common_prefixes: 11,
+            scan_restarts: 12,
             scan_key_bytes: 13,
             scan_value_bytes: 14,
             scan_raw_limit_stops: 15,
-            holt_cache_hits: 16,
-            holt_cache_misses: 17,
-            holt_full_blob_reads: 18,
-            holt_full_blob_read_bytes: 19,
-            holt_point_full_blob_reads: 20,
-            holt_scan_full_blob_reads: 21,
-            holt_silent_full_blob_reads: 22,
-            holt_read_page_hits: 23,
-            holt_read_page_misses: 24,
-            holt_read_index_cache_hits: 25,
-            holt_read_index_cache_misses: 26,
-            holt_read_index_loads: 27,
-            holt_read_index_dir_read_bytes: 28,
-            holt_read_index_bucket_reads: 29,
-            holt_read_index_bucket_read_bytes: 30,
-            holt_read_index_inline_hits: 31,
-            holt_read_index_value_hits: 32,
-            holt_read_index_value_read_bytes: 33,
-            holt_read_index_offset_hits: 34,
-            holt_read_index_negative_hits: 35,
-            holt_read_index_crossing_hits: 36,
-            holt_read_index_unknowns: 37,
-            holt_optimistic_restarts: 38,
-            holt_range_restarts: 39,
+            provider_cache_hits: Some(16),
+            provider_cache_misses: Some(17),
+            provider_full_read_operations: Some(18),
+            provider_full_read_bytes: Some(19),
+            provider_point_full_read_operations: Some(20),
+            provider_scan_full_read_operations: Some(21),
+            provider_internal_full_read_operations: Some(22),
+            provider_partial_read_cache_hits: Some(23),
+            provider_partial_read_cache_misses: Some(24),
         };
 
         assert_eq!(later.delta_since(&earlier).unwrap(), later);
         assert_eq!(later.point_reads_total(), 15);
+    }
+
+    #[test]
+    fn delta_preserves_unsupported_provider_dimensions() {
+        let earlier = MetadataReadStats::default();
+        let later = MetadataReadStats {
+            point_reads_other: 1,
+            ..MetadataReadStats::default()
+        };
+
+        assert_eq!(
+            later.delta_since(&earlier).unwrap(),
+            MetadataReadStats {
+                point_reads_other: 1,
+                ..MetadataReadStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn delta_rejects_provider_counter_availability_changes() {
+        let earlier = MetadataReadStats::default();
+        let later = MetadataReadStats {
+            provider_cache_hits: Some(0),
+            ..MetadataReadStats::default()
+        };
+
+        let error = later.delta_since(&earlier).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "metadata read counter provider_cache_hits availability changed from unsupported to supported"
+        );
     }
 
     #[cfg(feature = "metadata-read-stats")]

@@ -796,7 +796,7 @@ pub(super) fn scan_paths_at_visible_workspace(
 
 /// Scan direct logical children below an optional normalized parent.
 ///
-/// Holt common-prefix rollups are retained as implicit children. If an exact
+/// Provider common-prefix rollups are retained as implicit children. If an exact
 /// artifact exists at the same path, it replaces the implicit prefix in the
 /// returned logical item. The exclusive marker skips both representations.
 pub(super) fn scan_direct_path_children_at_visible_workspace(
@@ -994,7 +994,15 @@ mod tests {
         let store = AgentMetadataStore::open_memory(shard(1)).unwrap();
         store.advance_owner_epoch(None, owner()).unwrap();
         store
-            .execute(&fence_command(&store, request(1), RootFenceAction::Install))
+            .execute(&fence_command(
+                &store,
+                request(1),
+                RootFenceAction::Install {
+                    layout_profile: nokv_types::RootLayoutProfile::SingleShardRoot,
+                    layout_generation: nokv_types::RootLayoutGeneration::new(1).unwrap(),
+                    partition_id: nokv_types::RootPartitionId::SINGLE_SHARD,
+                },
+            ))
             .unwrap();
         store
             .execute(&fence_command(

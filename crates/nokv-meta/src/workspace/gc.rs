@@ -2187,7 +2187,11 @@ mod tests {
             .execute(&fence_command(
                 store,
                 request_id(counter),
-                RootFenceAction::Install,
+                RootFenceAction::Install {
+                    layout_profile: nokv_types::RootLayoutProfile::SingleShardRoot,
+                    layout_generation: nokv_types::RootLayoutGeneration::new(1).unwrap(),
+                    partition_id: nokv_types::RootPartitionId::SINGLE_SHARD,
+                },
             ))
             .unwrap();
         store

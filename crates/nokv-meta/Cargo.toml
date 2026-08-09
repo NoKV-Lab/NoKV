@@ -1,7 +1,7 @@
 [package]
 name = "nokv-meta"
 version = "0.1.0"
-description = "Holt-backed metadata service core for NoKV."
+description = "Provider-neutral metadata service core for NoKV."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,12 +10,15 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+foundationdb-provider = ["dep:foundationdb", "dep:tokio"]
 metadata-read-stats = []
 
 [dependencies]
+foundationdb = { version = "0.11", default-features = false, features = ["embedded-fdb-include", "fdb-7_3"], optional = true }
 holt.workspace = true
 nokv-types.workspace = true
 sha2.workspace = true
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

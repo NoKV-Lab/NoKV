@@ -1,14 +1,16 @@
 //! Durable, strictly ordered material for exporting and replaying metadata writes.
 //!
-//! The outbox is committed in the same Holt atomic batch as the authoritative
-//! mutation. It is not a second namespace state machine: a consumer replays the
-//! decoded mutation through the ordinary [`AgentMetadataStore`] write entrypoints.
+//! The outbox is committed in the same provider atomic plan as the
+//! authoritative mutation. It is not a second namespace state machine: a
+//! consumer replays the decoded mutation through the ordinary
+//! [`AgentMetadataStore`] write entrypoints.
 
 use std::fmt;
 
 use nokv_types::{
-    CommandDigest, CommitVersion, LogicalShardId, OwnerEpoch, PlacementGeneration, ReadVersion,
-    RequestId, RootActivationState, RootId,
+    CommandDigest, CommitVersion, LogicalShardId, MetadataContractDigest, OwnerEpoch,
+    PlacementGeneration, ReadVersion, RequestId, RootActivationState, RootId, RootLayoutGeneration,
+    RootLayoutProfile, RootPartitionId,
 };
 use sha2::{Digest, Sha256};
 
@@ -18,17 +20,17 @@ use super::engine::{
     MetadataFamily, RootFenceAction,
 };
 
-pub const RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 2;
+pub const RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 3;
 pub const RECOVERY_CHAIN_DIGEST_BYTES: usize = 32;
 const MAX_ITEMS: usize = 256;
 pub(crate) const MAX_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
-const GENESIS_DOMAIN: &[u8] = b"nokv.metadata.recovery.genesis.v1\0";
+const GENESIS_DOMAIN: &[u8] = b"nokv.metadata.recovery.genesis.v2\0";
 const CHAIN_DOMAIN: &[u8] = b"nokv.metadata.recovery.chain.v1\0";
 const STORAGE_HEADER_VERSION: u8 = 1;
 const STORAGE_CHUNK_VERSION: u8 = 1;
 const STORAGE_HEADER_KEY_TAG: u8 = 0;
 const STORAGE_CHUNK_KEY_TAG: u8 = 1;
-const MAX_STORAGE_CHUNK_DATA_BYTES: usize = 60 * 1024;
+pub(crate) const MAX_STORAGE_CHUNK_DATA_BYTES: usize = 60 * 1024;
 
 /// One canonical input to a real metadata write entrypoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -547,10 +549,12 @@ impl RecoveryResultV1 {
 
 pub(crate) fn recovery_genesis_digest(
     logical_shard_id: LogicalShardId,
+    contract_digest: MetadataContractDigest,
 ) -> [u8; RECOVERY_CHAIN_DIGEST_BYTES] {
     let mut hasher = Sha256::new();
     hasher.update(GENESIS_DOMAIN);
     hasher.update(logical_shard_id.as_bytes());
+    hasher.update(contract_digest.as_bytes());
     hasher.finalize().into()
 }
 
@@ -579,6 +583,13 @@ pub(crate) fn decode_recovery_outbox_key(key: &[u8]) -> Result<u64, RecoveryCode
 pub(crate) fn split_recovery_storage(
     logical: &[u8],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), RecoveryCodecError> {
+    if logical.len() > MAX_RECOVERY_BYTES {
+        return Err(RecoveryCodecError::LengthBound {
+            field: "recovery_logical_length",
+            length: logical.len(),
+            max: MAX_RECOVERY_BYTES,
+        });
+    }
     let chunk_count = logical.len().div_ceil(MAX_STORAGE_CHUNK_DATA_BYTES);
     let chunk_count_u32 = u32_len("recovery_chunk_count", chunk_count)?;
     let header = RecoveryStorageHeader {
@@ -795,7 +806,16 @@ fn validate_pair(
 
 fn encode_root_action(bytes: &mut Vec<u8>, action: &RootFenceAction) {
     match action {
-        RootFenceAction::Install => bytes.push(1),
+        RootFenceAction::Install {
+            layout_profile,
+            layout_generation,
+            partition_id,
+        } => {
+            bytes.push(1);
+            bytes.push((*layout_profile).into());
+            bytes.extend_from_slice(&layout_generation.get().to_be_bytes());
+            bytes.extend_from_slice(partition_id.as_bytes());
+        }
         RootFenceAction::RequireActive => bytes.push(2),
         RootFenceAction::Transition { expected, next } => {
             bytes.push(3);
@@ -807,7 +827,27 @@ fn encode_root_action(bytes: &mut Vec<u8>, action: &RootFenceAction) {
 
 fn decode_root_action(decoder: &mut Decoder<'_>) -> Result<RootFenceAction, RecoveryCodecError> {
     match decoder.u8("root_fence_action")? {
-        1 => Ok(RootFenceAction::Install),
+        1 => {
+            let value = decoder.u8("root_layout_profile")?;
+            let layout_profile = RootLayoutProfile::try_from(value).map_err(|error| {
+                RecoveryCodecError::UnknownDiscriminant {
+                    type_name: error.type_name(),
+                    value: error.value(),
+                }
+            })?;
+            let layout_generation = RootLayoutGeneration::new(
+                decoder.u64("root_layout_generation")?,
+            )
+            .map_err(|_| RecoveryCodecError::ZeroScalar {
+                field: "root_layout_generation",
+            })?;
+            let partition_id = RootPartitionId::from_bytes(decoder.fixed("root_partition_id")?);
+            Ok(RootFenceAction::Install {
+                layout_profile,
+                layout_generation,
+                partition_id,
+            })
+        }
         2 => Ok(RootFenceAction::RequireActive),
         3 => Ok(RootFenceAction::Transition {
             expected: decode_root_state(decoder.u8("expected_root_state")?)?,
@@ -1127,6 +1167,7 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::workspace_metadata_contract_digest;
 
     fn hex_encode(bytes: &[u8]) -> String {
         use std::fmt::Write as _;
@@ -1173,6 +1214,20 @@ mod tests {
     }
 
     #[test]
+    fn recovery_genesis_is_frozen_and_contract_bound() {
+        let shard = LogicalShardId::from_bytes([0x11; 16]);
+        let contract = workspace_metadata_contract_digest();
+        assert_eq!(
+            hex_encode(&recovery_genesis_digest(shard, contract)),
+            "a8d971f77e9f5cb92dce7d32612249daf1f4f7422104b9712f999fac8711b6ec"
+        );
+        assert_ne!(
+            recovery_genesis_digest(shard, contract),
+            recovery_genesis_digest(shard, MetadataContractDigest::from_bytes([0x23; 32]))
+        );
+    }
+
+    #[test]
     fn recovery_record_has_frozen_golden_and_strict_codec() {
         let mutation = RecoveryMutationV1::MetadataCommand {
             command: Box::new(command()),
@@ -1184,9 +1239,18 @@ mod tests {
         };
         let record = RecoveryOutboxRecord::new(8, [0x11; 32], mutation, result).unwrap();
         let encoded = record.encode().unwrap();
-        assert_eq!(hex_encode(&encoded), "0200000000000000081111111111111111111111111111111111111111111111111111111111111111f5e3ab61f72ceba583774bcd1e8d98c4f38621f8c5682c7586ac004c35d25d4200000106010000000e6e6f6b765f776f726b737061636501010101010101010101010101010101020202020202020202020202020202020000000000000003000000000000000405050505050505050505050505050505caf0269cc277bd5e16dbed022e7a3fdb4d49948b467ed050725cd6fdbcfc72df00000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
+        assert_eq!(hex_encode(&encoded), "0300000000000000081111111111111111111111111111111111111111111111111111111111111111f5e3ab61f72ceba583774bcd1e8d98c4f38621f8c5682c7586ac004c35d25d4200000106010000000e6e6f6b765f776f726b737061636501010101010101010101010101010101020202020202020202020202020202020000000000000003000000000000000405050505050505050505050505050505caf0269cc277bd5e16dbed022e7a3fdb4d49948b467ed050725cd6fdbcfc72df00000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
         assert_eq!(RecoveryOutboxRecord::decode(&encoded).unwrap(), record);
 
+        let mut superseded_v2 = encoded.clone();
+        superseded_v2[0] = 2;
+        assert_eq!(
+            RecoveryOutboxRecord::decode(&superseded_v2),
+            Err(RecoveryCodecError::UnsupportedVersion {
+                actual: 2,
+                expected: RECOVERY_OUTBOX_VALUE_FORMAT_VERSION,
+            })
+        );
         let mut unknown = encoded.clone();
         unknown[0] = 1;
         assert!(matches!(
@@ -1214,6 +1278,69 @@ mod tests {
         );
         for length in 0..encoded.len() {
             assert!(RecoveryMutationV1::decode_canonical(&encoded[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn install_layout_is_bound_by_command_digest_and_recovery_bytes() {
+        fn install_command(
+            profile: RootLayoutProfile,
+            generation: u64,
+            partition_id: RootPartitionId,
+        ) -> MetadataCommand {
+            let mut command = command();
+            command.root_fence_action = RootFenceAction::Install {
+                layout_profile: profile,
+                layout_generation: RootLayoutGeneration::new(generation).unwrap(),
+                partition_id,
+            };
+            command.predicates.clear();
+            command.mutations.clear();
+            command.history_projection.clear();
+            command.event_projection.clear();
+            command.seal()
+        }
+
+        let canonical = install_command(
+            RootLayoutProfile::SingleShardRoot,
+            1,
+            RootPartitionId::SINGLE_SHARD,
+        );
+        let canonical_mutation = RecoveryMutationV1::MetadataCommand {
+            command: Box::new(canonical.clone()),
+            lease_deadline_ms: None,
+        };
+        let canonical_bytes = canonical_mutation.encode_canonical().unwrap();
+        assert_eq!(
+            RecoveryMutationV1::decode_canonical(&canonical_bytes).unwrap(),
+            canonical_mutation
+        );
+
+        for changed in [
+            install_command(
+                RootLayoutProfile::PartitionedRoot,
+                1,
+                RootPartitionId::SINGLE_SHARD,
+            ),
+            install_command(
+                RootLayoutProfile::SingleShardRoot,
+                2,
+                RootPartitionId::SINGLE_SHARD,
+            ),
+            install_command(
+                RootLayoutProfile::SingleShardRoot,
+                1,
+                RootPartitionId::from_bytes([0x77; 16]),
+            ),
+        ] {
+            assert_ne!(changed.command_digest, canonical.command_digest);
+            let changed_bytes = RecoveryMutationV1::MetadataCommand {
+                command: Box::new(changed),
+                lease_deadline_ms: None,
+            }
+            .encode_canonical()
+            .unwrap();
+            assert_ne!(changed_bytes, canonical_bytes);
         }
     }
 
@@ -1287,6 +1414,16 @@ mod tests {
         assert!(matches!(
             assemble_recovery_storage(&header, chunks),
             Err(RecoveryCodecError::UnsupportedVersion { .. })
+        ));
+
+        let oversized = vec![0; MAX_RECOVERY_BYTES + 1];
+        assert!(matches!(
+            split_recovery_storage(&oversized),
+            Err(RecoveryCodecError::LengthBound {
+                field: "recovery_logical_length",
+                length,
+                max: MAX_RECOVERY_BYTES,
+            }) if length == MAX_RECOVERY_BYTES + 1
         ));
     }
 }

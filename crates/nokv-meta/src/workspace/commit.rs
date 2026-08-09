@@ -38,6 +38,7 @@ use super::commit_records::{
 use super::engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
     HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, RootFenceAction,
+    MAX_COMMAND_ITEMS,
 };
 use super::event_projection::change_event_projection;
 use super::namespace::{
@@ -51,7 +52,6 @@ use super::publication_records::{
 use super::query_records::{ChangeEventKind, ChangeEventRecord, QueryRecordError, TypedProjection};
 use super::snapshot_records::{HistoryHoldRecord, SnapshotRecordError};
 
-const MAX_COMMAND_ITEMS: usize = 256;
 /// Canonical Workbench projection installed only with its typed commit head.
 pub const RUN_MANIFEST_PATH: &str = "metadata/run_manifest.json";
 /// Member batches reserve three command items per path plus the operation row.
@@ -2887,7 +2887,11 @@ mod tests {
             .execute(&fence_command(
                 store,
                 next_request(counter),
-                RootFenceAction::Install,
+                RootFenceAction::Install {
+                    layout_profile: nokv_types::RootLayoutProfile::SingleShardRoot,
+                    layout_generation: nokv_types::RootLayoutGeneration::new(1).unwrap(),
+                    partition_id: nokv_types::RootPartitionId::SINGLE_SHARD,
+                },
             ))
             .unwrap();
         store

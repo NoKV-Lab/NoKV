@@ -35,6 +35,7 @@ use super::commit_records::{
 use super::engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
     HistoryProjection, MetadataCommand, MetadataFamily, MetadataScanItem, RootFenceAction,
+    MAX_COMMAND_ITEMS,
 };
 use super::event_projection::change_event_projection;
 use super::namespace::RootWriteContext;
@@ -61,7 +62,6 @@ pub const MAX_RESTORE_BATCH_MEMBERS: usize = 48;
 /// Exact Workbench initialization path published before publication.
 pub const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
 const RESTORE_OUTCOME_FORMAT: u8 = 1;
-const MAX_COMMAND_ITEMS: usize = 256;
 
 /// Caller selection before a snapshot read version is frozen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3069,7 +3069,11 @@ mod tests {
                 store,
                 request(counter),
                 owner_epoch,
-                RootFenceAction::Install,
+                RootFenceAction::Install {
+                    layout_profile: nokv_types::RootLayoutProfile::SingleShardRoot,
+                    layout_generation: nokv_types::RootLayoutGeneration::new(1).unwrap(),
+                    partition_id: nokv_types::RootPartitionId::SINGLE_SHARD,
+                },
             ))
             .unwrap();
         store

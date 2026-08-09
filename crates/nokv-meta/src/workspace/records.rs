@@ -2,16 +2,23 @@ use std::fmt;
 
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, PlacementGeneration, RootActivationState,
+    RootLayoutGeneration, RootLayoutProfile, RootPartitionId,
 };
 
 /// Initial value format for every durable workspace record.
 pub const VALUE_FORMAT_VERSION: u8 = 1;
+
+/// Durable value format of the shard-local root-layout fence.
+pub const ROOT_FENCE_VALUE_FORMAT_VERSION: u8 = 2;
 
 /// Installed shard-local placement fence for one Agent root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RootFence {
     pub logical_shard_id: LogicalShardId,
     pub placement_generation: PlacementGeneration,
+    pub layout_profile: RootLayoutProfile,
+    pub layout_generation: RootLayoutGeneration,
+    pub partition_id: RootPartitionId,
     pub activation_state: RootActivationState,
 }
 
@@ -130,22 +137,39 @@ impl std::error::Error for RecordCodecError {}
 
 impl RootFence {
     pub fn encode(&self) -> Result<Vec<u8>, RecordCodecError> {
-        let mut encoded = Vec::with_capacity(1 + LogicalShardId::BYTE_WIDTH + 8 + 1);
-        encoded.push(VALUE_FORMAT_VERSION);
+        let mut encoded = Vec::with_capacity(
+            1 + LogicalShardId::BYTE_WIDTH + 8 + 1 + 8 + RootPartitionId::BYTE_WIDTH + 1,
+        );
+        encoded.push(ROOT_FENCE_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(self.logical_shard_id.as_bytes());
         encoded.extend_from_slice(&self.placement_generation.get().to_be_bytes());
+        encoded.push(self.layout_profile.into());
+        encoded.extend_from_slice(&self.layout_generation.get().to_be_bytes());
+        encoded.extend_from_slice(self.partition_id.as_bytes());
         encoded.push(self.activation_state.into());
         Ok(encoded)
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, RecordCodecError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_version(ROOT_FENCE_VALUE_FORMAT_VERSION)?;
         let logical_shard_id = LogicalShardId::from_bytes(decoder.fixed("logical_shard_id")?);
         let placement_generation = PlacementGeneration::new(decoder.u64("placement_generation")?)
             .map_err(|_| RecordCodecError::ZeroScalar {
             field: "placement_generation",
         })?;
+        let layout_discriminant = decoder.u8("layout_profile")?;
+        let layout_profile = RootLayoutProfile::try_from(layout_discriminant).map_err(|error| {
+            RecordCodecError::UnknownDiscriminant {
+                type_name: error.type_name(),
+                value: error.value(),
+            }
+        })?;
+        let layout_generation = RootLayoutGeneration::new(decoder.u64("layout_generation")?)
+            .map_err(|_| RecordCodecError::ZeroScalar {
+                field: "layout_generation",
+            })?;
+        let partition_id = RootPartitionId::from_bytes(decoder.fixed("partition_id")?);
         let activation_discriminant = decoder.u8("activation_state")?;
         let activation_state =
             RootActivationState::try_from(activation_discriminant).map_err(|error| {
@@ -158,6 +182,9 @@ impl RootFence {
         Ok(Self {
             logical_shard_id,
             placement_generation,
+            layout_profile,
+            layout_generation,
+            partition_id,
             activation_state,
         })
     }
@@ -346,14 +373,15 @@ impl<'a> Decoder<'a> {
     }
 
     fn require_value_version(&mut self) -> Result<(), RecordCodecError> {
+        self.require_version(VALUE_FORMAT_VERSION)
+    }
+
+    fn require_version(&mut self, expected: u8) -> Result<(), RecordCodecError> {
         let actual = self.u8("value_format_version")?;
-        if actual == VALUE_FORMAT_VERSION {
+        if actual == expected {
             Ok(())
         } else {
-            Err(RecordCodecError::UnsupportedValueVersion {
-                actual,
-                expected: VALUE_FORMAT_VERSION,
-            })
+            Err(RecordCodecError::UnsupportedValueVersion { actual, expected })
         }
     }
 
@@ -454,12 +482,18 @@ mod tests {
         let record = RootFence {
             logical_shard_id: LogicalShardId::from_bytes([0x11; 16]),
             placement_generation: PlacementGeneration::new(0x0102_0304_0506_0708).unwrap(),
+            layout_profile: RootLayoutProfile::PartitionedRoot,
+            layout_generation: RootLayoutGeneration::new(0x1112_1314_1516_1718).unwrap(),
+            partition_id: RootPartitionId::from_bytes([0x22; 16]),
             activation_state: RootActivationState::Active,
         };
         let expected = [
-            &[VALUE_FORMAT_VERSION][..],
+            &[ROOT_FENCE_VALUE_FORMAT_VERSION][..],
             &[0x11; 16],
             &0x0102_0304_0506_0708_u64.to_be_bytes(),
+            &[2],
+            &0x1112_1314_1516_1718_u64.to_be_bytes(),
+            &[0x22; 16],
             &[2],
         ]
         .concat();
@@ -467,7 +501,17 @@ mod tests {
         assert_eq!(record.encode().unwrap(), expected);
         assert_eq!(RootFence::decode(&expected).unwrap(), record);
         assert_every_proper_prefix_is_truncated(&expected, RootFence::decode);
-        assert_trailing_byte_is_rejected(expected, RootFence::decode);
+        assert_trailing_byte_is_rejected(expected.clone(), RootFence::decode);
+
+        let mut superseded_v1 = expected;
+        superseded_v1[0] = 1;
+        assert_eq!(
+            RootFence::decode(&superseded_v1),
+            Err(RecordCodecError::UnsupportedValueVersion {
+                actual: 1,
+                expected: ROOT_FENCE_VALUE_FORMAT_VERSION,
+            })
+        );
     }
 
     #[test]
@@ -555,6 +599,9 @@ mod tests {
         let root_fence = RootFence {
             logical_shard_id: LogicalShardId::from_bytes([1; 16]),
             placement_generation: PlacementGeneration::new(1).unwrap(),
+            layout_profile: RootLayoutProfile::SingleShardRoot,
+            layout_generation: RootLayoutGeneration::new(1).unwrap(),
+            partition_id: RootPartitionId::SINGLE_SHARD,
             activation_state: RootActivationState::Active,
         };
         let current = CurrentValue {
@@ -581,9 +628,10 @@ mod tests {
             history.encode().unwrap(),
             dedupe.encode().unwrap(),
         ];
-        for value in &mut values {
+        for value in &mut values[1..3] {
             value[0] = VALUE_FORMAT_VERSION + 1;
         }
+        values[0][0] = ROOT_FENCE_VALUE_FORMAT_VERSION + 1;
         values[3][0] = 3;
         assert!(matches!(
             RootFence::decode(&values[0]),
@@ -618,8 +666,21 @@ mod tests {
         let record = RootFence {
             logical_shard_id: LogicalShardId::from_bytes([1; 16]),
             placement_generation: PlacementGeneration::new(1).unwrap(),
+            layout_profile: RootLayoutProfile::SingleShardRoot,
+            layout_generation: RootLayoutGeneration::new(1).unwrap(),
+            partition_id: RootPartitionId::SINGLE_SHARD,
             activation_state: RootActivationState::Active,
         };
+
+        let mut unknown_layout = record.encode().unwrap();
+        unknown_layout[1 + LogicalShardId::BYTE_WIDTH + 8] = 0xff;
+        assert_eq!(
+            RootFence::decode(&unknown_layout),
+            Err(RecordCodecError::UnknownDiscriminant {
+                type_name: "RootLayoutProfile",
+                value: 0xff,
+            })
+        );
 
         let mut unknown_state = record.encode().unwrap();
         *unknown_state.last_mut().unwrap() = 0xff;
@@ -637,6 +698,16 @@ mod tests {
             RootFence::decode(&zero_generation),
             Err(RecordCodecError::ZeroScalar {
                 field: "placement_generation",
+            })
+        );
+
+        let mut zero_layout_generation = record.encode().unwrap();
+        let layout_generation_offset = 1 + LogicalShardId::BYTE_WIDTH + 8 + 1;
+        zero_layout_generation[layout_generation_offset..layout_generation_offset + 8].fill(0);
+        assert_eq!(
+            RootFence::decode(&zero_layout_generation),
+            Err(RecordCodecError::ZeroScalar {
+                field: "layout_generation",
             })
         );
 

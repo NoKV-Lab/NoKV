@@ -2317,7 +2317,15 @@ mod tests {
     fn activate(store: &AgentMetadataStore) {
         store.advance_owner_epoch(None, owner()).unwrap();
         store
-            .execute(&fence_command(store, request(1), RootFenceAction::Install))
+            .execute(&fence_command(
+                store,
+                request(1),
+                RootFenceAction::Install {
+                    layout_profile: nokv_types::RootLayoutProfile::SingleShardRoot,
+                    layout_generation: nokv_types::RootLayoutGeneration::new(1).unwrap(),
+                    partition_id: nokv_types::RootPartitionId::SINGLE_SHARD,
+                },
+            ))
             .unwrap();
         store
             .execute(&fence_command(

@@ -75,7 +75,7 @@ pub(crate) const SCHEMA_TREES: &[&str] = &[
 
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
-const SYSTEM_FORMAT_VERSION: u32 = 8;
+const SYSTEM_FORMAT_VERSION: u32 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SchemaMarkerError;
@@ -1002,7 +1002,7 @@ mod tests {
 
         let mut previous_layout = marker.clone();
         let version_start = previous_layout.len() - std::mem::size_of::<u32>();
-        previous_layout[version_start..].copy_from_slice(&7_u32.to_be_bytes());
+        previous_layout[version_start..].copy_from_slice(&8_u32.to_be_bytes());
         assert_eq!(
             validate_schema_marker(&previous_layout),
             Err(SchemaMarkerError)
