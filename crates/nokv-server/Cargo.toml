@@ -15,6 +15,7 @@ etcd = ["nokv-control/etcd"]
 foundationdb-provider = ["nokv-meta/foundationdb-provider"]
 
 [dependencies]
+libc.workspace = true
 nokv-control.workspace = true
 nokv-meta.workspace = true
 nokv-object.workspace = true

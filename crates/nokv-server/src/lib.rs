@@ -18,6 +18,8 @@ mod registry;
 mod runtime_registry;
 mod server;
 mod service;
+#[cfg(test)]
+mod store_owner_journal;
 
 pub use bootstrap::{
     bootstrap_root_owner, validate_owner_admission_transition_v1,
