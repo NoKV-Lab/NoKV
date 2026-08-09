@@ -285,11 +285,12 @@ struct LifecycleCursors {
 
 /// One root-affine lifecycle runner. Calls are serialized because its bounded
 /// discovery cursors are in-memory soft state; all destructive progress lives
-/// in Holt operation records.
+/// in durable metadata operation records.
 pub struct LifecycleRunner {
     store: Arc<meta::AgentMetadataStore>,
     registry: Arc<RootOwnerRegistry>,
     route: RootRoute,
+    candidate: Option<crate::registry::OwnerCandidateToken>,
     owner_loss: OwnerLossSignal,
     objects: Arc<dyn LifecycleObjectDeleter>,
     options: LifecycleRunnerOptions,
@@ -297,7 +298,8 @@ pub struct LifecycleRunner {
 }
 
 impl LifecycleRunner {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         store: Arc<meta::AgentMetadataStore>,
         registry: Arc<RootOwnerRegistry>,
         route: RootRoute,
@@ -312,6 +314,7 @@ impl LifecycleRunner {
             store,
             registry,
             route,
+            candidate: None,
             owner_loss,
             objects,
             options: options.validate()?,
@@ -321,8 +324,50 @@ impl LifecycleRunner {
         Ok(runner)
     }
 
+    pub(crate) fn new_control_backed(
+        store: Arc<meta::AgentMetadataStore>,
+        registry: Arc<RootOwnerRegistry>,
+        ownership: &crate::ControlBackedRootOwner,
+        owner_loss: OwnerLossSignal,
+        objects: Arc<dyn LifecycleObjectDeleter>,
+        options: LifecycleRunnerOptions,
+    ) -> Result<Self, LifecycleError> {
+        if !ownership.is_for_registry(&registry) {
+            return Err(LifecycleError::InvalidOptions(
+                "lifecycle ownership belongs to another registry".to_owned(),
+            ));
+        }
+        let route = ownership.route();
+        route
+            .validate()
+            .map_err(|error| LifecycleError::InvalidOptions(error.to_string()))?;
+        let runner = Self {
+            store,
+            registry,
+            route,
+            candidate: Some(ownership.candidate_token()),
+            owner_loss,
+            objects,
+            options: options.validate()?,
+            cursors: Mutex::new(LifecycleCursors::default()),
+        };
+        runner.with_candidate_admission(|| runner.require_current_owner())??;
+        Ok(runner)
+    }
+
+    pub const fn route(&self) -> RootRoute {
+        self.route
+    }
+
     /// Execute one bounded recovery pass over every lifecycle family.
     pub fn run_once(&self, observed_now_ms: u64) -> Result<LifecycleCycleReport, LifecycleError> {
+        self.with_candidate_admission(|| self.run_once_admitted(observed_now_ms))?
+    }
+
+    fn run_once_admitted(
+        &self,
+        observed_now_ms: u64,
+    ) -> Result<LifecycleCycleReport, LifecycleError> {
         self.require_current_owner()?;
         let mut cursors = self
             .cursors
@@ -335,6 +380,49 @@ impl LifecycleRunner {
         self.retire_commits(&mut cursors, &mut report)?;
         self.collect_revisions(&mut cursors, &mut report)?;
         Ok(report)
+    }
+
+    pub(crate) fn with_candidate_admission<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, LifecycleError> {
+        let Some(candidate) = self.candidate.as_ref() else {
+            return Ok(operation());
+        };
+        let Some(admission) = candidate
+            .read_admission()
+            .map_err(|error| LifecycleError::OwnerLost(error.to_string()))?
+        else {
+            return Err(LifecycleError::OwnerLost(
+                "owner candidate is no longer admitting lifecycle work".to_owned(),
+            ));
+        };
+        if !candidate.runtime_is_valid() {
+            candidate
+                .flag_terminal()
+                .map_err(|error| LifecycleError::OwnerLost(error.to_string()))?;
+            drop(admission);
+            self.registry
+                .terminate_candidate(candidate)
+                .map_err(|error| LifecycleError::OwnerLost(error.to_string()))?;
+            return Err(LifecycleError::OwnerLost(
+                "metadata runtime validation failed before lifecycle work".to_owned(),
+            ));
+        }
+        let result = operation();
+        if !candidate.runtime_is_valid() {
+            candidate
+                .flag_terminal()
+                .map_err(|error| LifecycleError::OwnerLost(error.to_string()))?;
+            drop(admission);
+            self.registry
+                .terminate_candidate(candidate)
+                .map_err(|error| LifecycleError::OwnerLost(error.to_string()))?;
+            return Err(LifecycleError::OwnerLost(
+                "metadata runtime validation failed after lifecycle work".to_owned(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Run continuously until ownership is lost or a non-retryable invariant
@@ -1702,7 +1790,11 @@ mod tests {
             .execute(&command(
                 &store,
                 1,
-                meta::RootFenceAction::Install,
+                meta::RootFenceAction::Install {
+                    layout_profile: nokv_types::RootLayoutProfile::SingleShardRoot,
+                    layout_generation: nokv_types::RootLayoutGeneration::new(1).unwrap(),
+                    partition_id: nokv_types::RootPartitionId::SINGLE_SHARD,
+                },
                 Vec::new(),
             ))
             .unwrap();
@@ -2148,7 +2240,11 @@ mod tests {
             .execute(&command(
                 &store,
                 1,
-                meta::RootFenceAction::Install,
+                meta::RootFenceAction::Install {
+                    layout_profile: nokv_types::RootLayoutProfile::SingleShardRoot,
+                    layout_generation: nokv_types::RootLayoutGeneration::new(1).unwrap(),
+                    partition_id: nokv_types::RootPartitionId::SINGLE_SHARD,
+                },
                 Vec::new(),
             ))
             .unwrap();

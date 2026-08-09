@@ -94,9 +94,9 @@ impl WorkspaceServer {
                     "ownership entry {index} belongs to another registry"
                 )));
             }
-            if !registry.contains_exact(owner.route())? {
+            if !owner.is_active_candidate()? {
                 return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} has no exact installed route"
+                    "ownership entry {index} has no exact active owner candidate"
                 )));
             }
             if ownership[..index]
@@ -108,6 +108,11 @@ impl WorkspaceServer {
                 )));
             }
         }
+        let candidates = ownership
+            .iter()
+            .map(ControlBackedRootOwner::candidate_token)
+            .collect::<Vec<_>>();
+        registry.seal_for_server(&candidates)?;
         Ok(Self {
             options,
             registry,
@@ -185,8 +190,10 @@ impl WorkspaceServer {
 
     pub fn dispatch_frame(&self, encoded: &[u8]) -> Result<Vec<u8>, ServerError> {
         let request = decode_request(encoded)?;
-        let response = self.registry.dispatch(request)?;
-        encode_response(&response).map_err(ServerError::Protocol)
+        let response = self.registry.dispatch_admitted(request)?;
+        let encoded = encode_response(response.response()).map_err(ServerError::Protocol)?;
+        drop(response);
+        Ok(encoded)
     }
 }
 
@@ -203,9 +210,10 @@ fn serve_connection(
         .map_err(ServerError::Connection)?;
     while let Some(request) = read_frame(&mut stream)? {
         let request = decode_request(&request)?;
-        let response = registry.dispatch(request)?;
-        let response = encode_response(&response)?;
-        write_frame(&mut stream, &response)?;
+        let response = registry.dispatch_admitted(request)?;
+        let encoded = encode_response(response.response())?;
+        write_frame(&mut stream, &encoded)?;
+        drop(response);
     }
     Ok(())
 }

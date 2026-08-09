@@ -20,8 +20,9 @@ mod server;
 mod service;
 
 pub use bootstrap::{
-    bootstrap_root_owner, BootstrappedRootOwner, ControlBackedRootOwner, MetadataStoreOpen,
-    OwnerAdmission, RootOwnerBootstrapRequest,
+    bootstrap_root_owner, validate_owner_admission_transition_v1,
+    validate_owner_lease_model_before_control_read_v1, BootstrappedRootOwner,
+    ControlBackedRootOwner, OwnerAdmission, PendingOwnerRelease, RootOwnerBootstrapRequest,
 };
 pub use error::ServerError;
 pub use executor::MetadataWorkspaceRequestExecutor;
