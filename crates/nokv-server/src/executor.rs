@@ -2464,7 +2464,7 @@ fn encode_index_fields(fields: &[protocol::FieldValue]) -> Result<Vec<u8>, proto
 }
 
 fn decode_index_fields(encoded: &[u8]) -> Result<Vec<protocol::FieldValue>, protocol::RpcFailure> {
-    let projection = meta::TypedProjection::decode(encoded)
+    let projection = meta::TypedProjection::decode_stored(encoded)
         .map_err(|error| internal(format!("invalid durable typed projection: {error}")))?;
     Ok(projection
         .fields()
@@ -3489,6 +3489,7 @@ fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
             Some(protocol::ConflictKind::OperationState),
         ),
         meta::RestoreError::CorruptKey { .. }
+        | meta::RestoreError::CorruptSourceMember { .. }
         | meta::RestoreError::RevisionReferenceMissing { .. }
         | meta::RestoreError::ReferenceEpochAhead { .. }
         | meta::RestoreError::ReferenceEpochOverflow { .. }
@@ -3712,6 +3713,17 @@ fn bounded_message(mut message: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_zero_byte_projection_yields_empty_index_fields() {
+        assert!(decode_index_fields(&[]).unwrap().is_empty());
+        assert!(
+            decode_index_fields(&meta::TypedProjection::empty().encode().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decode_index_fields(&[0xff]).is_err());
+    }
 
     fn root() -> types::RootId {
         types::RootId::from_bytes([1; types::FIXED_ID_BYTES])
