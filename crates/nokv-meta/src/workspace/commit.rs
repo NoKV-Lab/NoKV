@@ -570,7 +570,7 @@ impl<'a> CommitService<'a> {
                     content_type: revision.record.content_type,
                     producer: None,
                     manifest_id: None,
-                    typed_projection: Vec::new(),
+                    typed_projection: TypedProjection::empty().encode()?,
                 })
             } else {
                 None
@@ -1213,15 +1213,15 @@ impl<'a> CommitService<'a> {
         if current_path.as_ref().map(|loaded| &loaded.record) != source_path.as_ref() {
             return Err(CommitError::HeadConflict);
         }
-        if current_path
-            .as_ref()
-            .is_some_and(|current| !current.record.typed_index_projection.is_empty())
-        {
-            return Err(CommitError::ClosureMismatch {
-                closure: "run manifest secondary index",
-                expected_count: 0,
-                actual_count: 1,
-            });
+        if let Some(current) = &current_path {
+            let projection = TypedProjection::decode(&current.record.typed_index_projection)?;
+            if !projection.fields().is_empty() {
+                return Err(CommitError::ClosureMismatch {
+                    closure: "run manifest secondary index",
+                    expected_count: 0,
+                    actual_count: 1,
+                });
+            }
         }
 
         let member_key = commit_member_key(context.root_id, operation.commit_id, &path);
@@ -1233,6 +1233,7 @@ impl<'a> CommitService<'a> {
                 actual_count: 0,
             })?;
         let member = CommitMemberRecord::decode(&member_payload)?;
+        let member_projection = TypedProjection::decode(&member.typed_projection)?;
         let binding =
             operation
                 .commit_staged_run_manifest
@@ -1252,7 +1253,7 @@ impl<'a> CommitService<'a> {
             || member.content_type != "application/json"
             || member.producer.is_some()
             || member.manifest_id.is_some()
-            || !member.typed_projection.is_empty()
+            || !member_projection.fields().is_empty()
         {
             return Err(CommitError::ClosureMismatch {
                 closure: "run manifest commit member",

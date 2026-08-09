@@ -598,16 +598,16 @@ impl<'a> GcService<'a> {
             revision: request.artifact_revision_id,
         })?;
         let revision = ArtifactRevisionRecord::decode(&revision_payload)?;
-        if revision.state != RevisionState::Available || revision.strong_reference_count != 0 {
-            return Err(GcError::RevisionNotClaimable {
-                state: revision.state,
-                strong_reference_count: revision.strong_reference_count,
-            });
-        }
         if revision.reference_epoch != request.reference_epoch {
             return Err(GcError::ReferenceEpochMismatch {
                 expected: request.reference_epoch,
                 actual: revision.reference_epoch,
+            });
+        }
+        if revision.state != RevisionState::Available || revision.strong_reference_count != 0 {
+            return Err(GcError::RevisionNotClaimable {
+                state: revision.state,
+                strong_reference_count: revision.strong_reference_count,
             });
         }
 
@@ -2531,6 +2531,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(revision.state, RevisionState::Deleting);
+    }
+
+    #[test]
+    fn stale_epoch_precedes_current_reference_state_when_claiming() {
+        let mut counter = 50;
+        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        initialize_store(&store, &mut counter);
+        let fixture = seed_fixture(&store, &mut counter, false, false);
+        let revision_key = artifact_revision_key(root(), fixture.target);
+        let revision_payload =
+            read_payload(&store, MetadataFamily::ArtifactRevision, &revision_key).unwrap();
+        let mut rereferenced = ArtifactRevisionRecord::decode(&revision_payload).unwrap();
+        let current_epoch = ReferenceEpoch::new(fixture.epoch.get() + 1);
+        rereferenced.reference_epoch = current_epoch;
+        rereferenced.strong_reference_count = 1;
+        rereferenced.last_zero_ref_version = None;
+        let mut command = base_command(write_context(&store, &mut counter), Vec::new());
+        replace_exact(
+            &mut command,
+            MetadataFamily::ArtifactRevision,
+            revision_key,
+            revision_payload,
+            rereferenced.encode().unwrap(),
+        );
+        store.execute(&command.seal()).unwrap();
+
+        let service = GcService::new(&store);
+        assert_eq!(
+            service.claim(ClaimGcRequest {
+                context: write_context(&store, &mut counter),
+                artifact_revision_id: fixture.target,
+                reference_epoch: fixture.epoch,
+            }),
+            Err(GcError::ReferenceEpochMismatch {
+                expected: fixture.epoch,
+                actual: current_epoch,
+            })
+        );
+        assert_eq!(
+            service.claim(ClaimGcRequest {
+                context: write_context(&store, &mut counter),
+                artifact_revision_id: fixture.target,
+                reference_epoch: current_epoch,
+            }),
+            Err(GcError::RevisionNotClaimable {
+                state: RevisionState::Available,
+                strong_reference_count: 1,
+            })
+        );
     }
 
     #[test]
