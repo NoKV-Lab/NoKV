@@ -12,3 +12,6 @@ homepage.workspace = true
 [lib]
 name = "nokv_types"
 path = "src/lib.rs"
+
+[dependencies]
+sha2.workspace = true

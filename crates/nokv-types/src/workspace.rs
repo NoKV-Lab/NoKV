@@ -7,6 +7,8 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
+use sha2::{Digest, Sha256};
+
 /// Width of every fixed-size workspace storage identifier.
 pub const FIXED_ID_BYTES: usize = 16;
 /// Width of SHA-256-backed identities and digests.
@@ -88,6 +90,26 @@ fixed_bytes_type!(
     FIXED_ID_BYTES
 );
 fixed_bytes_type!(
+    /// Never-reused identity of one physical owner incarnation.
+    ///
+    /// This provider-neutral lineage survives process restart for an exact
+    /// resume. Exact resume preserves this identity; every successor uses a
+    /// new identity and owner epoch. It is distinct from a backend-specific
+    /// lease handle.
+    OwnerIncarnationId,
+    FIXED_ID_BYTES
+);
+fixed_bytes_type!(
+    /// Stable identity of one partition within a persisted root layout.
+    RootPartitionId,
+    FIXED_ID_BYTES
+);
+
+impl RootPartitionId {
+    /// Reserved partition identity for the complete `SingleShardRoot` layout.
+    pub const SINGLE_SHARD: Self = Self::from_bytes([0; FIXED_ID_BYTES]);
+}
+fixed_bytes_type!(
     /// Never-reused identity for one durable lifecycle operation within a root.
     OperationId,
     FIXED_ID_BYTES
@@ -106,6 +128,21 @@ fixed_bytes_type!(
     /// SHA-256 digest of the canonical metadata command input.
     CommandDigest,
     SHA256_BYTES
+);
+fixed_bytes_type!(
+    /// Never-reused identity of one installed metadata authority.
+    MetadataAuthorityId,
+    FIXED_ID_BYTES
+);
+fixed_bytes_type!(
+    /// SHA-256 digest of the provider-neutral metadata semantics contract.
+    MetadataContractDigest,
+    SHA256_BYTES
+);
+fixed_bytes_type!(
+    /// Identity of one backend atomicity and ordering boundary.
+    ConsistencyDomainId,
+    FIXED_ID_BYTES
 );
 
 /// Error returned when a durable scalar that must be non-zero is constructed
@@ -179,8 +216,20 @@ non_zero_u64_type!(
     PlacementGeneration
 );
 non_zero_u64_type!(
+    /// Generation of a persisted root layout and partition map.
+    RootLayoutGeneration
+);
+non_zero_u64_type!(
     /// Epoch of the current physical shard owner. Zero never owns writes.
     OwnerEpoch
+);
+non_zero_u64_type!(
+    /// Generation of the active metadata authority. Zero is never installed.
+    MetadataAuthorityGeneration
+);
+non_zero_u64_type!(
+    /// Monotonic revision of one metadata authority control record.
+    MetadataAuthorityRevision
 );
 non_zero_u64_type!(
     /// Durable MVCC read version. The engine's zero sentinel is not readable.
@@ -190,6 +239,141 @@ non_zero_u64_type!(
     /// Durable version assigned to one committed metadata command.
     CommitVersion
 );
+
+/// Provider-independent recovery point used to prove migration convergence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetadataRecoveryFrontier {
+    pub recovery_lsn: u64,
+    pub chain_digest: [u8; SHA256_BYTES],
+    pub commit_version: CommitVersion,
+    pub state_digest: [u8; SHA256_BYTES],
+}
+
+/// Durable proof that one exact source authority stopped admitting writes at
+/// an exact logical recovery frontier.
+///
+/// The receipt is created by the metadata engine in the same provider
+/// transaction that changes its local authority marker from `Active` to
+/// `Quiescing`. It is provider-neutral and can therefore be persisted by the
+/// control plane without exposing provider keys or versions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SourceQuiesceReceipt {
+    pub logical_shard_id: LogicalShardId,
+    pub migration_id: OperationId,
+    pub source_authority_id: MetadataAuthorityId,
+    pub source_authority_generation: MetadataAuthorityGeneration,
+    pub owner_epoch: OwnerEpoch,
+    pub frontier: MetadataRecoveryFrontier,
+    pub contract_digest: MetadataContractDigest,
+}
+
+/// Immutable provider-local binding installed before a migration target may
+/// receive copied metadata or an activation token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetadataMigrationTargetBinding {
+    pub logical_shard_id: LogicalShardId,
+    pub migration_id: OperationId,
+    pub source_authority_id: MetadataAuthorityId,
+    pub source_authority_generation: MetadataAuthorityGeneration,
+    pub target_authority_id: MetadataAuthorityId,
+    pub target_authority_generation: MetadataAuthorityGeneration,
+    pub contract_digest: MetadataContractDigest,
+}
+
+impl SourceQuiesceReceipt {
+    /// SHA-256 of the frozen, tagged receipt preimage.
+    pub fn canonical_digest(&self) -> [u8; SHA256_BYTES] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"nokv.metadata.source-quiesce-receipt.v1\0");
+        hash_field(&mut hasher, 1, self.logical_shard_id.as_bytes());
+        hash_field(&mut hasher, 2, self.migration_id.as_bytes());
+        hash_field(&mut hasher, 3, self.source_authority_id.as_bytes());
+        hash_field(
+            &mut hasher,
+            4,
+            &self.source_authority_generation.get().to_be_bytes(),
+        );
+        hash_field(&mut hasher, 5, &self.owner_epoch.get().to_be_bytes());
+        hash_frontier(&mut hasher, 6, self.frontier);
+        hash_field(&mut hasher, 7, self.contract_digest.as_bytes());
+        hasher.finalize().into()
+    }
+}
+
+/// Deterministic control-plane authorization for activating one exact
+/// migration target after authority cutover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TargetActivationToken {
+    pub logical_shard_id: LogicalShardId,
+    pub migration_id: OperationId,
+    pub source_authority_id: MetadataAuthorityId,
+    pub source_authority_generation: MetadataAuthorityGeneration,
+    pub target_authority_id: MetadataAuthorityId,
+    pub target_authority_generation: MetadataAuthorityGeneration,
+    pub frontier: MetadataRecoveryFrontier,
+    pub contract_digest: MetadataContractDigest,
+    pub source_receipt_digest: [u8; SHA256_BYTES],
+}
+
+impl TargetActivationToken {
+    /// Construct the only token admitted for a cutover from `source_receipt`.
+    pub fn for_cutover(
+        source_receipt: &SourceQuiesceReceipt,
+        target_authority_id: MetadataAuthorityId,
+        target_authority_generation: MetadataAuthorityGeneration,
+    ) -> Self {
+        Self {
+            logical_shard_id: source_receipt.logical_shard_id,
+            migration_id: source_receipt.migration_id,
+            source_authority_id: source_receipt.source_authority_id,
+            source_authority_generation: source_receipt.source_authority_generation,
+            target_authority_id,
+            target_authority_generation,
+            frontier: source_receipt.frontier,
+            contract_digest: source_receipt.contract_digest,
+            source_receipt_digest: source_receipt.canonical_digest(),
+        }
+    }
+
+    /// SHA-256 of the frozen, tagged token preimage.
+    pub fn canonical_digest(&self) -> [u8; SHA256_BYTES] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"nokv.metadata.target-activation-token.v1\0");
+        hash_field(&mut hasher, 1, self.logical_shard_id.as_bytes());
+        hash_field(&mut hasher, 2, self.migration_id.as_bytes());
+        hash_field(&mut hasher, 3, self.source_authority_id.as_bytes());
+        hash_field(
+            &mut hasher,
+            4,
+            &self.source_authority_generation.get().to_be_bytes(),
+        );
+        hash_field(&mut hasher, 5, self.target_authority_id.as_bytes());
+        hash_field(
+            &mut hasher,
+            6,
+            &self.target_authority_generation.get().to_be_bytes(),
+        );
+        hash_frontier(&mut hasher, 7, self.frontier);
+        hash_field(&mut hasher, 8, self.contract_digest.as_bytes());
+        hash_field(&mut hasher, 9, &self.source_receipt_digest);
+        hasher.finalize().into()
+    }
+}
+
+fn hash_frontier(hasher: &mut Sha256, tag: u8, frontier: MetadataRecoveryFrontier) {
+    let mut encoded = Vec::with_capacity(8 + SHA256_BYTES + 8 + SHA256_BYTES);
+    encoded.extend_from_slice(&frontier.recovery_lsn.to_be_bytes());
+    encoded.extend_from_slice(&frontier.chain_digest);
+    encoded.extend_from_slice(&frontier.commit_version.get().to_be_bytes());
+    encoded.extend_from_slice(&frontier.state_digest);
+    hash_field(hasher, tag, &encoded);
+}
+
+fn hash_field(hasher: &mut Sha256, tag: u8, value: &[u8]) {
+    hasher.update([tag]);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
 non_zero_u64_type!(
     /// Generation of a published path, head, tag, or alias.
     Generation
@@ -599,6 +783,14 @@ durable_enum! {
 }
 
 durable_enum! {
+    /// Integration-selected partitioning contract for one Agent root.
+    pub enum RootLayoutProfile {
+        SingleShardRoot = 1,
+        PartitionedRoot = 2,
+    }
+}
+
+durable_enum! {
     /// Control-plane lifecycle of one persisted root placement.
     pub enum RootPlacementLifecycle {
         Provisioning = 1,
@@ -902,6 +1094,8 @@ mod tests {
 
         let root = RootId::from_bytes(bytes);
         let shard = LogicalShardId::from_bytes(bytes);
+        let owner_incarnation = OwnerIncarnationId::from_bytes(bytes);
+        let partition = RootPartitionId::from_bytes(bytes);
         let workspace = WorkspaceIncarnationId::from_bytes(bytes);
         let revision = ArtifactRevisionId::from_bytes(bytes);
         let operation = OperationId::from_bytes(bytes);
@@ -911,6 +1105,8 @@ mod tests {
 
         assert_eq!(root.as_bytes(), &bytes);
         assert_eq!(shard.as_bytes(), &bytes);
+        assert_eq!(owner_incarnation.as_bytes(), &bytes);
+        assert_eq!(partition.as_bytes(), &bytes);
         assert_eq!(workspace.as_bytes(), &bytes);
         assert_eq!(revision.as_bytes(), &bytes);
         assert_eq!(operation.as_bytes(), &bytes);
@@ -918,9 +1114,13 @@ mod tests {
         assert_eq!(commit.as_bytes(), &digest_bytes);
         assert_eq!(command_digest.as_bytes(), &digest_bytes);
         assert_eq!(shard.into_bytes(), bytes);
+        assert_eq!(owner_incarnation.into_bytes(), bytes);
+        assert_eq!(partition.into_bytes(), bytes);
         assert_eq!(commit.into_bytes(), digest_bytes);
         assert_eq!(std::mem::size_of::<RootId>(), FIXED_ID_BYTES);
         assert_eq!(std::mem::size_of::<LogicalShardId>(), FIXED_ID_BYTES);
+        assert_eq!(std::mem::size_of::<OwnerIncarnationId>(), FIXED_ID_BYTES);
+        assert_eq!(std::mem::size_of::<RootPartitionId>(), FIXED_ID_BYTES);
         assert_eq!(
             std::mem::size_of::<WorkspaceIncarnationId>(),
             FIXED_ID_BYTES
@@ -931,6 +1131,12 @@ mod tests {
         assert_eq!(std::mem::size_of::<CommitId>(), SHA256_BYTES);
         assert_eq!(std::mem::size_of::<CommandDigest>(), SHA256_BYTES);
         assert_eq!(LogicalShardId::BYTE_WIDTH, FIXED_ID_BYTES);
+        assert_eq!(OwnerIncarnationId::BYTE_WIDTH, FIXED_ID_BYTES);
+        assert_eq!(RootPartitionId::BYTE_WIDTH, FIXED_ID_BYTES);
+        assert_eq!(
+            RootPartitionId::SINGLE_SHARD.as_bytes(),
+            &[0; FIXED_ID_BYTES]
+        );
         assert_eq!(CommitId::BYTE_WIDTH, SHA256_BYTES);
     }
 
@@ -946,6 +1152,7 @@ mod tests {
         }
 
         assert_non_zero!(PlacementGeneration);
+        assert_non_zero!(RootLayoutGeneration);
         assert_non_zero!(OwnerEpoch);
         assert_non_zero!(ReadVersion);
         assert_non_zero!(CommitVersion);
@@ -1051,6 +1258,10 @@ mod tests {
             (RootActivationState::Active, 2),
             (RootActivationState::Draining, 3),
             (RootActivationState::Fenced, 4),
+        ]);
+        assert_durable_registry(&[
+            (RootLayoutProfile::SingleShardRoot, 1),
+            (RootLayoutProfile::PartitionedRoot, 2),
         ]);
         assert_durable_registry(&[
             (RootPlacementLifecycle::Provisioning, 1),
@@ -1263,5 +1474,58 @@ mod tests {
                 max: NormalizedRelativePath::MAX_COMPONENTS,
             })
         );
+    }
+
+    #[test]
+    fn migration_receipt_and_activation_token_digests_are_frozen() {
+        let receipt = SourceQuiesceReceipt {
+            logical_shard_id: LogicalShardId::from_bytes([0x11; FIXED_ID_BYTES]),
+            migration_id: OperationId::from_bytes([0x22; FIXED_ID_BYTES]),
+            source_authority_id: MetadataAuthorityId::from_bytes([0x33; FIXED_ID_BYTES]),
+            source_authority_generation: MetadataAuthorityGeneration::new(4).unwrap(),
+            owner_epoch: OwnerEpoch::new(5).unwrap(),
+            frontier: MetadataRecoveryFrontier {
+                recovery_lsn: 6,
+                chain_digest: [0x77; SHA256_BYTES],
+                commit_version: CommitVersion::new(8).unwrap(),
+                state_digest: [0x99; SHA256_BYTES],
+            },
+            contract_digest: MetadataContractDigest::from_bytes([0xaa; SHA256_BYTES]),
+        };
+        let token = TargetActivationToken::for_cutover(
+            &receipt,
+            MetadataAuthorityId::from_bytes([0xbb; FIXED_ID_BYTES]),
+            MetadataAuthorityGeneration::new(5).unwrap(),
+        );
+
+        assert_eq!(
+            hex_encode(&receipt.canonical_digest()),
+            "992d401f284532e5c749b64d478bd6ddef8661b7d1c080a771f0ae1c7c399ff9"
+        );
+        assert_eq!(
+            hex_encode(&token.canonical_digest()),
+            "1cdfaec2ceec20690b757efa7479a65ea379c75ded553a6bc7d96d4208d8b600"
+        );
+        assert_eq!(token.source_receipt_digest, receipt.canonical_digest());
+
+        let mut changed = receipt;
+        changed.owner_epoch = OwnerEpoch::new(6).unwrap();
+        assert_ne!(changed.canonical_digest(), receipt.canonical_digest());
+        let foreign = TargetActivationToken::for_cutover(
+            &receipt,
+            MetadataAuthorityId::from_bytes([0xbc; FIXED_ID_BYTES]),
+            MetadataAuthorityGeneration::new(5).unwrap(),
+        );
+        assert_ne!(foreign.canonical_digest(), token.canonical_digest());
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").unwrap();
+        }
+        encoded
     }
 }
