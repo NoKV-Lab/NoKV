@@ -1427,9 +1427,11 @@ name = "nokv"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.0",
+ "libc",
  "nokv-agent",
  "nokv-client",
  "nokv-control",
+ "nokv-meta",
  "nokv-object",
  "nokv-protocol",
  "nokv-server",

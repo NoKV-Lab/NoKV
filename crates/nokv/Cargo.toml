@@ -12,9 +12,11 @@ homepage.workspace = true
 [features]
 default = ["etcd"]
 etcd = ["nokv-client/etcd", "nokv-control/etcd", "nokv-server/etcd"]
+foundationdb-provider = ["nokv-server/foundationdb-provider"]
 
 [dependencies]
 base64.workspace = true
+libc.workspace = true
 nokv-client.workspace = true
 nokv-control.workspace = true
 nokv-object.workspace = true
@@ -31,4 +33,5 @@ name = "nokv"
 path = "src/main.rs"
 
 [dev-dependencies]
+nokv-meta.workspace = true
 tempfile.workspace = true

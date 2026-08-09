@@ -10,12 +10,17 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use nokv_control::MetadataProviderProfileId;
+use nokv_types::RootLayoutProfile;
+
 pub const DEFAULT_METADATA_ADDRESS: &str = "127.0.0.1:7750";
 pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:7750";
 pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
 pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
 pub const DEFAULT_LIFECYCLE_INTERVAL_MILLIS: u64 = 1_000;
+pub const DEFAULT_FDB_TRANSACTION_BUDGET_BYTES: usize = 1_000_000;
+pub const DEFAULT_FDB_TRANSACTION_TIMEOUT_MS: u32 = 5_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
@@ -67,20 +72,69 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub advertise_endpoint: Option<String>,
     pub node_id: Option<String>,
+    pub metadata_profile: MetadataProviderProfileId,
     pub metadata_store: Option<MetadataStoreConfig>,
+    pub foundationdb: FoundationDbConfig,
+    pub owner_session: Option<OwnerSessionConfig>,
     pub lifecycle_interval_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetadataStoreConfig {
+    HoltCreate(PathBuf),
+    HoltReopen(PathBuf),
+    FoundationDbCreate,
+    FoundationDbReopen,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct FoundationDbConfig {
+    pub cluster_file: Option<PathBuf>,
+    pub stable_cluster_id: Option<String>,
+    pub namespace: Option<String>,
+    pub transaction_budget_bytes: usize,
+    pub transaction_timeout_ms: u32,
+}
+
+impl fmt::Debug for FoundationDbConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FoundationDbConfig")
+            .field(
+                "cluster_file",
+                &self.cluster_file.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "stable_cluster_id",
+                &self.stable_cluster_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("namespace", &self.namespace)
+            .field("transaction_budget_bytes", &self.transaction_budget_bytes)
+            .field("transaction_timeout_ms", &self.transaction_timeout_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum OwnerSessionConfig {
     Create(PathBuf),
-    Reopen(PathBuf),
+    Resume(PathBuf),
+}
+
+impl fmt::Debug for OwnerSessionConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Create(_) => formatter.write_str("Create(<redacted>)"),
+            Self::Resume(_) => formatter.write_str("Resume(<redacted>)"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub client: ClientConfig,
     pub server: ServerConfig,
+    pub root_layout: RootLayoutProfile,
     pub workbench_root: Option<String>,
     pub command: Command,
 }
@@ -126,6 +180,18 @@ pub enum CliError {
     InvalidAddress { option: &'static str, value: String },
     MixedRoutingOptions,
     MixedMetadataStoreOptions,
+    MixedOwnerSessionOptions,
+    DuplicateMetadataProfile,
+    UnknownMetadataProfile(String),
+    FoundationDbOptionsProfileMismatch,
+    FoundationDbOptionsNotApplicable,
+    OwnerSessionNotApplicable,
+    HoltOwnerSessionRequired,
+    OwnerSessionMetadataModeMismatch,
+    MetadataStoreProfileMismatch,
+    DuplicateRootLayout,
+    UnknownRootLayout(String),
+    RootLayoutNotApplicable,
 }
 
 impl fmt::Display for CliError {
@@ -149,7 +215,42 @@ impl fmt::Display for CliError {
                 "static metadata routing options and etcd routing options cannot be combined",
             ),
             Self::MixedMetadataStoreOptions => formatter
-                .write_str("--metadata-create and --metadata-reopen are mutually exclusive"),
+                .write_str("metadata store create/reopen options are mutually exclusive"),
+            Self::MixedOwnerSessionOptions => formatter.write_str(
+                "--owner-session-create and --owner-session-resume are mutually exclusive",
+            ),
+            Self::DuplicateMetadataProfile => {
+                formatter.write_str("--metadata-profile may be specified only once")
+            }
+            Self::UnknownMetadataProfile(profile) => {
+                write!(formatter, "unknown metadata profile {profile:?}")
+            }
+            Self::FoundationDbOptionsProfileMismatch => formatter.write_str(
+                "FoundationDB options require --metadata-profile foundationdb-v1",
+            ),
+            Self::FoundationDbOptionsNotApplicable => formatter
+                .write_str("FoundationDB options are valid only with provision or serve"),
+            Self::OwnerSessionNotApplicable => formatter.write_str(
+                "--owner-session-create and --owner-session-resume are valid only with serve",
+            ),
+            Self::HoltOwnerSessionRequired => formatter.write_str(
+                "Holt Serving requires --owner-session-create with metadata create or --owner-session-resume with metadata reopen",
+            ),
+            Self::OwnerSessionMetadataModeMismatch => formatter.write_str(
+                "owner-session create requires metadata create and owner-session resume requires metadata reopen",
+            ),
+            Self::MetadataStoreProfileMismatch => formatter.write_str(
+                "metadata store open mode does not match the selected metadata profile",
+            ),
+            Self::DuplicateRootLayout => {
+                formatter.write_str("--root-layout may be specified only once")
+            }
+            Self::UnknownRootLayout(profile) => {
+                write!(formatter, "unknown root layout {profile:?}")
+            }
+            Self::RootLayoutNotApplicable => {
+                formatter.write_str("--root-layout is valid only with provision or serve")
+            }
         }
     }
 }
@@ -217,8 +318,26 @@ impl Default for ServerConfig {
                 .expect("default server bind is valid"),
             advertise_endpoint: None,
             node_id: None,
+            metadata_profile: MetadataProviderProfileId::new(
+                nokv_server::HOLT_LOCAL_METADATA_PROFILE_ID,
+            )
+            .expect("built-in Holt metadata profile id is canonical"),
             metadata_store: None,
+            foundationdb: FoundationDbConfig::default(),
+            owner_session: None,
             lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
+        }
+    }
+}
+
+impl Default for FoundationDbConfig {
+    fn default() -> Self {
+        Self {
+            cluster_file: None,
+            stable_cluster_id: None,
+            namespace: None,
+            transaction_budget_bytes: DEFAULT_FDB_TRANSACTION_BUDGET_BYTES,
+            transaction_timeout_ms: DEFAULT_FDB_TRANSACTION_TIMEOUT_MS,
         }
     }
 }
@@ -230,6 +349,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
     let mut routing_kind = None;
+    let mut metadata_profile_selected = false;
+    let mut foundationdb_option_selected = false;
+    let mut root_layout = RootLayoutProfile::SingleShardRoot;
+    let mut root_layout_selected = false;
     let mut workbench_root = None;
     let command = loop {
         let Some(argument) = arguments.next() else {
@@ -325,10 +448,28 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                 server.advertise_endpoint = Some(next_value(&mut arguments, &argument)?);
             }
             "--node-id" => server.node_id = Some(next_value(&mut arguments, &argument)?),
+            "--metadata-profile" => {
+                if metadata_profile_selected {
+                    return Err(CliError::DuplicateMetadataProfile);
+                }
+                let profile = next_value(&mut arguments, &argument)?;
+                server.metadata_profile = MetadataProviderProfileId::new(profile.clone())
+                    .map_err(|_| CliError::UnknownMetadataProfile(profile.clone()))?;
+                metadata_profile_selected = true;
+            }
+            "--root-layout" => {
+                if root_layout_selected {
+                    return Err(CliError::DuplicateRootLayout);
+                }
+                let profile = next_value(&mut arguments, &argument)?;
+                root_layout = parse_root_layout(&profile)
+                    .ok_or_else(|| CliError::UnknownRootLayout(profile.clone()))?;
+                root_layout_selected = true;
+            }
             "--metadata-create" => {
                 select_metadata_store(
                     &mut server.metadata_store,
-                    MetadataStoreConfig::Create(PathBuf::from(next_value(
+                    MetadataStoreConfig::HoltCreate(PathBuf::from(next_value(
                         &mut arguments,
                         &argument,
                     )?)),
@@ -337,7 +478,65 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--metadata-reopen" => {
                 select_metadata_store(
                     &mut server.metadata_store,
-                    MetadataStoreConfig::Reopen(PathBuf::from(next_value(
+                    MetadataStoreConfig::HoltReopen(PathBuf::from(next_value(
+                        &mut arguments,
+                        &argument,
+                    )?)),
+                )?;
+            }
+            "--metadata-fdb-create" => {
+                select_metadata_store(
+                    &mut server.metadata_store,
+                    MetadataStoreConfig::FoundationDbCreate,
+                )?;
+            }
+            "--metadata-fdb-reopen" => {
+                select_metadata_store(
+                    &mut server.metadata_store,
+                    MetadataStoreConfig::FoundationDbReopen,
+                )?;
+            }
+            "--fdb-cluster-file" => {
+                server.foundationdb.cluster_file =
+                    Some(PathBuf::from(next_value(&mut arguments, &argument)?));
+                foundationdb_option_selected = true;
+            }
+            "--fdb-stable-cluster-id" => {
+                server.foundationdb.stable_cluster_id =
+                    Some(next_value(&mut arguments, &argument)?);
+                foundationdb_option_selected = true;
+            }
+            "--fdb-namespace" => {
+                server.foundationdb.namespace = Some(next_value(&mut arguments, &argument)?);
+                foundationdb_option_selected = true;
+            }
+            "--fdb-transaction-budget-bytes" => {
+                server.foundationdb.transaction_budget_bytes = parse_number(
+                    "--fdb-transaction-budget-bytes",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+                foundationdb_option_selected = true;
+            }
+            "--fdb-transaction-timeout-ms" => {
+                server.foundationdb.transaction_timeout_ms = parse_number(
+                    "--fdb-transaction-timeout-ms",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+                foundationdb_option_selected = true;
+            }
+            "--owner-session-create" => {
+                select_owner_session(
+                    &mut server.owner_session,
+                    OwnerSessionConfig::Create(PathBuf::from(next_value(
+                        &mut arguments,
+                        &argument,
+                    )?)),
+                )?;
+            }
+            "--owner-session-resume" => {
+                select_owner_session(
+                    &mut server.owner_session,
+                    OwnerSessionConfig::Resume(PathBuf::from(next_value(
                         &mut arguments,
                         &argument,
                     )?)),
@@ -367,12 +566,74 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     {
         return Err(CliError::MissingOption("--workbench-root"));
     }
+    if root_layout_selected && !matches!(command, Command::Provision { .. } | Command::Serve) {
+        return Err(CliError::RootLayoutNotApplicable);
+    }
+    if server.owner_session.is_some() && command != Command::Serve {
+        return Err(CliError::OwnerSessionNotApplicable);
+    }
+    if command == Command::Serve {
+        let matches_metadata_profile = match server.metadata_store.as_ref() {
+            Some(MetadataStoreConfig::HoltCreate(_) | MetadataStoreConfig::HoltReopen(_)) => {
+                server.metadata_profile.as_str() == nokv_server::HOLT_LOCAL_METADATA_PROFILE_ID
+            }
+            Some(
+                MetadataStoreConfig::FoundationDbCreate | MetadataStoreConfig::FoundationDbReopen,
+            ) => server.metadata_profile.as_str() == nokv_server::FOUNDATIONDB_METADATA_PROFILE_ID,
+            None => true,
+        };
+        if !matches_metadata_profile {
+            return Err(CliError::MetadataStoreProfileMismatch);
+        }
+        if server.metadata_profile.as_str() == nokv_server::HOLT_LOCAL_METADATA_PROFILE_ID
+            && server.metadata_store.is_some()
+            && server.owner_session.is_none()
+        {
+            return Err(CliError::HoltOwnerSessionRequired);
+        }
+        let matches_metadata_mode = matches!(
+            (&server.owner_session, &server.metadata_store),
+            (
+                Some(OwnerSessionConfig::Create(_)),
+                Some(MetadataStoreConfig::HoltCreate(_))
+            ) | (
+                Some(OwnerSessionConfig::Resume(_)),
+                Some(MetadataStoreConfig::HoltReopen(_))
+            ) | (
+                None,
+                Some(
+                    MetadataStoreConfig::FoundationDbCreate
+                        | MetadataStoreConfig::FoundationDbReopen
+                )
+            ) | (None, None)
+        );
+        if !matches_metadata_mode {
+            return Err(CliError::OwnerSessionMetadataModeMismatch);
+        }
+    }
+    if foundationdb_option_selected {
+        if server.metadata_profile.as_str() != nokv_server::FOUNDATIONDB_METADATA_PROFILE_ID {
+            return Err(CliError::FoundationDbOptionsProfileMismatch);
+        }
+        if !matches!(command, Command::Provision { .. } | Command::Serve) {
+            return Err(CliError::FoundationDbOptionsNotApplicable);
+        }
+    }
     Ok(Invocation {
         client,
         server,
+        root_layout,
         workbench_root,
         command,
     })
+}
+
+fn parse_root_layout(value: &str) -> Option<RootLayoutProfile> {
+    match value {
+        "single-shard-root" => Some(RootLayoutProfile::SingleShardRoot),
+        "partitioned-root" => Some(RootLayoutProfile::PartitionedRoot),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,6 +662,17 @@ fn select_metadata_store(
 ) -> Result<(), CliError> {
     if selected.is_some() {
         return Err(CliError::MixedMetadataStoreOptions);
+    }
+    *selected = Some(requested);
+    Ok(())
+}
+
+fn select_owner_session(
+    selected: &mut Option<OwnerSessionConfig>,
+    requested: OwnerSessionConfig,
+) -> Result<(), CliError> {
+    if selected.is_some() {
+        return Err(CliError::MixedOwnerSessionOptions);
     }
     *selected = Some(requested);
     Ok(())
@@ -631,6 +903,48 @@ mod tests {
             }
         );
         assert!(matches!(parsed.client.routing, RoutingConfig::Etcd(_)));
+        assert_eq!(parsed.root_layout, RootLayoutProfile::SingleShardRoot);
+    }
+
+    #[test]
+    fn root_layout_is_explicit_and_unknown_or_duplicate_profiles_fail_closed() {
+        let parsed = parse(args(&[
+            "--root-layout",
+            "partitioned-root",
+            "--root-id",
+            "11",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "provision",
+            "22222222222222222222222222222222",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.root_layout, RootLayoutProfile::PartitionedRoot);
+
+        assert_eq!(
+            parse(args(&["--root-layout", "single-shard", "serve",])),
+            Err(CliError::UnknownRootLayout("single-shard".to_owned()))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--root-layout",
+                "single-shard-root",
+                "--root-layout",
+                "partitioned-root",
+                "serve",
+            ])),
+            Err(CliError::DuplicateRootLayout)
+        );
+        assert_eq!(
+            parse(args(&[
+                "--root-layout",
+                "single-shard-root",
+                "--workbench-root",
+                "/agents/test/wb",
+                "mcp",
+            ])),
+            Err(CliError::RootLayoutNotApplicable)
+        );
     }
 
     #[test]
@@ -654,6 +968,8 @@ mod tests {
         let parsed = parse(args(&[
             "--metadata-reopen",
             "/var/lib/nokv/shard.holt",
+            "--owner-session-resume",
+            "/var/lib/nokv/owner-session.json",
             "--node-id",
             "owner-a",
             "--advertise-endpoint",
@@ -663,7 +979,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             parsed.server.metadata_store,
-            Some(MetadataStoreConfig::Reopen(PathBuf::from(
+            Some(MetadataStoreConfig::HoltReopen(PathBuf::from(
                 "/var/lib/nokv/shard.holt"
             )))
         );
@@ -671,6 +987,10 @@ mod tests {
         assert_eq!(
             parsed.server.advertise_endpoint.as_deref(),
             Some("metadata-a.internal:7750")
+        );
+        assert_eq!(
+            parsed.server.metadata_profile.as_str(),
+            nokv_server::HOLT_LOCAL_METADATA_PROFILE_ID
         );
 
         assert_eq!(
@@ -682,6 +1002,220 @@ mod tests {
                 "serve",
             ])),
             Err(CliError::MixedMetadataStoreOptions)
+        );
+    }
+
+    #[test]
+    fn metadata_profile_is_a_canonical_string_and_duplicates_fail_closed() {
+        let parsed = parse(args(&[
+            "--metadata-profile",
+            "holt-local-v1",
+            "--metadata-create",
+            "/tmp/new.holt",
+            "--owner-session-create",
+            "/tmp/owner-session.json",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.server.metadata_profile.as_str(),
+            nokv_server::HOLT_LOCAL_METADATA_PROFILE_ID
+        );
+        assert_eq!(
+            parsed.server.metadata_store,
+            Some(MetadataStoreConfig::HoltCreate(PathBuf::from(
+                "/tmp/new.holt"
+            )))
+        );
+
+        #[cfg(not(feature = "foundationdb-provider"))]
+        {
+            let selected =
+                parse(args(&["--metadata-profile", "foundationdb-v1", "serve"])).unwrap();
+            assert_eq!(
+                selected.server.metadata_profile.as_str(),
+                nokv_server::FOUNDATIONDB_METADATA_PROFILE_ID
+            );
+        }
+        let external = parse(args(&["--metadata-profile", "external-v1", "serve"])).unwrap();
+        assert_eq!(external.server.metadata_profile.as_str(), "external-v1");
+        assert_eq!(
+            parse(args(&[
+                "--metadata-profile",
+                "holt-local-v1",
+                "--metadata-profile",
+                "holt-local-v1",
+                "serve",
+            ])),
+            Err(CliError::DuplicateMetadataProfile)
+        );
+    }
+
+    #[test]
+    fn holt_owner_session_modes_are_required_explicit_and_redacted() {
+        let missing = parse(args(&[
+            "--metadata-create",
+            "/tmp/new.holt",
+            "--node-id",
+            "owner-a",
+            "--advertise-endpoint",
+            "metadata-a.internal:7750",
+            "serve",
+        ]));
+        assert_eq!(missing, Err(CliError::HoltOwnerSessionRequired));
+
+        let create = parse(args(&[
+            "--metadata-create",
+            "/tmp/new.holt",
+            "--owner-session-create",
+            "/private/owner-session.json",
+            "serve",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            &create.server.owner_session,
+            Some(OwnerSessionConfig::Create(_))
+        ));
+        let debug = format!("{:?}", create.server.owner_session);
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("/private/owner-session.json"));
+
+        let resume = parse(args(&[
+            "--metadata-reopen",
+            "/tmp/existing.holt",
+            "--owner-session-resume",
+            "/private/owner-session.json",
+            "serve",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            &resume.server.owner_session,
+            Some(OwnerSessionConfig::Resume(_))
+        ));
+
+        assert_eq!(
+            parse(args(&[
+                "--metadata-reopen",
+                "/tmp/existing.holt",
+                "--owner-session-create",
+                "/private/owner-session.json",
+                "serve",
+            ])),
+            Err(CliError::OwnerSessionMetadataModeMismatch)
+        );
+        assert_eq!(
+            parse(args(&[
+                "--owner-session-create",
+                "/private/a.json",
+                "--owner-session-resume",
+                "/private/b.json",
+                "serve",
+            ])),
+            Err(CliError::MixedOwnerSessionOptions)
+        );
+        assert_eq!(
+            parse(args(&[
+                "--owner-session-create",
+                "/private/a.json",
+                "--workbench-root",
+                "/agents/test/wb",
+                "mcp",
+            ])),
+            Err(CliError::OwnerSessionNotApplicable)
+        );
+    }
+
+    #[test]
+    fn foundationdb_options_never_attach_to_holt_or_client_commands() {
+        assert_eq!(
+            parse(args(&[
+                "--fdb-cluster-file",
+                "/private/fdb.cluster",
+                "serve",
+            ])),
+            Err(CliError::FoundationDbOptionsProfileMismatch)
+        );
+
+        let debug = format!(
+            "{:?}",
+            FoundationDbConfig {
+                cluster_file: Some(PathBuf::from("/private/fdb.cluster")),
+                stable_cluster_id: Some("private-cluster-id".to_owned()),
+                namespace: Some("nokv-test".to_owned()),
+                ..FoundationDbConfig::default()
+            }
+        );
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("/private/fdb.cluster"));
+        assert!(!debug.contains("private-cluster-id"));
+    }
+
+    #[cfg(feature = "foundationdb-provider")]
+    #[test]
+    fn foundationdb_profile_has_one_explicit_config_and_open_matrix() {
+        let parsed = parse(args(&[
+            "--metadata-profile",
+            "foundationdb-v1",
+            "--metadata-fdb-reopen",
+            "--fdb-cluster-file",
+            "/private/fdb.cluster",
+            "--fdb-stable-cluster-id",
+            "cluster-a",
+            "--fdb-namespace",
+            "nokv-production",
+            "--fdb-transaction-budget-bytes",
+            "900000",
+            "--fdb-transaction-timeout-ms",
+            "4000",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.server.metadata_profile.as_str(),
+            nokv_server::FOUNDATIONDB_METADATA_PROFILE_ID
+        );
+        assert_eq!(
+            parsed.server.metadata_store,
+            Some(MetadataStoreConfig::FoundationDbReopen)
+        );
+        assert_eq!(parsed.server.foundationdb.transaction_budget_bytes, 900_000);
+        assert_eq!(parsed.server.foundationdb.transaction_timeout_ms, 4_000);
+        assert_eq!(parsed.server.owner_session, None);
+        let debug = format!("{:?}", parsed.server.foundationdb);
+        assert!(!debug.contains("/private/fdb.cluster"));
+        assert!(!debug.contains("cluster-a"));
+
+        assert_eq!(
+            parse(args(&[
+                "--metadata-profile",
+                "foundationdb-v1",
+                "--metadata-fdb-reopen",
+                "--fdb-cluster-file",
+                "/private/fdb.cluster",
+                "--fdb-namespace",
+                "nokv-production",
+                "--owner-session-resume",
+                "/private/owner-session.json",
+                "serve",
+            ])),
+            Err(CliError::OwnerSessionMetadataModeMismatch)
+        );
+
+        assert_eq!(
+            parse(args(&[
+                "--metadata-profile",
+                "foundationdb-v1",
+                "--metadata-create",
+                "/tmp/foreign.holt",
+                "--fdb-cluster-file",
+                "/private/fdb.cluster",
+                "--fdb-namespace",
+                "nokv-production",
+                "--owner-session-create",
+                "/private/owner-session.json",
+                "serve",
+            ])),
+            Err(CliError::MetadataStoreProfileMismatch)
         );
     }
 

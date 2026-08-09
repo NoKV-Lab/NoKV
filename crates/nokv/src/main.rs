@@ -9,6 +9,8 @@ mod backend;
 mod cli;
 mod connection;
 mod object_store;
+mod owner_session;
+mod owner_session_journal;
 mod provision;
 mod transfer;
 mod workbench_mcp;
@@ -24,7 +26,7 @@ use nokv_agent::{
     execute_tool, tool_definitions, ReadRequest, ReadView, ScopedPath, SdkWorkbenchToolHandler,
     Section, WorkbenchBackend, WorkbenchToolHandler, WORKBENCH_CONTRACT_SCHEMA,
 };
-use nokv_types::{NormalizedRelativePath, WorkbenchId};
+use nokv_types::{NormalizedRelativePath, RootLayoutProfile, WorkbenchId};
 use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
@@ -62,8 +64,14 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Command::Schema => print_schema(),
-        Command::Provision { logical_shard_id } => run_provision(&invocation, logical_shard_id),
-        Command::Serve => run_server(&invocation),
+        Command::Provision { logical_shard_id } => {
+            require_qualified_root_layout(&invocation)?;
+            run_provision(&invocation, logical_shard_id)
+        }
+        Command::Serve => {
+            require_qualified_root_layout(&invocation)?;
+            run_server(&invocation)
+        }
         Command::Workbench { tool, arguments } => {
             let handler = build_handler(&invocation)?;
             let arguments: Value = serde_json::from_str(arguments)
@@ -107,6 +115,17 @@ fn run() -> Result<(), String> {
                 content_type.as_deref(),
             )
         }
+    }
+}
+
+fn require_qualified_root_layout(invocation: &Invocation) -> Result<(), String> {
+    if invocation.root_layout == RootLayoutProfile::SingleShardRoot {
+        Ok(())
+    } else {
+        Err(format!(
+            "root layout {:?} is NOT QUALIFIED by this runtime",
+            invocation.root_layout
+        ))
     }
 }
 
@@ -274,11 +293,27 @@ AGENT PRESENTATION:
   RootId remains the only storage/routing identity; the presentation root never enters Holt keys
 
 OWNER:
-  provision creates the logical shard, installs immutable root affinity, and activates it
+  provision creates the logical shard, metadata authority, immutable root affinity, and activates it
   --root-id HEX32 --etcd-endpoint URL --node-id ID
   --advertise-endpoint HOST:PORT --bind HOST:PORT
-  --metadata-create PATH starts the first standalone local-WAL owner
-  --metadata-reopen PATH is recovery admission only; standalone successors currently fail closed
+  --root-layout single-shard-root is the default LingTai contract
+  --root-layout partitioned-root is parsed but explicitly NOT QUALIFIED
+  --metadata-profile holt-local-v1 selects the resolved metadata runtime profile
+  --metadata-create PATH requires --owner-session-create JOURNAL outside PATH
+  --metadata-reopen PATH requires --owner-session-resume JOURNAL for exact recovery admission
+  all fresh, successor, prepared-create, exact-resume, and prepared-resume transitions are
+  currently NOT QUALIFIED and fail before control, journal, locator, provider, or registry effects
+  qualification requires a durable planned exact incarnation before CAS and closed unknown-outcome recovery
+  a version-2 Releasing journal is release-only: restart retries its exact lease and never reopens
+  the pinned Holt revision lacks actual-held directory/lock identity; Holt provision is allowed,
+  but production Holt Serving remains NOT QUALIFIED until that reviewed API is pinned and wired
+
+EXPERIMENTAL FOUNDATIONDB METADATA:
+  --metadata-profile foundationdb-v1 requires the non-default foundationdb-provider feature
+  --fdb-cluster-file PATH --fdb-namespace NAME [--fdb-stable-cluster-id ID]
+  [--fdb-transaction-budget-bytes BYTES --fdb-transaction-timeout-ms MILLIS]
+  --metadata-fdb-create or --metadata-fdb-reopen selects an exact open mode
+  foundationdb-v1 currently fails before provision/Serving as NOT QUALIFIED; no fallback occurs
 
 OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]
@@ -286,6 +321,80 @@ OBJECT DATA:
 
 NoKV exposes SDK, CLI, and MCP operations. It does not expose FUSE or POSIX."
     );
+}
+
+fn resolve_runtime_descriptor(
+    server: &cli::ServerConfig,
+) -> Result<nokv_server::RuntimeDescriptor, String> {
+    let foundationdb_options_present = server.foundationdb.cluster_file.is_some()
+        || server.foundationdb.stable_cluster_id.is_some()
+        || server.foundationdb.namespace.is_some()
+        || server.foundationdb.transaction_budget_bytes
+            != cli::DEFAULT_FDB_TRANSACTION_BUDGET_BYTES
+        || server.foundationdb.transaction_timeout_ms != cli::DEFAULT_FDB_TRANSACTION_TIMEOUT_MS;
+    if server.metadata_profile.as_str() == nokv_server::HOLT_LOCAL_METADATA_PROFILE_ID
+        && foundationdb_options_present
+    {
+        return Err(
+            "FoundationDB options cannot be used with metadata profile holt-local-v1".to_owned(),
+        );
+    }
+
+    let descriptors =
+        vec![nokv_server::holt_runtime_descriptor().map_err(|error| error.to_string())?];
+    #[cfg(feature = "foundationdb-provider")]
+    let mut descriptors = descriptors;
+
+    if server.metadata_profile.as_str() == nokv_server::FOUNDATIONDB_METADATA_PROFILE_ID {
+        #[cfg(not(feature = "foundationdb-provider"))]
+        return Err(
+            "metadata profile foundationdb-v1 requires the non-default foundationdb-provider feature"
+                .to_owned(),
+        );
+        #[cfg(feature = "foundationdb-provider")]
+        {
+            use nokv_server::{
+                foundationdb_runtime_descriptor, FoundationDbRuntimeConfig,
+                FoundationDbTransactionPolicy,
+            };
+
+            let cluster_file = server
+                .foundationdb
+                .cluster_file
+                .as_ref()
+                .ok_or_else(|| "foundationdb-v1 requires --fdb-cluster-file".to_owned())?;
+            let namespace = server
+                .foundationdb
+                .namespace
+                .as_deref()
+                .ok_or_else(|| "foundationdb-v1 requires --fdb-namespace".to_owned())?;
+            let policy = FoundationDbTransactionPolicy {
+                transaction_budget_bytes: server.foundationdb.transaction_budget_bytes,
+                transaction_timeout_ms: server.foundationdb.transaction_timeout_ms,
+            };
+            let config = match server.foundationdb.stable_cluster_id.as_deref() {
+                Some(stable_id) => FoundationDbRuntimeConfig::with_explicit_stable_id(
+                    cluster_file,
+                    stable_id,
+                    namespace,
+                    policy,
+                ),
+                None => {
+                    FoundationDbRuntimeConfig::from_cluster_file(cluster_file, namespace, policy)
+                }
+            }
+            .map_err(|error| error.to_string())?;
+            descriptors
+                .push(foundationdb_runtime_descriptor(&config).map_err(|error| error.to_string())?);
+        }
+    }
+
+    let registry = nokv_server::RuntimeDescriptorRegistry::new(descriptors)
+        .map_err(|error| error.to_string())?;
+    registry
+        .descriptor(&server.metadata_profile)
+        .cloned()
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "etcd")]
@@ -301,6 +410,83 @@ fn connect_control(
 }
 
 #[cfg(feature = "etcd")]
+trait ExactOwnerReleaseControl {
+    fn release_exact_owner(
+        &self,
+        lease: &nokv_control::LogicalShardLease,
+    ) -> Result<nokv_control::OwnerReleaseOutcome, nokv_control::ControlError>;
+}
+
+#[cfg(feature = "etcd")]
+impl<T> ExactOwnerReleaseControl for T
+where
+    T: nokv_control::ControlStore + ?Sized,
+{
+    fn release_exact_owner(
+        &self,
+        lease: &nokv_control::LogicalShardLease,
+    ) -> Result<nokv_control::OwnerReleaseOutcome, nokv_control::ControlError> {
+        self.release_owner(lease)
+    }
+}
+
+#[cfg(feature = "etcd")]
+fn reconcile_releasing_owner<C, F>(
+    control: &C,
+    lease: &nokv_control::LogicalShardLease,
+    remove_exact_journal: F,
+) -> Result<(), String>
+where
+    C: ExactOwnerReleaseControl + ?Sized,
+    F: FnOnce() -> Result<(), owner_session_journal::OwnerSessionJournalError>,
+{
+    use nokv_control::OwnerReleaseOutcome;
+
+    match control.release_exact_owner(lease) {
+        Ok(OwnerReleaseOutcome::Released(_))
+        | Ok(OwnerReleaseOutcome::AlreadyReleased(_))
+        | Ok(OwnerReleaseOutcome::Superseded(_)) => remove_exact_journal()
+            .map_err(|error| format!("owner release reconciled but journal cleanup failed: {error}")),
+        Ok(OwnerReleaseOutcome::OutcomeUnknown) => {
+            Err("owner release outcome remains unknown; Releasing journal retained".to_owned())
+        }
+        Err(error) => Err(format!(
+            "owner release retry failed before a terminal outcome; Releasing journal retained: {error}"
+        )),
+    }
+}
+
+#[cfg(feature = "etcd")]
+fn render_owner_bootstrap_failure(error: nokv_server::ServerError) -> String {
+    use nokv_server::ServerError;
+
+    match error {
+        error @ (ServerError::BootstrapOwnerReleasePending { .. }
+        | ServerError::BootstrapOwnerReleaseRetryable { .. }) => {
+            format!("{error}; durable Releasing journal retained")
+        }
+        error @ ServerError::BootstrapOwnerReleaseReceiptRejected { .. } => format!(
+            "{error}; exact release capability is process-local only and will not survive this process exiting"
+        ),
+        error @ (ServerError::InvalidOptions(_)
+        | ServerError::InvalidRoute(_)
+        | ServerError::InvalidBootstrap(_)
+        | ServerError::RouteRollback(_)
+        | ServerError::Control(_)
+        | ServerError::Metadata(_)
+        | ServerError::OwnerReleaseReceipt(_)
+        | ServerError::OwnerReleasePending { .. }
+        | ServerError::OwnerReleaseRetryable { .. }
+        | ServerError::BootstrapRollback { .. }
+        | ServerError::Protocol(_)
+        | ServerError::Bind(_)
+        | ServerError::Connection(_)
+        | ServerError::FrameTooLarge { .. }
+        | ServerError::Executor(_)) => error.to_string(),
+    }
+}
+
+#[cfg(feature = "etcd")]
 fn run_provision(invocation: &Invocation, logical_shard_id: &str) -> Result<(), String> {
     use nokv_control::{LogicalShardId, RootId};
     use nokv_types::RootPlacementLifecycle;
@@ -308,6 +494,7 @@ fn run_provision(invocation: &Invocation, logical_shard_id: &str) -> Result<(), 
     let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
         return Err("provision requires control-backed etcd routing".to_owned());
     };
+    let metadata_runtime = resolve_provisioning_metadata_runtime(&invocation.server)?;
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
     );
@@ -315,8 +502,14 @@ fn run_provision(invocation: &Invocation, logical_shard_id: &str) -> Result<(), 
         connection::parse_logical_shard_id(logical_shard_id).map_err(|error| error.to_string())?,
     );
     let control = connect_control(route)?;
-    let outcome = provision::provision_and_activate(control.as_ref(), root_id, logical_shard_id)
-        .map_err(|error| error.to_string())?;
+    let outcome = provision::provision_and_activate(
+        control.as_ref(),
+        root_id,
+        logical_shard_id,
+        &metadata_runtime,
+        invocation.root_layout,
+    )
+    .map_err(|error| error.to_string())?;
     let lifecycle = match outcome.placement.lifecycle {
         RootPlacementLifecycle::Provisioning => "provisioning",
         RootPlacementLifecycle::Active => "active",
@@ -327,12 +520,28 @@ fn run_provision(invocation: &Invocation, logical_shard_id: &str) -> Result<(), 
         "status": "success",
         "root_id": encode_lowercase_hex(root_id.as_bytes()),
         "logical_shard_id": encode_lowercase_hex(logical_shard_id.as_bytes()),
+        "root_layout": "single-shard-root",
+        "root_layout_generation": outcome.placement.layout_generation.get(),
+        "root_partition_id": encode_lowercase_hex(outcome.placement.partition_id.as_bytes()),
         "placement_generation": outcome.placement.placement_generation.get(),
         "lifecycle": lifecycle,
         "logical_shard_preexisting": outcome.logical_shard_preexisting,
+        "metadata_authority_preexisting": outcome.metadata_authority_preexisting,
         "placement_preexisting": outcome.placement_preexisting,
         "activation_required": outcome.activation_required,
     }))
+}
+
+fn resolve_provisioning_metadata_runtime(
+    server: &cli::ServerConfig,
+) -> Result<nokv_server::RuntimeDescriptor, String> {
+    let descriptor = resolve_runtime_descriptor(server)?;
+    if let nokv_server::RuntimeQualification::NotQualified(code) = descriptor.qualification() {
+        return Err(format!(
+            "metadata runtime is not qualified for provisioning ({code:?})"
+        ));
+    }
+    Ok(descriptor)
 }
 
 #[cfg(not(feature = "etcd"))]
@@ -348,10 +557,11 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     use nokv_control::{NodeId, RecoveryPublication, RootId};
     use nokv_server::{
         bootstrap_root_owner, ArtifactLifecycleDeleter, LifecycleError, LifecycleObjectDeleter,
-        LifecycleRunner, LifecycleRunnerOptions, MetadataStoreOpen, OwnerAdmission,
-        RootOwnerBootstrapRequest, RootOwnerRegistry, ServerOptions, WorkspaceServer,
+        LifecycleRunner, LifecycleRunnerOptions, LifecycleTransition, OpenIntent, OwnerAdmission,
+        RootOwnerBootstrapRequest, RootOwnerRegistry, RuntimeQualification, RuntimeRegistry,
+        ServerOptions, WorkspaceServer,
     };
-    use nokv_types::RequestId;
+    use nokv_types::{OwnerIncarnationId, RequestId, RootLayoutGeneration, RootPartitionId};
     use sha2::{Digest, Sha256};
 
     static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -383,15 +593,9 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
         return Err("serve requires control-backed etcd routing".to_owned());
     };
-    let metadata = match invocation
-        .server
-        .metadata_store
-        .clone()
-        .ok_or_else(|| "serve requires --metadata-create or --metadata-reopen".to_owned())?
-    {
-        cli::MetadataStoreConfig::Create(path) => MetadataStoreOpen::Create(path),
-        cli::MetadataStoreConfig::Reopen(path) => MetadataStoreOpen::Reopen(path),
-    };
+    let metadata_config = invocation.server.metadata_store.clone().ok_or_else(|| {
+        "serve requires one explicit Holt or FoundationDB metadata create/reopen mode".to_owned()
+    })?;
     let node_id = NodeId::new(
         invocation
             .server
@@ -405,41 +609,297 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .advertise_endpoint
         .clone()
         .ok_or_else(|| "serve requires --advertise-endpoint".to_owned())?;
+    owner_session::OwnerSessionToken::validate_process_binding(&node_id, &endpoint)
+        .map_err(|error| error.to_string())?;
     let root_id = RootId::from(
         connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
     );
+    let release_only_paths = match (&invocation.server.owner_session, &metadata_config) {
+        (
+            Some(cli::OwnerSessionConfig::Create(journal_path)),
+            cli::MetadataStoreConfig::HoltCreate(metadata_path),
+        )
+        | (
+            Some(cli::OwnerSessionConfig::Resume(journal_path)),
+            cli::MetadataStoreConfig::HoltReopen(metadata_path),
+        ) => Some((journal_path, metadata_path)),
+        _ => None,
+    };
+    let releasing = match release_only_paths {
+        Some((journal_path, metadata_path)) => {
+            let preparation = owner_session_journal::OwnerReleasePreparation::new(
+                root_id,
+                node_id.clone(),
+                endpoint.clone(),
+                metadata_path,
+                journal_path,
+            )
+            .map_err(|error| error.to_string())?;
+            owner_session_journal::OwnerSessionJournal::load_releasing(journal_path, &preparation)
+                .map_err(|error| error.to_string())?
+        }
+        None => None,
+    };
     let control = connect_control(route)?;
+    if let Some((lease, journal)) = releasing {
+        return reconcile_releasing_owner(control.as_ref(), &lease, || journal.remove_if_exact());
+    }
+    nokv_server::validate_owner_lease_model_before_control_read_v1(control.owner_lease_model())
+        .map_err(|error| error.to_string())?;
     let placement = control
         .get_root_placement(&root_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "root placement does not exist; provision it before serve".to_owned())?;
+    if placement.layout_profile != invocation.root_layout {
+        return Err(format!(
+            "configured root layout {:?} differs from durable layout {:?}",
+            invocation.root_layout, placement.layout_profile
+        ));
+    }
+    if placement.layout_generation
+        != RootLayoutGeneration::new(1).expect("one is a valid root layout generation")
+        || placement.partition_id != RootPartitionId::SINGLE_SHARD
+    {
+        return Err(format!(
+            "durable root layout fence {:?} is NOT QUALIFIED by the single-shard runtime",
+            placement.layout_fence()
+        ));
+    }
     let shard = control
         .get_logical_shard(&placement.logical_shard_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "logical shard does not exist; provision it before serve".to_owned())?;
+    let authority = control
+        .get_metadata_authority(&placement.logical_shard_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "logical shard has no metadata authority; provision it before serve".to_owned()
+        })?;
     let recovery = RecoveryPublication {
         checkpoint: shard.checkpoint.clone(),
         log: shard.log.clone(),
         durable_lsn: shard.durable_lsn,
     };
+
+    if let Some(migration) = authority.migration.as_ref() {
+        return Err(format!(
+            "metadata authority migration is {:?}; owner Serving is refused before owner-session or provider side effects",
+            migration.phase
+        ));
+    }
+
+    let runtime_descriptor = resolve_runtime_descriptor(&invocation.server)?;
+    if let RuntimeQualification::NotQualified(code) = runtime_descriptor.qualification() {
+        return Err(format!(
+            "metadata runtime is not qualified for Serving ({code:?})"
+        ));
+    }
+    enum PreparedOwnerSession {
+        Create(Arc<owner_session_journal::OwnerSessionJournal>),
+        Resume(Arc<owner_session_journal::OwnerSessionJournal>),
+    }
+
+    let (admission, prepared_session, open_intent) = match (
+        &invocation.server.owner_session,
+        &metadata_config,
+    ) {
+        (
+            Some(cli::OwnerSessionConfig::Create(journal_path)),
+            cli::MetadataStoreConfig::HoltCreate(metadata_path),
+        ) => {
+            nokv_server::validate_owner_admission_transition_v1(
+                LifecycleTransition::PreparedFirstCreate,
+            )
+            .map_err(|code| code.to_string())?;
+            let preparation = owner_session_journal::OwnerSessionPreparation::new(
+                &placement,
+                &authority,
+                node_id.clone(),
+                endpoint.clone(),
+                metadata_path,
+                journal_path,
+            )
+            .map_err(|error| error.to_string())?;
+            // Planned admission remains NOT QUALIFIED. This explicit caller
+            // identity only keeps the characterized post-gate path type-exact;
+            // the planned-admission slice will persist it before any control CAS.
+            let owner_incarnation_id = OwnerIncarnationId::from_bytes(
+                request_id(b"owner-incarnation", root_id).into_bytes(),
+            );
+            let (admission, transition) = match preparation
+                .reconcile_control_owner(&shard, &authority)
+                .map_err(|error| error.to_string())?
+            {
+                owner_session_journal::PreparedControlOwner::First => (
+                    OwnerAdmission::Acquire {
+                        owner: node_id.clone(),
+                        owner_incarnation_id,
+                        endpoint: endpoint.clone(),
+                        expected_previous_epoch: None,
+                    },
+                    LifecycleTransition::PreparedFirstCreate,
+                ),
+                owner_session_journal::PreparedControlOwner::Successor(previous) => (
+                    OwnerAdmission::Acquire {
+                        owner: node_id.clone(),
+                        owner_incarnation_id,
+                        endpoint: endpoint.clone(),
+                        expected_previous_epoch: Some(previous),
+                    },
+                    LifecycleTransition::PreparedSuccessorCreate,
+                ),
+                owner_session_journal::PreparedControlOwner::ResumeOrSuccessor(lease) => (
+                    OwnerAdmission::ResumePreparedOrAcquireSuccessor {
+                        lease,
+                        endpoint: endpoint.clone(),
+                    },
+                    LifecycleTransition::PreparedResumeOrSuccessor,
+                ),
+            };
+            nokv_server::validate_owner_admission_transition_v1(transition)
+                .map_err(|code| code.to_string())?;
+            runtime_descriptor
+                .classify_bootstrap(OpenIntent::ReconcilePreparedCreate, transition)
+                .map_err(|error| error.to_string())?;
+            let (journal, _) = owner_session_journal::OwnerSessionJournal::prepare_create(
+                journal_path,
+                &preparation,
+            )
+            .map_err(|error| error.to_string())?;
+            (
+                admission,
+                PreparedOwnerSession::Create(journal),
+                OpenIntent::ReconcilePreparedCreate,
+            )
+        }
+        (
+            Some(cli::OwnerSessionConfig::Resume(journal_path)),
+            cli::MetadataStoreConfig::HoltReopen(metadata_path),
+        ) => {
+            nokv_server::validate_owner_admission_transition_v1(LifecycleTransition::ExactResume)
+                .map_err(|code| code.to_string())?;
+            runtime_descriptor
+                .classify_bootstrap(OpenIntent::ReopenExisting, LifecycleTransition::ExactResume)
+                .map_err(|error| error.to_string())?;
+            let (token, journal) = owner_session_journal::OwnerSessionJournal::load_resume(
+                journal_path,
+                metadata_path,
+            )
+            .map_err(|error| error.to_string())?;
+            token
+                .validate_resume(owner_session::OwnerSessionResumeBinding {
+                    root_id,
+                    layout_profile: invocation.root_layout,
+                    owner: &node_id,
+                    endpoint: &endpoint,
+                    metadata_profile: invocation.server.metadata_profile.clone(),
+                    placement: &placement,
+                    shard: &shard,
+                    authority: &authority,
+                })
+                .map_err(|error| error.to_string())?;
+            (
+                OwnerAdmission::Resume {
+                    lease: token.lease().clone(),
+                },
+                PreparedOwnerSession::Resume(journal),
+                OpenIntent::ReopenExisting,
+            )
+        }
+        _ => {
+            return Err(
+                "Holt Serving requires --owner-session-create with --metadata-create or --owner-session-resume with --metadata-reopen; FoundationDB Serving is NOT QUALIFIED"
+                    .to_owned(),
+            );
+        }
+    };
+    let journal = match &prepared_session {
+        PreparedOwnerSession::Create(journal) | PreparedOwnerSession::Resume(journal) => {
+            Arc::clone(journal)
+        }
+    };
+    let metadata_path = match &metadata_config {
+        cli::MetadataStoreConfig::HoltCreate(path) | cli::MetadataStoreConfig::HoltReopen(path) => {
+            path
+        }
+        cli::MetadataStoreConfig::FoundationDbCreate
+        | cli::MetadataStoreConfig::FoundationDbReopen => {
+            return Err("FoundationDB Serving is not qualified".to_owned());
+        }
+    };
+    let runtime_factory = nokv_server::holt_file_runtime_factory(metadata_path, journal.clone())
+        .map_err(|error| error.to_string())?;
+    let runtime_registry =
+        RuntimeRegistry::new(vec![runtime_factory]).map_err(|error| error.to_string())?;
+    let runtime = runtime_registry
+        .resolve(&invocation.server.metadata_profile)
+        .map_err(|error| error.to_string())?;
+    if runtime.descriptor() != &runtime_descriptor {
+        return Err("metadata runtime descriptor changed during stock composition".to_owned());
+    }
     let registry = Arc::new(RootOwnerRegistry::new());
-    let owner = bootstrap_root_owner(
+    let owner = match bootstrap_root_owner(
         Arc::clone(&control),
         Arc::clone(&registry),
         RootOwnerBootstrapRequest {
             root_id,
-            metadata,
-            admission: OwnerAdmission::Acquire {
-                owner: node_id,
-                endpoint,
-                expected_previous_epoch: shard.owner_epoch,
-            },
+            runtime,
+            open_intent,
+            admission,
             install_request_id: request_id(b"install", root_id),
             activate_request_id: request_id(b"activate", root_id),
             recovery,
         },
-    )
-    .map_err(|error| error.to_string())?;
+    ) {
+        Ok(owner) => owner,
+        Err(error) => return Err(render_owner_bootstrap_failure(error)),
+    };
+
+    let session_file = match prepared_session {
+        PreparedOwnerSession::Resume(journal) => Some(journal),
+        PreparedOwnerSession::Create(journal) => {
+            let current_placement = control
+                .get_root_placement(&root_id)
+                .map_err(|error| error.to_string());
+            let current_authority = control
+                .get_metadata_authority(&owner.lease.logical_shard_id)
+                .map_err(|error| error.to_string());
+            let token = match (current_placement, current_authority) {
+                (Ok(Some(current_placement)), Ok(Some(current_authority))) => {
+                    owner_session::OwnerSessionToken::from_serving(
+                        &current_placement,
+                        &owner.serving_record,
+                        &owner.lease,
+                        &endpoint,
+                        &current_authority,
+                    )
+                    .map_err(|error| error.to_string())
+                }
+                (Ok(None), _) => {
+                    Err("root placement disappeared before owner-session persistence".to_owned())
+                }
+                (_, Ok(None)) => Err(
+                    "metadata authority disappeared before owner-session persistence".to_owned(),
+                ),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            let persisted = token.and_then(|token| {
+                journal
+                    .complete_serving(&token)
+                    .map_err(|error| error.to_string())
+            });
+            match persisted {
+                Ok(()) => Some(journal),
+                Err(primary) => {
+                    return release_owner_and_session(
+                        &owner.ownership,
+                        Some(&journal),
+                        Some(primary),
+                    );
+                }
+            }
+        }
+    };
 
     let renew_seconds = u64::try_from(route.lease_ttl_seconds)
         .map_err(|_| "etcd lease TTL must be positive".to_owned())?
@@ -467,28 +927,28 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         let owner_loss = server.owner_loss_signal();
         let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
             Arc::new(ArtifactLifecycleDeleter::new(objects));
-        let lifecycle = LifecycleRunner::new(
-            Arc::clone(&owner.store),
-            Arc::clone(&registry),
-            owner.route,
-            owner_loss,
-            lifecycle_objects,
-            LifecycleRunnerOptions {
-                poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
-                ..LifecycleRunnerOptions::default()
-            },
-        )
-        .map_err(|error| error.to_string())?;
+        let lifecycle = owner
+            .lifecycle_runner(
+                owner_loss,
+                lifecycle_objects,
+                LifecycleRunnerOptions {
+                    poll_interval: Duration::from_millis(
+                        invocation.server.lifecycle_interval_millis,
+                    ),
+                    ..LifecycleRunnerOptions::default()
+                },
+            )
+            .map_err(|error| error.to_string())?;
         Ok((server, lifecycle))
     })();
     let (server, lifecycle) = match runtime {
         Ok(runtime) => runtime,
         Err(primary) => {
-            let release = owner.ownership.release();
-            return Err(match release {
-                Ok(_) => primary,
-                Err(release) => format!("{primary}; owner release failed: {release}"),
-            });
+            return release_owner_and_session(
+                &owner.ownership,
+                session_file.as_ref(),
+                Some(primary),
+            );
         }
     };
     let owner_loss = server.owner_loss_signal();
@@ -507,18 +967,18 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         Err(error) => {
             owner_loss.fail_closed();
             let primary = format!("cannot start lifecycle worker: {error}");
-            let release = owner.ownership.release();
-            return Err(match release {
-                Ok(_) => primary,
-                Err(release) => format!("{primary}; owner release failed: {release}"),
-            });
+            return release_owner_and_session(
+                &owner.ownership,
+                session_file.as_ref(),
+                Some(primary),
+            );
         }
     };
 
     let server_result = server.run();
     owner_loss.fail_closed();
     let lifecycle_result = lifecycle_worker.join();
-    let release_result = owner.ownership.release();
+    let release_result = release_owner_and_session(&owner.ownership, session_file.as_ref(), None);
 
     let mut failures = Vec::new();
     match lifecycle_result {
@@ -532,7 +992,41 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         failures.push(format!("RPC server stopped: {error}"));
     }
     if let Err(error) = release_result {
-        failures.push(format!("owner release failed: {error}"));
+        failures.push(error);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[cfg(feature = "etcd")]
+fn release_owner_and_session(
+    ownership: &nokv_server::ControlBackedRootOwner,
+    session_file: Option<&Arc<owner_session_journal::OwnerSessionJournal>>,
+    primary: Option<String>,
+) -> Result<(), String> {
+    let release = ownership.release();
+    let mut failures = Vec::new();
+    if let Some(primary) = primary {
+        failures.push(primary);
+    }
+    match release {
+        Ok(_) => {
+            if let Some(session_file) = session_file {
+                if let Err(error) = session_file.remove_if_exact() {
+                    failures.push(format!("owner-session cleanup failed: {error}"));
+                }
+            }
+        }
+        Err(error) => {
+            // A failed or ambiguous exact release preserves the durable
+            // Releasing token. Restart may reconcile only this release.
+            failures.push(format!(
+                "owner release failed; Releasing owner-session retained: {error}"
+            ));
+        }
     }
     if failures.is_empty() {
         Ok(())
@@ -548,7 +1042,57 @@ fn run_server(_invocation: &Invocation) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "etcd")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[cfg(feature = "etcd")]
+    #[derive(Clone, Copy, Debug)]
+    enum CurrentControlDrift {
+        MissingPlacement,
+        RetiredPlacement,
+        ChangedAuthority,
+        MigratingAuthority,
+    }
+
+    #[cfg(feature = "etcd")]
+    struct ReleaseOnlyControl {
+        scenario: CurrentControlDrift,
+        expected: nokv_control::LogicalShardLease,
+        release_calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "etcd")]
+    impl ExactOwnerReleaseControl for ReleaseOnlyControl {
+        fn release_exact_owner(
+            &self,
+            lease: &nokv_control::LogicalShardLease,
+        ) -> Result<nokv_control::OwnerReleaseOutcome, nokv_control::ControlError> {
+            assert_eq!(lease, &self.expected, "scenario: {:?}", self.scenario);
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
+            let mut released = nokv_control::LogicalShardRecord::unassigned(lease.logical_shard_id);
+            released.owner_epoch = Some(lease.owner_epoch);
+            released.owner_incarnation_id = Some(lease.owner_incarnation_id);
+            Ok(nokv_control::OwnerReleaseOutcome::AlreadyReleased(released))
+        }
+    }
+
+    #[cfg(feature = "etcd")]
+    fn release_only_lease() -> nokv_control::LogicalShardLease {
+        nokv_control::LogicalShardLease {
+            logical_shard_id: nokv_types::LogicalShardId::from_bytes([0x41; 16]),
+            owner: nokv_control::NodeId::new("release-only-owner").unwrap(),
+            owner_epoch: nokv_control::OwnerEpoch::new(7).unwrap(),
+            owner_incarnation_id: nokv_control::OwnerIncarnationId::from_bytes([0x43; 16]),
+            lease_id: 19,
+            authority: nokv_control::MetadataAuthorityFence {
+                logical_shard_id: nokv_types::LogicalShardId::from_bytes([0x41; 16]),
+                authority_id: nokv_control::MetadataAuthorityId::from_bytes([0x42; 16]),
+                authority_generation: nokv_control::MetadataAuthorityGeneration::new(3).unwrap(),
+            },
+        }
+    }
 
     #[test]
     fn scoped_artifact_accepts_only_the_five_virtual_sections() {
@@ -556,5 +1100,107 @@ mod tests {
         assert_eq!(path.logical_path(), "outputs/result.json");
         assert!(scoped_artifact("run-1", "tmp", "result.json").is_err());
         assert!(scoped_artifact("run-1", "outputs", "../result.json").is_err());
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn releasing_restart_ignores_current_placement_authority_and_migration_drift() {
+        for scenario in [
+            CurrentControlDrift::MissingPlacement,
+            CurrentControlDrift::RetiredPlacement,
+            CurrentControlDrift::ChangedAuthority,
+            CurrentControlDrift::MigratingAuthority,
+        ] {
+            let lease = release_only_lease();
+            let control = ReleaseOnlyControl {
+                scenario,
+                expected: lease.clone(),
+                release_calls: AtomicUsize::new(0),
+            };
+            let cleanup_calls = AtomicUsize::new(0);
+
+            reconcile_releasing_owner(&control, &lease, || {
+                cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+
+            assert_eq!(control.release_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn bootstrap_failure_rendering_is_an_exhaustive_closed_match() {
+        let code = nokv_server::AdmissionCode::PlannedOwnerAdmissionNotQualifiedV1.to_string();
+        let error = nokv_server::ServerError::InvalidBootstrap(code.clone());
+        assert_eq!(
+            render_owner_bootstrap_failure(error),
+            format!("invalid root-owner bootstrap: {code}")
+        );
+    }
+
+    #[test]
+    fn serve_descriptor_preflight_resolves_default_holt_without_a_runtime_factory() {
+        let server = cli::ServerConfig::default();
+        let descriptor = resolve_runtime_descriptor(&server).unwrap();
+        assert_eq!(
+            descriptor.profile_id().as_str(),
+            nokv_server::HOLT_LOCAL_METADATA_PROFILE_ID
+        );
+        assert_eq!(
+            descriptor.qualification(),
+            nokv_server::RuntimeQualification::Qualified
+        );
+    }
+
+    #[test]
+    fn descriptor_preflight_preserves_unknown_profile_errors() {
+        let server = cli::ServerConfig {
+            metadata_profile: nokv_control::MetadataProviderProfileId::new("external-v1").unwrap(),
+            ..cli::ServerConfig::default()
+        };
+        assert_eq!(
+            resolve_runtime_descriptor(&server).unwrap_err(),
+            "unknown metadata runtime profile external-v1"
+        );
+    }
+
+    #[cfg(feature = "foundationdb-provider")]
+    #[test]
+    fn foundationdb_descriptor_preflight_never_requires_runtime_resolution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cluster_file = temporary.path().join("fdb.cluster");
+        std::fs::write(&cluster_file, "nokv:0123456789abcdef@127.0.0.1:4500\n").unwrap();
+        let mut server = cli::ServerConfig {
+            metadata_profile: nokv_control::MetadataProviderProfileId::new(
+                nokv_server::FOUNDATIONDB_METADATA_PROFILE_ID,
+            )
+            .unwrap(),
+            ..cli::ServerConfig::default()
+        };
+        server.foundationdb.cluster_file = Some(cluster_file);
+        server.foundationdb.namespace = Some("openviking/metadata".to_owned());
+
+        let descriptor = resolve_runtime_descriptor(&server).unwrap();
+        assert_eq!(
+            descriptor.profile_id().as_str(),
+            nokv_server::FOUNDATIONDB_METADATA_PROFILE_ID
+        );
+        assert!(matches!(
+            descriptor.qualification(),
+            nokv_server::RuntimeQualification::NotQualified(_)
+        ));
+    }
+
+    #[test]
+    fn provision_resolves_the_provisioning_qualification_gate() {
+        let server = cli::ServerConfig::default();
+        let runtime = resolve_provisioning_metadata_runtime(&server).unwrap();
+        assert_eq!(
+            runtime.profile_id().as_str(),
+            nokv_server::HOLT_LOCAL_METADATA_PROFILE_ID
+        );
     }
 }
