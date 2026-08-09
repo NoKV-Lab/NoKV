@@ -3535,6 +3535,11 @@ fn publication_failure(error: meta::PublicationError) -> protocol::RpcFailure {
             error.to_string(),
             None,
         ),
+        meta::PublicationError::RevisionClaimHeld { .. } => conflict(
+            protocol::ConflictKind::OperationState,
+            error.to_string(),
+            None,
+        ),
         meta::PublicationError::OperationInputMismatch => failure(
             protocol::ErrorCode::RequestReplayMismatch,
             error.to_string(),

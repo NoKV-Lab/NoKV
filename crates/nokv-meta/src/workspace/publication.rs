@@ -13,9 +13,9 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitVersion, GcClaimState, Generation,
-    LogicalShardId, OperationKind, OwnerEpoch, PlacementGeneration, PublishPhase, ReadVersion,
-    ReferenceEpoch, RequestId, RestorePhase, RevisionState, RootId, StagedCleanupState,
-    StagedProviderState, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
+    LogicalShardId, OperationId, OperationKind, OwnerEpoch, PlacementGeneration, PublishPhase,
+    ReadVersion, ReferenceEpoch, RequestId, RestorePhase, RevisionState, RootId,
+    StagedCleanupState, StagedProviderState, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -24,10 +24,10 @@ use super::build_commit_records::{
     CommitOperationRecordError,
 };
 use super::codec::{
-    artifact_manifest_key, artifact_manifest_prefix, artifact_revision_key,
-    commit_revision_ref_key, gc_candidate_key, object_block_key, operation_key, path_current_key,
-    path_revision_ref_key, revision_dependency_ref_key, staged_object_key, staged_object_prefix,
-    workspace_current_key, SCHEMA_ID,
+    artifact_manifest_key, artifact_manifest_prefix, artifact_revision_claim_key,
+    artifact_revision_key, commit_revision_ref_key, gc_candidate_key, object_block_key,
+    operation_key, path_current_key, path_revision_ref_key, revision_dependency_ref_key,
+    staged_object_key, staged_object_prefix, workspace_current_key, SCHEMA_ID,
 };
 use super::commit::RUN_MANIFEST_PATH;
 use super::engine::{
@@ -36,8 +36,8 @@ use super::engine::{
 };
 use super::event_projection::change_event_projection;
 use super::publication_records::{
-    ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
-    RevisionRefRecord, WorkspaceRecord,
+    ArtifactRevisionClaimRecord, ArtifactRevisionRecord, GcCandidateRecord, PathEntry,
+    PublicationRecordCodecError, RevisionRefRecord, WorkspaceRecord,
 };
 use super::publish_operation_records::{
     ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim, PublishOperationRecord,
@@ -332,6 +332,10 @@ pub enum PublicationError {
     AppendBaseRevisionMismatch,
     PathGenerationOverflow,
     RevisionAlreadyExists,
+    RevisionClaimHeld {
+        revision: ArtifactRevisionId,
+        operation_id: OperationId,
+    },
     RevisionNotFound {
         revision: ArtifactRevisionId,
     },
@@ -568,6 +572,15 @@ impl fmt::Display for PublicationError {
             Self::RevisionAlreadyExists => {
                 formatter.write_str("artifact revision identity already exists")
             }
+            Self::RevisionClaimHeld {
+                revision,
+                operation_id,
+            } => write!(
+                formatter,
+                "artifact revision {:02x?} is claimed by in-flight publish operation {:02x?}",
+                revision.as_bytes(),
+                operation_id.as_bytes()
+            ),
             Self::RevisionNotFound { revision } => {
                 write!(
                     formatter,
@@ -1422,12 +1435,40 @@ impl PublicationService<'_> {
                 requested: request.operation.activity_deadline_ms,
             });
         }
+        // Take the revision-scoped exclusive claim before planning: staged
+        // rows derive permanent object keys from the revision id alone, so a
+        // second operation owning the same revision could later destroy the
+        // first operation's published objects during abort cleanup. Same-
+        // operation replays return above through the operation row.
+        let claim_key = artifact_revision_claim_key(
+            request.context.root_id,
+            request.operation.artifact_revision_id,
+        );
+        if let Some(payload) = self.read_payload(
+            request.context,
+            MetadataFamily::ArtifactRevision,
+            &claim_key,
+        )? {
+            let claim = ArtifactRevisionClaimRecord::decode(&payload)?;
+            return Err(PublicationError::RevisionClaimHeld {
+                revision: request.operation.artifact_revision_id,
+                operation_id: claim.operation_id,
+            });
+        }
         let operation_payload = request.operation.encode()?;
         let mut plan = CommandPlan::default();
         plan.put_absent(
             MetadataFamily::Operation,
             operation_key,
             operation_payload.clone(),
+        )?;
+        plan.put_absent(
+            MetadataFamily::ArtifactRevision,
+            claim_key,
+            ArtifactRevisionClaimRecord {
+                operation_id: request.operation.operation_id,
+            }
+            .encode()?,
         )?;
         plan.prefix_empty(
             MetadataFamily::StagedObject,
@@ -1922,6 +1963,17 @@ impl PublicationService<'_> {
             expected_operation_payload,
             next_operation_payload.clone(),
         )?;
+        // Cleanup completion is the terminal owner transition for an aborted
+        // operation: its provider objects are durably gone, so the revision
+        // identity becomes claimable again in the same command.
+        if matches!(request.transition, PublishTransition::FinishCleanup) {
+            self.release_revision_claim(
+                request.context,
+                request.expected_operation.artifact_revision_id,
+                request.expected_operation.operation_id,
+                &mut plan,
+            )?;
+        }
 
         let result = self.execute_plan(request.context, plan, next_operation_payload)?;
         decode_operation_outcome(result, next_operation.operation_id)
@@ -2350,6 +2402,33 @@ impl PublicationService<'_> {
                 workspace_key,
                 Some(workspace.payload),
             )?;
+        }
+        Ok(())
+    }
+
+    /// Release the operation's in-flight revision claim inside `plan`.
+    ///
+    /// An absent claim is tolerated so operations begun before claims existed
+    /// still finalize and clean up; a claim held by a different operation is
+    /// left untouched because it guards that operation's own lifecycle. A
+    /// quarantined operation deliberately keeps its claim: its provider-side
+    /// object state is unresolved, so the revision identity stays fail-closed
+    /// until operator reconciliation (which must release the claim) exists.
+    fn release_revision_claim(
+        &self,
+        context: PublicationContext,
+        revision: ArtifactRevisionId,
+        operation_id: OperationId,
+        plan: &mut CommandPlan,
+    ) -> Result<(), PublicationError> {
+        let claim_key = artifact_revision_claim_key(context.root_id, revision);
+        if let Some(payload) =
+            self.read_payload(context, MetadataFamily::ArtifactRevision, &claim_key)?
+        {
+            let claim = ArtifactRevisionClaimRecord::decode(&payload)?;
+            if claim.operation_id == operation_id {
+                plan.delete(MetadataFamily::ArtifactRevision, claim_key, payload)?;
+            }
         }
         Ok(())
     }
@@ -2891,6 +2970,12 @@ impl PublicationService<'_> {
             revision_key,
             new_revision.encode()?,
         )?;
+        self.release_revision_claim(
+            request.context,
+            request.expected_operation.artifact_revision_id,
+            request.expected_operation.operation_id,
+            &mut plan,
+        )?;
         let new_path_ref_key = path_revision_ref_key(
             request.context.root_id,
             request.expected_operation.workspace_incarnation_id,
@@ -3197,6 +3282,12 @@ impl PublicationService<'_> {
                 request.expected_operation.artifact_revision_id,
             ),
             revision.encode()?,
+        )?;
+        self.release_revision_claim(
+            request.context,
+            request.expected_operation.artifact_revision_id,
+            request.expected_operation.operation_id,
+            &mut plan,
         )?;
         plan.put_absent(
             MetadataFamily::RevisionRef,
@@ -4419,6 +4510,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(staged_outcome.operation.phase, PublishPhase::Published);
+        // The commit-staging finalize path must release the revision claim in
+        // the same command that created the hidden Available revision.
+        assert_eq!(read_revision_claim(&store, manifest_revision_id), None);
 
         let staged_version = store.current_read_version().unwrap();
         assert!(get_visible_path_at(
@@ -5513,6 +5607,330 @@ mod tests {
             ),
             0
         );
+    }
+
+    fn read_revision_claim(
+        store: &AgentMetadataStore,
+        revision_id: ArtifactRevisionId,
+    ) -> Option<Vec<u8>> {
+        let version = store.current_read_version().unwrap();
+        store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_claim_key(root(), revision_id),
+                version,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn begin_publish_rejects_second_operation_for_same_revision_until_cleanup_completes() {
+        // Staged rows derive permanent object keys from the revision id alone,
+        // so two operations owning one revision could destroy each other's
+        // published objects during abort cleanup (risk report P1-A). The
+        // begin-time exclusive claim must reject the second operation and must
+        // be released only when the first operation's cleanup completes.
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(910);
+        let staged = staged_rows(revision_id, 1);
+        let manifest = manifest_rows(&staged);
+        // Both operations would stage rows naming identical provider keys.
+        assert_eq!(
+            staged[0].object_key,
+            object_block_key(shard(), root(), revision_id, 0)
+        );
+
+        let operation_a = publish_operation(
+            operation_id(910),
+            revision_id,
+            path("outputs/duplicate-revision-claim.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let begun_a = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: operation_a.clone(),
+            })
+            .expect("operation A begins for revision R");
+        assert!(!begun_a.replayed);
+        let claim_payload =
+            read_revision_claim(&store, revision_id).expect("begin creates the revision claim");
+        assert_eq!(
+            ArtifactRevisionClaimRecord::decode(&claim_payload).unwrap(),
+            ArtifactRevisionClaimRecord {
+                operation_id: operation_id(910),
+            }
+        );
+
+        let operation_b = publish_operation(
+            operation_id(911),
+            revision_id,
+            path("outputs/duplicate-revision-claim.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        assert_eq!(
+            service.begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: operation_b.clone(),
+            }),
+            Err(PublicationError::RevisionClaimHeld {
+                revision: revision_id,
+                operation_id: operation_id(910),
+            })
+        );
+
+        // Exact same-operation replay is unaffected by the held claim.
+        let replayed = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: operation_a,
+            })
+            .expect("operation A replays its begin");
+        assert!(replayed.replayed);
+
+        // The claim survives abort and cleaning: provider objects for the
+        // revision may still exist until cleanup finishes.
+        let aborting = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: begun_a.operation,
+                transition: PublishTransition::BeginAbort {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::AbortedByCaller,
+                        message: "caller cancelled".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            })
+            .unwrap()
+            .operation;
+        let cleaning = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: aborting,
+                transition: PublishTransition::BeginCleaning,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(
+            service.begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: operation_b.clone(),
+            }),
+            Err(PublicationError::RevisionClaimHeld {
+                revision: revision_id,
+                operation_id: operation_id(910),
+            })
+        );
+
+        let cleaned = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: cleaning,
+                transition: PublishTransition::FinishCleanup,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(cleaned.phase, PublishPhase::Cleaned);
+        assert_eq!(read_revision_claim(&store, revision_id), None);
+
+        // With the previous owner's cleanup durably complete, the revision
+        // identity is claimable again.
+        let begun_b = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: operation_b,
+            })
+            .expect("operation B begins after operation A's cleanup completes");
+        assert!(!begun_b.replayed);
+    }
+
+    fn overwrite_revision_claim(
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        revision_id: ArtifactRevisionId,
+        next: Option<ArtifactRevisionClaimRecord>,
+    ) {
+        let claim_key = artifact_revision_claim_key(root(), revision_id);
+        let current = read_revision_claim(store, revision_id).expect("claim row exists");
+        let mutation = match &next {
+            Some(record) => CommandMutation::Put {
+                family: MetadataFamily::ArtifactRevision,
+                key: claim_key.clone(),
+                value: record.encode().unwrap(),
+            },
+            None => CommandMutation::Delete {
+                family: MetadataFamily::ArtifactRevision,
+                key: claim_key.clone(),
+            },
+        };
+        store
+            .execute(
+                &MetadataCommand {
+                    schema_id: SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    placement_generation: placement(),
+                    owner_epoch: owner(),
+                    request_id: request(*counter),
+                    command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                    read_version: store.current_read_version().unwrap(),
+                    root_fence_action: RootFenceAction::RequireActive,
+                    predicates: vec![CommandPredicate::Value {
+                        family: MetadataFamily::ArtifactRevision,
+                        key: claim_key.clone(),
+                        expected: Some(current),
+                    }],
+                    mutations: vec![mutation],
+                    history_projection: vec![HistoryProjection {
+                        family: MetadataFamily::ArtifactRevision,
+                        key: claim_key,
+                    }],
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .expect("raw claim overwrite for legacy simulation");
+        *counter += 1;
+    }
+
+    #[test]
+    fn finish_cleanup_preserves_foreign_claim_and_tolerates_absent_claim() {
+        // release_revision_claim must delete only the claim its own operation
+        // holds: a foreign claim guards that operation's lifecycle, and an
+        // absent claim means the operation predates claims entirely.
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+
+        let finish_cleanup = |service: &PublicationService<'_>, counter: &mut u128, operation| {
+            let aborting = service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(&store, counter),
+                    expected_operation: operation,
+                    transition: PublishTransition::BeginAbort {
+                        terminal_error: PublishTerminalError {
+                            kind: PublishTerminalErrorKind::AbortedByCaller,
+                            message: "caller cancelled".to_owned(),
+                            evidence_digest: None,
+                        },
+                    },
+                })
+                .unwrap()
+                .operation;
+            let cleaning = service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(&store, counter),
+                    expected_operation: aborting,
+                    transition: PublishTransition::BeginCleaning,
+                })
+                .unwrap()
+                .operation;
+            service
+                .transition_publish(TransitionPublishRequest {
+                    context: publication_context(&store, counter),
+                    expected_operation: cleaning,
+                    transition: PublishTransition::FinishCleanup,
+                })
+                .unwrap()
+                .operation
+        };
+
+        // Foreign claim: swap ownership to another operation id before the
+        // owner's cleanup finishes; the claim must survive it untouched.
+        let foreign_revision = revision(930);
+        let begun = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: publish_operation(
+                    operation_id(930),
+                    foreign_revision,
+                    path("outputs/foreign-claim.bin"),
+                    PublishClaim::CreateOnly,
+                    &[],
+                    &[],
+                ),
+            })
+            .unwrap()
+            .operation;
+        let foreign_claim = ArtifactRevisionClaimRecord {
+            operation_id: operation_id(931),
+        };
+        overwrite_revision_claim(&store, &mut counter, foreign_revision, Some(foreign_claim));
+        let cleaned = finish_cleanup(&service, &mut counter, begun);
+        assert_eq!(cleaned.phase, PublishPhase::Cleaned);
+        assert_eq!(
+            read_revision_claim(&store, foreign_revision)
+                .map(|payload| ArtifactRevisionClaimRecord::decode(&payload).unwrap()),
+            Some(foreign_claim)
+        );
+
+        // Absent claim: a pre-claim legacy operation still cleans up.
+        let legacy_revision = revision(940);
+        let begun = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: publish_operation(
+                    operation_id(940),
+                    legacy_revision,
+                    path("outputs/legacy-claimless.bin"),
+                    PublishClaim::CreateOnly,
+                    &[],
+                    &[],
+                ),
+            })
+            .unwrap()
+            .operation;
+        overwrite_revision_claim(&store, &mut counter, legacy_revision, None);
+        let cleaned = finish_cleanup(&service, &mut counter, begun);
+        assert_eq!(cleaned.phase, PublishPhase::Cleaned);
+        assert_eq!(read_revision_claim(&store, legacy_revision), None);
+    }
+
+    #[test]
+    fn finalize_publish_releases_revision_claim() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(920);
+
+        let outcome = publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(920),
+            revision_id,
+            path("outputs/claim-release.bin"),
+            PublishClaim::CreateOnly,
+            1,
+        );
+        assert_eq!(outcome.operation.phase, PublishPhase::Published);
+
+        // The same command that created the Available revision row released
+        // the in-flight claim; only the 32-byte revision row remains.
+        assert_eq!(read_revision_claim(&store, revision_id), None);
+        let version = store.current_read_version().unwrap();
+        assert!(store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                MetadataFamily::ArtifactRevision,
+                &artifact_revision_key(root(), revision_id),
+                version,
+            )
+            .unwrap()
+            .is_some());
     }
 
     #[test]

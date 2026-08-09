@@ -16,6 +16,7 @@ pub const PATH_COMPONENT_DELIMITER: u8 = 0;
 /// making an exact key a strict prefix of any valid path key.
 pub const PATH_EXACT_TERMINATOR: u8 = 0x01;
 const SNAPSHOT_ID_CLAIM_DISCRIMINATOR: u8 = 0xff;
+const ARTIFACT_REVISION_CLAIM_DISCRIMINATOR: u8 = 0xff;
 
 pub const SYSTEM_TREE: &str = "system";
 pub const ROOT_FENCE_TREE: &str = "root_fence";
@@ -213,6 +214,20 @@ pub fn decode_path_common_prefix(
 pub fn artifact_revision_key(root: RootId, revision: ArtifactRevisionId) -> Vec<u8> {
     let mut key = Vec::with_capacity(FIXED_ID_BYTES * 2);
     key.extend_from_slice(root.as_bytes());
+    key.extend_from_slice(revision.as_bytes());
+    key
+}
+
+/// Root-scoped in-flight publish ownership claim for one artifact revision id.
+///
+/// Exact revision rows use a 32-byte key, so this discriminated 33-byte key
+/// can never collide with one and stays invisible to exact revision reads.
+/// Reusing the revision family avoids a second authoritative tree the schema
+/// registry would have to migrate.
+pub fn artifact_revision_claim_key(root: RootId, revision: ArtifactRevisionId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(FIXED_ID_BYTES * 2 + 1);
+    key.extend_from_slice(root.as_bytes());
+    key.push(ARTIFACT_REVISION_CLAIM_DISCRIMINATOR);
     key.extend_from_slice(revision.as_bytes());
     key
 }

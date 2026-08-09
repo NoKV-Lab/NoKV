@@ -289,6 +289,22 @@ ArtifactRevision
        reference_epoch, strong_reference_count, last_zero_ref_version,
        created_version
 
+ArtifactRevisionClaim (reserved key inside the artifact_revision tree)
+  key: root_id | 0xff | artifact_revision_id
+  val: owning publish operation_id
+
+  Begin-publish atomically creates this in-flight exclusive claim; a second
+  begin with a different operation id fails while it exists. Staged rows
+  derive permanent object keys from the revision id alone, so without the
+  claim two operations could own identical provider keys and an aborted
+  loser's cleanup could delete the winner's published objects. The claim is
+  deleted in the same command that publishes the revision or finishes the
+  owning operation's cleanup. A quarantined operation keeps its claim
+  fail-closed: its provider-side object state is unresolved, so the revision
+  identity stays unclaimable until operator reconciliation releases it.
+  Exact revision keys are 32 bytes, so the 33-byte discriminated key can
+  never collide with one.
+
 RevisionRef
   key: root_id | reference_kind | reference_owner_id | artifact_revision_id
   val: reference_epoch_at_add, created_version
