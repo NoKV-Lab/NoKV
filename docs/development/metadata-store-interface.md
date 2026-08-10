@@ -382,9 +382,13 @@ keyspace mapping. `MetaShard` owns the `nokv_workspace` schema marker and system
 record values.
 
 Fresh initialization writes all domain system records in one transaction. A
-Holt adapter can resume an exact empty physical layout after a crash before
-that transaction. It must reject any unmarked namespace that contains domain
-records.
+Holt adapter requires an empty physical tree registry before it starts.
+
+If tree creation fails, the caller must discard that namespace and retry at a
+fresh location. The adapter does not complete a partial tree catalog.
+
+Existing mode requires the exact configured catalog. It must reject any
+unmarked namespace that contains domain records.
 
 The server uses a tagged configuration structure. It does not encode cluster
 files, credentials, or namespace settings into a provider URI. A missing build
