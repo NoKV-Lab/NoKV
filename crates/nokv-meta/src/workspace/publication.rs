@@ -41,8 +41,9 @@ use super::publication_records::{
 };
 use super::publish_operation_records::{
     ArtifactManifestRow, ManifestPosition, PublishAuthority, PublishClaim, PublishOperationRecord,
-    PublishRecordError, PublishResult, PublishTerminalError, PublishTransition, StagedObjectRecord,
-    MAX_DEPENDENCY_COUNT, MAX_MANIFEST_ROWS, MAX_STAGED_OBJECTS,
+    PublishRecordError, PublishResult, PublishTerminalError, PublishTerminalErrorKind,
+    PublishTransition, StagedObjectRecord, MAX_DEPENDENCY_COUNT, MAX_MANIFEST_ROWS,
+    MAX_STAGED_OBJECTS,
 };
 use super::query_records::{
     secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryRecordError,
@@ -160,6 +161,49 @@ pub struct CleanupPublishBatchRequest {
     /// Contiguous rows starting at `cleanup_staged_object_cursor`. Each next
     /// state is durable proof that provider cleanup completed.
     pub staged_object_updates: Vec<StagedObjectUpdate>,
+}
+
+/// Operator verdict about the provider-side state of one quarantined publish.
+///
+/// The operator verifies at the provider before calling; the metadata command
+/// enforces the machine-checkable half of each verdict atomically against the
+/// authoritative `ArtifactRevision` row so a wrong verdict fails loudly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarantineReconcileResolution {
+    /// Every staged provider key was verified absent and the artifact revision
+    /// was never published. Reconciliation releases the revision identity for
+    /// a fresh begin.
+    RevisionUnpublished,
+    /// The artifact revision is already published, so the staged provider
+    /// keys are the published revision's live objects and must not be touched.
+    /// Only this operation's private bookkeeping rows are removed.
+    RevisionPublished,
+}
+
+/// Bounded removal of one quarantined operation's durable staging rows.
+///
+/// The operation stays `Quarantined` while batches run, so an abandoned
+/// reconciliation keeps the fail-closed default and remains resumable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconcileQuarantinedPublishBatchRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub resolution: QuarantineReconcileResolution,
+    /// Exact durable staged rows starting at `cleanup_staged_object_cursor`.
+    /// Empty once the staged cursor is sealed and manifest pages remain.
+    pub staged_object_rows: Vec<StagedObjectRecord>,
+}
+
+/// Atomic operator resolution of one fully-swept quarantined operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinishReconcileQuarantinedPublishRequest {
+    pub context: PublicationContext,
+    pub expected_operation: PublishOperationRecord,
+    pub resolution: QuarantineReconcileResolution,
+    /// Operator-supplied audit reason retained in the terminal error.
+    pub reason: String,
+    /// Digest of the operator's provider verification transcript.
+    pub operator_evidence_digest: [u8; SHA256_BYTES],
 }
 
 /// Caller-visible metadata projected into both the revision and path records.
@@ -335,6 +379,13 @@ pub enum PublicationError {
     RevisionClaimHeld {
         revision: ArtifactRevisionId,
         operation_id: OperationId,
+    },
+    ReconcileResolutionMismatch {
+        resolution: QuarantineReconcileResolution,
+        revision_published: bool,
+    },
+    ReconcileManifestRowsRemain {
+        remaining: u32,
     },
     RevisionNotFound {
         revision: ArtifactRevisionId,
@@ -580,6 +631,20 @@ impl fmt::Display for PublicationError {
                 "artifact revision {:02x?} is claimed by in-flight publish operation {:02x?}",
                 revision.as_bytes(),
                 operation_id.as_bytes()
+            ),
+            Self::ReconcileResolutionMismatch {
+                resolution,
+                revision_published,
+            } => write!(
+                formatter,
+                "operator resolution {resolution:?} contradicts the authoritative revision state \
+                 (published: {revision_published})"
+            ),
+            Self::ReconcileManifestRowsRemain { remaining } => write!(
+                formatter,
+                "quarantined operation still owns {remaining} manifest rows under a published \
+                 revision; those rows are the published manifest and reconciliation refuses to \
+                 touch them"
             ),
             Self::RevisionNotFound { revision } => {
                 write!(
@@ -1225,6 +1290,44 @@ fn finalization_takeover_absence_proof(
     hasher.update(context.read_version.get().to_be_bytes());
     hash_bytes(&mut hasher, finalizing_payload)?;
     Ok(hasher.finalize().into())
+}
+
+fn reconcile_resolution_label(resolution: QuarantineReconcileResolution) -> &'static str {
+    match resolution {
+        QuarantineReconcileResolution::RevisionUnpublished => "revision-unpublished",
+        QuarantineReconcileResolution::RevisionPublished => "revision-published",
+    }
+}
+
+fn reconcile_terminal_message(resolution: QuarantineReconcileResolution, reason: &str) -> String {
+    format!(
+        "operator reconciliation ({}): {reason}",
+        reconcile_resolution_label(resolution)
+    )
+}
+
+/// Deterministic audit chain binding the operator verdict, the operator's
+/// provider verification transcript, and the original quarantine evidence.
+fn reconcile_evidence_digest(
+    resolution: QuarantineReconcileResolution,
+    original_evidence_digest: Option<[u8; SHA256_BYTES]>,
+    operator_evidence_digest: [u8; SHA256_BYTES],
+) -> [u8; SHA256_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.publish.reconcile-evidence.v1\0");
+    hasher.update([match resolution {
+        QuarantineReconcileResolution::RevisionUnpublished => 1,
+        QuarantineReconcileResolution::RevisionPublished => 2,
+    }]);
+    match original_evidence_digest {
+        None => hasher.update([0]),
+        Some(digest) => {
+            hasher.update([1]);
+            hasher.update(digest);
+        }
+    }
+    hasher.update(operator_evidence_digest);
+    hasher.finalize().into()
 }
 
 fn decode_operation_outcome(
@@ -2257,6 +2360,292 @@ impl PublicationService<'_> {
         decode_operation_outcome(result, next_operation.operation_id)
     }
 
+    /// Remove one bounded page of a quarantined operation's durable staging
+    /// rows under an explicit operator verdict. Staged-object rows are removed
+    /// first, exactly like aborted cleanup; manifest pages follow. The phase
+    /// stays `Quarantined` so an abandoned reconciliation remains fail-closed
+    /// and resumable, and every batch re-pins the verdict's revision predicate.
+    pub fn reconcile_quarantined_publish_batch(
+        &self,
+        request: ReconcileQuarantinedPublishBatchRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        require_operation_phase(&request.expected_operation, PublishPhase::Quarantined)?;
+
+        let mut next_operation = request.expected_operation.clone();
+        let mut plan = CommandPlan::default();
+        self.predicate_reconcile_revision_state(
+            request.context,
+            &next_operation,
+            request.resolution,
+            &mut plan,
+        )?;
+        if next_operation.cleanup_staged_object_cursor < next_operation.staged_object_cursor {
+            validate_batch_size("reconcile staged objects", request.staged_object_rows.len())?;
+            let next_cursor = checked_batch_cursor(
+                "reconcile staged objects",
+                next_operation.cleanup_staged_object_cursor,
+                request.staged_object_rows.len(),
+                next_operation.staged_object_cursor,
+            )?;
+            for (offset, expected) in request.staged_object_rows.iter().enumerate() {
+                expected.validate()?;
+                let sequence = next_operation
+                    .cleanup_staged_object_cursor
+                    .checked_add(u32::try_from(offset).map_err(|_| {
+                        PublicationError::BatchTooLarge {
+                            batch: "reconcile staged objects",
+                            count: request.staged_object_rows.len(),
+                            max: MAX_PUBLICATION_BATCH_ROWS,
+                        }
+                    })?)
+                    .ok_or(PublicationError::BatchExceedsPlannedCount {
+                        batch: "reconcile staged objects",
+                        cursor: next_operation.cleanup_staged_object_cursor,
+                        count: request.staged_object_rows.len(),
+                        planned: next_operation.staged_object_cursor,
+                    })?;
+                if expected.object_sequence != sequence {
+                    return Err(PublicationError::StagedObjectSequenceMismatch {
+                        expected: sequence,
+                        actual: expected.object_sequence,
+                    });
+                }
+                if expected.artifact_revision_id != next_operation.artifact_revision_id {
+                    return Err(PublicationError::StagedObjectRevisionMismatch);
+                }
+                plan.delete(
+                    MetadataFamily::StagedObject,
+                    staged_object_key(
+                        request.context.root_id,
+                        next_operation.operation_id,
+                        u64::from(sequence),
+                    ),
+                    expected.encode()?,
+                )?;
+            }
+            next_operation.cleanup_staged_object_cursor = next_cursor;
+        } else {
+            if !request.staged_object_rows.is_empty() {
+                return Err(PublicationError::BatchExceedsPlannedCount {
+                    batch: "reconcile staged objects",
+                    cursor: next_operation.cleanup_staged_object_cursor,
+                    count: request.staged_object_rows.len(),
+                    planned: next_operation.staged_object_cursor,
+                });
+            }
+            let remaining = next_operation
+                .manifest_cursor
+                .checked_sub(next_operation.cleanup_manifest_cursor)
+                .expect("operation validation orders manifest cleanup cursors");
+            if remaining == 0 {
+                return Err(PublicationError::EmptyBatch {
+                    batch: "reconcile manifest",
+                });
+            }
+            // Under a published revision the manifest prefix holds the
+            // published revision's live manifest. This operation legally never
+            // retains un-swept manifest rows in that case, so a remainder
+            // means the invariant derivation is wrong somewhere: stop loudly
+            // instead of deleting published data.
+            if matches!(
+                request.resolution,
+                QuarantineReconcileResolution::RevisionPublished
+            ) {
+                return Err(PublicationError::ReconcileManifestRowsRemain { remaining });
+            }
+            let limit = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(MAX_PUBLICATION_BATCH_ROWS);
+            let prefix = artifact_manifest_prefix(
+                request.context.root_id,
+                next_operation.artifact_revision_id,
+            );
+            let rows = self.store.scan_prefix_at(
+                request.context.root_id,
+                request.context.placement_generation,
+                request.context.owner_epoch,
+                MetadataFamily::ArtifactManifest,
+                &prefix,
+                request.context.read_version,
+                None,
+                limit,
+            )?;
+            if rows.is_empty() {
+                return Err(PublicationError::ManifestCountMismatch {
+                    expected: next_operation.manifest_cursor,
+                    actual: usize::try_from(next_operation.cleanup_manifest_cursor)
+                        .unwrap_or(usize::MAX),
+                });
+            }
+            for row in &rows {
+                plan.delete(
+                    MetadataFamily::ArtifactManifest,
+                    row.key.clone(),
+                    row.value.clone(),
+                )?;
+            }
+            next_operation.cleanup_manifest_cursor = next_operation
+                .cleanup_manifest_cursor
+                .checked_add(u32::try_from(rows.len()).map_err(|_| {
+                    PublicationError::BatchTooLarge {
+                        batch: "reconcile manifest",
+                        count: rows.len(),
+                        max: MAX_PUBLICATION_BATCH_ROWS,
+                    }
+                })?)
+                .ok_or(PublicationError::BatchExceedsPlannedCount {
+                    batch: "reconcile manifest",
+                    cursor: next_operation.cleanup_manifest_cursor,
+                    count: rows.len(),
+                    planned: next_operation.manifest_cursor,
+                })?;
+        }
+
+        let expected_payload = request.expected_operation.encode()?;
+        let next_payload = next_operation.encode()?;
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                next_operation.operation_id,
+            ),
+            expected_payload,
+            next_payload.clone(),
+        )?;
+        let result = self.execute_reconcile_plan(request.context, plan, next_payload)?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    /// Atomically resolve one fully-swept quarantined operation: CAS the
+    /// operator terminal error in, transition `Quarantined -> Cleaned`, and
+    /// release the revision claim when this operation owns it. The verdict's
+    /// revision predicate is pinned by the same command.
+    pub fn finish_reconcile_quarantined_publish(
+        &self,
+        request: FinishReconcileQuarantinedPublishRequest,
+    ) -> Result<PublishCommandOutcome, PublicationError> {
+        validate_operation_seals(&request.expected_operation)?;
+        require_operation_phase(&request.expected_operation, PublishPhase::Quarantined)?;
+
+        let mut plan = CommandPlan::default();
+        self.predicate_reconcile_revision_state(
+            request.context,
+            &request.expected_operation,
+            request.resolution,
+            &mut plan,
+        )?;
+        let original_evidence_digest = request
+            .expected_operation
+            .terminal_error
+            .as_ref()
+            .and_then(|error| error.evidence_digest);
+        let terminal_error = PublishTerminalError {
+            kind: PublishTerminalErrorKind::OperatorReconciled,
+            message: reconcile_terminal_message(request.resolution, &request.reason),
+            evidence_digest: Some(reconcile_evidence_digest(
+                request.resolution,
+                original_evidence_digest,
+                request.operator_evidence_digest,
+            )),
+        };
+        let mut next_operation = request.expected_operation.clone();
+        next_operation.reconcile_quarantine(terminal_error)?;
+
+        let expected_payload = request.expected_operation.encode()?;
+        let next_payload = next_operation.encode()?;
+        plan.replace(
+            MetadataFamily::Operation,
+            operation_key(
+                request.context.root_id,
+                OperationKind::Publish,
+                next_operation.operation_id,
+            ),
+            expected_payload,
+            next_payload.clone(),
+        )?;
+        // Reconciliation is the operator path the quarantine fail-closed
+        // default was waiting for: with the staged liability durably resolved,
+        // the revision identity becomes claimable again in the same command.
+        self.release_revision_claim(
+            request.context,
+            request.expected_operation.artifact_revision_id,
+            request.expected_operation.operation_id,
+            &mut plan,
+        )?;
+        let result = self.execute_reconcile_plan(request.context, plan, next_payload)?;
+        decode_operation_outcome(result, next_operation.operation_id)
+    }
+
+    /// Pin the authoritative revision row to the operator's verdict, refusing
+    /// loudly on contradiction. The predicate makes the verdict atomic with
+    /// every reconciliation mutation.
+    fn predicate_reconcile_revision_state(
+        &self,
+        context: PublicationContext,
+        operation: &PublishOperationRecord,
+        resolution: QuarantineReconcileResolution,
+        plan: &mut CommandPlan,
+    ) -> Result<(), PublicationError> {
+        let revision_key = artifact_revision_key(context.root_id, operation.artifact_revision_id);
+        let payload =
+            self.read_payload(context, MetadataFamily::ArtifactRevision, &revision_key)?;
+        match (resolution, payload) {
+            (QuarantineReconcileResolution::RevisionUnpublished, None) => {
+                plan.assert_value(MetadataFamily::ArtifactRevision, revision_key, None)?;
+            }
+            (QuarantineReconcileResolution::RevisionPublished, Some(payload)) => {
+                plan.assert_value(
+                    MetadataFamily::ArtifactRevision,
+                    revision_key,
+                    Some(payload),
+                )?;
+            }
+            (resolution, payload) => {
+                return Err(PublicationError::ReconcileResolutionMismatch {
+                    resolution,
+                    revision_published: payload.is_some(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute a reconciliation plan without publication-authority predicates.
+    ///
+    /// A quarantined operation's workspace incarnation, commit build, or
+    /// restore may be long retired, so `predicate_publication_authority` would
+    /// wrongly make such operations unresolvable. Operator reconciliation is
+    /// fenced by the exact operation-row CAS, the verdict's revision-row
+    /// predicate, and the active root fence instead.
+    fn execute_reconcile_plan(
+        &self,
+        context: PublicationContext,
+        plan: CommandPlan,
+        deterministic_result: Vec<u8>,
+    ) -> Result<MetadataCommandResult, PublicationError> {
+        plan.validate_bounds()?;
+        let command = MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: context.root_id,
+            logical_shard_id: context.logical_shard_id,
+            placement_generation: context.placement_generation,
+            owner_epoch: context.owner_epoch,
+            request_id: context.request_id,
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: context.read_version,
+            root_fence_action: RootFenceAction::RequireActive,
+            predicates: plan.predicates,
+            mutations: plan.mutations,
+            history_projection: plan.history,
+            event_projection: plan.events,
+            deterministic_result,
+        }
+        .seal();
+        self.store.execute(&command).map_err(Into::into)
+    }
+
     fn predicate_publication_authority(
         &self,
         context: PublicationContext,
@@ -2413,7 +2802,8 @@ impl PublicationService<'_> {
     /// left untouched because it guards that operation's own lifecycle. A
     /// quarantined operation deliberately keeps its claim: its provider-side
     /// object state is unresolved, so the revision identity stays fail-closed
-    /// until operator reconciliation (which must release the claim) exists.
+    /// until `finish_reconcile_quarantined_publish` releases it under an
+    /// operator verdict.
     fn release_revision_claim(
         &self,
         context: PublicationContext,
@@ -5943,6 +6333,554 @@ mod tests {
             )
             .unwrap()
             .is_some());
+    }
+
+    fn quarantine_after_abort(
+        service: &PublicationService<'_>,
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        operation: PublishOperationRecord,
+        evidence: &[u8],
+    ) -> PublishOperationRecord {
+        let aborting = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(store, counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginAbort {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::AbortedByCaller,
+                        message: "caller cancelled".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            })
+            .unwrap()
+            .operation;
+        let cleaning = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(store, counter),
+                expected_operation: aborting,
+                transition: PublishTransition::BeginCleaning,
+            })
+            .unwrap()
+            .operation;
+        service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(store, counter),
+                expected_operation: cleaning,
+                transition: PublishTransition::Quarantine {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::CleanupFailed,
+                        message: "provider cleanup outcome is ambiguous".to_owned(),
+                        evidence_digest: Some(Sha256::digest(evidence).into()),
+                    },
+                },
+            })
+            .unwrap()
+            .operation
+    }
+
+    fn put_operation_row_raw(
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        operation: &PublishOperationRecord,
+    ) {
+        let key = operation_key(root(), OperationKind::Publish, operation.operation_id);
+        store
+            .execute(
+                &MetadataCommand {
+                    schema_id: SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    placement_generation: placement(),
+                    owner_epoch: owner(),
+                    request_id: request(*counter),
+                    command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                    read_version: store.current_read_version().unwrap(),
+                    root_fence_action: RootFenceAction::RequireActive,
+                    predicates: vec![CommandPredicate::Value {
+                        family: MetadataFamily::Operation,
+                        key: key.clone(),
+                        expected: None,
+                    }],
+                    mutations: vec![CommandMutation::Put {
+                        family: MetadataFamily::Operation,
+                        key,
+                        value: operation.encode().unwrap(),
+                    }],
+                    history_projection: Vec::new(),
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .expect("raw operation write for invariant-violation simulation");
+        *counter += 1;
+    }
+
+    #[test]
+    fn operator_reconcile_resolves_quarantined_publish_and_releases_claim() {
+        // A quarantined operation keeps its revision claim fail-closed. The
+        // operator reconciliation surface must sweep the durable staging rows,
+        // transition Quarantined -> Cleaned with a durable operator audit
+        // trail, and release the claim so the revision id is usable again.
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(930);
+        let staged = staged_rows(revision_id, 3);
+        let uploaded = uploaded_rows(&staged);
+        let manifest = manifest_rows(&staged);
+        let operation = publish_operation(
+            operation_id(930),
+            revision_id,
+            path("outputs/reconcile.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let operation = stage_all(
+            &service,
+            &store,
+            &mut counter,
+            operation,
+            &staged,
+            &manifest,
+        );
+        let operation = quarantine_after_abort(
+            &service,
+            &store,
+            &mut counter,
+            operation,
+            b"ambiguous provider delete",
+        );
+        assert_eq!(operation.phase, PublishPhase::Quarantined);
+        let original_evidence_digest = operation
+            .terminal_error
+            .as_ref()
+            .and_then(|error| error.evidence_digest)
+            .expect("quarantine retains evidence");
+
+        let blocked = publish_operation(
+            operation_id(931),
+            revision_id,
+            path("outputs/reconcile.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        assert_eq!(
+            service.begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: blocked.clone(),
+            }),
+            Err(PublicationError::RevisionClaimHeld {
+                revision: revision_id,
+                operation_id: operation_id(930),
+            })
+        );
+
+        // Staged rows sweep first; the phase and the claim stay fail-closed
+        // between batches so an abandoned reconciliation changes nothing.
+        let operation = service
+            .reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                staged_object_rows: uploaded.clone(),
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(operation.phase, PublishPhase::Quarantined);
+        assert_eq!(operation.cleanup_staged_object_cursor, 3);
+        assert!(read_revision_claim(&store, revision_id).is_some());
+
+        let operation = service
+            .reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                staged_object_rows: Vec::new(),
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(operation.phase, PublishPhase::Quarantined);
+        assert_eq!(operation.cleanup_manifest_cursor, 3);
+
+        let finish_context = publication_context(&store, &mut counter);
+        let finished = service
+            .finish_reconcile_quarantined_publish(FinishReconcileQuarantinedPublishRequest {
+                context: finish_context,
+                expected_operation: operation.clone(),
+                resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                reason: "verified every staged key absent at the provider".to_owned(),
+                operator_evidence_digest: [7; SHA256_BYTES],
+            })
+            .unwrap();
+        assert!(!finished.replayed);
+        let resolved = finished.operation;
+        assert_eq!(resolved.phase, PublishPhase::Cleaned);
+        let terminal = resolved
+            .terminal_error
+            .as_ref()
+            .expect("reconciled operation retains its terminal error");
+        assert_eq!(terminal.kind, PublishTerminalErrorKind::OperatorReconciled);
+        assert!(terminal
+            .message
+            .contains("verified every staged key absent at the provider"));
+        assert_eq!(
+            terminal.evidence_digest,
+            Some(reconcile_evidence_digest(
+                QuarantineReconcileResolution::RevisionUnpublished,
+                Some(original_evidence_digest),
+                [7; SHA256_BYTES],
+            ))
+        );
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::StagedObject,
+                &staged_object_prefix(root(), resolved.operation_id),
+            ),
+            0
+        );
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), revision_id),
+            ),
+            0
+        );
+        assert_eq!(read_revision_claim(&store, revision_id), None);
+
+        // An exact response-loss replay of the finish returns the stored
+        // resolution without re-running it.
+        let replayed = service
+            .finish_reconcile_quarantined_publish(FinishReconcileQuarantinedPublishRequest {
+                context: finish_context,
+                expected_operation: operation,
+                resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                reason: "verified every staged key absent at the provider".to_owned(),
+                operator_evidence_digest: [7; SHA256_BYTES],
+            })
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.operation, resolved);
+
+        // The revision identity is claimable again.
+        let begun = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(&store, &mut counter),
+                operation: blocked,
+            })
+            .expect("revision claimable after operator reconciliation");
+        assert!(!begun.replayed);
+    }
+
+    #[test]
+    fn operator_reconcile_republished_revision_removes_bookkeeping_only() {
+        // Rolling-upgrade shape: a claimless legacy loser shares its revision
+        // id with a claimed winner that published. The loser's staged keys are
+        // the winner's live provider objects, so the revision-published
+        // verdict must delete only the loser's private bookkeeping rows and
+        // must refuse the contradictory verdict loudly.
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(940);
+
+        let staged = staged_rows(revision_id, 2);
+        let manifest = manifest_rows(&staged);
+        let loser = publish_operation(
+            operation_id(940),
+            revision_id,
+            path("outputs/reconcile-legacy.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let loser = begin_operation(&service, &store, &mut counter, loser);
+        overwrite_revision_claim(&store, &mut counter, revision_id, None);
+        let loser = service
+            .stage_objects_batch(StageObjectsBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: loser,
+                staged_objects: staged.clone(),
+            })
+            .unwrap()
+            .operation;
+        let loser = quarantine_after_abort(
+            &service,
+            &store,
+            &mut counter,
+            loser,
+            b"aborted publish cleanup found its artifact revision published",
+        );
+
+        let published = publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(941),
+            revision_id,
+            path("outputs/reconcile-winner.bin"),
+            PublishClaim::CreateOnly,
+            1,
+        );
+        assert_eq!(published.operation.phase, PublishPhase::Published);
+
+        // The absent-objects verdict contradicts the published revision row.
+        assert_eq!(
+            service.reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: loser.clone(),
+                resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                staged_object_rows: staged.clone(),
+            }),
+            Err(PublicationError::ReconcileResolutionMismatch {
+                resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                revision_published: true,
+            })
+        );
+
+        let loser = service
+            .reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: loser,
+                resolution: QuarantineReconcileResolution::RevisionPublished,
+                staged_object_rows: staged.clone(),
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(loser.cleanup_staged_object_cursor, 2);
+        let resolved = service
+            .finish_reconcile_quarantined_publish(FinishReconcileQuarantinedPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: loser,
+                resolution: QuarantineReconcileResolution::RevisionPublished,
+                reason: "revision was published by operation 941".to_owned(),
+                operator_evidence_digest: [9; SHA256_BYTES],
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(resolved.phase, PublishPhase::Cleaned);
+
+        // The winner's published revision, manifest, and claim state stay
+        // exactly as publication left them; only loser bookkeeping is gone.
+        let version = store.current_read_version().unwrap();
+        assert!(payload_at(
+            &store,
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), revision_id),
+            version,
+        )
+        .is_some());
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), revision_id),
+            ),
+            1
+        );
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::StagedObject,
+                &staged_object_prefix(root(), resolved.operation_id),
+            ),
+            0
+        );
+        assert_eq!(read_revision_claim(&store, revision_id), None);
+    }
+
+    #[test]
+    fn operator_reconcile_enforces_quarantined_phase_and_sealed_cursors() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(950);
+        let staged = staged_rows(revision_id, 1);
+        let uploaded = uploaded_rows(&staged);
+        let manifest = manifest_rows(&staged);
+        let operation = publish_operation(
+            operation_id(950),
+            revision_id,
+            path("outputs/reconcile-guard.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let operation = stage_all(
+            &service,
+            &store,
+            &mut counter,
+            operation,
+            &staged,
+            &manifest,
+        );
+        let aborting = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginAbort {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::AbortedByCaller,
+                        message: "caller cancelled".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            })
+            .unwrap()
+            .operation;
+        let cleaning = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: aborting,
+                transition: PublishTransition::BeginCleaning,
+            })
+            .unwrap()
+            .operation;
+
+        // Reconciliation is quarantine-only: normal cleanup owns Cleaning.
+        assert_eq!(
+            service.reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: cleaning.clone(),
+                resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                staged_object_rows: uploaded.clone(),
+            }),
+            Err(PublicationError::InvalidOperationPhase {
+                expected: PublishPhase::Quarantined,
+                actual: PublishPhase::Cleaning,
+            })
+        );
+
+        let quarantined = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: cleaning,
+                transition: PublishTransition::Quarantine {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::CleanupFailed,
+                        message: "provider cleanup outcome is ambiguous".to_owned(),
+                        evidence_digest: Some(Sha256::digest(b"ambiguous").into()),
+                    },
+                },
+            })
+            .unwrap()
+            .operation;
+
+        // The published-revision verdict contradicts the absent revision row.
+        assert_eq!(
+            service.reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: quarantined.clone(),
+                resolution: QuarantineReconcileResolution::RevisionPublished,
+                staged_object_rows: uploaded.clone(),
+            }),
+            Err(PublicationError::ReconcileResolutionMismatch {
+                resolution: QuarantineReconcileResolution::RevisionPublished,
+                revision_published: false,
+            })
+        );
+
+        // Finishing before every durable staging row is removed refuses.
+        assert!(matches!(
+            service.finish_reconcile_quarantined_publish(
+                FinishReconcileQuarantinedPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: quarantined,
+                    resolution: QuarantineReconcileResolution::RevisionUnpublished,
+                    reason: "premature".to_owned(),
+                    operator_evidence_digest: [1; SHA256_BYTES],
+                }
+            ),
+            Err(PublicationError::OperationCodec(
+                PublishRecordError::InvalidPhasePayload { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn operator_reconcile_refuses_manifest_rows_under_published_revision() {
+        // Legal flows never leave a quarantined operation with un-swept
+        // manifest rows once its revision is published: those rows ARE the
+        // published manifest. If that derivation is ever wrong, reconciliation
+        // must stop loudly instead of deleting published data.
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(960);
+        let published = publish_full(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(960),
+            revision_id,
+            path("outputs/reconcile-live.bin"),
+            PublishClaim::CreateOnly,
+            1,
+        );
+        assert_eq!(published.operation.phase, PublishPhase::Published);
+
+        let staged = staged_rows(revision_id, 1);
+        let manifest = manifest_rows(&staged);
+        let mut planted = publish_operation(
+            operation_id(961),
+            revision_id,
+            path("outputs/reconcile-planted.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        planted.phase = PublishPhase::Quarantined;
+        planted.manifest_cursor = 1;
+        planted.manifest_rolling_digest = planted.manifest_seal;
+        planted.manifest_last_position = Some(ManifestPosition { object_index: 0 });
+        planted.terminal_error = Some(PublishTerminalError {
+            kind: PublishTerminalErrorKind::CleanupFailed,
+            message: "provider cleanup outcome is ambiguous".to_owned(),
+            evidence_digest: Some(Sha256::digest(b"planted").into()),
+        });
+        put_operation_row_raw(&store, &mut counter, &planted);
+
+        assert_eq!(
+            service.reconcile_quarantined_publish_batch(ReconcileQuarantinedPublishBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: planted.clone(),
+                resolution: QuarantineReconcileResolution::RevisionPublished,
+                staged_object_rows: Vec::new(),
+            }),
+            Err(PublicationError::ReconcileManifestRowsRemain { remaining: 1 })
+        );
+        assert!(matches!(
+            service.finish_reconcile_quarantined_publish(
+                FinishReconcileQuarantinedPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    expected_operation: planted,
+                    resolution: QuarantineReconcileResolution::RevisionPublished,
+                    reason: "planted invariant violation".to_owned(),
+                    operator_evidence_digest: [2; SHA256_BYTES],
+                }
+            ),
+            Err(PublicationError::OperationCodec(
+                PublishRecordError::InvalidPhasePayload { .. }
+            ))
+        ));
+
+        // The published revision's manifest survives untouched.
+        assert_eq!(
+            count_prefix(
+                &store,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), revision_id),
+            ),
+            1
+        );
     }
 
     #[test]

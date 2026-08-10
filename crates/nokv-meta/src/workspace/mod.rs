@@ -99,10 +99,12 @@ pub use publication::{
     advance_manifest_rolling_digest, advance_staged_object_rolling_digest, dependency_owner_digest,
     manifest_rows_digest, seal_publish_operation, staged_object_ledger_digest, BeginPublishRequest,
     CleanupPublishBatchRequest, FinalizePublishOutcome, FinalizePublishRequest,
-    HeartbeatPublishRequest, ManifestRowInput, MarkObjectsUploadedBatchRequest, PublicationContext,
-    PublicationError, PublicationService, PublishCommandOutcome, PublishedArtifact,
-    StageManifestBatchRequest, StageObjectsBatchRequest, StagedObjectUpdate,
-    TakeOverOrphanedPublishRequest, TransitionPublishRequest, MAX_PUBLICATION_BATCH_ROWS,
+    FinishReconcileQuarantinedPublishRequest, HeartbeatPublishRequest, ManifestRowInput,
+    MarkObjectsUploadedBatchRequest, PublicationContext, PublicationError, PublicationService,
+    PublishCommandOutcome, PublishedArtifact, QuarantineReconcileResolution,
+    ReconcileQuarantinedPublishBatchRequest, StageManifestBatchRequest, StageObjectsBatchRequest,
+    StagedObjectUpdate, TakeOverOrphanedPublishRequest, TransitionPublishRequest,
+    MAX_PUBLICATION_BATCH_ROWS,
 };
 pub use publication_records::{
     ArtifactRevisionClaimRecord, ArtifactRevisionRecord, GcCandidateRecord, PathEntry,

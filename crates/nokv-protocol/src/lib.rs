@@ -38,9 +38,10 @@ pub use request::{
     FindWorkspacesRequest, GetOperationRequest, GetPathRequest, GetSnapshotRequest,
     GetWorkspaceRequest, ListPathsRequest, ListSnapshotsRequest,
     MarkArtifactObjectsUploadedRequest, MintSnapshotRequest, ObjectUploadProof,
-    PrepareRestoreRequest, QueryOperand, QueryOperator, QueryPredicate, QueryScope,
-    RemovePathRequest, RenewSnapshotRequest, RestoreManifestDescriptor, RestoreSource,
-    RetireSnapshotRequest, SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
+    PrepareRestoreRequest, QuarantineResolution, QueryOperand, QueryOperator, QueryPredicate,
+    QueryScope, ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest,
+    RenewSnapshotRequest, RestoreManifestDescriptor, RestoreSource, RetireSnapshotRequest,
+    SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
     StageArtifactObjectsRequest, WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest,
 };
 pub use response::{

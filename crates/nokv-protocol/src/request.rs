@@ -58,6 +58,7 @@ pub enum WorkspaceRequest {
     StageArtifactManifest(StageArtifactManifestRequest),
     CompleteArtifactPublish(CompleteArtifactPublishRequest),
     AbortArtifactPublish(AbortArtifactPublishRequest),
+    ReconcileQuarantinedArtifactPublish(ReconcileQuarantinedArtifactPublishRequest),
     Commit(CommitRequest),
     GetSnapshot(GetSnapshotRequest),
     MintSnapshot(MintSnapshotRequest),
@@ -89,6 +90,7 @@ impl WorkspaceRequest {
             Self::StageArtifactManifest(request) => request.validate(),
             Self::CompleteArtifactPublish(request) => request.validate(),
             Self::AbortArtifactPublish(request) => request.validate(),
+            Self::ReconcileQuarantinedArtifactPublish(request) => request.validate(),
             Self::Commit(request) => request.validate(),
             Self::GetSnapshot(request) => request.validate(),
             Self::MintSnapshot(request) => request.validate(),
@@ -526,6 +528,49 @@ pub struct AbortArtifactPublishRequest {
 impl AbortArtifactPublishRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         validate_required_text("abort_artifact_publish.reason", &self.reason, 1_024)
+    }
+}
+
+/// Operator verdict about provider-side object state for one quarantined
+/// artifact publication. The operator must verify at the provider before
+/// calling; the server atomically enforces the machine-checkable half of the
+/// verdict and refuses on contradiction.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineResolution {
+    /// Every staged provider key was verified absent and the artifact
+    /// revision was never published; the revision identity is released for a
+    /// fresh publication.
+    ProviderObjectsAbsent,
+    /// The artifact revision is already published; staged provider keys are
+    /// the published revision's live objects and only this operation's
+    /// private bookkeeping rows are removed.
+    RevisionPublished,
+}
+
+/// Operator reconciliation of one quarantined artifact publication.
+///
+/// The token must digest the exact quarantined operation state the operator
+/// inspected, so a concurrent change invalidates the verdict.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileQuarantinedArtifactPublishRequest {
+    pub token: OperationToken,
+    pub resolution: QuarantineResolution,
+    /// Audit reason durably retained in the resolved operation.
+    pub reason: String,
+    /// Digest of the operator's provider verification transcript, durably
+    /// bound into the resolved operation's evidence chain.
+    pub evidence_digest: Digest,
+}
+
+impl ReconcileQuarantinedArtifactPublishRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_required_text(
+            "reconcile_quarantined_artifact_publish.reason",
+            &self.reason,
+            1_024,
+        )
     }
 }
 

@@ -92,6 +92,9 @@ pub enum PublishTerminalErrorKind {
     CleanupFailed = 7,
     OwnerEpochSuperseded = 8,
     ActivityLeaseExpired = 9,
+    /// An operator verified provider-side object state for a quarantined
+    /// operation and resolved it through the reconciliation command.
+    OperatorReconciled = 10,
 }
 
 impl TryFrom<u8> for PublishTerminalErrorKind {
@@ -108,6 +111,7 @@ impl TryFrom<u8> for PublishTerminalErrorKind {
             7 => Ok(Self::CleanupFailed),
             8 => Ok(Self::OwnerEpochSuperseded),
             9 => Ok(Self::ActivityLeaseExpired),
+            10 => Ok(Self::OperatorReconciled),
             value => Err(PublishRecordError::UnknownDiscriminant {
                 type_name: "PublishTerminalErrorKind",
                 value,
@@ -967,6 +971,44 @@ impl PublishOperationRecord {
         let mut next = self.clone();
         next.phase = PublishPhase::Aborting;
         next.publication_absence_proof = Some(publication_absence_proof);
+        next.terminal_error = Some(terminal_error);
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Applies the operator-owned `Quarantined -> Cleaned` reconciliation
+    /// edge. Every durable staging row must already be removed, and the new
+    /// terminal error must retain reconciliation evidence so the operator
+    /// override stays durably distinguishable from a normal cleanup finish.
+    pub(super) fn reconcile_quarantine(
+        &mut self,
+        terminal_error: PublishTerminalError,
+    ) -> Result<(), PublishRecordError> {
+        self.validate()?;
+        if self.phase != PublishPhase::Quarantined {
+            return Err(PublishRecordError::PhaseMismatch {
+                expected: PublishPhase::Quarantined,
+                actual: self.phase,
+            });
+        }
+        validate_terminal_error(&terminal_error)?;
+        if terminal_error.evidence_digest.is_none() {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: PublishPhase::Quarantined,
+                reason: "reconciliation requires operator evidence",
+            });
+        }
+        if self.cleanup_staged_object_cursor != self.staged_object_cursor
+            || self.cleanup_manifest_cursor != self.manifest_cursor
+        {
+            return Err(PublishRecordError::InvalidPhasePayload {
+                phase: PublishPhase::Quarantined,
+                reason: "all durable staging rows must be removed before reconciliation completes",
+            });
+        }
+        let mut next = self.clone();
+        next.phase = PublishPhase::Cleaned;
         next.terminal_error = Some(terminal_error);
         next.validate()?;
         *self = next;

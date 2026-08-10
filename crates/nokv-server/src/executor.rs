@@ -88,6 +88,9 @@ impl MetadataWorkspaceRequestExecutor {
             protocol::WorkspaceRequest::AbortArtifactPublish(abort) => {
                 self.abort_artifact_publish(request, abort)
             }
+            protocol::WorkspaceRequest::ReconcileQuarantinedArtifactPublish(reconcile) => {
+                self.reconcile_quarantined_artifact_publish(request, reconcile)
+            }
             protocol::WorkspaceRequest::Commit(commit) => self.commit(request, commit),
             protocol::WorkspaceRequest::GetSnapshot(get) => self.get_snapshot(request, get),
             protocol::WorkspaceRequest::MintSnapshot(mint) => self.mint_snapshot(request, mint),
@@ -1414,6 +1417,136 @@ impl MetadataWorkspaceRequestExecutor {
             })
             .map_err(publication_failure)?;
         publish_operation_response(outcome)
+    }
+
+    /// Operator reconciliation of one quarantined publication. The operator
+    /// verifies provider-side object state out-of-band and presents a verdict
+    /// bound to the exact quarantined operation payload through the token;
+    /// this adapter only drives the durable metadata sweep and resolution.
+    fn reconcile_quarantined_artifact_publish(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::ReconcileQuarantinedArtifactPublishRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        let finish_id = derived_request_id(rpc.request_id, b"publish-reconcile-finish", 0);
+        if let Some(outcome) = self.replayed_publish(rpc.route, finish_id)? {
+            return publish_operation_response(outcome);
+        }
+        let resolution = match request.resolution {
+            protocol::QuarantineResolution::ProviderObjectsAbsent => {
+                meta::QuarantineReconcileResolution::RevisionUnpublished
+            }
+            protocol::QuarantineResolution::RevisionPublished => {
+                meta::QuarantineReconcileResolution::RevisionPublished
+            }
+        };
+        let service = meta::PublicationService::new(&self.store);
+        let read_version = self.store.current_read_version().map_err(engine_failure)?;
+        let mut operation =
+            self.load_publish_operation(rpc.route, read_version, request.token.operation_id)?;
+        require_publish_token(&operation, request.token)?;
+        if operation.phase != types::PublishPhase::Quarantined {
+            return Err(conflict(
+                protocol::ConflictKind::OperationState,
+                "operation is not quarantined",
+                None,
+            ));
+        }
+
+        let mut batch: u64 = 0;
+        while operation.cleanup_staged_object_cursor < operation.staged_object_cursor
+            || operation.cleanup_manifest_cursor < operation.manifest_cursor
+        {
+            let before = (
+                operation.cleanup_staged_object_cursor,
+                operation.cleanup_manifest_cursor,
+            );
+            let step_id = derived_request_id(rpc.request_id, b"publish-reconcile-batch", batch);
+            operation = if let Some(replayed) = self.replayed_publish(rpc.route, step_id)? {
+                replayed.operation
+            } else {
+                let staged_object_rows = self.reconcile_staged_batch_rows(rpc.route, &operation)?;
+                service
+                    .reconcile_quarantined_publish_batch(
+                        meta::ReconcileQuarantinedPublishBatchRequest {
+                            context: self.publication_context(rpc.route, step_id)?,
+                            expected_operation: operation,
+                            resolution,
+                            staged_object_rows,
+                        },
+                    )
+                    .map_err(publication_failure)?
+                    .operation
+            };
+            if (
+                operation.cleanup_staged_object_cursor,
+                operation.cleanup_manifest_cursor,
+            ) == before
+            {
+                return Err(internal(
+                    "quarantine reconciliation made no durable progress",
+                ));
+            }
+            batch = batch
+                .checked_add(1)
+                .ok_or_else(|| internal("quarantine reconciliation batch counter overflow"))?;
+        }
+
+        let outcome = service
+            .finish_reconcile_quarantined_publish(meta::FinishReconcileQuarantinedPublishRequest {
+                context: self.publication_context(rpc.route, finish_id)?,
+                expected_operation: operation,
+                resolution,
+                reason: request.reason.clone(),
+                operator_evidence_digest: request.evidence_digest.0,
+            })
+            .map_err(publication_failure)?;
+        publish_operation_response(outcome)
+    }
+
+    /// Read the exact durable staged rows for the next reconciliation batch.
+    /// Empty once the staged cursor is sealed and only manifest pages remain.
+    fn reconcile_staged_batch_rows(
+        &self,
+        route: protocol::RootRoute,
+        operation: &meta::PublishOperationRecord,
+    ) -> Result<Vec<meta::StagedObjectRecord>, protocol::RpcFailure> {
+        let remaining = operation
+            .staged_object_cursor
+            .saturating_sub(operation.cleanup_staged_object_cursor);
+        if remaining == 0 {
+            return Ok(Vec::new());
+        }
+        let route = route_parts(route)?;
+        let read_version = self.store.current_read_version().map_err(engine_failure)?;
+        let count = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(meta::MAX_PUBLICATION_BATCH_ROWS);
+        let mut rows = Vec::with_capacity(count);
+        for offset in 0..count {
+            let sequence = operation.cleanup_staged_object_cursor
+                + u32::try_from(offset).expect("bounded batch offset fits u32");
+            let key =
+                meta::staged_object_key(route.root_id, operation.operation_id, u64::from(sequence));
+            let payload = self
+                .store
+                .read_at(
+                    route.root_id,
+                    route.placement_generation,
+                    route.owner_epoch,
+                    meta::MetadataFamily::StagedObject,
+                    &key,
+                    read_version,
+                )
+                .map_err(engine_failure)?
+                .ok_or_else(|| internal(format!("durable staged object {sequence} is missing")))?;
+            rows.push(
+                meta::StagedObjectRecord::decode(&payload)
+                    .map_err(|error| internal(format!("invalid durable staged object: {error}")))?,
+            );
+        }
+        Ok(rows)
     }
 
     fn commit(
@@ -3541,6 +3674,13 @@ fn publication_failure(error: meta::PublicationError) -> protocol::RpcFailure {
             error.to_string(),
             None,
         ),
+        meta::PublicationError::ReconcileResolutionMismatch { .. }
+        | meta::PublicationError::ReconcileManifestRowsRemain { .. } => failure(
+            protocol::ErrorCode::PreconditionFailed,
+            error.to_string(),
+            false,
+            Some(protocol::ConflictKind::OperationState),
+        ),
         meta::PublicationError::OperationInputMismatch => failure(
             protocol::ErrorCode::RequestReplayMismatch,
             error.to_string(),
@@ -5269,6 +5409,314 @@ mod tests {
         let failure = executor.execute(&stale_catalog).unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::PreconditionFailed);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
+    }
+
+    #[test]
+    fn reconcile_quarantined_publish_rpc_resolves_operation_and_frees_revision() {
+        let (store, executor) = ready_executor();
+        executor
+            .execute(&create_request(0x70, "reconcile-test", 0x71, 1))
+            .unwrap();
+        let operation_identity = protocol::OperationIdentity([0x72; types::FIXED_ID_BYTES]);
+        let revision_identity = protocol::ArtifactRevisionIdentity([0x73; types::FIXED_ID_BYTES]);
+        let revision_id: types::ArtifactRevisionId = revision_identity.into();
+        let object_key = meta::object_block_key(shard(), root(), revision_id, 0);
+        let body_digest =
+            protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([0x61]).into()));
+        let staged_objects = vec![protocol::StagedObject {
+            sequence: 0,
+            object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
+            expected_length: 1,
+            expected_digest: body_digest.clone(),
+            multipart_token: None,
+        }];
+        let manifest_rows = vec![protocol::ArtifactManifestRow {
+            object_index: 0,
+            physical_object_index: 0,
+            logical_offset: 0,
+            physical_owner_revision_id: revision_identity,
+            object_identity: protocol::ObjectIdentity::new(object_key).unwrap(),
+            object_offset: 0,
+            length: 1,
+            digest: body_digest.clone(),
+            append_segment: None,
+        }];
+        let seals = protocol::seal_artifact_publish_plan(
+            revision_identity,
+            &staged_objects,
+            &manifest_rows,
+        )
+        .unwrap();
+        let rpc = |fill: u8, operation: protocol::WorkspaceRequest| protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([fill; types::FIXED_ID_BYTES]),
+            operation,
+        };
+        let operation_status = |result: ExecutedRequest| {
+            let protocol::WorkspaceResult::Operation(status) = result.result else {
+                panic!("publish request returned the wrong result variant");
+            };
+            status
+        };
+        let status = operation_status(
+            executor
+                .execute(&rpc(
+                    0x74,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(
+                        protocol::BeginArtifactPublishRequest {
+                            operation_id: operation_identity,
+                            artifact_revision_id: revision_identity,
+                            target: protocol::WorkspacePath {
+                                workbench: protocol::WorkbenchName::new("reconcile-test").unwrap(),
+                                path: protocol::RelativePath::new("outputs/quarantine.bin")
+                                    .unwrap(),
+                            },
+                            authority: protocol::PublicationAuthority::Visible,
+                            condition: protocol::PublishCondition::CreateOnly,
+                            staged_object_count: seals.staged_object_count,
+                            staged_object_seal: seals.staged_object_seal,
+                            manifest_row_count: seals.manifest_row_count,
+                            manifest_seal: seals.manifest_seal,
+                            dependency_owner_revision_ids: Vec::new(),
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        let status = operation_status(
+            executor
+                .execute(&rpc(
+                    0x75,
+                    protocol::WorkspaceRequest::StageArtifactObjects(
+                        protocol::StageArtifactObjectsRequest {
+                            token: status.token,
+                            objects: staged_objects,
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        let status = operation_status(
+            executor
+                .execute(&rpc(
+                    0x76,
+                    protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
+                        protocol::MarkArtifactObjectsUploadedRequest {
+                            token: status.token,
+                            objects: vec![protocol::ObjectUploadProof {
+                                sequence: 0,
+                                observed_length: 1,
+                                observed_digest: body_digest,
+                            }],
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        let status = operation_status(
+            executor
+                .execute(&rpc(
+                    0x77,
+                    protocol::WorkspaceRequest::StageArtifactManifest(
+                        protocol::StageArtifactManifestRequest {
+                            token: status.token,
+                            rows: manifest_rows,
+                            dependency_owner_revision_ids: Vec::new(),
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        let aborting_status = operation_status(
+            executor
+                .execute(&rpc(
+                    0x78,
+                    protocol::WorkspaceRequest::AbortArtifactPublish(
+                        protocol::AbortArtifactPublishRequest {
+                            token: status.token,
+                            reason: "orchestrator cancelled the publication".to_owned(),
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(aborting_status.state, protocol::OperationState::Aborting);
+
+        // Drive the durable state machine into Quarantined the way lifecycle
+        // cleanup does when the provider deletion outcome is ambiguous.
+        let service = meta::PublicationService::new(&store);
+        let meta_context = |fill: u8| meta::PublicationContext {
+            root_id: root(),
+            logical_shard_id: shard(),
+            placement_generation: placement(),
+            owner_epoch: owner(1),
+            request_id: request_id(fill),
+            read_version: store.current_read_version().unwrap(),
+        };
+        let load_operation = || {
+            let key = meta::operation_key(
+                root(),
+                types::OperationKind::Publish,
+                operation_identity.into(),
+            );
+            let payload = store
+                .read_at(
+                    root(),
+                    placement(),
+                    owner(1),
+                    meta::MetadataFamily::Operation,
+                    &key,
+                    store.current_read_version().unwrap(),
+                )
+                .unwrap()
+                .expect("publish operation row exists");
+            meta::PublishOperationRecord::decode(&payload).unwrap()
+        };
+        let cleaning = service
+            .transition_publish(meta::TransitionPublishRequest {
+                context: meta_context(0xA0),
+                expected_operation: load_operation(),
+                transition: meta::PublishTransition::BeginCleaning,
+            })
+            .unwrap()
+            .operation;
+        service
+            .transition_publish(meta::TransitionPublishRequest {
+                context: meta_context(0xA1),
+                expected_operation: cleaning,
+                transition: meta::PublishTransition::Quarantine {
+                    terminal_error: meta::PublishTerminalError {
+                        kind: meta::PublishTerminalErrorKind::CleanupFailed,
+                        message: "provider cleanup outcome is ambiguous".to_owned(),
+                        evidence_digest: Some(Sha256::digest(b"ambiguous delete").into()),
+                    },
+                },
+            })
+            .unwrap();
+        let claim_key = meta::artifact_revision_claim_key(root(), revision_id);
+        assert!(store
+            .read_at(
+                root(),
+                placement(),
+                owner(1),
+                meta::MetadataFamily::ArtifactRevision,
+                &claim_key,
+                store.current_read_version().unwrap(),
+            )
+            .unwrap()
+            .is_some());
+
+        // The verdict binds to the exact quarantined payload: a token that
+        // digests any earlier operation state is refused.
+        let stale = executor
+            .execute(&rpc(
+                0x79,
+                protocol::WorkspaceRequest::ReconcileQuarantinedArtifactPublish(
+                    protocol::ReconcileQuarantinedArtifactPublishRequest {
+                        token: aborting_status.token,
+                        resolution: protocol::QuarantineResolution::ProviderObjectsAbsent,
+                        reason: "stale operator view".to_owned(),
+                        evidence_digest: protocol::Digest([3; types::SHA256_BYTES]),
+                    },
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(stale.code, protocol::ErrorCode::Conflict);
+
+        let quarantined_status = operation_status(
+            executor
+                .execute(&rpc(
+                    0x7A,
+                    protocol::WorkspaceRequest::GetOperation(protocol::GetOperationRequest {
+                        operation_id: operation_identity,
+                    }),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(
+            quarantined_status.state,
+            protocol::OperationState::Quarantined
+        );
+
+        let reconcile = rpc(
+            0x7B,
+            protocol::WorkspaceRequest::ReconcileQuarantinedArtifactPublish(
+                protocol::ReconcileQuarantinedArtifactPublishRequest {
+                    token: quarantined_status.token,
+                    resolution: protocol::QuarantineResolution::ProviderObjectsAbsent,
+                    reason: "verified every staged key absent at the provider".to_owned(),
+                    evidence_digest: protocol::Digest([7; types::SHA256_BYTES]),
+                },
+            ),
+        );
+        let resolved = executor.execute(&reconcile).unwrap();
+        assert!(!resolved.replayed);
+        let resolved_status = operation_status(resolved);
+        assert_eq!(resolved_status.state, protocol::OperationState::Failed);
+        let failure_body = resolved_status
+            .failure
+            .as_ref()
+            .expect("reconciled operation reports its terminal failure");
+        assert!(failure_body.message.contains("operator reconciliation"));
+
+        // The same command released the revision claim; the staged ledger and
+        // invisible manifest are durably gone.
+        assert!(store
+            .read_at(
+                root(),
+                placement(),
+                owner(1),
+                meta::MetadataFamily::ArtifactRevision,
+                &claim_key,
+                store.current_read_version().unwrap(),
+            )
+            .unwrap()
+            .is_none());
+        let resolved_operation = load_operation();
+        assert_eq!(resolved_operation.phase, types::PublishPhase::Cleaned);
+        assert_eq!(
+            resolved_operation
+                .terminal_error
+                .as_ref()
+                .expect("terminal error retained")
+                .kind,
+            meta::PublishTerminalErrorKind::OperatorReconciled
+        );
+
+        // An exact response-loss retry replays the stored resolution.
+        let replayed = executor.execute(&reconcile).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(operation_status(replayed).token, resolved_status.token);
+
+        // The revision identity is claimable again through the normal path.
+        let retry_status = operation_status(
+            executor
+                .execute(&rpc(
+                    0x7C,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(
+                        protocol::BeginArtifactPublishRequest {
+                            operation_id: protocol::OperationIdentity(
+                                [0x7D; types::FIXED_ID_BYTES],
+                            ),
+                            artifact_revision_id: revision_identity,
+                            target: protocol::WorkspacePath {
+                                workbench: protocol::WorkbenchName::new("reconcile-test").unwrap(),
+                                path: protocol::RelativePath::new("outputs/quarantine-retry.bin")
+                                    .unwrap(),
+                            },
+                            authority: protocol::PublicationAuthority::Visible,
+                            condition: protocol::PublishCondition::CreateOnly,
+                            staged_object_count: seals.staged_object_count,
+                            staged_object_seal: seals.staged_object_seal,
+                            manifest_row_count: seals.manifest_row_count,
+                            manifest_seal: seals.manifest_seal,
+                            dependency_owner_revision_ids: Vec::new(),
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(retry_status.state, protocol::OperationState::Running);
     }
 
     #[test]
