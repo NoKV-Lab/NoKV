@@ -376,6 +376,10 @@ cursors. Every attached root gets one supervised lifecycle runner. Runtime
 root attachment stays private until the server can install and supervise that
 runner with the route.
 
+The CLI attaches every Active placement found for the shard at startup. A root
+that becomes Active later requires an owner restart until runtime attachment is
+implemented.
+
 Open mode does not decide successor admission. The store profile decides which
 failover paths have a valid authority and recovery boundary.
 
