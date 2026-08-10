@@ -14,6 +14,9 @@ mod errors;
 mod store;
 mod types;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
+
 pub use errors::{LimitKind, StoreError, UnknownCommit};
 pub use store::TxnStore;
 pub use types::{

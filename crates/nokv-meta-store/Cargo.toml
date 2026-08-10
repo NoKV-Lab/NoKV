@@ -9,4 +9,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
