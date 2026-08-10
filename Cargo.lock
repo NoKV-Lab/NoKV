@@ -750,9 +750,9 @@ dependencies = [
 
 [[package]]
 name = "holt"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a77f93b53614145e41674fd56c1ae83a71253d65f09039a3b5b201f89f54b688"
+checksum = "c0e62dad7ce341d1e1995cc0034cb347d0e562e444b2354f8418410e2ba770e4"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
