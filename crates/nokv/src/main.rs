@@ -363,9 +363,9 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
     use nokv_server::{
-        bootstrap_root_owner, ArtifactLifecycleDeleter, LifecycleError, LifecycleObjectDeleter,
-        LifecycleRunner, LifecycleRunnerOptions, MetadataStoreOpen, OwnerAdmission,
-        RootOwnerBootstrapRequest, RootOwnerRegistry, ServerOptions, WorkspaceServer,
+        bootstrap_shard, ArtifactLifecycleDeleter, LeaseMode, LifecycleError,
+        LifecycleObjectDeleter, LifecycleRunner, LifecycleRunnerOptions, OpenMode, RootAttach,
+        RootOwnerRegistry, ServerOptions, ShardBoot, WorkspaceServer,
     };
     use nokv_types::RequestId;
     use sha2::{Digest, Sha256};
@@ -405,8 +405,8 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .clone()
         .ok_or_else(|| "serve requires --metadata-create or --metadata-reopen".to_owned())?
     {
-        cli::MetadataStoreConfig::Create(path) => MetadataStoreOpen::Create(path),
-        cli::MetadataStoreConfig::Reopen(path) => MetadataStoreOpen::Reopen(path),
+        cli::MetadataStoreConfig::Create(path) => OpenMode::New(path),
+        cli::MetadataStoreConfig::Reopen(path) => OpenMode::Existing(path),
     };
     let node_id = NodeId::new(
         invocation
@@ -438,21 +438,31 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         log: shard.log.clone(),
         durable_lsn: shard.durable_lsn,
     };
+    if invocation.server.lifecycle_interval_millis == 0
+        || invocation.server.lifecycle_interval_millis > 60_000
+    {
+        return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
+    }
+    let objects = Arc::new(CliObjectStore::build(&invocation.client.object)?);
+    objects.validate_agent_capabilities()?;
     let registry = Arc::new(RootOwnerRegistry::new());
-    let owner = bootstrap_root_owner(
+    let owner = bootstrap_shard(
         Arc::clone(&control),
         Arc::clone(&registry),
-        RootOwnerBootstrapRequest {
-            root_id,
-            metadata,
-            admission: OwnerAdmission::Acquire {
+        ShardBoot {
+            shard_id: placement.logical_shard_id,
+            open: metadata,
+            lease: LeaseMode::Acquire {
                 owner: node_id,
                 endpoint,
-                expected_previous_epoch: shard.owner_epoch,
+                previous_epoch: shard.owner_epoch,
             },
-            install_request_id: request_id(b"install", root_id),
-            activate_request_id: request_id(b"activate", root_id),
             recovery,
+            roots: vec![RootAttach {
+                root_id,
+                install_id: request_id(b"install", root_id),
+                activate_id: request_id(b"activate", root_id),
+            }],
         },
     )
     .map_err(|error| error.to_string())?;
@@ -461,53 +471,43 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .map_err(|_| "etcd lease TTL must be positive".to_owned())?
         .saturating_div(3)
         .max(1);
-    let runtime = (|| -> Result<(WorkspaceServer, LifecycleRunner), String> {
-        if invocation.server.lifecycle_interval_millis == 0
-            || invocation.server.lifecycle_interval_millis > 60_000
-        {
-            return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
-        }
-        let objects = Arc::new(CliObjectStore::build(&invocation.client.object)?);
-        objects.validate_agent_capabilities()?;
-        let server = WorkspaceServer::new(
-            ServerOptions {
-                bind: invocation.server.bind,
-                read_timeout: Duration::from_secs(30),
-                write_timeout: Duration::from_secs(30),
-                lease_renew_interval: Duration::from_secs(renew_seconds),
-            },
-            Arc::clone(&registry),
-            vec![owner.ownership.clone()],
-        )
-        .map_err(|error| error.to_string())?;
-        let owner_loss = server.owner_loss_signal();
-        let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
-            Arc::new(ArtifactLifecycleDeleter::new(objects));
-        let lifecycle = LifecycleRunner::new(
-            Arc::clone(&owner.store),
-            Arc::clone(&registry),
-            owner.route,
-            owner_loss,
-            lifecycle_objects,
-            LifecycleRunnerOptions {
-                poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
-                ..LifecycleRunnerOptions::default()
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        Ok((server, lifecycle))
-    })();
-    let (server, lifecycle) = match runtime {
-        Ok(runtime) => runtime,
-        Err(primary) => {
-            let release = owner.ownership.release();
+    let store = Arc::clone(owner.store());
+    let owner_route = owner.routes()[0];
+    let server = WorkspaceServer::new(
+        ServerOptions {
+            bind: invocation.server.bind,
+            read_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            lease_renew_interval: Duration::from_secs(renew_seconds),
+        },
+        Arc::clone(&registry),
+        vec![owner],
+    )
+    .map_err(|error| error.to_string())?;
+    let owner_loss = server.owner_loss_signal();
+    let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
+        Arc::new(ArtifactLifecycleDeleter::new(objects));
+    let lifecycle = match LifecycleRunner::new(
+        store,
+        Arc::clone(&registry),
+        owner_route,
+        owner_loss.clone(),
+        lifecycle_objects,
+        LifecycleRunnerOptions {
+            poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
+            ..LifecycleRunnerOptions::default()
+        },
+    ) {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            let primary = error.to_string();
+            let release = server.release_ownership();
             return Err(match release {
-                Ok(_) => primary,
+                Ok(()) => primary,
                 Err(release) => format!("{primary}; owner release failed: {release}"),
             });
         }
     };
-    let owner_loss = server.owner_loss_signal();
     let worker_owner_loss = owner_loss.clone();
     let lifecycle_worker = std::thread::Builder::new()
         .name("nokv-workspace-lifecycle".to_owned())
@@ -523,9 +523,9 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         Err(error) => {
             owner_loss.fail_closed();
             let primary = format!("cannot start lifecycle worker: {error}");
-            let release = owner.ownership.release();
+            let release = server.release_ownership();
             return Err(match release {
-                Ok(_) => primary,
+                Ok(()) => primary,
                 Err(release) => format!("{primary}; owner release failed: {release}"),
             });
         }
@@ -534,7 +534,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let server_result = server.run();
     owner_loss.fail_closed();
     let lifecycle_result = lifecycle_worker.join();
-    let release_result = owner.ownership.release();
+    let release_result = server.release_ownership();
 
     let mut failures = Vec::new();
     match lifecycle_result {

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use nokv_protocol::{decode_request, encode_response, MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA};
 
-use crate::{ControlBackedRootOwner, RootOwnerRegistry, ServerError};
+use crate::{RootOwnerRegistry, ServerError, ShardOwner};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerOptions {
@@ -68,11 +69,10 @@ pub struct ServerHealth {
     pub installed_roots: usize,
 }
 
-#[derive(Clone)]
 pub struct WorkspaceServer {
     options: ServerOptions,
     registry: Arc<RootOwnerRegistry>,
-    ownership: Vec<ControlBackedRootOwner>,
+    ownership: Vec<ShardOwner>,
     owner_loss: OwnerLossSignal,
 }
 
@@ -80,33 +80,10 @@ impl WorkspaceServer {
     pub fn new(
         options: ServerOptions,
         registry: Arc<RootOwnerRegistry>,
-        ownership: Vec<ControlBackedRootOwner>,
+        ownership: Vec<ShardOwner>,
     ) -> Result<Self, ServerError> {
-        options.validate()?;
-        if ownership.is_empty() {
-            return Err(ServerError::InvalidOptions(
-                "serving requires at least one control-backed root owner".to_owned(),
-            ));
-        }
-        for (index, owner) in ownership.iter().enumerate() {
-            if !owner.is_for_registry(&registry) {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} belongs to another registry"
-                )));
-            }
-            if !registry.contains_exact(owner.route())? {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} has no exact installed route"
-                )));
-            }
-            if ownership[..index]
-                .iter()
-                .any(|current| current.route() == owner.route())
-            {
-                return Err(ServerError::InvalidOptions(format!(
-                    "ownership entry {index} duplicates a root route"
-                )));
-            }
+        if let Err(error) = validate_ownership(options, &registry, &ownership) {
+            return Err(release_rejected_ownership(ownership, error));
         }
         Ok(Self {
             options,
@@ -124,7 +101,7 @@ impl WorkspaceServer {
     }
 
     /// Runtime lease-renewal hook. A failed renewal uninstalls that owner's
-    /// exact route before the error is returned.
+    /// complete root-route set before the error is returned.
     pub fn renew_ownership(&self) -> Result<(), ServerError> {
         for owner in &self.ownership {
             if let Err(error) = owner.renew_or_uninstall() {
@@ -133,6 +110,11 @@ impl WorkspaceServer {
             }
         }
         Ok(())
+    }
+
+    /// Remove all routes and release every logical-shard lease once.
+    pub fn release_ownership(self) -> Result<(), ServerError> {
+        release_ownership(self.ownership)
     }
 
     pub fn owner_loss_signal(&self) -> OwnerLossSignal {
@@ -187,6 +169,85 @@ impl WorkspaceServer {
         let request = decode_request(encoded)?;
         let response = self.registry.dispatch(request)?;
         encode_response(&response).map_err(ServerError::Protocol)
+    }
+}
+
+fn validate_ownership(
+    options: ServerOptions,
+    registry: &Arc<RootOwnerRegistry>,
+    ownership: &[ShardOwner],
+) -> Result<(), ServerError> {
+    options.validate()?;
+    if ownership.is_empty() {
+        return Err(ServerError::InvalidOptions(
+            "serving requires at least one logical-shard owner".to_owned(),
+        ));
+    }
+    let mut shards = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    for (index, owner) in ownership.iter().enumerate() {
+        if !owner.is_for_registry(registry) {
+            return Err(ServerError::InvalidOptions(format!(
+                "ownership entry {index} belongs to another registry"
+            )));
+        }
+        if !shards.insert(owner.shard_id()) {
+            return Err(ServerError::InvalidOptions(format!(
+                "ownership entry {index} duplicates logical shard {:?}",
+                owner.shard_id()
+            )));
+        }
+        if owner.routes().is_empty() {
+            return Err(ServerError::InvalidOptions(format!(
+                "ownership entry {index} has no root routes"
+            )));
+        }
+        for route in owner.routes() {
+            if route.logical_shard_id != nokv_protocol::LogicalShardIdentity::from(owner.shard_id())
+            {
+                return Err(ServerError::InvalidOptions(format!(
+                    "ownership entry {index} contains a route for another logical shard"
+                )));
+            }
+            if !roots.insert(route.root_id) {
+                return Err(ServerError::InvalidOptions(format!(
+                    "ownership entry {index} duplicates root route {:?}",
+                    route.root_id
+                )));
+            }
+            if !registry.contains_exact(*route)? {
+                return Err(ServerError::InvalidOptions(format!(
+                    "ownership entry {index} has no exact installed route for root {:?}",
+                    route.root_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn release_rejected_ownership(ownership: Vec<ShardOwner>, primary: ServerError) -> ServerError {
+    match release_ownership(ownership) {
+        Ok(()) => primary,
+        Err(cleanup) => ServerError::BootstrapRollback {
+            primary: primary.to_string(),
+            rollback: cleanup.to_string(),
+        },
+    }
+}
+
+fn release_ownership(ownership: Vec<ShardOwner>) -> Result<(), ServerError> {
+    let failures = ownership
+        .into_iter()
+        .filter_map(|owner| owner.release().err().map(|error| error.to_string()))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ServerError::BootstrapRollback {
+            primary: "release logical-shard ownership".to_owned(),
+            rollback: failures.join("; "),
+        })
     }
 }
 

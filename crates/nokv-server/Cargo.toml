@@ -1,7 +1,7 @@
 [package]
 name = "nokv-server"
 version = "0.1.0"
-description = "Root-affine shard-owner RPC server for NoKV Agent workspaces."
+description = "Logical-shard owner RPC server for NoKV Agent workspaces."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
