@@ -96,7 +96,8 @@ Required evidence:
   visibility marker;
 - `PathCurrent(root_id, incarnation, normalized_relative_path)` is the only
   namespace truth;
-- exact reads use one marker point read plus one canonical path point read;
+- exact reads use one logical marker payload read plus one canonical logical
+  path payload read, with physical fence reads reported separately;
 - non-recursive lists use one marker check plus one bounded delimiter scan;
 - `a`, `ab`, and `a/child` remain component-safe;
 - full-path pagination is ordered, exclusive, stable at one read version, and
@@ -182,7 +183,7 @@ Required evidence:
   count;
 - unsupported cross-shard operations fail before any partial work;
 - every write and destructive provider action validates placement generation
-  and owner epoch at the Holt commit boundary;
+  and owner epoch in the same physical transaction as the metadata commit;
 - an expired or replaced owner cannot acknowledge writes or delete objects;
 - local-WAL and shared-log profiles state different acknowledgment boundaries;
 - checkpoint plus logical-log replay recovers the exact committed command

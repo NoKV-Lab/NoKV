@@ -5,7 +5,7 @@
 
 //! Owner-fenced background recovery for workspace lifecycle state machines.
 //!
-//! Every discovery scan is rooted in authoritative Holt metadata. Object-store
+//! Every discovery scan is rooted in authoritative metadata. Object-store
 //! listing is intentionally absent. Provider calls happen only after the exact
 //! local route, owner-loss signal, persisted owner epoch, and active root fence
 //! have all been checked.
@@ -225,7 +225,7 @@ pub struct LifecycleCycleReport {
 pub enum LifecycleError {
     InvalidOptions(String),
     OwnerLost(String),
-    Metadata(meta::AgentMetadataError),
+    Meta(meta::MetaError),
     CorruptMetadata {
         record: &'static str,
         detail: String,
@@ -245,7 +245,7 @@ impl fmt::Display for LifecycleError {
                 write!(formatter, "invalid lifecycle options: {detail}")
             }
             Self::OwnerLost(detail) => write!(formatter, "lifecycle owner fence lost: {detail}"),
-            Self::Metadata(error) => write!(formatter, "lifecycle metadata failed: {error}"),
+            Self::Meta(error) => write!(formatter, "lifecycle metadata failed: {error}"),
             Self::CorruptMetadata { record, detail } => {
                 write!(formatter, "corrupt lifecycle {record}: {detail}")
             }
@@ -261,15 +261,15 @@ impl fmt::Display for LifecycleError {
 impl std::error::Error for LifecycleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Metadata(error) => Some(error),
+            Self::Meta(error) => Some(error),
             _ => None,
         }
     }
 }
 
-impl From<meta::AgentMetadataError> for LifecycleError {
-    fn from(error: meta::AgentMetadataError) -> Self {
-        Self::Metadata(error)
+impl From<meta::MetaError> for LifecycleError {
+    fn from(error: meta::MetaError) -> Self {
+        Self::Meta(error)
     }
 }
 
@@ -285,10 +285,10 @@ struct LifecycleCursors {
 }
 
 /// One root-affine lifecycle runner. Calls are serialized because its bounded
-/// discovery cursors are in-memory soft state; all destructive progress lives
-/// in Holt operation records.
+/// discovery cursors are in-memory soft state; metadata records hold all
+/// destructive progress.
 pub struct LifecycleRunner {
-    store: Arc<meta::AgentMetadataStore>,
+    meta: Arc<meta::MetaShard>,
     registry: Arc<RootOwnerRegistry>,
     route: RootRoute,
     owner_loss: OwnerLossSignal,
@@ -299,7 +299,7 @@ pub struct LifecycleRunner {
 
 impl LifecycleRunner {
     pub fn new(
-        store: Arc<meta::AgentMetadataStore>,
+        meta: Arc<meta::MetaShard>,
         registry: Arc<RootOwnerRegistry>,
         route: RootRoute,
         owner_loss: OwnerLossSignal,
@@ -310,7 +310,7 @@ impl LifecycleRunner {
             .validate()
             .map_err(|error| LifecycleError::InvalidOptions(error.to_string()))?;
         let runner = Self {
-            store,
+            meta,
             registry,
             route,
             owner_loss,
@@ -421,7 +421,7 @@ impl LifecycleRunner {
                             .encode()
                             .map_err(|error| corrupt("publish operation", error.to_string()))?,
                     )?;
-                    match meta::PublicationService::new(&self.store).transition_publish(
+                    match meta::PublicationService::new(&self.meta).transition_publish(
                         meta::TransitionPublishRequest {
                             context,
                             expected_operation: operation,
@@ -473,7 +473,7 @@ impl LifecycleRunner {
                     ),
                 )
             };
-        match meta::PublicationService::new(&self.store).take_over_orphaned_publish(
+        match meta::PublicationService::new(&self.meta).take_over_orphaned_publish(
             meta::TakeOverOrphanedPublishRequest {
                 context,
                 expected_operation: operation,
@@ -498,7 +498,7 @@ impl LifecycleRunner {
         operation: meta::PublishOperationRecord,
         report: &mut LifecycleCycleReport,
     ) -> Result<(), LifecycleError> {
-        let service = meta::PublicationService::new(&self.store);
+        let service = meta::PublicationService::new(&self.meta);
         // A cleaning operation's staged object keys and manifest rows are
         // revision-scoped, so once that revision is published (or claimed by
         // another in-flight operation) they belong to that operation. The
@@ -632,7 +632,7 @@ impl LifecycleRunner {
             .encode()
             .map_err(|error| corrupt("publish operation", error.to_string()))?;
         let context = self.publication_context(b"publish-quarantine", &encoded)?;
-        match meta::PublicationService::new(&self.store).transition_publish(
+        match meta::PublicationService::new(&self.meta).transition_publish(
             meta::TransitionPublishRequest {
                 context,
                 expected_operation: operation,
@@ -659,7 +659,7 @@ impl LifecycleRunner {
         let context = self.read_context()?;
         let key = meta::artifact_revision_key(self.root_id(), revision);
         Ok(self
-            .store
+            .meta
             .read_at(
                 context.root_id,
                 context.placement_generation,
@@ -677,7 +677,7 @@ impl LifecycleRunner {
     ) -> Result<Option<OperationId>, LifecycleError> {
         let context = self.read_context()?;
         let key = meta::artifact_revision_claim_key(self.root_id(), revision);
-        self.store
+        self.meta
             .read_at(
                 context.root_id,
                 context.placement_generation,
@@ -702,7 +702,7 @@ impl LifecycleRunner {
         let context = self.read_context()?;
         let key = meta::staged_object_key(self.root_id(), operation_id, u64::from(sequence));
         let payload = self
-            .store
+            .meta
             .read_at(
                 context.root_id,
                 context.placement_generation,
@@ -775,7 +775,7 @@ impl LifecycleRunner {
                         &[&item.key, &item.value, &observed_now_ms.to_be_bytes()],
                     )?;
                     match meta::claim_expired_snapshot(
-                        &self.store,
+                        &self.meta,
                         context,
                         &meta::ClaimExpiredSnapshotRequest {
                             workbench_id: workbench.clone(),
@@ -795,7 +795,7 @@ impl LifecycleRunner {
                     let context =
                         self.write_context(b"snapshot-finish-reap", &[&item.key, &item.value])?;
                     match meta::finish_snapshot_reap(
-                        &self.store,
+                        &self.meta,
                         context,
                         &meta::FinishSnapshotReapRequest {
                             workbench_id: workbench.clone(),
@@ -854,7 +854,7 @@ impl LifecycleRunner {
                 RestorePhase::Aborting => {
                     let context =
                         self.write_context(b"restore-begin-cleaning", &[&item.key, &item.value])?;
-                    match meta::start_restore_cleanup(&self.store, context, request) {
+                    match meta::start_restore_cleanup(&self.meta, context, request) {
                         Ok(_) => report.metadata_transitions += 1,
                         Err(error) if restore_concurrent(&error) => {
                             report.deferred_operations += 1;
@@ -868,7 +868,7 @@ impl LifecycleRunner {
                     let context =
                         self.write_context(b"restore-clean-members", &[&item.key, &item.value])?;
                     match meta::cleanup_restore_batch(
-                        &self.store,
+                        &self.meta,
                         context,
                         meta::CopyRestoreBatchRequest {
                             operation_id,
@@ -885,7 +885,7 @@ impl LifecycleRunner {
                 RestorePhase::Cleaning => {
                     let context =
                         self.write_context(b"restore-finish-cleaning", &[&item.key, &item.value])?;
-                    match meta::finish_restore_cleanup(&self.store, context, request) {
+                    match meta::finish_restore_cleanup(&self.meta, context, request) {
                         Ok(_) => report.metadata_transitions += 1,
                         Err(error) if restore_concurrent(&error) => {
                             report.deferred_operations += 1;
@@ -915,7 +915,7 @@ impl LifecycleRunner {
             &operations,
             self.options.scan_page_size,
         );
-        let service = meta::CommitService::new(&self.store);
+        let service = meta::CommitService::new(&self.meta);
         for item in operations {
             let operation_id =
                 meta::decode_operation_key(self.root_id(), OperationKind::CommitRetire, &item.key)
@@ -995,7 +995,7 @@ impl LifecycleRunner {
         report: &mut LifecycleCycleReport,
     ) -> Result<(), LifecycleError> {
         let read_context = self.read_context()?;
-        let service = meta::GcService::new(&self.store);
+        let service = meta::GcService::new(&self.meta);
         let page = service
             .list_candidates(
                 read_context,
@@ -1099,7 +1099,7 @@ impl LifecycleRunner {
         let operation_key = meta::operation_key(self.root_id(), OperationKind::Gc, operation_id);
         let read = self.read_context()?;
         let payload = self
-            .store
+            .meta
             .read_at(
                 read.root_id,
                 read.placement_generation,
@@ -1114,7 +1114,7 @@ impl LifecycleRunner {
         if operation.operation_id != operation_id {
             return Err(corrupt("GC operation", "payload identity differs from key"));
         }
-        let service = meta::GcService::new(&self.store);
+        let service = meta::GcService::new(&self.meta);
         match operation.phase {
             GcPhase::Claimed => {
                 let context =
@@ -1139,7 +1139,7 @@ impl LifecycleRunner {
         operation: meta::GcOperationRecord,
         report: &mut LifecycleCycleReport,
     ) -> Result<(), LifecycleError> {
-        let service = meta::GcService::new(&self.store);
+        let service = meta::GcService::new(&self.meta);
         let scan_context = self.write_context(
             b"gc-scan-manifest",
             &[&operation
@@ -1249,7 +1249,7 @@ impl LifecycleRunner {
                 &evidence,
             ],
         )?;
-        match meta::GcService::new(&self.store).quarantine(meta::QuarantineGcRequest {
+        match meta::GcService::new(&self.meta).quarantine(meta::QuarantineGcRequest {
             context,
             expected_operation: operation,
             evidence,
@@ -1281,7 +1281,7 @@ impl LifecycleRunner {
         limit: usize,
     ) -> Result<Vec<meta::MetadataScanItem>, LifecycleError> {
         let context = self.read_context()?;
-        self.store
+        self.meta
             .scan_prefix_at(
                 context.root_id,
                 context.placement_generation,
@@ -1298,7 +1298,7 @@ impl LifecycleRunner {
     fn read_context(&self) -> Result<meta::RootReadContext, LifecycleError> {
         self.require_current_owner()?;
         meta::RootReadContext::current(
-            &self.store,
+            &self.meta,
             self.root_id(),
             self.placement_generation(),
             self.owner_epoch(),
@@ -1315,7 +1315,7 @@ impl LifecycleRunner {
         inputs: &[&[u8]],
     ) -> Result<meta::RootWriteContext, LifecycleError> {
         self.require_current_owner()?;
-        let read_version = self.store.current_read_version()?;
+        let read_version = self.meta.current_read_version()?;
         let request_id = derived_request_id(domain, read_version.get(), inputs);
         Ok(meta::RootWriteContext {
             root_id: self.root_id(),
@@ -1358,18 +1358,18 @@ impl LifecycleRunner {
                 "exact root route is no longer installed".to_owned(),
             ));
         }
-        if self.store.logical_shard_id() != self.logical_shard_id() {
+        if self.meta.logical_shard_id() != self.logical_shard_id() {
             return Err(LifecycleError::OwnerLost(
                 "metadata shard differs from the installed route".to_owned(),
             ));
         }
-        if self.store.current_owner_epoch()? != Some(self.owner_epoch()) {
+        if self.meta.current_owner_epoch()? != Some(self.owner_epoch()) {
             return Err(LifecycleError::OwnerLost(
                 "persisted owner epoch differs from the installed route".to_owned(),
             ));
         }
         let fence = self
-            .store
+            .meta
             .root_fence(self.root_id())?
             .ok_or_else(|| LifecycleError::OwnerLost("root fence is missing".to_owned()))?;
         if fence.logical_shard_id != self.logical_shard_id()
@@ -1467,36 +1467,36 @@ fn state(action: &'static str, error: impl fmt::Display) -> LifecycleError {
     }
 }
 
-fn concurrent_engine(error: &meta::AgentMetadataError) -> bool {
+fn concurrent_meta(error: &meta::MetaError) -> bool {
     matches!(
         error,
-        meta::AgentMetadataError::WriteReadVersionMismatch { .. }
-            | meta::AgentMetadataError::PredicateFailed
-            | meta::AgentMetadataError::WriteConflict
+        meta::MetaError::WriteReadVersionMismatch { .. }
+            | meta::MetaError::PredicateFailed
+            | meta::MetaError::WriteConflict
     )
 }
 
 fn publication_concurrent(error: &meta::PublicationError) -> bool {
-    matches!(error, meta::PublicationError::Metadata(source) if concurrent_engine(source))
+    matches!(error, meta::PublicationError::Meta(source) if concurrent_meta(source))
 }
 
 fn snapshot_concurrent(error: &meta::SnapshotError) -> bool {
     matches!(error, meta::SnapshotError::ConcurrentMutation)
-        || matches!(error, meta::SnapshotError::Engine(source) if concurrent_engine(source))
+        || matches!(error, meta::SnapshotError::Meta(source) if concurrent_meta(source))
 }
 
 fn restore_concurrent(error: &meta::RestoreError) -> bool {
     matches!(error, meta::RestoreError::ConcurrentMutation)
-        || matches!(error, meta::RestoreError::Engine(source) if concurrent_engine(source))
+        || matches!(error, meta::RestoreError::Meta(source) if concurrent_meta(source))
 }
 
 fn commit_concurrent(error: &meta::CommitError) -> bool {
-    matches!(error, meta::CommitError::Metadata(source) if concurrent_engine(source))
+    matches!(error, meta::CommitError::Meta(source) if concurrent_meta(source))
 }
 
 fn gc_concurrent(error: &meta::GcError) -> bool {
     matches!(error, meta::GcError::ConcurrentMutation)
-        || matches!(error, meta::GcError::Metadata(source) if concurrent_engine(source))
+        || matches!(error, meta::GcError::Meta(source) if concurrent_meta(source))
 }
 
 #[cfg(test)]
@@ -1673,7 +1673,7 @@ mod tests {
     }
 
     struct Fixture {
-        store: Arc<meta::AgentMetadataStore>,
+        store: Arc<meta::MetaShard>,
         registry: Arc<RootOwnerRegistry>,
         route: RootRoute,
         target: ArtifactRevisionId,
@@ -1712,7 +1712,7 @@ mod tests {
     }
 
     fn command(
-        store: &meta::AgentMetadataStore,
+        store: &meta::MetaShard,
         request: u8,
         action: meta::RootFenceAction,
         mutations: Vec<meta::CommandMutation>,
@@ -1764,7 +1764,7 @@ mod tests {
     }
 
     fn fixture_with_last_zero(last_zero: u64) -> Fixture {
-        let store = Arc::new(meta::AgentMetadataStore::open_memory(shard()).unwrap());
+        let store = crate::test_support::meta_shard(shard());
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&command(
@@ -2210,7 +2210,7 @@ mod tests {
 
     #[test]
     fn publish_uses_durable_activity_lease_and_new_owner_takeover() {
-        let store = Arc::new(meta::AgentMetadataStore::open_memory(shard()).unwrap());
+        let store = crate::test_support::meta_shard(shard());
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&command(
@@ -2439,7 +2439,7 @@ mod tests {
         use nokv_object::MemoryArtifactStore;
 
         fn publication_context(
-            store: &meta::AgentMetadataStore,
+            store: &meta::MetaShard,
             counter: &mut u8,
         ) -> meta::PublicationContext {
             let request = *counter;
@@ -2454,7 +2454,7 @@ mod tests {
             }
         }
 
-        let store = Arc::new(meta::AgentMetadataStore::open_memory(shard()).unwrap());
+        let store = crate::test_support::meta_shard(shard());
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&command(
@@ -2730,7 +2730,7 @@ mod tests {
         use nokv_object::MemoryArtifactStore;
 
         fn publication_context(
-            store: &meta::AgentMetadataStore,
+            store: &meta::MetaShard,
             counter: &mut u8,
         ) -> meta::PublicationContext {
             let request = *counter;
@@ -2745,7 +2745,7 @@ mod tests {
             }
         }
 
-        let store = Arc::new(meta::AgentMetadataStore::open_memory(shard()).unwrap());
+        let store = crate::test_support::meta_shard(shard());
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&command(
@@ -2990,7 +2990,7 @@ mod tests {
             .expect("operation A begins finalization")
             .operation;
 
-        let read_operation_b = |store: &Arc<meta::AgentMetadataStore>| {
+        let read_operation_b = |store: &Arc<meta::MetaShard>| {
             let read = meta::RootReadContext::current(store, root(), placement(), owner()).unwrap();
             let payload = store
                 .read_at(

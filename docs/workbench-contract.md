@@ -290,7 +290,7 @@ operation id, source and destination Workbench ids and presentation paths, and
 the selected snapshot id. Its exact digest, size, and JSON content type are
 bound durably when restore preparation begins and are checked again when the
 staging workspace is published. Restore member count and member digest remain
-typed Holt fields only; the metadata engine does not generate a second JSON
+typed metadata fields only. `MetaShard` does not generate a second JSON
 manifest schema.
 
 ## Contract Conformance

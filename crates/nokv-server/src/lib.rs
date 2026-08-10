@@ -16,6 +16,8 @@ mod lifecycle;
 mod registry;
 mod server;
 mod service;
+#[cfg(test)]
+mod test_support;
 
 pub use bootstrap::{bootstrap_shard, LeaseMode, OpenMode, RootAttach, ShardBoot, ShardOwner};
 pub use error::ServerError;

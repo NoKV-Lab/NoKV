@@ -6,7 +6,7 @@
 //! Durable object-first publication commands for NoKV workspaces.
 //!
 //! This module composes typed publication records into the sole
-//! [`MetadataCommand`] executor and never writes Holt directly.
+//! [`MetadataCommand`] executor and never writes a transaction store directly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -31,10 +31,11 @@ use super::codec::{
 };
 use super::commit::RUN_MANIFEST_PATH;
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
-    HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, RootFenceAction,
+    CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError, MetaShard,
+    MetadataCommand, MetadataCommandResult, RootFenceAction,
 };
 use super::event_projection::change_event_projection;
+use super::keyspace::MetadataFamily;
 use super::publication_records::{
     ArtifactRevisionClaimRecord, ArtifactRevisionRecord, GcCandidateRecord, PathEntry,
     PublicationRecordCodecError, RevisionRefRecord, WorkspaceRecord,
@@ -248,7 +249,7 @@ pub struct FinalizePublishOutcome {
 /// Typed publication-domain failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublicationError {
-    Metadata(AgentMetadataError),
+    Meta(MetaError),
     OperationCodec(PublishRecordError),
     RecordCodec(PublicationRecordCodecError),
     QueryRecord(QueryRecordError),
@@ -425,7 +426,7 @@ pub enum PublicationError {
 impl fmt::Display for PublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Metadata(error) => error.fmt(formatter),
+            Self::Meta(error) => error.fmt(formatter),
             Self::OperationCodec(error) => error.fmt(formatter),
             Self::RecordCodec(error) => error.fmt(formatter),
             Self::QueryRecord(error) => error.fmt(formatter),
@@ -1348,7 +1349,7 @@ fn decode_operation_outcome(
 impl std::error::Error for PublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Metadata(source) => Some(source),
+            Self::Meta(source) => Some(source),
             Self::OperationCodec(source) => Some(source),
             Self::RecordCodec(source) => Some(source),
             Self::QueryRecord(source) => Some(source),
@@ -1359,9 +1360,9 @@ impl std::error::Error for PublicationError {
     }
 }
 
-impl From<AgentMetadataError> for PublicationError {
-    fn from(error: AgentMetadataError) -> Self {
-        Self::Metadata(error)
+impl From<MetaError> for PublicationError {
+    fn from(error: MetaError) -> Self {
+        Self::Meta(error)
     }
 }
 
@@ -1398,11 +1399,11 @@ impl From<RestoreRecordError> for PublicationError {
 /// Publication command facade over the authoritative metadata executor.
 #[derive(Clone, Copy)]
 pub struct PublicationService<'a> {
-    store: &'a AgentMetadataStore,
+    store: &'a MetaShard,
 }
 
 impl<'a> PublicationService<'a> {
-    pub const fn new(store: &'a AgentMetadataStore) -> Self {
+    pub const fn new(store: &'a MetaShard) -> Self {
         Self { store }
     }
 }
@@ -2846,7 +2847,7 @@ impl PublicationService<'_> {
             .execute_before_lease_deadline(&command, activity_deadline_ms)
         {
             Ok(result) => Ok(result),
-            Err(AgentMetadataError::LeaseDeadlineReached {
+            Err(MetaError::LeaseDeadlineReached {
                 lease_clock_ms,
                 requested_deadline_ms,
             }) => Err(PublicationError::ActivityDeadlineNotFuture {
@@ -3836,7 +3837,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -3859,18 +3860,21 @@ mod tests {
         .seal()
     }
 
-    fn ready_store(counter: &mut u128) -> AgentMetadataStore {
-        prepare_store(AgentMetadataStore::open_memory(shard()).unwrap(), counter)
-    }
-
-    fn ready_file_store(path: &std::path::Path, counter: &mut u128) -> AgentMetadataStore {
+    fn ready_store(counter: &mut u128) -> MetaShard {
         prepare_store(
-            AgentMetadataStore::create_file(path, shard()).unwrap(),
+            crate::workspace::test_support::memory(shard()).unwrap(),
             counter,
         )
     }
 
-    fn prepare_store(store: AgentMetadataStore, counter: &mut u128) -> AgentMetadataStore {
+    fn ready_file_store(path: &std::path::Path, counter: &mut u128) -> MetaShard {
+        prepare_store(
+            crate::workspace::test_support::initialize_file(path, shard()).unwrap(),
+            counter,
+        )
+    }
+
+    fn prepare_store(store: MetaShard, counter: &mut u128) -> MetaShard {
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&fence_command(
@@ -3907,11 +3911,11 @@ mod tests {
         store
     }
 
-    fn publication_context(store: &AgentMetadataStore, counter: &mut u128) -> PublicationContext {
+    fn publication_context(store: &MetaShard, counter: &mut u128) -> PublicationContext {
         publication_context_for_owner(store, counter, owner())
     }
 
-    fn commit_context(store: &AgentMetadataStore, counter: &mut u128) -> RootWriteContext {
+    fn commit_context(store: &MetaShard, counter: &mut u128) -> RootWriteContext {
         RootWriteContext::current(
             store,
             root(),
@@ -3924,7 +3928,7 @@ mod tests {
     }
 
     fn publication_context_for_owner(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
     ) -> PublicationContext {
@@ -4079,7 +4083,7 @@ mod tests {
 
     fn begin_operation(
         service: &PublicationService<'_>,
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation: PublishOperationRecord,
     ) -> PublishOperationRecord {
@@ -4094,7 +4098,7 @@ mod tests {
 
     fn stage_all(
         service: &PublicationService<'_>,
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         mut operation: PublishOperationRecord,
         staged: &[StagedObjectRecord],
@@ -4117,7 +4121,7 @@ mod tests {
 
     fn stage_uploaded_objects(
         service: &PublicationService<'_>,
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         mut operation: PublishOperationRecord,
         staged: &[StagedObjectRecord],
@@ -4208,7 +4212,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn publish_full(
         service: &PublicationService<'_>,
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation_id: OperationId,
         artifact_revision_id: ArtifactRevisionId,
@@ -4232,7 +4236,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn publish_full_with_projection(
         service: &PublicationService<'_>,
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation_id: OperationId,
         artifact_revision_id: ArtifactRevisionId,
@@ -4273,7 +4277,7 @@ mod tests {
             .unwrap()
     }
 
-    fn count_prefix(store: &AgentMetadataStore, family: MetadataFamily, prefix: &[u8]) -> usize {
+    fn count_prefix(store: &MetaShard, family: MetadataFamily, prefix: &[u8]) -> usize {
         let version = store.current_read_version().unwrap();
         let mut start_after = None;
         let mut count = 0;
@@ -4302,7 +4306,7 @@ mod tests {
     }
 
     fn payload_at(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         family: MetadataFamily,
         key: &[u8],
         read_version: ReadVersion,
@@ -5548,7 +5552,7 @@ mod tests {
             .is_some());
         drop(store);
 
-        let reopened = AgentMetadataStore::reopen_file(&database_path, shard()).unwrap();
+        let reopened = crate::workspace::test_support::open_file(&database_path, shard()).unwrap();
         assert_eq!(
             reopened
                 .read_at(
@@ -5677,9 +5681,7 @@ mod tests {
             });
             assert!(matches!(
                 takeover,
-                Err(PublicationError::Metadata(
-                    AgentMetadataError::PredicateFailed
-                ))
+                Err(PublicationError::Meta(MetaError::PredicateFailed))
             ));
             assert!(get_visible_path_at(
                 &store,
@@ -5769,8 +5771,8 @@ mod tests {
             });
             assert!(matches!(
                 finalize_loser,
-                Err(PublicationError::Metadata(
-                    AgentMetadataError::WriteReadVersionMismatch { .. }
+                Err(PublicationError::Meta(
+                    MetaError::WriteReadVersionMismatch { .. }
                 ))
             ));
             assert_eq!(
@@ -6011,10 +6013,7 @@ mod tests {
         );
     }
 
-    fn read_revision_claim(
-        store: &AgentMetadataStore,
-        revision_id: ArtifactRevisionId,
-    ) -> Option<Vec<u8>> {
+    fn read_revision_claim(store: &MetaShard, revision_id: ArtifactRevisionId) -> Option<Vec<u8>> {
         let version = store.current_read_version().unwrap();
         store
             .read_at(
@@ -6157,7 +6156,7 @@ mod tests {
     }
 
     fn overwrite_revision_claim(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         revision_id: ArtifactRevisionId,
         next: Option<ArtifactRevisionClaimRecord>,
@@ -6337,7 +6336,7 @@ mod tests {
 
     fn quarantine_after_abort(
         service: &PublicationService<'_>,
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation: PublishOperationRecord,
         evidence: &[u8],
@@ -6381,7 +6380,7 @@ mod tests {
     }
 
     fn put_operation_row_raw(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation: &PublishOperationRecord,
     ) {

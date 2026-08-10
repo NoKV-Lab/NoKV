@@ -1,8 +1,8 @@
 //! Durable, strictly ordered material for exporting and replaying metadata writes.
 //!
-//! The outbox is committed in the same Holt atomic batch as the authoritative
+//! The outbox is committed in the same transaction as the authoritative
 //! mutation. It is not a second namespace state machine: a consumer replays the
-//! decoded mutation through the ordinary [`AgentMetadataStore`] write entrypoints.
+//! decoded mutation through the ordinary [`MetaShard`] write entrypoints.
 
 use std::fmt;
 
@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use super::codec::SCHEMA_ID;
 use super::engine::{
     CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetadataCommand,
-    MetadataFamily, RootFenceAction,
+    RootFenceAction,
 };
+use super::keyspace::MetadataFamily;
 
 pub const RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 2;
 pub const RECOVERY_CHAIN_DIGEST_BYTES: usize = 32;
@@ -299,7 +300,7 @@ impl RecoveryMutationV1 {
                     command.history_projection.len(),
                 )?;
                 for projection in &command.history_projection {
-                    bytes.push(projection.family as u8);
+                    bytes.push(projection.family.format_tag());
                     put_bytes(&mut bytes, "history_key", &projection.key)?;
                 }
                 put_count(
@@ -831,7 +832,7 @@ fn encode_predicate(
             expected,
         } => {
             bytes.push(1);
-            bytes.push(*family as u8);
+            bytes.push(family.format_tag());
             put_bytes(bytes, "predicate_key", key)?;
             match expected {
                 None => bytes.push(0),
@@ -843,7 +844,7 @@ fn encode_predicate(
         }
         CommandPredicate::PrefixEmpty { family, prefix } => {
             bytes.push(2);
-            bytes.push(*family as u8);
+            bytes.push(family.format_tag());
             put_bytes(bytes, "predicate_prefix", prefix)?;
         }
     }
@@ -889,13 +890,13 @@ fn encode_mutation(
     match mutation {
         CommandMutation::Put { family, key, value } => {
             bytes.push(1);
-            bytes.push(*family as u8);
+            bytes.push(family.format_tag());
             put_bytes(bytes, "mutation_key", key)?;
             put_bytes(bytes, "mutation_value", value)?;
         }
         CommandMutation::Delete { family, key } => {
             bytes.push(2);
-            bytes.push(*family as u8);
+            bytes.push(family.format_tag());
             put_bytes(bytes, "mutation_key", key)?;
         }
     }
@@ -921,35 +922,10 @@ fn decode_mutation(decoder: &mut Decoder<'_>) -> Result<CommandMutation, Recover
 }
 
 fn decode_family(value: u8) -> Result<MetadataFamily, RecoveryCodecError> {
-    let family = match value {
-        0x02 => MetadataFamily::WorkspaceCurrent,
-        0x03 => MetadataFamily::PathCurrent,
-        0x04 => MetadataFamily::ArtifactRevision,
-        0x05 => MetadataFamily::ArtifactManifest,
-        0x06 => MetadataFamily::RevisionRef,
-        0x07 => MetadataFamily::Commit,
-        0x08 => MetadataFamily::CommitMember,
-        0x09 => MetadataFamily::WorkbenchCommitHead,
-        0x0a => MetadataFamily::Tag,
-        0x0b => MetadataFamily::SnapshotRef,
-        0x0c => MetadataFamily::SnapshotAlias,
-        0x0d => MetadataFamily::HistoryHold,
-        0x0e => MetadataFamily::CommitConsumer,
-        0x0f => MetadataFamily::SecondaryIndex,
-        0x11 => MetadataFamily::Operation,
-        0x12 => MetadataFamily::RestoreMember,
-        0x13 => MetadataFamily::StagedObject,
-        0x15 => MetadataFamily::GcCandidate,
-        0x16 => MetadataFamily::GcBarrier,
-        0x17 => MetadataFamily::WorkspaceIncarnationClaim,
-        _ => {
-            return Err(RecoveryCodecError::UnknownDiscriminant {
-                type_name: "MetadataFamily",
-                value,
-            })
-        }
-    };
-    Ok(family)
+    MetadataFamily::from_format_tag(value).ok_or(RecoveryCodecError::UnknownDiscriminant {
+        type_name: "MetadataFamily",
+        value,
+    })
 }
 
 fn decode_root_state(value: u8) -> Result<RootActivationState, RecoveryCodecError> {

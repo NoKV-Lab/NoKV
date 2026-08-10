@@ -3,6 +3,7 @@ members = [
     "crates/nokv-types",
     "crates/nokv-protocol",
     "crates/nokv-meta-store",
+    "crates/nokv-meta-holt",
     "crates/nokv-meta",
     "crates/nokv-control",
     "crates/nokv-object",
@@ -28,6 +29,7 @@ base64 = "0.23.0"
 nokv-types = { path = "crates/nokv-types", version = "0.1.0" }
 nokv-protocol = { path = "crates/nokv-protocol", version = "0.1.0" }
 nokv-meta-store = { path = "crates/nokv-meta-store", version = "0.1.0" }
+nokv-meta-holt = { path = "crates/nokv-meta-holt", version = "0.1.0" }
 nokv-meta = { path = "crates/nokv-meta", version = "0.1.0" }
 nokv-control = { path = "crates/nokv-control", version = "0.1.0" }
 nokv-object = { path = "crates/nokv-object", version = "0.1.0" }

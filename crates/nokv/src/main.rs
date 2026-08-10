@@ -515,7 +515,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .map_err(|_| "etcd lease TTL must be positive".to_owned())?
         .saturating_div(3)
         .max(1);
-    let store = Arc::clone(owner.store());
+    let meta = Arc::clone(owner.meta());
     let owner_routes = owner.routes().to_vec();
     let server = WorkspaceServer::new(
         ServerOptions {
@@ -534,7 +534,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let mut lifecycles = Vec::with_capacity(owner_routes.len());
     for route in owner_routes {
         match LifecycleRunner::new(
-            Arc::clone(&store),
+            Arc::clone(&meta),
             Arc::clone(&registry),
             route,
             owner_loss.clone(),

@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use nokv_meta::workspace::{HoltReadStats, MetadataReadStats};
+use nokv_meta::workspace::MetadataReadStats;
+use nokv_meta_holt::HoltReadStats;
 use serde::Serialize;
 
 use crate::report::{measure_with_diagnostics, WorkloadReport};
@@ -265,12 +266,13 @@ pub(super) fn measure_metadata_workload(
         iterations,
         operation,
         || {
-            let store = harness.executor.store();
-            let metadata = store
+            let metadata = harness
+                .meta
                 .begin_read_stats_session()
                 .map_err(|error| error.to_string())?;
-            let holt = store
-                .begin_holt_read_stats_session()
+            let holt = harness
+                .holt
+                .begin_read_stats_session()
                 .map_err(|error| error.to_string())?;
             Ok((metadata, holt))
         },

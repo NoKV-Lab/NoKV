@@ -22,8 +22,9 @@ Workbench / SDK / CLI
 ```
 
 NoKV sends immutable block puts, ranged gets, integrity checks, and fenced
-deletes through the common object package. Holt remains the authority for
-paths, manifests, references, operations, and deletion eligibility.
+deletes through the common object package. The NoKV metadata schema remains the
+authority for paths, manifests, references, operations, and deletion
+eligibility. Holt is the current serving local metadata adapter.
 
 ## Deployment Identity
 

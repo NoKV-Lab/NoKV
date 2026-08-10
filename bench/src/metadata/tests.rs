@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use nokv_meta::workspace::{HoltReadStats, MetadataReadStats};
+use nokv_meta::workspace::MetadataReadStats;
+use nokv_meta_holt::HoltReadStats;
 
 use super::evidence::{MetadataReadCounterTotals, ReadStatsSample};
 use super::fixture::MAX_FIXTURE_PATHS;
@@ -74,13 +75,17 @@ fn metadata_runner_exercises_exact_and_cursor_reads() {
         .iter()
         .filter(|row| row.performance.workload.starts_with("exact_get_"))
     {
-        assert!(row.read_amplification.totals.point_reads_total >= 4);
-        assert!(row.read_amplification.totals.point_reads_authoritative >= 4);
+        assert_eq!(row.read_amplification.totals.point_reads_total, 22);
+        assert_eq!(row.read_amplification.totals.point_reads_fencing, 18);
+        assert_eq!(row.read_amplification.totals.point_reads_authoritative, 4);
+        assert_eq!(row.read_amplification.totals.point_reads_system, 12);
+        assert_eq!(row.read_amplification.totals.point_reads_root_fence, 6);
         assert_eq!(
             row.read_amplification.totals.point_reads_workspace_current,
             2
         );
         assert_eq!(row.read_amplification.totals.point_reads_path_current, 2);
+        assert_eq!(row.read_amplification.totals.point_reads_other, 0);
     }
     let recursive = report
         .workloads
@@ -89,6 +94,7 @@ fn metadata_runner_exercises_exact_and_cursor_reads() {
         .unwrap();
     assert_eq!(recursive.read_amplification.totals.scan_calls, 2);
     assert_eq!(recursive.read_amplification.totals.scan_cursors, 2);
+    assert_eq!(recursive.read_amplification.totals.scan_raw_limit_stops, 2);
     assert!(recursive.read_amplification.totals.holt_scan_returned_keys >= 4);
     let direct = report
         .workloads
@@ -96,6 +102,8 @@ fn metadata_runner_exercises_exact_and_cursor_reads() {
         .find(|row| row.performance.workload == "direct_list_middle_page")
         .unwrap();
     assert_eq!(direct.read_amplification.totals.scan_calls, 2);
+    assert_eq!(direct.read_amplification.totals.scan_cursors, 2);
+    assert_eq!(direct.read_amplification.totals.scan_raw_limit_stops, 2);
     assert!(direct.read_amplification.totals.holt_scan_returned_keys >= 4);
     assert_eq!(report.profile.cache_state, "same_request_warmup");
     assert_eq!(report.correctness.before_timing, "passed");

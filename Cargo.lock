@@ -1303,6 +1303,8 @@ name = "nokv-bench"
 version = "0.1.0"
 dependencies = [
  "nokv-meta",
+ "nokv-meta-holt",
+ "nokv-meta-store",
  "nokv-protocol",
  "nokv-server",
  "nokv-types",
@@ -1336,9 +1338,19 @@ dependencies = [
 name = "nokv-meta"
 version = "0.1.0"
 dependencies = [
- "holt",
+ "nokv-meta-holt",
+ "nokv-meta-store",
  "nokv-types",
  "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
+name = "nokv-meta-holt"
+version = "0.1.0"
+dependencies = [
+ "holt",
+ "nokv-meta-store",
  "tempfile",
 ]
 
@@ -1384,6 +1396,8 @@ version = "0.1.0"
 dependencies = [
  "nokv-control",
  "nokv-meta",
+ "nokv-meta-holt",
+ "nokv-meta-store",
  "nokv-object",
  "nokv-protocol",
  "nokv-types",

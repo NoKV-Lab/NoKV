@@ -84,27 +84,32 @@ PathCurrent
 It is achieved by passing the already-resolved visible workspace into the path
 primitive and storing the immutable result projection in `PathCurrent` in the
 same publication command as `ArtifactRevision`. `ArtifactRevision` remains the
-revision-lifetime authority; it is not needed to shape ordinary path metadata.
-The live server path captures the current version, validates the owner and root
-fences once, and performs both dependent point reads inside one short-lived
-NoKV read session. This describes two authoritative metadata payload reads; it
-does not count the once-per-session system and fence records as path rows.
+revision-lifetime authority. Ordinary path metadata does not read it.
+This describes two authoritative metadata payload reads, not two physical
+point operations. The current storage-neutral path first reads owner fence,
+root fence, and commit clock. It then repeats those three guards in the same
+`ReadBatch` as `WorkspaceCurrent`, and again with `PathCurrent`, for eleven
+point operations on a cold exact get. `TxnStore` deliberately has no read
+session that spans calls. A later retained or declarative read-view design can
+remove the repeated guards, but it must preserve one owner-fenced snapshot
+across the marker-dependent path lookup.
 
-The first listing composition likewise scanned the whole incarnation and
-filtered the requested prefix in server memory, while the engine materialized
-the complete prefix before applying cursor and limit. The accepted live-list
-target is one marker check, then a Holt seek at the encoded descendant prefix,
-an exclusive cursor, and streaming termination when the page is full. An
+The first listing composition scanned the whole incarnation and filtered the
+requested prefix in server memory. The metadata layer also materialized the
+complete prefix before it applied the cursor and limit. The accepted live-list
+target is one marker check, a store seek at the encoded descendant prefix, an
+exclusive cursor, and termination when the page is full. An
 optional exact-path probe is deferred until the descendant iterator reaches
 EOF, preserving "exact prefix or descendants" semantics without paying that
-point read on every hot-directory page. The engine captures that scoped Holt
-view while holding the shard read gate, then releases the gate before traversal
-and record decoding. A long page no longer holds the NoKV read gate for its
-complete iteration.
-Non-recursive pages also pass the encoded component delimiter to Holt. Holt
-folds each deeper subtree into a `CommonPrefix`; NoKV retains that as one
-storage-neutral implicit `Prefix` item, and an exact artifact at the same child
-wins during logical coalescing. Prefixes and artifacts both count toward the
+point read on every hot-directory page. Each bounded store page batches its
+owner fence, root fence, and commit clock with the scan. `ScanPage::more` is the
+only completion signal. Neither adapter nor metadata layer materializes the
+complete physical prefix before applying the page bounds.
+
+Non-recursive pages also pass the encoded component delimiter to `TxnStore`.
+The adapter folds each deeper subtree into a `CommonPrefix`. NoKV retains that
+as one storage-neutral implicit `Prefix` item. An exact artifact at the same
+child wins during logical coalescing. Prefixes and artifacts both count toward the
 page limit and can become cursor anchors. Recursive pages retain the ordinary
 ordered prefix iterator and emit artifacts only. System format version 8 uses
 NUL between components and `0x01` at exact keys so a rollup, exact child, and

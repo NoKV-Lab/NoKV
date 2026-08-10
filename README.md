@@ -11,7 +11,8 @@ SPDX-License-Identifier: Apache-2.0
   <p>
     NoKV is an Agent-native distributed workspace and artifact store. It
     publishes crash-consistent, versioned workspace state over immutable
-    S3-compatible artifacts, with ordered shard-local metadata in Holt.
+    S3-compatible artifacts. `TxnStore` persists ordered shard-local metadata.
+    Holt is the current serving local adapter.
   </p>
 
   <p>
@@ -82,8 +83,9 @@ Agent / Workbench / SDK / custom CLI / MCP
           +----------+----------+
           |                     |
           v                     v
-   shard-local Holt     S3-compatible storage
-   metadata truth       immutable artifact bytes
+ MetaShard + TxnStore   S3-compatible storage
+  metadata truth       immutable artifact bytes
+ (local: HoltStore)
 ```
 
 NoKV owns namespace truth, shard-local metadata transactions, versioned body
@@ -99,8 +101,8 @@ general NAS replacement are outside the product architecture.
 
 ## Workspace Guarantees
 
-- **Atomic publication.** Artifact bytes are uploaded first; one bounded Holt
-  command makes the new metadata generation visible last.
+- **Atomic publication.** NoKV uploads artifact bytes first. One bounded
+  metadata command makes the new generation visible last.
 - **Canonical path reads.**
   `PathCurrent(root, workspace_incarnation, normalized_relative_path)` is the
   only namespace truth, and directories are implicit prefixes.
@@ -155,8 +157,8 @@ the evidence itself — files, manifests, lineage, and the bytes they attest
 
 | Status | Capabilities and limits |
 | --- | --- |
-| **Current product** | Persisted `RootId -> LogicalShardId` affinity; one epoch-fenced active owner per shard; canonical full-path Holt keys; immutable S3-compatible bodies; Rust and Python SDKs; custom CLI; MCP; exact 18-tool Workbench; snapshots, commits, restore, queries, and reference-fenced GC |
-| **Current durability profile** | Acknowledged metadata writes are synchronously durable in the owning shard's local Holt WAL. Each mutation also appends canonical hash-chained replay material in the same store. First-owner creation and exact current-lease resume are admitted; unknown, mixed, or unverified successor stores fail closed. |
+| **Current product** | Persisted `RootId -> LogicalShardId` affinity; one epoch-fenced active owner per shard; canonical full-path metadata keys; immutable S3-compatible bodies; Rust and Python SDKs; custom CLI; MCP; exact 18-tool Workbench; snapshots, commits, restore, queries, and reference-fenced GC |
+| **Current durability profile** | Acknowledged metadata writes are synchronously durable in the owning shard's local Holt WAL. Each mutation also appends canonical hash-chained replay material in the same store. First-owner acquisition accepts a new or prepared epoch-zero store. Exact current-lease resume is also admitted. Unknown, mixed, or unverified successor stores fail closed. |
 | **Not qualified** | Remote checkpoint/log recovery, shared metadata durability, multi-machine failover, production metadata HA, tenant identity/RBAC, cross-shard transactions, and complete provider fault-injection qualification |
 
 Root placement is persisted control-plane state. NoKV never derives shard
@@ -181,7 +183,8 @@ the exact contracts and qualification gates.
   [`nokv-agent`](crates/nokv-agent), shared by every adapter.
 
 RootId is the only storage and routing identity. A Workbench presentation root
-shapes Agent-facing paths and manifests but never enters Holt keys.
+shapes Agent-facing paths and manifests but never enters canonical metadata
+keys.
 
 ## Stable Workbench
 
@@ -361,13 +364,15 @@ git diff --check
 | --- | --- |
 | [`nokv-types`](crates/nokv-types) | Storage-neutral Agent workspace domain types |
 | [`nokv-protocol`](crates/nokv-protocol) | Versioned metadata and lifecycle RPC DTOs and framing |
-| [`nokv-meta`](crates/nokv-meta) | Workspace schema, commands, Holt binding, history, indexes, commits, snapshots, restore, and GC |
+| [`nokv-meta-store`](crates/nokv-meta-store) | Storage-neutral ordered metadata transaction contract and conformance suite |
+| [`nokv-meta-holt`](crates/nokv-meta-holt) | Serving local Holt adapter, strict open/reopen, recovery, and physical diagnostics |
+| [`nokv-meta`](crates/nokv-meta) | Workspace schema, commands, history, indexes, commits, snapshots, restore, and GC over `TxnStore` |
 | [`nokv-control`](crates/nokv-control) | Persisted root placement, shard ownership, epoch fencing, and recovery coordination |
 | [`nokv-object`](crates/nokv-object) | Immutable S3-compatible artifact storage and local hot tier |
 | [`nokv-client`](crates/nokv-client) | Root-routed Rust Agent SDK and direct immutable-object data path |
 | [`nokv-agent`](crates/nokv-agent) | Transport-free 18-tool Workbench facade and stable result shaping |
 | [`nokv-python`](crates/nokv-python) | Direct Python SDK and explicit materialize/collect adapters |
-| [`nokv-server`](crates/nokv-server) | Root-affine shard-owner RPC server and lifecycle workers |
+| [`nokv-server`](crates/nokv-server) | Logical-shard owner, metadata adapter composition, RPC server, and root-affine lifecycle workers |
 | [`nokv`](crates/nokv) | Thin custom CLI and MCP wiring |
 | [`nokv-bench`](bench) | Non-product contract, recovery, and performance workloads |
 

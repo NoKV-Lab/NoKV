@@ -6,12 +6,14 @@
 use std::sync::Arc;
 
 use nokv_meta::workspace::{
-    artifact_revision_key, create_visible_workspace, dependency_owner_digest, path_current_key,
-    path_revision_ref_key, workspace_current_key, AgentMetadataStore, ArtifactRevisionRecord,
-    CommandMutation, CommandPredicate, HistoryProjection, MetadataCommand, MetadataFamily,
-    PathEntry, RevisionRefRecord, RootFenceAction, RootWriteContext, TypedProjection,
-    WorkspaceRecord, SCHEMA_ID,
+    artifact_revision_key, create_visible_workspace, dependency_owner_digest, keyspaces,
+    path_current_key, path_revision_ref_key, store_limits, workspace_current_key,
+    ArtifactRevisionRecord, CommandMutation, CommandPredicate, HistoryProjection, MetaShard,
+    MetadataCommand, MetadataFamily, PathEntry, RevisionRefRecord, RootFenceAction,
+    RootWriteContext, TypedProjection, WorkspaceRecord, SCHEMA_ID,
 };
+use nokv_meta_holt::{HoltOptions, HoltStore, TreeBinding};
+use nokv_meta_store::TxnStore;
 use nokv_protocol::{LogicalShardIdentity, RootIdentity, RootRoute, WorkbenchName};
 use nokv_server::MetadataWorkspaceRequestExecutor;
 use nokv_types::{
@@ -25,12 +27,15 @@ use super::options::MetadataOptions;
 pub(super) const EMPTY_SHA256_URI: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 // Each path installs PathCurrent, ArtifactRevision, and its strong RevisionRef.
-// Predicates and mutations both count against the engine's 256-item bound.
+// Predicates and mutations both count against the domain command's 256-item
+// bound.
 pub(super) const SEED_BATCH_SIZE: usize = 40;
 pub(super) const MAX_FIXTURE_PATHS: usize = 1_000_000;
 
 pub(super) struct Harness {
     pub(super) executor: MetadataWorkspaceRequestExecutor,
+    pub(super) meta: Arc<MetaShard>,
+    pub(super) holt: Arc<HoltStore>,
     pub(super) route: RootRoute,
     pub(super) workbench: WorkbenchName,
     pub(super) direct_children: usize,
@@ -45,22 +50,33 @@ impl Harness {
         let workspace_revision = u64::try_from(fixture_paths.len())
             .map_err(|_| "fixture path count does not fit u64".to_owned())?;
         let identity = Identities::new(options.seed)?;
-        let store = match &options.metadata_dir {
-            Some(path) => AgentMetadataStore::create_file(path, identity.shard),
-            None => AgentMetadataStore::open_memory(identity.shard),
-        }
-        .map_err(|error| error.to_string())?;
-        store
-            .advance_owner_epoch(None, identity.owner)
+        let catalog = keyspaces()
+            .iter()
+            .map(|definition| TreeBinding::new(definition.id, definition.name))
+            .collect::<Vec<_>>();
+        let holt = Arc::new(
+            match &options.metadata_dir {
+                Some(path) => {
+                    HoltStore::initialize(HoltOptions::file(path, catalog, store_limits()))
+                }
+                None => HoltStore::memory(catalog, store_limits()),
+            }
+            .map_err(|error| error.to_string())?,
+        );
+        let txn_store: Arc<dyn TxnStore> = holt.clone();
+        let meta = Arc::new(
+            MetaShard::initialize(txn_store, identity.shard).map_err(|error| error.to_string())?,
+        );
+        meta.advance_owner_epoch(None, identity.owner)
             .map_err(|error| error.to_string())?;
         execute_fence(
-            &store,
+            &meta,
             &identity,
             request_id(options.seed, 1),
             RootFenceAction::Install,
         )?;
         execute_fence(
-            &store,
+            &meta,
             &identity,
             request_id(options.seed, 2),
             RootFenceAction::Transition {
@@ -72,9 +88,9 @@ impl Harness {
         let workbench_id = WorkbenchId::new("benchmark").map_err(|error| error.to_string())?;
         let workspace_incarnation = fixed_id(options.seed, 3);
         let created = create_visible_workspace(
-            &store,
+            &meta,
             RootWriteContext::current(
-                &store,
+                &meta,
                 identity.root,
                 identity.shard,
                 identity.placement,
@@ -88,14 +104,14 @@ impl Harness {
         .map_err(|error| error.to_string())?;
 
         let next_mutation_sequence = seed_paths(
-            &store,
+            &meta,
             &identity,
             WorkspaceIncarnationId::from_bytes(workspace_incarnation),
             &fixture_paths,
             options.seed,
         )?;
         finish_fixture_workspace(
-            &store,
+            &meta,
             &identity,
             &workbench_id,
             created.workspace,
@@ -110,7 +126,9 @@ impl Harness {
             owner_epoch: identity.owner.get(),
         };
         Ok(Self {
-            executor: MetadataWorkspaceRequestExecutor::new(Arc::new(store)),
+            executor: MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta)),
+            meta,
+            holt,
             route,
             workbench: WorkbenchName::new(workbench_id.as_str())
                 .map_err(|error| error.to_string())?,
@@ -142,7 +160,7 @@ impl Identities {
 }
 
 fn execute_fence(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     identity: &Identities,
     request_id: RequestId,
     action: RootFenceAction,
@@ -174,7 +192,7 @@ fn execute_fence(
 }
 
 fn finish_fixture_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     identity: &Identities,
     workbench_id: &WorkbenchId,
     previous: WorkspaceRecord,
@@ -233,7 +251,7 @@ fn finish_fixture_workspace(
 }
 
 fn seed_paths(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     identity: &Identities,
     workspace_incarnation: WorkspaceIncarnationId,
     paths: &[String],

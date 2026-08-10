@@ -4,7 +4,7 @@ layout: home
 hero:
   name: NoKV
   text: Agent-native distributed workspace and artifact storage.
-  tagline: A stable Workbench, SDK, CLI, and MCP surface over path-primary Holt metadata and immutable object-backed revisions.
+  tagline: A stable Workbench, SDK, CLI, and MCP surface over path-primary ordered metadata and immutable object-backed revisions.
   image:
     src: /img/logo.png
     alt: NoKV
@@ -24,7 +24,7 @@ hero:
 features:
   - title: Stable Agent surface
     details: Preserve the complete 18-tool NoKV Workbench contract and expose the same semantics through SDK, custom CLI, and MCP adapters.
-  - title: Path-primary Holt metadata
+  - title: Path-primary metadata
     details: One normalized full path is namespace truth. Exact artifacts use point reads; child listing uses component-safe delimiter scans.
   - title: Immutable revisions
     details: Stream bytes to S3-compatible storage first, then atomically publish a revision, path, indexes, event, and deterministic replay result.
@@ -54,7 +54,7 @@ SPDX-License-Identifier: Apache-2.0
     </div>
     <div class="nokv-card">
       <div class="nokv-card-kicker">Metadata layer</div>
-      <h3>Canonical paths in Holt</h3>
+      <h3>Canonical ordered paths</h3>
       <p>Workspace incarnations gate visibility. Full relative paths are
       authoritative ordered keys; indexes remain derived.</p>
     </div>
@@ -76,7 +76,7 @@ SPDX-License-Identifier: Apache-2.0
   -&gt; route RootId to one logical shard
   -&gt; allocate publish operation + immutable revision
   -&gt; stream and verify object blocks
-  -&gt; one fenced Holt command publishes:
+  -&gt; one fenced metadata command publishes:
        path + revision + references + indexes + event + replay result</code></pre>
   <div class="nokv-callout"><strong>Recovery is explicit.</strong>
   Leased snapshots pin MVCC history. Durable commits retain exact revisions.

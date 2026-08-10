@@ -1,4 +1,4 @@
-//! Authoritative NoKV workspace metadata schema and Holt binding.
+//! Authoritative NoKV workspace metadata schema and transaction-store binding.
 //!
 //! This is the only supported durable namespace layout.
 
@@ -10,6 +10,7 @@ mod engine;
 mod event_projection;
 mod gc;
 mod gc_records;
+mod keyspace;
 mod namespace;
 mod publication;
 mod publication_records;
@@ -26,6 +27,8 @@ mod restore_records;
 mod snapshot;
 mod snapshot_query;
 mod snapshot_records;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use build_commit_records::{
     BuildCommitOperationRecord, BuildCommitResult, CommitManifestBinding, CommitManifestCondition,
@@ -48,13 +51,8 @@ pub use codec::{
     snapshot_history_hold_key, snapshot_id_claim_key, snapshot_ref_key, snapshot_ref_prefix,
     staged_object_key, staged_object_prefix, tag_commit_consumer_key, tag_key,
     workbench_commit_head_key, workbench_head_commit_consumer_key, workspace_current_key,
-    workspace_current_prefix, ARTIFACT_MANIFEST_TREE, ARTIFACT_REVISION_TREE, CHANGE_EVENT_TREE,
-    COMMAND_DEDUPE_TREE, COMMIT_CONSUMER_TREE, COMMIT_MEMBER_TREE, COMMIT_TREE, GC_BARRIER_TREE,
-    GC_CANDIDATE_TREE, HISTORY_HOLD_TREE, HISTORY_TREE, OPERATION_TREE, PATH_COMPONENT_DELIMITER,
-    PATH_CURRENT_TREE, PATH_EXACT_TERMINATOR, RECOVERY_OUTBOX_TREE, RESTORE_MEMBER_TREE,
-    REVISION_REF_TREE, ROOT_FENCE_TREE, SCHEMA_ID, SECONDARY_INDEX_TREE, SNAPSHOT_ALIAS_TREE,
-    SNAPSHOT_REF_TREE, STAGED_OBJECT_TREE, SYSTEM_TREE, TAG_TREE, VALUE_FORMAT_VERSION,
-    WORKBENCH_COMMIT_HEAD_TREE, WORKSPACE_CURRENT_TREE,
+    workspace_current_prefix, PATH_COMPONENT_DELIMITER, PATH_EXACT_TERMINATOR, SCHEMA_ID,
+    VALUE_FORMAT_VERSION,
 };
 pub use commit::{
     advance_commit_parent_rolling_digest, advance_commit_revision_rolling_digest,
@@ -70,13 +68,12 @@ pub use commit_records::{
     COMMIT_VALUE_FORMAT_VERSION, MAX_COMMIT_DIGEST_URI_BYTES, MAX_COMMIT_LINEAGE_BYTES,
     MAX_COMMIT_MEMBER_PROJECTION_BYTES, MAX_COMMIT_PRODUCER_BYTES, MAX_PARENT_COMMITS,
 };
-pub use engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
-    HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, MetadataScanItem,
-    RootFenceAction,
-};
 #[cfg(feature = "metadata-read-stats")]
-pub use engine::{HoltReadStatsSession, MetadataReadStatsSession};
+pub use engine::MetadataReadStatsSession;
+pub use engine::{
+    store_limits, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
+    MetaShard, MetadataCommand, MetadataCommandResult, MetadataScanItem, RootFenceAction,
+};
 pub use gc::{
     gc_operation_id, AdvanceGcDeletionBatchRequest, BeginGcDeletionRequest, ClaimGcRequest,
     ClearStaleGcCandidateRequest, CompleteGcRequest, GcCandidateClearOutcome, GcCandidateCursor,
@@ -88,6 +85,7 @@ pub use gc_records::{
     GcHistoryBarrierRecord, GcOperationRecord, GcRecordError, GcTransition,
     GC_VALUE_FORMAT_VERSION, MAX_GC_EVIDENCE_BYTES,
 };
+pub use keyspace::{keyspaces, KeyspaceDef, MetadataFamily};
 pub use namespace::{
     create_visible_workspace, get_current_visible_workspace_path, get_path_at_visible_workspace,
     get_visible_path_at, get_visible_workspace_at, get_visible_workspace_path_at,
@@ -140,10 +138,7 @@ pub use query_records::{
     MAX_TYPED_PROJECTION_FIELDS, QUERY_RECORD_VALUE_FORMAT_VERSION,
 };
 #[cfg(feature = "metadata-read-stats")]
-pub use read_stats::{
-    HoltReadStats, HoltReadStatsDeltaError, HoltReadStatsSessionError, MetadataReadStats,
-    MetadataReadStatsSessionError,
-};
+pub use read_stats::{MetadataReadStats, MetadataReadStatsSessionError};
 pub use records::{CommandDedupeRecord, CurrentValue, HistoryValue, RecordCodecError, RootFence};
 pub use recovery::{
     RecoveryCodecError, RecoveryMutationV1, RecoveryOutboxRecord, RecoveryResultV1, RecoveryState,

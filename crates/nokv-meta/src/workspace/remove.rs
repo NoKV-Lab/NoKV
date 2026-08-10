@@ -20,10 +20,11 @@ use super::codec::{
 };
 use super::commit::RUN_MANIFEST_PATH;
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, HistoryProjection,
-    MetadataCommand, MetadataFamily, RootFenceAction,
+    CommandMutation, CommandPredicate, HistoryProjection, MetaError, MetaShard, MetadataCommand,
+    RootFenceAction,
 };
 use super::event_projection::change_event_projection;
+use super::keyspace::MetadataFamily;
 use super::namespace::RootWriteContext;
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
@@ -58,7 +59,7 @@ pub struct RemovePathOutcome {
 /// Typed failure for atomic path removal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemovePathError {
-    Engine(AgentMetadataError),
+    Meta(MetaError),
     RecordCodec(PublicationRecordCodecError),
     QueryRecord(QueryRecordError),
     WorkspaceNotFound,
@@ -82,7 +83,7 @@ pub enum RemovePathError {
 impl fmt::Display for RemovePathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Engine(error) => write!(formatter, "metadata engine failed: {error}"),
+            Self::Meta(error) => error.fmt(formatter),
             Self::RecordCodec(error) => write!(formatter, "metadata record failed: {error}"),
             Self::QueryRecord(error) => write!(formatter, "query record failed: {error}"),
             Self::WorkspaceNotFound => formatter.write_str("workbench does not exist"),
@@ -137,7 +138,7 @@ impl fmt::Display for RemovePathError {
 impl std::error::Error for RemovePathError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Engine(error) => Some(error),
+            Self::Meta(error) => Some(error),
             Self::RecordCodec(error) => Some(error),
             Self::QueryRecord(error) => Some(error),
             _ => None,
@@ -145,9 +146,9 @@ impl std::error::Error for RemovePathError {
     }
 }
 
-impl From<AgentMetadataError> for RemovePathError {
-    fn from(error: AgentMetadataError) -> Self {
-        Self::Engine(error)
+impl From<MetaError> for RemovePathError {
+    fn from(error: MetaError) -> Self {
+        Self::Meta(error)
     }
 }
 
@@ -167,9 +168,9 @@ impl From<QueryRecordError> for RemovePathError {
 ///
 /// Path visibility, the path reference, the owner revision, a possible GC
 /// candidate, all secondary-index rows, the workspace revision, and the change
-/// event advance in one bounded Holt command.
+/// event advance in one bounded metadata command.
 pub fn remove_path(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     request: RemovePathRequest,
 ) -> Result<RemovePathOutcome, RemovePathError> {
     if matches!(
@@ -419,11 +420,11 @@ pub fn remove_path(
     let executed = match store.execute(&command) {
         Ok(executed) => executed,
         Err(
-            AgentMetadataError::PredicateFailed
-            | AgentMetadataError::WriteConflict
-            | AgentMetadataError::WriteReadVersionMismatch { .. },
+            MetaError::PredicateFailed
+            | MetaError::WriteConflict
+            | MetaError::WriteReadVersionMismatch { .. },
         ) => return Err(RemovePathError::ConcurrentMutation),
-        Err(error) => return Err(RemovePathError::Engine(error)),
+        Err(error) => return Err(RemovePathError::Meta(error)),
     };
     let result = decode_remove_result(&executed.deterministic_result, input_digest)?;
     Ok(RemovePathOutcome {
@@ -441,7 +442,7 @@ struct DecodedRemoveResult {
 }
 
 fn read_current(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     family: MetadataFamily,
     key: &[u8],
@@ -621,12 +622,12 @@ mod tests {
         ArtifactRevisionId::from_bytes([6; 16])
     }
 
-    fn write_context(store: &AgentMetadataStore, request_id: RequestId) -> RootWriteContext {
+    fn write_context(store: &MetaShard, request_id: RequestId) -> RootWriteContext {
         RootWriteContext::current(store, root(), shard(), placement(), owner(), request_id).unwrap()
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -649,8 +650,8 @@ mod tests {
         .seal()
     }
 
-    fn ready_store(reference_count: u64) -> (AgentMetadataStore, TypedProjection) {
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+    fn ready_store(reference_count: u64) -> (MetaShard, TypedProjection) {
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&fence_command(&store, request(1), RootFenceAction::Install))
@@ -780,7 +781,7 @@ mod tests {
         (store, projection)
     }
 
-    fn removal_request(store: &AgentMetadataStore, request_id: RequestId) -> RemovePathRequest {
+    fn removal_request(store: &MetaShard, request_id: RequestId) -> RemovePathRequest {
         RemovePathRequest {
             context: write_context(store, request_id),
             workbench_id: workbench(),
@@ -789,7 +790,7 @@ mod tests {
         }
     }
 
-    fn read_context(store: &AgentMetadataStore) -> RootReadContext {
+    fn read_context(store: &MetaShard) -> RootReadContext {
         RootReadContext::current(store, root(), placement(), owner()).unwrap()
     }
 

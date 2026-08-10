@@ -12,6 +12,8 @@ use nokv_control::{
     RootId, RootPlacement, RootPlacementLifecycle,
 };
 use nokv_meta::workspace as meta;
+use nokv_meta_holt::{HoltOptions, HoltStore, TreeBinding};
+use nokv_meta_store::TxnStore;
 use nokv_protocol::{LogicalShardIdentity, RootIdentity, RootRoute};
 use nokv_types::{CommandDigest, RequestId, RootActivationState, SHA256_BYTES};
 
@@ -68,13 +70,13 @@ pub struct ShardBoot {
 /// One control-backed logical-shard owner retained by the serving runtime.
 ///
 /// A failed renewal removes every exact local route before exposing the lease
-/// failure. All attached roots share one lease, store, and executor.
+/// failure. All attached roots share one lease, metadata shard, and executor.
 pub struct ShardOwner {
     control: Arc<dyn ControlStore>,
     registry: Arc<RootOwnerRegistry>,
     lease: LogicalShardLease,
     serving: LogicalShardRecord,
-    store: Arc<meta::AgentMetadataStore>,
+    meta: Arc<meta::MetaShard>,
     routes: Vec<RootRoute>,
 }
 
@@ -91,8 +93,8 @@ impl ShardOwner {
         &self.serving
     }
 
-    pub fn store(&self) -> &Arc<meta::AgentMetadataStore> {
-        &self.store
+    pub fn meta(&self) -> &Arc<meta::MetaShard> {
+        &self.meta
     }
 
     pub fn routes(&self) -> &[RootRoute] {
@@ -140,7 +142,7 @@ impl ShardOwner {
     }
 }
 
-/// Acquire or resume one logical-shard lease, open one metadata store, attach
+/// Acquire or resume one logical-shard lease, open one metadata shard, attach
 /// all initial roots, and publish the shard as serving.
 pub fn bootstrap_shard(
     control: Arc<dyn ControlStore>,
@@ -152,35 +154,44 @@ pub fn bootstrap_shard(
     reject_unrecovered_shared_frontier(control.as_ref(), boot.shard_id, &boot.recovery)?;
     validate_open_lease(&boot.open, &boot.lease)?;
 
+    // Initialize a new first-owner store, or reopen the same prepared
+    // epoch-zero store, before the control plane consumes the first epoch.
+    // Exact resumes keep the existing admission-before-open order.
+    let prepared_meta = prepare_first_owner_meta(&boot.open, &boot.lease, boot.shard_id)?;
+
     let (lease, acquired) = admit_owner(control.as_ref(), boot.shard_id, &boot.lease)?;
     let mut routes = Vec::with_capacity(placements.len());
 
-    let store = match open_store(boot.open, boot.shard_id) {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            return Err(rollback_bootstrap(
-                ServerError::Metadata(error),
-                control.as_ref(),
-                &registry,
-                &routes,
-                &lease,
-                acquired,
-            ));
+    let meta = match prepared_meta {
+        Some(meta) => meta,
+        None => {
+            let meta = match open_meta(boot.open, boot.shard_id) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    return Err(rollback_bootstrap(
+                        error,
+                        control.as_ref(),
+                        &registry,
+                        &routes,
+                        &lease,
+                        acquired,
+                    ));
+                }
+            };
+            if let Err(error) = validate_meta_shard(&meta, boot.shard_id) {
+                return Err(rollback_bootstrap(
+                    error,
+                    control.as_ref(),
+                    &registry,
+                    &routes,
+                    &lease,
+                    acquired,
+                ));
+            }
+            meta
         }
     };
-    if store.logical_shard_id() != boot.shard_id {
-        return Err(rollback_bootstrap(
-            ServerError::InvalidBootstrap(
-                "metadata store logical shard differs from requested shard".to_owned(),
-            ),
-            control.as_ref(),
-            &registry,
-            &routes,
-            &lease,
-            acquired,
-        ));
-    }
-    if let Err(error) = activate_shard(&store, &lease) {
+    if let Err(error) = activate_shard(&meta, &lease) {
         return Err(rollback_bootstrap(
             error,
             control.as_ref(),
@@ -191,9 +202,9 @@ pub fn bootstrap_shard(
         ));
     }
 
-    let executor = Arc::new(MetadataWorkspaceRequestExecutor::new(Arc::clone(&store)));
+    let executor = Arc::new(MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta)));
     for (placement, root) in placements.iter().zip(&boot.roots) {
-        match attach_root(&store, &registry, &executor, placement, &lease, root) {
+        match attach_root(&meta, &registry, &executor, placement, &lease, root) {
             Ok(route) => routes.push(route),
             Err(error) => {
                 return Err(rollback_bootstrap(
@@ -235,7 +246,7 @@ pub fn bootstrap_shard(
         registry,
         lease,
         serving,
-        store,
+        meta,
         routes,
     })
 }
@@ -293,7 +304,7 @@ fn load_placements(
 fn validate_open_lease(open: &OpenMode, lease: &LeaseMode) -> Result<(), ServerError> {
     match (open, lease) {
         (
-            OpenMode::New(_),
+            OpenMode::New(_) | OpenMode::Existing(_),
             LeaseMode::Acquire {
                 previous_epoch: None,
                 ..
@@ -309,17 +320,37 @@ fn validate_open_lease(open: &OpenMode, lease: &LeaseMode) -> Result<(), ServerE
         ) => Err(ServerError::InvalidBootstrap(format!(
             "successor acquisition after owner epoch {previous} is unavailable in the local-WAL profile; verified checkpoint/log recovery must complete before a new owner may serve"
         ))),
-        (OpenMode::Existing(_), LeaseMode::Acquire { .. }) => {
-            Err(ServerError::InvalidBootstrap(
-                "a first owner must explicitly open a new metadata store".to_owned(),
-            ))
-        }
         (OpenMode::New(_), LeaseMode::Resume { .. }) => {
             Err(ServerError::InvalidBootstrap(
                 "an exact owner resume must open its existing metadata store".to_owned(),
             ))
         }
     }
+}
+
+fn prepare_first_owner_meta(
+    open: &OpenMode,
+    lease: &LeaseMode,
+    logical_shard_id: nokv_types::LogicalShardId,
+) -> Result<Option<Arc<meta::MetaShard>>, ServerError> {
+    if !matches!(
+        lease,
+        LeaseMode::Acquire {
+            previous_epoch: None,
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
+
+    let meta = open_meta(open.clone(), logical_shard_id)?;
+    validate_meta_shard(&meta, logical_shard_id)?;
+    if let Some(owner_epoch) = meta.current_owner_epoch()? {
+        return Err(ServerError::InvalidBootstrap(format!(
+            "metadata shard is already fenced at owner epoch {owner_epoch}; reopen it only with Resume and the exact lease"
+        )));
+    }
+    Ok(Some(meta))
 }
 
 fn reject_unrecovered_shared_frontier(
@@ -390,13 +421,43 @@ fn admit_owner(
     }
 }
 
-fn open_store(
+fn open_meta(
     mode: OpenMode,
     logical_shard_id: nokv_types::LogicalShardId,
-) -> Result<meta::AgentMetadataStore, meta::AgentMetadataError> {
+) -> Result<Arc<meta::MetaShard>, ServerError> {
+    let catalog = || {
+        meta::keyspaces()
+            .iter()
+            .map(|definition| TreeBinding::new(definition.id, definition.name))
+    };
     match mode {
-        OpenMode::New(path) => meta::AgentMetadataStore::create_file(path, logical_shard_id),
-        OpenMode::Existing(path) => meta::AgentMetadataStore::reopen_file(path, logical_shard_id),
+        OpenMode::New(path) => {
+            let holt =
+                HoltStore::initialize(HoltOptions::file(path, catalog(), meta::store_limits()))?;
+            let store: Arc<dyn TxnStore> = Arc::new(holt);
+            Ok(Arc::new(meta::MetaShard::initialize(
+                store,
+                logical_shard_id,
+            )?))
+        }
+        OpenMode::Existing(path) => {
+            let holt = HoltStore::open(HoltOptions::file(path, catalog(), meta::store_limits()))?;
+            let store: Arc<dyn TxnStore> = Arc::new(holt);
+            Ok(Arc::new(meta::MetaShard::open(store, logical_shard_id)?))
+        }
+    }
+}
+
+fn validate_meta_shard(
+    meta: &meta::MetaShard,
+    requested: nokv_types::LogicalShardId,
+) -> Result<(), ServerError> {
+    if meta.logical_shard_id() == requested {
+        Ok(())
+    } else {
+        Err(ServerError::InvalidBootstrap(
+            "metadata shard identity differs from the requested shard".to_owned(),
+        ))
     }
 }
 
@@ -409,11 +470,8 @@ fn root_route(placement: &RootPlacement, lease: &LogicalShardLease) -> RootRoute
     }
 }
 
-fn activate_shard(
-    store: &meta::AgentMetadataStore,
-    lease: &LogicalShardLease,
-) -> Result<(), ServerError> {
-    let current_owner = store.current_owner_epoch()?;
+fn activate_shard(meta: &meta::MetaShard, lease: &LogicalShardLease) -> Result<(), ServerError> {
+    let current_owner = meta.current_owner_epoch()?;
     if current_owner != Some(lease.owner_epoch) {
         let expected_previous = predecessor(lease.owner_epoch);
         if current_owner != expected_previous {
@@ -424,13 +482,13 @@ fn activate_shard(
                 lease.owner_epoch
             )));
         }
-        store.advance_owner_epoch(expected_previous, lease.owner_epoch)?;
+        meta.advance_owner_epoch(expected_previous, lease.owner_epoch)?;
     }
     Ok(())
 }
 
 fn attach_root(
-    store: &meta::AgentMetadataStore,
+    meta: &meta::MetaShard,
     registry: &RootOwnerRegistry,
     executor: &Arc<MetadataWorkspaceRequestExecutor>,
     placement: &RootPlacement,
@@ -439,9 +497,9 @@ fn attach_root(
 ) -> Result<RootRoute, ServerError> {
     debug_assert_eq!(placement.root_id, root.root_id);
 
-    match store.root_fence(placement.root_id)? {
+    match meta.root_fence(placement.root_id)? {
         None => execute_fence_command(
-            store,
+            meta,
             placement,
             lease,
             root.install_id,
@@ -451,13 +509,13 @@ fn attach_root(
         Some(fence) => validate_existing_fence(placement, fence)?,
     }
 
-    let fence = store.root_fence(placement.root_id)?.ok_or_else(|| {
+    let fence = meta.root_fence(placement.root_id)?.ok_or_else(|| {
         ServerError::InvalidBootstrap("root fence install produced no durable fence".to_owned())
     })?;
     validate_existing_fence(placement, fence)?;
     if fence.activation_state == RootActivationState::Installing {
         execute_fence_command(
-            store,
+            meta,
             placement,
             lease,
             root.activate_id,
@@ -469,7 +527,7 @@ fn attach_root(
         )?;
     }
 
-    let active = store
+    let active = meta
         .root_fence(placement.root_id)?
         .ok_or_else(|| ServerError::InvalidBootstrap("active root fence disappeared".to_owned()))?;
     validate_existing_fence(placement, active)?;
@@ -509,7 +567,7 @@ fn validate_existing_fence(
 }
 
 fn execute_fence_command(
-    store: &meta::AgentMetadataStore,
+    meta: &meta::MetaShard,
     placement: &RootPlacement,
     lease: &LogicalShardLease,
     request_id: RequestId,
@@ -524,7 +582,7 @@ fn execute_fence_command(
         owner_epoch: lease.owner_epoch,
         request_id,
         command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
-        read_version: store.current_read_version()?,
+        read_version: meta.current_read_version()?,
         root_fence_action: action,
         predicates: Vec::new(),
         mutations: Vec::new(),
@@ -533,7 +591,7 @@ fn execute_fence_command(
         deterministic_result,
     }
     .seal();
-    store.execute(&command)?;
+    meta.execute(&command)?;
     Ok(())
 }
 
@@ -765,7 +823,7 @@ mod tests {
         assert!(registry.contains_exact(route).unwrap());
         assert_eq!(
             owner
-                .store()
+                .meta()
                 .root_fence(root_id)
                 .unwrap()
                 .unwrap()
@@ -773,7 +831,7 @@ mod tests {
             RootActivationState::Active
         );
         assert_eq!(
-            owner.store().current_owner_epoch().unwrap(),
+            owner.meta().current_owner_epoch().unwrap(),
             Some(owner.lease().owner_epoch)
         );
         assert_eq!(owner.serving_record().state, LogicalShardState::Serving);
@@ -814,7 +872,7 @@ mod tests {
         assert_eq!(reopened.lease(), &lease);
         assert_eq!(
             reopened
-                .store()
+                .meta()
                 .root_fence(root_id)
                 .unwrap()
                 .unwrap()
@@ -920,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn first_owner_existing_store_is_rejected_before_acquiring_a_lease() {
+    fn missing_prepared_store_is_rejected_before_acquiring_a_lease() {
         let temporary = TempDir::new().unwrap();
         let root_id = root(1);
         let control = active_control(&[root_id]);
@@ -929,6 +987,116 @@ mod tests {
         boot.open = OpenMode::Existing(temporary.path().join("missing"));
 
         assert!(bootstrap_shard(as_control(&control), registry.clone(), boot).is_err());
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(record.state, LogicalShardState::Unassigned);
+        assert!(record.owner.is_none());
+        assert_eq!(record.lease_id, 0);
+        assert!(record.owner_epoch.is_none());
+        assert_eq!(registry.installed_root_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn prepared_first_owner_store_retries_after_settled_acquire_failure() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let mut first = acquire_boot(database.clone(), &[root_id]);
+        let LeaseMode::Acquire { endpoint, .. } = &mut first.lease else {
+            unreachable!("acquire_boot always constructs an acquisition");
+        };
+        endpoint.clear();
+
+        let error = bootstrap_shard(as_control(&control), Arc::clone(&registry), first)
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("invalid logical-shard endpoint"));
+        assert!(database.exists());
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(record.state, LogicalShardState::Unassigned);
+        assert!(record.owner.is_none());
+        assert_eq!(record.lease_id, 0);
+        assert!(record.owner_epoch.is_none());
+        assert_eq!(registry.installed_root_count().unwrap(), 0);
+
+        let mut retry = acquire_boot(database.clone(), &[root_id]);
+        retry.open = OpenMode::Existing(database);
+        let owner = bootstrap_shard(as_control(&control), Arc::clone(&registry), retry).unwrap();
+
+        assert_eq!(owner.lease().owner_epoch.get(), 1);
+        assert_eq!(
+            owner.meta().current_owner_epoch().unwrap(),
+            Some(owner.lease().owner_epoch)
+        );
+        assert_eq!(owner.serving_record().state, LogicalShardState::Serving);
+        owner.release().unwrap();
+    }
+
+    #[test]
+    fn owned_existing_store_requires_exact_resume_without_advancing_epoch() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::clone(&registry),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+        let route = first.routes()[0];
+        let lease = first.lease().clone();
+        assert!(registry.remove(route).unwrap());
+        drop(first);
+        let before = control.get_logical_shard(&shard()).unwrap().unwrap();
+
+        let mut acquire = acquire_boot(database.clone(), &[root_id]);
+        acquire.open = OpenMode::Existing(database.clone());
+        let error = bootstrap_shard(as_control(&control), Arc::clone(&registry), acquire)
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("Resume and the exact lease"));
+        assert_eq!(control.get_logical_shard(&shard()).unwrap(), Some(before));
+        assert_eq!(registry.installed_root_count().unwrap(), 0);
+
+        let resumed = bootstrap_shard(
+            as_control(&control),
+            Arc::clone(&registry),
+            resume_boot(database, lease.clone(), &[root_id], 41),
+        )
+        .unwrap();
+        assert_eq!(resumed.lease(), &lease);
+        assert_eq!(resumed.lease().owner_epoch.get(), 1);
+        resumed.release().unwrap();
+    }
+
+    #[test]
+    fn failed_fresh_initialize_does_not_consume_owner_epoch_or_install_routes() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        std::fs::create_dir(&database).unwrap();
+        std::fs::write(database.join("owner.txt"), b"foreign").unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let registry = Arc::new(RootOwnerRegistry::new());
+
+        let error = bootstrap_shard(
+            as_control(&control),
+            Arc::clone(&registry),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("is not empty"));
+        assert_eq!(
+            std::fs::read(database.join("owner.txt")).unwrap(),
+            b"foreign"
+        );
         let record = control.get_logical_shard(&shard()).unwrap().unwrap();
         assert_eq!(record.state, LogicalShardState::Unassigned);
         assert!(record.owner.is_none());
@@ -1057,7 +1225,7 @@ mod tests {
             assert_eq!(route.owner_epoch, owner.lease().owner_epoch.get());
             assert_eq!(
                 owner
-                    .store()
+                    .meta()
                     .root_fence(*root_id)
                     .unwrap()
                     .unwrap()

@@ -7,7 +7,7 @@
 //!
 //! These records are deliberately complete recovery descriptions. A worker may
 //! disappear after any successful command; its replacement reconstructs the
-//! next bounded command from Holt and never depends on an in-memory path or
+//! next bounded command from metadata and never depends on an in-memory path or
 //! revision set.
 
 use std::fmt;

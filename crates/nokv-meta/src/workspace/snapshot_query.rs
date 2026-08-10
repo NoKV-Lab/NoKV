@@ -11,7 +11,8 @@ use nokv_types::{
     ReadVersion, RootId, SnapshotId, WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES,
 };
 
-use super::engine::{AgentMetadataError, AgentMetadataStore, MetadataFamily};
+use super::engine::{MetaError, MetaShard};
+use super::keyspace::MetadataFamily;
 use super::namespace::{get_visible_workspace_at, NamespaceError, RootReadContext};
 use super::snapshot::ResolvedSnapshot;
 use super::snapshot_records::{SnapshotRecordError, SnapshotRefRecord};
@@ -19,7 +20,7 @@ use super::snapshot_records::{SnapshotRecordError, SnapshotRefRecord};
 /// Maximum snapshots returned by one page.
 pub const MAX_SNAPSHOT_PAGE_SIZE: usize = 1_000;
 
-const ENGINE_SCAN_BATCH: usize = 256;
+const META_SCAN_BATCH: usize = 256;
 const CURSOR_FORMAT_VERSION: u8 = 1;
 const CURSOR_BYTES: usize = 1 + FIXED_ID_BYTES * 2 + 8 * 2;
 
@@ -43,7 +44,7 @@ pub enum SnapshotListError {
     CorruptSnapshotKey,
     SnapshotCodec(SnapshotRecordError),
     Namespace(NamespaceError),
-    Engine(AgentMetadataError),
+    Meta(MetaError),
 }
 
 impl fmt::Display for SnapshotListError {
@@ -68,7 +69,7 @@ impl fmt::Display for SnapshotListError {
             Self::CorruptSnapshotKey => formatter.write_str("corrupt SnapshotRef key"),
             Self::SnapshotCodec(source) => write!(formatter, "invalid SnapshotRef payload: {source}"),
             Self::Namespace(source) => source.fmt(formatter),
-            Self::Engine(source) => source.fmt(formatter),
+            Self::Meta(source) => source.fmt(formatter),
         }
     }
 }
@@ -78,7 +79,7 @@ impl std::error::Error for SnapshotListError {
         match self {
             Self::SnapshotCodec(source) => Some(source),
             Self::Namespace(source) => Some(source),
-            Self::Engine(source) => Some(source),
+            Self::Meta(source) => Some(source),
             _ => None,
         }
     }
@@ -96,15 +97,15 @@ impl From<NamespaceError> for SnapshotListError {
     }
 }
 
-impl From<AgentMetadataError> for SnapshotListError {
-    fn from(source: AgentMetadataError) -> Self {
-        Self::Engine(source)
+impl From<MetaError> for SnapshotListError {
+    fn from(source: MetaError) -> Self {
+        Self::Meta(source)
     }
 }
 
 /// List every durable snapshot state for the current visible workspace.
 pub fn list_snapshots_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
     cursor: Option<&[u8]>,
@@ -140,7 +141,7 @@ pub fn list_snapshots_at(
         if remaining == 0 {
             break;
         }
-        let batch_limit = remaining.min(ENGINE_SCAN_BATCH);
+        let batch_limit = remaining.min(META_SCAN_BATCH);
         let rows = store.scan_prefix_at(
             context.root_id,
             context.placement_generation,
@@ -303,7 +304,7 @@ mod tests {
     }
 
     fn command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -326,7 +327,7 @@ mod tests {
         .seal()
     }
 
-    fn write_context(store: &AgentMetadataStore, request: u8) -> RootWriteContext {
+    fn write_context(store: &MetaShard, request: u8) -> RootWriteContext {
         RootWriteContext::current(
             store,
             root(),
@@ -338,8 +339,8 @@ mod tests {
         .unwrap()
     }
 
-    fn ready_store() -> (AgentMetadataStore, WorkbenchId, WorkspaceIncarnationId) {
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+    fn ready_store() -> (MetaShard, WorkbenchId, WorkspaceIncarnationId) {
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&command(&store, request_id(1), RootFenceAction::Install))

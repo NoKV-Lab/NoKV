@@ -11,10 +11,12 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-metadata-read-stats = ["nokv-meta/metadata-read-stats"]
+metadata-read-stats = ["nokv-meta/metadata-read-stats", "nokv-meta-holt/read-stats"]
 
 [dependencies]
 nokv-meta.workspace = true
+nokv-meta-holt = { workspace = true, features = ["test-support"] }
+nokv-meta-store.workspace = true
 nokv-protocol.workspace = true
 nokv-server.workspace = true
 nokv-types.workspace = true

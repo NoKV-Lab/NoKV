@@ -6,7 +6,7 @@
 //! Durable payloads for immutable commits and their exact consumers.
 //!
 //! The key owns every identity field that selects a row. These payloads keep
-//! only the sealed closure and mutable lifetime state. Holt's [`CurrentValue`]
+//! only the sealed closure and mutable lifetime state. The executor's [`CurrentValue`]
 //! envelope owns created and modified versions.
 
 use std::fmt;

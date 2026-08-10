@@ -12,7 +12,8 @@ pub enum ServerError {
     InvalidBootstrap(String),
     RouteRollback(String),
     Control(nokv_control::ControlError),
-    Metadata(nokv_meta::workspace::AgentMetadataError),
+    Store(nokv_meta_store::StoreError),
+    Meta(nokv_meta::workspace::MetaError),
     BootstrapRollback { primary: String, rollback: String },
     Protocol(nokv_protocol::ProtocolError),
     Bind(std::io::Error),
@@ -37,7 +38,8 @@ impl fmt::Display for ServerError {
             }
             Self::RouteRollback(message) => write!(formatter, "root route rollback: {message}"),
             Self::Control(error) => write!(formatter, "control plane failed: {error}"),
-            Self::Metadata(error) => write!(formatter, "metadata store failed: {error}"),
+            Self::Store(error) => write!(formatter, "metadata store failed: {error}"),
+            Self::Meta(error) => write!(formatter, "metadata failed: {error}"),
             Self::BootstrapRollback { primary, rollback } => write!(
                 formatter,
                 "logical-shard ownership failed: {primary}; cleanup also failed: {rollback}"
@@ -61,8 +63,14 @@ impl From<nokv_control::ControlError> for ServerError {
     }
 }
 
-impl From<nokv_meta::workspace::AgentMetadataError> for ServerError {
-    fn from(error: nokv_meta::workspace::AgentMetadataError) -> Self {
-        Self::Metadata(error)
+impl From<nokv_meta_store::StoreError> for ServerError {
+    fn from(error: nokv_meta_store::StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<nokv_meta::workspace::MetaError> for ServerError {
+    fn from(error: nokv_meta::workspace::MetaError) -> Self {
+        Self::Meta(error)
     }
 }

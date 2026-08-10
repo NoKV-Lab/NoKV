@@ -24,17 +24,19 @@ System("schema")
 
 Startup is fail-closed:
 
-- an empty store is initialized with the exact supported marker and tree
-  registry;
-- a nonempty store opens only when its marker, value format, and exact tree
-  registry match this contract;
+- an empty store is initialized with the exact supported marker and logical
+  keyspace catalog;
+- a nonempty store opens only when its marker, value format, and configured
+  adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
 
 ## Ids, Names, And Keys
 
-Each family owns one named Holt tree; keys inside it do not repeat the family
-tag. The `History` tree prefixes its composite key with the source family's
-stable one-byte tag because it contains records from several families.
+Each family owns one stable logical keyspace; keys inside it do not repeat the
+keyspace identifier. A store adapter maps the catalog to Holt trees,
+FoundationDB subspaces, or a replicated namespace. The `History` keyspace
+prefixes its composite key with the source family's stable one-byte format tag
+because it contains records from several families.
 
 Fixed-width storage ids:
 
@@ -114,38 +116,43 @@ workbench/incarnation and concrete source selector needed for
 source-independent terminal replay. Unknown versions fail closed. Keys do not
 repeat a version because the store-level schema marker gates their codec.
 
-The exact Holt tree names and `History` source-family tags are:
+The metadata schema assigns each logical keyspace a stable `u16` identifier
+and name. Store adapters map this catalog to their physical layout.
 
-| Tree | Tag |
-| --- | ---: |
-| `root_fence` | `0x01` |
-| `workspace_current` | `0x02` |
-| `path_current` | `0x03` |
-| `artifact_revision` | `0x04` |
-| `artifact_manifest` | `0x05` |
-| `revision_ref` | `0x06` |
-| `commit` | `0x07` |
-| `commit_member` | `0x08` |
-| `workbench_commit_head` | `0x09` |
-| `tag` | `0x0a` |
-| `snapshot_ref` | `0x0b` |
-| `snapshot_alias` | `0x0c` |
-| `history_hold` | `0x0d` |
-| `commit_consumer` | `0x0e` |
-| `secondary_index` | `0x0f` |
-| `change_event` | `0x10` |
-| `operation` | `0x11` |
-| `restore_member` | `0x12` |
-| `staged_object` | `0x13` |
-| `command_dedupe` | `0x14` |
-| `gc_candidate` | `0x15` |
-| `gc_barrier` | `0x16` |
-| `workspace_incarnation_claim` | `0x17` |
+| Name | Keyspace ID | Format tag |
+| --- | ---: | ---: |
+| `system` | `0x0101` | - |
+| `root_fence` | `0x0102` | `0x01` (reserved) |
+| `command_dedupe` | `0x0103` | `0x14` (reserved) |
+| `change_event` | `0x0104` | `0x10` (reserved) |
+| `history` | `0x0105` | - |
+| `recovery_outbox` | `0x0106` | - |
+| `workspace_current` | `0x0202` | `0x02` |
+| `path_current` | `0x0203` | `0x03` |
+| `artifact_revision` | `0x0204` | `0x04` |
+| `artifact_manifest` | `0x0205` | `0x05` |
+| `revision_ref` | `0x0206` | `0x06` |
+| `commit` | `0x0207` | `0x07` |
+| `commit_member` | `0x0208` | `0x08` |
+| `workbench_commit_head` | `0x0209` | `0x09` |
+| `tag` | `0x020a` | `0x0a` |
+| `snapshot_ref` | `0x020b` | `0x0b` |
+| `snapshot_alias` | `0x020c` | `0x0c` |
+| `history_hold` | `0x020d` | `0x0d` |
+| `commit_consumer` | `0x020e` | `0x0e` |
+| `secondary_index` | `0x020f` | `0x0f` |
+| `operation` | `0x0211` | `0x11` |
+| `restore_member` | `0x0212` | `0x12` |
+| `staged_object` | `0x0213` | `0x13` |
+| `gc_candidate` | `0x0215` | `0x15` |
+| `gc_barrier` | `0x0216` | `0x16` |
+| `workspace_incarnation_claim` | `0x0217` | `0x17` |
 
-`system`, `history`, and `recovery_outbox` are reserved engine trees and are
-not themselves history sources. `recovery_outbox` has no `MetadataFamily` tag:
-the engine alone appends its ordered header/chunk rows in the same Holt atomic
-batch as each authoritative mutation.
+System keyspaces use IDs `0x0101` through `0x0106`. Domain keyspaces use
+`0x0200 | format_tag`. The `MetadataFamily` format tags remain one byte and keep
+their existing recovery and history encoding. Reserved format tags do not name
+caller-mutable metadata families. `MetaShard` appends `recovery_outbox` rows in
+the same transaction as each authoritative mutation.
 
 Initial durable enum discriminants:
 
@@ -238,9 +245,9 @@ The control-plane record uses `RootPlacementLifecycle`; the shard-local
 enums are not interchangeable, and both reject unknown values on reopen.
 
 Each metadata command carries the placement generation and owner epoch and
-validates them against the local `RootFence` and shard-owner fence at the Holt
-commit boundary. A router's remote control-plane lookup is not part of that
-atomic batch.
+validates them against the local `RootFence` and shard-owner fence in the same
+physical transaction as the metadata commit. A router's remote control-plane
+lookup is not part of that atomic batch.
 
 ## Shard-Local Families
 
@@ -464,23 +471,24 @@ that typed projection, and final publication updates `PathCurrent` and the
 corresponding `SecondaryIndex` rows in the same metadata command. There is no
 separate namespace-index registration RPC or second mutation path.
 
-A cold exact artifact lookup performs one `WorkspaceCurrent` point read and,
-only when its state is `Visible`, one `PathCurrent` point read. `PathEntry`
-atomically retains the immutable revision fields required to shape complete
-`PathMetadata`; exact stat/list reads never fan out to `ArtifactRevision`.
-A client/router
-may cache the incarnation because `Visible` is immutable; every request
-still passes the active `RootFence` and owner-epoch fence. The authoritative
-artifact lookup itself remains one Holt point read. A live direct-child listing
-performs the same marker check followed by one delimiter-aware ordered prefix
-scan path. Each engine call returns at most 255 logical items; a protocol page
-with a larger limit advances the exclusive marker through multiple bounded
-calls. Each Holt common-prefix rollup becomes one storage-neutral `Prefix` page
-item; an exact artifact at the same logical child wins. Recursive listing emits
-only artifact items. When the requested prefix can itself be a published file,
-the metadata listing also performs one exact-prefix point read after descendant
-EOF; the Workbench direct-child adapter does not expose the requested path as
-its own child. No listing performs per-entry revision reads.
+A cold exact artifact lookup needs one logical `WorkspaceCurrent` point read
+and, only when its state is `Visible`, one logical `PathCurrent` point read.
+`PathEntry` atomically retains the immutable revision fields required to shape
+complete `PathMetadata`; exact stat/list reads never fan out to
+`ArtifactRevision`. A client/router may cache the incarnation because `Visible`
+is immutable, but every physical read batch still validates the active
+`RootFence`, owner epoch, and commit clock.
+
+A live direct-child listing performs the marker check followed by one
+delimiter-aware ordered prefix-scan path. Each metadata call returns at most
+255 logical items; a protocol page with a larger limit advances the exclusive
+marker through multiple bounded store calls. Each store common-prefix rollup
+becomes one storage-neutral `Prefix` page item; an exact artifact at the same
+logical child wins. Recursive listing emits only artifact items. When the
+requested prefix can itself be a published file, the metadata listing also
+performs one exact-prefix point read after descendant EOF; the Workbench
+direct-child adapter does not expose the requested path as its own child. No
+listing performs per-entry revision reads.
 
 Each list page reports the exact `RootReadContext.read_version`. Continuations
 must send that version as an expected fence; an owner that has advanced returns

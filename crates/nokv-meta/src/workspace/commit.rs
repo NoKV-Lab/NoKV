@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Holt-native immutable commit construction, consumption, and retirement.
+//! Metadata-native immutable commit construction, consumption, and retirement.
 //!
 //! Every potentially large closure is materialized or released by bounded
 //! commands. The operation row is the sole durable cursor and the sole
@@ -36,10 +36,11 @@ use super::commit_records::{
     CommitMemberRecord, CommitRecord, CommitRecordError, TagRecord, WorkbenchCommitHeadRecord,
 };
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
-    HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, RootFenceAction,
+    CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError, MetaShard,
+    MetadataCommand, MetadataCommandResult, RootFenceAction,
 };
 use super::event_projection::change_event_projection;
+use super::keyspace::MetadataFamily;
 use super::namespace::{
     get_visible_path_at, get_visible_workspace_at, scan_visible_paths_at, NamespaceError,
     RootReadContext, RootWriteContext,
@@ -154,7 +155,7 @@ pub struct TagMutationOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitError {
-    Metadata(AgentMetadataError),
+    Meta(MetaError),
     Namespace(NamespaceError),
     CommitCodec(CommitRecordError),
     OperationCodec(CommitOperationRecordError),
@@ -210,7 +211,7 @@ pub enum CommitError {
 impl fmt::Display for CommitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Metadata(error) => error.fmt(formatter),
+            Self::Meta(error) => error.fmt(formatter),
             Self::Namespace(error) => error.fmt(formatter),
             Self::CommitCodec(error) => error.fmt(formatter),
             Self::OperationCodec(error) => error.fmt(formatter),
@@ -276,11 +277,24 @@ impl fmt::Display for CommitError {
     }
 }
 
-impl std::error::Error for CommitError {}
+impl std::error::Error for CommitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Meta(source) => Some(source),
+            Self::Namespace(source) => Some(source),
+            Self::CommitCodec(source) => Some(source),
+            Self::OperationCodec(source) => Some(source),
+            Self::PublicationCodec(source) => Some(source),
+            Self::SnapshotCodec(source) => Some(source),
+            Self::QueryRecord(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
-impl From<AgentMetadataError> for CommitError {
-    fn from(error: AgentMetadataError) -> Self {
-        Self::Metadata(error)
+impl From<MetaError> for CommitError {
+    fn from(error: MetaError) -> Self {
+        Self::Meta(error)
     }
 }
 
@@ -322,11 +336,11 @@ impl From<QueryRecordError> for CommitError {
 
 #[derive(Clone, Copy)]
 pub struct CommitService<'a> {
-    store: &'a AgentMetadataStore,
+    store: &'a MetaShard,
 }
 
 impl<'a> CommitService<'a> {
-    pub const fn new(store: &'a AgentMetadataStore) -> Self {
+    pub const fn new(store: &'a MetaShard) -> Self {
         Self { store }
     }
 
@@ -2845,7 +2859,7 @@ mod tests {
         request(value)
     }
 
-    fn write_context(store: &AgentMetadataStore, counter: &mut u128) -> RootWriteContext {
+    fn write_context(store: &MetaShard, counter: &mut u128) -> RootWriteContext {
         RootWriteContext::current(
             store,
             root(),
@@ -2858,7 +2872,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -2881,7 +2895,7 @@ mod tests {
         .seal()
     }
 
-    fn initialize(store: &AgentMetadataStore, counter: &mut u128) {
+    fn initialize(store: &MetaShard, counter: &mut u128) {
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&fence_command(
@@ -2909,14 +2923,14 @@ mod tests {
         .unwrap();
     }
 
-    fn ready_store(counter: &mut u128) -> AgentMetadataStore {
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+    fn ready_store(counter: &mut u128) -> MetaShard {
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize(&store, counter);
         store
     }
 
     fn raw_put(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         records: Vec<(MetadataFamily, Vec<u8>, Vec<u8>)>,
     ) {
@@ -2989,7 +3003,7 @@ mod tests {
         }
     }
 
-    fn seed_paths(store: &AgentMetadataStore, counter: &mut u128, count: usize) {
+    fn seed_paths(store: &MetaShard, counter: &mut u128, count: usize) {
         for start in (0..count).step_by(MAX_COMMIT_MEMBER_BATCH_ROWS) {
             let mut records = Vec::new();
             for index in start..(start + MAX_COMMIT_MEMBER_BATCH_ROWS).min(count) {
@@ -3038,7 +3052,7 @@ mod tests {
     }
 
     fn finish_build(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation_id: OperationId,
     ) -> BuildCommitOutcome {
@@ -3082,11 +3096,7 @@ mod tests {
             .unwrap()
     }
 
-    fn read_current(
-        store: &AgentMetadataStore,
-        family: MetadataFamily,
-        key: &[u8],
-    ) -> Option<Vec<u8>> {
+    fn read_current(store: &MetaShard, family: MetadataFamily, key: &[u8]) -> Option<Vec<u8>> {
         store
             .read_at(
                 root(),
@@ -3100,7 +3110,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_and_retires_closures_larger_than_one_holt_command() {
+    fn builds_and_retires_closures_larger_than_one_metadata_command() {
         let mut counter = 100_u128;
         let store = ready_store(&mut counter);
         seed_paths(&store, &mut counter, LARGE_CLOSURE_ROWS);
@@ -3308,7 +3318,7 @@ mod tests {
         ));
     }
 
-    fn detach_head(store: &AgentMetadataStore, counter: &mut u128, commit_id: CommitId) {
+    fn detach_head(store: &MetaShard, counter: &mut u128, commit_id: CommitId) {
         let context = write_context(store, counter);
         let head_key = workbench_commit_head_key(root(), incarnation());
         let head_payload =
@@ -3395,7 +3405,8 @@ mod tests {
         let database = directory.path().join("commit-reopen.holt");
         let mut counter = 1_000_u128;
         {
-            let store = AgentMetadataStore::create_file(&database, shard()).unwrap();
+            let store =
+                crate::workspace::test_support::initialize_file(&database, shard()).unwrap();
             initialize(&store, &mut counter);
             seed_paths(&store, &mut counter, 97);
             let service = CommitService::new(&store);
@@ -3419,341 +3430,10 @@ mod tests {
             assert!(!partial.operation.members_complete);
         }
 
-        let store = AgentMetadataStore::reopen_file(&database, shard()).unwrap();
+        let store = crate::workspace::test_support::open_file(&database, shard()).unwrap();
         let complete = finish_build(&store, &mut counter, operation(11));
         assert_eq!(complete.operation.member_count, 97);
         assert_eq!(complete.operation.phase, BuildCommitPhase::Complete);
-    }
-
-    /// Power-loss torn-write probe for the file-backed metadata store.
-    ///
-    /// Crash model: the process dies while holt's checkpoint round is
-    /// `pwrite`ing 512 KiB blob frames into `blobs.dat`. A frame write is
-    /// not power-loss atomic — any subset of the in-flight bytes may
-    /// persist — so a slot the durable manifest still references must
-    /// never be modified before a manifest flush stops referencing it.
-    /// An in-place same-GUID rewrite (holt <= 0.8.2) violates this and
-    /// tears the only complete copy of the frame the sync-WAL redo needs
-    /// as its base image.
-    ///
-    /// The probe drives the real store through public commands, brackets
-    /// one checkpoint round with directory snapshots (`journal.wal`
-    /// truncating back to its header marks a completed, quiescent round),
-    /// and asserts the round never rewrote a slot whose GUID -> slot
-    /// mapping was durable both before and after it. If violated, it
-    /// reconstructs the torn crash image and reports what reopening it
-    /// does to acked metadata. It then verifies recovery tolerates torn
-    /// bytes in slots the crash-time manifest does not reference.
-    #[test]
-    fn file_store_checkpoint_never_rewrites_durable_slots_in_place() {
-        use std::path::Path;
-        use std::time::{Duration, Instant};
-
-        const SLOT_BYTES: usize = 0x80000;
-
-        fn snapshot_store_dir(src: &Path, dst: &Path) {
-            std::fs::create_dir_all(dst).unwrap();
-            for entry in std::fs::read_dir(src).unwrap() {
-                let entry = entry.unwrap();
-                if entry.file_name().to_string_lossy() == "store.lock" {
-                    continue;
-                }
-                let target = dst.join(entry.file_name());
-                if entry.path().is_dir() {
-                    snapshot_store_dir(&entry.path(), &target);
-                } else {
-                    std::fs::copy(entry.path(), &target).unwrap();
-                }
-            }
-        }
-
-        /// A checkpoint round ends by truncating `journal.wal` back to
-        /// its file header; once that happens nothing is dirty and the
-        /// store files are stable until the next command.
-        fn wait_for_wal_truncation(dir: &Path, header_len: u64) {
-            let wal = dir.join("journal.wal");
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                let len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(u64::MAX);
-                if len <= header_len {
-                    return;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "checkpoint round did not complete within 30s (wal at {len} bytes)",
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-
-        /// GUID -> slot map of a snapshot's durable manifest, decoded
-        /// from holt's `manifest.bin` (ARTSNMNF header + fixed records)
-        /// and `manifest.log` (MLG1 length-framed set/delete deltas).
-        /// Byte-level parsing keeps the probe independent of the store
-        /// implementation under test.
-        fn durable_manifest(dir: &Path) -> BTreeMap<[u8; 16], u64> {
-            let mut entries = BTreeMap::new();
-            if let Ok(buf) = std::fs::read(dir.join("manifest.bin")) {
-                assert!(buf.len() >= 24, "manifest.bin header");
-                assert_eq!(&buf[..8], b"ARTSNMNF", "manifest.bin magic");
-                let count = u32::from_le_bytes(buf[10..14].try_into().unwrap()) as usize;
-                let mut off = 24;
-                for _ in 0..count {
-                    let mut guid = [0u8; 16];
-                    guid.copy_from_slice(&buf[off..off + 16]);
-                    let slot = u64::from_le_bytes(buf[off + 16..off + 24].try_into().unwrap());
-                    entries.insert(guid, slot);
-                    off += 24;
-                }
-            }
-            if let Ok(buf) = std::fs::read(dir.join("manifest.log")) {
-                let mut off = 0usize;
-                while off + 9 <= buf.len() {
-                    let start = off;
-                    assert_eq!(&buf[start..start + 4], b"MLG1", "manifest.log magic");
-                    let body_len =
-                        u32::from_le_bytes(buf[start + 4..start + 8].try_into().unwrap()) as usize;
-                    let record_len = 9 + body_len + 4;
-                    if buf.len() - start < record_len {
-                        break; // torn tail is legal; replay stops here
-                    }
-                    let body = &buf[start + 9..start + 9 + body_len];
-                    match buf[start + 8] {
-                        1 => {
-                            let mut guid = [0u8; 16];
-                            guid.copy_from_slice(&body[..16]);
-                            let slot = u64::from_le_bytes(body[16..24].try_into().unwrap());
-                            entries.insert(guid, slot);
-                        }
-                        2 => {
-                            let mut guid = [0u8; 16];
-                            guid.copy_from_slice(body);
-                            entries.remove(&guid);
-                        }
-                        other => panic!("manifest.log unknown op {other}"),
-                    }
-                    off = start + record_len;
-                }
-            }
-            entries
-        }
-
-        fn changed_slots(a: &[u8], b: &[u8]) -> Vec<u64> {
-            let overlap = a.len().min(b.len()) / SLOT_BYTES;
-            (0..overlap)
-                .filter(|s| {
-                    a[s * SLOT_BYTES..(s + 1) * SLOT_BYTES]
-                        != b[s * SLOT_BYTES..(s + 1) * SLOT_BYTES]
-                })
-                .map(|s| s as u64)
-                .collect()
-        }
-
-        let directory = tempdir().unwrap();
-        let database = directory.path().join("torn-frame.holt");
-        let mut counter = 7_000_u128;
-
-        let store = AgentMetadataStore::create_file(&database, shard()).unwrap();
-        let wal_header_len = std::fs::metadata(database.join("journal.wal"))
-            .unwrap()
-            .len();
-        initialize(&store, &mut counter);
-        seed_paths(&store, &mut counter, 128);
-        wait_for_wal_truncation(&database, wal_header_len);
-        let pre = directory.path().join("pre");
-        snapshot_store_dir(&database, &pre);
-
-        // One acked command: fresh revisions and paths that insert into
-        // the already-checkpointed ART frames, forcing same-GUID frame
-        // rewrites in the next round. The sync-WAL ack makes every
-        // record recovery-mandatory before that round starts.
-        let mut phase2 = Vec::new();
-        for index in 500..536usize {
-            let revision_id = revision(20_000 + index as u128);
-            let path = NormalizedRelativePath::new(format!("data/{index:04}.bin")).unwrap();
-            phase2.push((
-                MetadataFamily::ArtifactRevision,
-                artifact_revision_key(root(), revision_id),
-                artifact(index).encode().unwrap(),
-            ));
-            phase2.push((
-                MetadataFamily::PathCurrent,
-                path_current_key(root(), incarnation(), &path),
-                path_entry(index, revision_id).encode().unwrap(),
-            ));
-        }
-        let phase2_paths: Vec<(Vec<u8>, Vec<u8>)> = phase2
-            .iter()
-            .filter(|(family, ..)| *family == MetadataFamily::PathCurrent)
-            .map(|(_, key, value)| (key.clone(), value.clone()))
-            .collect();
-        raw_put(&store, &mut counter, phase2);
-
-        // Crash-time image: acked WAL plus store files the interrupted
-        // round has not touched yet. The copy must win the race against
-        // the background planner's idle interval; the equality asserts
-        // verify it did, so a lost race fails loudly instead of lying.
-        let mid = directory.path().join("mid");
-        snapshot_store_dir(&database, &mid);
-        assert_eq!(
-            std::fs::read(pre.join("blobs.dat")).unwrap(),
-            std::fs::read(mid.join("blobs.dat")).unwrap(),
-            "mid snapshot raced the checkpoint round (blobs.dat moved)",
-        );
-        assert_eq!(
-            std::fs::read(pre.join("manifest.bin")).ok(),
-            std::fs::read(mid.join("manifest.bin")).ok(),
-            "mid snapshot raced the checkpoint round (manifest.bin moved)",
-        );
-        assert_eq!(
-            std::fs::read(pre.join("manifest.log")).ok(),
-            std::fs::read(mid.join("manifest.log")).ok(),
-            "mid snapshot raced the checkpoint round (manifest.log moved)",
-        );
-        assert!(
-            std::fs::metadata(mid.join("journal.wal")).unwrap().len() > wal_header_len,
-            "acked command must be in the crash-time WAL",
-        );
-
-        // Let the interrupted round complete so its writes are the
-        // donor bytes for the torn overlay.
-        wait_for_wal_truncation(&database, wal_header_len);
-        let post = directory.path().join("post");
-        snapshot_store_dir(&database, &post);
-        drop(store);
-
-        let mid_blobs = std::fs::read(mid.join("blobs.dat")).unwrap();
-        let post_blobs = std::fs::read(post.join("blobs.dat")).unwrap();
-        let changed = changed_slots(&mid_blobs, &post_blobs);
-        assert!(
-            !changed.is_empty(),
-            "the round must rewrite at least one pre-existing frame slot",
-        );
-        let mid_manifest = durable_manifest(&mid);
-        let post_manifest = durable_manifest(&post);
-
-        // A slot whose GUID -> slot mapping is durable on both sides of
-        // the round was referenced by the durable manifest at every
-        // moment of it (the workload dirties each frame once, so no
-        // free/reuse cycle can produce the same pair). Modifying its
-        // bytes is the torn-base-frame crash window.
-        let in_place: Vec<u64> = changed
-            .iter()
-            .copied()
-            .filter(|slot| {
-                mid_manifest
-                    .iter()
-                    .any(|(guid, s)| s == slot && post_manifest.get(guid) == Some(slot))
-            })
-            .collect();
-
-        if !in_place.is_empty() {
-            // Demonstrate the consequence before failing: reconstruct
-            // the crash image — acked WAL, pre-round manifest, and the
-            // in-flight frame pwrites persisted in alternating 4 KiB
-            // blocks (device-level reordering inside one frame) — and
-            // reopen. The interleave lands inside the frames' used
-            // bytes even when the payload is far smaller than a slot.
-            let torn = directory.path().join("torn-demo");
-            snapshot_store_dir(&mid, &torn);
-            let mut blobs = mid_blobs.clone();
-            for &slot in &in_place {
-                const BLOCK: usize = 4096;
-                let start = slot as usize * SLOT_BYTES;
-                for (i, off) in (start..start + SLOT_BYTES).step_by(BLOCK).enumerate() {
-                    if i % 2 == 0 {
-                        blobs[off..off + BLOCK].copy_from_slice(&post_blobs[off..off + BLOCK]);
-                    }
-                }
-            }
-            std::fs::write(torn.join("blobs.dat"), &blobs).unwrap();
-            let outcome = match AgentMetadataStore::reopen_file(&torn, shard()) {
-                Err(error) => format!("reopen failed: {error}"),
-                Ok(reopened) => {
-                    let version = reopened.current_read_version().unwrap();
-                    let mut lost = 0;
-                    for (key, value) in &phase2_paths {
-                        match reopened.read_at(
-                            root(),
-                            placement(),
-                            owner(),
-                            MetadataFamily::PathCurrent,
-                            key,
-                            version,
-                        ) {
-                            Ok(Some(got)) if &got == value => {}
-                            other => {
-                                lost += 1;
-                                let _ = other;
-                            }
-                        }
-                    }
-                    format!(
-                        "reopen succeeded but {lost}/{} acked records lost",
-                        phase2_paths.len()
-                    )
-                }
-            };
-            panic!(
-                "checkpoint rewrote durable manifest slots {in_place:?} in place; \
-                 a power cut during those pwrites tears the WAL's only base image. \
-                 Torn-crash reopen outcome: {outcome}",
-            );
-        }
-
-        // Recovery leg: the round confined its writes to slots the
-        // crash-time manifest does not reference, so tearing all of
-        // them — half-frame prefix and 4 KiB interleave — must leave
-        // every acked record readable after reopen.
-        let torn_slots: Vec<u64> = changed
-            .iter()
-            .copied()
-            .filter(|slot| !mid_manifest.values().any(|s| s == slot))
-            .collect();
-        assert!(
-            !torn_slots.is_empty(),
-            "shadow rewrites must land in slots the crash-time manifest does not reference",
-        );
-        for (label, half) in [("new-prefix", true), ("interleave-4k", false)] {
-            let torn = directory.path().join(format!("torn-{label}"));
-            snapshot_store_dir(&mid, &torn);
-            let mut blobs = mid_blobs.clone();
-            for &slot in &torn_slots {
-                let start = slot as usize * SLOT_BYTES;
-                if half {
-                    let split = start + SLOT_BYTES / 2;
-                    blobs[start..split].copy_from_slice(&post_blobs[start..split]);
-                } else {
-                    const BLOCK: usize = 4096;
-                    for (i, off) in (start..start + SLOT_BYTES).step_by(BLOCK).enumerate() {
-                        if i % 2 == 0 {
-                            blobs[off..off + BLOCK].copy_from_slice(&post_blobs[off..off + BLOCK]);
-                        }
-                    }
-                }
-            }
-            std::fs::write(torn.join("blobs.dat"), &blobs).unwrap();
-
-            let reopened = AgentMetadataStore::reopen_file(&torn, shard())
-                .unwrap_or_else(|error| {
-                    panic!("reopen with torn unreferenced slots {torn_slots:?} ({label}) failed: {error}")
-                });
-            let version = reopened.current_read_version().unwrap();
-            for (key, value) in &phase2_paths {
-                let got = reopened
-                    .read_at(
-                        root(),
-                        placement(),
-                        owner(),
-                        MetadataFamily::PathCurrent,
-                        key,
-                        version,
-                    )
-                    .unwrap_or_else(|error| panic!("acked record unreadable ({label}): {error}"))
-                    .unwrap_or_else(|| panic!("acked record lost ({label})"));
-                assert_eq!(&got, value, "acked record corrupted ({label})");
-            }
-        }
     }
 
     #[test]
@@ -3763,7 +3443,8 @@ mod tests {
         let mut counter = 1_100_u128;
         let first_time = 1_700_000_000;
         {
-            let store = AgentMetadataStore::create_file(&database, shard()).unwrap();
+            let store =
+                crate::workspace::test_support::initialize_file(&database, shard()).unwrap();
             initialize(&store, &mut counter);
             let service = CommitService::new(&store);
             let mut request = begin_request(
@@ -3778,7 +3459,7 @@ mod tests {
             assert_eq!(begun.operation.committed_at_unix_seconds, first_time);
         }
 
-        let store = AgentMetadataStore::reopen_file(&database, shard()).unwrap();
+        let store = crate::workspace::test_support::open_file(&database, shard()).unwrap();
         let service = CommitService::new(&store);
         let mut retry = begin_request(
             write_context(&store, &mut counter),
@@ -4182,8 +3863,8 @@ mod tests {
                 commit_id: commit(21),
                 expected_consumer_epoch: zero.consumer_epoch,
             }),
-            Err(CommitError::Metadata(
-                AgentMetadataError::WriteReadVersionMismatch { .. }
+            Err(CommitError::Meta(
+                MetaError::WriteReadVersionMismatch { .. }
             ))
         ));
         assert!(matches!(
@@ -4193,8 +3874,8 @@ mod tests {
                 tag: TagName::new("late-tag").unwrap(),
                 commit_id: commit(21),
             }),
-            Err(CommitError::Metadata(
-                AgentMetadataError::WriteReadVersionMismatch { .. }
+            Err(CommitError::Meta(
+                MetaError::WriteReadVersionMismatch { .. }
             ))
         ));
         assert!(matches!(
@@ -4203,8 +3884,8 @@ mod tests {
                 operation_id: operation(24),
                 limit: 7,
             }),
-            Err(CommitError::Metadata(
-                AgentMetadataError::WriteReadVersionMismatch { .. }
+            Err(CommitError::Meta(
+                MetaError::WriteReadVersionMismatch { .. }
             ))
         ));
 
@@ -4233,7 +3914,7 @@ mod tests {
     }
 
     fn prepare_empty_build_for_sealing(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation_id: OperationId,
     ) {
