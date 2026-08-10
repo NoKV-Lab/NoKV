@@ -1032,7 +1032,7 @@ fn collect_rows(
             }
             let entry = PathEntry::decode(&item.value)
                 .map_err(|source| QueryError::PathCodec { source })?;
-            let projection = TypedProjection::decode(&entry.typed_index_projection)?;
+            let projection = TypedProjection::decode_stored(&entry.typed_index_projection)?;
             rows.push(MaterializedRow {
                 workbench_id: workbench_id.clone(),
                 path,
@@ -2681,6 +2681,49 @@ mod tests {
         .unwrap()
         .fields
         .is_empty());
+    }
+
+    /// Commit seals the run-manifest path row with a zero-byte stored
+    /// projection; queries must materialize it as an empty projection
+    /// instead of failing the whole page.
+    #[test]
+    fn search_materializes_zero_byte_stored_projection_as_empty() {
+        let store = ready_store();
+        let name = workbench("committed");
+        let incarnation_id = incarnation(8);
+        let mut manifest_entry = entry(7, 1, Vec::new());
+        manifest_entry.typed_index_projection = Vec::new();
+        put_records(
+            &store,
+            5,
+            vec![
+                workspace_row(&name, incarnation_id, WorkspaceState::Visible),
+                path_row(
+                    incarnation_id,
+                    "input/note.txt",
+                    &entry(
+                        6,
+                        1,
+                        vec![("visible.kind", QueryScalar::String("note".into()))],
+                    ),
+                ),
+                path_row(
+                    incarnation_id,
+                    "metadata/run_manifest.json",
+                    &manifest_entry,
+                ),
+            ],
+        );
+
+        let request = search_request(QueryScope::Workspace(name.clone()));
+        let page = search_paths_at(&store, context(&store), &request).unwrap();
+        assert_eq!(
+            page.hits
+                .iter()
+                .map(|hit| hit.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["input/note.txt", "metadata/run_manifest.json"]
+        );
     }
 
     #[test]

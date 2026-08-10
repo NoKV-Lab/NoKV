@@ -28,6 +28,7 @@ use super::codec::{
     restore_member_key, restore_member_prefix, snapshot_ref_key, workspace_current_key,
     workspace_incarnation_claim_key, SCHEMA_ID,
 };
+use super::commit::RUN_MANIFEST_PATH;
 use super::commit_records::{
     advance_commit_member_rolling_digest, commit_member_row_digest, CommitConsumerRecord,
     CommitMemberRecord, CommitRecord, CommitRecordError,
@@ -190,6 +191,11 @@ pub enum RestoreError {
     CorruptKey {
         family: &'static str,
     },
+    CorruptSourceMember {
+        family: &'static str,
+        path: String,
+        detail: String,
+    },
     RevisionMissing {
         revision: ArtifactRevisionId,
     },
@@ -319,6 +325,14 @@ impl fmt::Display for RestoreError {
                 "restore source contains reserved path {RESTORE_MANIFEST_PATH}"
             ),
             Self::CorruptKey { family } => write!(formatter, "corrupt {family} key"),
+            Self::CorruptSourceMember {
+                family,
+                path,
+                detail,
+            } => write!(
+                formatter,
+                "restore source member {path} has a corrupt {family} record: {detail}"
+            ),
             Self::RevisionMissing { revision } => write!(
                 formatter,
                 "artifact revision {:02x?} is missing",
@@ -1730,6 +1744,10 @@ fn scan_source_page(
             context.read_version,
         ),
     };
+    // Probe window: limit + 1 for the EOF probe + 2 for the at most two
+    // skipped provenance rows (run manifest and restore manifest), so a
+    // page never comes back empty with eof=false and the copy cursor
+    // always advances.
     let scanned = store.scan_prefix_at(
         context.root_id,
         context.placement_generation,
@@ -1738,22 +1756,28 @@ fn scan_source_page(
         &prefix,
         version,
         marker.as_deref(),
-        limit.saturating_add(1),
+        limit.saturating_add(3),
     )?;
-    let eof = scanned.len() <= limit;
     let mut members = Vec::with_capacity(scanned.len().min(limit));
-    for item in scanned.into_iter().take(limit) {
-        members.push(decode_source_member(context.root_id, operation, item)?);
+    let mut visible = 0_usize;
+    for item in scanned {
+        let Some(member) = decode_source_member(context.root_id, operation, item)? else {
+            continue;
+        };
+        visible += 1;
+        if members.len() < limit {
+            members.push(member);
+        }
     }
-    Ok((members, eof))
+    Ok((members, visible <= limit))
 }
 
 fn decode_source_member(
     root_id: nokv_types::RootId,
     operation: &RestoreOperationRecord,
     item: MetadataScanItem,
-) -> Result<SourceMember, RestoreError> {
-    let (path, entry) = match operation.source {
+) -> Result<Option<SourceMember>, RestoreError> {
+    let (family, path, entry) = match operation.source {
         RestoreSource::Snapshot { .. } => {
             let path = decode_path_current_key(
                 root_id,
@@ -1763,8 +1787,14 @@ fn decode_source_member(
             .ok_or(RestoreError::CorruptKey {
                 family: "PathCurrent",
             })?;
-            let entry = PathEntry::decode(&item.value)?;
-            (path, entry)
+            let entry = PathEntry::decode(&item.value).map_err(|error| {
+                RestoreError::CorruptSourceMember {
+                    family: "PathCurrent",
+                    path: path.as_str().to_owned(),
+                    detail: error.to_string(),
+                }
+            })?;
+            ("PathCurrent", path, entry)
         }
         RestoreSource::Commit { commit_id } => {
             let path = decode_commit_member_key(root_id, commit_id, &item.key).ok_or(
@@ -1772,15 +1802,50 @@ fn decode_source_member(
                     family: "CommitMember",
                 },
             )?;
-            let member = CommitMemberRecord::decode(&item.value)?;
+            let member = CommitMemberRecord::decode(&item.value).map_err(|error| {
+                RestoreError::CorruptSourceMember {
+                    family: "CommitMember",
+                    path: path.as_str().to_owned(),
+                    detail: error.to_string(),
+                }
+            })?;
             let entry = path_entry_from_commit_member(&member);
-            (path, entry)
+            ("CommitMember", path, entry)
         }
     };
+    // Both manifest rows describe their own workbench, so copying either
+    // would leave the destination claiming foreign provenance. A snapshot
+    // restore skips them: the destination's provenance row is the fresh
+    // restore manifest its own RestoreStaging publish creates (CreateOnly,
+    // so a copied source row would collide with it anyway), and the run
+    // manifest's durable projection is the zero-byte "no projection"
+    // convention sealed by commit, which no canonical decode accepts.
+    // A sealed commit's member digest covers both rows, so a commit-source
+    // restore cannot skip them without breaking the closure seal.
     if path.as_str() == RESTORE_MANIFEST_PATH {
-        return Err(RestoreError::ReservedPathInSource);
+        return match operation.source {
+            RestoreSource::Snapshot { .. } => Ok(None),
+            RestoreSource::Commit { .. } => Err(RestoreError::ReservedPathInSource),
+        };
     }
-    TypedProjection::decode(&entry.typed_index_projection)?;
+    if path.as_str() == RUN_MANIFEST_PATH {
+        return match operation.source {
+            RestoreSource::Snapshot { .. } => Ok(None),
+            RestoreSource::Commit { .. } => Err(RestoreError::SourceClosureMismatch {
+                reason: format!(
+                    "commit closures seal the virtual run manifest member {RUN_MANIFEST_PATH}, \
+                     which commit-source restore cannot materialize"
+                ),
+            }),
+        };
+    }
+    TypedProjection::decode(&entry.typed_index_projection).map_err(|error| {
+        RestoreError::CorruptSourceMember {
+            family,
+            path: path.as_str().to_owned(),
+            detail: error.to_string(),
+        }
+    })?;
     let canonical_member = CommitMemberRecord {
         artifact_revision_id: entry.artifact_revision_id,
         path_generation: entry.generation,
@@ -1795,11 +1860,11 @@ fn decode_source_member(
         typed_projection: entry.typed_index_projection.clone(),
     };
     let row_digest = commit_member_row_digest(&path, &canonical_member)?;
-    Ok(SourceMember {
+    Ok(Some(SourceMember {
         path,
         entry,
         row_digest,
-    })
+    }))
 }
 
 fn verify_source_and_members(
@@ -1812,7 +1877,9 @@ fn verify_source_and_members(
     let mut sequence = 0_u64;
     let mut rolling = [0; SHA256_BYTES];
     loop {
-        let (members, eof) = scan_source_page(store, context, operation, cursor.as_ref(), 255)?;
+        // 253 keeps scan_source_page's limit + 3 probe window within the
+        // engine's 256-item scan bound.
+        let (members, eof) = scan_source_page(store, context, operation, cursor.as_ref(), 253)?;
         for source in members {
             let member_key = restore_member_key(context.root_id, operation.operation_id, sequence);
             let restored = read_record(
@@ -3980,5 +4047,1086 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #429 scenario: the exact server-driven wire sequence over a
+    // real store. Unlike `seed_source`, every source row below is written
+    // by the production publication/commit services, never synthesized.
+    // ------------------------------------------------------------------
+
+    use nokv_types::{
+        BuildCommitPhase, NormalizedRelativePath, PublishPhase, SnapshotAliasName,
+        StagedCleanupState, StagedProviderState,
+    };
+
+    use super::super::build_commit_records::CommitManifestCondition;
+    use super::super::codec::object_block_key;
+    use super::super::commit::{
+        BeginBuildCommitRequest, BuildCommitStepRequest, CommitService,
+        MAX_COMMIT_MEMBER_BATCH_ROWS, MAX_COMMIT_PARENT_BATCH_ROWS, MAX_COMMIT_REVISION_BATCH_ROWS,
+        RUN_MANIFEST_PATH,
+    };
+    use super::super::publication::{
+        dependency_owner_digest, manifest_rows_digest, seal_publish_operation,
+        staged_object_ledger_digest, BeginPublishRequest, FinalizePublishRequest, ManifestRowInput,
+        MarkObjectsUploadedBatchRequest, PublicationContext, PublicationService, PublishedArtifact,
+        StageManifestBatchRequest, StageObjectsBatchRequest, StagedObjectUpdate,
+        TransitionPublishRequest,
+    };
+    use super::super::publish_operation_records::{
+        ArtifactManifestRow, PublishAuthority, PublishClaim, PublishOperationRecord,
+        PublishTransition, StagedObjectRecord,
+    };
+
+    fn operation(fill: u8) -> OperationId {
+        OperationId::from_bytes([fill; FIXED_ID_BYTES])
+    }
+
+    fn body_digest_uri(body: &[u8]) -> String {
+        sha256_digest_uri(Sha256::digest(body).into())
+    }
+
+    fn publication_context(
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+    ) -> PublicationContext {
+        PublicationContext {
+            root_id: root(),
+            logical_shard_id: shard(),
+            placement_generation: placement(),
+            owner_epoch,
+            request_id: request(counter),
+            read_version: store.current_read_version().unwrap(),
+        }
+    }
+
+    fn single_object_rows(
+        artifact_revision_id: ArtifactRevisionId,
+        body: &[u8],
+    ) -> (Vec<StagedObjectRecord>, Vec<ManifestRowInput>) {
+        let staged = vec![StagedObjectRecord {
+            artifact_revision_id,
+            object_sequence: 0,
+            object_key: object_block_key(shard(), root(), artifact_revision_id, 0),
+            multipart_upload_id: None,
+            expected_length: body.len() as u64,
+            expected_digest_uri: body_digest_uri(body),
+            provider_state: StagedProviderState::Planned,
+            cleanup_state: StagedCleanupState::Owned,
+        }];
+        let manifest = vec![ManifestRowInput {
+            object_index: 0,
+            row: ArtifactManifestRow {
+                physical_owner_revision_id: artifact_revision_id,
+                physical_object_index: 0,
+                object_key: staged[0].object_key.clone(),
+                logical_offset: 0,
+                offset: 0,
+                length: staged[0].expected_length,
+                digest_uri: staged[0].expected_digest_uri.clone(),
+                append_segment: None,
+            },
+        }];
+        (staged, manifest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wire_publish_operation(
+        operation_id: OperationId,
+        artifact_revision_id: ArtifactRevisionId,
+        target_workbench: &WorkbenchId,
+        target_incarnation: WorkspaceIncarnationId,
+        publish_path: NormalizedRelativePath,
+        authority: PublishAuthority,
+        owner_epoch: OwnerEpoch,
+        staged: &[StagedObjectRecord],
+        manifest: &[ManifestRowInput],
+    ) -> PublishOperationRecord {
+        let mut operation = PublishOperationRecord {
+            operation_id,
+            identity_digest: [0; SHA256_BYTES],
+            initialization_digest: [0; SHA256_BYTES],
+            initiating_owner_epoch: owner_epoch,
+            activity_deadline_ms: 1_000_000,
+            authority,
+            workbench_id: target_workbench.clone(),
+            workspace_incarnation_id: target_incarnation,
+            path: publish_path,
+            artifact_revision_id,
+            claim: PublishClaim::CreateOnly,
+            phase: PublishPhase::Uploading,
+            staged_object_count: u32::try_from(staged.len()).unwrap(),
+            staged_object_seal: staged_object_ledger_digest(staged).unwrap(),
+            staged_object_cursor: 0,
+            staged_object_rolling_digest: [0; SHA256_BYTES],
+            uploaded_object_cursor: 0,
+            uploaded_object_rolling_digest: [0; SHA256_BYTES],
+            manifest_row_count: u32::try_from(manifest.len()).unwrap(),
+            manifest_seal: manifest_rows_digest(manifest).unwrap(),
+            manifest_cursor: 0,
+            manifest_rolling_digest: [0; SHA256_BYTES],
+            manifest_last_position: None,
+            dependency_count: 0,
+            dependency_depth: 0,
+            dependency_digest: dependency_owner_digest(&[]).unwrap(),
+            cleanup_staged_object_cursor: 0,
+            cleanup_manifest_cursor: 0,
+            publication_absence_proof: None,
+            result: None,
+            terminal_error: None,
+        };
+        seal_publish_operation(&mut operation);
+        operation
+    }
+
+    /// Drives the five publication wire calls the server executes for one
+    /// artifact: Begin, StageObjects, MarkUploaded, StageManifest, Complete.
+    fn drive_publish_wire_calls(
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        operation: PublishOperationRecord,
+        staged: &[StagedObjectRecord],
+        manifest: &[ManifestRowInput],
+        artifact: PublishedArtifact,
+    ) -> super::super::publication::FinalizePublishOutcome {
+        let service = PublicationService::new(store);
+        let operation = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(store, counter, owner_epoch),
+                operation,
+            })
+            .unwrap()
+            .operation;
+        let operation = service
+            .stage_objects_batch(StageObjectsBatchRequest {
+                context: publication_context(store, counter, owner_epoch),
+                expected_operation: operation,
+                staged_objects: staged.to_vec(),
+            })
+            .unwrap()
+            .operation;
+        let uploads = staged
+            .iter()
+            .cloned()
+            .map(|expected| {
+                let mut next = expected.clone();
+                next.provider_state = StagedProviderState::Uploaded;
+                StagedObjectUpdate { expected, next }
+            })
+            .collect();
+        let operation = service
+            .mark_objects_uploaded_batch(MarkObjectsUploadedBatchRequest {
+                context: publication_context(store, counter, owner_epoch),
+                expected_operation: operation,
+                staged_object_updates: uploads,
+            })
+            .unwrap()
+            .operation;
+        let operation = service
+            .stage_manifest_batch(StageManifestBatchRequest {
+                context: publication_context(store, counter, owner_epoch),
+                expected_operation: operation,
+                manifest_rows: manifest.to_vec(),
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap()
+            .operation;
+        let operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(store, counter, owner_epoch),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(store, counter, owner_epoch),
+                artifact,
+                expected_operation: operation,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap()
+    }
+
+    /// Publishes one text file through the five production wire calls under
+    /// the Visible authority, exactly as workbench_put_file does.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_text_file(
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        target_workbench: &WorkbenchId,
+        target_incarnation: WorkspaceIncarnationId,
+        path: &str,
+        body: &[u8],
+        file_revision: ArtifactRevisionId,
+        publish_operation_id: OperationId,
+    ) {
+        let (staged, manifest) = single_object_rows(file_revision, body);
+        let publish = wire_publish_operation(
+            publish_operation_id,
+            file_revision,
+            target_workbench,
+            target_incarnation,
+            NormalizedRelativePath::new(path).unwrap(),
+            PublishAuthority::Visible,
+            owner_epoch,
+            &staged,
+            &manifest,
+        );
+        let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
+        drive_publish_wire_calls(
+            store,
+            counter,
+            owner_epoch,
+            publish,
+            &staged,
+            &manifest,
+            PublishedArtifact {
+                logical_size: body.len() as u64,
+                body_digest_uri: body_digest_uri(body),
+                manifest_digest_uri,
+                content_type: "text/plain".to_owned(),
+                producer: Some("issue-429".to_owned()),
+                manifest_id: None,
+                typed_index_projection: TypedProjection::empty().encode().unwrap(),
+            },
+        );
+    }
+
+    /// Drives the real commit wire sequence: begin_build, the CommitStaging
+    /// run-manifest publication, then build/seal/attach/sealing/finalize.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_commit_wire_calls(
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        source_workbench: &WorkbenchId,
+        source_incarnation: WorkspaceIncarnationId,
+        commit_id: CommitId,
+        commit_operation_id: OperationId,
+        run_manifest_publish_operation_id: OperationId,
+        tree_manifest_revision: ArtifactRevisionId,
+        run_manifest_body: &[u8],
+    ) {
+        let commits = CommitService::new(store);
+        let begun = commits
+            .begin_build(BeginBuildCommitRequest {
+                context: write_context(store, counter, owner_epoch),
+                operation_id: commit_operation_id,
+                workbench_id: source_workbench.clone(),
+                expected_source_workspace_incarnation_id: source_incarnation,
+                commit_id,
+                content_digest_uri: format!("sha256:{:064x}", 0x429),
+                manifest_digest_uri: body_digest_uri(run_manifest_body),
+                projection_input_digest: [0; SHA256_BYTES],
+                tree_manifest_revision_id: tree_manifest_revision,
+                replace: false,
+                run_manifest_condition: CommitManifestCondition::CreateOnly,
+                committed_at_unix_seconds: 1_700_000_000,
+                expected_head_generation: None,
+                producer: None,
+                lineage_projection: Vec::new(),
+                parent_commits: Vec::new(),
+            })
+            .unwrap();
+        assert!(begun.operation.commit_staged_run_manifest.is_none());
+
+        let (staged, manifest) = single_object_rows(tree_manifest_revision, run_manifest_body);
+        let publish = wire_publish_operation(
+            run_manifest_publish_operation_id,
+            tree_manifest_revision,
+            source_workbench,
+            source_incarnation,
+            NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
+            PublishAuthority::CommitStaging {
+                commit_operation_id,
+            },
+            owner_epoch,
+            &staged,
+            &manifest,
+        );
+        let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
+        drive_publish_wire_calls(
+            store,
+            counter,
+            owner_epoch,
+            publish,
+            &staged,
+            &manifest,
+            PublishedArtifact {
+                logical_size: run_manifest_body.len() as u64,
+                body_digest_uri: body_digest_uri(run_manifest_body),
+                manifest_digest_uri,
+                content_type: "application/json".to_owned(),
+                producer: None,
+                manifest_id: None,
+                typed_index_projection: TypedProjection::empty().encode().unwrap(),
+            },
+        );
+
+        loop {
+            let outcome = commits
+                .build_members(BuildCommitStepRequest {
+                    context: write_context(store, counter, owner_epoch),
+                    operation_id: commit_operation_id,
+                    limit: MAX_COMMIT_MEMBER_BATCH_ROWS,
+                })
+                .unwrap();
+            if outcome.operation.members_complete {
+                break;
+            }
+        }
+        loop {
+            let outcome = commits
+                .seal_revisions(BuildCommitStepRequest {
+                    context: write_context(store, counter, owner_epoch),
+                    operation_id: commit_operation_id,
+                    limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+                })
+                .unwrap();
+            if outcome.operation.revisions_complete {
+                break;
+            }
+        }
+        commits
+            .attach_parents(BuildCommitStepRequest {
+                context: write_context(store, counter, owner_epoch),
+                operation_id: commit_operation_id,
+                limit: MAX_COMMIT_PARENT_BATCH_ROWS,
+            })
+            .unwrap();
+        commits
+            .begin_sealing(
+                write_context(store, counter, owner_epoch),
+                commit_operation_id,
+            )
+            .unwrap();
+        let completed = commits
+            .finalize_build(
+                write_context(store, counter, owner_epoch),
+                commit_operation_id,
+            )
+            .unwrap();
+        assert_eq!(completed.operation.phase, BuildCommitPhase::Complete);
+    }
+
+    /// Drives one snapshot-source restore end to end exactly as the client
+    /// workflow does: begin, start copy, bounded copy batches, seal, the
+    /// RestoreStaging restore-manifest publication, initialization, complete.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_snapshot_restore_to_visible(
+        store: &AgentMetadataStore,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        source_workbench: &WorkbenchId,
+        source_incarnation: WorkspaceIncarnationId,
+        snapshot_id: SnapshotId,
+        destination_workbench: &WorkbenchId,
+        destination_incarnation: WorkspaceIncarnationId,
+        restore_manifest_publish_operation_id: OperationId,
+        restore_manifest_revision: ArtifactRevisionId,
+        copy_limit: usize,
+    ) -> CompleteRestoreOutcome {
+        let restore_manifest_body: &[u8] = br#"{"schema":"nokv.workbench.restore_manifest.v1"}"#;
+        let begun = begin_restore(
+            store,
+            write_context(store, counter, owner_epoch),
+            &BeginRestoreRequest {
+                source_workbench_id: source_workbench.clone(),
+                expected_source_workspace_incarnation_id: source_incarnation,
+                source: RestoreSourceSelector::Snapshot(snapshot_id),
+                destination_workbench_id: destination_workbench.clone(),
+                destination_workspace_incarnation_id: destination_incarnation,
+                restore_manifest: RestoreManifestDescriptor {
+                    body_digest_uri: body_digest_uri(restore_manifest_body),
+                    logical_size: restore_manifest_body.len() as u64,
+                    content_type: "application/json".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        let restore_operation_id = begun.operation.operation_id;
+
+        start_restore_copy(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: restore_operation_id,
+            },
+        )
+        .unwrap();
+        loop {
+            let outcome = copy_restore_batch(
+                store,
+                write_context(store, counter, owner_epoch),
+                CopyRestoreBatchRequest {
+                    operation_id: restore_operation_id,
+                    limit: copy_limit,
+                },
+            )
+            .unwrap_or_else(|error| panic!("copy_restore_batch failed: {error}"));
+            if outcome.source_eof {
+                break;
+            }
+        }
+        seal_restore_source(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: restore_operation_id,
+            },
+        )
+        .unwrap_or_else(|error| panic!("seal_restore_source failed: {error}"));
+
+        // RestoreStaging publish of metadata/restore_manifest.json into the
+        // hidden destination workspace.
+        let (staged, manifest) =
+            single_object_rows(restore_manifest_revision, restore_manifest_body);
+        let publish = wire_publish_operation(
+            restore_manifest_publish_operation_id,
+            restore_manifest_revision,
+            destination_workbench,
+            destination_incarnation,
+            NormalizedRelativePath::new(RESTORE_MANIFEST_PATH).unwrap(),
+            PublishAuthority::RestoreStaging {
+                restore_operation_id,
+            },
+            owner_epoch,
+            &staged,
+            &manifest,
+        );
+        let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
+        let published = drive_publish_wire_calls(
+            store,
+            counter,
+            owner_epoch,
+            publish,
+            &staged,
+            &manifest,
+            PublishedArtifact {
+                logical_size: restore_manifest_body.len() as u64,
+                body_digest_uri: body_digest_uri(restore_manifest_body),
+                manifest_digest_uri,
+                content_type: "application/json".to_owned(),
+                producer: None,
+                manifest_id: None,
+                typed_index_projection: TypedProjection::empty().encode().unwrap(),
+            },
+        );
+
+        apply_restore_initialization(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: restore_operation_id,
+            },
+        )
+        .unwrap_or_else(|error| panic!("apply_restore_initialization failed: {error}"));
+        let completed = complete_restore(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: restore_operation_id,
+            },
+        )
+        .unwrap_or_else(|error| panic!("complete_restore failed: {error}"));
+        // The staging publish reports the exact revision complete_restore
+        // installs.
+        assert_eq!(
+            published.result.workspace_revision,
+            completed.result.destination_workspace_revision
+        );
+        completed
+    }
+
+    /// Issue #429: create -> put_file(input/note.txt) -> commit ->
+    /// snapshot("frozen") -> restore into a new destination workbench.
+    ///
+    /// Every step runs the same production service the server executor
+    /// drives, in the same order. The restore must complete and the
+    /// destination must expose input/note.txt at the source revision.
+    #[test]
+    fn snapshot_restore_after_real_commit_completes_and_copies_source_paths() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+
+        // workbench_create
+        let source_workbench = workbench("minimal");
+        let source_incarnation = incarnation(10);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &source_workbench,
+            source_incarnation,
+        )
+        .unwrap();
+
+        // workbench_put_file: section "input", path "note.txt", small text.
+        let note_path = NormalizedRelativePath::new("input/note.txt").unwrap();
+        let note_body: &[u8] = b"issue 429 reproduction note";
+        let note_revision = revision(0x11);
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            "input/note.txt",
+            note_body,
+            note_revision,
+            operation(0x21),
+        );
+
+        // workbench_commit: run-manifest CommitStaging publish + full build.
+        let run_manifest_body: &[u8] =
+            br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/note.txt"]}"#;
+        drive_commit_wire_calls(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            CommitId::from_bytes([0x42; SHA256_BYTES]),
+            operation(0x31),
+            operation(0x32),
+            revision(0x12),
+            run_manifest_body,
+        );
+
+        // workbench_snapshot: alias "frozen", one-day lease.
+        let snapshot_id = SnapshotId::new(429);
+        mint_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &MintSnapshotRequest {
+                workbench_id: source_workbench.clone(),
+                snapshot_id,
+                alias: Some(SnapshotAliasName::new("frozen").unwrap()),
+                lease_deadline_ms: 86_400_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        // workbench_restore into destination "minimal-restored".
+        let destination_workbench = workbench("minimal-restored");
+        let destination_incarnation = incarnation(30);
+        let completed = drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            snapshot_id,
+            &destination_workbench,
+            destination_incarnation,
+            operation(0x41),
+            revision(0x13),
+            MAX_RESTORE_BATCH_MEMBERS,
+        );
+        assert_eq!(
+            completed.result.destination_workspace_incarnation_id,
+            destination_incarnation
+        );
+        // The snapshot closure excludes the commit-produced run manifest,
+        // so exactly one member (input/note.txt) is copied.
+        assert_eq!(completed.result.member_count, 1);
+        assert_eq!(
+            completed.result.destination_workspace_revision,
+            WorkspaceRevision::new(1)
+        );
+
+        // The destination is visible and contains the restored note.
+        let destination = get_visible_workspace_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+        )
+        .unwrap()
+        .expect("restored destination workbench is visible");
+        assert_eq!(destination.incarnation_id, destination_incarnation);
+        let restored_note = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+            &note_path,
+        )
+        .unwrap()
+        .expect("restored destination contains input/note.txt");
+        assert_eq!(restored_note.artifact_revision_id, note_revision);
+        assert_eq!(restored_note.body_digest_uri, body_digest_uri(note_body));
+        assert_eq!(restored_note.logical_size, note_body.len() as u64);
+
+        // The source's run manifest names the source workbench and must not
+        // follow the content into the destination; the destination's
+        // provenance row is its restore manifest.
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+            &NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
+        )
+        .unwrap()
+        .is_none());
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+            &NormalizedRelativePath::new(RESTORE_MANIFEST_PATH).unwrap(),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    /// The run-manifest row sorts between input/ and output/, so a one-row
+    /// copy limit forces it onto page boundaries of its own; the skip must
+    /// keep the cursor advancing and the copy/seal closures identical.
+    #[test]
+    fn snapshot_restore_skips_run_manifest_across_page_boundaries() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+
+        let source_workbench = workbench("paged");
+        let source_incarnation = incarnation(10);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &source_workbench,
+            source_incarnation,
+        )
+        .unwrap();
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            "input/a.txt",
+            b"first",
+            revision(0x11),
+            operation(0x21),
+        );
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            "output/z.txt",
+            b"last",
+            revision(0x12),
+            operation(0x22),
+        );
+        drive_commit_wire_calls(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            CommitId::from_bytes([0x43; SHA256_BYTES]),
+            operation(0x31),
+            operation(0x32),
+            revision(0x13),
+            br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/a.txt","output/z.txt"]}"#,
+        );
+        let snapshot_id = SnapshotId::new(430);
+        mint_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &MintSnapshotRequest {
+                workbench_id: source_workbench.clone(),
+                snapshot_id,
+                alias: None,
+                lease_deadline_ms: 86_400_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let destination_workbench = workbench("paged-restored");
+        let destination_incarnation = incarnation(30);
+        let completed = drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            snapshot_id,
+            &destination_workbench,
+            destination_incarnation,
+            operation(0x41),
+            revision(0x14),
+            1,
+        );
+        assert_eq!(completed.result.member_count, 2);
+        for (path, file_revision) in [
+            ("input/a.txt", revision(0x11)),
+            ("output/z.txt", revision(0x12)),
+        ] {
+            let restored = get_visible_path_at(
+                &store,
+                read_context(&store, owner_epoch),
+                &destination_workbench,
+                &NormalizedRelativePath::new(path).unwrap(),
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("restored destination is missing {path}"));
+            assert_eq!(restored.artifact_revision_id, file_revision);
+        }
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+            &NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// A restored workbench must itself be restorable: after recommitting
+    /// the destination, its snapshot source carries BOTH provenance rows
+    /// (its own restore manifest and the new run manifest), and a one-row
+    /// copy limit forces each onto page boundaries of its own.
+    #[test]
+    fn snapshot_restore_chains_from_a_restored_workbench() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+
+        let first = workbench("chain-a");
+        let first_incarnation = incarnation(10);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &first,
+            first_incarnation,
+        )
+        .unwrap();
+        let note_revision = revision(0x11);
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &first,
+            first_incarnation,
+            "input/note.txt",
+            b"chained restore evidence",
+            note_revision,
+            operation(0x21),
+        );
+        drive_commit_wire_calls(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &first,
+            first_incarnation,
+            CommitId::from_bytes([0x45; SHA256_BYTES]),
+            operation(0x31),
+            operation(0x32),
+            revision(0x12),
+            br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/note.txt"]}"#,
+        );
+        let first_snapshot = SnapshotId::new(432);
+        mint_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &MintSnapshotRequest {
+                workbench_id: first.clone(),
+                snapshot_id: first_snapshot,
+                alias: None,
+                lease_deadline_ms: 86_400_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let second = workbench("chain-b");
+        let second_incarnation = incarnation(30);
+        drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &first,
+            first_incarnation,
+            first_snapshot,
+            &second,
+            second_incarnation,
+            operation(0x41),
+            revision(0x13),
+            MAX_RESTORE_BATCH_MEMBERS,
+        );
+
+        // Recommit the restored workbench, then snapshot it: its path state
+        // now holds input/note.txt plus both provenance rows.
+        drive_commit_wire_calls(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &second,
+            second_incarnation,
+            CommitId::from_bytes([0x46; SHA256_BYTES]),
+            operation(0x51),
+            operation(0x52),
+            revision(0x14),
+            br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/note.txt"],"hop":2}"#,
+        );
+        let second_snapshot = SnapshotId::new(433);
+        mint_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &MintSnapshotRequest {
+                workbench_id: second.clone(),
+                snapshot_id: second_snapshot,
+                alias: None,
+                lease_deadline_ms: 86_400_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let third = workbench("chain-c");
+        let third_incarnation = incarnation(50);
+        let completed = drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &second,
+            second_incarnation,
+            second_snapshot,
+            &third,
+            third_incarnation,
+            operation(0x61),
+            revision(0x15),
+            1,
+        );
+        assert_eq!(completed.result.member_count, 1);
+        let restored_note = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &third,
+            &NormalizedRelativePath::new("input/note.txt").unwrap(),
+        )
+        .unwrap()
+        .expect("chained destination contains input/note.txt");
+        assert_eq!(restored_note.artifact_revision_id, note_revision);
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &third,
+            &NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
+        )
+        .unwrap()
+        .is_none());
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &third,
+            &NormalizedRelativePath::new(RESTORE_MANIFEST_PATH).unwrap(),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    /// A genuinely undecodable stored projection must surface as a typed
+    /// error naming the member path and family, never a raw codec string.
+    #[test]
+    fn corrupt_source_projection_reports_member_path_and_family() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+
+        let source_workbench = workbench("corrupt");
+        let source_incarnation = incarnation(10);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &source_workbench,
+            source_incarnation,
+        )
+        .unwrap();
+        let bad_path = nokv_types::NormalizedRelativePath::new("input/bad.txt").unwrap();
+        let bad_entry = PathEntry {
+            generation: Generation::new(1).unwrap(),
+            artifact_revision_id: revision(0x11),
+            body_digest_uri: format!("sha256:{:064x}", 0xbad),
+            manifest_digest_uri: format!("sha256:{:064x}", 0xbad + 1),
+            logical_size: 3,
+            dependency_count: 0,
+            dependency_depth: 0,
+            content_type: "text/plain".to_owned(),
+            producer: None,
+            manifest_id: None,
+            typed_index_projection: vec![0xff, 0xff],
+        };
+        put_absent(
+            &store,
+            &mut counter,
+            owner_epoch,
+            vec![(
+                MetadataFamily::PathCurrent,
+                path_current_key(root(), source_incarnation, &bad_path),
+                bad_entry.encode().unwrap(),
+            )],
+        );
+        let snapshot_id = SnapshotId::new(431);
+        mint_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &MintSnapshotRequest {
+                workbench_id: source_workbench.clone(),
+                snapshot_id,
+                alias: None,
+                lease_deadline_ms: 86_400_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let begun = begin_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &BeginRestoreRequest {
+                source_workbench_id: source_workbench.clone(),
+                expected_source_workspace_incarnation_id: source_incarnation,
+                source: RestoreSourceSelector::Snapshot(snapshot_id),
+                destination_workbench_id: workbench("corrupt-restored"),
+                destination_workspace_incarnation_id: incarnation(30),
+                restore_manifest: RestoreManifestDescriptor {
+                    body_digest_uri: format!("sha256:{:064x}", 0xcafe),
+                    logical_size: 2,
+                    content_type: "application/json".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        let error = copy_restore_batch(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            CopyRestoreBatchRequest {
+                operation_id: begun.operation.operation_id,
+                limit: MAX_RESTORE_BATCH_MEMBERS,
+            },
+        )
+        .unwrap_err();
+        let RestoreError::CorruptSourceMember {
+            family,
+            path,
+            detail,
+        } = &error
+        else {
+            panic!("expected CorruptSourceMember, got {error:?}");
+        };
+        assert_eq!(*family, "PathCurrent");
+        assert_eq!(path, "input/bad.txt");
+        assert!(detail.contains("value format version"), "detail: {detail}");
+        assert!(error
+            .to_string()
+            .starts_with("restore source member input/bad.txt has a corrupt PathCurrent record"));
+    }
+
+    /// A sealed commit's member digest covers the virtual run-manifest
+    /// member, so commit-source restore must reject it with a typed closure
+    /// error instead of a raw codec failure.
+    #[test]
+    fn commit_source_restore_rejects_virtual_run_manifest_member() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+
+        let source_workbench = workbench("commit-source");
+        let source_incarnation = incarnation(10);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &source_workbench,
+            source_incarnation,
+        )
+        .unwrap();
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            "input/note.txt",
+            b"commit source",
+            revision(0x11),
+            operation(0x21),
+        );
+        let commit_id = CommitId::from_bytes([0x44; SHA256_BYTES]);
+        drive_commit_wire_calls(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            commit_id,
+            operation(0x31),
+            operation(0x32),
+            revision(0x12),
+            br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/note.txt"]}"#,
+        );
+
+        let begun = begin_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &BeginRestoreRequest {
+                source_workbench_id: source_workbench.clone(),
+                expected_source_workspace_incarnation_id: source_incarnation,
+                source: RestoreSourceSelector::Commit(commit_id),
+                destination_workbench_id: workbench("commit-restored"),
+                destination_workspace_incarnation_id: incarnation(30),
+                restore_manifest: RestoreManifestDescriptor {
+                    body_digest_uri: format!("sha256:{:064x}", 0xcafe),
+                    logical_size: 2,
+                    content_type: "application/json".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        let error = copy_restore_batch(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            CopyRestoreBatchRequest {
+                operation_id: begun.operation.operation_id,
+                limit: MAX_RESTORE_BATCH_MEMBERS,
+            },
+        )
+        .unwrap_err();
+        let RestoreError::SourceClosureMismatch { reason } = &error else {
+            panic!("expected SourceClosureMismatch, got {error:?}");
+        };
+        assert!(
+            reason.contains("virtual run manifest member"),
+            "reason: {reason}"
+        );
     }
 }

@@ -2631,7 +2631,19 @@ impl PublicationService<'_> {
                 {
                     return Err(PublicationError::RestoreAuthorityMismatch);
                 }
-                (workspace.record.workspace_revision, None)
+                // Restore staging does not mutate WorkspaceCurrent. Persist
+                // the exact revision that complete_restore will install so
+                // the terminal publish result remains both non-zero and
+                // replay-stable.
+                let revision = WorkspaceRevision::new(
+                    workspace
+                        .record
+                        .workspace_revision
+                        .get()
+                        .checked_add(1)
+                        .ok_or(PublicationError::WorkspaceRevisionOverflow)?,
+                );
+                (revision, None)
             }
         };
 

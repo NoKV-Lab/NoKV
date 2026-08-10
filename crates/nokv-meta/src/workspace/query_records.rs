@@ -265,6 +265,20 @@ impl TypedProjection {
         Ok(encoded)
     }
 
+    /// Decode a projection field read back from a durable record.
+    ///
+    /// Commit seals its virtual run-manifest member with a zero-byte
+    /// `typed_projection`, so stored projection bytes carry "no projection"
+    /// as an empty slice; every reader of durable projection bytes must
+    /// accept that form alongside the canonical encoding.
+    pub fn decode_stored(encoded: &[u8]) -> Result<Self, QueryRecordError> {
+        if encoded.is_empty() {
+            Ok(Self::empty())
+        } else {
+            Self::decode(encoded)
+        }
+    }
+
     pub fn decode(encoded: &[u8]) -> Result<Self, QueryRecordError> {
         if encoded.len() > MAX_TYPED_PROJECTION_BYTES {
             return Err(QueryRecordError::LengthLimit {
@@ -1022,6 +1036,28 @@ mod tests {
             .concat()
         );
         assert_eq!(TypedProjection::decode(&encoded).unwrap(), projection);
+    }
+
+    #[test]
+    fn stored_projection_accepts_the_zero_byte_empty_convention() {
+        assert_eq!(
+            TypedProjection::decode_stored(&[]).unwrap(),
+            TypedProjection::empty()
+        );
+
+        let projection =
+            TypedProjection::new(BTreeMap::from([(field("alpha"), QueryScalar::Unsigned(1))]))
+                .unwrap();
+        let encoded = projection.encode().unwrap();
+        assert_eq!(
+            TypedProjection::decode_stored(&encoded).unwrap(),
+            projection
+        );
+
+        assert!(matches!(
+            TypedProjection::decode_stored(&[0xff]),
+            Err(QueryRecordError::UnsupportedValueVersion { .. })
+        ));
     }
 
     #[test]
