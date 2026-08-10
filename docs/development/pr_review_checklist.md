@@ -27,6 +27,12 @@ boundaries, or Workbench behavior.
 - Does import direction match the code contract?
 - Does `nokv-types` remain storage-neutral?
 - Does `nokv-protocol` contain DTOs rather than storage or execution logic?
+- Does `nokv-meta-store` expose only ordered byte-key transaction primitives,
+  limits, profiles, and physical store errors?
+- Are reads linearizable, scan completion explicit, and `Applied` writes
+  visible to later reads on the same store instance?
+- Do unknown commit states prevent raw transaction retries and poison an
+  uncertain local store before it can serve another request?
 - Does `nokv-meta` own schema, command execution, Holt binding, history,
   indexes, holds, lifecycle, GC policy, and recovery semantics?
 - Does `nokv-control` own placement/leases/epochs without learning path or

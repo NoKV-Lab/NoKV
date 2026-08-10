@@ -1,0 +1,12 @@
+[package]
+name = "nokv-meta-store"
+version = "0.1.0"
+description = "Storage-neutral ordered transaction interface for NoKV metadata."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]

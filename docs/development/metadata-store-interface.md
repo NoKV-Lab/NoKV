@@ -5,8 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Metadata Store Interface
 
-Status: proposed architecture decision. The production implementation still
-binds `nokv-meta` directly to Holt.
+Status: proposed architecture decision with the first migration stages in
+progress. The storage-neutral interface package exists, but the production
+implementation still binds `nokv-meta` directly to Holt.
 
 The [code contract](./code_contract.md), [architecture](../architecture.md),
 and [metadata schema](../metadata-schema.md) remain normative until the
@@ -56,15 +57,14 @@ The current `AgentMetadataStore` combines four responsibilities in
 - schema initialization and local path handling
 - logical recovery records and Holt read statistics
 
-The current bootstrap opens that logical-shard store from the root-scoped
-`bootstrap_root_owner` function in
-[`bootstrap.rs`](../../crates/nokv-server/src/bootstrap.rs). This works for the
-current one-root CLI process. It would open the same logical shard more than
-once when one process serves several roots from that shard.
+At the decision baseline, bootstrap opened a logical-shard store from a
+root-scoped function. The first migration stage replaced that path with
+`bootstrap_shard`. One shard owner now opens one store and attaches all Active
+roots found at startup.
 
-The current error boundary also names Holt in a domain error. The statistics
-boundary combines logical read counts with Holt-specific counters. Both
-boundaries must be split before another store can implement the same contract.
+The current error boundary still names Holt in a domain error. Logical metadata
+read counters and Holt diagnostics now use separate sessions. The Holt session
+and physical counter mapping remain in `engine.rs` until the adapter cutover.
 
 ## Runtime Shape
 
@@ -174,23 +174,40 @@ interface instead of keeping two variants.
 
 ## Read Contract
 
-`ReadBatch` contains point reads and bounded ordered range reads.
-`ReadSnapshot` returns one result for each request.
+`ReadBatch` contains point reads and bounded ordered prefix reads.
+`ReadSnapshot` returns one result for each request. Every batch is linearizable
+and observes one consistent store snapshot.
 
-All reads in one batch must observe one consistent store snapshot. A range read
+All reads in one batch must observe one consistent store snapshot. A scan
 must support:
 
-- one keyspace and one byte prefix or exclusive byte range
-- an exclusive `after` cursor
-- a positive result limit
+- one keyspace and one byte prefix
+- an empty prefix to select the full keyspace
+- an exclusive `after` cursor that is a canonical output key
+- positive row and byte limits
 - optional delimiter grouping
 - lexicographic byte ordering
-- early termination when the page is full
+- early termination when either page limit is full
 
 Each returned record or common prefix counts against the limit. The store must
 not materialize the complete prefix before it applies the cursor and limit.
+`ScanPage::more` states whether the store stopped before it reached the end of
+the prefix. The final item on any page that sets `more` supplies the next
+`after` cursor. Callers do not infer end of scan from a short page.
+
+The scan byte limit counts each returned key and value. A common prefix counts
+only its returned key bytes. The requested limit must allow one maximum-size
+row so every valid row can make progress.
+
 `MetaShard` may issue several bounded batches to reconstruct a historical view.
 It must not ask an adapter for an unbounded historical scan.
+
+Separate read calls do not share a physical snapshot. Each historical page
+must read the domain commit clock in the same batch as its rows.
+
+If the clock differs from the first page, `MetaShard` discards every collected
+page and restarts the reconstruction. The applicable snapshot or history hold
+must also prevent GC from removing the requested version during that work.
 
 NoKV `ReadVersion` remains a domain version. A store must not expose Holt
 record versions, FoundationDB versions, or consensus log indexes as a NoKV
@@ -237,10 +254,16 @@ pub enum Commit {
 ```
 
 The store evaluates all checks and mutations in one serializable transaction.
-`Applied` means the configured acknowledgement boundary accepted every
-mutation. `Conflict` means at least one check did not hold and no mutation
-applied. The interface does not identify one failed check because some stores
-cannot report it after an atomic conflict.
+`Applied` means every mutation reached the configured acknowledgement boundary
+and is visible to later reads on the same store instance. `Conflict` means at
+least one check did not hold and no mutation applied. The interface does not
+identify one failed check because some stores cannot report it after an atomic
+conflict.
+
+Any successor that the profile permits to serve must first observe every
+`Applied` commit under the same authority. `Local` forbids a successor from
+claiming another local authority. Shared and replicated profiles must complete
+their open or catch-up boundary before route admission.
 
 `MetaShard` will translate one validated `MetadataCommand` into a `WriteTxn`.
 Command deduplication, history, events, root fences, and deterministic results
@@ -266,23 +289,34 @@ remain adapter details.
 - invalid request
 - configured limit exceeded
 - unavailable before a commit could apply
-- commit outcome unknown
+- commit outcome unknown, with one recovery state
 - corrupt physical state
 
 `Conflict` is a commit result and not a store error. An adapter must not map an
 unknown outcome to `Conflict` or `Unavailable`.
 
-If a commit outcome is unknown, NoKV reconciles the original `RequestId` and
-command digest through `CommandDedupe`.
+Unknown outcomes use these states:
 
-NoKV returns an exact replay when the durable record exists. It replans the
-domain command when an authoritative read shows that the record is absent. It
-does not retry the old physical `WriteTxn` without reconciliation.
+| State | Store guarantee | NoKV action |
+| --- | --- | --- |
+| `Settled` | The physical call cannot change store state after returning. | Read `CommandDedupe` from the same linearizable store. Return the replay when present. Replan with the same request id and command digest when absent. |
+| `MayCommit` | The original call can still commit after returning. | Replan only as a new domain transaction guarded by the same dedupe absence and commit clock. Never retry the raw `WriteTxn`. |
+| `Poisoned` | The live view may be ahead of the acknowledgement boundary. The adapter poisoned the instance before returning. | Remove the shard routes, open and recover a new instance, and then reconcile `CommandDedupe`. |
 
-An adapter must mark itself unready when its live view can advance before the
-configured acknowledgement boundary. The server then removes the shard routes
-and reopens or replays the store to that boundary before dedupe reconciliation.
-Reading dedupe from the same uncertain live view is not durability evidence.
+A poisoned adapter must prevent every overlapping or later `read` and `commit`
+from returning success after the poison transition. It must serialize operation
+completion with that transition or recheck its state before publishing a
+result.
+
+`ready` remains unavailable until the caller opens a new instance.
+Route removal cannot replace these checks because it can race an in-flight
+request. Reading dedupe from the uncertain instance is not durability evidence.
+
+The proposed FoundationDB adapter maps a settled
+`commit_unknown_result` to `Settled`. It maps an error that permits a late
+commit to `MayCommit`. The current Holt binding must treat an atomic commit
+error as `Poisoned` until reopen and WAL replay establish the durable
+boundary.
 
 `MetaError` owns schema, command, history, placement, fence, and lifecycle
 errors. It can contain `MetaError::Store(StoreError)`. Upper packages must not
@@ -290,12 +324,15 @@ match Holt or FoundationDB error types.
 
 ## Limits
 
-`StoreProfile` reports physical limits and the acknowledgement boundary.
+`StoreProfile` reports physical limits, the acknowledgement boundary, and the
+location of recovery authority.
 NoKV defines one portable transaction budget below every qualified store
 limit.
 
 The portable budget covers:
 
+- point reads and range endpoints
+- bounded read result bytes
 - point and range checks
 - mutation count
 - key bytes
@@ -303,9 +340,19 @@ The portable budget covers:
 - total affected transaction bytes
 - result rows and bytes
 
-The current per-list count and per-value checks do not bound total transaction
-bytes. The FoundationDB adapter cannot qualify until NoKV enforces the portable
-total budget before dispatch.
+`max_read_bytes` is a conservative logical affected-byte budget. An adapter
+must reserve room for keyspace or subspace prefixes, range endpoints, conflict
+ranges, and other physical encoding overhead when it advertises that limit.
+The portable budget does not count values returned by point reads as affected
+transaction bytes, but `max_result_bytes` still bounds those values.
+
+An `EmptyPrefix` check reserves the prefix start, its exclusive end, and one
+maximum-size key. This covers the range read needed to prove that the prefix has
+no row. Adapter-specific encoding overhead still comes from the profile reserve.
+
+The current production Holt path does not yet dispatch through these limits.
+The FoundationDB adapter cannot qualify until every request passes the portable
+validators before physical I/O.
 
 Required transaction and read semantics are not optional capabilities. A store
 that cannot provide them fails during startup.
@@ -345,7 +392,8 @@ feature causes a startup error and never falls back to Holt.
 
 ## Shard Bootstrap
 
-The server will replace root-scoped store bootstrap with two operations:
+The first migration stage replaced root-scoped store bootstrap with two
+operations:
 
 ```text
 bootstrap_shard
@@ -380,18 +428,23 @@ The CLI attaches every Active placement found for the shard at startup. A root
 that becomes Active later requires an owner restart until runtime attachment is
 implemented.
 
-Open mode does not decide successor admission. The store profile decides which
-failover paths have a valid authority and recovery boundary.
+Open mode does not decide successor admission. `StoreProfile::authority` and
+the server's qualification policy decide whether a successor has a valid
+recovery path. `AckBoundary` alone is not a failover policy.
+
+An admitted successor must include every commit that returned `Applied` under
+that authority. Adapter conformance and server failover tests must prove this
+before the profile can qualify.
 
 ## Store Profiles
 
 The initial profiles are:
 
-| Store | Authority | Acknowledgement | Successor status |
+| Store | `Authority` | `AckBoundary` | Successor status |
 | --- | --- | --- | --- |
-| `HoltStore` | Process-local directory | Synchronous local WAL | Refused until checkpoint and log recovery qualify |
-| `FdbStore` | Shared transactional database | Successful FoundationDB commit | Proposed, not qualified |
-| `HoltClusterStore` | Replicated state machine | Quorum commit and local apply | Proposed, not implemented |
+| `HoltStore` | `Local` | `LocalSync` | Refused until checkpoint and log recovery qualify |
+| `FdbStore` | `Shared` | `SharedCommit` | Proposed, not qualified |
+| `HoltClusterStore` | `Replicated` | `QuorumCommit` | Proposed, not implemented |
 
 The current hash-chained `RecoveryOutbox` is local recovery and export material.
 It is not the consensus log for `HoltClusterStore`.
@@ -426,11 +479,14 @@ cross-partition semantics. Filename hashing is not an acceptable substitute.
 Every store implementation must run the same interface tests for:
 
 - consistent point and range reads
+- linearizable reads and read-after-`Applied`
 - ordered cursor and delimiter scans
+- explicit scan completion and byte limits
 - value, absence, and empty-prefix checks
 - atomic multi-keyspace writes
 - deterministic conflicts
-- unknown commit outcomes
+- settled, late-commit, and poisoned unknown outcomes
+- sticky poison and recovery before reconciliation
 - limit rejection
 - empty initialization and exact reopen
 
@@ -450,8 +506,9 @@ Implementation proceeds in separate changes:
 2. Replace root-scoped bootstrap with shard bootstrap and root attachment.
 3. Split domain statistics from Holt statistics and make historical reads use
    bounded store pages.
-4. Add `nokv-meta-store` and `nokv-meta-holt` in one Holt cutover.
-5. Remove the direct `nokv-meta -> holt` dependency and old constructors.
+4. Add the `nokv-meta-store` contract and storage-neutral validators.
+5. Add `nokv-meta-holt`, cut over `nokv-meta`, and remove its Holt dependency
+   and old constructors.
 6. Add portable limits and remove FoundationDB hot-path blockers.
 7. Replace the synchronous store and server path with one async path.
 8. Add the non-default `nokv-meta-fdb` adapter and its conformance suite.

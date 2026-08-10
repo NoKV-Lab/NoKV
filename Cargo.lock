@@ -1343,6 +1343,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nokv-meta-store"
+version = "0.1.0"
+
+[[package]]
 name = "nokv-object"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,25 @@
+/*
+ * Copyright 2024-2026 The NoKV Authors.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Ordered byte-key transaction interface for NoKV metadata stores.
+//!
+//! This crate defines physical store requests and results. Workspace schema,
+//! record codecs, command planning, history, and lifecycle rules stay in
+//! `nokv-meta`. Store adapters translate these byte operations to one physical
+//! transaction system without exposing backend types through this interface.
+
+mod errors;
+mod store;
+mod types;
+
+pub use errors::{LimitKind, StoreError, UnknownCommit};
+pub use store::TxnStore;
+pub use types::{
+    AckBoundary, Authority, Check, Commit, Key, Keyspace, Mutation, ReadBatch, ReadOp, ReadResult,
+    ReadSnapshot, Scan, ScanItem, ScanPage, StoreLimits, StoreProfile, WriteTxn,
+};
+
+#[cfg(test)]
+mod tests;
