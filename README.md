@@ -120,6 +120,37 @@ These guarantees are shard-local. NoKV does not provide cross-shard
 transactions. Snapshot protection is leased, and root or Workbench scoping is
 not an authentication or RBAC boundary.
 
+## Provenance and Evidence, Without a SQL Sidecar
+
+Run provenance is the workload NoKV is shaped for. The default answer — a
+relational database next to the object store — rebuilds everything the
+workspace already owns: tables of paths, hand-rolled versioning, a second
+GC, and a two-phase dance to keep rows and S3 bytes agreeing.
+
+Agent evidence is path-shaped, append-heavy, and immutable once sealed.
+NoKV stores it with the guarantees above, plus:
+
+- **Tamper-evident artifacts.** Never-reused revision ids and whole-body
+  digests on every published body; commits bind a caller-computed content
+  digest and replay idempotently.
+- **Hash-chained history.** Every acknowledged metadata mutation is
+  synchronously durable in the owning shard's WAL and appends canonical
+  hash-chained replay material in the same store.
+- **Crash-tested durability.** The metadata engine's checkpoint rewrites
+  are shadow-paged and power-loss tested down to torn 512 KiB frames
+  (holt >= 0.8.3); a torn-frame guard probe pins that property in this
+  repository's own test suite.
+- **Lineage as data.** Sealed commits and tags retain exact revisions,
+  leased snapshots freeze a consistent view, and restore forks it without
+  rewriting history.
+- **Evidence layout.** A Workbench keeps `logs/` as the tool-call evidence
+  stream and `metadata/` as run manifests, next to the inputs and outputs
+  they describe — one namespace, one query surface, one GC.
+
+Reach for SQL when you need relational reporting across many runs. Storing
+the evidence itself — files, manifests, lineage, and the bytes they attest
+— belongs in the workspace that publishes them atomically.
+
 ## Distributed Status
 
 | Status | Capabilities and limits |
@@ -201,6 +232,55 @@ upload dataset
 
 Materialization creates a disposable local sandbox. It is not a NoKV namespace
 or a transparent host-filesystem access path.
+
+## Use Case: A Research Workbench for Agents
+
+LingTai mounts NoKV as the durable artifact store behind its research agents.
+The runtime keeps agent state — locks, heartbeats, mailboxes, event logs — in
+a disposable local workdir; what a task produces and needs to prove crosses
+into a Workbench.
+
+One MCP registry entry is the whole integration. Each agent spawns the `nokv`
+binary as a stdio MCP server:
+
+```text
+nokv ... mcp --profile workbench --workbench-root /agents/{agent_id}/wb
+```
+
+LingTai expands `{agent_id}` per agent, so a single registry template gives
+every agent its own path-scoped Workbench root, and the 18 `workbench_*`
+tools land next to the agent's local file tools instead of replacing them.
+There is no client library and no NoKV-specific client code beyond that
+placeholder expansion; the whole contract lives server-side.
+
+A research run then follows the fixed section layout — `input`, `scripts`,
+`outputs`, `logs`, `metadata`:
+
+```text
+workbench_create spedas-task-001
+  put    input/    task payload and dataset references
+  put    scripts/  the exact analysis code a rerun needs
+  append logs/     tool-call evidence while the run executes
+  put    outputs/  figures, tables, reports
+  workbench_commit
+    -> seals the run, writes metadata/run_manifest.json,
+       binds the caller-computed content digest
+  workbench_snapshot        (leased checkpoint, default 7 days)
+  workbench_restore
+    -> forks the frozen view into a fresh Workbench
+       for handoff or replay
+```
+
+The write semantics are collaboration discipline, not convenience:
+`workbench_put_file` is create-only or replace-only, never upsert, and
+appends serialize server-side. A parent agent creates the Workbench, assigns
+paths, and commits; spawned child agents write only the paths they were
+assigned. When a local executable needs real files, `materialize` copies
+verified inputs into the sandbox and `collect` brings declared outputs back.
+
+What this buys an agent fleet: a task's artifacts, provenance, and history
+outlive any single context window, and a leased snapshot plus restore is how
+an agent — or its successor — finds its work again after a context reset.
 
 ## Quick Start
 
