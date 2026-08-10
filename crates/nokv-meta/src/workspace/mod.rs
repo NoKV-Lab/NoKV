@@ -70,13 +70,13 @@ pub use commit_records::{
     COMMIT_VALUE_FORMAT_VERSION, MAX_COMMIT_DIGEST_URI_BYTES, MAX_COMMIT_LINEAGE_BYTES,
     MAX_COMMIT_MEMBER_PROJECTION_BYTES, MAX_COMMIT_PRODUCER_BYTES, MAX_PARENT_COMMITS,
 };
-#[cfg(feature = "metadata-read-stats")]
-pub use engine::MetadataReadStatsSession;
 pub use engine::{
     AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
     HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, MetadataScanItem,
     RootFenceAction,
 };
+#[cfg(feature = "metadata-read-stats")]
+pub use engine::{HoltReadStatsSession, MetadataReadStatsSession};
 pub use gc::{
     gc_operation_id, AdvanceGcDeletionBatchRequest, BeginGcDeletionRequest, ClaimGcRequest,
     ClearStaleGcCandidateRequest, CompleteGcRequest, GcCandidateClearOutcome, GcCandidateCursor,
@@ -141,7 +141,8 @@ pub use query_records::{
 };
 #[cfg(feature = "metadata-read-stats")]
 pub use read_stats::{
-    MetadataReadStats, MetadataReadStatsDeltaError, MetadataReadStatsSessionError,
+    HoltReadStats, HoltReadStatsDeltaError, HoltReadStatsSessionError, MetadataReadStats,
+    MetadataReadStatsSessionError,
 };
 pub use records::{CommandDedupeRecord, CurrentValue, HistoryValue, RecordCodecError, RootFence};
 pub use recovery::{

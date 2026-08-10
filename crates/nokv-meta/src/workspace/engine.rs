@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "metadata-read-stats")]
 use std::marker::PhantomData;
+use std::ops::ControlFlow;
 use std::path::Path;
 #[cfg(feature = "metadata-read-stats")]
 use std::rc::Rc;
@@ -25,7 +26,10 @@ use super::codec::{
     TAG_TREE, WORKBENCH_COMMIT_HEAD_TREE, WORKSPACE_CURRENT_TREE, WORKSPACE_INCARNATION_CLAIM_TREE,
 };
 #[cfg(feature = "metadata-read-stats")]
-use super::read_stats::{self, MetadataReadStats, MetadataReadStatsSessionError};
+use super::read_stats::{
+    self, HoltReadStats, HoltReadStatsSessionError, MetadataReadStats,
+    MetadataReadStatsSessionError,
+};
 use super::records::{CommandDedupeRecord, CurrentValue, HistoryValue, RootFence};
 use super::recovery::{
     assemble_recovery_storage, decode_recovery_outbox_key, recovery_chunk_key,
@@ -46,6 +50,7 @@ const INITIAL_COMMIT_VERSION: u64 = 1;
 
 const MAX_COMMAND_ITEMS: usize = 256;
 const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
+const MAX_HISTORICAL_SCAN_PAGE_ROWS: usize = MAX_COMMAND_ITEMS;
 const MAX_COMMAND_KEY_BYTES: usize = 8 * 1024;
 // Holt limits one stored value to u16::MAX bytes. Domain payloads are wrapped
 // in CurrentValue, HistoryValue, or CommandDedupeRecord before insertion, so
@@ -455,7 +460,7 @@ pub struct AgentMetadataStore {
     logical_shard_id: LogicalShardId,
     command_gate: Arc<RwLock<()>>,
     #[cfg(feature = "metadata-read-stats")]
-    read_stats_identity: Arc<MetadataReadStatsIdentity>,
+    read_stats_identity: Arc<ReadStatsIdentity>,
     system: Tree,
     root_fence: Tree,
     command_dedupe: Tree,
@@ -467,8 +472,9 @@ pub struct AgentMetadataStore {
 
 #[cfg(feature = "metadata-read-stats")]
 #[derive(Default)]
-struct MetadataReadStatsIdentity {
-    active: AtomicBool,
+struct ReadStatsIdentity {
+    metadata_active: AtomicBool,
+    holt_active: AtomicBool,
 }
 
 /// Short-lived point reader bound to one validated root and read version.
@@ -483,19 +489,16 @@ pub(super) struct FencedPointReader<'a> {
     current_version: ReadVersion,
 }
 
-/// Thread-bound logical read counters plus a dedicated store's Holt telemetry.
+/// Thread-bound logical metadata read counters.
 ///
 /// This diagnostic API is available only with the `metadata-read-stats`
 /// feature. Reads through clones of `store` are included when they execute on
-/// the thread that owns the session. Holt's physical counters remain
-/// store-wide, so callers must exclude concurrent store activity before
-/// attributing them to the measured workload.
+/// the thread that owns the session.
 #[cfg(feature = "metadata-read-stats")]
 #[must_use = "finish the session to obtain counters, or drop it to cancel collection"]
 pub struct MetadataReadStatsSession<'a> {
     store: &'a AgentMetadataStore,
     store_key: usize,
-    storage_before: MetadataReadStats,
     active: bool,
     not_send: PhantomData<Rc<()>>,
 }
@@ -503,15 +506,7 @@ pub struct MetadataReadStatsSession<'a> {
 #[cfg(feature = "metadata-read-stats")]
 impl MetadataReadStatsSession<'_> {
     pub fn finish(mut self) -> Result<MetadataReadStats, MetadataReadStatsSessionError> {
-        let logical = read_stats::finish_session(self.store_key)?;
-        let storage_after = read_stats::storage_snapshot(&self.store.db.stats());
-        let result = storage_after
-            .delta_since(&self.storage_before)
-            .map(|mut combined| {
-                read_stats::merge_logical_counters(&mut combined, logical);
-                combined
-            })
-            .map_err(MetadataReadStatsSessionError::from);
+        let result = read_stats::finish_session(self.store_key);
         self.release();
         result
     }
@@ -520,8 +515,57 @@ impl MetadataReadStatsSession<'_> {
         self.active = false;
         self.store
             .read_stats_identity
-            .active
+            .metadata_active
             .store(false, Ordering::Release);
+    }
+}
+
+/// Thread-bound Holt cursor counters plus store-wide Holt I/O telemetry.
+///
+/// This binding-specific path is separate from the logical metadata session so
+/// the store-interface cutover can move it to `nokv-meta-holt` without changing
+/// `MetadataReadStatsSession`. Store-wide deltas belong to one workload only
+/// when the database has no concurrent activity.
+#[cfg(feature = "metadata-read-stats")]
+#[must_use = "finish the session to obtain counters, or drop it to cancel collection"]
+pub struct HoltReadStatsSession<'a> {
+    store: &'a AgentMetadataStore,
+    store_key: usize,
+    storage_before: HoltReadStats,
+    active: bool,
+    not_send: PhantomData<Rc<()>>,
+}
+
+#[cfg(feature = "metadata-read-stats")]
+impl HoltReadStatsSession<'_> {
+    pub fn finish(mut self) -> Result<HoltReadStats, HoltReadStatsSessionError> {
+        let cursor = read_stats::finish_holt_session(self.store_key)?;
+        let mut storage = self
+            .store
+            .holt_read_stats_snapshot()
+            .delta_since(&self.storage_before)
+            .map_err(HoltReadStatsSessionError::from)?;
+        read_stats::merge_holt_cursor_stats(&mut storage, cursor);
+        self.release();
+        Ok(storage)
+    }
+
+    fn release(&mut self) {
+        self.active = false;
+        self.store
+            .read_stats_identity
+            .holt_active
+            .store(false, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "metadata-read-stats")]
+impl Drop for HoltReadStatsSession<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            read_stats::cancel_holt_session(self.store_key);
+            self.release();
+        }
     }
 }
 
@@ -717,7 +761,7 @@ impl AgentMetadataStore {
             logical_shard_id,
             command_gate: Arc::new(RwLock::new(())),
             #[cfg(feature = "metadata-read-stats")]
-            read_stats_identity: Arc::new(MetadataReadStatsIdentity::default()),
+            read_stats_identity: Arc::new(ReadStatsIdentity::default()),
             system,
             root_fence,
             command_dedupe,
@@ -756,21 +800,52 @@ impl AgentMetadataStore {
     ) -> Result<MetadataReadStatsSession<'_>, MetadataReadStatsSessionError> {
         if self
             .read_stats_identity
-            .active
+            .metadata_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return Err(MetadataReadStatsSessionError::StoreSessionAlreadyActive);
         }
         let store_key = self.read_stats_store_key();
-        let storage_before = read_stats::storage_snapshot(&self.db.stats());
         if let Err(error) = read_stats::begin_session(store_key) {
             self.read_stats_identity
-                .active
+                .metadata_active
                 .store(false, Ordering::Release);
             return Err(error);
         }
         Ok(MetadataReadStatsSession {
+            store: self,
+            store_key,
+            active: true,
+            not_send: PhantomData,
+        })
+    }
+
+    /// Start a Holt-specific read-statistics diagnostic session.
+    ///
+    /// Only one Holt session may be active for this store. It can run beside a
+    /// logical metadata read-statistics session on the same thread.
+    #[cfg(feature = "metadata-read-stats")]
+    pub fn begin_holt_read_stats_session(
+        &self,
+    ) -> Result<HoltReadStatsSession<'_>, HoltReadStatsSessionError> {
+        if self
+            .read_stats_identity
+            .holt_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(HoltReadStatsSessionError::StoreSessionAlreadyActive);
+        }
+        let store_key = self.read_stats_store_key();
+        let storage_before = self.holt_read_stats_snapshot();
+        if let Err(error) = read_stats::begin_holt_session(store_key) {
+            self.read_stats_identity
+                .holt_active
+                .store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(HoltReadStatsSession {
             store: self,
             store_key,
             storage_before,
@@ -1602,87 +1677,53 @@ impl AgentMetadataStore {
         }
 
         let mut visible = BTreeMap::<Vec<u8>, Vec<u8>>::new();
-        #[cfg(feature = "metadata-read-stats")]
-        let mut current_key_bytes = 0_u64;
-        #[cfg(feature = "metadata-read-stats")]
-        let mut current_value_bytes = 0_u64;
-        let mut current_iterator = current_view.range().into_iter();
-        for entry in current_iterator.by_ref() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan current metadata", error))?
-            else {
-                continue;
-            };
-            #[cfg(feature = "metadata-read-stats")]
-            {
-                current_key_bytes = current_key_bytes.saturating_add(byte_len(&key));
-                current_value_bytes = current_value_bytes.saturating_add(byte_len(&value));
-            }
-            let current =
-                CurrentValue::decode(&value).map_err(|error| corrupt(family.tree_name(), error))?;
-            if current.modified_version.get() <= version.get() {
-                visible.insert(key, current.payload);
-            }
-        }
-        #[cfg(feature = "metadata-read-stats")]
-        {
-            let current_stats = current_iterator.stats();
-            self.record_scan_cursor(
-                current_stats.visited,
-                current_stats.returned,
-                current_stats.rollup,
-                current_stats.restarts,
-                current_key_bytes,
-                current_value_bytes,
-                false,
-            );
-        }
+        self.visit_historical_scan_pages(
+            |after| {
+                let mut range = current_view.range();
+                if let Some(after) = after {
+                    range = range.start_after(after);
+                }
+                range.into_iter()
+            },
+            "scan current metadata",
+            |key, value| {
+                let current = CurrentValue::decode(value)
+                    .map_err(|error| corrupt(family.tree_name(), error))?;
+                if current.modified_version.get() <= version.get() {
+                    visible.insert(key.to_vec(), current.payload);
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
 
         let history_view = history_view
             .expect("historical metadata scan captures the matching History family view");
-        #[cfg(feature = "metadata-read-stats")]
-        let mut history_key_bytes = 0_u64;
-        #[cfg(feature = "metadata-read-stats")]
-        let mut history_value_bytes = 0_u64;
-        let mut history_iterator = history_view.range().into_iter();
-        for entry in history_iterator.by_ref() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan metadata history", error))?
-            else {
-                continue;
-            };
-            #[cfg(feature = "metadata-read-stats")]
-            {
-                history_key_bytes = history_key_bytes.saturating_add(byte_len(&key));
-                history_value_bytes = history_value_bytes.saturating_add(byte_len(&value));
-            }
-            let user_key = history_user_key(&key)?;
-            if !user_key.starts_with(prefix) || visible.contains_key(user_key) {
-                continue;
-            }
-            let history =
-                HistoryValue::decode(&value).map_err(|error| corrupt("History", error))?;
-            if history.previous_modified_version.get() <= version.get()
-                && version.get() < history.transition_version.get()
-            {
-                if let Some(previous) = history.previous_payload {
-                    visible.insert(user_key.to_vec(), previous);
+        self.visit_historical_scan_pages(
+            |after| {
+                let mut range = history_view.range();
+                if let Some(after) = after {
+                    range = range.start_after(after);
                 }
-            }
-        }
-        #[cfg(feature = "metadata-read-stats")]
-        {
-            let history_stats = history_iterator.stats();
-            self.record_scan_cursor(
-                history_stats.visited,
-                history_stats.returned,
-                history_stats.rollup,
-                history_stats.restarts,
-                history_key_bytes,
-                history_value_bytes,
-                false,
-            );
-        }
+                range.into_iter()
+            },
+            "scan metadata history",
+            |key, value| {
+                let user_key = history_user_key(key)?;
+                if !user_key.starts_with(prefix) || visible.contains_key(user_key) {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let history =
+                    HistoryValue::decode(value).map_err(|error| corrupt("History", error))?;
+                if history.previous_modified_version.get() <= version.get()
+                    && version.get() < history.transition_version.get()
+                {
+                    if let Some(previous) = history.previous_payload {
+                        visible.insert(user_key.to_vec(), previous);
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
 
         let mut page = Vec::with_capacity(effective_limit);
         let mut last_common_prefix = None;
@@ -1715,6 +1756,70 @@ impl AgentMetadataStore {
             }
         }
         Ok(page)
+    }
+
+    /// Walk one immutable historical-read range through fixed-size physical
+    /// pages. The callback still sees every row, so reconstruction and
+    /// corruption checks retain their existing fail-closed behavior.
+    fn visit_historical_scan_pages(
+        &self,
+        mut open_page: impl FnMut(Option<&[u8]>) -> holt::RangeIter,
+        operation: &'static str,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<ControlFlow<()>, AgentMetadataError>,
+    ) -> Result<(), AgentMetadataError> {
+        let mut after = None::<Vec<u8>>;
+        loop {
+            let mut iterator = open_page(after.as_deref());
+            let mut page_rows = 0_usize;
+            let mut next_after = None;
+            let mut stopped_by_callback = false;
+            #[cfg(feature = "metadata-read-stats")]
+            let mut key_bytes = 0_u64;
+            #[cfg(feature = "metadata-read-stats")]
+            let mut value_bytes = 0_u64;
+
+            for entry in iterator.by_ref() {
+                let holt::RangeEntry::Key { key, value, .. } =
+                    entry.map_err(|error| backend(operation, error))?
+                else {
+                    continue;
+                };
+                #[cfg(feature = "metadata-read-stats")]
+                {
+                    key_bytes = key_bytes.saturating_add(byte_len(&key));
+                    value_bytes = value_bytes.saturating_add(byte_len(&value));
+                }
+                page_rows += 1;
+                next_after = Some(key.clone());
+                if visit(&key, &value)?.is_break() {
+                    stopped_by_callback = true;
+                    break;
+                }
+                if page_rows == MAX_HISTORICAL_SCAN_PAGE_ROWS {
+                    break;
+                }
+            }
+
+            let stopped_at_page_limit =
+                !stopped_by_callback && page_rows == MAX_HISTORICAL_SCAN_PAGE_ROWS;
+            #[cfg(feature = "metadata-read-stats")]
+            {
+                let stats = iterator.stats();
+                self.record_scan_cursor(
+                    stats.visited,
+                    stats.returned,
+                    stats.rollup,
+                    stats.restarts,
+                    key_bytes,
+                    value_bytes,
+                    stopped_at_page_limit,
+                );
+            }
+            if stopped_by_callback || !stopped_at_page_limit {
+                return Ok(());
+            }
+            after = next_after;
+        }
     }
 
     /// Read one immutable change event through the ordinary ownership fences.
@@ -1909,51 +2014,28 @@ impl AgentMetadataStore {
         let prefix = history_prefix(family, key);
         #[cfg(feature = "metadata-read-stats")]
         self.record_scan_call();
-        #[cfg(feature = "metadata-read-stats")]
-        let mut key_bytes = 0_u64;
-        #[cfg(feature = "metadata-read-stats")]
-        let mut value_bytes = 0_u64;
         let mut previous_payload = None;
-        let mut iterator = self.history.range().prefix(&prefix).into_iter();
-        for entry in iterator.by_ref() {
-            let entry = entry.map_err(|error| backend("read metadata history", error))?;
-            #[cfg(feature = "metadata-read-stats")]
-            let holt::RangeEntry::Key { key, value, .. } = entry
-            else {
-                continue;
-            };
-            #[cfg(not(feature = "metadata-read-stats"))]
-            let holt::RangeEntry::Key { value, .. } = entry
-            else {
-                continue;
-            };
-            #[cfg(feature = "metadata-read-stats")]
-            {
-                key_bytes = key_bytes.saturating_add(byte_len(&key));
-                value_bytes = value_bytes.saturating_add(byte_len(&value));
-            }
-            let history =
-                HistoryValue::decode(&value).map_err(|error| corrupt("History", error))?;
-            if history.previous_modified_version.get() <= version.get()
-                && version.get() < history.transition_version.get()
-            {
-                previous_payload = Some(history.previous_payload);
-                break;
-            }
-        }
-        #[cfg(feature = "metadata-read-stats")]
-        {
-            let stats = iterator.stats();
-            self.record_scan_cursor(
-                stats.visited,
-                stats.returned,
-                stats.rollup,
-                stats.restarts,
-                key_bytes,
-                value_bytes,
-                false,
-            );
-        }
+        self.visit_historical_scan_pages(
+            |after| {
+                let mut range = self.history.range().prefix(&prefix);
+                if let Some(after) = after {
+                    range = range.start_after(after);
+                }
+                range.into_iter()
+            },
+            "read metadata history",
+            |_key, value| {
+                let history =
+                    HistoryValue::decode(value).map_err(|error| corrupt("History", error))?;
+                if history.previous_modified_version.get() <= version.get()
+                    && version.get() < history.transition_version.get()
+                {
+                    previous_payload = Some(history.previous_payload);
+                    return Ok(ControlFlow::Break(()));
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
         Ok(previous_payload.flatten())
     }
 
@@ -2427,6 +2509,38 @@ impl AgentMetadataStore {
         self.families
             .get(&family)
             .expect("every MetadataFamily is opened at startup")
+    }
+
+    #[cfg(feature = "metadata-read-stats")]
+    fn holt_read_stats_snapshot(&self) -> HoltReadStats {
+        let stats = self.db.stats();
+        HoltReadStats {
+            cache_hits: stats.bm_cache_hits,
+            cache_misses: stats.bm_cache_misses,
+            full_blob_reads: stats.bm_full_blob_reads,
+            full_blob_read_bytes: stats.bm_full_blob_read_bytes,
+            point_full_blob_reads: stats.bm_point_full_blob_reads,
+            scan_full_blob_reads: stats.bm_scan_full_blob_reads,
+            silent_full_blob_reads: stats.bm_silent_full_blob_reads,
+            read_page_hits: stats.bm_read_page_hits,
+            read_page_misses: stats.bm_read_page_misses,
+            read_index_cache_hits: stats.bm_read_index_cache_hits,
+            read_index_cache_misses: stats.bm_read_index_cache_misses,
+            read_index_loads: stats.bm_read_index_loads,
+            read_index_dir_read_bytes: stats.bm_read_index_dir_read_bytes,
+            read_index_bucket_reads: stats.bm_read_index_bucket_reads,
+            read_index_bucket_read_bytes: stats.bm_read_index_bucket_read_bytes,
+            read_index_inline_hits: stats.bm_read_index_inline_hits,
+            read_index_value_hits: stats.bm_read_index_value_hits,
+            read_index_value_read_bytes: stats.bm_read_index_value_read_bytes,
+            read_index_offset_hits: stats.bm_read_index_offset_hits,
+            read_index_negative_hits: stats.bm_read_index_negative_hits,
+            read_index_crossing_hits: stats.bm_read_index_crossing_hits,
+            read_index_unknowns: stats.bm_read_index_unknowns,
+            optimistic_restarts: stats.bm_optimistic_restarts,
+            range_restarts: stats.bm_range_restarts,
+            ..HoltReadStats::default()
+        }
     }
 
     #[cfg(feature = "metadata-read-stats")]
@@ -3059,6 +3173,31 @@ mod tests {
             .unwrap()
     }
 
+    fn put_history_row(
+        store: &AgentMetadataStore,
+        key: &[u8],
+        transition_version: u64,
+        previous_modified_version: u64,
+        previous_payload: &[u8],
+    ) {
+        let transition_version = CommitVersion::new(transition_version).unwrap();
+        let value = HistoryValue {
+            transition_version,
+            previous_created_version: CommitVersion::new(2).unwrap(),
+            previous_modified_version: CommitVersion::new(previous_modified_version).unwrap(),
+            previous_payload: Some(previous_payload.to_vec()),
+        }
+        .encode()
+        .unwrap();
+        store
+            .history
+            .put(
+                &history_key(MetadataFamily::Operation, key, transition_version),
+                &value,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
         let store = AgentMetadataStore::open_memory(shard(1)).unwrap();
@@ -3326,6 +3465,62 @@ mod tests {
     }
 
     #[test]
+    fn historical_point_read_resumes_after_a_full_internal_page() {
+        let store = ready_store();
+        let key = scoped_key(root(2), b"historical-point-pages");
+        let target_version = CommitVersion::new(2).unwrap();
+        let newest_transition = 3 + MAX_HISTORICAL_SCAN_PAGE_ROWS as u64;
+
+        for transition in 3..=newest_transition {
+            let payload = if transition == 3 {
+                b"target".as_slice()
+            } else {
+                b"newer".as_slice()
+            };
+            put_history_row(&store, &key, transition, transition - 1, payload);
+        }
+        let current = CurrentValue {
+            created_version: target_version,
+            modified_version: CommitVersion::new(newest_transition).unwrap(),
+            payload: b"current".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        store
+            .family(MetadataFamily::Operation)
+            .put(&key, &current)
+            .unwrap();
+        store
+            .system
+            .put(
+                SYSTEM_COMMIT_CLOCK_KEY,
+                &encode_system_u64(newest_transition),
+            )
+            .unwrap();
+
+        #[cfg(feature = "metadata-read-stats")]
+        let metadata_stats_session = store.begin_read_stats_session().unwrap();
+        #[cfg(feature = "metadata-read-stats")]
+        let holt_stats_session = store.begin_holt_read_stats_session().unwrap();
+        assert_eq!(
+            read_operation(&store, &key, target_version),
+            Some(b"target".to_vec())
+        );
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let metadata = metadata_stats_session.finish().unwrap();
+            let holt = holt_stats_session.finish().unwrap();
+            assert_eq!(metadata.scan_calls, 1);
+            assert_eq!(metadata.scan_raw_limit_stops, 1);
+            assert_eq!(holt.scan_cursors, 2);
+            assert_eq!(
+                holt.scan_returned_keys,
+                MAX_HISTORICAL_SCAN_PAGE_ROWS as u64 + 1
+            );
+        }
+    }
+
+    #[test]
     fn current_prefix_scan_seeks_after_cursor_and_stops_at_limit() {
         let store = ready_store();
         let prefix = scoped_key(root(2), b"bounded/");
@@ -3365,7 +3560,9 @@ mod tests {
 
         let version = store.current_read_version().unwrap();
         #[cfg(feature = "metadata-read-stats")]
-        let stats_session = store.begin_read_stats_session().unwrap();
+        let metadata_stats_session = store.begin_read_stats_session().unwrap();
+        #[cfg(feature = "metadata-read-stats")]
+        let holt_stats_session = store.begin_holt_read_stats_session().unwrap();
         let page = store
             .scan_prefix_at(
                 root(2),
@@ -3393,14 +3590,15 @@ mod tests {
         );
         #[cfg(feature = "metadata-read-stats")]
         {
-            let stats = stats_session.finish().unwrap();
-            assert_eq!(stats.scan_calls, 1);
-            assert_eq!(stats.scan_cursors, 1);
-            assert_eq!(stats.holt_scan_returned_keys, 2);
-            assert!(stats.holt_scan_visited_units >= 2);
-            assert_eq!(stats.scan_raw_limit_stops, 1);
-            assert!(stats.scan_key_bytes > 0);
-            assert!(stats.scan_value_bytes > 0);
+            let metadata = metadata_stats_session.finish().unwrap();
+            let holt = holt_stats_session.finish().unwrap();
+            assert_eq!(metadata.scan_calls, 1);
+            assert_eq!(holt.scan_cursors, 1);
+            assert_eq!(holt.scan_returned_keys, 2);
+            assert!(holt.scan_visited_units >= 2);
+            assert_eq!(metadata.scan_raw_limit_stops, 1);
+            assert!(metadata.scan_key_bytes > 0);
+            assert!(metadata.scan_value_bytes > 0);
         }
     }
 
@@ -3434,6 +3632,32 @@ mod tests {
         drop(cancelled);
         let replacement = store.begin_read_stats_session().unwrap();
         replacement.finish().unwrap();
+    }
+
+    #[cfg(feature = "metadata-read-stats")]
+    #[test]
+    fn holt_read_stats_session_is_independent_and_drop_releases_it() {
+        let store = ready_store();
+        let clone = store.clone();
+        let holt = store.begin_holt_read_stats_session().unwrap();
+        let metadata = store.begin_read_stats_session().unwrap();
+
+        let contender = clone.clone();
+        let error = std::thread::spawn(move || match contender.begin_holt_read_stats_session() {
+            Ok(_) => panic!("a second Holt session for one store must be rejected"),
+            Err(error) => error,
+        })
+        .join()
+        .unwrap();
+        assert_eq!(error, HoltReadStatsSessionError::StoreSessionAlreadyActive);
+
+        metadata.finish().unwrap();
+        drop(holt);
+        clone
+            .begin_holt_read_stats_session()
+            .unwrap()
+            .finish()
+            .unwrap();
     }
 
     #[test]
@@ -3483,7 +3707,9 @@ mod tests {
         drop(store);
         let store = AgentMetadataStore::reopen_file(&database, shard(1)).unwrap();
         #[cfg(feature = "metadata-read-stats")]
-        let stats_session = store.begin_read_stats_session().unwrap();
+        let metadata_stats_session = store.begin_read_stats_session().unwrap();
+        #[cfg(feature = "metadata-read-stats")]
+        let holt_stats_session = store.begin_holt_read_stats_session().unwrap();
 
         let page = store
             .scan_delimited_prefix_at(
@@ -3539,18 +3765,19 @@ mod tests {
         );
         #[cfg(feature = "metadata-read-stats")]
         {
-            let stats = stats_session.finish().unwrap();
-            assert_eq!(stats.scan_calls, 2);
-            assert_eq!(stats.scan_cursors, 2);
-            assert!(stats.holt_scan_common_prefixes >= 1);
+            let metadata = metadata_stats_session.finish().unwrap();
+            let holt = holt_stats_session.finish().unwrap();
+            assert_eq!(metadata.scan_calls, 2);
+            assert_eq!(holt.scan_cursors, 2);
+            assert!(holt.scan_common_prefixes >= 1);
             assert!(
-                stats.holt_cache_hits
-                    + stats.holt_cache_misses
-                    + stats.holt_full_blob_reads
-                    + stats.holt_read_page_hits
-                    + stats.holt_read_page_misses
-                    + stats.holt_read_index_cache_hits
-                    + stats.holt_read_index_cache_misses
+                holt.cache_hits
+                    + holt.cache_misses
+                    + holt.full_blob_reads
+                    + holt.read_page_hits
+                    + holt.read_page_misses
+                    + holt.read_index_cache_hits
+                    + holt.read_index_cache_misses
                     > 0,
                 "file-backed read session should expose Holt read activity"
             );
@@ -3619,6 +3846,57 @@ mod tests {
     }
 
     #[test]
+    fn historical_prefix_read_resumes_each_physical_scan_page() {
+        let store = ready_store();
+        let prefix = scoped_key(root(2), b"historical-prefix-pages/");
+        let target_key = [prefix.as_slice(), b"zzz"].concat();
+        let start_after = [prefix.as_slice(), b"yyy"].concat();
+
+        for index in 0..MAX_HISTORICAL_SCAN_PAGE_ROWS {
+            let suffix = format!("{index:03}");
+            let key = [prefix.as_slice(), suffix.as_bytes()].concat();
+            put_history_row(&store, &key, 3, 2, b"earlier");
+        }
+        put_history_row(&store, &target_key, 3, 2, b"target");
+
+        #[cfg(feature = "metadata-read-stats")]
+        let metadata_stats_session = store.begin_read_stats_session().unwrap();
+        #[cfg(feature = "metadata-read-stats")]
+        let holt_stats_session = store.begin_holt_read_stats_session().unwrap();
+        let page = store
+            .scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                ReadVersion::new(2).unwrap(),
+                Some(&start_after),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            page,
+            vec![MetadataScanItem {
+                key: target_key,
+                value: b"target".to_vec(),
+            }]
+        );
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let metadata = metadata_stats_session.finish().unwrap();
+            let holt = holt_stats_session.finish().unwrap();
+            assert_eq!(metadata.scan_calls, 1);
+            assert_eq!(metadata.scan_raw_limit_stops, 1);
+            assert_eq!(holt.scan_cursors, 3);
+            assert_eq!(
+                holt.scan_returned_keys,
+                MAX_HISTORICAL_SCAN_PAGE_ROWS as u64 + 1
+            );
+        }
+    }
+
+    #[test]
     fn change_event_scan_uses_an_exclusive_cursor_and_page_limit() {
         let store = ready_store();
         let first = store
@@ -3656,25 +3934,24 @@ mod tests {
     }
 
     #[test]
-    fn historical_prefix_scan_remains_fail_closed_past_page_limit() {
+    fn historical_prefix_scan_fails_closed_on_corrupt_history_in_second_internal_page() {
         let store = ready_store();
         let prefix = scoped_key(root(2), b"historical-bounded/");
-        let first_key = scoped_key(root(2), b"historical-bounded/01");
-        let corrupt_tail = scoped_key(root(2), b"historical-bounded/02-corrupt");
-        let first = store
-            .execute(&create_command(&store, request(3), first_key, b"first"))
-            .unwrap();
+        for index in 0..MAX_HISTORICAL_SCAN_PAGE_ROWS {
+            let suffix = format!("{index:03}");
+            let key = [prefix.as_slice(), suffix.as_bytes()].concat();
+            put_history_row(&store, &key, 3, 2, b"visible-at-version-two");
+        }
+
+        let corrupt_key = [prefix.as_slice(), b"zzz"].concat();
+        let corrupt_history_key = history_key(
+            MetadataFamily::Operation,
+            &corrupt_key,
+            CommitVersion::new(3).unwrap(),
+        );
         store
-            .execute(&create_command(
-                &store,
-                request(4),
-                scoped_key(root(2), b"outside-prefix"),
-                b"advance-clock",
-            ))
-            .unwrap();
-        store
-            .family(MetadataFamily::Operation)
-            .put(&corrupt_tail, b"corrupt-historical-tail")
+            .history
+            .put(&corrupt_history_key, b"corrupt-history-tail")
             .unwrap();
 
         assert!(matches!(
@@ -3684,12 +3961,12 @@ mod tests {
                 epoch(1),
                 MetadataFamily::Operation,
                 &prefix,
-                ReadVersion::new(first.commit_version.get()).unwrap(),
+                ReadVersion::new(2).unwrap(),
                 None,
                 1,
             ),
             Err(AgentMetadataError::CorruptRecord {
-                record: OPERATION_TREE,
+                record: "History",
                 ..
             })
         ));

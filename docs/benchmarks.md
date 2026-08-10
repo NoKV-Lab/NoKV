@@ -108,16 +108,18 @@ directory.
 This runner measures metadata-domain behavior through
 `MetadataWorkspaceRequestExecutor`; it does not frame bytes, open a network
 connection, access object storage, invoke the SDK, or invoke the OpenViking
-facade. Every workload performs warmup first, starts an explicit thread-bound
-read-stat session, runs only the timed iterations, stops the timer, and finishes
-the session. Setup, warmup, correctness checks, and session setup/finish are
-therefore excluded from latency. The session's lightweight thread-local logical
-counter updates do execute inside the measured path and are declared in the
-report. The non-default `nokv-meta/metadata-read-stats` feature removes these
-hooks from ordinary production builds. The benchmark exposes that dependency
-feature through its own explicit `nokv-bench/metadata-read-stats` feature, so a
-normal `cargo build --workspace` does not enable instrumentation through Cargo
-feature unification.
+facade. Every workload completes warmup before it starts two thread-bound
+sessions. One session collects logical metadata counters. The other session
+collects Holt diagnostics. The runner times only the requested iterations and
+stops the timer before it finishes either session. Setup, warmup, correctness
+checks, and session setup and finish do not affect the reported latency.
+
+The timed path updates both thread-local counter sets. Holt database snapshots
+occur outside the timer. The non-default `nokv-meta/metadata-read-stats` feature
+removes these hooks from ordinary production builds. The benchmark exposes
+that dependency through its own `nokv-bench/metadata-read-stats` feature. A
+normal `cargo build --workspace` does not enable this instrumentation through
+Cargo feature unification.
 
 With `--warmup > 0`, each row is labelled `same_request_warmup`: the exact same
 request runs before that row, but this is not a claim that the operating-system

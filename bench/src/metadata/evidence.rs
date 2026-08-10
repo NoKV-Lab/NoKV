@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use nokv_meta::workspace::MetadataReadStats;
+use nokv_meta::workspace::{HoltReadStats, MetadataReadStats};
 use serde::Serialize;
 
 use crate::report::{measure_with_diagnostics, WorkloadReport};
@@ -70,7 +70,7 @@ pub struct MetadataReadAmplification {
     pub per_successful_operation: MetadataReadCountersPerOperation,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MetadataReadCounterTotals {
     pub point_reads_total: u64,
     pub point_reads_fencing: u64,
@@ -156,65 +156,72 @@ pub struct AmplificationQualification {
     pub network_utilization: &'static str,
 }
 
-impl From<MetadataReadStats> for MetadataReadCounterTotals {
-    fn from(stats: MetadataReadStats) -> Self {
-        let point_reads_fencing = stats
+pub(super) struct ReadStatsSample {
+    pub(super) metadata: MetadataReadStats,
+    pub(super) holt: HoltReadStats,
+}
+
+impl From<ReadStatsSample> for MetadataReadCounterTotals {
+    fn from(sample: ReadStatsSample) -> Self {
+        let metadata = sample.metadata;
+        let holt = sample.holt;
+        let point_reads_fencing = metadata
             .point_reads_system
-            .saturating_add(stats.point_reads_root_fence);
-        let point_reads_authoritative = stats
+            .saturating_add(metadata.point_reads_root_fence);
+        let point_reads_authoritative = metadata
             .point_reads_workspace_current
-            .saturating_add(stats.point_reads_path_current)
-            .saturating_add(stats.point_reads_other);
-        let holt_exposed_read_bytes = stats
-            .holt_full_blob_read_bytes
-            .saturating_add(stats.holt_read_index_dir_read_bytes)
-            .saturating_add(stats.holt_read_index_bucket_read_bytes)
-            .saturating_add(stats.holt_read_index_value_read_bytes);
+            .saturating_add(metadata.point_reads_path_current)
+            .saturating_add(metadata.point_reads_other);
+        let holt_exposed_read_bytes = holt
+            .full_blob_read_bytes
+            .saturating_add(holt.read_index_dir_read_bytes)
+            .saturating_add(holt.read_index_bucket_read_bytes)
+            .saturating_add(holt.read_index_value_read_bytes);
         Self {
-            point_reads_total: stats.point_reads_total(),
+            point_reads_total: metadata.point_reads_total(),
             point_reads_fencing,
             point_reads_authoritative,
-            point_reads_system: stats.point_reads_system,
-            point_reads_root_fence: stats.point_reads_root_fence,
-            point_reads_workspace_current: stats.point_reads_workspace_current,
-            point_reads_path_current: stats.point_reads_path_current,
-            point_reads_other: stats.point_reads_other,
-            point_hits: stats.point_hits,
-            point_misses: stats.point_misses,
-            point_value_bytes: stats.point_value_bytes,
-            scan_calls: stats.scan_calls,
-            scan_cursors: stats.scan_cursors,
-            holt_scan_visited_units: stats.holt_scan_visited_units,
-            holt_scan_returned_keys: stats.holt_scan_returned_keys,
-            holt_scan_common_prefixes: stats.holt_scan_common_prefixes,
-            holt_scan_restarts: stats.holt_scan_restarts,
-            scan_key_bytes: stats.scan_key_bytes,
-            scan_value_bytes: stats.scan_value_bytes,
-            scan_raw_limit_stops: stats.scan_raw_limit_stops,
-            holt_cache_hits: stats.holt_cache_hits,
-            holt_cache_misses: stats.holt_cache_misses,
-            holt_full_blob_reads: stats.holt_full_blob_reads,
-            holt_full_blob_read_bytes: stats.holt_full_blob_read_bytes,
-            holt_point_full_blob_reads: stats.holt_point_full_blob_reads,
-            holt_scan_full_blob_reads: stats.holt_scan_full_blob_reads,
-            holt_silent_full_blob_reads: stats.holt_silent_full_blob_reads,
-            holt_read_page_hits: stats.holt_read_page_hits,
-            holt_read_page_misses: stats.holt_read_page_misses,
-            holt_read_index_cache_hits: stats.holt_read_index_cache_hits,
-            holt_read_index_cache_misses: stats.holt_read_index_cache_misses,
-            holt_read_index_loads: stats.holt_read_index_loads,
-            holt_read_index_dir_read_bytes: stats.holt_read_index_dir_read_bytes,
-            holt_read_index_bucket_reads: stats.holt_read_index_bucket_reads,
-            holt_read_index_bucket_read_bytes: stats.holt_read_index_bucket_read_bytes,
-            holt_read_index_inline_hits: stats.holt_read_index_inline_hits,
-            holt_read_index_value_hits: stats.holt_read_index_value_hits,
-            holt_read_index_value_read_bytes: stats.holt_read_index_value_read_bytes,
-            holt_read_index_offset_hits: stats.holt_read_index_offset_hits,
-            holt_read_index_negative_hits: stats.holt_read_index_negative_hits,
-            holt_read_index_crossing_hits: stats.holt_read_index_crossing_hits,
-            holt_read_index_unknowns: stats.holt_read_index_unknowns,
-            holt_optimistic_restarts: stats.holt_optimistic_restarts,
-            holt_range_restarts: stats.holt_range_restarts,
+            point_reads_system: metadata.point_reads_system,
+            point_reads_root_fence: metadata.point_reads_root_fence,
+            point_reads_workspace_current: metadata.point_reads_workspace_current,
+            point_reads_path_current: metadata.point_reads_path_current,
+            point_reads_other: metadata.point_reads_other,
+            point_hits: metadata.point_hits,
+            point_misses: metadata.point_misses,
+            point_value_bytes: metadata.point_value_bytes,
+            scan_calls: metadata.scan_calls,
+            scan_cursors: holt.scan_cursors,
+            holt_scan_visited_units: holt.scan_visited_units,
+            holt_scan_returned_keys: holt.scan_returned_keys,
+            holt_scan_common_prefixes: holt.scan_common_prefixes,
+            holt_scan_restarts: holt.scan_restarts,
+            scan_key_bytes: metadata.scan_key_bytes,
+            scan_value_bytes: metadata.scan_value_bytes,
+            scan_raw_limit_stops: metadata.scan_raw_limit_stops,
+            holt_cache_hits: holt.cache_hits,
+            holt_cache_misses: holt.cache_misses,
+            holt_full_blob_reads: holt.full_blob_reads,
+            holt_full_blob_read_bytes: holt.full_blob_read_bytes,
+            holt_point_full_blob_reads: holt.point_full_blob_reads,
+            holt_scan_full_blob_reads: holt.scan_full_blob_reads,
+            holt_silent_full_blob_reads: holt.silent_full_blob_reads,
+            holt_read_page_hits: holt.read_page_hits,
+            holt_read_page_misses: holt.read_page_misses,
+            holt_read_index_cache_hits: holt.read_index_cache_hits,
+            holt_read_index_cache_misses: holt.read_index_cache_misses,
+            holt_read_index_loads: holt.read_index_loads,
+            holt_read_index_dir_read_bytes: holt.read_index_dir_read_bytes,
+            holt_read_index_bucket_reads: holt.read_index_bucket_reads,
+            holt_read_index_bucket_read_bytes: holt.read_index_bucket_read_bytes,
+            holt_read_index_inline_hits: holt.read_index_inline_hits,
+            holt_read_index_value_hits: holt.read_index_value_hits,
+            holt_read_index_value_read_bytes: holt.read_index_value_read_bytes,
+            holt_read_index_offset_hits: holt.read_index_offset_hits,
+            holt_read_index_negative_hits: holt.read_index_negative_hits,
+            holt_read_index_crossing_hits: holt.read_index_crossing_hits,
+            holt_read_index_unknowns: holt.read_index_unknowns,
+            holt_optimistic_restarts: holt.optimistic_restarts,
+            holt_range_restarts: holt.range_restarts,
             holt_exposed_read_bytes,
         }
     }
@@ -258,13 +265,20 @@ pub(super) fn measure_metadata_workload(
         iterations,
         operation,
         || {
-            harness
-                .executor
-                .store()
+            let store = harness.executor.store();
+            let metadata = store
                 .begin_read_stats_session()
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            let holt = store
+                .begin_holt_read_stats_session()
+                .map_err(|error| error.to_string())?;
+            Ok((metadata, holt))
         },
-        |session| session.finish().map_err(|error| error.to_string()),
+        |(metadata, holt)| {
+            let metadata = metadata.finish().map_err(|error| error.to_string())?;
+            let holt = holt.finish().map_err(|error| error.to_string())?;
+            Ok(ReadStatsSample { metadata, holt })
+        },
     )?;
     let delta = measured.diagnostics;
     let operations = measured.report.successful;
