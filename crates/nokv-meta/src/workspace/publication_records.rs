@@ -55,6 +55,17 @@ pub struct WorkspaceIncarnationClaimRecord {
     pub workbench_id: WorkbenchId,
 }
 
+/// In-flight exclusive publish ownership of one artifact revision identity.
+///
+/// Created atomically by `begin_publish` and deleted in the same command that
+/// publishes the revision or finishes the owning operation's cleanup, so two
+/// operations can never simultaneously own the revision's permanent object
+/// keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactRevisionClaimRecord {
+    pub operation_id: OperationId,
+}
+
 /// Current authoritative value for one normalized path.
 ///
 /// Immutable revision fields needed by `PathMetadata` are copied here in the
@@ -280,6 +291,23 @@ impl WorkspaceIncarnationClaimRecord {
         })?;
         decoder.finish()?;
         Ok(Self { workbench_id })
+    }
+}
+
+impl ArtifactRevisionClaimRecord {
+    pub fn encode(&self) -> Result<Vec<u8>, PublicationRecordCodecError> {
+        let mut encoded = Vec::with_capacity(1 + FIXED_ID_BYTES);
+        encoded.push(PUBLICATION_VALUE_FORMAT_VERSION);
+        encoded.extend_from_slice(self.operation_id.as_bytes());
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, PublicationRecordCodecError> {
+        let mut decoder = Decoder::new(encoded);
+        decoder.require_value_version()?;
+        let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
+        decoder.finish()?;
+        Ok(Self { operation_id })
     }
 }
 
@@ -980,6 +1008,26 @@ mod tests {
             WorkspaceIncarnationClaimRecord::decode(&invalid),
             Err(PublicationRecordCodecError::InvalidWorkbenchId { .. })
         ));
+    }
+
+    #[test]
+    fn artifact_revision_claim_has_frozen_golden_bytes() {
+        let record = ArtifactRevisionClaimRecord {
+            operation_id: OperationId::from_bytes([0x44; FIXED_ID_BYTES]),
+        };
+        let expected = [
+            &[PUBLICATION_VALUE_FORMAT_VERSION][..],
+            &[0x44; FIXED_ID_BYTES],
+        ]
+        .concat();
+
+        assert_eq!(record.encode().unwrap(), expected);
+        assert_eq!(
+            ArtifactRevisionClaimRecord::decode(&expected).unwrap(),
+            record
+        );
+        assert_every_proper_prefix_is_truncated(&expected, ArtifactRevisionClaimRecord::decode);
+        assert_trailing_byte_is_rejected(expected, ArtifactRevisionClaimRecord::decode);
     }
 
     #[test]

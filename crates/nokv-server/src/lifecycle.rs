@@ -19,9 +19,10 @@ use nokv_meta::workspace as meta;
 use nokv_object::{ArtifactObjectStore, ObjectDeleteOutcome, ObjectKey};
 use nokv_protocol::RootRoute;
 use nokv_types::{
-    CommitRetirePhase, CommitState, GcClaimState, GcPhase, OperationId, OperationKind, OwnerEpoch,
-    PlacementGeneration, PublishPhase, RequestId, RestorePhase, RootActivationState, RootId,
-    SnapshotState, StagedCleanupState, StagedProviderState, WorkspaceState, SHA256_BYTES,
+    ArtifactRevisionId, CommitRetirePhase, CommitState, GcClaimState, GcPhase, OperationId,
+    OperationKind, OwnerEpoch, PlacementGeneration, PublishPhase, RequestId, RestorePhase,
+    RootActivationState, RootId, SnapshotState, StagedCleanupState, StagedProviderState,
+    WorkspaceState, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -498,6 +499,34 @@ impl LifecycleRunner {
         report: &mut LifecycleCycleReport,
     ) -> Result<(), LifecycleError> {
         let service = meta::PublicationService::new(&self.store);
+        // A cleaning operation's staged object keys and manifest rows are
+        // revision-scoped, so once that revision is published (or claimed by
+        // another in-flight operation) they belong to that operation. The
+        // begin-time revision claim prevents two live owners, but a claimless
+        // pre-claim operation can still share its revision with a claimed one
+        // during a rolling upgrade: quarantine when the revision is already
+        // published, defer while another operation holds the claim so its
+        // outcome decides. The checks and the provider deletes below are not
+        // one atomic unit, so a claimless-vs-claimless upgrade-window race
+        // remains between one check and one delete batch; the claim makes
+        // that window impossible once both sides took one.
+        let destructive = operation.cleanup_staged_object_cursor < operation.staged_object_cursor
+            || operation.cleanup_manifest_cursor < operation.manifest_cursor;
+        if destructive {
+            if self.revision_published(operation.artifact_revision_id)? {
+                return self.quarantine_publication(
+                    operation,
+                    b"aborted publish cleanup found its artifact revision published".to_vec(),
+                    report,
+                );
+            }
+            if let Some(claim_owner) = self.revision_claim_owner(operation.artifact_revision_id)? {
+                if claim_owner != operation.operation_id {
+                    report.deferred_operations += 1;
+                    return Ok(());
+                }
+            }
+        }
         if operation.cleanup_staged_object_cursor < operation.staged_object_cursor {
             let remaining = operation
                 .staged_object_cursor
@@ -624,6 +653,45 @@ impl LifecycleRunner {
             Err(error) => return Err(state("quarantine publish cleanup", error)),
         }
         Ok(())
+    }
+
+    fn revision_published(&self, revision: ArtifactRevisionId) -> Result<bool, LifecycleError> {
+        let context = self.read_context()?;
+        let key = meta::artifact_revision_key(self.root_id(), revision);
+        Ok(self
+            .store
+            .read_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                meta::MetadataFamily::ArtifactRevision,
+                &key,
+                context.read_version,
+            )?
+            .is_some())
+    }
+
+    fn revision_claim_owner(
+        &self,
+        revision: ArtifactRevisionId,
+    ) -> Result<Option<OperationId>, LifecycleError> {
+        let context = self.read_context()?;
+        let key = meta::artifact_revision_claim_key(self.root_id(), revision);
+        self.store
+            .read_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                meta::MetadataFamily::ArtifactRevision,
+                &key,
+                context.read_version,
+            )?
+            .map(|payload| {
+                meta::ArtifactRevisionClaimRecord::decode(&payload)
+                    .map(|claim| claim.operation_id)
+                    .map_err(|error| corrupt("artifact revision claim", error.to_string()))
+            })
+            .transpose()
     }
 
     fn read_staged_object(
@@ -2355,6 +2423,655 @@ mod tests {
         assert_eq!(
             operation.terminal_error.unwrap().kind,
             meta::PublishTerminalErrorKind::OwnerEpochSuperseded
+        );
+    }
+
+    #[test]
+    fn aborted_publish_cleanup_must_not_delete_winner_published_objects() {
+        // TDD oracle for external risk report P1-A: operation A and operation
+        // B (different operation ids) both begin publishing the SAME
+        // artifact revision. Permanent object keys derive only from
+        // (logical_shard, root, revision, object_index), so both operations'
+        // staged rows name identical provider keys. A publishes successfully;
+        // B aborts; the lifecycle cleanup cycle for B then runs. The oracle is
+        // that A's already-published block object must still exist and be
+        // readable afterwards.
+        use nokv_object::MemoryArtifactStore;
+
+        fn publication_context(
+            store: &meta::AgentMetadataStore,
+            counter: &mut u8,
+        ) -> meta::PublicationContext {
+            let request = *counter;
+            *counter += 1;
+            meta::PublicationContext {
+                root_id: root(),
+                logical_shard_id: shard(),
+                placement_generation: placement(),
+                owner_epoch: owner(),
+                request_id: RequestId::from_bytes([request; FIXED_ID_BYTES]),
+                read_version: store.current_read_version().unwrap(),
+            }
+        }
+
+        let store = Arc::new(meta::AgentMetadataStore::open_memory(shard()).unwrap());
+        store.advance_owner_epoch(None, owner()).unwrap();
+        store
+            .execute(&command(
+                &store,
+                1,
+                meta::RootFenceAction::Install,
+                Vec::new(),
+            ))
+            .unwrap();
+        store
+            .execute(&command(
+                &store,
+                2,
+                meta::RootFenceAction::Transition {
+                    expected: RootActivationState::Installing,
+                    next: RootActivationState::Active,
+                },
+                Vec::new(),
+            ))
+            .unwrap();
+        let workbench = WorkbenchId::new("cow-publish-oracle").unwrap();
+        let incarnation = WorkspaceIncarnationId::from_bytes([0x51; FIXED_ID_BYTES]);
+        meta::create_visible_workspace(
+            &store,
+            meta::RootWriteContext::current(
+                &store,
+                root(),
+                shard(),
+                placement(),
+                owner(),
+                RequestId::from_bytes([3; FIXED_ID_BYTES]),
+            )
+            .unwrap(),
+            &workbench,
+            incarnation,
+        )
+        .unwrap();
+
+        let shared_revision = ArtifactRevisionId::from_bytes([0x77; FIXED_ID_BYTES]);
+        let shared_object_key = meta::object_block_key(shard(), root(), shared_revision, 0);
+        let block_bytes = b"winner!!".to_vec();
+        let staged_planned = vec![meta::StagedObjectRecord {
+            artifact_revision_id: shared_revision,
+            object_sequence: 0,
+            object_key: shared_object_key.clone(),
+            multipart_upload_id: None,
+            expected_length: block_bytes.len() as u64,
+            expected_digest_uri: sha256_uri([0x61; SHA256_BYTES]),
+            provider_state: StagedProviderState::Planned,
+            cleanup_state: StagedCleanupState::Owned,
+        }];
+        let manifest = vec![meta::ManifestRowInput {
+            object_index: 0,
+            row: meta::ArtifactManifestRow {
+                physical_owner_revision_id: shared_revision,
+                physical_object_index: 0,
+                object_key: shared_object_key.clone(),
+                logical_offset: 0,
+                offset: 0,
+                length: block_bytes.len() as u64,
+                digest_uri: sha256_uri([0x61; SHA256_BYTES]),
+                append_segment: None,
+            },
+        }];
+        let template = |operation_id_byte: u8| {
+            let mut operation = meta::PublishOperationRecord {
+                operation_id: OperationId::from_bytes([operation_id_byte; FIXED_ID_BYTES]),
+                identity_digest: [0; SHA256_BYTES],
+                initialization_digest: [0; SHA256_BYTES],
+                initiating_owner_epoch: owner(),
+                activity_deadline_ms: 1_000_000,
+                authority: meta::PublishAuthority::Visible,
+                workbench_id: workbench.clone(),
+                workspace_incarnation_id: incarnation,
+                path: NormalizedRelativePath::new("outputs/shared-revision.bin").unwrap(),
+                artifact_revision_id: shared_revision,
+                claim: meta::PublishClaim::CreateOnly,
+                phase: PublishPhase::Uploading,
+                staged_object_count: u32::try_from(staged_planned.len()).unwrap(),
+                staged_object_seal: meta::staged_object_ledger_digest(&staged_planned).unwrap(),
+                staged_object_cursor: 0,
+                staged_object_rolling_digest: [0; SHA256_BYTES],
+                uploaded_object_cursor: 0,
+                uploaded_object_rolling_digest: [0; SHA256_BYTES],
+                manifest_row_count: u32::try_from(manifest.len()).unwrap(),
+                manifest_seal: meta::manifest_rows_digest(&manifest).unwrap(),
+                manifest_cursor: 0,
+                manifest_rolling_digest: [0; SHA256_BYTES],
+                manifest_last_position: None,
+                dependency_count: 0,
+                dependency_depth: 0,
+                dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
+                cleanup_staged_object_cursor: 0,
+                cleanup_manifest_cursor: 0,
+                publication_absence_proof: None,
+                result: None,
+                terminal_error: None,
+            };
+            meta::seal_publish_operation(&mut operation);
+            operation
+        };
+
+        let service = meta::PublicationService::new(&store);
+        let mut request_counter = 10_u8;
+
+        // Operation A begins publishing revision R.
+        let operation_a = service
+            .begin_publish(meta::BeginPublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                operation: template(0xA1),
+            })
+            .expect("operation A begins for revision R")
+            .operation;
+
+        // Operation B targets the SAME revision with a different operation
+        // id. The begin-time revision claim must reject it: both operations'
+        // staged rows would otherwise derive identical permanent object keys,
+        // and B's abort cleanup would delete A's published objects.
+        assert_eq!(
+            service.begin_publish(meta::BeginPublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                operation: template(0xB1),
+            }),
+            Err(meta::PublicationError::RevisionClaimHeld {
+                revision: shared_revision,
+                operation_id: operation_a.operation_id,
+            })
+        );
+
+        // A stages the same rows, uploads the real block bytes, confirms the
+        // upload, seals the manifest, and publishes.
+        let operation_a = service
+            .stage_objects_batch(meta::StageObjectsBatchRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                staged_objects: staged_planned.clone(),
+            })
+            .expect("operation A stages its rows")
+            .operation;
+        let objects = Arc::new(MemoryArtifactStore::new());
+        let created = objects
+            .create_immutable(
+                &ObjectKey::new(shared_object_key.clone()).unwrap(),
+                &block_bytes,
+            )
+            .unwrap();
+        assert_eq!(created, ImmutableCreateOutcome::Created);
+        let uploaded_updates = staged_planned
+            .iter()
+            .cloned()
+            .map(|expected| {
+                let mut next = expected.clone();
+                next.provider_state = StagedProviderState::Uploaded;
+                meta::StagedObjectUpdate { expected, next }
+            })
+            .collect();
+        let operation_a = service
+            .mark_objects_uploaded_batch(meta::MarkObjectsUploadedBatchRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                staged_object_updates: uploaded_updates,
+            })
+            .expect("operation A confirms uploads")
+            .operation;
+        let operation_a = service
+            .stage_manifest_batch(meta::StageManifestBatchRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                manifest_rows: manifest.clone(),
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .expect("operation A stages its manifest")
+            .operation;
+        let operation_a = service
+            .transition_publish(meta::TransitionPublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                transition: meta::PublishTransition::BeginFinalization,
+            })
+            .expect("operation A begins finalization")
+            .operation;
+        let manifest_digest_uri = sha256_uri(operation_a.manifest_seal);
+        let finalized = service
+            .finalize_publish(meta::FinalizePublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                artifact: meta::PublishedArtifact {
+                    logical_size: block_bytes.len() as u64,
+                    body_digest_uri: sha256_uri([0x62; SHA256_BYTES]),
+                    manifest_digest_uri,
+                    content_type: "application/octet-stream".to_owned(),
+                    producer: Some("cow-oracle-test".to_owned()),
+                    manifest_id: Some("cow-oracle-manifest".to_owned()),
+                    typed_index_projection: meta::TypedProjection::empty().encode().unwrap(),
+                },
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .expect("operation A publishes revision R");
+        assert_eq!(finalized.operation.phase, PublishPhase::Published);
+        let read = meta::RootReadContext::current(&store, root(), placement(), owner()).unwrap();
+        let revision_payload = store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                meta::MetadataFamily::ArtifactRevision,
+                &meta::artifact_revision_key(root(), shared_revision),
+                read.read_version,
+            )
+            .unwrap()
+            .expect("published artifact revision record exists");
+        let revision_record = meta::ArtifactRevisionRecord::decode(&revision_payload).unwrap();
+        assert_eq!(revision_record.state, RevisionState::Available);
+        assert_eq!(
+            objects
+                .read(&ObjectKey::new(shared_object_key.clone()).unwrap(), None)
+                .expect("winner block is readable after publish"),
+            block_bytes
+        );
+
+        // Publication released the claim, so only the exact revision row
+        // remains under the revision identity.
+        assert_eq!(
+            store
+                .read_at(
+                    root(),
+                    placement(),
+                    owner(),
+                    meta::MetadataFamily::ArtifactRevision,
+                    &meta::artifact_revision_claim_key(root(), shared_revision),
+                    read.read_version,
+                )
+                .unwrap(),
+            None
+        );
+
+        // Lifecycle cycles find nothing to clean for the published revision.
+        let registry = Arc::new(RootOwnerRegistry::new());
+        registry.install(route(), Arc::new(UnusedExecutor)).unwrap();
+        let runner = LifecycleRunner::new(
+            Arc::clone(&store),
+            registry,
+            route(),
+            OwnerLossSignal::default(),
+            Arc::new(ArtifactLifecycleDeleter::new(Arc::clone(&objects))),
+            LifecycleRunnerOptions {
+                scan_page_size: 8,
+                mutation_batch_size: 8,
+                ..LifecycleRunnerOptions::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..5 {
+            runner.run_once(100).unwrap();
+        }
+
+        // ORACLE: operation A's published block object must still exist and be
+        // readable from the object store.
+        let survivor = objects.read(&ObjectKey::new(shared_object_key.clone()).unwrap(), None);
+        assert!(
+            survivor.is_ok(),
+            "P1-A regressed: winner operation A's published object \
+             {shared_object_key} was deleted: {survivor:?}"
+        );
+        assert_eq!(survivor.unwrap(), block_bytes);
+    }
+
+    #[test]
+    fn legacy_claimless_abort_cleanup_quarantines_when_revision_published() {
+        // Depth guard for operations begun before revision claims existed:
+        // a cleaning operation whose revision is meanwhile Available must be
+        // quarantined loudly instead of deleting the publisher's objects.
+        use nokv_object::MemoryArtifactStore;
+
+        fn publication_context(
+            store: &meta::AgentMetadataStore,
+            counter: &mut u8,
+        ) -> meta::PublicationContext {
+            let request = *counter;
+            *counter += 1;
+            meta::PublicationContext {
+                root_id: root(),
+                logical_shard_id: shard(),
+                placement_generation: placement(),
+                owner_epoch: owner(),
+                request_id: RequestId::from_bytes([request; FIXED_ID_BYTES]),
+                read_version: store.current_read_version().unwrap(),
+            }
+        }
+
+        let store = Arc::new(meta::AgentMetadataStore::open_memory(shard()).unwrap());
+        store.advance_owner_epoch(None, owner()).unwrap();
+        store
+            .execute(&command(
+                &store,
+                1,
+                meta::RootFenceAction::Install,
+                Vec::new(),
+            ))
+            .unwrap();
+        store
+            .execute(&command(
+                &store,
+                2,
+                meta::RootFenceAction::Transition {
+                    expected: RootActivationState::Installing,
+                    next: RootActivationState::Active,
+                },
+                Vec::new(),
+            ))
+            .unwrap();
+        let workbench = WorkbenchId::new("legacy-claimless-loser").unwrap();
+        let incarnation = WorkspaceIncarnationId::from_bytes([0x52; FIXED_ID_BYTES]);
+        meta::create_visible_workspace(
+            &store,
+            meta::RootWriteContext::current(
+                &store,
+                root(),
+                shard(),
+                placement(),
+                owner(),
+                RequestId::from_bytes([3; FIXED_ID_BYTES]),
+            )
+            .unwrap(),
+            &workbench,
+            incarnation,
+        )
+        .unwrap();
+
+        let shared_revision = ArtifactRevisionId::from_bytes([0x78; FIXED_ID_BYTES]);
+        let shared_object_key = meta::object_block_key(shard(), root(), shared_revision, 0);
+        let block_bytes = b"winner!!".to_vec();
+        let staged_planned = vec![meta::StagedObjectRecord {
+            artifact_revision_id: shared_revision,
+            object_sequence: 0,
+            object_key: shared_object_key.clone(),
+            multipart_upload_id: None,
+            expected_length: block_bytes.len() as u64,
+            expected_digest_uri: sha256_uri([0x61; SHA256_BYTES]),
+            provider_state: StagedProviderState::Planned,
+            cleanup_state: StagedCleanupState::Owned,
+        }];
+        let manifest = vec![meta::ManifestRowInput {
+            object_index: 0,
+            row: meta::ArtifactManifestRow {
+                physical_owner_revision_id: shared_revision,
+                physical_object_index: 0,
+                object_key: shared_object_key.clone(),
+                logical_offset: 0,
+                offset: 0,
+                length: block_bytes.len() as u64,
+                digest_uri: sha256_uri([0x61; SHA256_BYTES]),
+                append_segment: None,
+            },
+        }];
+        let template = |operation_id_byte: u8| {
+            let mut operation = meta::PublishOperationRecord {
+                operation_id: OperationId::from_bytes([operation_id_byte; FIXED_ID_BYTES]),
+                identity_digest: [0; SHA256_BYTES],
+                initialization_digest: [0; SHA256_BYTES],
+                initiating_owner_epoch: owner(),
+                activity_deadline_ms: 1_000_000,
+                authority: meta::PublishAuthority::Visible,
+                workbench_id: workbench.clone(),
+                workspace_incarnation_id: incarnation,
+                path: NormalizedRelativePath::new("outputs/legacy-claimless.bin").unwrap(),
+                artifact_revision_id: shared_revision,
+                claim: meta::PublishClaim::CreateOnly,
+                phase: PublishPhase::Uploading,
+                staged_object_count: u32::try_from(staged_planned.len()).unwrap(),
+                staged_object_seal: meta::staged_object_ledger_digest(&staged_planned).unwrap(),
+                staged_object_cursor: 0,
+                staged_object_rolling_digest: [0; SHA256_BYTES],
+                uploaded_object_cursor: 0,
+                uploaded_object_rolling_digest: [0; SHA256_BYTES],
+                manifest_row_count: u32::try_from(manifest.len()).unwrap(),
+                manifest_seal: meta::manifest_rows_digest(&manifest).unwrap(),
+                manifest_cursor: 0,
+                manifest_rolling_digest: [0; SHA256_BYTES],
+                manifest_last_position: None,
+                dependency_count: 0,
+                dependency_depth: 0,
+                dependency_digest: meta::dependency_owner_digest(&[]).unwrap(),
+                cleanup_staged_object_cursor: 0,
+                cleanup_manifest_cursor: 0,
+                publication_absence_proof: None,
+                result: None,
+                terminal_error: None,
+            };
+            meta::seal_publish_operation(&mut operation);
+            operation
+        };
+
+        let service = meta::PublicationService::new(&store);
+        let mut request_counter = 10_u8;
+
+        // Loser B begins (taking a claim), durably stages Planned/Owned rows
+        // naming the shared permanent key, and aborts.
+        let operation_b = service
+            .begin_publish(meta::BeginPublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                operation: template(0xB2),
+            })
+            .expect("operation B begins")
+            .operation;
+        let operation_b = service
+            .stage_objects_batch(meta::StageObjectsBatchRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_b,
+                staged_objects: staged_planned.clone(),
+            })
+            .expect("operation B stages its rows")
+            .operation;
+        let operation_b = service
+            .transition_publish(meta::TransitionPublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_b,
+                transition: meta::PublishTransition::BeginAbort {
+                    terminal_error: meta::PublishTerminalError {
+                        kind: meta::PublishTerminalErrorKind::AbortedByCaller,
+                        message: "legacy duplicate publish cancelled".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            })
+            .expect("operation B aborts")
+            .operation;
+        assert_eq!(operation_b.phase, PublishPhase::Aborting);
+
+        // Simulate a pre-claim legacy operation by deleting B's claim row the
+        // way no current command can.
+        let claim_key = meta::artifact_revision_claim_key(root(), shared_revision);
+        let read = meta::RootReadContext::current(&store, root(), placement(), owner()).unwrap();
+        let claim_payload = store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                meta::MetadataFamily::ArtifactRevision,
+                &claim_key,
+                read.read_version,
+            )
+            .unwrap()
+            .expect("operation B's claim exists");
+        store
+            .execute(
+                &meta::MetadataCommand {
+                    schema_id: meta::SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    placement_generation: placement(),
+                    owner_epoch: owner(),
+                    request_id: RequestId::from_bytes([0xEE; FIXED_ID_BYTES]),
+                    command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                    read_version: store.current_read_version().unwrap(),
+                    root_fence_action: meta::RootFenceAction::RequireActive,
+                    predicates: vec![meta::CommandPredicate::Value {
+                        family: meta::MetadataFamily::ArtifactRevision,
+                        key: claim_key.clone(),
+                        expected: Some(claim_payload),
+                    }],
+                    mutations: vec![meta::CommandMutation::Delete {
+                        family: meta::MetadataFamily::ArtifactRevision,
+                        key: claim_key.clone(),
+                    }],
+                    history_projection: vec![meta::HistoryProjection {
+                        family: meta::MetadataFamily::ArtifactRevision,
+                        key: claim_key,
+                    }],
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .expect("legacy simulation removes operation B's claim");
+
+        // Winner A begins the now-unclaimed revision, uploads the real bytes,
+        // and publishes.
+        let operation_a = service
+            .begin_publish(meta::BeginPublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                operation: template(0xA2),
+            })
+            .expect("operation A begins after the legacy claim removal")
+            .operation;
+        let operation_a = service
+            .stage_objects_batch(meta::StageObjectsBatchRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                staged_objects: staged_planned.clone(),
+            })
+            .expect("operation A stages its rows")
+            .operation;
+        let objects = Arc::new(MemoryArtifactStore::new());
+        objects
+            .create_immutable(
+                &ObjectKey::new(shared_object_key.clone()).unwrap(),
+                &block_bytes,
+            )
+            .unwrap();
+        let uploaded_updates = staged_planned
+            .iter()
+            .cloned()
+            .map(|expected| {
+                let mut next = expected.clone();
+                next.provider_state = StagedProviderState::Uploaded;
+                meta::StagedObjectUpdate { expected, next }
+            })
+            .collect();
+        let operation_a = service
+            .mark_objects_uploaded_batch(meta::MarkObjectsUploadedBatchRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                staged_object_updates: uploaded_updates,
+            })
+            .expect("operation A confirms uploads")
+            .operation;
+        let operation_a = service
+            .stage_manifest_batch(meta::StageManifestBatchRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                manifest_rows: manifest.clone(),
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .expect("operation A stages its manifest")
+            .operation;
+        let operation_a = service
+            .transition_publish(meta::TransitionPublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                transition: meta::PublishTransition::BeginFinalization,
+            })
+            .expect("operation A begins finalization")
+            .operation;
+
+        let read_operation_b = |store: &Arc<meta::AgentMetadataStore>| {
+            let read = meta::RootReadContext::current(store, root(), placement(), owner()).unwrap();
+            let payload = store
+                .read_at(
+                    root(),
+                    placement(),
+                    owner(),
+                    meta::MetadataFamily::Operation,
+                    &meta::operation_key(root(), OperationKind::Publish, operation_b.operation_id),
+                    read.read_version,
+                )
+                .unwrap()
+                .expect("operation B record exists");
+            meta::PublishOperationRecord::decode(&payload).unwrap()
+        };
+
+        let registry = Arc::new(RootOwnerRegistry::new());
+        registry.install(route(), Arc::new(UnusedExecutor)).unwrap();
+        let runner = LifecycleRunner::new(
+            Arc::clone(&store),
+            registry,
+            route(),
+            OwnerLossSignal::default(),
+            Arc::new(ArtifactLifecycleDeleter::new(Arc::clone(&objects))),
+            LifecycleRunnerOptions {
+                scan_page_size: 8,
+                mutation_batch_size: 8,
+                ..LifecycleRunnerOptions::default()
+            },
+        )
+        .unwrap();
+
+        // While winner A is mid-flight (claim held, revision not yet
+        // published), claimless B's destructive cleanup must defer: A's
+        // uploaded object shares B's staged key.
+        for _ in 0..2 {
+            runner.run_once(100).unwrap();
+        }
+        let deferred = read_operation_b(&store);
+        assert_eq!(
+            deferred.phase,
+            PublishPhase::Cleaning,
+            "claimless cleanup must defer while another operation claims the revision"
+        );
+        assert_eq!(deferred.cleanup_staged_object_cursor, 0);
+        assert_eq!(objects.stats().unwrap().deletes, 0);
+
+        let manifest_digest_uri = sha256_uri(operation_a.manifest_seal);
+        let finalized = service
+            .finalize_publish(meta::FinalizePublishRequest {
+                context: publication_context(&store, &mut request_counter),
+                expected_operation: operation_a,
+                artifact: meta::PublishedArtifact {
+                    logical_size: block_bytes.len() as u64,
+                    body_digest_uri: sha256_uri([0x62; SHA256_BYTES]),
+                    manifest_digest_uri,
+                    content_type: "application/octet-stream".to_owned(),
+                    producer: None,
+                    manifest_id: None,
+                    typed_index_projection: meta::TypedProjection::empty().encode().unwrap(),
+                },
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .expect("operation A publishes the revision");
+        assert_eq!(finalized.operation.phase, PublishPhase::Published);
+
+        // With the revision now published, the depth guard must quarantine
+        // claimless B before the first provider delete.
+        for _ in 0..5 {
+            runner.run_once(100).unwrap();
+        }
+        assert_eq!(
+            read_operation_b(&store).phase,
+            PublishPhase::Quarantined,
+            "claimless cleanup over a published revision must quarantine"
+        );
+        assert_eq!(objects.stats().unwrap().deletes, 0);
+        assert_eq!(
+            objects
+                .read(&ObjectKey::new(shared_object_key.clone()).unwrap(), None)
+                .expect("winner object survives the quarantined cleanup"),
+            block_bytes
         );
     }
 }
