@@ -3858,6 +3858,12 @@ fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
             true,
             None,
         ),
+        meta::MetaError::ReadStabilityExhausted { .. } => failure(
+            protocol::ErrorCode::Conflict,
+            error.to_string(),
+            true,
+            Some(protocol::ConflictKind::ReadVersion),
+        ),
         meta::MetaError::InvalidCommand { .. } | meta::MetaError::CommandDigestMismatch => {
             invalid_argument(error.to_string())
         }
@@ -5155,6 +5161,14 @@ mod tests {
             failure.conflict,
             Some(protocol::ConflictKind::RootPlacement)
         );
+    }
+
+    #[test]
+    fn unstable_metadata_read_maps_to_a_retryable_read_version_conflict() {
+        let failure = meta_failure(meta::MetaError::ReadStabilityExhausted { attempts: 4 });
+        assert_eq!(failure.code, protocol::ErrorCode::Conflict);
+        assert!(failure.retryable);
+        assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
     }
 
     #[test]

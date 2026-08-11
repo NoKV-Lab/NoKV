@@ -209,8 +209,9 @@ Separate read calls do not share a physical snapshot. Each historical page
 must read the domain commit clock in the same batch as its rows.
 
 If the clock differs from the first page, `MetaShard` discards every collected
-page and restarts the reconstruction. The applicable snapshot or history hold
-must also prevent GC from removing the requested version during that work.
+page and retries after 1, 2, and 4 milliseconds. The fourth failed attempt
+returns a retryable read-version conflict. The applicable snapshot or history
+hold must prevent GC from removing the requested version during that work.
 
 NoKV `ReadVersion` remains a domain version. A store must not expose Holt
 record versions, FoundationDB versions, or consensus log indexes as a NoKV

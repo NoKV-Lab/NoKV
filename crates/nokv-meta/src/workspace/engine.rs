@@ -6,6 +6,8 @@ use std::rc::Rc;
 #[cfg(feature = "metadata-read-stats")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
 
 use nokv_meta_store::{
     Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, ReadResult, ReadSnapshot,
@@ -47,6 +49,12 @@ const INITIAL_COMMIT_VERSION: u64 = 1;
 const MAX_COMMAND_ITEMS: usize = 256;
 const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
 const MAX_HISTORICAL_SCAN_PAGE_ROWS: usize = MAX_COMMAND_ITEMS;
+const MAX_HISTORICAL_SCAN_ATTEMPTS: usize = 4;
+const HISTORICAL_SCAN_RETRY_DELAYS: [Duration; MAX_HISTORICAL_SCAN_ATTEMPTS - 1] = [
+    Duration::from_millis(1),
+    Duration::from_millis(2),
+    Duration::from_millis(4),
+];
 const MAX_COMMAND_KEY_BYTES: usize = 8 * 1024;
 const HISTORY_KEY_OVERHEAD_BYTES: usize =
     1 + std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
@@ -335,6 +343,9 @@ pub enum MetaError {
         requested: u64,
         current: u64,
     },
+    ReadStabilityExhausted {
+        attempts: usize,
+    },
     WriteReadVersionMismatch {
         requested: u64,
         current: u64,
@@ -396,6 +407,10 @@ impl std::fmt::Display for MetaError {
             Self::ReadVersionInFuture { requested, current } => write!(
                 formatter,
                 "read version {requested} is newer than current version {current}"
+            ),
+            Self::ReadStabilityExhausted { attempts } => write!(
+                formatter,
+                "metadata read could not capture a stable shard commit clock after {attempts} attempts"
             ),
             Self::WriteReadVersionMismatch { requested, current } => write!(
                 formatter,
@@ -1525,6 +1540,7 @@ impl MetaShard {
         mut expected_clock: ReadVersion,
         read_context: ReadFenceContext,
     ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, MetaError> {
+        let mut attempt = 1;
         loop {
             let Some(current_rows) = self.collect_scan_at_clock(
                 family.keyspace(),
@@ -1536,15 +1552,20 @@ impl MetaShard {
                 "scan current metadata",
             )?
             else {
-                expected_clock = self.validate_read_fence(
+                expected_clock = self.prepare_historical_scan_retry(
                     root_id,
                     placement_generation,
                     owner_epoch,
                     prefix,
                     version,
+                    attempt,
                 )?;
+                attempt += 1;
                 continue;
             };
+            // History keys encode the complete user-key length before the
+            // root-scoped key. The current durable format therefore cannot
+            // seek one variable-length root prefix without a schema migration.
             let history_prefix = [family.format_tag()];
             let Some(history_rows) = self.collect_scan_at_clock(
                 HISTORY.id,
@@ -1556,13 +1577,15 @@ impl MetaShard {
                 "scan metadata history",
             )?
             else {
-                expected_clock = self.validate_read_fence(
+                expected_clock = self.prepare_historical_scan_retry(
                     root_id,
                     placement_generation,
                     owner_epoch,
                     prefix,
                     version,
+                    attempt,
                 )?;
+                attempt += 1;
                 continue;
             };
 
@@ -1603,6 +1626,26 @@ impl MetaShard {
             }
             return Ok(visible);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_historical_scan_retry(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        prefix: &[u8],
+        version: ReadVersion,
+        attempt: usize,
+    ) -> Result<ReadVersion, MetaError> {
+        if attempt == MAX_HISTORICAL_SCAN_ATTEMPTS {
+            self.validate_read_fence(root_id, placement_generation, owner_epoch, prefix, version)?;
+            return Err(MetaError::ReadStabilityExhausted {
+                attempts: MAX_HISTORICAL_SCAN_ATTEMPTS,
+            });
+        }
+        thread::sleep(HISTORICAL_SCAN_RETRY_DELAYS[attempt - 1]);
+        self.validate_read_fence(root_id, placement_generation, owner_epoch, prefix, version)
     }
 
     /// Read one immutable change event through the ordinary ownership fences.
@@ -3422,6 +3465,60 @@ mod tests {
         }
     }
 
+    struct HistoricalScanClockChurnStore {
+        inner: Arc<dyn TxnStore>,
+        controller: MetaShard,
+        remaining_advances: AtomicUsize,
+        history_scan_reads: AtomicUsize,
+    }
+
+    impl TxnStore for HistoricalScanClockChurnStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            let scans_history = batch
+                .ops
+                .iter()
+                .any(|op| matches!(op, ReadOp::Scan(scan) if scan.keyspace == HISTORY.id));
+            if scans_history {
+                let scan_index = self.history_scan_reads.fetch_add(1, Ordering::AcqRel);
+                if self
+                    .remaining_advances
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    let request_fill = u8::try_from(200 + scan_index)
+                        .expect("bounded historical scan attempts fit one request byte");
+                    let key = scoped_key(
+                        root(2),
+                        format!("historical-clock-churn/{scan_index}").as_bytes(),
+                    );
+                    self.controller
+                        .execute(&create_command(
+                            &self.controller,
+                            request(request_fill),
+                            key,
+                            b"advance-clock",
+                        ))
+                        .expect("injected clock advancement must succeed");
+                }
+            }
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
     struct ProfileOnlyStore {
         limits: StoreLimits,
     }
@@ -4252,7 +4349,7 @@ mod tests {
             advance_clock_on_second_scan: AtomicBool::new(true),
             controller: Some(controller),
         });
-        store.store = wrapper;
+        store.store = wrapper.clone();
 
         let actual = store
             .scan_prefix_at(
@@ -4269,6 +4366,7 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(!actual.iter().any(|item| item.key.ends_with(b"late")));
+        assert_eq!(wrapper.operation_scan_reads.load(Ordering::Acquire), 5);
     }
 
     #[test]
@@ -4734,6 +4832,66 @@ mod tests {
             assert_eq!(metadata.point_reads_system, 8);
             assert_eq!(metadata.point_reads_root_fence, 4);
         }
+    }
+
+    #[test]
+    fn historical_scan_returns_retryable_error_after_bounded_clock_churn() {
+        let mut store = ready_store();
+        let key = scoped_key(root(2), b"historical-clock-target");
+        let created = store
+            .execute(&create_command(
+                &store,
+                request(180),
+                key.clone(),
+                b"earlier",
+            ))
+            .unwrap();
+        let mut replace = base_command(&store, request(181), RootFenceAction::RequireActive);
+        replace.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            expected: Some(b"earlier".to_vec()),
+        });
+        replace.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            value: b"current".to_vec(),
+        });
+        replace.history_projection.push(HistoryProjection {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+        });
+        store.execute(&replace.seal()).unwrap();
+
+        let inner = Arc::clone(&store.store);
+        let controller = MetaShard::open(Arc::clone(&inner), shard(1)).unwrap();
+        let wrapper = Arc::new(HistoricalScanClockChurnStore {
+            inner,
+            controller,
+            remaining_advances: AtomicUsize::new(MAX_HISTORICAL_SCAN_ATTEMPTS),
+            history_scan_reads: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+
+        assert_eq!(
+            store.scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &key,
+                ReadVersion::new(created.commit_version.get()).unwrap(),
+                None,
+                1,
+            ),
+            Err(MetaError::ReadStabilityExhausted {
+                attempts: MAX_HISTORICAL_SCAN_ATTEMPTS,
+            })
+        );
+        assert_eq!(
+            wrapper.history_scan_reads.load(Ordering::Acquire),
+            MAX_HISTORICAL_SCAN_ATTEMPTS
+        );
     }
 
     #[test]

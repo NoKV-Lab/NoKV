@@ -344,7 +344,11 @@ impl LifecycleRunner {
     /// failure requires operator attention.
     pub fn run_until_owner_loss(&self) -> Result<(), LifecycleError> {
         loop {
-            self.run_once(unix_time_ms()?)?;
+            match self.run_once(unix_time_ms()?) {
+                Ok(_) => {}
+                Err(error) if retryable_lifecycle(&error) => {}
+                Err(error) => return Err(error),
+            }
             self.wait_poll_interval_or_owner_loss()?;
         }
     }
@@ -1540,6 +1544,14 @@ fn concurrent_meta(error: &meta::MetaError) -> bool {
         meta::MetaError::WriteReadVersionMismatch { .. }
             | meta::MetaError::PredicateFailed
             | meta::MetaError::WriteConflict
+            | meta::MetaError::ReadStabilityExhausted { .. }
+    )
+}
+
+fn retryable_lifecycle(error: &LifecycleError) -> bool {
+    matches!(
+        error,
+        LifecycleError::Meta(meta::MetaError::ReadStabilityExhausted { .. })
     )
 }
 
@@ -1589,6 +1601,13 @@ mod tests {
         fn execute(&self, _request: &WorkspaceRpcRequest) -> Result<ExecutedRequest, RpcFailure> {
             panic!("lifecycle test never dispatches RPC")
         }
+    }
+
+    #[test]
+    fn unstable_metadata_reads_are_retryable_lifecycle_work() {
+        let error = meta::MetaError::ReadStabilityExhausted { attempts: 4 };
+        assert!(concurrent_meta(&error));
+        assert!(retryable_lifecycle(&LifecycleError::Meta(error)));
     }
 
     struct FakeArtifactStore {
