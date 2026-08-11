@@ -32,16 +32,18 @@ shared-library ABIs.
 
 ## Product Boundary
 
-This decision changes internal metadata storage and server assembly. It does
-not change:
+This decision changes internal metadata storage and shard bootstrap. It
+preserves these Agent and Workbench boundaries:
 
 - the 18-tool Workbench contract
-- Rust or Python SDK semantics
-- CLI or MCP behavior
-- protocol request and response semantics
+- CLI Workbench commands and MCP tool behavior
 - the path-native `PathCurrent` namespace
 - immutable artifact storage
 - root placement in `nokv-control`
+
+The `serve` command now attaches every Active root on its logical shard. The
+protocol also limits artifact index fields to 60, which matches the metadata
+planner. Neither change alters the 18-tool Workbench contract.
 
 FUSE, POSIX, CSI, inode, and dentry behavior remain outside the product.
 
@@ -535,7 +537,7 @@ cross-partition semantics. Filename hashing is not an acceptable substitute.
 
 ## Validation
 
-Every store implementation must run the same interface tests for:
+Every store implementation must run the shared interface tests for:
 
 - consistent point and range reads
 - linearizable reads and read-after-`Applied`
@@ -544,14 +546,17 @@ Every store implementation must run the same interface tests for:
 - value, absence, and empty-prefix checks
 - atomic multi-keyspace writes
 - deterministic conflicts
-- settled, late-commit, and poisoned unknown outcomes
-- sticky poison and recovery before reconciliation
 - limit rejection
 - empty initialization and exact reopen
 
-The workspace suite must run unchanged over each store. Backend-specific tests
-then cover Holt crash/reopen, FoundationDB process and network failures, or Holt
-cluster leader and snapshot failures.
+### Adapter Fault Tests
+
+The shared runner does not inject commit faults.
+
+Each adapter must test every unknown-outcome state that it can return, including
+sticky poison and recovery when applicable. The unchanged workspace suite and
+backend-specific tests cover Holt crash/reopen, FoundationDB process and network
+failures, or Holt cluster leader and snapshot failures.
 
 No FoundationDB or Holt cluster profile can claim production durability,
 failover, or performance until the applicable workspace acceptance gates report

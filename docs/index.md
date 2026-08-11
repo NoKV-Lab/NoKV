@@ -100,7 +100,7 @@ SPDX-License-Identifier: Apache-2.0
   [`nokv-agent` Handbook](./development/nokv-agent.md),
   [PR Review Checklist](./development/pr_review_checklist.md), and
   [Path-Native Metadata Comparison](./development/path-native-metadata-comparison.md).
-- Proposed architecture: [Metadata Store Interface](./development/metadata-store-interface.md).
+- Storage architecture: [Metadata Store Interface](./development/metadata-store-interface.md).
 - Collaboration record: [NoKV x LingTai](./announcements/nokv-lingtai-design-partner.md)
   and [Chinese version](./announcements/nokv-lingtai-design-partner.zh-CN.md).
 
