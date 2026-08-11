@@ -3,11 +3,11 @@ Copyright 2024-2026 The NoKV Authors.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# LingTai Workbench Preflight
+# Workbench Deployment Preflight
 
-LingTai is the active NoKV design partner and first Workbench client. It uses
-the normal `nokv mcp` stdio endpoint; there is no partner-specific metadata
-format or compatibility route.
+This guide prepares any MCP-compatible Agent runtime to use the normal
+`nokv mcp` stdio endpoint. There is no runtime-specific metadata format or
+compatibility route.
 
 ## Required Inputs
 
@@ -33,7 +33,7 @@ Run:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-python3 scripts/lingtai-workbench/workbench_contract_test.py
+python3 scripts/workbench/workbench_contract_test.py
 git diff --check
 ```
 
@@ -43,13 +43,13 @@ It does not qualify persistence, object I/O, failover, restore, or latency.
 ## Live Contract Check
 
 Start `nokv mcp` with the same root, route, owner, and object configuration that
-LingTai will use. Send `initialize`, then `tools/list`, and validate the response
-with `workbench_contract.validate_tool_contract`.
+the Agent runtime will use. Send `initialize`, then `tools/list`, and validate
+the response with `workbench_contract.validate_tool_contract`.
 
-For the complete first-client path, run
-`scripts/lingtai-workbench/live_first_client.py`. It calls `nokv provision`,
+For the complete live Workbench path, run
+`scripts/workbench/live_workbench.py`. It calls `nokv provision`,
 starts `nokv serve` with explicit metadata create/reopen intent, starts
-`nokv mcp --workbench-root /agents/{agent}/wb`, exercises all 18 tools, and
+`nokv ... --workbench-root /agents/{agent}/wb mcp`, exercises all 18 tools, and
 retains exact requests/responses plus materialize/collect evidence. Run
 `--dry-run` first to inspect the redacted command and normalized-input plan.
 In the current local-WAL profile, `reopen` is a negative qualification run:

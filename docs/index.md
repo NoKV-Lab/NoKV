@@ -23,7 +23,7 @@ hero:
       link: /development/workspace-acceptance
 features:
   - title: Stable Agent surface
-    details: Preserve the complete 18-tool LingTai Workbench contract and expose the same semantics through SDK, custom CLI, and MCP adapters.
+    details: Preserve the complete 18-tool NoKV Workbench contract and expose the same semantics through SDK, custom CLI, and MCP adapters.
   - title: Path-primary Holt metadata
     details: One normalized full path is namespace truth. Exact artifacts use point reads; child listing uses component-safe delimiter scans.
   - title: Immutable revisions
@@ -94,7 +94,7 @@ SPDX-License-Identifier: Apache-2.0
   [RustFS Provider Profile](./rustfs.md).
 - Workloads and evidence: [AI Training Workload](./ai-training.md),
   [Benchmarks](./benchmarks.md),
-  [LingTai Workbench Preflight](./lingtai-workbench-preflight.md), and
+  [Workbench Deployment Preflight](./workbench-preflight.md), and
   [Workspace Acceptance](./development/workspace-acceptance.md).
 - Development: [Code Contract](./development/code_contract.md),
   [`nokv-agent` Handbook](./development/nokv-agent.md),
@@ -105,7 +105,7 @@ SPDX-License-Identifier: Apache-2.0
 
 <div class="nokv-section nokv-section--tight">
   <div class="nokv-section-head nokv-section-head--center">
-    <p class="nokv-eyebrow">First client</p>
+    <p class="nokv-eyebrow">Research workflow</p>
     <h2 class="nokv-h2">Reproducible reconstruction runs</h2>
     <p class="nokv-lead">Seal one immutable input dataset, materialize verified
     files for the local scientific executable, collect declared outputs, and

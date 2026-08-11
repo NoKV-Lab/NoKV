@@ -2,7 +2,7 @@
 # Copyright 2024-2026 The NoKV Authors.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Frozen semantic contract for LingTai's NoKV workbench MCP surface."""
+"""Frozen semantic contract for NoKV's Workbench MCP surface."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ SCHEMA_VALUE_KEYWORDS = frozenset(
 
 
 class WorkbenchContractError(ValueError):
-    """A live MCP surface cannot satisfy the LingTai workbench contract."""
+    """A live MCP surface cannot satisfy the NoKV Workbench contract."""
 
 
 def canonical_json(value: Any) -> str:

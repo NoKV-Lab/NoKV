@@ -12,7 +12,7 @@ help:
 	@echo "  make test        - Run the Rust workspace tests"
 	@echo "  make fmt         - Format the Rust workspace"
 	@echo "  make lint        - Run cargo clippy"
-	@echo "  make workbench-test - Run Workbench contract and LingTai first-client tests"
+	@echo "  make workbench-test - Run Workbench contract and live workflow tests"
 	@echo "  make verify      - Run Rust and Workbench validation"
 	@echo "  make clean       - Remove build artifacts"
 
@@ -32,8 +32,8 @@ lint:
 	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
 
 workbench-test:
-	python3 scripts/lingtai-workbench/workbench_contract_test.py
-	python3 scripts/lingtai-workbench/live_first_client_test.py
+	python3 scripts/workbench/workbench_contract_test.py
+	python3 scripts/workbench/live_workbench_test.py
 
 verify:
 	cargo fmt --manifest-path $(NOKV_MANIFEST) --all -- --check
@@ -42,8 +42,8 @@ verify:
 	cargo test --manifest-path $(NOKV_MANIFEST) --workspace
 	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta --features metadata-read-stats
 	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-bench --features metadata-read-stats
-	python3 scripts/lingtai-workbench/workbench_contract_test.py
-	python3 scripts/lingtai-workbench/live_first_client_test.py
+	python3 scripts/workbench/workbench_contract_test.py
+	python3 scripts/workbench/live_workbench_test.py
 	git diff --check
 
 clean:

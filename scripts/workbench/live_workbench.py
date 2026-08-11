@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box LingTai/Viking/Ptycho evidence over the flat ``nokv`` binary."""
+"""Black-box scientific Workbench evidence over the flat ``nokv`` binary."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from typing import Any, Iterable, TextIO
 from workbench_contract import WORKBENCH_TOOLS, contract_evidence, validate_tool_contract
 
 
-SCHEMA = "nokv.lingtai.first_client_evidence.v1"
+SCHEMA = "nokv.workbench.live_evidence.v1"
 PROTOCOL_VERSION = "2025-11-25"
 HEX_ID = re.compile(r"^[0-9a-f]{32}$")
 WORKBENCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -120,9 +120,8 @@ def now() -> str:
 
 def scan_bytes(state: str, revision: int) -> bytes:
     value = {
-        "experiment": "ptycho",
+        "experiment": "ptychography",
         "frames": 2,
-        "partner": "viking",
         "revision": revision,
         "state": state,
     }
@@ -131,7 +130,7 @@ def scan_bytes(state: str, revision: int) -> bytes:
 
 def reconstruction_bytes() -> bytes:
     value = {
-        "algorithm": "viking-ptycho",
+        "algorithm": "phase-retrieval",
         "frames": 2,
         "source_state": "calibrated",
         "status": "converged",
@@ -169,7 +168,7 @@ def tool_plan(config: Config) -> list[ToolStep]:
             "append-log",
             "workbench_append",
             {"id": wb, "section": "logs", "path": "reconstruction.log",
-             "text": "ptycho reconstruction started\n", "content_type": "text/plain"},
+             "text": "ptychography reconstruction started\n", "content_type": "text/plain"},
         ),
         ToolStep(
             "read-input",
@@ -190,7 +189,7 @@ def tool_plan(config: Config) -> list[ToolStep]:
         ToolStep(
             "grep-input",
             "workbench_grep",
-            {"id": wb, "section": "input", "pattern": "PTYCHO", "glob": "*.json",
+            {"id": wb, "section": "input", "pattern": "PTYCHOGRAPHY", "glob": "*.json",
              "recursive": True, "limit": 10},
         ),
         ToolStep(
@@ -216,16 +215,16 @@ def tool_plan(config: Config) -> list[ToolStep]:
             "commit",
             "workbench_commit",
             {"id": wb,
-             "manifest": {"dataset": "viking-first-client",
-                          "model": "scientific-reconstruction", "task": "ptycho"},
+             "manifest": {"dataset": "ptychography-scan",
+                          "model": "scientific-reconstruction", "task": "ptychography"},
              "content_digest_uri": commit_digest, "replace": False},
         ),
         ToolStep(
             "commit-replay",
             "workbench_commit",
             {"id": wb,
-             "manifest": {"dataset": "viking-first-client",
-                          "model": "scientific-reconstruction", "task": "ptycho"},
+             "manifest": {"dataset": "ptychography-scan",
+                          "model": "scientific-reconstruction", "task": "ptychography"},
              "content_digest_uri": commit_digest, "replace": False},
         ),
         ToolStep(
@@ -238,8 +237,8 @@ def tool_plan(config: Config) -> list[ToolStep]:
             "snapshot",
             "workbench_snapshot",
             {"id": wb, "name": snapshot, "ttl_days": 1,
-             "reason": "first-client frozen reconstruction",
-             "metadata": {"partner": "viking", "workflow": "ptycho"}},
+             "reason": "research workbench frozen reconstruction",
+             "metadata": {"domain": "imaging", "workflow": "ptychography"}},
         ),
         ToolStep(
             "post-snapshot-edit",
@@ -288,13 +287,13 @@ def tool_plan(config: Config) -> list[ToolStep]:
         ToolStep(
             "find",
             "workbench_find",
-            {"committed": True, "manifest_pattern": "ptycho",
+            {"committed": True, "manifest_pattern": "ptychography",
              "include_manifest": True, "limit": 100},
         ),
         ToolStep(
             "snapshot-retire",
             "workbench_snapshot_retire",
-            {"id": wb, "name": snapshot, "reason": "first-client workflow complete"},
+            {"id": wb, "name": snapshot, "reason": "workbench workflow complete"},
         ),
         ToolStep(
             "snapshot-retire-replay",
@@ -533,7 +532,7 @@ def assert_results(results: dict[str, dict[str, Any]], config: Config) -> None:
     if read_generation != replacement.get("generation") \
             or results["stat-input"].get("card", {}).get("generation") != read_generation:
         raise WorkflowFailure("put/read/stat generations differ")
-    delta = b"ptycho reconstruction started\n"
+    delta = b"ptychography reconstruction started\n"
     append = results["append-log"]
     if append.get("digest") != "sha256:" + digest(delta) \
             or append.get("appended_bytes") != len(delta):
@@ -583,7 +582,7 @@ def assert_results(results: dict[str, dict[str, Any]], config: Config) -> None:
     replayed_retire = results["snapshot-retire-replay"]
     expected_retire_annotation = {
         "metadata": None,
-        "reason": "first-client workflow complete",
+        "reason": "workbench workflow complete",
     }
     if retired.get("retired") is not True or retired.get("state") != "retired" \
             or retired.get("retire_annotation") != expected_retire_annotation:
@@ -671,7 +670,7 @@ def start_mcp(config: Config, evidence: Evidence, server: subprocess.Popen[str])
             initialized = session.request("initialize", {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "nokv-first-client-harness", "version": "1"},
+                "clientInfo": {"name": "nokv-workbench-harness", "version": "1"},
             })
             result = initialized.get("result", {})
             if result.get("serverInfo", {}).get("name") != "nokv-mcp" \
@@ -815,12 +814,12 @@ def qualification(state: str, reason: str, workflow: str,
                        "did not expire and reach reaped state; Gate 0 is partial evidence.")
     return {
         "schema": SCHEMA, "recorded_at": now(), "overall_status": state, "reason": reason,
-        "first_client_workflow": {"status": workflow, "transcript_sha256": transcript},
+        "workbench_workflow": {"status": workflow, "transcript_sha256": transcript},
         "acceptance_gates": {
             str(index): {
                 "status": gate_zero if index == 0 else "NOT QUALIFIED",
                 "reason": gate_reason if index == 0
-                else "This first-client harness does not qualify this gate.",
+                else "This Workbench harness does not qualify this gate.",
             }
             for index in range(9)
         },
@@ -840,10 +839,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--root-id", default=os.getenv("NOKV_LIVE_ROOT_ID", "11" * 16))
     parser.add_argument("--logical-shard-id",
                         default=os.getenv("NOKV_LIVE_LOGICAL_SHARD_ID", "22" * 16))
-    parser.add_argument("--agent-id", default="lingtai")
-    parser.add_argument("--workbench-id", default="ptycho-first-client")
-    parser.add_argument("--restored-workbench-id", default="ptycho-first-client-restored")
-    parser.add_argument("--snapshot-name", default="ptycho-frozen")
+    parser.add_argument("--agent-id", default="research-agent")
+    parser.add_argument("--workbench-id", default="ptychography-run")
+    parser.add_argument("--restored-workbench-id", default="ptychography-run-restored")
+    parser.add_argument("--snapshot-name", default="ptychography-frozen")
     parser.add_argument("--etcd-endpoint", action="append")
     parser.add_argument("--etcd-key-prefix", default="/nokv/control")
     parser.add_argument("--server-bind", default="127.0.0.1:7750")
@@ -851,7 +850,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--node-id")
     parser.add_argument("--object-bucket", default=os.getenv("NOKV_LIVE_S3_BUCKET", ""))
     parser.add_argument("--object-endpoint", default=os.getenv("NOKV_LIVE_S3_ENDPOINT", ""))
-    parser.add_argument("--object-root", default="lingtai-first-client")
+    parser.add_argument("--object-root", default="workbench-live")
     parser.add_argument("--object-region", default="us-east-1")
     parser.add_argument("--object-access-key-id",
                         default=os.getenv("NOKV_LIVE_S3_ACCESS_KEY_ID"))
@@ -866,11 +865,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         args.object_bucket = args.object_bucket or "nokv-live-dry-run"
         args.object_endpoint = args.object_endpoint or "http://127.0.0.1:9000"
     evidence = args.evidence_dir or (
-        repo / "target/lingtai-workbench/evidence" /
+        repo / "target/workbench-live/evidence" /
         f"gate0-{args.agent_id}-{args.workbench_id}-{args.root_id[:8]}"
     )
     metadata = args.metadata_dir or (
-        repo / "target/lingtai-workbench/metadata" /
+        repo / "target/workbench-live/metadata" /
         f"{args.root_id}-{args.metadata_mode}"
     )
     return Config(
@@ -878,7 +877,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         args.metadata_mode, args.root_id, args.logical_shard_id, args.agent_id,
         args.workbench_id, args.restored_workbench_id, args.snapshot_name, tuple(etcd),
         args.etcd_key_prefix, args.server_bind, args.advertise_endpoint,
-        args.node_id or f"lingtai-{args.root_id[:8]}", args.object_bucket,
+        args.node_id or f"workbench-{args.root_id[:8]}", args.object_bucket,
         args.object_endpoint, args.object_root, args.object_region,
         args.object_access_key_id, args.object_secret_access_key, args.build,
         args.dry_run, args.command_timeout_seconds,
@@ -916,7 +915,7 @@ def main(argv: list[str] | None = None) -> int:
         run_live(config, evidence, steps)
         transcript = digest_file(evidence.root / "mcp-transcript.jsonl")
         record = qualification(
-            "NOT QUALIFIED", "Live first-client workflow passed; full system acceptance "
+            "NOT QUALIFIED", "Live Workbench workflow passed; full system acceptance "
             "requires the remaining gates.", "PASS", transcript
         )
         evidence.json("qualification.json", record)

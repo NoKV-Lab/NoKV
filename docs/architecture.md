@@ -11,7 +11,7 @@ Status: normative workspace architecture.
 
 ```mermaid
 flowchart LR
-    Workbench["LingTai Workbench adapter"] --> SDK["Agent SDK"]
+    Workbench["Workbench adapter"] --> SDK["Agent SDK"]
     CLI["Custom CLI / MCP"] --> SDK
     Python["Python SDK"] --> SDK
     Local["Materialize / collect"] --> Python
@@ -326,6 +326,6 @@ experiments. The required evidence covers:
 3. protocol, server, SDK, CLI, MCP, control routing, and lifecycle workers on
    the same schema and identity model;
 4. owner failover, checkpoint/log recovery, ambiguous provider outcomes, and
-   first-client workflows;
+   live Workbench workflows;
 5. the complete [acceptance plan](./development/workspace-acceptance.md),
    with each applicable gate reported as `PASS`, `FAIL`, or `NOT QUALIFIED`.

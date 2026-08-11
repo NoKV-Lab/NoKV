@@ -170,5 +170,5 @@ runner and its implementation-invariant tests remain byte-identical; both
 patches are bound by the harness digest. Published comparisons must retain raw
 old/new reports from matched release builds and profiles. Even then, this
 metadata-domain diagnostic does not qualify Workspace Acceptance Gate 8.
-`bench/lingtai-first-client` remains correctness and interoperability evidence
+`bench/workbench-live` remains correctness and interoperability evidence
 rather than a performance result.

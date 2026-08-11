@@ -18,7 +18,7 @@ The contract sources are:
 - the Rust tool definitions and result shaping owned by `crates/nokv-agent/`;
 - the frozen normalized input-schema snapshot in
   `crates/nokv-agent/workbench_contract_schema.json`;
-- `scripts/lingtai-workbench/workbench_contract.py` for checking tool names and
+- `scripts/workbench/workbench_contract.py` for checking tool names and
   normalized input schemas.
 
 CLI and MCP wiring are consumers of this contract, not schema authorities.

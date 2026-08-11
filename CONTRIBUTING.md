@@ -93,7 +93,7 @@ Run the repository contract gates before opening a PR:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-python3 scripts/lingtai-workbench/workbench_contract_test.py
+python3 scripts/workbench/workbench_contract_test.py
 git diff --check
 ```
 

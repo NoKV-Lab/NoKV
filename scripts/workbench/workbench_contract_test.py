@@ -2,6 +2,8 @@
 # Copyright 2024-2026 The NoKV Authors.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Tests for the NoKV Workbench contract gate."""
+
 from __future__ import annotations
 
 import copy

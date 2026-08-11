@@ -13,20 +13,20 @@ permissions:
   contents: read
 
 jobs:
-  lingtai-first-client:
+  workbench-contract:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check Workbench and LingTai first-client contracts
+      - name: Check Workbench contract and live workflow
         run: |
           set -euo pipefail
           python3 -m py_compile \
-            scripts/lingtai-workbench/workbench_contract.py \
-            scripts/lingtai-workbench/live_first_client.py
-          python3 scripts/lingtai-workbench/workbench_contract_test.py
-          python3 scripts/lingtai-workbench/live_first_client_test.py
-          bash -n scripts/lingtai-workbench/start_rustfs.sh
+            scripts/workbench/workbench_contract.py \
+            scripts/workbench/live_workbench.py
+          python3 scripts/workbench/workbench_contract_test.py
+          python3 scripts/workbench/live_workbench_test.py
+          bash -n scripts/workbench/start_rustfs.sh
 
   nokv-workspace:
     runs-on: ubuntu-latest

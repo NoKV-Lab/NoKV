@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the first-client live evidence harness."""
+"""Unit tests for the generic live Workbench evidence harness."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import live_first_client as harness
+import live_workbench as harness
 
 
 REQUIRED_FIRST_OCCURRENCE_ORDER = [
@@ -45,7 +45,24 @@ def config(evidence_dir: Path) -> harness.Config:
     )
 
 
-class LiveFirstClientTest(unittest.TestCase):
+class LiveWorkbenchTest(unittest.TestCase):
+    def test_default_workflow_evidence_is_runtime_neutral(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            current = config(Path(directory) / "evidence")
+            encoded = harness.canonical_json(
+                {
+                    "agent": current.agent,
+                    "node": current.node,
+                    "object_root": current.object_root,
+                    "plan": harness.plan(current, harness.tool_plan(current)),
+                    "qualification": harness.qualification(
+                        "NOT QUALIFIED", "test", "NOT QUALIFIED"
+                    ),
+                }
+            ).lower()
+
+        self.assertNotIn("lingtai", encoded)
+
     def test_plan_covers_exact_eighteen_tools_in_dependency_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             steps = harness.tool_plan(config(Path(directory) / "evidence"))
@@ -91,7 +108,7 @@ class LiveFirstClientTest(unittest.TestCase):
             )
 
     def test_dry_run_writes_not_qualified_evidence_and_complete_coverage(self) -> None:
-        script = Path(__file__).with_name("live_first_client.py")
+        script = Path(__file__).with_name("live_workbench.py")
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence"
             completed = subprocess.run(
@@ -115,11 +132,11 @@ class LiveFirstClientTest(unittest.TestCase):
         self.assertTrue(plan["tool_coverage"]["complete"])
         self.assertEqual(qualification["overall_status"], "NOT QUALIFIED")
         self.assertEqual(
-            qualification["first_client_workflow"]["status"], "NOT QUALIFIED"
+            qualification["workbench_workflow"]["status"], "NOT QUALIFIED"
         )
 
     def test_missing_live_binary_is_not_qualified_not_pass(self) -> None:
-        script = Path(__file__).with_name("live_first_client.py")
+        script = Path(__file__).with_name("live_workbench.py")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             evidence = root / "evidence"
@@ -149,7 +166,7 @@ class LiveFirstClientTest(unittest.TestCase):
                 (evidence / "qualification.json").read_text(encoding="utf-8")
             )
         self.assertEqual(qualification["overall_status"], "NOT QUALIFIED")
-        self.assertNotEqual(qualification["first_client_workflow"]["status"], "PASS")
+        self.assertNotEqual(qualification["workbench_workflow"]["status"], "PASS")
 
 
 if __name__ == "__main__":

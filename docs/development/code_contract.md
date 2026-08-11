@@ -143,7 +143,7 @@ git diff --check
 For Workbench-facing changes also run:
 
 ```bash
-python3 scripts/lingtai-workbench/workbench_contract_test.py
+python3 scripts/workbench/workbench_contract_test.py
 ```
 
 When a checked-in documentation build exists, run it for documentation or
