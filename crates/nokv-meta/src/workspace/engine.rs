@@ -1282,8 +1282,8 @@ impl MetaShard {
 
     /// Stable ordered prefix scan at one fenced read version.
     ///
-    /// The current-version path is one transaction-store prefix scan. A historical scan also
-    /// reconstructs keys replaced or deleted after `version` from History.
+    /// The current-version path assembles one logical prefix scan from bounded physical pages.
+    /// A historical scan also reconstructs keys replaced or deleted after `version` from History.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_prefix_at(
         &self,
@@ -1383,43 +1383,21 @@ impl MetaShard {
             owner_epoch,
         };
 
-        // Current-state rows are already in caller order. Read the clock and
-        // page in one store snapshot. If the clock advanced, discard the page
-        // and reconstruct the requested version from History.
+        // Current-state rows are already in caller order. Read each physical
+        // page and the clock in one store snapshot. If the clock advances,
+        // discard every collected page and reconstruct the requested version
+        // from History.
         if version == current_version {
-            if let Some(page) = self.scan_page_at_clock(
-                family.keyspace(),
+            if let Some(visible) = self.collect_current_scan_at_clock(
+                family,
                 prefix,
                 start_after,
                 effective_limit,
                 delimiter,
+                version,
                 current_version,
                 read_context,
-                "scan current metadata",
             )? {
-                let mut visible = Vec::with_capacity(page.items.len());
-                for item in page.items {
-                    let item = match item {
-                        ScanItem::Row { key, value } => {
-                            let current = CurrentValue::decode(&value)
-                                .map_err(|error| corrupt(family.name(), error))?;
-                            if current.modified_version.get() > version.get() {
-                                return Err(corrupt(
-                                    family.name(),
-                                    "current row is newer than the stable scan clock",
-                                ));
-                            }
-                            DelimitedMetadataScanItem::Record(MetadataScanItem {
-                                key,
-                                value: current.payload,
-                            })
-                        }
-                        ScanItem::CommonPrefix(prefix) => {
-                            DelimitedMetadataScanItem::CommonPrefix(prefix)
-                        }
-                    };
-                    visible.push(item);
-                }
                 return Ok(visible);
             }
             current_version = self.validate_read_fence(
@@ -1473,6 +1451,81 @@ impl MetaShard {
             }
         }
         Ok(page)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_current_scan_at_clock(
+        &self,
+        family: MetadataFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        delimiter: Option<u8>,
+        version: ReadVersion,
+        expected_clock: ReadVersion,
+        read_context: ReadFenceContext,
+    ) -> Result<Option<Vec<DelimitedMetadataScanItem>>, MetaError> {
+        let mut after = start_after.map(ToOwned::to_owned);
+        let mut visible = Vec::with_capacity(limit);
+        loop {
+            let remaining = limit - visible.len();
+            if remaining == 0 {
+                return Ok(Some(visible));
+            }
+            let Some(page) = self.scan_page_at_clock(
+                family.keyspace(),
+                prefix,
+                after.as_deref(),
+                remaining,
+                delimiter,
+                expected_clock,
+                read_context,
+                "scan current metadata",
+            )?
+            else {
+                return Ok(None);
+            };
+            if page.items.len() > remaining {
+                return Err(corrupt(
+                    "transaction-store scan",
+                    "scan page exceeds the requested row limit",
+                ));
+            }
+            let more = page.more;
+            if let Some(last) = page.items.last() {
+                after = Some(last.key().to_vec());
+            } else if more {
+                return Err(corrupt(
+                    "transaction-store scan",
+                    "incomplete scan page omitted its continuation cursor",
+                ));
+            }
+            for item in page.items {
+                let item = match item {
+                    ScanItem::Row { key, value } => {
+                        let current = CurrentValue::decode(&value)
+                            .map_err(|error| corrupt(family.name(), error))?;
+                        if current.modified_version.get() > version.get() {
+                            return Err(corrupt(
+                                family.name(),
+                                "current row is newer than the stable scan clock",
+                            ));
+                        }
+                        DelimitedMetadataScanItem::Record(MetadataScanItem {
+                            key,
+                            value: current.payload,
+                        })
+                    }
+                    ScanItem::CommonPrefix(prefix) => {
+                        DelimitedMetadataScanItem::CommonPrefix(prefix)
+                    }
+                };
+                visible.push(item);
+            }
+            if !more {
+                return Ok(Some(visible));
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2996,7 +3049,7 @@ fn internal(operation: &'static str, error: impl std::fmt::Display) -> MetaError
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -3057,6 +3110,74 @@ mod tests {
                     .expect("injected owner advancement must succeed");
             }
             self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct ShortScanPageStore {
+        inner: Arc<dyn TxnStore>,
+        max_scan_items: usize,
+        operation_scan_reads: AtomicUsize,
+        advance_clock_on_second_scan: AtomicBool,
+        controller: Option<MetaShard>,
+    }
+
+    impl TxnStore for ShortScanPageStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            let scans_operation = batch.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    ReadOp::Scan(scan)
+                        if scan.keyspace == MetadataFamily::Operation.keyspace()
+                )
+            });
+            if scans_operation {
+                let scan_index = self.operation_scan_reads.fetch_add(1, Ordering::AcqRel);
+                if scan_index == 1
+                    && self
+                        .advance_clock_on_second_scan
+                        .swap(false, Ordering::AcqRel)
+                {
+                    let controller = self
+                        .controller
+                        .as_ref()
+                        .expect("clock advancement requires a controller");
+                    controller
+                        .execute(&create_command(
+                            controller,
+                            request(250),
+                            scoped_key(root(2), b"clock-short-page/1-late"),
+                            b"late",
+                        ))
+                        .expect("injected clock advancement must succeed");
+                }
+            }
+
+            let mut snapshot = self.inner.read(batch.clone())?;
+            for (op, result) in batch.ops.iter().zip(&mut snapshot.results) {
+                let (ReadOp::Scan(scan), ReadResult::Scan(page)) = (op, result) else {
+                    continue;
+                };
+                if scan.keyspace != MetadataFamily::Operation.keyspace()
+                    || page.items.len() <= self.max_scan_items
+                {
+                    continue;
+                }
+                page.items.truncate(self.max_scan_items);
+                page.more = true;
+            }
+            Ok(snapshot)
         }
 
         fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
@@ -3588,6 +3709,161 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn current_prefix_scan_resumes_short_store_pages() {
+        let mut store = ready_store();
+        let prefix = scoped_key(root(2), b"short-page/");
+        let mut expected = Vec::new();
+        for index in 0..5_u8 {
+            let key = [prefix.as_slice(), format!("{index}").as_bytes()].concat();
+            let value = format!("value-{index}").into_bytes();
+            store
+                .execute(&create_command(
+                    &store,
+                    request(20 + index),
+                    key.clone(),
+                    &value,
+                ))
+                .unwrap();
+            expected.push(MetadataScanItem { key, value });
+        }
+        let version = store.current_read_version().unwrap();
+        let wrapper = Arc::new(ShortScanPageStore {
+            inner: Arc::clone(&store.store),
+            max_scan_items: 2,
+            operation_scan_reads: AtomicUsize::new(0),
+            advance_clock_on_second_scan: AtomicBool::new(false),
+            controller: None,
+        });
+        store.store = wrapper.clone();
+
+        let actual = store
+            .scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                version,
+                None,
+                expected.len(),
+            )
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(wrapper.operation_scan_reads.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn current_delimited_scan_resumes_from_common_prefix_cursor() {
+        let mut store = ready_store();
+        let prefix = scoped_key(root(2), b"short-delimited/");
+        let common_a = [prefix.as_slice(), b"a/"].concat();
+        let common_b = [prefix.as_slice(), b"b/"].concat();
+        let direct_c = [prefix.as_slice(), b"c"].concat();
+        for (index, (suffix, value)) in [
+            (b"a/one".as_slice(), b"a-one".as_slice()),
+            (b"a/two".as_slice(), b"a-two".as_slice()),
+            (b"b/one".as_slice(), b"b-one".as_slice()),
+            (b"c".as_slice(), b"c".as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .execute(&create_command(
+                    &store,
+                    request(30 + index as u8),
+                    [prefix.as_slice(), suffix].concat(),
+                    value,
+                ))
+                .unwrap();
+        }
+        let version = store.current_read_version().unwrap();
+        let wrapper = Arc::new(ShortScanPageStore {
+            inner: Arc::clone(&store.store),
+            max_scan_items: 1,
+            operation_scan_reads: AtomicUsize::new(0),
+            advance_clock_on_second_scan: AtomicBool::new(false),
+            controller: None,
+        });
+        store.store = wrapper.clone();
+
+        let actual = store
+            .scan_delimited_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                b'/',
+                version,
+                None,
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(
+            actual,
+            vec![
+                DelimitedMetadataScanItem::CommonPrefix(common_a),
+                DelimitedMetadataScanItem::CommonPrefix(common_b),
+                DelimitedMetadataScanItem::Record(MetadataScanItem {
+                    key: direct_c,
+                    value: b"c".to_vec(),
+                }),
+            ]
+        );
+        assert_eq!(wrapper.operation_scan_reads.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn current_prefix_scan_discards_short_pages_after_clock_change() {
+        let mut store = ready_store();
+        let prefix = scoped_key(root(2), b"clock-short-page/");
+        let mut expected = Vec::new();
+        for index in 0..4_u8 {
+            let key = [prefix.as_slice(), format!("{index}").as_bytes()].concat();
+            let value = format!("value-{index}").into_bytes();
+            store
+                .execute(&create_command(
+                    &store,
+                    request(40 + index),
+                    key.clone(),
+                    &value,
+                ))
+                .unwrap();
+            expected.push(MetadataScanItem { key, value });
+        }
+        let version = store.current_read_version().unwrap();
+        let inner = Arc::clone(&store.store);
+        let controller = MetaShard::open(Arc::clone(&inner), shard(1)).unwrap();
+        let wrapper = Arc::new(ShortScanPageStore {
+            inner,
+            max_scan_items: 2,
+            operation_scan_reads: AtomicUsize::new(0),
+            advance_clock_on_second_scan: AtomicBool::new(true),
+            controller: Some(controller),
+        });
+        store.store = wrapper;
+
+        let actual = store
+            .scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                version,
+                None,
+                expected.len(),
+            )
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(!actual.iter().any(|item| item.key.ends_with(b"late")));
     }
 
     #[test]
