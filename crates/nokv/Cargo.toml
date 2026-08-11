@@ -1,6 +1,6 @@
 [package]
 name = "nokv"
-version = "0.1.0"
+version = "1.0.0"
 description = "Custom CLI and MCP wiring for NoKV Agent workspaces."
 edition.workspace = true
 rust-version.workspace = true
@@ -25,6 +25,9 @@ nokv-types.workspace = true
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
 
 [[bin]]
 name = "nokv"

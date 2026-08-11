@@ -111,6 +111,9 @@ pub enum Command {
     },
     Serve,
     Schema,
+    Version {
+        json: bool,
+    },
     Help,
 }
 
@@ -350,6 +353,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                 )?;
             }
             "--help" => break Command::Help,
+            "--version" => break Command::Version { json: false },
             _ => return Err(CliError::UnknownOption(argument)),
         }
     };
@@ -442,8 +446,18 @@ fn parse_command(
         }),
         "serve" => Ok(Command::Serve),
         "schema" => Ok(Command::Schema),
+        "version" => parse_version(arguments),
         "help" => Ok(Command::Help),
         _ => Err(CliError::UnknownCommand(command)),
+    }
+}
+
+fn parse_version(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    match arguments.next() {
+        None => Ok(Command::Version { json: false }),
+        Some(argument) if argument == "--json" => Ok(Command::Version { json: true }),
+        Some(argument) if argument.starts_with("--") => Err(CliError::UnknownOption(argument)),
+        Some(argument) => Err(CliError::UnexpectedArgument(argument)),
     }
 }
 
@@ -584,6 +598,22 @@ mod tests {
     #[test]
     fn absent_command_is_help() {
         assert_eq!(parse(Vec::new()).unwrap().command, Command::Help);
+    }
+
+    #[test]
+    fn parses_human_and_machine_readable_version_commands() {
+        assert_eq!(
+            parse(args(&["--version"])).unwrap().command,
+            Command::Version { json: false }
+        );
+        assert_eq!(
+            parse(args(&["version"])).unwrap().command,
+            Command::Version { json: false }
+        );
+        assert_eq!(
+            parse(args(&["version", "--json"])).unwrap().command,
+            Command::Version { json: true }
+        );
     }
 
     #[test]

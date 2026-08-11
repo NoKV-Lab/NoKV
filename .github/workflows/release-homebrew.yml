@@ -1,0 +1,354 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release Homebrew Source Formula
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Canonical stable tag, for example v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate immutable release identity
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: scripts/release
+
+      - name: Validate tag before resolving a ref
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/release/homebrew_source_release.py validate-tag "$RELEASE_TAG")"
+          git fetch --no-tags https://github.com/NoKV-Lab/NoKV.git \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Invalid release commit::Resolved commit is not canonical."
+            exit 1
+          fi
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "version=$version"
+            echo "commit=$commit"
+          } >>"$GITHUB_OUTPUT"
+
+  source:
+    name: Build deterministic source release
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Test release safety boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/test_homebrew_source_release.py
+          python3 scripts/workbench/workbench_contract_test.py
+
+      - name: Build archive, manifest, and published Formula
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/nokv-homebrew-release
+        run: |
+          set -euo pipefail
+          python3 scripts/release/homebrew_source_release.py prepare \
+            --repository . \
+            --tag "$RELEASE_TAG" \
+            --expected-commit "$EXPECTED_COMMIT" \
+            --no-local-tag \
+            --output "$RELEASE_DIR"
+          source_url="https://github.com/NoKV-Lab/NoKV/releases/download/$RELEASE_TAG/nokv-$RELEASE_VERSION-source.tar.gz"
+          python3 scripts/release/homebrew_source_release.py render-formula \
+            --manifest "$RELEASE_DIR/nokv-$RELEASE_VERSION-homebrew.json" \
+            --source-url "$source_url" \
+            --output "$RELEASE_DIR/Formula/nokv.rb"
+          cp scripts/release/private_tap_marker.json "$RELEASE_DIR/.nokv-tap.json"
+          python3 scripts/release/homebrew_source_release.py verify-tap \
+            --marker "$RELEASE_DIR/.nokv-tap.json"
+
+      - name: Upload exact release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: nokv-homebrew-${{ needs.validate.outputs.commit }}
+          path: ${{ runner.temp }}/nokv-homebrew-release
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
+  formula-smoke:
+    name: Source Formula smoke (${{ matrix.runner }})
+    needs:
+      - validate
+      - source
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15
+          - macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout validated release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Download exact release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: nokv-homebrew-${{ needs.validate.outputs.commit }}
+          path: ${{ runner.temp }}/nokv-homebrew-release
+
+      - name: Render an equivalent local-source Formula
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/nokv-homebrew-release
+          TAP_DIR: ${{ runner.temp }}/homebrew-tap
+        run: |
+          set -euo pipefail
+          archive="$RELEASE_DIR/nokv-$RELEASE_VERSION-source.tar.gz"
+          manifest="$RELEASE_DIR/nokv-$RELEASE_VERSION-homebrew.json"
+          python3 scripts/release/homebrew_source_release.py verify-archive \
+            --manifest "$manifest" \
+            --archive "$archive"
+          source_url="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$archive")"
+          mkdir -p "$TAP_DIR/Formula"
+          python3 scripts/release/homebrew_source_release.py render-formula \
+            --manifest "$manifest" \
+            --source-url "$source_url" \
+            --output "$TAP_DIR/Formula/nokv.rb"
+          cp "$RELEASE_DIR/.nokv-tap.json" "$TAP_DIR/.nokv-tap.json"
+          python3 scripts/release/homebrew_source_release.py verify-tap \
+            --marker "$TAP_DIR/.nokv-tap.json"
+          git -C "$TAP_DIR" init --initial-branch=main
+          git -C "$TAP_DIR" config user.name "NoKV Release Test"
+          git -C "$TAP_DIR" config user.email "nokv-release-test@example.invalid"
+          git -C "$TAP_DIR" add .
+          git -C "$TAP_DIR" commit -m "Test NoKV source Formula"
+
+      - name: Install and verify the source-built Formula
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          RELEASE_DIR: ${{ runner.temp }}/nokv-homebrew-release
+          TAP_DIR: ${{ runner.temp }}/homebrew-tap
+        run: |
+          set -euo pipefail
+          brew tap NoKV-Lab/tap "file://$TAP_DIR"
+          brew style NoKV-Lab/tap/nokv
+          brew install --formula --build-from-source NoKV-Lab/tap/nokv
+          brew test NoKV-Lab/tap/nokv
+          python3 scripts/release/homebrew_source_release.py verify-install \
+            --manifest "$RELEASE_DIR/nokv-$RELEASE_VERSION-homebrew.json" \
+            --binary "$(brew --prefix)/bin/nokv"
+
+      - name: Remove smoke installation
+        if: always()
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew uninstall --force nokv >/dev/null 2>&1 || true
+          brew untap NoKV-Lab/tap >/dev/null 2>&1 || true
+
+  publish:
+    name: Publish source assets after both macOS gates
+    needs:
+      - validate
+      - source
+      - formula-smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Download tested release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: nokv-homebrew-${{ needs.validate.outputs.commit }}
+          path: ${{ runner.temp }}/nokv-homebrew-release
+
+      - name: Revalidate tag binding before publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force https://github.com/NoKV-Lab/NoKV.git \
+            "refs/tags/$RELEASE_TAG:refs/nokv-release/$RELEASE_TAG"
+          actual="$(git rev-parse "refs/nokv-release/$RELEASE_TAG^{commit}")"
+          if [[ "$actual" != "$EXPECTED_COMMIT" ]]; then
+            echo "::error title=Release tag moved::Expected $EXPECTED_COMMIT, found $actual."
+            exit 1
+          fi
+
+      - name: Publish immutable source assets
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/nokv-homebrew-release
+        run: |
+          set -euo pipefail
+          archive="nokv-$RELEASE_VERSION-source.tar.gz"
+          manifest="nokv-$RELEASE_VERSION-homebrew.json"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            existing="$RUNNER_TEMP/existing-homebrew-release"
+            mkdir -p "$existing"
+            gh release download "$RELEASE_TAG" \
+              --dir "$existing" \
+              --pattern "$archive" \
+              --pattern "$manifest" \
+              --pattern SHA256SUMS
+            cmp "$RELEASE_DIR/$archive" "$existing/$archive"
+            cmp "$RELEASE_DIR/$manifest" "$existing/$manifest"
+            cmp "$RELEASE_DIR/SHA256SUMS" "$existing/SHA256SUMS"
+          else
+            gh release create "$RELEASE_TAG" \
+              "$RELEASE_DIR/$archive" \
+              "$RELEASE_DIR/$manifest" \
+              "$RELEASE_DIR/SHA256SUMS" \
+              --verify-tag \
+              --title "NoKV $RELEASE_VERSION" \
+              --notes "Source-only Homebrew release for commit $EXPECTED_COMMIT."
+          fi
+
+  update-private-tap:
+    name: Open private tap update PR
+    needs:
+      - validate
+      - source
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      TAP_REPOSITORY: NoKV-Lab/homebrew-tap
+    steps:
+      - name: Checkout validated release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          path: nokv-source
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Create repository-scoped GitHub App token
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: NoKV-Lab
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Fail closed unless the tap is private
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          private="$(gh api "repos/$TAP_REPOSITORY" --jq '.private')"
+          visibility="$(gh api "repos/$TAP_REPOSITORY" --jq '.visibility')"
+          if [[ "$private" != "true" || "$visibility" != "private" ]]; then
+            echo "::error title=Unsafe tap visibility::$TAP_REPOSITORY must remain private."
+            exit 1
+          fi
+
+      - name: Checkout private tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: NoKV-Lab/homebrew-tap
+          path: homebrew-tap
+          token: ${{ steps.tap-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Download tested release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: nokv-homebrew-${{ needs.validate.outputs.commit }}
+          path: ${{ runner.temp }}/nokv-homebrew-release
+
+      - name: Commit and open tap update PR
+        shell: bash
+        working-directory: homebrew-tap
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          RELEASE_DIR: ${{ runner.temp }}/nokv-homebrew-release
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/nokv-source/scripts/release/homebrew_source_release.py" verify-tap \
+            --marker "$GITHUB_WORKSPACE/homebrew-tap/.nokv-tap.json"
+          branch="release/nokv-$RELEASE_VERSION"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git fetch origin "$branch"
+            git switch --create "$branch" FETCH_HEAD
+          else
+            git switch --create "$branch"
+          fi
+          mkdir -p Formula
+          cp "$RELEASE_DIR/Formula/nokv.rb" Formula/nokv.rb
+          git add Formula/nokv.rb
+          if git diff --cached --quiet; then
+            echo "The private tap already contains this exact Formula."
+            exit 0
+          fi
+          git config user.name "wchwawa"
+          git config user.email "wch19961116@gmail.com"
+          git commit --signoff --message "release: update nokv to $RELEASE_VERSION"
+          gh auth setup-git
+          git push origin "HEAD:refs/heads/$branch"
+          existing="$(gh pr list --repo "$TAP_REPOSITORY" --head "$branch" --state open --json url --jq '.[0].url // empty')"
+          if [[ -z "$existing" ]]; then
+            gh pr create \
+              --repo "$TAP_REPOSITORY" \
+              --base main \
+              --head "$branch" \
+              --title "release: update nokv to $RELEASE_VERSION" \
+              --body "Updates the private tap to the source-only NoKV $RELEASE_VERSION Formula after Intel and Apple Silicon installation gates passed."
+          else
+            echo "Tap update PR already exists: $existing"
+          fi

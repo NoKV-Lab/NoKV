@@ -1,0 +1,6 @@
+{
+  "repository": "NoKV-Lab/homebrew-tap",
+  "schema": "nokv.homebrew.private_tap.v1",
+  "source_repository": "NoKV-Lab/NoKV",
+  "visibility": "private"
+}
