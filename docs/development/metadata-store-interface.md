@@ -332,9 +332,10 @@ request. Reading dedupe from the uncertain instance is not durability evidence.
 
 The proposed FoundationDB adapter would map a settled
 `commit_unknown_result` to `Settled`. It maps an error that permits a late
-commit to `MayCommit`. The Holt adapter treats an atomic commit
-error as `Poisoned` until reopen and WAL replay establish the durable
-boundary.
+commit to `MayCommit`. The Holt adapter maps `DefinitelyNotApplied` through
+normal physical error handling without poisoning the store. It poisons
+`OutcomeUnknown` and unclassified atomic errors until reopen and WAL replay
+establish the durable boundary.
 
 `MetaError` owns schema, command, history, placement, fence, and lifecycle
 errors. It can contain `MetaError::Store(StoreError)`. Upper packages must not

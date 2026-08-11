@@ -1000,6 +1000,35 @@ fn file_store_checkpoint_never_rewrites_durable_slots_in_place() {
 }
 
 #[test]
+fn definitely_not_applied_atomic_error_keeps_store_ready() {
+    let store = memory_store([FIRST]);
+    assert_eq!(put(&store, FIRST, b"healthy", b"value"), Commit::Applied);
+
+    let txn = WriteTxn {
+        checks: vec![],
+        mutations: vec![Mutation::Put {
+            key: Key::new(FIRST, b"not-applied"),
+            value: b"value".to_vec(),
+        }],
+    };
+    store.fail_next_atomic_not_applied();
+    let error = store
+        .commit(txn.clone())
+        .expect_err("classified pre-apply failure must be returned");
+    assert!(matches!(error, StoreError::Unavailable(_)));
+    assert_eq!(get(&store, FIRST, b"not-applied"), None);
+    assert_eq!(get(&store, FIRST, b"healthy"), Some(b"value".to_vec()));
+    store
+        .ready()
+        .expect("definitely-not-applied failure must not poison store");
+    assert_eq!(
+        store.commit(txn).expect("retry the same transaction"),
+        Commit::Applied
+    );
+    assert_eq!(get(&store, FIRST, b"not-applied"), Some(b"value".to_vec()));
+}
+
+#[test]
 fn atomic_error_poison_is_sticky_until_file_reopen() {
     let directory = tempdir().expect("create HoltStore directory");
     let path = directory.path().join("meta");

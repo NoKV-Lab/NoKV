@@ -11,7 +11,7 @@ use nokv_meta_store::{Keyspace, StoreError, StoreLimits};
 
 const HOLT_MAX_KEY_BYTES: usize = u16::MAX as usize - 1;
 const HOLT_MAX_VALUE_BYTES: usize = u16::MAX as usize;
-// Holt 0.8.4 uses one 16 MiB WAL ring entry for each DB atomic batch.
+// Holt uses one 16 MiB WAL ring entry for each DB atomic batch.
 const HOLT_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const HOLT_DB_RECORD_FIXED_BYTES: usize = 33;
 const HOLT_DB_MUTATION_OVERHEAD_BYTES: usize = 17;

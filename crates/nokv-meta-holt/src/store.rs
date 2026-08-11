@@ -45,6 +45,7 @@ struct ValueVersion {
 
 #[cfg(test)]
 struct TestHooks {
+    fail_before_atomic: std::sync::atomic::AtomicBool,
     fail_after_atomic: std::sync::atomic::AtomicBool,
     pause_before_poison: Mutex<Option<PoisonPause>>,
     pause_read_after_lock: Mutex<Option<PoisonPause>>,
@@ -96,6 +97,7 @@ impl HoltStore {
             read_stats: crate::stats::ReadStatsState::default(),
             #[cfg(test)]
             test_hooks: TestHooks {
+                fail_before_atomic: std::sync::atomic::AtomicBool::new(false),
                 fail_after_atomic: std::sync::atomic::AtomicBool::new(false),
                 pause_before_poison: Mutex::new(None),
                 pause_read_after_lock: Mutex::new(None),
@@ -151,6 +153,13 @@ impl HoltStore {
         let state = self.read_state()?;
         ensure_ready(&state)?;
         Ok(crate::stats::storage_snapshot(&state.db.stats()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_atomic_not_applied(&self) {
+        self.test_hooks
+            .fail_before_atomic
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(test)]
@@ -314,6 +323,24 @@ impl TxnStore for HoltStore {
         let Some(value_versions) = read_value_versions(&state, &txn)? else {
             return Ok(Commit::Conflict);
         };
+
+        #[cfg(test)]
+        if self
+            .test_hooks
+            .fail_before_atomic
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return map_atomic_result(
+                &mut state,
+                Err(holt::Error::Atomic {
+                    kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+                    source: Box::new(holt::Error::BlobStoreIo(std::io::Error::other(
+                        "injected error before Holt atomic apply",
+                    ))),
+                }),
+            );
+        }
+
         let applied = state.db.atomic(|batch| {
             for guard in &value_versions {
                 batch.assert_version(tree_name(&state, guard.keyspace), &guard.key, guard.version);
@@ -352,13 +379,17 @@ impl TxnStore for HoltStore {
         if injected && matches!(applied, Ok(true)) {
             #[cfg(test)]
             self.pause_before_poison();
-            return Err(poison(&mut state, "injected error after Holt atomic apply"));
+            return map_atomic_result(
+                &mut state,
+                Err(holt::Error::Atomic {
+                    kind: holt::AtomicErrorKind::OutcomeUnknown,
+                    source: Box::new(holt::Error::Internal(
+                        "injected error after Holt atomic apply",
+                    )),
+                }),
+            );
         }
-        match applied {
-            Ok(true) => Ok(Commit::Applied),
-            Ok(false) => Ok(Commit::Conflict),
-            Err(error) => Err(poison(&mut state, error.to_string())),
-        }
+        map_atomic_result(&mut state, applied)
     }
 
     fn ready(&self) -> Result<(), StoreError> {
@@ -826,6 +857,21 @@ fn poison(state: &mut State, reason: impl Into<String>) -> StoreError {
     StoreError::OutcomeUnknown {
         state: UnknownCommit::Poisoned,
         reason,
+    }
+}
+
+fn map_atomic_result(
+    state: &mut State,
+    applied: Result<bool, holt::Error>,
+) -> Result<Commit, StoreError> {
+    match applied {
+        Ok(true) => Ok(Commit::Applied),
+        Ok(false) => Ok(Commit::Conflict),
+        Err(holt::Error::Atomic {
+            kind: holt::AtomicErrorKind::DefinitelyNotApplied,
+            source,
+        }) => Err(map_holt_error(*source)),
+        Err(error) => Err(poison(state, error.to_string())),
     }
 }
 
