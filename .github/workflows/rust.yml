@@ -62,4 +62,5 @@ jobs:
       - name: Test metadata read diagnostics
         run: |
           cargo test -p nokv-meta --features metadata-read-stats
+          cargo test -p nokv-meta-holt --features read-stats
           cargo test -p nokv-bench --features metadata-read-stats
