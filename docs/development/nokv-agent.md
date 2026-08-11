@@ -129,7 +129,7 @@ Run:
 
 ```bash
 cargo test -p nokv-agent
-python3 scripts/lingtai-workbench/workbench_contract_test.py
+python3 scripts/workbench/workbench_contract_test.py
 ```
 
 Schema-only success is not complete conformance. Product qualification follows

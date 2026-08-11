@@ -2,22 +2,22 @@
 set -euo pipefail
 
 if [ "$#" -ne 0 ]; then
-  echo "start_rustfs.sh accepts no arguments; use LINGTAI_WORKBENCH_* environment variables" >&2
+  echo "start_rustfs.sh accepts no arguments; use NOKV_WORKBENCH_* environment variables" >&2
   exit 1
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-data_root="${LINGTAI_WORKBENCH_DATA_ROOT:-${repo_root}/target/lingtai-workbench}"
-container="${LINGTAI_WORKBENCH_RUSTFS_CONTAINER:-lingtai-workbench-rustfs}"
-image="${LINGTAI_WORKBENCH_RUSTFS_IMAGE:-rustfs/rustfs:latest}"
-host="${LINGTAI_WORKBENCH_RUSTFS_HOST:-127.0.0.1}"
-port="${LINGTAI_WORKBENCH_RUSTFS_PORT:-9000}"
-console_port="${LINGTAI_WORKBENCH_RUSTFS_CONSOLE_PORT:-9001}"
-access_key="${LINGTAI_WORKBENCH_S3_ACCESS_KEY_ID:-rustfsadmin}"
-secret_key="${LINGTAI_WORKBENCH_S3_SECRET_ACCESS_KEY:-rustfsadmin}"
-bucket="${LINGTAI_WORKBENCH_S3_BUCKET:-nokv-lingtai-workbench}"
-endpoint="${LINGTAI_WORKBENCH_S3_ENDPOINT:-http://${host}:${port}}"
-rustfs_data="${LINGTAI_WORKBENCH_RUSTFS_DATA_DIR:-${data_root}/rustfs}"
+data_root="${NOKV_WORKBENCH_DATA_ROOT:-${repo_root}/target/workbench-live}"
+container="${NOKV_WORKBENCH_RUSTFS_CONTAINER:-nokv-workbench-rustfs}"
+image="${NOKV_WORKBENCH_RUSTFS_IMAGE:-rustfs/rustfs:latest}"
+host="${NOKV_WORKBENCH_RUSTFS_HOST:-127.0.0.1}"
+port="${NOKV_WORKBENCH_RUSTFS_PORT:-9000}"
+console_port="${NOKV_WORKBENCH_RUSTFS_CONSOLE_PORT:-9001}"
+access_key="${NOKV_WORKBENCH_S3_ACCESS_KEY_ID:-rustfsadmin}"
+secret_key="${NOKV_WORKBENCH_S3_SECRET_ACCESS_KEY:-rustfsadmin}"
+bucket="${NOKV_WORKBENCH_S3_BUCKET:-nokv-workbench-live}"
+endpoint="${NOKV_WORKBENCH_S3_ENDPOINT:-http://${host}:${port}}"
+rustfs_data="${NOKV_WORKBENCH_RUSTFS_DATA_DIR:-${data_root}/rustfs}"
 
 if ! command -v aws >/dev/null 2>&1; then
   echo "aws CLI is required to create and verify the RustFS bucket" >&2
@@ -84,7 +84,7 @@ if ! aws --endpoint-url "${endpoint}" s3api head-bucket --bucket "${bucket}" >/d
 fi
 
 cat <<EOF
-LingTai workbench RustFS ready
+NoKV Workbench RustFS ready
   container: ${container}
   endpoint:  ${endpoint}
   bucket:    ${bucket}

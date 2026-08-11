@@ -219,10 +219,10 @@ Splitting one root and cross-shard transactions are deferred. They require
 version vectors, k-way query/list merge, distributed restore, and explicit
 cross-shard reference ownership.
 
-## First Client Flow
+## Reference Research Workflow
 
-The first client validates the product through a scientific reconstruction
-workflow:
+The runtime-neutral reference validates the product through a scientific
+reconstruction workflow:
 
 ```text
 upload input dataset

@@ -215,10 +215,11 @@ adapter concern and does not dictate durable metadata families.
 
 See the [Workbench Contract](docs/workbench-contract.md).
 
-## First Client
+## Integration Model
 
-LingTai is the active design partner and first Workbench client. Its scientific
-reconstruction workflow exercises the product boundary end to end:
+The Workbench contract is runtime-neutral. Any MCP-compatible Agent runtime can
+exercise the product boundary end to end through the same scientific
+reconstruction workflow:
 
 ```text
 upload dataset
@@ -233,21 +234,24 @@ upload dataset
 Materialization creates a disposable local sandbox. It is not a NoKV namespace
 or a transparent host-filesystem access path.
 
+LingTai is the active design partner and first integrated client, but it uses
+this same public boundary rather than a partner-specific NoKV route.
+
 ## Use Case: A Research Workbench for Agents
 
-LingTai mounts NoKV as the durable artifact store behind its research agents.
-The runtime keeps agent state — locks, heartbeats, mailboxes, event logs — in
-a disposable local workdir; what a task produces and needs to prove crosses
+An Agent runtime uses NoKV as the durable artifact store behind its research
+agents. Runtime state — locks, heartbeats, mailboxes, and event logs — can stay
+in a disposable local workdir; what a task produces and needs to prove crosses
 into a Workbench.
 
 One MCP registry entry is the whole integration. Each agent spawns the `nokv`
 binary as a stdio MCP server:
 
 ```text
-nokv ... mcp --profile workbench --workbench-root /agents/{agent_id}/wb
+nokv ... --workbench-root /agents/{agent_id}/wb mcp
 ```
 
-LingTai expands `{agent_id}` per agent, so a single registry template gives
+The runtime expands `{agent_id}` per agent, so a single registry template gives
 every agent its own path-scoped Workbench root, and the 18 `workbench_*`
 tools land next to the agent's local file tools instead of replacing them.
 There is no client library and no NoKV-specific client code beyond that
@@ -295,12 +299,12 @@ cargo build --release -p nokv --bin nokv
 Run the offline Workbench contract gate:
 
 ```bash
-python3 scripts/lingtai-workbench/workbench_contract_test.py
+python3 scripts/workbench/workbench_contract_test.py
 ```
 
 A live deployment additionally needs a root id, persisted logical-shard
 placement, one admitted shard owner, and S3-compatible object coordinates. The
-[LingTai setup and preflight guide](docs/lingtai-workbench-preflight.md) gives
+[Workbench deployment preflight](docs/workbench-preflight.md) gives
 the complete provision, serve, MCP, materialize, collect, and acceptance flow
 without hiding the current recovery limitations.
 
@@ -318,7 +322,7 @@ without hiding the current recovery limitations.
 - [Agent Contributor Handbook](docs/development/nokv-agent.md)
 - [Code Contract](docs/development/code_contract.md)
 - [PR Review Checklist](docs/development/pr_review_checklist.md)
-- [LingTai Workbench Setup](docs/lingtai-workbench-preflight.md)
+- [Workbench Deployment Preflight](docs/workbench-preflight.md)
 
 ## Contributing
 
@@ -336,7 +340,7 @@ Before pushing a substantial change, run:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-python3 scripts/lingtai-workbench/workbench_contract_test.py
+python3 scripts/workbench/workbench_contract_test.py
 git diff --check
 ```
 

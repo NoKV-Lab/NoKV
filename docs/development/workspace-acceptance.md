@@ -39,12 +39,12 @@ Performance records additionally retain warm/cold state, object and metadata
 payload distributions, concurrency, duration, retries, error counts,
 throughput, and p50/p95/p99/maximum latency.
 
-## Gate 0: First Client And Workbench Contract
+## Gate 0: Workbench Contract And Live Workflow
 
-The LingTai integration and scientific reconstruction workflow must exercise
-the complete 18-tool Workbench surface through the real adapter boundary.
+The scientific reconstruction workflow must exercise the complete 18-tool
+Workbench surface through the real adapter boundary.
 The black-box runner is
-[`scripts/lingtai-workbench/live_first_client.py`](../../scripts/lingtai-workbench/live_first_client.py).
+[`scripts/workbench/live_workbench.py`](../../scripts/workbench/live_workbench.py).
 Its dry-run proves only command construction and tool coverage. A live run
 retains exact MCP and process evidence; absent etcd, S3-compatible storage, or
 the requested binary is `NOT QUALIFIED`, never `PASS`.
@@ -63,7 +63,7 @@ Required evidence:
 - stable `metadata/run_manifest.json` and
   `metadata/restore_manifest.json` projections.
 
-The bounded first-client runner uses a minimum one-day snapshot lease. Even
+The bounded live Workbench runner uses a minimum one-day snapshot lease. Even
 when its 18-tool workflow passes, Gate 0 remains `NOT QUALIFIED` until separate
 retained evidence observes expiry and the terminal `reaped` state.
 
@@ -235,7 +235,7 @@ A release is qualified only when:
 3. the package and dependency graph contains one authoritative implementation;
 4. operator documentation names the exact schema, placement, object backend,
    backup, restore, fsck, and evidence-retention procedures;
-5. the first-client golden workflow passes against the release artifacts.
+5. the live Workbench golden workflow passes against the release artifacts.
 
 The decision record links raw evidence. Design documents, source presence, and
 unit-test counts are context, not substitutes for boundary-level results.
@@ -246,6 +246,6 @@ unit-test counts are context, not substitutes for boundary-level results.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-python3 scripts/lingtai-workbench/workbench_contract_test.py
+python3 scripts/workbench/workbench_contract_test.py
 git diff --check
 ```
