@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 
 use super::build_commit_records::{
     BuildCommitOperationRecord, BuildCommitResult, CommitManifestCondition,
-    CommitOperationRecordError, CommitOperationTerminalError, CommitRetireOperationRecord,
+    CommitOperationErrorKind, CommitOperationRecordError, CommitOperationTerminalError,
+    CommitRetireOperationRecord,
 };
 use super::codec::{
     artifact_revision_key, build_commit_history_hold_key, child_commit_consumer_key, commit_key,
@@ -36,8 +37,8 @@ use super::commit_records::{
     CommitMemberRecord, CommitRecord, CommitRecordError, TagRecord, WorkbenchCommitHeadRecord,
 };
 use super::engine::{
-    CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError, MetaShard,
-    MetadataCommand, MetadataCommandResult, RootFenceAction,
+    CommandFit, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
+    MetaShard, MetadataCommand, MetadataCommandResult, RootFenceAction,
 };
 use super::event_projection::change_event_projection;
 use super::keyspace::MetadataFamily;
@@ -339,6 +340,18 @@ pub struct CommitService<'a> {
     store: &'a MetaShard,
 }
 
+#[derive(Clone)]
+struct BuildCommandCandidate {
+    plan: CommandPlan,
+    operation: BuildCommitOperationRecord,
+}
+
+#[derive(Clone)]
+struct RetireCommandCandidate {
+    plan: CommandPlan,
+    operation: CommitRetireOperationRecord,
+}
+
 impl<'a> CommitService<'a> {
     pub const fn new(store: &'a MetaShard) -> Self {
         Self { store }
@@ -529,6 +542,7 @@ impl<'a> CommitService<'a> {
         )?;
         let mut next = loaded.record.clone();
         let mut plan = CommandPlan::default();
+        let mut candidates = Vec::new();
         let mut new_revisions =
             BTreeMap::<ArtifactRevisionId, Loaded<ArtifactRevisionRecord>>::new();
         let mut observed_revisions = BTreeSet::new();
@@ -607,6 +621,10 @@ impl<'a> CommitService<'a> {
                     &mut observed_revisions,
                     &mut plan,
                 )?;
+                candidates.push(BuildCommandCandidate {
+                    plan: plan.clone(),
+                    operation: next.clone(),
+                });
                 virtual_manifest_pending = false;
                 if next.member_count - loaded.record.member_count >= request.limit as u64 {
                     break;
@@ -627,6 +645,10 @@ impl<'a> CommitService<'a> {
                         &mut observed_revisions,
                         &mut plan,
                     )?;
+                    candidates.push(BuildCommandCandidate {
+                        plan: plan.clone(),
+                        operation: next.clone(),
+                    });
                     virtual_manifest_pending = false;
                 }
                 consumed_source_rows += 1;
@@ -654,6 +676,10 @@ impl<'a> CommitService<'a> {
                 &mut observed_revisions,
                 &mut plan,
             )?;
+            candidates.push(BuildCommandCandidate {
+                plan: plan.clone(),
+                operation: next.clone(),
+            });
             consumed_source_rows += 1;
         }
         if virtual_manifest_pending
@@ -672,6 +698,10 @@ impl<'a> CommitService<'a> {
                 &mut observed_revisions,
                 &mut plan,
             )?;
+            candidates.push(BuildCommandCandidate {
+                plan: plan.clone(),
+                operation: next.clone(),
+            });
             virtual_manifest_pending = false;
         }
 
@@ -689,10 +719,14 @@ impl<'a> CommitService<'a> {
             )?;
             next.members_complete = true;
         }
-        replace_operation(&mut plan, request.context.root_id, &loaded, &next)?;
-        let payload = next.encode()?;
-        let result = self.execute_plan(request.context, plan, payload)?;
-        decode_build_outcome(result, request.operation_id)
+        candidates.push(BuildCommandCandidate {
+            plan,
+            operation: next,
+        });
+        match self.execute_largest_fitting_build_candidate(request.context, &loaded, candidates)? {
+            Some(outcome) => Ok(outcome),
+            None => self.abort_capacity_exhausted(request.context, request.operation_id, "member"),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -885,6 +919,7 @@ impl<'a> CommitService<'a> {
         let end = (start + request.limit).min(loaded.record.parent_commits.len());
         let mut next = loaded.record.clone();
         let mut plan = CommandPlan::default();
+        let mut candidates = Vec::new();
         for index in start..end {
             let parent_id = next.parent_commits[index];
             if parent_id == next.commit_id {
@@ -938,12 +973,24 @@ impl<'a> CommitService<'a> {
                     .ok_or(CommitError::CounterOverflow {
                         field: "parent_cursor",
                     })?;
+            candidates.push(BuildCommandCandidate {
+                plan: plan.clone(),
+                operation: next.clone(),
+            });
         }
         next.parents_complete = end == next.parent_commits.len();
-        replace_operation(&mut plan, request.context.root_id, &loaded, &next)?;
-        let payload = next.encode()?;
-        let result = self.execute_plan(request.context, plan, payload)?;
-        decode_build_outcome(result, request.operation_id)
+        candidates.push(BuildCommandCandidate {
+            plan,
+            operation: next,
+        });
+        match self.execute_largest_fitting_build_candidate(request.context, &loaded, candidates)? {
+            Some(outcome) => Ok(outcome),
+            None => self.abort_capacity_exhausted(
+                request.context,
+                request.operation_id,
+                "parent attachment",
+            ),
+        }
     }
 
     pub fn begin_sealing(
@@ -1554,7 +1601,10 @@ impl<'a> CommitService<'a> {
 
         let mut next = loaded.record.clone();
         let mut plan = CommandPlan::default();
+        let mut candidates = Vec::new();
+        let cleanup_step;
         if next.cleanup_parent_count < next.parent_cursor {
+            cleanup_step = "parent consumer";
             let remaining = next.parent_cursor - next.cleanup_parent_count;
             let count = remaining.min(request.limit as u32);
             let next_commit = next_commit_version(request.context)?;
@@ -1587,10 +1637,22 @@ impl<'a> CommitService<'a> {
                         field: "cleanup_parent_count",
                     },
                 )?;
+                candidates.push(BuildCommandCandidate {
+                    plan: plan.clone(),
+                    operation: next.clone(),
+                });
             }
         } else if next.cleanup_revision_count < next.revision_ref_count {
-            self.plan_build_revision_cleanup(request.context, request.limit, &mut next, &mut plan)?;
+            cleanup_step = "revision reference";
+            self.plan_build_revision_cleanup(
+                request.context,
+                request.limit,
+                &mut next,
+                &mut plan,
+                &mut candidates,
+            )?;
         } else if next.cleanup_member_count < next.member_count {
+            cleanup_step = "member";
             let prefix = commit_member_prefix(request.context.root_id, next.commit_id);
             let rows = self.store.scan_prefix_at(
                 request.context.root_id,
@@ -1619,6 +1681,10 @@ impl<'a> CommitService<'a> {
                 plan.delete(MetadataFamily::CommitMember, row.key, row.value)?;
                 next.cleanup_member_count =
                     checked_add(next.cleanup_member_count, 1, "cleanup_member_count")?;
+                candidates.push(BuildCommandCandidate {
+                    plan: plan.clone(),
+                    operation: next.clone(),
+                });
             }
             if next.cleanup_member_count > next.member_count {
                 return Err(CommitError::ClosureMismatch {
@@ -1628,6 +1694,7 @@ impl<'a> CommitService<'a> {
                 });
             }
         } else {
+            cleanup_step = "finalization";
             let member_rows = self.scan_prefix(
                 request.context,
                 MetadataFamily::CommitMember,
@@ -1657,10 +1724,14 @@ impl<'a> CommitService<'a> {
             next.phase = BuildCommitPhase::Cleaned;
             next.history_hold_released = true;
         }
-        replace_operation(&mut plan, request.context.root_id, &loaded, &next)?;
-        let payload = next.encode()?;
-        let result = self.execute_plan(request.context, plan, payload)?;
-        decode_build_outcome(result, request.operation_id)
+        candidates.push(BuildCommandCandidate {
+            plan,
+            operation: next,
+        });
+        match self.execute_largest_fitting_build_candidate(request.context, &loaded, candidates)? {
+            Some(outcome) => Ok(outcome),
+            None => self.quarantine_cleanup_capacity(request.context, &loaded, cleanup_step),
+        }
     }
 
     fn plan_build_revision_cleanup(
@@ -1669,6 +1740,7 @@ impl<'a> CommitService<'a> {
         limit: usize,
         operation: &mut BuildCommitOperationRecord,
         plan: &mut CommandPlan,
+        candidates: &mut Vec<BuildCommandCandidate>,
     ) -> Result<(), CommitError> {
         let prefix = commit_revision_ref_prefix(context.root_id, operation.commit_id);
         let rows = self.scan_prefix(context, MetadataFamily::RevisionRef, &prefix, limit)?;
@@ -1717,6 +1789,10 @@ impl<'a> CommitService<'a> {
                 1,
                 "cleanup_revision_count",
             )?;
+            candidates.push(BuildCommandCandidate {
+                plan: plan.clone(),
+                operation: operation.clone(),
+            });
         }
         if operation.cleanup_revision_count > operation.revision_ref_count {
             return Err(CommitError::ClosureMismatch {
@@ -1820,6 +1896,8 @@ impl<'a> CommitService<'a> {
         }
         let mut next = loaded.record.clone();
         let mut plan = CommandPlan::default();
+        let mut candidates = Vec::new();
+        let release_step;
         plan.assert_value(
             MetadataFamily::Commit,
             commit_key(request.context.root_id, next.commit_id),
@@ -1827,27 +1905,34 @@ impl<'a> CommitService<'a> {
         )?;
 
         if next.released_revision_count < next.revision_count {
+            release_step = "revision reference";
             self.plan_retire_revision_release(
                 request.context,
                 request.limit.min(MAX_COMMIT_REVISION_BATCH_ROWS),
                 &mut next,
                 &mut plan,
+                &mut candidates,
             )?;
         } else if (next.released_parent_count as usize) < next.parent_commits.len() {
+            release_step = "parent consumer";
             self.plan_retire_parent_release(
                 request.context,
                 request.limit.min(MAX_COMMIT_PARENT_BATCH_ROWS),
                 &mut next,
                 &mut plan,
+                &mut candidates,
             )?;
         } else if next.released_member_count < next.member_count {
+            release_step = "member";
             self.plan_retire_member_release(
                 request.context,
                 request.limit.min(MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS),
                 &mut next,
                 &mut plan,
+                &mut candidates,
             )?;
         } else {
+            release_step = "finalization";
             verify_retire_seals(&next)?;
             let member_rows = self.scan_prefix(
                 request.context,
@@ -1877,11 +1962,15 @@ impl<'a> CommitService<'a> {
                 retired.encode()?,
             )?;
             next.phase = CommitRetirePhase::Complete;
+            candidates.push(RetireCommandCandidate {
+                plan: plan.clone(),
+                operation: next.clone(),
+            });
         }
-        replace_retire_operation(&mut plan, request.context.root_id, &loaded, &next)?;
-        let payload = next.encode()?;
-        let result = self.execute_plan(request.context, plan, payload)?;
-        decode_retire_outcome(result, request.operation_id)
+        match self.execute_largest_fitting_retire_candidate(request.context, &loaded, candidates)? {
+            Some(outcome) => Ok(outcome),
+            None => self.quarantine_retire_capacity(request.context, &loaded, release_step),
+        }
     }
 
     fn plan_retire_revision_release(
@@ -1890,6 +1979,7 @@ impl<'a> CommitService<'a> {
         limit: usize,
         operation: &mut CommitRetireOperationRecord,
         plan: &mut CommandPlan,
+        candidates: &mut Vec<RetireCommandCandidate>,
     ) -> Result<(), CommitError> {
         let prefix = commit_revision_ref_prefix(context.root_id, operation.commit_id);
         let rows = self.scan_prefix(context, MetadataFamily::RevisionRef, &prefix, limit)?;
@@ -1951,6 +2041,10 @@ impl<'a> CommitService<'a> {
                     .encode()?,
                 )?;
             }
+            candidates.push(RetireCommandCandidate {
+                plan: plan.clone(),
+                operation: operation.clone(),
+            });
         }
         Ok(())
     }
@@ -1961,6 +2055,7 @@ impl<'a> CommitService<'a> {
         limit: usize,
         operation: &mut CommitRetireOperationRecord,
         plan: &mut CommandPlan,
+        candidates: &mut Vec<RetireCommandCandidate>,
     ) -> Result<(), CommitError> {
         let start = operation.released_parent_count as usize;
         let end = (start + limit).min(operation.parent_commits.len());
@@ -1994,6 +2089,10 @@ impl<'a> CommitService<'a> {
                 .ok_or(CommitError::CounterOverflow {
                     field: "released_parent_count",
                 })?;
+            candidates.push(RetireCommandCandidate {
+                plan: plan.clone(),
+                operation: operation.clone(),
+            });
         }
         Ok(())
     }
@@ -2004,6 +2103,7 @@ impl<'a> CommitService<'a> {
         limit: usize,
         operation: &mut CommitRetireOperationRecord,
         plan: &mut CommandPlan,
+        candidates: &mut Vec<RetireCommandCandidate>,
     ) -> Result<(), CommitError> {
         let prefix = commit_member_prefix(context.root_id, operation.commit_id);
         let rows = self.scan_prefix(context, MetadataFamily::CommitMember, &prefix, limit)?;
@@ -2036,6 +2136,10 @@ impl<'a> CommitService<'a> {
                 });
             }
             plan.delete(MetadataFamily::CommitMember, row.key, row.value)?;
+            candidates.push(RetireCommandCandidate {
+                plan: plan.clone(),
+                operation: operation.clone(),
+            });
         }
         Ok(())
     }
@@ -2340,25 +2444,131 @@ impl<'a> CommitService<'a> {
         plan: CommandPlan,
         deterministic_result: Vec<u8>,
     ) -> Result<MetadataCommandResult, CommitError> {
-        let command = MetadataCommand {
-            schema_id: SCHEMA_ID.to_owned(),
-            root_id: context.root_id,
-            logical_shard_id: context.logical_shard_id,
-            placement_generation: context.placement_generation,
-            owner_epoch: context.owner_epoch,
-            request_id: context.request_id,
-            command_digest: nokv_types::CommandDigest::from_bytes([0; SHA256_BYTES]),
-            read_version: context.read_version,
-            root_fence_action: RootFenceAction::RequireActive,
-            predicates: plan.predicates,
-            mutations: plan.mutations,
-            history_projection: plan.history,
-            event_projection: plan.events,
-            deterministic_result,
-        }
-        .seal();
+        let command = build_command(context, plan, deterministic_result);
         self.store.execute(&command).map_err(Into::into)
     }
+
+    fn execute_largest_fitting_build_candidate(
+        &self,
+        context: RootWriteContext,
+        loaded: &Loaded<BuildCommitOperationRecord>,
+        candidates: Vec<BuildCommandCandidate>,
+    ) -> Result<Option<BuildCommitOutcome>, CommitError> {
+        for candidate in candidates.into_iter().rev() {
+            let mut plan = candidate.plan;
+            replace_operation(&mut plan, context.root_id, loaded, &candidate.operation)?;
+            let payload = candidate.operation.encode()?;
+            let command = build_command(context, plan, payload);
+            if self.store.command_fit(&command, None)? == CommandFit::Fits {
+                let result = self.store.execute(&command)?;
+                return decode_build_outcome(result, loaded.record.operation_id).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn abort_capacity_exhausted(
+        &self,
+        context: RootWriteContext,
+        operation_id: OperationId,
+        step: &'static str,
+    ) -> Result<BuildCommitOutcome, CommitError> {
+        self.abort_build(AbortBuildCommitRequest {
+            context,
+            operation_id,
+            terminal_error: CommitOperationTerminalError {
+                kind: CommitOperationErrorKind::InvariantViolation,
+                message: format!(
+                    "portable transaction capacity cannot admit one commit {step} step"
+                ),
+            },
+        })
+    }
+
+    fn quarantine_cleanup_capacity(
+        &self,
+        context: RootWriteContext,
+        loaded: &Loaded<BuildCommitOperationRecord>,
+        step: &'static str,
+    ) -> Result<BuildCommitOutcome, CommitError> {
+        let mut next = loaded.record.clone();
+        next.phase = BuildCommitPhase::Quarantined;
+        next.terminal_error = Some(CommitOperationTerminalError {
+            kind: CommitOperationErrorKind::InvariantViolation,
+            message: format!(
+                "portable transaction capacity cannot admit one commit cleanup {step} step"
+            ),
+        });
+        let mut plan = CommandPlan::default();
+        replace_operation(&mut plan, context.root_id, loaded, &next)?;
+        let payload = next.encode()?;
+        let result = self.execute_plan(context, plan, payload)?;
+        decode_build_outcome(result, loaded.record.operation_id)
+    }
+
+    fn execute_largest_fitting_retire_candidate(
+        &self,
+        context: RootWriteContext,
+        loaded: &Loaded<CommitRetireOperationRecord>,
+        candidates: Vec<RetireCommandCandidate>,
+    ) -> Result<Option<RetireCommitOutcome>, CommitError> {
+        for candidate in candidates.into_iter().rev() {
+            let mut plan = candidate.plan;
+            replace_retire_operation(&mut plan, context.root_id, loaded, &candidate.operation)?;
+            let payload = candidate.operation.encode()?;
+            let command = build_command(context, plan, payload);
+            if self.store.command_fit(&command, None)? == CommandFit::Fits {
+                let result = self.store.execute(&command)?;
+                return decode_retire_outcome(result, loaded.record.operation_id).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn quarantine_retire_capacity(
+        &self,
+        context: RootWriteContext,
+        loaded: &Loaded<CommitRetireOperationRecord>,
+        step: &'static str,
+    ) -> Result<RetireCommitOutcome, CommitError> {
+        let mut next = loaded.record.clone();
+        next.phase = CommitRetirePhase::Quarantined;
+        next.terminal_error = Some(CommitOperationTerminalError {
+            kind: super::build_commit_records::CommitOperationErrorKind::InvariantViolation,
+            message: format!(
+                "portable transaction capacity cannot admit one commit retirement {step} step"
+            ),
+        });
+        let mut plan = CommandPlan::default();
+        replace_retire_operation(&mut plan, context.root_id, loaded, &next)?;
+        let payload = next.encode()?;
+        let result = self.execute_plan(context, plan, payload)?;
+        decode_retire_outcome(result, loaded.record.operation_id)
+    }
+}
+
+fn build_command(
+    context: RootWriteContext,
+    plan: CommandPlan,
+    deterministic_result: Vec<u8>,
+) -> MetadataCommand {
+    MetadataCommand {
+        schema_id: SCHEMA_ID.to_owned(),
+        root_id: context.root_id,
+        logical_shard_id: context.logical_shard_id,
+        placement_generation: context.placement_generation,
+        owner_epoch: context.owner_epoch,
+        request_id: context.request_id,
+        command_digest: nokv_types::CommandDigest::from_bytes([0; SHA256_BYTES]),
+        read_version: context.read_version,
+        root_fence_action: RootFenceAction::RequireActive,
+        predicates: plan.predicates,
+        mutations: plan.mutations,
+        history_projection: plan.history,
+        event_projection: plan.events,
+        deterministic_result,
+    }
+    .seal()
 }
 
 #[derive(Clone, Debug)]
@@ -2367,7 +2577,7 @@ struct Loaded<T> {
     record: T,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CommandPlan {
     predicates: Vec<CommandPredicate>,
     mutations: Vec<CommandMutation>,
@@ -3024,6 +3234,61 @@ mod tests {
         }
     }
 
+    fn seed_large_paths(
+        store: &MetaShard,
+        counter: &mut u128,
+        count: usize,
+        projection_bytes: usize,
+    ) {
+        for index in 0..count {
+            let revision_id = revision(90_000 + index as u128);
+            let path = NormalizedRelativePath::new(format!("large/{index:04}.bin")).unwrap();
+            let mut entry = path_entry(index, revision_id);
+            entry.typed_index_projection = vec![index as u8; projection_bytes];
+            raw_put(
+                store,
+                counter,
+                vec![
+                    (
+                        MetadataFamily::ArtifactRevision,
+                        artifact_revision_key(root(), revision_id),
+                        artifact(index).encode().unwrap(),
+                    ),
+                    (
+                        MetadataFamily::PathCurrent,
+                        path_current_key(root(), incarnation(), &path),
+                        entry.encode().unwrap(),
+                    ),
+                ],
+            );
+        }
+    }
+
+    fn large_parent_record(
+        tree_revision: ArtifactRevisionId,
+        lineage_bytes: usize,
+    ) -> CommitRecord {
+        CommitRecord {
+            source_workspace_incarnation_id: incarnation(),
+            content_digest_uri: "sha256:parent-content".to_owned(),
+            manifest_digest_uri: "sha256:parent-manifest".to_owned(),
+            tree_manifest_revision_id: tree_revision,
+            tree_digest_uri: "sha256:parent-tree".to_owned(),
+            member_count: 0,
+            member_digest: [0; SHA256_BYTES],
+            unique_revision_count: 1,
+            revision_digest: [1; SHA256_BYTES],
+            parent_commits: Vec::new(),
+            parent_digest: [0; SHA256_BYTES],
+            producer: None,
+            lineage_projection: vec![0x5a; lineage_bytes],
+            consumer_count: 1,
+            consumer_epoch: ConsumerEpoch::new(1),
+            last_zero_consumer_version: None,
+            state: CommitState::Sealed,
+        }
+    }
+
     fn begin_request(
         context: RootWriteContext,
         operation_id: OperationId,
@@ -3237,6 +3502,471 @@ mod tests {
             )
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn member_build_and_cleanup_choose_fitting_prefixes_and_replay() {
+        const ROWS: usize = 24;
+        const PROJECTION_BYTES: usize = 24 * 1024;
+
+        let mut counter = 20_000_u128;
+        let store = ready_store(&mut counter);
+        seed_large_paths(&store, &mut counter, ROWS, PROJECTION_BYTES);
+        let service = CommitService::new(&store);
+        let operation_id = operation(90);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                operation_id,
+                commit(90),
+                revision(90_000),
+                vec![],
+            ))
+            .unwrap();
+
+        let first_context = write_context(&store, &mut counter);
+        let first_request = BuildCommitStepRequest {
+            context: first_context,
+            operation_id,
+            limit: ROWS,
+        };
+        let first = service.build_members(first_request).unwrap();
+        assert!(first.operation.member_count > 0);
+        assert!(first.operation.member_count < ROWS as u64);
+        let replay = service.build_members(first_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, first.operation);
+
+        let mut built = first;
+        while !built.operation.members_complete {
+            built = service
+                .build_members(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: ROWS,
+                })
+                .unwrap();
+            assert_eq!(built.operation.phase, BuildCommitPhase::Building);
+        }
+        assert_eq!(built.operation.member_count, ROWS as u64);
+
+        service
+            .abort_build(AbortBuildCommitRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                terminal_error: CommitOperationTerminalError {
+                    kind: super::super::CommitOperationErrorKind::AbortedByCaller,
+                    message: "exercise byte-aware cleanup".to_owned(),
+                },
+            })
+            .unwrap();
+        service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+            })
+            .unwrap();
+
+        let mut saw_partial_member_cleanup = false;
+        let mut previous_member_count = 0;
+        loop {
+            let outcome = service
+                .cleanup_build(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+                })
+                .unwrap();
+            assert_ne!(outcome.operation.phase, BuildCommitPhase::Quarantined);
+            let cleaned = outcome.operation.cleanup_member_count;
+            if cleaned > previous_member_count && cleaned < ROWS as u64 {
+                saw_partial_member_cleanup = true;
+            }
+            previous_member_count = cleaned;
+            if outcome.operation.phase == BuildCommitPhase::Cleaned {
+                assert!(outcome.operation.history_hold_released);
+                break;
+            }
+        }
+        assert!(saw_partial_member_cleanup);
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn retirement_member_release_chooses_a_fitting_prefix_and_replays() {
+        const ROWS: usize = 24;
+        const PROJECTION_BYTES: usize = 24 * 1024;
+
+        let mut counter = 24_000_u128;
+        let store = ready_store(&mut counter);
+        seed_large_paths(&store, &mut counter, ROWS, PROJECTION_BYTES);
+        let service = CommitService::new(&store);
+        let build_id = operation(91);
+        let commit_id = commit(91);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                build_id,
+                commit_id,
+                revision(90_000),
+                vec![],
+            ))
+            .unwrap();
+        let completed = finish_build(&store, &mut counter, build_id);
+        assert_eq!(completed.operation.member_count, ROWS as u64);
+
+        detach_head(&store, &mut counter, commit_id);
+        let zero = CommitRecord::decode(
+            &read_current(
+                &store,
+                MetadataFamily::Commit,
+                &commit_key(root(), commit_id),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let retire_id = operation(95);
+        service
+            .begin_retirement(BeginCommitRetirementRequest {
+                context: write_context(&store, &mut counter),
+                operation_id: retire_id,
+                commit_id,
+                expected_consumer_epoch: zero.consumer_epoch,
+            })
+            .unwrap();
+
+        let mut outcome = service
+            .release_retired_commit(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id: retire_id,
+                limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
+            })
+            .unwrap();
+        while outcome.operation.released_revision_count < outcome.operation.revision_count {
+            outcome = service
+                .release_retired_commit(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id: retire_id,
+                    limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
+                })
+                .unwrap();
+            assert_ne!(outcome.operation.phase, CommitRetirePhase::Quarantined);
+        }
+
+        let member_context = write_context(&store, &mut counter);
+        let member_request = BuildCommitStepRequest {
+            context: member_context,
+            operation_id: retire_id,
+            limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
+        };
+        let first = service.release_retired_commit(member_request).unwrap();
+        assert!(first.operation.released_member_count > 0);
+        assert!(first.operation.released_member_count < ROWS as u64);
+        let replay = service.release_retired_commit(member_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, first.operation);
+
+        outcome = first;
+        while outcome.operation.phase != CommitRetirePhase::Complete {
+            outcome = service
+                .release_retired_commit(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id: retire_id,
+                    limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
+                })
+                .unwrap();
+            assert_ne!(outcome.operation.phase, CommitRetirePhase::Quarantined);
+        }
+        assert_eq!(outcome.operation.released_member_count, ROWS as u64);
+        let retired = CommitRecord::decode(
+            &read_current(
+                &store,
+                MetadataFamily::Commit,
+                &commit_key(root(), commit_id),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retired.state, CommitState::Retired);
+    }
+
+    #[test]
+    fn capacity_abort_is_durable_replayable_and_cleanup_releases_hold() {
+        let mut counter = 25_000_u128;
+        let store = ready_store(&mut counter);
+        let service = CommitService::new(&store);
+        let operation_id = operation(92);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                operation_id,
+                commit(92),
+                revision(92_000),
+                vec![],
+            ))
+            .unwrap();
+
+        let abort_context = write_context(&store, &mut counter);
+        let aborted = service
+            .abort_capacity_exhausted(abort_context, operation_id, "member")
+            .unwrap();
+        assert_eq!(aborted.operation.phase, BuildCommitPhase::Aborting);
+        assert_eq!(
+            aborted.operation.terminal_error.as_ref().unwrap().kind,
+            super::super::CommitOperationErrorKind::InvariantViolation
+        );
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_some());
+
+        let replay = service
+            .abort_capacity_exhausted(abort_context, operation_id, "member")
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, aborted.operation);
+
+        service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: 1,
+            })
+            .unwrap();
+        let cleaned = service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(cleaned.operation.phase, BuildCommitPhase::Cleaned);
+        assert!(cleaned.operation.history_hold_released);
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cleanup_capacity_quarantine_replays_without_releasing_hold() {
+        let mut counter = 27_000_u128;
+        let store = ready_store(&mut counter);
+        let service = CommitService::new(&store);
+        let operation_id = operation(93);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                operation_id,
+                commit(93),
+                revision(93_000),
+                vec![],
+            ))
+            .unwrap();
+        service
+            .abort_build(AbortBuildCommitRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                terminal_error: CommitOperationTerminalError {
+                    kind: super::super::CommitOperationErrorKind::AbortedByCaller,
+                    message: "prepare cleanup quarantine".to_owned(),
+                },
+            })
+            .unwrap();
+        service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: 1,
+            })
+            .unwrap();
+
+        let quarantine_context = write_context(&store, &mut counter);
+        let loaded = service
+            .load_build_operation(quarantine_context, operation_id)
+            .unwrap();
+        let quarantined = service
+            .quarantine_cleanup_capacity(quarantine_context, &loaded, "member")
+            .unwrap();
+        assert_eq!(quarantined.operation.phase, BuildCommitPhase::Quarantined);
+        assert!(!quarantined.operation.history_hold_released);
+        assert_eq!(
+            quarantined.operation.terminal_error.as_ref().unwrap().kind,
+            super::super::CommitOperationErrorKind::InvariantViolation
+        );
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_some());
+
+        let replay = service
+            .quarantine_cleanup_capacity(quarantine_context, &loaded, "member")
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, quarantined.operation);
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn parent_attach_and_cleanup_choose_fitting_prefixes_and_replay() {
+        const PARENTS: usize = 24;
+        const LINEAGE_BYTES: usize = 24 * 1024;
+
+        let mut counter = 30_000_u128;
+        let store = ready_store(&mut counter);
+        let tree_revision = revision(95_000);
+        raw_put(
+            &store,
+            &mut counter,
+            vec![(
+                MetadataFamily::ArtifactRevision,
+                artifact_revision_key(root(), tree_revision),
+                artifact(0).encode().unwrap(),
+            )],
+        );
+        let parents = (0..PARENTS)
+            .map(|index| commit(100 + index as u8))
+            .collect::<Vec<_>>();
+        for parent in &parents {
+            raw_put(
+                &store,
+                &mut counter,
+                vec![(
+                    MetadataFamily::Commit,
+                    commit_key(root(), *parent),
+                    large_parent_record(tree_revision, LINEAGE_BYTES)
+                        .encode()
+                        .unwrap(),
+                )],
+            );
+        }
+
+        let service = CommitService::new(&store);
+        let operation_id = operation(91);
+        let child_commit = commit(99);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                operation_id,
+                child_commit,
+                tree_revision,
+                parents.clone(),
+            ))
+            .unwrap();
+        assert!(
+            service
+                .build_members(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: 1,
+                })
+                .unwrap()
+                .operation
+                .members_complete
+        );
+        assert!(
+            service
+                .seal_revisions(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+                })
+                .unwrap()
+                .operation
+                .revisions_complete
+        );
+
+        let first_context = write_context(&store, &mut counter);
+        let first_request = BuildCommitStepRequest {
+            context: first_context,
+            operation_id,
+            limit: PARENTS,
+        };
+        let first = service.attach_parents(first_request).unwrap();
+        assert!(first.operation.parent_cursor > 0);
+        assert!(first.operation.parent_cursor < PARENTS as u32);
+        let replay = service.attach_parents(first_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, first.operation);
+
+        let mut attached = first;
+        while !attached.operation.parents_complete {
+            attached = service
+                .attach_parents(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: PARENTS,
+                })
+                .unwrap();
+        }
+        service
+            .abort_build(AbortBuildCommitRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                terminal_error: CommitOperationTerminalError {
+                    kind: super::super::CommitOperationErrorKind::AbortedByCaller,
+                    message: "exercise byte-aware parent cleanup".to_owned(),
+                },
+            })
+            .unwrap();
+        service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+            })
+            .unwrap();
+
+        let mut saw_partial_parent_cleanup = false;
+        loop {
+            let outcome = service
+                .cleanup_build(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+                })
+                .unwrap();
+            assert_ne!(outcome.operation.phase, BuildCommitPhase::Quarantined);
+            if outcome.operation.cleanup_parent_count > 0
+                && outcome.operation.cleanup_parent_count < PARENTS as u32
+            {
+                saw_partial_parent_cleanup = true;
+            }
+            if outcome.operation.phase == BuildCommitPhase::Cleaned {
+                break;
+            }
+        }
+        assert!(saw_partial_parent_cleanup);
+        for parent in parents {
+            assert!(read_current(
+                &store,
+                MetadataFamily::CommitConsumer,
+                &child_commit_consumer_key(root(), parent, child_commit),
+            )
+            .is_none());
+            let record = CommitRecord::decode(
+                &read_current(&store, MetadataFamily::Commit, &commit_key(root(), parent)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(record.consumer_count, 1);
+        }
     }
 
     #[test]

@@ -635,13 +635,8 @@ impl MetadataWorkspaceRequestExecutor {
         )
         .map_err(restore_failure)?;
 
-        if matches!(
-            outcome.operation.phase,
-            types::RestorePhase::Cleaned | types::RestorePhase::Quarantined
-        ) {
-            return Err(restore_operation_status(&outcome.operation)?
-                .failure
-                .ok_or_else(|| internal("terminal restore status omitted its durable failure"))?);
+        if let Some(failure) = restore_terminal_failure(&outcome.operation) {
+            return Err(failure);
         }
 
         if outcome.operation.phase == types::RestorePhase::Preparing {
@@ -676,6 +671,9 @@ impl MetadataWorkspaceRequestExecutor {
             )
             .map_err(restore_failure)?;
             outcome = copied.command;
+            if let Some(failure) = restore_terminal_failure(&outcome.operation) {
+                return Err(failure);
+            }
             if !outcome.operation.source_eof && outcome.operation.next_member_sequence == before {
                 return Err(internal("restore copier made no durable progress"));
             }
@@ -1596,13 +1594,7 @@ impl MetadataWorkspaceRequestExecutor {
             outcome.operation.phase,
             types::BuildCommitPhase::Building | types::BuildCommitPhase::Sealing
         ) {
-            return Ok(ExecutedRequest {
-                result: protocol::WorkspaceResult::Operation(build_commit_operation_status(
-                    &outcome.operation,
-                )?),
-                commit_version: Some(outcome.commit_version.get()),
-                replayed: outcome.replayed,
-            });
+            return build_commit_response(outcome);
         }
 
         // The first commit call durably freezes the expected head and source
@@ -1629,6 +1621,12 @@ impl MetadataWorkspaceRequestExecutor {
                     limit: meta::MAX_COMMIT_MEMBER_BATCH_ROWS,
                 })
             })?;
+            if !matches!(
+                outcome.operation.phase,
+                types::BuildCommitPhase::Building | types::BuildCommitPhase::Sealing
+            ) {
+                return build_commit_response(outcome);
+            }
             if !outcome.operation.members_complete && outcome.operation.member_count == before {
                 return Err(internal("commit member builder made no durable progress"));
             }
@@ -1647,6 +1645,12 @@ impl MetadataWorkspaceRequestExecutor {
                     limit: meta::MAX_COMMIT_REVISION_BATCH_ROWS,
                 })
             })?;
+            if !matches!(
+                outcome.operation.phase,
+                types::BuildCommitPhase::Building | types::BuildCommitPhase::Sealing
+            ) {
+                return build_commit_response(outcome);
+            }
             if !outcome.operation.revisions_complete
                 && outcome.operation.revision_seal_count == before
             {
@@ -1667,6 +1671,12 @@ impl MetadataWorkspaceRequestExecutor {
                     limit: meta::MAX_COMMIT_PARENT_BATCH_ROWS,
                 })
             })?;
+            if !matches!(
+                outcome.operation.phase,
+                types::BuildCommitPhase::Building | types::BuildCommitPhase::Sealing
+            ) {
+                return build_commit_response(outcome);
+            }
             if !outcome.operation.parents_complete && outcome.operation.parent_cursor == before {
                 return Err(internal("commit parent builder made no durable progress"));
             }
@@ -3195,6 +3205,60 @@ fn build_commit_operation_status(
     })
 }
 
+fn build_commit_response(
+    outcome: meta::BuildCommitOutcome,
+) -> Result<ExecutedRequest, protocol::RpcFailure> {
+    let terminal_message = || {
+        outcome
+            .operation
+            .terminal_error
+            .as_ref()
+            .map(|error| error.message.as_str())
+            .unwrap_or("commit construction was aborted")
+    };
+    match outcome.operation.phase {
+        types::BuildCommitPhase::Aborting
+        | types::BuildCommitPhase::Cleaning
+        | types::BuildCommitPhase::Cleaned => {
+            return Err(operation_terminal_failure(terminal_message()));
+        }
+        types::BuildCommitPhase::Quarantined => {
+            return Err(operation_quarantined_failure(terminal_message()));
+        }
+        types::BuildCommitPhase::Building
+        | types::BuildCommitPhase::Sealing
+        | types::BuildCommitPhase::Complete => {}
+    }
+    Ok(ExecutedRequest {
+        result: protocol::WorkspaceResult::Operation(build_commit_operation_status(
+            &outcome.operation,
+        )?),
+        commit_version: Some(outcome.commit_version.get()),
+        replayed: outcome.replayed,
+    })
+}
+
+fn restore_terminal_failure(
+    operation: &meta::RestoreOperationRecord,
+) -> Option<protocol::RpcFailure> {
+    let message = operation
+        .terminal_error
+        .as_ref()
+        .map(|error| error.message.as_str())
+        .unwrap_or("restore was aborted");
+    match operation.phase {
+        types::RestorePhase::Aborting
+        | types::RestorePhase::Cleaning
+        | types::RestorePhase::Cleaned => Some(operation_terminal_failure(message)),
+        types::RestorePhase::Quarantined => Some(operation_quarantined_failure(message)),
+        types::RestorePhase::Preparing
+        | types::RestorePhase::Copying
+        | types::RestorePhase::SourceSealed
+        | types::RestorePhase::Ready
+        | types::RestorePhase::Complete => None,
+    }
+}
+
 fn restore_operation_preparation(
     operation: &meta::RestoreOperationRecord,
 ) -> Result<protocol::RestoreOperationPreparation, protocol::RpcFailure> {
@@ -3842,6 +3906,15 @@ fn operation_terminal_failure(message: &str) -> protocol::RpcFailure {
     )
 }
 
+fn operation_quarantined_failure(message: &str) -> protocol::RpcFailure {
+    failure(
+        protocol::ErrorCode::Quarantined,
+        message,
+        false,
+        Some(protocol::ConflictKind::OperationState),
+    )
+}
+
 fn conflict(
     kind: protocol::ConflictKind,
     message: impl Into<String>,
@@ -4062,6 +4135,97 @@ mod tests {
                 lineage_projection: Vec::new(),
             }),
         }
+    }
+
+    fn terminal_build_operation(
+        phase: types::BuildCommitPhase,
+    ) -> meta::BuildCommitOperationRecord {
+        let mut operation = meta::BuildCommitOperationRecord {
+            operation_id: types::OperationId::from_bytes([0x71; types::FIXED_ID_BYTES]),
+            identity_digest: [0; types::SHA256_BYTES],
+            initialization_digest: [0; types::SHA256_BYTES],
+            workbench_id: types::WorkbenchId::new("terminal-commit").unwrap(),
+            source_workspace_incarnation_id: types::WorkspaceIncarnationId::from_bytes(
+                [0x72; types::FIXED_ID_BYTES],
+            ),
+            source_read_version: types::ReadVersion::new(1).unwrap(),
+            commit_id: types::CommitId::from_bytes([0x73; types::SHA256_BYTES]),
+            expected_head: None,
+            content_digest_uri: format!("sha256:{}", "74".repeat(types::SHA256_BYTES)),
+            manifest_digest_uri: format!("sha256:{}", "75".repeat(types::SHA256_BYTES)),
+            projection_input_digest: [0x76; types::SHA256_BYTES],
+            tree_manifest_revision_id: types::ArtifactRevisionId::from_bytes(
+                [0x77; types::FIXED_ID_BYTES],
+            ),
+            replace: false,
+            run_manifest_condition: meta::CommitManifestCondition::CreateOnly,
+            committed_at_unix_seconds: 1,
+            commit_staged_run_manifest: None,
+            producer: None,
+            lineage_projection: Vec::new(),
+            parent_commits: Vec::new(),
+            phase,
+            member_cursor: None,
+            member_count: 0,
+            member_digest: [0; types::SHA256_BYTES],
+            members_complete: false,
+            revision_ref_count: 0,
+            revision_cursor: None,
+            revision_seal_count: 0,
+            revision_digest: [0; types::SHA256_BYTES],
+            revisions_complete: false,
+            parent_cursor: 0,
+            parent_digest: [0; types::SHA256_BYTES],
+            parents_complete: false,
+            cleanup_member_count: 0,
+            cleanup_revision_count: 0,
+            cleanup_parent_count: 0,
+            history_hold_released: false,
+            result: None,
+            terminal_error: Some(meta::CommitOperationTerminalError {
+                kind: meta::CommitOperationErrorKind::InvariantViolation,
+                message: "portable transaction capacity cannot admit one commit member step"
+                    .to_owned(),
+            }),
+        };
+        operation.seal_digests();
+        operation
+    }
+
+    #[test]
+    fn commit_capacity_abort_is_reported_as_a_terminal_rpc_failure() {
+        let operation = terminal_build_operation(types::BuildCommitPhase::Aborting);
+        let failure = build_commit_response(meta::BuildCommitOutcome {
+            commit_version: types::CommitVersion::new(2).unwrap(),
+            operation: operation.clone(),
+            replayed: false,
+        })
+        .unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::OperationFailed);
+        assert_eq!(
+            failure.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.message,
+            operation.terminal_error.as_ref().unwrap().message
+        );
+
+        let mut quarantined = operation;
+        quarantined.phase = types::BuildCommitPhase::Quarantined;
+        let failure = build_commit_response(meta::BuildCommitOutcome {
+            commit_version: types::CommitVersion::new(3).unwrap(),
+            operation: quarantined,
+            replayed: true,
+        })
+        .unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::Quarantined);
+        assert_eq!(
+            failure.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+        assert!(!failure.retryable);
     }
 
     fn replace_visible_workspace_incarnation(
@@ -4621,14 +4785,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sealed_restore_preparation_is_stable_through_ready_and_complete() {
+    fn ready_restore_operation() -> meta::RestoreOperationRecord {
         let destination_incarnation =
             types::WorkspaceIncarnationId::from_bytes([0x52; types::FIXED_ID_BYTES]);
         let member_digest = [0x33; types::SHA256_BYTES];
         let mut identity_digest = [0x11; types::SHA256_BYTES];
         identity_digest[..types::FIXED_ID_BYTES].fill(0x41);
-        let mut operation = meta::RestoreOperationRecord {
+        meta::RestoreOperationRecord {
             operation_id: types::OperationId::from_bytes([0x41; types::FIXED_ID_BYTES]),
             identity_digest,
             initialization_digest: Some([0x22; types::SHA256_BYTES]),
@@ -4656,7 +4819,14 @@ mod tests {
             cleanup_member_cursor: 0,
             result: None,
             terminal_error: None,
-        };
+        }
+    }
+
+    #[test]
+    fn sealed_restore_preparation_is_stable_through_ready_and_complete() {
+        let mut operation = ready_restore_operation();
+        let destination_incarnation = operation.destination_workspace_incarnation_id;
+        let member_digest = operation.member_rolling_digest;
         operation.validate().unwrap();
         let ready = sealed_restore_preparation(&operation).unwrap();
 
@@ -4675,6 +4845,59 @@ mod tests {
         assert_eq!(ready.destination_workbench.as_str(), "restore-destination");
         assert_eq!(ready.member_count, 0);
         assert_eq!(ready.member_digest, protocol::Digest(member_digest));
+    }
+
+    #[test]
+    fn restore_capacity_failure_is_stable_while_cleanup_advances() {
+        let ready = ready_restore_operation();
+        let terminal = meta::RestoreTerminalError {
+            kind: meta::RestoreTerminalErrorKind::InvariantViolation,
+            message: "portable transaction capacity cannot admit one restore member".to_owned(),
+            evidence_digest: None,
+        };
+        let aborting = ready
+            .apply(
+                types::RestorePhase::Ready,
+                meta::RestoreTransition::BeginAbort {
+                    terminal_error: terminal.clone(),
+                },
+            )
+            .unwrap();
+        let cleaning = aborting
+            .apply(
+                types::RestorePhase::Aborting,
+                meta::RestoreTransition::BeginCleaning,
+            )
+            .unwrap();
+        let cleaned = cleaning
+            .apply(
+                types::RestorePhase::Cleaning,
+                meta::RestoreTransition::FinishCleanup,
+            )
+            .unwrap();
+
+        for operation in [&aborting, &cleaning, &cleaned] {
+            let failure = restore_terminal_failure(operation).unwrap();
+            assert_eq!(failure.code, protocol::ErrorCode::OperationFailed);
+            assert_eq!(failure.message, terminal.message);
+            assert!(!failure.retryable);
+        }
+
+        let quarantined = cleaning
+            .apply(
+                types::RestorePhase::Cleaning,
+                meta::RestoreTransition::Quarantine {
+                    terminal_error: meta::RestoreTerminalError {
+                        kind: meta::RestoreTerminalErrorKind::CleanupFailed,
+                        message: "restore cleanup requires operator repair".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            )
+            .unwrap();
+        let failure = restore_terminal_failure(&quarantined).unwrap();
+        assert_eq!(failure.code, protocol::ErrorCode::Quarantined);
+        assert!(!failure.retryable);
     }
 
     #[test]

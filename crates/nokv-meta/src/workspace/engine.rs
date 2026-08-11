@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use nokv_meta_store::{
-    Check, Commit, Key, Keyspace, Mutation, ReadBatch, ReadOp, ReadResult, ReadSnapshot, Scan,
-    ScanItem, ScanPage, StoreError, StoreLimits, TxnStore, WriteTxn,
+    Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, ReadResult, ReadSnapshot,
+    Scan, ScanItem, ScanPage, StoreError, StoreLimits, TxnStore, WriteTxn,
 };
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, OwnerEpoch, PlacementGeneration, ReadVersion,
@@ -257,6 +257,25 @@ pub struct MetadataCommandResult {
     pub commit_version: CommitVersion,
     pub deterministic_result: Vec<u8>,
     pub replayed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandLimit {
+    Checks,
+    Mutations,
+    KeyBytes,
+    ValueBytes,
+    TransactionBytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandFit {
+    Fits,
+    Exceeds {
+        kind: CommandLimit,
+        actual: usize,
+        maximum: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -950,6 +969,77 @@ impl MetaShard {
         self.execute_with_lease_deadline(command, Some(lease_deadline_ms))
     }
 
+    /// Check whether a fresh execution of `command` fits the portable write
+    /// envelope without reading or mutating the transaction store.
+    ///
+    /// This check covers the fully derived transaction, including history,
+    /// dedupe, and recovery-outbox rows. It does not check current predicates,
+    /// fences, the commit clock, or an existing dedupe result.
+    pub(crate) fn command_fit(
+        &self,
+        command: &MetadataCommand,
+        lease_deadline_ms: Option<u64>,
+    ) -> Result<CommandFit, MetaError> {
+        let txn = self.command_txn_for_fit(command, lease_deadline_ms)?;
+        match txn.validate(&store_limits()) {
+            Ok(()) => Ok(CommandFit::Fits),
+            Err(StoreError::LimitExceeded {
+                kind,
+                actual,
+                maximum,
+            }) => Ok(CommandFit::Exceeds {
+                kind: command_limit(kind)?,
+                actual,
+                maximum,
+            }),
+            Err(error) => Err(internal("derive command fit", error)),
+        }
+    }
+
+    fn command_txn_for_fit(
+        &self,
+        command: &MetadataCommand,
+        lease_deadline_ms: Option<u64>,
+    ) -> Result<WriteTxn, MetaError> {
+        self.validate_command(command)?;
+        if command.command_digest != command.canonical_digest() {
+            return Err(MetaError::CommandDigestMismatch);
+        }
+        let next_version = command
+            .read_version
+            .get()
+            .checked_add(1)
+            .and_then(|version| CommitVersion::new(version).ok())
+            .ok_or(MetaError::VersionOverflow)?;
+        let predicate_plan = synthetic_predicate_plan(command)?;
+        self.validate_history_projection(command, &predicate_plan)?;
+        let root_plan = synthetic_root_fence_plan(command)?;
+        let recovery = build_recovery_plan(
+            encode_system_u64(0).to_vec(),
+            encode_system_digest(recovery_genesis_digest(command.logical_shard_id)),
+            RecoveryMutationV1::MetadataCommand {
+                command: Box::new(command.clone()),
+                lease_deadline_ms,
+            },
+            RecoveryResultV1::MetadataCommand {
+                commit_version: next_version,
+                deterministic_result: command.deterministic_result.clone(),
+            },
+        )?;
+        let state = CommandTxnState {
+            next_version,
+            schema: encode_schema_marker(),
+            shard: encode_shard_identity(command.logical_shard_id),
+            owner: encode_system_u64(command.owner_epoch.get()).to_vec(),
+            clock: encode_system_u64(command.read_version.get()).to_vec(),
+            lease_clock: lease_deadline_ms.map(|_| encode_system_u64(0).to_vec()),
+            root_plan,
+            predicate_plan,
+            recovery,
+        };
+        build_command_txn(command, &state)
+    }
+
     fn execute_with_lease_deadline(
         &self,
         command: &MetadataCommand,
@@ -1039,123 +1129,18 @@ impl MetaShard {
                 deterministic_result: command.deterministic_result.clone(),
             },
         )?;
-
-        let dedupe_record = CommandDedupeRecord {
-            command_digest: command.command_digest,
-            commit_version: next_version,
-            recovery_lsn: recovery.row.recovery_lsn,
-            deterministic_result: command.deterministic_result.clone(),
-        }
-        .encode()
-        .map_err(|error| corrupt("CommandDedupe", error))?;
-
-        let mut txn = WriteTxn {
-            checks: vec![
-                value_check(SYSTEM.id, SYSTEM_SCHEMA_KEY, &schema),
-                value_check(SYSTEM.id, SYSTEM_SHARD_IDENTITY_KEY, &shard),
-                value_check(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, &owner),
-                value_check(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY, &clock),
-            ],
-            mutations: vec![Mutation::Put {
-                key: Key::new(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY),
-                value: encode_system_u64(next_version_raw).to_vec(),
-            }],
+        let state = CommandTxnState {
+            next_version,
+            schema,
+            shard,
+            owner,
+            clock,
+            lease_clock,
+            root_plan,
+            predicate_plan,
+            recovery,
         };
-        if let Some(lease_clock) = &lease_clock {
-            txn.checks.push(value_check(
-                SYSTEM.id,
-                SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
-                lease_clock,
-            ));
-        }
-        enqueue_root_fence(&mut txn, command, &root_plan);
-        enqueue_predicate_guards(&mut txn, &predicate_plan);
-
-        for planned in predicate_plan.exact.values() {
-            let Some(previous) = &planned.current else {
-                continue;
-            };
-            if !command.history_projection.iter().any(|projection| {
-                projection.family == planned.family && projection.key == planned.key
-            }) {
-                continue;
-            }
-            let key = history_key(planned.family, &planned.key, next_version);
-            let value = HistoryValue {
-                transition_version: next_version,
-                previous_created_version: previous.created_version,
-                previous_modified_version: previous.modified_version,
-                previous_payload: Some(previous.payload.clone()),
-            }
-            .encode()
-            .expect("validated command history value fits the format envelope");
-            txn.checks.push(Check::Absent {
-                key: Key::new(HISTORY.id, key.clone()),
-            });
-            txn.mutations.push(Mutation::Put {
-                key: Key::new(HISTORY.id, key),
-                value,
-            });
-        }
-
-        for mutation in &command.mutations {
-            match mutation {
-                CommandMutation::Put { family, key, value } => {
-                    let planned = predicate_plan
-                        .exact
-                        .get(&(*family, key.clone()))
-                        .expect("every mutation has one exact predicate");
-                    let created_version = planned
-                        .current
-                        .as_ref()
-                        .map(|current| current.created_version)
-                        .unwrap_or(next_version);
-                    let encoded = CurrentValue {
-                        created_version,
-                        modified_version: next_version,
-                        payload: value.clone(),
-                    }
-                    .encode()
-                    .expect("validated command value fits the format envelope");
-                    txn.mutations.push(Mutation::Put {
-                        key: Key::new(family.keyspace(), key.clone()),
-                        value: encoded,
-                    });
-                }
-                CommandMutation::Delete { family, key } => {
-                    txn.mutations.push(Mutation::Delete {
-                        key: Key::new(family.keyspace(), key.clone()),
-                    });
-                }
-            }
-        }
-        for (sequence, projection) in command.event_projection.iter().enumerate() {
-            let sequence = u32::try_from(sequence)
-                .expect("validated event count fits the event-key sequence width");
-            let key = change_event_key(command.root_id, next_version, sequence);
-            let value = CurrentValue {
-                created_version: next_version,
-                modified_version: next_version,
-                payload: projection.payload.clone(),
-            }
-            .encode()
-            .expect("validated event fits the format envelope");
-            txn.checks.push(Check::Absent {
-                key: Key::new(CHANGE_EVENT.id, key.clone()),
-            });
-            txn.mutations.push(Mutation::Put {
-                key: Key::new(CHANGE_EVENT.id, key),
-                value,
-            });
-        }
-        txn.checks.push(Check::Absent {
-            key: Key::new(COMMAND_DEDUPE.id, dedupe_key.clone()),
-        });
-        txn.mutations.push(Mutation::Put {
-            key: Key::new(COMMAND_DEDUPE.id, dedupe_key.clone()),
-            value: dedupe_record,
-        });
-        enqueue_recovery(&mut txn, &recovery);
+        let txn = build_command_txn(command, &state)?;
 
         match self.commit("execute metadata command", txn)? {
             Commit::Applied => Ok(MetadataCommandResult {
@@ -2115,27 +2100,7 @@ impl MetaShard {
                 }
             }
         }
-        for mutation in &command.mutations {
-            let Some(predicate) = plan
-                .exact
-                .get(&(mutation.family(), mutation.key().to_vec()))
-            else {
-                return Err(invalid(
-                    "every mutation requires one exact value/absence predicate",
-                ));
-            };
-            if mutation.family() == MetadataFamily::WorkspaceIncarnationClaim
-                && (matches!(mutation, CommandMutation::Delete { .. })
-                    || predicate.current.is_some())
-            {
-                return Err(invalid(
-                    "workspace incarnation claims are append-only and permanent",
-                ));
-            }
-            if matches!(mutation, CommandMutation::Delete { .. }) && predicate.current.is_none() {
-                return Err(invalid("delete mutation requires an existing value"));
-            }
-        }
+        validate_predicate_plan(command, &plan)?;
         Ok(plan)
     }
 
@@ -2246,26 +2211,7 @@ impl MetaShard {
         result: RecoveryResultV1,
     ) -> Result<RecoveryPlan, MetaError> {
         let (lsn_value, digest_value) = self.recovery_tail_values()?;
-        let applied_lsn = decode_system_u64(&lsn_value, "System(applied_recovery_lsn)")?;
-        let recovery_lsn = applied_lsn
-            .checked_add(1)
-            .ok_or(MetaError::VersionOverflow)?;
-        let previous_chain_digest =
-            decode_system_digest(&digest_value, "System(recovery_chain_digest)")?;
-        let row = RecoveryOutboxRecord::new(recovery_lsn, previous_chain_digest, mutation, result)
-            .map_err(|error| corrupt("RecoveryOutbox", error))?;
-        let logical = row
-            .encode()
-            .map_err(|error| corrupt("RecoveryOutbox", error))?;
-        let (header, chunks) = split_recovery_storage(&logical)
-            .map_err(|error| corrupt("RecoveryOutbox storage", error))?;
-        Ok(RecoveryPlan {
-            lsn_value,
-            digest_value,
-            header,
-            chunks,
-            row,
-        })
+        build_recovery_plan(lsn_value, digest_value, mutation, result)
     }
 
     fn verify_recovery_chain_unlocked(&self) -> Result<RecoveryState, MetaError> {
@@ -2625,6 +2571,18 @@ struct RecoveryPlan {
     row: RecoveryOutboxRecord,
 }
 
+struct CommandTxnState {
+    next_version: CommitVersion,
+    schema: Vec<u8>,
+    shard: Vec<u8>,
+    owner: Vec<u8>,
+    clock: Vec<u8>,
+    lease_clock: Option<Vec<u8>>,
+    root_plan: RootFencePlan,
+    predicate_plan: PredicatePlan,
+    recovery: RecoveryPlan,
+}
+
 struct PlannedExactPredicate {
     family: MetadataFamily,
     key: Vec<u8>,
@@ -2636,6 +2594,264 @@ enum RootFencePlan {
     Install { value: Vec<u8> },
     Assert { expected: Vec<u8> },
     Replace { expected: Vec<u8>, value: Vec<u8> },
+}
+
+fn build_recovery_plan(
+    lsn_value: Vec<u8>,
+    digest_value: Vec<u8>,
+    mutation: RecoveryMutationV1,
+    result: RecoveryResultV1,
+) -> Result<RecoveryPlan, MetaError> {
+    let applied_lsn = decode_system_u64(&lsn_value, "System(applied_recovery_lsn)")?;
+    let recovery_lsn = applied_lsn
+        .checked_add(1)
+        .ok_or(MetaError::VersionOverflow)?;
+    let previous_chain_digest =
+        decode_system_digest(&digest_value, "System(recovery_chain_digest)")?;
+    let row = RecoveryOutboxRecord::new(recovery_lsn, previous_chain_digest, mutation, result)
+        .map_err(|error| corrupt("RecoveryOutbox", error))?;
+    let logical = row
+        .encode()
+        .map_err(|error| corrupt("RecoveryOutbox", error))?;
+    let (header, chunks) = split_recovery_storage(&logical)
+        .map_err(|error| corrupt("RecoveryOutbox storage", error))?;
+    Ok(RecoveryPlan {
+        lsn_value,
+        digest_value,
+        header,
+        chunks,
+        row,
+    })
+}
+
+fn synthetic_root_fence_plan(command: &MetadataCommand) -> Result<RootFencePlan, MetaError> {
+    let encoded = |state| {
+        RootFence {
+            logical_shard_id: command.logical_shard_id,
+            placement_generation: command.placement_generation,
+            activation_state: state,
+        }
+        .encode()
+        .map_err(|error| internal("derive command root fence", error))
+    };
+    match command.root_fence_action {
+        RootFenceAction::Install => Ok(RootFencePlan::Install {
+            value: encoded(RootActivationState::Installing)?,
+        }),
+        RootFenceAction::RequireActive => Ok(RootFencePlan::Assert {
+            expected: encoded(RootActivationState::Active)?,
+        }),
+        RootFenceAction::Transition { expected, next } => {
+            if !valid_root_transition(expected, next) {
+                return Err(MetaError::InvalidRootFenceTransition {
+                    from: expected,
+                    to: next,
+                });
+            }
+            Ok(RootFencePlan::Replace {
+                expected: encoded(expected)?,
+                value: encoded(next)?,
+            })
+        }
+    }
+}
+
+fn synthetic_predicate_plan(command: &MetadataCommand) -> Result<PredicatePlan, MetaError> {
+    let version =
+        CommitVersion::new(command.read_version.get()).map_err(|_| MetaError::VersionOverflow)?;
+    let mut plan = PredicatePlan::default();
+    for predicate in &command.predicates {
+        match predicate {
+            CommandPredicate::Value {
+                family,
+                key,
+                expected,
+            } => {
+                let map_key = (*family, key.clone());
+                if plan.exact.contains_key(&map_key) {
+                    return Err(invalid("duplicate exact predicate"));
+                }
+                let current = expected.as_ref().map(|payload| CurrentValue {
+                    created_version: version,
+                    modified_version: version,
+                    payload: payload.clone(),
+                });
+                let raw = current
+                    .as_ref()
+                    .map(CurrentValue::encode)
+                    .transpose()
+                    .map_err(|error| internal("derive command predicate", error))?;
+                plan.exact.insert(
+                    map_key,
+                    PlannedExactPredicate {
+                        family: *family,
+                        key: key.clone(),
+                        current,
+                        raw,
+                    },
+                );
+            }
+            CommandPredicate::PrefixEmpty { family, prefix } => {
+                plan.prefix_empty.push((*family, prefix.clone()));
+            }
+        }
+    }
+    validate_predicate_plan(command, &plan)?;
+    Ok(plan)
+}
+
+fn validate_predicate_plan(
+    command: &MetadataCommand,
+    plan: &PredicatePlan,
+) -> Result<(), MetaError> {
+    for mutation in &command.mutations {
+        let Some(predicate) = plan
+            .exact
+            .get(&(mutation.family(), mutation.key().to_vec()))
+        else {
+            return Err(invalid(
+                "every mutation requires one exact value/absence predicate",
+            ));
+        };
+        if mutation.family() == MetadataFamily::WorkspaceIncarnationClaim
+            && (matches!(mutation, CommandMutation::Delete { .. }) || predicate.current.is_some())
+        {
+            return Err(invalid(
+                "workspace incarnation claims are append-only and permanent",
+            ));
+        }
+        if matches!(mutation, CommandMutation::Delete { .. }) && predicate.current.is_none() {
+            return Err(invalid("delete mutation requires an existing value"));
+        }
+    }
+    Ok(())
+}
+
+fn build_command_txn(
+    command: &MetadataCommand,
+    state: &CommandTxnState,
+) -> Result<WriteTxn, MetaError> {
+    let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
+    let dedupe_record = CommandDedupeRecord {
+        command_digest: command.command_digest,
+        commit_version: state.next_version,
+        recovery_lsn: state.recovery.row.recovery_lsn,
+        deterministic_result: command.deterministic_result.clone(),
+    }
+    .encode()
+    .map_err(|error| internal("derive command dedupe", error))?;
+
+    let mut txn = WriteTxn {
+        checks: vec![
+            value_check(SYSTEM.id, SYSTEM_SCHEMA_KEY, &state.schema),
+            value_check(SYSTEM.id, SYSTEM_SHARD_IDENTITY_KEY, &state.shard),
+            value_check(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, &state.owner),
+            value_check(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY, &state.clock),
+        ],
+        mutations: vec![Mutation::Put {
+            key: Key::new(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY),
+            value: encode_system_u64(state.next_version.get()).to_vec(),
+        }],
+    };
+    if let Some(lease_clock) = &state.lease_clock {
+        txn.checks.push(value_check(
+            SYSTEM.id,
+            SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+            lease_clock,
+        ));
+    }
+    enqueue_root_fence(&mut txn, command, &state.root_plan);
+    enqueue_predicate_guards(&mut txn, &state.predicate_plan);
+
+    for planned in state.predicate_plan.exact.values() {
+        let Some(previous) = &planned.current else {
+            continue;
+        };
+        if !command
+            .history_projection
+            .iter()
+            .any(|projection| projection.family == planned.family && projection.key == planned.key)
+        {
+            continue;
+        }
+        let key = history_key(planned.family, &planned.key, state.next_version);
+        let value = HistoryValue {
+            transition_version: state.next_version,
+            previous_created_version: previous.created_version,
+            previous_modified_version: previous.modified_version,
+            previous_payload: Some(previous.payload.clone()),
+        }
+        .encode()
+        .map_err(|error| internal("derive command history", error))?;
+        txn.checks.push(Check::Absent {
+            key: Key::new(HISTORY.id, key.clone()),
+        });
+        txn.mutations.push(Mutation::Put {
+            key: Key::new(HISTORY.id, key),
+            value,
+        });
+    }
+
+    for mutation in &command.mutations {
+        match mutation {
+            CommandMutation::Put { family, key, value } => {
+                let planned = state
+                    .predicate_plan
+                    .exact
+                    .get(&(*family, key.clone()))
+                    .expect("every mutation has one exact predicate");
+                let created_version = planned
+                    .current
+                    .as_ref()
+                    .map(|current| current.created_version)
+                    .unwrap_or(state.next_version);
+                let encoded = CurrentValue {
+                    created_version,
+                    modified_version: state.next_version,
+                    payload: value.clone(),
+                }
+                .encode()
+                .map_err(|error| internal("derive command value", error))?;
+                txn.mutations.push(Mutation::Put {
+                    key: Key::new(family.keyspace(), key.clone()),
+                    value: encoded,
+                });
+            }
+            CommandMutation::Delete { family, key } => {
+                txn.mutations.push(Mutation::Delete {
+                    key: Key::new(family.keyspace(), key.clone()),
+                });
+            }
+        }
+    }
+    for (sequence, projection) in command.event_projection.iter().enumerate() {
+        let sequence = u32::try_from(sequence)
+            .expect("validated event count fits the event-key sequence width");
+        let key = change_event_key(command.root_id, state.next_version, sequence);
+        let value = CurrentValue {
+            created_version: state.next_version,
+            modified_version: state.next_version,
+            payload: projection.payload.clone(),
+        }
+        .encode()
+        .map_err(|error| internal("derive command event", error))?;
+        txn.checks.push(Check::Absent {
+            key: Key::new(CHANGE_EVENT.id, key.clone()),
+        });
+        txn.mutations.push(Mutation::Put {
+            key: Key::new(CHANGE_EVENT.id, key),
+            value,
+        });
+    }
+    txn.checks.push(Check::Absent {
+        key: Key::new(COMMAND_DEDUPE.id, dedupe_key.clone()),
+    });
+    txn.mutations.push(Mutation::Put {
+        key: Key::new(COMMAND_DEDUPE.id, dedupe_key),
+        value: dedupe_record,
+    });
+    enqueue_recovery(&mut txn, &state.recovery);
+    Ok(txn)
 }
 
 fn enqueue_root_fence(txn: &mut WriteTxn, command: &MetadataCommand, plan: &RootFencePlan) {
@@ -2958,6 +3174,23 @@ fn validate_store_profile(actual: StoreLimits) -> Result<(), MetaError> {
     Ok(())
 }
 
+fn command_limit(kind: LimitKind) -> Result<CommandLimit, MetaError> {
+    match kind {
+        LimitKind::Checks => Ok(CommandLimit::Checks),
+        LimitKind::Mutations => Ok(CommandLimit::Mutations),
+        LimitKind::KeyBytes => Ok(CommandLimit::KeyBytes),
+        LimitKind::ValueBytes => Ok(CommandLimit::ValueBytes),
+        LimitKind::TransactionBytes => Ok(CommandLimit::TransactionBytes),
+        LimitKind::Reads
+        | LimitKind::ReadBytes
+        | LimitKind::ResultRows
+        | LimitKind::ResultBytes => Err(internal(
+            "derive command fit",
+            format!("write transaction reported {kind}"),
+        )),
+    }
+}
+
 fn value_check(keyspace: Keyspace, key: &[u8], expected: &[u8]) -> Check {
     Check::Value {
         key: Key::new(keyspace, key),
@@ -3050,7 +3283,7 @@ fn internal(operation: &'static str, error: impl std::fmt::Display) -> MetaError
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
     use nokv_meta_store::{AckBoundary, Authority, LimitKind, StoreProfile, UnknownCommit};
@@ -3215,6 +3448,33 @@ mod tests {
         }
     }
 
+    struct CaptureCommitStore {
+        inner: Arc<dyn TxnStore>,
+        commits: Mutex<Vec<WriteTxn>>,
+    }
+
+    impl TxnStore for CaptureCommitStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.commits
+                .lock()
+                .expect("capture commit lock must be available")
+                .push(txn.clone());
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
     fn shard(fill: u8) -> LogicalShardId {
         LogicalShardId::from_bytes([fill; 16])
     }
@@ -3375,6 +3635,42 @@ mod tests {
         );
     }
 
+    type TxnShapeRow = (u8, u16, usize, usize);
+
+    fn txn_shape(txn: &WriteTxn) -> (Vec<TxnShapeRow>, Vec<TxnShapeRow>) {
+        let checks = txn
+            .checks
+            .iter()
+            .map(|check| match check {
+                Check::Value { key, expected } => {
+                    (0, key.keyspace.get(), key.bytes.len(), expected.len())
+                }
+                Check::Absent { key } => (1, key.keyspace.get(), key.bytes.len(), 0),
+                Check::EmptyPrefix { keyspace, prefix } => (2, keyspace.get(), prefix.len(), 0),
+            })
+            .collect();
+        let mutations = txn
+            .mutations
+            .iter()
+            .map(|mutation| match mutation {
+                Mutation::Put { key, value } => {
+                    (0, key.keyspace.get(), key.bytes.len(), value.len())
+                }
+                Mutation::Delete { key } => (1, key.keyspace.get(), key.bytes.len(), 0),
+            })
+            .collect();
+        (checks, mutations)
+    }
+
+    fn capture_next_commit(store: &mut MetaShard) -> Arc<CaptureCommitStore> {
+        let capture = Arc::new(CaptureCommitStore {
+            inner: Arc::clone(&store.store),
+            commits: Mutex::new(Vec::new()),
+        });
+        store.store = capture.clone();
+        capture
+    }
+
     fn put_history_row(
         store: &MetaShard,
         key: &[u8],
@@ -3465,6 +3761,106 @@ mod tests {
     }
 
     #[test]
+    fn command_fit_uses_no_store_io() {
+        let mut store = ready_store();
+        let mut command = create_command(
+            &store,
+            request(251),
+            scoped_key(root(2), b"fit-pure"),
+            b"value",
+        );
+        command.deterministic_result = vec![0x5a; MAX_DETERMINISTIC_RESULT_BYTES];
+        let command = command.seal();
+        store.store = Arc::new(ProfileOnlyStore {
+            limits: store_limits(),
+        });
+
+        assert_eq!(store.command_fit(&command, None), Ok(CommandFit::Fits));
+        let txn = store.command_txn_for_fit(&command, None).unwrap();
+        let recovery_rows = txn
+            .mutations
+            .iter()
+            .filter(|mutation| match mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => {
+                    key.keyspace == RECOVERY_OUTBOX.id
+                }
+            })
+            .count();
+        assert!(
+            recovery_rows > 2,
+            "maximum deterministic result must span multiple recovery chunks"
+        );
+    }
+
+    #[test]
+    fn command_fit_matches_create_event_and_multichunk_transaction_shape() {
+        let mut store = ready_store();
+        let mut command = create_command(
+            &store,
+            request(252),
+            scoped_key(root(2), b"fit-create"),
+            b"value",
+        );
+        command.deterministic_result = vec![0xa5; MAX_DETERMINISTIC_RESULT_BYTES];
+        let command = command.seal();
+        let predicted = store.command_txn_for_fit(&command, None).unwrap();
+        assert_eq!(store.command_fit(&command, None), Ok(CommandFit::Fits));
+
+        let capture = capture_next_commit(&mut store);
+        store.execute(&command).unwrap();
+        let commits = capture
+            .commits
+            .lock()
+            .expect("capture commit lock must be available");
+        let actual = commits.last().expect("execute must issue one commit");
+        assert_eq!(txn_shape(&predicted), txn_shape(actual));
+        assert_eq!(predicted.validate(&store_limits()), Ok(()));
+        assert_eq!(actual.validate(&store_limits()), Ok(()));
+    }
+
+    #[test]
+    fn command_fit_matches_replace_history_transaction_shape() {
+        let mut store = ready_store();
+        let key = scoped_key(root(2), b"fit-replace");
+        store
+            .execute(&create_command(&store, request(253), key.clone(), b"first"))
+            .unwrap();
+        let mut command = base_command(&store, request(254), RootFenceAction::RequireActive);
+        command.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            expected: Some(b"first".to_vec()),
+        });
+        command.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            value: b"second".to_vec(),
+        });
+        command.history_projection.push(HistoryProjection {
+            family: MetadataFamily::Operation,
+            key,
+        });
+        let command = command.seal();
+        let predicted = store.command_txn_for_fit(&command, None).unwrap();
+        assert_eq!(store.command_fit(&command, None), Ok(CommandFit::Fits));
+
+        let capture = capture_next_commit(&mut store);
+        store.execute(&command).unwrap();
+        let commits = capture
+            .commits
+            .lock()
+            .expect("capture commit lock must be available");
+        let actual = commits.last().expect("execute must issue one commit");
+        assert_eq!(txn_shape(&predicted), txn_shape(actual));
+        assert!(actual.mutations.iter().any(|mutation| matches!(
+            mutation,
+            Mutation::Put { key, .. } if key.keyspace == HISTORY.id
+        )));
+        assert_eq!(predicted.validate(&store_limits()), Ok(()));
+        assert_eq!(actual.validate(&store_limits()), Ok(()));
+    }
+
+    #[test]
     fn derived_transaction_limit_failure_has_no_state_change() {
         let store = ready_store();
         let version_before = store.current_read_version().unwrap();
@@ -3483,8 +3879,17 @@ mod tests {
                 value: vec![index as u8; MAX_COMMAND_VALUE_BYTES],
             });
         }
+        let command = command.seal();
+        assert!(matches!(
+            store.command_fit(&command, None),
+            Ok(CommandFit::Exceeds {
+                kind: CommandLimit::TransactionBytes,
+                maximum: 1_000_000,
+                ..
+            })
+        ));
         let error = store
-            .execute(&command.seal())
+            .execute(&command)
             .expect_err("fully derived transaction must exceed the portable byte budget");
         assert!(matches!(
             error,

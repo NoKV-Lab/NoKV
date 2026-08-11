@@ -828,6 +828,12 @@ cannot revive a cleaned build. A crash in `Sealing` resumes publication when
 its exact commit or dedupe result exists; otherwise only the fenced takeover
 may abort it.
 
+Build, cleanup, and retirement select the largest prefix whose
+fully derived metadata transaction fits the portable store limits. A valid new
+row must fit by itself. A legacy row that does not fit fails closed in
+`Quarantined` and retains its hold for operator repair. NoKV does not qualify
+automatic repair of that state.
+
 Every Workbench head, tag, restore/fork lease, and child commit owns one exact
 `CommitConsumer` row. Adding or removing one updates
 `Commit.consumer_count` and increments `consumer_epoch` in the same metadata
@@ -946,7 +952,11 @@ Ready-state abort both CAS the same operation record, so exactly one can win.
 After the cleanup cursor proves every destination path/reference is removed,
 its terminal command releases the source `HistoryHold` plus snapshot consumer,
 or the source commit consumer, exactly once. `Quarantined` retains that source
-until reconciliation completes. Cleanup never touches a `Visible` incarnation.
+for operator repair. NoKV does not qualify automatic reconciliation.
+
+New copy commands admit a member only after its worst valid single-member
+cleanup command also fits the portable store limits. Cleanup never touches a
+`Visible` incarnation.
 
 ## Garbage Collection State Machine
 

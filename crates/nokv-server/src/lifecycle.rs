@@ -19,10 +19,10 @@ use nokv_meta::workspace as meta;
 use nokv_object::{ArtifactObjectStore, ObjectDeleteOutcome, ObjectKey};
 use nokv_protocol::RootRoute;
 use nokv_types::{
-    ArtifactRevisionId, CommitRetirePhase, CommitState, GcClaimState, GcPhase, OperationId,
-    OperationKind, OwnerEpoch, PlacementGeneration, PublishPhase, RequestId, RestorePhase,
-    RootActivationState, RootId, SnapshotState, StagedCleanupState, StagedProviderState,
-    WorkspaceState, SHA256_BYTES,
+    ArtifactRevisionId, BuildCommitPhase, CommitRetirePhase, CommitState, GcClaimState, GcPhase,
+    OperationId, OperationKind, OwnerEpoch, PlacementGeneration, PublishPhase, RequestId,
+    RestorePhase, RootActivationState, RootId, SnapshotState, StagedCleanupState,
+    StagedProviderState, WorkspaceState, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -277,6 +277,7 @@ impl From<meta::MetaError> for LifecycleError {
 struct LifecycleCursors {
     publish_operation: Option<Vec<u8>>,
     restore_operation: Option<Vec<u8>>,
+    build_operation: Option<Vec<u8>>,
     retire_operation: Option<Vec<u8>>,
     commit: Option<Vec<u8>>,
     snapshot_workspace: Option<Vec<u8>>,
@@ -333,6 +334,7 @@ impl LifecycleRunner {
         self.recover_publications(&mut cursors, observed_now_ms, &mut report)?;
         self.reap_snapshots(&mut cursors, observed_now_ms, &mut report)?;
         self.recover_restores(&mut cursors, &mut report)?;
+        self.recover_commit_builds(&mut cursors, &mut report)?;
         self.retire_commits(&mut cursors, &mut report)?;
         self.collect_revisions(&mut cursors, &mut report)?;
         Ok(report)
@@ -893,6 +895,66 @@ impl LifecycleRunner {
                         Err(error) => return Err(state("finish restore cleanup", error)),
                     }
                 }
+                RestorePhase::Quarantined => {
+                    report.quarantined_operations += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_commit_builds(
+        &self,
+        cursors: &mut LifecycleCursors,
+        report: &mut LifecycleCycleReport,
+    ) -> Result<(), LifecycleError> {
+        let prefix = meta::operation_prefix(self.root_id(), OperationKind::BuildCommit);
+        let rows = self.scan_page(
+            meta::MetadataFamily::Operation,
+            &prefix,
+            cursors.build_operation.as_deref(),
+        )?;
+        advance_key_cursor(
+            &mut cursors.build_operation,
+            &rows,
+            self.options.scan_page_size,
+        );
+        let service = meta::CommitService::new(&self.meta);
+        for item in rows {
+            let operation_id = meta::decode_operation_key(
+                self.root_id(),
+                OperationKind::BuildCommit,
+                &item.key,
+            )
+            .ok_or_else(|| corrupt("commit-build operation key", "malformed root/kind key"))?;
+            let operation = meta::BuildCommitOperationRecord::decode(&item.value)
+                .map_err(|error| corrupt("commit-build operation", error.to_string()))?;
+            if operation.operation_id != operation_id {
+                return Err(corrupt(
+                    "commit-build operation",
+                    "payload identity differs from key",
+                ));
+            }
+            match operation.phase {
+                BuildCommitPhase::Aborting | BuildCommitPhase::Cleaning => {
+                    let context =
+                        self.write_context(b"commit-build-cleanup", &[&item.key, &item.value])?;
+                    match service.cleanup_build(meta::BuildCommitStepRequest {
+                        context,
+                        operation_id,
+                        limit: self.options.mutation_batch_size,
+                    }) {
+                        Ok(_) => report.metadata_transitions += 1,
+                        Err(error) if commit_concurrent(&error) => {
+                            report.deferred_operations += 1;
+                        }
+                        Err(error) => return Err(state("clean commit build", error)),
+                    }
+                }
+                BuildCommitPhase::Quarantined => {
+                    report.quarantined_operations += 1;
+                }
                 _ => {}
             }
         }
@@ -930,21 +992,26 @@ impl LifecycleRunner {
                     "payload identity differs from key",
                 ));
             }
-            if matches!(
-                operation.phase,
-                CommitRetirePhase::Claiming | CommitRetirePhase::Releasing
-            ) {
-                let context =
-                    self.write_context(b"commit-retire-release", &[&item.key, &item.value])?;
-                match service.release_retired_commit(meta::BuildCommitStepRequest {
-                    context,
-                    operation_id,
-                    limit: self.options.mutation_batch_size,
-                }) {
-                    Ok(_) => report.metadata_transitions += 1,
-                    Err(error) if commit_concurrent(&error) => report.deferred_operations += 1,
-                    Err(error) => return Err(state("release retired commit", error)),
+            match operation.phase {
+                CommitRetirePhase::Claiming | CommitRetirePhase::Releasing => {
+                    let context =
+                        self.write_context(b"commit-retire-release", &[&item.key, &item.value])?;
+                    match service.release_retired_commit(meta::BuildCommitStepRequest {
+                        context,
+                        operation_id,
+                        limit: self.options.mutation_batch_size,
+                    }) {
+                        Ok(_) => report.metadata_transitions += 1,
+                        Err(error) if commit_concurrent(&error) => {
+                            report.deferred_operations += 1;
+                        }
+                        Err(error) => return Err(state("release retired commit", error)),
+                    }
                 }
+                CommitRetirePhase::Quarantined => {
+                    report.quarantined_operations += 1;
+                }
+                CommitRetirePhase::Complete => {}
             }
         }
 
@@ -1508,9 +1575,9 @@ mod tests {
     };
     use nokv_protocol::{RpcFailure, WorkspaceRpcRequest};
     use nokv_types::{
-        ArtifactRevisionId, CommandDigest, CommitVersion, GcClaimState, LogicalShardId,
-        NormalizedRelativePath, ReferenceEpoch, RevisionState, RootActivationState, WorkbenchId,
-        WorkspaceIncarnationId, FIXED_ID_BYTES,
+        ArtifactRevisionId, CommandDigest, CommitVersion, GcClaimState, HistoryHoldState,
+        LogicalShardId, NormalizedRelativePath, ReferenceEpoch, RevisionState, RootActivationState,
+        WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES,
     };
 
     use super::*;
@@ -2065,6 +2132,162 @@ mod tests {
                 LifecycleDeleteDisposition::AlreadyAbsent,
             )
             .digest
+        );
+    }
+
+    #[test]
+    fn lifecycle_finishes_capacity_aborted_commit_and_releases_hold() {
+        let store = crate::test_support::meta_shard(shard());
+        store.advance_owner_epoch(None, owner()).unwrap();
+        store
+            .execute(&command(
+                &store,
+                1,
+                meta::RootFenceAction::Install,
+                Vec::new(),
+            ))
+            .unwrap();
+        store
+            .execute(&command(
+                &store,
+                2,
+                meta::RootFenceAction::Transition {
+                    expected: RootActivationState::Installing,
+                    next: RootActivationState::Active,
+                },
+                Vec::new(),
+            ))
+            .unwrap();
+
+        let operation_id = OperationId::from_bytes([0x81; FIXED_ID_BYTES]);
+        let commit_id = nokv_types::CommitId::from_bytes([0x82; SHA256_BYTES]);
+        let tree_revision = ArtifactRevisionId::from_bytes([0x83; FIXED_ID_BYTES]);
+        let source_read_version = store.current_read_version().unwrap();
+        let mut operation = meta::BuildCommitOperationRecord {
+            operation_id,
+            identity_digest: [0; SHA256_BYTES],
+            initialization_digest: [0; SHA256_BYTES],
+            workbench_id: WorkbenchId::new("capacity-aborted-commit").unwrap(),
+            source_workspace_incarnation_id: WorkspaceIncarnationId::from_bytes(
+                [0x84; FIXED_ID_BYTES],
+            ),
+            source_read_version,
+            commit_id,
+            expected_head: None,
+            content_digest_uri: sha256_uri([0x85; SHA256_BYTES]),
+            manifest_digest_uri: sha256_uri([0x86; SHA256_BYTES]),
+            projection_input_digest: [0x87; SHA256_BYTES],
+            tree_manifest_revision_id: tree_revision,
+            replace: false,
+            run_manifest_condition: meta::CommitManifestCondition::CreateOnly,
+            committed_at_unix_seconds: 1,
+            commit_staged_run_manifest: None,
+            producer: None,
+            lineage_projection: Vec::new(),
+            parent_commits: Vec::new(),
+            phase: BuildCommitPhase::Aborting,
+            member_cursor: None,
+            member_count: 0,
+            member_digest: [0; SHA256_BYTES],
+            members_complete: false,
+            revision_ref_count: 0,
+            revision_cursor: None,
+            revision_seal_count: 0,
+            revision_digest: [0; SHA256_BYTES],
+            revisions_complete: false,
+            parent_cursor: 0,
+            parent_digest: [0; SHA256_BYTES],
+            parents_complete: false,
+            cleanup_member_count: 0,
+            cleanup_revision_count: 0,
+            cleanup_parent_count: 0,
+            history_hold_released: false,
+            result: None,
+            terminal_error: Some(meta::CommitOperationTerminalError {
+                kind: meta::CommitOperationErrorKind::InvariantViolation,
+                message: "portable transaction capacity cannot admit one commit member step"
+                    .to_owned(),
+            }),
+        };
+        operation.seal_digests();
+        let operation_key = meta::operation_key(root(), OperationKind::BuildCommit, operation_id);
+        let hold_key = meta::build_commit_history_hold_key(root(), operation_id);
+        store
+            .execute(&command(
+                &store,
+                3,
+                meta::RootFenceAction::RequireActive,
+                vec![
+                    meta::CommandMutation::Put {
+                        family: meta::MetadataFamily::Operation,
+                        key: operation_key.clone(),
+                        value: operation.encode().unwrap(),
+                    },
+                    meta::CommandMutation::Put {
+                        family: meta::MetadataFamily::HistoryHold,
+                        key: hold_key.clone(),
+                        value: meta::HistoryHoldRecord {
+                            read_version: source_read_version,
+                            source_snapshot_id: None,
+                            state: HistoryHoldState::Active,
+                        }
+                        .encode(),
+                    },
+                ],
+            ))
+            .unwrap();
+
+        let registry = Arc::new(RootOwnerRegistry::new());
+        registry.install(route(), Arc::new(UnusedExecutor)).unwrap();
+        let runner = LifecycleRunner::new(
+            Arc::clone(&store),
+            registry,
+            route(),
+            OwnerLossSignal::default(),
+            Arc::new(FakeDeleter {
+                ambiguous: false,
+                calls: AtomicUsize::new(0),
+                object_keys: Mutex::new(Vec::new()),
+            }),
+            LifecycleRunnerOptions {
+                scan_page_size: 8,
+                mutation_batch_size: 8,
+                ..LifecycleRunnerOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(runner.run_once(100).unwrap().metadata_transitions, 1);
+        assert_eq!(runner.run_once(100).unwrap().metadata_transitions, 1);
+        assert_eq!(runner.run_once(100).unwrap().metadata_transitions, 0);
+
+        let read = meta::RootReadContext::current(&store, root(), placement(), owner()).unwrap();
+        let payload = store
+            .read_at(
+                root(),
+                placement(),
+                owner(),
+                meta::MetadataFamily::Operation,
+                &operation_key,
+                read.read_version,
+            )
+            .unwrap()
+            .unwrap();
+        let operation = meta::BuildCommitOperationRecord::decode(&payload).unwrap();
+        assert_eq!(operation.phase, BuildCommitPhase::Cleaned);
+        assert!(operation.history_hold_released);
+        assert_eq!(
+            store
+                .read_at(
+                    root(),
+                    placement(),
+                    owner(),
+                    meta::MetadataFamily::HistoryHold,
+                    &hold_key,
+                    read.read_version,
+                )
+                .unwrap(),
+            None
         );
     }
 
