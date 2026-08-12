@@ -17,9 +17,13 @@ use crate::{ExecutedRequest, WorkspaceRequestExecutor};
 const MANIFEST_SCAN_ROWS: usize = 256;
 const MANIFEST_PLAN_CURSOR_VERSION: u8 = 1;
 const MANIFEST_PLAN_CURSOR_BYTES: usize = 1 + types::FIXED_ID_BYTES * 2 + 8 * 3;
+// Keep store-wide generation churn inside the replay-safe RPC boundary instead
+// of spending the client's much smaller transport retry budget.
+const MAX_INTERNAL_METADATA_ATTEMPTS: u32 = 8;
 const PUBLISH_ACTIVITY_LEASE_MS: u64 = 30 * 60 * 1_000;
 const RUN_MANIFEST_PATH: &str = "metadata/run_manifest.json";
 const _: () = assert!(protocol::MAX_ARTIFACT_DEPENDENCY_OWNERS == meta::MAX_REVISION_DEPENDENCIES);
+const _: () = assert!(MAX_INTERNAL_METADATA_ATTEMPTS > 0);
 const _: () =
     assert!(protocol::MAX_ARTIFACT_DEPENDENCY_DEPTH == meta::MAX_REVISION_DEPENDENCY_DEPTH);
 const _: () =
@@ -113,6 +117,13 @@ impl MetadataWorkspaceRequestExecutor {
             protocol::WorkspaceRequest::FindWorkspaces(find) => self.find_workspaces(request, find),
             protocol::WorkspaceRequest::ReadChanges(changes) => self.read_changes(request, changes),
         }
+    }
+
+    fn execute_request_with_internal_retry(
+        &self,
+        request: &protocol::WorkspaceRpcRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        retry_internal_metadata_conflicts(|| self.execute_request(request))
     }
 
     fn preflight(
@@ -2243,7 +2254,16 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<meta::PublishOperationRecord, protocol::RpcFailure> {
         let heartbeat_id = derived_request_id(rpc.request_id, domain, 0);
         if let Some(outcome) = self.replayed_publish(rpc.route, heartbeat_id)? {
-            require_publish_token(&outcome.operation, token)?;
+            // `claim_mutation` has already exact-bound this outer request id to
+            // the complete encoded RPC, including the caller's pre-heartbeat
+            // token. The durable heartbeat result necessarily contains the
+            // post-heartbeat operation, so rechecking its digest against that
+            // earlier token would make a response-safe retry reject itself.
+            if outcome.operation.operation_id != types::OperationId::from(token.operation_id) {
+                return Err(invalid_argument(
+                    "replayed publish heartbeat belongs to another operation",
+                ));
+            }
             return Ok(outcome.operation);
         }
         let heartbeat_context = self.publication_context(rpc.route, heartbeat_id)?;
@@ -2328,7 +2348,7 @@ impl WorkspaceRequestExecutor for MetadataWorkspaceRequestExecutor {
         &self,
         request: &protocol::WorkspaceRpcRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        self.execute_request(request)
+        self.execute_request_with_internal_retry(request)
     }
 }
 
@@ -3776,11 +3796,16 @@ fn engine_failure(error: meta::AgentMetadataError) -> protocol::RpcFailure {
             false,
             None,
         ),
-        meta::AgentMetadataError::PredicateFailed
-        | meta::AgentMetadataError::WriteConflict
-        | meta::AgentMetadataError::WriteReadVersionMismatch { .. } => {
+        meta::AgentMetadataError::PredicateFailed => {
             failure(protocol::ErrorCode::Conflict, error.to_string(), true, None)
         }
+        meta::AgentMetadataError::WriteConflict
+        | meta::AgentMetadataError::WriteReadVersionMismatch { .. } => failure(
+            protocol::ErrorCode::Conflict,
+            error.to_string(),
+            true,
+            Some(protocol::ConflictKind::ReadVersion),
+        ),
         meta::AgentMetadataError::ReadVersionInFuture { .. } => failure(
             protocol::ErrorCode::PreconditionFailed,
             error.to_string(),
@@ -3791,6 +3816,26 @@ fn engine_failure(error: meta::AgentMetadataError) -> protocol::RpcFailure {
         | meta::AgentMetadataError::CommandDigestMismatch => invalid_argument(error.to_string()),
         _ => internal(error.to_string()),
     }
+}
+
+fn internal_metadata_conflict(failure: &protocol::RpcFailure) -> bool {
+    failure.code == protocol::ErrorCode::Conflict
+        && failure.retryable
+        && failure.conflict == Some(protocol::ConflictKind::ReadVersion)
+}
+
+fn retry_internal_metadata_conflicts<T>(
+    mut execute: impl FnMut() -> Result<T, protocol::RpcFailure>,
+) -> Result<T, protocol::RpcFailure> {
+    for attempt in 1..=MAX_INTERNAL_METADATA_ATTEMPTS {
+        match execute() {
+            Err(failure)
+                if internal_metadata_conflict(&failure)
+                    && attempt < MAX_INTERNAL_METADATA_ATTEMPTS => {}
+            result => return result,
+        }
+    }
+    unreachable!("internal metadata retry bound is non-zero")
 }
 
 fn invalid_argument(message: impl Into<String>) -> protocol::RpcFailure {
@@ -5410,6 +5455,194 @@ mod tests {
         let failure = executor.execute(&stale_catalog).unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::PreconditionFailed);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
+    }
+
+    #[test]
+    fn exact_publish_stage_retry_resumes_after_its_heartbeat_committed() {
+        let (store, executor) = ready_executor();
+        executor
+            .execute(&create_request(0x60, "heartbeat-retry", 0x61, 1))
+            .unwrap();
+        let operation_id = protocol::OperationIdentity([0x62; types::FIXED_ID_BYTES]);
+        let artifact_revision_id =
+            protocol::ArtifactRevisionIdentity([0x63; types::FIXED_ID_BYTES]);
+        let seals = protocol::seal_artifact_publish_plan(artifact_revision_id, &[], &[]).unwrap();
+        let begun = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x64; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::BeginArtifactPublish(
+                    protocol::BeginArtifactPublishRequest {
+                        operation_id,
+                        artifact_revision_id,
+                        target: protocol::WorkspacePath {
+                            workbench: protocol::WorkbenchName::new("heartbeat-retry").unwrap(),
+                            path: protocol::RelativePath::new("outputs/result.bin").unwrap(),
+                        },
+                        authority: protocol::PublicationAuthority::Visible,
+                        condition: protocol::PublishCondition::CreateOnly,
+                        staged_object_count: seals.staged_object_count,
+                        staged_object_seal: seals.staged_object_seal,
+                        manifest_row_count: seals.manifest_row_count,
+                        manifest_seal: seals.manifest_seal,
+                        dependency_owner_revision_ids: Vec::new(),
+                    },
+                ),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(status) = begun.result else {
+            panic!("begin artifact publication returned the wrong result variant");
+        };
+
+        let complete = protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([0x65; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::CompleteArtifactPublish(
+                protocol::CompleteArtifactPublishRequest {
+                    token: status.token,
+                    artifact: protocol::ArtifactDescriptor {
+                        logical_size: 0,
+                        body_digest: protocol::sha256_digest_uri(protocol::Digest(
+                            Sha256::digest([]).into(),
+                        )),
+                        manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
+                        content_type: protocol::ContentType::new("application/octet-stream")
+                            .unwrap(),
+                        producer: Some("heartbeat-retry-test".to_owned()),
+                        manifest_identity: None,
+                        index_fields: Vec::new(),
+                    },
+                },
+            ),
+        };
+        assert!(!executor.claim_mutation(&complete).unwrap());
+
+        // Model a response-safe partial attempt: the internal heartbeat is
+        // durable, but the following publication transition lost an unrelated
+        // store-wide read-version race before it could commit.
+        let before = executor
+            .load_publish_operation(
+                complete.route,
+                store.current_read_version().unwrap(),
+                operation_id,
+            )
+            .unwrap();
+        require_publish_token(&before, status.token).unwrap();
+        let heartbeat_id = derived_request_id(
+            complete.request_id,
+            b"publish-heartbeat-complete-transition",
+            0,
+        );
+        let heartbeated = meta::PublicationService::new(&store)
+            .heartbeat_publish(meta::HeartbeatPublishRequest {
+                context: executor
+                    .publication_context(complete.route, heartbeat_id)
+                    .unwrap(),
+                expected_operation: before.clone(),
+                activity_deadline_ms: before.activity_deadline_ms.checked_add(1).unwrap(),
+            })
+            .unwrap()
+            .operation;
+        assert_ne!(
+            publish_state_digest(&heartbeated).unwrap(),
+            status.token.state_digest
+        );
+
+        // The outer request id is the authority for this exact retry. Reusing
+        // it with different inputs remains rejected before heartbeat replay.
+        let mut mismatched = complete.clone();
+        let protocol::WorkspaceRequest::CompleteArtifactPublish(request) =
+            &mut mismatched.operation
+        else {
+            unreachable!();
+        };
+        request.token.state_digest = protocol::Digest([0x66; types::SHA256_BYTES]);
+        let mismatch = executor.claim_mutation(&mismatched).unwrap_err();
+        assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
+
+        assert!(executor.claim_mutation(&complete).unwrap());
+        let resumed = executor
+            .heartbeat_publish_operation(
+                &complete,
+                status.token,
+                b"publish-heartbeat-complete-transition",
+            )
+            .unwrap();
+        assert_eq!(resumed.encode().unwrap(), heartbeated.encode().unwrap());
+    }
+
+    #[test]
+    fn internal_retry_classification_excludes_business_conflicts() {
+        let transient = engine_failure(meta::AgentMetadataError::WriteReadVersionMismatch {
+            requested: 10,
+            current: 11,
+        });
+        assert!(internal_metadata_conflict(&transient));
+
+        let lost_race = engine_failure(meta::AgentMetadataError::WriteConflict);
+        assert!(internal_metadata_conflict(&lost_race));
+
+        let predicate = engine_failure(meta::AgentMetadataError::PredicateFailed);
+        assert!(!internal_metadata_conflict(&predicate));
+
+        let path = conflict(
+            protocol::ConflictKind::PathGeneration,
+            "path generation mismatch",
+            Some(1),
+        );
+        assert!(!internal_metadata_conflict(&path));
+
+        let operation = conflict(
+            protocol::ConflictKind::OperationState,
+            "operation token state digest is stale",
+            None,
+        );
+        assert!(!internal_metadata_conflict(&operation));
+    }
+
+    #[test]
+    fn internal_metadata_retry_converges_and_preserves_terminal_conflicts() {
+        let transient = || {
+            engine_failure(meta::AgentMetadataError::WriteReadVersionMismatch {
+                requested: 10,
+                current: 11,
+            })
+        };
+        let mut attempts = 0;
+        let converged = retry_internal_metadata_conflicts(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(transient())
+            } else {
+                Ok("applied")
+            }
+        })
+        .unwrap();
+        assert_eq!(converged, "applied");
+        assert_eq!(attempts, 3);
+
+        let business_conflict = conflict(
+            protocol::ConflictKind::PathGeneration,
+            "path already exists",
+            Some(1),
+        );
+        let mut business_attempts = 0;
+        let returned = retry_internal_metadata_conflicts::<()>(|| {
+            business_attempts += 1;
+            Err(business_conflict.clone())
+        })
+        .unwrap_err();
+        assert_eq!(returned, business_conflict);
+        assert_eq!(business_attempts, 1);
+
+        let mut exhausted_attempts = 0;
+        let exhausted = retry_internal_metadata_conflicts::<()>(|| {
+            exhausted_attempts += 1;
+            Err(transient())
+        })
+        .unwrap_err();
+        assert!(internal_metadata_conflict(&exhausted));
+        assert_eq!(exhausted_attempts, MAX_INTERNAL_METADATA_ATTEMPTS);
     }
 
     #[test]
