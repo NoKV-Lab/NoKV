@@ -87,9 +87,9 @@ impl WorkspaceServer {
         }
         Ok(Self {
             options,
+            owner_loss: registry.owner_loss_signal(),
             registry,
             ownership,
-            owner_loss: OwnerLossSignal::default(),
         })
     }
 
@@ -167,8 +167,8 @@ impl WorkspaceServer {
 
     pub fn dispatch_frame(&self, encoded: &[u8]) -> Result<Vec<u8>, ServerError> {
         let request = decode_request(encoded)?;
-        let response = self.registry.dispatch(request)?;
-        encode_response(&response).map_err(ServerError::Protocol)
+        let response = self.registry.dispatch_guarded(request)?;
+        encode_response(response.response()).map_err(ServerError::Protocol)
     }
 }
 
@@ -264,9 +264,15 @@ fn serve_connection(
         .map_err(ServerError::Connection)?;
     while let Some(request) = read_frame(&mut stream)? {
         let request = decode_request(&request)?;
-        let response = registry.dispatch(request)?;
-        let response = encode_response(&response)?;
-        write_frame(&mut stream, &response)?;
+        let response = registry.dispatch_guarded(request)?;
+        let encoded = encode_response(response.response())?;
+        write_frame(&mut stream, &encoded)?;
+        drop(response);
+        if registry.owner_loss_signal().is_lost() {
+            return Err(ServerError::InvalidBootstrap(
+                "control-plane owner was lost".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

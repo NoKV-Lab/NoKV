@@ -111,14 +111,16 @@ impl ShardOwner {
             Ok(record) => Ok(record),
             Err(error) => {
                 let primary = ServerError::Control(error);
-                let cleanup = uninstall_routes(&self.registry, &self.routes, "lease-lost");
-                if cleanup.is_empty() {
-                    Err(primary)
-                } else {
-                    Err(ServerError::BootstrapRollback {
+                let cleanup = self
+                    .registry
+                    .fail_closed_shard(LogicalShardIdentity::from(self.shard_id()))
+                    .err();
+                match cleanup {
+                    None => Err(primary),
+                    Some(cleanup) => Err(ServerError::BootstrapRollback {
                         primary: primary.to_string(),
-                        rollback: cleanup.join("; "),
-                    })
+                        rollback: format!("fail-close lease-lost logical shard: {}", cleanup),
+                    }),
                 }
             }
         }
@@ -126,17 +128,20 @@ impl ShardOwner {
 
     /// Stop admission for every attached root and release the shard lease once.
     pub fn release(self) -> Result<LogicalShardRecord, ServerError> {
-        let cleanup = uninstall_routes(&self.registry, &self.routes, "released");
-        match (self.control.release_owner(&self.lease), cleanup.is_empty()) {
-            (Ok(record), true) => Ok(record),
-            (Ok(_), false) => Err(ServerError::BootstrapRollback {
+        let cleanup = self
+            .registry
+            .fail_closed_shard(LogicalShardIdentity::from(self.shard_id()))
+            .err();
+        match (self.control.release_owner(&self.lease), cleanup) {
+            (Ok(record), None) => Ok(record),
+            (Ok(_), Some(cleanup)) => Err(ServerError::BootstrapRollback {
                 primary: "release logical-shard owner succeeded".to_owned(),
-                rollback: cleanup.join("; "),
+                rollback: cleanup.to_string(),
             }),
-            (Err(control), true) => Err(ServerError::Control(control)),
-            (Err(control), false) => Err(ServerError::BootstrapRollback {
+            (Err(control), None) => Err(ServerError::Control(control)),
+            (Err(control), Some(cleanup)) => Err(ServerError::BootstrapRollback {
                 primary: format!("release logical-shard owner: {control}"),
-                rollback: cleanup.join("; "),
+                rollback: cleanup.to_string(),
             }),
         }
     }
@@ -158,8 +163,18 @@ pub fn bootstrap_shard(
     // epoch-zero store, before the control plane consumes the first epoch.
     // Exact resumes keep the existing admission-before-open order.
     let prepared_meta = prepare_first_owner_meta(&boot.open, &boot.lease, boot.shard_id)?;
+    let prepared_path = prepared_meta.as_ref().map(|_| match &boot.open {
+        OpenMode::New(path) | OpenMode::Existing(path) => path.clone(),
+    });
 
-    let (lease, acquired) = admit_owner(control.as_ref(), boot.shard_id, &boot.lease)?;
+    let admission = admit_owner(control.as_ref(), boot.shard_id, &boot.lease);
+    let (lease, acquired) = match (admission, prepared_path) {
+        (Ok(admission), _) => admission,
+        (Err(ServerError::Control(source)), Some(path)) => {
+            return Err(ServerError::PreparedOwnerAdmission { path, source });
+        }
+        (Err(error), _) => return Err(error),
+    };
     let mut routes = Vec::with_capacity(placements.len());
 
     let meta = match prepared_meta {
@@ -996,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_first_owner_store_retries_after_settled_acquire_failure() {
+    fn prepared_first_owner_store_reports_reopen_after_settled_acquire_failure() {
         let temporary = TempDir::new().unwrap();
         let database = temporary.path().join("metadata");
         let root_id = root(1);
@@ -1013,7 +1028,13 @@ mod tests {
             .unwrap();
 
         assert!(error.to_string().contains("invalid logical-shard endpoint"));
+        assert!(matches!(
+            error,
+            ServerError::PreparedOwnerAdmission { ref path, .. } if *path == database
+        ));
+        assert!(error.to_string().contains("--metadata-reopen"));
         assert!(database.exists());
+        assert!(database.read_dir().unwrap().next().is_some());
         let record = control.get_logical_shard(&shard()).unwrap().unwrap();
         assert_eq!(record.state, LogicalShardState::Unassigned);
         assert!(record.owner.is_none());
@@ -1031,6 +1052,50 @@ mod tests {
             Some(owner.lease().owner_epoch)
         );
         assert_eq!(owner.serving_record().state, LogicalShardState::Serving);
+        owner.release().unwrap();
+    }
+
+    #[test]
+    fn backend_owner_admission_failure_keeps_prepared_state_fail_closed() {
+        let error = ServerError::PreparedOwnerAdmission {
+            path: PathBuf::from("prepared-meta"),
+            source: nokv_control::ControlError::Backend("outcome unavailable".to_owned()),
+        }
+        .to_string();
+        assert!(error.contains("outcome is unknown"));
+        assert!(error.contains("preserve the store"));
+        assert!(error.contains("do not delete"));
+    }
+
+    #[test]
+    fn caller_owned_empty_directory_is_preserved_as_a_prepared_reopen() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        std::fs::create_dir(&database).unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let mut first = acquire_boot(database.clone(), &[root_id]);
+        let LeaseMode::Acquire { endpoint, .. } = &mut first.lease else {
+            unreachable!("acquire_boot always constructs an acquisition");
+        };
+        endpoint.clear();
+
+        let error = bootstrap_shard(as_control(&control), Arc::clone(&registry), first)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            error,
+            ServerError::PreparedOwnerAdmission { path, .. } if path == database
+        ));
+        assert!(database.exists());
+        assert!(database.read_dir().unwrap().next().is_some());
+
+        let mut retry = acquire_boot(database.clone(), &[root_id]);
+        retry.open = OpenMode::Existing(database);
+        let owner = bootstrap_shard(as_control(&control), registry, retry).unwrap();
+        assert_eq!(owner.lease().owner_epoch.get(), 1);
         owner.release().unwrap();
     }
 

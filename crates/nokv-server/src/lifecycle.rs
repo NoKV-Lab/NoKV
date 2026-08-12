@@ -344,12 +344,27 @@ impl LifecycleRunner {
     /// failure requires operator attention.
     pub fn run_until_owner_loss(&self) -> Result<(), LifecycleError> {
         loop {
-            match self.run_once(unix_time_ms()?) {
+            let observed_now_ms = match unix_time_ms() {
+                Ok(observed_now_ms) => observed_now_ms,
+                Err(error) => return Err(self.fail_closed_error(error)),
+            };
+            match self.run_once(observed_now_ms) {
                 Ok(_) => {}
                 Err(error) if retryable_lifecycle(&error) => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(self.fail_closed_error(error)),
             }
-            self.wait_poll_interval_or_owner_loss()?;
+            if let Err(error) = self.wait_poll_interval_or_owner_loss() {
+                return Err(self.fail_closed_error(error));
+            }
+        }
+    }
+
+    fn fail_closed_error(&self, primary: LifecycleError) -> LifecycleError {
+        match self.registry.fail_closed_shard(self.route.logical_shard_id) {
+            Ok(()) => primary,
+            Err(fence) => LifecycleError::OwnerLost(format!(
+                "{primary}; logical-shard route/response fail-close failed: {fence}"
+            )),
         }
     }
 
@@ -2224,7 +2239,7 @@ mod tests {
             result: None,
             terminal_error: Some(meta::CommitOperationTerminalError {
                 kind: meta::CommitOperationErrorKind::InvariantViolation,
-                message: "portable transaction capacity cannot admit one commit member step"
+                message: "serving transaction capacity cannot admit one commit member step"
                     .to_owned(),
             }),
         };
@@ -2448,6 +2463,7 @@ mod tests {
         let result = worker.join().unwrap();
         assert!(matches!(result, Err(LifecycleError::OwnerLost(_))));
         assert!(interrupted_at.elapsed() < Duration::from_secs(1));
+        assert_eq!(fixture.registry.installed_root_count().unwrap(), 0);
     }
 
     #[test]

@@ -324,6 +324,13 @@ Unknown outcomes use these states:
 | `MayCommit` | The original call can still commit after returning. | Replan only as a new domain transaction guarded by the same dedupe absence and commit clock. Never retry the raw `WriteTxn`. |
 | `Poisoned` | The live view may be ahead of the acknowledgement boundary. The adapter poisoned the instance before returning. | Remove the shard routes, open and recover a new instance, and then reconcile `CommandDedupe`. |
 
+The current Holt-only server deliberately takes the conservative subset of
+this contract: every `OutcomeUnknown` fail-closes the process owner scope,
+removes the affected shard routes, and permits no follow-up physical work.
+State-specific `Settled` and `MayCommit` reconciliation remains part of the
+provider admission/recovery work. This avoids a raw transaction retry without
+claiming that third-party-provider recovery is already implemented.
+
 A poisoned adapter must prevent every overlapping or later `read` and `commit`
 from returning success after the poison transition. It must serialize operation
 completion with that transition or recheck its state before publishing a
@@ -348,10 +355,12 @@ match Holt or FoundationDB error types.
 
 `StoreProfile` reports the store-advertised logical request limits, the
 acknowledgement boundary, and the location of recovery authority. NoKV defines
-one portable transaction envelope that fits within every qualified store
-profile.
+one serving transaction envelope that every qualified store profile must meet.
+The Holt cutover sizes that envelope around characterized high-amplification
+metadata states accepted by the current main branch; it is not yet a
+FoundationDB-portable schema envelope.
 
-The portable budget covers:
+The serving budget covers:
 
 - point reads and range endpoints
 - bounded read result bytes
@@ -365,7 +374,7 @@ The portable budget covers:
 `max_read_bytes` is a conservative logical affected-byte budget. An adapter
 must reserve room for keyspace or subspace prefixes, range endpoints, conflict
 ranges, and other physical encoding overhead when it advertises that limit.
-The portable budget does not count values returned by point reads as affected
+The serving budget does not count values returned by point reads as affected
 transaction bytes, but `max_result_bytes` still bounds those values.
 
 An `EmptyPrefix` check reserves the prefix start, its exclusive end, and one
@@ -373,10 +382,21 @@ maximum-size key. This covers the range read needed to prove that the prefix has
 no row. Adapter-specific encoding overhead still comes from the profile reserve.
 
 `MetaShard` validates every derived read and write request against the profile
-before physical I/O. The local serving profile sets a 1,000,000-byte logical
+before physical I/O. The local serving profile sets a 16,000,000-byte logical
 write budget, an 8,205-byte encoded-key limit, a 65,535-byte value limit, and
-bounded read pages. This is a portable logical contract, not proof of
-FoundationDB physical affected-byte size or production qualification.
+bounded read pages. After maximum mutation overhead, the write budget stays
+within Holt's 16 MiB WAL record envelope. File-backed tests preserve
+create/reopen/replace/remove for both a short path with a 61,203-byte typed
+projection and a maximum-length path with 64 dependencies and a 57,243-byte
+projection. This is characterized compatibility evidence, not a universal
+domain-size proof.
+
+The envelope exceeds FoundationDB's
+[10,000,000-byte hard transaction limit](https://apple.github.io/foundationdb/known-limitations.html),
+so an FDB adapter remains `NOT QUALIFIED` until publication/index maintenance
+is redesigned into bounded transactions. Treating FoundationDB's one-megabyte
+redesign recommendation as a new hard limit would strand existing valid Holt
+metadata.
 
 Required transaction and read semantics are not optional capabilities. A store
 that cannot provide them fails during startup.
@@ -458,12 +478,19 @@ routes are ready. It renews and releases the shard lease once per shard, not
 once per root.
 
 A physical initialization failure for the first `New` owner occurs before
-control-plane acquisition and does not consume an owner epoch. The local
-profile still needs an explicit recovering ownership token for a failure after
-acquisition but before `Serving`. Releasing that lease is fail-closed, but it
-can strand the local authority because successor acquisition is not qualified. A
-control-store owner acquisition with an unknown outcome needs the same typed
-recovery treatment. Runtime admission work must close both windows.
+control-plane acquisition and does not consume an owner epoch. If subsequent
+owner acquisition fails, bootstrap closes and preserves the prepared epoch-zero
+store. A failure known not to have applied reports an exact corrected
+`Existing` retry. When the control backend cannot classify acquisition,
+bootstrap instead requires ownership reconciliation before that retry.
+Bootstrap never infers directory ownership from a path precheck or recursively
+deletes a prepared store; both would be unsafe under a concurrent path change.
+
+The local profile still needs an explicit recovering ownership token for a
+failure after acquisition but before `Serving`. Releasing that lease is
+fail-closed, but it can strand the local authority because successor
+acquisition is not qualified. Unknown control acquisition needs the same typed
+recovery treatment after the immediate preserve-and-report boundary.
 
 Lifecycle work remains root-scoped because each runner owns root-specific
 cursors. Every attached root gets one supervised lifecycle runner. Runtime
@@ -519,18 +546,20 @@ FoundationDB production work must address:
 - a root-scoped logical commit clock
 - removal of local recovery-chain writes from its hot commit path
 - physical affected-byte sizing and representative transaction qualification
-- typed publication admission for requests whose fully derived transaction is
-  larger than the portable budget
+- bounded publication and secondary-index maintenance for states whose fully
+  derived transaction is larger than FoundationDB's hard budget
 - asynchronous server execution
 - unknown-outcome and conflict fault injection
 - failover and benchmark qualification
 
 The server runtime must also persist and validate the exact binding between a
 logical shard, owner epoch, physical store identity, store profile, and
-configuration digest. Registry dispatch must hold a runtime guard through
-response delivery so lease loss or adapter poison cannot race a successful
-response. These are [Issue #436](https://github.com/NoKV-Lab/NoKV/issues/436)
-admission requirements, not `TxnStore` methods.
+configuration digest. The current registry now closes the complete shard
+route set and holds a response permit through socket delivery when lease loss
+or adapter poison occurs. Durable provider admission and restart-time
+unknown-outcome reconciliation remain
+[Issue #436](https://github.com/NoKV-Lab/NoKV/issues/436) requirements, not
+`TxnStore` methods.
 
 Splitting one hot root requires a permanent `MetadataPartitionId` and explicit
 cross-partition semantics. Filename hashing is not an acceptable substitute.
@@ -574,12 +603,14 @@ Completed in the local Holt cutover:
    poison handling, WAL recovery tests, and adapter diagnostics.
 5. Cut over `MetaShard`, remove the Holt dependency and old constructors from
    `nokv-meta`, and inject the adapter in `nokv-server`.
-6. Enforce the portable logical limits before physical I/O.
+6. Enforce the serving logical limits before physical I/O.
+7. Fence shard admission and response delivery immediately on lease loss or a
+   poisoned store outcome.
 
 Remaining work:
 
 1. Add provider-neutral configuration, persistent runtime binding, admission,
-   response-delivery fencing, and unknown-outcome recovery orchestration.
+   and unknown-outcome recovery orchestration.
 2. Replace the synchronous store and server path with one async path.
 3. Add a non-default `nokv-meta-fdb` adapter and keep it `NOT QUALIFIED` until
    its workspace, failure, failover, and benchmark gates pass.

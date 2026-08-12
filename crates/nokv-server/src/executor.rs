@@ -29,8 +29,11 @@ const _: () =
 const _: () =
     assert!(protocol::PageRequest::MAX_LIMIT as usize == meta::MAX_VISIBLE_PATH_LIST_PAGE_SIZE);
 const _: () = assert!(protocol::MAX_QUERY_PAGE_LIMIT as usize == meta::MAX_QUERY_PAGE_SIZE);
+// Workspace RPC v2 already admits up to 64 descriptor fields. The durable
+// projection planner has always accepted 60; preserve the wire contract and
+// reject the legacy 61..=64 gap at DTO-to-domain conversion as main does.
 const _: () =
-    assert!(protocol::ArtifactDescriptor::MAX_INDEX_FIELDS == meta::MAX_TYPED_PROJECTION_FIELDS);
+    assert!(protocol::ArtifactDescriptor::MAX_INDEX_FIELDS >= meta::MAX_TYPED_PROJECTION_FIELDS);
 const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 9] = [
     protocol::WorkspaceCapability::ArtifactPublishV1,
     protocol::WorkspaceCapability::ArtifactRangeReadV1,
@@ -3827,6 +3830,24 @@ fn commit_failure(error: meta::CommitError) -> protocol::RpcFailure {
 
 fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
     match error {
+        error @ meta::MetaError::Store {
+            source: nokv_meta_store::StoreError::OutcomeUnknown { .. },
+            ..
+        } => failure(
+            protocol::ErrorCode::NotOwner,
+            error.to_string(),
+            true,
+            Some(protocol::ConflictKind::RootPlacement),
+        ),
+        error @ meta::MetaError::Store {
+            source: nokv_meta_store::StoreError::LimitExceeded { .. },
+            ..
+        } => failure(
+            protocol::ErrorCode::ResourceExhausted,
+            error.to_string(),
+            false,
+            None,
+        ),
         meta::MetaError::OwnerEpochMismatch { .. }
         | meta::MetaError::PlacementMismatch
         | meta::MetaError::RootFenceMissing
@@ -4191,7 +4212,7 @@ mod tests {
             result: None,
             terminal_error: Some(meta::CommitOperationTerminalError {
                 kind: meta::CommitOperationErrorKind::InvariantViolation,
-                message: "portable transaction capacity cannot admit one commit member step"
+                message: "serving transaction capacity cannot admit one commit member step"
                     .to_owned(),
             }),
         };
@@ -4859,7 +4880,7 @@ mod tests {
         let ready = ready_restore_operation();
         let terminal = meta::RestoreTerminalError {
             kind: meta::RestoreTerminalErrorKind::InvariantViolation,
-            message: "portable transaction capacity cannot admit one restore member".to_owned(),
+            message: "serving transaction capacity cannot admit one restore member".to_owned(),
             evidence_digest: None,
         };
         let aborting = ready
@@ -5804,14 +5825,57 @@ mod tests {
         let predicate = meta_failure(meta::MetaError::PredicateFailed);
         assert!(!internal_metadata_conflict(&predicate));
 
-        let unknown = meta_failure(meta::MetaError::Store {
+        for state in [
+            nokv_meta_store::UnknownCommit::Settled,
+            nokv_meta_store::UnknownCommit::MayCommit,
+            nokv_meta_store::UnknownCommit::Poisoned,
+        ] {
+            let unknown = meta_failure(meta::MetaError::Store {
+                operation: "commit",
+                source: nokv_meta_store::StoreError::OutcomeUnknown {
+                    state,
+                    reason: "injected unknown outcome".to_owned(),
+                },
+            });
+            assert!(!internal_metadata_conflict(&unknown));
+            assert_eq!(unknown.code, protocol::ErrorCode::NotOwner);
+            assert_eq!(
+                unknown.conflict,
+                Some(protocol::ConflictKind::RootPlacement)
+            );
+            assert!(unknown.retryable);
+            assert!(unknown.message.contains(&state.to_string()));
+        }
+
+        let known_not_applied = meta_failure(meta::MetaError::Store {
             operation: "commit",
-            source: nokv_meta_store::StoreError::OutcomeUnknown {
-                state: nokv_meta_store::UnknownCommit::Poisoned,
-                reason: "injected unknown outcome".to_owned(),
+            source: nokv_meta_store::StoreError::Unavailable(
+                "injected definitely-not-applied outcome".to_owned(),
+            ),
+        });
+        assert_eq!(known_not_applied.code, protocol::ErrorCode::Internal);
+        assert!(!known_not_applied.retryable);
+
+        let limit = meta_failure(meta::MetaError::Store {
+            operation: "commit",
+            source: nokv_meta_store::StoreError::LimitExceeded {
+                kind: nokv_meta_store::LimitKind::TransactionBytes,
+                actual: 1_000_001,
+                maximum: 1_000_000,
             },
         });
-        assert!(!internal_metadata_conflict(&unknown));
+        assert_eq!(limit.code, protocol::ErrorCode::ResourceExhausted);
+        assert!(!limit.retryable);
+        assert!(limit.message.contains("transaction bytes"));
+        assert!(limit.message.contains("1000001"));
+        assert!(limit.message.contains("1000000"));
+
+        let internal_store_failure = meta_failure(meta::MetaError::Store {
+            operation: "commit",
+            source: nokv_meta_store::StoreError::InvalidRequest("invalid key range".to_owned()),
+        });
+        assert_eq!(internal_store_failure.code, protocol::ErrorCode::Internal);
+        assert!(!internal_store_failure.retryable);
 
         let path = conflict(
             protocol::ConflictKind::PathGeneration,

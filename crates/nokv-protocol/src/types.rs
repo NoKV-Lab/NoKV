@@ -691,7 +691,7 @@ pub struct ArtifactDescriptor {
 impl ArtifactDescriptor {
     pub const MAX_PRODUCER_BYTES: usize = 512;
     pub const MAX_MANIFEST_IDENTITY_BYTES: usize = 1_024;
-    pub const MAX_INDEX_FIELDS: usize = 60;
+    pub const MAX_INDEX_FIELDS: usize = 64;
     pub const MAX_INDEX_FIELD_BYTES: usize = 64 * 1_024;
 
     pub fn validate(&self) -> Result<(), ProtocolError> {

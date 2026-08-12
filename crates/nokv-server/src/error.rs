@@ -4,6 +4,7 @@
  */
 
 use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -12,13 +13,23 @@ pub enum ServerError {
     InvalidBootstrap(String),
     RouteRollback(String),
     Control(nokv_control::ControlError),
+    PreparedOwnerAdmission {
+        path: PathBuf,
+        source: nokv_control::ControlError,
+    },
     Store(nokv_meta_store::StoreError),
     Meta(nokv_meta::workspace::MetaError),
-    BootstrapRollback { primary: String, rollback: String },
+    BootstrapRollback {
+        primary: String,
+        rollback: String,
+    },
     Protocol(nokv_protocol::ProtocolError),
     Bind(std::io::Error),
     Connection(std::io::Error),
-    FrameTooLarge { bytes: usize, max: usize },
+    FrameTooLarge {
+        bytes: usize,
+        max: usize,
+    },
     Executor(String),
 }
 
@@ -38,6 +49,27 @@ impl fmt::Display for ServerError {
             }
             Self::RouteRollback(message) => write!(formatter, "root route rollback: {message}"),
             Self::Control(error) => write!(formatter, "control plane failed: {error}"),
+            Self::PreparedOwnerAdmission { path, source } => {
+                if matches!(source, nokv_control::ControlError::Backend(_)) {
+                    write!(
+                        formatter,
+                        "control-plane owner acquisition outcome is unknown after preparing the \
+                         epoch-zero metadata store at {}: {source}; preserve the store and \
+                         reconcile control-plane ownership before retrying; do not delete it \
+                         while acquisition may have succeeded",
+                        path.display()
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "control plane failed after preparing the epoch-zero metadata store at \
+                         {}: {source}; retry the corrected first-owner command with \
+                         --metadata-reopen {}",
+                        path.display(),
+                        path.display()
+                    )
+                }
+            }
             Self::Store(error) => write!(formatter, "metadata store failed: {error}"),
             Self::Meta(error) => write!(formatter, "metadata failed: {error}"),
             Self::BootstrapRollback { primary, rollback } => write!(
