@@ -296,15 +296,41 @@ cargo build --release -p nokv --bin nokv
 ./target/release/nokv schema
 ```
 
-Maintainers and integration partners with access to the private tap can instead
-build the same locked source release through Homebrew:
+Anyone can instead install the current stable source release from NoKV's public
+Homebrew tap. The fully qualified command adds the tap and trusts only the
+`nokv` Formula:
 
 ```bash
-brew tap NoKV-Lab/tap
-brew install nokv
+brew install NoKV-Lab/tap/nokv
 nokv version --json
 nokv schema
 ```
+
+The current source Formula release gate covers Apple Silicon and Intel macOS.
+Linuxbrew is not yet a qualified release target.
+
+To add the tap separately before installing by short name, grant the same
+Formula-scoped trust explicitly:
+
+```bash
+brew tap NoKV-Lab/tap
+brew trust --formula NoKV-Lab/tap/nokv
+brew install nokv
+```
+
+Pull a merged tap update and install a newer NoKV release with:
+
+```bash
+brew update
+brew upgrade nokv
+nokv version --json
+```
+
+The Formula version follows the stable NoKV release tag and the `crates/nokv`
+package version, not Holt, Rust, or protobuf. Every NoKV release carries its
+own `Cargo.lock` and embeds the exact Holt version, source, and checksum in the
+installed identity. A Holt update reaches the tap only as part of a new NoKV
+release whose generated Formula has been merged into the tap.
 
 Run the offline Workbench contract gate:
 

@@ -343,8 +343,8 @@ class InstalledIdentityTest(unittest.TestCase):
                     release.verify_installed_identity(manifest, drifted, schema)
 
 
-class PrivateTapAndWorkflowTest(unittest.TestCase):
-    def test_private_tap_marker_is_exact(self) -> None:
+class PublicTapAndWorkflowTest(unittest.TestCase):
+    def test_public_tap_marker_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / ".nokv-tap.json"
             marker.write_text(
@@ -352,7 +352,7 @@ class PrivateTapAndWorkflowTest(unittest.TestCase):
                     {
                         "schema": release.TAP_MARKER_SCHEMA,
                         "repository": "NoKV-Lab/homebrew-tap",
-                        "visibility": "private",
+                        "visibility": "public",
                         "source_repository": "NoKV-Lab/NoKV",
                     }
                 ),
@@ -360,11 +360,18 @@ class PrivateTapAndWorkflowTest(unittest.TestCase):
             )
             release.verify_tap_marker(marker)
             marker.write_text(
-                marker.read_text(encoding="utf-8").replace("private", "public"),
+                marker.read_text(encoding="utf-8").replace("public", "private"),
                 encoding="utf-8",
             )
             with self.assertRaises(release.ReleaseError):
                 release.verify_tap_marker(marker)
+
+    def test_checked_in_marker_declares_the_public_tap(self) -> None:
+        marker = REPOSITORY_ROOT / "scripts/release/public_tap_marker.json"
+        release.verify_tap_marker(marker)
+        self.assertFalse(
+            (REPOSITORY_ROOT / "scripts/release/private_tap_marker.json").exists()
+        )
 
     def test_workflow_keeps_untrusted_tag_away_from_shell_and_tokens(self) -> None:
         workflow = (
@@ -396,6 +403,12 @@ class PrivateTapAndWorkflowTest(unittest.TestCase):
         self.assertIn("NoKV-Lab/homebrew-tap", workflow)
         self.assertIn("create-github-app-token", workflow)
         self.assertIn("gh pr create", workflow)
+        self.assertIn("Fail closed unless the tap is public", workflow)
+        self.assertIn('"$private" != "false"', workflow)
+        self.assertIn('"$visibility" != "public"', workflow)
+        self.assertIn("public_tap_marker.json", workflow)
+        self.assertNotIn("must remain private", workflow)
+        self.assertNotIn("Updates the private tap", workflow)
         self.assertNotIn("HOMEBREW_TAP_PAT", workflow)
         self.assertNotIn("archive/refs/tags", workflow)
 

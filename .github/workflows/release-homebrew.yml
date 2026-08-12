@@ -91,7 +91,7 @@ jobs:
             --manifest "$RELEASE_DIR/nokv-$RELEASE_VERSION-homebrew.json" \
             --source-url "$source_url" \
             --output "$RELEASE_DIR/Formula/nokv.rb"
-          cp scripts/release/private_tap_marker.json "$RELEASE_DIR/.nokv-tap.json"
+          cp scripts/release/public_tap_marker.json "$RELEASE_DIR/.nokv-tap.json"
           python3 scripts/release/homebrew_source_release.py verify-tap \
             --marker "$RELEASE_DIR/.nokv-tap.json"
 
@@ -253,8 +253,8 @@ jobs:
               --notes "Source-only Homebrew release for commit $EXPECTED_COMMIT."
           fi
 
-  update-private-tap:
-    name: Open private tap update PR
+  update-public-tap:
+    name: Open public tap update PR
     needs:
       - validate
       - source
@@ -285,7 +285,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - name: Fail closed unless the tap is private
+      - name: Fail closed unless the tap is public
         shell: bash
         env:
           GH_TOKEN: ${{ steps.tap-token.outputs.token }}
@@ -293,12 +293,12 @@ jobs:
           set -euo pipefail
           private="$(gh api "repos/$TAP_REPOSITORY" --jq '.private')"
           visibility="$(gh api "repos/$TAP_REPOSITORY" --jq '.visibility')"
-          if [[ "$private" != "true" || "$visibility" != "private" ]]; then
-            echo "::error title=Unsafe tap visibility::$TAP_REPOSITORY must remain private."
+          if [[ "$private" != "false" || "$visibility" != "public" ]]; then
+            echo "::error title=Unavailable public tap::$TAP_REPOSITORY must remain public."
             exit 1
           fi
 
-      - name: Checkout private tap
+      - name: Checkout public tap
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: NoKV-Lab/homebrew-tap
@@ -333,7 +333,7 @@ jobs:
           cp "$RELEASE_DIR/Formula/nokv.rb" Formula/nokv.rb
           git add Formula/nokv.rb
           if git diff --cached --quiet; then
-            echo "The private tap already contains this exact Formula."
+            echo "The public tap already contains this exact Formula."
             exit 0
           fi
           git config user.name "wchwawa"
@@ -348,7 +348,7 @@ jobs:
               --base main \
               --head "$branch" \
               --title "release: update nokv to $RELEASE_VERSION" \
-              --body "Updates the private tap to the source-only NoKV $RELEASE_VERSION Formula after Intel and Apple Silicon installation gates passed."
+              --body "Updates the public tap to the source-only NoKV $RELEASE_VERSION Formula after Intel and Apple Silicon installation gates passed."
           else
             echo "Tap update PR already exists: $existing"
           fi

@@ -22,7 +22,7 @@ from typing import Any, NoReturn
 
 
 MANIFEST_SCHEMA = "nokv.homebrew.source_release.v1"
-TAP_MARKER_SCHEMA = "nokv.homebrew.private_tap.v1"
+TAP_MARKER_SCHEMA = "nokv.homebrew.public_tap.v1"
 SOURCE_REPOSITORY = "NoKV-Lab/NoKV"
 TAP_REPOSITORY = "NoKV-Lab/homebrew-tap"
 WORKBENCH_TOOL_COUNT = 18
@@ -572,12 +572,12 @@ def verify_tap_marker(marker_path: Path) -> None:
     expected = {
         "schema": TAP_MARKER_SCHEMA,
         "repository": TAP_REPOSITORY,
-        "visibility": "private",
+        "visibility": "public",
         "source_repository": SOURCE_REPOSITORY,
     }
     if marker != expected:
         raise ReleaseError(
-            f"tap marker does not identify the exact private repository: {marker!r}"
+            f"tap marker does not identify the exact public repository: {marker!r}"
         )
 
 
