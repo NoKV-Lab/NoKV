@@ -38,7 +38,7 @@ mod tests {
         assert_eq!(VERSION, "1.0.0");
         assert!(GIT_COMMIT == "unknown" || GIT_COMMIT.len() == 40);
         assert_eq!(CARGO_LOCK_SHA256.len(), 64);
-        assert_eq!(HOLT_VERSION, "0.8.4");
+        assert_eq!(HOLT_VERSION, "0.8.5");
         assert_eq!(
             HOLT_SOURCE,
             "registry+https://github.com/rust-lang/crates.io-index"
