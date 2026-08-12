@@ -829,7 +829,7 @@ its exact commit or dedupe result exists; otherwise only the fenced takeover
 may abort it.
 
 Build, cleanup, and retirement select the largest prefix whose
-fully derived metadata transaction fits the portable store limits. A valid new
+fully derived metadata transaction fits the serving store limits. A valid new
 row must fit by itself. A legacy row that does not fit fails closed in
 `Quarantined` and retains its hold for operator repair. NoKV does not qualify
 automatic repair of that state.
@@ -955,7 +955,7 @@ or the source commit consumer, exactly once. `Quarantined` retains that source
 for operator repair. NoKV does not qualify automatic reconciliation.
 
 New copy commands admit a member only after its worst valid single-member
-cleanup command also fits the portable store limits. Cleanup never touches a
+cleanup command also fits the serving store limits. Cleanup never touches a
 `Visible` incarnation.
 
 ## Garbage Collection State Machine

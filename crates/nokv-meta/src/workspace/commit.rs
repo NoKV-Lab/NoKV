@@ -2479,7 +2479,7 @@ impl<'a> CommitService<'a> {
             terminal_error: CommitOperationTerminalError {
                 kind: CommitOperationErrorKind::InvariantViolation,
                 message: format!(
-                    "portable transaction capacity cannot admit one commit {step} step"
+                    "serving transaction capacity cannot admit one commit {step} step"
                 ),
             },
         })
@@ -2496,7 +2496,7 @@ impl<'a> CommitService<'a> {
         next.terminal_error = Some(CommitOperationTerminalError {
             kind: CommitOperationErrorKind::InvariantViolation,
             message: format!(
-                "portable transaction capacity cannot admit one commit cleanup {step} step"
+                "serving transaction capacity cannot admit one commit cleanup {step} step"
             ),
         });
         let mut plan = CommandPlan::default();
@@ -2536,7 +2536,7 @@ impl<'a> CommitService<'a> {
         next.terminal_error = Some(CommitOperationTerminalError {
             kind: super::build_commit_records::CommitOperationErrorKind::InvariantViolation,
             message: format!(
-                "portable transaction capacity cannot admit one commit retirement {step} step"
+                "serving transaction capacity cannot admit one commit retirement {step} step"
             ),
         });
         let mut plan = CommandPlan::default();
@@ -3505,7 +3505,7 @@ mod tests {
     }
 
     #[test]
-    fn member_build_and_cleanup_choose_fitting_prefixes_and_replay() {
+    fn member_build_and_cleanup_fit_bounded_batches_and_replay() {
         const ROWS: usize = 24;
         const PROJECTION_BYTES: usize = 24 * 1024;
 
@@ -3531,8 +3531,8 @@ mod tests {
             limit: ROWS,
         };
         let first = service.build_members(first_request).unwrap();
-        assert!(first.operation.member_count > 0);
-        assert!(first.operation.member_count < ROWS as u64);
+        assert_eq!(first.operation.member_count, ROWS as u64);
+        assert!(first.operation.members_complete);
         let replay = service.build_members(first_request).unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.operation, first.operation);
@@ -3568,8 +3568,6 @@ mod tests {
             })
             .unwrap();
 
-        let mut saw_partial_member_cleanup = false;
-        let mut previous_member_count = 0;
         loop {
             let outcome = service
                 .cleanup_build(BuildCommitStepRequest {
@@ -3579,17 +3577,12 @@ mod tests {
                 })
                 .unwrap();
             assert_ne!(outcome.operation.phase, BuildCommitPhase::Quarantined);
-            let cleaned = outcome.operation.cleanup_member_count;
-            if cleaned > previous_member_count && cleaned < ROWS as u64 {
-                saw_partial_member_cleanup = true;
-            }
-            previous_member_count = cleaned;
             if outcome.operation.phase == BuildCommitPhase::Cleaned {
+                assert_eq!(outcome.operation.cleanup_member_count, ROWS as u64);
                 assert!(outcome.operation.history_hold_released);
                 break;
             }
         }
-        assert!(saw_partial_member_cleanup);
         assert!(read_current(
             &store,
             MetadataFamily::HistoryHold,
@@ -3599,7 +3592,7 @@ mod tests {
     }
 
     #[test]
-    fn retirement_member_release_chooses_a_fitting_prefix_and_replays() {
+    fn retirement_member_release_fits_bounded_batch_and_replays() {
         const ROWS: usize = 24;
         const PROJECTION_BYTES: usize = 24 * 1024;
 
@@ -3666,8 +3659,7 @@ mod tests {
             limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
         };
         let first = service.release_retired_commit(member_request).unwrap();
-        assert!(first.operation.released_member_count > 0);
-        assert!(first.operation.released_member_count < ROWS as u64);
+        assert_eq!(first.operation.released_member_count, ROWS as u64);
         let replay = service.release_retired_commit(member_request).unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.operation, first.operation);
@@ -3825,9 +3817,13 @@ mod tests {
     }
 
     #[test]
-    fn parent_attach_and_cleanup_choose_fitting_prefixes_and_replay() {
-        const PARENTS: usize = 24;
-        const LINEAGE_BYTES: usize = 24 * 1024;
+    fn parent_attach_shrinks_to_transaction_byte_budget_replays_and_cleans_up() {
+        // Fifty-three values are the smallest prefix in this fixture whose
+        // fully derived command crosses the 16 MB serving envelope. The
+        // 52-parent prefix fits, while 53 parents remain below the 256-item
+        // command ceiling, isolating transaction bytes as the limiting axis.
+        const PARENTS: usize = 53;
+        const LINEAGE_BYTES: usize = 60_000;
 
         let mut counter = 30_000_u128;
         let store = ready_store(&mut counter);
@@ -3844,19 +3840,22 @@ mod tests {
         let parents = (0..PARENTS)
             .map(|index| commit(100 + index as u8))
             .collect::<Vec<_>>();
-        for parent in &parents {
-            raw_put(
-                &store,
-                &mut counter,
-                vec![(
-                    MetadataFamily::Commit,
-                    commit_key(root(), *parent),
-                    large_parent_record(tree_revision, LINEAGE_BYTES)
-                        .encode()
-                        .unwrap(),
-                )],
-            );
-        }
+        raw_put(
+            &store,
+            &mut counter,
+            parents
+                .iter()
+                .map(|parent| {
+                    (
+                        MetadataFamily::Commit,
+                        commit_key(root(), *parent),
+                        large_parent_record(tree_revision, LINEAGE_BYTES)
+                            .encode()
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        );
 
         let service = CommitService::new(&store);
         let operation_id = operation(91);
@@ -3900,8 +3899,8 @@ mod tests {
             limit: PARENTS,
         };
         let first = service.attach_parents(first_request).unwrap();
-        assert!(first.operation.parent_cursor > 0);
-        assert!(first.operation.parent_cursor < PARENTS as u32);
+        assert_eq!(first.operation.parent_cursor, 52);
+        assert!(!first.operation.parents_complete);
         let replay = service.attach_parents(first_request).unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.operation, first.operation);
@@ -3934,26 +3933,20 @@ mod tests {
             })
             .unwrap();
 
-        let mut saw_partial_parent_cleanup = false;
         loop {
             let outcome = service
                 .cleanup_build(BuildCommitStepRequest {
                     context: write_context(&store, &mut counter),
                     operation_id,
-                    limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+                    limit: 1,
                 })
                 .unwrap();
             assert_ne!(outcome.operation.phase, BuildCommitPhase::Quarantined);
-            if outcome.operation.cleanup_parent_count > 0
-                && outcome.operation.cleanup_parent_count < PARENTS as u32
-            {
-                saw_partial_parent_cleanup = true;
-            }
             if outcome.operation.phase == BuildCommitPhase::Cleaned {
+                assert_eq!(outcome.operation.cleanup_parent_count, PARENTS as u32);
                 break;
             }
         }
-        assert!(saw_partial_parent_cleanup);
         for parent in parents {
             assert!(read_current(
                 &store,

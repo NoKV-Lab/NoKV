@@ -68,12 +68,16 @@ const MAX_COMMAND_VALUE_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 const MAX_DETERMINISTIC_RESULT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 const MAX_EVENT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 
-/// Fixed portable transaction-store limits for the workspace schema.
+/// Transitional transaction-store limits for the workspace schema.
 ///
-/// Adapters may support larger requests, but `MetaShard` never emits one. The
-/// decimal 1,000,000-byte transaction budget follows FoundationDB's
-/// documented redesign threshold and stays below every planned adapter's hard
-/// limit.
+/// The decimal 16,000,000-byte transaction envelope preserves two
+/// high-amplification lifecycles characterized against the pre-provider
+/// Holt-backed engine: a 60-field, 61,203-byte projection on a short path, and
+/// a 4,096-byte path with 64 dependencies and a 57,243-byte projection.
+/// Together with the configured maximum mutation overhead it remains below
+/// Holt's 16 MiB WAL-record ceiling. This is a transitional compatibility
+/// profile, not proof that every domain-valid command fits; providers with a
+/// smaller hard transaction limit are not qualified for it.
 pub const fn store_limits() -> StoreLimits {
     StoreLimits {
         max_reads: 8,
@@ -82,7 +86,7 @@ pub const fn store_limits() -> StoreLimits {
         max_key_bytes: MAX_DERIVED_KEY_BYTES,
         max_value_bytes: MAX_STORED_VALUE_BYTES,
         max_read_bytes: 8 * 1024 * 1024,
-        max_transaction_bytes: 1_000_000,
+        max_transaction_bytes: 16_000_000,
         max_result_rows: 1_024,
         max_result_bytes: 8 * 1024 * 1024,
     }
@@ -984,7 +988,7 @@ impl MetaShard {
         self.execute_with_lease_deadline(command, Some(lease_deadline_ms))
     }
 
-    /// Check whether a fresh execution of `command` fits the portable write
+    /// Check whether a fresh execution of `command` fits the serving write
     /// envelope without reading or mutating the transaction store.
     ///
     /// This check covers the fully derived transaction, including history,
@@ -3209,7 +3213,7 @@ fn validate_store_profile(actual: StoreLimits) -> Result<(), MetaError> {
         if available < needed {
             return Err(MetaError::SchemaGate {
                 reason: format!(
-                    "metadata store supports {available} {name}, portable schema requires {needed}"
+                    "metadata store supports {available} {name}, serving schema requires {needed}"
                 ),
             });
         }
@@ -3809,7 +3813,7 @@ mod tests {
     }
 
     #[test]
-    fn initialization_rejects_a_store_below_the_portable_profile_before_io() {
+    fn initialization_rejects_a_store_below_the_serving_profile_before_io() {
         let mut limits = store_limits();
         limits.max_key_bytes -= 1;
         let error = match MetaShard::initialize(Arc::new(ProfileOnlyStore { limits }), shard(1)) {
@@ -3963,8 +3967,8 @@ mod tests {
         let version_before = store.current_read_version().unwrap();
         let recovery_before = store.recovery_state().unwrap();
         let mut command = base_command(&store, request(82), RootFenceAction::RequireActive);
-        for index in 0..20 {
-            let key = scoped_key(root(2), format!("portable-limit/{index:02}").as_bytes());
+        for index in 0..160 {
+            let key = scoped_key(root(2), format!("serving-limit/{index:02}").as_bytes());
             command.predicates.push(CommandPredicate::Value {
                 family: MetadataFamily::Operation,
                 key: key.clone(),
@@ -3981,20 +3985,20 @@ mod tests {
             store.command_fit(&command, None),
             Ok(CommandFit::Exceeds {
                 kind: CommandLimit::TransactionBytes,
-                maximum: 1_000_000,
+                maximum: 16_000_000,
                 ..
             })
         ));
         let error = store
             .execute(&command)
-            .expect_err("fully derived transaction must exceed the portable byte budget");
+            .expect_err("fully derived transaction must exceed the serving byte envelope");
         assert!(matches!(
             error,
             MetaError::Store {
                 operation: "execute metadata command",
                 source: StoreError::LimitExceeded {
                     kind: LimitKind::TransactionBytes,
-                    maximum: 1_000_000,
+                    maximum: 16_000_000,
                     ..
                 },
             }
@@ -5206,9 +5210,9 @@ mod tests {
     }
 
     #[test]
-    fn command_size_bounds_fit_portable_envelopes_and_reject_before_atomic() {
+    fn command_size_bounds_fit_serving_envelopes_and_reject_before_atomic() {
         let store = ready_store();
-        let key = scoped_key(root(2), b"portable-value-boundary");
+        let key = scoped_key(root(2), b"serving-value-boundary");
         let boundary = vec![0x5a; MAX_RECORD_PAYLOAD_BYTES];
 
         let mut create = create_command(&store, request(40), key.clone(), &boundary);

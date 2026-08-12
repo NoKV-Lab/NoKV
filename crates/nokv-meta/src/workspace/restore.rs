@@ -66,9 +66,9 @@ pub const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
 const RESTORE_OUTCOME_FORMAT: u8 = 1;
 const MAX_COMMAND_ITEMS: usize = 256;
 const CAPACITY_EXCEEDED_MESSAGE: &str =
-    "restore source member exceeds the portable metadata transaction budget";
+    "restore source member exceeds the serving metadata transaction budget";
 const CLEANUP_CAPACITY_EXCEEDED_MESSAGE: &str =
-    "restore cleanup member exceeds the portable metadata transaction budget";
+    "restore cleanup member exceeds the serving metadata transaction budget";
 
 /// Caller selection before a snapshot read version is frozen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4231,7 +4231,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_snapshot_member_aborts_replays_and_releases_retention() {
+    fn large_snapshot_member_copies_replays_and_releases_retention_after_abort() {
         let mut counter = 1900_u128;
         let store = crate::workspace::test_support::memory(shard()).unwrap();
         let current_owner = owner(1);
@@ -4242,12 +4242,14 @@ mod tests {
                 .map(|index| {
                     (
                         QueryFieldId::new(format!("capacity.field_{index:02}")).unwrap(),
-                        QueryScalar::String("x".repeat(700)),
+                        QueryScalar::String("x".repeat(998)),
                     )
                 })
                 .collect(),
         )
         .unwrap();
+        // Keep the fixture at the largest valid stored projection shape.
+        assert_eq!(projection.encode().unwrap().len(), 61_323);
         replace_source_projection(&store, &mut counter, current_owner, &source, projection);
         let snapshot_id = mint_source_snapshot(&store, &mut counter, current_owner, &source);
         let begun = begin_snapshot_restore(
@@ -4272,22 +4274,26 @@ mod tests {
             operation_id,
             limit: MAX_RESTORE_BATCH_MEMBERS,
         };
-        let aborted = copy_restore_batch(&store, copy_context, request).unwrap();
-        assert_eq!(aborted.command.operation.phase, RestorePhase::Aborting);
-        assert_eq!(aborted.copied_members, 0);
-        assert_eq!(
-            aborted
-                .command
-                .operation
-                .terminal_error
-                .as_ref()
-                .unwrap()
-                .kind,
-            RestoreTerminalErrorKind::InvariantViolation
-        );
+        let copied = copy_restore_batch(&store, copy_context, request).unwrap();
+        assert_eq!(copied.command.operation.phase, RestorePhase::Copying);
+        assert_eq!(copied.copied_members, 1);
         let replay = copy_restore_batch(&store, copy_context, request).unwrap();
         assert!(replay.command.replayed);
-        assert_eq!(replay.command.operation, aborted.command.operation);
+        assert_eq!(replay.command.operation, copied.command.operation);
+
+        abort_restore(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            &AbortRestoreRequest {
+                operation_id,
+                terminal_error: RestoreTerminalError {
+                    kind: RestoreTerminalErrorKind::AbortedByCaller,
+                    message: "cancelled after large-member copy".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+        )
+        .unwrap();
 
         start_restore_cleanup(
             &store,
@@ -4295,6 +4301,20 @@ mod tests {
             RestoreOperationRequest { operation_id },
         )
         .unwrap();
+        loop {
+            let outcome = cleanup_restore_batch(
+                &store,
+                write_context(&store, &mut counter, current_owner),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap();
+            if outcome.source_eof {
+                break;
+            }
+        }
         let cleaned = finish_restore_cleanup(
             &store,
             write_context(&store, &mut counter, current_owner),
@@ -4323,7 +4343,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_restore_batch_shrinks_to_the_fully_derived_budget() {
+    fn cleanup_restore_batch_shrinks_to_the_fully_derived_byte_budget() {
         let terminal = maximum_cleanup_terminal_error();
         assert_eq!(terminal.message.len(), MAX_RESTORE_TERMINAL_ERROR_BYTES);
         assert!(terminal.evidence_digest.is_some());
@@ -4331,18 +4351,20 @@ mod tests {
         let store = crate::workspace::test_support::memory(shard()).unwrap();
         let current_owner = owner(1);
         activate_root(&store, &mut counter, current_owner);
-        let source = seed_source(&store, &mut counter, current_owner, 8);
+        let source = seed_source(&store, &mut counter, current_owner, 2);
         let projection = TypedProjection::new(
-            (0..12)
+            (0..super::super::query_records::MAX_TYPED_PROJECTION_FIELDS)
                 .map(|index| {
                     (
                         QueryFieldId::new(format!("cleanup.field_{index:02}")).unwrap(),
-                        QueryScalar::String("y".repeat(500)),
+                        QueryScalar::String("y".repeat(700)),
                     )
                 })
                 .collect(),
         )
         .unwrap();
+        // Freeze the payload size so this remains a byte-budget fixture.
+        assert_eq!(projection.encode().unwrap().len(), 43_383);
         replace_source_projection(&store, &mut counter, current_owner, &source, projection);
         let snapshot_id = mint_source_snapshot(&store, &mut counter, current_owner, &source);
         let begun = begin_snapshot_restore(
@@ -4420,8 +4442,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(first.copied_members > 0);
-        assert!(first.copied_members < source.paths.len());
+        assert_eq!(first.copied_members, 1);
         let mut cleanup = first;
         while !cleanup.source_eof {
             cleanup = cleanup_restore_batch(

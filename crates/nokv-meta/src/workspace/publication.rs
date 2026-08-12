@@ -3782,6 +3782,7 @@ mod tests {
         AppendSegment, PublishTerminalError, PublishTerminalErrorKind,
     };
     use super::super::query_records::{QueryFieldId, QueryScalar};
+    use super::super::remove::{remove_path, RemovePathRequest};
     use super::*;
 
     const TEST_BATCH_ROWS: usize = 300;
@@ -4081,6 +4082,24 @@ mod tests {
         }
     }
 
+    fn budget_projection(scalar_bytes: usize) -> TypedProjection {
+        budget_projection_with_prefix("budget", scalar_bytes)
+    }
+
+    fn budget_projection_with_prefix(prefix: &str, scalar_bytes: usize) -> TypedProjection {
+        TypedProjection::new(
+            (0..super::super::query_records::MAX_TYPED_PROJECTION_FIELDS)
+                .map(|index| {
+                    (
+                        QueryFieldId::new(format!("{prefix}.field.{index:02}")).unwrap(),
+                        QueryScalar::String("x".repeat(scalar_bytes)),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
     fn begin_operation(
         service: &PublicationService<'_>,
         store: &MetaShard,
@@ -4275,6 +4294,98 @@ mod tests {
                 dependency_owner_revision_ids: Vec::new(),
             })
             .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_with_dependencies_and_projection(
+        service: &PublicationService<'_>,
+        store: &MetaShard,
+        counter: &mut u128,
+        operation_id: OperationId,
+        artifact_revision_id: ArtifactRevisionId,
+        path: NormalizedRelativePath,
+        claim: PublishClaim,
+        dependencies: &[ArtifactRevisionId],
+        projection: TypedProjection,
+    ) -> FinalizePublishOutcome {
+        let staged = staged_rows(artifact_revision_id, 1);
+        let manifest = manifest_rows(&staged);
+        let mut operation = publish_operation(
+            operation_id,
+            artifact_revision_id,
+            path,
+            claim,
+            &staged,
+            &manifest,
+        );
+        operation.dependency_count = u8::try_from(dependencies.len()).unwrap();
+        operation.dependency_depth = u8::from(!dependencies.is_empty());
+        operation.dependency_digest = dependency_owner_digest(dependencies).unwrap();
+        seal_publish_operation(&mut operation);
+        let operation = begin_operation(service, store, counter, operation);
+        let operation = stage_uploaded_objects(service, store, counter, operation, &staged);
+        let operation = service
+            .stage_manifest_batch(StageManifestBatchRequest {
+                context: publication_context(store, counter),
+                expected_operation: operation,
+                manifest_rows: manifest,
+                dependency_owner_revision_ids: dependencies.to_vec(),
+            })
+            .unwrap()
+            .operation;
+        let operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(store, counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let mut artifact = published_artifact(&operation);
+        artifact.typed_index_projection = projection.encode().unwrap();
+        service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(store, counter),
+                artifact,
+                expected_operation: operation,
+                dependency_owner_revision_ids: dependencies.to_vec(),
+            })
+            .unwrap()
+    }
+
+    fn maximum_path(discriminator: usize) -> NormalizedRelativePath {
+        let prefix = format!("p{discriminator:03}");
+        let value = format!(
+            "{prefix}{}",
+            "x".repeat(NormalizedRelativePath::MAX_BYTES - prefix.len())
+        );
+        let path = NormalizedRelativePath::new(value).unwrap();
+        assert_eq!(path.byte_len(), NormalizedRelativePath::MAX_BYTES);
+        path
+    }
+
+    fn seed_maximum_dependencies(
+        service: &PublicationService<'_>,
+        store: &MetaShard,
+        counter: &mut u128,
+    ) -> Vec<ArtifactRevisionId> {
+        (0..usize::from(MAX_DEPENDENCY_COUNT))
+            .map(|index| {
+                let identity = 20_000 + index as u128;
+                let revision_id = revision(identity);
+                publish_full(
+                    service,
+                    store,
+                    counter,
+                    operation_id(identity),
+                    revision_id,
+                    path(&format!("dependencies/{index:02}.bin")),
+                    PublishClaim::CreateOnly,
+                    1,
+                );
+                revision_id
+            })
+            .collect()
     }
 
     fn count_prefix(store: &MetaShard, family: MetadataFamily, prefix: &[u8]) -> usize {
@@ -5418,6 +5529,328 @@ mod tests {
         .unwrap();
         assert_eq!(visible.generation, Generation::new(2).unwrap());
         assert_eq!(visible.artifact_revision_id, squashed_revision);
+    }
+
+    #[test]
+    fn main_holt_projection_boundary_remains_full_lifecycle_compatible() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("metadata-budget-compatibility");
+        let mut counter = 1;
+        let store = ready_file_store(&database_path, &mut counter);
+        let service = PublicationService::new(&store);
+        let projection = budget_projection(998);
+        assert_eq!(projection.encode().unwrap().len(), 61_203);
+
+        let replaced_path = path("outputs/boundary-replace.bin");
+        publish_full_with_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(215),
+            revision(215),
+            replaced_path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+            projection.clone(),
+        );
+        let removed_path = path("outputs/boundary-remove.bin");
+        publish_full_with_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(216),
+            revision(216),
+            removed_path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+            projection,
+        );
+        drop(store);
+
+        let store = crate::workspace::test_support::open_file(&database_path, shard()).unwrap();
+        let service = PublicationService::new(&store);
+        let replaced = publish_full_with_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(217),
+            revision(217),
+            replaced_path,
+            PublishClaim::ReplaceOnly {
+                expected_generation: Generation::new(1).unwrap(),
+            },
+            1,
+            TypedProjection::empty(),
+        );
+        assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
+
+        let removed = remove_path(
+            &store,
+            RemovePathRequest {
+                context: RootWriteContext::current(
+                    &store,
+                    root(),
+                    shard(),
+                    placement(),
+                    owner(),
+                    next_request(&mut counter),
+                )
+                .unwrap(),
+                workbench_id: workbench(),
+                path: removed_path,
+                expected_generation: Generation::new(1).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(removed.removed_artifact_revision_id, revision(216));
+    }
+
+    #[test]
+    fn main_max_path_and_dependency_projection_boundary_remains_compatible() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("metadata-max-domain-compatibility");
+        let mut counter = 1;
+        let store = ready_file_store(&database_path, &mut counter);
+        let service = PublicationService::new(&store);
+        let dependencies = seed_maximum_dependencies(&service, &store, &mut counter);
+        assert_eq!(dependencies.len(), usize::from(MAX_DEPENDENCY_COUNT));
+        let projection = budget_projection(932);
+        assert_eq!(projection.encode().unwrap().len(), 57_243);
+
+        let replaced_path = maximum_path(100);
+        publish_with_dependencies_and_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(40_000),
+            revision(40_000),
+            replaced_path.clone(),
+            PublishClaim::CreateOnly,
+            &dependencies,
+            projection.clone(),
+        );
+        let removed_path = maximum_path(101);
+        publish_with_dependencies_and_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(40_001),
+            revision(40_001),
+            removed_path.clone(),
+            PublishClaim::CreateOnly,
+            &dependencies,
+            projection,
+        );
+        drop(store);
+
+        let store = crate::workspace::test_support::open_file(&database_path, shard()).unwrap();
+        let service = PublicationService::new(&store);
+        let replaced = publish_with_dependencies_and_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(40_002),
+            revision(40_002),
+            replaced_path,
+            PublishClaim::ReplaceOnly {
+                expected_generation: Generation::new(1).unwrap(),
+            },
+            &[],
+            TypedProjection::empty(),
+        );
+        assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
+        let removed = remove_path(
+            &store,
+            RemovePathRequest {
+                context: RootWriteContext::current(
+                    &store,
+                    root(),
+                    shard(),
+                    placement(),
+                    owner(),
+                    next_request(&mut counter),
+                )
+                .unwrap(),
+                workbench_id: workbench(),
+                path: removed_path,
+                expected_generation: Generation::new(1).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(removed.removed_artifact_revision_id, revision(40_001));
+    }
+
+    #[test]
+    fn multi_megabyte_body_size_is_not_metadata_transaction_bytes() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let revision_id = revision(216);
+        let mut staged = staged_rows(revision_id, 1);
+        staged[0].expected_length = 3_600_000;
+        let manifest = manifest_rows(&staged);
+        let operation = begin_operation(
+            &service,
+            &store,
+            &mut counter,
+            publish_operation(
+                operation_id(216),
+                revision_id,
+                path("outputs/large-body.bin"),
+                PublishClaim::CreateOnly,
+                &staged,
+                &manifest,
+            ),
+        );
+        let operation = stage_all(
+            &service,
+            &store,
+            &mut counter,
+            operation,
+            &staged,
+            &manifest,
+        );
+        let operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let mut artifact = published_artifact(&operation);
+        artifact.logical_size = 3_600_000;
+        let finalized = service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                artifact,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(finalized.result.logical_size, 3_600_000);
+        assert_eq!(finalized.operation.phase, PublishPhase::Published);
+    }
+
+    #[test]
+    fn maximum_valid_projection_union_rejects_before_metadata_side_effects() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("metadata-budget-rejection");
+        let mut counter = 1;
+        let store = ready_file_store(&database_path, &mut counter);
+        let service = PublicationService::new(&store);
+        let artifact_path = path("outputs/disjoint-projections.bin");
+        let old_projection = budget_projection_with_prefix("oldget", 998);
+        let next_projection = budget_projection_with_prefix("newget", 993);
+        assert_eq!(old_projection.encode().unwrap().len(), 61_203);
+        assert_eq!(next_projection.encode().unwrap().len(), 60_903);
+        assert!(old_projection
+            .fields()
+            .keys()
+            .all(|field| !next_projection.fields().contains_key(field)));
+        publish_full_with_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(218),
+            revision(218),
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+            old_projection,
+        );
+
+        let revision_id = revision(217);
+        let staged = staged_rows(revision_id, 1);
+        let manifest = manifest_rows(&staged);
+        let operation = begin_operation(
+            &service,
+            &store,
+            &mut counter,
+            publish_operation(
+                operation_id(217),
+                revision_id,
+                artifact_path.clone(),
+                PublishClaim::ReplaceOnly {
+                    expected_generation: Generation::new(1).unwrap(),
+                },
+                &staged,
+                &manifest,
+            ),
+        );
+        let operation = stage_all(
+            &service,
+            &store,
+            &mut counter,
+            operation,
+            &staged,
+            &manifest,
+        );
+        let operation = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let mut artifact = published_artifact(&operation);
+        artifact.typed_index_projection = next_projection.encode().unwrap();
+        let version_before = store.current_read_version().unwrap();
+        let recovery_before = store.recovery_state().unwrap();
+        let path_key = path_current_key(root(), incarnation(9), &artifact_path);
+        let path_before = payload_at(
+            &store,
+            MetadataFamily::PathCurrent,
+            &path_key,
+            version_before,
+        )
+        .unwrap();
+        let error = service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation.clone(),
+                artifact,
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .expect_err("maximum valid projection union must be rejected before commit");
+        assert!(matches!(
+            error,
+            PublicationError::Meta(MetaError::InvalidCommand { ref reason })
+                if reason == "event projection exceeds size bound"
+        ));
+        assert_eq!(store.current_read_version().unwrap(), version_before);
+        assert_eq!(store.recovery_state().unwrap(), recovery_before);
+        assert_eq!(
+            payload_at(
+                &store,
+                MetadataFamily::PathCurrent,
+                &path_key,
+                version_before,
+            )
+            .unwrap(),
+            path_before
+        );
+        assert!(payload_at(
+            &store,
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), revision_id),
+            version_before,
+        )
+        .is_none());
+        assert!(read_revision_claim(&store, revision_id).is_some());
+        let durable_operation = PublishOperationRecord::decode(
+            &payload_at(
+                &store,
+                MetadataFamily::Operation,
+                &operation_key(root(), OperationKind::Publish, operation.operation_id),
+                version_before,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable_operation.phase, PublishPhase::Finalizing);
     }
 
     #[test]
