@@ -34,7 +34,7 @@ const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const CURSOR_VERSION: &[u8] = b"nokv.workspace.cursor\0";
 const LIST_CURSOR_VERSION: &[u8] = b"nokv.workspace.list-cursor.v3\0";
-const SERVER_PAGE_LIMIT: u32 = wire::PageRequest::MAX_LIMIT;
+const QUERY_SERVER_PAGE_LIMIT: u32 = wire::MAX_QUERY_PAGE_LIMIT;
 const CONSISTENT_READ_MAX_ATTEMPTS: u32 = 3;
 
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -698,7 +698,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                         .as_deref()
                         .map(|cursor| decode_cursor("search", cursor))
                         .transpose()?,
-                    limit: page_limit(request.limit)?,
+                    limit: query_page_limit(request.limit)?,
                 },
             })
             .map_err(map_client_error)?;
@@ -756,7 +756,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 sort: query_sort(&request.sort),
                 page: wire::PageRequest {
                     cursor: None,
-                    limit: page_limit(request.limit)?,
+                    limit: query_page_limit(request.limit)?,
                 },
             })
             .map_err(map_client_error)?;
@@ -791,7 +791,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                     field_prefix: request.field_prefix.clone(),
                     page: wire::PageRequest {
                         cursor,
-                        limit: SERVER_PAGE_LIMIT,
+                        limit: QUERY_SERVER_PAGE_LIMIT,
                     },
                 }) {
                     Ok(call) => call,
@@ -851,7 +851,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                         .as_deref()
                         .map(|cursor| decode_cursor("find", cursor))
                         .transpose()?,
-                    limit: page_limit(request.limit)?,
+                    limit: query_page_limit(request.limit)?,
                 },
             })
             .map_err(map_client_error)?;
@@ -1962,6 +1962,17 @@ fn page_limit(limit: usize) -> Result<u32, agent::BackendError> {
     Ok(limit)
 }
 
+fn query_page_limit(limit: usize) -> Result<u32, agent::BackendError> {
+    let limit = page_limit(limit)?;
+    if limit > wire::MAX_QUERY_PAGE_LIMIT {
+        return Err(invalid_backend_input(format!(
+            "query page limit must be between 1 and {}",
+            wire::MAX_QUERY_PAGE_LIMIT
+        )));
+    }
+    Ok(limit)
+}
+
 fn list_server_page_limit(limit: usize, candidate_count: usize, first_page: bool) -> u32 {
     let union_target = limit.saturating_add(1);
     let requested = if first_page {
@@ -2584,6 +2595,14 @@ mod tests {
     }
 
     #[test]
+    fn query_page_limits_match_the_execution_bound() {
+        assert_eq!(query_page_limit(256).unwrap(), 256);
+        assert!(query_page_limit(257).is_err());
+        assert_eq!(page_limit(1_000).unwrap(), 1_000);
+        assert_eq!(list_server_page_limit(1_000, 0, true), 1_000);
+    }
+
+    #[test]
     fn virtual_only_list_still_performs_one_authoritative_path_read() {
         let (backend, requests, server) = scripted_backend(vec![success(
             wire::WorkspaceResult::Paths(wire::PathPage {
@@ -2847,6 +2866,12 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| matches!(request.operation, wire::WorkspaceRequest::Catalog(_))));
+        assert!(requests.iter().all(|request| {
+            let wire::WorkspaceRequest::Catalog(catalog) = &request.operation else {
+                return false;
+            };
+            catalog.page.limit == 256
+        }));
     }
 
     #[test]

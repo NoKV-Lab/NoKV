@@ -24,6 +24,7 @@ const _: () =
     assert!(protocol::MAX_ARTIFACT_DEPENDENCY_DEPTH == meta::MAX_REVISION_DEPENDENCY_DEPTH);
 const _: () =
     assert!(protocol::PageRequest::MAX_LIMIT as usize == meta::MAX_VISIBLE_PATH_LIST_PAGE_SIZE);
+const _: () = assert!(protocol::MAX_QUERY_PAGE_LIMIT as usize == meta::MAX_QUERY_PAGE_SIZE);
 const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 9] = [
     protocol::WorkspaceCapability::ArtifactPublishV1,
     protocol::WorkspaceCapability::ArtifactRangeReadV1,

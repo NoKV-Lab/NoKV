@@ -23,8 +23,11 @@ const MAX_QUERY_IN_VALUES: usize = 64;
 const MAX_QUERY_FIELDS: usize = 64;
 const MAX_SORT_FIELDS: usize = 8;
 const MAX_FACET_FIELDS: usize = 16;
+/// Maximum page size accepted by metadata query, catalog, discovery, and event RPCs.
+pub const MAX_QUERY_PAGE_LIMIT: u32 = 256;
 pub(crate) const MAX_PARENT_COMMITS: usize = 32;
 const MAX_RESTORE_MANIFEST_BYTES: u64 = 1024 * 1024;
+const _: () = assert!(MAX_QUERY_PAGE_LIMIT <= PageRequest::MAX_LIMIT);
 
 /// One root-routed metadata or lifecycle request.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -990,7 +993,7 @@ impl SearchRequest {
             sort.validate()?;
         }
         validate_field_ids("search.facets", &self.facets, MAX_FACET_FIELDS)?;
-        self.page.validate("search.page")
+        validate_query_page(&self.page, "search.page")
     }
 }
 
@@ -1071,7 +1074,7 @@ impl AggregateRequest {
         for sort in &self.sort {
             sort.validate()?;
         }
-        self.page.validate("aggregate.page")
+        validate_query_page(&self.page, "aggregate.page")
     }
 }
 
@@ -1089,7 +1092,7 @@ impl CatalogRequest {
         if let Some(prefix) = self.field_prefix.as_deref() {
             validate_field_id("catalog.field_prefix", prefix)?;
         }
-        self.page.validate("catalog.page")
+        validate_query_page(&self.page, "catalog.page")
     }
 }
 
@@ -1102,7 +1105,7 @@ pub struct FindWorkspacesRequest {
 
 impl FindWorkspacesRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        self.page.validate("find_workspaces.page")
+        validate_query_page(&self.page, "find_workspaces.page")
     }
 }
 
@@ -1122,8 +1125,18 @@ impl ChangePageRequest {
                 "must be greater than zero",
             ));
         }
-        self.page.validate("read_changes.page")
+        validate_query_page(&self.page, "read_changes.page")
     }
+}
+
+fn validate_query_page(page: &PageRequest, field: &'static str) -> Result<(), ProtocolError> {
+    if !(1..=MAX_QUERY_PAGE_LIMIT).contains(&page.limit) {
+        return Err(ProtocolError::invalid(
+            field,
+            format!("limit must be between 1 and {MAX_QUERY_PAGE_LIMIT}"),
+        ));
+    }
+    page.validate(field)
 }
 
 fn validate_artifact_batch<T>(field: &'static str, rows: &[T]) -> Result<(), ProtocolError> {
@@ -1187,6 +1200,82 @@ fn validate_field_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXPECTED_QUERY_PAGE_LIMIT: u32 = 256;
+
+    fn query_requests(limit: u32) -> Vec<(WorkspaceRequest, &'static str)> {
+        let page = || PageRequest {
+            cursor: None,
+            limit,
+        };
+        let scope = || QueryScope::Root { path_prefix: None };
+        vec![
+            (
+                WorkspaceRequest::Search(SearchRequest {
+                    scope: scope(),
+                    predicates: Vec::new(),
+                    projection: Vec::new(),
+                    sort: Vec::new(),
+                    facets: Vec::new(),
+                    page: page(),
+                }),
+                "search.page",
+            ),
+            (
+                WorkspaceRequest::Aggregate(AggregateRequest {
+                    scope: scope(),
+                    predicates: Vec::new(),
+                    group_by: Vec::new(),
+                    aggregates: vec![AggregateSpec {
+                        function: AggregateFunction::Count,
+                        field_id: None,
+                        result_id: "count".to_owned(),
+                    }],
+                    sort: Vec::new(),
+                    page: page(),
+                }),
+                "aggregate.page",
+            ),
+            (
+                WorkspaceRequest::Catalog(CatalogRequest {
+                    scope: scope(),
+                    field_prefix: None,
+                    page: page(),
+                }),
+                "catalog.page",
+            ),
+            (
+                WorkspaceRequest::FindWorkspaces(FindWorkspacesRequest {
+                    committed_only: false,
+                    page: page(),
+                }),
+                "find_workspaces.page",
+            ),
+            (
+                WorkspaceRequest::ReadChanges(ChangePageRequest {
+                    after_commit_version: None,
+                    workbench: None,
+                    page: page(),
+                }),
+                "read_changes.page",
+            ),
+        ]
+    }
+
+    #[test]
+    fn query_requests_reject_pages_above_the_execution_limit() {
+        assert_eq!(MAX_QUERY_PAGE_LIMIT, EXPECTED_QUERY_PAGE_LIMIT);
+        for (request, _) in query_requests(EXPECTED_QUERY_PAGE_LIMIT) {
+            request.validate().unwrap();
+        }
+
+        for (request, expected_field) in query_requests(EXPECTED_QUERY_PAGE_LIMIT + 1) {
+            let ProtocolError::InvalidField { field, .. } = request.validate().unwrap_err() else {
+                panic!("query page limit must fail as invalid input");
+            };
+            assert_eq!(field, expected_field);
+        }
+    }
 
     fn get_path(range: Option<ByteRange>, plan_page: Option<PageRequest>) -> GetPathRequest {
         GetPathRequest {
