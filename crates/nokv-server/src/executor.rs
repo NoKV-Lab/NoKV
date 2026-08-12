@@ -3845,13 +3845,14 @@ fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
         meta::MetaError::PredicateFailed => {
             failure(protocol::ErrorCode::Conflict, error.to_string(), true, None)
         }
-        meta::MetaError::WriteConflict
-        | meta::MetaError::WriteReadVersionMismatch { .. } => failure(
-            protocol::ErrorCode::Conflict,
-            error.to_string(),
-            true,
-            Some(protocol::ConflictKind::ReadVersion),
-        ),
+        meta::MetaError::WriteConflict | meta::MetaError::WriteReadVersionMismatch { .. } => {
+            failure(
+                protocol::ErrorCode::Conflict,
+                error.to_string(),
+                true,
+                Some(protocol::ConflictKind::ReadVersion),
+            )
+        }
         meta::MetaError::ReadVersionInFuture { .. } => failure(
             protocol::ErrorCode::PreconditionFailed,
             error.to_string(),
@@ -5169,6 +5170,7 @@ mod tests {
         assert_eq!(failure.code, protocol::ErrorCode::Conflict);
         assert!(failure.retryable);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
+        assert!(internal_metadata_conflict(&failure));
     }
 
     #[test]
@@ -5790,17 +5792,26 @@ mod tests {
 
     #[test]
     fn internal_retry_classification_excludes_business_conflicts() {
-        let transient = engine_failure(meta::AgentMetadataError::WriteReadVersionMismatch {
+        let transient = meta_failure(meta::MetaError::WriteReadVersionMismatch {
             requested: 10,
             current: 11,
         });
         assert!(internal_metadata_conflict(&transient));
 
-        let lost_race = engine_failure(meta::AgentMetadataError::WriteConflict);
+        let lost_race = meta_failure(meta::MetaError::WriteConflict);
         assert!(internal_metadata_conflict(&lost_race));
 
-        let predicate = engine_failure(meta::AgentMetadataError::PredicateFailed);
+        let predicate = meta_failure(meta::MetaError::PredicateFailed);
         assert!(!internal_metadata_conflict(&predicate));
+
+        let unknown = meta_failure(meta::MetaError::Store {
+            operation: "commit",
+            source: nokv_meta_store::StoreError::OutcomeUnknown {
+                state: nokv_meta_store::UnknownCommit::Poisoned,
+                reason: "injected unknown outcome".to_owned(),
+            },
+        });
+        assert!(!internal_metadata_conflict(&unknown));
 
         let path = conflict(
             protocol::ConflictKind::PathGeneration,
@@ -5820,7 +5831,7 @@ mod tests {
     #[test]
     fn internal_metadata_retry_converges_and_preserves_terminal_conflicts() {
         let transient = || {
-            engine_failure(meta::AgentMetadataError::WriteReadVersionMismatch {
+            meta_failure(meta::MetaError::WriteReadVersionMismatch {
                 requested: 10,
                 current: 11,
             })
