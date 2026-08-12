@@ -296,6 +296,16 @@ cargo build --release -p nokv --bin nokv
 ./target/release/nokv schema
 ```
 
+Maintainers and integration partners with access to the private tap can instead
+build the same locked source release through Homebrew:
+
+```bash
+brew tap NoKV-Lab/tap
+brew install nokv
+nokv version --json
+nokv schema
+```
+
 Run the offline Workbench contract gate:
 
 ```bash
@@ -323,6 +333,7 @@ without hiding the current recovery limitations.
 - [Code Contract](docs/development/code_contract.md)
 - [PR Review Checklist](docs/development/pr_review_checklist.md)
 - [Workbench Deployment Preflight](docs/workbench-preflight.md)
+- [Source-only Homebrew Release](scripts/release/README.md)
 
 ## Contributing
 

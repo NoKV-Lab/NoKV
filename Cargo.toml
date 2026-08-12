@@ -32,7 +32,7 @@ nokv-object = { path = "crates/nokv-object", version = "0.1.0" }
 nokv-client = { path = "crates/nokv-client", version = "0.1.0" }
 nokv-agent = { path = "crates/nokv-agent", version = "0.1.0" }
 nokv-server = { path = "crates/nokv-server", version = "0.1.0" }
-nokv = { path = "crates/nokv", version = "0.1.0" }
+nokv = { path = "crates/nokv", version = "1.0.0" }
 nokv-python = { path = "crates/nokv-python", version = "0.1.0" }
 nokv-bench = { path = "bench", version = "0.1.0" }
 holt = { version = "=0.8.4", default-features = false }

@@ -6,6 +6,7 @@
 //! Custom CLI, MCP adapter, and shard-owner process for NoKV Agent workspaces.
 
 mod backend;
+mod build_info;
 mod cli;
 mod connection;
 mod object_store;
@@ -62,6 +63,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Command::Schema => print_schema(),
+        Command::Version { json } => print_version(*json),
         Command::Provision { logical_shard_id } => run_provision(&invocation, logical_shard_id),
         Command::Serve => run_server(&invocation),
         Command::Workbench { tool, arguments } => {
@@ -230,6 +232,18 @@ fn print_schema() -> Result<(), String> {
     }))
 }
 
+fn print_version(json: bool) -> Result<(), String> {
+    if json {
+        print_json(&build_info::identity(
+            WORKBENCH_CONTRACT_SCHEMA,
+            tool_definitions().len(),
+        ))
+    } else {
+        println!("nokv {}", build_info::VERSION);
+        Ok(())
+    }
+}
+
 fn print_json(value: &Value) -> Result<(), String> {
     println!(
         "{}",
@@ -262,6 +276,8 @@ USAGE:
   nokv --root-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32>
   nokv [owner options] serve
   nokv schema
+  nokv version [--json]
+  nokv --version
 
 CLIENT ROUTING:
   --root-id HEX32
