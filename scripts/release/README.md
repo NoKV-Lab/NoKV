@@ -1,6 +1,6 @@
 # NoKV source-only Homebrew release
 
-NoKV is distributed through the private `NoKV-Lab/homebrew-tap` as a Homebrew
+NoKV is distributed through the public `NoKV-Lab/homebrew-tap` as a Homebrew
 Formula. The Formula downloads one release-owned source archive and compiles the
 `nokv` CLI locally with Homebrew's locked standard Cargo install arguments. It
 is deliberately not a Cask, does not install a precompiled executable, and does
@@ -8,14 +8,24 @@ not require Apple signing or notarization.
 
 ## Consumer flow
 
-Developers with read access to the private tap authenticate GitHub for Git and
-then run:
+Anyone can install the fully qualified Formula without GitHub repository
+credentials. Homebrew adds the public tap and trusts only that Formula:
+
+```shell
+brew install NoKV-Lab/tap/nokv
+nokv version --json
+nokv schema
+```
+
+The current release gate covers Apple Silicon and Intel macOS. Linuxbrew is not
+yet a qualified release target.
+
+The equivalent explicit tap flow is:
 
 ```shell
 brew tap NoKV-Lab/tap
+brew trust --formula NoKV-Lab/tap/nokv
 brew install nokv
-nokv version --json
-nokv schema
 ```
 
 After a tap update is merged, the same installation is updated with:
@@ -29,6 +39,11 @@ The Formula declares Homebrew `rust` and `protobuf` as build-only dependencies.
 The Rust dependency graph is resolved exclusively from the release
 `Cargo.lock`; the installed binary reports its NoKV version, exact source
 commit, `Cargo.lock` SHA-256, and exact Holt version/source/checksum.
+
+The Formula version follows the stable NoKV tag and the `crates/nokv` package
+version. It does not follow Holt or either Homebrew build dependency. A Holt
+change is published only inside a new NoKV release after its exact pin and lock
+entry pass the release gates and the generated Formula is merged into the tap.
 
 Installing the executable does not create a NoKV deployment. A LingTai MCP
 configuration must still supply the selected NoKV control-plane endpoint,
@@ -64,17 +79,17 @@ gzip-compressed with a fixed timestamp. GitHub-generated tag archives and
    same candidate through Homebrew.
 6. Only after both gates pass does the workflow publish the source archive,
    manifest, and checksums to the GitHub release.
-7. A repository-scoped GitHub App opens a PR against the private tap. A human
+7. A repository-scoped GitHub App opens a PR against the public tap. A human
    merges that PR to make the version available to consumers.
 
-The tap repository must already exist with private visibility and contain
-`.nokv-tap.json` equal to `scripts/release/private_tap_marker.json`. Configure
+The tap repository must have public visibility and contain `.nokv-tap.json`
+equal to `scripts/release/public_tap_marker.json`. Configure
 the GitHub App client ID as `HOMEBREW_TAP_APP_CLIENT_ID` and its private key as
 `HOMEBREW_TAP_APP_PRIVATE_KEY`. The App must be installed only where needed and
 grant `contents: write` plus `pull requests: write` on `homebrew-tap`.
 
 The workflow fails closed if the repository API does not report the tap as
-private. It never accepts a broad personal access token and never pushes
+public. It never accepts a broad personal access token and never pushes
 directly to the tap's default branch.
 
 ## Local release checks
