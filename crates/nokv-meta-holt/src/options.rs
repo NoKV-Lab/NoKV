@@ -23,7 +23,7 @@ pub struct HoltOptions {
     pub config: TreeConfig,
     /// Exact physical tree catalog supplied by the metadata schema.
     pub catalog: Vec<TreeBinding>,
-    /// Portable request and result limits advertised by the adapter.
+    /// Serving request and result limits advertised by the adapter.
     pub limits: StoreLimits,
 }
 

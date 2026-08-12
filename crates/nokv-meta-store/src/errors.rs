@@ -39,7 +39,7 @@ pub enum UnknownCommit {
 pub enum StoreError {
     /// The request is malformed independently of current store state.
     InvalidRequest(String),
-    /// The request exceeds a configured portable or physical limit.
+    /// The request exceeds a configured serving or physical limit.
     LimitExceeded {
         kind: LimitKind,
         actual: usize,

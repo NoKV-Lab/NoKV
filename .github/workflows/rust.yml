@@ -54,7 +54,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Clippy metadata read diagnostics
-        run: cargo clippy -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
+        run: |
+          cargo clippy -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
+          cargo clippy -p nokv-meta-holt --all-targets --features read-stats -- -D warnings
 
       - name: Test
         run: cargo test --workspace

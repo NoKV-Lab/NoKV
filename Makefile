@@ -31,6 +31,7 @@ fmt:
 lint:
 	cargo clippy --manifest-path $(NOKV_MANIFEST) --workspace --all-targets -- -D warnings
 	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
+	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --all-targets --features read-stats -- -D warnings
 
 workbench-test:
 	python3 scripts/workbench/workbench_contract_test.py
@@ -40,6 +41,7 @@ verify:
 	cargo fmt --manifest-path $(NOKV_MANIFEST) --all -- --check
 	cargo clippy --manifest-path $(NOKV_MANIFEST) --workspace --all-targets -- -D warnings
 	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
+	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --all-targets --features read-stats -- -D warnings
 	cargo test --manifest-path $(NOKV_MANIFEST) --workspace
 	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta --features metadata-read-stats
 	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --features read-stats

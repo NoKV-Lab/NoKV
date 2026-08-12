@@ -439,9 +439,28 @@ fn check_exact_checks(store: &dyn TxnStore) {
         .unwrap_or_else(|error| panic!("false absence check returned an error: {error}"));
     assert_eq!(absent, Commit::Conflict);
     assert_eq!(
-        read_values(store, vec![target]),
+        read_values(store, vec![target.clone()]),
         vec![Some(b"before".to_vec())],
         "false absence check applied a mutation"
+    );
+
+    commit_applied(
+        store,
+        WriteTxn {
+            checks: vec![Check::Value {
+                key: target.clone(),
+                expected: b"before".to_vec(),
+            }],
+            mutations: vec![Mutation::Delete {
+                key: target.clone(),
+            }],
+        },
+        "apply checked delete",
+    );
+    assert_eq!(
+        read_values(store, vec![target]),
+        vec![None],
+        "applied delete remained visible"
     );
 }
 
