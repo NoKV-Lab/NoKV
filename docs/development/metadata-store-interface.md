@@ -343,7 +343,9 @@ request. Reading dedupe from the uncertain instance is not durability evidence.
 The proposed FoundationDB adapter would map a settled
 `commit_unknown_result` to `Settled`. It maps an error that permits a late
 commit to `MayCommit`. The Holt adapter maps `DefinitelyNotApplied` through
-normal physical error handling without poisoning the store. It poisons
+normal physical error classification. When that classification is
+`Unavailable`, the server exposes a retryable request-local failure without
+fencing the shard; a classified corruption remains non-retryable. It poisons
 `OutcomeUnknown` and unclassified atomic errors until reopen and WAL replay
 establish the durable boundary.
 
@@ -388,8 +390,14 @@ bounded read pages. After maximum mutation overhead, the write budget stays
 within Holt's 16 MiB WAL record envelope. File-backed tests preserve
 create/reopen/replace/remove for both a short path with a 61,203-byte typed
 projection and a maximum-length path with 64 dependencies and a 57,243-byte
-projection. This is characterized compatibility evidence, not a universal
-domain-size proof.
+projection. A separate successful replacement changes all 60 index fields at
+once: the before/after event is 61,323 bytes and the fully derived transaction
+is 9,859,091 bytes. The short-path replace-to-empty and remove transactions are
+also pinned at 11,797,794 and 11,791,459 bytes. These are characterized storage
+and metadata-engine compatibility results, not a universal domain-size proof
+or a qualified `nokv serve` restart/rolling-upgrade path. The local-WAL server
+still refuses successor admission until its checkpoint/log recovery and exact
+lease-resume workflow are implemented.
 
 The envelope exceeds FoundationDB's
 [10,000,000-byte hard transaction limit](https://apple.github.io/foundationdb/known-limitations.html),
@@ -482,7 +490,11 @@ control-plane acquisition and does not consume an owner epoch. If subsequent
 owner acquisition fails, bootstrap closes and preserves the prepared epoch-zero
 store. A failure known not to have applied reports an exact corrected
 `Existing` retry. When the control backend cannot classify acquisition,
-bootstrap instead requires ownership reconciliation before that retry.
+bootstrap explicitly reports that automatic ownership reconciliation is not
+implemented. The operator must inspect the configured control backend; only a
+proven-not-applied acquisition may retry with the reported `--metadata-reopen`
+path. An acquisition that may have applied remains fail-closed and retains both
+the prepared store and owner record for operator recovery.
 Bootstrap never infers directory ownership from a path precheck or recursively
 deletes a prepared store; both would be unsafe under a concurrent path change.
 

@@ -46,6 +46,10 @@ pub enum StoreError {
         maximum: usize,
     },
     /// The operation could not run because the store was unavailable.
+    ///
+    /// No mutation from this call applied. An upper layer may retry the same
+    /// domain request without fencing the store; an outcome that may have
+    /// applied must use [`StoreError::OutcomeUnknown`] instead.
     Unavailable(String),
     /// A commit may or may not have reached its acknowledgement boundary.
     ///

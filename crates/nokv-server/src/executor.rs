@@ -3831,6 +3831,10 @@ fn commit_failure(error: meta::CommitError) -> protocol::RpcFailure {
 fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
     match error {
         error @ meta::MetaError::Store {
+            source: nokv_meta_store::StoreError::Unavailable(_),
+            ..
+        } => failure(protocol::ErrorCode::Internal, error.to_string(), true, None),
+        error @ meta::MetaError::Store {
             source: nokv_meta_store::StoreError::OutcomeUnknown { .. },
             ..
         } => failure(
@@ -5854,7 +5858,7 @@ mod tests {
             ),
         });
         assert_eq!(known_not_applied.code, protocol::ErrorCode::Internal);
-        assert!(!known_not_applied.retryable);
+        assert!(known_not_applied.retryable);
 
         let limit = meta_failure(meta::MetaError::Store {
             operation: "commit",

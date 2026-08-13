@@ -55,8 +55,13 @@ impl fmt::Display for ServerError {
                         formatter,
                         "control-plane owner acquisition outcome is unknown after preparing the \
                          epoch-zero metadata store at {}: {source}; preserve the store and \
-                         reconcile control-plane ownership before retrying; do not delete it \
-                         while acquisition may have succeeded",
+                         inspect the configured control backend because automatic owner \
+                         reconciliation is not implemented; only after proving acquisition did \
+                         not apply, retry the corrected first-owner command with \
+                         --metadata-reopen {}; otherwise retain the store and owner record for \
+                         operator recovery; do not delete either while acquisition may have \
+                         succeeded",
+                        path.display(),
                         path.display()
                     )
                 } else {

@@ -3764,6 +3764,8 @@ impl PublicationService<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::tempdir;
 
     use nokv_types::{
@@ -3866,6 +3868,30 @@ mod tests {
             crate::workspace::test_support::memory(shard()).unwrap(),
             counter,
         )
+    }
+
+    fn ready_capturing_store(
+        counter: &mut u128,
+    ) -> (
+        MetaShard,
+        Arc<crate::workspace::test_support::CommitCaptureStore>,
+    ) {
+        let inner = crate::workspace::test_support::memory_txn_store().unwrap();
+        let (wrapped, capture) = crate::workspace::test_support::capture_txn_store(inner);
+        let store = MetaShard::initialize(wrapped, shard()).unwrap();
+        (prepare_store(store, counter), capture)
+    }
+
+    fn open_capturing_file_store(
+        path: &std::path::Path,
+    ) -> (
+        MetaShard,
+        Arc<crate::workspace::test_support::CommitCaptureStore>,
+    ) {
+        let inner = crate::workspace::test_support::open_file_txn_store(path).unwrap();
+        let (wrapped, capture) = crate::workspace::test_support::capture_txn_store(inner);
+        let store = MetaShard::open(wrapped, shard()).unwrap();
+        (store, capture)
     }
 
     fn ready_file_store(path: &std::path::Path, counter: &mut u128) -> MetaShard {
@@ -5567,7 +5593,7 @@ mod tests {
         );
         drop(store);
 
-        let store = crate::workspace::test_support::open_file(&database_path, shard()).unwrap();
+        let (store, capture) = open_capturing_file_store(&database_path);
         let service = PublicationService::new(&store);
         let replaced = publish_full_with_projection(
             &service,
@@ -5583,6 +5609,9 @@ mod tests {
             TypedProjection::empty(),
         );
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
+        let replace_bytes =
+            capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
+        assert_eq!(replace_bytes, 11_797_794);
 
         let removed = remove_path(
             &store,
@@ -5603,6 +5632,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(removed.removed_artifact_revision_id, revision(216));
+        let remove_bytes =
+            capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
+        assert_eq!(remove_bytes, 11_791_459);
     }
 
     #[test]
@@ -5678,6 +5710,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(removed.removed_artifact_revision_id, revision(40_001));
+    }
+
+    #[test]
+    fn maximum_event_sized_disjoint_sixty_field_republish_pins_transaction_bytes() {
+        let mut counter = 1;
+        let (store, capture) = ready_capturing_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let artifact_path = path("outputs/disjoint-republish.bin");
+        let old_projection = budget_projection_with_prefix("oldset", 488);
+        let next_projection = budget_projection_with_prefix("newset", 488);
+        assert_eq!(old_projection.fields().len(), 60);
+        assert_eq!(next_projection.fields().len(), 60);
+        assert_eq!(old_projection.encode().unwrap().len(), 30_603);
+        assert_eq!(next_projection.encode().unwrap().len(), 30_603);
+        assert!(old_projection
+            .fields()
+            .keys()
+            .all(|field| !next_projection.fields().contains_key(field)));
+        let event = ChangeEventRecord {
+            workbench_id: workbench(),
+            workspace_incarnation_id: incarnation(9),
+            kind: ChangeEventKind::ArtifactPublished,
+            artifact_revision_id: Some(revision(220)),
+            commit_id: None,
+            operation_id: Some(operation_id(220)),
+            path: Some(artifact_path.clone()),
+            before: old_projection.clone(),
+            after: next_projection.clone(),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(event.len(), 61_323);
+        let oversized_before = budget_projection_with_prefix("oldmax", 489);
+        let oversized_after = budget_projection_with_prefix("newmax", 489);
+        let oversized_event = ChangeEventRecord {
+            workbench_id: workbench(),
+            workspace_incarnation_id: incarnation(9),
+            kind: ChangeEventKind::ArtifactPublished,
+            artifact_revision_id: Some(revision(220)),
+            commit_id: None,
+            operation_id: Some(operation_id(220)),
+            path: Some(artifact_path.clone()),
+            before: oversized_before,
+            after: oversized_after,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(oversized_event.len(), 61_443);
+        assert!(event.len() <= 60 * 1024);
+        assert!(oversized_event.len() > 60 * 1024);
+        publish_full_with_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(219),
+            revision(219),
+            artifact_path.clone(),
+            PublishClaim::CreateOnly,
+            1,
+            old_projection,
+        );
+        let replaced = publish_full_with_projection(
+            &service,
+            &store,
+            &mut counter,
+            operation_id(220),
+            revision(220),
+            artifact_path,
+            PublishClaim::ReplaceOnly {
+                expected_generation: Generation::new(1).unwrap(),
+            },
+            1,
+            next_projection,
+        );
+        assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
+
+        assert_eq!(
+            capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
+            9_859_091
+        );
     }
 
     #[test]

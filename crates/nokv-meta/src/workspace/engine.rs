@@ -70,10 +70,12 @@ const MAX_EVENT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
 
 /// Transitional transaction-store limits for the workspace schema.
 ///
-/// The decimal 16,000,000-byte transaction envelope preserves two
+/// The decimal 16,000,000-byte transaction envelope preserves three
 /// high-amplification lifecycles characterized against the pre-provider
 /// Holt-backed engine: a 60-field, 61,203-byte projection on a short path, and
-/// a 4,096-byte path with 64 dependencies and a 57,243-byte projection.
+/// a 4,096-byte path with 64 dependencies and a 57,243-byte projection, plus a
+/// successful disjoint 60-field replacement whose fully derived transaction is
+/// 9,859,091 bytes at the maximum tested event-union boundary.
 /// Together with the configured maximum mutation overhead it remains below
 /// Holt's 16 MiB WAL-record ceiling. This is a transitional compatibility
 /// profile, not proof that every domain-valid command fits; providers with a
@@ -3330,7 +3332,7 @@ fn internal(operation: &'static str, error: impl std::fmt::Display) -> MetaError
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     use nokv_meta_store::{AckBoundary, Authority, LimitKind, StoreProfile, UnknownCommit};
@@ -3549,33 +3551,6 @@ mod tests {
         }
     }
 
-    struct CaptureCommitStore {
-        inner: Arc<dyn TxnStore>,
-        commits: Mutex<Vec<WriteTxn>>,
-    }
-
-    impl TxnStore for CaptureCommitStore {
-        fn profile(&self) -> StoreProfile {
-            self.inner.profile()
-        }
-
-        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
-            self.inner.read(batch)
-        }
-
-        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
-            self.commits
-                .lock()
-                .expect("capture commit lock must be available")
-                .push(txn.clone());
-            self.inner.commit(txn)
-        }
-
-        fn ready(&self) -> Result<(), StoreError> {
-            self.inner.ready()
-        }
-    }
-
     fn shard(fill: u8) -> LogicalShardId {
         LogicalShardId::from_bytes([fill; 16])
     }
@@ -3763,12 +3738,12 @@ mod tests {
         (checks, mutations)
     }
 
-    fn capture_next_commit(store: &mut MetaShard) -> Arc<CaptureCommitStore> {
-        let capture = Arc::new(CaptureCommitStore {
-            inner: Arc::clone(&store.store),
-            commits: Mutex::new(Vec::new()),
-        });
-        store.store = capture.clone();
+    fn capture_next_commit(
+        store: &mut MetaShard,
+    ) -> Arc<crate::workspace::test_support::CommitCaptureStore> {
+        let (wrapped, capture) =
+            crate::workspace::test_support::capture_txn_store(Arc::clone(&store.store));
+        store.store = wrapped;
         capture
     }
 
@@ -3909,14 +3884,11 @@ mod tests {
 
         let capture = capture_next_commit(&mut store);
         store.execute(&command).unwrap();
-        let commits = capture
-            .commits
-            .lock()
-            .expect("capture commit lock must be available");
-        let actual = commits.last().expect("execute must issue one commit");
-        assert_eq!(txn_shape(&predicted), txn_shape(actual));
+        capture.with_last_commit(|actual| {
+            assert_eq!(txn_shape(&predicted), txn_shape(actual));
+            assert_eq!(actual.validate(&store_limits()), Ok(()));
+        });
         assert_eq!(predicted.validate(&store_limits()), Ok(()));
-        assert_eq!(actual.validate(&store_limits()), Ok(()));
     }
 
     #[test]
@@ -3947,18 +3919,15 @@ mod tests {
 
         let capture = capture_next_commit(&mut store);
         store.execute(&command).unwrap();
-        let commits = capture
-            .commits
-            .lock()
-            .expect("capture commit lock must be available");
-        let actual = commits.last().expect("execute must issue one commit");
-        assert_eq!(txn_shape(&predicted), txn_shape(actual));
-        assert!(actual.mutations.iter().any(|mutation| matches!(
-            mutation,
-            Mutation::Put { key, .. } if key.keyspace == HISTORY.id
-        )));
+        capture.with_last_commit(|actual| {
+            assert_eq!(txn_shape(&predicted), txn_shape(actual));
+            assert!(actual.mutations.iter().any(|mutation| matches!(
+                mutation,
+                Mutation::Put { key, .. } if key.keyspace == HISTORY.id
+            )));
+            assert_eq!(actual.validate(&store_limits()), Ok(()));
+        });
         assert_eq!(predicted.validate(&store_limits()), Ok(()));
-        assert_eq!(actual.validate(&store_limits()), Ok(()));
     }
 
     #[test]

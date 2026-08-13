@@ -1064,6 +1064,8 @@ mod tests {
         .to_string();
         assert!(error.contains("outcome is unknown"));
         assert!(error.contains("preserve the store"));
+        assert!(error.contains("automatic owner reconciliation is not implemented"));
+        assert!(error.contains("--metadata-reopen prepared-meta"));
         assert!(error.contains("do not delete"));
     }
 

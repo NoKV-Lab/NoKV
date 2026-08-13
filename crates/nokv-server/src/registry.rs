@@ -903,6 +903,7 @@ mod tests {
             first.outcome,
             WorkspaceRpcOutcome::Failure(RpcFailure {
                 code: ErrorCode::Internal,
+                retryable: true,
                 ..
             })
         ));
