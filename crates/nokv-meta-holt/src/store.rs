@@ -120,6 +120,32 @@ impl HoltStore {
         )
     }
 
+    /// Force one checkpoint round for adapter-backed storage tests.
+    #[cfg(feature = "test-support")]
+    pub fn checkpoint_for_test(&self) -> Result<(), StoreError> {
+        let state = self.read_state()?;
+        ensure_ready(&state)?;
+        state.db.checkpoint().map_err(map_holt_error)
+    }
+
+    /// Return physical Holt statistics for one configured keyspace in tests.
+    #[cfg(feature = "test-support")]
+    pub fn keyspace_stats_for_test(
+        &self,
+        keyspace: Keyspace,
+    ) -> Result<holt::TreeStats, StoreError> {
+        let state = self.read_state()?;
+        ensure_ready(&state)?;
+        let name = state.trees.get(&keyspace).ok_or_else(|| {
+            StoreError::InvalidRequest(format!(
+                "keyspace {:04x} is not configured for this HoltStore",
+                keyspace.get()
+            ))
+        })?;
+        let tree = state.db.open_tree(name).map_err(map_holt_error)?;
+        tree.stats().map_err(map_holt_error)
+    }
+
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, StoreError> {
         self.state
             .read()

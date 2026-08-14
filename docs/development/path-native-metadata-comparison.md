@@ -111,11 +111,12 @@ The adapter folds each deeper subtree into a `CommonPrefix`. NoKV retains that
 as one storage-neutral implicit `Prefix` item. An exact artifact at the same
 child wins during logical coalescing. Prefixes and artifacts both count toward the
 page limit and can become cursor anchors. Recursive pages retain the ordinary
-ordered prefix iterator and emit artifacts only. System format version 8 uses
-NUL between components and `0x01` at exact keys so a rollup, exact child, and
-longer sibling have one pagination-safe order. Each UTF-8 component byte is
-shifted by one so the delimiter and exact marker cannot occur inside an encoded
-component, while byte order and key length stay unchanged.
+ordered prefix iterator and emit artifacts only. System format version 9
+retains the version-8 path layout: NUL between components and `0x01` at exact
+keys give a rollup, exact child, and longer sibling one pagination-safe order.
+Each UTF-8 component byte is shifted by one so the delimiter and exact marker
+cannot occur inside an encoded component, while byte order and key length stay
+unchanged.
 
 Historical MVCC is a distinct path. A key that is absent or newer in current
 state may still be visible at the requested version, so historical listing

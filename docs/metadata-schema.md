@@ -19,15 +19,18 @@ Every logical-shard store has one authoritative marker:
 System("schema")
   -> value_format_version = 1
      schema_id = "nokv_workspace"
-     format_version = 8
+     format_version = 9
 ```
 
 Startup is fail-closed:
 
 - an empty store is initialized with the exact supported marker and logical
   keyspace catalog;
-- a nonempty store opens only when its marker, value format, and configured
-  adapter catalog match this contract;
+- a format-8 store first passes the complete shard, system-record, and recovery
+  chain validation, then atomically advances only its schema marker to version
+  9; existing recovery rows are not rewritten;
+- a nonempty current store opens only when its marker, value format, and
+  configured adapter catalog match this contract;
 - a missing, malformed, unknown-version, or inconsistent store is rejected.
 
 ## Ids, Names, And Keys
@@ -51,8 +54,9 @@ OperationId             16 bytes, unique within one RootId
 CommitId                32 bytes, root-global SHA-256 identity
 ```
 
-All integers are unsigned big-endian. General variable byte strings use a
-four-byte big-endian length followed by exact bytes.
+Integers are unsigned big-endian unless a family defines an order-preserving
+key codec. General variable byte strings use a four-byte big-endian length
+followed by exact bytes.
 
 An external `workbench_id`:
 
@@ -78,9 +82,9 @@ delimiter; `0x01` terminates an exact row. The resulting order is `a/NUL
 subtree`, exact `a`, then longer siblings such as `a\u{1}` and `ab`, and no
 exact key is a strict prefix of another valid path key. A child/subtree prefix
 appends NUL, so `a` cannot match `ab`. The empty path has no `PathCurrent`
-record; the workspace root is synthesized from `WorkspaceCurrent`. This
-key-layout cutover is gated by system format version 8; older stores are
-rejected rather than dual-read.
+record; the workspace root is synthesized from `WorkspaceCurrent`. This path
+key layout was introduced by system format version 8 and is retained by
+version 9.
 
 The one shared normalizer enforces:
 
@@ -101,7 +105,20 @@ float, timestamp, bytes, and string values.
 
 ## Durable Format Registry
 
-`System.format_version` is `8`. Durable codecs are independently versioned:
+`System.format_version` is `9`. Version 9 writes RecoveryOutbox LSNs as
+canonical fixed-width decimal keys. Numeric ordering is unchanged, while the
+sequential key shape avoids pathological underfilled Holt frames. Logical
+recovery records, deterministic results, and hash-chain bytes are unchanged.
+
+Opening a format-8 store validates its complete recovery chain before an
+atomic, one-way marker upgrade. Its `0x00`/`0x01` binary-LSN rows remain in
+place and readable; later writes use the disjoint version-9 `0x02`/`0x03`
+tags, so old and new rows retain one unambiguous chronological order. A binary
+that understands only format 8 rejects the upgraded marker rather than
+misreading the mixed physical layout. Other older or unknown markers remain
+fail-closed.
+
+Durable codecs are independently versioned:
 publication-owned workspace/path/revision records and immutable commit records
 use value version `2`; `ChangeEvent` and the logical recovery-outbox record use
 value version `2`; other ordinary workspace records and the recovery storage
@@ -258,8 +275,10 @@ System
        recovery chain digest
 
 RecoveryOutbox
-  header key: 0x00 | recovery_lsn
-  chunk key:  0x01 | recovery_lsn | chunk_index
+  format-9 header key: 0x02 | decimal20(recovery_lsn)
+  format-9 chunk key:  0x03 | decimal20(recovery_lsn) | chunk_index_u32_be
+  retained format-8 header key: 0x00 | recovery_lsn_u64_be
+  retained format-8 chunk key:  0x01 | recovery_lsn_u64_be | chunk_index_u32_be
   val: canonical mutation plus typed deterministic result evidence,
        previous/current chain digest, and strict storage framing
 

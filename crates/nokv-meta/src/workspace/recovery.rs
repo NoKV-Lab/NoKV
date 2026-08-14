@@ -27,9 +27,53 @@ const GENESIS_DOMAIN: &[u8] = b"nokv.metadata.recovery.genesis.v1\0";
 const CHAIN_DOMAIN: &[u8] = b"nokv.metadata.recovery.chain.v1\0";
 const STORAGE_HEADER_VERSION: u8 = 1;
 const STORAGE_CHUNK_VERSION: u8 = 1;
-const STORAGE_HEADER_KEY_TAG: u8 = 0;
-const STORAGE_CHUNK_KEY_TAG: u8 = 1;
+const LEGACY_STORAGE_HEADER_KEY_TAG: u8 = 0;
+const LEGACY_STORAGE_CHUNK_KEY_TAG: u8 = 1;
+const STORAGE_HEADER_KEY_TAG: u8 = 2;
+const STORAGE_CHUNK_KEY_TAG: u8 = 3;
+const RECOVERY_LSN_DECIMAL_BYTES: usize = 20;
+const RECOVERY_OUTBOX_KEY_BYTES: usize = 1 + RECOVERY_LSN_DECIMAL_BYTES;
+const RECOVERY_CHUNK_KEY_BYTES: usize = RECOVERY_OUTBOX_KEY_BYTES + 4;
 const MAX_STORAGE_CHUNK_DATA_BYTES: usize = 60 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryKeyLayout {
+    Format8,
+    Format9,
+}
+
+impl RecoveryKeyLayout {
+    pub(crate) const ORDERED: [Self; 2] = [Self::Format8, Self::Format9];
+
+    pub(crate) const fn header_tag(self) -> u8 {
+        match self {
+            Self::Format8 => LEGACY_STORAGE_HEADER_KEY_TAG,
+            Self::Format9 => STORAGE_HEADER_KEY_TAG,
+        }
+    }
+
+    pub(crate) const fn from_header_tag(tag: u8) -> Option<Self> {
+        match tag {
+            LEGACY_STORAGE_HEADER_KEY_TAG => Some(Self::Format8),
+            STORAGE_HEADER_KEY_TAG => Some(Self::Format9),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn from_chunk_tag(tag: u8) -> Option<Self> {
+        match tag {
+            LEGACY_STORAGE_CHUNK_KEY_TAG => Some(Self::Format8),
+            STORAGE_CHUNK_KEY_TAG => Some(Self::Format9),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DecodedRecoveryOutboxKey {
+    pub(crate) recovery_lsn: u64,
+    pub(crate) layout: RecoveryKeyLayout,
+}
 
 /// One canonical input to a real metadata write entrypoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -555,26 +599,83 @@ pub(crate) fn recovery_genesis_digest(
     hasher.finalize().into()
 }
 
-pub(crate) fn recovery_outbox_key(recovery_lsn: u64) -> [u8; 9] {
-    let mut key = [0; 9];
+/// Format-v9 header key. Fixed-width decimal preserves numeric order while
+/// keeping sequential LSNs in Holt's well-filled key shape.
+pub(crate) fn recovery_outbox_key(recovery_lsn: u64) -> [u8; RECOVERY_OUTBOX_KEY_BYTES] {
+    let mut key = [0; RECOVERY_OUTBOX_KEY_BYTES];
     key[0] = STORAGE_HEADER_KEY_TAG;
-    key[1..].copy_from_slice(&recovery_lsn.to_be_bytes());
+    key[1..].copy_from_slice(&encode_recovery_lsn(recovery_lsn));
     key
 }
 
-pub(crate) fn decode_recovery_outbox_key(key: &[u8]) -> Result<u64, RecoveryCodecError> {
-    if key.len() != 9 || key.first() != Some(&STORAGE_HEADER_KEY_TAG) {
-        return Err(RecoveryCodecError::InvalidValue {
-            field: "recovery_outbox_key",
-        });
+pub(crate) fn recovery_outbox_scan_start(layout: RecoveryKeyLayout, recovery_lsn: u64) -> Vec<u8> {
+    match layout {
+        RecoveryKeyLayout::Format8 => legacy_recovery_outbox_key(recovery_lsn).to_vec(),
+        RecoveryKeyLayout::Format9 => recovery_outbox_key(recovery_lsn).to_vec(),
     }
-    let lsn = u64::from_be_bytes(key[1..].try_into().expect("width checked"));
+}
+
+pub(crate) fn decode_recovery_outbox_key(
+    key: &[u8],
+) -> Result<DecodedRecoveryOutboxKey, RecoveryCodecError> {
+    let (layout, lsn) = match key.first().copied() {
+        Some(LEGACY_STORAGE_HEADER_KEY_TAG) if key.len() == 9 => (
+            RecoveryKeyLayout::Format8,
+            u64::from_be_bytes(key[1..].try_into().expect("width checked")),
+        ),
+        Some(STORAGE_HEADER_KEY_TAG) if key.len() == RECOVERY_OUTBOX_KEY_BYTES => {
+            (RecoveryKeyLayout::Format9, decode_recovery_lsn(&key[1..])?)
+        }
+        _ => {
+            return Err(RecoveryCodecError::InvalidValue {
+                field: "recovery_outbox_key",
+            });
+        }
+    };
     if lsn == 0 {
         return Err(RecoveryCodecError::ZeroScalar {
             field: "recovery_lsn",
         });
     }
-    Ok(lsn)
+    Ok(DecodedRecoveryOutboxKey {
+        recovery_lsn: lsn,
+        layout,
+    })
+}
+
+fn legacy_recovery_outbox_key(recovery_lsn: u64) -> [u8; 9] {
+    let mut key = [0; 9];
+    key[0] = LEGACY_STORAGE_HEADER_KEY_TAG;
+    key[1..].copy_from_slice(&recovery_lsn.to_be_bytes());
+    key
+}
+
+fn encode_recovery_lsn(mut recovery_lsn: u64) -> [u8; RECOVERY_LSN_DECIMAL_BYTES] {
+    let mut encoded = [b'0'; RECOVERY_LSN_DECIMAL_BYTES];
+    for digit in encoded.iter_mut().rev() {
+        *digit = b'0' + (recovery_lsn % 10) as u8;
+        recovery_lsn /= 10;
+    }
+    debug_assert_eq!(recovery_lsn, 0);
+    encoded
+}
+
+fn decode_recovery_lsn(encoded: &[u8]) -> Result<u64, RecoveryCodecError> {
+    let mut recovery_lsn = 0_u64;
+    for digit in encoded {
+        if !digit.is_ascii_digit() {
+            return Err(RecoveryCodecError::InvalidValue {
+                field: "recovery_outbox_key",
+            });
+        }
+        recovery_lsn = recovery_lsn
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit - b'0')))
+            .ok_or(RecoveryCodecError::InvalidValue {
+                field: "recovery_outbox_key",
+            })?;
+    }
+    Ok(recovery_lsn)
 }
 
 pub(crate) fn split_recovery_storage(
@@ -596,12 +697,29 @@ pub(crate) fn split_recovery_storage(
     Ok((header, chunks))
 }
 
-pub(crate) fn recovery_chunk_key(recovery_lsn: u64, index: u32) -> [u8; 13] {
-    let mut key = [0; 13];
+pub(crate) fn recovery_chunk_key(recovery_lsn: u64, index: u32) -> [u8; RECOVERY_CHUNK_KEY_BYTES] {
+    let mut key = [0; RECOVERY_CHUNK_KEY_BYTES];
     key[0] = STORAGE_CHUNK_KEY_TAG;
-    key[1..9].copy_from_slice(&recovery_lsn.to_be_bytes());
-    key[9..].copy_from_slice(&index.to_be_bytes());
+    key[1..RECOVERY_OUTBOX_KEY_BYTES].copy_from_slice(&encode_recovery_lsn(recovery_lsn));
+    key[RECOVERY_OUTBOX_KEY_BYTES..].copy_from_slice(&index.to_be_bytes());
     key
+}
+
+pub(crate) fn recovery_chunk_key_for_layout(
+    layout: RecoveryKeyLayout,
+    recovery_lsn: u64,
+    index: u32,
+) -> Vec<u8> {
+    match layout {
+        RecoveryKeyLayout::Format8 => {
+            let mut key = [0; 13];
+            key[0] = LEGACY_STORAGE_CHUNK_KEY_TAG;
+            key[1..9].copy_from_slice(&recovery_lsn.to_be_bytes());
+            key[9..].copy_from_slice(&index.to_be_bytes());
+            key.to_vec()
+        }
+        RecoveryKeyLayout::Format9 => recovery_chunk_key(recovery_lsn, index).to_vec(),
+    }
 }
 
 pub(crate) fn assemble_recovery_storage(
@@ -1237,6 +1355,59 @@ mod tests {
                 field: "owner_epoch_transition"
             })
         ));
+    }
+
+    #[test]
+    fn recovery_storage_keys_use_fixed_width_decimal_lsns() {
+        assert_eq!(
+            recovery_outbox_key(42).as_slice(),
+            b"\x0200000000000000000042"
+        );
+        assert_eq!(
+            recovery_chunk_key(42, 7).as_slice(),
+            b"\x0300000000000000000042\x00\x00\x00\x07"
+        );
+        assert_eq!(
+            decode_recovery_outbox_key(b"\x0218446744073709551615").unwrap(),
+            DecodedRecoveryOutboxKey {
+                recovery_lsn: u64::MAX,
+                layout: RecoveryKeyLayout::Format9,
+            }
+        );
+
+        let ordered = [0, 1, 9, 10, 99, 100, u64::MAX - 1, u64::MAX];
+        for pair in ordered.windows(2) {
+            assert!(recovery_outbox_key(pair[0]) < recovery_outbox_key(pair[1]));
+        }
+    }
+
+    #[test]
+    fn recovery_outbox_key_decoder_accepts_format8_binary_lsns() {
+        assert_eq!(
+            decode_recovery_outbox_key(&legacy_recovery_outbox_key(42)).unwrap(),
+            DecodedRecoveryOutboxKey {
+                recovery_lsn: 42,
+                layout: RecoveryKeyLayout::Format8,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_outbox_key_decoder_rejects_malformed_decimal_lsns() {
+        assert!(decode_recovery_outbox_key(b"\x0200000000000000000000").is_err());
+        assert!(decode_recovery_outbox_key(b"\x020000000000000000001").is_err());
+
+        let mut non_digit = recovery_outbox_key(1);
+        non_digit[10] = b'x';
+        assert!(decode_recovery_outbox_key(&non_digit).is_err());
+
+        let mut overflow = [b'9'; RECOVERY_OUTBOX_KEY_BYTES];
+        overflow[0] = STORAGE_HEADER_KEY_TAG;
+        assert!(decode_recovery_outbox_key(&overflow).is_err());
+
+        let mut wrong_tag = recovery_outbox_key(1);
+        wrong_tag[0] = 0xff;
+        assert!(decode_recovery_outbox_key(&wrong_tag).is_err());
     }
 
     #[test]
