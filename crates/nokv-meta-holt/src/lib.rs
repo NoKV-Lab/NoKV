@@ -8,8 +8,8 @@
 //! The adapter maps each configured [`nokv_meta_store::Keyspace`] to the
 //! caller-configured physical Holt tree. It does not know the workspace schema
 //! or record codecs. One `HoltStore` instance owns one local physical authority.
-//! The `test-support` feature exposes an in-memory constructor to test and
-//! diagnostic packages.
+//! The `test-support` feature exposes an in-memory constructor plus explicit
+//! checkpoint and keyspace-stat probes to test and diagnostic packages.
 
 mod options;
 #[cfg(feature = "read-stats")]

@@ -97,6 +97,19 @@ pub(crate) fn initialize_file(
     MetaShard::initialize(initialize_file_txn_store(path)?, logical_shard_id)
 }
 
+pub(crate) fn initialize_file_with_holt_store(
+    path: &Path,
+    logical_shard_id: LogicalShardId,
+) -> Result<(MetaShard, Arc<HoltStore>), MetaError> {
+    let physical = Arc::new(
+        HoltStore::initialize(HoltOptions::file(path, catalog(), store_limits()))
+            .map_err(|source| store_error("initialize test metadata store", source))?,
+    );
+    let store: Arc<dyn TxnStore> = physical.clone();
+    let shard = MetaShard::initialize(store, logical_shard_id)?;
+    Ok((shard, physical))
+}
+
 pub(crate) fn open_file(
     path: &Path,
     logical_shard_id: LogicalShardId,

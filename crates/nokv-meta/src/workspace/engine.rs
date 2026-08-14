@@ -20,7 +20,8 @@ use nokv_types::{
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    change_event_key, encode_schema_marker, validate_schema_marker, SCHEMA_ID, SYSTEM_SCHEMA_KEY,
+    change_event_key, classify_schema_marker_for_open, encode_schema_marker,
+    validate_schema_marker, SchemaMarkerVersion, SCHEMA_ID, SYSTEM_SCHEMA_KEY,
 };
 use super::keyspace::{
     keyspaces, MetadataFamily, CHANGE_EVENT, COMMAND_DEDUPE, HISTORY, RECOVERY_OUTBOX, ROOT_FENCE,
@@ -31,8 +32,9 @@ use super::read_stats::{self, MetadataReadStats, MetadataReadStatsSessionError};
 use super::records::{CommandDedupeRecord, CurrentValue, HistoryValue, RootFence};
 use super::recovery::{
     assemble_recovery_storage, decode_recovery_outbox_key, recovery_chunk_key,
-    recovery_genesis_digest, recovery_outbox_key, recovery_storage_chunk_count,
-    recovery_storage_logical_length, split_recovery_storage, RecoveryMutationV1,
+    recovery_chunk_key_for_layout, recovery_genesis_digest, recovery_outbox_key,
+    recovery_outbox_scan_start, recovery_storage_chunk_count, recovery_storage_logical_length,
+    split_recovery_storage, DecodedRecoveryOutboxKey, RecoveryKeyLayout, RecoveryMutationV1,
     RecoveryOutboxRecord, RecoveryResultV1, RecoveryState, MAX_RECOVERY_BYTES,
     RECOVERY_CHAIN_DIGEST_BYTES,
 };
@@ -582,9 +584,10 @@ impl MetaShard {
 
     fn open_domain(self) -> Result<Self, MetaError> {
         let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-        validate_schema_marker(&schema).map_err(|error| MetaError::SchemaGate {
-            reason: error.to_string(),
-        })?;
+        let schema_version =
+            classify_schema_marker_for_open(&schema).map_err(|error| MetaError::SchemaGate {
+                reason: error.to_string(),
+            })?;
         let shard = self.required_value(
             SYSTEM.id,
             SYSTEM_SHARD_IDENTITY_KEY,
@@ -629,7 +632,34 @@ impl MetaShard {
             "System(lease_clock_high_water)",
         )?;
         self.verify_recovery_chain_unlocked()?;
+        if schema_version == SchemaMarkerVersion::Format8 {
+            self.upgrade_format8_schema_marker(&schema)?;
+        }
         Ok(self)
+    }
+
+    fn upgrade_format8_schema_marker(&self, previous: &[u8]) -> Result<(), MetaError> {
+        let current = encode_schema_marker();
+        let txn = WriteTxn {
+            checks: vec![value_check(SYSTEM.id, SYSTEM_SCHEMA_KEY, previous)],
+            mutations: vec![Mutation::Put {
+                key: Key::new(SYSTEM.id, SYSTEM_SCHEMA_KEY),
+                value: current,
+            }],
+        };
+        match self.commit("upgrade format-8 schema marker", txn)? {
+            Commit::Applied => Ok(()),
+            Commit::Conflict => {
+                let observed =
+                    self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+                match validate_schema_marker(&observed) {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(MetaError::SchemaGate {
+                        reason: "format-8 schema upgrade lost its compare-and-swap".to_owned(),
+                    }),
+                }
+            }
+        }
     }
 
     pub fn current_read_version(&self) -> Result<ReadVersion, MetaError> {
@@ -753,55 +783,63 @@ impl MetaShard {
             .command_gate
             .read()
             .map_err(|error| internal("lock read gate", error))?;
-        let start = recovery_outbox_key(start_after_lsn).to_vec();
         let mut rows = Vec::with_capacity(limit);
         let mut encoded_bytes = 0_usize;
-        let mut after = Some(start);
-        loop {
-            let page = self.scan_page(
-                RECOVERY_OUTBOX.id,
-                &[0],
-                after.as_deref(),
-                (limit - rows.len()).min(MAX_HISTORICAL_SCAN_PAGE_ROWS),
-                None,
-                0,
-                "scan RecoveryOutbox",
-            )?;
-            let more = page.more;
-            for item in page.items {
-                let ScanItem::Row { key, value } = item else {
-                    return Err(corrupt(
-                        "RecoveryOutbox",
-                        "non-delimited scan returned a common prefix",
-                    ));
-                };
-                after = Some(key.clone());
-                let key_lsn = decode_recovery_outbox_key(&key)
-                    .map_err(|error| corrupt("RecoveryOutbox key", error))?;
-                let row_encoded_bytes = recovery_storage_logical_length(&value)
-                    .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
-                if !rows.is_empty()
-                    && encoded_bytes.saturating_add(row_encoded_bytes) > max_encoded_bytes
-                {
-                    return Ok(rows);
+        for layout in RecoveryKeyLayout::ORDERED {
+            let mut after = Some(recovery_outbox_scan_start(layout, start_after_lsn));
+            loop {
+                let page = self.scan_page(
+                    RECOVERY_OUTBOX.id,
+                    &[layout.header_tag()],
+                    after.as_deref(),
+                    (limit - rows.len()).min(MAX_HISTORICAL_SCAN_PAGE_ROWS),
+                    None,
+                    0,
+                    "scan RecoveryOutbox",
+                )?;
+                let more = page.more;
+                for item in page.items {
+                    let ScanItem::Row { key, value } = item else {
+                        return Err(corrupt(
+                            "RecoveryOutbox",
+                            "non-delimited scan returned a common prefix",
+                        ));
+                    };
+                    after = Some(key.clone());
+                    let decoded = decode_recovery_outbox_key(&key)
+                        .map_err(|error| corrupt("RecoveryOutbox key", error))?;
+                    if decoded.layout != layout {
+                        return Err(corrupt(
+                            "RecoveryOutbox key",
+                            "header tag and decoded layout disagree",
+                        ));
+                    }
+                    let row_encoded_bytes = recovery_storage_logical_length(&value)
+                        .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
+                    if !rows.is_empty()
+                        && encoded_bytes.saturating_add(row_encoded_bytes) > max_encoded_bytes
+                    {
+                        return Ok(rows);
+                    }
+                    let row = self.read_recovery_record(decoded, &value)?;
+                    if row.recovery_lsn != decoded.recovery_lsn {
+                        return Err(MetaError::CorruptRecord {
+                            record: "RecoveryOutbox",
+                            reason: "row LSN does not match ordered key".to_owned(),
+                        });
+                    }
+                    encoded_bytes = encoded_bytes.saturating_add(row_encoded_bytes);
+                    rows.push(row);
+                    if rows.len() == limit {
+                        return Ok(rows);
+                    }
                 }
-                let row = self.read_recovery_record(key_lsn, &value)?;
-                if row.recovery_lsn != key_lsn {
-                    return Err(MetaError::CorruptRecord {
-                        record: "RecoveryOutbox",
-                        reason: "row LSN does not match ordered key".to_owned(),
-                    });
+                if !more {
+                    break;
                 }
-                encoded_bytes = encoded_bytes.saturating_add(row_encoded_bytes);
-                rows.push(row);
-                if rows.len() == limit {
-                    return Ok(rows);
-                }
-            }
-            if !more {
-                return Ok(rows);
             }
         }
+        Ok(rows)
     }
 
     /// Verify every durable recovery row and the `System` tail.
@@ -2289,21 +2327,26 @@ impl MetaShard {
                 };
                 after = Some(key.clone());
                 match key.first().copied() {
-                    Some(0) => {
-                        let key_lsn = decode_recovery_outbox_key(&key)
+                    Some(tag) if RecoveryKeyLayout::from_header_tag(tag).is_some() => {
+                        let decoded = decode_recovery_outbox_key(&key)
                             .map_err(|error| corrupt("RecoveryOutbox key", error))?;
                         let chunk_count = recovery_storage_chunk_count(&value)
                             .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
                         for index in 0..chunk_count {
-                            expected_chunk_keys.insert(recovery_chunk_key(key_lsn, index).to_vec());
+                            expected_chunk_keys.insert(recovery_chunk_key_for_layout(
+                                decoded.layout,
+                                decoded.recovery_lsn,
+                                index,
+                            ));
                         }
-                        let row = self.read_recovery_record(key_lsn, &value)?;
-                        if key_lsn != expected_lsn || row.recovery_lsn != expected_lsn {
+                        let row = self.read_recovery_record(decoded, &value)?;
+                        if decoded.recovery_lsn != expected_lsn || row.recovery_lsn != expected_lsn
+                        {
                             return Err(MetaError::CorruptRecord {
                                 record: "RecoveryOutbox",
                                 reason: format!(
-                                    "expected contiguous LSN {expected_lsn}, found key {key_lsn} row {}",
-                                    row.recovery_lsn
+                                    "expected contiguous LSN {expected_lsn}, found key {} row {}",
+                                    decoded.recovery_lsn, row.recovery_lsn
                                 ),
                             });
                         }
@@ -2320,7 +2363,7 @@ impl MetaShard {
                             .checked_add(1)
                             .ok_or(MetaError::VersionOverflow)?;
                     }
-                    Some(1) => {
+                    Some(tag) if RecoveryKeyLayout::from_chunk_tag(tag).is_some() => {
                         if !expected_chunk_keys.remove(&key) {
                             return Err(MetaError::CorruptRecord {
                                 record: "RecoveryOutbox chunk",
@@ -2362,7 +2405,7 @@ impl MetaShard {
 
     fn read_recovery_record(
         &self,
-        recovery_lsn: u64,
+        decoded: DecodedRecoveryOutboxKey,
         header: &[u8],
     ) -> Result<RecoveryOutboxRecord, MetaError> {
         let chunk_count = recovery_storage_chunk_count(header)
@@ -2372,13 +2415,13 @@ impl MetaShard {
             let value = self
                 .read_value(
                     RECOVERY_OUTBOX.id,
-                    &recovery_chunk_key(recovery_lsn, index),
+                    &recovery_chunk_key_for_layout(decoded.layout, decoded.recovery_lsn, index),
                     MetadataPointReadSource::Other,
                     "read RecoveryOutbox chunk",
                 )?
                 .ok_or_else(|| MetaError::CorruptRecord {
                     record: "RecoveryOutbox chunk",
-                    reason: format!("missing LSN {recovery_lsn} chunk {index}"),
+                    reason: format!("missing LSN {} chunk {index}", decoded.recovery_lsn),
                 })?;
             chunks.push(value);
         }
@@ -5329,6 +5372,46 @@ mod tests {
     }
 
     #[test]
+    fn sequential_recovery_outbox_writes_avoid_pathological_holt_fragmentation() {
+        const COMMANDS: u8 = 160;
+        const VALUE_BYTES: usize = 3 * 1024;
+
+        let temporary = tempdir().unwrap();
+        let (store, physical) = crate::workspace::test_support::initialize_file_with_holt_store(
+            &temporary.path().join("metadata"),
+            shard(1),
+        )
+        .unwrap();
+        let store = make_store_ready(store);
+        let value = vec![0x5a; VALUE_BYTES];
+        for index in 0..COMMANDS {
+            let command = create_command(
+                &store,
+                request(index + 10),
+                scoped_key(root(2), &[b'w', index]),
+                &value,
+            );
+            store.execute(&command).unwrap();
+        }
+
+        physical.checkpoint_for_test().unwrap();
+        let stats = physical
+            .keyspace_stats_for_test(RECOVERY_OUTBOX.id)
+            .unwrap();
+        // The fixed-width decimal layout uses two blobs. Keep 4x headroom for
+        // Holt shape changes while rejecting the binary-LSN layout's cliff.
+        assert!(
+            stats.blob_count <= 8,
+            "{} sequential outbox records fragmented across {} Holt blobs (space={}, max_fill={}, underfilled={})",
+            COMMANDS + 3,
+            stats.blob_count,
+            stats.total_space_used,
+            stats.max_blob_fill_per_mille,
+            stats.underfilled_child_blobs
+        );
+    }
+
+    #[test]
     fn recovery_outbox_survives_file_reopen_with_exact_tail() {
         let temporary = tempdir().unwrap();
         let database = temporary.path().join("metadata");
@@ -5364,6 +5447,129 @@ mod tests {
         assert_eq!(reopened.verify_recovery_chain().unwrap(), expected);
         assert_eq!(reopened.recovery_outbox_after(0, 10).unwrap().len(), 4);
         assert_eq!(reopened.lease_clock_high_water().unwrap(), 55);
+    }
+
+    #[test]
+    fn format8_store_upgrades_without_rewriting_legacy_recovery_rows() {
+        let temporary = tempdir().unwrap();
+        let database = temporary.path().join("metadata");
+        let expected;
+        {
+            let store = ready_file_store(&database);
+            expected = store.verify_recovery_chain().unwrap();
+            assert_eq!(expected.applied_recovery_lsn, 3);
+
+            for recovery_lsn in 1..=expected.applied_recovery_lsn {
+                let current_header_key = recovery_outbox_key(recovery_lsn);
+                let header = store
+                    .required_value(
+                        RECOVERY_OUTBOX.id,
+                        &current_header_key,
+                        "RecoveryOutbox header",
+                    )
+                    .unwrap();
+                let chunk_count = recovery_storage_chunk_count(&header).unwrap();
+                raw_put(
+                    &store,
+                    RECOVERY_OUTBOX.id,
+                    &recovery_outbox_scan_start(RecoveryKeyLayout::Format8, recovery_lsn),
+                    &header,
+                );
+                raw_delete(&store, RECOVERY_OUTBOX.id, &current_header_key);
+
+                for index in 0..chunk_count {
+                    let current_chunk_key = recovery_chunk_key(recovery_lsn, index);
+                    let chunk = store
+                        .required_value(
+                            RECOVERY_OUTBOX.id,
+                            &current_chunk_key,
+                            "RecoveryOutbox chunk",
+                        )
+                        .unwrap();
+                    raw_put(
+                        &store,
+                        RECOVERY_OUTBOX.id,
+                        &recovery_chunk_key_for_layout(
+                            RecoveryKeyLayout::Format8,
+                            recovery_lsn,
+                            index,
+                        ),
+                        &chunk,
+                    );
+                    raw_delete(&store, RECOVERY_OUTBOX.id, &current_chunk_key);
+                }
+            }
+
+            let mut format8_marker = encode_schema_marker();
+            let version_start = format8_marker.len() - std::mem::size_of::<u32>();
+            format8_marker[version_start..].copy_from_slice(&8_u32.to_be_bytes());
+            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format8_marker);
+        }
+
+        let reopened = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
+        assert_eq!(reopened.verify_recovery_chain().unwrap(), expected);
+        assert_eq!(
+            reopened
+                .required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")
+                .unwrap(),
+            encode_schema_marker()
+        );
+        for recovery_lsn in 1..=expected.applied_recovery_lsn {
+            reopened
+                .required_value(
+                    RECOVERY_OUTBOX.id,
+                    &recovery_outbox_scan_start(RecoveryKeyLayout::Format8, recovery_lsn),
+                    "legacy RecoveryOutbox header",
+                )
+                .unwrap();
+        }
+
+        let command = create_command(
+            &reopened,
+            request(9),
+            scoped_key(root(2), b"after-format8-upgrade"),
+            b"value",
+        );
+        reopened.execute(&command).unwrap();
+        let rows = reopened.recovery_outbox_after(0, 10).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.recovery_lsn).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            reopened
+                .recovery_outbox_after(2, 10)
+                .unwrap()
+                .iter()
+                .map(|row| row.recovery_lsn)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(
+            reopened
+                .verify_recovery_chain()
+                .unwrap()
+                .applied_recovery_lsn,
+            4
+        );
+        reopened
+            .required_value(
+                RECOVERY_OUTBOX.id,
+                &recovery_outbox_key(4),
+                "format-9 RecoveryOutbox header",
+            )
+            .unwrap();
+        drop(reopened);
+
+        let mixed = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
+        assert_eq!(
+            mixed.recovery_outbox_after(3, 10).unwrap()[0].recovery_lsn,
+            4
+        );
+        assert_eq!(
+            mixed.verify_recovery_chain().unwrap().applied_recovery_lsn,
+            4
+        );
     }
 
     #[test]

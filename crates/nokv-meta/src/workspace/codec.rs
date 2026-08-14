@@ -20,7 +20,14 @@ const ARTIFACT_REVISION_CLAIM_DISCRIMINATOR: u8 = 0xff;
 
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
-const SYSTEM_FORMAT_VERSION: u32 = 8;
+const SYSTEM_FORMAT_VERSION: u32 = 9;
+const PREVIOUS_SYSTEM_FORMAT_VERSION: u32 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SchemaMarkerVersion {
+    Current,
+    Format8,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SchemaMarkerError;
@@ -589,16 +596,32 @@ pub fn object_block_key(
 }
 
 pub(crate) fn encode_schema_marker() -> Vec<u8> {
+    encode_schema_marker_version(SYSTEM_FORMAT_VERSION)
+}
+
+fn encode_schema_marker_version(format_version: u32) -> Vec<u8> {
     let mut value = Vec::with_capacity(1 + 4 + SCHEMA_ID.len() + 4);
     value.push(VALUE_FORMAT_VERSION);
     push_len_prefixed(&mut value, SCHEMA_ID.as_bytes());
-    value.extend_from_slice(&SYSTEM_FORMAT_VERSION.to_be_bytes());
+    value.extend_from_slice(&format_version.to_be_bytes());
     value
 }
 
 pub(crate) fn validate_schema_marker(value: &[u8]) -> Result<(), SchemaMarkerError> {
     if value == encode_schema_marker() {
         Ok(())
+    } else {
+        Err(SchemaMarkerError)
+    }
+}
+
+pub(crate) fn classify_schema_marker_for_open(
+    value: &[u8],
+) -> Result<SchemaMarkerVersion, SchemaMarkerError> {
+    if value == encode_schema_marker() {
+        Ok(SchemaMarkerVersion::Current)
+    } else if value == encode_schema_marker_version(PREVIOUS_SYSTEM_FORMAT_VERSION) {
+        Ok(SchemaMarkerVersion::Format8)
     } else {
         Err(SchemaMarkerError)
     }
@@ -951,6 +974,7 @@ mod tests {
 
     #[test]
     fn schema_marker_is_exact_and_versioned() {
+        assert_eq!(SYSTEM_FORMAT_VERSION, 9);
         let marker = encode_schema_marker();
         assert_eq!(marker[0], VALUE_FORMAT_VERSION);
         assert_eq!(
@@ -958,17 +982,27 @@ mod tests {
             &SYSTEM_FORMAT_VERSION.to_be_bytes()
         );
         validate_schema_marker(&marker).unwrap();
+        assert_eq!(
+            classify_schema_marker_for_open(&marker).unwrap(),
+            SchemaMarkerVersion::Current
+        );
 
-        let mut previous_layout = marker.clone();
-        let version_start = previous_layout.len() - std::mem::size_of::<u32>();
-        previous_layout[version_start..].copy_from_slice(&7_u32.to_be_bytes());
+        let previous_layout = encode_schema_marker_version(PREVIOUS_SYSTEM_FORMAT_VERSION);
         assert_eq!(
             validate_schema_marker(&previous_layout),
             Err(SchemaMarkerError)
+        );
+        assert_eq!(
+            classify_schema_marker_for_open(&previous_layout).unwrap(),
+            SchemaMarkerVersion::Format8
         );
 
         let mut unknown = marker;
         unknown[0] = VALUE_FORMAT_VERSION + 1;
         assert_eq!(validate_schema_marker(&unknown), Err(SchemaMarkerError));
+        assert_eq!(
+            classify_schema_marker_for_open(&unknown),
+            Err(SchemaMarkerError)
+        );
     }
 }

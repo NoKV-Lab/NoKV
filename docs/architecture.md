@@ -103,7 +103,7 @@ This reserves both markers, places a child's delimiter rollup before its exact
 artifact and both before longer siblings, and prevents an exact key from being
 a strict prefix of another valid path key. The same normalizer/codec owns
 storage keys, request identities, index identities, and restore member ids.
-System format version 8 gates this layout.
+System format version 9 retains and gates this layout.
 
 Directories are implicit. The Workbench root and five standard sections are
 virtual. A file stat is a point read; an implicit-directory stat is a prefix
