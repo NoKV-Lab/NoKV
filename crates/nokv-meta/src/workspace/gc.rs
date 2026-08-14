@@ -23,10 +23,11 @@ use super::codec::{
     object_block_key, operation_key, revision_dependency_ref_prefix, SCHEMA_ID,
 };
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, HistoryProjection,
-    MetadataCommand, MetadataCommandResult, MetadataFamily, RootFenceAction,
+    CommandMutation, CommandPredicate, HistoryProjection, MetaError, MetaShard, MetadataCommand,
+    MetadataCommandResult, RootFenceAction,
 };
 use super::gc_records::{GcHistoryBarrierRecord, GcOperationRecord, GcRecordError, GcTransition};
+use super::keyspace::MetadataFamily;
 use super::namespace::{RootReadContext, RootWriteContext};
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PublicationRecordCodecError, RevisionRefRecord,
@@ -39,10 +40,10 @@ const GC_RESULT_FORMAT_VERSION: u8 = 1;
 const GC_RESULT_OPERATION: u8 = 1;
 const GC_RESULT_STALE_CANDIDATE: u8 = 2;
 const GC_RESULT_HISTORY_BARRIER: u8 = 3;
-const MAX_ENGINE_SCAN_ROWS: usize = 256;
+const MAX_META_SCAN_ROWS: usize = 256;
 // Complete mutates revision/candidate/operation plus, for each dependency,
 // its reference, owner revision, and at most one newly-zero candidate.
-const _: () = assert!(MAX_DEPENDENCY_COUNT as usize * 3 + 3 <= MAX_ENGINE_SCAN_ROWS);
+const _: () = assert!(MAX_DEPENDENCY_COUNT as usize * 3 + 3 <= MAX_META_SCAN_ROWS);
 
 /// Maximum number of manifest rows admitted by one recoverable delete batch.
 pub const MAX_GC_BATCH_ROWS: usize = 192;
@@ -153,7 +154,7 @@ pub struct GcHistoryBarrierOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GcError {
-    Metadata(AgentMetadataError),
+    Meta(MetaError),
     OperationCodec(GcRecordError),
     PublicationRecordCodec(PublicationRecordCodecError),
     ManifestCodec(PublishRecordError),
@@ -250,7 +251,7 @@ pub enum GcError {
 impl fmt::Display for GcError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Metadata(error) => write!(formatter, "GC metadata command failed: {error}"),
+            Self::Meta(error) => error.fmt(formatter),
             Self::OperationCodec(error) => write!(formatter, "invalid GC operation: {error}"),
             Self::PublicationRecordCodec(error) => {
                 write!(formatter, "invalid GC publication record: {error}")
@@ -373,11 +374,22 @@ impl fmt::Display for GcError {
     }
 }
 
-impl std::error::Error for GcError {}
+impl std::error::Error for GcError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Meta(source) => Some(source),
+            Self::OperationCodec(source) => Some(source),
+            Self::PublicationRecordCodec(source) => Some(source),
+            Self::ManifestCodec(source) => Some(source),
+            Self::SnapshotRecordCodec(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
-impl From<AgentMetadataError> for GcError {
-    fn from(error: AgentMetadataError) -> Self {
-        Self::Metadata(error)
+impl From<MetaError> for GcError {
+    fn from(error: MetaError) -> Self {
+        Self::Meta(error)
     }
 }
 
@@ -407,11 +419,11 @@ impl From<SnapshotRecordError> for GcError {
 
 #[derive(Clone, Copy)]
 pub struct GcService<'a> {
-    store: &'a AgentMetadataStore,
+    store: &'a MetaShard,
 }
 
 impl<'a> GcService<'a> {
-    pub const fn new(store: &'a AgentMetadataStore) -> Self {
+    pub const fn new(store: &'a MetaShard) -> Self {
         Self { store }
     }
 
@@ -430,7 +442,7 @@ impl<'a> GcService<'a> {
                 &prefix,
                 context.read_version,
                 start_after.as_deref(),
-                MAX_ENGINE_SCAN_ROWS,
+                MAX_META_SCAN_ROWS,
             )?;
             if page.is_empty() {
                 break;
@@ -440,7 +452,7 @@ impl<'a> GcService<'a> {
                 floor = floor.min(hold.read_version);
             }
             start_after = page.last().map(|item| item.key.clone());
-            if page.len() < MAX_ENGINE_SCAN_ROWS {
+            if page.len() < MAX_META_SCAN_ROWS {
                 break;
             }
         }
@@ -1173,7 +1185,7 @@ fn validate_batch_size(count: usize) -> Result<(), GcError> {
 }
 
 fn require_current_write_frontier(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
 ) -> Result<(), GcError> {
     if store.current_read_version()? == context.read_version {
@@ -1205,7 +1217,7 @@ fn read_context(context: RootWriteContext) -> RootReadContext {
 }
 
 fn read_current(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     family: MetadataFamily,
     key: &[u8],
@@ -1234,7 +1246,7 @@ struct LoadedGcTriple {
 }
 
 fn load_gc_triple(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     expected_operation: &GcOperationRecord,
 ) -> Result<LoadedGcTriple, GcError> {
@@ -1385,7 +1397,7 @@ fn predicate_triple(command: &mut MetadataCommand, triple: &LoadedGcTriple) {
 }
 
 fn load_manifest_rows(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     logical_shard_id: LogicalShardId,
     operation: &GcOperationRecord,
@@ -1443,7 +1455,7 @@ fn load_manifest_rows(
 }
 
 fn validate_complete_manifest(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &GcOperationRecord,
     revision: &ArtifactRevisionRecord,
@@ -1486,7 +1498,7 @@ struct DependencyUpdate {
 }
 
 fn load_dependency_updates(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &GcOperationRecord,
     revision: &ArtifactRevisionRecord,
@@ -1746,7 +1758,7 @@ fn delete_exact(
 }
 
 fn execute_operation_command(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     command: MetadataCommand,
     input_digest: [u8; SHA256_BYTES],
     operation_id: OperationId,
@@ -1756,7 +1768,7 @@ fn execute_operation_command(
 }
 
 fn execute_candidate_clear_command(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     command: MetadataCommand,
     input_digest: [u8; SHA256_BYTES],
     revision: ArtifactRevisionId,
@@ -1767,22 +1779,22 @@ fn execute_candidate_clear_command(
 }
 
 fn execute_command(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     command: &MetadataCommand,
 ) -> Result<MetadataCommandResult, GcError> {
     match store.execute(command) {
         Ok(result) => Ok(result),
         Err(
-            AgentMetadataError::PredicateFailed
-            | AgentMetadataError::WriteConflict
-            | AgentMetadataError::WriteReadVersionMismatch { .. },
+            MetaError::PredicateFailed
+            | MetaError::WriteConflict
+            | MetaError::WriteReadVersionMismatch { .. },
         ) => Err(GcError::ConcurrentMutation),
-        Err(error) => Err(GcError::Metadata(error)),
+        Err(error) => Err(GcError::Meta(error)),
     }
 }
 
 fn replay_operation_outcome(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
     operation_id: OperationId,
@@ -1808,7 +1820,7 @@ fn replay_operation_outcome(
 }
 
 fn replay_candidate_clear_outcome(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
     revision: ArtifactRevisionId,
@@ -1836,7 +1848,7 @@ fn replay_candidate_clear_outcome(
 }
 
 fn replay_history_barrier_outcome(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
 ) -> Result<Option<GcHistoryBarrierOutcome>, GcError> {
@@ -2158,7 +2170,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -2181,7 +2193,7 @@ mod tests {
         .seal()
     }
 
-    fn initialize_store(store: &AgentMetadataStore, counter: &mut u128) {
+    fn initialize_store(store: &MetaShard, counter: &mut u128) {
         store.advance_owner_epoch(None, owner_epoch()).unwrap();
         store
             .execute(&fence_command(
@@ -2202,7 +2214,7 @@ mod tests {
             .unwrap();
     }
 
-    fn write_context(store: &AgentMetadataStore, counter: &mut u128) -> RootWriteContext {
+    fn write_context(store: &MetaShard, counter: &mut u128) -> RootWriteContext {
         RootWriteContext::current(
             store,
             root(),
@@ -2214,7 +2226,7 @@ mod tests {
         .unwrap()
     }
 
-    fn read_context(store: &AgentMetadataStore) -> RootReadContext {
+    fn read_context(store: &MetaShard) -> RootReadContext {
         RootReadContext::current(store, root(), placement(), owner_epoch()).unwrap()
     }
 
@@ -2239,7 +2251,7 @@ mod tests {
     }
 
     fn seed_fixture(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         history_hold: bool,
         stale_candidate: bool,
@@ -2446,11 +2458,7 @@ mod tests {
         }
     }
 
-    fn read_payload(
-        store: &AgentMetadataStore,
-        family: MetadataFamily,
-        key: &[u8],
-    ) -> Option<Vec<u8>> {
+    fn read_payload(store: &MetaShard, family: MetadataFamily, key: &[u8]) -> Option<Vec<u8>> {
         let context = read_context(store);
         store
             .read_at(
@@ -2466,7 +2474,7 @@ mod tests {
 
     fn claim_and_begin(
         service: GcService<'_>,
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         fixture: &Fixture,
     ) -> GcOperationRecord {
@@ -2489,7 +2497,7 @@ mod tests {
     #[test]
     fn claim_replays_and_reference_race_has_one_winner() {
         let mut counter = 1;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize_store(&store, &mut counter);
         let fixture = seed_fixture(&store, &mut counter, false, false);
         let service = GcService::new(&store);
@@ -2532,7 +2540,7 @@ mod tests {
     #[test]
     fn releasing_history_hold_blocks_claim() {
         let mut counter = 100;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize_store(&store, &mut counter);
         let fixture = seed_fixture(&store, &mut counter, true, false);
         let service = GcService::new(&store);
@@ -2556,7 +2564,7 @@ mod tests {
     #[test]
     fn root_history_barrier_is_real_replayable_and_hold_fenced() {
         let mut counter = 150;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize_store(&store, &mut counter);
         let service = GcService::new(&store);
 
@@ -2591,7 +2599,7 @@ mod tests {
     #[test]
     fn manifest_fault_is_atomic_and_complete_releases_dependencies() {
         let mut counter = 200;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize_store(&store, &mut counter);
         let fixture = seed_fixture(&store, &mut counter, false, false);
         let service = GcService::new(&store);
@@ -2720,7 +2728,7 @@ mod tests {
     #[test]
     fn append_child_then_base_gc_separates_manifest_positions_from_physical_indexes() {
         let mut counter = 260;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize_store(&store, &mut counter);
         let fixture = seed_fixture(&store, &mut counter, false, false);
         let service = GcService::new(&store);
@@ -2870,7 +2878,7 @@ mod tests {
     #[test]
     fn stale_candidate_cleanup_is_safe_and_replayable() {
         let mut counter = 300;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize_store(&store, &mut counter);
         let fixture = seed_fixture(&store, &mut counter, false, true);
         let service = GcService::new(&store);
@@ -2904,7 +2912,7 @@ mod tests {
     #[test]
     fn candidate_pages_preserve_epoch_key_order() {
         let mut counter = 400;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize_store(&store, &mut counter);
         seed_fixture(&store, &mut counter, false, true);
         let service = GcService::new(&store);
@@ -2926,7 +2934,7 @@ mod tests {
         let temporary = tempdir().unwrap();
         let database = temporary.path().join("gc-metadata");
         let mut counter = 500;
-        let store = AgentMetadataStore::create_file(&database, shard()).unwrap();
+        let store = crate::workspace::test_support::initialize_file(&database, shard()).unwrap();
         initialize_store(&store, &mut counter);
         let fixture = seed_fixture(&store, &mut counter, false, false);
         let service = GcService::new(&store);
@@ -2940,7 +2948,7 @@ mod tests {
         assert_eq!(quarantined.operation.phase, GcPhase::Quarantined);
         drop(store);
 
-        let reopened = AgentMetadataStore::reopen_file(&database, shard()).unwrap();
+        let reopened = crate::workspace::test_support::open_file(&database, shard()).unwrap();
         let service = GcService::new(&reopened);
         let replay = service.quarantine(quarantine_request).unwrap();
         assert!(replay.replayed);

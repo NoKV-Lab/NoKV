@@ -26,7 +26,8 @@ use super::codec::{
     workbench_commit_head_key,
 };
 use super::commit_records::{CommitRecordError, WorkbenchCommitHeadRecord};
-use super::engine::{AgentMetadataError, AgentMetadataStore, MetadataFamily, MetadataScanItem};
+use super::engine::{MetaError, MetaShard, MetadataScanItem};
+use super::keyspace::MetadataFamily;
 use super::namespace::{get_visible_workspace_at, NamespaceError, RootReadContext};
 use super::publication_records::{PathEntry, PublicationRecordCodecError, WorkspaceRecord};
 use super::query_records::{
@@ -55,7 +56,7 @@ pub const MAX_FACET_BUCKETS_PER_FIELD: usize = 256;
 /// Maximum opaque cursor size.
 pub const MAX_QUERY_CURSOR_BYTES: usize = 8 * 1024;
 
-const ENGINE_SCAN_BATCH: usize = 256;
+const META_SCAN_BATCH: usize = 256;
 const CURSOR_FORMAT_VERSION: u8 = 1;
 
 /// Root-wide or exact-workbench query scope.
@@ -376,7 +377,7 @@ pub enum QueryError {
     CommitHeadCodec {
         source: CommitRecordError,
     },
-    Engine(AgentMetadataError),
+    Meta(MetaError),
 }
 
 impl fmt::Display for QueryError {
@@ -446,7 +447,7 @@ impl fmt::Display for QueryError {
             Self::CommitHeadCodec { source } => {
                 write!(formatter, "invalid WorkbenchCommitHead payload: {source}")
             }
-            Self::Engine(source) => source.fmt(formatter),
+            Self::Meta(source) => source.fmt(formatter),
         }
     }
 }
@@ -458,15 +459,15 @@ impl std::error::Error for QueryError {
             Self::Projection { source } => Some(source),
             Self::WorkspaceCodec { source } | Self::PathCodec { source } => Some(source),
             Self::CommitHeadCodec { source } => Some(source),
-            Self::Engine(source) => Some(source),
+            Self::Meta(source) => Some(source),
             _ => None,
         }
     }
 }
 
-impl From<AgentMetadataError> for QueryError {
-    fn from(source: AgentMetadataError) -> Self {
-        Self::Engine(source)
+impl From<MetaError> for QueryError {
+    fn from(source: MetaError) -> Self {
+        Self::Meta(source)
     }
 }
 
@@ -526,7 +527,7 @@ struct CollectedRows {
 
 /// Execute one metadata-only search at the exact fenced read version.
 pub fn search_paths_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     request: &SearchRequest,
 ) -> Result<SearchPage, QueryError> {
@@ -599,7 +600,7 @@ pub fn search_paths_at(
 
 /// Execute one bounded metadata aggregate at the exact fenced read version.
 pub fn aggregate_paths_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     request: &AggregateRequest,
 ) -> Result<AggregatePage, QueryError> {
@@ -677,7 +678,7 @@ pub fn aggregate_paths_at(
 
 /// Discover stable built-in and typed projection fields.
 pub fn catalog_fields_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     request: &CatalogRequest,
 ) -> Result<CatalogPage, QueryError> {
@@ -738,7 +739,7 @@ pub fn catalog_fields_at(
 
 /// Discover every visible workbench and its optional durable commit head.
 pub fn find_workspaces_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     request: &FindWorkspacesRequest,
 ) -> Result<FindWorkspacesPage, QueryError> {
@@ -793,7 +794,7 @@ pub fn find_workspaces_at(
 
 /// Resolve one visible workbench and its optional commit head without a scan.
 pub fn get_workspace_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
 ) -> Result<Option<WorkspaceDiscovery>, QueryError> {
@@ -826,7 +827,7 @@ pub fn get_workspace_at(
 /// Page strict typed events from an append-only durable position, rechecking
 /// workspace visibility at each event's commit version.
 pub fn read_changes_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     request: &ChangePageRequest,
 ) -> Result<ChangePage, QueryError> {
@@ -835,15 +836,13 @@ pub fn read_changes_at(
         .after_commit_version
         .is_some_and(|version| version.get() > context.read_version.get())
     {
-        return Err(QueryError::Engine(
-            AgentMetadataError::ReadVersionInFuture {
-                requested: request
-                    .after_commit_version
-                    .expect("checked as present")
-                    .get(),
-                current: context.read_version.get(),
-            },
-        ));
+        return Err(QueryError::Meta(MetaError::ReadVersionInFuture {
+            requested: request
+                .after_commit_version
+                .expect("checked as present")
+                .get(),
+            current: context.read_version.get(),
+        }));
     }
     let prefix = context.root_id.as_bytes();
     let digest = change_digest(context.root_id, request);
@@ -891,12 +890,12 @@ pub fn read_changes_at(
             prefix,
             context.read_version,
             marker.as_deref(),
-            ENGINE_SCAN_BATCH,
+            META_SCAN_BATCH,
         )?;
         if batch.is_empty() {
             break;
         }
-        let short = batch.len() < ENGINE_SCAN_BATCH;
+        let short = batch.len() < META_SCAN_BATCH;
         for item in batch {
             marker = Some(item.key.clone());
             if let Some(event) =
@@ -937,7 +936,7 @@ pub fn read_changes_at(
 }
 
 fn visible_change_event(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     scope: &QueryScope,
     item: MetadataScanItem,
@@ -991,7 +990,7 @@ fn visible_change_event(
 }
 
 fn collect_rows(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     scope: &QueryScope,
     path_prefix: Option<&NormalizedRelativePath>,
@@ -1001,7 +1000,7 @@ fn collect_rows(
         QueryScope::Workspace(workbench_id) => {
             get_visible_workspace_at(store, context, workbench_id)
                 .map_err(|error| match error {
-                    super::namespace::NamespaceError::Engine(source) => QueryError::Engine(source),
+                    super::namespace::NamespaceError::Meta(source) => QueryError::Meta(source),
                     super::namespace::NamespaceError::Codec { source, .. } => {
                         QueryError::WorkspaceCodec { source }
                     }
@@ -1048,7 +1047,7 @@ fn collect_rows(
 }
 
 fn scan_visible_workspaces(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
 ) -> Result<Vec<(WorkbenchId, WorkspaceRecord)>, QueryError> {
     let items = scan_all_prefix(
@@ -1084,7 +1083,7 @@ fn scan_visible_workspaces(
 }
 
 fn scan_commit_heads(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
 ) -> Result<BTreeMap<WorkspaceIncarnationId, WorkbenchCommitHeadRecord>, QueryError> {
     let items = scan_all_prefix(
@@ -1120,7 +1119,7 @@ fn scan_commit_heads(
 }
 
 fn scan_all_prefix(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     family: MetadataFamily,
     prefix: &[u8],
@@ -1136,13 +1135,13 @@ fn scan_all_prefix(
             prefix,
             context.read_version,
             marker.as_deref(),
-            ENGINE_SCAN_BATCH,
+            META_SCAN_BATCH,
         )?;
         if batch.is_empty() {
             break;
         }
         marker = batch.last().map(|item| item.key.clone());
-        let short = batch.len() < ENGINE_SCAN_BATCH;
+        let short = batch.len() < META_SCAN_BATCH;
         items.extend(batch);
         if short {
             break;
@@ -2291,7 +2290,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -2314,7 +2313,7 @@ mod tests {
         .seal()
     }
 
-    fn activate(store: &AgentMetadataStore) {
+    fn activate(store: &MetaShard) {
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&fence_command(store, request(1), RootFenceAction::Install))
@@ -2331,13 +2330,13 @@ mod tests {
             .unwrap();
     }
 
-    fn ready_store() -> AgentMetadataStore {
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+    fn ready_store() -> MetaShard {
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         activate(&store);
         store
     }
 
-    fn context(store: &AgentMetadataStore) -> RootReadContext {
+    fn context(store: &MetaShard) -> RootReadContext {
         RootReadContext::current(store, root(), placement(), owner()).unwrap()
     }
 
@@ -2351,7 +2350,7 @@ mod tests {
     }
 
     fn execute(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_fill: u8,
         predicates: Vec<CommandPredicate>,
         mutations: Vec<CommandMutation>,
@@ -2388,7 +2387,7 @@ mod tests {
     }
 
     fn put_records(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_fill: u8,
         records: Vec<(MetadataFamily, Vec<u8>, Vec<u8>)>,
     ) -> CommitVersion {
@@ -2472,7 +2471,7 @@ mod tests {
         QueryOperand::Set(values.into_iter().collect())
     }
 
-    fn predicate_store() -> (AgentMetadataStore, WorkbenchId) {
+    fn predicate_store() -> (MetaShard, WorkbenchId) {
         let store = ready_store();
         let name = workbench("predicate-fixture");
         let incarnation_id = incarnation(31);
@@ -2537,7 +2536,7 @@ mod tests {
     }
 
     fn aggregate_count(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         name: WorkbenchId,
         predicates: Vec<QueryPredicate>,
     ) -> u64 {
@@ -3501,12 +3500,10 @@ mod tests {
                     limit: 10,
                 },
             ),
-            Err(QueryError::Engine(
-                AgentMetadataError::ReadVersionInFuture {
-                    requested: future.get(),
-                    current: current.read_version.get(),
-                }
-            ))
+            Err(QueryError::Meta(MetaError::ReadVersionInFuture {
+                requested: future.get(),
+                current: current.read_version.get(),
+            }))
         );
     }
 
@@ -3757,10 +3754,10 @@ mod tests {
     }
 
     #[test]
-    fn more_than_engine_batch_pages_stably_after_file_reopen() {
+    fn more_than_meta_batch_pages_stably_after_file_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let store_path = directory.path().join("query-store");
-        let store = AgentMetadataStore::create_file(&store_path, shard()).unwrap();
+        let store = crate::workspace::test_support::initialize_file(&store_path, shard()).unwrap();
         activate(&store);
         let name = workbench("large");
         let incarnation_id = incarnation(13);
@@ -3792,7 +3789,7 @@ mod tests {
         let frozen = context(&store);
         drop(store);
 
-        let store = AgentMetadataStore::reopen_file(&store_path, shard()).unwrap();
+        let store = crate::workspace::test_support::open_file(&store_path, shard()).unwrap();
         let mut request = search_request(QueryScope::Workspace(name));
         request.projection = vec![field("row.number")];
         request.limit = 73;

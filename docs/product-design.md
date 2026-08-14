@@ -95,11 +95,11 @@ PathEntry
   -> immutable ArtifactRevisionId for manifest/lifetime ownership
 
 ArtifactRevisionId
-  -> compact Holt manifest
+  -> compact metadata manifest
   -> immutable S3-compatible object blocks
 ```
 
-The complete normalized filename is stored in the canonical ordered Holt key.
+The complete normalized filename is stored in the canonical ordered metadata key.
 Directories are derived from prefixes. The path value atomically projects the
 revision digest, manifest digest, size, dependency bounds, content type, and
 typed index fields needed by stat/list. This makes a cached-marker exact read
@@ -110,9 +110,11 @@ A cold request first resolves the Workbench marker. Its never-reused
 incarnation prevents abandoned restore rows from becoming visible under a
 reclaimed name.
 
-## Holt's Role
+## Transaction Store Role
 
-Holt is the shard-local ordered metadata engine, not the product API.
+`MetaShard` owns workspace semantics. `TxnStore` supplies ordered reads and
+checked atomic writes. Holt is the current serving local adapter, not the
+product API.
 
 ```text
 NoKV metadata layer
@@ -123,16 +125,20 @@ NoKV metadata layer
   revision references and GC
   root/owner fencing
 
-Holt
+TxnStore
   point reads
   prefix/delimiter scans
-  atomic multi-tree batches
-  WAL, checkpoints, views, and recovery substrate
+  checked atomic multi-keyspace writes
+
+HoltStore
+  keyspace-to-tree mapping
+  synchronous local WAL
+  checkpoints, views, and reopen recovery
 ```
 
-NoKV should exploit Holt's ART-shaped point/prefix behavior directly. It should
-not leak Holt layout into SDKs, protocol DTOs, Workbench tools, or object
-providers.
+The Holt adapter uses Holt's ART-shaped point and prefix behavior. NoKV does
+not leak the physical tree layout into metadata records, SDKs, protocol DTOs,
+Workbench tools, or object providers.
 
 ## Immutable Bodies And Publication
 

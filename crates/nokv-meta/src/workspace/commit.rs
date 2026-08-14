@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Holt-native immutable commit construction, consumption, and retirement.
+//! Metadata-native immutable commit construction, consumption, and retirement.
 //!
 //! Every potentially large closure is materialized or released by bounded
 //! commands. The operation row is the sole durable cursor and the sole
@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 
 use super::build_commit_records::{
     BuildCommitOperationRecord, BuildCommitResult, CommitManifestCondition,
-    CommitOperationRecordError, CommitOperationTerminalError, CommitRetireOperationRecord,
+    CommitOperationErrorKind, CommitOperationRecordError, CommitOperationTerminalError,
+    CommitRetireOperationRecord,
 };
 use super::codec::{
     artifact_revision_key, build_commit_history_hold_key, child_commit_consumer_key, commit_key,
@@ -36,10 +37,11 @@ use super::commit_records::{
     CommitMemberRecord, CommitRecord, CommitRecordError, TagRecord, WorkbenchCommitHeadRecord,
 };
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
-    HistoryProjection, MetadataCommand, MetadataCommandResult, MetadataFamily, RootFenceAction,
+    CommandFit, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
+    MetaShard, MetadataCommand, MetadataCommandResult, RootFenceAction,
 };
 use super::event_projection::change_event_projection;
+use super::keyspace::MetadataFamily;
 use super::namespace::{
     get_visible_path_at, get_visible_workspace_at, scan_visible_paths_at, NamespaceError,
     RootReadContext, RootWriteContext,
@@ -154,7 +156,7 @@ pub struct TagMutationOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitError {
-    Metadata(AgentMetadataError),
+    Meta(MetaError),
     Namespace(NamespaceError),
     CommitCodec(CommitRecordError),
     OperationCodec(CommitOperationRecordError),
@@ -210,7 +212,7 @@ pub enum CommitError {
 impl fmt::Display for CommitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Metadata(error) => error.fmt(formatter),
+            Self::Meta(error) => error.fmt(formatter),
             Self::Namespace(error) => error.fmt(formatter),
             Self::CommitCodec(error) => error.fmt(formatter),
             Self::OperationCodec(error) => error.fmt(formatter),
@@ -276,11 +278,24 @@ impl fmt::Display for CommitError {
     }
 }
 
-impl std::error::Error for CommitError {}
+impl std::error::Error for CommitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Meta(source) => Some(source),
+            Self::Namespace(source) => Some(source),
+            Self::CommitCodec(source) => Some(source),
+            Self::OperationCodec(source) => Some(source),
+            Self::PublicationCodec(source) => Some(source),
+            Self::SnapshotCodec(source) => Some(source),
+            Self::QueryRecord(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
-impl From<AgentMetadataError> for CommitError {
-    fn from(error: AgentMetadataError) -> Self {
-        Self::Metadata(error)
+impl From<MetaError> for CommitError {
+    fn from(error: MetaError) -> Self {
+        Self::Meta(error)
     }
 }
 
@@ -322,11 +337,23 @@ impl From<QueryRecordError> for CommitError {
 
 #[derive(Clone, Copy)]
 pub struct CommitService<'a> {
-    store: &'a AgentMetadataStore,
+    store: &'a MetaShard,
+}
+
+#[derive(Clone)]
+struct BuildCommandCandidate {
+    plan: CommandPlan,
+    operation: BuildCommitOperationRecord,
+}
+
+#[derive(Clone)]
+struct RetireCommandCandidate {
+    plan: CommandPlan,
+    operation: CommitRetireOperationRecord,
 }
 
 impl<'a> CommitService<'a> {
-    pub const fn new(store: &'a AgentMetadataStore) -> Self {
+    pub const fn new(store: &'a MetaShard) -> Self {
         Self { store }
     }
 
@@ -515,6 +542,7 @@ impl<'a> CommitService<'a> {
         )?;
         let mut next = loaded.record.clone();
         let mut plan = CommandPlan::default();
+        let mut candidates = Vec::new();
         let mut new_revisions =
             BTreeMap::<ArtifactRevisionId, Loaded<ArtifactRevisionRecord>>::new();
         let mut observed_revisions = BTreeSet::new();
@@ -593,6 +621,10 @@ impl<'a> CommitService<'a> {
                     &mut observed_revisions,
                     &mut plan,
                 )?;
+                candidates.push(BuildCommandCandidate {
+                    plan: plan.clone(),
+                    operation: next.clone(),
+                });
                 virtual_manifest_pending = false;
                 if next.member_count - loaded.record.member_count >= request.limit as u64 {
                     break;
@@ -613,6 +645,10 @@ impl<'a> CommitService<'a> {
                         &mut observed_revisions,
                         &mut plan,
                     )?;
+                    candidates.push(BuildCommandCandidate {
+                        plan: plan.clone(),
+                        operation: next.clone(),
+                    });
                     virtual_manifest_pending = false;
                 }
                 consumed_source_rows += 1;
@@ -640,6 +676,10 @@ impl<'a> CommitService<'a> {
                 &mut observed_revisions,
                 &mut plan,
             )?;
+            candidates.push(BuildCommandCandidate {
+                plan: plan.clone(),
+                operation: next.clone(),
+            });
             consumed_source_rows += 1;
         }
         if virtual_manifest_pending
@@ -658,6 +698,10 @@ impl<'a> CommitService<'a> {
                 &mut observed_revisions,
                 &mut plan,
             )?;
+            candidates.push(BuildCommandCandidate {
+                plan: plan.clone(),
+                operation: next.clone(),
+            });
             virtual_manifest_pending = false;
         }
 
@@ -675,10 +719,14 @@ impl<'a> CommitService<'a> {
             )?;
             next.members_complete = true;
         }
-        replace_operation(&mut plan, request.context.root_id, &loaded, &next)?;
-        let payload = next.encode()?;
-        let result = self.execute_plan(request.context, plan, payload)?;
-        decode_build_outcome(result, request.operation_id)
+        candidates.push(BuildCommandCandidate {
+            plan,
+            operation: next,
+        });
+        match self.execute_largest_fitting_build_candidate(request.context, &loaded, candidates)? {
+            Some(outcome) => Ok(outcome),
+            None => self.abort_capacity_exhausted(request.context, request.operation_id, "member"),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -871,6 +919,7 @@ impl<'a> CommitService<'a> {
         let end = (start + request.limit).min(loaded.record.parent_commits.len());
         let mut next = loaded.record.clone();
         let mut plan = CommandPlan::default();
+        let mut candidates = Vec::new();
         for index in start..end {
             let parent_id = next.parent_commits[index];
             if parent_id == next.commit_id {
@@ -924,12 +973,24 @@ impl<'a> CommitService<'a> {
                     .ok_or(CommitError::CounterOverflow {
                         field: "parent_cursor",
                     })?;
+            candidates.push(BuildCommandCandidate {
+                plan: plan.clone(),
+                operation: next.clone(),
+            });
         }
         next.parents_complete = end == next.parent_commits.len();
-        replace_operation(&mut plan, request.context.root_id, &loaded, &next)?;
-        let payload = next.encode()?;
-        let result = self.execute_plan(request.context, plan, payload)?;
-        decode_build_outcome(result, request.operation_id)
+        candidates.push(BuildCommandCandidate {
+            plan,
+            operation: next,
+        });
+        match self.execute_largest_fitting_build_candidate(request.context, &loaded, candidates)? {
+            Some(outcome) => Ok(outcome),
+            None => self.abort_capacity_exhausted(
+                request.context,
+                request.operation_id,
+                "parent attachment",
+            ),
+        }
     }
 
     pub fn begin_sealing(
@@ -1540,7 +1601,10 @@ impl<'a> CommitService<'a> {
 
         let mut next = loaded.record.clone();
         let mut plan = CommandPlan::default();
+        let mut candidates = Vec::new();
+        let cleanup_step;
         if next.cleanup_parent_count < next.parent_cursor {
+            cleanup_step = "parent consumer";
             let remaining = next.parent_cursor - next.cleanup_parent_count;
             let count = remaining.min(request.limit as u32);
             let next_commit = next_commit_version(request.context)?;
@@ -1573,10 +1637,22 @@ impl<'a> CommitService<'a> {
                         field: "cleanup_parent_count",
                     },
                 )?;
+                candidates.push(BuildCommandCandidate {
+                    plan: plan.clone(),
+                    operation: next.clone(),
+                });
             }
         } else if next.cleanup_revision_count < next.revision_ref_count {
-            self.plan_build_revision_cleanup(request.context, request.limit, &mut next, &mut plan)?;
+            cleanup_step = "revision reference";
+            self.plan_build_revision_cleanup(
+                request.context,
+                request.limit,
+                &mut next,
+                &mut plan,
+                &mut candidates,
+            )?;
         } else if next.cleanup_member_count < next.member_count {
+            cleanup_step = "member";
             let prefix = commit_member_prefix(request.context.root_id, next.commit_id);
             let rows = self.store.scan_prefix_at(
                 request.context.root_id,
@@ -1605,6 +1681,10 @@ impl<'a> CommitService<'a> {
                 plan.delete(MetadataFamily::CommitMember, row.key, row.value)?;
                 next.cleanup_member_count =
                     checked_add(next.cleanup_member_count, 1, "cleanup_member_count")?;
+                candidates.push(BuildCommandCandidate {
+                    plan: plan.clone(),
+                    operation: next.clone(),
+                });
             }
             if next.cleanup_member_count > next.member_count {
                 return Err(CommitError::ClosureMismatch {
@@ -1614,6 +1694,7 @@ impl<'a> CommitService<'a> {
                 });
             }
         } else {
+            cleanup_step = "finalization";
             let member_rows = self.scan_prefix(
                 request.context,
                 MetadataFamily::CommitMember,
@@ -1643,10 +1724,14 @@ impl<'a> CommitService<'a> {
             next.phase = BuildCommitPhase::Cleaned;
             next.history_hold_released = true;
         }
-        replace_operation(&mut plan, request.context.root_id, &loaded, &next)?;
-        let payload = next.encode()?;
-        let result = self.execute_plan(request.context, plan, payload)?;
-        decode_build_outcome(result, request.operation_id)
+        candidates.push(BuildCommandCandidate {
+            plan,
+            operation: next,
+        });
+        match self.execute_largest_fitting_build_candidate(request.context, &loaded, candidates)? {
+            Some(outcome) => Ok(outcome),
+            None => self.quarantine_cleanup_capacity(request.context, &loaded, cleanup_step),
+        }
     }
 
     fn plan_build_revision_cleanup(
@@ -1655,6 +1740,7 @@ impl<'a> CommitService<'a> {
         limit: usize,
         operation: &mut BuildCommitOperationRecord,
         plan: &mut CommandPlan,
+        candidates: &mut Vec<BuildCommandCandidate>,
     ) -> Result<(), CommitError> {
         let prefix = commit_revision_ref_prefix(context.root_id, operation.commit_id);
         let rows = self.scan_prefix(context, MetadataFamily::RevisionRef, &prefix, limit)?;
@@ -1703,6 +1789,10 @@ impl<'a> CommitService<'a> {
                 1,
                 "cleanup_revision_count",
             )?;
+            candidates.push(BuildCommandCandidate {
+                plan: plan.clone(),
+                operation: operation.clone(),
+            });
         }
         if operation.cleanup_revision_count > operation.revision_ref_count {
             return Err(CommitError::ClosureMismatch {
@@ -1806,6 +1896,8 @@ impl<'a> CommitService<'a> {
         }
         let mut next = loaded.record.clone();
         let mut plan = CommandPlan::default();
+        let mut candidates = Vec::new();
+        let release_step;
         plan.assert_value(
             MetadataFamily::Commit,
             commit_key(request.context.root_id, next.commit_id),
@@ -1813,27 +1905,34 @@ impl<'a> CommitService<'a> {
         )?;
 
         if next.released_revision_count < next.revision_count {
+            release_step = "revision reference";
             self.plan_retire_revision_release(
                 request.context,
                 request.limit.min(MAX_COMMIT_REVISION_BATCH_ROWS),
                 &mut next,
                 &mut plan,
+                &mut candidates,
             )?;
         } else if (next.released_parent_count as usize) < next.parent_commits.len() {
+            release_step = "parent consumer";
             self.plan_retire_parent_release(
                 request.context,
                 request.limit.min(MAX_COMMIT_PARENT_BATCH_ROWS),
                 &mut next,
                 &mut plan,
+                &mut candidates,
             )?;
         } else if next.released_member_count < next.member_count {
+            release_step = "member";
             self.plan_retire_member_release(
                 request.context,
                 request.limit.min(MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS),
                 &mut next,
                 &mut plan,
+                &mut candidates,
             )?;
         } else {
+            release_step = "finalization";
             verify_retire_seals(&next)?;
             let member_rows = self.scan_prefix(
                 request.context,
@@ -1863,11 +1962,15 @@ impl<'a> CommitService<'a> {
                 retired.encode()?,
             )?;
             next.phase = CommitRetirePhase::Complete;
+            candidates.push(RetireCommandCandidate {
+                plan: plan.clone(),
+                operation: next.clone(),
+            });
         }
-        replace_retire_operation(&mut plan, request.context.root_id, &loaded, &next)?;
-        let payload = next.encode()?;
-        let result = self.execute_plan(request.context, plan, payload)?;
-        decode_retire_outcome(result, request.operation_id)
+        match self.execute_largest_fitting_retire_candidate(request.context, &loaded, candidates)? {
+            Some(outcome) => Ok(outcome),
+            None => self.quarantine_retire_capacity(request.context, &loaded, release_step),
+        }
     }
 
     fn plan_retire_revision_release(
@@ -1876,6 +1979,7 @@ impl<'a> CommitService<'a> {
         limit: usize,
         operation: &mut CommitRetireOperationRecord,
         plan: &mut CommandPlan,
+        candidates: &mut Vec<RetireCommandCandidate>,
     ) -> Result<(), CommitError> {
         let prefix = commit_revision_ref_prefix(context.root_id, operation.commit_id);
         let rows = self.scan_prefix(context, MetadataFamily::RevisionRef, &prefix, limit)?;
@@ -1937,6 +2041,10 @@ impl<'a> CommitService<'a> {
                     .encode()?,
                 )?;
             }
+            candidates.push(RetireCommandCandidate {
+                plan: plan.clone(),
+                operation: operation.clone(),
+            });
         }
         Ok(())
     }
@@ -1947,6 +2055,7 @@ impl<'a> CommitService<'a> {
         limit: usize,
         operation: &mut CommitRetireOperationRecord,
         plan: &mut CommandPlan,
+        candidates: &mut Vec<RetireCommandCandidate>,
     ) -> Result<(), CommitError> {
         let start = operation.released_parent_count as usize;
         let end = (start + limit).min(operation.parent_commits.len());
@@ -1980,6 +2089,10 @@ impl<'a> CommitService<'a> {
                 .ok_or(CommitError::CounterOverflow {
                     field: "released_parent_count",
                 })?;
+            candidates.push(RetireCommandCandidate {
+                plan: plan.clone(),
+                operation: operation.clone(),
+            });
         }
         Ok(())
     }
@@ -1990,6 +2103,7 @@ impl<'a> CommitService<'a> {
         limit: usize,
         operation: &mut CommitRetireOperationRecord,
         plan: &mut CommandPlan,
+        candidates: &mut Vec<RetireCommandCandidate>,
     ) -> Result<(), CommitError> {
         let prefix = commit_member_prefix(context.root_id, operation.commit_id);
         let rows = self.scan_prefix(context, MetadataFamily::CommitMember, &prefix, limit)?;
@@ -2022,6 +2136,10 @@ impl<'a> CommitService<'a> {
                 });
             }
             plan.delete(MetadataFamily::CommitMember, row.key, row.value)?;
+            candidates.push(RetireCommandCandidate {
+                plan: plan.clone(),
+                operation: operation.clone(),
+            });
         }
         Ok(())
     }
@@ -2326,25 +2444,131 @@ impl<'a> CommitService<'a> {
         plan: CommandPlan,
         deterministic_result: Vec<u8>,
     ) -> Result<MetadataCommandResult, CommitError> {
-        let command = MetadataCommand {
-            schema_id: SCHEMA_ID.to_owned(),
-            root_id: context.root_id,
-            logical_shard_id: context.logical_shard_id,
-            placement_generation: context.placement_generation,
-            owner_epoch: context.owner_epoch,
-            request_id: context.request_id,
-            command_digest: nokv_types::CommandDigest::from_bytes([0; SHA256_BYTES]),
-            read_version: context.read_version,
-            root_fence_action: RootFenceAction::RequireActive,
-            predicates: plan.predicates,
-            mutations: plan.mutations,
-            history_projection: plan.history,
-            event_projection: plan.events,
-            deterministic_result,
-        }
-        .seal();
+        let command = build_command(context, plan, deterministic_result);
         self.store.execute(&command).map_err(Into::into)
     }
+
+    fn execute_largest_fitting_build_candidate(
+        &self,
+        context: RootWriteContext,
+        loaded: &Loaded<BuildCommitOperationRecord>,
+        candidates: Vec<BuildCommandCandidate>,
+    ) -> Result<Option<BuildCommitOutcome>, CommitError> {
+        for candidate in candidates.into_iter().rev() {
+            let mut plan = candidate.plan;
+            replace_operation(&mut plan, context.root_id, loaded, &candidate.operation)?;
+            let payload = candidate.operation.encode()?;
+            let command = build_command(context, plan, payload);
+            if self.store.command_fit(&command, None)? == CommandFit::Fits {
+                let result = self.store.execute(&command)?;
+                return decode_build_outcome(result, loaded.record.operation_id).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn abort_capacity_exhausted(
+        &self,
+        context: RootWriteContext,
+        operation_id: OperationId,
+        step: &'static str,
+    ) -> Result<BuildCommitOutcome, CommitError> {
+        self.abort_build(AbortBuildCommitRequest {
+            context,
+            operation_id,
+            terminal_error: CommitOperationTerminalError {
+                kind: CommitOperationErrorKind::InvariantViolation,
+                message: format!(
+                    "serving transaction capacity cannot admit one commit {step} step"
+                ),
+            },
+        })
+    }
+
+    fn quarantine_cleanup_capacity(
+        &self,
+        context: RootWriteContext,
+        loaded: &Loaded<BuildCommitOperationRecord>,
+        step: &'static str,
+    ) -> Result<BuildCommitOutcome, CommitError> {
+        let mut next = loaded.record.clone();
+        next.phase = BuildCommitPhase::Quarantined;
+        next.terminal_error = Some(CommitOperationTerminalError {
+            kind: CommitOperationErrorKind::InvariantViolation,
+            message: format!(
+                "serving transaction capacity cannot admit one commit cleanup {step} step"
+            ),
+        });
+        let mut plan = CommandPlan::default();
+        replace_operation(&mut plan, context.root_id, loaded, &next)?;
+        let payload = next.encode()?;
+        let result = self.execute_plan(context, plan, payload)?;
+        decode_build_outcome(result, loaded.record.operation_id)
+    }
+
+    fn execute_largest_fitting_retire_candidate(
+        &self,
+        context: RootWriteContext,
+        loaded: &Loaded<CommitRetireOperationRecord>,
+        candidates: Vec<RetireCommandCandidate>,
+    ) -> Result<Option<RetireCommitOutcome>, CommitError> {
+        for candidate in candidates.into_iter().rev() {
+            let mut plan = candidate.plan;
+            replace_retire_operation(&mut plan, context.root_id, loaded, &candidate.operation)?;
+            let payload = candidate.operation.encode()?;
+            let command = build_command(context, plan, payload);
+            if self.store.command_fit(&command, None)? == CommandFit::Fits {
+                let result = self.store.execute(&command)?;
+                return decode_retire_outcome(result, loaded.record.operation_id).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn quarantine_retire_capacity(
+        &self,
+        context: RootWriteContext,
+        loaded: &Loaded<CommitRetireOperationRecord>,
+        step: &'static str,
+    ) -> Result<RetireCommitOutcome, CommitError> {
+        let mut next = loaded.record.clone();
+        next.phase = CommitRetirePhase::Quarantined;
+        next.terminal_error = Some(CommitOperationTerminalError {
+            kind: super::build_commit_records::CommitOperationErrorKind::InvariantViolation,
+            message: format!(
+                "serving transaction capacity cannot admit one commit retirement {step} step"
+            ),
+        });
+        let mut plan = CommandPlan::default();
+        replace_retire_operation(&mut plan, context.root_id, loaded, &next)?;
+        let payload = next.encode()?;
+        let result = self.execute_plan(context, plan, payload)?;
+        decode_retire_outcome(result, loaded.record.operation_id)
+    }
+}
+
+fn build_command(
+    context: RootWriteContext,
+    plan: CommandPlan,
+    deterministic_result: Vec<u8>,
+) -> MetadataCommand {
+    MetadataCommand {
+        schema_id: SCHEMA_ID.to_owned(),
+        root_id: context.root_id,
+        logical_shard_id: context.logical_shard_id,
+        placement_generation: context.placement_generation,
+        owner_epoch: context.owner_epoch,
+        request_id: context.request_id,
+        command_digest: nokv_types::CommandDigest::from_bytes([0; SHA256_BYTES]),
+        read_version: context.read_version,
+        root_fence_action: RootFenceAction::RequireActive,
+        predicates: plan.predicates,
+        mutations: plan.mutations,
+        history_projection: plan.history,
+        event_projection: plan.events,
+        deterministic_result,
+    }
+    .seal()
 }
 
 #[derive(Clone, Debug)]
@@ -2353,7 +2577,7 @@ struct Loaded<T> {
     record: T,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CommandPlan {
     predicates: Vec<CommandPredicate>,
     mutations: Vec<CommandMutation>,
@@ -2845,7 +3069,7 @@ mod tests {
         request(value)
     }
 
-    fn write_context(store: &AgentMetadataStore, counter: &mut u128) -> RootWriteContext {
+    fn write_context(store: &MetaShard, counter: &mut u128) -> RootWriteContext {
         RootWriteContext::current(
             store,
             root(),
@@ -2858,7 +3082,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -2881,7 +3105,7 @@ mod tests {
         .seal()
     }
 
-    fn initialize(store: &AgentMetadataStore, counter: &mut u128) {
+    fn initialize(store: &MetaShard, counter: &mut u128) {
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&fence_command(
@@ -2909,14 +3133,14 @@ mod tests {
         .unwrap();
     }
 
-    fn ready_store(counter: &mut u128) -> AgentMetadataStore {
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+    fn ready_store(counter: &mut u128) -> MetaShard {
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         initialize(&store, counter);
         store
     }
 
     fn raw_put(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         records: Vec<(MetadataFamily, Vec<u8>, Vec<u8>)>,
     ) {
@@ -2989,7 +3213,7 @@ mod tests {
         }
     }
 
-    fn seed_paths(store: &AgentMetadataStore, counter: &mut u128, count: usize) {
+    fn seed_paths(store: &MetaShard, counter: &mut u128, count: usize) {
         for start in (0..count).step_by(MAX_COMMIT_MEMBER_BATCH_ROWS) {
             let mut records = Vec::new();
             for index in start..(start + MAX_COMMIT_MEMBER_BATCH_ROWS).min(count) {
@@ -3007,6 +3231,61 @@ mod tests {
                 ));
             }
             raw_put(store, counter, records);
+        }
+    }
+
+    fn seed_large_paths(
+        store: &MetaShard,
+        counter: &mut u128,
+        count: usize,
+        projection_bytes: usize,
+    ) {
+        for index in 0..count {
+            let revision_id = revision(90_000 + index as u128);
+            let path = NormalizedRelativePath::new(format!("large/{index:04}.bin")).unwrap();
+            let mut entry = path_entry(index, revision_id);
+            entry.typed_index_projection = vec![index as u8; projection_bytes];
+            raw_put(
+                store,
+                counter,
+                vec![
+                    (
+                        MetadataFamily::ArtifactRevision,
+                        artifact_revision_key(root(), revision_id),
+                        artifact(index).encode().unwrap(),
+                    ),
+                    (
+                        MetadataFamily::PathCurrent,
+                        path_current_key(root(), incarnation(), &path),
+                        entry.encode().unwrap(),
+                    ),
+                ],
+            );
+        }
+    }
+
+    fn large_parent_record(
+        tree_revision: ArtifactRevisionId,
+        lineage_bytes: usize,
+    ) -> CommitRecord {
+        CommitRecord {
+            source_workspace_incarnation_id: incarnation(),
+            content_digest_uri: "sha256:parent-content".to_owned(),
+            manifest_digest_uri: "sha256:parent-manifest".to_owned(),
+            tree_manifest_revision_id: tree_revision,
+            tree_digest_uri: "sha256:parent-tree".to_owned(),
+            member_count: 0,
+            member_digest: [0; SHA256_BYTES],
+            unique_revision_count: 1,
+            revision_digest: [1; SHA256_BYTES],
+            parent_commits: Vec::new(),
+            parent_digest: [0; SHA256_BYTES],
+            producer: None,
+            lineage_projection: vec![0x5a; lineage_bytes],
+            consumer_count: 1,
+            consumer_epoch: ConsumerEpoch::new(1),
+            last_zero_consumer_version: None,
+            state: CommitState::Sealed,
         }
     }
 
@@ -3038,7 +3317,7 @@ mod tests {
     }
 
     fn finish_build(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation_id: OperationId,
     ) -> BuildCommitOutcome {
@@ -3082,11 +3361,7 @@ mod tests {
             .unwrap()
     }
 
-    fn read_current(
-        store: &AgentMetadataStore,
-        family: MetadataFamily,
-        key: &[u8],
-    ) -> Option<Vec<u8>> {
+    fn read_current(store: &MetaShard, family: MetadataFamily, key: &[u8]) -> Option<Vec<u8>> {
         store
             .read_at(
                 root(),
@@ -3100,7 +3375,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_and_retires_closures_larger_than_one_holt_command() {
+    fn builds_and_retires_closures_larger_than_one_metadata_command() {
         let mut counter = 100_u128;
         let store = ready_store(&mut counter);
         seed_paths(&store, &mut counter, LARGE_CLOSURE_ROWS);
@@ -3230,6 +3505,464 @@ mod tests {
     }
 
     #[test]
+    fn member_build_and_cleanup_fit_bounded_batches_and_replay() {
+        const ROWS: usize = 24;
+        const PROJECTION_BYTES: usize = 24 * 1024;
+
+        let mut counter = 20_000_u128;
+        let store = ready_store(&mut counter);
+        seed_large_paths(&store, &mut counter, ROWS, PROJECTION_BYTES);
+        let service = CommitService::new(&store);
+        let operation_id = operation(90);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                operation_id,
+                commit(90),
+                revision(90_000),
+                vec![],
+            ))
+            .unwrap();
+
+        let first_context = write_context(&store, &mut counter);
+        let first_request = BuildCommitStepRequest {
+            context: first_context,
+            operation_id,
+            limit: ROWS,
+        };
+        let first = service.build_members(first_request).unwrap();
+        assert_eq!(first.operation.member_count, ROWS as u64);
+        assert!(first.operation.members_complete);
+        let replay = service.build_members(first_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, first.operation);
+
+        let mut built = first;
+        while !built.operation.members_complete {
+            built = service
+                .build_members(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: ROWS,
+                })
+                .unwrap();
+            assert_eq!(built.operation.phase, BuildCommitPhase::Building);
+        }
+        assert_eq!(built.operation.member_count, ROWS as u64);
+
+        service
+            .abort_build(AbortBuildCommitRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                terminal_error: CommitOperationTerminalError {
+                    kind: super::super::CommitOperationErrorKind::AbortedByCaller,
+                    message: "exercise byte-aware cleanup".to_owned(),
+                },
+            })
+            .unwrap();
+        service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+            })
+            .unwrap();
+
+        loop {
+            let outcome = service
+                .cleanup_build(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+                })
+                .unwrap();
+            assert_ne!(outcome.operation.phase, BuildCommitPhase::Quarantined);
+            if outcome.operation.phase == BuildCommitPhase::Cleaned {
+                assert_eq!(outcome.operation.cleanup_member_count, ROWS as u64);
+                assert!(outcome.operation.history_hold_released);
+                break;
+            }
+        }
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn retirement_member_release_fits_bounded_batch_and_replays() {
+        const ROWS: usize = 24;
+        const PROJECTION_BYTES: usize = 24 * 1024;
+
+        let mut counter = 24_000_u128;
+        let store = ready_store(&mut counter);
+        seed_large_paths(&store, &mut counter, ROWS, PROJECTION_BYTES);
+        let service = CommitService::new(&store);
+        let build_id = operation(91);
+        let commit_id = commit(91);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                build_id,
+                commit_id,
+                revision(90_000),
+                vec![],
+            ))
+            .unwrap();
+        let completed = finish_build(&store, &mut counter, build_id);
+        assert_eq!(completed.operation.member_count, ROWS as u64);
+
+        detach_head(&store, &mut counter, commit_id);
+        let zero = CommitRecord::decode(
+            &read_current(
+                &store,
+                MetadataFamily::Commit,
+                &commit_key(root(), commit_id),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let retire_id = operation(95);
+        service
+            .begin_retirement(BeginCommitRetirementRequest {
+                context: write_context(&store, &mut counter),
+                operation_id: retire_id,
+                commit_id,
+                expected_consumer_epoch: zero.consumer_epoch,
+            })
+            .unwrap();
+
+        let mut outcome = service
+            .release_retired_commit(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id: retire_id,
+                limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
+            })
+            .unwrap();
+        while outcome.operation.released_revision_count < outcome.operation.revision_count {
+            outcome = service
+                .release_retired_commit(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id: retire_id,
+                    limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
+                })
+                .unwrap();
+            assert_ne!(outcome.operation.phase, CommitRetirePhase::Quarantined);
+        }
+
+        let member_context = write_context(&store, &mut counter);
+        let member_request = BuildCommitStepRequest {
+            context: member_context,
+            operation_id: retire_id,
+            limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
+        };
+        let first = service.release_retired_commit(member_request).unwrap();
+        assert_eq!(first.operation.released_member_count, ROWS as u64);
+        let replay = service.release_retired_commit(member_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, first.operation);
+
+        outcome = first;
+        while outcome.operation.phase != CommitRetirePhase::Complete {
+            outcome = service
+                .release_retired_commit(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id: retire_id,
+                    limit: MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
+                })
+                .unwrap();
+            assert_ne!(outcome.operation.phase, CommitRetirePhase::Quarantined);
+        }
+        assert_eq!(outcome.operation.released_member_count, ROWS as u64);
+        let retired = CommitRecord::decode(
+            &read_current(
+                &store,
+                MetadataFamily::Commit,
+                &commit_key(root(), commit_id),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retired.state, CommitState::Retired);
+    }
+
+    #[test]
+    fn capacity_abort_is_durable_replayable_and_cleanup_releases_hold() {
+        let mut counter = 25_000_u128;
+        let store = ready_store(&mut counter);
+        let service = CommitService::new(&store);
+        let operation_id = operation(92);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                operation_id,
+                commit(92),
+                revision(92_000),
+                vec![],
+            ))
+            .unwrap();
+
+        let abort_context = write_context(&store, &mut counter);
+        let aborted = service
+            .abort_capacity_exhausted(abort_context, operation_id, "member")
+            .unwrap();
+        assert_eq!(aborted.operation.phase, BuildCommitPhase::Aborting);
+        assert_eq!(
+            aborted.operation.terminal_error.as_ref().unwrap().kind,
+            super::super::CommitOperationErrorKind::InvariantViolation
+        );
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_some());
+
+        let replay = service
+            .abort_capacity_exhausted(abort_context, operation_id, "member")
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, aborted.operation);
+
+        service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: 1,
+            })
+            .unwrap();
+        let cleaned = service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(cleaned.operation.phase, BuildCommitPhase::Cleaned);
+        assert!(cleaned.operation.history_hold_released);
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cleanup_capacity_quarantine_replays_without_releasing_hold() {
+        let mut counter = 27_000_u128;
+        let store = ready_store(&mut counter);
+        let service = CommitService::new(&store);
+        let operation_id = operation(93);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                operation_id,
+                commit(93),
+                revision(93_000),
+                vec![],
+            ))
+            .unwrap();
+        service
+            .abort_build(AbortBuildCommitRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                terminal_error: CommitOperationTerminalError {
+                    kind: super::super::CommitOperationErrorKind::AbortedByCaller,
+                    message: "prepare cleanup quarantine".to_owned(),
+                },
+            })
+            .unwrap();
+        service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: 1,
+            })
+            .unwrap();
+
+        let quarantine_context = write_context(&store, &mut counter);
+        let loaded = service
+            .load_build_operation(quarantine_context, operation_id)
+            .unwrap();
+        let quarantined = service
+            .quarantine_cleanup_capacity(quarantine_context, &loaded, "member")
+            .unwrap();
+        assert_eq!(quarantined.operation.phase, BuildCommitPhase::Quarantined);
+        assert!(!quarantined.operation.history_hold_released);
+        assert_eq!(
+            quarantined.operation.terminal_error.as_ref().unwrap().kind,
+            super::super::CommitOperationErrorKind::InvariantViolation
+        );
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_some());
+
+        let replay = service
+            .quarantine_cleanup_capacity(quarantine_context, &loaded, "member")
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, quarantined.operation);
+        assert!(read_current(
+            &store,
+            MetadataFamily::HistoryHold,
+            &build_commit_history_hold_key(root(), operation_id),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn parent_attach_shrinks_to_transaction_byte_budget_replays_and_cleans_up() {
+        // Fifty-three values are the smallest prefix in this fixture whose
+        // fully derived command crosses the 16 MB serving envelope. The
+        // 52-parent prefix fits, while 53 parents remain below the 256-item
+        // command ceiling, isolating transaction bytes as the limiting axis.
+        const PARENTS: usize = 53;
+        const LINEAGE_BYTES: usize = 60_000;
+
+        let mut counter = 30_000_u128;
+        let store = ready_store(&mut counter);
+        let tree_revision = revision(95_000);
+        raw_put(
+            &store,
+            &mut counter,
+            vec![(
+                MetadataFamily::ArtifactRevision,
+                artifact_revision_key(root(), tree_revision),
+                artifact(0).encode().unwrap(),
+            )],
+        );
+        let parents = (0..PARENTS)
+            .map(|index| commit(100 + index as u8))
+            .collect::<Vec<_>>();
+        raw_put(
+            &store,
+            &mut counter,
+            parents
+                .iter()
+                .map(|parent| {
+                    (
+                        MetadataFamily::Commit,
+                        commit_key(root(), *parent),
+                        large_parent_record(tree_revision, LINEAGE_BYTES)
+                            .encode()
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        );
+
+        let service = CommitService::new(&store);
+        let operation_id = operation(91);
+        let child_commit = commit(99);
+        service
+            .begin_build(begin_request(
+                write_context(&store, &mut counter),
+                operation_id,
+                child_commit,
+                tree_revision,
+                parents.clone(),
+            ))
+            .unwrap();
+        assert!(
+            service
+                .build_members(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: 1,
+                })
+                .unwrap()
+                .operation
+                .members_complete
+        );
+        assert!(
+            service
+                .seal_revisions(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+                })
+                .unwrap()
+                .operation
+                .revisions_complete
+        );
+
+        let first_context = write_context(&store, &mut counter);
+        let first_request = BuildCommitStepRequest {
+            context: first_context,
+            operation_id,
+            limit: PARENTS,
+        };
+        let first = service.attach_parents(first_request).unwrap();
+        assert_eq!(first.operation.parent_cursor, 52);
+        assert!(!first.operation.parents_complete);
+        let replay = service.attach_parents(first_request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, first.operation);
+
+        let mut attached = first;
+        while !attached.operation.parents_complete {
+            attached = service
+                .attach_parents(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: PARENTS,
+                })
+                .unwrap();
+        }
+        service
+            .abort_build(AbortBuildCommitRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                terminal_error: CommitOperationTerminalError {
+                    kind: super::super::CommitOperationErrorKind::AbortedByCaller,
+                    message: "exercise byte-aware parent cleanup".to_owned(),
+                },
+            })
+            .unwrap();
+        service
+            .cleanup_build(BuildCommitStepRequest {
+                context: write_context(&store, &mut counter),
+                operation_id,
+                limit: MAX_COMMIT_REVISION_BATCH_ROWS,
+            })
+            .unwrap();
+
+        loop {
+            let outcome = service
+                .cleanup_build(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter),
+                    operation_id,
+                    limit: 1,
+                })
+                .unwrap();
+            assert_ne!(outcome.operation.phase, BuildCommitPhase::Quarantined);
+            if outcome.operation.phase == BuildCommitPhase::Cleaned {
+                assert_eq!(outcome.operation.cleanup_parent_count, PARENTS as u32);
+                break;
+            }
+        }
+        for parent in parents {
+            assert!(read_current(
+                &store,
+                MetadataFamily::CommitConsumer,
+                &child_commit_consumer_key(root(), parent, child_commit),
+            )
+            .is_none());
+            let record = CommitRecord::decode(
+                &read_current(&store, MetadataFamily::Commit, &commit_key(root(), parent)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(record.consumer_count, 1);
+        }
+    }
+
+    #[test]
     fn begin_retry_reuses_first_durable_commit_time_after_clock_advances() {
         let mut counter = 10_u128;
         let store = ready_store(&mut counter);
@@ -3308,7 +4041,7 @@ mod tests {
         ));
     }
 
-    fn detach_head(store: &AgentMetadataStore, counter: &mut u128, commit_id: CommitId) {
+    fn detach_head(store: &MetaShard, counter: &mut u128, commit_id: CommitId) {
         let context = write_context(store, counter);
         let head_key = workbench_commit_head_key(root(), incarnation());
         let head_payload =
@@ -3395,7 +4128,8 @@ mod tests {
         let database = directory.path().join("commit-reopen.holt");
         let mut counter = 1_000_u128;
         {
-            let store = AgentMetadataStore::create_file(&database, shard()).unwrap();
+            let store =
+                crate::workspace::test_support::initialize_file(&database, shard()).unwrap();
             initialize(&store, &mut counter);
             seed_paths(&store, &mut counter, 97);
             let service = CommitService::new(&store);
@@ -3419,341 +4153,10 @@ mod tests {
             assert!(!partial.operation.members_complete);
         }
 
-        let store = AgentMetadataStore::reopen_file(&database, shard()).unwrap();
+        let store = crate::workspace::test_support::open_file(&database, shard()).unwrap();
         let complete = finish_build(&store, &mut counter, operation(11));
         assert_eq!(complete.operation.member_count, 97);
         assert_eq!(complete.operation.phase, BuildCommitPhase::Complete);
-    }
-
-    /// Power-loss torn-write probe for the file-backed metadata store.
-    ///
-    /// Crash model: the process dies while holt's checkpoint round is
-    /// `pwrite`ing 512 KiB blob frames into `blobs.dat`. A frame write is
-    /// not power-loss atomic — any subset of the in-flight bytes may
-    /// persist — so a slot the durable manifest still references must
-    /// never be modified before a manifest flush stops referencing it.
-    /// An in-place same-GUID rewrite (holt <= 0.8.2) violates this and
-    /// tears the only complete copy of the frame the sync-WAL redo needs
-    /// as its base image.
-    ///
-    /// The probe drives the real store through public commands, brackets
-    /// one checkpoint round with directory snapshots (`journal.wal`
-    /// truncating back to its header marks a completed, quiescent round),
-    /// and asserts the round never rewrote a slot whose GUID -> slot
-    /// mapping was durable both before and after it. If violated, it
-    /// reconstructs the torn crash image and reports what reopening it
-    /// does to acked metadata. It then verifies recovery tolerates torn
-    /// bytes in slots the crash-time manifest does not reference.
-    #[test]
-    fn file_store_checkpoint_never_rewrites_durable_slots_in_place() {
-        use std::path::Path;
-        use std::time::{Duration, Instant};
-
-        const SLOT_BYTES: usize = 0x80000;
-
-        fn snapshot_store_dir(src: &Path, dst: &Path) {
-            std::fs::create_dir_all(dst).unwrap();
-            for entry in std::fs::read_dir(src).unwrap() {
-                let entry = entry.unwrap();
-                if entry.file_name().to_string_lossy() == "store.lock" {
-                    continue;
-                }
-                let target = dst.join(entry.file_name());
-                if entry.path().is_dir() {
-                    snapshot_store_dir(&entry.path(), &target);
-                } else {
-                    std::fs::copy(entry.path(), &target).unwrap();
-                }
-            }
-        }
-
-        /// A checkpoint round ends by truncating `journal.wal` back to
-        /// its file header; once that happens nothing is dirty and the
-        /// store files are stable until the next command.
-        fn wait_for_wal_truncation(dir: &Path, header_len: u64) {
-            let wal = dir.join("journal.wal");
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                let len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(u64::MAX);
-                if len <= header_len {
-                    return;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "checkpoint round did not complete within 30s (wal at {len} bytes)",
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-
-        /// GUID -> slot map of a snapshot's durable manifest, decoded
-        /// from holt's `manifest.bin` (ARTSNMNF header + fixed records)
-        /// and `manifest.log` (MLG1 length-framed set/delete deltas).
-        /// Byte-level parsing keeps the probe independent of the store
-        /// implementation under test.
-        fn durable_manifest(dir: &Path) -> BTreeMap<[u8; 16], u64> {
-            let mut entries = BTreeMap::new();
-            if let Ok(buf) = std::fs::read(dir.join("manifest.bin")) {
-                assert!(buf.len() >= 24, "manifest.bin header");
-                assert_eq!(&buf[..8], b"ARTSNMNF", "manifest.bin magic");
-                let count = u32::from_le_bytes(buf[10..14].try_into().unwrap()) as usize;
-                let mut off = 24;
-                for _ in 0..count {
-                    let mut guid = [0u8; 16];
-                    guid.copy_from_slice(&buf[off..off + 16]);
-                    let slot = u64::from_le_bytes(buf[off + 16..off + 24].try_into().unwrap());
-                    entries.insert(guid, slot);
-                    off += 24;
-                }
-            }
-            if let Ok(buf) = std::fs::read(dir.join("manifest.log")) {
-                let mut off = 0usize;
-                while off + 9 <= buf.len() {
-                    let start = off;
-                    assert_eq!(&buf[start..start + 4], b"MLG1", "manifest.log magic");
-                    let body_len =
-                        u32::from_le_bytes(buf[start + 4..start + 8].try_into().unwrap()) as usize;
-                    let record_len = 9 + body_len + 4;
-                    if buf.len() - start < record_len {
-                        break; // torn tail is legal; replay stops here
-                    }
-                    let body = &buf[start + 9..start + 9 + body_len];
-                    match buf[start + 8] {
-                        1 => {
-                            let mut guid = [0u8; 16];
-                            guid.copy_from_slice(&body[..16]);
-                            let slot = u64::from_le_bytes(body[16..24].try_into().unwrap());
-                            entries.insert(guid, slot);
-                        }
-                        2 => {
-                            let mut guid = [0u8; 16];
-                            guid.copy_from_slice(body);
-                            entries.remove(&guid);
-                        }
-                        other => panic!("manifest.log unknown op {other}"),
-                    }
-                    off = start + record_len;
-                }
-            }
-            entries
-        }
-
-        fn changed_slots(a: &[u8], b: &[u8]) -> Vec<u64> {
-            let overlap = a.len().min(b.len()) / SLOT_BYTES;
-            (0..overlap)
-                .filter(|s| {
-                    a[s * SLOT_BYTES..(s + 1) * SLOT_BYTES]
-                        != b[s * SLOT_BYTES..(s + 1) * SLOT_BYTES]
-                })
-                .map(|s| s as u64)
-                .collect()
-        }
-
-        let directory = tempdir().unwrap();
-        let database = directory.path().join("torn-frame.holt");
-        let mut counter = 7_000_u128;
-
-        let store = AgentMetadataStore::create_file(&database, shard()).unwrap();
-        let wal_header_len = std::fs::metadata(database.join("journal.wal"))
-            .unwrap()
-            .len();
-        initialize(&store, &mut counter);
-        seed_paths(&store, &mut counter, 128);
-        wait_for_wal_truncation(&database, wal_header_len);
-        let pre = directory.path().join("pre");
-        snapshot_store_dir(&database, &pre);
-
-        // One acked command: fresh revisions and paths that insert into
-        // the already-checkpointed ART frames, forcing same-GUID frame
-        // rewrites in the next round. The sync-WAL ack makes every
-        // record recovery-mandatory before that round starts.
-        let mut phase2 = Vec::new();
-        for index in 500..536usize {
-            let revision_id = revision(20_000 + index as u128);
-            let path = NormalizedRelativePath::new(format!("data/{index:04}.bin")).unwrap();
-            phase2.push((
-                MetadataFamily::ArtifactRevision,
-                artifact_revision_key(root(), revision_id),
-                artifact(index).encode().unwrap(),
-            ));
-            phase2.push((
-                MetadataFamily::PathCurrent,
-                path_current_key(root(), incarnation(), &path),
-                path_entry(index, revision_id).encode().unwrap(),
-            ));
-        }
-        let phase2_paths: Vec<(Vec<u8>, Vec<u8>)> = phase2
-            .iter()
-            .filter(|(family, ..)| *family == MetadataFamily::PathCurrent)
-            .map(|(_, key, value)| (key.clone(), value.clone()))
-            .collect();
-        raw_put(&store, &mut counter, phase2);
-
-        // Crash-time image: acked WAL plus store files the interrupted
-        // round has not touched yet. The copy must win the race against
-        // the background planner's idle interval; the equality asserts
-        // verify it did, so a lost race fails loudly instead of lying.
-        let mid = directory.path().join("mid");
-        snapshot_store_dir(&database, &mid);
-        assert_eq!(
-            std::fs::read(pre.join("blobs.dat")).unwrap(),
-            std::fs::read(mid.join("blobs.dat")).unwrap(),
-            "mid snapshot raced the checkpoint round (blobs.dat moved)",
-        );
-        assert_eq!(
-            std::fs::read(pre.join("manifest.bin")).ok(),
-            std::fs::read(mid.join("manifest.bin")).ok(),
-            "mid snapshot raced the checkpoint round (manifest.bin moved)",
-        );
-        assert_eq!(
-            std::fs::read(pre.join("manifest.log")).ok(),
-            std::fs::read(mid.join("manifest.log")).ok(),
-            "mid snapshot raced the checkpoint round (manifest.log moved)",
-        );
-        assert!(
-            std::fs::metadata(mid.join("journal.wal")).unwrap().len() > wal_header_len,
-            "acked command must be in the crash-time WAL",
-        );
-
-        // Let the interrupted round complete so its writes are the
-        // donor bytes for the torn overlay.
-        wait_for_wal_truncation(&database, wal_header_len);
-        let post = directory.path().join("post");
-        snapshot_store_dir(&database, &post);
-        drop(store);
-
-        let mid_blobs = std::fs::read(mid.join("blobs.dat")).unwrap();
-        let post_blobs = std::fs::read(post.join("blobs.dat")).unwrap();
-        let changed = changed_slots(&mid_blobs, &post_blobs);
-        assert!(
-            !changed.is_empty(),
-            "the round must rewrite at least one pre-existing frame slot",
-        );
-        let mid_manifest = durable_manifest(&mid);
-        let post_manifest = durable_manifest(&post);
-
-        // A slot whose GUID -> slot mapping is durable on both sides of
-        // the round was referenced by the durable manifest at every
-        // moment of it (the workload dirties each frame once, so no
-        // free/reuse cycle can produce the same pair). Modifying its
-        // bytes is the torn-base-frame crash window.
-        let in_place: Vec<u64> = changed
-            .iter()
-            .copied()
-            .filter(|slot| {
-                mid_manifest
-                    .iter()
-                    .any(|(guid, s)| s == slot && post_manifest.get(guid) == Some(slot))
-            })
-            .collect();
-
-        if !in_place.is_empty() {
-            // Demonstrate the consequence before failing: reconstruct
-            // the crash image — acked WAL, pre-round manifest, and the
-            // in-flight frame pwrites persisted in alternating 4 KiB
-            // blocks (device-level reordering inside one frame) — and
-            // reopen. The interleave lands inside the frames' used
-            // bytes even when the payload is far smaller than a slot.
-            let torn = directory.path().join("torn-demo");
-            snapshot_store_dir(&mid, &torn);
-            let mut blobs = mid_blobs.clone();
-            for &slot in &in_place {
-                const BLOCK: usize = 4096;
-                let start = slot as usize * SLOT_BYTES;
-                for (i, off) in (start..start + SLOT_BYTES).step_by(BLOCK).enumerate() {
-                    if i % 2 == 0 {
-                        blobs[off..off + BLOCK].copy_from_slice(&post_blobs[off..off + BLOCK]);
-                    }
-                }
-            }
-            std::fs::write(torn.join("blobs.dat"), &blobs).unwrap();
-            let outcome = match AgentMetadataStore::reopen_file(&torn, shard()) {
-                Err(error) => format!("reopen failed: {error}"),
-                Ok(reopened) => {
-                    let version = reopened.current_read_version().unwrap();
-                    let mut lost = 0;
-                    for (key, value) in &phase2_paths {
-                        match reopened.read_at(
-                            root(),
-                            placement(),
-                            owner(),
-                            MetadataFamily::PathCurrent,
-                            key,
-                            version,
-                        ) {
-                            Ok(Some(got)) if &got == value => {}
-                            other => {
-                                lost += 1;
-                                let _ = other;
-                            }
-                        }
-                    }
-                    format!(
-                        "reopen succeeded but {lost}/{} acked records lost",
-                        phase2_paths.len()
-                    )
-                }
-            };
-            panic!(
-                "checkpoint rewrote durable manifest slots {in_place:?} in place; \
-                 a power cut during those pwrites tears the WAL's only base image. \
-                 Torn-crash reopen outcome: {outcome}",
-            );
-        }
-
-        // Recovery leg: the round confined its writes to slots the
-        // crash-time manifest does not reference, so tearing all of
-        // them — half-frame prefix and 4 KiB interleave — must leave
-        // every acked record readable after reopen.
-        let torn_slots: Vec<u64> = changed
-            .iter()
-            .copied()
-            .filter(|slot| !mid_manifest.values().any(|s| s == slot))
-            .collect();
-        assert!(
-            !torn_slots.is_empty(),
-            "shadow rewrites must land in slots the crash-time manifest does not reference",
-        );
-        for (label, half) in [("new-prefix", true), ("interleave-4k", false)] {
-            let torn = directory.path().join(format!("torn-{label}"));
-            snapshot_store_dir(&mid, &torn);
-            let mut blobs = mid_blobs.clone();
-            for &slot in &torn_slots {
-                let start = slot as usize * SLOT_BYTES;
-                if half {
-                    let split = start + SLOT_BYTES / 2;
-                    blobs[start..split].copy_from_slice(&post_blobs[start..split]);
-                } else {
-                    const BLOCK: usize = 4096;
-                    for (i, off) in (start..start + SLOT_BYTES).step_by(BLOCK).enumerate() {
-                        if i % 2 == 0 {
-                            blobs[off..off + BLOCK].copy_from_slice(&post_blobs[off..off + BLOCK]);
-                        }
-                    }
-                }
-            }
-            std::fs::write(torn.join("blobs.dat"), &blobs).unwrap();
-
-            let reopened = AgentMetadataStore::reopen_file(&torn, shard())
-                .unwrap_or_else(|error| {
-                    panic!("reopen with torn unreferenced slots {torn_slots:?} ({label}) failed: {error}")
-                });
-            let version = reopened.current_read_version().unwrap();
-            for (key, value) in &phase2_paths {
-                let got = reopened
-                    .read_at(
-                        root(),
-                        placement(),
-                        owner(),
-                        MetadataFamily::PathCurrent,
-                        key,
-                        version,
-                    )
-                    .unwrap_or_else(|error| panic!("acked record unreadable ({label}): {error}"))
-                    .unwrap_or_else(|| panic!("acked record lost ({label})"));
-                assert_eq!(&got, value, "acked record corrupted ({label})");
-            }
-        }
     }
 
     #[test]
@@ -3763,7 +4166,8 @@ mod tests {
         let mut counter = 1_100_u128;
         let first_time = 1_700_000_000;
         {
-            let store = AgentMetadataStore::create_file(&database, shard()).unwrap();
+            let store =
+                crate::workspace::test_support::initialize_file(&database, shard()).unwrap();
             initialize(&store, &mut counter);
             let service = CommitService::new(&store);
             let mut request = begin_request(
@@ -3778,7 +4182,7 @@ mod tests {
             assert_eq!(begun.operation.committed_at_unix_seconds, first_time);
         }
 
-        let store = AgentMetadataStore::reopen_file(&database, shard()).unwrap();
+        let store = crate::workspace::test_support::open_file(&database, shard()).unwrap();
         let service = CommitService::new(&store);
         let mut retry = begin_request(
             write_context(&store, &mut counter),
@@ -4182,8 +4586,8 @@ mod tests {
                 commit_id: commit(21),
                 expected_consumer_epoch: zero.consumer_epoch,
             }),
-            Err(CommitError::Metadata(
-                AgentMetadataError::WriteReadVersionMismatch { .. }
+            Err(CommitError::Meta(
+                MetaError::WriteReadVersionMismatch { .. }
             ))
         ));
         assert!(matches!(
@@ -4193,8 +4597,8 @@ mod tests {
                 tag: TagName::new("late-tag").unwrap(),
                 commit_id: commit(21),
             }),
-            Err(CommitError::Metadata(
-                AgentMetadataError::WriteReadVersionMismatch { .. }
+            Err(CommitError::Meta(
+                MetaError::WriteReadVersionMismatch { .. }
             ))
         ));
         assert!(matches!(
@@ -4203,8 +4607,8 @@ mod tests {
                 operation_id: operation(24),
                 limit: 7,
             }),
-            Err(CommitError::Metadata(
-                AgentMetadataError::WriteReadVersionMismatch { .. }
+            Err(CommitError::Meta(
+                MetaError::WriteReadVersionMismatch { .. }
             ))
         ));
 
@@ -4233,7 +4637,7 @@ mod tests {
     }
 
     fn prepare_empty_build_for_sealing(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         operation_id: OperationId,
     ) {

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Fenced leased-snapshot lifecycle over workspace-native Holt records.
+//! Fenced leased-snapshot lifecycle over workspace-native metadata records.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,10 +20,11 @@ use super::codec::{
     snapshot_ref_key, workspace_current_key, SCHEMA_ID,
 };
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
-    HistoryProjection, MetadataCommand, MetadataFamily, RootFenceAction,
+    CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError, MetaShard,
+    MetadataCommand, RootFenceAction,
 };
 use super::event_projection::change_event_projection;
+use super::keyspace::MetadataFamily;
 use super::namespace::{RootReadContext, RootWriteContext};
 use super::publication_records::{PublicationRecordCodecError, WorkspaceRecord};
 use super::query_records::{
@@ -173,7 +174,7 @@ pub enum SnapshotError {
     WorkspaceCodec(PublicationRecordCodecError),
     SnapshotCodec(SnapshotRecordError),
     QueryRecord(QueryRecordError),
-    Engine(AgentMetadataError),
+    Meta(MetaError),
 }
 
 impl fmt::Display for SnapshotError {
@@ -258,7 +259,7 @@ impl fmt::Display for SnapshotError {
             Self::WorkspaceCodec(source) => source.fmt(formatter),
             Self::SnapshotCodec(source) => source.fmt(formatter),
             Self::QueryRecord(source) => source.fmt(formatter),
-            Self::Engine(source) => source.fmt(formatter),
+            Self::Meta(source) => source.fmt(formatter),
         }
     }
 }
@@ -269,15 +270,15 @@ impl std::error::Error for SnapshotError {
             Self::WorkspaceCodec(source) => Some(source),
             Self::SnapshotCodec(source) => Some(source),
             Self::QueryRecord(source) => Some(source),
-            Self::Engine(source) => Some(source),
+            Self::Meta(source) => Some(source),
             _ => None,
         }
     }
 }
 
-impl From<AgentMetadataError> for SnapshotError {
-    fn from(source: AgentMetadataError) -> Self {
-        Self::Engine(source)
+impl From<MetaError> for SnapshotError {
+    fn from(source: MetaError) -> Self {
+        Self::Meta(source)
     }
 }
 
@@ -295,7 +296,7 @@ impl From<QueryRecordError> for SnapshotError {
 
 /// Mint a new leased MVCC snapshot and its history hold atomically.
 pub fn mint_snapshot(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &MintSnapshotRequest,
 ) -> Result<SnapshotWriteOutcome, SnapshotError> {
@@ -418,7 +419,7 @@ pub fn mint_snapshot(
 
 /// Resolve one snapshot at an exact MVCC read version.
 pub fn get_snapshot_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
     selector: &SnapshotSelector,
@@ -431,7 +432,7 @@ pub fn get_snapshot_at(
 
 /// Extend an active snapshot lease. Expired but unclaimed snapshots may revive.
 pub fn renew_snapshot(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &RenewSnapshotRequest,
 ) -> Result<SnapshotWriteOutcome, SnapshotError> {
@@ -491,7 +492,7 @@ pub fn renew_snapshot(
 
 /// Explicitly retire an active snapshot and release its history hold.
 pub fn retire_snapshot(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &RetireSnapshotRequest,
 ) -> Result<SnapshotWriteOutcome, SnapshotError> {
@@ -523,7 +524,7 @@ pub fn retire_snapshot(
 /// Claim one expired snapshot after persisted clock-skew grace and release its
 /// history hold. The claim is the point after which renewal is forbidden.
 pub fn claim_expired_snapshot(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &ClaimExpiredSnapshotRequest,
 ) -> Result<SnapshotWriteOutcome, SnapshotError> {
@@ -571,7 +572,7 @@ pub fn claim_expired_snapshot(
 /// Mark a claimed snapshot as fully reaped after history pruning observes its
 /// released hold.
 pub fn finish_snapshot_reap(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &FinishSnapshotReapRequest,
 ) -> Result<SnapshotWriteOutcome, SnapshotError> {
@@ -627,7 +628,7 @@ pub fn finish_snapshot_reap(
 /// Attach one restore consumer to a live snapshot and create its exact source
 /// history hold in the same command.
 pub fn attach_snapshot_consumer(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &AttachSnapshotConsumerRequest,
 ) -> Result<SnapshotWriteOutcome, SnapshotError> {
@@ -701,7 +702,7 @@ pub fn attach_snapshot_consumer(
 
 /// Release one restore consumer and its exact source history hold atomically.
 pub fn release_snapshot_consumer(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &ReleaseSnapshotConsumerRequest,
 ) -> Result<SnapshotWriteOutcome, SnapshotError> {
@@ -767,7 +768,7 @@ pub fn release_snapshot_consumer(
 }
 
 fn terminalize_snapshot(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
     workspace: LoadedWorkspace,
@@ -886,7 +887,7 @@ struct LoadedSnapshot {
 }
 
 fn load_visible_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     workbench_id: &WorkbenchId,
 ) -> Result<LoadedWorkspace, SnapshotError> {
@@ -910,7 +911,7 @@ fn load_visible_workspace(
 }
 
 fn load_visible_workspace_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
 ) -> Result<Option<WorkspaceRecord>, SnapshotError> {
@@ -931,7 +932,7 @@ fn load_visible_workspace_at(
 }
 
 fn load_snapshot_for_write(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     workspace: WorkspaceIncarnationId,
     selector: &SnapshotSelector,
@@ -977,7 +978,7 @@ fn load_snapshot_for_write(
 }
 
 fn load_snapshot_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workspace: WorkspaceIncarnationId,
     selector: &SnapshotSelector,
@@ -1057,7 +1058,7 @@ fn load_snapshot_at(
 }
 
 fn plan_alias_mint(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     workspace: WorkspaceIncarnationId,
     alias: &SnapshotAliasName,
@@ -1097,7 +1098,7 @@ struct AliasMintPlan {
 }
 
 fn read_current(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     family: MetadataFamily,
     key: &[u8],
@@ -1111,7 +1112,7 @@ fn read_current(
             key,
             context.read_version,
         )
-        .map_err(SnapshotError::Engine)
+        .map_err(SnapshotError::Meta)
 }
 
 fn predicate_workspace(command: &mut MetadataCommand, workspace: &LoadedWorkspace) {
@@ -1253,7 +1254,7 @@ fn base_command(context: RootWriteContext, deterministic_result: Vec<u8>) -> Met
 }
 
 fn execute_snapshot_command(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     command: MetadataCommand,
     input_digest: [u8; SHA256_BYTES],
     lease_deadline_ms: Option<u64>,
@@ -1264,7 +1265,7 @@ fn execute_snapshot_command(
     };
     let result = match executed {
         Ok(result) => result,
-        Err(AgentMetadataError::LeaseDeadlineReached {
+        Err(MetaError::LeaseDeadlineReached {
             lease_clock_ms,
             requested_deadline_ms,
         }) => {
@@ -1273,10 +1274,10 @@ fn execute_snapshot_command(
                 requested: requested_deadline_ms,
             });
         }
-        Err(AgentMetadataError::PredicateFailed | AgentMetadataError::WriteConflict) => {
+        Err(MetaError::PredicateFailed | MetaError::WriteConflict) => {
             return Err(SnapshotError::ConcurrentMutation);
         }
-        Err(source) => return Err(SnapshotError::Engine(source)),
+        Err(source) => return Err(SnapshotError::Meta(source)),
     };
     let snapshot = decode_snapshot_result(&result.deterministic_result, input_digest)?;
     Ok(SnapshotWriteOutcome {
@@ -1287,7 +1288,7 @@ fn execute_snapshot_command(
 }
 
 fn replay_outcome(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
 ) -> Result<Option<SnapshotWriteOutcome>, SnapshotError> {
@@ -1675,7 +1676,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -1698,7 +1699,7 @@ mod tests {
         .seal()
     }
 
-    fn activate_root(store: &AgentMetadataStore) {
+    fn activate_root(store: &MetaShard) {
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&fence_command(store, request(1), RootFenceAction::Install))
@@ -1715,13 +1716,13 @@ mod tests {
             .unwrap();
     }
 
-    fn ready_store() -> AgentMetadataStore {
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+    fn ready_store() -> MetaShard {
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         activate_root(&store);
         store
     }
 
-    fn write_context(store: &AgentMetadataStore, request_fill: u8) -> RootWriteContext {
+    fn write_context(store: &MetaShard, request_fill: u8) -> RootWriteContext {
         RootWriteContext::current(
             store,
             root(),
@@ -1733,12 +1734,12 @@ mod tests {
         .unwrap()
     }
 
-    fn read_context(store: &AgentMetadataStore) -> RootReadContext {
+    fn read_context(store: &MetaShard) -> RootReadContext {
         RootReadContext::current(store, root(), placement(), owner()).unwrap()
     }
 
     fn create_workspace(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_fill: u8,
         name: &WorkbenchId,
         incarnation_fill: u8,
@@ -1750,7 +1751,7 @@ mod tests {
     }
 
     fn mint(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_fill: u8,
         name: &WorkbenchId,
         snapshot_id: u64,
@@ -1771,21 +1772,13 @@ mod tests {
         .unwrap()
     }
 
-    fn get(
-        store: &AgentMetadataStore,
-        name: &WorkbenchId,
-        selector: SnapshotSelector,
-    ) -> ResolvedSnapshot {
+    fn get(store: &MetaShard, name: &WorkbenchId, selector: SnapshotSelector) -> ResolvedSnapshot {
         get_snapshot_at(store, read_context(store), name, &selector)
             .unwrap()
             .unwrap()
     }
 
-    fn read_family(
-        store: &AgentMetadataStore,
-        family: MetadataFamily,
-        key: &[u8],
-    ) -> Option<Vec<u8>> {
+    fn read_family(store: &MetaShard, family: MetadataFamily, key: &[u8]) -> Option<Vec<u8>> {
         let context = read_context(store);
         store
             .read_at(
@@ -2168,7 +2161,7 @@ mod tests {
         let mint_request;
         let created;
         {
-            let store = AgentMetadataStore::create_file(&path, shard()).unwrap();
+            let store = crate::workspace::test_support::initialize_file(&path, shard()).unwrap();
             activate_root(&store);
             create_workspace(&store, 3, &name, 3);
             mint_context = write_context(&store, 4);
@@ -2185,7 +2178,7 @@ mod tests {
                 .unwrap();
         }
 
-        let reopened = AgentMetadataStore::reopen_file(&path, shard()).unwrap();
+        let reopened = crate::workspace::test_support::open_file(&path, shard()).unwrap();
         assert_eq!(reopened.lease_clock_high_water().unwrap(), 321);
         assert_eq!(
             get(&reopened, &name, SnapshotSelector::Alias(alias("saved")),),

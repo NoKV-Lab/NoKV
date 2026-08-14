@@ -24,10 +24,11 @@ use super::codec::{
     workspace_current_key, workspace_incarnation_claim_key, PATH_COMPONENT_DELIMITER, SCHEMA_ID,
 };
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate,
-    DelimitedMetadataScanItem, MetadataCommand, MetadataFamily, RootFenceAction,
+    CommandMutation, CommandPredicate, DelimitedMetadataScanItem, MetaError, MetaShard,
+    MetadataCommand, RootFenceAction,
 };
 use super::event_projection::change_event_projection;
+use super::keyspace::MetadataFamily;
 use super::publication_records::{
     PathEntry, PublicationRecordCodecError, WorkspaceIncarnationClaimRecord, WorkspaceRecord,
 };
@@ -45,8 +46,8 @@ pub(super) const MAX_VISIBLE_PATH_PAGE_SIZE: usize = 255;
 
 /// Maximum number of logical entries returned by one namespace listing.
 ///
-/// Larger logical pages are assembled from bounded Holt scans so callers do
-/// not need to know the engine's raw scan bound.
+/// Larger logical pages are assembled from bounded transaction-store scans so callers do
+/// not need to know the metadata layer's raw scan bound.
 pub const MAX_VISIBLE_PATH_LIST_PAGE_SIZE: usize = 1_000;
 
 /// Fenced root context for one exact MVCC namespace read.
@@ -61,7 +62,7 @@ pub struct RootReadContext {
 impl RootReadContext {
     /// Capture the store's current durable read version.
     pub fn current(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         root_id: RootId,
         placement_generation: PlacementGeneration,
         owner_epoch: OwnerEpoch,
@@ -93,7 +94,7 @@ pub struct RootWriteContext {
 impl RootWriteContext {
     /// Capture the store's current durable read version for a new request.
     pub fn current(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         root_id: RootId,
         logical_shard_id: LogicalShardId,
         placement_generation: PlacementGeneration,
@@ -221,7 +222,7 @@ pub enum NamespaceError {
         reason: String,
     },
     QueryRecord(QueryRecordError),
-    Engine(AgentMetadataError),
+    Meta(MetaError),
 }
 
 impl fmt::Display for NamespaceError {
@@ -256,7 +257,7 @@ impl fmt::Display for NamespaceError {
                 write!(formatter, "invalid workspace creation result: {reason}")
             }
             Self::QueryRecord(source) => source.fmt(formatter),
-            Self::Engine(source) => source.fmt(formatter),
+            Self::Meta(source) => source.fmt(formatter),
         }
     }
 }
@@ -266,15 +267,15 @@ impl std::error::Error for NamespaceError {
         match self {
             Self::Codec { source, .. } => Some(source),
             Self::QueryRecord(source) => Some(source),
-            Self::Engine(source) => Some(source),
+            Self::Meta(source) => Some(source),
             _ => None,
         }
     }
 }
 
-impl From<AgentMetadataError> for NamespaceError {
-    fn from(source: AgentMetadataError) -> Self {
-        Self::Engine(source)
+impl From<MetaError> for NamespaceError {
+    fn from(source: MetaError) -> Self {
+        Self::Meta(source)
     }
 }
 
@@ -290,7 +291,7 @@ impl From<QueryRecordError> for NamespaceError {
 /// predicates. An exact request replay returns and validates the originally
 /// persisted typed result.
 pub fn create_visible_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     workbench_id: &WorkbenchId,
     incarnation_id: WorkspaceIncarnationId,
@@ -367,7 +368,7 @@ pub fn create_visible_workspace(
 
     let result = match store.execute(&command) {
         Ok(result) => result,
-        Err(AgentMetadataError::PredicateFailed) => {
+        Err(MetaError::PredicateFailed) => {
             if store
                 .read_at(
                     context.root_id,
@@ -395,8 +396,8 @@ pub fn create_visible_workspace(
             else {
                 // The command has only the two exact absence predicates above.
                 // If neither key existed at its exact MVCC read version, keep
-                // the engine failure instead of inventing a domain conflict.
-                return Err(NamespaceError::Engine(AgentMetadataError::PredicateFailed));
+                // the metadata failure instead of inventing a domain conflict.
+                return Err(NamespaceError::Meta(MetaError::PredicateFailed));
             };
             let claim = WorkspaceIncarnationClaimRecord::decode(&claim_payload)
                 .map_err(|source| codec_error("WorkspaceIncarnationClaim", source))?;
@@ -405,7 +406,7 @@ pub fn create_visible_workspace(
                 workbench_id: claim.workbench_id,
             });
         }
-        Err(source) => return Err(NamespaceError::Engine(source)),
+        Err(source) => return Err(NamespaceError::Meta(source)),
     };
     let decoded = WorkspaceRecord::decode(&result.deterministic_result)
         .map_err(|source| codec_error("CreateVisibleWorkspaceResult", source))?;
@@ -431,7 +432,7 @@ pub fn create_visible_workspace(
 /// Staging and retired incarnations are deliberately indistinguishable from an
 /// absent workbench on every namespace read surface.
 pub fn get_visible_workspace_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
 ) -> Result<Option<WorkspaceRecord>, NamespaceError> {
@@ -454,7 +455,7 @@ pub fn get_visible_workspace_at(
 
 /// Read one exact normalized path after resolving its visible workspace marker.
 pub fn get_visible_path_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
     path: &NormalizedRelativePath,
@@ -468,7 +469,7 @@ pub fn get_visible_path_at(
 /// Resolve a live workspace marker and one dependent path while capturing the
 /// current read version inside the same fenced point-read session.
 pub fn get_current_visible_workspace_path(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     root_id: RootId,
     placement_generation: PlacementGeneration,
     owner_epoch: OwnerEpoch,
@@ -489,7 +490,7 @@ pub fn get_current_visible_workspace_path(
 /// Resolve a workspace marker and one dependent path at an exact read version
 /// under one ownership/fence validation.
 pub fn get_visible_workspace_path_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
     path: &NormalizedRelativePath,
@@ -506,7 +507,7 @@ pub fn get_visible_workspace_path_at(
 }
 
 fn get_visible_workspace_path(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     root_id: RootId,
     placement_generation: PlacementGeneration,
     owner_epoch: OwnerEpoch,
@@ -561,7 +562,7 @@ fn get_visible_workspace_path(
 /// state check fails closed if a staging or retired record is passed by an
 /// internal caller.
 pub fn get_path_at_visible_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workspace: &WorkspaceRecord,
     path: &NormalizedRelativePath,
@@ -595,7 +596,7 @@ pub fn get_path_at_visible_workspace(
 /// full-path key order. `start_after` must be the exact full-path marker
 /// returned by a preceding page at the same listing level.
 pub fn list_paths_at_visible_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workspace: &WorkspaceRecord,
     prefix: Option<&NormalizedRelativePath>,
@@ -709,7 +710,7 @@ pub fn list_paths_at_visible_workspace(
 /// the current page and is safe to pass to the next call at the same read
 /// version.
 pub(super) fn scan_visible_paths_at(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workbench_id: &WorkbenchId,
     start_after: Option<&NormalizedRelativePath>,
@@ -736,7 +737,7 @@ pub(super) fn scan_visible_paths_at(
 /// merge the exact point read after the descendant scan because the exact key
 /// sorts after its descendants.
 pub(super) fn scan_paths_at_visible_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workspace: &WorkspaceRecord,
     path_prefix: Option<&NormalizedRelativePath>,
@@ -796,11 +797,11 @@ pub(super) fn scan_paths_at_visible_workspace(
 
 /// Scan direct logical children below an optional normalized parent.
 ///
-/// Holt common-prefix rollups are retained as implicit children. If an exact
+/// Transaction-store common-prefix rollups are retained as implicit children. If an exact
 /// artifact exists at the same path, it replaces the implicit prefix in the
 /// returned logical item. The exclusive marker skips both representations.
 pub(super) fn scan_direct_path_children_at_visible_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootReadContext,
     workspace: &WorkspaceRecord,
     path_prefix: Option<&NormalizedRelativePath>,
@@ -967,7 +968,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -990,8 +991,8 @@ mod tests {
         .seal()
     }
 
-    fn ready_store() -> AgentMetadataStore {
-        let store = AgentMetadataStore::open_memory(shard(1)).unwrap();
+    fn ready_store() -> MetaShard {
+        let store = crate::workspace::test_support::memory(shard(1)).unwrap();
         store.advance_owner_epoch(None, owner()).unwrap();
         store
             .execute(&fence_command(&store, request(1), RootFenceAction::Install))
@@ -1009,7 +1010,7 @@ mod tests {
         store
     }
 
-    fn write_context(store: &AgentMetadataStore, request_fill: u8) -> RootWriteContext {
+    fn write_context(store: &MetaShard, request_fill: u8) -> RootWriteContext {
         RootWriteContext::current(
             store,
             root(2),
@@ -1021,7 +1022,7 @@ mod tests {
         .unwrap()
     }
 
-    fn read_context(store: &AgentMetadataStore) -> RootReadContext {
+    fn read_context(store: &MetaShard) -> RootReadContext {
         RootReadContext::current(store, root(2), placement(), owner()).unwrap()
     }
 
@@ -1035,7 +1036,7 @@ mod tests {
     }
 
     fn put_absent(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_fill: u8,
         records: Vec<(MetadataFamily, Vec<u8>, Vec<u8>)>,
     ) -> CommitVersion {
@@ -1077,7 +1078,7 @@ mod tests {
     }
 
     fn create_workspace(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_fill: u8,
         name: &WorkbenchId,
         incarnation_fill: u8,
@@ -1113,7 +1114,7 @@ mod tests {
 
         assert!(matches!(
             create_visible_workspace(&store, context, &name, incarnation(4)),
-            Err(NamespaceError::Engine(AgentMetadataError::RequestIdReused))
+            Err(NamespaceError::Meta(MetaError::RequestIdReused))
         ));
         assert_eq!(
             create_visible_workspace(&store, write_context(&store, 4), &name, incarnation(4)),
@@ -1613,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_listing_assembles_pages_larger_than_one_engine_scan() {
+    fn logical_listing_assembles_pages_larger_than_one_meta_scan() {
         let store = ready_store();
         let name = workbench("wb-wide-list");
         let created = create_workspace(&store, 3, &name, 17);

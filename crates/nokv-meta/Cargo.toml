@@ -1,7 +1,7 @@
 [package]
 name = "nokv-meta"
 version = "0.1.0"
-description = "Holt-backed metadata service core for NoKV."
+description = "Storage-neutral metadata service core for NoKV."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,9 +13,10 @@ homepage.workspace = true
 metadata-read-stats = []
 
 [dependencies]
-holt.workspace = true
+nokv-meta-store.workspace = true
 nokv-types.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+nokv-meta-holt = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

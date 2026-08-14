@@ -2,6 +2,8 @@
 members = [
     "crates/nokv-types",
     "crates/nokv-protocol",
+    "crates/nokv-meta-store",
+    "crates/nokv-meta-holt",
     "crates/nokv-meta",
     "crates/nokv-control",
     "crates/nokv-object",
@@ -26,6 +28,8 @@ homepage = "https://nokv.io"
 base64 = "0.23.0"
 nokv-types = { path = "crates/nokv-types", version = "0.1.0" }
 nokv-protocol = { path = "crates/nokv-protocol", version = "0.1.0" }
+nokv-meta-store = { path = "crates/nokv-meta-store", version = "0.1.0" }
+nokv-meta-holt = { path = "crates/nokv-meta-holt", version = "0.1.0" }
 nokv-meta = { path = "crates/nokv-meta", version = "0.1.0" }
 nokv-control = { path = "crates/nokv-control", version = "0.1.0" }
 nokv-object = { path = "crates/nokv-object", version = "0.1.0" }
@@ -35,7 +39,7 @@ nokv-server = { path = "crates/nokv-server", version = "0.1.0" }
 nokv = { path = "crates/nokv", version = "1.0.0" }
 nokv-python = { path = "crates/nokv-python", version = "0.1.0" }
 nokv-bench = { path = "bench", version = "0.1.0" }
-holt = { version = "=0.8.4", default-features = false }
+holt = { version = "=0.8.5", default-features = false }
 etcd-client = { version = "0.19.0", default-features = false }
 opendal = { version = "0.57.0", default-features = false, features = ["blocking", "executors-tokio", "reqwest-rustls-tls", "services-s3"] }
 rmp-serde = "1.3"

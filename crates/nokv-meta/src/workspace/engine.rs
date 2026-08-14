@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "metadata-read-stats")]
 use std::marker::PhantomData;
-use std::path::Path;
 #[cfg(feature = "metadata-read-stats")]
 use std::rc::Rc;
 #[cfg(feature = "metadata-read-stats")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
 
-use holt::{Durability, Record, RecordVersion, Tree, TreeConfig, DB};
+use nokv_meta_store::{
+    Check, Commit, Key, Keyspace, LimitKind, Mutation, ReadBatch, ReadOp, ReadResult, ReadSnapshot,
+    Scan, ScanItem, ScanPage, StoreError, StoreLimits, TxnStore, WriteTxn,
+};
 use nokv_types::{
     CommandDigest, CommitVersion, LogicalShardId, OwnerEpoch, PlacementGeneration, ReadVersion,
     RequestId, RootActivationState, RootId,
@@ -16,13 +20,11 @@ use nokv_types::{
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    change_event_key, encode_schema_marker, validate_schema_marker, ARTIFACT_MANIFEST_TREE,
-    ARTIFACT_REVISION_TREE, CHANGE_EVENT_TREE, COMMAND_DEDUPE_TREE, COMMIT_CONSUMER_TREE,
-    COMMIT_MEMBER_TREE, COMMIT_TREE, GC_BARRIER_TREE, GC_CANDIDATE_TREE, HISTORY_HOLD_TREE,
-    HISTORY_TREE, OPERATION_TREE, PATH_CURRENT_TREE, RECOVERY_OUTBOX_TREE, RESTORE_MEMBER_TREE,
-    REVISION_REF_TREE, ROOT_FENCE_TREE, SCHEMA_ID, SCHEMA_TREES, SECONDARY_INDEX_TREE,
-    SNAPSHOT_ALIAS_TREE, SNAPSHOT_REF_TREE, STAGED_OBJECT_TREE, SYSTEM_SCHEMA_KEY, SYSTEM_TREE,
-    TAG_TREE, WORKBENCH_COMMIT_HEAD_TREE, WORKSPACE_CURRENT_TREE, WORKSPACE_INCARNATION_CLAIM_TREE,
+    change_event_key, encode_schema_marker, validate_schema_marker, SCHEMA_ID, SYSTEM_SCHEMA_KEY,
+};
+use super::keyspace::{
+    keyspaces, MetadataFamily, CHANGE_EVENT, COMMAND_DEDUPE, HISTORY, RECOVERY_OUTBOX, ROOT_FENCE,
+    SYSTEM,
 };
 #[cfg(feature = "metadata-read-stats")]
 use super::read_stats::{self, MetadataReadStats, MetadataReadStatsSessionError};
@@ -46,14 +48,51 @@ const INITIAL_COMMIT_VERSION: u64 = 1;
 
 const MAX_COMMAND_ITEMS: usize = 256;
 const MAX_DELIMITED_SCAN_ITEMS: usize = MAX_COMMAND_ITEMS * 2;
+const MAX_HISTORICAL_SCAN_PAGE_ROWS: usize = MAX_COMMAND_ITEMS;
+const MAX_HISTORICAL_SCAN_ATTEMPTS: usize = 4;
+const HISTORICAL_SCAN_RETRY_DELAYS: [Duration; MAX_HISTORICAL_SCAN_ATTEMPTS - 1] = [
+    Duration::from_millis(1),
+    Duration::from_millis(2),
+    Duration::from_millis(4),
+];
 const MAX_COMMAND_KEY_BYTES: usize = 8 * 1024;
-// Holt limits one stored value to u16::MAX bytes. Domain payloads are wrapped
-// in CurrentValue, HistoryValue, or CommandDedupeRecord before insertion, so
-// keep explicit headroom for every durable envelope.
-const MAX_HOLT_RECORD_PAYLOAD_BYTES: usize = 60 * 1024;
-const MAX_COMMAND_VALUE_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
-const MAX_DETERMINISTIC_RESULT_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
-const MAX_EVENT_BYTES: usize = MAX_HOLT_RECORD_PAYLOAD_BYTES;
+const HISTORY_KEY_OVERHEAD_BYTES: usize =
+    1 + std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
+const MAX_DERIVED_KEY_BYTES: usize = MAX_COMMAND_KEY_BYTES + HISTORY_KEY_OVERHEAD_BYTES;
+const MAX_STORED_VALUE_BYTES: usize = u16::MAX as usize;
+// Domain payloads are wrapped in CurrentValue, HistoryValue, or
+// CommandDedupeRecord before insertion. Keep explicit headroom for every
+// durable envelope without binding the schema to one adapter.
+const MAX_RECORD_PAYLOAD_BYTES: usize = 60 * 1024;
+const MAX_COMMAND_VALUE_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
+const MAX_DETERMINISTIC_RESULT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
+const MAX_EVENT_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES;
+
+/// Transitional transaction-store limits for the workspace schema.
+///
+/// The decimal 16,000,000-byte transaction envelope preserves three
+/// high-amplification lifecycles characterized against the pre-provider
+/// Holt-backed engine: a 60-field, 61,203-byte projection on a short path, and
+/// a 4,096-byte path with 64 dependencies and a 57,243-byte projection, plus a
+/// successful disjoint 60-field replacement whose fully derived transaction is
+/// 9,859,091 bytes at the maximum tested event-union boundary.
+/// Together with the configured maximum mutation overhead it remains below
+/// Holt's 16 MiB WAL-record ceiling. This is a transitional compatibility
+/// profile, not proof that every domain-valid command fits; providers with a
+/// smaller hard transaction limit are not qualified for it.
+pub const fn store_limits() -> StoreLimits {
+    StoreLimits {
+        max_reads: 8,
+        max_checks: 1_024,
+        max_mutations: 1_024,
+        max_key_bytes: MAX_DERIVED_KEY_BYTES,
+        max_value_bytes: MAX_STORED_VALUE_BYTES,
+        max_read_bytes: 8 * 1024 * 1024,
+        max_transaction_bytes: 16_000_000,
+        max_result_rows: 1_024,
+        max_result_bytes: 8 * 1024 * 1024,
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum MetadataPointReadSource {
@@ -62,89 +101,6 @@ pub(super) enum MetadataPointReadSource {
     WorkspaceCurrent,
     PathCurrent,
     Other,
-}
-
-/// Durable metadata families that domain commands may mutate.
-///
-/// System, root-fence, dedupe, and history records are deliberately absent:
-/// the executor owns those families and derives their mutations itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum MetadataFamily {
-    WorkspaceCurrent = 0x02,
-    PathCurrent = 0x03,
-    ArtifactRevision = 0x04,
-    ArtifactManifest = 0x05,
-    RevisionRef = 0x06,
-    Commit = 0x07,
-    CommitMember = 0x08,
-    WorkbenchCommitHead = 0x09,
-    Tag = 0x0a,
-    SnapshotRef = 0x0b,
-    SnapshotAlias = 0x0c,
-    HistoryHold = 0x0d,
-    CommitConsumer = 0x0e,
-    SecondaryIndex = 0x0f,
-    Operation = 0x11,
-    RestoreMember = 0x12,
-    StagedObject = 0x13,
-    GcCandidate = 0x15,
-    GcBarrier = 0x16,
-    WorkspaceIncarnationClaim = 0x17,
-}
-
-impl MetadataFamily {
-    pub const fn tree_name(self) -> &'static str {
-        match self {
-            Self::WorkspaceCurrent => WORKSPACE_CURRENT_TREE,
-            Self::PathCurrent => PATH_CURRENT_TREE,
-            Self::ArtifactRevision => ARTIFACT_REVISION_TREE,
-            Self::ArtifactManifest => ARTIFACT_MANIFEST_TREE,
-            Self::RevisionRef => REVISION_REF_TREE,
-            Self::Commit => COMMIT_TREE,
-            Self::CommitMember => COMMIT_MEMBER_TREE,
-            Self::WorkbenchCommitHead => WORKBENCH_COMMIT_HEAD_TREE,
-            Self::Tag => TAG_TREE,
-            Self::SnapshotRef => SNAPSHOT_REF_TREE,
-            Self::SnapshotAlias => SNAPSHOT_ALIAS_TREE,
-            Self::HistoryHold => HISTORY_HOLD_TREE,
-            Self::CommitConsumer => COMMIT_CONSUMER_TREE,
-            Self::SecondaryIndex => SECONDARY_INDEX_TREE,
-            Self::Operation => OPERATION_TREE,
-            Self::RestoreMember => RESTORE_MEMBER_TREE,
-            Self::StagedObject => STAGED_OBJECT_TREE,
-            Self::GcCandidate => GC_CANDIDATE_TREE,
-            Self::GcBarrier => GC_BARRIER_TREE,
-            Self::WorkspaceIncarnationClaim => WORKSPACE_INCARNATION_CLAIM_TREE,
-        }
-    }
-
-    pub const fn history_tag(self) -> u8 {
-        self as u8
-    }
-
-    const ALL: [Self; 20] = [
-        Self::WorkspaceCurrent,
-        Self::PathCurrent,
-        Self::ArtifactRevision,
-        Self::ArtifactManifest,
-        Self::RevisionRef,
-        Self::Commit,
-        Self::CommitMember,
-        Self::WorkbenchCommitHead,
-        Self::Tag,
-        Self::SnapshotRef,
-        Self::SnapshotAlias,
-        Self::HistoryHold,
-        Self::CommitConsumer,
-        Self::SecondaryIndex,
-        Self::Operation,
-        Self::RestoreMember,
-        Self::StagedObject,
-        Self::GcCandidate,
-        Self::GcBarrier,
-        Self::WorkspaceIncarnationClaim,
-    ];
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,7 +222,7 @@ impl MetadataCommand {
                     key,
                     expected,
                 } => {
-                    hasher.update([1, *family as u8]);
+                    hasher.update([1, family.format_tag()]);
                     hash_bytes(&mut hasher, key);
                     match expected {
                         Some(value) => {
@@ -277,7 +233,7 @@ impl MetadataCommand {
                     }
                 }
                 CommandPredicate::PrefixEmpty { family, prefix } => {
-                    hasher.update([2, *family as u8]);
+                    hasher.update([2, family.format_tag()]);
                     hash_bytes(&mut hasher, prefix);
                 }
             }
@@ -286,19 +242,19 @@ impl MetadataCommand {
         for mutation in &self.mutations {
             match mutation {
                 CommandMutation::Put { family, key, value } => {
-                    hasher.update([1, *family as u8]);
+                    hasher.update([1, family.format_tag()]);
                     hash_bytes(&mut hasher, key);
                     hash_bytes(&mut hasher, value);
                 }
                 CommandMutation::Delete { family, key } => {
-                    hasher.update([2, *family as u8]);
+                    hasher.update([2, family.format_tag()]);
                     hash_bytes(&mut hasher, key);
                 }
             }
         }
         hash_u64(&mut hasher, self.history_projection.len());
         for projection in &self.history_projection {
-            hasher.update([projection.family as u8]);
+            hasher.update([projection.family.format_tag()]);
             hash_bytes(&mut hasher, &projection.key);
         }
         hash_u64(&mut hasher, self.event_projection.len());
@@ -317,6 +273,25 @@ pub struct MetadataCommandResult {
     pub replayed: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandLimit {
+    Checks,
+    Mutations,
+    KeyBytes,
+    ValueBytes,
+    TransactionBytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandFit {
+    Fits,
+    Exceeds {
+        kind: CommandLimit,
+        actual: usize,
+        maximum: usize,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetadataScanItem {
     pub key: Vec<u8>,
@@ -330,8 +305,12 @@ pub(super) enum DelimitedMetadataScanItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AgentMetadataError {
-    Backend {
+pub enum MetaError {
+    Store {
+        operation: &'static str,
+        source: StoreError,
+    },
+    Internal {
         operation: &'static str,
         message: String,
     },
@@ -370,6 +349,9 @@ pub enum AgentMetadataError {
         requested: u64,
         current: u64,
     },
+    ReadStabilityExhausted {
+        attempts: usize,
+    },
     WriteReadVersionMismatch {
         requested: u64,
         current: u64,
@@ -383,11 +365,14 @@ pub enum AgentMetadataError {
     VersionOverflow,
 }
 
-impl std::fmt::Display for AgentMetadataError {
+impl std::fmt::Display for MetaError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Backend { operation, message } => {
-                write!(formatter, "Holt {operation} failed: {message}")
+            Self::Store { operation, source } => {
+                write!(formatter, "metadata store {operation} failed: {source}")
+            }
+            Self::Internal { operation, message } => {
+                write!(formatter, "metadata {operation} failed: {message}")
             }
             Self::SchemaGate { reason } => write!(formatter, "metadata schema rejected: {reason}"),
             Self::CorruptRecord { record, reason } => {
@@ -429,6 +414,10 @@ impl std::fmt::Display for AgentMetadataError {
                 formatter,
                 "read version {requested} is newer than current version {current}"
             ),
+            Self::ReadStabilityExhausted { attempts } => write!(
+                formatter,
+                "metadata read could not capture a stable shard commit clock after {attempts} attempts"
+            ),
             Self::WriteReadVersionMismatch { requested, current } => write!(
                 formatter,
                 "metadata write read-version mismatch: requested {requested}, current {current}"
@@ -447,55 +436,51 @@ impl std::fmt::Display for AgentMetadataError {
     }
 }
 
-impl std::error::Error for AgentMetadataError {}
+impl std::error::Error for MetaError {}
 
 #[derive(Clone)]
-pub struct AgentMetadataStore {
-    db: DB,
+pub struct MetaShard {
+    store: Arc<dyn TxnStore>,
     logical_shard_id: LogicalShardId,
     command_gate: Arc<RwLock<()>>,
     #[cfg(feature = "metadata-read-stats")]
-    read_stats_identity: Arc<MetadataReadStatsIdentity>,
-    system: Tree,
-    root_fence: Tree,
-    command_dedupe: Tree,
-    change_event: Tree,
-    history: Tree,
-    recovery_outbox: Tree,
-    families: BTreeMap<MetadataFamily, Tree>,
+    read_stats_identity: Arc<ReadStatsIdentity>,
 }
 
 #[cfg(feature = "metadata-read-stats")]
 #[derive(Default)]
-struct MetadataReadStatsIdentity {
-    active: AtomicBool,
+struct ReadStatsIdentity {
+    metadata_active: AtomicBool,
 }
 
 /// Short-lived point reader bound to one validated root and read version.
 ///
-/// The owning store keeps the shard read gate for the reader's complete
+/// The owning `MetaShard` keeps the command gate for the reader's complete
 /// lifetime. This type stays inside the workspace package so callers cannot
 /// retain the gate across scans, object I/O, or RPC work.
 pub(super) struct FencedPointReader<'a> {
-    store: &'a AgentMetadataStore,
-    root_id: RootId,
+    store: &'a MetaShard,
+    context: ReadFenceContext,
     version: ReadVersion,
-    current_version: ReadVersion,
 }
 
-/// Thread-bound logical read counters plus a dedicated store's Holt telemetry.
+#[derive(Clone, Copy)]
+struct ReadFenceContext {
+    root_id: RootId,
+    placement_generation: PlacementGeneration,
+    owner_epoch: OwnerEpoch,
+}
+
+/// Thread-bound logical metadata read counters.
 ///
 /// This diagnostic API is available only with the `metadata-read-stats`
 /// feature. Reads through clones of `store` are included when they execute on
-/// the thread that owns the session. Holt's physical counters remain
-/// store-wide, so callers must exclude concurrent store activity before
-/// attributing them to the measured workload.
+/// the thread that owns the session.
 #[cfg(feature = "metadata-read-stats")]
 #[must_use = "finish the session to obtain counters, or drop it to cancel collection"]
 pub struct MetadataReadStatsSession<'a> {
-    store: &'a AgentMetadataStore,
+    store: &'a MetaShard,
     store_key: usize,
-    storage_before: MetadataReadStats,
     active: bool,
     not_send: PhantomData<Rc<()>>,
 }
@@ -503,15 +488,7 @@ pub struct MetadataReadStatsSession<'a> {
 #[cfg(feature = "metadata-read-stats")]
 impl MetadataReadStatsSession<'_> {
     pub fn finish(mut self) -> Result<MetadataReadStats, MetadataReadStatsSessionError> {
-        let logical = read_stats::finish_session(self.store_key)?;
-        let storage_after = read_stats::storage_snapshot(&self.store.db.stats());
-        let result = storage_after
-            .delta_since(&self.storage_before)
-            .map(|mut combined| {
-                read_stats::merge_logical_counters(&mut combined, logical);
-                combined
-            })
-            .map_err(MetadataReadStatsSessionError::from);
+        let result = read_stats::finish_session(self.store_key);
         self.release();
         result
     }
@@ -520,7 +497,7 @@ impl MetadataReadStatsSession<'_> {
         self.active = false;
         self.store
             .read_stats_identity
-            .active
+            .metadata_active
             .store(false, Ordering::Release);
     }
 }
@@ -540,203 +517,125 @@ impl FencedPointReader<'_> {
         &self,
         family: MetadataFamily,
         key: &[u8],
-    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
-        validate_root_scoped_bytes(self.root_id, key, "point-read key")?;
-        if self.version == self.current_version {
-            self.store
-                .read_current_at_unfenced(family, key, self.current_version)
-        } else {
-            self.store.read_at_unfenced(family, key, self.version)
-        }
+    ) -> Result<Option<Vec<u8>>, MetaError> {
+        validate_root_scoped_bytes(self.context.root_id, key, "point-read key")?;
+        self.store
+            .read_at_fence(family, key, self.version, self.context)
     }
 }
 
-impl AgentMetadataStore {
-    pub fn open_memory(logical_shard_id: LogicalShardId) -> Result<Self, AgentMetadataError> {
-        Self::initialize_fresh(TreeConfig::memory(), logical_shard_id)
-    }
-
-    pub fn create_file(
-        path: impl AsRef<Path>,
+impl MetaShard {
+    /// Initialize the workspace schema in one empty physical store.
+    pub fn initialize(
+        store: Arc<dyn TxnStore>,
         logical_shard_id: LogicalShardId,
-    ) -> Result<Self, AgentMetadataError> {
-        let path = path.as_ref();
-        require_fresh_location(path)?;
-        let mut config = TreeConfig::new(path);
-        config.durability = Durability::Wal { sync: true };
-        config.checkpoint.auto_vacuum = false;
-        Self::initialize_fresh(config, logical_shard_id)
-    }
-
-    pub fn reopen_file(
-        path: impl AsRef<Path>,
-        logical_shard_id: LogicalShardId,
-    ) -> Result<Self, AgentMetadataError> {
-        let path = path.as_ref();
-        require_existing_location(path)?;
-        let mut config = TreeConfig::new(path);
-        config.durability = Durability::Wal { sync: true };
-        config.checkpoint.auto_vacuum = false;
-        let db = DB::open(config).map_err(|error| backend("open database", error))?;
-        Self::open_marked(db, logical_shard_id)
-    }
-
-    fn initialize_fresh(
-        config: TreeConfig,
-        logical_shard_id: LogicalShardId,
-    ) -> Result<Self, AgentMetadataError> {
-        let db = DB::open(config).map_err(|error| backend("create database", error))?;
-        let existing = db
-            .list_trees()
-            .map_err(|error| backend("inspect fresh database", error))?;
-        if !existing.is_empty() {
-            return Err(AgentMetadataError::SchemaGate {
-                reason: format!("fresh store already contains trees {existing:?}"),
+    ) -> Result<Self, MetaError> {
+        let shard = Self::bind(store, logical_shard_id)?;
+        let mut txn = WriteTxn {
+            checks: keyspaces()
+                .iter()
+                .map(|definition| Check::EmptyPrefix {
+                    keyspace: definition.id,
+                    prefix: Vec::new(),
+                })
+                .collect(),
+            mutations: Vec::new(),
+        };
+        for (key, value) in system_bootstrap_rows(logical_shard_id) {
+            txn.checks.push(Check::Absent {
+                key: Key::new(SYSTEM.id, key),
+            });
+            txn.mutations.push(Mutation::Put {
+                key: Key::new(SYSTEM.id, key),
+                value,
             });
         }
-        for tree in SCHEMA_TREES {
-            db.create_tree(tree)
-                .map_err(|error| backend("create schema tree", error))?;
+        match shard.commit("initialize system records", txn)? {
+            Commit::Applied => shard.open_domain(),
+            Commit::Conflict => Err(MetaError::SchemaGate {
+                reason: "fresh metadata store is not empty".to_owned(),
+            }),
         }
-        let initialized = db
-            .atomic(|batch| {
-                batch.put_if_absent(SYSTEM_TREE, SYSTEM_SCHEMA_KEY, &encode_schema_marker());
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_SHARD_IDENTITY_KEY,
-                    &encode_shard_identity(logical_shard_id),
-                );
-                batch.put_if_absent(SYSTEM_TREE, SYSTEM_OWNER_FENCE_KEY, &encode_system_u64(0));
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_COMMIT_CLOCK_KEY,
-                    &encode_system_u64(INITIAL_COMMIT_VERSION),
-                );
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
-                    &encode_system_u64(0),
-                );
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_APPLIED_RECOVERY_LSN_KEY,
-                    &encode_system_u64(0),
-                );
-                batch.put_if_absent(
-                    SYSTEM_TREE,
-                    SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
-                    &encode_system_digest(recovery_genesis_digest(logical_shard_id)),
-                );
-            })
-            .map_err(|error| backend("initialize system records", error))?;
-        if !initialized {
-            return Err(AgentMetadataError::SchemaGate {
-                reason: "fresh system records collided".to_owned(),
-            });
-        }
-        Self::open_marked(db, logical_shard_id)
     }
 
-    fn open_marked(db: DB, logical_shard_id: LogicalShardId) -> Result<Self, AgentMetadataError> {
-        validate_tree_registry(&db)?;
-        let system = db
-            .open_tree(SYSTEM_TREE)
-            .map_err(|error| backend("open System", error))?;
-        let schema = required_record(&system, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-        validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
+    /// Open and validate an existing workspace schema.
+    pub fn open(
+        store: Arc<dyn TxnStore>,
+        logical_shard_id: LogicalShardId,
+    ) -> Result<Self, MetaError> {
+        Self::bind(store, logical_shard_id)?.open_domain()
+    }
+
+    fn bind(store: Arc<dyn TxnStore>, logical_shard_id: LogicalShardId) -> Result<Self, MetaError> {
+        validate_store_profile(store.profile().limits)?;
+        store
+            .ready()
+            .map_err(|source| store_error("readiness check", source))?;
+        Ok(Self {
+            store,
+            logical_shard_id,
+            command_gate: Arc::new(RwLock::new(())),
+            #[cfg(feature = "metadata-read-stats")]
+            read_stats_identity: Arc::new(ReadStatsIdentity::default()),
+        })
+    }
+
+    fn open_domain(self) -> Result<Self, MetaError> {
+        let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+        validate_schema_marker(&schema).map_err(|error| MetaError::SchemaGate {
             reason: error.to_string(),
         })?;
-        let shard = required_record(&system, SYSTEM_SHARD_IDENTITY_KEY, "System(shard_identity)")?;
-        if decode_shard_identity(&shard.value)? != logical_shard_id {
-            return Err(AgentMetadataError::SchemaGate {
+        let shard = self.required_value(
+            SYSTEM.id,
+            SYSTEM_SHARD_IDENTITY_KEY,
+            "System(shard_identity)",
+        )?;
+        if decode_shard_identity(&shard)? != self.logical_shard_id {
+            return Err(MetaError::SchemaGate {
                 reason: "logical shard identity does not match requested store".to_owned(),
             });
         }
         decode_system_u64(
-            &required_record(&system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?.value,
+            &self.required_value(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?,
             "System(owner_fence)",
         )?;
         decode_system_u64(
-            &required_record(
-                &system,
+            &self.required_value(
+                SYSTEM.id,
                 SYSTEM_APPLIED_RECOVERY_LSN_KEY,
                 "System(applied_recovery_lsn)",
-            )?
-            .value,
+            )?,
             "System(applied_recovery_lsn)",
         )?;
         decode_system_digest(
-            &required_record(
-                &system,
+            &self.required_value(
+                SYSTEM.id,
                 SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
                 "System(recovery_chain_digest)",
-            )?
-            .value,
+            )?,
             "System(recovery_chain_digest)",
         )?;
         let clock = decode_system_u64(
-            &required_record(&system, SYSTEM_COMMIT_CLOCK_KEY, "System(commit_clock)")?.value,
+            &self.required_value(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY, "System(commit_clock)")?,
             "System(commit_clock)",
         )?;
         CommitVersion::new(clock).map_err(|error| corrupt("System(commit_clock)", error))?;
         decode_system_u64(
-            &required_record(
-                &system,
+            &self.required_value(
+                SYSTEM.id,
                 SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
                 "System(lease_clock_high_water)",
-            )?
-            .value,
+            )?,
             "System(lease_clock_high_water)",
         )?;
-
-        let root_fence = db
-            .open_tree(ROOT_FENCE_TREE)
-            .map_err(|error| backend("open RootFence", error))?;
-        let command_dedupe = db
-            .open_tree(COMMAND_DEDUPE_TREE)
-            .map_err(|error| backend("open CommandDedupe", error))?;
-        let change_event = db
-            .open_tree(CHANGE_EVENT_TREE)
-            .map_err(|error| backend("open ChangeEvent", error))?;
-        let history = db
-            .open_tree(HISTORY_TREE)
-            .map_err(|error| backend("open History", error))?;
-        let recovery_outbox = db
-            .open_tree(RECOVERY_OUTBOX_TREE)
-            .map_err(|error| backend("open RecoveryOutbox", error))?;
-        let mut families = BTreeMap::new();
-        for family in MetadataFamily::ALL {
-            families.insert(
-                family,
-                db.open_tree(family.tree_name())
-                    .map_err(|error| backend("open metadata family", error))?,
-            );
-        }
-        let store = Self {
-            db,
-            logical_shard_id,
-            command_gate: Arc::new(RwLock::new(())),
-            #[cfg(feature = "metadata-read-stats")]
-            read_stats_identity: Arc::new(MetadataReadStatsIdentity::default()),
-            system,
-            root_fence,
-            command_dedupe,
-            change_event,
-            history,
-            recovery_outbox,
-            families,
-        };
-        store.verify_recovery_chain_unlocked()?;
-        Ok(store)
+        self.verify_recovery_chain_unlocked()?;
+        Ok(self)
     }
 
-    pub fn current_read_version(&self) -> Result<ReadVersion, AgentMetadataError> {
-        let record = self.required_system_record(
-            &self.system,
-            SYSTEM_COMMIT_CLOCK_KEY,
-            "System(commit_clock)",
-        )?;
-        let value = decode_system_u64(&record.value, "System(commit_clock)")?;
+    pub fn current_read_version(&self) -> Result<ReadVersion, MetaError> {
+        let value =
+            self.required_value(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY, "System(commit_clock)")?;
+        let value = decode_system_u64(&value, "System(commit_clock)")?;
         ReadVersion::new(value).map_err(|error| corrupt("System(commit_clock)", error))
     }
 
@@ -756,24 +655,22 @@ impl AgentMetadataStore {
     ) -> Result<MetadataReadStatsSession<'_>, MetadataReadStatsSessionError> {
         if self
             .read_stats_identity
-            .active
+            .metadata_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return Err(MetadataReadStatsSessionError::StoreSessionAlreadyActive);
         }
         let store_key = self.read_stats_store_key();
-        let storage_before = read_stats::storage_snapshot(&self.db.stats());
         if let Err(error) = read_stats::begin_session(store_key) {
             self.read_stats_identity
-                .active
+                .metadata_active
                 .store(false, Ordering::Release);
             return Err(error);
         }
         Ok(MetadataReadStatsSession {
             store: self,
             store_key,
-            storage_before,
             active: true,
             not_send: PhantomData,
         })
@@ -781,13 +678,10 @@ impl AgentMetadataStore {
 
     /// Return the persisted physical-owner epoch. `None` is the fresh epoch-zero
     /// sentinel before the first owner is admitted.
-    pub fn current_owner_epoch(&self) -> Result<Option<OwnerEpoch>, AgentMetadataError> {
-        let record = self.required_system_record(
-            &self.system,
-            SYSTEM_OWNER_FENCE_KEY,
-            "System(owner_fence)",
-        )?;
-        let value = decode_system_u64(&record.value, "System(owner_fence)")?;
+    pub fn current_owner_epoch(&self) -> Result<Option<OwnerEpoch>, MetaError> {
+        let value =
+            self.required_value(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
+        let value = decode_system_u64(&value, "System(owner_fence)")?;
         if value == 0 {
             Ok(None)
         } else {
@@ -800,13 +694,13 @@ impl AgentMetadataStore {
     /// Inspect one shard-local root fence during owner bootstrap.
     ///
     /// Ordinary reads and writes must still use the fenced context APIs.
-    pub fn root_fence(&self, root_id: RootId) -> Result<Option<RootFence>, AgentMetadataError> {
+    pub fn root_fence(&self, root_id: RootId) -> Result<Option<RootFence>, MetaError> {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| backend("lock read gate", error))?;
-        self.read_tree_value(
-            &self.root_fence,
+            .map_err(|error| internal("lock read gate", error))?;
+        self.read_value(
+            ROOT_FENCE.id,
             root_id.as_bytes(),
             MetadataPointReadSource::RootFence,
             "read RootFence",
@@ -816,21 +710,21 @@ impl AgentMetadataStore {
     }
 
     /// Return the persisted monotonic lease clock used by snapshot expiry.
-    pub fn lease_clock_high_water(&self) -> Result<u64, AgentMetadataError> {
-        let record = self.required_system_record(
-            &self.system,
+    pub fn lease_clock_high_water(&self) -> Result<u64, MetaError> {
+        let value = self.required_value(
+            SYSTEM.id,
             SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
             "System(lease_clock_high_water)",
         )?;
-        decode_system_u64(&record.value, "System(lease_clock_high_water)")
+        decode_system_u64(&value, "System(lease_clock_high_water)")
     }
 
     /// Return the durable recovery tail atomically serialized with writes.
-    pub fn recovery_state(&self) -> Result<RecoveryState, AgentMetadataError> {
+    pub fn recovery_state(&self) -> Result<RecoveryState, MetaError> {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| backend("lock read gate", error))?;
+            .map_err(|error| internal("lock read gate", error))?;
         self.recovery_state_unlocked()
     }
 
@@ -839,7 +733,7 @@ impl AgentMetadataStore {
         &self,
         start_after_lsn: u64,
         limit: usize,
-    ) -> Result<Vec<RecoveryOutboxRecord>, AgentMetadataError> {
+    ) -> Result<Vec<RecoveryOutboxRecord>, MetaError> {
         self.recovery_outbox_after_with_byte_budget(start_after_lsn, limit, MAX_RECOVERY_BYTES)
     }
 
@@ -848,7 +742,7 @@ impl AgentMetadataStore {
         start_after_lsn: u64,
         limit: usize,
         max_encoded_bytes: usize,
-    ) -> Result<Vec<RecoveryOutboxRecord>, AgentMetadataError> {
+    ) -> Result<Vec<RecoveryOutboxRecord>, MetaError> {
         const MAX_RECOVERY_PAGE_ROWS: usize = 1024;
         if limit == 0 || limit > MAX_RECOVERY_PAGE_ROWS {
             return Err(invalid(format!(
@@ -858,52 +752,64 @@ impl AgentMetadataStore {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| backend("lock read gate", error))?;
-        let start = recovery_outbox_key(start_after_lsn);
+            .map_err(|error| internal("lock read gate", error))?;
+        let start = recovery_outbox_key(start_after_lsn).to_vec();
         let mut rows = Vec::with_capacity(limit);
         let mut encoded_bytes = 0_usize;
-        for entry in self
-            .recovery_outbox
-            .range()
-            .prefix(&[0])
-            .start_after(&start)
-        {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan RecoveryOutbox", error))?
-            else {
-                continue;
-            };
-            let key_lsn = decode_recovery_outbox_key(&key)
-                .map_err(|error| corrupt("RecoveryOutbox key", error))?;
-            let row_encoded_bytes = recovery_storage_logical_length(&value)
-                .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
-            if !rows.is_empty()
-                && encoded_bytes.saturating_add(row_encoded_bytes) > max_encoded_bytes
-            {
-                break;
+        let mut after = Some(start);
+        loop {
+            let page = self.scan_page(
+                RECOVERY_OUTBOX.id,
+                &[0],
+                after.as_deref(),
+                (limit - rows.len()).min(MAX_HISTORICAL_SCAN_PAGE_ROWS),
+                None,
+                0,
+                "scan RecoveryOutbox",
+            )?;
+            let more = page.more;
+            for item in page.items {
+                let ScanItem::Row { key, value } = item else {
+                    return Err(corrupt(
+                        "RecoveryOutbox",
+                        "non-delimited scan returned a common prefix",
+                    ));
+                };
+                after = Some(key.clone());
+                let key_lsn = decode_recovery_outbox_key(&key)
+                    .map_err(|error| corrupt("RecoveryOutbox key", error))?;
+                let row_encoded_bytes = recovery_storage_logical_length(&value)
+                    .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
+                if !rows.is_empty()
+                    && encoded_bytes.saturating_add(row_encoded_bytes) > max_encoded_bytes
+                {
+                    return Ok(rows);
+                }
+                let row = self.read_recovery_record(key_lsn, &value)?;
+                if row.recovery_lsn != key_lsn {
+                    return Err(MetaError::CorruptRecord {
+                        record: "RecoveryOutbox",
+                        reason: "row LSN does not match ordered key".to_owned(),
+                    });
+                }
+                encoded_bytes = encoded_bytes.saturating_add(row_encoded_bytes);
+                rows.push(row);
+                if rows.len() == limit {
+                    return Ok(rows);
+                }
             }
-            let row = self.read_recovery_record(key_lsn, &value)?;
-            if row.recovery_lsn != key_lsn {
-                return Err(AgentMetadataError::CorruptRecord {
-                    record: "RecoveryOutbox",
-                    reason: "row LSN does not match ordered key".to_owned(),
-                });
-            }
-            encoded_bytes = encoded_bytes.saturating_add(row_encoded_bytes);
-            rows.push(row);
-            if rows.len() == limit {
-                break;
+            if !more {
+                return Ok(rows);
             }
         }
-        Ok(rows)
     }
 
     /// Verify every durable recovery row and the `System` tail.
-    pub fn verify_recovery_chain(&self) -> Result<RecoveryState, AgentMetadataError> {
+    pub fn verify_recovery_chain(&self) -> Result<RecoveryState, MetaError> {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| backend("lock read gate", error))?;
+            .map_err(|error| internal("lock read gate", error))?;
         self.verify_recovery_chain_unlocked()
     }
 
@@ -917,55 +823,58 @@ impl AgentMetadataStore {
         placement_generation: PlacementGeneration,
         owner_epoch: OwnerEpoch,
         observed_ms: u64,
-    ) -> Result<u64, AgentMetadataError> {
+    ) -> Result<u64, MetaError> {
         let _command_guard = self
             .command_gate
             .write()
-            .map_err(|error| backend("lock command gate", error))?;
-        let schema = required_record(&self.system, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-        validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
+            .map_err(|error| internal("lock command gate", error))?;
+        let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+        validate_schema_marker(&schema).map_err(|error| MetaError::SchemaGate {
             reason: error.to_string(),
         })?;
-        let shard = required_record(
-            &self.system,
+        let shard = self.required_value(
+            SYSTEM.id,
             SYSTEM_SHARD_IDENTITY_KEY,
             "System(shard_identity)",
         )?;
-        if decode_shard_identity(&shard.value)? != self.logical_shard_id {
-            return Err(AgentMetadataError::PlacementMismatch);
+        if decode_shard_identity(&shard)? != self.logical_shard_id {
+            return Err(MetaError::PlacementMismatch);
         }
-        let owner = required_record(&self.system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
-        let actual_owner = decode_system_u64(&owner.value, "System(owner_fence)")?;
+        let owner =
+            self.required_value(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
+        let actual_owner = decode_system_u64(&owner, "System(owner_fence)")?;
         if actual_owner != owner_epoch.get() {
-            return Err(AgentMetadataError::OwnerEpochMismatch {
+            return Err(MetaError::OwnerEpochMismatch {
                 expected: owner_epoch.get(),
                 actual: actual_owner,
             });
         }
         let root_fence = self
-            .root_fence
-            .get_record(root_id.as_bytes())
-            .map_err(|error| backend("read RootFence", error))?
-            .ok_or(AgentMetadataError::RootFenceMissing)?;
-        let fence =
-            RootFence::decode(&root_fence.value).map_err(|error| corrupt("RootFence", error))?;
+            .read_value(
+                ROOT_FENCE.id,
+                root_id.as_bytes(),
+                MetadataPointReadSource::RootFence,
+                "read RootFence",
+            )?
+            .ok_or(MetaError::RootFenceMissing)?;
+        let fence = RootFence::decode(&root_fence).map_err(|error| corrupt("RootFence", error))?;
         if fence.logical_shard_id != self.logical_shard_id
             || fence.placement_generation != placement_generation
         {
-            return Err(AgentMetadataError::PlacementMismatch);
+            return Err(MetaError::PlacementMismatch);
         }
         if fence.activation_state != RootActivationState::Active {
-            return Err(AgentMetadataError::RootFenceStateMismatch {
+            return Err(MetaError::RootFenceStateMismatch {
                 expected: RootActivationState::Active,
                 actual: fence.activation_state,
             });
         }
-        let clock = required_record(
-            &self.system,
+        let clock = self.required_value(
+            SYSTEM.id,
             SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
             "System(lease_clock_high_water)",
         )?;
-        let current = decode_system_u64(&clock.value, "System(lease_clock_high_water)")?;
+        let current = decode_system_u64(&clock, "System(lease_clock_high_water)")?;
         if observed_ms <= current {
             return Ok(current);
         }
@@ -980,26 +889,23 @@ impl AgentMetadataStore {
                 effective_high_water_ms: observed_ms,
             },
         )?;
-        let committed = self
-            .db
-            .atomic(|batch| {
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SCHEMA_KEY, schema.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SHARD_IDENTITY_KEY, shard.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_OWNER_FENCE_KEY, owner.version);
-                batch.assert_version(ROOT_FENCE_TREE, root_id.as_bytes(), root_fence.version);
-                batch.compare_and_put(
-                    SYSTEM_TREE,
-                    SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
-                    clock.version,
-                    &encode_system_u64(observed_ms),
-                );
-                enqueue_recovery(batch, &recovery);
-            })
-            .map_err(|error| backend("advance lease clock", error))?;
-        if committed {
-            Ok(observed_ms)
-        } else {
-            Err(AgentMetadataError::WriteConflict)
+        let mut txn = WriteTxn {
+            checks: vec![
+                value_check(SYSTEM.id, SYSTEM_SCHEMA_KEY, &schema),
+                value_check(SYSTEM.id, SYSTEM_SHARD_IDENTITY_KEY, &shard),
+                value_check(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, &owner),
+                value_check(ROOT_FENCE.id, root_id.as_bytes(), &root_fence),
+                value_check(SYSTEM.id, SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY, &clock),
+            ],
+            mutations: vec![Mutation::Put {
+                key: Key::new(SYSTEM.id, SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY),
+                value: encode_system_u64(observed_ms).to_vec(),
+            }],
+        };
+        enqueue_recovery(&mut txn, &recovery);
+        match self.commit("advance lease clock", txn)? {
+            Commit::Applied => Ok(observed_ms),
+            Commit::Conflict => Err(MetaError::WriteConflict),
         }
     }
 
@@ -1012,37 +918,38 @@ impl AgentMetadataStore {
         &self,
         expected: Option<OwnerEpoch>,
         next: OwnerEpoch,
-    ) -> Result<(), AgentMetadataError> {
+    ) -> Result<(), MetaError> {
         let _command_guard = self
             .command_gate
             .write()
-            .map_err(|error| backend("lock command gate", error))?;
+            .map_err(|error| internal("lock command gate", error))?;
         let expected_raw = expected.map(OwnerEpoch::get).unwrap_or(0);
-        let schema = required_record(&self.system, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-        validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
+        let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+        validate_schema_marker(&schema).map_err(|error| MetaError::SchemaGate {
             reason: error.to_string(),
         })?;
-        let shard = required_record(
-            &self.system,
+        let shard = self.required_value(
+            SYSTEM.id,
             SYSTEM_SHARD_IDENTITY_KEY,
             "System(shard_identity)",
         )?;
-        if decode_shard_identity(&shard.value)? != self.logical_shard_id {
-            return Err(AgentMetadataError::PlacementMismatch);
+        if decode_shard_identity(&shard)? != self.logical_shard_id {
+            return Err(MetaError::PlacementMismatch);
         }
-        let owner = required_record(&self.system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
-        let current = decode_system_u64(&owner.value, "System(owner_fence)")?;
+        let owner =
+            self.required_value(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
+        let current = decode_system_u64(&owner, "System(owner_fence)")?;
         if current == next.get() {
             return Ok(());
         }
         if current != expected_raw {
-            return Err(AgentMetadataError::OwnerEpochMismatch {
+            return Err(MetaError::OwnerEpochMismatch {
                 expected: expected_raw,
                 actual: current,
             });
         }
         if next.get() <= current {
-            return Err(AgentMetadataError::OwnerEpochNotMonotonic {
+            return Err(MetaError::OwnerEpochNotMonotonic {
                 current,
                 next: next.get(),
             });
@@ -1053,31 +960,25 @@ impl AgentMetadataStore {
                 applied_owner_epoch: next,
             },
         )?;
-        let committed = self
-            .db
-            .atomic(|batch| {
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SCHEMA_KEY, schema.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SHARD_IDENTITY_KEY, shard.version);
-                batch.compare_and_put(
-                    SYSTEM_TREE,
-                    SYSTEM_OWNER_FENCE_KEY,
-                    owner.version,
-                    &encode_system_u64(next.get()),
-                );
-                enqueue_recovery(batch, &recovery);
-            })
-            .map_err(|error| backend("advance owner epoch", error))?;
-        if committed {
-            Ok(())
-        } else {
-            Err(AgentMetadataError::WriteConflict)
+        let mut txn = WriteTxn {
+            checks: vec![
+                value_check(SYSTEM.id, SYSTEM_SCHEMA_KEY, &schema),
+                value_check(SYSTEM.id, SYSTEM_SHARD_IDENTITY_KEY, &shard),
+                value_check(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, &owner),
+            ],
+            mutations: vec![Mutation::Put {
+                key: Key::new(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY),
+                value: encode_system_u64(next.get()).to_vec(),
+            }],
+        };
+        enqueue_recovery(&mut txn, &recovery);
+        match self.commit("advance owner epoch", txn)? {
+            Commit::Applied => Ok(()),
+            Commit::Conflict => Err(MetaError::WriteConflict),
         }
     }
 
-    pub fn execute(
-        &self,
-        command: &MetadataCommand,
-    ) -> Result<MetadataCommandResult, AgentMetadataError> {
+    pub fn execute(&self, command: &MetadataCommand) -> Result<MetadataCommandResult, MetaError> {
         self.execute_with_lease_deadline(command, None)
     }
 
@@ -1085,82 +986,150 @@ impl AgentMetadataStore {
         &self,
         command: &MetadataCommand,
         lease_deadline_ms: u64,
-    ) -> Result<MetadataCommandResult, AgentMetadataError> {
+    ) -> Result<MetadataCommandResult, MetaError> {
         self.execute_with_lease_deadline(command, Some(lease_deadline_ms))
+    }
+
+    /// Check whether a fresh execution of `command` fits the serving write
+    /// envelope without reading or mutating the transaction store.
+    ///
+    /// This check covers the fully derived transaction, including history,
+    /// dedupe, and recovery-outbox rows. It does not check current predicates,
+    /// fences, the commit clock, or an existing dedupe result.
+    pub(crate) fn command_fit(
+        &self,
+        command: &MetadataCommand,
+        lease_deadline_ms: Option<u64>,
+    ) -> Result<CommandFit, MetaError> {
+        let txn = self.command_txn_for_fit(command, lease_deadline_ms)?;
+        match txn.validate(&store_limits()) {
+            Ok(()) => Ok(CommandFit::Fits),
+            Err(StoreError::LimitExceeded {
+                kind,
+                actual,
+                maximum,
+            }) => Ok(CommandFit::Exceeds {
+                kind: command_limit(kind)?,
+                actual,
+                maximum,
+            }),
+            Err(error) => Err(internal("derive command fit", error)),
+        }
+    }
+
+    fn command_txn_for_fit(
+        &self,
+        command: &MetadataCommand,
+        lease_deadline_ms: Option<u64>,
+    ) -> Result<WriteTxn, MetaError> {
+        self.validate_command(command)?;
+        if command.command_digest != command.canonical_digest() {
+            return Err(MetaError::CommandDigestMismatch);
+        }
+        let next_version = command
+            .read_version
+            .get()
+            .checked_add(1)
+            .and_then(|version| CommitVersion::new(version).ok())
+            .ok_or(MetaError::VersionOverflow)?;
+        let predicate_plan = synthetic_predicate_plan(command)?;
+        self.validate_history_projection(command, &predicate_plan)?;
+        let root_plan = synthetic_root_fence_plan(command)?;
+        let recovery = build_recovery_plan(
+            encode_system_u64(0).to_vec(),
+            encode_system_digest(recovery_genesis_digest(command.logical_shard_id)),
+            RecoveryMutationV1::MetadataCommand {
+                command: Box::new(command.clone()),
+                lease_deadline_ms,
+            },
+            RecoveryResultV1::MetadataCommand {
+                commit_version: next_version,
+                deterministic_result: command.deterministic_result.clone(),
+            },
+        )?;
+        let state = CommandTxnState {
+            next_version,
+            schema: encode_schema_marker(),
+            shard: encode_shard_identity(command.logical_shard_id),
+            owner: encode_system_u64(command.owner_epoch.get()).to_vec(),
+            clock: encode_system_u64(command.read_version.get()).to_vec(),
+            lease_clock: lease_deadline_ms.map(|_| encode_system_u64(0).to_vec()),
+            root_plan,
+            predicate_plan,
+            recovery,
+        };
+        build_command_txn(command, &state)
     }
 
     fn execute_with_lease_deadline(
         &self,
         command: &MetadataCommand,
         lease_deadline_ms: Option<u64>,
-    ) -> Result<MetadataCommandResult, AgentMetadataError> {
+    ) -> Result<MetadataCommandResult, MetaError> {
         // Validation and canonical hashing depend only on caller-owned command
         // bytes. Keep that potentially non-trivial work outside the shard-wide
         // sequencing window; the guarded section below is reserved for reads
         // and writes that must observe one commit-clock / recovery-chain state.
         self.validate_command(command)?;
         if command.command_digest != command.canonical_digest() {
-            return Err(AgentMetadataError::CommandDigestMismatch);
+            return Err(MetaError::CommandDigestMismatch);
         }
         let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
         let _command_guard = self
             .command_gate
             .write()
-            .map_err(|error| backend("lock command gate", error))?;
+            .map_err(|error| internal("lock command gate", error))?;
         if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
             return Ok(result);
         }
 
-        let schema = required_record(&self.system, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-        validate_schema_marker(&schema.value).map_err(|error| AgentMetadataError::SchemaGate {
+        let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
+        validate_schema_marker(&schema).map_err(|error| MetaError::SchemaGate {
             reason: error.to_string(),
         })?;
-        let shard = required_record(
-            &self.system,
+        let shard = self.required_value(
+            SYSTEM.id,
             SYSTEM_SHARD_IDENTITY_KEY,
             "System(shard_identity)",
         )?;
-        if decode_shard_identity(&shard.value)? != command.logical_shard_id {
-            return Err(AgentMetadataError::PlacementMismatch);
+        if decode_shard_identity(&shard)? != command.logical_shard_id {
+            return Err(MetaError::PlacementMismatch);
         }
-        let owner = required_record(&self.system, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
-        let actual_owner = decode_system_u64(&owner.value, "System(owner_fence)")?;
+        let owner =
+            self.required_value(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, "System(owner_fence)")?;
+        let actual_owner = decode_system_u64(&owner, "System(owner_fence)")?;
         if actual_owner != command.owner_epoch.get() {
-            return Err(AgentMetadataError::OwnerEpochMismatch {
+            return Err(MetaError::OwnerEpochMismatch {
                 expected: command.owner_epoch.get(),
                 actual: actual_owner,
             });
         }
-        let clock = required_record(
-            &self.system,
-            SYSTEM_COMMIT_CLOCK_KEY,
-            "System(commit_clock)",
-        )?;
-        let current_version = decode_system_u64(&clock.value, "System(commit_clock)")?;
+        let clock =
+            self.required_value(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY, "System(commit_clock)")?;
+        let current_version = decode_system_u64(&clock, "System(commit_clock)")?;
         if command.read_version.get() != current_version {
-            return Err(AgentMetadataError::WriteReadVersionMismatch {
+            return Err(MetaError::WriteReadVersionMismatch {
                 requested: command.read_version.get(),
                 current: current_version,
             });
         }
         let next_version_raw = current_version
             .checked_add(1)
-            .ok_or(AgentMetadataError::VersionOverflow)?;
-        let next_version = CommitVersion::new(next_version_raw)
-            .map_err(|_| AgentMetadataError::VersionOverflow)?;
+            .ok_or(MetaError::VersionOverflow)?;
+        let next_version =
+            CommitVersion::new(next_version_raw).map_err(|_| MetaError::VersionOverflow)?;
 
         let root_plan = self.plan_root_fence(command)?;
         let lease_clock = lease_deadline_ms
             .map(|requested_deadline_ms| {
-                let clock = required_record(
-                    &self.system,
+                let clock = self.required_value(
+                    SYSTEM.id,
                     SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
                     "System(lease_clock_high_water)",
                 )?;
-                let lease_clock_ms =
-                    decode_system_u64(&clock.value, "System(lease_clock_high_water)")?;
+                let lease_clock_ms = decode_system_u64(&clock, "System(lease_clock_high_water)")?;
                 if requested_deadline_ms <= lease_clock_ms {
-                    return Err(AgentMetadataError::LeaseDeadlineReached {
+                    return Err(MetaError::LeaseDeadlineReached {
                         lease_clock_ms,
                         requested_deadline_ms,
                     });
@@ -1181,112 +1150,32 @@ impl AgentMetadataStore {
                 deterministic_result: command.deterministic_result.clone(),
             },
         )?;
+        let state = CommandTxnState {
+            next_version,
+            schema,
+            shard,
+            owner,
+            clock,
+            lease_clock,
+            root_plan,
+            predicate_plan,
+            recovery,
+        };
+        let txn = build_command_txn(command, &state)?;
 
-        let dedupe_record = CommandDedupeRecord {
-            command_digest: command.command_digest,
-            commit_version: next_version,
-            recovery_lsn: recovery.row.recovery_lsn,
-            deterministic_result: command.deterministic_result.clone(),
-        }
-        .encode()
-        .map_err(|error| corrupt("CommandDedupe", error))?;
-
-        let committed = self
-            .db
-            .atomic(|batch| {
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SCHEMA_KEY, schema.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_SHARD_IDENTITY_KEY, shard.version);
-                batch.assert_version(SYSTEM_TREE, SYSTEM_OWNER_FENCE_KEY, owner.version);
-                if let Some(lease_clock) = &lease_clock {
-                    batch.assert_version(
-                        SYSTEM_TREE,
-                        SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
-                        lease_clock.version,
-                    );
-                }
-                batch.compare_and_put(
-                    SYSTEM_TREE,
-                    SYSTEM_COMMIT_CLOCK_KEY,
-                    clock.version,
-                    &encode_system_u64(next_version_raw),
-                );
-                enqueue_root_fence(batch, command, &root_plan);
-                enqueue_predicate_guards(batch, &predicate_plan, next_version);
-
-                for planned in predicate_plan.exact.values() {
-                    let Some(previous) = &planned.current else {
-                        continue;
-                    };
-                    if !command.history_projection.iter().any(|projection| {
-                        projection.family == planned.family && projection.key == planned.key
-                    }) {
-                        continue;
-                    }
-                    let key = history_key(planned.family, &planned.key, next_version);
-                    let value = HistoryValue {
-                        transition_version: next_version,
-                        previous_created_version: previous.created_version,
-                        previous_modified_version: previous.modified_version,
-                        previous_payload: Some(previous.payload.clone()),
-                    }
-                    .encode()
-                    .expect("validated command history value fits the format envelope");
-                    batch.put(HISTORY_TREE, &key, &value);
-                }
-
-                for mutation in &command.mutations {
-                    match mutation {
-                        CommandMutation::Put { family, key, value } => {
-                            let planned = predicate_plan
-                                .exact
-                                .get(&(*family, key.clone()))
-                                .expect("every mutation has one exact predicate");
-                            let created_version = planned
-                                .current
-                                .as_ref()
-                                .map(|current| current.created_version)
-                                .unwrap_or(next_version);
-                            let encoded = CurrentValue {
-                                created_version,
-                                modified_version: next_version,
-                                payload: value.clone(),
-                            }
-                            .encode()
-                            .expect("validated command value fits the format envelope");
-                            batch.put(family.tree_name(), key, &encoded);
-                        }
-                        CommandMutation::Delete { family, key } => {
-                            batch.delete(family.tree_name(), key);
-                        }
-                    }
-                }
-                for (sequence, projection) in command.event_projection.iter().enumerate() {
-                    let sequence = u32::try_from(sequence)
-                        .expect("validated event count fits the event-key sequence width");
-                    let key = change_event_key(command.root_id, next_version, sequence);
-                    let value = CurrentValue {
-                        created_version: next_version,
-                        modified_version: next_version,
-                        payload: projection.payload.clone(),
-                    }
-                    .encode()
-                    .expect("validated event fits the format envelope");
-                    batch.put_if_absent(CHANGE_EVENT_TREE, &key, &value);
-                }
-                batch.put_if_absent(COMMAND_DEDUPE_TREE, &dedupe_key, &dedupe_record);
-                enqueue_recovery(batch, &recovery);
-            })
-            .map_err(|error| backend("execute metadata command", error))?;
-        if committed {
-            Ok(MetadataCommandResult {
+        match self.commit("execute metadata command", txn)? {
+            Commit::Applied => Ok(MetadataCommandResult {
                 commit_version: next_version,
                 deterministic_result: command.deterministic_result.clone(),
                 replayed: false,
-            })
-        } else if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
-            Ok(result)
-        } else {
-            Err(AgentMetadataError::WriteConflict)
+            }),
+            Commit::Conflict => {
+                if let Some(result) = self.replayed_result(&dedupe_key, command.command_digest)? {
+                    Ok(result)
+                } else {
+                    Err(MetaError::WriteConflict)
+                }
+            }
         }
     }
 
@@ -1298,21 +1187,32 @@ impl AgentMetadataStore {
         family: MetadataFamily,
         key: &[u8],
         version: ReadVersion,
-    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
+    ) -> Result<Option<Vec<u8>>, MetaError> {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| backend("lock read gate", error))?;
-        self.validate_read_fence(root_id, placement_generation, owner_epoch, key, version)?;
-        self.read_at_unfenced(family, key, version)
+            .map_err(|error| internal("lock read gate", error))?;
+        validate_root_scoped_bytes(root_id, key, "read key")?;
+        self.read_at_fence(
+            family,
+            key,
+            version,
+            ReadFenceContext {
+                root_id,
+                placement_generation,
+                owner_epoch,
+            },
+        )
     }
 
-    /// Run dependent point reads under one ownership/fence validation.
+    /// Run dependent point reads at one captured logical version.
     ///
     /// `requested_version = None` captures the current version inside the
     /// guarded window. A supplied historical version is rejected if it is
-    /// newer than the same captured current version. The callback must remain
-    /// limited to metadata point reads and local decoding.
+    /// newer than the same captured current version. Every callback point read
+    /// revalidates owner, root, and commit-clock records in the same store
+    /// snapshot as its data row. The callback must remain limited to metadata
+    /// point reads and local decoding.
     pub(super) fn with_fenced_point_reads<R, E>(
         &self,
         root_id: RootId,
@@ -1322,27 +1222,30 @@ impl AgentMetadataStore {
         read: impl FnOnce(ReadVersion, &FencedPointReader<'_>) -> Result<R, E>,
     ) -> Result<R, E>
     where
-        E: From<AgentMetadataError>,
+        E: From<MetaError>,
     {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| E::from(backend("lock read gate", error)))?;
+            .map_err(|error| E::from(internal("lock read gate", error)))?;
         let current_version = self
             .validate_read_context(root_id, placement_generation, owner_epoch)
             .map_err(E::from)?;
         let version = requested_version.unwrap_or(current_version);
         if version > current_version {
-            return Err(E::from(AgentMetadataError::ReadVersionInFuture {
+            return Err(E::from(MetaError::ReadVersionInFuture {
                 requested: version.get(),
                 current: current_version.get(),
             }));
         }
         let reader = FencedPointReader {
             store: self,
-            root_id,
+            context: ReadFenceContext {
+                root_id,
+                placement_generation,
+                owner_epoch,
+            },
             version,
-            current_version,
         };
         read(version, &reader)
     }
@@ -1359,36 +1262,34 @@ impl AgentMetadataStore {
         placement_generation: PlacementGeneration,
         owner_epoch: OwnerEpoch,
         request_id: RequestId,
-    ) -> Result<Option<CommandDedupeRecord>, AgentMetadataError> {
+    ) -> Result<Option<CommandDedupeRecord>, MetaError> {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| backend("lock read gate", error))?;
+            .map_err(|error| internal("lock read gate", error))?;
         let key = command_dedupe_key(root_id, request_id);
-        let current_version = self.current_read_version()?;
-        self.validate_read_fence(
-            root_id,
-            placement_generation,
-            owner_epoch,
-            &key,
-            current_version,
-        )?;
-        self.read_tree_value(
-            &self.command_dedupe,
+        let (_, value) = self.read_value_at_fence(
+            COMMAND_DEDUPE.id,
             &key,
             MetadataPointReadSource::Other,
             "read CommandDedupe",
-        )?
-        .map(|value| {
-            CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))
-        })
-        .transpose()
+            ReadFenceContext {
+                root_id,
+                placement_generation,
+                owner_epoch,
+            },
+        )?;
+        value
+            .map(|value| {
+                CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))
+            })
+            .transpose()
     }
 
     /// Stable ordered prefix scan at one fenced read version.
     ///
-    /// The current-version path is one Holt prefix scan. A historical scan also
-    /// reconstructs keys replaced or deleted after `version` from History.
+    /// The current-version path assembles one logical prefix scan from bounded physical pages.
+    /// A historical scan also reconstructs keys replaced or deleted after `version` from History.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_prefix_at(
         &self,
@@ -1400,7 +1301,7 @@ impl AgentMetadataStore {
         version: ReadVersion,
         start_after: Option<&[u8]>,
         limit: usize,
-    ) -> Result<Vec<MetadataScanItem>, AgentMetadataError> {
+    ) -> Result<Vec<MetadataScanItem>, MetaError> {
         self.scan_prefix_at_impl(
             root_id,
             placement_generation,
@@ -1444,7 +1345,7 @@ impl AgentMetadataStore {
         version: ReadVersion,
         start_after: Option<&[u8]>,
         limit: usize,
-    ) -> Result<Vec<DelimitedMetadataScanItem>, AgentMetadataError> {
+    ) -> Result<Vec<DelimitedMetadataScanItem>, MetaError> {
         self.scan_prefix_at_impl(
             root_id,
             placement_generation,
@@ -1472,7 +1373,7 @@ impl AgentMetadataStore {
         start_after: Option<&[u8]>,
         limit: usize,
         max_items: usize,
-    ) -> Result<Vec<DelimitedMetadataScanItem>, AgentMetadataError> {
+    ) -> Result<Vec<DelimitedMetadataScanItem>, MetaError> {
         let effective_limit = if limit == 0 {
             max_items
         } else {
@@ -1480,209 +1381,50 @@ impl AgentMetadataStore {
         };
         #[cfg(feature = "metadata-read-stats")]
         self.record_scan_call();
-        // Fence and capture one immutable cross-tree view while writes are
-        // excluded, then release the NoKV read gate before walking or decoding
-        // the page. Holt's captured views keep current and History consistent
-        // without making a long or historical scan block the write sequencer.
-        let (current_version, current_view, history_view) = {
-            let _read_guard = self
-                .command_gate
-                .read()
-                .map_err(|error| backend("lock read gate", error))?;
-            let current_version = self.validate_read_fence(
+        let mut current_version =
+            self.validate_read_fence(root_id, placement_generation, owner_epoch, prefix, version)?;
+        let read_context = ReadFenceContext {
+            root_id,
+            placement_generation,
+            owner_epoch,
+        };
+
+        // Current-state rows are already in caller order. Read each physical
+        // page and the clock in one store snapshot. If the clock advances,
+        // discard every collected page and reconstruct the requested version
+        // from History.
+        if version == current_version {
+            if let Some(visible) = self.collect_current_scan_at_clock(
+                family,
+                prefix,
+                start_after,
+                effective_limit,
+                delimiter,
+                version,
+                current_version,
+                read_context,
+            )? {
+                return Ok(visible);
+            }
+            current_version = self.validate_read_fence(
                 root_id,
                 placement_generation,
                 owner_epoch,
                 prefix,
                 version,
             )?;
-            let history_family_prefix = [family.history_tag()];
-            let scopes = if version == current_version {
-                vec![(family.tree_name(), prefix)]
-            } else {
-                vec![
-                    (family.tree_name(), prefix),
-                    (HISTORY_TREE, history_family_prefix.as_slice()),
-                ]
-            };
-            let (current_view, history_view) = self
-                .db
-                .view(&scopes, |view| {
-                    let current = view
-                        .tree(family.tree_name())
-                        .expect("requested metadata family is present in the DB view")
-                        .clone();
-                    let history = view.tree(HISTORY_TREE).cloned();
-                    Ok((current, history))
-                })
-                .map_err(|error| backend("capture metadata scan view", error))?;
-            (current_version, current_view, history_view)
-        };
-
-        // Current-state rows are already in the exact order required by the
-        // caller. Push the exclusive cursor into Holt and stop advancing the
-        // storage iterator as soon as the bounded page is full. Historical
-        // reads cannot use this shortcut: a key absent from current state may
-        // still need to be reconstructed from History before ordering and
-        // pagination are applied.
-        if version == current_version {
-            let mut range = current_view.range();
-            if let Some(marker) = start_after {
-                range = range.start_after(marker);
-            }
-            if let Some(delimiter) = delimiter {
-                range = range.delimiter(delimiter);
-            }
-
-            let mut visible = Vec::with_capacity(effective_limit);
-            #[cfg(feature = "metadata-read-stats")]
-            let mut key_bytes = 0_u64;
-            #[cfg(feature = "metadata-read-stats")]
-            let mut value_bytes = 0_u64;
-            #[cfg(feature = "metadata-read-stats")]
-            let mut stopped_at_limit = false;
-            let mut iterator = range.into_iter();
-            for entry in iterator.by_ref() {
-                let item = match entry.map_err(|error| backend("scan current metadata", error))? {
-                    holt::RangeEntry::Key { key, value, .. } => {
-                        #[cfg(feature = "metadata-read-stats")]
-                        {
-                            key_bytes = key_bytes.saturating_add(byte_len(&key));
-                            value_bytes = value_bytes.saturating_add(byte_len(&value));
-                        }
-                        let current = CurrentValue::decode(&value)
-                            .map_err(|error| corrupt(family.tree_name(), error))?;
-                        if current.modified_version.get() > version.get() {
-                            return Err(AgentMetadataError::CorruptRecord {
-                                record: family.tree_name(),
-                                reason: format!(
-                                    "current row version {} exceeds captured version {}",
-                                    current.modified_version.get(),
-                                    version.get()
-                                ),
-                            });
-                        }
-                        DelimitedMetadataScanItem::Record(MetadataScanItem {
-                            key,
-                            value: current.payload,
-                        })
-                    }
-                    holt::RangeEntry::CommonPrefix(prefix) => {
-                        #[cfg(feature = "metadata-read-stats")]
-                        {
-                            key_bytes = key_bytes.saturating_add(byte_len(&prefix));
-                        }
-                        DelimitedMetadataScanItem::CommonPrefix(prefix)
-                    }
-                    _ => continue,
-                };
-                visible.push(item);
-                if visible.len() == effective_limit {
-                    #[cfg(feature = "metadata-read-stats")]
-                    {
-                        stopped_at_limit = true;
-                    }
-                    break;
-                }
-            }
-            #[cfg(feature = "metadata-read-stats")]
-            {
-                let stats = iterator.stats();
-                self.record_scan_cursor(
-                    stats.visited,
-                    stats.returned,
-                    stats.rollup,
-                    stats.restarts,
-                    key_bytes,
-                    value_bytes,
-                    stopped_at_limit,
-                );
-            }
-            return Ok(visible);
         }
 
-        let mut visible = BTreeMap::<Vec<u8>, Vec<u8>>::new();
-        #[cfg(feature = "metadata-read-stats")]
-        let mut current_key_bytes = 0_u64;
-        #[cfg(feature = "metadata-read-stats")]
-        let mut current_value_bytes = 0_u64;
-        let mut current_iterator = current_view.range().into_iter();
-        for entry in current_iterator.by_ref() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan current metadata", error))?
-            else {
-                continue;
-            };
-            #[cfg(feature = "metadata-read-stats")]
-            {
-                current_key_bytes = current_key_bytes.saturating_add(byte_len(&key));
-                current_value_bytes = current_value_bytes.saturating_add(byte_len(&value));
-            }
-            let current =
-                CurrentValue::decode(&value).map_err(|error| corrupt(family.tree_name(), error))?;
-            if current.modified_version.get() <= version.get() {
-                visible.insert(key, current.payload);
-            }
-        }
-        #[cfg(feature = "metadata-read-stats")]
-        {
-            let current_stats = current_iterator.stats();
-            self.record_scan_cursor(
-                current_stats.visited,
-                current_stats.returned,
-                current_stats.rollup,
-                current_stats.restarts,
-                current_key_bytes,
-                current_value_bytes,
-                false,
-            );
-        }
-
-        let history_view = history_view
-            .expect("historical metadata scan captures the matching History family view");
-        #[cfg(feature = "metadata-read-stats")]
-        let mut history_key_bytes = 0_u64;
-        #[cfg(feature = "metadata-read-stats")]
-        let mut history_value_bytes = 0_u64;
-        let mut history_iterator = history_view.range().into_iter();
-        for entry in history_iterator.by_ref() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan metadata history", error))?
-            else {
-                continue;
-            };
-            #[cfg(feature = "metadata-read-stats")]
-            {
-                history_key_bytes = history_key_bytes.saturating_add(byte_len(&key));
-                history_value_bytes = history_value_bytes.saturating_add(byte_len(&value));
-            }
-            let user_key = history_user_key(&key)?;
-            if !user_key.starts_with(prefix) || visible.contains_key(user_key) {
-                continue;
-            }
-            let history =
-                HistoryValue::decode(&value).map_err(|error| corrupt("History", error))?;
-            if history.previous_modified_version.get() <= version.get()
-                && version.get() < history.transition_version.get()
-            {
-                if let Some(previous) = history.previous_payload {
-                    visible.insert(user_key.to_vec(), previous);
-                }
-            }
-        }
-        #[cfg(feature = "metadata-read-stats")]
-        {
-            let history_stats = history_iterator.stats();
-            self.record_scan_cursor(
-                history_stats.visited,
-                history_stats.returned,
-                history_stats.rollup,
-                history_stats.restarts,
-                history_key_bytes,
-                history_value_bytes,
-                false,
-            );
-        }
+        let visible = self.reconstruct_historical_scan(
+            root_id,
+            placement_generation,
+            owner_epoch,
+            family,
+            prefix,
+            version,
+            current_version,
+            read_context,
+        )?;
 
         let mut page = Vec::with_capacity(effective_limit);
         let mut last_common_prefix = None;
@@ -1717,6 +1459,201 @@ impl AgentMetadataStore {
         Ok(page)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn collect_current_scan_at_clock(
+        &self,
+        family: MetadataFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+        delimiter: Option<u8>,
+        version: ReadVersion,
+        expected_clock: ReadVersion,
+        read_context: ReadFenceContext,
+    ) -> Result<Option<Vec<DelimitedMetadataScanItem>>, MetaError> {
+        let mut after = start_after.map(ToOwned::to_owned);
+        let mut visible = Vec::with_capacity(limit);
+        loop {
+            let remaining = limit - visible.len();
+            if remaining == 0 {
+                return Ok(Some(visible));
+            }
+            let Some(page) = self.scan_page_at_clock(
+                family.keyspace(),
+                prefix,
+                after.as_deref(),
+                remaining,
+                delimiter,
+                expected_clock,
+                read_context,
+                "scan current metadata",
+            )?
+            else {
+                return Ok(None);
+            };
+            if page.items.len() > remaining {
+                return Err(corrupt(
+                    "transaction-store scan",
+                    "scan page exceeds the requested row limit",
+                ));
+            }
+            let more = page.more;
+            if let Some(last) = page.items.last() {
+                after = Some(last.key().to_vec());
+            } else if more {
+                return Err(corrupt(
+                    "transaction-store scan",
+                    "incomplete scan page omitted its continuation cursor",
+                ));
+            }
+            for item in page.items {
+                let item = match item {
+                    ScanItem::Row { key, value } => {
+                        let current = CurrentValue::decode(&value)
+                            .map_err(|error| corrupt(family.name(), error))?;
+                        if current.modified_version.get() > version.get() {
+                            return Err(corrupt(
+                                family.name(),
+                                "current row is newer than the stable scan clock",
+                            ));
+                        }
+                        DelimitedMetadataScanItem::Record(MetadataScanItem {
+                            key,
+                            value: current.payload,
+                        })
+                    }
+                    ScanItem::CommonPrefix(prefix) => {
+                        DelimitedMetadataScanItem::CommonPrefix(prefix)
+                    }
+                };
+                visible.push(item);
+            }
+            if !more {
+                return Ok(Some(visible));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_historical_scan(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        family: MetadataFamily,
+        prefix: &[u8],
+        version: ReadVersion,
+        mut expected_clock: ReadVersion,
+        read_context: ReadFenceContext,
+    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, MetaError> {
+        let mut attempt = 1;
+        loop {
+            let Some(current_rows) = self.collect_scan_at_clock(
+                family.keyspace(),
+                prefix,
+                None,
+                MAX_HISTORICAL_SCAN_PAGE_ROWS,
+                expected_clock,
+                read_context,
+                "scan current metadata",
+            )?
+            else {
+                expected_clock = self.prepare_historical_scan_retry(
+                    root_id,
+                    placement_generation,
+                    owner_epoch,
+                    prefix,
+                    version,
+                    attempt,
+                )?;
+                attempt += 1;
+                continue;
+            };
+            // History keys encode the complete user-key length before the
+            // root-scoped key. The current durable format therefore cannot
+            // seek one variable-length root prefix without a schema migration.
+            let history_prefix = [family.format_tag()];
+            let Some(history_rows) = self.collect_scan_at_clock(
+                HISTORY.id,
+                &history_prefix,
+                None,
+                MAX_HISTORICAL_SCAN_PAGE_ROWS,
+                expected_clock,
+                read_context,
+                "scan metadata history",
+            )?
+            else {
+                expected_clock = self.prepare_historical_scan_retry(
+                    root_id,
+                    placement_generation,
+                    owner_epoch,
+                    prefix,
+                    version,
+                    attempt,
+                )?;
+                attempt += 1;
+                continue;
+            };
+
+            let mut visible = BTreeMap::new();
+            for item in current_rows {
+                let ScanItem::Row { key, value } = item else {
+                    return Err(corrupt(
+                        family.name(),
+                        "non-delimited scan returned a common prefix",
+                    ));
+                };
+                let current =
+                    CurrentValue::decode(&value).map_err(|error| corrupt(family.name(), error))?;
+                if current.modified_version.get() <= version.get() {
+                    visible.insert(key, current.payload);
+                }
+            }
+            for item in history_rows {
+                let ScanItem::Row { key, value } = item else {
+                    return Err(corrupt(
+                        "History",
+                        "non-delimited scan returned a common prefix",
+                    ));
+                };
+                let user_key = history_user_key(&key)?;
+                if !user_key.starts_with(prefix) || visible.contains_key(user_key) {
+                    continue;
+                }
+                let history =
+                    HistoryValue::decode(&value).map_err(|error| corrupt("History", error))?;
+                if history.previous_modified_version.get() <= version.get()
+                    && version.get() < history.transition_version.get()
+                {
+                    if let Some(previous) = history.previous_payload {
+                        visible.insert(user_key.to_vec(), previous);
+                    }
+                }
+            }
+            return Ok(visible);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_historical_scan_retry(
+        &self,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: OwnerEpoch,
+        prefix: &[u8],
+        version: ReadVersion,
+        attempt: usize,
+    ) -> Result<ReadVersion, MetaError> {
+        if attempt == MAX_HISTORICAL_SCAN_ATTEMPTS {
+            self.validate_read_fence(root_id, placement_generation, owner_epoch, prefix, version)?;
+            return Err(MetaError::ReadStabilityExhausted {
+                attempts: MAX_HISTORICAL_SCAN_ATTEMPTS,
+            });
+        }
+        thread::sleep(HISTORICAL_SCAN_RETRY_DELAYS[attempt - 1]);
+        self.validate_read_fence(root_id, placement_generation, owner_epoch, prefix, version)
+    }
+
     /// Read one immutable change event through the ordinary ownership fences.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn read_change_event_at(
@@ -1726,19 +1663,30 @@ impl AgentMetadataStore {
         owner_epoch: OwnerEpoch,
         key: &[u8],
         version: ReadVersion,
-    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
+    ) -> Result<Option<Vec<u8>>, MetaError> {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| backend("lock read gate", error))?;
-        self.validate_read_fence(root_id, placement_generation, owner_epoch, key, version)?;
-        let Some(record) = self.read_tree_value(
-            &self.change_event,
+            .map_err(|error| internal("lock read gate", error))?;
+        validate_root_scoped_bytes(root_id, key, "change-event key")?;
+        let (current_version, record) = self.read_value_at_fence(
+            CHANGE_EVENT.id,
             key,
             MetadataPointReadSource::Other,
             "read ChangeEvent",
-        )?
-        else {
+            ReadFenceContext {
+                root_id,
+                placement_generation,
+                owner_epoch,
+            },
+        )?;
+        if version > current_version {
+            return Err(MetaError::ReadVersionInFuture {
+                requested: version.get(),
+                current: current_version.get(),
+            });
+        }
+        let Some(record) = record else {
             return Ok(None);
         };
         let current =
@@ -1762,12 +1710,13 @@ impl AgentMetadataStore {
         version: ReadVersion,
         start_after: Option<&[u8]>,
         limit: usize,
-    ) -> Result<Vec<MetadataScanItem>, AgentMetadataError> {
+    ) -> Result<Vec<MetadataScanItem>, MetaError> {
         let _read_guard = self
             .command_gate
             .read()
-            .map_err(|error| backend("lock read gate", error))?;
-        self.validate_read_fence(root_id, placement_generation, owner_epoch, prefix, version)?;
+            .map_err(|error| internal("lock read gate", error))?;
+        let mut expected_clock =
+            self.validate_read_fence(root_id, placement_generation, owner_epoch, prefix, version)?;
         let effective_limit = if limit == 0 {
             MAX_COMMAND_ITEMS
         } else {
@@ -1775,60 +1724,63 @@ impl AgentMetadataStore {
         };
         #[cfg(feature = "metadata-read-stats")]
         self.record_scan_call();
-        let mut events = Vec::with_capacity(effective_limit);
-        let mut range = self.change_event.range().prefix(prefix);
-        if let Some(marker) = start_after {
-            range = range.start_after(marker);
-        }
-        #[cfg(feature = "metadata-read-stats")]
-        let mut key_bytes = 0_u64;
-        #[cfg(feature = "metadata-read-stats")]
-        let mut value_bytes = 0_u64;
-        #[cfg(feature = "metadata-read-stats")]
-        let mut stopped_at_limit = false;
-        let mut iterator = range.into_iter();
-        for entry in iterator.by_ref() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("scan ChangeEvent", error))?
-            else {
-                continue;
-            };
-            #[cfg(feature = "metadata-read-stats")]
-            {
-                key_bytes = key_bytes.saturating_add(byte_len(&key));
-                value_bytes = value_bytes.saturating_add(byte_len(&value));
-            }
-            let current =
-                CurrentValue::decode(&value).map_err(|error| corrupt("ChangeEvent", error))?;
-            if current.modified_version.get() > version.get() {
-                continue;
-            }
-            events.push(MetadataScanItem {
-                key,
-                value: current.payload,
-            });
-            if events.len() == effective_limit {
-                #[cfg(feature = "metadata-read-stats")]
-                {
-                    stopped_at_limit = true;
+        let read_context = ReadFenceContext {
+            root_id,
+            placement_generation,
+            owner_epoch,
+        };
+        'restart: loop {
+            let mut events = Vec::with_capacity(effective_limit);
+            let mut after = start_after.map(ToOwned::to_owned);
+            loop {
+                let Some(page) = self.scan_page_at_clock(
+                    CHANGE_EVENT.id,
+                    prefix,
+                    after.as_deref(),
+                    effective_limit,
+                    None,
+                    expected_clock,
+                    read_context,
+                    "scan ChangeEvent",
+                )?
+                else {
+                    expected_clock = self.validate_read_fence(
+                        root_id,
+                        placement_generation,
+                        owner_epoch,
+                        prefix,
+                        version,
+                    )?;
+                    continue 'restart;
+                };
+                let more = page.more;
+                if let Some(last) = page.items.last() {
+                    after = Some(last.key().to_vec());
                 }
-                break;
+                for item in page.items {
+                    let ScanItem::Row { key, value } = item else {
+                        return Err(corrupt(
+                            "ChangeEvent",
+                            "non-delimited scan returned a common prefix",
+                        ));
+                    };
+                    let current = CurrentValue::decode(&value)
+                        .map_err(|error| corrupt("ChangeEvent", error))?;
+                    if current.modified_version.get() <= version.get() {
+                        events.push(MetadataScanItem {
+                            key,
+                            value: current.payload,
+                        });
+                    }
+                    if events.len() == effective_limit {
+                        return Ok(events);
+                    }
+                }
+                if !more {
+                    return Ok(events);
+                }
             }
         }
-        #[cfg(feature = "metadata-read-stats")]
-        {
-            let stats = iterator.stats();
-            self.record_scan_cursor(
-                stats.visited,
-                stats.returned,
-                stats.rollup,
-                stats.restarts,
-                key_bytes,
-                value_bytes,
-                stopped_at_limit,
-            );
-        }
-        Ok(events)
     }
 
     fn validate_read_fence(
@@ -1838,12 +1790,12 @@ impl AgentMetadataStore {
         owner_epoch: OwnerEpoch,
         key_or_prefix: &[u8],
         version: ReadVersion,
-    ) -> Result<ReadVersion, AgentMetadataError> {
+    ) -> Result<ReadVersion, MetaError> {
         validate_root_scoped_bytes(root_id, key_or_prefix, "read key or prefix")?;
         let current_version =
             self.validate_read_context(root_id, placement_generation, owner_epoch)?;
         if version > current_version {
-            return Err(AgentMetadataError::ReadVersionInFuture {
+            return Err(MetaError::ReadVersionInFuture {
                 requested: version.get(),
                 current: current_version.get(),
             });
@@ -1856,139 +1808,164 @@ impl AgentMetadataStore {
         root_id: RootId,
         placement_generation: PlacementGeneration,
         owner_epoch: OwnerEpoch,
-    ) -> Result<ReadVersion, AgentMetadataError> {
-        let owner = self.required_system_record(
-            &self.system,
-            SYSTEM_OWNER_FENCE_KEY,
-            "System(owner_fence)",
-        )?;
-        let actual_owner = decode_system_u64(&owner.value, "System(owner_fence)")?;
-        if actual_owner != owner_epoch.get() {
-            return Err(AgentMetadataError::OwnerEpochMismatch {
-                expected: owner_epoch.get(),
+    ) -> Result<ReadVersion, MetaError> {
+        self.read_batch_at_fence(
+            ReadFenceContext {
+                root_id,
+                placement_generation,
+                owner_epoch,
+            },
+            Vec::new(),
+            "validate read context",
+        )
+        .map(|(version, _)| version)
+    }
+
+    fn read_batch_at_fence(
+        &self,
+        context: ReadFenceContext,
+        data_ops: Vec<ReadOp>,
+        operation: &'static str,
+    ) -> Result<(ReadVersion, Vec<ReadResult>), MetaError> {
+        let mut ops = Vec::with_capacity(3 + data_ops.len());
+        ops.push(ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY)));
+        ops.push(ReadOp::Get(Key::new(
+            ROOT_FENCE.id,
+            context.root_id.as_bytes(),
+        )));
+        ops.push(ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY)));
+        ops.extend(data_ops);
+        let snapshot = self.read_batch(ReadBatch { ops }, operation)?;
+        let mut results = snapshot.results.into_iter();
+        let owner = required_get_result(results.next(), "System(owner_fence)")?;
+        let fence = required_get_result(results.next(), "RootFence")?;
+        let clock = required_get_result(results.next(), "System(commit_clock)")?;
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            self.record_point(MetadataPointReadSource::System, Some(owner.len()));
+            self.record_point(MetadataPointReadSource::RootFence, Some(fence.len()));
+            self.record_point(MetadataPointReadSource::System, Some(clock.len()));
+        }
+        let actual_owner = decode_system_u64(&owner, "System(owner_fence)")?;
+        if actual_owner != context.owner_epoch.get() {
+            return Err(MetaError::OwnerEpochMismatch {
+                expected: context.owner_epoch.get(),
                 actual: actual_owner,
             });
         }
-        let fence = self
-            .read_tree_value(
-                &self.root_fence,
-                root_id.as_bytes(),
-                MetadataPointReadSource::RootFence,
-                "read RootFence",
-            )?
-            .ok_or(AgentMetadataError::RootFenceMissing)?;
         let fence = RootFence::decode(&fence).map_err(|error| corrupt("RootFence", error))?;
         if fence.logical_shard_id != self.logical_shard_id
-            || fence.placement_generation != placement_generation
+            || fence.placement_generation != context.placement_generation
         {
-            return Err(AgentMetadataError::PlacementMismatch);
+            return Err(MetaError::PlacementMismatch);
         }
         if fence.activation_state != RootActivationState::Active {
-            return Err(AgentMetadataError::RootFenceStateMismatch {
+            return Err(MetaError::RootFenceStateMismatch {
                 expected: RootActivationState::Active,
                 actual: fence.activation_state,
             });
         }
-        let current_version = self.current_read_version()?;
-        Ok(current_version)
+        let clock = decode_system_u64(&clock, "System(commit_clock)")?;
+        let clock =
+            ReadVersion::new(clock).map_err(|error| corrupt("System(commit_clock)", error))?;
+        Ok((clock, results.collect()))
     }
 
-    fn read_at_unfenced(
+    fn read_at_fence(
         &self,
         family: MetadataFamily,
         key: &[u8],
         version: ReadVersion,
-    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
-        if let Some(record) = self.read_family_value(family, key, "read current metadata")? {
-            let current = CurrentValue::decode(&record)
-                .map_err(|error| corrupt(family.tree_name(), error))?;
+        context: ReadFenceContext,
+    ) -> Result<Option<Vec<u8>>, MetaError> {
+        let (mut expected_clock, record) = self.read_value_at_fence(
+            family.keyspace(),
+            key,
+            point_source(family),
+            "read current metadata",
+            context,
+        )?;
+        if version > expected_clock {
+            return Err(MetaError::ReadVersionInFuture {
+                requested: version.get(),
+                current: expected_clock.get(),
+            });
+        }
+        if let Some(record) = record {
+            let current =
+                CurrentValue::decode(&record).map_err(|error| corrupt(family.name(), error))?;
+            if current.modified_version.get() > expected_clock.get() {
+                return Err(corrupt(
+                    family.name(),
+                    format!(
+                        "record version {} is newer than the captured commit clock {}",
+                        current.modified_version.get(),
+                        expected_clock.get()
+                    ),
+                ));
+            }
             if current.modified_version.get() <= version.get() {
                 return Ok(Some(current.payload));
             }
+        } else if version == expected_clock {
+            return Ok(None);
         }
         let prefix = history_prefix(family, key);
         #[cfg(feature = "metadata-read-stats")]
         self.record_scan_call();
-        #[cfg(feature = "metadata-read-stats")]
-        let mut key_bytes = 0_u64;
-        #[cfg(feature = "metadata-read-stats")]
-        let mut value_bytes = 0_u64;
-        let mut previous_payload = None;
-        let mut iterator = self.history.range().prefix(&prefix).into_iter();
-        for entry in iterator.by_ref() {
-            let entry = entry.map_err(|error| backend("read metadata history", error))?;
-            #[cfg(feature = "metadata-read-stats")]
-            let holt::RangeEntry::Key { key, value, .. } = entry
+        loop {
+            let Some(rows) = self.collect_scan_at_clock(
+                HISTORY.id,
+                &prefix,
+                None,
+                MAX_HISTORICAL_SCAN_PAGE_ROWS,
+                expected_clock,
+                context,
+                "read metadata history",
+            )?
             else {
+                expected_clock = self.validate_read_context(
+                    context.root_id,
+                    context.placement_generation,
+                    context.owner_epoch,
+                )?;
+                if version > expected_clock {
+                    return Err(MetaError::ReadVersionInFuture {
+                        requested: version.get(),
+                        current: expected_clock.get(),
+                    });
+                }
                 continue;
             };
-            #[cfg(not(feature = "metadata-read-stats"))]
-            let holt::RangeEntry::Key { value, .. } = entry
-            else {
-                continue;
-            };
-            #[cfg(feature = "metadata-read-stats")]
-            {
-                key_bytes = key_bytes.saturating_add(byte_len(&key));
-                value_bytes = value_bytes.saturating_add(byte_len(&value));
+            let mut previous_payload = None;
+            for item in rows {
+                let ScanItem::Row { value, .. } = item else {
+                    return Err(corrupt(
+                        "History",
+                        "non-delimited scan returned a common prefix",
+                    ));
+                };
+                let history =
+                    HistoryValue::decode(&value).map_err(|error| corrupt("History", error))?;
+                if history.previous_modified_version.get() <= version.get()
+                    && version.get() < history.transition_version.get()
+                {
+                    previous_payload = Some(history.previous_payload);
+                    break;
+                }
             }
-            let history =
-                HistoryValue::decode(&value).map_err(|error| corrupt("History", error))?;
-            if history.previous_modified_version.get() <= version.get()
-                && version.get() < history.transition_version.get()
-            {
-                previous_payload = Some(history.previous_payload);
-                break;
-            }
+            return Ok(previous_payload.flatten());
         }
-        #[cfg(feature = "metadata-read-stats")]
-        {
-            let stats = iterator.stats();
-            self.record_scan_cursor(
-                stats.visited,
-                stats.returned,
-                stats.rollup,
-                stats.restarts,
-                key_bytes,
-                value_bytes,
-                false,
-            );
-        }
-        Ok(previous_payload.flatten())
     }
 
-    fn read_current_at_unfenced(
-        &self,
-        family: MetadataFamily,
-        key: &[u8],
-        current_version: ReadVersion,
-    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
-        let Some(record) = self.read_family_value(family, key, "read current metadata")? else {
-            return Ok(None);
-        };
-        let current =
-            CurrentValue::decode(&record).map_err(|error| corrupt(family.tree_name(), error))?;
-        if current.modified_version.get() > current_version.get() {
-            return Err(corrupt(
-                family.tree_name(),
-                format!(
-                    "record version {} is newer than the captured commit clock {}",
-                    current.modified_version.get(),
-                    current_version.get()
-                ),
-            ));
-        }
-        Ok(Some(current.payload))
-    }
-
-    fn validate_command(&self, command: &MetadataCommand) -> Result<(), AgentMetadataError> {
+    fn validate_command(&self, command: &MetadataCommand) -> Result<(), MetaError> {
         if command.schema_id != SCHEMA_ID {
-            return Err(AgentMetadataError::SchemaGate {
+            return Err(MetaError::SchemaGate {
                 reason: format!("expected schema {SCHEMA_ID}, found {}", command.schema_id),
             });
         }
         if command.logical_shard_id != self.logical_shard_id {
-            return Err(AgentMetadataError::PlacementMismatch);
+            return Err(MetaError::PlacementMismatch);
         }
         for (name, count) in [
             ("predicates", command.predicates.len()),
@@ -2051,19 +2028,18 @@ impl AgentMetadataStore {
         Ok(())
     }
 
-    fn plan_root_fence(
-        &self,
-        command: &MetadataCommand,
-    ) -> Result<RootFencePlan, AgentMetadataError> {
+    fn plan_root_fence(&self, command: &MetadataCommand) -> Result<RootFencePlan, MetaError> {
         let key = command.root_id.as_bytes();
-        let current = self
-            .root_fence
-            .get_record(key)
-            .map_err(|error| backend("read RootFence", error))?;
+        let current = self.read_value(
+            ROOT_FENCE.id,
+            key,
+            MetadataPointReadSource::RootFence,
+            "read RootFence",
+        )?;
         match command.root_fence_action {
             RootFenceAction::Install => {
                 if current.is_some() {
-                    return Err(AgentMetadataError::RootFenceAlreadyInstalled);
+                    return Err(MetaError::RootFenceAlreadyInstalled);
                 }
                 Ok(RootFencePlan::Install {
                     value: RootFence {
@@ -2076,39 +2052,37 @@ impl AgentMetadataStore {
                 })
             }
             RootFenceAction::RequireActive => {
-                let current = current.ok_or(AgentMetadataError::RootFenceMissing)?;
-                let fence = RootFence::decode(&current.value)
-                    .map_err(|error| corrupt("RootFence", error))?;
+                let current = current.ok_or(MetaError::RootFenceMissing)?;
+                let fence =
+                    RootFence::decode(&current).map_err(|error| corrupt("RootFence", error))?;
                 validate_root_placement(command, fence)?;
                 if fence.activation_state != RootActivationState::Active {
-                    return Err(AgentMetadataError::RootFenceStateMismatch {
+                    return Err(MetaError::RootFenceStateMismatch {
                         expected: RootActivationState::Active,
                         actual: fence.activation_state,
                     });
                 }
-                Ok(RootFencePlan::Assert {
-                    version: current.version,
-                })
+                Ok(RootFencePlan::Assert { expected: current })
             }
             RootFenceAction::Transition { expected, next } => {
                 if !valid_root_transition(expected, next) {
-                    return Err(AgentMetadataError::InvalidRootFenceTransition {
+                    return Err(MetaError::InvalidRootFenceTransition {
                         from: expected,
                         to: next,
                     });
                 }
-                let current = current.ok_or(AgentMetadataError::RootFenceMissing)?;
-                let fence = RootFence::decode(&current.value)
-                    .map_err(|error| corrupt("RootFence", error))?;
+                let current = current.ok_or(MetaError::RootFenceMissing)?;
+                let fence =
+                    RootFence::decode(&current).map_err(|error| corrupt("RootFence", error))?;
                 validate_root_placement(command, fence)?;
                 if fence.activation_state != expected {
-                    return Err(AgentMetadataError::RootFenceStateMismatch {
+                    return Err(MetaError::RootFenceStateMismatch {
                         expected,
                         actual: fence.activation_state,
                     });
                 }
                 Ok(RootFencePlan::Replace {
-                    version: current.version,
+                    expected: current,
                     value: RootFence {
                         activation_state: next,
                         ..fence
@@ -2120,10 +2094,7 @@ impl AgentMetadataStore {
         }
     }
 
-    fn plan_predicates(
-        &self,
-        command: &MetadataCommand,
-    ) -> Result<PredicatePlan, AgentMetadataError> {
+    fn plan_predicates(&self, command: &MetadataCommand) -> Result<PredicatePlan, MetaError> {
         let mut plan = PredicatePlan::default();
         for predicate in &command.predicates {
             match predicate {
@@ -2136,20 +2107,17 @@ impl AgentMetadataStore {
                     if plan.exact.contains_key(&map_key) {
                         return Err(invalid("duplicate exact predicate"));
                     }
-                    let record = self
-                        .family(*family)
-                        .get_record(key)
-                        .map_err(|error| backend("plan exact predicate", error))?;
-                    let (current, version) = match record {
-                        Some(record) => {
-                            let current = CurrentValue::decode(&record.value)
-                                .map_err(|error| corrupt(family.tree_name(), error))?;
-                            (Some(current), Some(record.version))
+                    let raw = self.read_family_value(*family, key, "plan exact predicate")?;
+                    let current = match &raw {
+                        Some(value) => {
+                            let current = CurrentValue::decode(value)
+                                .map_err(|error| corrupt(family.name(), error))?;
+                            Some(current)
                         }
-                        None => (None, None),
+                        None => None,
                     };
                     if current.as_ref().map(|value| &value.payload) != expected.as_ref() {
-                        return Err(AgentMetadataError::PredicateFailed);
+                        return Err(MetaError::PredicateFailed);
                     }
                     plan.exact.insert(
                         map_key,
@@ -2157,48 +2125,31 @@ impl AgentMetadataStore {
                             family: *family,
                             key: key.clone(),
                             current,
-                            version,
+                            raw,
                         },
                     );
                 }
                 CommandPredicate::PrefixEmpty { family, prefix } => {
-                    if self
-                        .family(*family)
-                        .range()
-                        .prefix(prefix)
-                        .into_iter()
-                        .next()
-                        .transpose()
-                        .map_err(|error| backend("plan prefix-empty predicate", error))?
-                        .is_some()
+                    if !self
+                        .scan_page(
+                            family.keyspace(),
+                            prefix,
+                            None,
+                            1,
+                            None,
+                            0,
+                            "plan prefix-empty predicate",
+                        )?
+                        .items
+                        .is_empty()
                     {
-                        return Err(AgentMetadataError::PredicateFailed);
+                        return Err(MetaError::PredicateFailed);
                     }
                     plan.prefix_empty.push((*family, prefix.clone()));
                 }
             }
         }
-        for mutation in &command.mutations {
-            let Some(predicate) = plan
-                .exact
-                .get(&(mutation.family(), mutation.key().to_vec()))
-            else {
-                return Err(invalid(
-                    "every mutation requires one exact value/absence predicate",
-                ));
-            };
-            if mutation.family() == MetadataFamily::WorkspaceIncarnationClaim
-                && (matches!(mutation, CommandMutation::Delete { .. })
-                    || predicate.current.is_some())
-            {
-                return Err(invalid(
-                    "workspace incarnation claims are append-only and permanent",
-                ));
-            }
-            if matches!(mutation, CommandMutation::Delete { .. }) && predicate.current.is_none() {
-                return Err(invalid("delete mutation requires an existing value"));
-            }
-        }
+        validate_predicate_plan(command, &plan)?;
         Ok(plan)
     }
 
@@ -2206,7 +2157,7 @@ impl AgentMetadataStore {
         &self,
         command: &MetadataCommand,
         plan: &PredicatePlan,
-    ) -> Result<(), AgentMetadataError> {
+    ) -> Result<(), MetaError> {
         let requested = command
             .history_projection
             .iter()
@@ -2240,18 +2191,20 @@ impl AgentMetadataStore {
         &self,
         key: &[u8],
         digest: CommandDigest,
-    ) -> Result<Option<MetadataCommandResult>, AgentMetadataError> {
-        let Some(value) = self
-            .command_dedupe
-            .get(key)
-            .map_err(|error| backend("read CommandDedupe", error))?
+    ) -> Result<Option<MetadataCommandResult>, MetaError> {
+        let Some(value) = self.read_value(
+            COMMAND_DEDUPE.id,
+            key,
+            MetadataPointReadSource::Other,
+            "read CommandDedupe",
+        )?
         else {
             return Ok(None);
         };
         let record =
             CommandDedupeRecord::decode(&value).map_err(|error| corrupt("CommandDedupe", error))?;
         if record.command_digest != digest {
-            return Err(AgentMetadataError::RequestIdReused);
+            return Err(MetaError::RequestIdReused);
         }
         Ok(Some(MetadataCommandResult {
             commit_version: record.commit_version,
@@ -2260,127 +2213,135 @@ impl AgentMetadataStore {
         }))
     }
 
-    fn recovery_state_unlocked(&self) -> Result<RecoveryState, AgentMetadataError> {
-        let lsn = decode_system_u64(
-            &required_record(
-                &self.system,
-                SYSTEM_APPLIED_RECOVERY_LSN_KEY,
-                "System(applied_recovery_lsn)",
-            )?
-            .value,
-            "System(applied_recovery_lsn)",
-        )?;
-        let chain_digest = decode_system_digest(
-            &required_record(
-                &self.system,
-                SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
-                "System(recovery_chain_digest)",
-            )?
-            .value,
-            "System(recovery_chain_digest)",
-        )?;
+    fn recovery_state_unlocked(&self) -> Result<RecoveryState, MetaError> {
+        let (lsn_value, digest_value) = self.recovery_tail_values()?;
+        let lsn = decode_system_u64(&lsn_value, "System(applied_recovery_lsn)")?;
+        let chain_digest = decode_system_digest(&digest_value, "System(recovery_chain_digest)")?;
         Ok(RecoveryState {
             applied_recovery_lsn: lsn,
             chain_digest,
         })
     }
 
+    fn recovery_tail_values(&self) -> Result<(Vec<u8>, Vec<u8>), MetaError> {
+        let snapshot = self.read_batch(
+            ReadBatch {
+                ops: vec![
+                    ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_APPLIED_RECOVERY_LSN_KEY)),
+                    ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_RECOVERY_CHAIN_DIGEST_KEY)),
+                ],
+            },
+            "read recovery tail",
+        )?;
+        let mut results = snapshot.results.into_iter();
+        let Some(ReadResult::Get(lsn)) = results.next() else {
+            return Err(corrupt("System(recovery tail)", "LSN result is missing"));
+        };
+        let Some(ReadResult::Get(digest)) = results.next() else {
+            return Err(corrupt(
+                "System(recovery tail)",
+                "chain digest result is missing",
+            ));
+        };
+        let lsn = lsn.ok_or_else(|| MetaError::CorruptRecord {
+            record: "System(applied_recovery_lsn)",
+            reason: "record is missing".to_owned(),
+        })?;
+        let digest = digest.ok_or_else(|| MetaError::CorruptRecord {
+            record: "System(recovery_chain_digest)",
+            reason: "record is missing".to_owned(),
+        })?;
+        Ok((lsn, digest))
+    }
+
     fn plan_recovery(
         &self,
         mutation: RecoveryMutationV1,
         result: RecoveryResultV1,
-    ) -> Result<RecoveryPlan, AgentMetadataError> {
-        let lsn_record = required_record(
-            &self.system,
-            SYSTEM_APPLIED_RECOVERY_LSN_KEY,
-            "System(applied_recovery_lsn)",
-        )?;
-        let applied_lsn = decode_system_u64(&lsn_record.value, "System(applied_recovery_lsn)")?;
-        let recovery_lsn = applied_lsn
-            .checked_add(1)
-            .ok_or(AgentMetadataError::VersionOverflow)?;
-        let digest_record = required_record(
-            &self.system,
-            SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
-            "System(recovery_chain_digest)",
-        )?;
-        let previous_chain_digest =
-            decode_system_digest(&digest_record.value, "System(recovery_chain_digest)")?;
-        let row = RecoveryOutboxRecord::new(recovery_lsn, previous_chain_digest, mutation, result)
-            .map_err(|error| corrupt("RecoveryOutbox", error))?;
-        let logical = row
-            .encode()
-            .map_err(|error| corrupt("RecoveryOutbox", error))?;
-        let (header, chunks) = split_recovery_storage(&logical)
-            .map_err(|error| corrupt("RecoveryOutbox storage", error))?;
-        Ok(RecoveryPlan {
-            lsn_record,
-            digest_record,
-            header,
-            chunks,
-            row,
-        })
+    ) -> Result<RecoveryPlan, MetaError> {
+        let (lsn_value, digest_value) = self.recovery_tail_values()?;
+        build_recovery_plan(lsn_value, digest_value, mutation, result)
     }
 
-    fn verify_recovery_chain_unlocked(&self) -> Result<RecoveryState, AgentMetadataError> {
+    fn verify_recovery_chain_unlocked(&self) -> Result<RecoveryState, MetaError> {
         let state = self.recovery_state_unlocked()?;
         let mut expected_lsn = 1_u64;
         let mut previous_chain_digest = recovery_genesis_digest(self.logical_shard_id);
         let mut expected_chunk_keys = BTreeSet::new();
-        for entry in self.recovery_outbox.range() {
-            let holt::RangeEntry::Key { key, value, .. } =
-                entry.map_err(|error| backend("verify RecoveryOutbox", error))?
-            else {
-                continue;
-            };
-            match key.first().copied() {
-                Some(0) => {
-                    let key_lsn = decode_recovery_outbox_key(&key)
-                        .map_err(|error| corrupt("RecoveryOutbox key", error))?;
-                    let chunk_count = recovery_storage_chunk_count(&value)
-                        .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
-                    for index in 0..chunk_count {
-                        expected_chunk_keys.insert(recovery_chunk_key(key_lsn, index).to_vec());
+        let mut after = None;
+        loop {
+            let page = self.scan_page(
+                RECOVERY_OUTBOX.id,
+                &[],
+                after.as_deref(),
+                MAX_HISTORICAL_SCAN_PAGE_ROWS,
+                None,
+                0,
+                "verify RecoveryOutbox",
+            )?;
+            let more = page.more;
+            for item in page.items {
+                let ScanItem::Row { key, value } = item else {
+                    return Err(corrupt(
+                        "RecoveryOutbox",
+                        "non-delimited scan returned a common prefix",
+                    ));
+                };
+                after = Some(key.clone());
+                match key.first().copied() {
+                    Some(0) => {
+                        let key_lsn = decode_recovery_outbox_key(&key)
+                            .map_err(|error| corrupt("RecoveryOutbox key", error))?;
+                        let chunk_count = recovery_storage_chunk_count(&value)
+                            .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
+                        for index in 0..chunk_count {
+                            expected_chunk_keys.insert(recovery_chunk_key(key_lsn, index).to_vec());
+                        }
+                        let row = self.read_recovery_record(key_lsn, &value)?;
+                        if key_lsn != expected_lsn || row.recovery_lsn != expected_lsn {
+                            return Err(MetaError::CorruptRecord {
+                                record: "RecoveryOutbox",
+                                reason: format!(
+                                    "expected contiguous LSN {expected_lsn}, found key {key_lsn} row {}",
+                                    row.recovery_lsn
+                                ),
+                            });
+                        }
+                        if row.previous_chain_digest != previous_chain_digest {
+                            return Err(MetaError::CorruptRecord {
+                                record: "RecoveryOutbox",
+                                reason: format!(
+                                    "LSN {expected_lsn} does not link to its predecessor"
+                                ),
+                            });
+                        }
+                        previous_chain_digest = row.chain_digest;
+                        expected_lsn = expected_lsn
+                            .checked_add(1)
+                            .ok_or(MetaError::VersionOverflow)?;
                     }
-                    let row = self.read_recovery_record(key_lsn, &value)?;
-                    if key_lsn != expected_lsn || row.recovery_lsn != expected_lsn {
-                        return Err(AgentMetadataError::CorruptRecord {
-                            record: "RecoveryOutbox",
-                            reason: format!(
-                                "expected contiguous LSN {expected_lsn}, found key {key_lsn} row {}",
-                                row.recovery_lsn
-                            ),
+                    Some(1) => {
+                        if !expected_chunk_keys.remove(&key) {
+                            return Err(MetaError::CorruptRecord {
+                                record: "RecoveryOutbox chunk",
+                                reason: "orphaned or malformed chunk key".to_owned(),
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(MetaError::CorruptRecord {
+                            record: "RecoveryOutbox key",
+                            reason: "unknown storage-key tag".to_owned(),
                         });
                     }
-                    if row.previous_chain_digest != previous_chain_digest {
-                        return Err(AgentMetadataError::CorruptRecord {
-                            record: "RecoveryOutbox",
-                            reason: format!("LSN {expected_lsn} does not link to its predecessor"),
-                        });
-                    }
-                    previous_chain_digest = row.chain_digest;
-                    expected_lsn = expected_lsn
-                        .checked_add(1)
-                        .ok_or(AgentMetadataError::VersionOverflow)?;
                 }
-                Some(1) => {
-                    if !expected_chunk_keys.remove(&key) {
-                        return Err(AgentMetadataError::CorruptRecord {
-                            record: "RecoveryOutbox chunk",
-                            reason: "orphaned or malformed chunk key".to_owned(),
-                        });
-                    }
-                }
-                _ => {
-                    return Err(AgentMetadataError::CorruptRecord {
-                        record: "RecoveryOutbox key",
-                        reason: "unknown storage-key tag".to_owned(),
-                    });
-                }
+            }
+            if !more {
+                break;
             }
         }
         if !expected_chunk_keys.is_empty() {
-            return Err(AgentMetadataError::CorruptRecord {
+            return Err(MetaError::CorruptRecord {
                 record: "RecoveryOutbox chunk",
                 reason: "one or more declared chunks are missing".to_owned(),
             });
@@ -2388,7 +2349,7 @@ impl AgentMetadataStore {
         let observed_lsn = expected_lsn - 1;
         if state.applied_recovery_lsn != observed_lsn || state.chain_digest != previous_chain_digest
         {
-            return Err(AgentMetadataError::CorruptRecord {
+            return Err(MetaError::CorruptRecord {
                 record: "System(recovery tail)",
                 reason: format!(
                     "tail does not match outbox: System LSN {}, scanned LSN {observed_lsn}",
@@ -2403,16 +2364,19 @@ impl AgentMetadataStore {
         &self,
         recovery_lsn: u64,
         header: &[u8],
-    ) -> Result<RecoveryOutboxRecord, AgentMetadataError> {
+    ) -> Result<RecoveryOutboxRecord, MetaError> {
         let chunk_count = recovery_storage_chunk_count(header)
             .map_err(|error| corrupt("RecoveryOutbox storage header", error))?;
         let mut chunks = Vec::with_capacity(chunk_count as usize);
         for index in 0..chunk_count {
             let value = self
-                .recovery_outbox
-                .get(&recovery_chunk_key(recovery_lsn, index))
-                .map_err(|error| backend("read RecoveryOutbox chunk", error))?
-                .ok_or_else(|| AgentMetadataError::CorruptRecord {
+                .read_value(
+                    RECOVERY_OUTBOX.id,
+                    &recovery_chunk_key(recovery_lsn, index),
+                    MetadataPointReadSource::Other,
+                    "read RecoveryOutbox chunk",
+                )?
+                .ok_or_else(|| MetaError::CorruptRecord {
                     record: "RecoveryOutbox chunk",
                     reason: format!("missing LSN {recovery_lsn} chunk {index}"),
                 })?;
@@ -2421,12 +2385,6 @@ impl AgentMetadataStore {
         let logical = assemble_recovery_storage(header, chunks)
             .map_err(|error| corrupt("RecoveryOutbox storage", error))?;
         RecoveryOutboxRecord::decode(&logical).map_err(|error| corrupt("RecoveryOutbox", error))
-    }
-
-    fn family(&self, family: MetadataFamily) -> &Tree {
-        self.families
-            .get(&family)
-            .expect("every MetadataFamily is opened at startup")
     }
 
     #[cfg(feature = "metadata-read-stats")]
@@ -2449,26 +2407,20 @@ impl AgentMetadataStore {
 
     #[cfg(feature = "metadata-read-stats")]
     #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn record_scan_cursor(
-        &self,
-        visited_units: u64,
-        returned_keys: u64,
-        common_prefixes: u64,
-        restarts: u64,
-        key_bytes: u64,
-        value_bytes: u64,
-        stopped_at_limit: bool,
-    ) {
-        read_stats::record_scan_cursor(
+    fn record_scan_result(&self, page: &ScanPage, requested_limit: usize) {
+        let mut key_bytes = 0_u64;
+        let mut value_bytes = 0_u64;
+        for item in &page.items {
+            key_bytes = key_bytes.saturating_add(byte_len(item.key()));
+            if let ScanItem::Row { value, .. } = item {
+                value_bytes = value_bytes.saturating_add(byte_len(value));
+            }
+        }
+        read_stats::record_scan_result(
             self.read_stats_store_key(),
-            visited_units,
-            returned_keys,
-            common_prefixes,
-            restarts,
             key_bytes,
             value_bytes,
-            stopped_at_limit,
+            page.more || page.items.len() == requested_limit,
         );
     }
 
@@ -2477,18 +2429,26 @@ impl AgentMetadataStore {
         family: MetadataFamily,
         key: &[u8],
         operation: &'static str,
-    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
-        self.read_tree_value(self.family(family), key, point_source(family), operation)
+    ) -> Result<Option<Vec<u8>>, MetaError> {
+        self.read_value(family.keyspace(), key, point_source(family), operation)
     }
 
-    fn read_tree_value(
+    fn read_value(
         &self,
-        tree: &Tree,
+        keyspace: Keyspace,
         key: &[u8],
         source: MetadataPointReadSource,
         operation: &'static str,
-    ) -> Result<Option<Vec<u8>>, AgentMetadataError> {
-        let value = tree.get(key).map_err(|error| backend(operation, error))?;
+    ) -> Result<Option<Vec<u8>>, MetaError> {
+        let snapshot = self.read_batch(
+            ReadBatch {
+                ops: vec![ReadOp::Get(Key::new(keyspace, key))],
+            },
+            operation,
+        )?;
+        let Some(ReadResult::Get(value)) = snapshot.results.into_iter().next() else {
+            return Err(corrupt("transaction-store read", "point result is missing"));
+        };
         #[cfg(feature = "metadata-read-stats")]
         self.record_point(source, value.as_ref().map(Vec::len));
         #[cfg(not(feature = "metadata-read-stats"))]
@@ -2496,39 +2456,153 @@ impl AgentMetadataStore {
         Ok(value)
     }
 
-    fn read_tree_record(
+    fn read_value_at_fence(
         &self,
-        tree: &Tree,
+        keyspace: Keyspace,
         key: &[u8],
         source: MetadataPointReadSource,
         operation: &'static str,
-    ) -> Result<Option<Record>, AgentMetadataError> {
-        let record = tree
-            .get_record(key)
-            .map_err(|error| backend(operation, error))?;
+        context: ReadFenceContext,
+    ) -> Result<(ReadVersion, Option<Vec<u8>>), MetaError> {
+        let (clock, mut results) = self.read_batch_at_fence(
+            context,
+            vec![ReadOp::Get(Key::new(keyspace, key))],
+            operation,
+        )?;
+        let Some(ReadResult::Get(value)) = results.pop() else {
+            return Err(corrupt("transaction-store read", "point result is missing"));
+        };
         #[cfg(feature = "metadata-read-stats")]
-        self.record_point(source, record.as_ref().map(|record| record.value.len()));
+        self.record_point(source, value.as_ref().map(Vec::len));
         #[cfg(not(feature = "metadata-read-stats"))]
         let _ = source;
-        Ok(record)
+        Ok((clock, value))
     }
 
-    fn required_system_record(
+    fn required_value(
         &self,
-        tree: &Tree,
+        keyspace: Keyspace,
         key: &[u8],
         record: &'static str,
-    ) -> Result<Record, AgentMetadataError> {
-        self.read_tree_record(
-            tree,
+    ) -> Result<Vec<u8>, MetaError> {
+        self.read_value(
+            keyspace,
             key,
             MetadataPointReadSource::System,
             "read required record",
         )?
-        .ok_or_else(|| AgentMetadataError::CorruptRecord {
+        .ok_or_else(|| MetaError::CorruptRecord {
             record,
             reason: "record is missing".to_owned(),
         })
+    }
+
+    fn read_batch(
+        &self,
+        batch: ReadBatch,
+        operation: &'static str,
+    ) -> Result<ReadSnapshot, MetaError> {
+        batch
+            .validate(&store_limits())
+            .map_err(|source| store_error(operation, source))?;
+        self.store
+            .read(batch)
+            .map_err(|source| store_error(operation, source))
+    }
+
+    fn commit(&self, operation: &'static str, txn: WriteTxn) -> Result<Commit, MetaError> {
+        txn.validate(&store_limits())
+            .map_err(|source| store_error(operation, source))?;
+        self.store
+            .commit(txn)
+            .map_err(|source| store_error(operation, source))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_page(
+        &self,
+        keyspace: Keyspace,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+        delimiter: Option<u8>,
+        reserved_gets: usize,
+        operation: &'static str,
+    ) -> Result<ScanPage, MetaError> {
+        let scan = scan_request(keyspace, prefix, after, limit, delimiter, reserved_gets)?;
+        let snapshot = self.read_batch(
+            ReadBatch {
+                ops: vec![ReadOp::Scan(scan)],
+            },
+            operation,
+        )?;
+        let Some(ReadResult::Scan(page)) = snapshot.results.into_iter().next() else {
+            return Err(corrupt("transaction-store read", "scan result is missing"));
+        };
+        #[cfg(feature = "metadata-read-stats")]
+        self.record_scan_result(&page, limit);
+        Ok(page)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_page_at_clock(
+        &self,
+        keyspace: Keyspace,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+        delimiter: Option<u8>,
+        expected_clock: ReadVersion,
+        context: ReadFenceContext,
+        operation: &'static str,
+    ) -> Result<Option<ScanPage>, MetaError> {
+        let scan = scan_request(keyspace, prefix, after, limit, delimiter, 3)?;
+        let (clock, mut results) =
+            self.read_batch_at_fence(context, vec![ReadOp::Scan(scan)], operation)?;
+        let Some(ReadResult::Scan(page)) = results.pop() else {
+            return Err(corrupt("transaction-store read", "scan result is missing"));
+        };
+        #[cfg(feature = "metadata-read-stats")]
+        self.record_scan_result(&page, limit);
+        Ok((clock == expected_clock).then_some(page))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_scan_at_clock(
+        &self,
+        keyspace: Keyspace,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        page_rows: usize,
+        expected_clock: ReadVersion,
+        context: ReadFenceContext,
+        operation: &'static str,
+    ) -> Result<Option<Vec<ScanItem>>, MetaError> {
+        let mut after = start_after.map(ToOwned::to_owned);
+        let mut rows = Vec::new();
+        loop {
+            let Some(page) = self.scan_page_at_clock(
+                keyspace,
+                prefix,
+                after.as_deref(),
+                page_rows,
+                None,
+                expected_clock,
+                context,
+                operation,
+            )?
+            else {
+                return Ok(None);
+            };
+            let more = page.more;
+            if let Some(last) = page.items.last() {
+                after = Some(last.key().to_vec());
+            }
+            rows.extend(page.items);
+            if !more {
+                return Ok(Some(rows));
+            }
+        }
     }
 }
 
@@ -2539,116 +2613,390 @@ struct PredicatePlan {
 }
 
 struct RecoveryPlan {
-    lsn_record: Record,
-    digest_record: Record,
+    lsn_value: Vec<u8>,
+    digest_value: Vec<u8>,
     header: Vec<u8>,
     chunks: Vec<Vec<u8>>,
     row: RecoveryOutboxRecord,
+}
+
+struct CommandTxnState {
+    next_version: CommitVersion,
+    schema: Vec<u8>,
+    shard: Vec<u8>,
+    owner: Vec<u8>,
+    clock: Vec<u8>,
+    lease_clock: Option<Vec<u8>>,
+    root_plan: RootFencePlan,
+    predicate_plan: PredicatePlan,
+    recovery: RecoveryPlan,
 }
 
 struct PlannedExactPredicate {
     family: MetadataFamily,
     key: Vec<u8>,
     current: Option<CurrentValue>,
-    version: Option<RecordVersion>,
+    raw: Option<Vec<u8>>,
 }
 
 enum RootFencePlan {
-    Install {
-        value: Vec<u8>,
-    },
-    Assert {
-        version: RecordVersion,
-    },
-    Replace {
-        version: RecordVersion,
-        value: Vec<u8>,
-    },
+    Install { value: Vec<u8> },
+    Assert { expected: Vec<u8> },
+    Replace { expected: Vec<u8>, value: Vec<u8> },
 }
 
-fn enqueue_root_fence(
-    batch: &mut holt::DBAtomicBatch,
-    command: &MetadataCommand,
-    plan: &RootFencePlan,
-) {
-    match plan {
-        RootFencePlan::Install { value } => {
-            batch.put_if_absent(ROOT_FENCE_TREE, command.root_id.as_bytes(), value);
-        }
-        RootFencePlan::Assert { version } => {
-            batch.assert_version(ROOT_FENCE_TREE, command.root_id.as_bytes(), *version);
-        }
-        RootFencePlan::Replace { version, value } => {
-            batch.compare_and_put(ROOT_FENCE_TREE, command.root_id.as_bytes(), *version, value);
-        }
-    }
+fn build_recovery_plan(
+    lsn_value: Vec<u8>,
+    digest_value: Vec<u8>,
+    mutation: RecoveryMutationV1,
+    result: RecoveryResultV1,
+) -> Result<RecoveryPlan, MetaError> {
+    let applied_lsn = decode_system_u64(&lsn_value, "System(applied_recovery_lsn)")?;
+    let recovery_lsn = applied_lsn
+        .checked_add(1)
+        .ok_or(MetaError::VersionOverflow)?;
+    let previous_chain_digest =
+        decode_system_digest(&digest_value, "System(recovery_chain_digest)")?;
+    let row = RecoveryOutboxRecord::new(recovery_lsn, previous_chain_digest, mutation, result)
+        .map_err(|error| corrupt("RecoveryOutbox", error))?;
+    let logical = row
+        .encode()
+        .map_err(|error| corrupt("RecoveryOutbox", error))?;
+    let (header, chunks) = split_recovery_storage(&logical)
+        .map_err(|error| corrupt("RecoveryOutbox storage", error))?;
+    Ok(RecoveryPlan {
+        lsn_value,
+        digest_value,
+        header,
+        chunks,
+        row,
+    })
 }
 
-fn enqueue_recovery(batch: &mut holt::DBAtomicBatch, plan: &RecoveryPlan) {
-    batch.compare_and_put(
-        SYSTEM_TREE,
-        SYSTEM_APPLIED_RECOVERY_LSN_KEY,
-        plan.lsn_record.version,
-        &encode_system_u64(plan.row.recovery_lsn),
-    );
-    batch.compare_and_put(
-        SYSTEM_TREE,
-        SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
-        plan.digest_record.version,
-        &encode_system_digest(plan.row.chain_digest),
-    );
-    batch.put_if_absent(
-        RECOVERY_OUTBOX_TREE,
-        &recovery_outbox_key(plan.row.recovery_lsn),
-        &plan.header,
-    );
-    for (index, chunk) in plan.chunks.iter().enumerate() {
-        batch.put_if_absent(
-            RECOVERY_OUTBOX_TREE,
-            &recovery_chunk_key(plan.row.recovery_lsn, index as u32),
-            chunk,
-        );
-    }
-}
-
-fn enqueue_predicate_guards(
-    batch: &mut holt::DBAtomicBatch,
-    plan: &PredicatePlan,
-    commit_version: CommitVersion,
-) {
-    for predicate in plan.exact.values() {
-        match predicate.version {
-            Some(version) => {
-                batch.assert_version(predicate.family.tree_name(), &predicate.key, version);
+fn synthetic_root_fence_plan(command: &MetadataCommand) -> Result<RootFencePlan, MetaError> {
+    let encoded = |state| {
+        RootFence {
+            logical_shard_id: command.logical_shard_id,
+            placement_generation: command.placement_generation,
+            activation_state: state,
+        }
+        .encode()
+        .map_err(|error| internal("derive command root fence", error))
+    };
+    match command.root_fence_action {
+        RootFenceAction::Install => Ok(RootFencePlan::Install {
+            value: encoded(RootActivationState::Installing)?,
+        }),
+        RootFenceAction::RequireActive => Ok(RootFencePlan::Assert {
+            expected: encoded(RootActivationState::Active)?,
+        }),
+        RootFenceAction::Transition { expected, next } => {
+            if !valid_root_transition(expected, next) {
+                return Err(MetaError::InvalidRootFenceTransition {
+                    from: expected,
+                    to: next,
+                });
             }
-            None => {
-                let sentinel = CurrentValue {
-                    created_version: commit_version,
-                    modified_version: commit_version,
-                    payload: Vec::new(),
+            Ok(RootFencePlan::Replace {
+                expected: encoded(expected)?,
+                value: encoded(next)?,
+            })
+        }
+    }
+}
+
+fn synthetic_predicate_plan(command: &MetadataCommand) -> Result<PredicatePlan, MetaError> {
+    let version =
+        CommitVersion::new(command.read_version.get()).map_err(|_| MetaError::VersionOverflow)?;
+    let mut plan = PredicatePlan::default();
+    for predicate in &command.predicates {
+        match predicate {
+            CommandPredicate::Value {
+                family,
+                key,
+                expected,
+            } => {
+                let map_key = (*family, key.clone());
+                if plan.exact.contains_key(&map_key) {
+                    return Err(invalid("duplicate exact predicate"));
+                }
+                let current = expected.as_ref().map(|payload| CurrentValue {
+                    created_version: version,
+                    modified_version: version,
+                    payload: payload.clone(),
+                });
+                let raw = current
+                    .as_ref()
+                    .map(CurrentValue::encode)
+                    .transpose()
+                    .map_err(|error| internal("derive command predicate", error))?;
+                plan.exact.insert(
+                    map_key,
+                    PlannedExactPredicate {
+                        family: *family,
+                        key: key.clone(),
+                        current,
+                        raw,
+                    },
+                );
+            }
+            CommandPredicate::PrefixEmpty { family, prefix } => {
+                plan.prefix_empty.push((*family, prefix.clone()));
+            }
+        }
+    }
+    validate_predicate_plan(command, &plan)?;
+    Ok(plan)
+}
+
+fn validate_predicate_plan(
+    command: &MetadataCommand,
+    plan: &PredicatePlan,
+) -> Result<(), MetaError> {
+    for mutation in &command.mutations {
+        let Some(predicate) = plan
+            .exact
+            .get(&(mutation.family(), mutation.key().to_vec()))
+        else {
+            return Err(invalid(
+                "every mutation requires one exact value/absence predicate",
+            ));
+        };
+        if mutation.family() == MetadataFamily::WorkspaceIncarnationClaim
+            && (matches!(mutation, CommandMutation::Delete { .. }) || predicate.current.is_some())
+        {
+            return Err(invalid(
+                "workspace incarnation claims are append-only and permanent",
+            ));
+        }
+        if matches!(mutation, CommandMutation::Delete { .. }) && predicate.current.is_none() {
+            return Err(invalid("delete mutation requires an existing value"));
+        }
+    }
+    Ok(())
+}
+
+fn build_command_txn(
+    command: &MetadataCommand,
+    state: &CommandTxnState,
+) -> Result<WriteTxn, MetaError> {
+    let dedupe_key = command_dedupe_key(command.root_id, command.request_id);
+    let dedupe_record = CommandDedupeRecord {
+        command_digest: command.command_digest,
+        commit_version: state.next_version,
+        recovery_lsn: state.recovery.row.recovery_lsn,
+        deterministic_result: command.deterministic_result.clone(),
+    }
+    .encode()
+    .map_err(|error| internal("derive command dedupe", error))?;
+
+    let mut txn = WriteTxn {
+        checks: vec![
+            value_check(SYSTEM.id, SYSTEM_SCHEMA_KEY, &state.schema),
+            value_check(SYSTEM.id, SYSTEM_SHARD_IDENTITY_KEY, &state.shard),
+            value_check(SYSTEM.id, SYSTEM_OWNER_FENCE_KEY, &state.owner),
+            value_check(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY, &state.clock),
+        ],
+        mutations: vec![Mutation::Put {
+            key: Key::new(SYSTEM.id, SYSTEM_COMMIT_CLOCK_KEY),
+            value: encode_system_u64(state.next_version.get()).to_vec(),
+        }],
+    };
+    if let Some(lease_clock) = &state.lease_clock {
+        txn.checks.push(value_check(
+            SYSTEM.id,
+            SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+            lease_clock,
+        ));
+    }
+    enqueue_root_fence(&mut txn, command, &state.root_plan);
+    enqueue_predicate_guards(&mut txn, &state.predicate_plan);
+
+    for planned in state.predicate_plan.exact.values() {
+        let Some(previous) = &planned.current else {
+            continue;
+        };
+        if !command
+            .history_projection
+            .iter()
+            .any(|projection| projection.family == planned.family && projection.key == planned.key)
+        {
+            continue;
+        }
+        let key = history_key(planned.family, &planned.key, state.next_version);
+        let value = HistoryValue {
+            transition_version: state.next_version,
+            previous_created_version: previous.created_version,
+            previous_modified_version: previous.modified_version,
+            previous_payload: Some(previous.payload.clone()),
+        }
+        .encode()
+        .map_err(|error| internal("derive command history", error))?;
+        txn.checks.push(Check::Absent {
+            key: Key::new(HISTORY.id, key.clone()),
+        });
+        txn.mutations.push(Mutation::Put {
+            key: Key::new(HISTORY.id, key),
+            value,
+        });
+    }
+
+    for mutation in &command.mutations {
+        match mutation {
+            CommandMutation::Put { family, key, value } => {
+                let planned = state
+                    .predicate_plan
+                    .exact
+                    .get(&(*family, key.clone()))
+                    .expect("every mutation has one exact predicate");
+                let created_version = planned
+                    .current
+                    .as_ref()
+                    .map(|current| current.created_version)
+                    .unwrap_or(state.next_version);
+                let encoded = CurrentValue {
+                    created_version,
+                    modified_version: state.next_version,
+                    payload: value.clone(),
                 }
                 .encode()
-                .expect("empty sentinel fits current-value envelope");
-                batch.put_if_absent(predicate.family.tree_name(), &predicate.key, &sentinel);
-                batch.delete(predicate.family.tree_name(), &predicate.key);
+                .map_err(|error| internal("derive command value", error))?;
+                txn.mutations.push(Mutation::Put {
+                    key: Key::new(family.keyspace(), key.clone()),
+                    value: encoded,
+                });
+            }
+            CommandMutation::Delete { family, key } => {
+                txn.mutations.push(Mutation::Delete {
+                    key: Key::new(family.keyspace(), key.clone()),
+                });
             }
         }
     }
-    for (family, prefix) in &plan.prefix_empty {
-        batch.assert_prefix_empty(family.tree_name(), prefix);
+    for (sequence, projection) in command.event_projection.iter().enumerate() {
+        let sequence = u32::try_from(sequence)
+            .expect("validated event count fits the event-key sequence width");
+        let key = change_event_key(command.root_id, state.next_version, sequence);
+        let value = CurrentValue {
+            created_version: state.next_version,
+            modified_version: state.next_version,
+            payload: projection.payload.clone(),
+        }
+        .encode()
+        .map_err(|error| internal("derive command event", error))?;
+        txn.checks.push(Check::Absent {
+            key: Key::new(CHANGE_EVENT.id, key.clone()),
+        });
+        txn.mutations.push(Mutation::Put {
+            key: Key::new(CHANGE_EVENT.id, key),
+            value,
+        });
+    }
+    txn.checks.push(Check::Absent {
+        key: Key::new(COMMAND_DEDUPE.id, dedupe_key.clone()),
+    });
+    txn.mutations.push(Mutation::Put {
+        key: Key::new(COMMAND_DEDUPE.id, dedupe_key),
+        value: dedupe_record,
+    });
+    enqueue_recovery(&mut txn, &state.recovery);
+    Ok(txn)
+}
+
+fn enqueue_root_fence(txn: &mut WriteTxn, command: &MetadataCommand, plan: &RootFencePlan) {
+    let key = Key::new(ROOT_FENCE.id, command.root_id.as_bytes());
+    match plan {
+        RootFencePlan::Install { value } => {
+            txn.checks.push(Check::Absent { key: key.clone() });
+            txn.mutations.push(Mutation::Put {
+                key,
+                value: value.clone(),
+            });
+        }
+        RootFencePlan::Assert { expected } => {
+            txn.checks.push(Check::Value {
+                key,
+                expected: expected.clone(),
+            });
+        }
+        RootFencePlan::Replace { expected, value } => {
+            txn.checks.push(Check::Value {
+                key: key.clone(),
+                expected: expected.clone(),
+            });
+            txn.mutations.push(Mutation::Put {
+                key,
+                value: value.clone(),
+            });
+        }
     }
 }
 
-fn validate_root_placement(
-    command: &MetadataCommand,
-    fence: RootFence,
-) -> Result<(), AgentMetadataError> {
+fn enqueue_recovery(txn: &mut WriteTxn, plan: &RecoveryPlan) {
+    txn.checks.push(value_check(
+        SYSTEM.id,
+        SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+        &plan.lsn_value,
+    ));
+    txn.checks.push(value_check(
+        SYSTEM.id,
+        SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+        &plan.digest_value,
+    ));
+    txn.mutations.push(Mutation::Put {
+        key: Key::new(SYSTEM.id, SYSTEM_APPLIED_RECOVERY_LSN_KEY),
+        value: encode_system_u64(plan.row.recovery_lsn).to_vec(),
+    });
+    txn.mutations.push(Mutation::Put {
+        key: Key::new(SYSTEM.id, SYSTEM_RECOVERY_CHAIN_DIGEST_KEY),
+        value: encode_system_digest(plan.row.chain_digest),
+    });
+    let header_key = recovery_outbox_key(plan.row.recovery_lsn);
+    txn.checks.push(Check::Absent {
+        key: Key::new(RECOVERY_OUTBOX.id, header_key),
+    });
+    txn.mutations.push(Mutation::Put {
+        key: Key::new(RECOVERY_OUTBOX.id, header_key),
+        value: plan.header.clone(),
+    });
+    for (index, chunk) in plan.chunks.iter().enumerate() {
+        let key = recovery_chunk_key(plan.row.recovery_lsn, index as u32);
+        txn.checks.push(Check::Absent {
+            key: Key::new(RECOVERY_OUTBOX.id, key),
+        });
+        txn.mutations.push(Mutation::Put {
+            key: Key::new(RECOVERY_OUTBOX.id, key),
+            value: chunk.clone(),
+        });
+    }
+}
+
+fn enqueue_predicate_guards(txn: &mut WriteTxn, plan: &PredicatePlan) {
+    for predicate in plan.exact.values() {
+        let key = Key::new(predicate.family.keyspace(), predicate.key.clone());
+        txn.checks.push(match &predicate.raw {
+            Some(expected) => Check::Value {
+                key,
+                expected: expected.clone(),
+            },
+            None => Check::Absent { key },
+        });
+    }
+    for (family, prefix) in &plan.prefix_empty {
+        txn.checks.push(Check::EmptyPrefix {
+            keyspace: family.keyspace(),
+            prefix: prefix.clone(),
+        });
+    }
+}
+
+fn validate_root_placement(command: &MetadataCommand, fence: RootFence) -> Result<(), MetaError> {
     if fence.logical_shard_id == command.logical_shard_id
         && fence.placement_generation == command.placement_generation
     {
         Ok(())
     } else {
-        Err(AgentMetadataError::PlacementMismatch)
+        Err(MetaError::PlacementMismatch)
     }
 }
 
@@ -2660,38 +3008,6 @@ fn valid_root_transition(from: RootActivationState, to: RootActivationState) -> 
             | (RootActivationState::Active, RootActivationState::Fenced)
             | (RootActivationState::Draining, RootActivationState::Fenced)
     )
-}
-
-fn validate_tree_registry(db: &DB) -> Result<(), AgentMetadataError> {
-    let mut actual = db
-        .list_trees()
-        .map_err(|error| backend("inspect schema trees", error))?;
-    actual.sort();
-    let mut expected = SCHEMA_TREES
-        .iter()
-        .map(|tree| (*tree).to_owned())
-        .collect::<Vec<_>>();
-    expected.sort();
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(AgentMetadataError::SchemaGate {
-            reason: format!("expected trees {expected:?}, found {actual:?}"),
-        })
-    }
-}
-
-fn required_record(
-    tree: &Tree,
-    key: &[u8],
-    record: &'static str,
-) -> Result<Record, AgentMetadataError> {
-    tree.get_record(key)
-        .map_err(|error| backend("read required record", error))?
-        .ok_or_else(|| AgentMetadataError::CorruptRecord {
-            record,
-            reason: "record is missing".to_owned(),
-        })
 }
 
 fn point_source(family: MetadataFamily) -> MetadataPointReadSource {
@@ -2714,11 +3030,11 @@ fn encode_shard_identity(shard: LogicalShardId) -> Vec<u8> {
     value
 }
 
-fn decode_shard_identity(value: &[u8]) -> Result<LogicalShardId, AgentMetadataError> {
+fn decode_shard_identity(value: &[u8]) -> Result<LogicalShardId, MetaError> {
     if value.len() != 1 + LogicalShardId::BYTE_WIDTH
         || value.first() != Some(&SYSTEM_VALUE_FORMAT_VERSION)
     {
-        return Err(AgentMetadataError::CorruptRecord {
+        return Err(MetaError::CorruptRecord {
             record: "System(shard_identity)",
             reason: "invalid version or width".to_owned(),
         });
@@ -2735,9 +3051,9 @@ fn encode_system_u64(value: u64) -> [u8; 9] {
     encoded
 }
 
-fn decode_system_u64(value: &[u8], record: &'static str) -> Result<u64, AgentMetadataError> {
+fn decode_system_u64(value: &[u8], record: &'static str) -> Result<u64, MetaError> {
     if value.len() != 9 || value.first() != Some(&SYSTEM_VALUE_FORMAT_VERSION) {
-        return Err(AgentMetadataError::CorruptRecord {
+        return Err(MetaError::CorruptRecord {
             record,
             reason: "invalid version or width".to_owned(),
         });
@@ -2757,11 +3073,11 @@ fn encode_system_digest(value: [u8; RECOVERY_CHAIN_DIGEST_BYTES]) -> Vec<u8> {
 fn decode_system_digest(
     value: &[u8],
     record: &'static str,
-) -> Result<[u8; RECOVERY_CHAIN_DIGEST_BYTES], AgentMetadataError> {
+) -> Result<[u8; RECOVERY_CHAIN_DIGEST_BYTES], MetaError> {
     if value.len() != 1 + RECOVERY_CHAIN_DIGEST_BYTES
         || value.first() != Some(&SYSTEM_VALUE_FORMAT_VERSION)
     {
-        return Err(AgentMetadataError::CorruptRecord {
+        return Err(MetaError::CorruptRecord {
             record,
             reason: "invalid version or width".to_owned(),
         });
@@ -2777,7 +3093,7 @@ fn command_dedupe_key(root: RootId, request: RequestId) -> Vec<u8> {
 
 fn history_prefix(family: MetadataFamily, key: &[u8]) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(1 + 4 + key.len());
-    prefix.push(family.history_tag());
+    prefix.push(family.format_tag());
     prefix.extend_from_slice(
         &u32::try_from(key.len())
             .expect("validated metadata key length fits u32")
@@ -2793,11 +3109,11 @@ fn history_key(family: MetadataFamily, key: &[u8], transition_version: CommitVer
     encoded
 }
 
-fn history_user_key(encoded: &[u8]) -> Result<&[u8], AgentMetadataError> {
+fn history_user_key(encoded: &[u8]) -> Result<&[u8], MetaError> {
     const HEADER_BYTES: usize = 1 + 4;
     const VERSION_BYTES: usize = 8;
     if encoded.len() < HEADER_BYTES + VERSION_BYTES {
-        return Err(AgentMetadataError::CorruptRecord {
+        return Err(MetaError::CorruptRecord {
             record: "History key",
             reason: "key is truncated".to_owned(),
         });
@@ -2808,12 +3124,12 @@ fn history_user_key(encoded: &[u8]) -> Result<&[u8], AgentMetadataError> {
     let expected = HEADER_BYTES
         .checked_add(user_key_bytes)
         .and_then(|length| length.checked_add(VERSION_BYTES))
-        .ok_or_else(|| AgentMetadataError::CorruptRecord {
+        .ok_or_else(|| MetaError::CorruptRecord {
             record: "History key",
             reason: "key length overflow".to_owned(),
         })?;
     if encoded.len() != expected {
-        return Err(AgentMetadataError::CorruptRecord {
+        return Err(MetaError::CorruptRecord {
             record: "History key",
             reason: format!("expected {expected} bytes, found {}", encoded.len()),
         });
@@ -2825,7 +3141,7 @@ fn validate_root_scoped_bytes(
     root: RootId,
     value: &[u8],
     kind: &'static str,
-) -> Result<(), AgentMetadataError> {
+) -> Result<(), MetaError> {
     if value.len() > MAX_COMMAND_KEY_BYTES {
         return Err(invalid(format!("{kind} exceeds size bound")));
     }
@@ -2835,7 +3151,7 @@ fn validate_root_scoped_bytes(
     Ok(())
 }
 
-fn validate_value_bytes(value: &[u8], kind: &'static str) -> Result<(), AgentMetadataError> {
+fn validate_value_bytes(value: &[u8], kind: &'static str) -> Result<(), MetaError> {
     if value.len() > MAX_COMMAND_VALUE_BYTES {
         Err(invalid(format!("{kind} exceeds size bound")))
     } else {
@@ -2843,52 +3159,141 @@ fn validate_value_bytes(value: &[u8], kind: &'static str) -> Result<(), AgentMet
     }
 }
 
-fn require_fresh_location(path: &Path) -> Result<(), AgentMetadataError> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if !metadata.is_dir() => Err(AgentMetadataError::SchemaGate {
-            reason: format!("{} is not a directory", path.display()),
-        }),
-        Ok(_) => {
-            let mut entries =
-                std::fs::read_dir(path).map_err(|error| AgentMetadataError::Backend {
-                    operation: "inspect store directory",
-                    message: error.to_string(),
-                })?;
-            if entries
-                .next()
-                .transpose()
-                .map_err(|error| AgentMetadataError::Backend {
-                    operation: "inspect store directory",
-                    message: error.to_string(),
-                })?
-                .is_some()
-            {
-                Err(AgentMetadataError::SchemaGate {
-                    reason: format!("{} is not empty", path.display()),
-                })
-            } else {
-                Ok(())
-            }
+fn system_bootstrap_rows(shard: LogicalShardId) -> Vec<(&'static [u8], Vec<u8>)> {
+    vec![
+        (SYSTEM_SCHEMA_KEY, encode_schema_marker()),
+        (SYSTEM_SHARD_IDENTITY_KEY, encode_shard_identity(shard)),
+        (SYSTEM_OWNER_FENCE_KEY, encode_system_u64(0).to_vec()),
+        (
+            SYSTEM_COMMIT_CLOCK_KEY,
+            encode_system_u64(INITIAL_COMMIT_VERSION).to_vec(),
+        ),
+        (
+            SYSTEM_LEASE_CLOCK_HIGH_WATER_KEY,
+            encode_system_u64(0).to_vec(),
+        ),
+        (
+            SYSTEM_APPLIED_RECOVERY_LSN_KEY,
+            encode_system_u64(0).to_vec(),
+        ),
+        (
+            SYSTEM_RECOVERY_CHAIN_DIGEST_KEY,
+            encode_system_digest(recovery_genesis_digest(shard)),
+        ),
+    ]
+}
+
+fn validate_store_profile(actual: StoreLimits) -> Result<(), MetaError> {
+    let required = store_limits();
+    for (name, available, needed) in [
+        ("reads", actual.max_reads, required.max_reads),
+        ("checks", actual.max_checks, required.max_checks),
+        ("mutations", actual.max_mutations, required.max_mutations),
+        ("key bytes", actual.max_key_bytes, required.max_key_bytes),
+        (
+            "value bytes",
+            actual.max_value_bytes,
+            required.max_value_bytes,
+        ),
+        ("read bytes", actual.max_read_bytes, required.max_read_bytes),
+        (
+            "transaction bytes",
+            actual.max_transaction_bytes,
+            required.max_transaction_bytes,
+        ),
+        (
+            "result rows",
+            actual.max_result_rows,
+            required.max_result_rows,
+        ),
+        (
+            "result bytes",
+            actual.max_result_bytes,
+            required.max_result_bytes,
+        ),
+    ] {
+        if available < needed {
+            return Err(MetaError::SchemaGate {
+                reason: format!(
+                    "metadata store supports {available} {name}, serving schema requires {needed}"
+                ),
+            });
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(AgentMetadataError::Backend {
-            operation: "inspect store path",
-            message: error.to_string(),
-        }),
+    }
+    Ok(())
+}
+
+fn command_limit(kind: LimitKind) -> Result<CommandLimit, MetaError> {
+    match kind {
+        LimitKind::Checks => Ok(CommandLimit::Checks),
+        LimitKind::Mutations => Ok(CommandLimit::Mutations),
+        LimitKind::KeyBytes => Ok(CommandLimit::KeyBytes),
+        LimitKind::ValueBytes => Ok(CommandLimit::ValueBytes),
+        LimitKind::TransactionBytes => Ok(CommandLimit::TransactionBytes),
+        LimitKind::Reads
+        | LimitKind::ReadBytes
+        | LimitKind::ResultRows
+        | LimitKind::ResultBytes => Err(internal(
+            "derive command fit",
+            format!("write transaction reported {kind}"),
+        )),
     }
 }
 
-fn require_existing_location(path: &Path) -> Result<(), AgentMetadataError> {
-    let metadata = std::fs::metadata(path).map_err(|error| AgentMetadataError::SchemaGate {
-        reason: format!("cannot open {}: {error}", path.display()),
-    })?;
-    if metadata.is_dir() {
-        Ok(())
-    } else {
-        Err(AgentMetadataError::SchemaGate {
-            reason: format!("{} is not a directory", path.display()),
-        })
+fn value_check(keyspace: Keyspace, key: &[u8], expected: &[u8]) -> Check {
+    Check::Value {
+        key: Key::new(keyspace, key),
+        expected: expected.to_vec(),
     }
+}
+
+fn required_get_result(
+    result: Option<ReadResult>,
+    record: &'static str,
+) -> Result<Vec<u8>, MetaError> {
+    let Some(ReadResult::Get(value)) = result else {
+        return Err(corrupt("transaction-store read", "point result is missing"));
+    };
+    value.ok_or_else(|| MetaError::CorruptRecord {
+        record,
+        reason: "record is missing".to_owned(),
+    })
+}
+
+fn scan_request(
+    keyspace: Keyspace,
+    prefix: &[u8],
+    after: Option<&[u8]>,
+    limit: usize,
+    delimiter: Option<u8>,
+    reserved_gets: usize,
+) -> Result<Scan, MetaError> {
+    let limits = store_limits();
+    let reserved_bytes = reserved_gets
+        .checked_mul(limits.max_value_bytes)
+        .ok_or_else(|| internal("build scan", "point-read reserve overflow"))?;
+    let max_bytes = limits
+        .max_result_bytes
+        .checked_sub(reserved_bytes)
+        .ok_or_else(|| internal("build scan", "point reads exhaust result budget"))?;
+    let minimum_row = limits
+        .max_key_bytes
+        .checked_add(limits.max_value_bytes)
+        .ok_or_else(|| internal("build scan", "maximum row size overflow"))?;
+    if max_bytes < minimum_row {
+        return Err(internal(
+            "build scan",
+            "remaining result budget cannot hold one maximum row",
+        ));
+    }
+    Ok(Scan {
+        keyspace,
+        prefix: prefix.to_vec(),
+        after: after.map(ToOwned::to_owned),
+        limit,
+        max_bytes,
+        delimiter,
+    })
 }
 
 fn hash_bytes(hasher: &mut Sha256, value: &[u8]) {
@@ -2900,21 +3305,25 @@ fn hash_u64(hasher: &mut Sha256, value: usize) {
     hasher.update((value as u64).to_be_bytes());
 }
 
-fn invalid(reason: impl Into<String>) -> AgentMetadataError {
-    AgentMetadataError::InvalidCommand {
+fn invalid(reason: impl Into<String>) -> MetaError {
+    MetaError::InvalidCommand {
         reason: reason.into(),
     }
 }
 
-fn corrupt(record: &'static str, error: impl std::fmt::Display) -> AgentMetadataError {
-    AgentMetadataError::CorruptRecord {
+fn corrupt(record: &'static str, error: impl std::fmt::Display) -> MetaError {
+    MetaError::CorruptRecord {
         record,
         reason: error.to_string(),
     }
 }
 
-fn backend(operation: &'static str, error: impl std::fmt::Display) -> AgentMetadataError {
-    AgentMetadataError::Backend {
+fn store_error(operation: &'static str, source: StoreError) -> MetaError {
+    MetaError::Store { operation, source }
+}
+
+fn internal(operation: &'static str, error: impl std::fmt::Display) -> MetaError {
+    MetaError::Internal {
         operation,
         message: error.to_string(),
     }
@@ -2922,13 +3331,225 @@ fn backend(operation: &'static str, error: impl std::fmt::Display) -> AgentMetad
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
+    use nokv_meta_store::{AckBoundary, Authority, LimitKind, StoreProfile, UnknownCommit};
     use tempfile::tempdir;
 
     use super::super::query_records::{ChangeEventKind, ChangeEventRecord, TypedProjection};
     use super::*;
+
+    struct UnknownCommitStore {
+        inner: Arc<dyn TxnStore>,
+        fail_next_commit: AtomicBool,
+    }
+
+    impl TxnStore for UnknownCommitStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            if self.fail_next_commit.swap(false, Ordering::AcqRel) {
+                return Err(StoreError::OutcomeUnknown {
+                    state: UnknownCommit::MayCommit,
+                    reason: "injected uncertain acknowledgement".to_owned(),
+                });
+            }
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct AdvanceOwnerBeforeDataRead {
+        inner: Arc<dyn TxnStore>,
+        controller: MetaShard,
+        armed: AtomicBool,
+    }
+
+    impl TxnStore for AdvanceOwnerBeforeDataRead {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            let reads_operation = batch.ops.iter().any(|op| match op {
+                ReadOp::Get(key) => key.keyspace == MetadataFamily::Operation.keyspace(),
+                ReadOp::Scan(scan) => scan.keyspace == MetadataFamily::Operation.keyspace(),
+            });
+            if reads_operation && self.armed.swap(false, Ordering::AcqRel) {
+                self.controller
+                    .advance_owner_epoch(Some(epoch(1)), epoch(2))
+                    .expect("injected owner advancement must succeed");
+            }
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct ShortScanPageStore {
+        inner: Arc<dyn TxnStore>,
+        max_scan_items: usize,
+        operation_scan_reads: AtomicUsize,
+        advance_clock_on_second_scan: AtomicBool,
+        controller: Option<MetaShard>,
+    }
+
+    impl TxnStore for ShortScanPageStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            let scans_operation = batch.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    ReadOp::Scan(scan)
+                        if scan.keyspace == MetadataFamily::Operation.keyspace()
+                )
+            });
+            if scans_operation {
+                let scan_index = self.operation_scan_reads.fetch_add(1, Ordering::AcqRel);
+                if scan_index == 1
+                    && self
+                        .advance_clock_on_second_scan
+                        .swap(false, Ordering::AcqRel)
+                {
+                    let controller = self
+                        .controller
+                        .as_ref()
+                        .expect("clock advancement requires a controller");
+                    controller
+                        .execute(&create_command(
+                            controller,
+                            request(250),
+                            scoped_key(root(2), b"clock-short-page/1-late"),
+                            b"late",
+                        ))
+                        .expect("injected clock advancement must succeed");
+                }
+            }
+
+            let mut snapshot = self.inner.read(batch.clone())?;
+            for (op, result) in batch.ops.iter().zip(&mut snapshot.results) {
+                let (ReadOp::Scan(scan), ReadResult::Scan(page)) = (op, result) else {
+                    continue;
+                };
+                if scan.keyspace != MetadataFamily::Operation.keyspace()
+                    || page.items.len() <= self.max_scan_items
+                {
+                    continue;
+                }
+                page.items.truncate(self.max_scan_items);
+                page.more = true;
+            }
+            Ok(snapshot)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct HistoricalScanClockChurnStore {
+        inner: Arc<dyn TxnStore>,
+        controller: MetaShard,
+        remaining_advances: AtomicUsize,
+        history_scan_reads: AtomicUsize,
+    }
+
+    impl TxnStore for HistoricalScanClockChurnStore {
+        fn profile(&self) -> StoreProfile {
+            self.inner.profile()
+        }
+
+        fn read(&self, batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            let scans_history = batch
+                .ops
+                .iter()
+                .any(|op| matches!(op, ReadOp::Scan(scan) if scan.keyspace == HISTORY.id));
+            if scans_history {
+                let scan_index = self.history_scan_reads.fetch_add(1, Ordering::AcqRel);
+                if self
+                    .remaining_advances
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    let request_fill = u8::try_from(200 + scan_index)
+                        .expect("bounded historical scan attempts fit one request byte");
+                    let key = scoped_key(
+                        root(2),
+                        format!("historical-clock-churn/{scan_index}").as_bytes(),
+                    );
+                    self.controller
+                        .execute(&create_command(
+                            &self.controller,
+                            request(request_fill),
+                            key,
+                            b"advance-clock",
+                        ))
+                        .expect("injected clock advancement must succeed");
+                }
+            }
+            self.inner.read(batch)
+        }
+
+        fn commit(&self, txn: WriteTxn) -> Result<Commit, StoreError> {
+            self.inner.commit(txn)
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            self.inner.ready()
+        }
+    }
+
+    struct ProfileOnlyStore {
+        limits: StoreLimits,
+    }
+
+    impl TxnStore for ProfileOnlyStore {
+        fn profile(&self) -> StoreProfile {
+            StoreProfile {
+                limits: self.limits,
+                ack: AckBoundary::LocalSync,
+                authority: Authority::Local,
+            }
+        }
+
+        fn read(&self, _batch: ReadBatch) -> Result<ReadSnapshot, StoreError> {
+            panic!("profile rejection must happen before store I/O")
+        }
+
+        fn commit(&self, _txn: WriteTxn) -> Result<Commit, StoreError> {
+            panic!("profile rejection must happen before store I/O")
+        }
+
+        fn ready(&self) -> Result<(), StoreError> {
+            panic!("profile rejection must happen before readiness I/O")
+        }
+    }
 
     fn shard(fill: u8) -> LogicalShardId {
         LogicalShardId::from_bytes([fill; 16])
@@ -2955,7 +3576,7 @@ mod tests {
     }
 
     fn base_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         action: RootFenceAction,
     ) -> MetadataCommand {
@@ -2977,17 +3598,17 @@ mod tests {
         }
     }
 
-    fn ready_store() -> AgentMetadataStore {
-        let store = AgentMetadataStore::open_memory(shard(1)).unwrap();
+    fn ready_store() -> MetaShard {
+        let store = crate::workspace::test_support::memory(shard(1)).unwrap();
         make_store_ready(store)
     }
 
-    fn ready_file_store(path: &std::path::Path) -> AgentMetadataStore {
-        let store = AgentMetadataStore::create_file(path, shard(1)).unwrap();
+    fn ready_file_store(path: &std::path::Path) -> MetaShard {
+        let store = crate::workspace::test_support::initialize_file(path, shard(1)).unwrap();
         make_store_ready(store)
     }
 
-    fn make_store_ready(store: AgentMetadataStore) -> AgentMetadataStore {
+    fn make_store_ready(store: MetaShard) -> MetaShard {
         store.advance_owner_epoch(None, epoch(1)).unwrap();
         let install = base_command(&store, request(1), RootFenceAction::Install).seal();
         let installed = store.execute(&install).unwrap();
@@ -3007,7 +3628,7 @@ mod tests {
     }
 
     fn create_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         key: Vec<u8>,
         value: &[u8],
@@ -3042,11 +3663,7 @@ mod tests {
         command.seal()
     }
 
-    fn read_operation(
-        store: &AgentMetadataStore,
-        key: &[u8],
-        version: CommitVersion,
-    ) -> Option<Vec<u8>> {
+    fn read_operation(store: &MetaShard, key: &[u8], version: CommitVersion) -> Option<Vec<u8>> {
         store
             .read_at(
                 root(2),
@@ -3059,21 +3676,109 @@ mod tests {
             .unwrap()
     }
 
+    fn raw_put(store: &MetaShard, keyspace: Keyspace, key: &[u8], value: &[u8]) {
+        assert_eq!(
+            store
+                .commit(
+                    "inject test row",
+                    WriteTxn {
+                        checks: Vec::new(),
+                        mutations: vec![Mutation::Put {
+                            key: Key::new(keyspace, key),
+                            value: value.to_vec(),
+                        }],
+                    },
+                )
+                .unwrap(),
+            Commit::Applied
+        );
+    }
+
+    fn raw_delete(store: &MetaShard, keyspace: Keyspace, key: &[u8]) {
+        assert_eq!(
+            store
+                .commit(
+                    "delete test row",
+                    WriteTxn {
+                        checks: Vec::new(),
+                        mutations: vec![Mutation::Delete {
+                            key: Key::new(keyspace, key),
+                        }],
+                    },
+                )
+                .unwrap(),
+            Commit::Applied
+        );
+    }
+
+    type TxnShapeRow = (u8, u16, usize, usize);
+
+    fn txn_shape(txn: &WriteTxn) -> (Vec<TxnShapeRow>, Vec<TxnShapeRow>) {
+        let checks = txn
+            .checks
+            .iter()
+            .map(|check| match check {
+                Check::Value { key, expected } => {
+                    (0, key.keyspace.get(), key.bytes.len(), expected.len())
+                }
+                Check::Absent { key } => (1, key.keyspace.get(), key.bytes.len(), 0),
+                Check::EmptyPrefix { keyspace, prefix } => (2, keyspace.get(), prefix.len(), 0),
+            })
+            .collect();
+        let mutations = txn
+            .mutations
+            .iter()
+            .map(|mutation| match mutation {
+                Mutation::Put { key, value } => {
+                    (0, key.keyspace.get(), key.bytes.len(), value.len())
+                }
+                Mutation::Delete { key } => (1, key.keyspace.get(), key.bytes.len(), 0),
+            })
+            .collect();
+        (checks, mutations)
+    }
+
+    fn capture_next_commit(
+        store: &mut MetaShard,
+    ) -> Arc<crate::workspace::test_support::CommitCaptureStore> {
+        let (wrapped, capture) =
+            crate::workspace::test_support::capture_txn_store(Arc::clone(&store.store));
+        store.store = wrapped;
+        capture
+    }
+
+    fn put_history_row(
+        store: &MetaShard,
+        key: &[u8],
+        transition_version: u64,
+        previous_modified_version: u64,
+        previous_payload: &[u8],
+    ) {
+        let transition_version = CommitVersion::new(transition_version).unwrap();
+        let value = HistoryValue {
+            transition_version,
+            previous_created_version: CommitVersion::new(2).unwrap(),
+            previous_modified_version: CommitVersion::new(previous_modified_version).unwrap(),
+            previous_payload: Some(previous_payload.to_vec()),
+        }
+        .encode()
+        .unwrap();
+        raw_put(
+            store,
+            HISTORY.id,
+            &history_key(MetadataFamily::Operation, key, transition_version),
+            &value,
+        );
+    }
+
     #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
-        let store = AgentMetadataStore::open_memory(shard(1)).unwrap();
-        let mut actual = store.db.list_trees().unwrap();
-        actual.sort();
-        let mut expected = SCHEMA_TREES
-            .iter()
-            .map(|tree| (*tree).to_owned())
-            .collect::<Vec<_>>();
-        expected.sort();
-        assert_eq!(actual, expected);
+        let store = crate::workspace::test_support::memory(shard(1)).unwrap();
+        assert_eq!(keyspaces().len(), 26);
         assert_eq!(store.current_read_version().unwrap().get(), 1);
         assert_eq!(
             store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
-            Err(AgentMetadataError::OwnerEpochMismatch {
+            Err(MetaError::OwnerEpochMismatch {
                 expected: 1,
                 actual: 0,
             })
@@ -3083,18 +3788,270 @@ mod tests {
     }
 
     #[test]
+    fn initialization_rejects_a_store_below_the_serving_profile_before_io() {
+        let mut limits = store_limits();
+        limits.max_key_bytes -= 1;
+        let error = match MetaShard::initialize(Arc::new(ProfileOnlyStore { limits }), shard(1)) {
+            Ok(_) => panic!("a smaller physical profile must not bind"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MetaError::SchemaGate { reason }
+                if reason.contains("key bytes") && reason.contains("8205")
+        ));
+    }
+
+    #[test]
+    fn maximum_domain_key_leaves_exact_history_key_headroom() {
+        let store = ready_store();
+        let mut key = root(2).as_bytes().to_vec();
+        key.resize(MAX_COMMAND_KEY_BYTES, b'k');
+        let history = history_key(
+            MetadataFamily::Operation,
+            &key,
+            CommitVersion::new(5).unwrap(),
+        );
+        assert_eq!(history.len(), MAX_DERIVED_KEY_BYTES);
+        assert_eq!(store_limits().max_key_bytes, MAX_DERIVED_KEY_BYTES);
+
+        store
+            .execute(&create_command(&store, request(80), key.clone(), b"first"))
+            .unwrap();
+        let mut replace = base_command(&store, request(81), RootFenceAction::RequireActive);
+        replace.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            expected: Some(b"first".to_vec()),
+        });
+        replace.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            value: b"second".to_vec(),
+        });
+        replace.history_projection.push(HistoryProjection {
+            family: MetadataFamily::Operation,
+            key,
+        });
+        store.execute(&replace.seal()).unwrap();
+    }
+
+    #[test]
+    fn command_fit_uses_no_store_io() {
+        let mut store = ready_store();
+        let mut command = create_command(
+            &store,
+            request(251),
+            scoped_key(root(2), b"fit-pure"),
+            b"value",
+        );
+        command.deterministic_result = vec![0x5a; MAX_DETERMINISTIC_RESULT_BYTES];
+        let command = command.seal();
+        store.store = Arc::new(ProfileOnlyStore {
+            limits: store_limits(),
+        });
+
+        assert_eq!(store.command_fit(&command, None), Ok(CommandFit::Fits));
+        let txn = store.command_txn_for_fit(&command, None).unwrap();
+        let recovery_rows = txn
+            .mutations
+            .iter()
+            .filter(|mutation| match mutation {
+                Mutation::Put { key, .. } | Mutation::Delete { key } => {
+                    key.keyspace == RECOVERY_OUTBOX.id
+                }
+            })
+            .count();
+        assert!(
+            recovery_rows > 2,
+            "maximum deterministic result must span multiple recovery chunks"
+        );
+    }
+
+    #[test]
+    fn command_fit_matches_create_event_and_multichunk_transaction_shape() {
+        let mut store = ready_store();
+        let mut command = create_command(
+            &store,
+            request(252),
+            scoped_key(root(2), b"fit-create"),
+            b"value",
+        );
+        command.deterministic_result = vec![0xa5; MAX_DETERMINISTIC_RESULT_BYTES];
+        let command = command.seal();
+        let predicted = store.command_txn_for_fit(&command, None).unwrap();
+        assert_eq!(store.command_fit(&command, None), Ok(CommandFit::Fits));
+
+        let capture = capture_next_commit(&mut store);
+        store.execute(&command).unwrap();
+        capture.with_last_commit(|actual| {
+            assert_eq!(txn_shape(&predicted), txn_shape(actual));
+            assert_eq!(actual.validate(&store_limits()), Ok(()));
+        });
+        assert_eq!(predicted.validate(&store_limits()), Ok(()));
+    }
+
+    #[test]
+    fn command_fit_matches_replace_history_transaction_shape() {
+        let mut store = ready_store();
+        let key = scoped_key(root(2), b"fit-replace");
+        store
+            .execute(&create_command(&store, request(253), key.clone(), b"first"))
+            .unwrap();
+        let mut command = base_command(&store, request(254), RootFenceAction::RequireActive);
+        command.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            expected: Some(b"first".to_vec()),
+        });
+        command.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            value: b"second".to_vec(),
+        });
+        command.history_projection.push(HistoryProjection {
+            family: MetadataFamily::Operation,
+            key,
+        });
+        let command = command.seal();
+        let predicted = store.command_txn_for_fit(&command, None).unwrap();
+        assert_eq!(store.command_fit(&command, None), Ok(CommandFit::Fits));
+
+        let capture = capture_next_commit(&mut store);
+        store.execute(&command).unwrap();
+        capture.with_last_commit(|actual| {
+            assert_eq!(txn_shape(&predicted), txn_shape(actual));
+            assert!(actual.mutations.iter().any(|mutation| matches!(
+                mutation,
+                Mutation::Put { key, .. } if key.keyspace == HISTORY.id
+            )));
+            assert_eq!(actual.validate(&store_limits()), Ok(()));
+        });
+        assert_eq!(predicted.validate(&store_limits()), Ok(()));
+    }
+
+    #[test]
+    fn derived_transaction_limit_failure_has_no_state_change() {
+        let store = ready_store();
+        let version_before = store.current_read_version().unwrap();
+        let recovery_before = store.recovery_state().unwrap();
+        let mut command = base_command(&store, request(82), RootFenceAction::RequireActive);
+        for index in 0..160 {
+            let key = scoped_key(root(2), format!("serving-limit/{index:02}").as_bytes());
+            command.predicates.push(CommandPredicate::Value {
+                family: MetadataFamily::Operation,
+                key: key.clone(),
+                expected: None,
+            });
+            command.mutations.push(CommandMutation::Put {
+                family: MetadataFamily::Operation,
+                key,
+                value: vec![index as u8; MAX_COMMAND_VALUE_BYTES],
+            });
+        }
+        let command = command.seal();
+        assert!(matches!(
+            store.command_fit(&command, None),
+            Ok(CommandFit::Exceeds {
+                kind: CommandLimit::TransactionBytes,
+                maximum: 16_000_000,
+                ..
+            })
+        ));
+        let error = store
+            .execute(&command)
+            .expect_err("fully derived transaction must exceed the serving byte envelope");
+        assert!(matches!(
+            error,
+            MetaError::Store {
+                operation: "execute metadata command",
+                source: StoreError::LimitExceeded {
+                    kind: LimitKind::TransactionBytes,
+                    maximum: 16_000_000,
+                    ..
+                },
+            }
+        ));
+        assert_eq!(store.current_read_version().unwrap(), version_before);
+        assert_eq!(store.recovery_state().unwrap(), recovery_before);
+    }
+
+    #[test]
+    fn outcome_unknown_remains_typed() {
+        let mut store = ready_store();
+        let wrapper = Arc::new(UnknownCommitStore {
+            inner: Arc::clone(&store.store),
+            fail_next_commit: AtomicBool::new(false),
+        });
+        store.store = wrapper.clone();
+        let command = create_command(
+            &store,
+            request(83),
+            scoped_key(root(2), b"unknown-outcome"),
+            b"value",
+        );
+        wrapper.fail_next_commit.store(true, Ordering::Release);
+        assert!(matches!(
+            store.execute(&command),
+            Err(MetaError::Store {
+                operation: "execute metadata command",
+                source: StoreError::OutcomeUnknown {
+                    state: UnknownCommit::MayCommit,
+                    ..
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn point_data_and_owner_fence_share_one_store_snapshot() {
+        let store = ready_store();
+        let key = scoped_key(root(2), b"owner-race");
+        store
+            .execute(&create_command(&store, request(84), key.clone(), b"value"))
+            .unwrap();
+        let version = store.current_read_version().unwrap();
+        let inner = Arc::clone(&store.store);
+        let controller = MetaShard::open(Arc::clone(&inner), shard(1)).unwrap();
+        let wrapper = Arc::new(AdvanceOwnerBeforeDataRead {
+            inner,
+            controller: controller.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let stale = MetaShard::open(wrapper.clone(), shard(1)).unwrap();
+        wrapper.armed.store(true, Ordering::Release);
+
+        assert_eq!(
+            stale.read_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &key,
+                version,
+            ),
+            Err(MetaError::OwnerEpochMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        );
+        assert_eq!(controller.current_read_version().unwrap(), version);
+    }
+
+    #[test]
     fn file_reopen_rejects_a_different_logical_shard() {
         let temporary = tempdir().unwrap();
         let database = temporary.path().join("metadata");
         {
-            let store = AgentMetadataStore::create_file(&database, shard(1)).unwrap();
+            let store =
+                crate::workspace::test_support::initialize_file(&database, shard(1)).unwrap();
             store.advance_owner_epoch(None, epoch(1)).unwrap();
         }
         assert!(matches!(
-            AgentMetadataStore::reopen_file(&database, shard(2)),
-            Err(AgentMetadataError::SchemaGate { .. })
+            crate::workspace::test_support::open_file(&database, shard(2)),
+            Err(MetaError::SchemaGate { .. })
         ));
-        let reopened = AgentMetadataStore::reopen_file(&database, shard(1)).unwrap();
+        let reopened = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
         assert_eq!(reopened.current_read_version().unwrap().get(), 1);
     }
 
@@ -3104,7 +4061,7 @@ mod tests {
         let duplicate_install = base_command(&store, request(3), RootFenceAction::Install).seal();
         assert_eq!(
             store.execute(&duplicate_install),
-            Err(AgentMetadataError::RootFenceAlreadyInstalled)
+            Err(MetaError::RootFenceAlreadyInstalled)
         );
 
         let mut stale_placement = create_command(
@@ -3117,7 +4074,7 @@ mod tests {
         stale_placement = stale_placement.seal();
         assert_eq!(
             store.execute(&stale_placement),
-            Err(AgentMetadataError::PlacementMismatch)
+            Err(MetaError::PlacementMismatch)
         );
 
         store.advance_owner_epoch(Some(epoch(1)), epoch(2)).unwrap();
@@ -3125,7 +4082,7 @@ mod tests {
             create_command(&store, request(5), scoped_key(root(2), b"other"), b"value");
         assert_eq!(
             store.execute(&stale_owner),
-            Err(AgentMetadataError::OwnerEpochMismatch {
+            Err(MetaError::OwnerEpochMismatch {
                 expected: 1,
                 actual: 2,
             })
@@ -3160,10 +4117,7 @@ mod tests {
         let mut mismatch = command.clone();
         mismatch.deterministic_result = b"different".to_vec();
         mismatch = mismatch.seal();
-        assert_eq!(
-            store.execute(&mismatch),
-            Err(AgentMetadataError::RequestIdReused)
-        );
+        assert_eq!(store.execute(&mismatch), Err(MetaError::RequestIdReused));
         assert_eq!(
             read_operation(&store, &key, first.commit_version),
             Some(b"v1".to_vec())
@@ -3177,10 +4131,7 @@ mod tests {
             store.with_fenced_point_reads(root(2), generation(7), epoch(1), None, |_, reader| {
                 reader.get(MetadataFamily::Operation, &scoped_key(root(3), b"foreign"))
             });
-        assert!(matches!(
-            result,
-            Err(AgentMetadataError::InvalidCommand { .. })
-        ));
+        assert!(matches!(result, Err(MetaError::InvalidCommand { .. })));
     }
 
     #[test]
@@ -3192,7 +4143,7 @@ mod tests {
             &key,
             CommitVersion::new(2).unwrap(),
         );
-        store.history.put(&history_key, b"corrupt-history").unwrap();
+        raw_put(&store, HISTORY.id, &history_key, b"corrupt-history");
 
         let value = store
             .with_fenced_point_reads(root(2), generation(7), epoch(1), None, |_, reader| {
@@ -3215,10 +4166,7 @@ mod tests {
         }
         .encode()
         .unwrap();
-        store
-            .family(MetadataFamily::Operation)
-            .put(&key, &encoded)
-            .unwrap();
+        raw_put(&store, MetadataFamily::Operation.keyspace(), &key, &encoded);
 
         assert!(matches!(
             store.scan_prefix_at(
@@ -3231,11 +4179,167 @@ mod tests {
                 None,
                 1,
             ),
-            Err(AgentMetadataError::CorruptRecord {
-                record: OPERATION_TREE,
+            Err(MetaError::CorruptRecord {
+                record: "operation",
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn current_prefix_scan_resumes_short_store_pages() {
+        let mut store = ready_store();
+        let prefix = scoped_key(root(2), b"short-page/");
+        let mut expected = Vec::new();
+        for index in 0..5_u8 {
+            let key = [prefix.as_slice(), format!("{index}").as_bytes()].concat();
+            let value = format!("value-{index}").into_bytes();
+            store
+                .execute(&create_command(
+                    &store,
+                    request(20 + index),
+                    key.clone(),
+                    &value,
+                ))
+                .unwrap();
+            expected.push(MetadataScanItem { key, value });
+        }
+        let version = store.current_read_version().unwrap();
+        let wrapper = Arc::new(ShortScanPageStore {
+            inner: Arc::clone(&store.store),
+            max_scan_items: 2,
+            operation_scan_reads: AtomicUsize::new(0),
+            advance_clock_on_second_scan: AtomicBool::new(false),
+            controller: None,
+        });
+        store.store = wrapper.clone();
+
+        let actual = store
+            .scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                version,
+                None,
+                expected.len(),
+            )
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(wrapper.operation_scan_reads.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn current_delimited_scan_resumes_from_common_prefix_cursor() {
+        let mut store = ready_store();
+        let prefix = scoped_key(root(2), b"short-delimited/");
+        let common_a = [prefix.as_slice(), b"a/"].concat();
+        let common_b = [prefix.as_slice(), b"b/"].concat();
+        let direct_c = [prefix.as_slice(), b"c"].concat();
+        for (index, (suffix, value)) in [
+            (b"a/one".as_slice(), b"a-one".as_slice()),
+            (b"a/two".as_slice(), b"a-two".as_slice()),
+            (b"b/one".as_slice(), b"b-one".as_slice()),
+            (b"c".as_slice(), b"c".as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .execute(&create_command(
+                    &store,
+                    request(30 + index as u8),
+                    [prefix.as_slice(), suffix].concat(),
+                    value,
+                ))
+                .unwrap();
+        }
+        let version = store.current_read_version().unwrap();
+        let wrapper = Arc::new(ShortScanPageStore {
+            inner: Arc::clone(&store.store),
+            max_scan_items: 1,
+            operation_scan_reads: AtomicUsize::new(0),
+            advance_clock_on_second_scan: AtomicBool::new(false),
+            controller: None,
+        });
+        store.store = wrapper.clone();
+
+        let actual = store
+            .scan_delimited_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                b'/',
+                version,
+                None,
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(
+            actual,
+            vec![
+                DelimitedMetadataScanItem::CommonPrefix(common_a),
+                DelimitedMetadataScanItem::CommonPrefix(common_b),
+                DelimitedMetadataScanItem::Record(MetadataScanItem {
+                    key: direct_c,
+                    value: b"c".to_vec(),
+                }),
+            ]
+        );
+        assert_eq!(wrapper.operation_scan_reads.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn current_prefix_scan_discards_short_pages_after_clock_change() {
+        let mut store = ready_store();
+        let prefix = scoped_key(root(2), b"clock-short-page/");
+        let mut expected = Vec::new();
+        for index in 0..4_u8 {
+            let key = [prefix.as_slice(), format!("{index}").as_bytes()].concat();
+            let value = format!("value-{index}").into_bytes();
+            store
+                .execute(&create_command(
+                    &store,
+                    request(40 + index),
+                    key.clone(),
+                    &value,
+                ))
+                .unwrap();
+            expected.push(MetadataScanItem { key, value });
+        }
+        let version = store.current_read_version().unwrap();
+        let inner = Arc::clone(&store.store);
+        let controller = MetaShard::open(Arc::clone(&inner), shard(1)).unwrap();
+        let wrapper = Arc::new(ShortScanPageStore {
+            inner,
+            max_scan_items: 2,
+            operation_scan_reads: AtomicUsize::new(0),
+            advance_clock_on_second_scan: AtomicBool::new(true),
+            controller: Some(controller),
+        });
+        store.store = wrapper.clone();
+
+        let actual = store
+            .scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                version,
+                None,
+                expected.len(),
+            )
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(!actual.iter().any(|item| item.key.ends_with(b"late")));
+        assert_eq!(wrapper.operation_scan_reads.load(Ordering::Acquire), 5);
     }
 
     #[test]
@@ -3326,6 +4430,52 @@ mod tests {
     }
 
     #[test]
+    fn historical_point_read_resumes_after_a_full_internal_page() {
+        let store = ready_store();
+        let key = scoped_key(root(2), b"historical-point-pages");
+        let target_version = CommitVersion::new(2).unwrap();
+        let newest_transition = 3 + MAX_HISTORICAL_SCAN_PAGE_ROWS as u64;
+
+        for transition in 3..=newest_transition {
+            let payload = if transition == 3 {
+                b"target".as_slice()
+            } else {
+                b"newer".as_slice()
+            };
+            put_history_row(&store, &key, transition, transition - 1, payload);
+        }
+        let current = CurrentValue {
+            created_version: target_version,
+            modified_version: CommitVersion::new(newest_transition).unwrap(),
+            payload: b"current".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        raw_put(&store, MetadataFamily::Operation.keyspace(), &key, &current);
+        raw_put(
+            &store,
+            SYSTEM.id,
+            SYSTEM_COMMIT_CLOCK_KEY,
+            &encode_system_u64(newest_transition),
+        );
+
+        #[cfg(feature = "metadata-read-stats")]
+        let metadata_stats_session = store.begin_read_stats_session().unwrap();
+        assert_eq!(
+            read_operation(&store, &key, target_version),
+            Some(b"target".to_vec())
+        );
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let metadata = metadata_stats_session.finish().unwrap();
+            assert_eq!(metadata.scan_calls, 1);
+            assert_eq!(metadata.scan_raw_limit_stops, 1);
+            assert_eq!(metadata.point_reads_system, 6);
+            assert_eq!(metadata.point_reads_root_fence, 3);
+        }
+    }
+
+    #[test]
     fn current_prefix_scan_seeks_after_cursor_and_stops_at_limit() {
         let store = ready_store();
         let prefix = scoped_key(root(2), b"bounded/");
@@ -3354,18 +4504,22 @@ mod tests {
         // Deliberately malformed envelopes provide an observable test seam:
         // decoding either row means the cursor or page bound was not pushed
         // into the current-version storage iteration.
-        store
-            .family(MetadataFamily::Operation)
-            .put(&before_cursor, b"corrupt-before-cursor")
-            .unwrap();
-        store
-            .family(MetadataFamily::Operation)
-            .put(&after_limit, b"corrupt-after-limit")
-            .unwrap();
+        raw_put(
+            &store,
+            MetadataFamily::Operation.keyspace(),
+            &before_cursor,
+            b"corrupt-before-cursor",
+        );
+        raw_put(
+            &store,
+            MetadataFamily::Operation.keyspace(),
+            &after_limit,
+            b"corrupt-after-limit",
+        );
 
         let version = store.current_read_version().unwrap();
         #[cfg(feature = "metadata-read-stats")]
-        let stats_session = store.begin_read_stats_session().unwrap();
+        let metadata_stats_session = store.begin_read_stats_session().unwrap();
         let page = store
             .scan_prefix_at(
                 root(2),
@@ -3393,14 +4547,13 @@ mod tests {
         );
         #[cfg(feature = "metadata-read-stats")]
         {
-            let stats = stats_session.finish().unwrap();
-            assert_eq!(stats.scan_calls, 1);
-            assert_eq!(stats.scan_cursors, 1);
-            assert_eq!(stats.holt_scan_returned_keys, 2);
-            assert!(stats.holt_scan_visited_units >= 2);
-            assert_eq!(stats.scan_raw_limit_stops, 1);
-            assert!(stats.scan_key_bytes > 0);
-            assert!(stats.scan_value_bytes > 0);
+            let metadata = metadata_stats_session.finish().unwrap();
+            assert_eq!(metadata.scan_calls, 1);
+            assert_eq!(metadata.scan_raw_limit_stops, 1);
+            assert!(metadata.scan_key_bytes > 0);
+            assert!(metadata.scan_value_bytes > 0);
+            assert_eq!(metadata.point_reads_system, 4);
+            assert_eq!(metadata.point_reads_root_fence, 2);
         }
     }
 
@@ -3476,14 +4629,16 @@ mod tests {
             .unwrap();
         // A delimiter rollup must skip this nested subtree without decoding
         // its value. A recursive scan would fail closed on this envelope.
-        store
-            .family(MetadataFamily::Operation)
-            .put(&nested_a, b"corrupt-nested-value")
-            .unwrap();
+        raw_put(
+            &store,
+            MetadataFamily::Operation.keyspace(),
+            &nested_a,
+            b"corrupt-nested-value",
+        );
         drop(store);
-        let store = AgentMetadataStore::reopen_file(&database, shard(1)).unwrap();
+        let store = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
         #[cfg(feature = "metadata-read-stats")]
-        let stats_session = store.begin_read_stats_session().unwrap();
+        let metadata_stats_session = store.begin_read_stats_session().unwrap();
 
         let page = store
             .scan_delimited_prefix_at(
@@ -3539,21 +4694,10 @@ mod tests {
         );
         #[cfg(feature = "metadata-read-stats")]
         {
-            let stats = stats_session.finish().unwrap();
-            assert_eq!(stats.scan_calls, 2);
-            assert_eq!(stats.scan_cursors, 2);
-            assert!(stats.holt_scan_common_prefixes >= 1);
-            assert!(
-                stats.holt_cache_hits
-                    + stats.holt_cache_misses
-                    + stats.holt_full_blob_reads
-                    + stats.holt_read_page_hits
-                    + stats.holt_read_page_misses
-                    + stats.holt_read_index_cache_hits
-                    + stats.holt_read_index_cache_misses
-                    > 0,
-                "file-backed read session should expose Holt read activity"
-            );
+            let metadata = metadata_stats_session.finish().unwrap();
+            assert_eq!(metadata.scan_calls, 2);
+            assert!(metadata.scan_key_bytes > 0);
+            assert!(metadata.scan_value_bytes > 0);
         }
     }
 
@@ -3619,6 +4763,111 @@ mod tests {
     }
 
     #[test]
+    fn historical_prefix_read_resumes_each_physical_scan_page() {
+        let store = ready_store();
+        let prefix = scoped_key(root(2), b"historical-prefix-pages/");
+        let target_key = [prefix.as_slice(), b"zzz"].concat();
+        let start_after = [prefix.as_slice(), b"yyy"].concat();
+
+        for index in 0..MAX_HISTORICAL_SCAN_PAGE_ROWS {
+            let suffix = format!("{index:03}");
+            let key = [prefix.as_slice(), suffix.as_bytes()].concat();
+            put_history_row(&store, &key, 3, 2, b"earlier");
+        }
+        put_history_row(&store, &target_key, 3, 2, b"target");
+
+        #[cfg(feature = "metadata-read-stats")]
+        let metadata_stats_session = store.begin_read_stats_session().unwrap();
+        let page = store
+            .scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &prefix,
+                ReadVersion::new(2).unwrap(),
+                Some(&start_after),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            page,
+            vec![MetadataScanItem {
+                key: target_key,
+                value: b"target".to_vec(),
+            }]
+        );
+        #[cfg(feature = "metadata-read-stats")]
+        {
+            let metadata = metadata_stats_session.finish().unwrap();
+            assert_eq!(metadata.scan_calls, 1);
+            assert_eq!(metadata.scan_raw_limit_stops, 1);
+            assert_eq!(metadata.point_reads_system, 8);
+            assert_eq!(metadata.point_reads_root_fence, 4);
+        }
+    }
+
+    #[test]
+    fn historical_scan_returns_retryable_error_after_bounded_clock_churn() {
+        let mut store = ready_store();
+        let key = scoped_key(root(2), b"historical-clock-target");
+        let created = store
+            .execute(&create_command(
+                &store,
+                request(180),
+                key.clone(),
+                b"earlier",
+            ))
+            .unwrap();
+        let mut replace = base_command(&store, request(181), RootFenceAction::RequireActive);
+        replace.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            expected: Some(b"earlier".to_vec()),
+        });
+        replace.mutations.push(CommandMutation::Put {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+            value: b"current".to_vec(),
+        });
+        replace.history_projection.push(HistoryProjection {
+            family: MetadataFamily::Operation,
+            key: key.clone(),
+        });
+        store.execute(&replace.seal()).unwrap();
+
+        let inner = Arc::clone(&store.store);
+        let controller = MetaShard::open(Arc::clone(&inner), shard(1)).unwrap();
+        let wrapper = Arc::new(HistoricalScanClockChurnStore {
+            inner,
+            controller,
+            remaining_advances: AtomicUsize::new(MAX_HISTORICAL_SCAN_ATTEMPTS),
+            history_scan_reads: AtomicUsize::new(0),
+        });
+        store.store = wrapper.clone();
+
+        assert_eq!(
+            store.scan_prefix_at(
+                root(2),
+                generation(7),
+                epoch(1),
+                MetadataFamily::Operation,
+                &key,
+                ReadVersion::new(created.commit_version.get()).unwrap(),
+                None,
+                1,
+            ),
+            Err(MetaError::ReadStabilityExhausted {
+                attempts: MAX_HISTORICAL_SCAN_ATTEMPTS,
+            })
+        );
+        assert_eq!(
+            wrapper.history_scan_reads.load(Ordering::Acquire),
+            MAX_HISTORICAL_SCAN_ATTEMPTS
+        );
+    }
+
+    #[test]
     fn change_event_scan_uses_an_exclusive_cursor_and_page_limit() {
         let store = ready_store();
         let first = store
@@ -3656,26 +4905,27 @@ mod tests {
     }
 
     #[test]
-    fn historical_prefix_scan_remains_fail_closed_past_page_limit() {
+    fn historical_prefix_scan_fails_closed_on_corrupt_history_in_second_internal_page() {
         let store = ready_store();
         let prefix = scoped_key(root(2), b"historical-bounded/");
-        let first_key = scoped_key(root(2), b"historical-bounded/01");
-        let corrupt_tail = scoped_key(root(2), b"historical-bounded/02-corrupt");
-        let first = store
-            .execute(&create_command(&store, request(3), first_key, b"first"))
-            .unwrap();
-        store
-            .execute(&create_command(
-                &store,
-                request(4),
-                scoped_key(root(2), b"outside-prefix"),
-                b"advance-clock",
-            ))
-            .unwrap();
-        store
-            .family(MetadataFamily::Operation)
-            .put(&corrupt_tail, b"corrupt-historical-tail")
-            .unwrap();
+        for index in 0..MAX_HISTORICAL_SCAN_PAGE_ROWS {
+            let suffix = format!("{index:03}");
+            let key = [prefix.as_slice(), suffix.as_bytes()].concat();
+            put_history_row(&store, &key, 3, 2, b"visible-at-version-two");
+        }
+
+        let corrupt_key = [prefix.as_slice(), b"zzz"].concat();
+        let corrupt_history_key = history_key(
+            MetadataFamily::Operation,
+            &corrupt_key,
+            CommitVersion::new(3).unwrap(),
+        );
+        raw_put(
+            &store,
+            HISTORY.id,
+            &corrupt_history_key,
+            b"corrupt-history-tail",
+        );
 
         assert!(matches!(
             store.scan_prefix_at(
@@ -3684,12 +4934,12 @@ mod tests {
                 epoch(1),
                 MetadataFamily::Operation,
                 &prefix,
-                ReadVersion::new(first.commit_version.get()).unwrap(),
+                ReadVersion::new(2).unwrap(),
                 None,
                 1,
             ),
-            Err(AgentMetadataError::CorruptRecord {
-                record: OPERATION_TREE,
+            Err(MetaError::CorruptRecord {
+                record: "History",
                 ..
             })
         ));
@@ -3722,7 +4972,7 @@ mod tests {
         });
         assert_eq!(
             store.execute(&command.seal()),
-            Err(AgentMetadataError::PredicateFailed)
+            Err(MetaError::PredicateFailed)
         );
         assert_eq!(store.current_read_version().unwrap(), before);
         assert_eq!(store.recovery_state().unwrap(), recovery_before);
@@ -3747,11 +4997,11 @@ mod tests {
         assert_eq!(store.lease_clock_high_water().unwrap(), 100);
         assert_eq!(
             store.observe_lease_clock(root(2), generation(8), epoch(1), 101),
-            Err(AgentMetadataError::PlacementMismatch)
+            Err(MetaError::PlacementMismatch)
         );
         assert_eq!(
             store.observe_lease_clock(root(2), generation(7), epoch(2), 101),
-            Err(AgentMetadataError::OwnerEpochMismatch {
+            Err(MetaError::OwnerEpochMismatch {
                 expected: 2,
                 actual: 1,
             })
@@ -3766,7 +5016,7 @@ mod tests {
         );
         assert_eq!(
             store.execute_before_lease_deadline(&expired, 100),
-            Err(AgentMetadataError::LeaseDeadlineReached {
+            Err(MetaError::LeaseDeadlineReached {
                 lease_clock_ms: 100,
                 requested_deadline_ms: 100,
             })
@@ -3807,7 +5057,7 @@ mod tests {
 
         assert_eq!(
             store.execute(&stale),
-            Err(AgentMetadataError::WriteReadVersionMismatch {
+            Err(MetaError::WriteReadVersionMismatch {
                 requested: intervening.commit_version.get() - 1,
                 current: intervening.commit_version.get(),
             })
@@ -3855,7 +5105,7 @@ mod tests {
         command.deterministic_result = b"tampered".to_vec();
         assert_eq!(
             store.execute(&command),
-            Err(AgentMetadataError::CommandDigestMismatch)
+            Err(MetaError::CommandDigestMismatch)
         );
 
         store
@@ -3874,7 +5124,7 @@ mod tests {
         });
         assert!(matches!(
             store.execute(&replace.seal()),
-            Err(AgentMetadataError::InvalidCommand { .. })
+            Err(MetaError::InvalidCommand { .. })
         ));
     }
 
@@ -3909,7 +5159,7 @@ mod tests {
         });
         assert!(matches!(
             store.execute(&replace.seal()),
-            Err(AgentMetadataError::InvalidCommand { .. })
+            Err(MetaError::InvalidCommand { .. })
         ));
 
         let mut delete = base_command(&store, request(32), RootFenceAction::RequireActive);
@@ -3924,15 +5174,15 @@ mod tests {
         });
         assert!(matches!(
             store.execute(&delete.seal()),
-            Err(AgentMetadataError::InvalidCommand { .. })
+            Err(MetaError::InvalidCommand { .. })
         ));
     }
 
     #[test]
-    fn command_size_bounds_fit_holt_envelopes_and_reject_before_atomic() {
+    fn command_size_bounds_fit_serving_envelopes_and_reject_before_atomic() {
         let store = ready_store();
-        let key = scoped_key(root(2), b"holt-value-boundary");
-        let boundary = vec![0x5a; MAX_HOLT_RECORD_PAYLOAD_BYTES];
+        let key = scoped_key(root(2), b"serving-value-boundary");
+        let boundary = vec![0x5a; MAX_RECORD_PAYLOAD_BYTES];
 
         let mut create = create_command(&store, request(40), key.clone(), &boundary);
         create.event_projection = vec![EventProjection {
@@ -3945,7 +5195,7 @@ mod tests {
             Some(boundary.clone())
         );
 
-        let replacement = vec![0x6b; MAX_HOLT_RECORD_PAYLOAD_BYTES];
+        let replacement = vec![0x6b; MAX_RECORD_PAYLOAD_BYTES];
         let mut replace = base_command(&store, request(41), RootFenceAction::RequireActive);
         replace.predicates.push(CommandPredicate::Value {
             family: MetadataFamily::Operation,
@@ -3973,7 +5223,7 @@ mod tests {
 
         let recovery_before = store.recovery_state().unwrap();
         let version_before = store.current_read_version().unwrap();
-        let oversized = vec![0; MAX_HOLT_RECORD_PAYLOAD_BYTES + 1];
+        let oversized = vec![0; MAX_RECORD_PAYLOAD_BYTES + 1];
 
         let oversized_mutation = create_command(
             &store,
@@ -3983,7 +5233,7 @@ mod tests {
         );
         assert!(matches!(
             store.execute(&oversized_mutation),
-            Err(AgentMetadataError::InvalidCommand { .. })
+            Err(MetaError::InvalidCommand { .. })
         ));
 
         let mut oversized_event = base_command(&store, request(43), RootFenceAction::RequireActive);
@@ -3992,7 +5242,7 @@ mod tests {
         });
         assert!(matches!(
             store.execute(&oversized_event.seal()),
-            Err(AgentMetadataError::InvalidCommand { .. })
+            Err(MetaError::InvalidCommand { .. })
         ));
 
         let mut oversized_result =
@@ -4000,7 +5250,7 @@ mod tests {
         oversized_result.deterministic_result = oversized;
         assert!(matches!(
             store.execute(&oversized_result.seal()),
-            Err(AgentMetadataError::InvalidCommand { .. })
+            Err(MetaError::InvalidCommand { .. })
         ));
         assert_eq!(store.current_read_version().unwrap(), version_before);
         assert_eq!(store.recovery_state().unwrap(), recovery_before);
@@ -4084,7 +5334,8 @@ mod tests {
         let database = temporary.path().join("metadata");
         let expected;
         {
-            let store = AgentMetadataStore::create_file(&database, shard(1)).unwrap();
+            let store =
+                crate::workspace::test_support::initialize_file(&database, shard(1)).unwrap();
             store.advance_owner_epoch(None, epoch(1)).unwrap();
             store
                 .execute(&base_command(&store, request(1), RootFenceAction::Install).seal())
@@ -4109,7 +5360,7 @@ mod tests {
             assert_eq!(expected.applied_recovery_lsn, 4);
         }
 
-        let reopened = AgentMetadataStore::reopen_file(&database, shard(1)).unwrap();
+        let reopened = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
         assert_eq!(reopened.verify_recovery_chain().unwrap(), expected);
         assert_eq!(reopened.recovery_outbox_after(0, 10).unwrap().len(), 4);
         assert_eq!(reopened.lease_clock_high_water().unwrap(), 55);
@@ -4121,14 +5372,16 @@ mod tests {
         let database = temporary.path().join("metadata");
         {
             let store = ready_file_store(&database);
-            store
-                .recovery_outbox
-                .put(&[2, 0, 0, 0, 0], b"unknown recovery row")
-                .unwrap();
+            raw_put(
+                &store,
+                RECOVERY_OUTBOX.id,
+                &[2, 0, 0, 0, 0],
+                b"unknown recovery row",
+            );
         }
         assert!(matches!(
-            AgentMetadataStore::reopen_file(&database, shard(1)),
-            Err(AgentMetadataError::CorruptRecord {
+            crate::workspace::test_support::open_file(&database, shard(1)),
+            Err(MetaError::CorruptRecord {
                 record: "RecoveryOutbox key",
                 ..
             })
@@ -4141,14 +5394,11 @@ mod tests {
         let database = temporary.path().join("metadata");
         {
             let store = ready_file_store(&database);
-            assert!(store
-                .recovery_outbox
-                .delete(&recovery_chunk_key(1, 0))
-                .unwrap());
+            raw_delete(&store, RECOVERY_OUTBOX.id, &recovery_chunk_key(1, 0));
         }
         assert!(matches!(
-            AgentMetadataStore::reopen_file(&database, shard(1)),
-            Err(AgentMetadataError::CorruptRecord {
+            crate::workspace::test_support::open_file(&database, shard(1)),
+            Err(MetaError::CorruptRecord {
                 record: "RecoveryOutbox chunk",
                 ..
             })
@@ -4173,7 +5423,7 @@ mod tests {
             .unwrap();
         let source_rows = source.recovery_outbox_after(0, 16).unwrap();
 
-        let target = AgentMetadataStore::open_memory(shard(1)).unwrap();
+        let target = crate::workspace::test_support::memory(shard(1)).unwrap();
         for row in &source_rows {
             match (&row.mutation, &row.result) {
                 (

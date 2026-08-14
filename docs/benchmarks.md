@@ -63,11 +63,12 @@ Do not merge or average rows across those profiles.
 ## Executable Metadata Read Workload
 
 `nokv-bench metadata` exercises the production protocol DTO executor over one
-real `AgentMetadataStore`. It creates one root, one owner, one visible
-workbench, and a deterministic path tree. Untimed setup uses bounded metadata
-commands to install each zero-length `PathCurrent` artifact together with its
-available `ArtifactRevision` and strong path `RevisionRef`; it does not pretend
-to measure publication or object upload. The timed interval then measures:
+`MetaShard` backed by a real `HoltStore`. It creates one root, one owner, one
+visible workbench, and a deterministic path tree. Untimed setup uses bounded
+metadata commands to install each zero-length `PathCurrent` artifact together
+with its available `ArtifactRevision` and strong path `RevisionRef`; it does
+not pretend to measure publication or object upload. The timed interval then
+measures:
 
 - existing and missing exact reads at shallow and deep paths;
 - a small first page from a recursive prefix;
@@ -108,15 +109,18 @@ directory.
 This runner measures metadata-domain behavior through
 `MetadataWorkspaceRequestExecutor`; it does not frame bytes, open a network
 connection, access object storage, invoke the SDK, or invoke the OpenViking
-facade. Every workload performs warmup first, starts an explicit thread-bound
-read-stat session, runs only the timed iterations, stops the timer, and finishes
-the session. Setup, warmup, correctness checks, and session setup/finish are
-therefore excluded from latency. The session's lightweight thread-local logical
-counter updates do execute inside the measured path and are declared in the
-report. The non-default `nokv-meta/metadata-read-stats` feature removes these
-hooks from ordinary production builds. The benchmark exposes that dependency
-feature through its own explicit `nokv-bench/metadata-read-stats` feature, so a
-normal `cargo build --workspace` does not enable instrumentation through Cargo
+facade. Every workload completes warmup before it starts two thread-bound
+sessions. One session collects logical metadata counters. The other session
+collects Holt diagnostics. The runner times only the requested iterations and
+stops the timer before it finishes either session. Setup, warmup, correctness
+checks, and session setup and finish do not affect the reported latency.
+
+The timed path updates the logical counters and the Holt adapter's cursor
+counters. Holt database snapshots occur outside the timer. The non-default
+`nokv-meta/metadata-read-stats` and `nokv-meta-holt/read-stats` features remove
+these hooks from ordinary production builds. The benchmark enables both
+features through `nokv-bench/metadata-read-stats`. A normal
+`cargo build --workspace` does not enable this instrumentation through Cargo
 feature unification.
 
 With `--warmup > 0`, each row is labelled `same_request_warmup`: the exact same
@@ -135,7 +139,7 @@ The report separates three different quantities:
 
 `visited` is a Holt cursor work unit, not a physical row or device read.
 Emitted value bytes are materialized bytes, not device bytes or a claim about
-decoder CPU cost. Holt 0.8.2 does not expose an exact internal seek count, so
+decoder CPU cost. Holt 0.8.5 does not expose an exact internal seek count, so
 the report leaves that metric unavailable rather than inferring it from scan
 calls. Logical counters exclude reads performed concurrently on other threads
 and by other stores. Their coverage is the fenced query paths used by these

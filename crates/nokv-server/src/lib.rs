@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Root-affine shard-owner RPC process for Agent workspaces.
+//! Logical-shard owner RPC process for Agent workspaces.
 //!
 //! The server validates the exact installed root route, frames the sole
 //! workspace protocol, and delegates domain execution. Metadata semantics stay
@@ -16,11 +16,10 @@ mod lifecycle;
 mod registry;
 mod server;
 mod service;
+#[cfg(test)]
+mod test_support;
 
-pub use bootstrap::{
-    bootstrap_root_owner, BootstrappedRootOwner, ControlBackedRootOwner, MetadataStoreOpen,
-    OwnerAdmission, RootOwnerBootstrapRequest,
-};
+pub use bootstrap::{bootstrap_shard, LeaseMode, OpenMode, RootAttach, ShardBoot, ShardOwner};
 pub use error::ServerError;
 pub use executor::MetadataWorkspaceRequestExecutor;
 pub use lifecycle::{

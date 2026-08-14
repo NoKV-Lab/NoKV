@@ -29,6 +29,11 @@ const _: () =
 const _: () =
     assert!(protocol::PageRequest::MAX_LIMIT as usize == meta::MAX_VISIBLE_PATH_LIST_PAGE_SIZE);
 const _: () = assert!(protocol::MAX_QUERY_PAGE_LIMIT as usize == meta::MAX_QUERY_PAGE_SIZE);
+// Workspace RPC v2 already admits up to 64 descriptor fields. The durable
+// projection planner has always accepted 60; preserve the wire contract and
+// reject the legacy 61..=64 gap at DTO-to-domain conversion as main does.
+const _: () =
+    assert!(protocol::ArtifactDescriptor::MAX_INDEX_FIELDS >= meta::MAX_TYPED_PROJECTION_FIELDS);
 const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 9] = [
     protocol::WorkspaceCapability::ArtifactPublishV1,
     protocol::WorkspaceCapability::ArtifactRangeReadV1,
@@ -41,22 +46,22 @@ const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 9] = [
     protocol::WorkspaceCapability::WorkspacePathV1,
 ];
 
-/// Storage-neutral protocol adapter over one authoritative Holt metadata shard.
+/// Storage-neutral protocol adapter over one authoritative metadata shard.
 ///
 /// The adapter owns DTO conversion and exact RPC request binding only. Durable
 /// lifecycle transitions remain in `nokv-meta`.
 #[derive(Clone)]
 pub struct MetadataWorkspaceRequestExecutor {
-    store: Arc<meta::AgentMetadataStore>,
+    meta: Arc<meta::MetaShard>,
 }
 
 impl MetadataWorkspaceRequestExecutor {
-    pub fn new(store: Arc<meta::AgentMetadataStore>) -> Self {
-        Self { store }
+    pub fn new(meta: Arc<meta::MetaShard>) -> Self {
+        Self { meta }
     }
 
-    pub fn store(&self) -> &Arc<meta::AgentMetadataStore> {
-        &self.store
+    pub fn meta(&self) -> &Arc<meta::MetaShard> {
+        &self.meta
     }
 
     fn execute_request(
@@ -162,7 +167,7 @@ impl MetadataWorkspaceRequestExecutor {
         let context = self.write_context(rpc.route, step_id)?;
         let workbench = workbench_id(&request.workbench)?;
         let outcome = meta::create_visible_workspace(
-            &self.store,
+            &self.meta,
             context,
             &workbench,
             request.workspace_incarnation_id.into(),
@@ -187,7 +192,7 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::GetWorkspaceRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let workspace = meta::get_workspace_at(
-            &self.store,
+            &self.meta,
             self.read_context(rpc.route)?,
             &workbench_id(&request.workbench)?,
         )
@@ -218,7 +223,7 @@ impl MetadataWorkspaceRequestExecutor {
         let resolved = if matches!(&request.view, protocol::WorkspaceReadView::Live) {
             let route = route_parts(rpc.route)?;
             meta::get_current_visible_workspace_path(
-                &self.store,
+                &self.meta,
                 route.root_id,
                 route.placement_generation,
                 route.owner_epoch,
@@ -227,7 +232,7 @@ impl MetadataWorkspaceRequestExecutor {
             )
         } else {
             let context = self.workspace_read_context(rpc.route, &workbench, &request.view)?;
-            meta::get_visible_workspace_path_at(&self.store, context, &workbench, &path)
+            meta::get_visible_workspace_path_at(&self.meta, context, &workbench, &path)
         }
         .map_err(namespace_failure)?
         .ok_or_else(|| not_found("workbench does not exist"))?;
@@ -308,7 +313,7 @@ impl MetadataWorkspaceRequestExecutor {
                 Some(protocol::ConflictKind::ReadVersion),
             ));
         }
-        let workspace = meta::get_visible_workspace_at(&self.store, context, &workbench)
+        let workspace = meta::get_visible_workspace_at(&self.meta, context, &workbench)
             .map_err(namespace_failure)?
             .ok_or_else(|| not_found("workbench does not exist"))?;
         let prefix = request.prefix.as_ref().map(relative_path).transpose()?;
@@ -321,7 +326,7 @@ impl MetadataWorkspaceRequestExecutor {
         let wanted =
             usize::try_from(request.page.limit).expect("protocol page limit always fits usize");
         let page = meta::list_paths_at_visible_workspace(
-            &self.store,
+            &self.meta,
             context,
             &workspace,
             prefix.as_ref(),
@@ -368,7 +373,7 @@ impl MetadataWorkspaceRequestExecutor {
         self.claim_mutation(rpc)?;
         let step_id = derived_request_id(rpc.request_id, b"remove-path", 0);
         let outcome = meta::remove_path(
-            &self.store,
+            &self.meta,
             meta::RemovePathRequest {
                 context: self.write_context(rpc.route, step_id)?,
                 workbench_id: workbench_id(&request.target.workbench)?,
@@ -396,21 +401,18 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
         let workbench_id = workbench_id(&request.workbench)?;
-        let workspace = meta::get_visible_workspace_at(&self.store, context, &workbench_id)
+        let workspace = meta::get_visible_workspace_at(&self.meta, context, &workbench_id)
             .map_err(namespace_failure)?
             .ok_or_else(|| not_found("workbench does not exist"))?;
         let snapshot = meta::get_snapshot_at(
-            &self.store,
+            &self.meta,
             context,
             &workbench_id,
             &snapshot_selector(&request.selector)?,
         )
         .map_err(snapshot_failure)?
         .ok_or_else(|| not_found("snapshot does not exist for the visible workbench"))?;
-        let lease_clock = self
-            .store
-            .lease_clock_high_water()
-            .map_err(engine_failure)?;
+        let lease_clock = self.meta.lease_clock_high_water().map_err(meta_failure)?;
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Snapshot(snapshot_result(
                 &request.workbench,
@@ -433,7 +435,7 @@ impl MetadataWorkspaceRequestExecutor {
         let context = self.write_context(rpc.route, step_id)?;
         let workbench_id = workbench_id(&request.workbench)?;
         let workspace = meta::get_visible_workspace_at(
-            &self.store,
+            &self.meta,
             read_context_from_write(context),
             &workbench_id,
         )
@@ -449,7 +451,7 @@ impl MetadataWorkspaceRequestExecutor {
             ));
         }
         let outcome = meta::mint_snapshot(
-            &self.store,
+            &self.meta,
             context,
             &meta::MintSnapshotRequest {
                 workbench_id,
@@ -465,10 +467,7 @@ impl MetadataWorkspaceRequestExecutor {
             },
         )
         .map_err(snapshot_failure)?;
-        let lease_clock = self
-            .store
-            .lease_clock_high_water()
-            .map_err(engine_failure)?;
+        let lease_clock = self.meta.lease_clock_high_water().map_err(meta_failure)?;
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Snapshot(snapshot_result(
                 &request.workbench,
@@ -491,14 +490,14 @@ impl MetadataWorkspaceRequestExecutor {
         let context = self.write_context(rpc.route, step_id)?;
         let workbench_id = workbench_id(&request.workbench)?;
         let workspace = meta::get_visible_workspace_at(
-            &self.store,
+            &self.meta,
             read_context_from_write(context),
             &workbench_id,
         )
         .map_err(namespace_failure)?
         .ok_or_else(|| not_found("workbench does not exist"))?;
         let outcome = meta::renew_snapshot(
-            &self.store,
+            &self.meta,
             context,
             &meta::RenewSnapshotRequest {
                 workbench_id,
@@ -507,10 +506,7 @@ impl MetadataWorkspaceRequestExecutor {
             },
         )
         .map_err(snapshot_failure)?;
-        let lease_clock = self
-            .store
-            .lease_clock_high_water()
-            .map_err(engine_failure)?;
+        let lease_clock = self.meta.lease_clock_high_water().map_err(meta_failure)?;
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Snapshot(snapshot_result(
                 &request.workbench,
@@ -533,14 +529,14 @@ impl MetadataWorkspaceRequestExecutor {
         let context = self.write_context(rpc.route, step_id)?;
         let workbench_id = workbench_id(&request.workbench)?;
         let workspace = meta::get_visible_workspace_at(
-            &self.store,
+            &self.meta,
             read_context_from_write(context),
             &workbench_id,
         )
         .map_err(namespace_failure)?
         .ok_or_else(|| not_found("workbench does not exist"))?;
         let outcome = meta::retire_snapshot(
-            &self.store,
+            &self.meta,
             context,
             &meta::RetireSnapshotRequest {
                 workbench_id,
@@ -549,10 +545,7 @@ impl MetadataWorkspaceRequestExecutor {
             },
         )
         .map_err(snapshot_failure)?;
-        let lease_clock = self
-            .store
-            .lease_clock_high_water()
-            .map_err(engine_failure)?;
+        let lease_clock = self.meta.lease_clock_high_water().map_err(meta_failure)?;
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Snapshot(snapshot_result(
                 &request.workbench,
@@ -572,17 +565,14 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
         let page = meta::list_snapshots_at(
-            &self.store,
+            &self.meta,
             context,
             &workbench_id(&request.workbench)?,
             request.page.cursor.as_deref(),
             query_limit(request.page.limit),
         )
         .map_err(snapshot_list_failure)?;
-        let lease_clock = self
-            .store
-            .lease_clock_high_water()
-            .map_err(engine_failure)?;
+        let lease_clock = self.meta.lease_clock_high_water().map_err(meta_failure)?;
         let snapshots = page
             .snapshots
             .into_iter()
@@ -627,7 +617,7 @@ impl MetadataWorkspaceRequestExecutor {
         };
         let begin_id = derived_request_id(rpc.request_id, b"restore-begin", 0);
         let mut outcome = meta::begin_restore(
-            &self.store,
+            &self.meta,
             self.write_context(rpc.route, begin_id)?,
             &meta::BeginRestoreRequest {
                 source_workbench_id: source_workbench,
@@ -648,18 +638,13 @@ impl MetadataWorkspaceRequestExecutor {
         )
         .map_err(restore_failure)?;
 
-        if matches!(
-            outcome.operation.phase,
-            types::RestorePhase::Cleaned | types::RestorePhase::Quarantined
-        ) {
-            return Err(restore_operation_status(&outcome.operation)?
-                .failure
-                .ok_or_else(|| internal("terminal restore status omitted its durable failure"))?);
+        if let Some(failure) = restore_terminal_failure(&outcome.operation) {
+            return Err(failure);
         }
 
         if outcome.operation.phase == types::RestorePhase::Preparing {
             outcome = meta::start_restore_copy(
-                &self.store,
+                &self.meta,
                 self.write_context(
                     rpc.route,
                     derived_request_id(rpc.request_id, b"restore-start-copy", 0),
@@ -677,7 +662,7 @@ impl MetadataWorkspaceRequestExecutor {
         {
             let before = outcome.operation.next_member_sequence;
             let copied = meta::copy_restore_batch(
-                &self.store,
+                &self.meta,
                 self.write_context(
                     rpc.route,
                     derived_request_id(rpc.request_id, b"restore-copy", batch),
@@ -689,6 +674,9 @@ impl MetadataWorkspaceRequestExecutor {
             )
             .map_err(restore_failure)?;
             outcome = copied.command;
+            if let Some(failure) = restore_terminal_failure(&outcome.operation) {
+                return Err(failure);
+            }
             if !outcome.operation.source_eof && outcome.operation.next_member_sequence == before {
                 return Err(internal("restore copier made no durable progress"));
             }
@@ -698,7 +686,7 @@ impl MetadataWorkspaceRequestExecutor {
         }
         if outcome.operation.phase == types::RestorePhase::Copying && outcome.operation.source_eof {
             outcome = meta::seal_restore_source(
-                &self.store,
+                &self.meta,
                 self.write_context(
                     rpc.route,
                     derived_request_id(rpc.request_id, b"restore-seal-source", 0),
@@ -725,7 +713,7 @@ impl MetadataWorkspaceRequestExecutor {
         self.claim_mutation(rpc)?;
         let operation_id: types::OperationId = request.operation_id.into();
         let applied = meta::apply_restore_initialization(
-            &self.store,
+            &self.meta,
             self.write_context(
                 rpc.route,
                 derived_request_id(rpc.request_id, b"restore-apply-initialization", 0),
@@ -739,7 +727,7 @@ impl MetadataWorkspaceRequestExecutor {
             ));
         }
         let completed = meta::complete_restore(
-            &self.store,
+            &self.meta,
             self.write_context(
                 rpc.route,
                 derived_request_id(rpc.request_id, b"restore-complete", 0),
@@ -787,15 +775,15 @@ impl MetadataWorkspaceRequestExecutor {
             cursor: request.page.cursor.clone(),
             limit: query_limit(request.page.limit),
         };
-        let page = meta::search_paths_at(&self.store, context, &query).map_err(query_failure)?;
+        let page = meta::search_paths_at(&self.meta, context, &query).map_err(query_failure)?;
         let mut hits = Vec::with_capacity(page.hits.len());
         for hit in page.hits {
             let workbench = protocol_workbench(&hit.workbench_id)?;
-            let workspace = meta::get_visible_workspace_at(&self.store, context, &hit.workbench_id)
+            let workspace = meta::get_visible_workspace_at(&self.meta, context, &hit.workbench_id)
                 .map_err(namespace_failure)?
                 .ok_or_else(|| internal("query hit references an invisible workbench"))?;
             let visible =
-                meta::get_path_at_visible_workspace(&self.store, context, &workspace, &hit.path)
+                meta::get_path_at_visible_workspace(&self.meta, context, &workspace, &hit.path)
                     .map_err(namespace_failure)?
                     .ok_or_else(|| internal("query hit references an invisible path"))?;
             if visible.generation != hit.generation
@@ -864,7 +852,7 @@ impl MetadataWorkspaceRequestExecutor {
             cursor: request.page.cursor.clone(),
             limit: query_limit(request.page.limit),
         };
-        let page = meta::aggregate_paths_at(&self.store, context, &query).map_err(query_failure)?;
+        let page = meta::aggregate_paths_at(&self.meta, context, &query).map_err(query_failure)?;
         let groups = page
             .groups
             .into_iter()
@@ -898,7 +886,7 @@ impl MetadataWorkspaceRequestExecutor {
             cursor: request.page.cursor.clone(),
             limit: query_limit(request.page.limit),
         };
-        let page = meta::catalog_fields_at(&self.store, context, &query).map_err(query_failure)?;
+        let page = meta::catalog_fields_at(&self.meta, context, &query).map_err(query_failure)?;
         let fields = page
             .fields
             .into_iter()
@@ -941,7 +929,7 @@ impl MetadataWorkspaceRequestExecutor {
             cursor: request.page.cursor.clone(),
             limit: query_limit(request.page.limit),
         };
-        let page = meta::find_workspaces_at(&self.store, context, &query).map_err(query_failure)?;
+        let page = meta::find_workspaces_at(&self.meta, context, &query).map_err(query_failure)?;
         let workspaces = page
             .workspaces
             .into_iter()
@@ -993,7 +981,7 @@ impl MetadataWorkspaceRequestExecutor {
             cursor: request.page.cursor.clone(),
             limit: query_limit(request.page.limit),
         };
-        let page = meta::read_changes_at(&self.store, context, &query).map_err(query_failure)?;
+        let page = meta::read_changes_at(&self.meta, context, &query).map_err(query_failure)?;
         let changes = page
             .events
             .into_iter()
@@ -1032,11 +1020,11 @@ impl MetadataWorkspaceRequestExecutor {
         let path = relative_path(&request.target.path)?;
         let (authority, workspace_incarnation_id, claim) = match request.authority {
             protocol::PublicationAuthority::Visible => {
-                let workspace = meta::get_visible_workspace_at(&self.store, read, &workbench)
+                let workspace = meta::get_visible_workspace_at(&self.meta, read, &workbench)
                     .map_err(namespace_failure)?
                     .ok_or_else(|| not_found("workbench does not exist"))?;
                 let current =
-                    meta::get_path_at_visible_workspace(&self.store, read, &workspace, &path)
+                    meta::get_path_at_visible_workspace(&self.meta, read, &workspace, &path)
                         .map_err(namespace_failure)?;
                 (
                     meta::PublishAuthority::Visible,
@@ -1054,7 +1042,7 @@ impl MetadataWorkspaceRequestExecutor {
                     commit_operation_id,
                 );
                 let payload = self
-                    .store
+                    .meta
                     .read_at(
                         read.root_id,
                         read.placement_generation,
@@ -1063,15 +1051,15 @@ impl MetadataWorkspaceRequestExecutor {
                         &commit_key,
                         read.read_version,
                     )
-                    .map_err(engine_failure)?
+                    .map_err(meta_failure)?
                     .ok_or_else(|| not_found("commit operation does not exist"))?;
                 let commit = meta::BuildCommitOperationRecord::decode(&payload)
                     .map_err(|error| internal(format!("invalid commit operation: {error}")))?;
-                let workspace = meta::get_visible_workspace_at(&self.store, read, &workbench)
+                let workspace = meta::get_visible_workspace_at(&self.meta, read, &workbench)
                     .map_err(namespace_failure)?
                     .ok_or_else(|| not_found("workbench does not exist"))?;
                 let current =
-                    meta::get_path_at_visible_workspace(&self.store, read, &workspace, &path)
+                    meta::get_path_at_visible_workspace(&self.meta, read, &workspace, &path)
                         .map_err(namespace_failure)?;
                 if commit.phase != types::BuildCommitPhase::Building
                     || commit.operation_id != commit_operation_id
@@ -1102,7 +1090,7 @@ impl MetadataWorkspaceRequestExecutor {
             } => {
                 let operation_id: types::OperationId = restore_operation_id.into();
                 let restore = meta::get_restore(
-                    &self.store,
+                    &self.meta,
                     write_context_from_publication(context),
                     operation_id,
                 )
@@ -1134,7 +1122,7 @@ impl MetadataWorkspaceRequestExecutor {
             identity_digest: [0; types::SHA256_BYTES],
             initialization_digest: [0; types::SHA256_BYTES],
             initiating_owner_epoch: context.owner_epoch,
-            activity_deadline_ms: publish_activity_deadline_ms(&self.store)?,
+            activity_deadline_ms: publish_activity_deadline_ms(&self.meta)?,
             authority,
             workbench_id: workbench,
             workspace_incarnation_id,
@@ -1164,7 +1152,7 @@ impl MetadataWorkspaceRequestExecutor {
             terminal_error: None,
         };
         meta::seal_publish_operation(&mut operation);
-        let outcome = meta::PublicationService::new(&self.store)
+        let outcome = meta::PublicationService::new(&self.meta)
             .begin_publish(meta::BeginPublishRequest { context, operation })
             .map_err(publication_failure)?;
         publish_operation_response(outcome)
@@ -1200,7 +1188,7 @@ impl MetadataWorkspaceRequestExecutor {
                 cleanup_state: types::StagedCleanupState::Owned,
             })
             .collect();
-        let outcome = meta::PublicationService::new(&self.store)
+        let outcome = meta::PublicationService::new(&self.meta)
             .stage_objects_batch(meta::StageObjectsBatchRequest {
                 context,
                 expected_operation: operation,
@@ -1234,7 +1222,7 @@ impl MetadataWorkspaceRequestExecutor {
                 u64::from(proof.sequence),
             );
             let payload = self
-                .store
+                .meta
                 .read_at(
                     context.root_id,
                     context.placement_generation,
@@ -1243,7 +1231,7 @@ impl MetadataWorkspaceRequestExecutor {
                     &key,
                     context.read_version,
                 )
-                .map_err(engine_failure)?
+                .map_err(meta_failure)?
                 .ok_or_else(|| not_found("staged object does not exist"))?;
             let expected = meta::StagedObjectRecord::decode(&payload).map_err(|error| {
                 internal(format!("invalid durable staged-object record: {error}"))
@@ -1262,7 +1250,7 @@ impl MetadataWorkspaceRequestExecutor {
             next.provider_state = types::StagedProviderState::Uploaded;
             updates.push(meta::StagedObjectUpdate { expected, next });
         }
-        let outcome = meta::PublicationService::new(&self.store)
+        let outcome = meta::PublicationService::new(&self.meta)
             .mark_objects_uploaded_batch(meta::MarkObjectsUploadedBatchRequest {
                 context,
                 expected_operation: operation,
@@ -1307,7 +1295,7 @@ impl MetadataWorkspaceRequestExecutor {
                 },
             });
         }
-        let outcome = meta::PublicationService::new(&self.store)
+        let outcome = meta::PublicationService::new(&self.meta)
             .stage_manifest_batch(meta::StageManifestBatchRequest {
                 context,
                 expected_operation: operation,
@@ -1339,7 +1327,7 @@ impl MetadataWorkspaceRequestExecutor {
                 b"publish-heartbeat-complete-transition",
             )?;
             let context = self.publication_context(rpc.route, transition_id)?;
-            meta::PublicationService::new(&self.store)
+            meta::PublicationService::new(&self.meta)
                 .transition_publish(meta::TransitionPublishRequest {
                     context,
                     expected_operation: operation,
@@ -1382,7 +1370,7 @@ impl MetadataWorkspaceRequestExecutor {
             manifest_id: request.artifact.manifest_identity.clone(),
             typed_index_projection: encode_index_fields(&request.artifact.index_fields)?,
         };
-        let outcome = meta::PublicationService::new(&self.store)
+        let outcome = meta::PublicationService::new(&self.meta)
             .finalize_publish(meta::FinalizePublishRequest {
                 context,
                 expected_operation: finalizing_operation,
@@ -1415,7 +1403,7 @@ impl MetadataWorkspaceRequestExecutor {
             request.token.operation_id,
         )?;
         require_publish_token(&operation, request.token)?;
-        let outcome = meta::PublicationService::new(&self.store)
+        let outcome = meta::PublicationService::new(&self.meta)
             .transition_publish(meta::TransitionPublishRequest {
                 context,
                 expected_operation: operation,
@@ -1453,8 +1441,8 @@ impl MetadataWorkspaceRequestExecutor {
                 meta::QuarantineReconcileResolution::RevisionPublished
             }
         };
-        let service = meta::PublicationService::new(&self.store);
-        let read_version = self.store.current_read_version().map_err(engine_failure)?;
+        let service = meta::PublicationService::new(&self.meta);
+        let read_version = self.meta.current_read_version().map_err(meta_failure)?;
         let mut operation =
             self.load_publish_operation(rpc.route, read_version, request.token.operation_id)?;
         require_publish_token(&operation, request.token)?;
@@ -1531,7 +1519,7 @@ impl MetadataWorkspaceRequestExecutor {
             return Ok(Vec::new());
         }
         let route = route_parts(route)?;
-        let read_version = self.store.current_read_version().map_err(engine_failure)?;
+        let read_version = self.meta.current_read_version().map_err(meta_failure)?;
         let count = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
             .min(meta::MAX_PUBLICATION_BATCH_ROWS);
@@ -1542,7 +1530,7 @@ impl MetadataWorkspaceRequestExecutor {
             let key =
                 meta::staged_object_key(route.root_id, operation.operation_id, u64::from(sequence));
             let payload = self
-                .store
+                .meta
                 .read_at(
                     route.root_id,
                     route.placement_generation,
@@ -1551,7 +1539,7 @@ impl MetadataWorkspaceRequestExecutor {
                     &key,
                     read_version,
                 )
-                .map_err(engine_failure)?
+                .map_err(meta_failure)?
                 .ok_or_else(|| internal(format!("durable staged object {sequence} is missing")))?;
             rows.push(
                 meta::StagedObjectRecord::decode(&payload)
@@ -1567,7 +1555,7 @@ impl MetadataWorkspaceRequestExecutor {
         request: &protocol::CommitRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
-        let service = meta::CommitService::new(&self.store);
+        let service = meta::CommitService::new(&self.meta);
         let operation_id: types::OperationId = request.operation_id.into();
         let begin_id = derived_request_id(rpc.request_id, b"commit-begin", 0);
         let mut outcome = if let Some(outcome) = self.replayed_build_commit(rpc.route, begin_id)? {
@@ -1592,7 +1580,7 @@ impl MetadataWorkspaceRequestExecutor {
                     run_manifest_condition: commit_manifest_condition(
                         request.run_manifest_condition,
                     )?,
-                    committed_at_unix_seconds: commit_time_unix_seconds(&self.store)?,
+                    committed_at_unix_seconds: commit_time_unix_seconds(&self.meta)?,
                     expected_head_generation: request
                         .expected_head_generation
                         .map(types::Generation::new)
@@ -1609,13 +1597,7 @@ impl MetadataWorkspaceRequestExecutor {
             outcome.operation.phase,
             types::BuildCommitPhase::Building | types::BuildCommitPhase::Sealing
         ) {
-            return Ok(ExecutedRequest {
-                result: protocol::WorkspaceResult::Operation(build_commit_operation_status(
-                    &outcome.operation,
-                )?),
-                commit_version: Some(outcome.commit_version.get()),
-                replayed: outcome.replayed,
-            });
+            return build_commit_response(outcome);
         }
 
         // The first commit call durably freezes the expected head and source
@@ -1642,6 +1624,12 @@ impl MetadataWorkspaceRequestExecutor {
                     limit: meta::MAX_COMMIT_MEMBER_BATCH_ROWS,
                 })
             })?;
+            if !matches!(
+                outcome.operation.phase,
+                types::BuildCommitPhase::Building | types::BuildCommitPhase::Sealing
+            ) {
+                return build_commit_response(outcome);
+            }
             if !outcome.operation.members_complete && outcome.operation.member_count == before {
                 return Err(internal("commit member builder made no durable progress"));
             }
@@ -1660,6 +1648,12 @@ impl MetadataWorkspaceRequestExecutor {
                     limit: meta::MAX_COMMIT_REVISION_BATCH_ROWS,
                 })
             })?;
+            if !matches!(
+                outcome.operation.phase,
+                types::BuildCommitPhase::Building | types::BuildCommitPhase::Sealing
+            ) {
+                return build_commit_response(outcome);
+            }
             if !outcome.operation.revisions_complete
                 && outcome.operation.revision_seal_count == before
             {
@@ -1680,6 +1674,12 @@ impl MetadataWorkspaceRequestExecutor {
                     limit: meta::MAX_COMMIT_PARENT_BATCH_ROWS,
                 })
             })?;
+            if !matches!(
+                outcome.operation.phase,
+                types::BuildCommitPhase::Building | types::BuildCommitPhase::Sealing
+            ) {
+                return build_commit_response(outcome);
+            }
             if !outcome.operation.parents_complete && outcome.operation.parent_cursor == before {
                 return Err(internal("commit parent builder made no durable progress"));
             }
@@ -1740,7 +1740,7 @@ impl MetadataWorkspaceRequestExecutor {
         ] {
             let key = meta::operation_key(context.root_id, kind, operation_id);
             if let Some(payload) = self
-                .store
+                .meta
                 .read_at(
                     context.root_id,
                     context.placement_generation,
@@ -1749,7 +1749,7 @@ impl MetadataWorkspaceRequestExecutor {
                     &key,
                     context.read_version,
                 )
-                .map_err(engine_failure)?
+                .map_err(meta_failure)?
             {
                 found.push((kind, payload));
             }
@@ -1843,7 +1843,7 @@ impl MetadataWorkspaceRequestExecutor {
                     decode_manifest_plan_cursor(encoded, context.root_id, revision_id, range)?;
                 let key = meta::artifact_manifest_key(context.root_id, revision_id, object_index);
                 let payload = self
-                    .store
+                    .meta
                     .read_at(
                         context.root_id,
                         context.placement_generation,
@@ -1852,7 +1852,7 @@ impl MetadataWorkspaceRequestExecutor {
                         &key,
                         context.read_version,
                     )
-                    .map_err(engine_failure)?
+                    .map_err(meta_failure)?
                     .ok_or_else(|| invalid_argument("manifest plan cursor row is absent"))?;
                 let row = meta::ArtifactManifestRow::decode(&payload)
                     .map_err(|error| internal(format!("invalid artifact manifest row: {error}")))?;
@@ -1874,7 +1874,7 @@ impl MetadataWorkspaceRequestExecutor {
         let mut selected = Vec::with_capacity(wanted);
         'scan: loop {
             let rows = self
-                .store
+                .meta
                 .scan_prefix_at(
                     context.root_id,
                     context.placement_generation,
@@ -1885,7 +1885,7 @@ impl MetadataWorkspaceRequestExecutor {
                     marker.as_deref(),
                     MANIFEST_SCAN_ROWS,
                 )
-                .map_err(engine_failure)?;
+                .map_err(meta_failure)?;
             if rows.is_empty() {
                 break;
             }
@@ -1982,7 +1982,7 @@ impl MetadataWorkspaceRequestExecutor {
         let mut maximum_owner_depth = 0_u8;
         for owner in &owners {
             let payload = self
-                .store
+                .meta
                 .read_at(
                     context.root_id,
                     context.placement_generation,
@@ -1991,7 +1991,7 @@ impl MetadataWorkspaceRequestExecutor {
                     &meta::artifact_revision_key(context.root_id, *owner),
                     context.read_version,
                 )
-                .map_err(engine_failure)?
+                .map_err(meta_failure)?
                 .ok_or_else(|| not_found("dependency owner revision does not exist"))?;
             let revision = meta::ArtifactRevisionRecord::decode(&payload)
                 .map_err(|error| internal(format!("invalid dependency owner revision: {error}")))?;
@@ -2028,7 +2028,7 @@ impl MetadataWorkspaceRequestExecutor {
         let mut owners = BTreeSet::new();
         loop {
             let rows = self
-                .store
+                .meta
                 .scan_prefix_at(
                     context.root_id,
                     context.placement_generation,
@@ -2039,7 +2039,7 @@ impl MetadataWorkspaceRequestExecutor {
                     marker.as_deref(),
                     MANIFEST_SCAN_ROWS,
                 )
-                .map_err(engine_failure)?;
+                .map_err(meta_failure)?;
             if rows.is_empty() {
                 break;
             }
@@ -2091,7 +2091,7 @@ impl MetadataWorkspaceRequestExecutor {
             owner_epoch: route.owner_epoch,
             request_id,
             command_digest: types::CommandDigest::from_bytes([0; types::SHA256_BYTES]),
-            read_version: self.store.current_read_version().map_err(engine_failure)?,
+            read_version: self.meta.current_read_version().map_err(meta_failure)?,
             root_fence_action: meta::RootFenceAction::RequireActive,
             predicates: Vec::new(),
             mutations: Vec::new(),
@@ -2100,7 +2100,7 @@ impl MetadataWorkspaceRequestExecutor {
             deterministic_result: request_digest.to_vec(),
         }
         .seal();
-        self.store.execute(&command).map_err(engine_failure)?;
+        self.meta.execute(&command).map_err(meta_failure)?;
         Ok(false)
     }
 
@@ -2110,7 +2110,7 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<meta::RootReadContext, protocol::RpcFailure> {
         let route = route_parts(route)?;
         meta::RootReadContext::current(
-            &self.store,
+            &self.meta,
             route.root_id,
             route.placement_generation,
             route.owner_epoch,
@@ -2129,7 +2129,7 @@ impl MetadataWorkspaceRequestExecutor {
             return Ok(live);
         };
         let snapshot =
-            meta::get_snapshot_at(&self.store, live, workbench, &snapshot_selector(selector)?)
+            meta::get_snapshot_at(&self.meta, live, workbench, &snapshot_selector(selector)?)
                 .map_err(snapshot_failure)?
                 .ok_or_else(|| not_found("snapshot does not exist for the visible workbench"))?;
         if snapshot.record.state != types::SnapshotState::Active {
@@ -2140,10 +2140,7 @@ impl MetadataWorkspaceRequestExecutor {
                 Some(protocol::ConflictKind::SnapshotLifecycle),
             ));
         }
-        let lease_clock = self
-            .store
-            .lease_clock_high_water()
-            .map_err(engine_failure)?;
+        let lease_clock = self.meta.lease_clock_high_water().map_err(meta_failure)?;
         if snapshot.record.lease_deadline_ms <= lease_clock {
             return Err(failure(
                 protocol::ErrorCode::SnapshotExpired,
@@ -2173,7 +2170,7 @@ impl MetadataWorkspaceRequestExecutor {
                     .ok_or_else(|| internal("dedupe commit version has no predecessor"))?,
             )
             .map_err(|error| internal(error.to_string()))?,
-            None => self.store.current_read_version().map_err(engine_failure)?,
+            None => self.meta.current_read_version().map_err(meta_failure)?,
         };
         Ok(meta::RootWriteContext {
             root_id: route.root_id,
@@ -2207,14 +2204,14 @@ impl MetadataWorkspaceRequestExecutor {
         request_id: types::RequestId,
     ) -> Result<Option<meta::CommandDedupeRecord>, protocol::RpcFailure> {
         let route = route_parts(route)?;
-        self.store
+        self.meta
             .lookup_request(
                 route.root_id,
                 route.placement_generation,
                 route.owner_epoch,
                 request_id,
             )
-            .map_err(engine_failure)
+            .map_err(meta_failure)
     }
 
     fn load_publish_operation(
@@ -2227,7 +2224,7 @@ impl MetadataWorkspaceRequestExecutor {
         let operation_id: types::OperationId = operation_id.into();
         let key = meta::operation_key(route.root_id, types::OperationKind::Publish, operation_id);
         let payload = self
-            .store
+            .meta
             .read_at(
                 route.root_id,
                 route.placement_generation,
@@ -2236,7 +2233,7 @@ impl MetadataWorkspaceRequestExecutor {
                 &key,
                 read_version,
             )
-            .map_err(engine_failure)?
+            .map_err(meta_failure)?
             .ok_or_else(|| not_found("publish operation does not exist"))?;
         let operation = meta::PublishOperationRecord::decode(&payload)
             .map_err(|error| internal(format!("invalid durable publish operation: {error}")))?;
@@ -2273,11 +2270,11 @@ impl MetadataWorkspaceRequestExecutor {
             token.operation_id,
         )?;
         require_publish_token(&operation, token)?;
-        let activity_deadline_ms = publish_activity_deadline_ms(&self.store)?;
+        let activity_deadline_ms = publish_activity_deadline_ms(&self.meta)?;
         if activity_deadline_ms <= operation.activity_deadline_ms {
             return Ok(operation);
         }
-        meta::PublicationService::new(&self.store)
+        meta::PublicationService::new(&self.meta)
             .heartbeat_publish(meta::HeartbeatPublishRequest {
                 context: heartbeat_context,
                 expected_operation: operation,
@@ -2781,9 +2778,7 @@ fn decode_manifest_plan_cursor(
     ))
 }
 
-fn publish_activity_deadline_ms(
-    store: &meta::AgentMetadataStore,
-) -> Result<u64, protocol::RpcFailure> {
+fn publish_activity_deadline_ms(meta: &meta::MetaShard) -> Result<u64, protocol::RpcFailure> {
     let wall_clock_ms = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2791,14 +2786,14 @@ fn publish_activity_deadline_ms(
             .as_millis(),
     )
     .map_err(|_| internal("system clock milliseconds exceed u64"))?;
-    let lease_clock_ms = store.lease_clock_high_water().map_err(engine_failure)?;
+    let lease_clock_ms = meta.lease_clock_high_water().map_err(meta_failure)?;
     wall_clock_ms
         .max(lease_clock_ms)
         .checked_add(PUBLISH_ACTIVITY_LEASE_MS)
         .ok_or_else(|| internal("publish activity deadline overflows u64"))
 }
 
-fn commit_time_unix_seconds(store: &meta::AgentMetadataStore) -> Result<u64, protocol::RpcFailure> {
+fn commit_time_unix_seconds(meta: &meta::MetaShard) -> Result<u64, protocol::RpcFailure> {
     let wall_clock_ms = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2806,7 +2801,7 @@ fn commit_time_unix_seconds(store: &meta::AgentMetadataStore) -> Result<u64, pro
             .as_millis(),
     )
     .map_err(|_| internal("system clock milliseconds exceed u64"))?;
-    let lease_clock_ms = store.lease_clock_high_water().map_err(engine_failure)?;
+    let lease_clock_ms = meta.lease_clock_high_water().map_err(meta_failure)?;
     let seconds = wall_clock_ms.max(lease_clock_ms) / 1_000;
     if seconds == 0 {
         return Err(internal("commit time must be after the Unix epoch"));
@@ -3213,6 +3208,60 @@ fn build_commit_operation_status(
     })
 }
 
+fn build_commit_response(
+    outcome: meta::BuildCommitOutcome,
+) -> Result<ExecutedRequest, protocol::RpcFailure> {
+    let terminal_message = || {
+        outcome
+            .operation
+            .terminal_error
+            .as_ref()
+            .map(|error| error.message.as_str())
+            .unwrap_or("commit construction was aborted")
+    };
+    match outcome.operation.phase {
+        types::BuildCommitPhase::Aborting
+        | types::BuildCommitPhase::Cleaning
+        | types::BuildCommitPhase::Cleaned => {
+            return Err(operation_terminal_failure(terminal_message()));
+        }
+        types::BuildCommitPhase::Quarantined => {
+            return Err(operation_quarantined_failure(terminal_message()));
+        }
+        types::BuildCommitPhase::Building
+        | types::BuildCommitPhase::Sealing
+        | types::BuildCommitPhase::Complete => {}
+    }
+    Ok(ExecutedRequest {
+        result: protocol::WorkspaceResult::Operation(build_commit_operation_status(
+            &outcome.operation,
+        )?),
+        commit_version: Some(outcome.commit_version.get()),
+        replayed: outcome.replayed,
+    })
+}
+
+fn restore_terminal_failure(
+    operation: &meta::RestoreOperationRecord,
+) -> Option<protocol::RpcFailure> {
+    let message = operation
+        .terminal_error
+        .as_ref()
+        .map(|error| error.message.as_str())
+        .unwrap_or("restore was aborted");
+    match operation.phase {
+        types::RestorePhase::Aborting
+        | types::RestorePhase::Cleaning
+        | types::RestorePhase::Cleaned => Some(operation_terminal_failure(message)),
+        types::RestorePhase::Quarantined => Some(operation_quarantined_failure(message)),
+        types::RestorePhase::Preparing
+        | types::RestorePhase::Copying
+        | types::RestorePhase::SourceSealed
+        | types::RestorePhase::Ready
+        | types::RestorePhase::Complete => None,
+    }
+}
+
 fn restore_operation_preparation(
     operation: &meta::RestoreOperationRecord,
 ) -> Result<protocol::RestoreOperationPreparation, protocol::RpcFailure> {
@@ -3401,7 +3450,7 @@ fn namespace_failure(error: meta::NamespaceError) -> protocol::RpcFailure {
         meta::NamespaceError::InvalidPageLimit { .. } | meta::NamespaceError::InvalidListMarker => {
             invalid_argument(error.to_string())
         }
-        meta::NamespaceError::Engine(source) => engine_failure(source),
+        meta::NamespaceError::Meta(source) => meta_failure(source),
         _ => internal(error.to_string()),
     }
 }
@@ -3409,7 +3458,7 @@ fn namespace_failure(error: meta::NamespaceError) -> protocol::RpcFailure {
 fn query_failure(error: meta::QueryError) -> protocol::RpcFailure {
     match error {
         meta::QueryError::Namespace(source) => namespace_failure(source),
-        meta::QueryError::Engine(source) => engine_failure(source),
+        meta::QueryError::Meta(source) => meta_failure(source),
         meta::QueryError::CursorReadVersionMismatch { .. } => failure(
             protocol::ErrorCode::PreconditionFailed,
             error.to_string(),
@@ -3443,7 +3492,7 @@ fn query_failure(error: meta::QueryError) -> protocol::RpcFailure {
 
 fn remove_path_failure(error: meta::RemovePathError) -> protocol::RpcFailure {
     match error {
-        meta::RemovePathError::Engine(source) => engine_failure(source),
+        meta::RemovePathError::Meta(source) => meta_failure(source),
         meta::RemovePathError::WorkspaceNotFound
         | meta::RemovePathError::PathNotFound
         | meta::RemovePathError::RevisionNotFound { .. } => not_found(error.to_string()),
@@ -3488,7 +3537,7 @@ fn remove_path_failure(error: meta::RemovePathError) -> protocol::RpcFailure {
 
 fn snapshot_failure(error: meta::SnapshotError) -> protocol::RpcFailure {
     match error {
-        meta::SnapshotError::Engine(source) => engine_failure(source),
+        meta::SnapshotError::Meta(source) => meta_failure(source),
         meta::SnapshotError::WorkspaceMissing { .. }
         | meta::SnapshotError::SnapshotMissing { .. }
         | meta::SnapshotError::AliasMissing { .. }
@@ -3554,7 +3603,7 @@ fn snapshot_failure(error: meta::SnapshotError) -> protocol::RpcFailure {
 
 fn snapshot_list_failure(error: meta::SnapshotListError) -> protocol::RpcFailure {
     match error {
-        meta::SnapshotListError::Engine(source) => engine_failure(source),
+        meta::SnapshotListError::Meta(source) => meta_failure(source),
         meta::SnapshotListError::Namespace(source) => namespace_failure(source),
         meta::SnapshotListError::WorkspaceNotFound { .. } => not_found(error.to_string()),
         meta::SnapshotListError::InvalidLimit { .. }
@@ -3574,7 +3623,7 @@ fn snapshot_list_failure(error: meta::SnapshotListError) -> protocol::RpcFailure
 
 fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
     match error {
-        meta::RestoreError::Engine(source) => engine_failure(source),
+        meta::RestoreError::Meta(source) => meta_failure(source),
         meta::RestoreError::SourceWorkspaceMissing { .. } => failure(
             protocol::ErrorCode::NotFound,
             error.to_string(),
@@ -3666,7 +3715,7 @@ fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
 
 fn publication_failure(error: meta::PublicationError) -> protocol::RpcFailure {
     match error {
-        meta::PublicationError::Metadata(source) => engine_failure(source),
+        meta::PublicationError::Meta(source) => meta_failure(source),
         meta::PublicationError::WorkspaceNotFound | meta::PublicationError::PathNotFound => {
             not_found(error.to_string())
         }
@@ -3742,7 +3791,7 @@ fn publication_failure(error: meta::PublicationError) -> protocol::RpcFailure {
 
 fn commit_failure(error: meta::CommitError) -> protocol::RpcFailure {
     match error {
-        meta::CommitError::Metadata(source) => engine_failure(source),
+        meta::CommitError::Meta(source) => meta_failure(source),
         meta::CommitError::Namespace(source) => namespace_failure(source),
         meta::CommitError::WorkspaceNotFound
         | meta::CommitError::OperationNotFound
@@ -3779,41 +3828,71 @@ fn commit_failure(error: meta::CommitError) -> protocol::RpcFailure {
     }
 }
 
-fn engine_failure(error: meta::AgentMetadataError) -> protocol::RpcFailure {
+fn meta_failure(error: meta::MetaError) -> protocol::RpcFailure {
     match error {
-        meta::AgentMetadataError::OwnerEpochMismatch { .. }
-        | meta::AgentMetadataError::PlacementMismatch
-        | meta::AgentMetadataError::RootFenceMissing
-        | meta::AgentMetadataError::RootFenceStateMismatch { .. } => failure(
+        error @ meta::MetaError::Store {
+            source: nokv_meta_store::StoreError::Unavailable(_),
+            ..
+        } => failure(protocol::ErrorCode::Internal, error.to_string(), true, None),
+        error @ meta::MetaError::Store {
+            source: nokv_meta_store::StoreError::OutcomeUnknown { .. },
+            ..
+        } => failure(
             protocol::ErrorCode::NotOwner,
             error.to_string(),
             true,
             Some(protocol::ConflictKind::RootPlacement),
         ),
-        meta::AgentMetadataError::RequestIdReused => failure(
+        error @ meta::MetaError::Store {
+            source: nokv_meta_store::StoreError::LimitExceeded { .. },
+            ..
+        } => failure(
+            protocol::ErrorCode::ResourceExhausted,
+            error.to_string(),
+            false,
+            None,
+        ),
+        meta::MetaError::OwnerEpochMismatch { .. }
+        | meta::MetaError::PlacementMismatch
+        | meta::MetaError::RootFenceMissing
+        | meta::MetaError::RootFenceStateMismatch { .. } => failure(
+            protocol::ErrorCode::NotOwner,
+            error.to_string(),
+            true,
+            Some(protocol::ConflictKind::RootPlacement),
+        ),
+        meta::MetaError::RequestIdReused => failure(
             protocol::ErrorCode::RequestReplayMismatch,
             error.to_string(),
             false,
             None,
         ),
-        meta::AgentMetadataError::PredicateFailed => {
+        meta::MetaError::PredicateFailed => {
             failure(protocol::ErrorCode::Conflict, error.to_string(), true, None)
         }
-        meta::AgentMetadataError::WriteConflict
-        | meta::AgentMetadataError::WriteReadVersionMismatch { .. } => failure(
-            protocol::ErrorCode::Conflict,
-            error.to_string(),
-            true,
-            Some(protocol::ConflictKind::ReadVersion),
-        ),
-        meta::AgentMetadataError::ReadVersionInFuture { .. } => failure(
+        meta::MetaError::WriteConflict | meta::MetaError::WriteReadVersionMismatch { .. } => {
+            failure(
+                protocol::ErrorCode::Conflict,
+                error.to_string(),
+                true,
+                Some(protocol::ConflictKind::ReadVersion),
+            )
+        }
+        meta::MetaError::ReadVersionInFuture { .. } => failure(
             protocol::ErrorCode::PreconditionFailed,
             error.to_string(),
             true,
             None,
         ),
-        meta::AgentMetadataError::InvalidCommand { .. }
-        | meta::AgentMetadataError::CommandDigestMismatch => invalid_argument(error.to_string()),
+        meta::MetaError::ReadStabilityExhausted { .. } => failure(
+            protocol::ErrorCode::Conflict,
+            error.to_string(),
+            true,
+            Some(protocol::ConflictKind::ReadVersion),
+        ),
+        meta::MetaError::InvalidCommand { .. } | meta::MetaError::CommandDigestMismatch => {
+            invalid_argument(error.to_string())
+        }
         _ => internal(error.to_string()),
     }
 }
@@ -3853,6 +3932,15 @@ fn internal(message: impl Into<String>) -> protocol::RpcFailure {
 fn operation_terminal_failure(message: &str) -> protocol::RpcFailure {
     failure(
         protocol::ErrorCode::OperationFailed,
+        message,
+        false,
+        Some(protocol::ConflictKind::OperationState),
+    )
+}
+
+fn operation_quarantined_failure(message: &str) -> protocol::RpcFailure {
+    failure(
+        protocol::ErrorCode::Quarantined,
         message,
         false,
         Some(protocol::ConflictKind::OperationState),
@@ -3946,7 +4034,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &meta::AgentMetadataStore,
+        store: &meta::MetaShard,
         request_id: types::RequestId,
         action: meta::RootFenceAction,
         owner_epoch: types::OwnerEpoch,
@@ -3970,11 +4058,8 @@ mod tests {
         .seal()
     }
 
-    fn ready_executor() -> (
-        Arc<meta::AgentMetadataStore>,
-        MetadataWorkspaceRequestExecutor,
-    ) {
-        let store = Arc::new(meta::AgentMetadataStore::open_memory(shard()).unwrap());
+    fn ready_executor() -> (Arc<meta::MetaShard>, MetadataWorkspaceRequestExecutor) {
+        let store = crate::test_support::meta_shard(shard());
         store.advance_owner_epoch(None, owner(1)).unwrap();
         store
             .execute(&fence_command(
@@ -4001,7 +4086,7 @@ mod tests {
 
     #[test]
     fn preflight_uses_no_workspace_state_and_reports_the_exact_route() {
-        let store = Arc::new(meta::AgentMetadataStore::open_memory(shard()).unwrap());
+        let store = crate::test_support::meta_shard(shard());
         let version_before = store.current_read_version().unwrap();
         let executor = MetadataWorkspaceRequestExecutor::new(Arc::clone(&store));
         let request = protocol::WorkspaceRpcRequest {
@@ -4084,8 +4169,99 @@ mod tests {
         }
     }
 
+    fn terminal_build_operation(
+        phase: types::BuildCommitPhase,
+    ) -> meta::BuildCommitOperationRecord {
+        let mut operation = meta::BuildCommitOperationRecord {
+            operation_id: types::OperationId::from_bytes([0x71; types::FIXED_ID_BYTES]),
+            identity_digest: [0; types::SHA256_BYTES],
+            initialization_digest: [0; types::SHA256_BYTES],
+            workbench_id: types::WorkbenchId::new("terminal-commit").unwrap(),
+            source_workspace_incarnation_id: types::WorkspaceIncarnationId::from_bytes(
+                [0x72; types::FIXED_ID_BYTES],
+            ),
+            source_read_version: types::ReadVersion::new(1).unwrap(),
+            commit_id: types::CommitId::from_bytes([0x73; types::SHA256_BYTES]),
+            expected_head: None,
+            content_digest_uri: format!("sha256:{}", "74".repeat(types::SHA256_BYTES)),
+            manifest_digest_uri: format!("sha256:{}", "75".repeat(types::SHA256_BYTES)),
+            projection_input_digest: [0x76; types::SHA256_BYTES],
+            tree_manifest_revision_id: types::ArtifactRevisionId::from_bytes(
+                [0x77; types::FIXED_ID_BYTES],
+            ),
+            replace: false,
+            run_manifest_condition: meta::CommitManifestCondition::CreateOnly,
+            committed_at_unix_seconds: 1,
+            commit_staged_run_manifest: None,
+            producer: None,
+            lineage_projection: Vec::new(),
+            parent_commits: Vec::new(),
+            phase,
+            member_cursor: None,
+            member_count: 0,
+            member_digest: [0; types::SHA256_BYTES],
+            members_complete: false,
+            revision_ref_count: 0,
+            revision_cursor: None,
+            revision_seal_count: 0,
+            revision_digest: [0; types::SHA256_BYTES],
+            revisions_complete: false,
+            parent_cursor: 0,
+            parent_digest: [0; types::SHA256_BYTES],
+            parents_complete: false,
+            cleanup_member_count: 0,
+            cleanup_revision_count: 0,
+            cleanup_parent_count: 0,
+            history_hold_released: false,
+            result: None,
+            terminal_error: Some(meta::CommitOperationTerminalError {
+                kind: meta::CommitOperationErrorKind::InvariantViolation,
+                message: "serving transaction capacity cannot admit one commit member step"
+                    .to_owned(),
+            }),
+        };
+        operation.seal_digests();
+        operation
+    }
+
+    #[test]
+    fn commit_capacity_abort_is_reported_as_a_terminal_rpc_failure() {
+        let operation = terminal_build_operation(types::BuildCommitPhase::Aborting);
+        let failure = build_commit_response(meta::BuildCommitOutcome {
+            commit_version: types::CommitVersion::new(2).unwrap(),
+            operation: operation.clone(),
+            replayed: false,
+        })
+        .unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::OperationFailed);
+        assert_eq!(
+            failure.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.message,
+            operation.terminal_error.as_ref().unwrap().message
+        );
+
+        let mut quarantined = operation;
+        quarantined.phase = types::BuildCommitPhase::Quarantined;
+        let failure = build_commit_response(meta::BuildCommitOutcome {
+            commit_version: types::CommitVersion::new(3).unwrap(),
+            operation: quarantined,
+            replayed: true,
+        })
+        .unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::Quarantined);
+        assert_eq!(
+            failure.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+        assert!(!failure.retryable);
+    }
+
     fn replace_visible_workspace_incarnation(
-        store: &meta::AgentMetadataStore,
+        store: &meta::MetaShard,
         workbench: &str,
         previous_incarnation: types::WorkspaceIncarnationId,
         replacement_incarnation: types::WorkspaceIncarnationId,
@@ -4143,7 +4319,7 @@ mod tests {
     }
 
     fn install_terminal_commit_and_newer_head(
-        store: &meta::AgentMetadataStore,
+        store: &meta::MetaShard,
         request: &protocol::CommitRequest,
     ) {
         let operation_id: types::OperationId = request.operation_id.into();
@@ -4257,7 +4433,7 @@ mod tests {
     }
 
     fn put_visible_path(
-        store: &meta::AgentMetadataStore,
+        store: &meta::MetaShard,
         workbench_incarnation: types::WorkspaceIncarnationId,
     ) {
         let revision = types::ArtifactRevisionId::from_bytes([9; types::FIXED_ID_BYTES]);
@@ -4378,7 +4554,7 @@ mod tests {
         store.execute(&command).unwrap();
     }
 
-    fn corrupt_visible_path_revision(store: &meta::AgentMetadataStore) {
+    fn corrupt_visible_path_revision(store: &meta::MetaShard) {
         let revision = types::ArtifactRevisionId::from_bytes([9; types::FIXED_ID_BYTES]);
         let key = meta::artifact_revision_key(root(), revision);
         let read_version = store.current_read_version().unwrap();
@@ -4428,7 +4604,7 @@ mod tests {
     }
 
     fn put_path_projection_rows(
-        store: &meta::AgentMetadataStore,
+        store: &meta::MetaShard,
         workbench_incarnation: types::WorkspaceIncarnationId,
         paths: &[&str],
     ) {
@@ -4491,7 +4667,7 @@ mod tests {
     }
 
     fn put_ranged_path(
-        store: &meta::AgentMetadataStore,
+        store: &meta::MetaShard,
         workbench_incarnation: types::WorkspaceIncarnationId,
         row_count: u64,
     ) -> protocol::WorkspacePath {
@@ -4641,14 +4817,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sealed_restore_preparation_is_stable_through_ready_and_complete() {
+    fn ready_restore_operation() -> meta::RestoreOperationRecord {
         let destination_incarnation =
             types::WorkspaceIncarnationId::from_bytes([0x52; types::FIXED_ID_BYTES]);
         let member_digest = [0x33; types::SHA256_BYTES];
         let mut identity_digest = [0x11; types::SHA256_BYTES];
         identity_digest[..types::FIXED_ID_BYTES].fill(0x41);
-        let mut operation = meta::RestoreOperationRecord {
+        meta::RestoreOperationRecord {
             operation_id: types::OperationId::from_bytes([0x41; types::FIXED_ID_BYTES]),
             identity_digest,
             initialization_digest: Some([0x22; types::SHA256_BYTES]),
@@ -4676,7 +4851,14 @@ mod tests {
             cleanup_member_cursor: 0,
             result: None,
             terminal_error: None,
-        };
+        }
+    }
+
+    #[test]
+    fn sealed_restore_preparation_is_stable_through_ready_and_complete() {
+        let mut operation = ready_restore_operation();
+        let destination_incarnation = operation.destination_workspace_incarnation_id;
+        let member_digest = operation.member_rolling_digest;
         operation.validate().unwrap();
         let ready = sealed_restore_preparation(&operation).unwrap();
 
@@ -4695,6 +4877,59 @@ mod tests {
         assert_eq!(ready.destination_workbench.as_str(), "restore-destination");
         assert_eq!(ready.member_count, 0);
         assert_eq!(ready.member_digest, protocol::Digest(member_digest));
+    }
+
+    #[test]
+    fn restore_capacity_failure_is_stable_while_cleanup_advances() {
+        let ready = ready_restore_operation();
+        let terminal = meta::RestoreTerminalError {
+            kind: meta::RestoreTerminalErrorKind::InvariantViolation,
+            message: "serving transaction capacity cannot admit one restore member".to_owned(),
+            evidence_digest: None,
+        };
+        let aborting = ready
+            .apply(
+                types::RestorePhase::Ready,
+                meta::RestoreTransition::BeginAbort {
+                    terminal_error: terminal.clone(),
+                },
+            )
+            .unwrap();
+        let cleaning = aborting
+            .apply(
+                types::RestorePhase::Aborting,
+                meta::RestoreTransition::BeginCleaning,
+            )
+            .unwrap();
+        let cleaned = cleaning
+            .apply(
+                types::RestorePhase::Cleaning,
+                meta::RestoreTransition::FinishCleanup,
+            )
+            .unwrap();
+
+        for operation in [&aborting, &cleaning, &cleaned] {
+            let failure = restore_terminal_failure(operation).unwrap();
+            assert_eq!(failure.code, protocol::ErrorCode::OperationFailed);
+            assert_eq!(failure.message, terminal.message);
+            assert!(!failure.retryable);
+        }
+
+        let quarantined = cleaning
+            .apply(
+                types::RestorePhase::Cleaning,
+                meta::RestoreTransition::Quarantine {
+                    terminal_error: meta::RestoreTerminalError {
+                        kind: meta::RestoreTerminalErrorKind::CleanupFailed,
+                        message: "restore cleanup requires operator repair".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            )
+            .unwrap();
+        let failure = restore_terminal_failure(&quarantined).unwrap();
+        assert_eq!(failure.code, protocol::ErrorCode::Quarantined);
+        assert!(!failure.retryable);
     }
 
     #[test]
@@ -4952,6 +5187,15 @@ mod tests {
             failure.conflict,
             Some(protocol::ConflictKind::RootPlacement)
         );
+    }
+
+    #[test]
+    fn unstable_metadata_read_maps_to_a_retryable_read_version_conflict() {
+        let failure = meta_failure(meta::MetaError::ReadStabilityExhausted { attempts: 4 });
+        assert_eq!(failure.code, protocol::ErrorCode::Conflict);
+        assert!(failure.retryable);
+        assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
+        assert!(internal_metadata_conflict(&failure));
     }
 
     #[test]
@@ -5573,17 +5817,69 @@ mod tests {
 
     #[test]
     fn internal_retry_classification_excludes_business_conflicts() {
-        let transient = engine_failure(meta::AgentMetadataError::WriteReadVersionMismatch {
+        let transient = meta_failure(meta::MetaError::WriteReadVersionMismatch {
             requested: 10,
             current: 11,
         });
         assert!(internal_metadata_conflict(&transient));
 
-        let lost_race = engine_failure(meta::AgentMetadataError::WriteConflict);
+        let lost_race = meta_failure(meta::MetaError::WriteConflict);
         assert!(internal_metadata_conflict(&lost_race));
 
-        let predicate = engine_failure(meta::AgentMetadataError::PredicateFailed);
+        let predicate = meta_failure(meta::MetaError::PredicateFailed);
         assert!(!internal_metadata_conflict(&predicate));
+
+        for state in [
+            nokv_meta_store::UnknownCommit::Settled,
+            nokv_meta_store::UnknownCommit::MayCommit,
+            nokv_meta_store::UnknownCommit::Poisoned,
+        ] {
+            let unknown = meta_failure(meta::MetaError::Store {
+                operation: "commit",
+                source: nokv_meta_store::StoreError::OutcomeUnknown {
+                    state,
+                    reason: "injected unknown outcome".to_owned(),
+                },
+            });
+            assert!(!internal_metadata_conflict(&unknown));
+            assert_eq!(unknown.code, protocol::ErrorCode::NotOwner);
+            assert_eq!(
+                unknown.conflict,
+                Some(protocol::ConflictKind::RootPlacement)
+            );
+            assert!(unknown.retryable);
+            assert!(unknown.message.contains(&state.to_string()));
+        }
+
+        let known_not_applied = meta_failure(meta::MetaError::Store {
+            operation: "commit",
+            source: nokv_meta_store::StoreError::Unavailable(
+                "injected definitely-not-applied outcome".to_owned(),
+            ),
+        });
+        assert_eq!(known_not_applied.code, protocol::ErrorCode::Internal);
+        assert!(known_not_applied.retryable);
+
+        let limit = meta_failure(meta::MetaError::Store {
+            operation: "commit",
+            source: nokv_meta_store::StoreError::LimitExceeded {
+                kind: nokv_meta_store::LimitKind::TransactionBytes,
+                actual: 1_000_001,
+                maximum: 1_000_000,
+            },
+        });
+        assert_eq!(limit.code, protocol::ErrorCode::ResourceExhausted);
+        assert!(!limit.retryable);
+        assert!(limit.message.contains("transaction bytes"));
+        assert!(limit.message.contains("1000001"));
+        assert!(limit.message.contains("1000000"));
+
+        let internal_store_failure = meta_failure(meta::MetaError::Store {
+            operation: "commit",
+            source: nokv_meta_store::StoreError::InvalidRequest("invalid key range".to_owned()),
+        });
+        assert_eq!(internal_store_failure.code, protocol::ErrorCode::Internal);
+        assert!(!internal_store_failure.retryable);
 
         let path = conflict(
             protocol::ConflictKind::PathGeneration,
@@ -5603,7 +5899,7 @@ mod tests {
     #[test]
     fn internal_metadata_retry_converges_and_preserves_terminal_conflicts() {
         let transient = || {
-            engine_failure(meta::AgentMetadataError::WriteReadVersionMismatch {
+            meta_failure(meta::MetaError::WriteReadVersionMismatch {
                 requested: 10,
                 current: 11,
             })
@@ -6251,7 +6547,7 @@ mod tests {
     }
 
     #[test]
-    fn ranged_manifest_plan_pages_across_engine_batches_without_truncation() {
+    fn ranged_manifest_plan_pages_across_meta_batches_without_truncation() {
         let (store, executor) = ready_executor();
         let incarnation = types::WorkspaceIncarnationId::from_bytes([51; types::FIXED_ID_BYTES]);
         executor

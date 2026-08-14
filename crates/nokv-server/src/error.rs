@@ -4,6 +4,7 @@
  */
 
 use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -12,12 +13,23 @@ pub enum ServerError {
     InvalidBootstrap(String),
     RouteRollback(String),
     Control(nokv_control::ControlError),
-    Metadata(nokv_meta::workspace::AgentMetadataError),
-    BootstrapRollback { primary: String, rollback: String },
+    PreparedOwnerAdmission {
+        path: PathBuf,
+        source: nokv_control::ControlError,
+    },
+    Store(nokv_meta_store::StoreError),
+    Meta(nokv_meta::workspace::MetaError),
+    BootstrapRollback {
+        primary: String,
+        rollback: String,
+    },
     Protocol(nokv_protocol::ProtocolError),
     Bind(std::io::Error),
     Connection(std::io::Error),
-    FrameTooLarge { bytes: usize, max: usize },
+    FrameTooLarge {
+        bytes: usize,
+        max: usize,
+    },
     Executor(String),
 }
 
@@ -33,14 +45,41 @@ impl fmt::Display for ServerError {
             Self::InvalidOptions(message) => write!(formatter, "invalid server options: {message}"),
             Self::InvalidRoute(message) => write!(formatter, "invalid root route: {message}"),
             Self::InvalidBootstrap(message) => {
-                write!(formatter, "invalid root-owner bootstrap: {message}")
+                write!(formatter, "invalid logical-shard bootstrap: {message}")
             }
             Self::RouteRollback(message) => write!(formatter, "root route rollback: {message}"),
             Self::Control(error) => write!(formatter, "control plane failed: {error}"),
-            Self::Metadata(error) => write!(formatter, "metadata store failed: {error}"),
+            Self::PreparedOwnerAdmission { path, source } => {
+                if matches!(source, nokv_control::ControlError::Backend(_)) {
+                    write!(
+                        formatter,
+                        "control-plane owner acquisition outcome is unknown after preparing the \
+                         epoch-zero metadata store at {}: {source}; preserve the store and \
+                         inspect the configured control backend because automatic owner \
+                         reconciliation is not implemented; only after proving acquisition did \
+                         not apply, retry the corrected first-owner command with \
+                         --metadata-reopen {}; otherwise retain the store and owner record for \
+                         operator recovery; do not delete either while acquisition may have \
+                         succeeded",
+                        path.display(),
+                        path.display()
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "control plane failed after preparing the epoch-zero metadata store at \
+                         {}: {source}; retry the corrected first-owner command with \
+                         --metadata-reopen {}",
+                        path.display(),
+                        path.display()
+                    )
+                }
+            }
+            Self::Store(error) => write!(formatter, "metadata store failed: {error}"),
+            Self::Meta(error) => write!(formatter, "metadata failed: {error}"),
             Self::BootstrapRollback { primary, rollback } => write!(
                 formatter,
-                "root-owner bootstrap failed: {primary}; rollback also failed: {rollback}"
+                "logical-shard ownership failed: {primary}; cleanup also failed: {rollback}"
             ),
             Self::Protocol(error) => write!(formatter, "workspace protocol failed: {error}"),
             Self::Bind(error) => write!(formatter, "server bind failed: {error}"),
@@ -61,8 +100,14 @@ impl From<nokv_control::ControlError> for ServerError {
     }
 }
 
-impl From<nokv_meta::workspace::AgentMetadataError> for ServerError {
-    fn from(error: nokv_meta::workspace::AgentMetadataError) -> Self {
-        Self::Metadata(error)
+impl From<nokv_meta_store::StoreError> for ServerError {
+    fn from(error: nokv_meta_store::StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<nokv_meta::workspace::MetaError> for ServerError {
+    fn from(error: nokv_meta::workspace::MetaError) -> Self {
+        Self::Meta(error)
     }
 }

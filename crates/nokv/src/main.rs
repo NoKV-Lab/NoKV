@@ -357,15 +357,55 @@ fn run_provision(_invocation: &Invocation, _logical_shard_id: &str) -> Result<()
 }
 
 #[cfg(feature = "etcd")]
+fn active_shard_placements(
+    control: &dyn nokv_control::ControlStore,
+    seed: &nokv_control::RootPlacement,
+) -> Result<Vec<nokv_control::RootPlacement>, String> {
+    let mut placements = control
+        .list_root_placements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|placement| {
+            placement.logical_shard_id == seed.logical_shard_id
+                && placement.lifecycle == nokv_control::RootPlacementLifecycle::Active
+        })
+        .collect::<Vec<_>>();
+    placements.sort_by_key(|placement| placement.root_id);
+    if !placements
+        .iter()
+        .any(|placement| placement.root_id == seed.root_id)
+    {
+        return Err("configured root placement must be Active before serve".to_owned());
+    }
+    Ok(placements)
+}
+
+#[cfg(feature = "etcd")]
+fn join_lifecycle_workers(
+    workers: Vec<std::thread::JoinHandle<Result<(), nokv_server::LifecycleError>>>,
+    failures: &mut Vec<String>,
+) {
+    for worker in workers {
+        match worker.join() {
+            Ok(Err(error)) if !matches!(error, nokv_server::LifecycleError::OwnerLost(_)) => {
+                failures.push(format!("lifecycle worker failed: {error}"));
+            }
+            Ok(_) => {}
+            Err(_) => failures.push("lifecycle worker panicked".to_owned()),
+        }
+    }
+}
+
+#[cfg(feature = "etcd")]
 fn run_server(invocation: &Invocation) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
     use nokv_server::{
-        bootstrap_root_owner, ArtifactLifecycleDeleter, LifecycleError, LifecycleObjectDeleter,
-        LifecycleRunner, LifecycleRunnerOptions, MetadataStoreOpen, OwnerAdmission,
-        RootOwnerBootstrapRequest, RootOwnerRegistry, ServerOptions, WorkspaceServer,
+        bootstrap_shard, ArtifactLifecycleDeleter, LeaseMode, LifecycleObjectDeleter,
+        LifecycleRunner, LifecycleRunnerOptions, OpenMode, RootAttach, RootOwnerRegistry,
+        ServerOptions, ShardBoot, WorkspaceServer,
     };
     use nokv_types::RequestId;
     use sha2::{Digest, Sha256};
@@ -405,8 +445,8 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .clone()
         .ok_or_else(|| "serve requires --metadata-create or --metadata-reopen".to_owned())?
     {
-        cli::MetadataStoreConfig::Create(path) => MetadataStoreOpen::Create(path),
-        cli::MetadataStoreConfig::Reopen(path) => MetadataStoreOpen::Reopen(path),
+        cli::MetadataStoreConfig::Create(path) => OpenMode::New(path),
+        cli::MetadataStoreConfig::Reopen(path) => OpenMode::Existing(path),
     };
     let node_id = NodeId::new(
         invocation
@@ -438,21 +478,35 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         log: shard.log.clone(),
         durable_lsn: shard.durable_lsn,
     };
+    let placements = active_shard_placements(control.as_ref(), &placement)?;
+    if invocation.server.lifecycle_interval_millis == 0
+        || invocation.server.lifecycle_interval_millis > 60_000
+    {
+        return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
+    }
+    let objects = Arc::new(CliObjectStore::build(&invocation.client.object)?);
+    objects.validate_agent_capabilities()?;
     let registry = Arc::new(RootOwnerRegistry::new());
-    let owner = bootstrap_root_owner(
+    let owner = bootstrap_shard(
         Arc::clone(&control),
         Arc::clone(&registry),
-        RootOwnerBootstrapRequest {
-            root_id,
-            metadata,
-            admission: OwnerAdmission::Acquire {
+        ShardBoot {
+            shard_id: placement.logical_shard_id,
+            open: metadata,
+            lease: LeaseMode::Acquire {
                 owner: node_id,
                 endpoint,
-                expected_previous_epoch: shard.owner_epoch,
+                previous_epoch: shard.owner_epoch,
             },
-            install_request_id: request_id(b"install", root_id),
-            activate_request_id: request_id(b"activate", root_id),
             recovery,
+            roots: placements
+                .iter()
+                .map(|placement| RootAttach {
+                    root_id: placement.root_id,
+                    install_id: request_id(b"install", placement.root_id),
+                    activate_id: request_id(b"activate", placement.root_id),
+                })
+                .collect(),
         },
     )
     .map_err(|error| error.to_string())?;
@@ -461,89 +515,78 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .map_err(|_| "etcd lease TTL must be positive".to_owned())?
         .saturating_div(3)
         .max(1);
-    let runtime = (|| -> Result<(WorkspaceServer, LifecycleRunner), String> {
-        if invocation.server.lifecycle_interval_millis == 0
-            || invocation.server.lifecycle_interval_millis > 60_000
-        {
-            return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
-        }
-        let objects = Arc::new(CliObjectStore::build(&invocation.client.object)?);
-        objects.validate_agent_capabilities()?;
-        let server = WorkspaceServer::new(
-            ServerOptions {
-                bind: invocation.server.bind,
-                read_timeout: Duration::from_secs(30),
-                write_timeout: Duration::from_secs(30),
-                lease_renew_interval: Duration::from_secs(renew_seconds),
-            },
+    let meta = Arc::clone(owner.meta());
+    let owner_routes = owner.routes().to_vec();
+    let server = WorkspaceServer::new(
+        ServerOptions {
+            bind: invocation.server.bind,
+            read_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            lease_renew_interval: Duration::from_secs(renew_seconds),
+        },
+        Arc::clone(&registry),
+        vec![owner],
+    )
+    .map_err(|error| error.to_string())?;
+    let owner_loss = server.owner_loss_signal();
+    let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
+        Arc::new(ArtifactLifecycleDeleter::new(objects));
+    let mut lifecycles = Vec::with_capacity(owner_routes.len());
+    for route in owner_routes {
+        match LifecycleRunner::new(
+            Arc::clone(&meta),
             Arc::clone(&registry),
-            vec![owner.ownership.clone()],
-        )
-        .map_err(|error| error.to_string())?;
-        let owner_loss = server.owner_loss_signal();
-        let lifecycle_objects: Arc<dyn LifecycleObjectDeleter> =
-            Arc::new(ArtifactLifecycleDeleter::new(objects));
-        let lifecycle = LifecycleRunner::new(
-            Arc::clone(&owner.store),
-            Arc::clone(&registry),
-            owner.route,
-            owner_loss,
-            lifecycle_objects,
+            route,
+            owner_loss.clone(),
+            Arc::clone(&lifecycle_objects),
             LifecycleRunnerOptions {
                 poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
                 ..LifecycleRunnerOptions::default()
             },
-        )
-        .map_err(|error| error.to_string())?;
-        Ok((server, lifecycle))
-    })();
-    let (server, lifecycle) = match runtime {
-        Ok(runtime) => runtime,
-        Err(primary) => {
-            let release = owner.ownership.release();
-            return Err(match release {
-                Ok(_) => primary,
-                Err(release) => format!("{primary}; owner release failed: {release}"),
-            });
-        }
-    };
-    let owner_loss = server.owner_loss_signal();
-    let worker_owner_loss = owner_loss.clone();
-    let lifecycle_worker = std::thread::Builder::new()
-        .name("nokv-workspace-lifecycle".to_owned())
-        .spawn(move || {
-            let result = lifecycle.run_until_owner_loss();
-            if result.is_err() {
-                worker_owner_loss.fail_closed();
+        ) {
+            Ok(lifecycle) => lifecycles.push(lifecycle),
+            Err(error) => {
+                let primary = error.to_string();
+                let release = server.release_ownership();
+                return Err(match release {
+                    Ok(()) => primary,
+                    Err(release) => format!("{primary}; owner release failed: {release}"),
+                });
             }
-            result
-        });
-    let lifecycle_worker = match lifecycle_worker {
-        Ok(worker) => worker,
-        Err(error) => {
-            owner_loss.fail_closed();
-            let primary = format!("cannot start lifecycle worker: {error}");
-            let release = owner.ownership.release();
-            return Err(match release {
-                Ok(_) => primary,
-                Err(release) => format!("{primary}; owner release failed: {release}"),
-            });
         }
-    };
+    }
+    let mut lifecycle_workers = Vec::with_capacity(lifecycles.len());
+    for (index, lifecycle) in lifecycles.into_iter().enumerate() {
+        let worker_owner_loss = owner_loss.clone();
+        let worker = std::thread::Builder::new()
+            .name(format!("nokv-workspace-lifecycle-{index}"))
+            .spawn(move || {
+                let result = lifecycle.run_until_owner_loss();
+                if result.is_err() {
+                    worker_owner_loss.fail_closed();
+                }
+                result
+            });
+        match worker {
+            Ok(worker) => lifecycle_workers.push(worker),
+            Err(error) => {
+                owner_loss.fail_closed();
+                let mut failures = vec![format!("cannot start lifecycle worker: {error}")];
+                join_lifecycle_workers(lifecycle_workers, &mut failures);
+                if let Err(error) = server.release_ownership() {
+                    failures.push(format!("owner release failed: {error}"));
+                }
+                return Err(failures.join("; "));
+            }
+        }
+    }
 
     let server_result = server.run();
     owner_loss.fail_closed();
-    let lifecycle_result = lifecycle_worker.join();
-    let release_result = owner.ownership.release();
 
     let mut failures = Vec::new();
-    match lifecycle_result {
-        Ok(Err(error)) if !matches!(error, LifecycleError::OwnerLost(_)) => {
-            failures.push(format!("lifecycle worker failed: {error}"));
-        }
-        Ok(_) => {}
-        Err(_) => failures.push("lifecycle worker panicked".to_owned()),
-    }
+    join_lifecycle_workers(lifecycle_workers, &mut failures);
+    let release_result = server.release_ownership();
     if let Err(error) = server_result {
         failures.push(format!("RPC server stopped: {error}"));
     }
@@ -572,5 +615,40 @@ mod tests {
         assert_eq!(path.logical_path(), "outputs/result.json");
         assert!(scoped_artifact("run-1", "tmp", "result.json").is_err());
         assert!(scoped_artifact("run-1", "outputs", "../result.json").is_err());
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn shard_startup_selects_every_active_root_and_no_other_placement() {
+        use nokv_control::{ControlStore, InMemoryControlStore, RootPlacement};
+        use nokv_types::{LogicalShardId, PlacementGeneration, RootId, RootPlacementLifecycle};
+
+        let root = |fill| RootId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
+        let shard = |fill| LogicalShardId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
+        let control = InMemoryControlStore::new();
+        provision::provision_and_activate(&control, root(1), shard(9)).unwrap();
+        provision::provision_and_activate(&control, root(2), shard(9)).unwrap();
+        provision::provision_and_activate(&control, root(3), shard(8)).unwrap();
+        control
+            .create_root_placement(RootPlacement {
+                root_id: root(4),
+                logical_shard_id: shard(9),
+                placement_generation: PlacementGeneration::new(1).unwrap(),
+                lifecycle: RootPlacementLifecycle::Provisioning,
+            })
+            .unwrap();
+
+        let seed = control.get_root_placement(&root(1)).unwrap().unwrap();
+        let placements = active_shard_placements(&control, &seed).unwrap();
+        assert_eq!(
+            placements
+                .iter()
+                .map(|placement| placement.root_id)
+                .collect::<Vec<_>>(),
+            vec![root(1), root(2)]
+        );
+
+        let provisioning = control.get_root_placement(&root(4)).unwrap().unwrap();
+        assert!(active_shard_placements(&control, &provisioning).is_err());
     }
 }

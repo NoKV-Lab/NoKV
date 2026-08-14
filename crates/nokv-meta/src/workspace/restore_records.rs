@@ -27,7 +27,7 @@ pub const RESTORE_MANIFEST_CONTENT_TYPE: &str = "application/json";
 
 /// Caller-computed object-plane descriptor bound when restore begins.
 ///
-/// The body bytes stay out of Holt. This descriptor proves that the one
+/// The body bytes stay out of the metadata store. This descriptor proves that the one
 /// restore-staging publication is the Workbench projection selected before
 /// any source rows are copied.
 #[derive(Clone, Debug, PartialEq, Eq)]

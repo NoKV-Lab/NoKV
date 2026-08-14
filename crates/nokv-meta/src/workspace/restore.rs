@@ -15,9 +15,9 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, CommandDigest, CommitId, CommitState, CommitVersion, ConsumerEpoch,
-    GcClaimState, HistoryHoldState, OperationId, OperationKind, ReadVersion, ReferenceEpoch,
-    RestorePhase, RevisionState, SnapshotId, SnapshotState, WorkbenchId, WorkspaceIncarnationId,
-    WorkspaceRevision, WorkspaceState, SHA256_BYTES,
+    GcClaimState, HistoryHoldState, NormalizedRelativePath, OperationId, OperationKind,
+    ReadVersion, ReferenceEpoch, RestorePhase, RevisionState, SnapshotId, SnapshotState,
+    WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -34,10 +34,11 @@ use super::commit_records::{
     CommitMemberRecord, CommitRecord, CommitRecordError,
 };
 use super::engine::{
-    AgentMetadataError, AgentMetadataStore, CommandMutation, CommandPredicate, EventProjection,
-    HistoryProjection, MetadataCommand, MetadataFamily, MetadataScanItem, RootFenceAction,
+    CommandFit, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
+    MetaShard, MetadataCommand, MetadataScanItem, RootFenceAction,
 };
 use super::event_projection::change_event_projection;
+use super::keyspace::MetadataFamily;
 use super::namespace::RootWriteContext;
 use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
@@ -49,20 +50,25 @@ use super::query_records::{
 };
 use super::restore_records::{
     RestoreManifestDescriptor, RestoreMemberRecord, RestoreOperationRecord, RestoreRecordError,
-    RestoreResult, RestoreSource, RestoreTerminalError, RestoreTransition,
+    RestoreResult, RestoreSource, RestoreTerminalError, RestoreTerminalErrorKind,
+    RestoreTransition, MAX_RESTORE_TERMINAL_ERROR_BYTES,
 };
 use super::snapshot_records::{HistoryHoldRecord, SnapshotRecordError, SnapshotRefRecord};
 
 /// Maximum source rows copied by one metadata command.
 ///
 /// Each row may require one path, reference, member, and revision predicate /
-/// mutation pair. Forty-eight rows remain below the engine's independent
+/// mutation pair. Forty-eight rows remain below the metadata layer's independent
 /// 256-item bounds even when every row names a distinct revision.
 pub const MAX_RESTORE_BATCH_MEMBERS: usize = 48;
 /// Exact Workbench initialization path published before publication.
 pub const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
 const RESTORE_OUTCOME_FORMAT: u8 = 1;
 const MAX_COMMAND_ITEMS: usize = 256;
+const CAPACITY_EXCEEDED_MESSAGE: &str =
+    "restore source member exceeds the serving metadata transaction budget";
+const CLEANUP_CAPACITY_EXCEEDED_MESSAGE: &str =
+    "restore cleanup member exceeds the serving metadata transaction budget";
 
 /// Caller selection before a snapshot read version is frozen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +81,7 @@ pub enum RestoreSourceSelector {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreInitialization {
     /// Exact already-published staging path entry. The object body remains in
-    /// the object plane and is never copied into Holt.
+    /// the object plane and is never copied into metadata.
     pub restore_manifest: PathEntry,
 }
 
@@ -239,7 +245,7 @@ pub enum RestoreError {
     SnapshotCodec(SnapshotRecordError),
     RestoreCodec(RestoreRecordError),
     QueryRecord(QueryRecordError),
-    Engine(AgentMetadataError),
+    Meta(MetaError),
 }
 
 impl fmt::Display for RestoreError {
@@ -397,7 +403,7 @@ impl fmt::Display for RestoreError {
             Self::SnapshotCodec(source) => source.fmt(formatter),
             Self::RestoreCodec(source) => source.fmt(formatter),
             Self::QueryRecord(source) => source.fmt(formatter),
-            Self::Engine(source) => source.fmt(formatter),
+            Self::Meta(source) => source.fmt(formatter),
         }
     }
 }
@@ -410,7 +416,7 @@ impl std::error::Error for RestoreError {
             Self::SnapshotCodec(source) => Some(source),
             Self::RestoreCodec(source) => Some(source),
             Self::QueryRecord(source) => Some(source),
-            Self::Engine(source) => Some(source),
+            Self::Meta(source) => Some(source),
             _ => None,
         }
     }
@@ -440,9 +446,9 @@ impl From<RestoreRecordError> for RestoreError {
     }
 }
 
-impl From<AgentMetadataError> for RestoreError {
-    fn from(source: AgentMetadataError) -> Self {
-        Self::Engine(source)
+impl From<MetaError> for RestoreError {
+    fn from(source: MetaError) -> Self {
+        Self::Meta(source)
     }
 }
 
@@ -465,13 +471,36 @@ struct SourceMember {
     row_digest: [u8; SHA256_BYTES],
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CommandPlan {
     predicates: Vec<CommandPredicate>,
     mutations: Vec<CommandMutation>,
     history: Vec<HistoryProjection>,
     events: Vec<EventProjection>,
     exact_keys: BTreeSet<(MetadataFamily, Vec<u8>)>,
+}
+
+struct PlannedRestoreCommand {
+    command: MetadataCommand,
+    operation: RestoreOperationRecord,
+}
+
+struct PlannedCopiedMember {
+    sequence: u64,
+    path: nokv_types::NormalizedRelativePath,
+    entry_payload: Vec<u8>,
+    revision: ArtifactRevisionId,
+    revision_ref_payload: Vec<u8>,
+    restore_member_key: Vec<u8>,
+    restore_member_payload: Vec<u8>,
+    secondary_index_rows: BTreeMap<Vec<u8>, Vec<u8>>,
+    revision_after_copy: ArtifactRevisionRecord,
+}
+
+struct PlannedCopyBatch {
+    command: PlannedRestoreCommand,
+    members: Vec<PlannedCopiedMember>,
+    staging_payload: Vec<u8>,
 }
 
 impl CommandPlan {
@@ -544,7 +573,7 @@ impl CommandPlan {
 
 /// Atomically claim a hidden destination and retain the exact source.
 pub fn begin_restore(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &BeginRestoreRequest,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
@@ -870,7 +899,7 @@ pub fn begin_restore(
 
 /// Change a newly-created restore from `Preparing` to `Copying`.
 pub fn start_restore_copy(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: RestoreOperationRequest,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
@@ -911,7 +940,7 @@ pub fn start_restore_copy(
 
 /// Copy one canonical source page into the hidden destination.
 pub fn copy_restore_batch(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: CopyRestoreBatchRequest,
 ) -> Result<CopyRestoreBatchOutcome, RestoreError> {
@@ -952,7 +981,76 @@ pub fn copy_restore_batch(
         admitted += 1;
     }
     members.truncate(admitted);
-    let source_eof = scanned_eof && admitted == scanned_count;
+    if scanned_count == 0 {
+        let planned = plan_copy_batch(store, context, &loaded, &[], scanned_eof, input_digest)?;
+        let command = execute_restore_command(
+            store,
+            &planned.command.command,
+            input_digest,
+            None,
+            request.operation_id,
+        )?;
+        return Ok(CopyRestoreBatchOutcome {
+            copied_members: command.affected_members as usize,
+            source_eof: command.operation.source_eof,
+            command,
+        });
+    }
+
+    let mut selected = None;
+    for count in (1..=members.len()).rev() {
+        let planned = plan_copy_batch(
+            store,
+            context,
+            &loaded,
+            &members[..count],
+            scanned_eof && count == scanned_count,
+            input_digest,
+        )?;
+        if !command_fits(store, &planned.command.command)?
+            || !every_copied_member_can_be_cleaned(store, context, &planned, input_digest)?
+        {
+            continue;
+        }
+        selected = Some(planned);
+        break;
+    }
+
+    let Some(planned) = selected else {
+        let (plan, operation, operation_payload) =
+            plan_restore_abort(store, context, loaded, capacity_exceeded_error())?;
+        let command = build_restore_command(context, plan, input_digest, operation_payload, 0);
+        let outcome =
+            execute_restore_command(store, &command, input_digest, None, request.operation_id)?;
+        debug_assert_eq!(outcome.operation, operation);
+        return Ok(CopyRestoreBatchOutcome {
+            copied_members: 0,
+            source_eof: false,
+            command: outcome,
+        });
+    };
+    let command = execute_restore_command(
+        store,
+        &planned.command.command,
+        input_digest,
+        None,
+        request.operation_id,
+    )?;
+    Ok(CopyRestoreBatchOutcome {
+        copied_members: command.affected_members as usize,
+        source_eof: command.operation.source_eof,
+        command,
+    })
+}
+
+fn plan_copy_batch(
+    store: &MetaShard,
+    context: RootWriteContext,
+    loaded: &Loaded<RestoreOperationRecord>,
+    members: &[SourceMember],
+    source_eof: bool,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<PlannedCopyBatch, RestoreError> {
     let additional = u64::try_from(members.len()).expect("restore batch length fits u64");
     let next_sequence = loaded
         .record
@@ -968,7 +1066,7 @@ pub fn copy_restore_batch(
     }
 
     let mut revision_occurrences = BTreeMap::<ArtifactRevisionId, u64>::new();
-    for member in &members {
+    for member in members {
         let count = revision_occurrences
             .entry(member.entry.artifact_revision_id)
             .or_default();
@@ -1035,24 +1133,28 @@ pub fn copy_restore_batch(
     next.validate()?;
     let next_payload = next.encode()?;
 
+    let staging = load_staging_workspace(store, context, &next)?;
     let mut plan = CommandPlan::default();
     plan.replace(
         MetadataFamily::Operation,
-        operation_key(
-            context.root_id,
-            OperationKind::Restore,
-            request.operation_id,
-        ),
-        loaded.payload,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload.clone(),
         next_payload.clone(),
     )?;
-    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    plan.assert_value(
+        MetadataFamily::WorkspaceCurrent,
+        workspace_current_key(context.root_id, &next.destination_workbench_id),
+        Some(staging.payload.clone()),
+    )?;
+
+    let mut copied = Vec::with_capacity(members.len());
     for (offset, member) in members.iter().enumerate() {
         let sequence = loaded
             .record
             .next_member_sequence
             .checked_add(u64::try_from(offset).expect("batch offset fits u64"))
             .expect("sequence bound was checked");
+        let entry_payload = member.entry.encode()?;
         plan.put_absent(
             MetadataFamily::PathCurrent,
             path_current_key(
@@ -1060,13 +1162,17 @@ pub fn copy_restore_batch(
                 next.destination_workspace_incarnation_id,
                 &member.path,
             ),
-            member.entry.encode()?,
+            entry_payload.clone(),
         )?;
-        let next_epoch = revision_updates
+        let revision_after_copy = revision_updates
             .get(&member.entry.artifact_revision_id)
             .expect("every source revision has one update")
             .1
-            .reference_epoch;
+            .clone();
+        let revision_ref_payload = RevisionRefRecord {
+            reference_epoch_at_add: revision_after_copy.reference_epoch,
+        }
+        .encode()?;
         plan.put_absent(
             MetadataFamily::RevisionRef,
             path_revision_ref_key(
@@ -1075,21 +1181,20 @@ pub fn copy_restore_batch(
                 &member.path,
                 member.entry.artifact_revision_id,
             ),
-            RevisionRefRecord {
-                reference_epoch_at_add: next_epoch,
-            }
-            .encode()?,
+            revision_ref_payload.clone(),
         )?;
+        let restore_member_key = restore_member_key(context.root_id, next.operation_id, sequence);
+        let restore_member_payload = RestoreMemberRecord {
+            destination_path: member.path.clone(),
+            artifact_revision_id: member.entry.artifact_revision_id,
+            path_generation: member.entry.generation,
+            row_digest: member.row_digest,
+        }
+        .encode();
         plan.put_absent(
             MetadataFamily::RestoreMember,
-            restore_member_key(context.root_id, request.operation_id, sequence),
-            RestoreMemberRecord {
-                destination_path: member.path.clone(),
-                artifact_revision_id: member.entry.artifact_revision_id,
-                path_generation: member.entry.generation,
-                row_digest: member.row_digest,
-            }
-            .encode(),
+            restore_member_key.clone(),
+            restore_member_payload.clone(),
         )?;
         let index_rows = secondary_index_rows(
             context.root_id,
@@ -1097,9 +1202,20 @@ pub fn copy_restore_batch(
             &member.path,
             &member.entry,
         )?;
-        for (key, value) in index_rows {
-            plan.put_absent(MetadataFamily::SecondaryIndex, key, value)?;
+        for (key, value) in &index_rows {
+            plan.put_absent(MetadataFamily::SecondaryIndex, key.clone(), value.clone())?;
         }
+        copied.push(PlannedCopiedMember {
+            sequence,
+            path: member.path.clone(),
+            entry_payload,
+            revision: member.entry.artifact_revision_id,
+            revision_ref_payload,
+            restore_member_key,
+            restore_member_payload,
+            secondary_index_rows: index_rows,
+            revision_after_copy,
+        });
     }
     for (revision, (loaded_revision, next_revision)) in revision_updates {
         plan.replace(
@@ -1109,28 +1225,198 @@ pub fn copy_restore_batch(
             next_revision.encode()?,
         )?;
     }
-    let copied_members = u32::try_from(members.len()).expect("bounded batch length fits u32");
-    let command = execute_plan(
-        store,
-        context,
-        plan,
-        input_digest,
-        next_payload,
-        None,
-        request.operation_id,
-        copied_members,
-    )?;
-    Ok(CopyRestoreBatchOutcome {
-        copied_members: command.affected_members as usize,
-        source_eof: command.operation.source_eof,
-        command,
+    let affected_members =
+        u32::try_from(members.len()).expect("bounded restore batch length fits u32");
+    let command =
+        build_restore_command(context, plan, input_digest, next_payload, affected_members);
+    Ok(PlannedCopyBatch {
+        command: PlannedRestoreCommand {
+            command,
+            operation: next,
+        },
+        members: copied,
+        staging_payload: staging.payload,
     })
+}
+
+fn command_fits(store: &MetaShard, command: &MetadataCommand) -> Result<bool, RestoreError> {
+    match store.command_fit(command, None) {
+        Ok(CommandFit::Fits) => Ok(true),
+        Ok(CommandFit::Exceeds { .. }) => Ok(false),
+        Err(source) => Err(RestoreError::Meta(source)),
+    }
+}
+
+fn capacity_exceeded_error() -> RestoreTerminalError {
+    RestoreTerminalError {
+        kind: RestoreTerminalErrorKind::InvariantViolation,
+        message: CAPACITY_EXCEEDED_MESSAGE.to_owned(),
+        evidence_digest: None,
+    }
+}
+
+fn maximum_cleanup_terminal_error() -> RestoreTerminalError {
+    RestoreTerminalError {
+        kind: RestoreTerminalErrorKind::CleanupFailed,
+        message: "x".repeat(MAX_RESTORE_TERMINAL_ERROR_BYTES),
+        evidence_digest: Some([0; SHA256_BYTES]),
+    }
+}
+
+fn every_copied_member_can_be_cleaned(
+    store: &MetaShard,
+    context: RootWriteContext,
+    batch: &PlannedCopyBatch,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<bool, RestoreError> {
+    for member in &batch.members {
+        let command = plan_single_member_cleanup_command(context, batch, member, input_digest)?;
+        if !command_fits(store, &command.command)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn plan_single_member_cleanup_command(
+    context: RootWriteContext,
+    batch: &PlannedCopyBatch,
+    member: &PlannedCopiedMember,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<PlannedRestoreCommand, RestoreError> {
+    let mut cleaning = maximum_cleanup_operation(&batch.command.operation)?;
+    cleaning.cleanup_member_cursor = member.sequence;
+    cleaning.validate()?;
+    let cleaning_payload = cleaning.encode()?;
+    let mut next = cleaning.clone();
+    next.cleanup_member_cursor =
+        member
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "cleanup cursor overflow".to_owned(),
+            })?;
+    next.validate()?;
+    let next_payload = next.encode()?;
+
+    let mut plan = CommandPlan::default();
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        cleaning_payload,
+        next_payload.clone(),
+    )?;
+    plan.assert_value(
+        MetadataFamily::WorkspaceCurrent,
+        workspace_current_key(context.root_id, &next.destination_workbench_id),
+        Some(batch.staging_payload.clone()),
+    )?;
+    for (key, value) in &member.secondary_index_rows {
+        plan.delete(MetadataFamily::SecondaryIndex, key.clone(), value.clone())?;
+    }
+    plan.delete(
+        MetadataFamily::PathCurrent,
+        path_current_key(
+            context.root_id,
+            next.destination_workspace_incarnation_id,
+            &member.path,
+        ),
+        member.entry_payload.clone(),
+    )?;
+    plan.delete(
+        MetadataFamily::RevisionRef,
+        path_revision_ref_key(
+            context.root_id,
+            next.destination_workspace_incarnation_id,
+            &member.path,
+            member.revision,
+        ),
+        member.revision_ref_payload.clone(),
+    )?;
+
+    // Exercise the exact, heavier zero-reference cleanup branch. Any real
+    // non-zero cleanup writes a strict subset of these rows with the same
+    // fixed-width revision values.
+    let mut revision_before = member.revision_after_copy.clone();
+    revision_before.strong_reference_count = 1;
+    revision_before.last_zero_ref_version = None;
+    let mut revision_after = revision_before.clone();
+    revision_after.reference_epoch =
+        increment_reference_epoch(revision_after.reference_epoch, member.revision)?;
+    revision_after.strong_reference_count = 0;
+    let zero_version = next_commit_version(context.read_version)?;
+    revision_after.last_zero_ref_version = Some(zero_version);
+    plan.replace(
+        MetadataFamily::ArtifactRevision,
+        artifact_revision_key(context.root_id, member.revision),
+        revision_before.encode()?,
+        revision_after.encode()?,
+    )?;
+    plan.put_absent(
+        MetadataFamily::GcCandidate,
+        gc_candidate_key(
+            context.root_id,
+            member.revision,
+            revision_after.reference_epoch,
+        ),
+        GcCandidateRecord {
+            last_zero_ref_version: zero_version,
+            claim_state: GcClaimState::Candidate,
+            retry_count: 0,
+            quarantine_evidence: None,
+        }
+        .encode()?,
+    )?;
+    plan.delete(
+        MetadataFamily::RestoreMember,
+        member.restore_member_key.clone(),
+        member.restore_member_payload.clone(),
+    )?;
+    Ok(PlannedRestoreCommand {
+        command: build_restore_command(context, plan, input_digest, next_payload, 1),
+        operation: next,
+    })
+}
+
+fn maximum_cleanup_operation(
+    copied: &RestoreOperationRecord,
+) -> Result<RestoreOperationRecord, RestoreError> {
+    // A member admitted by an early copy page must remain cleanable after the
+    // restore reaches its largest later operation shape. Model the maximum
+    // source cursor plus the seal and initialization digests before deriving
+    // the worst legal abort and zero-reference cleanup transaction.
+    let mut ready = copied.clone();
+    ready.source_cursor = Some(
+        NormalizedRelativePath::new("x".repeat(NormalizedRelativePath::MAX_BYTES))
+            .expect("the path type accepts its documented maximum byte length"),
+    );
+    ready.source_eof = true;
+    let member_seal = ready.member_rolling_digest;
+    ready = ready.apply(
+        RestorePhase::Copying,
+        RestoreTransition::SealSource { member_seal },
+    )?;
+    ready = ready.apply(
+        RestorePhase::SourceSealed,
+        RestoreTransition::MarkReady {
+            initialization_digest: [0; SHA256_BYTES],
+        },
+    )?;
+    let aborting = ready.apply(
+        RestorePhase::Ready,
+        RestoreTransition::BeginAbort {
+            terminal_error: maximum_cleanup_terminal_error(),
+        },
+    )?;
+    aborting
+        .apply(RestorePhase::Aborting, RestoreTransition::BeginCleaning)
+        .map_err(Into::into)
 }
 
 /// Re-read the frozen source and ordered member ledger, then seal the exact
 /// closure in one operation CAS.
 pub fn seal_restore_source(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: RestoreOperationRequest,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
@@ -1182,7 +1468,7 @@ pub fn seal_restore_source(
 /// hidden. The operation becomes `Ready` in the same command as the path
 /// change and its strong-reference updates.
 pub fn apply_restore_initialization(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: RestoreOperationRequest,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
@@ -1258,7 +1544,7 @@ pub fn apply_restore_initialization(
 /// Publish the destination marker and release the exact source retention in
 /// one bounded command.
 pub fn complete_restore(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: RestoreOperationRequest,
 ) -> Result<CompleteRestoreOutcome, RestoreError> {
@@ -1367,7 +1653,7 @@ pub fn complete_restore(
 /// Win the terminal race against publication and persist the exact abort
 /// reason. Source retention remains attached until cleanup is proven complete.
 pub fn abort_restore(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: &AbortRestoreRequest,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
@@ -1389,25 +1675,8 @@ pub fn abort_restore(
             actual: loaded.record.phase,
         });
     }
-    let next = loaded.record.apply(
-        loaded.record.phase,
-        RestoreTransition::BeginAbort {
-            terminal_error: request.terminal_error.clone(),
-        },
-    )?;
-    let next_payload = next.encode()?;
-    let mut plan = CommandPlan::default();
-    plan.replace(
-        MetadataFamily::Operation,
-        operation_key(
-            context.root_id,
-            OperationKind::Restore,
-            request.operation_id,
-        ),
-        loaded.payload,
-        next_payload.clone(),
-    )?;
-    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    let (plan, _next, next_payload) =
+        plan_restore_abort(store, context, loaded, request.terminal_error.clone())?;
     execute_plan(
         store,
         context,
@@ -1420,9 +1689,31 @@ pub fn abort_restore(
     )
 }
 
+fn plan_restore_abort(
+    store: &MetaShard,
+    context: RootWriteContext,
+    loaded: Loaded<RestoreOperationRecord>,
+    terminal_error: RestoreTerminalError,
+) -> Result<(CommandPlan, RestoreOperationRecord, Vec<u8>), RestoreError> {
+    let next = loaded.record.apply(
+        loaded.record.phase,
+        RestoreTransition::BeginAbort { terminal_error },
+    )?;
+    let next_payload = next.encode()?;
+    let mut plan = CommandPlan::default();
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload,
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    Ok((plan, next, next_payload))
+}
+
 /// Transfer an aborted restore into its durable cleanup phase.
 pub fn start_restore_cleanup(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: RestoreOperationRequest,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
@@ -1463,7 +1754,7 @@ pub fn start_restore_cleanup(
 
 /// Delete one bounded contiguous range of staged destination members.
 pub fn cleanup_restore_batch(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: CopyRestoreBatchRequest,
 ) -> Result<CopyRestoreBatchOutcome, RestoreError> {
@@ -1550,6 +1841,90 @@ pub fn cleanup_restore_batch(
         });
         members.push((key, member));
     }
+    let mut selected = None;
+    for count in (1..=members.len()).rev() {
+        let planned = plan_cleanup_batch(
+            store,
+            context,
+            &loaded,
+            &members[..count],
+            &path_changes[..count],
+            input_digest,
+        )?;
+        if command_fits(store, &planned.command)? {
+            selected = Some(planned);
+            break;
+        }
+    }
+    let Some(planned) = selected else {
+        let planned = plan_cleanup_capacity_quarantine(store, context, loaded, input_digest)?;
+        let command = execute_restore_command(
+            store,
+            &planned.command,
+            input_digest,
+            None,
+            request.operation_id,
+        )?;
+        return Ok(CopyRestoreBatchOutcome {
+            copied_members: 0,
+            source_eof: false,
+            command,
+        });
+    };
+    let command = execute_restore_command(
+        store,
+        &planned.command,
+        input_digest,
+        None,
+        request.operation_id,
+    )?;
+    Ok(CopyRestoreBatchOutcome {
+        copied_members: command.affected_members as usize,
+        source_eof: command.operation.cleanup_member_cursor
+            == command.operation.next_member_sequence,
+        command,
+    })
+}
+
+fn plan_cleanup_capacity_quarantine(
+    store: &MetaShard,
+    context: RootWriteContext,
+    loaded: Loaded<RestoreOperationRecord>,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<PlannedRestoreCommand, RestoreError> {
+    let next = loaded.record.apply(
+        RestorePhase::Cleaning,
+        RestoreTransition::Quarantine {
+            terminal_error: RestoreTerminalError {
+                kind: RestoreTerminalErrorKind::CleanupFailed,
+                message: CLEANUP_CAPACITY_EXCEEDED_MESSAGE.to_owned(),
+                evidence_digest: None,
+            },
+        },
+    )?;
+    let next_payload = next.encode()?;
+    let mut plan = CommandPlan::default();
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload,
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    Ok(PlannedRestoreCommand {
+        command: build_restore_command(context, plan, input_digest, next_payload, 0),
+        operation: next,
+    })
+}
+
+fn plan_cleanup_batch(
+    store: &MetaShard,
+    context: RootWriteContext,
+    loaded: &Loaded<RestoreOperationRecord>,
+    members: &[(Vec<u8>, Loaded<RestoreMemberRecord>)],
+    path_changes: &[PathChange],
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<PlannedRestoreCommand, RestoreError> {
     let count = members.len();
     let mut next = loaded.record.clone();
     next.cleanup_member_cursor = next
@@ -1561,12 +1936,8 @@ pub fn cleanup_restore_batch(
     let mut plan = CommandPlan::default();
     plan.replace(
         MetadataFamily::Operation,
-        operation_key(
-            context.root_id,
-            OperationKind::Restore,
-            request.operation_id,
-        ),
-        loaded.payload,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload.clone(),
         next_payload.clone(),
     )?;
     predicate_staging_workspace(store, context, &next, &mut plan)?;
@@ -1574,35 +1945,27 @@ pub fn cleanup_restore_batch(
         store,
         context,
         next.destination_workspace_incarnation_id,
-        path_changes,
+        path_changes.to_vec(),
         &mut plan,
     )?;
     for (key, member) in members {
-        plan.delete(MetadataFamily::RestoreMember, key, member.payload)?;
+        plan.delete(
+            MetadataFamily::RestoreMember,
+            key.clone(),
+            member.payload.clone(),
+        )?;
     }
     let affected_members = u32::try_from(count).expect("bounded batch count fits u32");
-    let command = execute_plan(
-        store,
-        context,
-        plan,
-        input_digest,
-        next_payload,
-        None,
-        request.operation_id,
-        affected_members,
-    )?;
-    Ok(CopyRestoreBatchOutcome {
-        copied_members: command.affected_members as usize,
-        source_eof: command.operation.cleanup_member_cursor
-            == command.operation.next_member_sequence,
-        command,
+    Ok(PlannedRestoreCommand {
+        command: build_restore_command(context, plan, input_digest, next_payload, affected_members),
+        operation: next,
     })
 }
 
 /// Retire the hidden marker and release source retention only after the member
 /// ledger is empty and its cleanup cursor proves the full closure was removed.
 pub fn finish_restore_cleanup(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     request: RestoreOperationRequest,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
@@ -1683,7 +2046,7 @@ pub fn finish_restore_cleanup(
 
 /// Read one exact restore operation through current placement and owner fences.
 pub fn get_restore(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation_id: OperationId,
 ) -> Result<Option<RestoreOperationRecord>, RestoreError> {
@@ -1698,7 +2061,7 @@ pub fn get_restore(
 }
 
 fn scan_source_members(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
     limit: usize,
@@ -1714,7 +2077,7 @@ fn scan_source_members(
 }
 
 fn scan_source_page(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
     start_after: Option<&nokv_types::NormalizedRelativePath>,
@@ -1868,7 +2231,7 @@ fn decode_source_member(
 }
 
 fn verify_source_and_members(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
 ) -> Result<(), RestoreError> {
@@ -1878,7 +2241,7 @@ fn verify_source_and_members(
     let mut rolling = [0; SHA256_BYTES];
     loop {
         // 253 keeps scan_source_page's limit + 3 probe window within the
-        // engine's 256-item scan bound.
+        // metadata layer's 256-item scan bound.
         let (members, eof) = scan_source_page(store, context, operation, cursor.as_ref(), 253)?;
         for source in members {
             let member_key = restore_member_key(context.root_id, operation.operation_id, sequence);
@@ -1956,7 +2319,7 @@ fn verify_source_and_members(
 }
 
 fn validate_source_retention(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
 ) -> Result<(), RestoreError> {
@@ -2141,7 +2504,7 @@ struct ReferenceDelta {
 }
 
 fn apply_path_changes(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     workspace: WorkspaceIncarnationId,
     changes: Vec<PathChange>,
@@ -2323,7 +2686,7 @@ fn apply_reference_delta(
 }
 
 fn release_source_retention(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
     plan: &mut CommandPlan,
@@ -2424,7 +2787,7 @@ fn release_source_retention(
 }
 
 fn load_visible_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     workbench_id: &WorkbenchId,
 ) -> Result<Loaded<WorkspaceRecord>, RestoreError> {
@@ -2449,7 +2812,7 @@ fn load_visible_workspace(
 }
 
 fn load_staging_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
 ) -> Result<Loaded<WorkspaceRecord>, RestoreError> {
@@ -2472,7 +2835,7 @@ fn load_staging_workspace(
 }
 
 fn predicate_staging_workspace(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
     plan: &mut CommandPlan,
@@ -2486,7 +2849,7 @@ fn predicate_staging_workspace(
 }
 
 fn load_operation(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     operation_id: OperationId,
 ) -> Result<Loaded<RestoreOperationRecord>, RestoreError> {
@@ -2501,7 +2864,7 @@ fn load_operation(
 }
 
 fn load_path(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     workspace: WorkspaceIncarnationId,
     path: &nokv_types::NormalizedRelativePath,
@@ -2516,7 +2879,7 @@ fn load_path(
 }
 
 fn load_available_revision(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     revision: ArtifactRevisionId,
 ) -> Result<Loaded<ArtifactRevisionRecord>, RestoreError> {
@@ -2538,7 +2901,7 @@ fn load_available_revision(
 }
 
 fn load_commit(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     commit_id: CommitId,
 ) -> Result<Loaded<CommitRecord>, RestoreError> {
@@ -2560,7 +2923,7 @@ fn load_commit(
 }
 
 fn read_record<T, E>(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     family: MetadataFamily,
     key: &[u8],
@@ -2578,7 +2941,7 @@ where
 }
 
 fn read_payload(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     family: MetadataFamily,
     key: &[u8],
@@ -2630,7 +2993,7 @@ fn validate_initialization(
 }
 
 fn validate_manifest_revision(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     manifest: &PathEntry,
 ) -> Result<Loaded<ArtifactRevisionRecord>, RestoreError> {
@@ -2682,7 +3045,7 @@ fn commit_version_from_read(read_version: ReadVersion) -> Result<CommitVersion, 
 
 #[allow(clippy::too_many_arguments)]
 fn execute_plan(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     plan: CommandPlan,
     input_digest: [u8; SHA256_BYTES],
@@ -2691,9 +3054,26 @@ fn execute_plan(
     operation_id: OperationId,
     affected_members: u32,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
+    let command = build_restore_command(
+        context,
+        plan,
+        input_digest,
+        operation_payload,
+        affected_members,
+    );
+    execute_restore_command(store, &command, input_digest, lease_guard, operation_id)
+}
+
+fn build_restore_command(
+    context: RootWriteContext,
+    plan: CommandPlan,
+    input_digest: [u8; SHA256_BYTES],
+    operation_payload: Vec<u8>,
+    affected_members: u32,
+) -> MetadataCommand {
     let deterministic_result =
         encode_restore_outcome(input_digest, &operation_payload, affected_members);
-    let command = MetadataCommand {
+    MetadataCommand {
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
@@ -2709,14 +3089,23 @@ fn execute_plan(
         event_projection: plan.events,
         deterministic_result,
     }
-    .seal();
+    .seal()
+}
+
+fn execute_restore_command(
+    store: &MetaShard,
+    command: &MetadataCommand,
+    input_digest: [u8; SHA256_BYTES],
+    lease_guard: Option<(SnapshotId, u64)>,
+    operation_id: OperationId,
+) -> Result<RestoreCommandOutcome, RestoreError> {
     let executed = match lease_guard {
-        Some((_, deadline)) => store.execute_before_lease_deadline(&command, deadline),
-        None => store.execute(&command),
+        Some((_, deadline)) => store.execute_before_lease_deadline(command, deadline),
+        None => store.execute(command),
     };
     let result = match executed {
         Ok(result) => result,
-        Err(AgentMetadataError::LeaseDeadlineReached {
+        Err(MetaError::LeaseDeadlineReached {
             lease_clock_ms,
             requested_deadline_ms,
         }) => {
@@ -2728,13 +3117,13 @@ fn execute_plan(
                 lease_deadline_ms: requested_deadline_ms,
             });
         }
-        Err(AgentMetadataError::PredicateFailed | AgentMetadataError::WriteConflict) => {
+        Err(MetaError::PredicateFailed | MetaError::WriteConflict) => {
             return Err(RestoreError::ConcurrentMutation);
         }
-        Err(AgentMetadataError::RequestIdReused) => {
+        Err(MetaError::RequestIdReused) => {
             return Err(RestoreError::RequestInputMismatch);
         }
-        Err(source) => return Err(RestoreError::Engine(source)),
+        Err(source) => return Err(RestoreError::Meta(source)),
     };
     let (operation, decoded_affected) = decode_restore_outcome(
         &result.deterministic_result,
@@ -2750,7 +3139,7 @@ fn execute_plan(
 }
 
 fn replay_outcome(
-    store: &AgentMetadataStore,
+    store: &MetaShard,
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
     operation_id: Option<OperationId>,
@@ -3080,7 +3469,7 @@ mod tests {
     }
 
     fn write_context(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
     ) -> RootWriteContext {
@@ -3095,7 +3484,7 @@ mod tests {
         .unwrap()
     }
 
-    fn read_context(store: &AgentMetadataStore, owner_epoch: OwnerEpoch) -> RootReadContext {
+    fn read_context(store: &MetaShard, owner_epoch: OwnerEpoch) -> RootReadContext {
         RootReadContext {
             root_id: root(),
             placement_generation: placement(),
@@ -3105,7 +3494,7 @@ mod tests {
     }
 
     fn fence_command(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         request_id: RequestId,
         owner_epoch: OwnerEpoch,
         action: RootFenceAction,
@@ -3129,7 +3518,7 @@ mod tests {
         .seal()
     }
 
-    fn activate_root(store: &AgentMetadataStore, counter: &mut u128, owner_epoch: OwnerEpoch) {
+    fn activate_root(store: &MetaShard, counter: &mut u128, owner_epoch: OwnerEpoch) {
         store.advance_owner_epoch(None, owner_epoch).unwrap();
         store
             .execute(&fence_command(
@@ -3153,7 +3542,7 @@ mod tests {
     }
 
     fn put_absent(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         rows: Vec<(MetadataFamily, Vec<u8>, Vec<u8>)>,
@@ -3225,7 +3614,7 @@ mod tests {
     }
 
     fn seed_source(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         path_count: usize,
@@ -3351,7 +3740,7 @@ mod tests {
     }
 
     fn mint_source_snapshot(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         source: &SeededSource,
@@ -3372,8 +3761,56 @@ mod tests {
         snapshot_id
     }
 
+    fn replace_source_projection(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        source: &SeededSource,
+        projection: TypedProjection,
+    ) {
+        let encoded_projection = projection.encode().unwrap();
+        for path in &source.paths {
+            let context = write_context(store, counter, owner_epoch);
+            let loaded = load_path(store, context, source.source_incarnation, path)
+                .unwrap()
+                .expect("seeded source path exists");
+            let mut next = loaded.record;
+            next.typed_index_projection = encoded_projection.clone();
+            let key = path_current_key(root(), source.source_incarnation, path);
+            let command = MetadataCommand {
+                schema_id: SCHEMA_ID.to_owned(),
+                root_id: root(),
+                logical_shard_id: shard(),
+                placement_generation: placement(),
+                owner_epoch,
+                request_id: context.request_id,
+                command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                read_version: context.read_version,
+                root_fence_action: RootFenceAction::RequireActive,
+                predicates: vec![CommandPredicate::Value {
+                    family: MetadataFamily::PathCurrent,
+                    key: key.clone(),
+                    expected: Some(loaded.payload),
+                }],
+                mutations: vec![CommandMutation::Put {
+                    family: MetadataFamily::PathCurrent,
+                    key: key.clone(),
+                    value: next.encode().unwrap(),
+                }],
+                history_projection: vec![HistoryProjection {
+                    family: MetadataFamily::PathCurrent,
+                    key,
+                }],
+                event_projection: Vec::new(),
+                deterministic_result: Vec::new(),
+            }
+            .seal();
+            store.execute(&command).unwrap();
+        }
+    }
+
     fn begin_snapshot_restore(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         source: &SeededSource,
@@ -3397,7 +3834,7 @@ mod tests {
     }
 
     fn publish_restore_manifest_for_test(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         operation_id: OperationId,
@@ -3443,7 +3880,7 @@ mod tests {
     }
 
     fn copy_all(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         operation_id: OperationId,
@@ -3465,7 +3902,7 @@ mod tests {
     }
 
     fn drive_to_ready(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         operation_id: OperationId,
@@ -3503,7 +3940,7 @@ mod tests {
     fn restore_cannot_reuse_an_existing_workspace_incarnation() {
         let mut counter = 0_u128;
         let owner_epoch = owner(1);
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         activate_root(&store, &mut counter, owner_epoch);
         let source = seed_source(&store, &mut counter, owner_epoch, 0);
         let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
@@ -3540,7 +3977,7 @@ mod tests {
         let path = directory.path().join("restore-meta");
         let mut counter = 0_u128;
         let initial_owner = owner(1);
-        let store = AgentMetadataStore::create_file(&path, shard()).unwrap();
+        let store = crate::workspace::test_support::initialize_file(&path, shard()).unwrap();
         activate_root(&store, &mut counter, initial_owner);
         let source = seed_source(&store, &mut counter, initial_owner, 300);
         let snapshot_id = mint_source_snapshot(&store, &mut counter, initial_owner, &source);
@@ -3619,7 +4056,7 @@ mod tests {
         .is_none());
         drop(store);
 
-        let store = AgentMetadataStore::reopen_file(&path, shard()).unwrap();
+        let store = crate::workspace::test_support::open_file(&path, shard()).unwrap();
         assert_eq!(
             store
                 .read_at(
@@ -3739,7 +4176,7 @@ mod tests {
     #[test]
     fn owner_change_fences_old_worker_and_new_owner_resumes() {
         let mut counter = 1000_u128;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         let first_owner = owner(1);
         activate_root(&store, &mut counter, first_owner);
         let source = seed_source(&store, &mut counter, first_owner, 3);
@@ -3775,9 +4212,7 @@ mod tests {
                     limit: 2,
                 }
             ),
-            Err(RestoreError::Engine(
-                AgentMetadataError::OwnerEpochMismatch { .. }
-            ))
+            Err(RestoreError::Meta(MetaError::OwnerEpochMismatch { .. }))
         ));
         copy_all(
             &store,
@@ -3796,9 +4231,243 @@ mod tests {
     }
 
     #[test]
+    fn large_snapshot_member_copies_replays_and_releases_retention_after_abort() {
+        let mut counter = 1900_u128;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        let current_owner = owner(1);
+        activate_root(&store, &mut counter, current_owner);
+        let source = seed_source(&store, &mut counter, current_owner, 1);
+        let projection = TypedProjection::new(
+            (0..super::super::query_records::MAX_TYPED_PROJECTION_FIELDS)
+                .map(|index| {
+                    (
+                        QueryFieldId::new(format!("capacity.field_{index:02}")).unwrap(),
+                        QueryScalar::String("x".repeat(998)),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        // Keep the fixture at the largest valid stored projection shape.
+        assert_eq!(projection.encode().unwrap().len(), 61_323);
+        replace_source_projection(&store, &mut counter, current_owner, &source, projection);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, current_owner, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            current_owner,
+            &source,
+            snapshot_id,
+            "capacity-abort",
+            incarnation(31),
+        );
+        let operation_id = begun.operation.operation_id;
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+
+        let copy_context = write_context(&store, &mut counter, current_owner);
+        let request = CopyRestoreBatchRequest {
+            operation_id,
+            limit: MAX_RESTORE_BATCH_MEMBERS,
+        };
+        let copied = copy_restore_batch(&store, copy_context, request).unwrap();
+        assert_eq!(copied.command.operation.phase, RestorePhase::Copying);
+        assert_eq!(copied.copied_members, 1);
+        let replay = copy_restore_batch(&store, copy_context, request).unwrap();
+        assert!(replay.command.replayed);
+        assert_eq!(replay.command.operation, copied.command.operation);
+
+        abort_restore(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            &AbortRestoreRequest {
+                operation_id,
+                terminal_error: RestoreTerminalError {
+                    kind: RestoreTerminalErrorKind::AbortedByCaller,
+                    message: "cancelled after large-member copy".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+        )
+        .unwrap();
+
+        start_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        loop {
+            let outcome = cleanup_restore_batch(
+                &store,
+                write_context(&store, &mut counter, current_owner),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap();
+            if outcome.source_eof {
+                break;
+            }
+        }
+        let cleaned = finish_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert_eq!(cleaned.operation.phase, RestorePhase::Cleaned);
+        let snapshot = read_record(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            MetadataFamily::SnapshotRef,
+            &snapshot_ref_key(root(), source.source_incarnation, snapshot_id),
+            SnapshotRefRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.record.consumer_count, 0);
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            MetadataFamily::HistoryHold,
+            &restore_history_hold_key(root(), operation_id),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn cleanup_restore_batch_shrinks_to_the_fully_derived_byte_budget() {
+        let terminal = maximum_cleanup_terminal_error();
+        assert_eq!(terminal.message.len(), MAX_RESTORE_TERMINAL_ERROR_BYTES);
+        assert!(terminal.evidence_digest.is_some());
+        let mut counter = 1950_u128;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        let current_owner = owner(1);
+        activate_root(&store, &mut counter, current_owner);
+        let source = seed_source(&store, &mut counter, current_owner, 2);
+        let projection = TypedProjection::new(
+            (0..super::super::query_records::MAX_TYPED_PROJECTION_FIELDS)
+                .map(|index| {
+                    (
+                        QueryFieldId::new(format!("cleanup.field_{index:02}")).unwrap(),
+                        QueryScalar::String("y".repeat(700)),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        // Freeze the payload size so this remains a byte-budget fixture.
+        assert_eq!(projection.encode().unwrap().len(), 43_383);
+        replace_source_projection(&store, &mut counter, current_owner, &source, projection);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, current_owner, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            current_owner,
+            &source,
+            snapshot_id,
+            "cleanup-budget",
+            incarnation(35),
+        );
+        let operation_id = begun.operation.operation_id;
+        let mut outcome = start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        while !outcome.operation.source_eof {
+            outcome = copy_restore_batch(
+                &store,
+                write_context(&store, &mut counter, current_owner),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap()
+            .command;
+        }
+        let maximum_cleanup = maximum_cleanup_operation(&outcome.operation).unwrap();
+        assert_eq!(maximum_cleanup.phase, RestorePhase::Cleaning);
+        assert_eq!(
+            maximum_cleanup
+                .source_cursor
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .len(),
+            NormalizedRelativePath::MAX_BYTES
+        );
+        assert!(maximum_cleanup.member_seal.is_some());
+        assert!(maximum_cleanup.initialization_digest.is_some());
+        let maximum_error = maximum_cleanup.terminal_error.as_ref().unwrap();
+        assert_eq!(
+            maximum_error.message.len(),
+            MAX_RESTORE_TERMINAL_ERROR_BYTES
+        );
+        assert!(maximum_error.evidence_digest.is_some());
+        abort_restore(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            &AbortRestoreRequest {
+                operation_id,
+                terminal_error: RestoreTerminalError {
+                    kind: RestoreTerminalErrorKind::AbortedByCaller,
+                    message: "cancelled".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+        )
+        .unwrap();
+        start_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        let first = cleanup_restore_batch(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            CopyRestoreBatchRequest {
+                operation_id,
+                limit: MAX_RESTORE_BATCH_MEMBERS,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.copied_members, 1);
+        let mut cleanup = first;
+        while !cleanup.source_eof {
+            cleanup = cleanup_restore_batch(
+                &store,
+                write_context(&store, &mut counter, current_owner),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap();
+        }
+        let cleaned = finish_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert_eq!(cleaned.operation.phase, RestorePhase::Cleaned);
+    }
+
+    #[test]
     fn abort_wins_ready_race_and_cleanup_releases_every_reference() {
         let mut counter = 2000_u128;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         let current_owner = owner(1);
         activate_root(&store, &mut counter, current_owner);
         let source = seed_source(&store, &mut counter, current_owner, 5);
@@ -3945,7 +4614,7 @@ mod tests {
     #[test]
     fn commit_source_consumer_is_exact_and_released_on_publication() {
         let mut counter = 3000_u128;
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         let current_owner = owner(1);
         activate_root(&store, &mut counter, current_owner);
         let source = seed_source(&store, &mut counter, current_owner, 3);
@@ -4088,7 +4757,7 @@ mod tests {
     }
 
     fn publication_context(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
     ) -> PublicationContext {
@@ -4184,7 +4853,7 @@ mod tests {
     /// Drives the five publication wire calls the server executes for one
     /// artifact: Begin, StageObjects, MarkUploaded, StageManifest, Complete.
     fn drive_publish_wire_calls(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         operation: PublishOperationRecord,
@@ -4256,7 +4925,7 @@ mod tests {
     /// the Visible authority, exactly as workbench_put_file does.
     #[allow(clippy::too_many_arguments)]
     fn publish_text_file(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         target_workbench: &WorkbenchId,
@@ -4302,7 +4971,7 @@ mod tests {
     /// run-manifest publication, then build/seal/attach/sealing/finalize.
     #[allow(clippy::too_many_arguments)]
     fn drive_commit_wire_calls(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         source_workbench: &WorkbenchId,
@@ -4420,7 +5089,7 @@ mod tests {
     /// RestoreStaging restore-manifest publication, initialization, complete.
     #[allow(clippy::too_many_arguments)]
     fn drive_snapshot_restore_to_visible(
-        store: &AgentMetadataStore,
+        store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         source_workbench: &WorkbenchId,
@@ -4554,7 +5223,7 @@ mod tests {
     fn snapshot_restore_after_real_commit_completes_and_copies_source_paths() {
         let mut counter = 0_u128;
         let owner_epoch = owner(1);
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         activate_root(&store, &mut counter, owner_epoch);
 
         // workbench_create
@@ -4692,7 +5361,7 @@ mod tests {
     fn snapshot_restore_skips_run_manifest_across_page_boundaries() {
         let mut counter = 0_u128;
         let owner_epoch = owner(1);
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         activate_root(&store, &mut counter, owner_epoch);
 
         let source_workbench = workbench("paged");
@@ -4800,7 +5469,7 @@ mod tests {
     fn snapshot_restore_chains_from_a_restored_workbench() {
         let mut counter = 0_u128;
         let owner_epoch = owner(1);
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         activate_root(&store, &mut counter, owner_epoch);
 
         let first = workbench("chain-a");
@@ -4943,7 +5612,7 @@ mod tests {
     fn corrupt_source_projection_reports_member_path_and_family() {
         let mut counter = 0_u128;
         let owner_epoch = owner(1);
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         activate_root(&store, &mut counter, owner_epoch);
 
         let source_workbench = workbench("corrupt");
@@ -5050,7 +5719,7 @@ mod tests {
     fn commit_source_restore_rejects_virtual_run_manifest_member() {
         let mut counter = 0_u128;
         let owner_epoch = owner(1);
-        let store = AgentMetadataStore::open_memory(shard()).unwrap();
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
         activate_root(&store, &mut counter, owner_epoch);
 
         let source_workbench = workbench("commit-source");

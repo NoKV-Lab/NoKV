@@ -27,8 +27,17 @@ boundaries, or Workbench behavior.
 - Does import direction match the code contract?
 - Does `nokv-types` remain storage-neutral?
 - Does `nokv-protocol` contain DTOs rather than storage or execution logic?
-- Does `nokv-meta` own schema, command execution, Holt binding, history,
-  indexes, holds, lifecycle, GC policy, and recovery semantics?
+- Does `nokv-meta-store` expose only ordered byte-key transaction primitives,
+  limits, profiles, and physical store errors?
+- Does `nokv-meta-holt` implement only the local transaction-store adapter and
+  avoid workspace records, codecs, server composition, and shared authority?
+- Are reads linearizable, scan completion explicit, and `Applied` writes
+  visible to later reads on the same store instance?
+- Do unknown commit states prevent raw transaction retries and poison an
+  uncertain local store before it can serve another request?
+- Does `nokv-meta` own schema, command execution, history, indexes, holds,
+  lifecycle, GC policy, and recovery semantics without importing a physical
+  store implementation?
 - Does `nokv-control` own placement/leases/epochs without learning path or
   artifact semantics?
 - Does `nokv-object` avoid namespace, reachability, and metadata transaction
@@ -105,15 +114,17 @@ boundaries, or Workbench behavior.
 - Is root placement persisted before the first write?
 - Does routing avoid filename hashing and modulo-N recomputation?
 - Are unsupported cross-shard operations rejected before partial work?
-- Is owner epoch validated at the Holt commit boundary?
+- Is owner epoch validated in the same physical transaction as the metadata
+  commit?
 - Are acknowledgement durability, checkpoint, logical-log replay, and recovery
   behavior stated and tested for the claimed mode?
 - Do permanent object keys exclude physical owner addresses and epochs?
 
 ## Performance
 
-- Is cold exact get exactly one workspace-marker point read plus one
-  authoritative path point read, with only the marker safely cacheable?
+- Does cold exact get perform exactly one logical workspace-marker read plus
+  one logical authoritative path read, while accounting separately for the
+  physical owner, root-fence, and commit-clock guards?
 - Does non-recursive list seek only the targeted prefix through bounded
   delimiter-aware cursor scans, defer any exact-prefix point read until
   descendant EOF, and avoid per-entry fanout?

@@ -18,62 +18,6 @@ pub const PATH_EXACT_TERMINATOR: u8 = 0x01;
 const SNAPSHOT_ID_CLAIM_DISCRIMINATOR: u8 = 0xff;
 const ARTIFACT_REVISION_CLAIM_DISCRIMINATOR: u8 = 0xff;
 
-pub const SYSTEM_TREE: &str = "system";
-pub const ROOT_FENCE_TREE: &str = "root_fence";
-pub const WORKSPACE_CURRENT_TREE: &str = "workspace_current";
-pub const WORKSPACE_INCARNATION_CLAIM_TREE: &str = "workspace_incarnation_claim";
-pub const PATH_CURRENT_TREE: &str = "path_current";
-pub const ARTIFACT_REVISION_TREE: &str = "artifact_revision";
-pub const ARTIFACT_MANIFEST_TREE: &str = "artifact_manifest";
-pub const REVISION_REF_TREE: &str = "revision_ref";
-pub const COMMIT_TREE: &str = "commit";
-pub const COMMIT_MEMBER_TREE: &str = "commit_member";
-pub const WORKBENCH_COMMIT_HEAD_TREE: &str = "workbench_commit_head";
-pub const TAG_TREE: &str = "tag";
-pub const SNAPSHOT_REF_TREE: &str = "snapshot_ref";
-pub const SNAPSHOT_ALIAS_TREE: &str = "snapshot_alias";
-pub const HISTORY_HOLD_TREE: &str = "history_hold";
-pub const COMMIT_CONSUMER_TREE: &str = "commit_consumer";
-pub const SECONDARY_INDEX_TREE: &str = "secondary_index";
-pub const CHANGE_EVENT_TREE: &str = "change_event";
-pub const OPERATION_TREE: &str = "operation";
-pub const RESTORE_MEMBER_TREE: &str = "restore_member";
-pub const STAGED_OBJECT_TREE: &str = "staged_object";
-pub const COMMAND_DEDUPE_TREE: &str = "command_dedupe";
-pub const GC_CANDIDATE_TREE: &str = "gc_candidate";
-pub const GC_BARRIER_TREE: &str = "gc_barrier";
-pub const HISTORY_TREE: &str = "history";
-pub const RECOVERY_OUTBOX_TREE: &str = "recovery_outbox";
-
-pub(crate) const SCHEMA_TREES: &[&str] = &[
-    SYSTEM_TREE,
-    ROOT_FENCE_TREE,
-    WORKSPACE_CURRENT_TREE,
-    WORKSPACE_INCARNATION_CLAIM_TREE,
-    PATH_CURRENT_TREE,
-    ARTIFACT_REVISION_TREE,
-    ARTIFACT_MANIFEST_TREE,
-    REVISION_REF_TREE,
-    COMMIT_TREE,
-    COMMIT_MEMBER_TREE,
-    WORKBENCH_COMMIT_HEAD_TREE,
-    TAG_TREE,
-    SNAPSHOT_REF_TREE,
-    SNAPSHOT_ALIAS_TREE,
-    HISTORY_HOLD_TREE,
-    COMMIT_CONSUMER_TREE,
-    SECONDARY_INDEX_TREE,
-    CHANGE_EVENT_TREE,
-    OPERATION_TREE,
-    RESTORE_MEMBER_TREE,
-    STAGED_OBJECT_TREE,
-    COMMAND_DEDUPE_TREE,
-    GC_CANDIDATE_TREE,
-    GC_BARRIER_TREE,
-    HISTORY_TREE,
-    RECOVERY_OUTBOX_TREE,
-];
-
 const FIXED_ID_BYTES: usize = 16;
 pub(crate) const SYSTEM_SCHEMA_KEY: &[u8] = b"schema";
 const SYSTEM_FORMAT_VERSION: u32 = 8;

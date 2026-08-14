@@ -1,0 +1,23 @@
+[package]
+name = "nokv-meta-holt"
+version = "0.1.0"
+description = "Embedded Holt transaction store adapter for NoKV metadata."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+read-stats = []
+test-support = []
+
+[dependencies]
+holt.workspace = true
+nokv-meta-store.workspace = true
+
+[dev-dependencies]
+nokv-meta-store = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

@@ -26,12 +26,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NOKV_BUILD_HOLT_SOURCE");
     println!("cargo:rerun-if-env-changed=NOKV_BUILD_HOLT_CHECKSUM");
 
-    let manifest_directory = env::var("CARGO_MANIFEST_DIR").expect("Cargo sets manifest dir");
-    let repository = Path::new(&manifest_directory).join("../..");
-    let lock_path = repository.join("Cargo.lock");
+    let manifest_directory =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("Cargo sets manifest dir"));
+    let repository = manifest_directory.join("../..");
+    let lock_path = build_lock_path(&manifest_directory);
     println!("cargo:rerun-if-changed={}", lock_path.display());
 
-    let lock = fs::read(&lock_path).expect("NoKV builds require the workspace Cargo.lock");
+    let lock = fs::read(&lock_path).expect("NoKV builds require a source Cargo.lock");
     let lock_sha256 = encode_hex(&Sha256::digest(&lock));
     require_matching_override("NOKV_BUILD_CARGO_LOCK_SHA256", &lock_sha256);
 
@@ -49,16 +50,20 @@ fn main() {
     require_matching_override("NOKV_BUILD_HOLT_SOURCE", &holt.source);
     require_matching_override("NOKV_BUILD_HOLT_CHECKSUM", &holt.checksum);
 
-    let repository_commit = git_commit(&repository);
+    let source_commit = if is_workspace_source(&manifest_directory) {
+        git_commit(&repository)
+    } else {
+        cargo_vcs_commit(&manifest_directory)
+    };
     let release_commit = env::var("NOKV_BUILD_GIT_COMMIT").ok();
-    if let (Some(expected), Some(actual)) = (&release_commit, &repository_commit) {
+    if let (Some(expected), Some(actual)) = (&release_commit, &source_commit) {
         assert_eq!(
             expected, actual,
             "NOKV_BUILD_GIT_COMMIT does not match the checked-out commit"
         );
     }
     let commit = release_commit
-        .or(repository_commit)
+        .or(source_commit)
         .unwrap_or_else(|| "unknown".to_owned());
     assert!(
         commit == "unknown" || is_lower_hex(&commit, 40),
@@ -70,6 +75,24 @@ fn main() {
     emit("NOKV_HOLT_VERSION", &holt.version);
     emit("NOKV_HOLT_SOURCE", &holt.source);
     emit("NOKV_HOLT_CHECKSUM", &holt.checksum);
+}
+
+fn build_lock_path(manifest_directory: &Path) -> PathBuf {
+    // `cargo package` verifies `nokv` as a standalone source tree with its own
+    // generated lockfile; complete workspace sources retain the root lockfile.
+    let workspace_lock = manifest_directory.join("../..").join("Cargo.lock");
+    if is_workspace_source(manifest_directory) {
+        return workspace_lock;
+    }
+    manifest_directory.join("Cargo.lock")
+}
+
+fn is_workspace_source(manifest_directory: &Path) -> bool {
+    manifest_directory.ends_with(Path::new("crates/nokv"))
+        && manifest_directory
+            .join("../..")
+            .join("Cargo.lock")
+            .is_file()
 }
 
 fn locked_package(lock: &str, package_name: &str) -> LockedPackage {
@@ -131,6 +154,21 @@ fn git_commit(repository: &Path) -> Option<String> {
     let commit = String::from_utf8(output.stdout).ok()?;
     let commit = commit.trim().to_owned();
     is_lower_hex(&commit, 40).then_some(commit)
+}
+
+fn cargo_vcs_commit(manifest_directory: &Path) -> Option<String> {
+    let path = manifest_directory.join(".cargo_vcs_info.json");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let value = fs::read_to_string(path).ok()?;
+    vcs_commit(&value)
+}
+
+fn vcs_commit(value: &str) -> Option<String> {
+    let (_, suffix) = value.split_once("\"sha1\"")?;
+    let (_, suffix) = suffix.split_once(':')?;
+    let suffix = suffix.trim_start().strip_prefix('"')?;
+    let (commit, _) = suffix.split_once('"')?;
+    is_lower_hex(commit, 40).then(|| commit.to_owned())
 }
 
 fn git_identity_paths(repository: &Path) -> Vec<PathBuf> {
@@ -214,5 +252,20 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 checksum: "a".repeat(64),
             }
         );
+    }
+
+    #[test]
+    fn extracts_packaged_vcs_commit() {
+        let value = r#"{
+  "git": {
+    "sha1": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "path_in_vcs": "crates/nokv"
+}"#;
+        assert_eq!(
+            vcs_commit(value),
+            Some("0123456789abcdef0123456789abcdef01234567".to_owned())
+        );
+        assert_eq!(vcs_commit(r#"{"git":{"sha1":"unknown"}}"#), None);
     }
 }

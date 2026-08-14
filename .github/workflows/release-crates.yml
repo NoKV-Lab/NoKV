@@ -47,6 +47,8 @@ jobs:
             nokv-types
             nokv-protocol
             nokv-object
+            nokv-meta-store
+            nokv-meta-holt
             nokv-meta
             nokv-agent
             nokv-control

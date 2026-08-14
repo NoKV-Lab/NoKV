@@ -21,7 +21,8 @@ flowchart LR
     Router --> Owner["Fenced logical-shard owner"]
 
     Owner --> Meta["NoKV metadata semantics"]
-    Meta --> Holt["Holt named trees<br/>point + delimiter + atomic batch"]
+    Meta --> Store["TxnStore<br/>ordered reads + checked writes"]
+    Store --> Holt["HoltStore<br/>serving local adapter"]
 
     SDK --> Data["Direct immutable-object data path"]
     Data --> Cache["Local NVMe soft cache"]
@@ -49,10 +50,14 @@ flowchart TD
 
     Server["nokv-server"] --> Protocol
     Server --> Meta["nokv-meta"]
+    Server --> Store["nokv-meta-store"]
+    Server --> HoltAdapter["nokv-meta-holt"]
     Server --> Control["nokv-control"]
     Server --> Object
     Meta --> Types
-    Meta --> Holt["Holt"]
+    Meta --> Store
+    HoltAdapter --> Store
+    HoltAdapter --> Holt["Holt"]
     Control --> Types
     Object --> Types
 ```
@@ -63,7 +68,8 @@ Arrows point from a consumer to its dependency. The
 Key constraints:
 
 - types and protocol are storage-neutral;
-- metadata owns durable semantics and Holt layout;
+- metadata owns durable semantics, logical keyspaces, and record codecs;
+- the Holt adapter owns the physical tree mapping and local durability;
 - control owns root placement and owner fencing, not path semantics;
 - object owns provider I/O, not reachability;
 - client uses protocol/routing and never imports meta/server;
@@ -113,13 +119,13 @@ sequenceDiagram
     participant C as SDK
     participant R as Router
     participant M as Shard owner
-    participant H as Holt
+    participant S as TxnStore (Holt local profile)
     participant O as Object backend/cache
 
     C->>R: stat/open(root, workbench, path)
     R->>M: versioned request + placement generation
-    M->>H: read visible WorkspaceCurrent
-    M->>H: point-get PathCurrent
+    M->>S: read visible WorkspaceCurrent
+    M->>S: point-get PathCurrent
     M-->>C: generation + immutable read plan
     C->>O: ranged block reads
     O-->>C: verified bytes
@@ -127,16 +133,22 @@ sequenceDiagram
 
 A valid cached Workbench marker can avoid its routing/lookup work, but the
 client still uses generation/version validation. The authoritative artifact
-lookup is one Holt point read and does not follow the revision-lifetime row.
-For a live exact get, the owner, root fence, and current version are validated
-once around the dependent marker and path reads. A direct-child list replaces
-the path lookup with one ordered prefix-scan path whose common-prefix rollups
-are first-class implicit-prefix page items; a recursive list uses the same
-prefix without delimiter rollup. One protocol page may use multiple bounded
-Holt cursor scans of at most 255 logical items each when its requested limit is
-larger. The metadata listing may merge an exact-prefix point read only after
-descendant EOF, while the Workbench adapter exposes only direct children and
-drops that self row.
+lookup is one exact schema key and does not follow the revision-lifetime row.
+The current portable read path first captures owner, root-fence, and commit
+clock state. Each dependent marker or path point read then batches those three
+guards with its data key in one `TxnStore::read` call. This costs eleven point
+reads for an uncached live exact get, but it does not rely on a backend-specific
+snapshot session. A later declarative batch API can remove the repeated guards
+without weakening owner fencing.
+
+A direct-child list replaces the path lookup with one ordered prefix-scan path.
+Its common-prefix rollups become implicit-prefix page items. A recursive list
+uses the same prefix without delimiter rollup. Each physical
+page batches its owner, root-fence, and commit-clock guards with a bounded store
+scan. One protocol page may use multiple scans of at most 255 logical items
+each when its requested limit is larger. The metadata listing may merge an
+exact-prefix point read only after descendant EOF, while the Workbench adapter
+exposes only direct children and drops that self row.
 There is no per-entry metadata fanout. The returned cursor is bound to the
 workbench scope, read view, read version, and child anchor. Resuming after
 live-state drift fails closed;
@@ -155,15 +167,15 @@ sequenceDiagram
     participant C as SDK
     participant M as Shard owner
     participant O as Object backend
-    participant H as Holt
+    participant S as TxnStore (Holt local profile)
 
     C->>M: begin publish + request id
     M-->>C: operation/revision/object plan
     C->>O: stream immutable blocks
     C->>M: complete(lengths, digests)
     M->>O: verify completion evidence
-    M->>H: one fenced MetadataCommand
-    H-->>M: deterministic commit result
+    M->>S: one fenced MetadataCommand transaction
+    S-->>M: deterministic commit result
     M-->>C: generation + revision + digest
 ```
 
@@ -221,7 +233,7 @@ restore/commit-versus-delete race.
 
 ## Snapshot And Commit Reads
 
-Holt's MVCC/view substrate supports two different products:
+NoKV's logical history and hold records support two different products:
 
 - a leased snapshot creates a `HistoryHold(read_version)`;
 - a durable commit scans under a temporary `HistoryHold`, writes an ordered
@@ -230,6 +242,11 @@ Holt's MVCC/view substrate supports two different products:
 
 The snapshot reaper and renew operation race through one durable lifecycle CAS.
 Once `ReapClaimed` wins, the history hold is gone and renewal fails.
+
+`TxnStore` supplies a consistent snapshot for each read batch. `MetaShard`
+reconstructs historical state across bounded batches and restarts if the
+domain commit clock changes. NoKV does not expose a retained Holt view as a
+snapshot or commit contract.
 
 Commits do not pin global history. Tags are CAS-protected names for commits.
 Commit retirement is explicit and checks all heads, tags, leases, lineage
@@ -267,9 +284,9 @@ RootId -> immutable LogicalShardId
 LogicalShardId -> current physical owner, lease, epoch
 ```
 
-The owner installs/validates `RootFence` locally and checks its lease/epoch at
-the Holt commit boundary. Placement is never inferred from a path or modulo
-the number of owners.
+The owner installs or validates `RootFence` in its metadata shard and checks
+the lease epoch in the same physical transaction as each metadata commit.
+Placement is never inferred from a path or modulo the number of owners.
 
 A hot root's logical shard may be assigned to a dedicated physical process.
 That is owner movement, not a change to logical shard or object keys.
@@ -301,8 +318,9 @@ implemented and verified, bootstrap rejects any non-zero or referenced Control
 recovery frontier before acquiring an owner or installing a route; it cannot
 mark such a shard `Serving` from an arbitrary local directory. Even while the
 frontier is empty, the local-WAL profile permits only first-owner `Create` and
-exact current-lease `Resume` with `Reopen`; it refuses every successor
-acquisition rather than risk serving a replacement empty Holt store.
+an epoch-zero `Reopen` retry, or exact current-lease `Resume` with `Reopen`. It
+refuses every successor acquisition rather than risk serving a replacement
+empty Holt store.
 
 Durable ledgers, not object listing, recover:
 
