@@ -52,9 +52,13 @@ starts `nokv serve` with explicit metadata create/reopen intent, starts
 `nokv ... --workbench-root /agents/{agent}/wb mcp`, exercises all 18 tools, and
 retains exact requests/responses plus materialize/collect evidence. Run
 `--dry-run` first to inspect the redacted command and normalized-input plan.
-In the current local-WAL profile, `reopen` is a negative qualification run:
-standalone successor admission fails closed until verified checkpoint/log
-recovery and fsck exist. A successful `create` run is not failover evidence.
+In the local-WAL profile, `reopen` qualifies only a restart of the same
+exclusive Holt namespace. Admission validates Holt WAL recovery, the exact
+workspace schema and shard identity, the complete recovery-outbox chain, and
+the local/control owner-epoch relation before consuming a new epoch. An
+unfinished `Recovering` epoch is rebound rather than skipped. This remains
+restart evidence, not copied-directory, cross-host, shared-log, or rolling
+upgrade failover evidence.
 The selected `--workbench-root` is durable presentation configuration because
 canonical v1 manifests contain its projected paths. Keep it identical across
 restart/replay; it never replaces `RootId` as the storage or routing identity.

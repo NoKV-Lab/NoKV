@@ -54,7 +54,9 @@ pub enum AckBoundary {
 /// that reached [`Commit::Applied`] under the same authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authority {
-    /// One process-local durable namespace. A successor must not attach.
+    /// One exclusive, persistent local namespace. A restarted owner may
+    /// reattach only by reopening that same namespace and completing its
+    /// WAL/schema/recovery-chain and owner-epoch admission checks.
     Local,
     /// One shared transactional namespace available to a successor.
     Shared,

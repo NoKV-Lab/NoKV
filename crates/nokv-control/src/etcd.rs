@@ -9,8 +9,8 @@ use crate::codec::{
 };
 use crate::store::{
     prepare_mark_serving, prepare_owner_acquisition, prepare_owner_release,
-    validate_new_root_placement, validate_record_lease, validate_root_placement_update,
-    ControlStore,
+    prepare_recovery_reacquisition, prepare_recovery_suspension, validate_new_root_placement,
+    validate_record_lease, validate_root_placement_update, ControlStore,
 };
 use crate::{
     ControlError, EtcdControlStoreOptions, LogicalShardId, LogicalShardLease, LogicalShardRecord,
@@ -333,6 +333,55 @@ impl ControlStore for EtcdControlStore {
         })
     }
 
+    fn reacquire_recovery(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        recovery_epoch: OwnerEpoch,
+        owner: NodeId,
+        endpoint: String,
+    ) -> Result<LogicalShardLease, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let logical_shard_id = *logical_shard_id;
+        self.block_on(async move {
+            let placement = find_write_placement(&mut client, &options, &logical_shard_id).await?;
+            let current = fetch_logical_shard(&mut client, &options, &logical_shard_id)
+                .await?
+                .ok_or(ControlError::LogicalShardNotFound(logical_shard_id))?;
+            if current.record.owner_epoch != Some(recovery_epoch) {
+                return Err(ControlError::StaleOwnerEpoch {
+                    logical_shard_id,
+                    expected: Some(recovery_epoch),
+                    actual: current.record.owner_epoch,
+                });
+            }
+            let lease_id = grant_lease(&mut client, options.lease_ttl_seconds()).await?;
+            let (next, lease) = match prepare_recovery_reacquisition(
+                &current.record,
+                recovery_epoch,
+                owner,
+                endpoint,
+                lease_id,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    revoke_lease_best_effort(&mut client, lease_id).await;
+                    return Err(error);
+                }
+            };
+            install_owner(
+                &mut client,
+                &options,
+                &current,
+                &placement,
+                &next,
+                &lease,
+                Some(recovery_epoch),
+            )
+            .await
+        })
+    }
+
     fn renew_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError> {
         let mut client = self.client.clone();
         let options = self.options.clone();
@@ -399,6 +448,46 @@ impl ControlStore for EtcdControlStore {
                     classify_mark_serving_failure(&mut client, &options, &lease, &next).await
                 }
             }
+        })
+    }
+
+    fn suspend_recovery(
+        &self,
+        lease: &LogicalShardLease,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let lease = lease.clone();
+        self.block_on(async move {
+            let current = fetch_logical_shard(&mut client, &options, &lease.logical_shard_id)
+                .await?
+                .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+            let session = validate_owner_session(&mut client, &options, &lease).await?;
+            let retained = prepare_recovery_suspension(&current.record, &lease)?;
+            let record_key = options.logical_shard_record_key(&lease.logical_shard_id);
+            let session_key = options.logical_shard_session_key(&lease.logical_shard_id);
+            let txn = Txn::new()
+                .when(vec![
+                    Compare::value(record_key, CompareOp::Equal, current.encoded),
+                    Compare::value(session_key.clone(), CompareOp::Equal, session.encoded),
+                    Compare::lease(
+                        session_key.clone(),
+                        CompareOp::Equal,
+                        lease_id_i64(lease.lease_id)?,
+                    ),
+                ])
+                .and_then(vec![TxnOp::delete(session_key, None)]);
+            let result = match client.txn(txn).await {
+                Ok(response) if response.succeeded() => Ok(retained),
+                Ok(_) | Err(_) => {
+                    classify_suspend_recovery_failure(&mut client, &options, &lease, &retained)
+                        .await
+                }
+            };
+            if result.is_ok() {
+                revoke_lease_best_effort(&mut client, lease.lease_id).await;
+            }
+            result
         })
     }
 
@@ -800,6 +889,29 @@ async fn classify_mark_serving_failure(
     validate_owner_session(client, options, lease).await?;
     Err(ControlError::Backend(
         "owner mutation CAS failed while the exact owner session remained current".to_owned(),
+    ))
+}
+
+async fn classify_suspend_recovery_failure(
+    client: &mut Client,
+    options: &EtcdControlStoreOptions,
+    lease: &LogicalShardLease,
+    retained: &LogicalShardRecord,
+) -> Result<LogicalShardRecord, ControlError> {
+    let latest = fetch_logical_shard(client, options, &lease.logical_shard_id)
+        .await?
+        .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+    if latest.record == *retained
+        && fetch_owner_session(client, options, &lease.logical_shard_id)
+            .await?
+            .is_none()
+    {
+        return Ok(retained.clone());
+    }
+    validate_record_lease(&latest.record, lease)?;
+    validate_owner_session(client, options, lease).await?;
+    Err(ControlError::Backend(
+        "recovery suspension CAS failed while the exact owner session remained current".to_owned(),
     ))
 }
 

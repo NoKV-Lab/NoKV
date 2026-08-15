@@ -72,16 +72,19 @@ python3 scripts/workbench/live_workbench.py \
   --evidence-dir target/workbench-live/evidence/live-01
 ```
 
-`--metadata-mode reopen` is currently a negative qualification path, not a
-supported standalone restart: local-WAL bootstrap refuses successor ownership
-until checkpoint/log recovery and fsck are verified. The harness always calls
-`nokv provision`, starts `nokv serve` with exactly one of `--metadata-create`
-or `--metadata-reopen`, and starts
-`nokv ... --workbench-root /agents/{agent}/wb mcp`. The scientific step uses the
-explicit `materialize` and `collect` commands; its local sandbox is not a NoKV
-namespace. Keep the configured Workbench root stable across restarts because
-canonical v1 manifest presentation paths are replay-bound; `RootId`, not this
-display root, remains the storage/routing identity.
+`--metadata-mode reopen` restarts the same explicit local-WAL namespace after
+the prior owner session is gone. Startup exclusively opens Holt, replays and
+validates its WAL, checks the workspace schema, shard identity, recovery chain,
+and local/control owner epochs, then either acquires the next epoch or resumes
+an interrupted `Recovering` epoch. It does not qualify another directory, a
+copied/rolled-back namespace, cross-host failover, or a non-empty shared
+checkpoint/log frontier. The harness always calls `nokv provision`, starts
+`nokv serve` with exactly one of `--metadata-create` or `--metadata-reopen`,
+and starts `nokv ... --workbench-root /agents/{agent}/wb mcp`. The scientific
+step uses the explicit `materialize` and `collect` commands; its local sandbox
+is not a NoKV namespace. Keep the configured Workbench root stable across
+restarts because canonical v1 manifest presentation paths are replay-bound;
+`RootId`, not this display root, remains the storage/routing identity.
 
 The deterministic evidence directory contains `plan.json`, exact paired
 requests/responses in `mcp-transcript.jsonl`, `processes.jsonl` and process
