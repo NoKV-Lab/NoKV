@@ -79,14 +79,19 @@ pub struct RootPlacement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalShardRecord {
     pub logical_shard_id: LogicalShardId,
+    /// Last owner admitted into this durable generation. Session liveness is
+    /// proved separately by the backend's lease-attached session key.
     pub owner: Option<NodeId>,
     /// `None` means the shard has never had an owner. Once assigned, the last
     /// epoch remains present after release and every successor must increment it.
     pub owner_epoch: Option<OwnerEpoch>,
-    /// Backend lease identity. Zero means there is no current owner session.
+    /// Backend lease identity installed with this record. A non-zero value may
+    /// remain after lease expiry; only the separate session key proves that it
+    /// is still live. A clean `Serving` release resets it to zero.
     pub lease_id: u64,
     pub state: LogicalShardState,
-    /// Reachable endpoint of the current owner. `None` while unowned.
+    /// Endpoint admitted with `owner`. It may describe an expired session
+    /// retained for recovery reconciliation. `None` only when unassigned.
     pub endpoint: Option<String>,
     pub checkpoint: Option<CheckpointRef>,
     pub log: Option<LogRef>,

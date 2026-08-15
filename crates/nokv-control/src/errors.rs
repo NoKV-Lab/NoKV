@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::{LogicalShardId, LogicalShardLease, NodeId, OwnerEpoch, RootId, RootPlacement};
+use crate::{
+    LogicalShardId, LogicalShardLease, LogicalShardState, NodeId, OwnerEpoch, RootId, RootPlacement,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlError {
@@ -31,6 +33,14 @@ pub enum ControlError {
     PreviousOwnerSessionLive {
         logical_shard_id: LogicalShardId,
         owner_epoch: OwnerEpoch,
+    },
+    RecoveryAttemptPending {
+        logical_shard_id: LogicalShardId,
+        owner_epoch: OwnerEpoch,
+    },
+    RecoveryStateConflict {
+        logical_shard_id: LogicalShardId,
+        actual: LogicalShardState,
     },
     StaleOwnerEpoch {
         logical_shard_id: LogicalShardId,
@@ -104,6 +114,20 @@ impl fmt::Display for ControlError {
             } => write!(
                 formatter,
                 "logical shard {logical_shard_id:?} still has a live owner session at epoch {owner_epoch}"
+            ),
+            Self::RecoveryAttemptPending {
+                logical_shard_id,
+                owner_epoch,
+            } => write!(
+                formatter,
+                "logical shard {logical_shard_id:?} has an unfinished recovery attempt at epoch {owner_epoch}; reacquire that recovery epoch instead of advancing it"
+            ),
+            Self::RecoveryStateConflict {
+                logical_shard_id,
+                actual,
+            } => write!(
+                formatter,
+                "logical shard {logical_shard_id:?} is {actual:?}, not Recovering"
             ),
             Self::StaleOwnerEpoch {
                 logical_shard_id,

@@ -175,6 +175,11 @@ Required evidence:
 
 ## Gate 6: Routing, Ownership, And Durability
 
+The real-etcd local-WAL epoch runner is
+[`scripts/workbench/local_wal_recovery_gate.py`](../../scripts/workbench/local_wal_recovery_gate.py).
+Its bench-owned fault process acquires the real control lease and holds the
+same Holt authority; the production CLI contains no fault-only admission path.
+
 Required evidence:
 
 - root placement is persisted before the first write;
@@ -189,6 +194,12 @@ Required evidence:
 - checkpoint plus logical-log replay recovers the exact committed command
   sequence and deterministic results;
 - failover tests inject loss before and after each durability boundary.
+- local-WAL restart kills `Recovering(E+1)` both before and after the local
+  owner fence advances, waits for the lease-attached etcd session to disappear,
+  and proves retry reaches `Serving(E+1)` without allocating `E+2`;
+- the epoch kill/retry record names the exact NoKV commit and dirty state,
+  binary digests, etcd version, control records, local crash epoch, commands,
+  process exits, and terminal metadata probe.
 
 ## Gate 7: SDK, CLI, MCP, And Package Boundaries
 

@@ -316,11 +316,19 @@ outbox. Remote outbox consumption/ACK, shared-log replication, checkpoint
 installation/replay, and fsck remain qualification work. Until those are
 implemented and verified, bootstrap rejects any non-zero or referenced Control
 recovery frontier before acquiring an owner or installing a route; it cannot
-mark such a shard `Serving` from an arbitrary local directory. Even while the
-frontier is empty, the local-WAL profile permits only first-owner `Create` and
-an epoch-zero `Reopen` retry, or exact current-lease `Resume` with `Reopen`. It
-refuses every successor acquisition rather than risk serving a replacement
-empty Holt store.
+mark such a shard `Serving` from an arbitrary local directory. With an empty
+shared frontier, `Reopen` can restart the same exclusive Holt namespace after
+the prior etcd session is gone. Startup first opens Holt under its lifetime
+directory lock, replays the WAL, validates schema/shard identity and the full
+recovery-outbox chain, and compares the local owner fence with the control
+record. A completed owner gets the next epoch. A crash while the control record
+is `Recovering` rebinds that same recovery epoch whether the local fence is its
+predecessor or already exact, so repeated crashes cannot create an epoch gap.
+A live session, stale local epoch, corrupt or uninitialized replacement, or
+non-empty shared recovery frontier remains fail-closed. A byte-for-byte copy
+may carry the same shard and epoch bits and cannot yet be distinguished from
+the original without a persistent provider identity; copied-directory and
+cross-host failover remain outside this qualification.
 
 Durable ledgers, not object listing, recover:
 

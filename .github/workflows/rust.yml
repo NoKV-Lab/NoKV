@@ -23,9 +23,11 @@ jobs:
           set -euo pipefail
           python3 -m py_compile \
             scripts/workbench/workbench_contract.py \
-            scripts/workbench/live_workbench.py
+            scripts/workbench/live_workbench.py \
+            scripts/workbench/local_wal_recovery_gate.py
           python3 scripts/workbench/workbench_contract_test.py
           python3 scripts/workbench/live_workbench_test.py
+          python3 scripts/workbench/local_wal_recovery_gate_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
       - name: Check Homebrew release safety
@@ -33,6 +35,10 @@ jobs:
 
   nokv-workspace:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ETCD_VERSION: v3.7.1
+      ETCD_LINUX_AMD64_SHA256: e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9
     steps:
       - uses: actions/checkout@v7
 
@@ -66,3 +72,41 @@ jobs:
           cargo test -p nokv-meta --features metadata-read-stats
           cargo test -p nokv-meta-holt --features read-stats
           cargo test -p nokv-bench --features metadata-read-stats
+
+      - name: Install pinned etcd
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
+          install_dir="$RUNNER_TEMP/etcd-$ETCD_VERSION"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
+          echo "$ETCD_LINUX_AMD64_SHA256  $archive" | sha256sum --check
+          mkdir -p "$install_dir"
+          tar -xzf "$archive" -C "$install_dir" --strip-components=1
+          echo "$install_dir" >>"$GITHUB_PATH"
+          "$install_dir/etcd" --version
+          "$install_dir/etcdctl" version
+
+      - name: Qualify interrupted local-WAL successor recovery
+        id: local_wal_recovery
+        shell: bash
+        env:
+          RECOVERY_EVIDENCE_DIR: ${{ runner.temp }}/local-wal-recovery-evidence
+        run: |
+          set -euo pipefail
+          python3 scripts/workbench/local_wal_recovery_gate.py \
+            --build \
+            --target-dir target \
+            --evidence-dir "$RECOVERY_EVIDENCE_DIR" \
+            --timeout 45
+
+      - name: Upload local-WAL recovery evidence
+        if: ${{ always() && steps.local_wal_recovery.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: local-wal-recovery-${{ github.sha }}
+          path: ${{ runner.temp }}/local-wal-recovery-evidence
+          if-no-files-found: error
+          retention-days: 7

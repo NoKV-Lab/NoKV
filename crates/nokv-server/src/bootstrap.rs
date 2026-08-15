@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nokv_control::{
-    ControlStore, LogicalShardLease, LogicalShardRecord, NodeId, OwnerEpoch, RecoveryPublication,
-    RootId, RootPlacement, RootPlacementLifecycle,
+    ControlStore, LogicalShardLease, LogicalShardRecord, LogicalShardState, NodeId, OwnerEpoch,
+    RecoveryPublication, RootId, RootPlacement, RootPlacementLifecycle,
 };
 use nokv_meta::workspace as meta;
 use nokv_meta_holt::{HoltOptions, HoltStore, TreeBinding};
@@ -156,19 +156,32 @@ pub fn bootstrap_shard(
 ) -> Result<ShardOwner, ServerError> {
     validate_boot(&boot)?;
     let placements = load_placements(control.as_ref(), boot.shard_id, &boot.roots)?;
-    reject_unrecovered_shared_frontier(control.as_ref(), boot.shard_id, &boot.recovery)?;
+    let control_record = load_control_record(control.as_ref(), boot.shard_id, &boot.recovery)?;
     validate_open_lease(&boot.open, &boot.lease)?;
 
-    // Initialize a new first-owner store, or reopen the same prepared
-    // epoch-zero store, before the control plane consumes the first epoch.
-    // Exact resumes keep the existing admission-before-open order.
-    let prepared_meta = prepare_first_owner_meta(&boot.open, &boot.lease, boot.shard_id)?;
-    let prepared_path = prepared_meta.as_ref().map(|_| match &boot.open {
-        OpenMode::New(path) | OpenMode::Existing(path) => path.clone(),
-    });
+    // Every new acquisition opens and validates the exclusive local authority
+    // before it mutates the control epoch. This prevents a bad/missing/stale
+    // local store from consuming an epoch that the store cannot install.
+    // Exact live-session resumes retain their admission-before-open order.
+    let prepared_meta =
+        prepare_acquiring_meta(&boot.open, &boot.lease, boot.shard_id, &control_record)?;
+    let prepared_first_owner_path = match &boot.lease {
+        LeaseMode::Acquire {
+            previous_epoch: None,
+            ..
+        } if prepared_meta.is_some() => Some(match &boot.open {
+            OpenMode::New(path) | OpenMode::Existing(path) => path.clone(),
+        }),
+        _ => None,
+    };
 
-    let admission = admit_owner(control.as_ref(), boot.shard_id, &boot.lease);
-    let (lease, acquired) = match (admission, prepared_path) {
+    let admission = admit_owner(
+        control.as_ref(),
+        boot.shard_id,
+        &boot.lease,
+        &control_record,
+    );
+    let (lease, acquired) = match (admission, prepared_first_owner_path) {
         (Ok(admission), _) => admission,
         (Err(ServerError::Control(source)), Some(path)) => {
             return Err(ServerError::PreparedOwnerAdmission { path, source });
@@ -325,15 +338,22 @@ fn validate_open_lease(open: &OpenMode, lease: &LeaseMode) -> Result<(), ServerE
                 ..
             },
         )
+        | (
+            OpenMode::Existing(_),
+            LeaseMode::Acquire {
+                previous_epoch: Some(_),
+                ..
+            },
+        )
         | (OpenMode::Existing(_), LeaseMode::Resume { .. }) => Ok(()),
         (
-            _,
+            OpenMode::New(_),
             LeaseMode::Acquire {
                 previous_epoch: Some(previous),
                 ..
             },
         ) => Err(ServerError::InvalidBootstrap(format!(
-            "successor acquisition after owner epoch {previous} is unavailable in the local-WAL profile; verified checkpoint/log recovery must complete before a new owner may serve"
+            "successor acquisition after owner epoch {previous} must reopen the existing local metadata authority"
         ))),
         (OpenMode::New(_), LeaseMode::Resume { .. }) => {
             Err(ServerError::InvalidBootstrap(
@@ -343,36 +363,64 @@ fn validate_open_lease(open: &OpenMode, lease: &LeaseMode) -> Result<(), ServerE
     }
 }
 
-fn prepare_first_owner_meta(
+fn prepare_acquiring_meta(
     open: &OpenMode,
     lease: &LeaseMode,
     logical_shard_id: nokv_types::LogicalShardId,
+    control_record: &LogicalShardRecord,
 ) -> Result<Option<Arc<meta::MetaShard>>, ServerError> {
-    if !matches!(
-        lease,
-        LeaseMode::Acquire {
-            previous_epoch: None,
-            ..
-        }
-    ) {
+    let LeaseMode::Acquire { previous_epoch, .. } = lease else {
         return Ok(None);
-    }
+    };
 
     let meta = open_meta(open.clone(), logical_shard_id)?;
     validate_meta_shard(&meta, logical_shard_id)?;
-    if let Some(owner_epoch) = meta.current_owner_epoch()? {
-        return Err(ServerError::InvalidBootstrap(format!(
-            "metadata shard is already fenced at owner epoch {owner_epoch}; reopen it only with Resume and the exact lease"
-        )));
+    let local_epoch = meta.current_owner_epoch()?;
+    match previous_epoch {
+        None => {
+            if let Some(owner_epoch) = local_epoch {
+                return Err(ServerError::InvalidBootstrap(format!(
+                    "metadata shard is already fenced at owner epoch {owner_epoch}; reopen it only with Resume and the exact lease or acquire from that durable epoch"
+                )));
+            }
+        }
+        Some(expected) => {
+            if control_record.owner_epoch != Some(*expected) {
+                return Err(ServerError::InvalidBootstrap(format!(
+                    "control record changed while preparing local recovery: requested epoch {expected}, actual {}",
+                    display_epoch(control_record.owner_epoch)
+                )));
+            }
+            let valid_local_epoch = if control_record.state == LogicalShardState::Recovering {
+                local_epoch == Some(*expected) || local_epoch == predecessor(*expected)
+            } else {
+                local_epoch == Some(*expected)
+            };
+            if !valid_local_epoch {
+                let requirement = if control_record.state == LogicalShardState::Recovering {
+                    format!(
+                        "predecessor {} or exact recovery epoch {expected}",
+                        display_epoch(predecessor(*expected))
+                    )
+                } else {
+                    format!("exact durable epoch {expected}")
+                };
+                return Err(ServerError::InvalidBootstrap(format!(
+                    "local metadata authority is fenced at {}, but control state {:?} requires {requirement}",
+                    display_epoch(local_epoch),
+                    control_record.state
+                )));
+            }
+        }
     }
     Ok(Some(meta))
 }
 
-fn reject_unrecovered_shared_frontier(
+fn load_control_record(
     control: &dyn ControlStore,
     shard_id: nokv_types::LogicalShardId,
     requested: &RecoveryPublication,
-) -> Result<(), ServerError> {
+) -> Result<LogicalShardRecord, ServerError> {
     let shard = control
         .get_logical_shard(&shard_id)?
         .ok_or_else(|| ServerError::InvalidBootstrap("logical shard does not exist".to_owned()))?;
@@ -386,7 +434,7 @@ fn reject_unrecovered_shared_frontier(
             shard_id, shard.durable_lsn, requested.durable_lsn
         )));
     }
-    Ok(())
+    Ok(shard)
 }
 
 fn validate_serving_placement(placement: &RootPlacement) -> Result<(), ServerError> {
@@ -406,6 +454,7 @@ fn admit_owner(
     control: &dyn ControlStore,
     shard_id: nokv_types::LogicalShardId,
     mode: &LeaseMode,
+    control_record: &LogicalShardRecord,
 ) -> Result<(LogicalShardLease, bool), ServerError> {
     match mode {
         LeaseMode::Acquire {
@@ -415,6 +464,8 @@ fn admit_owner(
         } => {
             let lease = match previous_epoch {
                 None => control.acquire_owner(&shard_id, owner.clone(), endpoint.clone())?,
+                Some(expected) if control_record.state == LogicalShardState::Recovering => control
+                    .reacquire_recovery(&shard_id, *expected, owner.clone(), endpoint.clone())?,
                 Some(expected) => control.acquire_successor(
                     &shard_id,
                     *expected,
@@ -629,8 +680,8 @@ fn rollback_bootstrap(
 ) -> ServerError {
     let mut rollback = uninstall_routes(registry, routes, "bootstrap rollback");
     if release_acquired_lease {
-        if let Err(error) = control.release_owner(lease) {
-            rollback.push(format!("release logical-shard lease: {error}"));
+        if let Err(error) = control.suspend_recovery(lease) {
+            rollback.push(format!("suspend logical-shard recovery: {error}"));
         }
     }
     if rollback.is_empty() {
@@ -1064,9 +1115,9 @@ mod tests {
         .to_string();
         assert!(error.contains("outcome is unknown"));
         assert!(error.contains("preserve the store"));
-        assert!(error.contains("automatic owner reconciliation is not implemented"));
         assert!(error.contains("--metadata-reopen prepared-meta"));
-        assert!(error.contains("do not delete"));
+        assert!(error.contains("rebind the durable Recovering epoch one"));
+        assert!(error.contains("do not delete the prepared store"));
     }
 
     #[test]
@@ -1173,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_frontier_successor_is_rejected_before_opening_any_store() {
+    fn released_local_authority_restarts_as_the_next_owner() {
         let temporary = TempDir::new().unwrap();
         let database = temporary.path().join("metadata");
         let root_id = root(1);
@@ -1186,7 +1237,10 @@ mod tests {
         )
         .unwrap();
         let first_epoch = first.lease().owner_epoch;
+        let durable_fence = first.meta().root_fence(root_id).unwrap().unwrap();
+        let durable_version = first.meta().current_read_version().unwrap();
         first.release().unwrap();
+        let registry = Arc::new(RootOwnerRegistry::new());
 
         let boot = ShardBoot {
             shard_id: shard(),
@@ -1199,16 +1253,402 @@ mod tests {
             recovery: empty_recovery(),
             roots: vec![root_attach(root_id, 33)],
         };
-        let error = bootstrap_shard(as_control(&control), Arc::clone(&registry), boot)
-            .err()
+        let successor = bootstrap_shard(as_control(&control), Arc::clone(&registry), boot).unwrap();
+
+        assert_eq!(successor.lease().owner_epoch.get(), first_epoch.get() + 1);
+        assert_eq!(
+            successor.meta().current_owner_epoch().unwrap(),
+            Some(successor.lease().owner_epoch)
+        );
+        assert_eq!(
+            successor.meta().root_fence(root_id).unwrap(),
+            Some(durable_fence)
+        );
+        assert!(successor.meta().current_read_version().unwrap() >= durable_version);
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(record.state, LogicalShardState::Serving);
+        assert_eq!(record.owner_epoch, Some(successor.lease().owner_epoch));
+        assert_eq!(record.durable_lsn, 0);
+        assert_eq!(registry.installed_root_count().unwrap(), 1);
+        successor.release().unwrap();
+    }
+
+    #[test]
+    fn live_local_authority_lock_blocks_takeover_before_control_mutation() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+        let before = control.get_logical_shard(&shard()).unwrap().unwrap();
+
+        let error = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("competing-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(first.lease().owner_epoch),
+                },
+                recovery: empty_recovery(),
+                roots: vec![root_attach(root_id, 35)],
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("incompatible live access mode"));
+        assert_eq!(control.get_logical_shard(&shard()).unwrap(), Some(before));
+        first.release().unwrap();
+    }
+
+    #[test]
+    fn bootstrap_rollback_rebinds_the_same_recovery_epoch() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let roots = [root(1), root(2)];
+        let control = active_control(&roots);
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &roots[..1]),
+        )
+        .unwrap();
+        let first_epoch = first.lease().owner_epoch;
+        let future_root_two = RootPlacement {
+            root_id: roots[1],
+            logical_shard_id: shard(),
+            placement_generation: PlacementGeneration::new(4).unwrap(),
+            lifecycle: RootPlacementLifecycle::Active,
+        };
+        execute_fence_command(
+            first.meta(),
+            &future_root_two,
+            first.lease(),
+            request_id(61),
+            meta::RootFenceAction::Install,
+            b"future root-two fence".to_vec(),
+        )
+        .unwrap();
+        first.release().unwrap();
+
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let error = bootstrap_shard(
+            as_control(&control),
+            Arc::clone(&registry),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database.clone()),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("interrupted-node").unwrap(),
+                    endpoint: "127.0.0.1:9015".to_owned(),
+                    previous_epoch: Some(first_epoch),
+                },
+                recovery: empty_recovery(),
+                roots: vec![root_attach(roots[0], 47), root_attach(roots[1], 49)],
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("root fence placement does not match the control-plane placement"));
+        assert_eq!(registry.installed_root_count().unwrap(), 0);
+        let interrupted = control.get_logical_shard(&shard()).unwrap().unwrap();
+        let recovery_epoch = interrupted.owner_epoch.unwrap();
+        assert_eq!(recovery_epoch.get(), first_epoch.get() + 1);
+        assert_eq!(interrupted.state, LogicalShardState::Recovering);
+        assert_eq!(
+            open_meta(OpenMode::Existing(database.clone()), shard())
+                .unwrap()
+                .current_owner_epoch()
+                .unwrap(),
+            Some(recovery_epoch),
+            "the failed boot had already installed its local fence"
+        );
+
+        let active = control.get_root_placement(&roots[1]).unwrap().unwrap();
+        let draining = control
+            .compare_and_set_root_placement(
+                &active,
+                RootPlacement {
+                    placement_generation: PlacementGeneration::new(3).unwrap(),
+                    lifecycle: RootPlacementLifecycle::Draining,
+                    ..active
+                },
+            )
+            .unwrap();
+        control
+            .compare_and_set_root_placement(
+                &draining,
+                RootPlacement {
+                    placement_generation: PlacementGeneration::new(4).unwrap(),
+                    lifecycle: RootPlacementLifecycle::Active,
+                    ..draining
+                },
+            )
             .unwrap();
 
-        assert!(error.to_string().contains("local-WAL profile"));
+        let recovered = bootstrap_shard(
+            as_control(&control),
+            Arc::clone(&registry),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(recovery_epoch),
+                },
+                recovery: empty_recovery(),
+                roots: vec![root_attach(roots[0], 51), root_attach(roots[1], 53)],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(recovered.lease().owner_epoch, recovery_epoch);
+        assert_eq!(registry.installed_root_count().unwrap(), 2);
+        recovered.release().unwrap();
+    }
+
+    #[test]
+    fn interrupted_successor_reuses_its_recovery_epoch_before_local_fence() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+        let first_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+
+        let interrupted = control
+            .acquire_successor(
+                &shard(),
+                first_epoch,
+                NodeId::new("interrupted-node").unwrap(),
+                "127.0.0.1:9015".to_owned(),
+            )
+            .unwrap();
+        control.suspend_recovery(&interrupted).unwrap();
+        assert_eq!(
+            open_meta(OpenMode::Existing(database.clone()), shard())
+                .unwrap()
+                .current_owner_epoch()
+                .unwrap(),
+            Some(first_epoch),
+            "the crash happened before the local fence advanced"
+        );
+
+        let recovered = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(interrupted.owner_epoch),
+                },
+                recovery: empty_recovery(),
+                roots: vec![root_attach(root_id, 37)],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(recovered.lease().owner_epoch, interrupted.owner_epoch);
+        assert_eq!(
+            recovered.meta().current_owner_epoch().unwrap(),
+            Some(interrupted.owner_epoch)
+        );
+        recovered.release().unwrap();
+    }
+
+    #[test]
+    fn interrupted_successor_reuses_its_recovery_epoch_after_local_fence() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+        let first_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+
+        let interrupted = control
+            .acquire_successor(
+                &shard(),
+                first_epoch,
+                NodeId::new("interrupted-node").unwrap(),
+                "127.0.0.1:9015".to_owned(),
+            )
+            .unwrap();
+        let meta = open_meta(OpenMode::Existing(database.clone()), shard()).unwrap();
+        meta.advance_owner_epoch(Some(first_epoch), interrupted.owner_epoch)
+            .unwrap();
+        drop(meta);
+        control.suspend_recovery(&interrupted).unwrap();
+
+        let recovered = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(interrupted.owner_epoch),
+                },
+                recovery: empty_recovery(),
+                roots: vec![root_attach(root_id, 39)],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(recovered.lease().owner_epoch, interrupted.owner_epoch);
+        assert_eq!(
+            recovered.meta().current_owner_epoch().unwrap(),
+            Some(interrupted.owner_epoch)
+        );
+        recovered.release().unwrap();
+    }
+
+    #[test]
+    fn stale_local_epoch_is_rejected_before_consuming_another_control_epoch() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+        let first_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+
+        // Advance only the control plane. The local authority remains at the
+        // first epoch and therefore cannot prove it contains the second
+        // owner's applied history.
+        let control_only = control
+            .acquire_successor(
+                &shard(),
+                first_epoch,
+                NodeId::new("control-only-node").unwrap(),
+                "127.0.0.1:9015".to_owned(),
+            )
+            .unwrap();
+        control
+            .mark_serving(&control_only, empty_recovery())
+            .unwrap();
+        control.release_owner(&control_only).unwrap();
+
+        let error = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("stale-store-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(control_only.owner_epoch),
+                },
+                recovery: empty_recovery(),
+                roots: vec![root_attach(root_id, 43)],
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("exact durable epoch 2"));
         let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(record.owner_epoch, Some(control_only.owner_epoch));
         assert_eq!(record.state, LogicalShardState::Unassigned);
+    }
+
+    #[test]
+    fn corrupt_recovery_outbox_is_rejected_before_successor_acquisition() {
+        use nokv_meta_store::{Commit, Key, Mutation, WriteTxn};
+
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+        let first_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+
+        let catalog = meta::keyspaces()
+            .iter()
+            .map(|definition| TreeBinding::new(definition.id, definition.name));
+        let holt =
+            HoltStore::open(HoltOptions::file(&database, catalog, meta::store_limits())).unwrap();
+        let recovery_keyspace = meta::keyspaces()
+            .iter()
+            .find(|definition| definition.name == "recovery_outbox")
+            .unwrap()
+            .id;
+        assert_eq!(
+            holt.commit(WriteTxn {
+                checks: Vec::new(),
+                mutations: vec![Mutation::Put {
+                    key: Key::new(recovery_keyspace, b"malformed-key".to_vec()),
+                    value: b"malformed-value".to_vec(),
+                }],
+            })
+            .unwrap(),
+            Commit::Applied
+        );
+        drop(holt);
+
+        let error = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(first_epoch),
+                },
+                recovery: empty_recovery(),
+                roots: vec![root_attach(root_id, 45)],
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("RecoveryOutbox key"));
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
         assert_eq!(record.owner_epoch, Some(first_epoch));
-        assert_eq!(record.durable_lsn, 0);
-        assert_eq!(registry.installed_root_count().unwrap(), 0);
+        assert_eq!(record.state, LogicalShardState::Unassigned);
     }
 
     #[test]

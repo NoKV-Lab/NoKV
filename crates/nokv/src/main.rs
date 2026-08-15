@@ -294,7 +294,7 @@ OWNER:
   --root-id HEX32 --etcd-endpoint URL --node-id ID
   --advertise-endpoint HOST:PORT --bind HOST:PORT
   --metadata-create PATH starts the first standalone local-WAL owner
-  --metadata-reopen PATH is recovery admission only; standalone successors currently fail closed
+  --metadata-reopen PATH restarts the same exclusive local-WAL authority after lease loss
 
 OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]

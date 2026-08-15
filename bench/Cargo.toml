@@ -14,6 +14,7 @@ homepage.workspace = true
 metadata-read-stats = ["nokv-meta/metadata-read-stats", "nokv-meta-holt/read-stats"]
 
 [dependencies]
+nokv-control = { workspace = true, features = ["etcd"] }
 nokv-meta.workspace = true
 nokv-meta-holt = { workspace = true, features = ["test-support"] }
 nokv-meta-store.workspace = true
@@ -26,6 +27,10 @@ serde_json.workspace = true
 [[bin]]
 name = "nokv-workspace-bench"
 path = "src/bin/nokv-workspace-bench.rs"
+
+[[bin]]
+name = "nokv-local-wal-recovery-fault"
+path = "src/bin/nokv-local-wal-recovery-fault.rs"
 
 [[bin]]
 name = "nokv-bench"

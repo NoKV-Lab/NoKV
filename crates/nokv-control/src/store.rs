@@ -52,6 +52,16 @@ pub trait ControlStore: Send + Sync {
         endpoint: String,
     ) -> Result<LogicalShardLease, ControlError>;
 
+    /// Rebind the lease/session of an unfinished recovery attempt without
+    /// consuming another owner epoch. The previous session must be gone.
+    fn reacquire_recovery(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        recovery_epoch: OwnerEpoch,
+        owner: NodeId,
+        endpoint: String,
+    ) -> Result<LogicalShardLease, ControlError>;
+
     fn renew_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError>;
 
     /// Publish a caller-serialized recovery frontier and make the exact owner
@@ -62,6 +72,13 @@ pub trait ControlStore: Send + Sync {
         publication: RecoveryPublication,
     ) -> Result<LogicalShardRecord, ControlError>;
 
+    /// End the live session for a boot that has not reached `Serving`, while
+    /// retaining its durable recovery epoch for an exact retry.
+    fn suspend_recovery(
+        &self,
+        lease: &LogicalShardLease,
+    ) -> Result<LogicalShardRecord, ControlError>;
+
     fn release_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError>;
 }
 
@@ -69,6 +86,7 @@ pub trait ControlStore: Send + Sync {
 struct InMemoryState {
     root_placements: BTreeMap<RootId, RootPlacement>,
     logical_shards: BTreeMap<LogicalShardId, LogicalShardRecord>,
+    owner_sessions: BTreeMap<LogicalShardId, LogicalShardLease>,
     next_lease_id: u64,
 }
 
@@ -205,6 +223,9 @@ impl ControlStore for InMemoryControlStore {
         let lease_id = allocate_lease_id(&mut state, *logical_shard_id)?;
         let (next, lease) = prepare_owner_acquisition(&current, None, owner, endpoint, lease_id)?;
         state.logical_shards.insert(*logical_shard_id, next);
+        state
+            .owner_sessions
+            .insert(*logical_shard_id, lease.clone());
         Ok(lease)
     }
 
@@ -230,7 +251,13 @@ impl ControlStore for InMemoryControlStore {
                 actual: current.owner_epoch,
             });
         }
-        if current.owner.is_some() {
+        if current.state == LogicalShardState::Recovering {
+            return Err(ControlError::RecoveryAttemptPending {
+                logical_shard_id: *logical_shard_id,
+                owner_epoch: expected_owner_epoch,
+            });
+        }
+        if state.owner_sessions.contains_key(logical_shard_id) {
             return Err(ControlError::PreviousOwnerSessionLive {
                 logical_shard_id: *logical_shard_id,
                 owner_epoch: expected_owner_epoch,
@@ -245,6 +272,47 @@ impl ControlStore for InMemoryControlStore {
             lease_id,
         )?;
         state.logical_shards.insert(*logical_shard_id, next);
+        state
+            .owner_sessions
+            .insert(*logical_shard_id, lease.clone());
+        Ok(lease)
+    }
+
+    fn reacquire_recovery(
+        &self,
+        logical_shard_id: &LogicalShardId,
+        recovery_epoch: OwnerEpoch,
+        owner: NodeId,
+        endpoint: String,
+    ) -> Result<LogicalShardLease, ControlError> {
+        validate_endpoint(&endpoint)?;
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        ensure_root_placement(&state, logical_shard_id)?;
+        let current = state
+            .logical_shards
+            .get(logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(*logical_shard_id))?;
+        if current.owner_epoch != Some(recovery_epoch) {
+            return Err(ControlError::StaleOwnerEpoch {
+                logical_shard_id: *logical_shard_id,
+                expected: Some(recovery_epoch),
+                actual: current.owner_epoch,
+            });
+        }
+        if state.owner_sessions.contains_key(logical_shard_id) {
+            return Err(ControlError::PreviousOwnerSessionLive {
+                logical_shard_id: *logical_shard_id,
+                owner_epoch: recovery_epoch,
+            });
+        }
+        let lease_id = allocate_lease_id(&mut state, *logical_shard_id)?;
+        let (next, lease) =
+            prepare_recovery_reacquisition(&current, recovery_epoch, owner, endpoint, lease_id)?;
+        state.logical_shards.insert(*logical_shard_id, next);
+        state
+            .owner_sessions
+            .insert(*logical_shard_id, lease.clone());
         Ok(lease)
     }
 
@@ -255,6 +323,7 @@ impl ControlStore for InMemoryControlStore {
             .get(&lease.logical_shard_id)
             .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
         validate_record_lease(record, lease)?;
+        validate_in_memory_session(&state, lease)?;
         Ok(record.clone())
     }
 
@@ -269,11 +338,30 @@ impl ControlStore for InMemoryControlStore {
             .get(&lease.logical_shard_id)
             .cloned()
             .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        validate_record_lease(&current, lease)?;
+        validate_in_memory_session(&state, lease)?;
         let next = prepare_mark_serving(&current, lease, publication)?;
         state
             .logical_shards
             .insert(lease.logical_shard_id, next.clone());
         Ok(next)
+    }
+
+    fn suspend_recovery(
+        &self,
+        lease: &LogicalShardLease,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        let current = state
+            .logical_shards
+            .get(&lease.logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        validate_record_lease(&current, lease)?;
+        validate_in_memory_session(&state, lease)?;
+        let retained = prepare_recovery_suspension(&current, lease)?;
+        state.owner_sessions.remove(&lease.logical_shard_id);
+        Ok(retained)
     }
 
     fn release_owner(&self, lease: &LogicalShardLease) -> Result<LogicalShardRecord, ControlError> {
@@ -283,11 +371,25 @@ impl ControlStore for InMemoryControlStore {
             .get(&lease.logical_shard_id)
             .cloned()
             .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        validate_record_lease(&current, lease)?;
+        validate_in_memory_session(&state, lease)?;
         let next = prepare_owner_release(&current, lease)?;
         state
             .logical_shards
             .insert(lease.logical_shard_id, next.clone());
+        state.owner_sessions.remove(&lease.logical_shard_id);
         Ok(next)
+    }
+}
+
+fn validate_in_memory_session(
+    state: &InMemoryState,
+    lease: &LogicalShardLease,
+) -> Result<(), ControlError> {
+    if state.owner_sessions.get(&lease.logical_shard_id) == Some(lease) {
+        Ok(())
+    } else {
+        Err(ControlError::StaleLease(lease.clone()))
     }
 }
 
@@ -424,6 +526,14 @@ pub(crate) fn prepare_owner_acquisition(
             actual: current.owner_epoch,
         });
     }
+    if let Some(owner_epoch) = expected_owner_epoch {
+        if current.state == LogicalShardState::Recovering {
+            return Err(ControlError::RecoveryAttemptPending {
+                logical_shard_id: current.logical_shard_id,
+                owner_epoch,
+            });
+        }
+    }
     if expected_owner_epoch.is_none() {
         if let (Some(current_owner), Some(owner_epoch)) =
             (current.owner.clone(), current.owner_epoch)
@@ -467,6 +577,47 @@ pub(crate) fn prepare_owner_acquisition(
     Ok((next, lease))
 }
 
+pub(crate) fn prepare_recovery_reacquisition(
+    current: &LogicalShardRecord,
+    recovery_epoch: OwnerEpoch,
+    owner: NodeId,
+    endpoint: String,
+    lease_id: u64,
+) -> Result<(LogicalShardRecord, LogicalShardLease), ControlError> {
+    validate_logical_shard_record(current)?;
+    validate_endpoint(&endpoint)?;
+    if current.state != LogicalShardState::Recovering {
+        return Err(ControlError::RecoveryStateConflict {
+            logical_shard_id: current.logical_shard_id,
+            actual: current.state,
+        });
+    }
+    if current.owner_epoch != Some(recovery_epoch) {
+        return Err(ControlError::StaleOwnerEpoch {
+            logical_shard_id: current.logical_shard_id,
+            expected: Some(recovery_epoch),
+            actual: current.owner_epoch,
+        });
+    }
+    if lease_id == 0 {
+        return Err(ControlError::InvalidRecord(
+            "active owner lease id must be non-zero".to_owned(),
+        ));
+    }
+    let lease = LogicalShardLease {
+        logical_shard_id: current.logical_shard_id,
+        owner: owner.clone(),
+        owner_epoch: recovery_epoch,
+        lease_id,
+    };
+    let mut next = current.clone();
+    next.owner = Some(owner);
+    next.lease_id = lease_id;
+    next.endpoint = Some(endpoint);
+    validate_logical_shard_record(&next)?;
+    Ok((next, lease))
+}
+
 pub(crate) fn prepare_mark_serving(
     current: &LogicalShardRecord,
     lease: &LogicalShardLease,
@@ -485,6 +636,12 @@ pub(crate) fn prepare_owner_release(
     lease: &LogicalShardLease,
 ) -> Result<LogicalShardRecord, ControlError> {
     validate_record_lease(current, lease)?;
+    if current.state == LogicalShardState::Recovering {
+        return Err(ControlError::RecoveryAttemptPending {
+            logical_shard_id: current.logical_shard_id,
+            owner_epoch: lease.owner_epoch,
+        });
+    }
     let mut next = current.clone();
     next.owner = None;
     next.lease_id = 0;
@@ -492,6 +649,20 @@ pub(crate) fn prepare_owner_release(
     next.endpoint = None;
     validate_logical_shard_record(&next)?;
     Ok(next)
+}
+
+pub(crate) fn prepare_recovery_suspension(
+    current: &LogicalShardRecord,
+    lease: &LogicalShardLease,
+) -> Result<LogicalShardRecord, ControlError> {
+    validate_record_lease(current, lease)?;
+    if current.state != LogicalShardState::Recovering {
+        return Err(ControlError::RecoveryStateConflict {
+            logical_shard_id: current.logical_shard_id,
+            actual: current.state,
+        });
+    }
+    Ok(current.clone())
 }
 
 pub(crate) fn validate_record_lease(
@@ -1004,6 +1175,16 @@ mod tests {
         let store = InMemoryControlStore::new();
         let first = acquire_placed_shard(&store, 1, 1);
         assert_eq!(first.owner_epoch.get(), 1);
+        store
+            .mark_serving(
+                &first,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 0,
+                },
+            )
+            .unwrap();
         let released = store.release_owner(&first).unwrap();
         assert_eq!(released.owner_epoch, Some(first.owner_epoch));
         assert!(released.owner.is_none());
@@ -1034,6 +1215,89 @@ mod tests {
             store.renew_owner(&first),
             Err(ControlError::NotOwner { .. }) | Err(ControlError::StaleLease(_))
         ));
+    }
+
+    #[test]
+    fn unfinished_recovery_rebinds_the_same_epoch_after_session_loss() {
+        let store = InMemoryControlStore::new();
+        let first = acquire_placed_shard(&store, 1, 1);
+        assert_eq!(first.owner_epoch.get(), 1);
+
+        let retained = store.suspend_recovery(&first).unwrap();
+        assert_eq!(retained.state, LogicalShardState::Recovering);
+        assert_eq!(retained.owner_epoch, Some(first.owner_epoch));
+        assert_eq!(retained.owner.as_ref(), Some(&first.owner));
+        assert_eq!(retained.lease_id, first.lease_id);
+        assert!(matches!(
+            store.renew_owner(&first),
+            Err(ControlError::StaleLease(_))
+        ));
+        assert!(matches!(
+            store.acquire_successor(
+                &shard_id(1),
+                first.owner_epoch,
+                node("node-b"),
+                "node-b:7000".to_owned()
+            ),
+            Err(ControlError::RecoveryAttemptPending { .. })
+        ));
+
+        let rebound = store
+            .reacquire_recovery(
+                &shard_id(1),
+                first.owner_epoch,
+                node("node-b"),
+                "node-b:7000".to_owned(),
+            )
+            .unwrap();
+        assert_eq!(rebound.owner_epoch, first.owner_epoch);
+        assert_ne!(rebound.lease_id, first.lease_id);
+        assert!(matches!(
+            store.reacquire_recovery(
+                &shard_id(1),
+                first.owner_epoch,
+                node("node-c"),
+                "node-c:7000".to_owned()
+            ),
+            Err(ControlError::PreviousOwnerSessionLive { .. })
+        ));
+
+        store
+            .mark_serving(
+                &rebound,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 0,
+                },
+            )
+            .unwrap();
+        store.release_owner(&rebound).unwrap();
+    }
+
+    #[test]
+    fn serving_owner_cannot_be_suspended_as_recovery() {
+        let store = InMemoryControlStore::new();
+        let lease = acquire_placed_shard(&store, 1, 1);
+        store
+            .mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 0,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.suspend_recovery(&lease),
+            Err(ControlError::RecoveryStateConflict {
+                actual: LogicalShardState::Serving,
+                ..
+            })
+        ));
+        store.release_owner(&lease).unwrap();
     }
 
     #[test]

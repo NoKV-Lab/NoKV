@@ -267,9 +267,11 @@ identify one failed check because some stores cannot report it after an atomic
 conflict.
 
 Any successor that the profile permits to serve must first observe every
-`Applied` commit under the same authority. `Local` forbids a successor from
-claiming another local authority. Shared and replicated profiles must complete
-their open or catch-up boundary before route admission.
+`Applied` commit under the same authority. `Local` permits an owner restart
+only after the exact exclusive namespace is explicitly reopened and its WAL,
+schema, recovery chain, and owner fence validate; it never permits a different
+local authority to substitute for it. Shared and replicated profiles must
+complete their open or catch-up boundary before route admission.
 
 `MetaShard` translates one validated `MetadataCommand` into a `WriteTxn`.
 Command deduplication, history, events, root fences, and deterministic results
@@ -300,8 +302,12 @@ reached its advertised acknowledgement boundary.
 An adapter can keep a physical transaction or log identifier for diagnostics
 and recovery, but it cannot expose that identifier as a NoKV receipt or
 `ReadVersion`. Before a shard can serve, the runtime must bind the domain
-receipt namespace to the admitted physical store identity and owner epoch.
-That admission binding is still pending.
+receipt namespace to the admitted physical authority and owner epoch. The
+current local profile does this narrowly through an explicit `Existing` path,
+Holt's lifetime exclusive directory lock, the durable shard identity and owner
+fence, and full recovery-chain validation. A provider-neutral persistent store
+identity and configuration digest remain pending; without them, another
+directory, copy/rollback, or cross-host failover is not qualified.
 
 ## Error Contract
 
@@ -394,10 +400,10 @@ projection. A separate successful replacement changes all 60 index fields at
 once: the before/after event is 61,323 bytes and the fully derived transaction
 is 9,859,091 bytes. The short-path replace-to-empty and remove transactions are
 also pinned at 11,797,794 and 11,791,459 bytes. These are characterized storage
-and metadata-engine compatibility results, not a universal domain-size proof
-or a qualified `nokv serve` restart/rolling-upgrade path. The local-WAL server
-still refuses successor admission until its checkpoint/log recovery and exact
-lease-resume workflow are implemented.
+and metadata-engine compatibility results, not a universal domain-size proof.
+The local-WAL server qualifies restart of the same exclusive namespace with an
+empty shared recovery frontier. It does not qualify rolling upgrade onto
+another store, copied-directory recovery, or checkpoint/log failover.
 
 The envelope exceeds FoundationDB's
 [10,000,000-byte hard transaction limit](https://apple.github.io/foundationdb/known-limitations.html),
@@ -464,15 +470,19 @@ attach_root
 
 `bootstrap_shard` performs these steps:
 
-1. Validate the open mode, lease admission, and store failover profile.
-2. For the first owner, initialize a `New` namespace or reopen a prepared
-   `Existing` namespace. Validate that its durable owner fence remains epoch
-   zero and records no owner.
-3. Acquire one first-owner lease or renew the exact resumed lease. An existing
-   store with a nonzero owner fence opens only with that resumed lease.
-4. Validate the schema and logical-shard identity.
-5. Advance the shard owner epoch in the metadata transaction store before any
-   route is installed.
+1. Validate the open mode, root placements, control record, and shared recovery
+   frontier.
+2. Before any new acquisition, initialize or exclusively reopen the explicit
+   local namespace. Holt replays its WAL; `MetaShard` validates the catalog,
+   schema, logical-shard identity, system rows, and full recovery-outbox chain.
+3. Compare the local owner fence with the durable control state. A normal
+   successor requires the exact previous epoch. An interrupted `Recovering`
+   attempt accepts only that recovery epoch or its immediate predecessor.
+4. Atomically acquire the first/next epoch, or rebind an unfinished recovery
+   attempt at the same epoch after proving its previous session key is absent.
+   An exact live-session `Resume` still renews before reopening.
+5. Advance the local owner fence idempotently before any route is installed,
+   attach roots, renew once, and publish `Serving`.
 
 `attach_root` then:
 
@@ -485,24 +495,24 @@ The server publishes the logical shard as serving only after its initial root
 routes are ready. It renews and releases the shard lease once per shard, not
 once per root.
 
-A physical initialization failure for the first `New` owner occurs before
-control-plane acquisition and does not consume an owner epoch. If subsequent
-owner acquisition fails, bootstrap closes and preserves the prepared epoch-zero
-store. A failure known not to have applied reports an exact corrected
-`Existing` retry. When the control backend cannot classify acquisition,
-bootstrap explicitly reports that automatic ownership reconciliation is not
-implemented. The operator must inspect the configured control backend; only a
-proven-not-applied acquisition may retry with the reported `--metadata-reopen`
-path. An acquisition that may have applied remains fail-closed and retains both
-the prepared store and owner record for operator recovery.
-Bootstrap never infers directory ownership from a path precheck or recursively
-deletes a prepared store; both would be unsafe under a concurrent path change.
+A physical initialization or reopen validation failure occurs before control
+acquisition and consumes no epoch. A first-owner admission failure preserves
+the prepared epoch-zero store and reports an `Existing` retry. If the control
+outcome was unknown, that retry reconciles either result after the session
+settles: it acquires epoch one if the transaction did not apply, or rebinds the
+durable `Recovering` epoch one if it did. Bootstrap never infers directory
+ownership from a path precheck or recursively deletes a prepared store; both
+would be unsafe under a concurrent path change.
 
-The local profile still needs an explicit recovering ownership token for a
-failure after acquisition but before `Serving`. Releasing that lease is
-fail-closed, but it can strand the local authority because successor
-acquisition is not qualified. Unknown control acquisition needs the same typed
-recovery treatment after the immediate preserve-and-report boundary.
+The control record and the lease-backed session key have separate lifetimes.
+`Recovering` is a durable attempt token. A bootstrap rollback removes only its
+session (`suspend_recovery`) and retains the record; an ungraceful process loss
+gets the same result when etcd expires the session key. Control refuses to
+increment past a `Recovering` record. The next bootstrap must rebind that exact
+epoch, then tolerate only two local states: the predecessor when the crash was
+before local fence installation, or the exact epoch when it was after. This
+keeps retries idempotent and prevents the epoch-gap strand where control moves
+to `E+2` while the local authority remains at `E`.
 
 Lifecycle work remains root-scoped because each runner owns root-specific
 cursors. Every attached root gets one supervised lifecycle runner. Runtime
@@ -514,9 +524,11 @@ that becomes Active later requires an owner restart until runtime attachment is
 implemented.
 
 The current Holt-only bootstrap admits a first `New` owner, an epoch-zero
-`Existing` store that retries a settled first-owner acquisition, or an exact
-`Existing` lease resume. It hard-codes refusal of every successor acquisition.
-It does not yet select admission from `StoreProfile`.
+`Existing` retry, an exact live-session `Resume`, and same-namespace
+`Existing` restart after owner loss. A live session, non-empty shared recovery
+frontier, local/control epoch mismatch, or store validation failure remains
+fail-closed. Bootstrap does not yet select provider construction from a
+provider-neutral persistent configuration.
 
 In the target runtime, open mode does not decide successor admission.
 `StoreProfile::authority` and the server's qualification policy decide whether
@@ -533,7 +545,7 @@ The initial profiles are:
 
 | Store | `Authority` | `AckBoundary` | Successor status |
 | --- | --- | --- | --- |
-| `HoltStore` | `Local` | `LocalSync` | Refused until checkpoint and log recovery qualify |
+| `HoltStore` | `Local` | `LocalSync` | Same exclusive namespace restart qualified; replacement/cross-host failover refused |
 | `FdbStore` | `Shared` | `SharedCommit` | Proposed, not qualified |
 | `HoltClusterStore` | `Replicated` | `QuorumCommit` | Proposed, not implemented |
 
@@ -569,7 +581,7 @@ logical shard, owner epoch, physical store identity, store profile, and
 configuration digest. The current registry now closes the complete shard
 route set and holds a response permit through socket delivery when lease loss
 or adapter poison occurs. Durable provider admission and restart-time
-unknown-outcome reconciliation remain
+metadata-transaction unknown-outcome reconciliation remain
 [Issue #436](https://github.com/NoKV-Lab/NoKV/issues/436) requirements, not
 `TxnStore` methods.
 
@@ -618,11 +630,13 @@ Completed in the local Holt cutover:
 6. Enforce the serving logical limits before physical I/O.
 7. Fence shard admission and response delivery immediately on lease loss or a
    poisoned store outcome.
+8. Reopen the same exclusive local authority as a successor and retain/rebind
+   interrupted control-plane recovery epochs without creating an epoch gap.
 
 Remaining work:
 
 1. Add provider-neutral configuration, persistent runtime binding, admission,
-   and unknown-outcome recovery orchestration.
+   and metadata-transaction unknown-outcome recovery orchestration.
 2. Replace the synchronous store and server path with one async path.
 3. Add a non-default `nokv-meta-fdb` adapter and keep it `NOT QUALIFIED` until
    its workspace, failure, failover, and benchmark gates pass.
