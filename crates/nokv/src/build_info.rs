@@ -35,7 +35,7 @@ mod tests {
 
     #[test]
     fn compiled_identity_is_complete() {
-        assert_eq!(VERSION, "1.0.0");
+        assert_eq!(VERSION, "0.10.0");
         assert!(GIT_COMMIT == "unknown" || GIT_COMMIT.len() == 40);
         assert_eq!(CARGO_LOCK_SHA256.len(), 64);
         assert_eq!(HOLT_VERSION, "0.8.5");

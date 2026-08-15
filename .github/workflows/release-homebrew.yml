@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Canonical stable tag, for example v1.0.0"
+        description: "Canonical stable tag, for example v0.10.0"
         required: true
         type: string
 
@@ -249,6 +249,7 @@ jobs:
               "$RELEASE_DIR/$manifest" \
               "$RELEASE_DIR/SHA256SUMS" \
               --verify-tag \
+              --latest \
               --title "NoKV $RELEASE_VERSION" \
               --notes "Source-only Homebrew release for commit $EXPECTED_COMMIT."
           fi
