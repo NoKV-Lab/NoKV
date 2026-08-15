@@ -96,6 +96,7 @@ jobs:
         shell: bash
         env:
           NOKV_WORKBENCH_RUSTFS_CONTAINER: nokv-local-wal-recovery-rustfs
+          NOKV_WORKBENCH_RUSTFS_VOLUME: nokv-local-wal-recovery-rustfs-data
           NOKV_WORKBENCH_RUSTFS_IMAGE: ${{ env.RUSTFS_IMAGE }}
           NOKV_WORKBENCH_S3_BUCKET: nokv-local-wal-recovery-gate
           NOKV_WORKBENCH_S3_ENDPOINT: http://127.0.0.1:9000
@@ -134,6 +135,13 @@ jobs:
           path: ${{ runner.temp }}/local-wal-recovery-evidence
           if-no-files-found: error
           retention-days: 7
+
+      - name: Remove pinned RustFS
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          docker rm -f nokv-local-wal-recovery-rustfs >/dev/null 2>&1 || true
+          docker volume rm -f nokv-local-wal-recovery-rustfs-data >/dev/null 2>&1 || true
 
   object-namespace-recovery:
     runs-on: ubuntu-latest

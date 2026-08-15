@@ -34,7 +34,10 @@ The checked-in integration assets are deliberately small:
 - `object_namespace_recovery_gate_test.py` freezes those terminal assertions
   and the independent GitHub Actions evidence-upload contract.
 - `start_rustfs.sh` starts the optional local S3-compatible artifact backend
-  with a digest-pinned image and bounded AWS CLI readiness attempts.
+  with a digest-pinned image and bounded AWS CLI readiness attempts. It uses a
+  Docker-managed volume by default so RustFS's non-root UID owns `/data` on
+  Linux and macOS alike. `NOKV_WORKBENCH_RUSTFS_DATA_DIR` opts into a host bind
+  mount; that directory must be writable by UID/GID `10001:10001`.
 
 Build and validate the product directly:
 

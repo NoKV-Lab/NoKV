@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import copy
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from object_namespace_recovery_gate import (
@@ -17,7 +19,9 @@ from object_namespace_recovery_gate import (
     aws_environment,
     phymat_documents,
     run,
+    rustfs_container_command,
     validate_gate_evidence,
+    wait_rustfs,
 )
 
 
@@ -75,6 +79,43 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
         self.assertIn("AWS_MAX_ATTEMPTS=1", launcher)
         self.assertIn("--cli-connect-timeout 1", launcher)
         self.assertIn("--cli-read-timeout 2", launcher)
+        self.assertIn("NOKV_WORKBENCH_RUSTFS_VOLUME", launcher)
+        self.assertIn("docker volume create", launcher)
+
+    def test_live_gate_uses_a_docker_volume_for_non_root_rustfs(self) -> None:
+        command = rustfs_container_command(
+            Path("/usr/bin/docker"),
+            container="gate",
+            volume="gate-data",
+            s3_port=19000,
+            console_port=19001,
+            image=PINNED_RUSTFS_IMAGE,
+            access_key="access",
+            secret_key="secret",
+        )
+        self.assertIn("type=volume,source=gate-data,target=/data", command)
+        self.assertNotIn("--secret-key", command)
+        self.assertNotIn("--access-key", command)
+
+    @mock.patch("object_namespace_recovery_gate.run")
+    def test_readiness_fails_fast_when_rustfs_exits(self, run_mock: mock.Mock) -> None:
+        run_mock.side_effect = [
+            subprocess.CompletedProcess(["aws"], 1, "", "not ready"),
+            subprocess.CompletedProcess(["docker"], 0, "exited 13\n", ""),
+        ]
+        with self.assertRaisesRegex(
+            WorkflowFailure, "container exited before readiness.*exit code 13"
+        ):
+            wait_rustfs(
+                Path("/usr/bin/aws"),
+                "http://127.0.0.1:9000",
+                {},
+                REPO,
+                60,
+                docker=Path("/usr/bin/docker"),
+                container="gate",
+            )
+        self.assertEqual(run_mock.call_count, 2)
 
     def test_live_gate_bounds_each_aws_readiness_attempt(self) -> None:
         environment = aws_environment("access", "secret")

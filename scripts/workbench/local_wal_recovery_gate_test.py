@@ -55,6 +55,8 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
             "--object-endpoint http://127.0.0.1:9000",
             "--object-bucket nokv-local-wal-recovery-gate",
             "bash scripts/workbench/start_rustfs.sh",
+            "NOKV_WORKBENCH_RUSTFS_VOLUME: nokv-local-wal-recovery-rustfs-data",
+            "docker volume rm -f nokv-local-wal-recovery-rustfs-data",
             "sha256sum --check",
             "if: ${{ always() && steps.local_wal_recovery.outcome != 'skipped' }}",
             "if-no-files-found: error",

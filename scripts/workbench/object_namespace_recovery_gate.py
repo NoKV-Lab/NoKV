@@ -217,6 +217,9 @@ class Evidence:
         with (self.root / name).open("a", encoding="utf-8") as output:
             output.write(canonical_json(value) + "\n")
 
+    def text(self, name: str, value: str) -> None:
+        (self.root / name).write_text(value.rstrip() + "\n", encoding="utf-8")
+
 
 def run(
     argv: Sequence[os.PathLike[str] | str],
@@ -366,12 +369,52 @@ def aws_command(aws: Path, endpoint: str, *arguments: os.PathLike[str] | str) ->
     ]
 
 
+def rustfs_container_command(
+    docker: Path,
+    *,
+    container: str,
+    volume: str,
+    s3_port: int,
+    console_port: int,
+    image: str,
+    access_key: str,
+    secret_key: str,
+) -> list[str]:
+    return [
+        str(docker),
+        "run",
+        "-d",
+        "--name",
+        container,
+        "-p",
+        f"127.0.0.1:{s3_port}:9000",
+        "-p",
+        f"127.0.0.1:{console_port}:9001",
+        "-e",
+        f"RUSTFS_ACCESS_KEY={access_key}",
+        "-e",
+        f"RUSTFS_SECRET_KEY={secret_key}",
+        "-e",
+        "RUSTFS_CONSOLE_ENABLE=true",
+        "--mount",
+        f"type=volume,source={volume},target=/data",
+        image,
+        "--address",
+        ":9000",
+        "--console-enable",
+        "/data",
+    ]
+
+
 def wait_rustfs(
     aws: Path,
     endpoint: str,
     environment: dict[str, str],
     repo: Path,
     timeout: float,
+    *,
+    docker: Path | None = None,
+    container: str | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -384,8 +427,53 @@ def wait_rustfs(
         )
         if result.returncode == 0:
             return
+        if docker is not None and container is not None:
+            state = run(
+                [
+                    docker,
+                    "inspect",
+                    "--format",
+                    "{{.State.Status}} {{.State.ExitCode}}",
+                    container,
+                ],
+                cwd=repo,
+                timeout=min(timeout, 5.0),
+                check=False,
+            )
+            if state.returncode != 0:
+                raise WorkflowFailure("RustFS container disappeared before readiness")
+            status_and_code = state.stdout.strip().split()
+            if status_and_code and status_and_code[0] in {"dead", "exited"}:
+                exit_code = status_and_code[1] if len(status_and_code) > 1 else "unknown"
+                raise WorkflowFailure(
+                    f"RustFS container exited before readiness (exit code {exit_code})"
+                )
         time.sleep(0.25)
     raise WorkflowFailure(f"RustFS did not become ready at {endpoint}")
+
+
+def capture_rustfs_log(
+    docker: Path,
+    container: str,
+    repo: Path,
+    timeout: float,
+    evidence: Evidence,
+    secrets: Sequence[str],
+) -> None:
+    try:
+        result = run(
+            [docker, "logs", "--tail", "200", container],
+            cwd=repo,
+            timeout=min(timeout, 10.0),
+            check=False,
+        )
+        content = result.stdout + result.stderr
+    except WorkflowFailure as error:
+        content = f"RustFS log capture failed: {error}"
+    for secret in secrets:
+        if secret:
+            content = content.replace(secret, "<redacted>")
+    evidence.text("rustfs.log", content or "RustFS produced no container log output")
 
 
 def etcd_value(etcdctl: Path, endpoint: str, key: str, repo: Path, timeout: float) -> str:
@@ -664,6 +752,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
     wrong_object_root = f"object-namespace-gate/{fixed_id(args.seed, 'object')}/wrong"
     bucket = f"nokv-object-gate-{fixed_id(args.seed, 'bucket')[:12]}"
     container = f"nokv-object-gate-{os.getpid()}"
+    volume = f"{container}-data"
     access_key, secret_key = "rustfsadmin", "rustfsadmin"
     etcd_port, peer_port = free_port(), free_port()
     s3_port, console_port = free_port(), free_port()
@@ -681,6 +770,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
     retry_owner: subprocess.Popen[str] | None = None
     mcp_process: subprocess.Popen[str] | None = None
     container_created = False
+    volume_created = False
     started_at = now()
 
     try:
@@ -712,42 +802,41 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         )
         wait_etcd(Path(args.etcdctl_bin), etcd_endpoint, etcd, repo, args.timeout)
 
+        docker = Path(args.docker_bin)
         run(
-            [
-                args.docker_bin,
-                "run",
-                "-d",
-                "--name",
-                container,
-                "-p",
-                f"127.0.0.1:{s3_port}:9000",
-                "-p",
-                f"127.0.0.1:{console_port}:9001",
-                "-e",
-                f"RUSTFS_ACCESS_KEY={access_key}",
-                "-e",
-                f"RUSTFS_SECRET_KEY={secret_key}",
-                "-e",
-                "RUSTFS_CONSOLE_ENABLE=true",
-                "-v",
-                f"{evidence.root / 'rustfs-data'}:/data",
-                args.rustfs_image,
-                "--address",
-                ":9000",
-                "--console-enable",
-                "--access-key",
-                access_key,
-                "--secret-key",
-                secret_key,
-                "/data",
-            ],
+            [docker, "volume", "create", volume],
+            cwd=repo,
+            timeout=args.timeout,
+            evidence=evidence,
+            label="create-rustfs-volume",
+        )
+        volume_created = True
+        run(
+            rustfs_container_command(
+                docker,
+                container=container,
+                volume=volume,
+                s3_port=s3_port,
+                console_port=console_port,
+                image=args.rustfs_image,
+                access_key=access_key,
+                secret_key=secret_key,
+            ),
             cwd=repo,
             timeout=args.timeout,
             evidence=evidence,
             label="start-rustfs",
         )
         container_created = True
-        wait_rustfs(Path(args.aws_bin), s3_endpoint, aws_env, repo, args.timeout)
+        wait_rustfs(
+            Path(args.aws_bin),
+            s3_endpoint,
+            aws_env,
+            repo,
+            args.timeout,
+            docker=docker,
+            container=container,
+        )
         run(
             aws_command(
                 Path(args.aws_bin), s3_endpoint, "s3api", "create-bucket", "--bucket", bucket
@@ -1065,7 +1154,15 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             evidence=evidence,
             label="restart-rustfs",
         )
-        wait_rustfs(Path(args.aws_bin), s3_endpoint, aws_env, repo, args.timeout)
+        wait_rustfs(
+            Path(args.aws_bin),
+            s3_endpoint,
+            aws_env,
+            repo,
+            args.timeout,
+            docker=Path(args.docker_bin),
+            container=container,
+        )
         recovered_result = mcp.call("workbench_read", read_arguments)
         recovered_request_digest = mcp.last_call_digest
         if recovered_result.get("status") != "success":
@@ -1141,8 +1238,23 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         for log in (mcp_log, retry_log, owner_log, etcd_log):
             log.close()
         if container_created:
+            capture_rustfs_log(
+                Path(args.docker_bin),
+                container,
+                repo,
+                args.timeout,
+                evidence,
+                (access_key, secret_key),
+            )
             run(
                 [args.docker_bin, "rm", "-f", container],
+                cwd=repo,
+                timeout=max(args.timeout, 10.0),
+                check=False,
+            )
+        if volume_created:
+            run(
+                [args.docker_bin, "volume", "rm", "-f", volume],
                 cwd=repo,
                 timeout=max(args.timeout, 10.0),
                 check=False,

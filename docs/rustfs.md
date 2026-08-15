@@ -105,6 +105,12 @@ Keep RustFS data and Holt metadata in separate durable directories. Removing
 one does not safely reset the other; create a fresh paired test deployment
 instead of mixing prior metadata with an empty object directory.
 
+The checked-in local launcher uses a Docker-managed volume by default because
+the pinned RustFS image runs as non-root UID/GID `10001:10001`. An explicit
+`NOKV_WORKBENCH_RUSTFS_DATA_DIR` host bind mount is supported only when that
+directory is already writable by the container user. CI gates use isolated
+named volumes; the gate or workflow cleanup removes them after qualification.
+
 ## Failure Semantics
 
 Publication follows object-first, metadata-last ordering:
