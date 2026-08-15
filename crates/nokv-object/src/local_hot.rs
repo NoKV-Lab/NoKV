@@ -221,11 +221,14 @@ impl ArtifactObjectStore for LocalHotTier {
         if bytes.len() as u64 > self.max_bytes {
             let mut state = self.state.lock().map_err(ObjectError::poisoned)?;
             state.stats.admission_rejections = state.stats.admission_rejections.saturating_add(1);
-            return Err(ObjectError::Backend(format!(
-                "local hot admission rejected {} bytes with capacity {}",
-                bytes.len(),
-                self.max_bytes
-            )));
+            return Err(ObjectError::backend_failure(
+                format!(
+                    "local hot admission rejected {} bytes with capacity {}",
+                    bytes.len(),
+                    self.max_bytes
+                ),
+                false,
+            ));
         }
 
         let destination = self.object_path(key);
@@ -357,7 +360,7 @@ fn scan_resident_directory(
             .components()
             .map(|component| component.as_os_str().to_str())
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| ObjectError::Backend("local hot key is not valid UTF-8".to_owned()))?
+            .ok_or_else(|| ObjectError::backend_failure("local hot key is not valid UTF-8", false))?
             .join("/");
         let key = ObjectKey::new(relative)?;
         state.access_clock = state.access_clock.saturating_add(1);

@@ -2087,6 +2087,7 @@ impl MetadataWorkspaceRequestExecutor {
             schema_id: meta::SCHEMA_ID.to_owned(),
             root_id: route.root_id,
             logical_shard_id: route.logical_shard_id,
+            object_namespace_id: Some(route.object_namespace_id),
             placement_generation: route.placement_generation,
             owner_epoch: route.owner_epoch,
             request_id,
@@ -2175,6 +2176,7 @@ impl MetadataWorkspaceRequestExecutor {
         Ok(meta::RootWriteContext {
             root_id: route.root_id,
             logical_shard_id: route.logical_shard_id,
+            object_namespace_id: route.object_namespace_id,
             placement_generation: route.placement_generation,
             owner_epoch: route.owner_epoch,
             request_id,
@@ -2191,6 +2193,7 @@ impl MetadataWorkspaceRequestExecutor {
         Ok(meta::PublicationContext {
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
+            object_namespace_id: context.object_namespace_id,
             placement_generation: context.placement_generation,
             owner_epoch: context.owner_epoch,
             request_id: context.request_id,
@@ -2354,6 +2357,7 @@ struct RouteParts {
     protocol: protocol::RootRoute,
     root_id: types::RootId,
     logical_shard_id: types::LogicalShardId,
+    object_namespace_id: types::ObjectNamespaceId,
     placement_generation: types::PlacementGeneration,
     owner_epoch: types::OwnerEpoch,
 }
@@ -2363,6 +2367,7 @@ fn route_parts(route: protocol::RootRoute) -> Result<RouteParts, protocol::RpcFa
         protocol: route,
         root_id: route.root_id.into(),
         logical_shard_id: route.logical_shard_id.into(),
+        object_namespace_id: route.object_namespace_id.into(),
         placement_generation: types::PlacementGeneration::new(route.placement_generation)
             .map_err(|error| invalid_argument(error.to_string()))?,
         owner_epoch: types::OwnerEpoch::new(route.owner_epoch)
@@ -2875,6 +2880,7 @@ fn write_context_from_publication(context: meta::PublicationContext) -> meta::Ro
     meta::RootWriteContext {
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
+        object_namespace_id: context.object_namespace_id,
         placement_generation: context.placement_generation,
         owner_epoch: context.owner_epoch,
         request_id: context.request_id,
@@ -4028,6 +4034,8 @@ mod tests {
         protocol::RootRoute {
             root_id: root().into(),
             logical_shard_id: shard().into(),
+            object_namespace_id: types::ObjectNamespaceId::from_bytes([10; types::FIXED_ID_BYTES])
+                .into(),
             placement_generation: placement().get(),
             owner_epoch,
         }
@@ -4043,6 +4051,9 @@ mod tests {
             schema_id: meta::SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                [10; types::FIXED_ID_BYTES],
+            )),
             placement_generation: placement(),
             owner_epoch,
             request_id,
@@ -4290,6 +4301,9 @@ mod tests {
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
                     placement_generation: placement(),
                     owner_epoch: owner(1),
                     request_id: request_id(249),
@@ -4393,6 +4407,9 @@ mod tests {
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
                     placement_generation: placement(),
                     owner_epoch: owner(1),
                     request_id: request_id(248),
@@ -4487,6 +4504,9 @@ mod tests {
             schema_id: meta::SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                [10; types::FIXED_ID_BYTES],
+            )),
             placement_generation: placement(),
             owner_epoch: owner(1),
             request_id: request_id(202),
@@ -4575,6 +4595,9 @@ mod tests {
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
                     placement_generation: placement(),
                     owner_epoch: owner(1),
                     request_id: request_id(203),
@@ -4649,6 +4672,9 @@ mod tests {
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
                     placement_generation: placement(),
                     owner_epoch: owner(1),
                     request_id: request_id(204),
@@ -4708,6 +4734,9 @@ mod tests {
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
                     placement_generation: placement(),
                     owner_epoch: owner(1),
                     request_id: request_id(202),
@@ -4779,6 +4808,9 @@ mod tests {
                         schema_id: meta::SCHEMA_ID.to_owned(),
                         root_id: root(),
                         logical_shard_id: shard(),
+                        object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                            [10; types::FIXED_ID_BYTES],
+                        )),
                         placement_generation: placement(),
                         owner_epoch: owner(1),
                         request_id: request_id(
@@ -6078,6 +6110,7 @@ mod tests {
         let meta_context = |fill: u8| meta::PublicationContext {
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: types::ObjectNamespaceId::from_bytes([10; types::FIXED_ID_BYTES]),
             placement_generation: placement(),
             owner_epoch: owner(1),
             request_id: request_id(fill),

@@ -17,7 +17,7 @@ use nokv_client::{
     ClientError, ClientOptions, FramedTcpOptions, FramedTcpTransport, RouteResolver,
     StaticRouteResolver, TransportError, WorkspaceClient,
 };
-use nokv_protocol::{LogicalShardIdentity, RootIdentity, RootRoute};
+use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
 
 use super::cli::{ClientConfig, EtcdRoutingConfig, RoutingConfig, StaticRoutingConfig};
 
@@ -138,10 +138,15 @@ fn static_route_resolver(
         "--logical-shard-id",
         config.logical_shard_id.as_deref(),
     )?);
+    let object_namespace_id = ObjectNamespaceIdentity(required_fixed_identity(
+        "--object-namespace-id",
+        config.object_namespace_id.as_deref(),
+    )?);
     let resolver = StaticRouteResolver::new(
         RootRoute {
             root_id,
             logical_shard_id,
+            object_namespace_id,
             placement_generation: config.placement_generation,
             owner_epoch: config.owner_epoch,
         },
@@ -230,6 +235,7 @@ mod tests {
             routing: RoutingConfig::Static(StaticRoutingConfig {
                 metadata_address: "127.0.0.1:17750".parse().expect("test address is valid"),
                 logical_shard_id: Some(identity(0x22)),
+                object_namespace_id: Some(identity(0x33)),
                 placement_generation: 7,
                 owner_epoch: 9,
             }),
@@ -247,6 +253,10 @@ mod tests {
         assert_eq!(
             resolved.route.logical_shard_id,
             LogicalShardIdentity([0x22; FIXED_ID_BYTES])
+        );
+        assert_eq!(
+            resolved.route.object_namespace_id,
+            ObjectNamespaceIdentity([0x33; FIXED_ID_BYTES])
         );
         assert_eq!(resolved.route.placement_generation, 7);
         assert_eq!(resolved.route.owner_epoch, 9);

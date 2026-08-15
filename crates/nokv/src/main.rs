@@ -64,7 +64,14 @@ fn run() -> Result<(), String> {
         }
         Command::Schema => print_schema(),
         Command::Version { json } => print_version(*json),
-        Command::Provision { logical_shard_id } => run_provision(&invocation, logical_shard_id),
+        Command::Provision {
+            logical_shard_id,
+            adopt_legacy_object_namespace,
+        } => run_provision(
+            &invocation,
+            logical_shard_id,
+            *adopt_legacy_object_namespace,
+        ),
         Command::Serve => run_server(&invocation),
         Command::Workbench { tool, arguments } => {
             let handler = build_handler(&invocation)?;
@@ -114,10 +121,12 @@ fn run() -> Result<(), String> {
 
 fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, String> {
     let client = connection::connect(&invocation.client).map_err(|error| error.to_string())?;
-    client
+    let preflight = client
         .preflight(WORKBENCH_REQUIRED_RPC_CAPABILITIES)
         .map_err(|error| format!("workspace preflight failed: {error}"))?;
-    let objects = Arc::new(CliObjectStore::build(&invocation.client.object)?);
+    let expected_namespace = preflight.value.route.object_namespace_id.into();
+    let objects =
+        Arc::new(CliObjectStore::build(&invocation.client.object)?.bind(expected_namespace)?);
     objects.validate_agent_capabilities()?;
     Ok(CliWorkbenchBackend::new(
         client,
@@ -273,7 +282,7 @@ USAGE:
   nokv [connection/object options] mcp
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--content-type TYPE]
-  nokv --root-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32>
+  nokv --root-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [--adopt-legacy-object-namespace]
   nokv [owner options] serve
   nokv schema
   nokv version [--json]
@@ -281,7 +290,7 @@ USAGE:
 
 CLIENT ROUTING:
   --root-id HEX32
-  --metadata-address HOST:PORT --logical-shard-id HEX32
+  --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
   --etcd-endpoint URL [--etcd-endpoint URL ...]
 
 AGENT PRESENTATION:
@@ -290,7 +299,8 @@ AGENT PRESENTATION:
   RootId remains the only storage/routing identity; the presentation root never enters Holt keys
 
 OWNER:
-  provision creates the logical shard, installs immutable root affinity, and activates it
+  provision creates the logical shard, immutable object-namespace binding, and root affinity
+  --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
   --root-id HEX32 --etcd-endpoint URL --node-id ID
   --advertise-endpoint HOST:PORT --bind HOST:PORT
   --metadata-create PATH starts the first standalone local-WAL owner
@@ -317,7 +327,11 @@ fn connect_control(
 }
 
 #[cfg(feature = "etcd")]
-fn run_provision(invocation: &Invocation, logical_shard_id: &str) -> Result<(), String> {
+fn run_provision(
+    invocation: &Invocation,
+    logical_shard_id: &str,
+    adopt_legacy_object_namespace: bool,
+) -> Result<(), String> {
     use nokv_control::{LogicalShardId, RootId};
     use nokv_types::RootPlacementLifecycle;
 
@@ -331,8 +345,44 @@ fn run_provision(invocation: &Invocation, logical_shard_id: &str) -> Result<(), 
         connection::parse_logical_shard_id(logical_shard_id).map_err(|error| error.to_string())?,
     );
     let control = connect_control(route)?;
-    let outcome = provision::provision_and_activate(control.as_ref(), root_id, logical_shard_id)
-        .map_err(|error| error.to_string())?;
+    let existing_placement =
+        provision::preflight_provision(control.as_ref(), root_id, logical_shard_id)
+            .map_err(|error| error.to_string())?;
+    let objects = CliObjectStore::build(&invocation.client.object)?;
+    objects.validate_agent_capabilities()?;
+    let namespace_id = match control
+        .get_root_object_namespace_binding(&root_id)
+        .map_err(|error| error.to_string())?
+    {
+        Some(binding) => {
+            objects.clone().bind(binding.object_namespace_id)?;
+            binding.object_namespace_id
+        }
+        None => {
+            if existing_placement.is_some() && !adopt_legacy_object_namespace {
+                return Err(
+                    "legacy root has no durable object namespace binding; verify the configured bucket/prefix, then rerun provision with --adopt-legacy-object-namespace"
+                        .to_owned(),
+                );
+            }
+            match objects.load_namespace()? {
+                Some(existing) => existing,
+                None => {
+                    let created = provision::new_object_namespace_id(root_id);
+                    objects.ensure_namespace(created)?;
+                    created
+                }
+            }
+        }
+    };
+    let outcome = provision::provision_and_activate(
+        control.as_ref(),
+        root_id,
+        logical_shard_id,
+        namespace_id,
+    )
+    .map_err(|error| error.to_string())?;
+    objects.bind(namespace_id)?;
     let lifecycle = match outcome.placement.lifecycle {
         RootPlacementLifecycle::Provisioning => "provisioning",
         RootPlacementLifecycle::Active => "active",
@@ -343,16 +393,22 @@ fn run_provision(invocation: &Invocation, logical_shard_id: &str) -> Result<(), 
         "status": "success",
         "root_id": encode_lowercase_hex(root_id.as_bytes()),
         "logical_shard_id": encode_lowercase_hex(logical_shard_id.as_bytes()),
+        "object_namespace_id": encode_lowercase_hex(namespace_id.as_bytes()),
         "placement_generation": outcome.placement.placement_generation.get(),
         "lifecycle": lifecycle,
         "logical_shard_preexisting": outcome.logical_shard_preexisting,
+        "object_namespace_preexisting": outcome.object_namespace_preexisting,
         "placement_preexisting": outcome.placement_preexisting,
         "activation_required": outcome.activation_required,
     }))
 }
 
 #[cfg(not(feature = "etcd"))]
-fn run_provision(_invocation: &Invocation, _logical_shard_id: &str) -> Result<(), String> {
+fn run_provision(
+    _invocation: &Invocation,
+    _logical_shard_id: &str,
+    _adopt_legacy_object_namespace: bool,
+) -> Result<(), String> {
     Err("provision requires the nokv etcd feature".to_owned())
 }
 
@@ -469,6 +525,13 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .get_root_placement(&root_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "root placement does not exist; provision it before serve".to_owned())?;
+    let object_namespace = control
+        .get_root_object_namespace_binding(&root_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "root object namespace is not bound; run provision after verifying the configured bucket/prefix"
+                .to_owned()
+        })?;
     let shard = control
         .get_logical_shard(&placement.logical_shard_id)
         .map_err(|error| error.to_string())?
@@ -484,7 +547,28 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     {
         return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
     }
-    let objects = Arc::new(CliObjectStore::build(&invocation.client.object)?);
+    let expected_namespace = object_namespace.object_namespace_id;
+    let namespace_bindings = placements
+        .iter()
+        .map(|placement| {
+            control
+                .get_root_object_namespace_binding(&placement.root_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "every root on a served shard must have an object namespace binding".to_owned()
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if namespace_bindings
+        .iter()
+        .any(|binding| binding.object_namespace_id != expected_namespace)
+    {
+        return Err(
+            "one shard owner cannot serve roots bound to different object namespaces".to_owned(),
+        );
+    }
+    let objects =
+        Arc::new(CliObjectStore::build(&invocation.client.object)?.bind(expected_namespace)?);
     objects.validate_agent_capabilities()?;
     let registry = Arc::new(RootOwnerRegistry::new());
     let owner = bootstrap_shard(
@@ -503,7 +587,12 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
                 .iter()
                 .map(|placement| RootAttach {
                     root_id: placement.root_id,
+                    object_namespace_id: expected_namespace,
                     install_id: request_id(b"install", placement.root_id),
+                    bind_object_namespace_id: request_id(
+                        b"bind-object-namespace",
+                        placement.root_id,
+                    ),
                     activate_id: request_id(b"activate", placement.root_id),
                 })
                 .collect(),
@@ -626,9 +715,10 @@ mod tests {
         let root = |fill| RootId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
         let shard = |fill| LogicalShardId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
         let control = InMemoryControlStore::new();
-        provision::provision_and_activate(&control, root(1), shard(9)).unwrap();
-        provision::provision_and_activate(&control, root(2), shard(9)).unwrap();
-        provision::provision_and_activate(&control, root(3), shard(8)).unwrap();
+        let namespace = nokv_types::ObjectNamespaceId::from_bytes([10; 16]);
+        provision::provision_and_activate(&control, root(1), shard(9), namespace).unwrap();
+        provision::provision_and_activate(&control, root(2), shard(9), namespace).unwrap();
+        provision::provision_and_activate(&control, root(3), shard(8), namespace).unwrap();
         control
             .create_root_placement(RootPlacement {
                 root_id: root(4),

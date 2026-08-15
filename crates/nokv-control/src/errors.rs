@@ -1,7 +1,8 @@
 use std::fmt;
 
 use crate::{
-    LogicalShardId, LogicalShardLease, LogicalShardState, NodeId, OwnerEpoch, RootId, RootPlacement,
+    LogicalShardId, LogicalShardLease, LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch,
+    RootId, RootPlacement,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9,6 +10,11 @@ pub enum ControlError {
     InvalidEndpoint(String),
     RootPlacementNotFound(RootId),
     RootPlacementAlreadyExists(RootId),
+    RootObjectNamespaceAlreadyBound {
+        root_id: RootId,
+        existing: ObjectNamespaceId,
+        requested: ObjectNamespaceId,
+    },
     ImmutableShardAffinity {
         root_id: RootId,
         existing: LogicalShardId,
@@ -75,6 +81,10 @@ impl fmt::Display for ControlError {
             Self::RootPlacementAlreadyExists(root_id) => {
                 write!(formatter, "root placement {root_id:?} already exists")
             }
+            Self::RootObjectNamespaceAlreadyBound { root_id, .. } => write!(
+                formatter,
+                "root {root_id:?} is already bound to another artifact object namespace"
+            ),
             Self::ImmutableShardAffinity {
                 root_id,
                 existing,

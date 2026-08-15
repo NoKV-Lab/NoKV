@@ -9,7 +9,7 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 data_root="${NOKV_WORKBENCH_DATA_ROOT:-${repo_root}/target/workbench-live}"
 container="${NOKV_WORKBENCH_RUSTFS_CONTAINER:-nokv-workbench-rustfs}"
-image="${NOKV_WORKBENCH_RUSTFS_IMAGE:-rustfs/rustfs:latest}"
+image="${NOKV_WORKBENCH_RUSTFS_IMAGE:-rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab}"
 host="${NOKV_WORKBENCH_RUSTFS_HOST:-127.0.0.1}"
 port="${NOKV_WORKBENCH_RUSTFS_PORT:-9000}"
 console_port="${NOKV_WORKBENCH_RUSTFS_CONSOLE_PORT:-9001}"
@@ -28,9 +28,18 @@ export AWS_ACCESS_KEY_ID="${access_key}"
 export AWS_SECRET_ACCESS_KEY="${secret_key}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 export AWS_EC2_METADATA_DISABLED=true
+export AWS_MAX_ATTEMPTS=1
+
+aws_s3() {
+  aws \
+    --cli-connect-timeout 1 \
+    --cli-read-timeout 2 \
+    --endpoint-url "${endpoint}" \
+    "$@"
+}
 
 endpoint_ready=0
-if aws --endpoint-url "${endpoint}" s3api list-buckets >/dev/null 2>&1; then
+if aws_s3 s3api list-buckets >/dev/null 2>&1; then
   endpoint_ready=1
 fi
 
@@ -66,7 +75,7 @@ fi
 
 ready=0
 for _ in $(seq 1 60); do
-  if aws --endpoint-url "${endpoint}" s3api list-buckets >/dev/null 2>&1; then
+  if aws_s3 s3api list-buckets >/dev/null 2>&1; then
     ready=1
     break
   fi
@@ -79,8 +88,8 @@ if [ "${ready}" != "1" ]; then
   exit 1
 fi
 
-if ! aws --endpoint-url "${endpoint}" s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
-  aws --endpoint-url "${endpoint}" s3api create-bucket --bucket "${bucket}" >/dev/null
+if ! aws_s3 s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+  aws_s3 s3api create-bucket --bucket "${bucket}" >/dev/null
 fi
 
 cat <<EOF

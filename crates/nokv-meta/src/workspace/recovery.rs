@@ -7,8 +7,8 @@
 use std::fmt;
 
 use nokv_types::{
-    CommandDigest, CommitVersion, LogicalShardId, OwnerEpoch, PlacementGeneration, ReadVersion,
-    RequestId, RootActivationState, RootId,
+    CommandDigest, CommitVersion, LogicalShardId, ObjectNamespaceId, OwnerEpoch,
+    PlacementGeneration, ReadVersion, RequestId, RootActivationState, RootId,
 };
 use sha2::{Digest, Sha256};
 
@@ -19,7 +19,8 @@ use super::engine::{
 };
 use super::keyspace::MetadataFamily;
 
-pub const RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 2;
+pub const RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 3;
+const LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 2;
 pub const RECOVERY_CHAIN_DIGEST_BYTES: usize = 32;
 const MAX_ITEMS: usize = 256;
 pub(crate) const MAX_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
@@ -112,6 +113,7 @@ pub enum RecoveryResultV1 {
 /// One hash-chained recovery outbox row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryOutboxRecord {
+    format_version: u8,
     pub recovery_lsn: u64,
     pub previous_chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
     pub chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
@@ -227,6 +229,7 @@ impl RecoveryOutboxRecord {
             &result_bytes,
         );
         Ok(Self {
+            format_version: RECOVERY_OUTBOX_VALUE_FORMAT_VERSION,
             recovery_lsn,
             previous_chain_digest,
             chain_digest,
@@ -237,7 +240,9 @@ impl RecoveryOutboxRecord {
 
     pub fn encode(&self) -> Result<Vec<u8>, RecoveryCodecError> {
         validate_pair(&self.mutation, &self.result)?;
-        let mutation = self.mutation.encode_canonical()?;
+        let mutation = self
+            .mutation
+            .encode_canonical_for_version(self.format_version)?;
         let result = self.result.encode_canonical()?;
         let expected = recovery_chain_digest(
             self.previous_chain_digest,
@@ -256,7 +261,7 @@ impl RecoveryOutboxRecord {
         let mutation_len = u32_len("mutation", mutation.len())?;
         let result_len = u32_len("result", result.len())?;
         let mut bytes = Vec::with_capacity(1 + 8 + 32 + 32 + 4 + mutation.len() + 4 + result.len());
-        bytes.push(RECOVERY_OUTBOX_VALUE_FORMAT_VERSION);
+        bytes.push(self.format_version);
         bytes.extend_from_slice(&self.recovery_lsn.to_be_bytes());
         bytes.extend_from_slice(&self.previous_chain_digest);
         bytes.extend_from_slice(&self.chain_digest);
@@ -269,7 +274,7 @@ impl RecoveryOutboxRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, RecoveryCodecError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_version()?;
+        let format_version = decoder.recovery_version()?;
         let recovery_lsn = decoder.u64("recovery_lsn")?;
         if recovery_lsn == 0 {
             return Err(RecoveryCodecError::ZeroScalar {
@@ -278,10 +283,14 @@ impl RecoveryOutboxRecord {
         }
         let previous_chain_digest = decoder.fixed("previous_chain_digest")?;
         let chain_digest = decoder.fixed("chain_digest")?;
-        let mutation = RecoveryMutationV1::decode_canonical(decoder.bytes("mutation")?)?;
+        let mutation = RecoveryMutationV1::decode_canonical_for_version(
+            decoder.bytes("mutation")?,
+            format_version,
+        )?;
         let result = RecoveryResultV1::decode_canonical(decoder.bytes("result")?)?;
         decoder.finish()?;
         let record = Self {
+            format_version,
             recovery_lsn,
             previous_chain_digest,
             chain_digest,
@@ -289,7 +298,9 @@ impl RecoveryOutboxRecord {
             result,
         };
         validate_pair(&record.mutation, &record.result)?;
-        let mutation_bytes = record.mutation.encode_canonical()?;
+        let mutation_bytes = record
+            .mutation
+            .encode_canonical_for_version(record.format_version)?;
         let result_bytes = record.result.encode_canonical()?;
         if recovery_chain_digest(
             record.previous_chain_digest,
@@ -306,6 +317,13 @@ impl RecoveryOutboxRecord {
 
 impl RecoveryMutationV1 {
     pub fn encode_canonical(&self) -> Result<Vec<u8>, RecoveryCodecError> {
+        self.encode_canonical_for_version(RECOVERY_OUTBOX_VALUE_FORMAT_VERSION)
+    }
+
+    fn encode_canonical_for_version(
+        &self,
+        format_version: u8,
+    ) -> Result<Vec<u8>, RecoveryCodecError> {
         let mut bytes = Vec::new();
         match self {
             Self::MetadataCommand {
@@ -324,6 +342,17 @@ impl RecoveryMutationV1 {
                 put_bytes(&mut bytes, "schema_id", command.schema_id.as_bytes())?;
                 bytes.extend_from_slice(command.root_id.as_bytes());
                 bytes.extend_from_slice(command.logical_shard_id.as_bytes());
+                match (format_version, command.object_namespace_id) {
+                    (LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION, None) => {}
+                    (RECOVERY_OUTBOX_VALUE_FORMAT_VERSION, Some(object_namespace_id)) => {
+                        bytes.extend_from_slice(object_namespace_id.as_bytes());
+                    }
+                    _ => {
+                        return Err(RecoveryCodecError::InvalidValue {
+                            field: "object_namespace_id",
+                        });
+                    }
+                }
                 bytes.extend_from_slice(&command.placement_generation.get().to_be_bytes());
                 bytes.extend_from_slice(&command.owner_epoch.get().to_be_bytes());
                 bytes.extend_from_slice(command.request_id.as_bytes());
@@ -401,6 +430,13 @@ impl RecoveryMutationV1 {
     }
 
     pub fn decode_canonical(encoded: &[u8]) -> Result<Self, RecoveryCodecError> {
+        Self::decode_canonical_for_version(encoded, RECOVERY_OUTBOX_VALUE_FORMAT_VERSION)
+    }
+
+    fn decode_canonical_for_version(
+        encoded: &[u8],
+        format_version: u8,
+    ) -> Result<Self, RecoveryCodecError> {
         if encoded.len() > MAX_RECOVERY_BYTES {
             return Err(RecoveryCodecError::LengthBound {
                 field: "mutation",
@@ -416,6 +452,18 @@ impl RecoveryMutationV1 {
                 let root_id = RootId::from_bytes(decoder.fixed("root_id")?);
                 let logical_shard_id =
                     LogicalShardId::from_bytes(decoder.fixed("logical_shard_id")?);
+                let object_namespace_id = match format_version {
+                    LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION => None,
+                    RECOVERY_OUTBOX_VALUE_FORMAT_VERSION => Some(ObjectNamespaceId::from_bytes(
+                        decoder.fixed("object_namespace_id")?,
+                    )),
+                    _ => {
+                        return Err(RecoveryCodecError::UnsupportedVersion {
+                            actual: format_version,
+                            expected: RECOVERY_OUTBOX_VALUE_FORMAT_VERSION,
+                        });
+                    }
+                };
                 let placement_generation =
                     nonzero_generation(decoder.u64("placement_generation")?)?;
                 let owner_epoch = nonzero_owner(decoder.u64("owner_epoch")?, "owner_epoch")?;
@@ -459,6 +507,7 @@ impl RecoveryMutationV1 {
                     schema_id,
                     root_id,
                     logical_shard_id,
+                    object_namespace_id,
                     placement_generation,
                     owner_epoch,
                     request_id,
@@ -502,7 +551,7 @@ impl RecoveryMutationV1 {
             }
         };
         decoder.finish()?;
-        if mutation.encode_canonical()? != encoded {
+        if mutation.encode_canonical_for_version(format_version)? != encoded {
             return Err(RecoveryCodecError::InvalidValue {
                 field: "canonical_mutation",
             });
@@ -915,6 +964,10 @@ fn validate_pair(
 fn encode_root_action(bytes: &mut Vec<u8>, action: &RootFenceAction) {
     match action {
         RootFenceAction::Install => bytes.push(1),
+        RootFenceAction::BindObjectNamespace { expected } => {
+            bytes.push(4);
+            bytes.push((*expected).into());
+        }
         RootFenceAction::RequireActive => bytes.push(2),
         RootFenceAction::Transition { expected, next } => {
             bytes.push(3);
@@ -931,6 +984,9 @@ fn decode_root_action(decoder: &mut Decoder<'_>) -> Result<RootFenceAction, Reco
         3 => Ok(RootFenceAction::Transition {
             expected: decode_root_state(decoder.u8("expected_root_state")?)?,
             next: decode_root_state(decoder.u8("next_root_state")?)?,
+        }),
+        4 => Ok(RootFenceAction::BindObjectNamespace {
+            expected: decode_root_state(decoder.u8("expected_root_state")?)?,
         }),
         value => Err(RecoveryCodecError::UnknownDiscriminant {
             type_name: "RootFenceAction",
@@ -1118,10 +1174,12 @@ impl<'a> Decoder<'a> {
         Self { encoded, offset: 0 }
     }
 
-    fn require_version(&mut self) -> Result<(), RecoveryCodecError> {
+    fn recovery_version(&mut self) -> Result<u8, RecoveryCodecError> {
         let actual = self.u8("value_format_version")?;
-        if actual == RECOVERY_OUTBOX_VALUE_FORMAT_VERSION {
-            Ok(())
+        if actual == LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION
+            || actual == RECOVERY_OUTBOX_VALUE_FORMAT_VERSION
+        {
+            Ok(actual)
         } else {
             Err(RecoveryCodecError::UnsupportedVersion {
                 actual,
@@ -1232,12 +1290,28 @@ mod tests {
         encoded
     }
 
+    fn hex_decode(encoded: &str) -> Vec<u8> {
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |byte: u8| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    _ => panic!("test fixture contains non-hex input"),
+                };
+                (digit(pair[0]) << 4) | digit(pair[1])
+            })
+            .collect()
+    }
+
     fn command() -> MetadataCommand {
         let root = RootId::from_bytes([1; 16]);
         MetadataCommand {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root,
             logical_shard_id: LogicalShardId::from_bytes([2; 16]),
+            object_namespace_id: Some(ObjectNamespaceId::from_bytes([8; 16])),
             placement_generation: PlacementGeneration::new(3).unwrap(),
             owner_epoch: OwnerEpoch::new(4).unwrap(),
             request_id: RequestId::from_bytes([5; 16]),
@@ -1278,7 +1352,7 @@ mod tests {
         };
         let record = RecoveryOutboxRecord::new(8, [0x11; 32], mutation, result).unwrap();
         let encoded = record.encode().unwrap();
-        assert_eq!(hex_encode(&encoded), "0200000000000000081111111111111111111111111111111111111111111111111111111111111111f5e3ab61f72ceba583774bcd1e8d98c4f38621f8c5682c7586ac004c35d25d4200000106010000000e6e6f6b765f776f726b737061636501010101010101010101010101010101020202020202020202020202020202020000000000000003000000000000000405050505050505050505050505050505caf0269cc277bd5e16dbed022e7a3fdb4d49948b467ed050725cd6fdbcfc72df00000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
+        assert_eq!(hex_encode(&encoded), "030000000000000008111111111111111111111111111111111111111111111111111111111111111167bcc73b77c67e87b06fe9b72e888d6ee6ed531065032bd8a36567af7648db8800000116010000000e6e6f6b765f776f726b73706163650101010101010101010101010101010102020202020202020202020202020202080808080808080808080808080808080000000000000003000000000000000405050505050505050505050505050505a5a3252ff9a303877dbcc8ca4a4bff31d0e14b1e19982ed20a06419d80b9a08700000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
         assert_eq!(RecoveryOutboxRecord::decode(&encoded).unwrap(), record);
 
         let mut unknown = encoded.clone();
@@ -1293,6 +1367,17 @@ mod tests {
             RecoveryOutboxRecord::decode(&corrupted),
             Err(RecoveryCodecError::ChainDigestMismatch)
         );
+    }
+
+    #[test]
+    fn recovery_record_decodes_and_preserves_v2_without_namespace_bytes() {
+        let legacy = hex_decode("0200000000000000081111111111111111111111111111111111111111111111111111111111111111f5e3ab61f72ceba583774bcd1e8d98c4f38621f8c5682c7586ac004c35d25d4200000106010000000e6e6f6b765f776f726b737061636501010101010101010101010101010101020202020202020202020202020202020000000000000003000000000000000405050505050505050505050505050505caf0269cc277bd5e16dbed022e7a3fdb4d49948b467ed050725cd6fdbcfc72df00000000000000060200000001011100000013010101010101010101010101010101016b657901000000066265666f726500000001011100000013010101010101010101010101010101016b6579000000056166746572000000011100000013010101010101010101010101010101016b657900000001000000056576656e7400000006726573756c740100000000000000630000001301000000000000000700000006726573756c74");
+        let decoded = RecoveryOutboxRecord::decode(&legacy).unwrap();
+        let RecoveryMutationV1::MetadataCommand { command, .. } = &decoded.mutation else {
+            panic!("legacy fixture must contain a metadata command");
+        };
+        assert_eq!(command.object_namespace_id, None);
+        assert_eq!(decoded.encode().unwrap(), legacy);
     }
 
     #[test]

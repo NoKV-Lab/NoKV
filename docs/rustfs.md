@@ -53,6 +53,25 @@ nokv/artifacts/{logical_shard_id}/{root_id}/{artifact_revision_id}/blocks/{objec
 
 Changing the endpoint or physical RustFS node does not change that identity.
 
+The bucket plus configured prefix contains one immutable, provider-neutral
+identity marker:
+
+```text
+nokv/system/object-namespace
+```
+
+The control plane binds each `RootId` to the marker's `ObjectNamespaceId`
+exactly once. Routes carry that ID, and the Holt root fence persists it in the
+same metadata authority that enforces placement generation and owner epoch.
+Endpoint, bucket, prefix, and credentials remain deployment configuration; NoKV
+does not copy provider-specific values into metadata.
+
+Consequently, two healthy RustFS prefixes are not interchangeable. A process
+configured with the wrong prefix observes a different or absent marker and is
+rejected before it can publish a route or use that provider for artifact or
+lifecycle operations. A changed endpoint is safe only when it resolves to the
+same durable namespace marker.
+
 ## Required Bucket Behavior
 
 Before serving writes, verify:
@@ -99,6 +118,42 @@ If metadata publication fails, staged-object records drive cleanup. If delete
 completion is uncertain, the operation enters quarantine and reconciliation.
 The system does not infer success from a later bucket listing.
 
+Temporary provider failures remain retryable across the object, client, and
+Workbench error boundaries. After bounded attempts, callers receive
+`ObjectUnavailable` with `retryable: true` and an attempt count. Public errors
+do not include endpoint, bucket, prefix, or physical object keys. Immutable
+create and delete operations with ambiguous completion remain reconciliation
+cases rather than blind retries.
+
+## Existing Roots
+
+Roots created before object-namespace binding have no durable evidence from
+which NoKV could infer the historical bucket/prefix. Automatic adoption would
+therefore make a typo authoritative. Upgrade them only while all owners are
+stopped and after an operator verifies the exact existing object profile:
+
+```bash
+nokv \
+  --root-id ROOT_HEX32 \
+  --etcd-endpoint ETCD_URL \
+  --object-bucket BUCKET \
+  --object-endpoint S3_URL \
+  --object-root PREFIX \
+  provision LOGICAL_SHARD_HEX32 \
+  --adopt-legacy-object-namespace
+```
+
+Without the explicit flag, provisioning an existing unbound root fails before
+creating a marker or control binding. The next `--metadata-reopen` validates
+the control binding and upgrades the legacy Holt root fence through the normal
+owner-fenced metadata command and recovery outbox. Existing v1 root-fence and
+v2 recovery bytes remain readable and re-encode canonically.
+
+The legacy `None` decode and explicit adoption path may be removed only after
+every supported deployment proves that all root control bindings and Holt root
+fences contain an `ObjectNamespaceId`, and the documented upgrade window has
+ended. It must never be replaced by implicit adoption.
+
 ## Qualification
 
 RustFS qualification covers:
@@ -111,6 +166,9 @@ RustFS qualification covers:
 - zero-reference deletion;
 - ambiguous-delete reconciliation;
 - process restart and owner replacement;
+- healthy wrong-prefix rejection without owner-epoch or payload mutation;
+- provider outage returning a redacted retryable error and the same logical
+  request succeeding after provider recovery;
 - throughput and latency under the declared payload/concurrency matrix.
 
 Retain raw evidence using [Benchmarks](./benchmarks.md) and

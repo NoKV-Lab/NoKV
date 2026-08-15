@@ -36,6 +36,7 @@ pub enum RoutingConfig {
 pub struct StaticRoutingConfig {
     pub metadata_address: SocketAddr,
     pub logical_shard_id: Option<String>,
+    pub object_namespace_id: Option<String>,
     pub placement_generation: u64,
     pub owner_epoch: u64,
 }
@@ -108,6 +109,7 @@ pub enum Command {
     },
     Provision {
         logical_shard_id: String,
+        adopt_legacy_object_namespace: bool,
     },
     Serve,
     Schema,
@@ -178,6 +180,7 @@ impl Default for StaticRoutingConfig {
                 .parse()
                 .expect("default metadata address is valid"),
             logical_shard_id: None,
+            object_namespace_id: None,
             placement_generation: 1,
             owner_epoch: 1,
         }
@@ -254,6 +257,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             "--logical-shard-id" => {
                 select_routing(&mut routing_kind, RoutingKind::Static)?;
                 static_routing.logical_shard_id = Some(next_value(&mut arguments, &argument)?);
+            }
+            "--object-namespace-id" => {
+                select_routing(&mut routing_kind, RoutingKind::Static)?;
+                static_routing.object_namespace_id = Some(next_value(&mut arguments, &argument)?);
             }
             "--placement-generation" => {
                 select_routing(&mut routing_kind, RoutingKind::Static)?;
@@ -439,17 +446,31 @@ fn parse_command(
             ),
         }),
         "collect" => parse_collect(arguments),
-        "provision" => Ok(Command::Provision {
-            logical_shard_id: arguments
-                .next()
-                .ok_or(CliError::MissingArgument("logical shard id"))?,
-        }),
+        "provision" => parse_provision(arguments),
         "serve" => Ok(Command::Serve),
         "schema" => Ok(Command::Schema),
         "version" => parse_version(arguments),
         "help" => Ok(Command::Help),
         _ => Err(CliError::UnknownCommand(command)),
     }
+}
+
+fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let logical_shard_id = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("logical shard id"))?;
+    let adopt_legacy_object_namespace = match arguments.next() {
+        None => false,
+        Some(argument) if argument == "--adopt-legacy-object-namespace" => true,
+        Some(argument) if argument.starts_with("--") => {
+            return Err(CliError::UnknownOption(argument))
+        }
+        Some(argument) => return Err(CliError::UnexpectedArgument(argument)),
+    };
+    Ok(Command::Provision {
+        logical_shard_id,
+        adopt_legacy_object_namespace,
+    })
 }
 
 fn parse_version(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -658,9 +679,48 @@ mod tests {
             parsed.command,
             Command::Provision {
                 logical_shard_id: "22222222222222222222222222222222".to_owned(),
+                adopt_legacy_object_namespace: false,
             }
         );
         assert!(matches!(parsed.client.routing, RoutingConfig::Etcd(_)));
+    }
+
+    #[test]
+    fn legacy_namespace_adoption_requires_an_explicit_provision_flag() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "provision",
+            "22222222222222222222222222222222",
+            "--adopt-legacy-object-namespace",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Provision {
+                adopt_legacy_object_namespace: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_namespace_adoption_rejects_unparsed_trailing_arguments() {
+        let error = parse(args(&[
+            "--root-id",
+            "11",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "provision",
+            "22222222222222222222222222222222",
+            "--adopt-legacy-object-namespace",
+            "unexpected",
+        ]))
+        .unwrap_err();
+
+        assert_eq!(error, CliError::UnexpectedArgument("unexpected".to_owned()));
     }
 
     #[test]

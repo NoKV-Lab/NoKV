@@ -88,6 +88,14 @@ fixed_bytes_type!(
     FIXED_ID_BYTES
 );
 fixed_bytes_type!(
+    /// Never-reused identity for one durable artifact-object namespace.
+    ///
+    /// Endpoints and credentials are deployment details. This identity names
+    /// the durable bucket/prefix contents they resolve to.
+    ObjectNamespaceId,
+    FIXED_ID_BYTES
+);
+fixed_bytes_type!(
     /// Never-reused identity for one durable lifecycle operation within a root.
     OperationId,
     FIXED_ID_BYTES
@@ -902,6 +910,7 @@ mod tests {
 
         let root = RootId::from_bytes(bytes);
         let shard = LogicalShardId::from_bytes(bytes);
+        let object_namespace = ObjectNamespaceId::from_bytes(bytes);
         let workspace = WorkspaceIncarnationId::from_bytes(bytes);
         let revision = ArtifactRevisionId::from_bytes(bytes);
         let operation = OperationId::from_bytes(bytes);
@@ -911,6 +920,7 @@ mod tests {
 
         assert_eq!(root.as_bytes(), &bytes);
         assert_eq!(shard.as_bytes(), &bytes);
+        assert_eq!(object_namespace.as_bytes(), &bytes);
         assert_eq!(workspace.as_bytes(), &bytes);
         assert_eq!(revision.as_bytes(), &bytes);
         assert_eq!(operation.as_bytes(), &bytes);
@@ -918,6 +928,7 @@ mod tests {
         assert_eq!(commit.as_bytes(), &digest_bytes);
         assert_eq!(command_digest.as_bytes(), &digest_bytes);
         assert_eq!(shard.into_bytes(), bytes);
+        assert_eq!(object_namespace.into_bytes(), bytes);
         assert_eq!(commit.into_bytes(), digest_bytes);
         assert_eq!(std::mem::size_of::<RootId>(), FIXED_ID_BYTES);
         assert_eq!(std::mem::size_of::<LogicalShardId>(), FIXED_ID_BYTES);

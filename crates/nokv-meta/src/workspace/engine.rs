@@ -14,8 +14,8 @@ use nokv_meta_store::{
     Scan, ScanItem, ScanPage, StoreError, StoreLimits, TxnStore, WriteTxn,
 };
 use nokv_types::{
-    CommandDigest, CommitVersion, LogicalShardId, OwnerEpoch, PlacementGeneration, ReadVersion,
-    RequestId, RootActivationState, RootId,
+    CommandDigest, CommitVersion, LogicalShardId, ObjectNamespaceId, OwnerEpoch,
+    PlacementGeneration, ReadVersion, RequestId, RootActivationState, RootId,
 };
 use sha2::{Digest, Sha256};
 
@@ -108,6 +108,11 @@ pub(super) enum MetadataPointReadSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RootFenceAction {
     Install,
+    /// One-way upgrade of a pre-namespace root fence. It preserves placement,
+    /// activation state, and owner epoch while adding the immutable namespace.
+    BindObjectNamespace {
+        expected: RootActivationState,
+    },
     RequireActive,
     Transition {
         expected: RootActivationState,
@@ -180,6 +185,7 @@ pub struct MetadataCommand {
     pub schema_id: String,
     pub root_id: RootId,
     pub logical_shard_id: LogicalShardId,
+    pub object_namespace_id: Option<ObjectNamespaceId>,
     pub placement_generation: PlacementGeneration,
     pub owner_epoch: OwnerEpoch,
     pub request_id: RequestId,
@@ -205,12 +211,18 @@ impl MetadataCommand {
         hash_bytes(&mut hasher, self.schema_id.as_bytes());
         hasher.update(self.root_id.as_bytes());
         hasher.update(self.logical_shard_id.as_bytes());
+        if let Some(object_namespace_id) = self.object_namespace_id {
+            hasher.update(object_namespace_id.as_bytes());
+        }
         hasher.update(self.placement_generation.get().to_be_bytes());
         hasher.update(self.owner_epoch.get().to_be_bytes());
         hasher.update(self.request_id.as_bytes());
         hasher.update(self.read_version.get().to_be_bytes());
         match self.root_fence_action {
             RootFenceAction::Install => hasher.update([1]),
+            RootFenceAction::BindObjectNamespace { expected } => {
+                hasher.update([4, expected.into()]);
+            }
             RootFenceAction::RequireActive => hasher.update([2]),
             RootFenceAction::Transition { expected, next } => {
                 hasher.update([3, expected.into(), next.into()]);
@@ -2005,6 +2017,11 @@ impl MetaShard {
         if command.logical_shard_id != self.logical_shard_id {
             return Err(MetaError::PlacementMismatch);
         }
+        if command.object_namespace_id.is_none() {
+            return Err(invalid(
+                "metadata command requires an object namespace identity",
+            ));
+        }
         for (name, count) in [
             ("predicates", command.predicates.len()),
             ("mutations", command.mutations.len()),
@@ -2082,12 +2099,43 @@ impl MetaShard {
                 Ok(RootFencePlan::Install {
                     value: RootFence {
                         logical_shard_id: command.logical_shard_id,
+                        object_namespace_id: command.object_namespace_id,
                         placement_generation: command.placement_generation,
                         activation_state: RootActivationState::Installing,
                     }
                     .encode()
                     .expect("typed RootFence always fits its fixed format"),
                 })
+            }
+            RootFenceAction::BindObjectNamespace { expected } => {
+                let current = current.ok_or(MetaError::RootFenceMissing)?;
+                let fence =
+                    RootFence::decode(&current).map_err(|error| corrupt("RootFence", error))?;
+                validate_root_placement_identity(command, fence)?;
+                if fence.activation_state != expected {
+                    return Err(MetaError::RootFenceStateMismatch {
+                        expected,
+                        actual: fence.activation_state,
+                    });
+                }
+                let object_namespace_id = command
+                    .object_namespace_id
+                    .ok_or_else(|| invalid("object namespace binding requires a namespace id"))?;
+                match fence.object_namespace_id {
+                    None => Ok(RootFencePlan::Replace {
+                        expected: current,
+                        value: RootFence {
+                            object_namespace_id: Some(object_namespace_id),
+                            ..fence
+                        }
+                        .encode()
+                        .expect("typed RootFence always fits its fixed format"),
+                    }),
+                    Some(actual) if actual == object_namespace_id => {
+                        Ok(RootFencePlan::Assert { expected: current })
+                    }
+                    Some(_) => Err(MetaError::PlacementMismatch),
+                }
             }
             RootFenceAction::RequireActive => {
                 let current = current.ok_or(MetaError::RootFenceMissing)?;
@@ -2717,9 +2765,10 @@ fn build_recovery_plan(
 }
 
 fn synthetic_root_fence_plan(command: &MetadataCommand) -> Result<RootFencePlan, MetaError> {
-    let encoded = |state| {
+    let encoded = |state, object_namespace_id| {
         RootFence {
             logical_shard_id: command.logical_shard_id,
+            object_namespace_id,
             placement_generation: command.placement_generation,
             activation_state: state,
         }
@@ -2728,10 +2777,19 @@ fn synthetic_root_fence_plan(command: &MetadataCommand) -> Result<RootFencePlan,
     };
     match command.root_fence_action {
         RootFenceAction::Install => Ok(RootFencePlan::Install {
-            value: encoded(RootActivationState::Installing)?,
+            value: encoded(RootActivationState::Installing, command.object_namespace_id)?,
         }),
+        RootFenceAction::BindObjectNamespace { expected } => {
+            let object_namespace_id = command
+                .object_namespace_id
+                .ok_or_else(|| invalid("object namespace binding requires a namespace id"))?;
+            Ok(RootFencePlan::Replace {
+                expected: encoded(expected, None)?,
+                value: encoded(expected, Some(object_namespace_id))?,
+            })
+        }
         RootFenceAction::RequireActive => Ok(RootFencePlan::Assert {
-            expected: encoded(RootActivationState::Active)?,
+            expected: encoded(RootActivationState::Active, command.object_namespace_id)?,
         }),
         RootFenceAction::Transition { expected, next } => {
             if !valid_root_transition(expected, next) {
@@ -2741,8 +2799,8 @@ fn synthetic_root_fence_plan(command: &MetadataCommand) -> Result<RootFencePlan,
                 });
             }
             Ok(RootFencePlan::Replace {
-                expected: encoded(expected)?,
-                value: encoded(next)?,
+                expected: encoded(expected, command.object_namespace_id)?,
+                value: encoded(next, command.object_namespace_id)?,
             })
         }
     }
@@ -3034,6 +3092,19 @@ fn enqueue_predicate_guards(txn: &mut WriteTxn, plan: &PredicatePlan) {
 }
 
 fn validate_root_placement(command: &MetadataCommand, fence: RootFence) -> Result<(), MetaError> {
+    if validate_root_placement_identity(command, fence).is_ok()
+        && fence.object_namespace_id == command.object_namespace_id
+    {
+        Ok(())
+    } else {
+        Err(MetaError::PlacementMismatch)
+    }
+}
+
+fn validate_root_placement_identity(
+    command: &MetadataCommand,
+    fence: RootFence,
+) -> Result<(), MetaError> {
     if fence.logical_shard_id == command.logical_shard_id
         && fence.placement_generation == command.placement_generation
     {
@@ -3627,6 +3698,7 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(2),
             logical_shard_id: shard(1),
+            object_namespace_id: Some(ObjectNamespaceId::from_bytes([10; 16])),
             placement_generation: generation(7),
             owner_epoch: epoch(1),
             request_id,
@@ -3828,6 +3900,28 @@ mod tests {
         );
         store.advance_owner_epoch(None, epoch(1)).unwrap();
         store.advance_owner_epoch(None, epoch(1)).unwrap();
+    }
+
+    #[test]
+    fn new_root_fence_install_requires_an_object_namespace_before_mutation() {
+        let store = crate::workspace::test_support::memory(shard(1)).unwrap();
+        store.advance_owner_epoch(None, epoch(1)).unwrap();
+        let before = store.recovery_state().unwrap();
+        let mut install = base_command(&store, request(1), RootFenceAction::Install);
+        install.object_namespace_id = None;
+        let install = install.seal();
+
+        let error = store
+            .execute(&install)
+            .expect_err("a production install must not recreate a legacy unbound fence");
+
+        assert!(
+            matches!(&error, MetaError::InvalidCommand { reason }
+                if reason.contains("object namespace")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(store.root_fence(root(2)).unwrap(), None);
+        assert_eq!(store.recovery_state().unwrap(), before);
     }
 
     #[test]

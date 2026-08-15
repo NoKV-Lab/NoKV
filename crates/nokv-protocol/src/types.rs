@@ -6,9 +6,9 @@
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, CommitId, LogicalShardId, NormalizedRelativePath, OperationId, OwnerEpoch,
-    PlacementGeneration, RequestId, RootId, SnapshotAliasName, SnapshotId, TagName, WorkbenchId,
-    WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
+    ArtifactRevisionId, CommitId, LogicalShardId, NormalizedRelativePath, ObjectNamespaceId,
+    OperationId, OwnerEpoch, PlacementGeneration, RequestId, RootId, SnapshotAliasName, SnapshotId,
+    TagName, WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
 
@@ -60,6 +60,12 @@ identity!(
     FIXED_ID_BYTES
 );
 identity!(
+    /// Durable artifact-object namespace admitted by root placement.
+    ObjectNamespaceIdentity,
+    ObjectNamespaceId,
+    FIXED_ID_BYTES
+);
+identity!(
     /// Exact-replay request identity.
     RequestIdentity,
     RequestId,
@@ -102,6 +108,7 @@ pub struct Digest(pub [u8; SHA256_BYTES]);
 pub struct RootRoute {
     pub root_id: RootIdentity,
     pub logical_shard_id: LogicalShardIdentity,
+    pub object_namespace_id: ObjectNamespaceIdentity,
     pub placement_generation: u64,
     pub owner_epoch: u64,
 }

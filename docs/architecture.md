@@ -154,7 +154,8 @@ workbench scope, read view, read version, and child anchor. Resuming after
 live-state drift fails closed;
 an initial bounded collection may restart in full but never merges versions.
 The breaking ordered-list response is gated by protocol schema
-`nokv.workspace.rpc.v2`; there is no legacy response decoder.
+`nokv.workspace.rpc.v3`; v3 adds the provider-neutral object namespace identity
+to every root route, and there is no legacy response decoder.
 
 Secondary-index queries run at one read version and filter every result by the
 matching visible incarnation. Object bodies are read only when the selected

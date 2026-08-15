@@ -1,7 +1,8 @@
 use std::fmt;
 
 pub use nokv_types::{
-    LogicalShardId, OwnerEpoch, PlacementGeneration, RootId, RootPlacementLifecycle,
+    LogicalShardId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RootId,
+    RootPlacementLifecycle,
 };
 
 /// Stable identity of one physical metadata-shard process.
@@ -73,6 +74,17 @@ pub struct RootPlacement {
     pub logical_shard_id: LogicalShardId,
     pub placement_generation: PlacementGeneration,
     pub lifecycle: RootPlacementLifecycle,
+}
+
+/// Immutable provider-neutral binding from one root to its artifact namespace.
+///
+/// This is separate from placement lifecycle so v1 placements remain readable
+/// and a legacy root can acquire the missing identity exactly once without
+/// pretending that its shard affinity changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootObjectNamespaceBinding {
+    pub root_id: RootId,
+    pub object_namespace_id: ObjectNamespaceId,
 }
 
 /// Durable ownership and recovery state for one logical metadata shard.
