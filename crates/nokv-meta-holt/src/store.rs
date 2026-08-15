@@ -80,7 +80,7 @@ impl HoltStore {
     ) -> Result<Self, StoreError> {
         let trees = options.validate(allow_memory)?;
         preflight_location(&options, action)?;
-        let db = DB::open(options.config).map_err(map_holt_error)?;
+        let db = DB::open(options.config).map_err(map_open_error)?;
         prepare_trees(&db, &trees, action)?;
         Ok(Self {
             profile: StoreProfile {
@@ -899,6 +899,24 @@ fn map_atomic_result(
         }) => Err(map_holt_error(*source)),
         Err(error) => Err(poison(state, error.to_string())),
     }
+}
+
+/// Map an open failure, naming the one an operator actually hits.
+///
+/// The store directory is the exclusive local authority, so a second owner
+/// aimed at a live directory is refused by the blob store's own lock. Holt
+/// reports that as a `WouldBlock` I/O error whose text describes access modes;
+/// say what it means for the deployment and keep the original as the cause.
+fn map_open_error(error: holt::Error) -> StoreError {
+    if let holt::Error::BlobStoreIo(source) = &error {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            return StoreError::Unavailable(format!(
+                "another live owner already holds this metadata store; stop it before \
+                 opening the same directory ({error})"
+            ));
+        }
+    }
+    map_holt_error(error)
 }
 
 fn map_holt_error(error: holt::Error) -> StoreError {

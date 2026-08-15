@@ -582,6 +582,36 @@ fn initialize_and_open_enforce_the_exact_physical_catalog() {
 }
 
 #[test]
+fn opening_a_live_store_names_the_owner_conflict_not_the_access_mode() {
+    let directory = tempdir().expect("create HoltStore parent directory");
+    let path = directory.path().join("metadata");
+    let live = HoltStore::initialize(HoltOptions::file(&path, catalog([FIRST]), limits()))
+        .expect("initialize the first owner");
+
+    // The directory is the exclusive local authority, so a second owner aimed
+    // at it must be refused while the first is still open.
+    let reason = match HoltStore::open(HoltOptions::file(&path, catalog([FIRST]), limits())) {
+        Ok(_) => panic!("a second owner opened a live store"),
+        Err(StoreError::Unavailable(reason)) => reason,
+        Err(other) => panic!("expected an Unavailable refusal, got {other:?}"),
+    };
+    assert!(
+        reason.contains("another live owner already holds this metadata store"),
+        "refusal did not name the owner conflict: {reason}"
+    );
+
+    // The original blob-store text is retained as the cause, and the refusal
+    // must not disturb the live owner.
+    assert!(
+        reason.contains("incompatible live access mode"),
+        "refusal dropped its underlying cause: {reason}"
+    );
+    drop(live);
+    HoltStore::open(HoltOptions::file(&path, catalog([FIRST]), limits()))
+        .expect("reopen after the live owner released the store");
+}
+
+#[test]
 fn path_preflight_refuses_missing_open_and_foreign_directories() {
     let directory = tempdir().expect("create HoltStore parent directory");
     let missing = directory.path().join("missing");
