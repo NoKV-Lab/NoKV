@@ -314,6 +314,25 @@ where
                                 ));
                             }
                         };
+                        // The replay branch is the one path the engine takes
+                        // without re-checking the live path claim, so a
+                        // visible publication whose path was later removed and
+                        // reclaimed by another writer would otherwise be
+                        // reported as current. Commit and restore both re-read
+                        // live state before returning a replayed terminal
+                        // result; publish does the same rather than handing
+                        // back a generation the caller could CAS against.
+                        if matches!(authority, PublicationAuthority::Visible) {
+                            if let Err(source) =
+                                self.confirm_replayed_publication_is_live(logical_shard, &value)
+                            {
+                                return Err(ClientError::ArtifactPublishFailed {
+                                    stage: ArtifactPublishStage::Begin,
+                                    source: Box::new(source),
+                                    abort_failure: None,
+                                });
+                            }
+                        }
                         return Ok(ArtifactPublishOutcome {
                             publication: ClientCall {
                                 value,
@@ -981,6 +1000,41 @@ where
                 ))
             }
         }
+    }
+
+    /// Confirm a replayed publication still describes the live path.
+    ///
+    /// `begin_publish` returns a terminal operation row after comparing its
+    /// digests, without re-evaluating the path claim, so a create-only
+    /// publication whose path was later removed and reclaimed replays as
+    /// succeeded while the path holds a different revision. Returning that
+    /// record unchecked would hand the caller a generation to compare-and-swap
+    /// against a revision that is not theirs.
+    fn confirm_replayed_publication_is_live(
+        &self,
+        logical_shard: LogicalShardIdentity,
+        published: &PublishResult,
+    ) -> Result<(), ClientError> {
+        let metadata = self
+            .load_artifact_metadata(logical_shard, &published.target, WorkspaceReadView::Live)
+            .map_err(|source| match source {
+                ClientError::Rpc(failure) if failure.code == ErrorCode::NotFound => {
+                    ClientError::ResponseMismatch(
+                        "this publication succeeded earlier but its path no longer exists; the \
+                         replayed result cannot describe live state"
+                            .to_owned(),
+                    )
+                }
+                other => other,
+            })?;
+        if metadata.artifact_revision_id != published.artifact_revision_id {
+            return Err(ClientError::ResponseMismatch(
+                "this publication succeeded earlier but its path now holds a different revision; \
+                 the replayed result cannot describe live state"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn recover_completed_publish(
@@ -3052,6 +3106,51 @@ mod tests {
             (0, 0),
             "a replayed publication uploads nothing"
         );
+    }
+
+    #[test]
+    fn a_replayed_publication_whose_path_moved_is_not_reported_as_current() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+
+        // The path is removed and reclaimed by another writer, so the durable
+        // operation row still says succeeded while the path holds a revision
+        // that is not this caller's.
+        {
+            let mut state = inspector.state();
+            let metadata = state.path.as_mut().unwrap().metadata.as_mut().unwrap();
+            metadata.artifact_revision_id = ArtifactRevisionIdentity([0x5c; 16]);
+        }
+
+        let error = client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap_err();
+        let ClientError::ArtifactPublishFailed {
+            stage,
+            source,
+            abort_failure,
+        } = error
+        else {
+            panic!("expected a publish failure, got {error:?}");
+        };
+        assert_eq!(stage, ArtifactPublishStage::Begin);
+        assert!(
+            abort_failure.is_none(),
+            "a terminal row must not be aborted"
+        );
+        assert!(
+            matches!(*source, ClientError::ResponseMismatch(ref reason)
+                if reason.contains("holds a different revision")),
+            "unexpected source: {source:?}"
+        );
+        assert_eq!(inspector.state().abort_applies, 0);
     }
 
     #[test]
