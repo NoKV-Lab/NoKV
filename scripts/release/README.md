@@ -35,6 +35,11 @@ brew update
 brew upgrade nokv
 ```
 
+The generated Formula keeps `version_scheme 1`. This is the permanent Homebrew
+ordering boundary for the corrected pre-1.0 release line, so an existing
+`1.0.0` installation is eligible to upgrade to `0.10.0` and later `0.x`
+releases. Future Formula updates must not remove or decrease it.
+
 The Formula declares Homebrew `rust` and `protobuf` as build-only dependencies.
 The Rust dependency graph is resolved exclusively from the release
 `Cargo.lock`; the installed binary reports its NoKV version, exact source
