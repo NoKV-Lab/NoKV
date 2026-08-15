@@ -21,6 +21,12 @@ The checked-in integration assets are deliberately small:
   scientific reconstruction workflow through all 18 tools.
 - `live_workbench_test.py` checks exact coverage/order, flat commands,
   secret redaction, dry-run evidence, and fail-closed qualification.
+- `local_wal_recovery_gate.py` starts an isolated real etcd process and proves
+  that a killed `Recovering(2)` owner is retried at epoch 2 both before and
+  after the local Holt fence advances.
+- `local_wal_recovery_gate_test.py` freezes the gate's crash-stage and terminal
+  evidence contract. Its fault process is the bench-owned
+  `nokv-local-wal-recovery-fault` binary, not a production CLI test hook.
 - `start_rustfs.sh` starts the optional local S3-compatible artifact backend.
 
 Build and validate the product directly:
@@ -30,6 +36,7 @@ cargo build -p nokv --bin nokv
 cargo test --workspace
 python3 scripts/workbench/workbench_contract_test.py
 python3 scripts/workbench/live_workbench_test.py
+python3 scripts/workbench/local_wal_recovery_gate_test.py
 ```
 
 Register the built binary in any MCP-compatible Agent runtime as a stdio MCP
@@ -101,3 +108,32 @@ Live durability, failover, object-provider, and end-to-end Workbench
 qualification must be reported separately according to
 `docs/development/workspace-acceptance.md`. Unit tests or schema checks are not
 substitutes for those gates.
+
+## Local-WAL epoch recovery evidence
+
+The release recovery gate requires local `etcd` and `etcdctl` binaries. It
+starts a fresh single-member etcd under the evidence directory, builds the real
+`nokv` CLI plus the bench fault driver, and retains every control record,
+process log, crash-boundary record, binary digest, and terminal result:
+
+```bash
+python3 scripts/workbench/local_wal_recovery_gate.py \
+  --build \
+  --target-dir target/local-wal-recovery-gate/build \
+  --evidence-dir target/local-wal-recovery-gate/evidence/run-01
+```
+
+The two mandatory boundaries are:
+
+1. etcd is `Recovering(2)` while the local Holt fence is still epoch 1;
+2. etcd is `Recovering(2)` after the local Holt fence has committed epoch 2.
+
+For each boundary the driver holds a live lease and the same exclusive Holt
+path until the gate sends `SIGKILL`. Retry begins only after the lease-attached
+session key disappears. The real CLI must reopen the path, preserve the
+metadata probe, and publish `Serving(2)`; observing epoch 3 is a hard `FAIL`.
+
+This gate isolates control/local-WAL recovery and intentionally performs no
+object I/O. RustFS/S3 publication and reads remain the responsibility of
+`live_workbench.py`. Missing local etcd dependencies report `NOT QUALIFIED`;
+an invariant violation reports `FAIL`.

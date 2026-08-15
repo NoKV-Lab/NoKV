@@ -59,6 +59,10 @@ the local/control owner-epoch relation before consuming a new epoch. An
 unfinished `Recovering` epoch is rebound rather than skipped. This remains
 restart evidence, not copied-directory, cross-host, shared-log, or rolling
 upgrade failover evidence.
+The release-level epoch proof is the real-etcd fence-before/fence-after
+`SIGKILL` runner in
+[`scripts/workbench/local_wal_recovery_gate.py`](../scripts/workbench/local_wal_recovery_gate.py);
+a normal reopen alone does not cover interrupted `Recovering` retries.
 The selected `--workbench-root` is durable presentation configuration because
 canonical v1 manifests contain its projected paths. Keep it identical across
 restart/replay; it never replaces `RootId` as the storage or routing identity.

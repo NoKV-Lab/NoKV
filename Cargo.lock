@@ -1302,6 +1302,7 @@ dependencies = [
 name = "nokv-bench"
 version = "0.1.0"
 dependencies = [
+ "nokv-control",
  "nokv-meta",
  "nokv-meta-holt",
  "nokv-meta-store",
