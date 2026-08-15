@@ -128,6 +128,12 @@ The two mandatory boundaries are:
 1. etcd is `Recovering(2)` while the local Holt fence is still epoch 1;
 2. etcd is `Recovering(2)` after the local Holt fence has committed epoch 2.
 
+The `nokv-workspace` GitHub Actions check runs both boundaries against a
+checksum-pinned real etcd release. It uploads the complete evidence directory
+for seven days even when the gate fails, so a failed retry retains its control
+records, process logs, and terminal `qualification.json` instead of exposing
+only a transient CI error line.
+
 For each boundary the driver holds a live lease and the same exclusive Holt
 path until the gate sends `SIGKILL`. Retry begins only after the lease-attached
 session key disappears. The real CLI must reopen the path, preserve the

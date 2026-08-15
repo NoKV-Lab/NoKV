@@ -20,6 +20,9 @@ from local_wal_recovery_gate import (
 )
 
 
+REPO = Path(__file__).resolve().parents[2]
+
+
 def valid_evidence(stage: str) -> dict[str, object]:
     local_epoch = 1 if stage == "before-local-fence" else 2
     return {
@@ -39,6 +42,26 @@ def valid_evidence(stage: str) -> dict[str, object]:
 
 
 class LocalWalRecoveryGateContractTests(unittest.TestCase):
+    def test_rust_ci_runs_the_real_gate_and_retains_failure_evidence(self) -> None:
+        workflow = (REPO / ".github/workflows/rust.yml").read_text()
+
+        for required in (
+            "python3 scripts/workbench/local_wal_recovery_gate_test.py",
+            "id: local_wal_recovery",
+            "python3 scripts/workbench/local_wal_recovery_gate.py",
+            "--build",
+            "--evidence-dir \"$RECOVERY_EVIDENCE_DIR\"",
+            "sha256sum --check",
+            "if: ${{ always() && steps.local_wal_recovery.outcome != 'skipped' }}",
+            "if-no-files-found: error",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, workflow)
+        self.assertRegex(
+            workflow,
+            r"ETCD_LINUX_AMD64_SHA256: [0-9a-f]{64}",
+        )
+
     def test_gate_has_exactly_the_two_epoch_two_crash_boundaries(self) -> None:
         self.assertEqual(
             CRASH_STAGES,
