@@ -278,15 +278,10 @@ where
             },
         );
         let (mut token, resume, begin_replayed) = match begin {
-            Ok(status) => {
-                let replayed = status.replayed;
-                match running_publish_resume(
-                    status.value,
-                    operation_id,
-                    staged_objects.len(),
-                    manifest_rows.len(),
-                ) {
-                    Ok(resume) => (resume.token, resume, replayed),
+            Ok(call) => {
+                let (replayed, commit_version) = (call.replayed, call.commit_version);
+                let status = match validated_publish_status(call.value, operation_id) {
+                    Ok(status) => status,
                     Err(source) => {
                         return Err(self.failed_publication(
                             logical_shard,
@@ -296,6 +291,71 @@ where
                             source,
                         ));
                     }
+                };
+                // Begin observes whichever durable state the operation row is
+                // already in, so every state the engine can declare is handled
+                // here rather than collapsed into one running-state assertion.
+                match status.state {
+                    OperationState::Succeeded => {
+                        // The engine compares the operation identity and
+                        // initialization digests before it replays a terminal
+                        // row, so this record describes exactly this
+                        // publication: same target, same revision, same bytes.
+                        // Nothing was staged or uploaded on this attempt.
+                        let value = match published_result_from_status(&status) {
+                            Ok(value) => value,
+                            Err(source) => {
+                                return Err(self.failed_publication(
+                                    logical_shard,
+                                    operation_id,
+                                    None,
+                                    ArtifactPublishStage::Begin,
+                                    source,
+                                ));
+                            }
+                        };
+                        return Ok(ArtifactPublishOutcome {
+                            publication: ClientCall {
+                                value,
+                                commit_version,
+                                replayed: true,
+                            },
+                            upload_stats: ArtifactUploadStats::default(),
+                        });
+                    }
+                    OperationState::Aborting
+                    | OperationState::Failed
+                    | OperationState::Quarantined => {
+                        // The operation identity is durably spent. Aborting it
+                        // again is meaningless, so report the terminal state
+                        // instead of attempting one.
+                        return Err(ClientError::ArtifactPublishFailed {
+                            stage: ArtifactPublishStage::Begin,
+                            source: Box::new(ClientError::ResponseMismatch(format!(
+                                "artifact publication operation is durably {:?} and cannot be \
+                                 resumed; retry with a new operation identity",
+                                status.state
+                            ))),
+                            abort_failure: None,
+                        });
+                    }
+                    OperationState::Running => match running_publish_resume(
+                        status,
+                        operation_id,
+                        staged_objects.len(),
+                        manifest_rows.len(),
+                    ) {
+                        Ok(resume) => (resume.token, resume, replayed),
+                        Err(source) => {
+                            return Err(self.failed_publication(
+                                logical_shard,
+                                operation_id,
+                                None,
+                                ArtifactPublishStage::Begin,
+                                source,
+                            ));
+                        }
+                    },
                 }
             }
             Err(source) if is_definitive_append_race(&source) => return Err(source),
@@ -936,14 +996,7 @@ where
         if status.state != OperationState::Succeeded {
             return Ok(None);
         }
-        let result = match status.result {
-            Some(OperationResult::ArtifactPublish(result)) => result,
-            _ => {
-                return Err(ClientError::ResponseMismatch(
-                    "succeeded artifact operation did not contain a publish result".to_owned(),
-                ));
-            }
-        };
+        let result = published_result_from_status(&status)?;
         Ok(Some(ClientCall {
             value: result,
             commit_version: operation.commit_version,
@@ -1736,6 +1789,20 @@ fn running_publish_resume(
     })
 }
 
+/// The publication a terminal, successful operation record carries.
+///
+/// One definition shared by every path that observes a succeeded publication,
+/// whether it is discovered at `Begin` or recovered after a lost `Complete`
+/// response.
+fn published_result_from_status(status: &OperationStatus) -> Result<PublishResult, ClientError> {
+    match &status.result {
+        Some(OperationResult::ArtifactPublish(result)) => Ok(result.clone()),
+        _ => Err(ClientError::ResponseMismatch(
+            "succeeded artifact operation did not contain a publish result".to_owned(),
+        )),
+    }
+}
+
 fn running_publish_token(
     status: OperationStatus,
     operation_id: OperationIdentity,
@@ -1893,6 +1960,20 @@ mod tests {
             }
         }
 
+        /// The durable operation row the engine would replay for `operation_id`
+        /// when it has already reached a terminal state.
+        fn replayable_terminal_status(
+            &self,
+            operation_id: OperationIdentity,
+        ) -> Option<OperationStatus> {
+            let status = self.operation.as_ref()?;
+            if status.token.operation_id != operation_id || status.state == OperationState::Running
+            {
+                return None;
+            }
+            Some(status.clone())
+        }
+
         fn running_status(&mut self, operation_id: OperationIdentity) -> OperationStatus {
             OperationStatus {
                 token: self.next_token(operation_id),
@@ -2021,6 +2102,14 @@ mod tests {
     ) -> Result<WorkspaceResult, TransportError> {
         match &request.operation {
             WorkspaceRequest::BeginArtifactPublish(begin) => {
+                // The engine replays a durable operation row whose identity and
+                // initialization digests match, including one that already
+                // reached a terminal state. Model that here: an exact retry of a
+                // publication that already succeeded observes the stored
+                // terminal record rather than a fresh running one.
+                if let Some(status) = state.replayable_terminal_status(begin.operation_id) {
+                    return Ok(WorkspaceResult::Operation(status));
+                }
                 state.begin = Some(begin.clone());
                 state.staged_objects.clear();
                 state.manifest_rows.clear();
@@ -2920,6 +3009,48 @@ mod tests {
         assert_eq!(
             state.operation.as_ref().unwrap().state,
             OperationState::Succeeded
+        );
+    }
+
+    #[test]
+    fn retrying_a_succeeded_publication_converges_without_reuploading() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+
+        let first = client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+        assert!(!first.publication.replayed);
+        let uploads_after_first = inspector.state().stage_applies;
+
+        // A scheduler resubmits the job. A fresh process republishes the same
+        // bytes to the same path under the same durable identities.
+        let retry = client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+
+        assert!(
+            retry.publication.replayed,
+            "an exact retry must report replay"
+        );
+        assert_eq!(retry.publication.value, first.publication.value);
+        assert_eq!(
+            inspector.state().stage_applies,
+            uploads_after_first,
+            "a replayed publication must not stage objects again"
+        );
+        assert_eq!(
+            inspector.state().abort_applies,
+            0,
+            "a replayed publication must not attempt an abort"
+        );
+        assert_eq!(
+            (retry.upload_stats.blocks, retry.upload_stats.bytes),
+            (0, 0),
+            "a replayed publication uploads nothing"
         );
     }
 
