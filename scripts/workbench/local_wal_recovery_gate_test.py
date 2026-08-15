@@ -13,9 +13,11 @@ import unittest
 from pathlib import Path
 
 from local_wal_recovery_gate import (
+    CONCURRENT_STAGE,
     CRASH_STAGES,
     WorkflowFailure,
     main,
+    validate_concurrent_evidence,
     validate_stage_evidence,
 )
 
@@ -37,6 +39,22 @@ def valid_evidence(stage: str) -> dict[str, object]:
         "metadata_probe": {
             "status": "success",
             "path": "/agents/issue450/wb/restart-proof",
+        },
+    }
+
+
+def valid_concurrent_evidence() -> dict[str, object]:
+    record = {"owner_epoch": 1, "state": 3, "owner": "gate-incumbent"}
+    return {
+        "stage": CONCURRENT_STAGE,
+        "loser_exit_code": 1,
+        "loser_stderr": "nokv: metadata store failed: ... is held by another owner",
+        "incumbent_alive_after": True,
+        "control_record_before": dict(record),
+        "control_record_after": dict(record),
+        "metadata_probe": {
+            "status": "success",
+            "path": "/agents/issue450/wb/exclusion-proof",
         },
     }
 
@@ -67,6 +85,48 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
             CRASH_STAGES,
             ("before-local-fence", "after-local-fence"),
         )
+
+    def test_a_live_owner_keeps_a_second_process_out(self) -> None:
+        validate_concurrent_evidence(valid_concurrent_evidence())
+
+    def test_the_second_owner_must_actually_fail(self) -> None:
+        evidence = valid_concurrent_evidence()
+        evidence["loser_exit_code"] = 0
+
+        with self.assertRaisesRegex(WorkflowFailure, "second owner did not fail"):
+            validate_concurrent_evidence(evidence)
+
+    def test_a_refused_takeover_must_not_touch_the_control_record(self) -> None:
+        evidence = valid_concurrent_evidence()
+        evidence["control_record_after"] = {
+            "owner_epoch": 2,
+            "state": 2,
+            "owner": "gate-challenger",
+        }
+
+        with self.assertRaisesRegex(WorkflowFailure, "mutated the control record"):
+            validate_concurrent_evidence(evidence)
+
+    def test_the_incumbent_must_survive_the_refused_takeover(self) -> None:
+        evidence = valid_concurrent_evidence()
+        evidence["incumbent_alive_after"] = False
+
+        with self.assertRaisesRegex(WorkflowFailure, "incumbent did not survive"):
+            validate_concurrent_evidence(evidence)
+
+    def test_the_incumbent_must_still_serve_after_the_refusal(self) -> None:
+        evidence = valid_concurrent_evidence()
+        evidence["metadata_probe"] = {"status": "error"}
+
+        with self.assertRaisesRegex(WorkflowFailure, "stopped serving"):
+            validate_concurrent_evidence(evidence)
+
+    def test_the_refusal_must_carry_a_diagnostic(self) -> None:
+        evidence = valid_concurrent_evidence()
+        evidence["loser_stderr"] = "   "
+
+        with self.assertRaisesRegex(WorkflowFailure, "without a diagnostic"):
+            validate_concurrent_evidence(evidence)
 
     def test_each_stage_converges_to_the_same_recovery_epoch(self) -> None:
         for stage in CRASH_STAGES:
