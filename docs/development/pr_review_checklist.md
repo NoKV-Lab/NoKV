@@ -11,11 +11,10 @@ boundaries, or Workbench behavior.
 
 ## Merge Governance
 
-- Does one core maintainer approve the exact current head commit?
-- Did a new push dismiss every older approval?
-- Is the final required approval from someone other than the last pusher?
-- Did a CODEOWNER review the change?
-- If additions plus deletions exceed 10,000 lines, does the protected
+- If additions plus deletions exceed 5,000 lines, does one core maintainer
+  other than the current-head pusher approve the exact current head commit?
+- Did a new push make every older approval ineligible?
+- If additions plus deletions exceed 5,000 lines, does the protected
   `change-governance/large-change-review` status pass?
 - Is the change actually reviewable as one logical boundary even if the formal
   approval count and status checks pass?
