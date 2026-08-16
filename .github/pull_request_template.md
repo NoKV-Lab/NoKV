@@ -38,9 +38,9 @@ Closes | Fixes | Relates to #
 ## Change Size And Review
 
 - [ ] I checked GitHub's additions plus deletions for this pull request.
-- [ ] If the total is more than 10,000 lines, at least two distinct human
-      reviewers approved the exact current head commit. The author, bots,
-      duplicate reviewers, dismissed reviews, and stale approvals do not count.
+- [ ] If the total is more than 10,000 lines, one core maintainer approved the
+      exact current head commit. The author, bots, non-core reviewers, duplicate
+      reviewers, dismissed reviews, and stale approvals do not count.
 - [ ] This change is still small enough for a focused review; approval count is
       not being used to justify mixed package or lifecycle boundaries.
 

@@ -113,14 +113,14 @@ and run `git diff --check`.
 - Link related issue(s).
 - Include docs updates when behavior/config/CLI changes.
 - Keep PRs small enough for focused review.
-- Every PR requires two approving reviews. A new push dismisses prior
-  approvals, the last pusher cannot supply the final approval, a CODEOWNER must
-  approve, and administrators are subject to the same branch protection.
+- Every PR requires one approving CODEOWNER review. A new push dismisses prior
+  approvals, the last pusher cannot supply the required approval, and
+  administrators are subject to the same branch protection.
 - A PR with more than 10,000 GitHub-reported changed lines (additions plus
-  deletions) requires two distinct human approvals on the exact current head.
-  Authors, bots, duplicate reviewers, dismissed reviews, and approvals on older
-  commits do not count. The governance status fails closed if it cannot verify
-  these facts.
+  deletions) requires one core maintainer approval on the exact current head.
+  Authors, bots, non-core reviewers, duplicate reviewers, dismissed reviews,
+  and approvals on older commits do not count. The governance status fails
+  closed if it cannot verify these facts.
 - Keep each PR scoped to one logical boundary. Do not mix metadata model,
   Holt layout, object-store, docs, benchmark, or unrelated refactors.
 - Every non-merge commit must include a `Signed-off-by` trailer matching the Developer Certificate of Origin in [`DCO`](./DCO).

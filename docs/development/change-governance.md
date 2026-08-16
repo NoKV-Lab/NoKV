@@ -14,7 +14,7 @@ SDK, or Workbench rewrite.
 The `main` branch must enforce all of the following through GitHub branch
 protection:
 
-- every pull request requires at least two approving reviews;
+- every pull request requires one approving CODEOWNER review;
 - approvals are dismissed after a new push;
 - the last pusher cannot supply the final required approval;
 - a CODEOWNER review is required;
@@ -23,14 +23,14 @@ protection:
 - the branch must be current with `main` and every required status must pass.
 
 GitHub-reported additions plus deletions are the review-size measure. A pull
-request with more than 10,000 changed lines requires at least two distinct
-human approvals on its exact current head commit. The author, bots, duplicate
-reviews, dismissed reviews, requested changes, and approvals against an older
-head do not count. Generated files, fixtures, documentation, and deletions are
-not exempt.
+request with more than 10,000 changed lines requires one core maintainer's
+approval on its exact current head commit. The author, bots, non-core reviewers,
+duplicate reviews, dismissed reviews, requested changes, and approvals against
+an older head do not count. Generated files, fixtures, documentation, and
+deletions are not exempt.
 
-The native branch rule deliberately requires two approvals for every pull
-request. The `change-governance/large-change-review` status independently
+The native branch rule deliberately requires one CODEOWNER approval for every
+pull request. The `change-governance/large-change-review` status independently
 checks the more-than-10,000-line rule and fails closed when GitHub data is
 missing, malformed, paginated beyond its bound, or unavailable.
 
@@ -54,17 +54,18 @@ The required status set is:
 
 The custom governance status must be added to branch protection only after the
 workflow exists on `main`; adding it earlier makes the bootstrap pull request
-impossible to merge. Until then, the native two-review rule is the bootstrap
+impossible to merge. Until then, the native CODEOWNER rule is the bootstrap
 authority.
 
 ## Review Expectations
 
-Two approvals are a minimum gate, not evidence that a broad rewrite is
-reviewable. Split a change when it crosses logical package or lifecycle
-boundaries, hides behavior changes among mechanical churn, or cannot be
-reproduced and reviewed within one focused diff. For storage changes, reviewers
-must apply the [PR Review Checklist](./pr_review_checklist.md) and retain exact
-recovery, failure, retry, retention, and downstream Workbench evidence.
+One core maintainer approval is a minimum gate, not evidence that a broad
+rewrite is reviewable. Split a change when it crosses logical package or
+lifecycle boundaries, hides behavior changes among mechanical churn, or cannot
+be reproduced and reviewed within one focused diff. For storage changes,
+reviewers must apply the [PR Review Checklist](./pr_review_checklist.md) and
+retain exact recovery, failure, retry, retention, and downstream Workbench
+evidence.
 
 ## Administrative Boundary
 

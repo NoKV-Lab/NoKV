@@ -16,17 +16,23 @@ from pr_change_governance import GovernanceInputError, evaluate_policy  # noqa: 
 
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
+CORE_ONE = "wchwawa"
+CORE_TWO = "feichai0017"
 
 
 def pull_request(
-    *, additions: int = 0, deletions: int = 0, changed_files: int = 1
+    *,
+    additions: int = 0,
+    deletions: int = 0,
+    changed_files: int = 1,
+    author: str = "author",
 ) -> dict[str, Any]:
     return {
         "additions": additions,
         "deletions": deletions,
         "changed_files": changed_files,
         "head": {"sha": HEAD},
-        "user": {"login": "author", "type": "User"},
+        "user": {"login": author, "type": "User"},
     }
 
 
@@ -55,80 +61,71 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.required_approvals, 0)
 
-    def test_one_line_over_threshold_requires_two_approvals(self) -> None:
+    def test_one_line_over_threshold_requires_one_core_approval(self) -> None:
         decision = evaluate_policy(pull_request(additions=10_001), [])
 
         self.assertTrue(decision.is_large_change)
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.required_approvals, 2)
+        self.assertEqual(decision.required_approvals, 1)
 
-    def test_two_distinct_current_human_approvals_pass(self) -> None:
+    def test_current_core_maintainer_approval_passes(self) -> None:
         decision = evaluate_policy(
             pull_request(additions=8_000, deletions=3_000),
-            [review("reviewer-one", review_id=1), review("reviewer-two", review_id=2)],
+            [review(CORE_ONE, review_id=1)],
         )
 
         self.assertTrue(decision.allowed)
-        self.assertEqual(
-            decision.current_approval_logins, ("reviewer-one", "reviewer-two")
-        )
+        self.assertEqual(decision.current_approval_logins, (CORE_ONE,))
 
     def test_duplicate_approvals_count_once(self) -> None:
         decision = evaluate_policy(
             pull_request(additions=10_001),
-            [review("reviewer", review_id=1), review("Reviewer", review_id=2)],
+            [review(CORE_ONE, review_id=1), review(CORE_ONE.upper(), review_id=2)],
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.current_approval_logins, ("Reviewer",))
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.current_approval_logins, (CORE_ONE.upper(),))
 
-    def test_author_and_bots_do_not_count(self) -> None:
+    def test_author_bots_and_non_core_reviewers_do_not_count(self) -> None:
         decision = evaluate_policy(
-            pull_request(additions=10_001),
+            pull_request(additions=10_001, author=CORE_ONE),
             [
-                review("author", review_id=1),
+                review(CORE_ONE, review_id=1),
                 review("automation[bot]", reviewer_type="Bot", review_id=2),
-                review("human", review_id=3),
+                review("non-core-human", review_id=3),
             ],
         )
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.current_approval_logins, ("human",))
+        self.assertEqual(decision.current_approval_logins, ())
 
     def test_approval_on_an_old_head_does_not_count(self) -> None:
         decision = evaluate_policy(
             pull_request(additions=10_001),
-            [
-                review("stale", commit_id=OLD_HEAD, review_id=1),
-                review("current", review_id=2),
-            ],
+            [review(CORE_ONE, commit_id=OLD_HEAD, review_id=1)],
         )
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.current_approval_logins, ("current",))
+        self.assertEqual(decision.current_approval_logins, ())
 
     def test_later_changes_requested_overrides_approval(self) -> None:
         decision = evaluate_policy(
             pull_request(additions=10_001),
             [
-                review("reviewer-one", review_id=1),
-                review("reviewer-two", review_id=2),
-                review(
-                    "reviewer-two", state="CHANGES_REQUESTED", review_id=3
-                ),
+                review(CORE_ONE, review_id=1),
+                review(CORE_ONE, state="CHANGES_REQUESTED", review_id=2),
             ],
         )
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.current_approval_logins, ("reviewer-one",))
+        self.assertEqual(decision.current_approval_logins, ())
 
     def test_comment_does_not_erase_an_approval(self) -> None:
         decision = evaluate_policy(
             pull_request(additions=10_001),
             [
-                review("reviewer-one", review_id=1),
-                review("reviewer-one", state="COMMENTED", review_id=2),
-                review("reviewer-two", review_id=3),
+                review(CORE_TWO, review_id=1),
+                review(CORE_TWO, state="COMMENTED", review_id=2),
             ],
         )
 
@@ -137,14 +134,11 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
     def test_dismissed_review_does_not_count(self) -> None:
         decision = evaluate_policy(
             pull_request(additions=10_001),
-            [
-                review("dismissed", state="DISMISSED", review_id=1),
-                review("current", review_id=2),
-            ],
+            [review(CORE_ONE, state="DISMISSED", review_id=1)],
         )
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.current_approval_logins, ("current",))
+        self.assertEqual(decision.current_approval_logins, ())
 
     def test_malformed_pull_request_data_fails_closed(self) -> None:
         malformed = pull_request(additions=10_001)
@@ -154,7 +148,7 @@ class ChangeGovernancePolicyTest(unittest.TestCase):
             evaluate_policy(malformed, [])
 
     def test_malformed_decisive_review_fails_closed(self) -> None:
-        malformed_review = review("reviewer")
+        malformed_review = review(CORE_ONE)
         del malformed_review["commit_id"]
 
         with self.assertRaises(GovernanceInputError):

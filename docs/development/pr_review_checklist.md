@@ -11,7 +11,7 @@ boundaries, or Workbench behavior.
 
 ## Merge Governance
 
-- Do at least two independent humans approve the exact current head commit?
+- Does one core maintainer approve the exact current head commit?
 - Did a new push dismiss every older approval?
 - Is the final required approval from someone other than the last pusher?
 - Did a CODEOWNER review the change?

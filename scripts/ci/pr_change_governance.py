@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed when a large pull request lacks current human approvals."""
+"""Fail closed when a large pull request lacks core-maintainer approval."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ from typing import Any
 
 
 LARGE_CHANGE_LINE_THRESHOLD = 10_000
-LARGE_CHANGE_REQUIRED_APPROVALS = 2
+LARGE_CHANGE_REQUIRED_APPROVALS = 1
+CORE_MAINTAINER_LOGINS = frozenset({"feichai0017", "wchwawa"})
 MAX_REVIEW_PAGES = 100
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -125,7 +126,7 @@ def _review_order(review: dict[str, Any]) -> tuple[str, int]:
     )
 
 
-def current_human_approvals(
+def current_core_maintainer_approvals(
     pull_request: dict[str, Any], reviews: list[dict[str, Any]]
 ) -> tuple[str, ...]:
     user = pull_request.get("user")
@@ -150,14 +151,19 @@ def current_human_approvals(
             raise GovernanceInputError("decisive review has no reviewer identity")
         login = _required_string(reviewer, "login", "reviewer")
         reviewer_type = _required_string(reviewer, "type", "reviewer")
-        if reviewer_type != "User" or login.casefold() == author_login:
+        normalized_login = login.casefold()
+        if (
+            reviewer_type != "User"
+            or normalized_login == author_login
+            or normalized_login not in CORE_MAINTAINER_LOGINS
+        ):
             continue
 
         commit_id = _required_string(review, "commit_id", "review")
         if commit_id != head_sha:
             continue
 
-        key = login.casefold()
+        key = normalized_login
         if state == "APPROVED":
             decisive_state[key] = (login, True)
         else:
@@ -184,7 +190,7 @@ def evaluate_policy(
         if changed_lines > LARGE_CHANGE_LINE_THRESHOLD
         else 0
     )
-    approvals = current_human_approvals(pull_request, reviews)
+    approvals = current_core_maintainer_approvals(pull_request, reviews)
     return GovernanceDecision(
         additions=additions,
         deletions=deletions,
@@ -216,7 +222,8 @@ def _write_step_summary(decision: GovernanceDecision) -> None:
         )
         summary.write(f"- Changed files: **{decision.changed_files:,}**\n")
         summary.write(
-            f"- Current-head human approvals: **{len(decision.current_approval_logins)}** "
+            "- Current-head core maintainer approvals: "
+            f"**{len(decision.current_approval_logins)}** "
             f"({approval_text})\n"
         )
         summary.write(f"- Required by this gate: **{decision.required_approvals}**\n")
@@ -266,18 +273,18 @@ def main(argv: list[str] | None = None) -> int:
     if decision.allowed:
         print(
             f"Change governance passed: {decision.changed_lines} changed lines, "
-            f"{len(decision.current_approval_logins)} current human approvals."
+            f"{len(decision.current_approval_logins)} current core maintainer approvals."
         )
         return 0
 
     print(
-        "::error title=Large change lacks two current human approvals::"
+        "::error title=Large change lacks current core maintainer approval::"
         + _annotation(
             f"PR #{args.pull_request} changes {decision.changed_lines} lines, above "
             f"the {decision.threshold} line threshold, but has only "
             f"{len(decision.current_approval_logins)} eligible approvals on head "
-            f"{decision.head_sha}. The author, bots, dismissed reviews, duplicate "
-            "reviewers, and approvals on older commits do not count."
+            f"{decision.head_sha}. The author, bots, non-core reviewers, dismissed "
+            "reviews, duplicate reviewers, and approvals on older commits do not count."
         ),
         file=sys.stderr,
     )
