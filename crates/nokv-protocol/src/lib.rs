@@ -33,26 +33,28 @@ pub use codec::{
 pub use error::{ConflictKind, ErrorCode, ProtocolError, RpcFailure};
 pub use request::{
     AbortArtifactPublishRequest, AggregateFunction, AggregateRequest, AggregateSpec,
-    BeginArtifactPublishRequest, CatalogRequest, ChangePageRequest, CommitRequest,
-    CompleteArtifactPublishRequest, CreateWorkspaceRequest, FinalizeRestoreRequest,
+    BeginArtifactPublishRequest, BindRestoreDestinationRequest, CatalogRequest, ChangePageRequest,
+    CommitRequest, CompleteArtifactPublishRequest, CreateWorkspaceRequest, FinalizeRestoreRequest,
     FindWorkspacesRequest, GetOperationRequest, GetPathRequest, GetSnapshotRequest,
     GetWorkspaceRequest, ListPathsRequest, ListSnapshotsRequest,
     MarkArtifactObjectsUploadedRequest, MintSnapshotRequest, ObjectUploadProof,
     PrepareRestoreRequest, QuarantineResolution, QueryOperand, QueryOperator, QueryPredicate,
-    QueryScope, ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest,
-    RenewSnapshotRequest, RestoreManifestDescriptor, RestoreSource, RetireSnapshotRequest,
-    SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
-    StageArtifactObjectsRequest, WorkspaceContinuationFence, WorkspacePreflightRequest,
-    WorkspaceRequest, WorkspaceRpcRequest, MAX_QUERY_PAGE_LIMIT,
+    QueryScope, ReadRestoreSourceRunManifestRequest, ReconcileQuarantinedArtifactPublishRequest,
+    RemovePathRequest, RenewSnapshotRequest, RestoreManifestDescriptor, RestoreManifestIdentity,
+    RestoreSource, RetireSnapshotRequest, SearchRequest, SortDirection, SortField,
+    StageArtifactManifestRequest, StageArtifactObjectsRequest, WorkspaceContinuationFence,
+    WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest, MAX_QUERY_PAGE_LIMIT,
 };
 pub use response::{
     AggregateGroup, AggregateResult, CatalogField, CatalogResult, ChangeEvent, ChangeKind,
     ChangePage, CommitManifestBinding, CommitPreparation, CommitResult, FacetBucket, FacetResult,
     FindWorkspacesResult, OperationProgress, OperationResult, OperationState, OperationStatus,
     PathListEntry, PathPage, PathReadResult, PublishResult, RemovePathResult,
-    RestoreOperationPreparation, RestorePreparation, RestoreResult, SearchHit, SearchResult,
-    SnapshotPage, SnapshotResult, SnapshotStatus, WorkspacePreflightResult, WorkspaceResult,
-    WorkspaceRpcOutcome, WorkspaceRpcResponse, WorkspaceSummary, WorkspaceSummaryWithCommit,
+    RestoreDestinationBinding, RestoreDestinationManifestBindings, RestoreManifestBinding,
+    RestoreOperationPreparation, RestorePreparation, RestoreResult, RestoreSourceCommitBinding,
+    SearchHit, SearchResult, SnapshotPage, SnapshotResult, SnapshotStatus,
+    WorkspacePreflightResult, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcResponse,
+    WorkspaceSummary, WorkspaceSummaryWithCommit,
 };
 pub use types::{
     AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,

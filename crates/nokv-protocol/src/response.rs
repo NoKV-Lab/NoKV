@@ -87,6 +87,7 @@ pub enum WorkspaceResult {
     Snapshot(SnapshotResult),
     Snapshots(SnapshotPage),
     RestorePrepared(RestorePreparation),
+    RestoreSourceRunManifest(PathReadResult),
     Restored(RestoreResult),
     Search(SearchResult),
     Aggregate(AggregateResult),
@@ -109,6 +110,9 @@ impl WorkspaceResult {
             Self::Snapshot(snapshot) => snapshot.validate(),
             Self::Snapshots(snapshots) => snapshots.validate(),
             Self::RestorePrepared(prepared) => prepared.validate(),
+            Self::RestoreSourceRunManifest(manifest) => {
+                manifest.validate_restore_source_run_manifest()
+            }
             Self::Restored(restored) => restored.validate(),
             Self::Search(search) => search.validate(),
             Self::Aggregate(aggregate) => aggregate.validate(),
@@ -301,6 +305,47 @@ impl PathReadResult {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_restore_source_run_manifest(&self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.not_modified {
+            return Err(ProtocolError::invalid(
+                "restore_source_run_manifest",
+                "cannot be not-modified without a conditional request",
+            ));
+        }
+        let metadata = self
+            .metadata
+            .as_ref()
+            .expect("ordinary path validation requires metadata");
+        if metadata.path.path.as_str() != "metadata/run_manifest.json"
+            || metadata.dependency_count != 0
+            || metadata.dependency_depth != 0
+            || metadata.descriptor.logical_size == 0
+            || metadata.descriptor.content_type.as_str() != "application/json"
+            || metadata.descriptor.producer.is_some()
+            || metadata.descriptor.manifest_identity.is_some()
+            || !metadata.descriptor.index_fields.is_empty()
+        {
+            return Err(ProtocolError::invalid(
+                "restore_source_run_manifest.metadata",
+                "must be the dependency-free canonical JSON run manifest",
+            ));
+        }
+        crate::parse_sha256_digest_uri(&metadata.descriptor.body_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "restore_source_run_manifest.metadata.body_digest",
+                error.to_string(),
+            )
+        })?;
+        crate::parse_sha256_digest_uri(&metadata.descriptor.manifest_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "restore_source_run_manifest.metadata.manifest_digest",
+                error.to_string(),
+            )
+        })?;
         Ok(())
     }
 }
@@ -611,14 +656,239 @@ pub struct RestoreResult {
     pub object_bytes_copied: u64,
 }
 
+/// Exact immutable source commit resolved for one restore operation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreSourceCommitBinding {
+    pub commit_id: CommitIdentity,
+    pub content_digest: DigestUri,
+    pub manifest_digest: DigestUri,
+    pub tree_manifest_revision_id: ArtifactRevisionIdentity,
+    pub member_count: u64,
+    pub member_digest: Digest,
+}
+
+impl RestoreSourceCommitBinding {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        crate::parse_sha256_digest_uri(&self.content_digest).map_err(|error| {
+            ProtocolError::invalid("restore.source_commit.content_digest", error.to_string())
+        })?;
+        crate::parse_sha256_digest_uri(&self.manifest_digest).map_err(|error| {
+            ProtocolError::invalid("restore.source_commit.manifest_digest", error.to_string())
+        })?;
+        validate_restore_member_seal(
+            "restore.source_commit.members",
+            self.member_count,
+            self.member_digest,
+        )
+    }
+}
+
+/// Immutable destination manifest publication bound to one restore.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreManifestBinding {
+    pub publication_operation_id: OperationIdentity,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+    pub descriptor: ArtifactDescriptor,
+}
+
+impl RestoreManifestBinding {
+    fn validate(&self, field: &'static str) -> Result<(), ProtocolError> {
+        self.descriptor.validate()?;
+        if self.descriptor.logical_size == 0 {
+            return Err(ProtocolError::invalid(
+                field,
+                "canonical JSON manifest must not be empty",
+            ));
+        }
+        crate::parse_sha256_digest_uri(&self.descriptor.body_digest)
+            .map_err(|error| ProtocolError::invalid(field, error.to_string()))?;
+        crate::parse_sha256_digest_uri(&self.descriptor.manifest_digest)
+            .map_err(|error| ProtocolError::invalid(field, error.to_string()))?;
+        if self.descriptor.content_type.as_str() != "application/json"
+            || self.descriptor.producer.is_some()
+            || self.descriptor.manifest_identity.is_some()
+            || !self.descriptor.index_fields.is_empty()
+        {
+            return Err(ProtocolError::invalid(
+                field,
+                "restore-owned manifest must be dependency-free canonical JSON metadata",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Both destination-owned canonical manifests. They become durable together;
+/// neither binding is independently optional.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreDestinationManifestBindings {
+    pub run_manifest: RestoreManifestBinding,
+    pub restore_manifest: RestoreManifestBinding,
+}
+
+impl RestoreDestinationManifestBindings {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.run_manifest
+            .validate("operation.restore_preparation.destination_manifests.run_manifest")?;
+        self.restore_manifest
+            .validate("operation.restore_preparation.destination_manifests.restore_manifest")?;
+        Ok(())
+    }
+}
+
+/// Durable late-bound destination commit intent. Expected publication
+/// identities are frozen before object-first publication; final bindings only
+/// appear after both manifests have been accepted.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreDestinationBinding {
+    pub destination_commit_id: CommitIdentity,
+    pub effective_content_digest: DigestUri,
+    pub destination_run_manifest_projection_input_digest: Digest,
+    pub destination_run_manifest_identity: crate::request::RestoreManifestIdentity,
+    pub destination_restore_manifest_identity: crate::request::RestoreManifestIdentity,
+    pub destination_manifests: Option<RestoreDestinationManifestBindings>,
+}
+
+impl RestoreDestinationBinding {
+    fn validate(
+        &self,
+        request: &PrepareRestoreRequest,
+        source_commit: &RestoreSourceCommitBinding,
+        source_matches_base_commit: bool,
+    ) -> Result<(), ProtocolError> {
+        self.validate_common(
+            request.operation_id,
+            request.destination_workspace_incarnation_id,
+            source_commit,
+            source_matches_base_commit,
+        )?;
+        if self.destination_restore_manifest_identity
+            != request.destination_restore_manifest_identity
+        {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.destination_restore_manifest_identity",
+                "does not match the durable prepare request",
+            ));
+        }
+        if let Some(manifests) = &self.destination_manifests {
+            if manifests.restore_manifest.descriptor.body_digest
+                != request.restore_manifest.body_digest
+                || manifests.restore_manifest.descriptor.logical_size
+                    != request.restore_manifest.logical_size
+                || manifests.restore_manifest.descriptor.content_type
+                    != request.restore_manifest.content_type
+            {
+                return Err(ProtocolError::invalid(
+                    "operation.restore_preparation.destination_binding.destination_manifests",
+                    "restore manifest does not exactly match the durable prepare descriptor",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_common(
+        &self,
+        restore_operation_id: OperationIdentity,
+        destination_workspace_incarnation_id: WorkspaceIdentity,
+        source_commit: &RestoreSourceCommitBinding,
+        source_matches_base_commit: bool,
+    ) -> Result<(), ProtocolError> {
+        crate::parse_sha256_digest_uri(&self.effective_content_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.effective_content_digest",
+                error.to_string(),
+            )
+        })?;
+        if self.destination_commit_id == source_commit.commit_id {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.destination_commit_id",
+                "must differ from the source commit",
+            ));
+        }
+        if source_matches_base_commit
+            != (self.effective_content_digest == source_commit.content_digest)
+        {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.effective_content_digest",
+                "must preserve the base content digest exactly for a clean source and use a distinct materialized digest otherwise",
+            ));
+        }
+        if self.destination_run_manifest_projection_input_digest == Digest([0; 32]) {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.destination_run_manifest_projection_input_digest",
+                "must not be the zero digest",
+            ));
+        }
+        if self
+            .destination_run_manifest_identity
+            .publication_operation_id
+            == self
+                .destination_restore_manifest_identity
+                .publication_operation_id
+            || self.destination_run_manifest_identity.artifact_revision_id
+                == self
+                    .destination_restore_manifest_identity
+                    .artifact_revision_id
+            || restore_operation_id
+                == self
+                    .destination_run_manifest_identity
+                    .publication_operation_id
+            || restore_operation_id
+                == self
+                    .destination_restore_manifest_identity
+                    .publication_operation_id
+        {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.destination_manifests",
+                "restore, run-manifest, and restore-manifest operations and revisions must remain distinct",
+            ));
+        }
+        if let Some(manifests) = &self.destination_manifests {
+            manifests.validate()?;
+            let run_identity = self.destination_run_manifest_identity;
+            let restore_identity = self.destination_restore_manifest_identity;
+            if manifests.run_manifest.publication_operation_id
+                != run_identity.publication_operation_id
+                || manifests.run_manifest.artifact_revision_id != run_identity.artifact_revision_id
+                || manifests.restore_manifest.publication_operation_id
+                    != restore_identity.publication_operation_id
+                || manifests.restore_manifest.artifact_revision_id
+                    != restore_identity.artifact_revision_id
+                || manifests.run_manifest.workspace_incarnation_id
+                    != destination_workspace_incarnation_id
+                || manifests.restore_manifest.workspace_incarnation_id
+                    != destination_workspace_incarnation_id
+            {
+                return Err(ProtocolError::invalid(
+                    "operation.restore_preparation.destination_binding.destination_manifests",
+                    "do not exactly match the durable identities and destination incarnation",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RestorePreparation {
     pub operation_id: OperationIdentity,
     pub destination_workbench: WorkbenchName,
     pub destination_workspace_incarnation_id: WorkspaceIdentity,
-    pub member_count: u64,
-    pub member_digest: Digest,
+    pub source_commit: RestoreSourceCommitBinding,
+    pub destination_committed_at_unix_seconds: u64,
+    pub source_member_count: u64,
+    pub source_member_digest: Digest,
+    pub materialized_member_count: u64,
+    pub materialized_member_digest: Digest,
+    pub source_matches_base_commit: bool,
+    pub destination_binding: Option<Box<RestoreDestinationBinding>>,
 }
 
 /// Durable restore inputs returned by operation lookup. A client may use this
@@ -629,13 +899,20 @@ pub struct RestorePreparation {
 pub struct RestoreOperationPreparation {
     pub request: PrepareRestoreRequest,
     pub source_snapshot_read_version: Option<u64>,
-    pub sealed_member_count: Option<u64>,
-    pub sealed_member_digest: Option<Digest>,
+    pub source_commit: RestoreSourceCommitBinding,
+    pub destination_committed_at_unix_seconds: u64,
+    pub source_member_count: Option<u64>,
+    pub source_member_digest: Option<Digest>,
+    pub materialized_member_count: Option<u64>,
+    pub materialized_member_digest: Option<Digest>,
+    pub source_matches_base_commit: Option<bool>,
+    pub destination_binding: Option<Box<RestoreDestinationBinding>>,
 }
 
 impl RestoreOperationPreparation {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.request.validate()?;
+        self.source_commit.validate()?;
         match (&self.request.source, self.source_snapshot_read_version) {
             (crate::request::RestoreSource::Snapshot(_), Some(version)) if version != 0 => {}
             (crate::request::RestoreSource::Commit(_), None) => {}
@@ -646,10 +923,85 @@ impl RestoreOperationPreparation {
                 ));
             }
         }
-        if self.sealed_member_count.is_some() != self.sealed_member_digest.is_some() {
+        if let crate::request::RestoreSource::Commit(commit_id) = &self.request.source {
+            if *commit_id != self.source_commit.commit_id {
+                return Err(ProtocolError::invalid(
+                    "operation.restore_preparation.source_commit",
+                    "does not match the requested source commit",
+                ));
+            }
+        }
+        if self.destination_committed_at_unix_seconds == 0 {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_committed_at_unix_seconds",
+                "must be greater than zero",
+            ));
+        }
+        let seal_fields_present = [
+            self.source_member_count.is_some(),
+            self.source_member_digest.is_some(),
+            self.materialized_member_count.is_some(),
+            self.materialized_member_digest.is_some(),
+            self.source_matches_base_commit.is_some(),
+        ];
+        if seal_fields_present.iter().any(|present| *present)
+            && seal_fields_present.iter().any(|present| !*present)
+        {
             return Err(ProtocolError::invalid(
                 "operation.restore_preparation",
-                "sealed member count and digest must be present together",
+                "raw and materialized source seals and their base-commit comparison must be present together",
+            ));
+        }
+        if let (
+            Some(source_member_count),
+            Some(source_member_digest),
+            Some(materialized_member_count),
+            Some(materialized_member_digest),
+            Some(source_matches_base_commit),
+        ) = (
+            self.source_member_count,
+            self.source_member_digest,
+            self.materialized_member_count,
+            self.materialized_member_digest,
+            self.source_matches_base_commit,
+        ) {
+            validate_restore_member_seal(
+                "operation.restore_preparation.source_members",
+                source_member_count,
+                source_member_digest,
+            )?;
+            validate_restore_member_seal(
+                "operation.restore_preparation.materialized_members",
+                materialized_member_count,
+                materialized_member_digest,
+            )?;
+            validate_source_commit_match(
+                &self.source_commit,
+                source_member_count,
+                source_member_digest,
+                source_matches_base_commit,
+            )?;
+            if matches!(
+                self.request.source,
+                crate::request::RestoreSource::Commit(_)
+            ) && !source_matches_base_commit
+            {
+                return Err(ProtocolError::invalid(
+                    "operation.restore_preparation.source_matches_base_commit",
+                    "must be true for a direct commit source",
+                ));
+            }
+            if let Some(binding) = &self.destination_binding {
+                binding.validate(
+                    &self.request,
+                    &self.source_commit,
+                    source_matches_base_commit,
+                )?;
+            }
+        } else if self.destination_binding.is_some() {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding",
+                "cannot precede the sealed raw and materialized source closures",
             ));
         }
         Ok(())
@@ -658,13 +1010,86 @@ impl RestoreOperationPreparation {
 
 impl RestorePreparation {
     fn validate(&self) -> Result<(), ProtocolError> {
+        self.source_commit.validate()?;
+        if self.destination_committed_at_unix_seconds == 0 {
+            return Err(ProtocolError::invalid(
+                "restore_prepared.destination_committed_at_unix_seconds",
+                "must be greater than zero",
+            ));
+        }
+        validate_restore_member_seal(
+            "restore_prepared.source_members",
+            self.source_member_count,
+            self.source_member_digest,
+        )?;
+        validate_restore_member_seal(
+            "restore_prepared.materialized_members",
+            self.materialized_member_count,
+            self.materialized_member_digest,
+        )?;
+        validate_source_commit_match(
+            &self.source_commit,
+            self.source_member_count,
+            self.source_member_digest,
+            self.source_matches_base_commit,
+        )?;
+        if let Some(binding) = &self.destination_binding {
+            // The compact prepare response does not repeat the prepare
+            // descriptor; operation lookup performs that final exact check.
+            binding.validate_common(
+                self.operation_id,
+                self.destination_workspace_incarnation_id,
+                &self.source_commit,
+                self.source_matches_base_commit,
+            )?;
+        }
         Ok(())
     }
+}
+
+fn validate_restore_member_seal(
+    field: &'static str,
+    member_count: u64,
+    member_digest: Digest,
+) -> Result<(), ProtocolError> {
+    if (member_count == 0) != (member_digest == Digest([0; 32])) {
+        return Err(ProtocolError::invalid(
+            field,
+            "zero member count and zero digest must be present together",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_commit_match(
+    source_commit: &RestoreSourceCommitBinding,
+    source_member_count: u64,
+    source_member_digest: Digest,
+    source_matches_base_commit: bool,
+) -> Result<(), ProtocolError> {
+    let exact_match = source_member_count == source_commit.member_count
+        && source_member_digest == source_commit.member_digest;
+    if source_matches_base_commit != exact_match {
+        return Err(ProtocolError::invalid(
+            "restore.source_matches_base_commit",
+            "must equal the exact raw-source/base-commit member seal comparison",
+        ));
+    }
+    Ok(())
 }
 
 impl RestoreResult {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.destination.validate()?;
+        if self.destination.commit_head.is_none()
+            || self.destination.commit_head_generation.is_none()
+        {
+            return Err(ProtocolError::invalid(
+                "restore.destination.commit_head",
+                "a successful restore must return its committed destination head",
+            ));
+        }
+        validate_restore_member_seal("restore.members", self.member_count, self.member_digest)?;
         if self.object_bytes_copied != 0 {
             return Err(ProtocolError::invalid(
                 "restore.object_bytes_copied",
@@ -869,12 +1294,29 @@ impl OperationStatus {
                 if preparation.request.destination_workbench != result.destination.workbench
                     || preparation.request.destination_workspace_incarnation_id
                         != result.destination.workspace_incarnation_id
-                    || preparation.sealed_member_count != Some(result.member_count)
-                    || preparation.sealed_member_digest != Some(result.member_digest)
+                    || preparation.materialized_member_count != Some(result.member_count)
+                    || preparation.materialized_member_digest != Some(result.member_digest)
                 {
                     return Err(ProtocolError::invalid(
                         "operation.restore_preparation",
                         "does not match the terminal restore result",
+                    ));
+                }
+                let destination_binding =
+                    preparation.destination_binding.as_ref().ok_or_else(|| {
+                        ProtocolError::invalid(
+                            "operation.restore_preparation.destination_binding",
+                            "is required for a terminal restore result",
+                        )
+                    })?;
+                if destination_binding.destination_manifests.is_none()
+                    || result.destination.commit_head
+                        != Some(destination_binding.destination_commit_id)
+                    || result.destination.commit_head_generation != Some(1)
+                {
+                    return Err(ProtocolError::invalid(
+                        "operation.restore_preparation.destination_binding",
+                        "does not contain the final manifest bindings and generation-one destination commit receipt",
                     ));
                 }
             }
@@ -1320,6 +1762,81 @@ mod tests {
         }
     }
 
+    fn restore_descriptor(body_byte: &str) -> ArtifactDescriptor {
+        ArtifactDescriptor {
+            logical_size: 128,
+            body_digest: DigestUri::new(format!("sha256:{}", body_byte.repeat(32))).unwrap(),
+            manifest_digest: DigestUri::new(format!("sha256:{}", "cd".repeat(32))).unwrap(),
+            content_type: crate::ContentType::new("application/json").unwrap(),
+            producer: None,
+            manifest_identity: None,
+            index_fields: Vec::new(),
+        }
+    }
+
+    fn restore_operation_preparation(destination: &WorkbenchName) -> RestoreOperationPreparation {
+        let source_commit = RestoreSourceCommitBinding {
+            commit_id: CommitIdentity([0x11; 32]),
+            content_digest: DigestUri::new(format!("sha256:{}", "12".repeat(32))).unwrap(),
+            manifest_digest: DigestUri::new(format!("sha256:{}", "13".repeat(32))).unwrap(),
+            tree_manifest_revision_id: ArtifactRevisionIdentity([0x14; 16]),
+            member_count: 2,
+            member_digest: Digest([0x15; 32]),
+        };
+        let restore_identity = crate::request::RestoreManifestIdentity {
+            publication_operation_id: OperationIdentity([0x16; 16]),
+            artifact_revision_id: ArtifactRevisionIdentity([0x17; 16]),
+        };
+        RestoreOperationPreparation {
+            request: PrepareRestoreRequest {
+                operation_id: OperationIdentity([1; 16]),
+                source_workbench: WorkbenchName::new("source").unwrap(),
+                source_workspace_incarnation_id: WorkspaceIdentity([3; 16]),
+                source: crate::request::RestoreSource::Snapshot(crate::SnapshotSelector::Id(7)),
+                destination_workbench: destination.clone(),
+                destination_workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                destination_restore_manifest_identity: restore_identity,
+                restore_manifest: crate::request::RestoreManifestDescriptor {
+                    body_digest: DigestUri::new(format!("sha256:{}", "ab".repeat(32))).unwrap(),
+                    logical_size: 128,
+                    content_type: crate::ContentType::new("application/json").unwrap(),
+                },
+            },
+            source_snapshot_read_version: Some(9),
+            source_commit: source_commit.clone(),
+            destination_committed_at_unix_seconds: 1_700_000_000,
+            source_member_count: Some(2),
+            source_member_digest: Some(Digest([0x15; 32])),
+            materialized_member_count: Some(4),
+            materialized_member_digest: Some(Digest([0x18; 32])),
+            source_matches_base_commit: Some(true),
+            destination_binding: Some(Box::new(RestoreDestinationBinding {
+                destination_commit_id: CommitIdentity([0x19; 32]),
+                effective_content_digest: source_commit.content_digest.clone(),
+                destination_run_manifest_projection_input_digest: Digest([0x1a; 32]),
+                destination_run_manifest_identity: crate::request::RestoreManifestIdentity {
+                    publication_operation_id: OperationIdentity([0x1b; 16]),
+                    artifact_revision_id: ArtifactRevisionIdentity([0x1c; 16]),
+                },
+                destination_restore_manifest_identity: restore_identity,
+                destination_manifests: Some(RestoreDestinationManifestBindings {
+                    run_manifest: RestoreManifestBinding {
+                        publication_operation_id: OperationIdentity([0x1b; 16]),
+                        workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                        artifact_revision_id: ArtifactRevisionIdentity([0x1c; 16]),
+                        descriptor: restore_descriptor("de"),
+                    },
+                    restore_manifest: RestoreManifestBinding {
+                        publication_operation_id: restore_identity.publication_operation_id,
+                        workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                        artifact_revision_id: restore_identity.artifact_revision_id,
+                        descriptor: restore_descriptor("ab"),
+                    },
+                }),
+            })),
+        }
+    }
+
     #[test]
     fn commit_status_requires_exact_durable_preparation() {
         let mut status = running_status(OperationKind::Commit);
@@ -1391,23 +1908,7 @@ mod tests {
     fn restore_status_requires_durable_identity_source_and_seal() {
         let destination = WorkbenchName::new("destination").unwrap();
         let mut status = running_status(OperationKind::Restore);
-        status.restore_preparation = Some(Box::new(RestoreOperationPreparation {
-            request: PrepareRestoreRequest {
-                source_workbench: WorkbenchName::new("source").unwrap(),
-                source_workspace_incarnation_id: WorkspaceIdentity([3; 16]),
-                source: crate::request::RestoreSource::Snapshot(crate::SnapshotSelector::Id(7)),
-                destination_workbench: destination.clone(),
-                destination_workspace_incarnation_id: WorkspaceIdentity([4; 16]),
-                restore_manifest: crate::request::RestoreManifestDescriptor {
-                    body_digest: DigestUri::new(format!("sha256:{}", "ab".repeat(32))).unwrap(),
-                    logical_size: 128,
-                    content_type: crate::ContentType::new("application/json").unwrap(),
-                },
-            },
-            source_snapshot_read_version: Some(9),
-            sealed_member_count: Some(2),
-            sealed_member_digest: Some(Digest([5; 32])),
-        }));
+        status.restore_preparation = Some(Box::new(restore_operation_preparation(&destination)));
         status.validate().unwrap();
 
         status.state = OperationState::Succeeded;
@@ -1417,12 +1918,12 @@ mod tests {
                 workbench: destination,
                 workspace_incarnation_id: WorkspaceIdentity([4; 16]),
                 workspace_revision: 1,
-                commit_head: None,
-                commit_head_generation: None,
+                commit_head: Some(CommitIdentity([0x19; 32])),
+                commit_head_generation: Some(1),
             },
-            member_count: 2,
-            member_digest: Digest([5; 32]),
-            metadata_rows_copied: 2,
+            member_count: 4,
+            member_digest: Digest([0x18; 32]),
+            metadata_rows_copied: 4,
             object_bytes_copied: 0,
         }));
         status.validate().unwrap();
@@ -1431,7 +1932,157 @@ mod tests {
             .restore_preparation
             .as_mut()
             .unwrap()
-            .sealed_member_count = Some(3);
+            .materialized_member_count = Some(3);
         assert!(status.validate().is_err());
+    }
+
+    #[test]
+    fn restore_operation_preparation_uses_phase_aware_complete_seals() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_member_count = None;
+        preparation.source_member_digest = None;
+        preparation.materialized_member_count = None;
+        preparation.materialized_member_digest = None;
+        preparation.source_matches_base_commit = None;
+        preparation.destination_binding = None;
+        preparation.validate().unwrap();
+
+        preparation.source_member_count = Some(2);
+        assert!(preparation.validate().is_err());
+    }
+
+    #[test]
+    fn restore_source_match_is_recomputed_from_the_base_commit_seal() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_matches_base_commit = Some(false);
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "restore.source_matches_base_commit",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dirty_restore_requires_a_distinct_effective_content_digest() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_member_digest = Some(Digest([0x44; 32]));
+        preparation.source_matches_base_commit = Some(false);
+        assert!(preparation.validate().is_err());
+
+        preparation
+            .destination_binding
+            .as_mut()
+            .unwrap()
+            .effective_content_digest =
+            DigestUri::new(format!("sha256:{}", "45".repeat(32))).unwrap();
+        preparation.validate().unwrap();
+    }
+
+    #[test]
+    fn direct_commit_restore_forbids_dirty_source_semantics() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.request.source =
+            crate::request::RestoreSource::Commit(preparation.source_commit.commit_id);
+        preparation.source_snapshot_read_version = None;
+        preparation.source_member_digest = Some(Digest([0x44; 32]));
+        preparation.source_matches_base_commit = Some(false);
+        preparation
+            .destination_binding
+            .as_mut()
+            .unwrap()
+            .effective_content_digest =
+            DigestUri::new(format!("sha256:{}", "45".repeat(32))).unwrap();
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "operation.restore_preparation.source_matches_base_commit",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn final_restore_manifests_exact_bind_expected_identities_and_incarnation() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation
+            .destination_binding
+            .as_mut()
+            .unwrap()
+            .destination_manifests
+            .as_mut()
+            .unwrap()
+            .run_manifest
+            .workspace_incarnation_id = WorkspaceIdentity([0x46; 16]);
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "operation.restore_preparation.destination_binding.destination_manifests",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn source_commit_binding_rejects_noncanonical_member_seals() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_commit.member_count = 0;
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "restore.source_commit.members",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn successful_restore_result_requires_a_committed_destination() {
+        let result = RestoreResult {
+            operation_id: OperationIdentity([1; 16]),
+            destination: WorkspaceSummary {
+                workbench: WorkbenchName::new("destination").unwrap(),
+                workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                workspace_revision: 1,
+                commit_head: None,
+                commit_head_generation: None,
+            },
+            member_count: 0,
+            member_digest: Digest([0; 32]),
+            metadata_rows_copied: 0,
+            object_bytes_copied: 0,
+        };
+        assert!(matches!(
+            result.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "restore.destination.commit_head",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_source_run_manifest_response_cannot_claim_not_modified() {
+        let result = WorkspaceResult::RestoreSourceRunManifest(PathReadResult {
+            not_modified: true,
+            metadata: None,
+            range: None,
+            blocks: Vec::new(),
+            next_cursor: None,
+        });
+        assert!(matches!(
+            result.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "restore_source_run_manifest",
+                ..
+            })
+        ));
     }
 }

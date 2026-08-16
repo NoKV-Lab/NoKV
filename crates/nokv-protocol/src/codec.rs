@@ -3,14 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, de::IgnoredAny, Deserialize, Serialize};
 
 use crate::error::ProtocolError;
 use crate::request::WorkspaceRpcRequest;
 use crate::response::WorkspaceRpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v4";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v5";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -70,14 +70,19 @@ fn decode_payload<T: DeserializeOwned>(encoded: &[u8]) -> Result<T, ProtocolErro
             max: MAX_FRAME_BYTES,
         });
     }
-    let frame: Frame<T> =
+    // Inspect the version envelope before decoding a version-specific payload.
+    // Otherwise a structurally older, valid frame could surface as a generic
+    // payload decode failure before its explicit schema mismatch is reported.
+    let header: Frame<IgnoredAny> =
         rmp_serde::from_slice(encoded).map_err(|error| ProtocolError::Decode(error.to_string()))?;
-    if frame.schema != WORKSPACE_PROTOCOL_SCHEMA {
+    if header.schema != WORKSPACE_PROTOCOL_SCHEMA {
         return Err(ProtocolError::SchemaMismatch {
-            actual: frame.schema,
+            actual: header.schema,
             expected: WORKSPACE_PROTOCOL_SCHEMA,
         });
     }
+    let frame: Frame<T> =
+        rmp_serde::from_slice(encoded).map_err(|error| ProtocolError::Decode(error.to_string()))?;
     Ok(frame.payload)
 }
 
@@ -85,16 +90,20 @@ fn decode_payload<T: DeserializeOwned>(encoded: &[u8]) -> Result<T, ProtocolErro
 mod tests {
     use super::*;
     use crate::{
-        ArtifactDescriptor, ArtifactRevisionIdentity, CommitIdentity, CommitPreparation,
-        CommitRequest, ContentType, CreateWorkspaceRequest, Digest, DigestUri, GetSnapshotRequest,
-        ListPathsRequest, LogicalShardIdentity, ObjectNamespaceIdentity, OperationIdentity,
-        OperationKind, OperationProgress, OperationState, OperationStatus, OperationToken,
-        PageRequest, PathListEntry, PathMetadata, PathPage, PublishCondition, RelativePath,
-        RequestIdentity, RootIdentity, RootRoute, SnapshotAlias, SnapshotSelector, WorkbenchName,
-        WorkspaceCapability, WorkspaceContinuationFence, WorkspaceIdentity, WorkspacePath,
-        WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceReadView, WorkspaceRequest,
-        WorkspaceResult, WorkspaceRpcOutcome, WorkspaceSummary,
+        ArtifactDescriptor, ArtifactRevisionIdentity, BindRestoreDestinationRequest,
+        CommitIdentity, CommitPreparation, CommitRequest, ContentType, CreateWorkspaceRequest,
+        Digest, DigestUri, GetSnapshotRequest, ListPathsRequest, LogicalShardIdentity,
+        ObjectNamespaceIdentity, OperationIdentity, OperationKind, OperationProgress,
+        OperationState, OperationStatus, OperationToken, PageRequest, PathListEntry, PathMetadata,
+        PathPage, PathReadResult, PrepareRestoreRequest, PublishCondition,
+        ReadRestoreSourceRunManifestRequest, RelativePath, RequestIdentity,
+        RestoreManifestDescriptor, RestoreManifestIdentity, RestorePreparation, RestoreSource,
+        RestoreSourceCommitBinding, RootIdentity, RootRoute, SnapshotAlias, SnapshotSelector,
+        WorkbenchName, WorkspaceCapability, WorkspaceContinuationFence, WorkspaceIdentity,
+        WorkspacePath, WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceReadView,
+        WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceSummary,
     };
+    use sha2::{Digest as _, Sha256};
 
     fn route() -> RootRoute {
         RootRoute {
@@ -119,7 +128,7 @@ mod tests {
 
     #[test]
     fn request_round_trips_with_exact_schema() {
-        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v4");
+        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v5");
         let expected = request();
         let encoded = encode_request(&expected).unwrap();
         assert!(encoded
@@ -188,6 +197,171 @@ mod tests {
         assert_eq!(
             decode_response(&encode_response(&response).unwrap()).unwrap(),
             response
+        );
+    }
+
+    #[test]
+    fn restore_v5_late_binding_and_source_manifest_read_round_trip() {
+        let restore_identity = RestoreManifestIdentity {
+            publication_operation_id: OperationIdentity([0x21; 16]),
+            artifact_revision_id: ArtifactRevisionIdentity([0x22; 16]),
+        };
+        let prepare = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x23; 16]),
+            operation: WorkspaceRequest::PrepareRestore(PrepareRestoreRequest {
+                operation_id: OperationIdentity([0x24; 16]),
+                source_workbench: WorkbenchName::new("source").unwrap(),
+                source_workspace_incarnation_id: WorkspaceIdentity([0x25; 16]),
+                source: RestoreSource::Snapshot(SnapshotSelector::Id(7)),
+                destination_workbench: WorkbenchName::new("destination").unwrap(),
+                destination_workspace_incarnation_id: WorkspaceIdentity([0x26; 16]),
+                destination_restore_manifest_identity: restore_identity,
+                restore_manifest: RestoreManifestDescriptor {
+                    body_digest: DigestUri::new(format!("sha256:{}", "27".repeat(32))).unwrap(),
+                    logical_size: 128,
+                    content_type: ContentType::new("application/json").unwrap(),
+                },
+            }),
+        };
+        let encoded_prepare = encode_request(&prepare).unwrap();
+        assert_eq!(decode_request(&encoded_prepare).unwrap(), prepare);
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(&encoded_prepare)),
+            [
+                28, 238, 115, 109, 64, 218, 24, 81, 50, 136, 168, 153, 22, 248, 227, 135, 85, 198,
+                66, 144, 250, 45, 180, 116, 53, 12, 208, 24, 202, 32, 63, 37,
+            ],
+            "update only for an intentional restore-v5 wire change"
+        );
+
+        let bind = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x28; 16]),
+            operation: WorkspaceRequest::BindRestoreDestination(BindRestoreDestinationRequest {
+                operation_id: OperationIdentity([0x24; 16]),
+                destination_commit_id: CommitIdentity([0x29; 32]),
+                effective_content_digest: DigestUri::new(format!("sha256:{}", "2a".repeat(32)))
+                    .unwrap(),
+                destination_run_manifest_projection_input_digest: Digest([0x2b; 32]),
+                destination_run_manifest_identity: RestoreManifestIdentity {
+                    publication_operation_id: OperationIdentity([0x2c; 16]),
+                    artifact_revision_id: ArtifactRevisionIdentity([0x2d; 16]),
+                },
+                destination_restore_manifest_identity: restore_identity,
+            }),
+        };
+        let encoded_bind = encode_request(&bind).unwrap();
+        assert_eq!(decode_request(&encoded_bind).unwrap(), bind);
+
+        let read = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x2e; 16]),
+            operation: WorkspaceRequest::ReadRestoreSourceRunManifest(
+                ReadRestoreSourceRunManifestRequest {
+                    operation_id: OperationIdentity([0x24; 16]),
+                    range: None,
+                    plan_page: None,
+                },
+            ),
+        };
+        let encoded_read = encode_request(&read).unwrap();
+        assert_eq!(decode_request(&encoded_read).unwrap(), read);
+
+        let prepared = WorkspaceRpcResponse {
+            route: route(),
+            request_id: RequestIdentity([0x23; 16]),
+            commit_version: Some(19),
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::RestorePrepared(
+                RestorePreparation {
+                    operation_id: OperationIdentity([0x24; 16]),
+                    destination_workbench: WorkbenchName::new("destination").unwrap(),
+                    destination_workspace_incarnation_id: WorkspaceIdentity([0x26; 16]),
+                    source_commit: RestoreSourceCommitBinding {
+                        commit_id: CommitIdentity([0x2f; 32]),
+                        content_digest: DigestUri::new(format!("sha256:{}", "30".repeat(32)))
+                            .unwrap(),
+                        manifest_digest: DigestUri::new(format!("sha256:{}", "31".repeat(32)))
+                            .unwrap(),
+                        tree_manifest_revision_id: ArtifactRevisionIdentity([0x32; 16]),
+                        member_count: 0,
+                        member_digest: Digest([0; 32]),
+                    },
+                    destination_committed_at_unix_seconds: 1_700_000_000,
+                    source_member_count: 0,
+                    source_member_digest: Digest([0; 32]),
+                    materialized_member_count: 0,
+                    materialized_member_digest: Digest([0; 32]),
+                    source_matches_base_commit: true,
+                    destination_binding: None,
+                },
+            ))),
+        };
+        let encoded_prepared = encode_response(&prepared).unwrap();
+        assert_eq!(decode_response(&encoded_prepared).unwrap(), prepared);
+
+        let source_manifest = WorkspaceRpcResponse {
+            route: route(),
+            request_id: RequestIdentity([0x2e; 16]),
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(
+                WorkspaceResult::RestoreSourceRunManifest(PathReadResult {
+                    not_modified: false,
+                    metadata: Some(PathMetadata {
+                        path: WorkspacePath {
+                            workbench: WorkbenchName::new("source").unwrap(),
+                            path: RelativePath::new("metadata/run_manifest.json").unwrap(),
+                        },
+                        workspace_incarnation_id: WorkspaceIdentity([0x25; 16]),
+                        workspace_revision: 7,
+                        generation: 1,
+                        artifact_revision_id: ArtifactRevisionIdentity([0x32; 16]),
+                        dependency_count: 0,
+                        dependency_depth: 0,
+                        descriptor: ArtifactDescriptor {
+                            logical_size: 128,
+                            body_digest: DigestUri::new(format!("sha256:{}", "33".repeat(32)))
+                                .unwrap(),
+                            manifest_digest: DigestUri::new(format!("sha256:{}", "34".repeat(32)))
+                                .unwrap(),
+                            content_type: ContentType::new("application/json").unwrap(),
+                            producer: None,
+                            manifest_identity: None,
+                            index_fields: Vec::new(),
+                        },
+                    }),
+                    range: None,
+                    blocks: Vec::new(),
+                    next_cursor: None,
+                }),
+            )),
+        };
+        let encoded_source_manifest = encode_response(&source_manifest).unwrap();
+        assert_eq!(
+            decode_response(&encoded_source_manifest).unwrap(),
+            source_manifest
+        );
+
+        let mut complete_v5_golden = Sha256::new();
+        for encoded in [
+            encoded_prepare,
+            encoded_bind,
+            encoded_read,
+            encoded_prepared,
+            encoded_source_manifest,
+        ] {
+            complete_v5_golden.update((encoded.len() as u64).to_be_bytes());
+            complete_v5_golden.update(encoded);
+        }
+        assert_eq!(
+            <[u8; 32]>::from(complete_v5_golden.finalize()),
+            [
+                112, 11, 7, 236, 110, 64, 3, 160, 92, 62, 237, 117, 13, 87, 193, 173, 214, 252, 37,
+                85, 113, 91, 86, 78, 24, 81, 107, 18, 186, 104, 169, 3,
+            ],
+            "update only for an intentional restore-v5 wire change"
         );
     }
 
@@ -307,14 +481,70 @@ mod tests {
     #[test]
     fn schema_mismatch_fails_closed() {
         let encoded = rmp_serde::to_vec_named(&Frame {
-            schema: "nokv.workspace.rpc.v3".to_owned(),
+            schema: "nokv.workspace.rpc.v4".to_owned(),
             payload: request(),
         })
         .unwrap();
-        assert!(matches!(
+        assert_eq!(
             decode_request(&encoded),
-            Err(ProtocolError::SchemaMismatch { .. })
-        ));
+            Err(ProtocolError::SchemaMismatch {
+                actual: "nokv.workspace.rpc.v4".to_owned(),
+                expected: "nokv.workspace.rpc.v5",
+            })
+        );
+
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct V4PrepareRestoreRequest {
+            source_workbench: WorkbenchName,
+            source_workspace_incarnation_id: WorkspaceIdentity,
+            source: RestoreSource,
+            destination_workbench: WorkbenchName,
+            destination_workspace_incarnation_id: WorkspaceIdentity,
+            restore_manifest: RestoreManifestDescriptor,
+        }
+
+        #[derive(Serialize)]
+        #[serde(tag = "operation", content = "request", rename_all = "snake_case")]
+        enum V4WorkspaceRequest {
+            PrepareRestore(V4PrepareRestoreRequest),
+        }
+
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct V4WorkspaceRpcRequest {
+            route: RootRoute,
+            request_id: RequestIdentity,
+            operation: V4WorkspaceRequest,
+        }
+
+        let actual_v4 = rmp_serde::to_vec_named(&Frame {
+            schema: "nokv.workspace.rpc.v4".to_owned(),
+            payload: V4WorkspaceRpcRequest {
+                route: route(),
+                request_id: RequestIdentity([0x41; 16]),
+                operation: V4WorkspaceRequest::PrepareRestore(V4PrepareRestoreRequest {
+                    source_workbench: WorkbenchName::new("source").unwrap(),
+                    source_workspace_incarnation_id: WorkspaceIdentity([0x42; 16]),
+                    source: RestoreSource::Snapshot(SnapshotSelector::Id(7)),
+                    destination_workbench: WorkbenchName::new("destination").unwrap(),
+                    destination_workspace_incarnation_id: WorkspaceIdentity([0x43; 16]),
+                    restore_manifest: RestoreManifestDescriptor {
+                        body_digest: DigestUri::new(format!("sha256:{}", "44".repeat(32))).unwrap(),
+                        logical_size: 128,
+                        content_type: ContentType::new("application/json").unwrap(),
+                    },
+                }),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            decode_request(&actual_v4),
+            Err(ProtocolError::SchemaMismatch {
+                actual: "nokv.workspace.rpc.v4".to_owned(),
+                expected: "nokv.workspace.rpc.v5",
+            })
+        );
 
         let response = WorkspaceRpcResponse {
             route: route(),
@@ -332,14 +562,17 @@ mod tests {
             ))),
         };
         let encoded = rmp_serde::to_vec_named(&Frame {
-            schema: "nokv.workspace.rpc.v3".to_owned(),
+            schema: "nokv.workspace.rpc.v4".to_owned(),
             payload: response,
         })
         .unwrap();
-        assert!(matches!(
+        assert_eq!(
             decode_response(&encoded),
-            Err(ProtocolError::SchemaMismatch { .. })
-        ));
+            Err(ProtocolError::SchemaMismatch {
+                actual: "nokv.workspace.rpc.v4".to_owned(),
+                expected: "nokv.workspace.rpc.v5",
+            })
+        );
     }
 
     #[test]

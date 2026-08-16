@@ -69,6 +69,8 @@ pub enum WorkspaceRequest {
     RetireSnapshot(RetireSnapshotRequest),
     ListSnapshots(ListSnapshotsRequest),
     PrepareRestore(PrepareRestoreRequest),
+    BindRestoreDestination(BindRestoreDestinationRequest),
+    ReadRestoreSourceRunManifest(ReadRestoreSourceRunManifestRequest),
     FinalizeRestore(FinalizeRestoreRequest),
     GetOperation(GetOperationRequest),
     Search(SearchRequest),
@@ -101,6 +103,8 @@ impl WorkspaceRequest {
             Self::RetireSnapshot(request) => request.validate(),
             Self::ListSnapshots(request) => request.validate(),
             Self::PrepareRestore(request) => request.validate(),
+            Self::BindRestoreDestination(request) => request.validate(),
+            Self::ReadRestoreSourceRunManifest(request) => request.validate(),
             Self::FinalizeRestore(request) => request.validate(),
             Self::GetOperation(request) => request.validate(),
             Self::Search(request) => request.validate(),
@@ -792,6 +796,12 @@ pub struct RestoreManifestDescriptor {
 
 impl RestoreManifestDescriptor {
     fn validate(&self) -> Result<(), ProtocolError> {
+        crate::parse_sha256_digest_uri(&self.body_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "prepare_restore.restore_manifest.body_digest",
+                error.to_string(),
+            )
+        })?;
         if !(1..=MAX_RESTORE_MANIFEST_BYTES).contains(&self.logical_size) {
             return Err(ProtocolError::invalid(
                 "prepare_restore.restore_manifest.logical_size",
@@ -808,14 +818,24 @@ impl RestoreManifestDescriptor {
     }
 }
 
+/// Immutable publication identities reserved for one destination manifest.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreManifestIdentity {
+    pub publication_operation_id: OperationIdentity,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareRestoreRequest {
+    pub operation_id: OperationIdentity,
     pub source_workbench: WorkbenchName,
     pub source_workspace_incarnation_id: WorkspaceIdentity,
     pub source: RestoreSource,
     pub destination_workbench: WorkbenchName,
     pub destination_workspace_incarnation_id: WorkspaceIdentity,
+    pub destination_restore_manifest_identity: RestoreManifestIdentity,
     pub restore_manifest: RestoreManifestDescriptor,
 }
 
@@ -836,7 +856,117 @@ impl PrepareRestoreRequest {
                 ));
             }
         }
+        if self.operation_id
+            == self
+                .destination_restore_manifest_identity
+                .publication_operation_id
+        {
+            return Err(ProtocolError::invalid(
+                "prepare_restore.destination_restore_manifest_identity",
+                "restore and manifest publication operations must be distinct",
+            ));
+        }
         self.restore_manifest.validate()
+    }
+}
+
+/// Late-bind the destination commit after the exact materialized source
+/// closure has been sealed by the restore operation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BindRestoreDestinationRequest {
+    pub operation_id: OperationIdentity,
+    pub destination_commit_id: CommitIdentity,
+    pub effective_content_digest: DigestUri,
+    pub destination_run_manifest_projection_input_digest: Digest,
+    pub destination_run_manifest_identity: RestoreManifestIdentity,
+    pub destination_restore_manifest_identity: RestoreManifestIdentity,
+}
+
+impl BindRestoreDestinationRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        crate::parse_sha256_digest_uri(&self.effective_content_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "bind_restore_destination.effective_content_digest",
+                error.to_string(),
+            )
+        })?;
+        if self.destination_run_manifest_projection_input_digest == Digest([0; 32]) {
+            return Err(ProtocolError::invalid(
+                "bind_restore_destination.destination_run_manifest_projection_input_digest",
+                "must not be the zero digest",
+            ));
+        }
+        if self
+            .destination_run_manifest_identity
+            .publication_operation_id
+            == self
+                .destination_restore_manifest_identity
+                .publication_operation_id
+            || self.destination_run_manifest_identity.artifact_revision_id
+                == self
+                    .destination_restore_manifest_identity
+                    .artifact_revision_id
+        {
+            return Err(ProtocolError::invalid(
+                "bind_restore_destination.destination_manifests",
+                "run and restore manifests require distinct publication operations and artifact revisions",
+            ));
+        }
+        if self.operation_id
+            == self
+                .destination_run_manifest_identity
+                .publication_operation_id
+            || self.operation_id
+                == self
+                    .destination_restore_manifest_identity
+                    .publication_operation_id
+        {
+            return Err(ProtocolError::invalid(
+                "bind_restore_destination.destination_manifests",
+                "restore and manifest publication operations must be distinct",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read the exact source commit-owned run manifest bound to one restore.
+///
+/// The operation identity provides the durable source binding; callers cannot
+/// substitute a path or read view.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadRestoreSourceRunManifestRequest {
+    pub operation_id: OperationIdentity,
+    pub range: Option<ByteRange>,
+    pub plan_page: Option<PageRequest>,
+}
+
+impl ReadRestoreSourceRunManifestRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match (self.range, self.plan_page.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(range), Some(page)) => {
+                range.validate()?;
+                page.validate("read_restore_source_run_manifest.plan_page")?;
+                if page.limit as usize > crate::MAX_ARTIFACT_READ_PLAN_ROWS {
+                    return Err(ProtocolError::invalid(
+                        "read_restore_source_run_manifest.plan_page.limit",
+                        format!("exceeds {}", crate::MAX_ARTIFACT_READ_PLAN_ROWS),
+                    ));
+                }
+                Ok(())
+            }
+            (None, Some(_)) => Err(ProtocolError::invalid(
+                "read_restore_source_run_manifest.plan_page",
+                "metadata-only reads must not include a plan page",
+            )),
+            (Some(_), None) => Err(ProtocolError::invalid(
+                "read_restore_source_run_manifest.plan_page",
+                "ranged reads require an explicit plan page",
+            )),
+        }
     }
 }
 
@@ -1600,6 +1730,19 @@ mod tests {
                 ..
             })
         ));
+
+        let noncanonical = RestoreManifestDescriptor {
+            body_digest: DigestUri::new(format!("sha256:{}", "AB".repeat(32))).unwrap(),
+            logical_size: 128,
+            content_type: crate::ContentType::new("application/json").unwrap(),
+        };
+        assert!(matches!(
+            noncanonical.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "prepare_restore.restore_manifest.body_digest",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1610,11 +1753,16 @@ mod tests {
             content_type: crate::ContentType::new("application/json").unwrap(),
         };
         let mut request = PrepareRestoreRequest {
+            operation_id: OperationIdentity([9; 16]),
             source_workbench: WorkbenchName::new("source").unwrap(),
             source_workspace_incarnation_id: WorkspaceIdentity([1; 16]),
             source: RestoreSource::Snapshot(SnapshotSelector::Id(7)),
             destination_workbench: WorkbenchName::new("destination").unwrap(),
             destination_workspace_incarnation_id: WorkspaceIdentity([2; 16]),
+            destination_restore_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationIdentity([7; 16]),
+                artifact_revision_id: ArtifactRevisionIdentity([8; 16]),
+            },
             restore_manifest: descriptor,
         };
         request.validate().unwrap();
@@ -1629,6 +1777,110 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn restore_destination_binding_requires_distinct_manifest_publications() {
+        let mut request = BindRestoreDestinationRequest {
+            operation_id: OperationIdentity([1; 16]),
+            destination_commit_id: CommitIdentity([2; 32]),
+            effective_content_digest: DigestUri::new(format!("sha256:{}", "03".repeat(32)))
+                .unwrap(),
+            destination_run_manifest_projection_input_digest: Digest([4; 32]),
+            destination_run_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationIdentity([5; 16]),
+                artifact_revision_id: ArtifactRevisionIdentity([6; 16]),
+            },
+            destination_restore_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationIdentity([7; 16]),
+                artifact_revision_id: ArtifactRevisionIdentity([8; 16]),
+            },
+        };
+        request.validate().unwrap();
+
+        request
+            .destination_restore_manifest_identity
+            .publication_operation_id = request
+            .destination_run_manifest_identity
+            .publication_operation_id;
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "bind_restore_destination.destination_manifests",
+                ..
+            })
+        ));
+        request
+            .destination_restore_manifest_identity
+            .publication_operation_id = OperationIdentity([7; 16]);
+        request
+            .destination_restore_manifest_identity
+            .artifact_revision_id = request
+            .destination_run_manifest_identity
+            .artifact_revision_id;
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "bind_restore_destination.destination_manifests",
+                ..
+            })
+        ));
+
+        request
+            .destination_restore_manifest_identity
+            .artifact_revision_id = ArtifactRevisionIdentity([8; 16]);
+        request.destination_run_manifest_projection_input_digest = Digest([0; 32]);
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "bind_restore_destination.destination_run_manifest_projection_input_digest",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_source_run_manifest_read_requires_a_bounded_plan() {
+        let operation_id = OperationIdentity([1; 16]);
+        ReadRestoreSourceRunManifestRequest {
+            operation_id,
+            range: None,
+            plan_page: None,
+        }
+        .validate()
+        .unwrap();
+        let range = ByteRange {
+            offset: 5,
+            length: 8,
+        };
+        ReadRestoreSourceRunManifestRequest {
+            operation_id,
+            range: Some(range),
+            plan_page: Some(PageRequest {
+                cursor: None,
+                limit: crate::MAX_ARTIFACT_READ_PLAN_ROWS as u32,
+            }),
+        }
+        .validate()
+        .unwrap();
+
+        assert!(ReadRestoreSourceRunManifestRequest {
+            operation_id,
+            range: Some(range),
+            plan_page: None,
+        }
+        .validate()
+        .is_err());
+        assert!(ReadRestoreSourceRunManifestRequest {
+            operation_id,
+            range: Some(range),
+            plan_page: Some(PageRequest {
+                cursor: vec![0; PageRequest::MAX_CURSOR_BYTES + 1].into(),
+                limit: 1,
+            }),
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
