@@ -19,6 +19,7 @@ use sha2::{Digest as _, Sha256};
 pub const RUN_MANIFEST_V1_SCHEMA: &str = "nokv.workbench.run_manifest.v1";
 const RUN_MANIFEST_PROJECTION_INPUT_DOMAIN: &[u8] =
     b"nokv.workbench.run_manifest.projection_input.v1\0";
+const RESTORED_CONTENT_DIGEST_DOMAIN: &[u8] = b"nokv.workbench.restored_content_digest.v1\0";
 pub const RESTORE_MANIFEST_V1_SCHEMA: &str = "nokv.workbench.restore_manifest.v1";
 
 const RUN_MANIFEST_FIELDS: [&str; 8] = [
@@ -249,13 +250,14 @@ pub fn verify_run_manifest_v1(bytes: &[u8]) -> Result<VerifiedRunManifestV1, Pro
 /// Rebuild a committed run-manifest projection for a restored destination.
 ///
 /// The source envelope is accepted only as canonical v1 input. Its user
-/// manifest and content commitments are retained, while all Workbench-owned
-/// binding fields are rebuilt for the destination through the one canonical
-/// run-manifest builder.
+/// manifest commitment is retained, while the effective content commitment
+/// and all Workbench-owned binding fields are rebuilt for the destination
+/// through the one canonical run-manifest builder.
 pub fn build_restored_run_manifest_v1(
     source_run_manifest: &[u8],
     destination_workbench_id: &WorkbenchId,
     destination_workbench_path: &str,
+    effective_content_digest_uri: &str,
     destination_commit_identity: [u8; 32],
     destination_committed_at_unix_seconds: u64,
 ) -> Result<Vec<u8>, ProjectionError> {
@@ -273,12 +275,34 @@ pub fn build_restored_run_manifest_v1(
     build_run_manifest_v1(
         destination_workbench_id,
         destination_workbench_path,
-        &source.content_digest_uri,
+        effective_content_digest_uri,
         &source.canonical_manifest,
         &source.manifest_digest_uri,
         destination_commit_identity,
         destination_committed_at_unix_seconds,
     )
+}
+
+/// Choose the destination content commitment for one frozen restore source.
+///
+/// An unchanged snapshot retains the caller-owned source commitment. A dirty
+/// snapshot instead commits to its exact materialized member seal under a
+/// separate domain so two different uncommitted trees cannot reuse one
+/// destination commit identity.
+pub fn restore_effective_content_digest_uri_v1(
+    source_content_digest_uri: &str,
+    source_matches_base_commit: bool,
+    materialized_member_digest: [u8; 32],
+) -> Result<String, ProjectionError> {
+    validate_digest_uri("source_content_digest_uri", source_content_digest_uri)?;
+    if source_matches_base_commit {
+        return Ok(source_content_digest_uri.to_owned());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(RESTORED_CONTENT_DIGEST_DOMAIN);
+    hasher.update(materialized_member_digest);
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(format!("sha256:{}", lowercase_hex(&digest)))
 }
 
 pub fn build_restore_manifest_v1(
@@ -718,6 +742,7 @@ mod tests {
             &source,
             &destination_id,
             "/agents/test/wb/destination",
+            &content_digest_uri,
             destination_commit_identity,
             1_800_000_000,
         )
@@ -770,6 +795,7 @@ mod tests {
             &source,
             &first_destination_id,
             "/agents/test/wb/destination-one",
+            &content_digest_uri,
             first_destination_commit_identity,
             2,
         )
@@ -778,6 +804,7 @@ mod tests {
             &source,
             &first_destination_id,
             "/agents/test/wb/destination-one",
+            &content_digest_uri,
             first_destination_commit_identity,
             2,
         )
@@ -786,6 +813,7 @@ mod tests {
             &source,
             &second_destination_id,
             "/agents/test/wb/destination-two",
+            &content_digest_uri,
             second_destination_commit_identity,
             2,
         )
@@ -825,6 +853,7 @@ mod tests {
             &source,
             &destination_id,
             "/agents/test/wb/destination",
+            &content_digest_uri,
             [9; 32],
             2,
         )
@@ -833,6 +862,7 @@ mod tests {
             &source,
             &source_id,
             "/agents/test/wb/source",
+            &content_digest_uri,
             source_commit_identity,
             2,
         )
@@ -841,6 +871,7 @@ mod tests {
             &source,
             &destination_id,
             "/agents/test/wb/destination",
+            &content_digest_uri,
             destination_commit_identity,
             0,
         )
@@ -849,6 +880,7 @@ mod tests {
             br#"{ "not": "canonical" }"#,
             &destination_id,
             "/agents/test/wb/destination",
+            &content_digest_uri,
             destination_commit_identity,
             2,
         )
@@ -857,10 +889,30 @@ mod tests {
             br#"{"not":"a run manifest"}"#,
             &destination_id,
             "/agents/test/wb/destination",
+            &content_digest_uri,
             destination_commit_identity,
             2,
         )
         .is_err());
+    }
+
+    #[test]
+    fn restore_content_commitment_preserves_clean_and_separates_dirty_snapshots() {
+        let source = format!("sha256:{}", "77".repeat(32));
+        assert_eq!(
+            restore_effective_content_digest_uri_v1(&source, true, [1; 32]).unwrap(),
+            source
+        );
+
+        let first = restore_effective_content_digest_uri_v1(&source, false, [1; 32]).unwrap();
+        let replay = restore_effective_content_digest_uri_v1(&source, false, [1; 32]).unwrap();
+        let second = restore_effective_content_digest_uri_v1(&source, false, [2; 32]).unwrap();
+        assert_eq!(first, replay);
+        assert_ne!(first, source);
+        assert_ne!(first, second);
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(first.len(), 71);
+        assert!(restore_effective_content_digest_uri_v1("not-a-digest", true, [1; 32]).is_err());
     }
 
     #[test]
