@@ -17,6 +17,7 @@ mod workbench_mcp;
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::process::ExitCode;
+#[cfg(feature = "etcd")]
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
@@ -30,10 +31,12 @@ use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
 use cli::{Command, Invocation};
+#[cfg(feature = "etcd")]
 use object_store::CliObjectStore;
 
 type CliHandler = SdkWorkbenchToolHandler<CliWorkbenchBackend>;
 
+#[cfg(feature = "etcd")]
 const WORKBENCH_REQUIRED_RPC_CAPABILITIES: [nokv_protocol::WorkspaceCapability; 8] = [
     nokv_protocol::WorkspaceCapability::ArtifactPublishV1,
     nokv_protocol::WorkspaceCapability::ArtifactRangeReadV1,
@@ -67,10 +70,12 @@ fn run() -> Result<(), String> {
         Command::Provision {
             logical_shard_id,
             adopt_legacy_object_namespace,
+            adopt_legacy_agent_binding,
         } => run_provision(
             &invocation,
             logical_shard_id,
             *adopt_legacy_object_namespace,
+            *adopt_legacy_agent_binding,
         ),
         Command::Serve => run_server(&invocation),
         Command::Workbench { tool, arguments } => {
@@ -119,7 +124,100 @@ fn run() -> Result<(), String> {
     }
 }
 
+#[derive(Debug)]
+struct ConfiguredAgentAdmission<'a> {
+    route: &'a cli::EtcdRoutingConfig,
+    root_id: nokv_control::RootId,
+    agent_id: nokv_types::AgentId,
+}
+
+fn configured_agent_admission(
+    invocation: &Invocation,
+) -> Result<ConfiguredAgentAdmission<'_>, String> {
+    let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
+        return Err(
+            "Agent-facing commands require durable etcd control routing; static routes cannot prove the RootId-to-AgentId binding"
+                .to_owned(),
+        );
+    };
+    let root_id = nokv_control::RootId::from(
+        connection::configured_root_id(&invocation.client).map_err(|error| error.to_string())?,
+    );
+    let agent_id = connection::parse_agent_id(
+        invocation
+            .agent_id
+            .as_deref()
+            .ok_or_else(|| "--agent-id is required for Agent-facing commands".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(ConfiguredAgentAdmission {
+        route,
+        root_id,
+        agent_id,
+    })
+}
+
+fn load_root_agent_binding(
+    control: &dyn nokv_control::ControlStore,
+    root_id: nokv_control::RootId,
+) -> Result<nokv_control::RootAgentBinding, String> {
+    let binding = control
+        .get_root_agent_binding(&root_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "root {root_id:?} has no durable Agent binding; run provision with its stable --agent-id, adding --adopt-legacy-agent-binding only for a verified legacy root"
+            )
+        })?;
+    if binding.root_id != root_id {
+        return Err(format!(
+            "root {root_id:?} Agent binding key/value identity mismatch"
+        ));
+    }
+    Ok(binding)
+}
+
+fn after_agent_root_admission<T>(
+    control: &dyn nokv_control::ControlStore,
+    root_id: nokv_control::RootId,
+    agent_id: nokv_types::AgentId,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let binding = load_root_agent_binding(control, root_id)?;
+    if binding.agent_id != agent_id {
+        return Err(nokv_control::ControlError::RootAgentAlreadyBound { root_id }.to_string());
+    }
+    operation()
+}
+
 fn build_backend(invocation: &Invocation) -> Result<CliWorkbenchBackend, String> {
+    let admission = configured_agent_admission(invocation)?;
+    #[cfg(feature = "etcd")]
+    {
+        let control = connect_control(admission.route)?;
+        after_agent_root_admission(
+            control.as_ref(),
+            admission.root_id,
+            admission.agent_id,
+            || build_backend_after_agent_admission(invocation),
+        )
+    }
+    #[cfg(not(feature = "etcd"))]
+    {
+        let ConfiguredAgentAdmission {
+            route,
+            root_id,
+            agent_id,
+        } = admission;
+        let _ = (route, root_id, agent_id);
+        Err("Agent-facing commands require the nokv etcd feature".to_owned())
+    }
+}
+
+#[cfg(feature = "etcd")]
+fn build_backend_after_agent_admission(
+    invocation: &Invocation,
+) -> Result<CliWorkbenchBackend, String> {
     let client = connection::connect(&invocation.client).map_err(|error| error.to_string())?;
     let preflight = client
         .preflight(WORKBENCH_REQUIRED_RPC_CAPABILITIES)
@@ -282,25 +380,28 @@ USAGE:
   nokv [connection/object options] mcp
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--content-type TYPE]
-  nokv --root-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [--adopt-legacy-object-namespace]
+  nokv --root-id HEX32 --agent-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [adoption options]
   nokv [owner options] serve
   nokv schema
   nokv version [--json]
   nokv --version
 
-CLIENT ROUTING:
+AGENT CONTROL ROUTING:
   --root-id HEX32
-  --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
+  --agent-id HEX32 is required by provision, workbench, mcp, materialize, and collect
+  AgentId is a durable deployment identity used to prevent root misconfiguration; it is not an authentication credential
   --etcd-endpoint URL [--etcd-endpoint URL ...]
 
 AGENT PRESENTATION:
-  --workbench-root /agents/AGENT_ID/wb is required by workbench, collect, and mcp
+  --workbench-root /agents/AGENT_NAME/wb is required by workbench, collect, and mcp
   keep this presentation root stable: it shapes responses and canonical v1 manifest paths
   RootId remains the only storage/routing identity; the presentation root never enters Holt keys
 
 OWNER:
-  provision creates the logical shard, immutable object-namespace binding, and root affinity
+  provision first binds RootId to an explicit AgentId, then creates namespace, shard, and affinity
+  --adopt-legacy-agent-binding is a one-time explicit migration for a verified legacy root
   --adopt-legacy-object-namespace is a one-time explicit migration after verifying bucket/prefix
+  serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
   --root-id HEX32 --etcd-endpoint URL --node-id ID
   --advertise-endpoint HOST:PORT --bind HOST:PORT
   --metadata-create PATH starts the first standalone local-WAL owner
@@ -331,6 +432,7 @@ fn run_provision(
     invocation: &Invocation,
     logical_shard_id: &str,
     adopt_legacy_object_namespace: bool,
+    adopt_legacy_agent_binding: bool,
 ) -> Result<(), String> {
     use nokv_control::{LogicalShardId, RootId};
     use nokv_types::RootPlacementLifecycle;
@@ -344,10 +446,24 @@ fn run_provision(
     let logical_shard_id = LogicalShardId::from(
         connection::parse_logical_shard_id(logical_shard_id).map_err(|error| error.to_string())?,
     );
+    let agent_id = connection::parse_agent_id(
+        invocation
+            .agent_id
+            .as_deref()
+            .ok_or_else(|| "provision requires --agent-id".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
     let control = connect_control(route)?;
     let existing_placement =
         provision::preflight_provision(control.as_ref(), root_id, logical_shard_id)
             .map_err(|error| error.to_string())?;
+    let binding_preexisting = provision::ensure_root_agent_binding(
+        control.as_ref(),
+        root_id,
+        agent_id,
+        adopt_legacy_agent_binding,
+    )
+    .map_err(|error| error.to_string())?;
     let objects = CliObjectStore::build(&invocation.client.object)?;
     objects.validate_agent_capabilities()?;
     let namespace_id = match control
@@ -392,6 +508,8 @@ fn run_provision(
     print_json(&json!({
         "status": "success",
         "root_id": encode_lowercase_hex(root_id.as_bytes()),
+        "agent_id": encode_lowercase_hex(agent_id.as_bytes()),
+        "binding_preexisting": binding_preexisting,
         "logical_shard_id": encode_lowercase_hex(logical_shard_id.as_bytes()),
         "object_namespace_id": encode_lowercase_hex(namespace_id.as_bytes()),
         "placement_generation": outcome.placement.placement_generation.get(),
@@ -408,6 +526,7 @@ fn run_provision(
     _invocation: &Invocation,
     _logical_shard_id: &str,
     _adopt_legacy_object_namespace: bool,
+    _adopt_legacy_agent_binding: bool,
 ) -> Result<(), String> {
     Err("provision requires the nokv etcd feature".to_owned())
 }
@@ -434,6 +553,17 @@ fn active_shard_placements(
         return Err("configured root placement must be Active before serve".to_owned());
     }
     Ok(placements)
+}
+
+#[cfg(feature = "etcd")]
+fn validate_served_root_agent_bindings(
+    control: &dyn nokv_control::ControlStore,
+    placements: &[nokv_control::RootPlacement],
+) -> Result<(), String> {
+    for placement in placements {
+        load_root_agent_binding(control, placement.root_id)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "etcd")]
@@ -525,6 +655,8 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .get_root_placement(&root_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "root placement does not exist; provision it before serve".to_owned())?;
+    let placements = active_shard_placements(control.as_ref(), &placement)?;
+    validate_served_root_agent_bindings(control.as_ref(), &placements)?;
     let object_namespace = control
         .get_root_object_namespace_binding(&root_id)
         .map_err(|error| error.to_string())?
@@ -541,7 +673,6 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         log: shard.log.clone(),
         durable_lsn: shard.durable_lsn,
     };
-    let placements = active_shard_placements(control.as_ref(), &placement)?;
     if invocation.server.lifecycle_interval_millis == 0
         || invocation.server.lifecycle_interval_millis > 60_000
     {
@@ -696,6 +827,8 @@ fn run_server(_invocation: &Invocation) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -706,11 +839,104 @@ mod tests {
         assert!(scoped_artifact("run-1", "outputs", "../result.json").is_err());
     }
 
+    #[test]
+    fn agent_binding_mismatch_stops_before_client_preflight() {
+        use nokv_control::{ControlStore, InMemoryControlStore, RootAgentBinding};
+        use nokv_types::{AgentId, RootId};
+
+        let control = InMemoryControlStore::new();
+        let root_id = RootId::from_bytes([1; nokv_types::FIXED_ID_BYTES]);
+        control
+            .create_root_agent_binding(RootAgentBinding {
+                root_id,
+                agent_id: AgentId::from_bytes([7; nokv_types::FIXED_ID_BYTES]),
+            })
+            .unwrap();
+        let rpc_preflight_called = Cell::new(false);
+
+        let error = after_agent_root_admission(
+            &control,
+            root_id,
+            AgentId::from_bytes([8; nokv_types::FIXED_ID_BYTES]),
+            || {
+                rpc_preflight_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("already bound to another Agent"));
+        assert!(!rpc_preflight_called.get());
+        assert!(!error.contains(&"07".repeat(nokv_types::FIXED_ID_BYTES)));
+        assert!(!error.contains(&"08".repeat(nokv_types::FIXED_ID_BYTES)));
+
+        after_agent_root_admission(
+            &control,
+            root_id,
+            AgentId::from_bytes([7; nokv_types::FIXED_ID_BYTES]),
+            || {
+                rpc_preflight_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(rpc_preflight_called.get());
+    }
+
+    #[test]
+    fn missing_agent_binding_stops_before_client_preflight() {
+        use nokv_control::InMemoryControlStore;
+        use nokv_types::{AgentId, RootId};
+
+        let control = InMemoryControlStore::new();
+        let rpc_preflight_called = Cell::new(false);
+        let error = after_agent_root_admission(
+            &control,
+            RootId::from_bytes([1; nokv_types::FIXED_ID_BYTES]),
+            AgentId::from_bytes([7; nokv_types::FIXED_ID_BYTES]),
+            || {
+                rpc_preflight_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("no durable Agent binding"));
+        assert!(error.contains("--adopt-legacy-agent-binding"));
+        assert!(!rpc_preflight_called.get());
+    }
+
+    #[test]
+    fn static_agent_route_fails_before_rpc_configuration() {
+        let invocation = cli::parse(
+            [
+                "--root-id",
+                "11111111111111111111111111111111",
+                "--agent-id",
+                "77777777777777777777777777777777",
+                "--workbench-root",
+                "/agents/test/wb",
+                "--logical-shard-id",
+                "not-a-valid-shard-id",
+                "mcp",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        let error = configured_agent_admission(&invocation).unwrap_err();
+        assert!(error.contains("durable etcd control"));
+        assert!(!error.contains("logical-shard-id"));
+    }
+
     #[cfg(feature = "etcd")]
     #[test]
     fn shard_startup_selects_every_active_root_and_no_other_placement() {
-        use nokv_control::{ControlStore, InMemoryControlStore, RootPlacement};
-        use nokv_types::{LogicalShardId, PlacementGeneration, RootId, RootPlacementLifecycle};
+        use nokv_control::{ControlStore, InMemoryControlStore, RootAgentBinding, RootPlacement};
+        use nokv_types::{
+            AgentId, LogicalShardId, PlacementGeneration, RootId, RootPlacementLifecycle,
+        };
 
         let root = |fill| RootId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
         let shard = |fill| LogicalShardId::from_bytes([fill; nokv_types::FIXED_ID_BYTES]);
@@ -737,6 +963,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![root(1), root(2)]
         );
+
+        let owner_before = control
+            .get_logical_shard(&shard(9))
+            .unwrap()
+            .unwrap()
+            .owner_epoch;
+        let error = validate_served_root_agent_bindings(&control, &placements).unwrap_err();
+        assert!(error.contains("no durable Agent binding"));
+        assert_eq!(
+            control
+                .get_logical_shard(&shard(9))
+                .unwrap()
+                .unwrap()
+                .owner_epoch,
+            owner_before
+        );
+
+        for (root_id, agent_fill) in [(root(1), 7), (root(2), 8)] {
+            control
+                .create_root_agent_binding(RootAgentBinding {
+                    root_id,
+                    agent_id: AgentId::from_bytes([agent_fill; nokv_types::FIXED_ID_BYTES]),
+                })
+                .unwrap();
+        }
+        validate_served_root_agent_bindings(&control, &placements).unwrap();
 
         let provisioning = control.get_root_placement(&root(4)).unwrap().unwrap();
         assert!(active_shard_placements(&control, &provisioning).is_err());

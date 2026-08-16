@@ -251,14 +251,18 @@ One MCP registry entry is the whole integration. Each agent spawns the `nokv`
 binary as a stdio MCP server:
 
 ```text
-nokv ... --workbench-root /agents/{agent_id}/wb mcp
+nokv ... --agent-id {stable_agent_id_hex32} \
+  --workbench-root /agents/{agent_name}/wb mcp
 ```
 
-The runtime expands `{agent_id}` per agent, so a single registry template gives
-every agent its own path-scoped Workbench root, and the 18 `workbench_*`
-tools land next to the agent's local file tools instead of replacing them.
-There is no client library and no NoKV-specific client code beyond that
-placeholder expansion; the whole contract lives server-side.
+The runtime persists a stable `AgentId` and a distinct `RootId` for each
+isolation boundary. Provisioning immutably binds that root to the AgentId;
+`--workbench-root` remains only the human-facing path projection and cannot
+grant isolation by itself. The binding prevents accidental root reuse, but is
+not an authentication credential. The 18 `workbench_*` tools land next to the
+agent's local file tools instead of replacing them. There is no client library;
+the runtime only supplies the persisted identities, route, presentation root,
+and object configuration to the flat MCP command.
 
 A research run then follows the fixed section layout — `input`, `scripts`,
 `outputs`, `logs`, `metadata`:

@@ -14,6 +14,8 @@ compatibility route.
 Before registration, obtain:
 
 - one 16-byte `RootId`;
+- one persisted 16-byte `AgentId` and its immutable control-plane binding to
+  that RootId;
 - its persisted 16-byte `LogicalShardId` affinity;
 - the current non-zero placement generation and owner epoch;
 - the reachable workspace RPC owner address;
@@ -49,7 +51,8 @@ the response with `workbench_contract.validate_tool_contract`.
 For the complete live Workbench path, run
 `scripts/workbench/live_workbench.py`. It calls `nokv provision`,
 starts `nokv serve` with explicit metadata create/reopen intent, starts
-`nokv ... --workbench-root /agents/{agent}/wb mcp`, exercises all 18 tools, and
+`nokv ... --agent-id {stable-id} --workbench-root /agents/{name}/wb mcp`,
+exercises all 18 tools, and
 retains exact requests/responses plus materialize/collect evidence. Run
 `--dry-run` first to inspect the redacted command and normalized-input plan.
 In the local-WAL profile, `reopen` qualifies only a restart of the same
@@ -66,6 +69,12 @@ a normal reopen alone does not cover interrupted `Recovering` retries.
 The selected `--workbench-root` is durable presentation configuration because
 canonical v1 manifests contain its projected paths. Keep it identical across
 restart/replay; it never replaces `RootId` as the storage or routing identity.
+Agent-facing commands require etcd control routing and verify the immutable
+RootId-to-AgentId binding before RPC preflight, object binding, stdin reads, or
+tool advertisement. This is a fail-closed deployment identity check, not
+authentication. A legacy root without a binding requires a one-time,
+operator-verified provision with `--adopt-legacy-agent-binding`; NoKV never
+infers identity from the presentation path.
 Before reading MCP stdin or advertising tools, the flat CLI performs the typed
 workspace RPC preflight for every capability required by this 18-tool profile;
 a missing capability or route mismatch stops startup.
@@ -75,6 +84,7 @@ Registration must stop if:
 - the tool set is not exactly 18 tools;
 - any normalized input schema differs;
 - the root route is stale or belongs to another logical shard;
+- the root has no durable Agent binding or is bound to another AgentId;
 - the metadata schema marker differs from `nokv_workspace`;
 - the object backend cannot guarantee immutable creation;
 - a write/read/snapshot/restore probe returns a placeholder or unsupported

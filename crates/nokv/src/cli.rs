@@ -82,6 +82,7 @@ pub enum MetadataStoreConfig {
 pub struct Invocation {
     pub client: ClientConfig,
     pub server: ServerConfig,
+    pub agent_id: Option<String>,
     pub workbench_root: Option<String>,
     pub command: Command,
 }
@@ -110,6 +111,7 @@ pub enum Command {
     Provision {
         logical_shard_id: String,
         adopt_legacy_object_namespace: bool,
+        adopt_legacy_agent_binding: bool,
     },
     Serve,
     Schema,
@@ -236,6 +238,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
     let mut routing_kind = None;
+    let mut agent_id = None;
     let mut workbench_root = None;
     let command = loop {
         let Some(argument) = arguments.next() else {
@@ -251,6 +254,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                     parse_address("--metadata-address", next_value(&mut arguments, &argument)?)?;
             }
             "--root-id" => client.root_id = Some(next_value(&mut arguments, &argument)?),
+            "--agent-id" => agent_id = Some(next_value(&mut arguments, &argument)?),
             "--workbench-root" => {
                 workbench_root = Some(next_value(&mut arguments, &argument)?);
             }
@@ -372,15 +376,27 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
         return Err(CliError::UnexpectedArgument(argument));
     }
     if matches!(
-        command,
+        &command,
         Command::Workbench { .. } | Command::Mcp | Command::Collect { .. }
     ) && workbench_root.is_none()
     {
         return Err(CliError::MissingOption("--workbench-root"));
     }
+    if matches!(
+        &command,
+        Command::Workbench { .. }
+            | Command::Mcp
+            | Command::Materialize { .. }
+            | Command::Collect { .. }
+            | Command::Provision { .. }
+    ) && agent_id.is_none()
+    {
+        return Err(CliError::MissingOption("--agent-id"));
+    }
     Ok(Invocation {
         client,
         server,
+        agent_id,
         workbench_root,
         command,
     })
@@ -459,17 +475,20 @@ fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Comma
     let logical_shard_id = arguments
         .next()
         .ok_or(CliError::MissingArgument("logical shard id"))?;
-    let adopt_legacy_object_namespace = match arguments.next() {
-        None => false,
-        Some(argument) if argument == "--adopt-legacy-object-namespace" => true,
-        Some(argument) if argument.starts_with("--") => {
-            return Err(CliError::UnknownOption(argument))
+    let mut adopt_legacy_object_namespace = false;
+    let mut adopt_legacy_agent_binding = false;
+    for argument in arguments.by_ref() {
+        match argument.as_str() {
+            "--adopt-legacy-object-namespace" => adopt_legacy_object_namespace = true,
+            "--adopt-legacy-agent-binding" => adopt_legacy_agent_binding = true,
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
         }
-        Some(argument) => return Err(CliError::UnexpectedArgument(argument)),
-    };
+    }
     Ok(Command::Provision {
         logical_shard_id,
         adopt_legacy_object_namespace,
+        adopt_legacy_agent_binding,
     })
 }
 
@@ -556,6 +575,8 @@ mod tests {
         let parsed = parse(args(&[
             "--root-id",
             "01",
+            "--agent-id",
+            "44444444444444444444444444444444",
             "--workbench-root",
             "/agents/test/wb",
             "--logical-shard-id",
@@ -572,6 +593,10 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(parsed.client.root_id.as_deref(), Some("01"));
+        assert_eq!(
+            parsed.agent_id.as_deref(),
+            Some("44444444444444444444444444444444")
+        );
         assert_eq!(parsed.workbench_root.as_deref(), Some("/agents/test/wb"));
         let RoutingConfig::Static(route) = parsed.client.routing else {
             panic!("static route expected");
@@ -591,6 +616,8 @@ mod tests {
     #[test]
     fn collect_is_explicit_local_transfer() {
         let parsed = parse(args(&[
+            "--agent-id",
+            "44444444444444444444444444444444",
             "--workbench-root",
             "/agents/test/wb",
             "collect",
@@ -642,6 +669,8 @@ mod tests {
         let parsed = parse(args(&[
             "--root-id",
             "01",
+            "--agent-id",
+            "44444444444444444444444444444444",
             "--workbench-root",
             "/agents/test/wb",
             "--etcd-endpoint",
@@ -669,6 +698,8 @@ mod tests {
         let parsed = parse(args(&[
             "--root-id",
             "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
             "--etcd-endpoint",
             "http://127.0.0.1:2379",
             "provision",
@@ -680,6 +711,7 @@ mod tests {
             Command::Provision {
                 logical_shard_id: "22222222222222222222222222222222".to_owned(),
                 adopt_legacy_object_namespace: false,
+                adopt_legacy_agent_binding: false,
             }
         );
         assert!(matches!(parsed.client.routing, RoutingConfig::Etcd(_)));
@@ -690,6 +722,8 @@ mod tests {
         let parsed = parse(args(&[
             "--root-id",
             "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
             "--etcd-endpoint",
             "http://127.0.0.1:2379",
             "provision",
@@ -711,6 +745,8 @@ mod tests {
         let error = parse(args(&[
             "--root-id",
             "11",
+            "--agent-id",
+            "44444444444444444444444444444444",
             "--etcd-endpoint",
             "http://127.0.0.1:2379",
             "provision",
@@ -786,16 +822,111 @@ mod tests {
     #[test]
     fn agent_commands_require_an_explicit_presentation_root() {
         assert_eq!(
-            parse(args(&["mcp"])),
+            parse(args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "mcp",
+            ])),
             Err(CliError::MissingOption("--workbench-root"))
         );
         assert_eq!(
             parse(args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
                 "workbench",
                 "workbench_create",
                 r#"{"id":"run-1"}"#,
             ])),
             Err(CliError::MissingOption("--workbench-root"))
         );
+    }
+
+    #[test]
+    fn agent_commands_and_provision_require_an_explicit_agent_id() {
+        for arguments in [
+            args(&["--workbench-root", "/agents/test/wb", "mcp"]),
+            args(&[
+                "--workbench-root",
+                "/agents/test/wb",
+                "workbench",
+                "workbench_create",
+                r#"{"id":"run-1"}"#,
+            ]),
+            args(&[
+                "materialize",
+                "run-1",
+                "outputs",
+                "result.bin",
+                "/tmp/result.bin",
+            ]),
+            args(&[
+                "--workbench-root",
+                "/agents/test/wb",
+                "collect",
+                "run-1",
+                "outputs",
+                "/tmp/result.bin",
+                "result.bin",
+            ]),
+            args(&[
+                "--root-id",
+                "11111111111111111111111111111111",
+                "--etcd-endpoint",
+                "http://127.0.0.1:2379",
+                "provision",
+                "22222222222222222222222222222222",
+            ]),
+        ] {
+            assert_eq!(parse(arguments), Err(CliError::MissingOption("--agent-id")));
+        }
+    }
+
+    #[test]
+    fn schema_version_help_and_serve_do_not_require_an_agent_id() {
+        assert_eq!(parse(args(&["schema"])).unwrap().command, Command::Schema);
+        assert!(matches!(
+            parse(args(&["version"])).unwrap().command,
+            Command::Version { .. }
+        ));
+        assert_eq!(parse(args(&["help"])).unwrap().command, Command::Help);
+        assert_eq!(parse(args(&["serve"])).unwrap().command, Command::Serve);
+    }
+
+    #[test]
+    fn legacy_agent_binding_adoption_is_explicit_and_provision_only() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "provision",
+            "22222222222222222222222222222222",
+            "--adopt-legacy-agent-binding",
+            "--adopt-legacy-object-namespace",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Provision {
+                adopt_legacy_agent_binding: true,
+                adopt_legacy_object_namespace: true,
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            parse(args(&[
+                "--agent-id",
+                "44444444444444444444444444444444",
+                "--workbench-root",
+                "/agents/test/wb",
+                "mcp",
+                "--adopt-legacy-agent-binding",
+            ])),
+            Err(CliError::UnexpectedArgument(argument))
+                if argument == "--adopt-legacy-agent-binding"
+        ));
     }
 }
