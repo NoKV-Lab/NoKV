@@ -376,13 +376,15 @@ impl BeginArtifactPublishRequest {
                 }
             }
             PublicationAuthority::RestoreStaging { .. } => {
-                if self.target.path.as_str() != "metadata/restore_manifest.json"
-                    || !matches!(self.condition, PublishCondition::CreateOnly)
+                if !matches!(
+                    self.target.path.as_str(),
+                    "metadata/run_manifest.json" | "metadata/restore_manifest.json"
+                ) || !matches!(self.condition, PublishCondition::CreateOnly)
                     || !self.dependency_owner_revision_ids.is_empty()
                 {
                     return Err(ProtocolError::invalid(
                         "begin_artifact_publish.authority",
-                        "restore staging may only create one dependency-free metadata/restore_manifest.json",
+                        "restore staging may only create dependency-free metadata/run_manifest.json and metadata/restore_manifest.json",
                     ));
                 }
             }
@@ -1683,6 +1685,32 @@ mod tests {
         )
         .validate()
         .unwrap();
+        begin_manifest_publish(
+            run_manifest,
+            PublicationAuthority::RestoreStaging {
+                restore_operation_id: OperationIdentity([6; 16]),
+            },
+            PublishCondition::CreateOnly,
+        )
+        .validate()
+        .unwrap();
+
+        assert!(matches!(
+            begin_manifest_publish(
+                run_manifest,
+                PublicationAuthority::RestoreStaging {
+                    restore_operation_id: OperationIdentity([6; 16]),
+                },
+                PublishCondition::Append {
+                    expected_generation: Some(1),
+                },
+            )
+            .validate(),
+            Err(ProtocolError::InvalidField {
+                field: "begin_artifact_publish.authority",
+                ..
+            })
+        ));
 
         for manifest_path in [run_manifest, restore_manifest] {
             let request = RemovePathRequest {
