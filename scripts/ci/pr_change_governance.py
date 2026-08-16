@@ -19,6 +19,18 @@ from typing import Any
 LARGE_CHANGE_LINE_THRESHOLD = 5_000
 LARGE_CHANGE_REQUIRED_APPROVALS = 1
 CORE_MAINTAINER_LOGINS = frozenset({"feichai0017", "wchwawa"})
+GOVERNANCE_SENSITIVE_EXACT_PATHS = frozenset(
+    {
+        ".github/CODEOWNERS",
+        "scripts/release/test_homebrew_source_release.py",
+    }
+)
+GOVERNANCE_SENSITIVE_PREFIXES = (
+    ".github/actions/",
+    ".github/workflows/",
+    "scripts/ci/",
+    "scripts/workbench/",
+)
 MAX_API_PAGES = 100
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -33,15 +45,21 @@ class GovernanceDecision:
     deletions: int
     changed_files: int
     changed_lines: int
+    changed_paths: tuple[str, ...]
+    governance_sensitive_paths: tuple[str, ...]
     threshold: int
     required_approvals: int
     current_approval_logins: tuple[str, ...]
-    current_head_push_logins: tuple[str, ...]
+    current_head_introducer_logins: tuple[str, ...]
     head_sha: str
 
     @property
     def is_large_change(self) -> bool:
         return self.changed_lines > self.threshold
+
+    @property
+    def is_governance_sensitive(self) -> bool:
+        return bool(self.governance_sensitive_paths)
 
     @property
     def allowed(self) -> bool:
@@ -104,15 +122,53 @@ class GitHubApi:
             f"GitHub API pagination exceeded {MAX_API_PAGES} pages for {path}"
         )
 
-    def get_current_head_push_actors(
-        self, repository: str, head_sha: str
+    def get_changed_paths(
+        self, repository: str, pull_request_number: int, expected_count: int
     ) -> tuple[str, ...]:
-        """Return the actor that introduced the current head to pull-request CI.
+        files = self.get_all(
+            f"repos/{repository}/pulls/{pull_request_number}/files"
+        )
+        if len(files) != expected_count:
+            raise GovernanceInputError(
+                "pull request changed-file list is incomplete: "
+                f"expected {expected_count}, received {len(files)}"
+            )
+        paths = tuple(
+            _required_string(item, "filename", "pull request file")
+            for item in files
+        )
+        previous_paths = tuple(
+            previous
+            for item in files
+            if isinstance((previous := item.get("previous_filename")), str)
+            and previous
+        )
+        all_paths = paths + previous_paths
+        if len(set(paths)) != len(paths):
+            raise GovernanceInputError("pull request changed-file list contains duplicates")
+        for path in all_paths:
+            if path.startswith("/") or path.endswith("/") or ".." in path.split("/"):
+                raise GovernanceInputError(
+                    f"pull request file path is not canonical: {path!r}"
+                )
+        return tuple(sorted(set(all_paths)))
 
-        The earliest pull_request workflow run for a head is created by the
-        opened or synchronize event that made that head reviewable. Reruns keep
-        the original actor. Selecting the earliest run avoids mistaking a later
-        reopen event for a push.
+    def get_current_head_introducers(
+        self,
+        repository: str,
+        head_sha: str,
+        pull_request_number: int,
+        head_repository_id: int,
+        head_ref: str,
+        pull_request_created_at: str,
+    ) -> tuple[str, ...]:
+        """Return the actor that first introduced the exact head to PR CI.
+
+        GitHub does not expose an authoritative conditional last-pusher API.
+        The earliest original ``pull_request`` workflow run is a conservative
+        proxy for the actor that made this exact head reviewable. Runs with an
+        empty pull-request array are bound by head repository, ref, SHA, and PR
+        creation time. Conflicting earliest actors fail closed.
         """
 
         runs: list[tuple[str, int, str]] = []
@@ -145,6 +201,19 @@ class GitHubApi:
                         "GitHub Actions API returned a workflow run for another head"
                     )
                 created_at = _required_string(run, "created_at", "workflow run")
+                head_branch = _required_string(run, "head_branch", "workflow run")
+                run_head_repository = run.get("head_repository")
+                if not isinstance(run_head_repository, dict):
+                    raise GovernanceInputError("workflow run head repository is missing")
+                run_head_repository_id = run_head_repository.get("id")
+                if (
+                    isinstance(run_head_repository_id, bool)
+                    or not isinstance(run_head_repository_id, int)
+                    or run_head_repository_id <= 0
+                ):
+                    raise GovernanceInputError(
+                        "workflow run head repository id is not valid"
+                    )
                 run_id = run.get("id")
                 if (
                     isinstance(run_id, bool)
@@ -156,15 +225,45 @@ class GitHubApi:
                 if not isinstance(actor, dict):
                     raise GovernanceInputError("workflow run actor is missing")
                 login = _required_string(actor, "login", "workflow run actor")
+                pull_requests = run.get("pull_requests")
+                if not isinstance(pull_requests, list) or not all(
+                    isinstance(item, dict) for item in pull_requests
+                ):
+                    raise GovernanceInputError(
+                        "workflow run pull-request identity is missing"
+                    )
+                run_pull_numbers = []
+                for item in pull_requests:
+                    number = item.get("number")
+                    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                        raise GovernanceInputError(
+                            "workflow run pull-request number is not valid"
+                        )
+                    run_pull_numbers.append(number)
+                if run_pull_numbers and pull_request_number not in run_pull_numbers:
+                    continue
+                if (
+                    run_head_repository_id != head_repository_id
+                    or head_branch != head_ref
+                    or created_at < pull_request_created_at
+                ):
+                    continue
                 runs.append((created_at, run_id, login))
 
             if len(page_runs) < 100:
                 if not runs:
                     raise GovernanceInputError(
-                        "no pull-request workflow run identifies the current-head pusher"
+                        "no pull-request workflow run identifies the current-head introducer"
                     )
-                earliest = min(runs)
-                return (earliest[2],)
+                earliest_time = min(created_at for created_at, _, _ in runs)
+                earliest_actors = {
+                    login for created_at, _, login in runs if created_at == earliest_time
+                }
+                if len(earliest_actors) != 1:
+                    raise GovernanceInputError(
+                        "current-head introducer actors conflict at the earliest event"
+                    )
+                return tuple(sorted(earliest_actors))
 
         raise GovernanceInputError(
             "GitHub Actions workflow-run pagination exceeded "
@@ -198,7 +297,7 @@ def _review_order(review: dict[str, Any]) -> tuple[str, int]:
 def current_core_maintainer_approvals(
     pull_request: dict[str, Any],
     reviews: list[dict[str, Any]],
-    last_push_logins: tuple[str, ...],
+    head_introducer_logins: tuple[str, ...],
 ) -> tuple[str, ...]:
     user = pull_request.get("user")
     head = pull_request.get("head")
@@ -208,7 +307,7 @@ def current_core_maintainer_approvals(
     author_login = _required_string(user, "login", "pull request author").casefold()
     head_sha = _required_string(head, "sha", "pull request head")
     excluded_logins = {author_login}
-    excluded_logins.update(login.casefold() for login in last_push_logins)
+    excluded_logins.update(login.casefold() for login in head_introducer_logins)
     decisive_state: dict[str, tuple[str, bool]] = {}
 
     for review in sorted(reviews, key=_review_order):
@@ -247,10 +346,21 @@ def current_core_maintainer_approvals(
     )
 
 
+def governance_sensitive_paths(changed_paths: tuple[str, ...]) -> tuple[str, ...]:
+    sensitive = []
+    for path in changed_paths:
+        if path in GOVERNANCE_SENSITIVE_EXACT_PATHS or path.startswith(
+            GOVERNANCE_SENSITIVE_PREFIXES
+        ):
+            sensitive.append(path)
+    return tuple(sorted(sensitive))
+
+
 def evaluate_policy(
     pull_request: dict[str, Any],
     reviews: list[dict[str, Any]],
-    last_push_logins: tuple[str, ...] = (),
+    head_introducer_logins: tuple[str, ...] = (),
+    changed_paths: tuple[str, ...] = (),
 ) -> GovernanceDecision:
     additions = _nonnegative_int(pull_request, "additions")
     deletions = _nonnegative_int(pull_request, "deletions")
@@ -260,27 +370,30 @@ def evaluate_policy(
         raise GovernanceInputError("pull request head identity is missing")
     head_sha = _required_string(head, "sha", "pull request head")
     changed_lines = additions + deletions
+    sensitive_paths = governance_sensitive_paths(changed_paths)
     required_approvals = (
         LARGE_CHANGE_REQUIRED_APPROVALS
-        if changed_lines > LARGE_CHANGE_LINE_THRESHOLD
+        if changed_lines > LARGE_CHANGE_LINE_THRESHOLD or sensitive_paths
         else 0
     )
-    if required_approvals and not last_push_logins:
+    if required_approvals and not head_introducer_logins:
         raise GovernanceInputError(
-            "current-head pusher identity is required for a large change"
+            "current-head introducer identity is required for a governed change"
         )
     approvals = current_core_maintainer_approvals(
-        pull_request, reviews, last_push_logins
+        pull_request, reviews, head_introducer_logins
     )
     return GovernanceDecision(
         additions=additions,
         deletions=deletions,
         changed_files=changed_files,
         changed_lines=changed_lines,
+        changed_paths=tuple(sorted(changed_paths)),
+        governance_sensitive_paths=sensitive_paths,
         threshold=LARGE_CHANGE_LINE_THRESHOLD,
         required_approvals=required_approvals,
         current_approval_logins=approvals,
-        current_head_push_logins=last_push_logins,
+        current_head_introducer_logins=head_introducer_logins,
         head_sha=head_sha,
     )
 
@@ -294,7 +407,7 @@ def _write_step_summary(decision: GovernanceDecision) -> None:
     if not path:
         return
     approval_text = ", ".join(decision.current_approval_logins) or "none"
-    pusher_text = ", ".join(decision.current_head_push_logins) or "not required"
+    introducer_text = ", ".join(decision.current_head_introducer_logins) or "not required"
     outcome = "PASS" if decision.allowed else "FAIL"
     with Path(path).open("a", encoding="utf-8") as summary:
         summary.write("## Pull request change governance\n\n")
@@ -304,7 +417,9 @@ def _write_step_summary(decision: GovernanceDecision) -> None:
             f"({decision.additions:,} additions + {decision.deletions:,} deletions)\n"
         )
         summary.write(f"- Changed files: **{decision.changed_files:,}**\n")
-        summary.write(f"- Current-head pusher: **{pusher_text}**\n")
+        sensitive_text = ", ".join(decision.governance_sensitive_paths) or "none"
+        summary.write(f"- Governance-sensitive paths: **{sensitive_text}**\n")
+        summary.write(f"- Current-head introducer: **{introducer_text}**\n")
         summary.write(
             "- Current-head core maintainer approvals: "
             f"**{len(decision.current_approval_logins)}** "
@@ -342,8 +457,15 @@ def main(argv: list[str] | None = None) -> int:
             raise GovernanceInputError("GitHub API returned a non-object pull request")
         additions = _nonnegative_int(pull_request, "additions")
         deletions = _nonnegative_int(pull_request, "deletions")
-        is_large_change = additions + deletions > LARGE_CHANGE_LINE_THRESHOLD
-        if is_large_change:
+        changed_files = _nonnegative_int(pull_request, "changed_files")
+        changed_paths = api.get_changed_paths(
+            args.repository, args.pull_request, changed_files
+        )
+        requires_review = (
+            additions + deletions > LARGE_CHANGE_LINE_THRESHOLD
+            or bool(governance_sensitive_paths(changed_paths))
+        )
+        if requires_review:
             reviews = api.get_all(
                 f"repos/{args.repository}/pulls/{args.pull_request}/reviews"
             )
@@ -351,13 +473,34 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(head, dict):
                 raise GovernanceInputError("pull request head identity is missing")
             head_sha = _required_string(head, "sha", "pull request head")
-            last_push_logins = api.get_current_head_push_actors(
-                args.repository, head_sha
+            head_ref = _required_string(head, "ref", "pull request head")
+            head_repository = head.get("repo")
+            if not isinstance(head_repository, dict):
+                raise GovernanceInputError("pull request head repository is missing")
+            head_repository_id = head_repository.get("id")
+            if (
+                isinstance(head_repository_id, bool)
+                or not isinstance(head_repository_id, int)
+                or head_repository_id <= 0
+            ):
+                raise GovernanceInputError("pull request head repository id is not valid")
+            pull_request_created_at = _required_string(
+                pull_request, "created_at", "pull request"
+            )
+            head_introducer_logins = api.get_current_head_introducers(
+                args.repository,
+                head_sha,
+                args.pull_request,
+                head_repository_id,
+                head_ref,
+                pull_request_created_at,
             )
         else:
             reviews = []
-            last_push_logins = ()
-        decision = evaluate_policy(pull_request, reviews, last_push_logins)
+            head_introducer_logins = ()
+        decision = evaluate_policy(
+            pull_request, reviews, head_introducer_logins, changed_paths
+        )
     except GovernanceInputError as error:
         print(
             "::error title=Change governance failed closed::"
@@ -376,12 +519,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(
-        "::error title=Large change lacks current core maintainer approval::"
+        "::error title=Governed change lacks current core maintainer approval::"
         + _annotation(
-            f"PR #{args.pull_request} changes {decision.changed_lines} lines, above "
-            f"the {decision.threshold} line threshold, but has only "
+            f"PR #{args.pull_request} changes {decision.changed_lines} lines and "
+            f"touches {len(decision.governance_sensitive_paths)} protected CI trust-root "
+            f"paths, but has only "
             f"{len(decision.current_approval_logins)} eligible approvals on head "
-            f"{decision.head_sha}. The author, current-head pusher, bots, non-core "
+            f"{decision.head_sha}. The author, current-head introducer, bots, non-core "
             "reviewers, dismissed reviews, duplicate reviewers, and approvals on "
             "older commits do not count."
         ),
