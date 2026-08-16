@@ -33,6 +33,11 @@ from typing import Any, Sequence, TextIO
 
 SCHEMA = "nokv.local_wal_recovery_gate.v1"
 CRASH_STAGES = ("before-local-fence", "after-local-fence")
+# Reopening admits a successor only because the local authority directory is
+# itself the mutex. The crash stages prove sequential handover; this one proves
+# the exclusion that replaced the blanket successor refusal, and proves it
+# across real processes rather than two calls inside one.
+CONCURRENT_STAGE = "concurrent-takeover"
 
 
 class NotQualified(RuntimeError):
@@ -102,6 +107,39 @@ def validate_stage_evidence(evidence: dict[str, object]) -> None:
         raise WorkflowFailure(f"{stage} terminal metadata probe did not succeed")
 
 
+def validate_concurrent_evidence(evidence: dict[str, object]) -> None:
+    if evidence.get("stage") != CONCURRENT_STAGE:
+        raise WorkflowFailure(f"unknown concurrent stage {evidence.get('stage')!r}")
+
+    if evidence.get("loser_exit_code") in (None, 0):
+        raise WorkflowFailure(
+            f"{CONCURRENT_STAGE} second owner did not fail: "
+            f"{evidence.get('loser_exit_code')!r}"
+        )
+    if not str(evidence.get("loser_stderr") or "").strip():
+        raise WorkflowFailure(f"{CONCURRENT_STAGE} second owner failed without a diagnostic")
+    # The whole point of the stage: the refusal must land before the control
+    # plane is touched, so the record is byte-identical across the attempt and
+    # no owner epoch was spent on a takeover that never happened.
+    before = evidence.get("control_record_before")
+    after = evidence.get("control_record_after")
+    if not isinstance(before, dict) or before != after:
+        raise WorkflowFailure(
+            f"{CONCURRENT_STAGE} mutated the control record: {before!r} -> {after!r}"
+        )
+    if before.get("owner_epoch") != 1 or before.get("state") != 3:
+        raise WorkflowFailure(
+            f"{CONCURRENT_STAGE} incumbent was not Serving(1): {before!r}"
+        )
+    if evidence.get("incumbent_alive_after") is not True:
+        raise WorkflowFailure(f"{CONCURRENT_STAGE} incumbent did not survive the takeover")
+    probe = evidence.get("metadata_probe")
+    if not isinstance(probe, dict) or probe.get("status") != "success":
+        raise WorkflowFailure(
+            f"{CONCURRENT_STAGE} incumbent stopped serving after the refused takeover"
+        )
+
+
 def run(
     argv: Sequence[os.PathLike[str] | str],
     *,
@@ -152,6 +190,15 @@ def wait_tcp(process: subprocess.Popen[bytes], port: int, timeout: float) -> Non
         except OSError:
             time.sleep(0.05)
     raise WorkflowFailure(f"server did not listen on 127.0.0.1:{port}")
+
+
+def wait_exit(process: subprocess.Popen[bytes], timeout: float) -> int:
+    try:
+        return int(process.wait(timeout=timeout))
+    except subprocess.TimeoutExpired as error:
+        raise WorkflowFailure(
+            "second owner kept running against a directory another owner holds"
+        ) from error
 
 
 def wait_json(path: Path, process: subprocess.Popen[bytes], timeout: float) -> dict[str, Any]:
@@ -472,6 +519,143 @@ def run_stage(
             log.close()
 
 
+def run_concurrent_stage(
+    *,
+    repo: Path,
+    binary: Path,
+    etcdctl: Path,
+    etcd_endpoint: str,
+    evidence: Path,
+    seed: str,
+    object_endpoint: str,
+    object_bucket: str,
+    object_root: str,
+    timeout: float,
+) -> dict[str, object]:
+    stage = CONCURRENT_STAGE
+    stage_dir = evidence / stage
+    stage_dir.mkdir(parents=True)
+    metadata = stage_dir / "metadata"
+    root_id = fixed_id(seed, f"{stage}:root")
+    shard_id = fixed_id(seed, f"{stage}:shard")
+    prefix = f"/nokv/local-wal-recovery/{fixed_id(seed, stage)}"
+    record_key = f"{prefix}/logical-shards/{shard_id}"
+    common = control_args(binary, root_id, etcd_endpoint, prefix)
+    objects = object_args(stage, object_endpoint, object_bucket, object_root)
+    processes: list[subprocess.Popen[bytes]] = []
+    logs: list[TextIO] = []
+
+    try:
+        provision_command = [*common, *objects, "provision", shard_id]
+        provision = run(provision_command, cwd=repo, timeout=timeout)
+        (stage_dir / "provision.stdout.log").write_text(provision.stdout)
+        (stage_dir / "provision.stderr.log").write_text(provision.stderr)
+
+        incumbent_port = free_port()
+        incumbent_log = (stage_dir / "owner-incumbent.log").open("w")
+        logs.append(incumbent_log)
+        incumbent_command = [
+            *common,
+            *objects,
+            "--bind",
+            f"127.0.0.1:{incumbent_port}",
+            "--advertise-endpoint",
+            f"127.0.0.1:{incumbent_port}",
+            "--node-id",
+            f"gate-{stage}-incumbent",
+            "--metadata-create",
+            metadata,
+            "serve",
+        ]
+        incumbent = start_process(incumbent_command, repo, incumbent_log)
+        processes.append(incumbent)
+        wait_tcp(incumbent, incumbent_port, timeout)
+
+        client = [*common, "--workbench-root", "/agents/issue450/wb", *objects]
+        create_command = [
+            *client,
+            "workbench",
+            "workbench_create",
+            canonical_json({"id": "exclusion-proof"}),
+        ]
+        create = run(create_command, cwd=repo, timeout=timeout)
+        create_result = json.loads(create.stdout)
+        before = decode_control_record(
+            etcdctl, etcd_endpoint, record_key, cwd=repo, timeout=timeout
+        )
+        if before.get("owner_epoch") != 1 or before.get("state") != 3:
+            raise WorkflowFailure(f"incumbent did not reach Serving(1): {before}")
+
+        # The incumbent keeps serving throughout. A second process now asks to
+        # reopen the very directory the incumbent holds open.
+        challenger_port = free_port()
+        challenger_command = [
+            *common,
+            *objects,
+            "--bind",
+            f"127.0.0.1:{challenger_port}",
+            "--advertise-endpoint",
+            f"127.0.0.1:{challenger_port}",
+            "--node-id",
+            f"gate-{stage}-challenger",
+            "--metadata-reopen",
+            metadata,
+            "serve",
+        ]
+        challenger = subprocess.Popen(
+            [str(item) for item in challenger_command],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        processes.append(challenger)
+        challenger_exit = wait_exit(challenger, timeout)
+        challenger_stdout, challenger_stderr = challenger.communicate()
+        (stage_dir / "owner-challenger.stdout.log").write_text(challenger_stdout or "")
+        (stage_dir / "owner-challenger.stderr.log").write_text(challenger_stderr or "")
+
+        after = decode_control_record(
+            etcdctl, etcd_endpoint, record_key, cwd=repo, timeout=timeout
+        )
+        incumbent_alive = incumbent.poll() is None
+        catalog_command = [
+            *client,
+            "workbench",
+            "workbench_catalog",
+            canonical_json({"id": "exclusion-proof", "include_facets": True}),
+        ]
+        catalog = run(catalog_command, cwd=repo, timeout=timeout)
+        metadata_probe = json.loads(catalog.stdout)
+        stop(incumbent, signal.SIGTERM)
+
+        result: dict[str, object] = {
+            "stage": stage,
+            "loser_exit_code": challenger_exit,
+            "loser_stderr": (challenger_stderr or "").strip(),
+            "incumbent_alive_after": incumbent_alive,
+            "control_record_before": before,
+            "control_record_after": after,
+            "metadata_probe": metadata_probe,
+            "create_result": create_result,
+            "etcd_prefix": prefix,
+            "commands": {
+                "provision": [str(item) for item in provision_command],
+                "owner_incumbent": [str(item) for item in incumbent_command],
+                "create_metadata_probe": [str(item) for item in create_command],
+                "owner_challenger": [str(item) for item in challenger_command],
+                "terminal_metadata_probe": [str(item) for item in catalog_command],
+            },
+        }
+        validate_concurrent_evidence(result)
+        return result
+    finally:
+        for process in reversed(processes):
+            stop(process)
+        for log in logs:
+            log.close()
+
+
 def build_binaries(repo: Path, target: Path, timeout: float) -> tuple[Path, Path]:
     environment = os.environ.copy()
     environment["CARGO_TARGET_DIR"] = str(target)
@@ -604,6 +788,20 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                     timeout=args.timeout,
                 )
             )
+        stages.append(
+            run_concurrent_stage(
+                repo=repo,
+                binary=binary,
+                etcdctl=Path(args.etcdctl_bin),
+                etcd_endpoint=endpoint,
+                evidence=evidence,
+                seed=args.seed,
+                object_endpoint=args.object_endpoint,
+                object_bucket=args.object_bucket,
+                object_root=args.object_root,
+                timeout=args.timeout,
+            )
+        )
     finally:
         stop(etcd, signal.SIGTERM)
         etcd_log.close()
@@ -640,7 +838,8 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             "recovery_epoch": 2,
             "retry_must_not_allocate_epoch": 3,
             "session_must_expire_before_retry": True,
-            "stages": list(CRASH_STAGES),
+            "concurrent_takeover_must_not_touch_control": True,
+            "stages": [*CRASH_STAGES, CONCURRENT_STAGE],
         },
         "stages": stages,
     }
