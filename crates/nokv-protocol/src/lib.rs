@@ -12,6 +12,7 @@
 mod artifact_publish;
 mod codec;
 mod error;
+mod handshake;
 mod request;
 mod response;
 mod types;
@@ -31,6 +32,12 @@ pub use codec::{
     WORKSPACE_CAPABILITY_SCHEMA, WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA,
 };
 pub use error::{ConflictKind, ErrorCode, ProtocolError, RpcFailure};
+pub use handshake::{
+    decode_handshake_frame, decode_handshake_payload, encode_handshake_frame,
+    encode_handshake_payload, has_handshake_magic, HandshakeError, HandshakeKind,
+    WorkspaceHandshake, HANDSHAKE_FRAME_BYTES, HANDSHAKE_PAYLOAD_BYTES, HANDSHAKE_SCHEMA_BYTES,
+    WORKSPACE_HANDSHAKE_MAGIC,
+};
 pub use request::{
     AbortArtifactPublishRequest, AggregateFunction, AggregateRequest, AggregateSpec,
     BeginArtifactPublishRequest, BindRestoreDestinationRequest, CatalogRequest, ChangePageRequest,

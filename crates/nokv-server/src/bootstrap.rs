@@ -938,9 +938,11 @@ mod tests {
     fn options() -> ServerOptions {
         ServerOptions {
             bind: "127.0.0.1:0".parse().unwrap(),
+            handshake_timeout: Duration::from_secs(1),
             read_timeout: Duration::from_secs(1),
             write_timeout: Duration::from_secs(1),
             lease_renew_interval: Duration::from_millis(10),
+            max_inflight_connections: 8,
         }
     }
 

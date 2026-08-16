@@ -16,6 +16,8 @@ pub const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
 pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
 pub const DEFAULT_LIFECYCLE_INTERVAL_MILLIS: u64 = 1_000;
+pub const DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: u64 = 5_000;
+pub const DEFAULT_MAX_INFLIGHT_CONNECTIONS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
@@ -66,6 +68,8 @@ pub struct ObjectConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
     pub bind: SocketAddr,
+    pub handshake_timeout_millis: u64,
+    pub max_inflight_connections: usize,
     pub advertise_endpoint: Option<String>,
     pub node_id: Option<String>,
     pub metadata_store: Option<MetadataStoreConfig>,
@@ -248,6 +252,8 @@ impl Default for ServerConfig {
             bind: DEFAULT_SERVER_BIND
                 .parse()
                 .expect("default server bind is valid"),
+            handshake_timeout_millis: DEFAULT_HANDSHAKE_TIMEOUT_MILLIS,
+            max_inflight_connections: DEFAULT_MAX_INFLIGHT_CONNECTIONS,
             advertise_endpoint: None,
             node_id: None,
             metadata_store: None,
@@ -359,6 +365,18 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             }
             "--bind" => {
                 server.bind = parse_address("--bind", next_value(&mut arguments, &argument)?)?;
+            }
+            "--handshake-timeout-millis" => {
+                server.handshake_timeout_millis = parse_number(
+                    "--handshake-timeout-millis",
+                    next_value(&mut arguments, &argument)?,
+                )?;
+            }
+            "--max-inflight-connections" => {
+                server.max_inflight_connections = parse_number(
+                    "--max-inflight-connections",
+                    next_value(&mut arguments, &argument)?,
+                )?;
             }
             "--advertise-endpoint" => {
                 server.advertise_endpoint = Some(next_value(&mut arguments, &argument)?);
@@ -1022,6 +1040,20 @@ mod tests {
             ])),
             Err(CliError::MixedMetadataStoreOptions)
         );
+    }
+
+    #[test]
+    fn parses_server_handshake_resource_limits() {
+        let parsed = parse(args(&[
+            "--handshake-timeout-millis",
+            "750",
+            "--max-inflight-connections",
+            "64",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.server.handshake_timeout_millis, 750);
+        assert_eq!(parsed.server.max_inflight_connections, 64);
     }
 
     #[test]

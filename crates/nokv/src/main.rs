@@ -576,6 +576,7 @@ OWNER:
   serve validates every active root's Agent binding; it does not require or compare one shard-wide AgentId
   --root-id HEX32 --etcd-endpoint URL --node-id ID
   --advertise-endpoint HOST:PORT --bind HOST:PORT
+  --handshake-timeout-millis N --max-inflight-connections N
   --metadata-create PATH starts the first standalone local-WAL owner
   --metadata-reopen PATH restarts the same exclusive local-WAL authority after lease loss
 
@@ -850,6 +851,16 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     {
         return Err("--lifecycle-interval-millis must be within 1..=60000".to_owned());
     }
+    if invocation.server.handshake_timeout_millis == 0
+        || invocation.server.handshake_timeout_millis > 60_000
+    {
+        return Err("--handshake-timeout-millis must be within 1..=60000".to_owned());
+    }
+    if invocation.server.max_inflight_connections == 0
+        || invocation.server.max_inflight_connections > 4_096
+    {
+        return Err("--max-inflight-connections must be within 1..=4096".to_owned());
+    }
     let expected_namespace = object_namespace.object_namespace_id;
     let namespace_bindings = placements
         .iter()
@@ -912,9 +923,11 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let server = WorkspaceServer::new(
         ServerOptions {
             bind: invocation.server.bind,
+            handshake_timeout: Duration::from_millis(invocation.server.handshake_timeout_millis),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
             lease_renew_interval: Duration::from_secs(renew_seconds),
+            max_inflight_connections: invocation.server.max_inflight_connections,
         },
         Arc::clone(&registry),
         vec![owner],

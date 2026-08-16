@@ -12,6 +12,7 @@
 mod bootstrap;
 mod error;
 mod executor;
+mod legacy_rejection;
 mod lifecycle;
 mod registry;
 mod server;

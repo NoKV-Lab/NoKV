@@ -2787,6 +2787,22 @@ mod tests {
         let server = thread::spawn(move || {
             for outcome in outcomes {
                 let (mut stream, _) = listener.accept().unwrap();
+                let mut handshake = [0_u8; wire::HANDSHAKE_FRAME_BYTES];
+                stream.read_exact(&mut handshake).unwrap();
+                let handshake = wire::decode_handshake_frame(&handshake).unwrap();
+                assert_eq!(handshake.kind(), wire::HandshakeKind::ClientHello);
+                assert_eq!(
+                    handshake.operation_schema(),
+                    wire::WORKSPACE_PROTOCOL_SCHEMA
+                );
+                let accepted = wire::WorkspaceHandshake::new(
+                    wire::HandshakeKind::Accepted,
+                    wire::WORKSPACE_PROTOCOL_SCHEMA,
+                )
+                .unwrap();
+                stream
+                    .write_all(&wire::encode_handshake_frame(&accepted).unwrap())
+                    .unwrap();
                 let mut length = [0_u8; 4];
                 stream.read_exact(&mut length).unwrap();
                 let mut encoded = vec![0_u8; u32::from_be_bytes(length) as usize];

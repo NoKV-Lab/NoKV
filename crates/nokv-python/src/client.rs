@@ -71,7 +71,8 @@ impl PythonWorkspaceClient {
         max_attempts = 3,
         connect_timeout_ms = 5_000,
         read_timeout_ms = 30_000,
-        write_timeout_ms = 30_000
+        write_timeout_ms = 30_000,
+        handshake_timeout_ms = 5_000
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -83,10 +84,12 @@ impl PythonWorkspaceClient {
         connect_timeout_ms: u64,
         read_timeout_ms: u64,
         write_timeout_ms: u64,
+        handshake_timeout_ms: u64,
     ) -> PyResult<Self> {
         let root_id = RootIdentity(parse_fixed_hex("root_id", root_id)?);
         let transport = FramedTcpTransport::new(FramedTcpOptions {
             connect_timeout: Duration::from_millis(connect_timeout_ms),
+            handshake_timeout: Duration::from_millis(handshake_timeout_ms),
             read_timeout: Duration::from_millis(read_timeout_ms),
             write_timeout: Duration::from_millis(write_timeout_ms),
         })

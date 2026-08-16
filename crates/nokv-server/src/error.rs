@@ -24,6 +24,7 @@ pub enum ServerError {
         rollback: String,
     },
     Protocol(nokv_protocol::ProtocolError),
+    Handshake(nokv_protocol::HandshakeError),
     Bind(std::io::Error),
     Connection(std::io::Error),
     FrameTooLarge {
@@ -80,6 +81,7 @@ impl fmt::Display for ServerError {
                 "logical-shard ownership failed: {primary}; cleanup also failed: {rollback}"
             ),
             Self::Protocol(error) => write!(formatter, "workspace protocol failed: {error}"),
+            Self::Handshake(error) => write!(formatter, "workspace handshake failed: {error}"),
             Self::Bind(error) => write!(formatter, "server bind failed: {error}"),
             Self::Connection(error) => write!(formatter, "server connection failed: {error}"),
             Self::FrameTooLarge { bytes, max } => {
@@ -107,5 +109,11 @@ impl From<nokv_meta_store::StoreError> for ServerError {
 impl From<nokv_meta::workspace::MetaError> for ServerError {
     fn from(error: nokv_meta::workspace::MetaError) -> Self {
         Self::Meta(error)
+    }
+}
+
+impl From<nokv_protocol::HandshakeError> for ServerError {
+    fn from(error: nokv_protocol::HandshakeError) -> Self {
+        Self::Handshake(error)
     }
 }
