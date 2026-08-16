@@ -5,6 +5,7 @@
 mod build_commit_records;
 mod codec;
 mod commit;
+mod commit_closure;
 mod commit_records;
 mod engine;
 mod event_projection;
@@ -48,19 +49,24 @@ pub use codec::{
     operation_prefix, path_child_prefix, path_current_key, path_revision_ref_key,
     restore_history_hold_key, restore_member_key, restore_member_prefix,
     revision_dependency_ref_key, revision_dependency_ref_prefix, snapshot_alias_key,
-    snapshot_history_hold_key, snapshot_id_claim_key, snapshot_ref_key, snapshot_ref_prefix,
-    staged_object_key, staged_object_prefix, tag_commit_consumer_key, tag_key,
-    workbench_commit_head_key, workbench_head_commit_consumer_key, workspace_current_key,
-    workspace_current_prefix, PATH_COMPONENT_DELIMITER, PATH_EXACT_TERMINATOR, SCHEMA_ID,
-    VALUE_FORMAT_VERSION,
+    snapshot_commit_consumer_key, snapshot_history_hold_key, snapshot_id_claim_key,
+    snapshot_ref_key, snapshot_ref_prefix, staged_object_key, staged_object_prefix,
+    tag_commit_consumer_key, tag_key, workbench_commit_head_key,
+    workbench_head_commit_consumer_key, workspace_current_key, workspace_current_prefix,
+    PATH_COMPONENT_DELIMITER, PATH_EXACT_TERMINATOR, SCHEMA_ID, VALUE_FORMAT_VERSION,
 };
 pub use commit::{
-    advance_commit_parent_rolling_digest, advance_commit_revision_rolling_digest,
     AbortBuildCommitRequest, BeginBuildCommitRequest, BeginCommitRetirementRequest,
     BuildCommitOutcome, BuildCommitStepRequest, CommitError, CommitService, DeleteCommitTagRequest,
     RetireCommitOutcome, SetCommitTagRequest, TagMutationOutcome, MAX_COMMIT_MEMBER_BATCH_ROWS,
     MAX_COMMIT_PARENT_BATCH_ROWS, MAX_COMMIT_RETIRE_MEMBER_BATCH_ROWS,
     MAX_COMMIT_REVISION_BATCH_ROWS,
+};
+pub use commit_closure::{
+    advance_commit_parent_rolling_digest, advance_commit_revision_rolling_digest,
+    plan_commit_member, plan_commit_parent, plan_commit_revision, verify_commit_closure_seal,
+    CommitClosureError, CommitMemberClosureStep, CommitParentClosureStep,
+    CommitRevisionClosureStep,
 };
 pub use commit_records::{
     advance_commit_member_rolling_digest, commit_member_row_digest, CommitConsumerRecord,
@@ -146,18 +152,26 @@ pub use recovery::{
 };
 pub use remove::{remove_path, RemovePathError, RemovePathOutcome, RemovePathRequest};
 pub use restore::{
-    abort_restore, apply_restore_initialization, begin_restore, cleanup_restore_batch,
-    complete_restore, copy_restore_batch, finish_restore_cleanup, get_restore, seal_restore_source,
-    start_restore_cleanup, start_restore_copy, AbortRestoreRequest, BeginRestoreRequest,
-    CompleteRestoreOutcome, CopyRestoreBatchOutcome, CopyRestoreBatchRequest,
-    RestoreCommandOutcome, RestoreError, RestoreInitialization, RestoreOperationRequest,
-    RestoreSourceSelector, MAX_RESTORE_BATCH_MEMBERS, RESTORE_MANIFEST_PATH,
+    abort_restore, apply_restore_initialization, begin_restore, bind_restore_destination,
+    build_restore_commit_members, cleanup_restore_batch, complete_restore, copy_restore_batch,
+    finish_restore_cleanup, get_restore, read_restore_source_run_manifest, restore_operation_id,
+    seal_restore_commit_revisions, seal_restore_source, start_restore_cleanup, start_restore_copy,
+    AbortRestoreRequest, BeginRestoreRequest, BindRestoreDestinationRequest,
+    BuildRestoreCommitBatchOutcome, CompleteRestoreOutcome, CopyRestoreBatchOutcome,
+    CopyRestoreBatchRequest, RestoreClosureBatchRequest, RestoreCommandOutcome, RestoreError,
+    RestoreInitialization, RestoreOperationRequest, RestoreSourceRunManifest,
+    RestoreSourceSelector, SealRestoreCommitBatchOutcome, MAX_RESTORE_BATCH_MEMBERS,
+    RESTORE_MANIFEST_PATH,
 };
 pub use restore_records::{
-    RestoreManifestDescriptor, RestoreMemberRecord, RestoreOperationRecord, RestoreRecordError,
-    RestoreResult, RestoreSource, RestoreTerminalError, RestoreTerminalErrorKind,
-    RestoreTransition, MAX_RESTORE_MANIFEST_BYTES, MAX_RESTORE_MEMBERS,
-    MAX_RESTORE_TERMINAL_ERROR_BYTES, RESTORE_MANIFEST_CONTENT_TYPE, RESTORE_VALUE_FORMAT_VERSION,
+    RestoreCommitClosureProgress, RestoreCommitProvenance, RestoreCommitProvenanceV5,
+    RestoreDestinationBinding, RestoreDestinationCommitReceipt, RestoreDestinationManifests,
+    RestoreManifestDescriptor, RestoreManifestIdentity, RestoreManifestPublication,
+    RestoreMemberRecord, RestoreOperationRecord, RestoreRecordError, RestoreResult, RestoreSource,
+    RestoreSourceCommitSeal, RestoreTerminalError, RestoreTerminalErrorKind, RestoreTransition,
+    MAX_RESTORE_MANIFEST_BYTES, MAX_RESTORE_MEMBERS, MAX_RESTORE_TERMINAL_ERROR_BYTES,
+    RESTORE_MANIFEST_CONTENT_TYPE, RESTORE_MEMBER_VALUE_FORMAT_VERSION,
+    RESTORE_OPERATION_VALUE_FORMAT_VERSION,
 };
 pub use snapshot::{
     attach_snapshot_consumer, claim_expired_snapshot, finish_snapshot_reap, get_snapshot_at,

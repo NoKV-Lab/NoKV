@@ -13,8 +13,14 @@ use nokv_types::{
     WorkspaceRevision, SHA256_BYTES,
 };
 
-/// Only supported value format for restore-owned payloads.
-pub const RESTORE_VALUE_FORMAT_VERSION: u8 = 4;
+use super::commit_closure::advance_commit_parent_rolling_digest;
+use super::commit_records::MAX_COMMIT_DIGEST_URI_BYTES;
+
+/// Only supported value format for restore-operation payloads.
+pub const RESTORE_OPERATION_VALUE_FORMAT_VERSION: u8 = 5;
+/// Restore-member rows retain their v4 layout; operation v5 owns the new
+/// destination-commit recovery state.
+pub const RESTORE_MEMBER_VALUE_FORMAT_VERSION: u8 = 4;
 
 /// Maximum reconciliation text retained by a failed restore.
 pub const MAX_RESTORE_TERMINAL_ERROR_BYTES: usize = 4 * 1024;
@@ -37,6 +43,103 @@ pub struct RestoreManifestDescriptor {
     pub content_type: String,
 }
 
+/// Caller-reserved identity of one object-first manifest publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreManifestIdentity {
+    pub publication_operation_id: OperationId,
+    pub artifact_revision_id: ArtifactRevisionId,
+}
+
+/// Immutable source commit facts frozen by restore admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreSourceCommitSeal {
+    pub commit_id: CommitId,
+    pub content_digest_uri: String,
+    pub manifest_digest_uri: String,
+    pub tree_manifest_revision_id: ArtifactRevisionId,
+    pub member_count: u64,
+    pub member_digest: [u8; SHA256_BYTES],
+    pub unique_revision_count: u64,
+    pub revision_digest: [u8; SHA256_BYTES],
+    pub parent_digest: [u8; SHA256_BYTES],
+}
+
+/// Exact object-first publication identity for a destination-owned manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreManifestPublication {
+    pub publication_operation_id: OperationId,
+    pub workspace_incarnation_id: WorkspaceIncarnationId,
+    pub artifact_revision_id: ArtifactRevisionId,
+    pub body_digest_uri: String,
+    pub manifest_digest_uri: String,
+    pub logical_size: u64,
+    pub content_type: String,
+}
+
+/// Both destination-owned Workbench projections staged atomically while the
+/// destination is hidden.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreDestinationManifests {
+    pub run_manifest: RestoreManifestPublication,
+    pub restore_manifest: RestoreManifestPublication,
+}
+
+/// Destination authority bound only after the source closure is sealed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreDestinationBinding {
+    pub destination_commit_id: CommitId,
+    pub effective_content_digest_uri: String,
+    pub destination_projection_input_digest: [u8; SHA256_BYTES],
+    pub run_manifest_identity: RestoreManifestIdentity,
+    pub restore_manifest_identity: RestoreManifestIdentity,
+    pub manifests: Option<RestoreDestinationManifests>,
+}
+
+/// Durable cursors and seals for the destination immutable commit closure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreCommitClosureProgress {
+    /// Canonical `PathCurrent` scan cursor. This ordering is independent of
+    /// the append-ordered `RestoreMember` copy ledger.
+    pub member_cursor: Option<NormalizedRelativePath>,
+    /// Number of final destination paths materialized as `CommitMember` rows.
+    pub member_count: u64,
+    /// Canonical `CommitMember` rolling digest, never the `RestoreMember`
+    /// rolling digest.
+    pub member_digest: [u8; SHA256_BYTES],
+    pub member_seal: Option<[u8; SHA256_BYTES]>,
+    /// Number of unique revision refs materialized while members are built.
+    pub revision_ref_count: u64,
+    /// Last sorted revision ref included by the independent sealing scan.
+    pub revision_cursor: Option<ArtifactRevisionId>,
+    pub revision_seal_count: u64,
+    pub revision_digest: [u8; SHA256_BYTES],
+    pub revision_seal: Option<[u8; SHA256_BYTES]>,
+    /// The single-parent seal must bind exactly the frozen source commit.
+    pub parent_digest: [u8; SHA256_BYTES],
+    pub parent_seal: Option<[u8; SHA256_BYTES]>,
+    /// Reverse cleanup cursors for rows created before visibility publication.
+    pub cleanup_member_count: u64,
+    pub cleanup_revision_count: u64,
+}
+
+/// Commit provenance is absent only for terminal restore-operation v4 rows
+/// retained for historical status inspection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreCommitProvenanceV5 {
+    pub source_commit: RestoreSourceCommitSeal,
+    pub destination_committed_at_unix_seconds: u64,
+    pub destination_binding: Option<RestoreDestinationBinding>,
+    pub closure: RestoreCommitClosureProgress,
+    pub destination_head_generation: Option<Generation>,
+}
+
+/// Versioned commit provenance carried by a restore operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreCommitProvenance {
+    MissingLegacyV4,
+    V5(Box<RestoreCommitProvenanceV5>),
+}
+
 impl RestoreManifestDescriptor {
     pub fn validate(&self) -> Result<(), RestoreRecordError> {
         if self.logical_size == 0 || self.logical_size > MAX_RESTORE_MANIFEST_BYTES as u64 {
@@ -57,6 +160,193 @@ impl RestoreManifestDescriptor {
         {
             return Err(RestoreRecordError::InvalidManifestDescriptor {
                 reason: "body_digest_uri must be canonical lowercase SHA-256",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl RestoreSourceCommitSeal {
+    fn validate(&self, phase: RestorePhase) -> Result<(), RestoreRecordError> {
+        validate_commit_digest_field("source_commit.content_digest_uri", &self.content_digest_uri)?;
+        validate_commit_digest_field(
+            "source_commit.manifest_digest_uri",
+            &self.manifest_digest_uri,
+        )?;
+        validate_bounded_count("source_commit.member_count", self.member_count)?;
+        validate_bounded_count(
+            "source_commit.unique_revision_count",
+            self.unique_revision_count,
+        )?;
+        if (self.member_count == 0) != (self.member_digest == [0; SHA256_BYTES])
+            || (self.unique_revision_count == 0) != (self.revision_digest == [0; SHA256_BYTES])
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "source commit count and immutable closure digest are inconsistent",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl RestoreManifestPublication {
+    fn validate(&self) -> Result<(), RestoreRecordError> {
+        validate_digest_uri("manifest.body_digest_uri", &self.body_digest_uri)?;
+        validate_digest_uri("manifest.manifest_digest_uri", &self.manifest_digest_uri)?;
+        if self.logical_size == 0 {
+            return Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "published logical_size must be non-zero",
+            });
+        }
+        if self.content_type != RESTORE_MANIFEST_CONTENT_TYPE {
+            return Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "published content_type must be application/json",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl RestoreDestinationManifests {
+    fn validate(&self) -> Result<(), RestoreRecordError> {
+        self.run_manifest.validate()?;
+        self.restore_manifest.validate()?;
+        if self.restore_manifest.logical_size > MAX_RESTORE_MANIFEST_BYTES as u64 {
+            return Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "published restore manifest exceeds its body bound",
+            });
+        }
+        if self.run_manifest.publication_operation_id
+            == self.restore_manifest.publication_operation_id
+            || self.run_manifest.artifact_revision_id == self.restore_manifest.artifact_revision_id
+        {
+            return Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "run and restore manifests must use distinct publication operations and revisions",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl RestoreDestinationBinding {
+    fn validate(&self) -> Result<(), RestoreRecordError> {
+        validate_digest_uri(
+            "destination_binding.effective_content_digest_uri",
+            &self.effective_content_digest_uri,
+        )?;
+        if self.destination_projection_input_digest == [0; SHA256_BYTES] {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: RestorePhase::SourceSealed,
+                reason: "destination projection input digest must be non-zero",
+            });
+        }
+        if self.run_manifest_identity.publication_operation_id
+            == self.restore_manifest_identity.publication_operation_id
+            || self.run_manifest_identity.artifact_revision_id
+                == self.restore_manifest_identity.artifact_revision_id
+        {
+            return Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "run and restore manifest identities must use distinct publication operations and revisions",
+            });
+        }
+        if let Some(manifests) = &self.manifests {
+            manifests.validate()?;
+            for (identity, publication) in [
+                (&self.run_manifest_identity, &manifests.run_manifest),
+                (&self.restore_manifest_identity, &manifests.restore_manifest),
+            ] {
+                if identity.publication_operation_id != publication.publication_operation_id
+                    || identity.artifact_revision_id != publication.artifact_revision_id
+                {
+                    return Err(RestoreRecordError::InvalidManifestDescriptor {
+                        reason: "published destination manifest must match its expected identity",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RestoreCommitClosureProgress {
+    fn validate(&self, phase: RestorePhase) -> Result<(), RestoreRecordError> {
+        for (field, count) in [
+            ("commit_member_count", self.member_count),
+            ("commit_revision_ref_count", self.revision_ref_count),
+            ("commit_revision_seal_count", self.revision_seal_count),
+        ] {
+            validate_bounded_count(field, count)?;
+        }
+        if self.member_cursor.is_some() != (self.member_count > 0) {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit member cursor must match non-empty member progress",
+            });
+        }
+        if (self.member_count == 0) != (self.member_digest == [0; SHA256_BYTES]) {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit member count and rolling digest are inconsistent",
+            });
+        }
+        if self
+            .member_seal
+            .is_some_and(|seal| seal != self.member_digest)
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit member seal must equal the rolling digest",
+            });
+        }
+        if self.revision_cursor.is_some() != (self.revision_seal_count > 0) {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit revision cursor must match non-empty sealing progress",
+            });
+        }
+        if self.revision_seal_count > self.revision_ref_count {
+            return Err(RestoreRecordError::CursorOutOfRange {
+                field: "commit revision seal",
+                cursor: self.revision_seal_count,
+                member_count: self.revision_ref_count,
+            });
+        }
+        if (self.revision_seal_count == 0) != (self.revision_digest == [0; SHA256_BYTES]) {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit revision seal count and rolling digest are inconsistent",
+            });
+        }
+        if self.revision_seal.is_some_and(|seal| {
+            seal != self.revision_digest || self.revision_seal_count != self.revision_ref_count
+        }) {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit revision seal requires the complete revision closure",
+            });
+        }
+        if self
+            .parent_seal
+            .is_some_and(|seal| seal != self.parent_digest)
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit parent seal must equal the single-parent digest",
+            });
+        }
+        if self.cleanup_member_count > self.member_count {
+            return Err(RestoreRecordError::CursorOutOfRange {
+                field: "commit member cleanup",
+                cursor: self.cleanup_member_count,
+                member_count: self.member_count,
+            });
+        }
+        if self.cleanup_revision_count > self.revision_ref_count {
+            return Err(RestoreRecordError::CursorOutOfRange {
+                field: "commit revision cleanup",
+                cursor: self.cleanup_revision_count,
+                member_count: self.revision_ref_count,
             });
         }
         Ok(())
@@ -91,6 +381,15 @@ pub struct RestoreResult {
     pub destination_workspace_revision: WorkspaceRevision,
     pub member_count: u64,
     pub member_digest: [u8; SHA256_BYTES],
+}
+
+/// Immutable destination commit receipt projected only from a terminal v5
+/// restore operation. Callers must not reconstruct this from the later live
+/// Workbench head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreDestinationCommitReceipt {
+    pub destination_commit_id: CommitId,
+    pub destination_head_generation: Generation,
 }
 
 /// Stable class of a terminal restore failure.
@@ -152,11 +451,23 @@ pub struct RestoreOperationRecord {
     pub source: RestoreSource,
     pub destination_workbench_id: WorkbenchId,
     pub destination_workspace_incarnation_id: WorkspaceIncarnationId,
+    /// Present for every v5 row and absent only on historical terminal v4
+    /// status rows whose publication authority was never recorded.
+    pub destination_restore_manifest_identity: Option<RestoreManifestIdentity>,
     pub restore_manifest: RestoreManifestDescriptor,
+    pub commit_provenance: RestoreCommitProvenance,
     pub phase: RestorePhase,
-    /// Last source path copied into the contiguous member closure.
+    /// Last raw source path folded into the complete frozen source scan.
     pub source_cursor: Option<NormalizedRelativePath>,
     pub source_eof: bool,
+    pub source_member_count: u64,
+    pub source_member_rolling_digest: [u8; SHA256_BYTES],
+    pub source_member_seal: Option<[u8; SHA256_BYTES]>,
+    /// Whether the sealed raw snapshot closure exactly equals the frozen base
+    /// commit. Snapshot restores may legitimately persist `Some(false)`.
+    pub source_matches_base_commit: Option<bool>,
+    /// Dense ordinary destination closure. RestoreMember rows use this
+    /// sequence and exclude both source-owned and destination-owned manifests.
     pub next_member_sequence: u64,
     pub member_rolling_digest: [u8; SHA256_BYTES],
     /// Present after the source closure reaches EOF.
@@ -181,13 +492,25 @@ pub struct RestoreMemberRecord {
 pub enum RestoreTransition {
     BeginCopying,
     SealSource {
+        source_member_seal: [u8; SHA256_BYTES],
+    },
+    BindDestination {
+        binding: RestoreDestinationBinding,
+    },
+    BeginDestinationBuilding {
+        initialization_digest: [u8; SHA256_BYTES],
+        manifests: RestoreDestinationManifests,
+    },
+    BeginDestinationSealing {
         member_seal: [u8; SHA256_BYTES],
     },
     MarkReady {
-        initialization_digest: [u8; SHA256_BYTES],
+        revision_seal: [u8; SHA256_BYTES],
+        parent_seal: [u8; SHA256_BYTES],
     },
     Complete {
         result: RestoreResult,
+        destination_head_generation: Generation,
     },
     BeginAbort {
         terminal_error: RestoreTerminalError,
@@ -240,8 +563,15 @@ pub enum RestoreRecordError {
         max: u64,
     },
     CursorOutOfRange {
+        field: &'static str,
         cursor: u64,
         member_count: u64,
+    },
+    LegacyNonterminalRequiresUpgrade {
+        phase: RestorePhase,
+    },
+    LegacyProvenanceMissing {
+        phase: RestorePhase,
     },
     InvalidPhasePayload {
         phase: RestorePhase,
@@ -295,11 +625,20 @@ impl fmt::Display for RestoreRecordError {
                 write!(formatter, "{field} {value} exceeds maximum {max}")
             }
             Self::CursorOutOfRange {
+                field,
                 cursor,
                 member_count,
             } => write!(
                 formatter,
-                "restore cleanup cursor {cursor} exceeds member count {member_count}"
+                "restore {field} cursor {cursor} exceeds count {member_count}"
+            ),
+            Self::LegacyNonterminalRequiresUpgrade { phase } => write!(
+                formatter,
+                "restore-operation v4 phase {phase:?} is nonterminal and blocks schema upgrade"
+            ),
+            Self::LegacyProvenanceMissing { phase } => write!(
+                formatter,
+                "restore-operation v4 phase {phase:?} has no destination commit provenance"
             ),
             Self::InvalidPhasePayload { phase, reason } => {
                 write!(formatter, "invalid {phase:?} restore payload: {reason}")
@@ -341,15 +680,11 @@ impl RestoreOperationRecord {
                 reason: "operation id must equal the identity digest prefix",
             });
         }
-        if self.next_member_sequence > MAX_RESTORE_MEMBERS {
-            return Err(RestoreRecordError::CountOutOfRange {
-                field: "next_member_sequence",
-                value: self.next_member_sequence,
-                max: MAX_RESTORE_MEMBERS,
-            });
-        }
+        validate_bounded_count("source_member_count", self.source_member_count)?;
+        validate_bounded_count("next_member_sequence", self.next_member_sequence)?;
         if self.cleanup_member_cursor > self.next_member_sequence {
             return Err(RestoreRecordError::CursorOutOfRange {
+                field: "materialized member cleanup",
                 cursor: self.cleanup_member_cursor,
                 member_count: self.next_member_sequence,
             });
@@ -361,10 +696,37 @@ impl RestoreOperationRecord {
                 reason: "source and destination workbenches must differ",
             });
         }
-        if self.source_cursor.is_some() != (self.next_member_sequence > 0) {
+        if self.source_cursor.is_some() != (self.source_member_count > 0) {
             return Err(RestoreRecordError::InvalidPhasePayload {
                 phase: self.phase,
-                reason: "source cursor presence must match non-empty member progress",
+                reason: "source cursor presence must match non-empty raw source progress",
+            });
+        }
+        if self.next_member_sequence > self.source_member_count {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "materialized closure cannot contain rows absent from the raw source",
+            });
+        }
+        if (self.source_member_count == 0)
+            != (self.source_member_rolling_digest == [0; SHA256_BYTES])
+            || (self.next_member_sequence == 0) != (self.member_rolling_digest == [0; SHA256_BYTES])
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "restore closure counts and rolling digests are inconsistent",
+            });
+        }
+        if self
+            .source_member_seal
+            .is_some_and(|seal| seal != self.source_member_rolling_digest)
+            || self
+                .member_seal
+                .is_some_and(|seal| seal != self.member_rolling_digest)
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "restore closure seals must equal their rolling digests",
             });
         }
         if let Some(error) = &self.terminal_error {
@@ -382,13 +744,160 @@ impl RestoreOperationRecord {
                 });
             }
         }
-        validate_restore_phase(self)
+        match &self.commit_provenance {
+            RestoreCommitProvenance::MissingLegacyV4 => validate_legacy_restore_phase(self),
+            RestoreCommitProvenance::V5(provenance) => {
+                let destination_restore_manifest_identity = self
+                    .destination_restore_manifest_identity
+                    .as_ref()
+                    .ok_or(RestoreRecordError::InvalidPhasePayload {
+                        phase: self.phase,
+                        reason: "v5 restore requires the expected restore-manifest identity",
+                    })?;
+                if destination_restore_manifest_identity.publication_operation_id
+                    == self.operation_id
+                {
+                    return Err(RestoreRecordError::InvalidManifestDescriptor {
+                        reason: "restore and manifest publication operations must differ",
+                    });
+                }
+                let RestoreCommitProvenanceV5 {
+                    source_commit,
+                    destination_committed_at_unix_seconds,
+                    destination_binding,
+                    closure,
+                    destination_head_generation,
+                } = provenance.as_ref();
+                source_commit.validate(self.phase)?;
+                if matches!(
+                    self.source,
+                    RestoreSource::Commit { commit_id } if commit_id != source_commit.commit_id
+                ) {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: self.phase,
+                        reason: "commit restore selector must equal the frozen source commit",
+                    });
+                }
+                let source_matches_base_commit = self.source_member_count
+                    == source_commit.member_count
+                    && self.source_member_rolling_digest == source_commit.member_digest;
+                if self.source_member_seal.is_some() != self.source_matches_base_commit.is_some()
+                    || self
+                        .source_matches_base_commit
+                        .is_some_and(|matches| matches != source_matches_base_commit)
+                {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: self.phase,
+                        reason:
+                            "source/base-commit match projection must equal the sealed raw closure",
+                    });
+                }
+                if matches!(self.source, RestoreSource::Commit { .. })
+                    && self.source_matches_base_commit == Some(false)
+                {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: self.phase,
+                        reason:
+                            "commit-source restore must exactly match its immutable commit closure",
+                    });
+                }
+                if *destination_committed_at_unix_seconds == 0 {
+                    return Err(RestoreRecordError::ZeroScalar {
+                        field: "destination_committed_at_unix_seconds",
+                    });
+                }
+                if let Some(binding) = destination_binding {
+                    binding.validate()?;
+                    if binding.destination_commit_id == source_commit.commit_id {
+                        return Err(RestoreRecordError::InvalidPhasePayload {
+                            phase: self.phase,
+                            reason: "destination commit must not reuse the source commit identity",
+                        });
+                    }
+                    if self.source_matches_base_commit.is_some_and(|matches| {
+                        matches
+                            != (binding.effective_content_digest_uri
+                                == source_commit.content_digest_uri)
+                    }) {
+                        return Err(RestoreRecordError::InvalidPhasePayload {
+                            phase: self.phase,
+                            reason: "effective content digest must preserve clean source content and distinguish dirty materialization",
+                        });
+                    }
+                    if binding.restore_manifest_identity != *destination_restore_manifest_identity {
+                        return Err(RestoreRecordError::InvalidManifestDescriptor {
+                            reason: "late bind must repeat the begin restore-manifest identity",
+                        });
+                    }
+                    if binding.run_manifest_identity.publication_operation_id == self.operation_id {
+                        return Err(RestoreRecordError::InvalidManifestDescriptor {
+                            reason: "restore and manifest publication operations must differ",
+                        });
+                    }
+                    if let Some(manifests) = &binding.manifests {
+                        if manifests.run_manifest.workspace_incarnation_id
+                            != self.destination_workspace_incarnation_id
+                            || manifests.restore_manifest.workspace_incarnation_id
+                                != self.destination_workspace_incarnation_id
+                        {
+                            return Err(RestoreRecordError::InvalidManifestDescriptor {
+                                reason: "published destination manifests must target the hidden destination incarnation",
+                            });
+                        }
+                        if manifests.restore_manifest.body_digest_uri
+                            != self.restore_manifest.body_digest_uri
+                            || manifests.restore_manifest.logical_size
+                                != self.restore_manifest.logical_size
+                            || manifests.restore_manifest.content_type
+                                != self.restore_manifest.content_type
+                        {
+                            return Err(RestoreRecordError::InvalidManifestDescriptor {
+                                reason:
+                                    "published restore manifest must match its begin descriptor",
+                            });
+                        }
+                    }
+                }
+                closure.validate(self.phase)?;
+                let expected_parent_digest = advance_commit_parent_rolling_digest(
+                    [0; SHA256_BYTES],
+                    0,
+                    source_commit.commit_id,
+                );
+                if closure.parent_digest != expected_parent_digest {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: self.phase,
+                        reason: "destination commit parent digest must bind only the source commit",
+                    });
+                }
+                if self.phase == RestorePhase::Complete {
+                    if destination_head_generation.is_none() {
+                        return Err(RestoreRecordError::InvalidPhasePayload {
+                            phase: self.phase,
+                            reason: "complete restore requires the destination head generation",
+                        });
+                    }
+                } else if destination_head_generation.is_some() {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: self.phase,
+                        reason: "destination head generation is terminal-only",
+                    });
+                }
+                validate_restore_phase(self, destination_binding.as_ref(), closure)
+            }
+        }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, RestoreRecordError> {
         self.validate()?;
+        if matches!(
+            self.commit_provenance,
+            RestoreCommitProvenance::MissingLegacyV4
+        ) {
+            return Err(RestoreRecordError::LegacyProvenanceMissing { phase: self.phase });
+        }
         let mut encoded = Vec::new();
-        encoded.push(RESTORE_VALUE_FORMAT_VERSION);
+        encoded.push(RESTORE_OPERATION_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(self.operation_id.as_bytes());
         encoded.extend_from_slice(&self.identity_digest);
         put_optional_fixed(&mut encoded, self.initialization_digest.as_ref());
@@ -397,15 +906,25 @@ impl RestoreOperationRecord {
         put_source(&mut encoded, self.source);
         put_bytes(&mut encoded, self.destination_workbench_id.as_bytes());
         encoded.extend_from_slice(self.destination_workspace_incarnation_id.as_bytes());
+        let destination_restore_manifest_identity = self
+            .destination_restore_manifest_identity
+            .as_ref()
+            .expect("validated v5 restore has its restore-manifest identity");
+        put_manifest_identity(&mut encoded, destination_restore_manifest_identity);
         put_bytes(
             &mut encoded,
             self.restore_manifest.body_digest_uri.as_bytes(),
         );
         encoded.extend_from_slice(&self.restore_manifest.logical_size.to_be_bytes());
         put_bytes(&mut encoded, self.restore_manifest.content_type.as_bytes());
+        put_commit_provenance(&mut encoded, &self.commit_provenance)?;
         encoded.push(self.phase.into());
         put_optional_path(&mut encoded, self.source_cursor.as_ref());
         encoded.push(u8::from(self.source_eof));
+        encoded.extend_from_slice(&self.source_member_count.to_be_bytes());
+        encoded.extend_from_slice(&self.source_member_rolling_digest);
+        put_optional_fixed(&mut encoded, self.source_member_seal.as_ref());
+        put_optional_boolean(&mut encoded, self.source_matches_base_commit);
         encoded.extend_from_slice(&self.next_member_sequence.to_be_bytes());
         encoded.extend_from_slice(&self.member_rolling_digest);
         put_optional_fixed(&mut encoded, self.member_seal.as_ref());
@@ -415,9 +934,57 @@ impl RestoreOperationRecord {
         Ok(encoded)
     }
 
+    pub fn destination_commit_receipt(
+        &self,
+    ) -> Result<RestoreDestinationCommitReceipt, RestoreRecordError> {
+        self.validate()?;
+        if self.phase != RestorePhase::Complete {
+            return Err(RestoreRecordError::PhaseMismatch {
+                expected: RestorePhase::Complete,
+                actual: self.phase,
+            });
+        }
+        let RestoreCommitProvenance::V5(provenance) = &self.commit_provenance else {
+            return Err(RestoreRecordError::LegacyProvenanceMissing { phase: self.phase });
+        };
+        let destination_head_generation = provenance.destination_head_generation.ok_or(
+            RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "complete restore requires the destination head generation",
+            },
+        )?;
+        Ok(RestoreDestinationCommitReceipt {
+            destination_commit_id: provenance
+                .destination_binding
+                .as_ref()
+                .ok_or(RestoreRecordError::InvalidPhasePayload {
+                    phase: self.phase,
+                    reason: "complete restore requires bound destination authority",
+                })?
+                .destination_commit_id,
+            destination_head_generation,
+        })
+    }
+
     pub fn decode(encoded: &[u8]) -> Result<Self, RestoreRecordError> {
+        match encoded.first().copied() {
+            Some(RESTORE_OPERATION_VALUE_FORMAT_VERSION) => Self::decode_v5(encoded),
+            Some(RESTORE_MEMBER_VALUE_FORMAT_VERSION) => decode_legacy_v4_operation(encoded),
+            Some(actual) => Err(RestoreRecordError::UnsupportedValueVersion {
+                actual,
+                expected: RESTORE_OPERATION_VALUE_FORMAT_VERSION,
+            }),
+            None => Err(RestoreRecordError::Truncated {
+                field: "value_format_version",
+                needed: 1,
+                remaining: 0,
+            }),
+        }
+    }
+
+    fn decode_v5(encoded: &[u8]) -> Result<Self, RestoreRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_value_version(RESTORE_OPERATION_VALUE_FORMAT_VERSION)?;
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
         let identity_digest = decoder.fixed("identity_digest")?;
         let initialization_digest = decoder.optional_fixed("initialization_digest")?;
@@ -429,14 +996,21 @@ impl RestoreOperationRecord {
         let destination_workspace_incarnation_id = WorkspaceIncarnationId::from_bytes(
             decoder.fixed("destination_workspace_incarnation_id")?,
         );
+        let destination_restore_manifest_identity =
+            Some(decoder.manifest_identity("destination_restore_manifest_identity")?);
         let restore_manifest = RestoreManifestDescriptor {
             body_digest_uri: decoder.string("restore_manifest.body_digest_uri")?,
             logical_size: decoder.u64("restore_manifest.logical_size")?,
             content_type: decoder.string("restore_manifest.content_type")?,
         };
+        let commit_provenance = decoder.commit_provenance()?;
         let phase = decode_durable_enum(decoder.u8("phase")?)?;
         let source_cursor = decoder.optional_path("source_cursor")?;
         let source_eof = decoder.boolean("source_eof")?;
+        let source_member_count = decoder.u64("source_member_count")?;
+        let source_member_rolling_digest = decoder.fixed("source_member_rolling_digest")?;
+        let source_member_seal = decoder.optional_fixed("source_member_seal")?;
+        let source_matches_base_commit = decoder.optional_boolean("source_matches_base_commit")?;
         let next_member_sequence = decoder.u64("next_member_sequence")?;
         let member_rolling_digest = decoder.fixed("member_rolling_digest")?;
         let member_seal = decoder.optional_fixed("member_seal")?;
@@ -453,10 +1027,16 @@ impl RestoreOperationRecord {
             source,
             destination_workbench_id,
             destination_workspace_incarnation_id,
+            destination_restore_manifest_identity,
             restore_manifest,
+            commit_provenance,
             phase,
             source_cursor,
             source_eof,
+            source_member_count,
+            source_member_rolling_digest,
+            source_member_seal,
+            source_matches_base_commit,
             next_member_sequence,
             member_rolling_digest,
             member_seal,
@@ -485,27 +1065,116 @@ impl RestoreOperationRecord {
             RestoreTransition::BeginCopying if expected == RestorePhase::Preparing => {
                 next.phase = RestorePhase::Copying;
             }
-            RestoreTransition::SealSource { member_seal }
+            RestoreTransition::SealSource { source_member_seal }
                 if expected == RestorePhase::Copying && self.source_eof =>
             {
-                if member_seal != self.member_rolling_digest {
+                if source_member_seal != self.source_member_rolling_digest {
                     return Err(RestoreRecordError::InvalidPhasePayload {
                         phase: expected,
-                        reason: "source seal does not match the rolling member digest",
+                        reason: "raw source seal does not match its rolling digest",
                     });
                 }
                 next.phase = RestorePhase::SourceSealed;
-                next.member_seal = Some(member_seal);
+                next.source_member_seal = Some(source_member_seal);
+                next.member_seal = Some(next.member_rolling_digest);
+                let RestoreCommitProvenance::V5(provenance) = &next.commit_provenance else {
+                    return Err(RestoreRecordError::LegacyProvenanceMissing { phase: expected });
+                };
+                next.source_matches_base_commit = Some(
+                    next.source_member_count == provenance.source_commit.member_count
+                        && source_member_seal == provenance.source_commit.member_digest,
+                );
             }
-            RestoreTransition::MarkReady {
+            RestoreTransition::BindDestination { binding }
+                if expected == RestorePhase::SourceSealed =>
+            {
+                if binding.manifests.is_some() {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: expected,
+                        reason: "late destination bind cannot claim unpublished manifests",
+                    });
+                }
+                let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+                    return Err(RestoreRecordError::LegacyProvenanceMissing { phase: expected });
+                };
+                if provenance.destination_binding.is_some() {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: expected,
+                        reason: "destination authority was already bound",
+                    });
+                }
+                provenance.destination_binding = Some(binding);
+            }
+            RestoreTransition::BeginDestinationBuilding {
                 initialization_digest,
+                manifests,
             } if expected == RestorePhase::SourceSealed && self.initialization_digest.is_none() => {
-                next.phase = RestorePhase::Ready;
+                let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+                    return Err(RestoreRecordError::LegacyProvenanceMissing { phase: expected });
+                };
+                let Some(binding) = &mut provenance.destination_binding else {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: expected,
+                        reason: "destination authority must be bound before commit construction",
+                    });
+                };
+                if binding.manifests.is_some() {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: expected,
+                        reason: "destination manifests were already installed",
+                    });
+                }
+                binding.manifests = Some(manifests);
+                next.phase = RestorePhase::DestinationBuilding;
                 next.initialization_digest = Some(initialization_digest);
             }
-            RestoreTransition::Complete { result } if expected == RestorePhase::Ready => {
+            RestoreTransition::BeginDestinationSealing { member_seal }
+                if expected == RestorePhase::DestinationBuilding =>
+            {
+                let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+                    return Err(RestoreRecordError::LegacyProvenanceMissing { phase: expected });
+                };
+                let closure = &mut provenance.closure;
+                if member_seal != closure.member_digest {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: expected,
+                        reason: "destination commit member seal does not match its rolling digest",
+                    });
+                }
+                closure.member_seal = Some(member_seal);
+                next.phase = RestorePhase::DestinationSealing;
+            }
+            RestoreTransition::MarkReady {
+                revision_seal,
+                parent_seal,
+            } if expected == RestorePhase::DestinationSealing => {
+                let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+                    return Err(RestoreRecordError::LegacyProvenanceMissing { phase: expected });
+                };
+                let closure = &mut provenance.closure;
+                if revision_seal != closure.revision_digest
+                    || closure.revision_seal_count != closure.revision_ref_count
+                    || parent_seal != closure.parent_digest
+                {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: expected,
+                        reason: "destination commit closure seals do not match durable progress",
+                    });
+                }
+                closure.revision_seal = Some(revision_seal);
+                closure.parent_seal = Some(parent_seal);
+                next.phase = RestorePhase::Ready;
+            }
+            RestoreTransition::Complete {
+                result,
+                destination_head_generation,
+            } if expected == RestorePhase::Ready => {
+                let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+                    return Err(RestoreRecordError::LegacyProvenanceMissing { phase: expected });
+                };
                 next.phase = RestorePhase::Complete;
                 next.result = Some(result);
+                provenance.destination_head_generation = Some(destination_head_generation);
             }
             RestoreTransition::BeginAbort { terminal_error }
                 if matches!(
@@ -513,6 +1182,8 @@ impl RestoreOperationRecord {
                     RestorePhase::Preparing
                         | RestorePhase::Copying
                         | RestorePhase::SourceSealed
+                        | RestorePhase::DestinationBuilding
+                        | RestorePhase::DestinationSealing
                         | RestorePhase::Ready
                 ) =>
             {
@@ -527,6 +1198,12 @@ impl RestoreOperationRecord {
                 if expected == RestorePhase::Cleaning
                     && self.cleanup_member_cursor == self.next_member_sequence =>
             {
+                if !commit_cleanup_complete(&self.commit_provenance) {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: expected,
+                        reason: "destination commit scaffolding cleanup is incomplete",
+                    });
+                }
                 next.phase = RestorePhase::Cleaned;
             }
             RestoreTransition::Quarantine { terminal_error }
@@ -552,6 +1229,9 @@ impl RestoreTransition {
         match self {
             Self::BeginCopying => RestorePhase::Copying,
             Self::SealSource { .. } => RestorePhase::SourceSealed,
+            Self::BindDestination { .. } => RestorePhase::SourceSealed,
+            Self::BeginDestinationBuilding { .. } => RestorePhase::DestinationBuilding,
+            Self::BeginDestinationSealing { .. } => RestorePhase::DestinationSealing,
             Self::MarkReady { .. } => RestorePhase::Ready,
             Self::Complete { .. } => RestorePhase::Complete,
             Self::BeginAbort { .. } => RestorePhase::Aborting,
@@ -566,7 +1246,7 @@ impl RestoreMemberRecord {
     pub fn encode(&self) -> Vec<u8> {
         let path = self.destination_path.as_str().as_bytes();
         let mut encoded = Vec::with_capacity(1 + 4 + path.len() + 16 + 8 + SHA256_BYTES);
-        encoded.push(RESTORE_VALUE_FORMAT_VERSION);
+        encoded.push(RESTORE_MEMBER_VALUE_FORMAT_VERSION);
         put_bytes(&mut encoded, path);
         encoded.extend_from_slice(self.artifact_revision_id.as_bytes());
         encoded.extend_from_slice(&self.path_generation.get().to_be_bytes());
@@ -576,7 +1256,7 @@ impl RestoreMemberRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, RestoreRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_value_version(RESTORE_MEMBER_VALUE_FORMAT_VERSION)?;
         let destination_path = decoder.path("destination_path")?;
         let artifact_revision_id =
             ArtifactRevisionId::from_bytes(decoder.fixed("artifact_revision_id")?);
@@ -592,7 +1272,12 @@ impl RestoreMemberRecord {
     }
 }
 
-fn validate_restore_phase(record: &RestoreOperationRecord) -> Result<(), RestoreRecordError> {
+fn validate_restore_phase(
+    record: &RestoreOperationRecord,
+    destination_binding: Option<&RestoreDestinationBinding>,
+    closure: &RestoreCommitClosureProgress,
+) -> Result<(), RestoreRecordError> {
+    let destination_manifests = destination_binding.and_then(|binding| binding.manifests.as_ref());
     let fail = |reason| {
         Err(RestoreRecordError::InvalidPhasePayload {
             phase: record.phase,
@@ -603,8 +1288,14 @@ fn validate_restore_phase(record: &RestoreOperationRecord) -> Result<(), Restore
         RestorePhase::Preparing => {
             if record.initialization_digest.is_some()
                 || record.source_eof
+                || record.source_member_count != 0
+                || record.source_member_rolling_digest != [0; SHA256_BYTES]
+                || record.source_member_seal.is_some()
+                || record.source_matches_base_commit.is_some()
                 || record.next_member_sequence != 0
                 || record.member_seal.is_some()
+                || destination_binding.is_some()
+                || !commit_closure_is_pristine(closure)
                 || record.cleanup_member_cursor != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
@@ -614,7 +1305,11 @@ fn validate_restore_phase(record: &RestoreOperationRecord) -> Result<(), Restore
         }
         RestorePhase::Copying => {
             if record.initialization_digest.is_some()
+                || record.source_member_seal.is_some()
+                || record.source_matches_base_commit.is_some()
                 || record.member_seal.is_some()
+                || destination_binding.is_some()
+                || !commit_closure_is_pristine(closure)
                 || record.cleanup_member_cursor != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
@@ -625,31 +1320,92 @@ fn validate_restore_phase(record: &RestoreOperationRecord) -> Result<(), Restore
         RestorePhase::SourceSealed => {
             if record.initialization_digest.is_some()
                 || !record.source_eof
+                || record.source_member_seal != Some(record.source_member_rolling_digest)
+                || record.source_matches_base_commit.is_none()
                 || record.member_seal != Some(record.member_rolling_digest)
-                || record.cleanup_member_cursor != 0
-                || record.result.is_some()
-                || record.terminal_error.is_some()
-            {
-                return fail("sealed source requires the exact closure and no terminal payload");
-            }
-        }
-        RestorePhase::Ready => {
-            if record.initialization_digest.is_none()
-                || !record.source_eof
-                || record.member_seal != Some(record.member_rolling_digest)
+                || destination_manifests.is_some()
+                || !commit_closure_is_pristine(closure)
                 || record.cleanup_member_cursor != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
             {
                 return fail(
-                    "ready restore requires a bound initialization and exact source closure",
+                    "sealed source requires raw and materialized seals plus optional late binding",
                 );
+            }
+        }
+        RestorePhase::DestinationBuilding => {
+            if record.initialization_digest.is_none()
+                || !record.source_eof
+                || record.source_member_seal != Some(record.source_member_rolling_digest)
+                || record.source_matches_base_commit.is_none()
+                || record.member_seal != Some(record.member_rolling_digest)
+                || destination_binding.is_none()
+                || destination_manifests.is_none()
+                || closure.member_seal.is_some()
+                || closure.revision_seal_count != 0
+                || closure.revision_cursor.is_some()
+                || closure.revision_seal.is_some()
+                || closure.parent_seal.is_some()
+                || record.cleanup_member_cursor != 0
+                || closure.cleanup_member_count != 0
+                || closure.cleanup_revision_count != 0
+                || record.result.is_some()
+                || record.terminal_error.is_some()
+            {
+                return fail(
+                    "destination build requires staged manifests and unsealed commit progress",
+                );
+            }
+        }
+        RestorePhase::DestinationSealing => {
+            if record.initialization_digest.is_none()
+                || !record.source_eof
+                || record.source_member_seal != Some(record.source_member_rolling_digest)
+                || record.source_matches_base_commit.is_none()
+                || record.member_seal != Some(record.member_rolling_digest)
+                || destination_binding.is_none()
+                || destination_manifests.is_none()
+                || closure.member_seal != Some(closure.member_digest)
+                || closure.revision_seal.is_some()
+                || closure.parent_seal.is_some()
+                || !commit_closure_matches_materialized(record, closure)
+                || record.cleanup_member_cursor != 0
+                || closure.cleanup_member_count != 0
+                || closure.cleanup_revision_count != 0
+                || record.result.is_some()
+                || record.terminal_error.is_some()
+            {
+                return fail("destination sealing requires the complete member seal only");
+            }
+        }
+        RestorePhase::Ready => {
+            if record.initialization_digest.is_none()
+                || !record.source_eof
+                || record.source_member_seal != Some(record.source_member_rolling_digest)
+                || record.source_matches_base_commit.is_none()
+                || record.member_seal != Some(record.member_rolling_digest)
+                || destination_binding.is_none()
+                || destination_manifests.is_none()
+                || !commit_closure_is_sealed(closure)
+                || !commit_closure_matches_materialized(record, closure)
+                || record.cleanup_member_cursor != 0
+                || record.result.is_some()
+                || record.terminal_error.is_some()
+            {
+                return fail("ready restore requires all destination commit closures to be sealed");
             }
         }
         RestorePhase::Complete => {
             if record.initialization_digest.is_none()
                 || !record.source_eof
+                || record.source_member_seal != Some(record.source_member_rolling_digest)
+                || record.source_matches_base_commit.is_none()
                 || record.member_seal != Some(record.member_rolling_digest)
+                || destination_binding.is_none()
+                || destination_manifests.is_none()
+                || !commit_closure_is_sealed(closure)
+                || !commit_closure_matches_materialized(record, closure)
                 || record.cleanup_member_cursor != 0
                 || record.result.is_none()
                 || record.terminal_error.is_some()
@@ -659,6 +1415,8 @@ fn validate_restore_phase(record: &RestoreOperationRecord) -> Result<(), Restore
         }
         RestorePhase::Aborting => {
             if record.cleanup_member_cursor != 0
+                || closure.cleanup_member_count != 0
+                || closure.cleanup_revision_count != 0
                 || record.result.is_some()
                 || record.terminal_error.is_none()
             {
@@ -672,6 +1430,7 @@ fn validate_restore_phase(record: &RestoreOperationRecord) -> Result<(), Restore
         }
         RestorePhase::Cleaned => {
             if record.cleanup_member_cursor != record.next_member_sequence
+                || !commit_cleanup_complete(&record.commit_provenance)
                 || record.result.is_some()
                 || record.terminal_error.is_none()
             {
@@ -687,6 +1446,95 @@ fn validate_restore_phase(record: &RestoreOperationRecord) -> Result<(), Restore
     Ok(())
 }
 
+fn validate_legacy_restore_phase(
+    record: &RestoreOperationRecord,
+) -> Result<(), RestoreRecordError> {
+    if record.destination_restore_manifest_identity.is_some()
+        || record.source_matches_base_commit.is_some()
+    {
+        return Err(RestoreRecordError::InvalidPhasePayload {
+            phase: record.phase,
+            reason: "legacy v4 status cannot claim v5 provenance",
+        });
+    }
+    match record.phase {
+        RestorePhase::Complete => {
+            if record.initialization_digest.is_none()
+                || !record.source_eof
+                || record.source_member_seal != Some(record.source_member_rolling_digest)
+                || record.member_seal != Some(record.member_rolling_digest)
+                || record.cleanup_member_cursor != 0
+                || record.result.is_none()
+                || record.terminal_error.is_some()
+            {
+                return Err(RestoreRecordError::InvalidPhasePayload {
+                    phase: record.phase,
+                    reason: "legacy complete restore payload is inconsistent",
+                });
+            }
+            Ok(())
+        }
+        RestorePhase::Cleaned => {
+            if record.cleanup_member_cursor != record.next_member_sequence
+                || record.result.is_some()
+                || record.terminal_error.is_none()
+            {
+                return Err(RestoreRecordError::InvalidPhasePayload {
+                    phase: record.phase,
+                    reason: "legacy cleaned restore payload is inconsistent",
+                });
+            }
+            Ok(())
+        }
+        phase => Err(RestoreRecordError::LegacyNonterminalRequiresUpgrade { phase }),
+    }
+}
+
+fn commit_closure_is_pristine(closure: &RestoreCommitClosureProgress) -> bool {
+    closure.member_cursor.is_none()
+        && closure.member_count == 0
+        && closure.member_digest == [0; SHA256_BYTES]
+        && closure.member_seal.is_none()
+        && closure.revision_ref_count == 0
+        && closure.revision_cursor.is_none()
+        && closure.revision_seal_count == 0
+        && closure.revision_digest == [0; SHA256_BYTES]
+        && closure.revision_seal.is_none()
+        && closure.parent_seal.is_none()
+        && closure.cleanup_member_count == 0
+        && closure.cleanup_revision_count == 0
+}
+
+fn commit_closure_is_sealed(closure: &RestoreCommitClosureProgress) -> bool {
+    closure.member_seal == Some(closure.member_digest)
+        && closure.revision_seal_count == closure.revision_ref_count
+        && closure.revision_seal == Some(closure.revision_digest)
+        && closure.parent_seal == Some(closure.parent_digest)
+}
+
+fn commit_closure_matches_materialized(
+    record: &RestoreOperationRecord,
+    closure: &RestoreCommitClosureProgress,
+) -> bool {
+    record
+        .next_member_sequence
+        .checked_add(2)
+        .is_some_and(|final_count| closure.member_count == final_count)
+        && closure.revision_ref_count >= 2
+        && closure.revision_ref_count <= closure.member_count
+}
+
+fn commit_cleanup_complete(provenance: &RestoreCommitProvenance) -> bool {
+    match provenance {
+        RestoreCommitProvenance::MissingLegacyV4 => true,
+        RestoreCommitProvenance::V5(provenance) => {
+            provenance.closure.cleanup_member_count == provenance.closure.member_count
+                && provenance.closure.cleanup_revision_count
+                    == provenance.closure.revision_ref_count
+        }
+    }
+}
+
 fn validate_terminal_error(error: &RestoreTerminalError) -> Result<(), RestoreRecordError> {
     if error.message.is_empty() {
         return Err(RestoreRecordError::EmptyField {
@@ -698,6 +1546,55 @@ fn validate_terminal_error(error: &RestoreTerminalError) -> Result<(), RestoreRe
             field: "terminal_error.message",
             length: error.message.len(),
             max: MAX_RESTORE_TERMINAL_ERROR_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_bounded_count(field: &'static str, value: u64) -> Result<(), RestoreRecordError> {
+    if value > MAX_RESTORE_MEMBERS {
+        Err(RestoreRecordError::CountOutOfRange {
+            field,
+            value,
+            max: MAX_RESTORE_MEMBERS,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_digest_uri(_field: &'static str, value: &str) -> Result<(), RestoreRecordError> {
+    if value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(RestoreRecordError::InvalidManifestDescriptor {
+            reason: "digest URI must be canonical lowercase SHA-256",
+        })
+    }
+}
+
+fn validate_commit_digest_field(
+    field: &'static str,
+    value: &str,
+) -> Result<(), RestoreRecordError> {
+    if value.is_empty() {
+        return Err(RestoreRecordError::EmptyField { field });
+    }
+    if value.len() > MAX_COMMIT_DIGEST_URI_BYTES {
+        return Err(RestoreRecordError::FieldTooLong {
+            field,
+            length: value.len(),
+            max: MAX_COMMIT_DIGEST_URI_BYTES,
+        });
+    }
+    if value.as_bytes().contains(&0) {
+        return Err(RestoreRecordError::InvalidManifestDescriptor {
+            reason: "source commit digest must not contain NUL",
         });
     }
     Ok(())
@@ -717,6 +1614,95 @@ fn put_source(encoded: &mut Vec<u8>, source: RestoreSource) {
             encoded.extend_from_slice(commit_id.as_bytes());
         }
     }
+}
+
+fn put_commit_provenance(
+    encoded: &mut Vec<u8>,
+    provenance: &RestoreCommitProvenance,
+) -> Result<(), RestoreRecordError> {
+    let RestoreCommitProvenance::V5(provenance) = provenance else {
+        return Err(RestoreRecordError::LegacyProvenanceMissing {
+            phase: RestorePhase::Complete,
+        });
+    };
+    let RestoreCommitProvenanceV5 {
+        source_commit,
+        destination_committed_at_unix_seconds,
+        destination_binding,
+        closure,
+        destination_head_generation,
+    } = provenance.as_ref();
+    encoded.extend_from_slice(source_commit.commit_id.as_bytes());
+    put_bytes(encoded, source_commit.content_digest_uri.as_bytes());
+    put_bytes(encoded, source_commit.manifest_digest_uri.as_bytes());
+    encoded.extend_from_slice(source_commit.tree_manifest_revision_id.as_bytes());
+    encoded.extend_from_slice(&source_commit.member_count.to_be_bytes());
+    encoded.extend_from_slice(&source_commit.member_digest);
+    encoded.extend_from_slice(&source_commit.unique_revision_count.to_be_bytes());
+    encoded.extend_from_slice(&source_commit.revision_digest);
+    encoded.extend_from_slice(&source_commit.parent_digest);
+    encoded.extend_from_slice(&destination_committed_at_unix_seconds.to_be_bytes());
+    match destination_binding {
+        None => encoded.push(0),
+        Some(binding) => {
+            encoded.push(1);
+            encoded.extend_from_slice(binding.destination_commit_id.as_bytes());
+            put_bytes(encoded, binding.effective_content_digest_uri.as_bytes());
+            encoded.extend_from_slice(&binding.destination_projection_input_digest);
+            put_manifest_identity(encoded, &binding.run_manifest_identity);
+            put_manifest_identity(encoded, &binding.restore_manifest_identity);
+            match &binding.manifests {
+                None => encoded.push(0),
+                Some(manifests) => {
+                    encoded.push(1);
+                    put_manifest_publication(encoded, &manifests.run_manifest);
+                    put_manifest_publication(encoded, &manifests.restore_manifest);
+                }
+            }
+        }
+    }
+    put_optional_path(encoded, closure.member_cursor.as_ref());
+    encoded.extend_from_slice(&closure.member_count.to_be_bytes());
+    encoded.extend_from_slice(&closure.member_digest);
+    put_optional_fixed(encoded, closure.member_seal.as_ref());
+    encoded.extend_from_slice(&closure.revision_ref_count.to_be_bytes());
+    put_optional_fixed(
+        encoded,
+        closure
+            .revision_cursor
+            .as_ref()
+            .map(ArtifactRevisionId::as_bytes),
+    );
+    encoded.extend_from_slice(&closure.revision_seal_count.to_be_bytes());
+    encoded.extend_from_slice(&closure.revision_digest);
+    put_optional_fixed(encoded, closure.revision_seal.as_ref());
+    encoded.extend_from_slice(&closure.parent_digest);
+    put_optional_fixed(encoded, closure.parent_seal.as_ref());
+    encoded.extend_from_slice(&closure.cleanup_member_count.to_be_bytes());
+    encoded.extend_from_slice(&closure.cleanup_revision_count.to_be_bytes());
+    match destination_head_generation {
+        None => encoded.push(0),
+        Some(generation) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&generation.get().to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn put_manifest_publication(encoded: &mut Vec<u8>, publication: &RestoreManifestPublication) {
+    encoded.extend_from_slice(publication.publication_operation_id.as_bytes());
+    encoded.extend_from_slice(publication.workspace_incarnation_id.as_bytes());
+    encoded.extend_from_slice(publication.artifact_revision_id.as_bytes());
+    put_bytes(encoded, publication.body_digest_uri.as_bytes());
+    put_bytes(encoded, publication.manifest_digest_uri.as_bytes());
+    encoded.extend_from_slice(&publication.logical_size.to_be_bytes());
+    put_bytes(encoded, publication.content_type.as_bytes());
+}
+
+fn put_manifest_identity(encoded: &mut Vec<u8>, identity: &RestoreManifestIdentity) {
+    encoded.extend_from_slice(identity.publication_operation_id.as_bytes());
+    encoded.extend_from_slice(identity.artifact_revision_id.as_bytes());
 }
 
 fn put_bytes(encoded: &mut Vec<u8>, value: &[u8]) {
@@ -746,6 +1732,14 @@ fn put_optional_fixed<const N: usize>(encoded: &mut Vec<u8>, value: Option<&[u8;
             encoded.extend_from_slice(value);
         }
     }
+}
+
+fn put_optional_boolean(encoded: &mut Vec<u8>, value: Option<bool>) {
+    encoded.push(match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    });
 }
 
 fn put_optional_result(encoded: &mut Vec<u8>, result: Option<&RestoreResult>) {
@@ -788,6 +1782,69 @@ where
     })
 }
 
+fn decode_legacy_v4_operation(
+    encoded: &[u8],
+) -> Result<RestoreOperationRecord, RestoreRecordError> {
+    let mut decoder = Decoder::new(encoded);
+    decoder.require_value_version(RESTORE_MEMBER_VALUE_FORMAT_VERSION)?;
+    let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
+    let identity_digest = decoder.fixed("identity_digest")?;
+    let initialization_digest = decoder.optional_fixed("initialization_digest")?;
+    let source_workbench_id = decoder.workbench_id("source_workbench_id")?;
+    let source_workspace_incarnation_id =
+        WorkspaceIncarnationId::from_bytes(decoder.fixed("source_workspace_incarnation_id")?);
+    let source = decoder.source()?;
+    let destination_workbench_id = decoder.workbench_id("destination_workbench_id")?;
+    let destination_workspace_incarnation_id =
+        WorkspaceIncarnationId::from_bytes(decoder.fixed("destination_workspace_incarnation_id")?);
+    let restore_manifest = RestoreManifestDescriptor {
+        body_digest_uri: decoder.string("restore_manifest.body_digest_uri")?,
+        logical_size: decoder.u64("restore_manifest.logical_size")?,
+        content_type: decoder.string("restore_manifest.content_type")?,
+    };
+    let phase = decode_durable_enum(decoder.u8("phase")?)?;
+    if !matches!(phase, RestorePhase::Complete | RestorePhase::Cleaned) {
+        return Err(RestoreRecordError::LegacyNonterminalRequiresUpgrade { phase });
+    }
+    let source_cursor = decoder.optional_path("source_cursor")?;
+    let source_eof = decoder.boolean("source_eof")?;
+    let next_member_sequence = decoder.u64("next_member_sequence")?;
+    let member_rolling_digest = decoder.fixed("member_rolling_digest")?;
+    let member_seal = decoder.optional_fixed("member_seal")?;
+    let cleanup_member_cursor = decoder.u64("cleanup_member_cursor")?;
+    let result = decoder.optional_result("result")?;
+    let terminal_error = decoder.optional_terminal_error("terminal_error")?;
+    decoder.finish()?;
+    let record = RestoreOperationRecord {
+        operation_id,
+        identity_digest,
+        initialization_digest,
+        source_workbench_id,
+        source_workspace_incarnation_id,
+        source,
+        destination_workbench_id,
+        destination_workspace_incarnation_id,
+        destination_restore_manifest_identity: None,
+        restore_manifest,
+        commit_provenance: RestoreCommitProvenance::MissingLegacyV4,
+        phase,
+        source_cursor,
+        source_eof,
+        source_member_count: next_member_sequence,
+        source_member_rolling_digest: member_rolling_digest,
+        source_member_seal: member_seal,
+        source_matches_base_commit: None,
+        next_member_sequence,
+        member_rolling_digest,
+        member_seal,
+        cleanup_member_cursor,
+        result,
+        terminal_error,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
 struct Decoder<'a> {
     input: &'a [u8],
     offset: usize,
@@ -798,15 +1855,12 @@ impl<'a> Decoder<'a> {
         Self { input, offset: 0 }
     }
 
-    fn require_value_version(&mut self) -> Result<(), RestoreRecordError> {
+    fn require_value_version(&mut self, expected: u8) -> Result<(), RestoreRecordError> {
         let actual = self.u8("value_format_version")?;
-        if actual == RESTORE_VALUE_FORMAT_VERSION {
+        if actual == expected {
             Ok(())
         } else {
-            Err(RestoreRecordError::UnsupportedValueVersion {
-                actual,
-                expected: RESTORE_VALUE_FORMAT_VERSION,
-            })
+            Err(RestoreRecordError::UnsupportedValueVersion { actual, expected })
         }
     }
 
@@ -874,6 +1928,132 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    fn commit_provenance(&mut self) -> Result<RestoreCommitProvenance, RestoreRecordError> {
+        let source_commit = RestoreSourceCommitSeal {
+            commit_id: CommitId::from_bytes(self.fixed("source_commit.commit_id")?),
+            content_digest_uri: self.string("source_commit.content_digest_uri")?,
+            manifest_digest_uri: self.string("source_commit.manifest_digest_uri")?,
+            tree_manifest_revision_id: ArtifactRevisionId::from_bytes(
+                self.fixed("source_commit.tree_manifest_revision_id")?,
+            ),
+            member_count: self.u64("source_commit.member_count")?,
+            member_digest: self.fixed("source_commit.member_digest")?,
+            unique_revision_count: self.u64("source_commit.unique_revision_count")?,
+            revision_digest: self.fixed("source_commit.revision_digest")?,
+            parent_digest: self.fixed("source_commit.parent_digest")?,
+        };
+        let destination_committed_at_unix_seconds =
+            self.u64("destination_committed_at_unix_seconds")?;
+        let destination_binding = match self.u8("destination_binding")? {
+            0 => None,
+            1 => Some(RestoreDestinationBinding {
+                destination_commit_id: CommitId::from_bytes(
+                    self.fixed("destination_binding.destination_commit_id")?,
+                ),
+                effective_content_digest_uri: self
+                    .string("destination_binding.effective_content_digest_uri")?,
+                destination_projection_input_digest: self
+                    .fixed("destination_binding.destination_projection_input_digest")?,
+                run_manifest_identity: self
+                    .manifest_identity("destination_binding.run_manifest_identity")?,
+                restore_manifest_identity: self
+                    .manifest_identity("destination_binding.restore_manifest_identity")?,
+                manifests: match self.u8("destination_binding.manifests")? {
+                    0 => None,
+                    1 => Some(RestoreDestinationManifests {
+                        run_manifest: self.manifest_publication("run_manifest")?,
+                        restore_manifest: self.manifest_publication("restore_manifest")?,
+                    }),
+                    value => {
+                        return Err(RestoreRecordError::InvalidOptionalTag {
+                            field: "destination_binding.manifests",
+                            value,
+                        });
+                    }
+                },
+            }),
+            value => {
+                return Err(RestoreRecordError::InvalidOptionalTag {
+                    field: "destination_binding",
+                    value,
+                });
+            }
+        };
+        let member_cursor = self.optional_path("commit_closure.member_cursor")?;
+        let member_count = self.u64("commit_closure.member_count")?;
+        let member_digest = self.fixed("commit_closure.member_digest")?;
+        let member_seal = self.optional_fixed("commit_closure.member_seal")?;
+        let revision_ref_count = self.u64("commit_closure.revision_ref_count")?;
+        let revision_cursor = self
+            .optional_fixed("commit_closure.revision_cursor")?
+            .map(ArtifactRevisionId::from_bytes);
+        let revision_seal_count = self.u64("commit_closure.revision_seal_count")?;
+        let revision_digest = self.fixed("commit_closure.revision_digest")?;
+        let revision_seal = self.optional_fixed("commit_closure.revision_seal")?;
+        let parent_digest = self.fixed("commit_closure.parent_digest")?;
+        let parent_seal = self.optional_fixed("commit_closure.parent_seal")?;
+        let cleanup_member_count = self.u64("commit_closure.cleanup_member_count")?;
+        let cleanup_revision_count = self.u64("commit_closure.cleanup_revision_count")?;
+        let destination_head_generation = match self.u8("destination_head_generation")? {
+            0 => None,
+            1 => Some(self.generation("destination_head_generation")?),
+            value => {
+                return Err(RestoreRecordError::InvalidOptionalTag {
+                    field: "destination_head_generation",
+                    value,
+                });
+            }
+        };
+        Ok(RestoreCommitProvenance::V5(Box::new(
+            RestoreCommitProvenanceV5 {
+                source_commit,
+                destination_committed_at_unix_seconds,
+                destination_binding,
+                closure: RestoreCommitClosureProgress {
+                    member_cursor,
+                    member_count,
+                    member_digest,
+                    member_seal,
+                    revision_ref_count,
+                    revision_cursor,
+                    revision_seal_count,
+                    revision_digest,
+                    revision_seal,
+                    parent_digest,
+                    parent_seal,
+                    cleanup_member_count,
+                    cleanup_revision_count,
+                },
+                destination_head_generation,
+            },
+        )))
+    }
+
+    fn manifest_publication(
+        &mut self,
+        field: &'static str,
+    ) -> Result<RestoreManifestPublication, RestoreRecordError> {
+        Ok(RestoreManifestPublication {
+            publication_operation_id: OperationId::from_bytes(self.fixed(field)?),
+            workspace_incarnation_id: WorkspaceIncarnationId::from_bytes(self.fixed(field)?),
+            artifact_revision_id: ArtifactRevisionId::from_bytes(self.fixed(field)?),
+            body_digest_uri: self.string(field)?,
+            manifest_digest_uri: self.string(field)?,
+            logical_size: self.u64(field)?,
+            content_type: self.string(field)?,
+        })
+    }
+
+    fn manifest_identity(
+        &mut self,
+        field: &'static str,
+    ) -> Result<RestoreManifestIdentity, RestoreRecordError> {
+        Ok(RestoreManifestIdentity {
+            publication_operation_id: OperationId::from_bytes(self.fixed(field)?),
+            artifact_revision_id: ArtifactRevisionId::from_bytes(self.fixed(field)?),
+        })
+    }
+
     fn workbench_id(&mut self, field: &'static str) -> Result<WorkbenchId, RestoreRecordError> {
         let bytes = self.bytes(field)?;
         let value =
@@ -917,6 +2097,18 @@ impl<'a> Decoder<'a> {
         match self.u8(field)? {
             0 => Ok(None),
             1 => self.fixed(field).map(Some),
+            value => Err(RestoreRecordError::InvalidOptionalTag { field, value }),
+        }
+    }
+
+    fn optional_boolean(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Option<bool>, RestoreRecordError> {
+        match self.u8(field)? {
+            0 => Ok(None),
+            1 => Ok(Some(false)),
+            2 => Ok(Some(true)),
             value => Err(RestoreRecordError::InvalidOptionalTag { field, value }),
         }
     }
@@ -993,7 +2185,55 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
+    use super::super::commit_records::advance_commit_member_rolling_digest;
     use super::*;
+
+    fn digest_uri(byte: u8) -> String {
+        format!("sha256:{}", format!("{byte:02x}").repeat(SHA256_BYTES))
+    }
+
+    fn manifest_identity(operation_fill: u8, revision_fill: u8) -> RestoreManifestIdentity {
+        RestoreManifestIdentity {
+            publication_operation_id: OperationId::from_bytes([operation_fill; 16]),
+            artifact_revision_id: ArtifactRevisionId::from_bytes([revision_fill; 16]),
+        }
+    }
+
+    fn manifests() -> RestoreDestinationManifests {
+        RestoreDestinationManifests {
+            run_manifest: RestoreManifestPublication {
+                publication_operation_id: OperationId::from_bytes([0x41; 16]),
+                workspace_incarnation_id: WorkspaceIncarnationId::from_bytes([7; 16]),
+                artifact_revision_id: ArtifactRevisionId::from_bytes([0x31; 16]),
+                body_digest_uri: digest_uri(0x41),
+                manifest_digest_uri: digest_uri(0x42),
+                logical_size: 129,
+                content_type: RESTORE_MANIFEST_CONTENT_TYPE.to_owned(),
+            },
+            restore_manifest: RestoreManifestPublication {
+                publication_operation_id: OperationId::from_bytes([0x42; 16]),
+                workspace_incarnation_id: WorkspaceIncarnationId::from_bytes([7; 16]),
+                artifact_revision_id: ArtifactRevisionId::from_bytes([0x32; 16]),
+                body_digest_uri: digest_uri(0xab),
+                manifest_digest_uri: digest_uri(0x43),
+                logical_size: 128,
+                content_type: RESTORE_MANIFEST_CONTENT_TYPE.to_owned(),
+            },
+        }
+    }
+
+    fn binding() -> RestoreDestinationBinding {
+        RestoreDestinationBinding {
+            destination_commit_id: CommitId::from_bytes([4; SHA256_BYTES]),
+            effective_content_digest_uri: digest_uri(0x51),
+            destination_projection_input_digest: [0x44; SHA256_BYTES],
+            run_manifest_identity: manifest_identity(0x41, 0x31),
+            restore_manifest_identity: manifest_identity(0x42, 0x32),
+            manifests: None,
+        }
+    }
 
     fn operation(phase: RestorePhase) -> RestoreOperationRecord {
         let mut identity_digest = [2; SHA256_BYTES];
@@ -1010,14 +2250,54 @@ mod tests {
             },
             destination_workbench_id: WorkbenchId::new("fork").unwrap(),
             destination_workspace_incarnation_id: WorkspaceIncarnationId::from_bytes([7; 16]),
+            destination_restore_manifest_identity: Some(manifest_identity(0x42, 0x32)),
             restore_manifest: RestoreManifestDescriptor {
-                body_digest_uri: format!("sha256:{}", "ab".repeat(32)),
+                body_digest_uri: digest_uri(0xab),
                 logical_size: 128,
                 content_type: RESTORE_MANIFEST_CONTENT_TYPE.to_owned(),
             },
+            commit_provenance: RestoreCommitProvenance::V5(Box::new(RestoreCommitProvenanceV5 {
+                source_commit: RestoreSourceCommitSeal {
+                    commit_id: CommitId::from_bytes([3; SHA256_BYTES]),
+                    content_digest_uri: digest_uri(0x11),
+                    manifest_digest_uri: digest_uri(0x12),
+                    tree_manifest_revision_id: ArtifactRevisionId::from_bytes([0x21; 16]),
+                    member_count: 1,
+                    member_digest: [0x22; SHA256_BYTES],
+                    unique_revision_count: 1,
+                    revision_digest: [0x23; SHA256_BYTES],
+                    parent_digest: [0; SHA256_BYTES],
+                },
+                destination_committed_at_unix_seconds: 7,
+                destination_binding: None,
+                closure: RestoreCommitClosureProgress {
+                    member_cursor: None,
+                    member_count: 0,
+                    member_digest: [0; SHA256_BYTES],
+                    member_seal: None,
+                    revision_ref_count: 0,
+                    revision_cursor: None,
+                    revision_seal_count: 0,
+                    revision_digest: [0; SHA256_BYTES],
+                    revision_seal: None,
+                    parent_digest: advance_commit_parent_rolling_digest(
+                        [0; SHA256_BYTES],
+                        0,
+                        CommitId::from_bytes([3; SHA256_BYTES]),
+                    ),
+                    parent_seal: None,
+                    cleanup_member_count: 0,
+                    cleanup_revision_count: 0,
+                },
+                destination_head_generation: None,
+            })),
             phase,
             source_cursor: None,
             source_eof: false,
+            source_member_count: 0,
+            source_member_rolling_digest: [0; SHA256_BYTES],
+            source_member_seal: None,
+            source_matches_base_commit: None,
             next_member_sequence: 0,
             member_rolling_digest: [0; SHA256_BYTES],
             member_seal: None,
@@ -1025,6 +2305,45 @@ mod tests {
             result: None,
             terminal_error: None,
         }
+    }
+
+    fn bound_source_operation() -> RestoreOperationRecord {
+        let mut record = operation(RestorePhase::Preparing)
+            .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
+            .unwrap();
+        record.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
+        record.source_eof = true;
+        record.source_member_count = 1;
+        record.source_member_rolling_digest = [7; SHA256_BYTES];
+        record.next_member_sequence = 1;
+        record.member_rolling_digest = [8; SHA256_BYTES];
+        record = record
+            .apply(
+                RestorePhase::Copying,
+                RestoreTransition::SealSource {
+                    source_member_seal: [7; SHA256_BYTES],
+                },
+            )
+            .unwrap();
+        record = record
+            .apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination { binding: binding() },
+            )
+            .unwrap();
+        record
+    }
+
+    fn destination_building_operation() -> RestoreOperationRecord {
+        bound_source_operation()
+            .apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [3; SHA256_BYTES],
+                    manifests: manifests(),
+                },
+            )
+            .unwrap()
     }
 
     fn terminal_error() -> RestoreTerminalError {
@@ -1035,17 +2354,742 @@ mod tests {
         }
     }
 
+    fn legacy_v4_operation(phase: RestorePhase) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut identity_digest = [2; SHA256_BYTES];
+        identity_digest[..OperationId::BYTE_WIDTH].fill(1);
+        encoded.push(RESTORE_MEMBER_VALUE_FORMAT_VERSION);
+        encoded.extend_from_slice(OperationId::from_bytes([1; 16]).as_bytes());
+        encoded.extend_from_slice(&identity_digest);
+        match phase {
+            RestorePhase::Complete => put_optional_fixed(&mut encoded, Some(&[3; SHA256_BYTES])),
+            RestorePhase::Cleaned => put_optional_fixed::<SHA256_BYTES>(&mut encoded, None),
+            _ => put_optional_fixed::<SHA256_BYTES>(&mut encoded, None),
+        }
+        put_bytes(&mut encoded, b"source");
+        encoded.extend_from_slice(&[4; 16]);
+        put_source(
+            &mut encoded,
+            RestoreSource::Snapshot {
+                snapshot_id: SnapshotId::new(5),
+                read_version: ReadVersion::new(6).unwrap(),
+            },
+        );
+        put_bytes(&mut encoded, b"fork");
+        encoded.extend_from_slice(&[7; 16]);
+        put_bytes(&mut encoded, digest_uri(0xab).as_bytes());
+        encoded.extend_from_slice(&128_u64.to_be_bytes());
+        put_bytes(&mut encoded, RESTORE_MANIFEST_CONTENT_TYPE.as_bytes());
+        encoded.push(phase.into());
+        put_optional_path(
+            &mut encoded,
+            Some(&NormalizedRelativePath::new("input/a").unwrap()),
+        );
+        encoded.push(u8::from(phase == RestorePhase::Complete));
+        encoded.extend_from_slice(&1_u64.to_be_bytes());
+        encoded.extend_from_slice(&[8; SHA256_BYTES]);
+        match phase {
+            RestorePhase::Complete => put_optional_fixed(&mut encoded, Some(&[8; SHA256_BYTES])),
+            _ => put_optional_fixed::<SHA256_BYTES>(&mut encoded, None),
+        }
+        encoded.extend_from_slice(
+            &(if phase == RestorePhase::Cleaned {
+                1_u64
+            } else {
+                0_u64
+            })
+            .to_be_bytes(),
+        );
+        if phase == RestorePhase::Complete {
+            put_optional_result(
+                &mut encoded,
+                Some(&RestoreResult {
+                    destination_workspace_incarnation_id: WorkspaceIncarnationId::from_bytes(
+                        [7; 16],
+                    ),
+                    destination_workspace_revision: WorkspaceRevision::new(1),
+                    member_count: 1,
+                    member_digest: [8; SHA256_BYTES],
+                }),
+            );
+            put_optional_terminal_error(&mut encoded, None).unwrap();
+        } else {
+            put_optional_result(&mut encoded, None);
+            put_optional_terminal_error(&mut encoded, Some(&terminal_error())).unwrap();
+        }
+        encoded
+    }
+
+    fn v5_phase_offset(encoded: &[u8]) -> usize {
+        let mut decoder = Decoder::new(encoded);
+        decoder
+            .require_value_version(RESTORE_OPERATION_VALUE_FORMAT_VERSION)
+            .unwrap();
+        let _: [u8; OperationId::BYTE_WIDTH] = decoder.fixed("operation_id").unwrap();
+        let _: [u8; SHA256_BYTES] = decoder.fixed("identity_digest").unwrap();
+        let _: Option<[u8; SHA256_BYTES]> =
+            decoder.optional_fixed("initialization_digest").unwrap();
+        decoder.workbench_id("source_workbench_id").unwrap();
+        let _: [u8; nokv_types::FIXED_ID_BYTES] =
+            decoder.fixed("source_workspace_incarnation_id").unwrap();
+        decoder.source().unwrap();
+        decoder.workbench_id("destination_workbench_id").unwrap();
+        let _: [u8; nokv_types::FIXED_ID_BYTES] = decoder
+            .fixed("destination_workspace_incarnation_id")
+            .unwrap();
+        decoder
+            .manifest_identity("destination_restore_manifest_identity")
+            .unwrap();
+        decoder.string("restore_manifest.body_digest_uri").unwrap();
+        decoder.u64("restore_manifest.logical_size").unwrap();
+        decoder.string("restore_manifest.content_type").unwrap();
+        decoder.commit_provenance().unwrap();
+        decoder.offset
+    }
+
     #[test]
-    fn preparing_operation_round_trip_and_strict_envelope() {
+    fn restore_operation_v5_has_frozen_golden_digest_and_strict_envelope() {
         let record = operation(RestorePhase::Preparing);
         let encoded = record.encode().unwrap();
+        assert_eq!(encoded[0], RESTORE_OPERATION_VALUE_FORMAT_VERSION);
+        assert_eq!(encoded.len(), 809);
+        assert_eq!(
+            <[u8; SHA256_BYTES]>::from(Sha256::digest(&encoded)),
+            [
+                187, 141, 176, 65, 197, 79, 149, 230, 56, 116, 177, 115, 83, 238, 179, 92, 61, 20,
+                150, 171, 221, 149, 103, 217, 151, 30, 200, 95, 251, 50, 104, 20,
+            ]
+        );
         assert_eq!(RestoreOperationRecord::decode(&encoded).unwrap(), record);
+        assert_eq!(
+            record.destination_commit_receipt(),
+            Err(RestoreRecordError::PhaseMismatch {
+                expected: RestorePhase::Complete,
+                actual: RestorePhase::Preparing,
+            })
+        );
         let mut trailing = encoded;
         trailing.push(0);
         assert_eq!(
             RestoreOperationRecord::decode(&trailing),
             Err(RestoreRecordError::TrailingBytes { count: 1 })
         );
+    }
+
+    #[test]
+    fn legacy_v4_terminal_status_is_read_only_and_nonterminal_blocks_upgrade() {
+        for phase in [RestorePhase::Complete, RestorePhase::Cleaned] {
+            let decoded = RestoreOperationRecord::decode(&legacy_v4_operation(phase)).unwrap();
+            assert_eq!(decoded.phase, phase);
+            assert_eq!(
+                decoded.commit_provenance,
+                RestoreCommitProvenance::MissingLegacyV4
+            );
+            assert_eq!(
+                decoded.encode(),
+                Err(RestoreRecordError::LegacyProvenanceMissing { phase })
+            );
+            if phase == RestorePhase::Complete {
+                assert_eq!(
+                    decoded.destination_commit_receipt(),
+                    Err(RestoreRecordError::LegacyProvenanceMissing { phase })
+                );
+            }
+        }
+
+        let nonterminal = legacy_v4_operation(RestorePhase::Preparing);
+        assert_eq!(
+            RestoreOperationRecord::decode(&nonterminal),
+            Err(RestoreRecordError::LegacyNonterminalRequiresUpgrade {
+                phase: RestorePhase::Preparing,
+            })
+        );
+        let mut future = operation(RestorePhase::Preparing).encode().unwrap();
+        future[0] = RESTORE_OPERATION_VALUE_FORMAT_VERSION + 1;
+        assert_eq!(
+            RestoreOperationRecord::decode(&future),
+            Err(RestoreRecordError::UnsupportedValueVersion {
+                actual: RESTORE_OPERATION_VALUE_FORMAT_VERSION + 1,
+                expected: RESTORE_OPERATION_VALUE_FORMAT_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn v5_rejects_noncanonical_closure_combinations() {
+        let mut record = operation(RestorePhase::Preparing);
+        let RestoreCommitProvenance::V5(provenance) = &mut record.commit_provenance else {
+            unreachable!();
+        };
+        let closure = &mut provenance.closure;
+        closure.revision_ref_count = 1;
+        closure.revision_seal_count = 1;
+        closure.revision_cursor = Some(ArtifactRevisionId::from_bytes([7; 16]));
+        closure.revision_digest = [7; SHA256_BYTES];
+        closure.revision_seal = Some([8; SHA256_BYTES]);
+        assert!(matches!(
+            record.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "commit revision seal requires the complete revision closure",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn v5_late_destination_bind_is_required_exact_and_fail_closed() {
+        let mut sealed = operation(RestorePhase::Preparing)
+            .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
+            .unwrap();
+        sealed.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
+        sealed.source_eof = true;
+        sealed.source_member_count = 1;
+        sealed.source_member_rolling_digest = [7; SHA256_BYTES];
+        sealed.next_member_sequence = 1;
+        sealed.member_rolling_digest = [8; SHA256_BYTES];
+        sealed = sealed
+            .apply(
+                RestorePhase::Copying,
+                RestoreTransition::SealSource {
+                    source_member_seal: [7; SHA256_BYTES],
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            sealed.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [3; SHA256_BYTES],
+                    manifests: manifests(),
+                },
+            ),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "destination authority must be bound before commit construction",
+                ..
+            })
+        ));
+
+        let mut duplicate_revisions = binding();
+        duplicate_revisions
+            .restore_manifest_identity
+            .artifact_revision_id = duplicate_revisions
+            .run_manifest_identity
+            .artifact_revision_id;
+        assert!(matches!(
+            sealed.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination {
+                    binding: duplicate_revisions,
+                },
+            ),
+            Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "run and restore manifest identities must use distinct publication operations and revisions",
+            })
+        ));
+
+        let mut missing_projection = binding();
+        missing_projection.destination_projection_input_digest = [0; SHA256_BYTES];
+        assert!(matches!(
+            sealed.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination {
+                    binding: missing_projection,
+                },
+            ),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "destination projection input digest must be non-zero",
+                ..
+            })
+        ));
+
+        let mut dirty_reuses_base_content = binding();
+        dirty_reuses_base_content.effective_content_digest_uri = digest_uri(0x11);
+        assert!(matches!(
+            sealed.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination {
+                    binding: dirty_reuses_base_content,
+                },
+            ),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "effective content digest must preserve clean source content and distinguish dirty materialization",
+                ..
+            })
+        ));
+
+        let bound = sealed
+            .apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination { binding: binding() },
+            )
+            .unwrap();
+        let mut different = binding();
+        different.destination_commit_id = CommitId::from_bytes([5; SHA256_BYTES]);
+        assert!(matches!(
+            bound.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination { binding: different },
+            ),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "destination authority was already bound",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn snapshot_may_diverge_from_base_commit_but_commit_source_may_not() {
+        let mut snapshot = operation(RestorePhase::Preparing)
+            .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
+            .unwrap();
+        snapshot.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
+        snapshot.source_eof = true;
+        snapshot.source_member_count = 1;
+        snapshot.source_member_rolling_digest = [7; SHA256_BYTES];
+        snapshot.next_member_sequence = 1;
+        snapshot.member_rolling_digest = [8; SHA256_BYTES];
+        let sealed_snapshot = snapshot
+            .apply(
+                RestorePhase::Copying,
+                RestoreTransition::SealSource {
+                    source_member_seal: [7; SHA256_BYTES],
+                },
+            )
+            .unwrap();
+        assert_eq!(sealed_snapshot.source_matches_base_commit, Some(false));
+
+        let mut commit = snapshot;
+        commit.source = RestoreSource::Commit {
+            commit_id: CommitId::from_bytes([3; SHA256_BYTES]),
+        };
+        assert!(matches!(
+            commit.apply(
+                RestorePhase::Copying,
+                RestoreTransition::SealSource {
+                    source_member_seal: [7; SHA256_BYTES],
+                },
+            ),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "commit-source restore must exactly match its immutable commit closure",
+                ..
+            })
+        ));
+
+        let mut clean = operation(RestorePhase::Preparing)
+            .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
+            .unwrap();
+        clean.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
+        clean.source_eof = true;
+        clean.source_member_count = 1;
+        clean.source_member_rolling_digest = [0x22; SHA256_BYTES];
+        clean.next_member_sequence = 1;
+        clean.member_rolling_digest = [8; SHA256_BYTES];
+        clean = clean
+            .apply(
+                RestorePhase::Copying,
+                RestoreTransition::SealSource {
+                    source_member_seal: [0x22; SHA256_BYTES],
+                },
+            )
+            .unwrap();
+        assert_eq!(clean.source_matches_base_commit, Some(true));
+        assert!(matches!(
+            clean.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination { binding: binding() },
+            ),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "effective content digest must preserve clean source content and distinguish dirty materialization",
+                ..
+            })
+        ));
+        let mut preserves_base = binding();
+        preserves_base.effective_content_digest_uri = digest_uri(0x11);
+        assert!(clean
+            .apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination {
+                    binding: preserves_base,
+                },
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn v5_rejects_each_closure_cursor_and_seal_mismatch() {
+        let base = operation(RestorePhase::Preparing);
+
+        let mut raw_cursor = base.clone();
+        raw_cursor.source_member_count = 1;
+        raw_cursor.source_member_rolling_digest = [1; SHA256_BYTES];
+        assert!(matches!(
+            raw_cursor.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "source cursor presence must match non-empty raw source progress",
+                ..
+            })
+        ));
+
+        let mut raw_seal = base.clone();
+        raw_seal.source_cursor = Some(NormalizedRelativePath::new("input/a").unwrap());
+        raw_seal.source_member_count = 1;
+        raw_seal.source_member_rolling_digest = [1; SHA256_BYTES];
+        raw_seal.source_member_seal = Some([2; SHA256_BYTES]);
+        assert!(matches!(
+            raw_seal.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "restore closure seals must equal their rolling digests",
+                ..
+            })
+        ));
+
+        let mut destination_only_member = base.clone();
+        destination_only_member.next_member_sequence = 1;
+        destination_only_member.member_rolling_digest = [3; SHA256_BYTES];
+        assert!(matches!(
+            destination_only_member.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "materialized closure cannot contain rows absent from the raw source",
+                ..
+            })
+        ));
+
+        let mut materialized_seal = base.clone();
+        materialized_seal.source_cursor = Some(NormalizedRelativePath::new("input/a").unwrap());
+        materialized_seal.source_member_count = 1;
+        materialized_seal.source_member_rolling_digest = [2; SHA256_BYTES];
+        materialized_seal.next_member_sequence = 1;
+        materialized_seal.member_rolling_digest = [3; SHA256_BYTES];
+        materialized_seal.member_seal = Some([4; SHA256_BYTES]);
+        assert!(matches!(
+            materialized_seal.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "restore closure seals must equal their rolling digests",
+                ..
+            })
+        ));
+
+        let mut commit_member_cursor = base.clone();
+        let RestoreCommitProvenance::V5(provenance) = &mut commit_member_cursor.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.closure.member_count = 1;
+        provenance.closure.member_digest = [5; SHA256_BYTES];
+        assert!(matches!(
+            commit_member_cursor.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "commit member cursor must match non-empty member progress",
+                ..
+            })
+        ));
+
+        let mut commit_member_seal = base.clone();
+        let RestoreCommitProvenance::V5(provenance) = &mut commit_member_seal.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.closure.member_cursor =
+            Some(NormalizedRelativePath::new("output/result").unwrap());
+        provenance.closure.member_count = 1;
+        provenance.closure.member_digest = [5; SHA256_BYTES];
+        provenance.closure.member_seal = Some([6; SHA256_BYTES]);
+        assert!(matches!(
+            commit_member_seal.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "commit member seal must equal the rolling digest",
+                ..
+            })
+        ));
+
+        let mut revision_cursor = base.clone();
+        let RestoreCommitProvenance::V5(provenance) = &mut revision_cursor.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.revision_ref_count = 1;
+        provenance.closure.revision_seal_count = 1;
+        provenance.closure.revision_digest = [7; SHA256_BYTES];
+        assert!(matches!(
+            revision_cursor.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "commit revision cursor must match non-empty sealing progress",
+                ..
+            })
+        ));
+
+        let mut parent_seal = base;
+        let RestoreCommitProvenance::V5(provenance) = &mut parent_seal.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.parent_seal = Some([8; SHA256_BYTES]);
+        assert!(matches!(
+            parent_seal.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                reason: "commit parent seal must equal the single-parent digest",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn destination_building_and_sealing_accept_only_their_own_progress() {
+        let building = destination_building_operation();
+        assert_eq!(
+            RestoreOperationRecord::decode(&building.encode().unwrap()).unwrap(),
+            building
+        );
+
+        let mut prematurely_sealed = building.clone();
+        let RestoreCommitProvenance::V5(provenance) = &mut prematurely_sealed.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.closure.member_seal = Some([0; SHA256_BYTES]);
+        assert!(matches!(
+            prematurely_sealed.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                phase: RestorePhase::DestinationBuilding,
+                reason: "destination build requires staged manifests and unsealed commit progress",
+            })
+        ));
+
+        let mut building = building;
+        let parent_digest = match &mut building.commit_provenance {
+            RestoreCommitProvenance::V5(provenance) => {
+                let closure = &mut provenance.closure;
+                closure.member_cursor =
+                    Some(NormalizedRelativePath::new("metadata/run_manifest.json").unwrap());
+                closure.member_count = 3;
+                closure.member_digest = [9; SHA256_BYTES];
+                closure.revision_ref_count = 2;
+                closure.parent_digest
+            }
+            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+        };
+        let sealing = building
+            .apply(
+                RestorePhase::DestinationBuilding,
+                RestoreTransition::BeginDestinationSealing {
+                    member_seal: [9; SHA256_BYTES],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            RestoreOperationRecord::decode(&sealing.encode().unwrap()).unwrap(),
+            sealing
+        );
+
+        let mut partial_revision_scan = sealing;
+        match &mut partial_revision_scan.commit_provenance {
+            RestoreCommitProvenance::V5(provenance) => {
+                provenance.closure.revision_cursor =
+                    Some(ArtifactRevisionId::from_bytes([0x31; 16]));
+                provenance.closure.revision_seal_count = 1;
+                provenance.closure.revision_digest = [10; SHA256_BYTES];
+            }
+            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+        }
+        assert!(partial_revision_scan.encode().is_ok());
+
+        let RestoreCommitProvenance::V5(provenance) = &mut partial_revision_scan.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.closure.parent_seal = Some(parent_digest);
+        assert!(matches!(
+            partial_revision_scan.encode(),
+            Err(RestoreRecordError::InvalidPhasePayload {
+                phase: RestorePhase::DestinationSealing,
+                reason: "destination sealing requires the complete member seal only",
+            })
+        ));
+    }
+
+    #[test]
+    fn actual_destination_manifests_install_atomically_and_exactly_once() {
+        let bound = bound_source_operation();
+
+        let mut wrong_identity = manifests();
+        wrong_identity.run_manifest.publication_operation_id = OperationId::from_bytes([0x43; 16]);
+        assert!(matches!(
+            bound.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [3; SHA256_BYTES],
+                    manifests: wrong_identity,
+                },
+            ),
+            Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "published destination manifest must match its expected identity",
+            })
+        ));
+
+        let mut wrong_incarnation = manifests();
+        wrong_incarnation.restore_manifest.workspace_incarnation_id =
+            WorkspaceIncarnationId::from_bytes([8; 16]);
+        assert!(matches!(
+            bound.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [3; SHA256_BYTES],
+                    manifests: wrong_incarnation,
+                },
+            ),
+            Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason:
+                    "published destination manifests must target the hidden destination incarnation",
+            })
+        ));
+
+        let mut wrong_descriptor = manifests();
+        wrong_descriptor.restore_manifest.logical_size += 1;
+        assert!(matches!(
+            bound.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [3; SHA256_BYTES],
+                    manifests: wrong_descriptor,
+                },
+            ),
+            Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "published restore manifest must match its begin descriptor",
+            })
+        ));
+
+        let building = bound
+            .apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [3; SHA256_BYTES],
+                    manifests: manifests(),
+                },
+            )
+            .unwrap();
+        assert_eq!(building.next_member_sequence, 1);
+        assert_eq!(building.member_seal, Some([8; SHA256_BYTES]));
+        assert!(matches!(
+            building.apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [3; SHA256_BYTES],
+                    manifests: manifests(),
+                },
+            ),
+            Err(RestoreRecordError::PhaseMismatch {
+                expected: RestorePhase::SourceSealed,
+                actual: RestorePhase::DestinationBuilding,
+            })
+        ));
+    }
+
+    #[test]
+    fn run_and_restore_manifest_publications_have_distinct_size_contracts() {
+        let mut large_run = manifests();
+        large_run.run_manifest.logical_size = MAX_RESTORE_MANIFEST_BYTES as u64 + 1;
+        assert!(large_run.validate().is_ok());
+
+        let mut large_restore = manifests();
+        large_restore.restore_manifest.logical_size = MAX_RESTORE_MANIFEST_BYTES as u64 + 1;
+        assert_eq!(
+            large_restore.validate(),
+            Err(RestoreRecordError::InvalidManifestDescriptor {
+                reason: "published restore manifest exceeds its body bound",
+            })
+        );
+    }
+
+    #[test]
+    fn empty_materialized_workspace_still_requires_two_commit_members_and_revisions() {
+        let mut record = operation(RestorePhase::Preparing)
+            .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
+            .unwrap();
+        record.source_cursor =
+            Some(NormalizedRelativePath::new("metadata/run_manifest.json").unwrap());
+        record.source_eof = true;
+        record.source_member_count = 1;
+        record.source_member_rolling_digest = [7; SHA256_BYTES];
+        record = record
+            .apply(
+                RestorePhase::Copying,
+                RestoreTransition::SealSource {
+                    source_member_seal: [7; SHA256_BYTES],
+                },
+            )
+            .unwrap()
+            .apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BindDestination { binding: binding() },
+            )
+            .unwrap()
+            .apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [3; SHA256_BYTES],
+                    manifests: manifests(),
+                },
+            )
+            .unwrap();
+        assert_eq!(record.next_member_sequence, 0);
+        assert_eq!(record.member_seal, Some([0; SHA256_BYTES]));
+        let RestoreCommitProvenance::V5(provenance) = &mut record.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.member_cursor =
+            Some(NormalizedRelativePath::new("metadata/run_manifest.json").unwrap());
+        provenance.closure.member_count = 2;
+        provenance.closure.member_digest = [9; SHA256_BYTES];
+        provenance.closure.revision_ref_count = 2;
+        assert!(record
+            .apply(
+                RestorePhase::DestinationBuilding,
+                RestoreTransition::BeginDestinationSealing {
+                    member_seal: [9; SHA256_BYTES],
+                },
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn destination_commit_digest_is_independent_of_manifest_append_order() {
+        fn roll(rows: [[u8; SHA256_BYTES]; 3]) -> [u8; SHA256_BYTES] {
+            rows.into_iter()
+                .enumerate()
+                .fold([0; SHA256_BYTES], |digest, (sequence, row)| {
+                    advance_commit_member_rolling_digest(digest, sequence as u64, row)
+                })
+        }
+
+        let ordinary = [1; SHA256_BYTES];
+        let run_manifest = [2; SHA256_BYTES];
+        let restore_manifest = [3; SHA256_BYTES];
+        // RestoreMember is append ordered: copied ordinary member, then the
+        // two destination-owned publications.
+        let publication_order_digest = roll([ordinary, run_manifest, restore_manifest]);
+        // CommitMember is path ordered: metadata/restore_manifest.json,
+        // metadata/run_manifest.json, then outputs/result.
+        let canonical_commit_digest = roll([restore_manifest, run_manifest, ordinary]);
+        assert_ne!(publication_order_digest, canonical_commit_digest);
+
+        let mut building = destination_building_operation();
+        let RestoreCommitProvenance::V5(provenance) = &mut building.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.member_cursor =
+            Some(NormalizedRelativePath::new("outputs/result").unwrap());
+        provenance.closure.member_count = 3;
+        provenance.closure.member_digest = canonical_commit_digest;
+        provenance.closure.revision_ref_count = 2;
+
+        let sealing = building
+            .apply(
+                RestorePhase::DestinationBuilding,
+                RestoreTransition::BeginDestinationSealing {
+                    member_seal: canonical_commit_digest,
+                },
+            )
+            .unwrap();
+        assert!(sealing.encode().is_ok());
     }
 
     #[test]
@@ -1063,25 +3107,42 @@ mod tests {
 
     #[test]
     fn complete_state_machine_path_is_validated() {
-        let mut record = operation(RestorePhase::Preparing)
-            .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
-            .unwrap();
-        record.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
-        record.source_eof = true;
-        record.next_member_sequence = 1;
-        record.member_rolling_digest = [8; SHA256_BYTES];
+        let mut record = destination_building_operation();
+        let parent_seal = match &mut record.commit_provenance {
+            RestoreCommitProvenance::V5(provenance) => {
+                let closure = &mut provenance.closure;
+                closure.member_cursor =
+                    Some(NormalizedRelativePath::new("metadata/run_manifest.json").unwrap());
+                closure.member_count = 3;
+                closure.member_digest = [9; SHA256_BYTES];
+                closure.revision_ref_count = 2;
+                closure.parent_digest
+            }
+            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+        };
         record = record
             .apply(
-                RestorePhase::Copying,
-                RestoreTransition::SealSource {
-                    member_seal: [8; SHA256_BYTES],
+                RestorePhase::DestinationBuilding,
+                RestoreTransition::BeginDestinationSealing {
+                    member_seal: [9; SHA256_BYTES],
                 },
             )
-            .unwrap()
+            .unwrap();
+        match &mut record.commit_provenance {
+            RestoreCommitProvenance::V5(provenance) => {
+                let closure = &mut provenance.closure;
+                closure.revision_cursor = Some(ArtifactRevisionId::from_bytes([0x32; 16]));
+                closure.revision_seal_count = 2;
+                closure.revision_digest = [11; SHA256_BYTES];
+            }
+            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+        }
+        record = record
             .apply(
-                RestorePhase::SourceSealed,
+                RestorePhase::DestinationSealing,
                 RestoreTransition::MarkReady {
-                    initialization_digest: [3; SHA256_BYTES],
+                    revision_seal: [11; SHA256_BYTES],
+                    parent_seal,
                 },
             )
             .unwrap();
@@ -1092,9 +3153,22 @@ mod tests {
             member_digest: [8; SHA256_BYTES],
         };
         record = record
-            .apply(RestorePhase::Ready, RestoreTransition::Complete { result })
+            .apply(
+                RestorePhase::Ready,
+                RestoreTransition::Complete {
+                    result,
+                    destination_head_generation: Generation::new(1).unwrap(),
+                },
+            )
             .unwrap();
         assert_eq!(record.phase, RestorePhase::Complete);
+        assert_eq!(
+            record.destination_commit_receipt().unwrap(),
+            RestoreDestinationCommitReceipt {
+                destination_commit_id: CommitId::from_bytes([4; SHA256_BYTES]),
+                destination_head_generation: Generation::new(1).unwrap(),
+            }
+        );
         assert_eq!(
             RestoreOperationRecord::decode(&record.encode().unwrap()).unwrap(),
             record
@@ -1107,7 +3181,10 @@ mod tests {
             .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
             .unwrap();
         record.source_cursor = Some(NormalizedRelativePath::new("input/a").unwrap());
+        record.source_member_count = 1;
+        record.source_member_rolling_digest = [7; SHA256_BYTES];
         record.next_member_sequence = 1;
+        record.member_rolling_digest = [8; SHA256_BYTES];
         record = record
             .apply(
                 RestorePhase::Copying,
@@ -1161,6 +3238,17 @@ mod tests {
             RestoreOperationRecord::decode(&encoded),
             Err(RestoreRecordError::UnknownDiscriminant {
                 type_name: "RestoreSourceKind",
+                value: 0xff,
+            })
+        );
+
+        let mut encoded = record.encode().unwrap();
+        let phase_offset = v5_phase_offset(&encoded);
+        encoded[phase_offset] = 0xff;
+        assert_eq!(
+            RestoreOperationRecord::decode(&encoded),
+            Err(RestoreRecordError::UnknownDiscriminant {
+                type_name: "RestorePhase",
                 value: 0xff,
             })
         );

@@ -470,6 +470,16 @@ pub fn lease_commit_consumer_key(
     key
 }
 
+pub fn snapshot_commit_consumer_key(
+    root: RootId,
+    commit: CommitId,
+    snapshot: SnapshotId,
+) -> Vec<u8> {
+    let mut key = commit_consumer_prefix(root, commit, CommitConsumerKind::Snapshot);
+    key.extend_from_slice(&snapshot.get().to_be_bytes());
+    key
+}
+
 pub fn child_commit_consumer_key(root: RootId, parent: CommitId, child: CommitId) -> Vec<u8> {
     let mut key = commit_consumer_prefix(root, parent, CommitConsumerKind::ChildCommit);
     key.extend_from_slice(child.as_bytes());
@@ -960,13 +970,16 @@ mod tests {
         let tag_owner = tag_commit_consumer_key(root, parent, workspace, &tag);
         let lease = lease_commit_consumer_key(root, parent, operation);
         let child_owner = child_commit_consumer_key(root, parent, child);
+        let snapshot_owner = snapshot_commit_consumer_key(root, parent, SnapshotId::new(9));
         assert_eq!(head[48], u8::from(CommitConsumerKind::WorkbenchHead));
         assert_eq!(tag_owner[48], u8::from(CommitConsumerKind::Tag));
         assert_eq!(lease[48], u8::from(CommitConsumerKind::Lease));
         assert_eq!(child_owner[48], u8::from(CommitConsumerKind::ChildCommit));
+        assert_eq!(snapshot_owner[48], u8::from(CommitConsumerKind::Snapshot));
         assert_eq!(&head[49..], workspace.as_bytes());
         assert_eq!(&lease[49..], operation.as_bytes());
         assert_eq!(&child_owner[49..], child.as_bytes());
+        assert_eq!(&snapshot_owner[49..], &9_u64.to_be_bytes());
         assert_eq!(&tag_owner[49..65], workspace.as_bytes());
         assert_eq!(&tag_owner[65..67], &4_u16.to_be_bytes());
         assert_eq!(&tag_owner[67..], b"prod");

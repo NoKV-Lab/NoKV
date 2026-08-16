@@ -12,14 +12,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use nokv_types::{
-    ArtifactRevisionId, BuildCommitPhase, CommitId, CommitRetirePhase, CommitState, CommitVersion,
-    ConsumerEpoch, GcClaimState, Generation, HistoryHoldState, NormalizedRelativePath, OperationId,
-    OperationKind, ReferenceEpoch, RevisionState, RootId, TagName, WorkbenchId,
-    WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState, FIXED_ID_BYTES, SHA256_BYTES,
-};
-use sha2::{Digest, Sha256};
-
 use super::build_commit_records::{
     BuildCommitOperationRecord, BuildCommitResult, CommitManifestCondition,
     CommitOperationErrorKind, CommitOperationRecordError, CommitOperationTerminalError,
@@ -32,9 +24,15 @@ use super::codec::{
     path_revision_ref_key, tag_commit_consumer_key, tag_key, workbench_commit_head_key,
     workbench_head_commit_consumer_key, workspace_current_key, SCHEMA_ID,
 };
+use super::commit_closure::{
+    advance_commit_parent_rolling_digest, advance_commit_revision_rolling_digest,
+    plan_commit_member as plan_member_closure, plan_commit_parent, plan_commit_revision,
+    CommitClosureError,
+};
 use super::commit_records::{
-    advance_commit_member_rolling_digest, commit_member_row_digest, CommitConsumerRecord,
-    CommitMemberRecord, CommitRecord, CommitRecordError, TagRecord, WorkbenchCommitHeadRecord,
+    add_commit_consumer, advance_commit_member_rolling_digest, commit_member_row_digest,
+    remove_commit_consumer, CommitConsumerMutationError, CommitConsumerRecord, CommitMemberRecord,
+    CommitRecord, CommitRecordError, TagRecord, WorkbenchCommitHeadRecord,
 };
 use super::engine::{
     CommandFit, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
@@ -52,6 +50,12 @@ use super::publication_records::{
 };
 use super::query_records::{ChangeEventKind, ChangeEventRecord, QueryRecordError, TypedProjection};
 use super::snapshot_records::{HistoryHoldRecord, SnapshotRecordError};
+use nokv_types::{
+    ArtifactRevisionId, BuildCommitPhase, CommitId, CommitRetirePhase, CommitState, CommitVersion,
+    ConsumerEpoch, GcClaimState, Generation, HistoryHoldState, NormalizedRelativePath, OperationId,
+    OperationKind, ReferenceEpoch, RevisionState, RootId, TagName, WorkbenchId,
+    WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState, FIXED_ID_BYTES, SHA256_BYTES,
+};
 
 const MAX_COMMAND_ITEMS: usize = 256;
 /// Canonical Workbench projection installed only with its typed commit head.
@@ -159,6 +163,7 @@ pub enum CommitError {
     Meta(MetaError),
     Namespace(NamespaceError),
     CommitCodec(CommitRecordError),
+    CommitClosure(CommitClosureError),
     OperationCodec(CommitOperationRecordError),
     PublicationCodec(PublicationRecordCodecError),
     SnapshotCodec(SnapshotRecordError),
@@ -215,6 +220,7 @@ impl fmt::Display for CommitError {
             Self::Meta(error) => error.fmt(formatter),
             Self::Namespace(error) => error.fmt(formatter),
             Self::CommitCodec(error) => error.fmt(formatter),
+            Self::CommitClosure(error) => error.fmt(formatter),
             Self::OperationCodec(error) => error.fmt(formatter),
             Self::PublicationCodec(error) => error.fmt(formatter),
             Self::SnapshotCodec(error) => error.fmt(formatter),
@@ -284,6 +290,7 @@ impl std::error::Error for CommitError {
             Self::Meta(source) => Some(source),
             Self::Namespace(source) => Some(source),
             Self::CommitCodec(source) => Some(source),
+            Self::CommitClosure(source) => Some(source),
             Self::OperationCodec(source) => Some(source),
             Self::PublicationCodec(source) => Some(source),
             Self::SnapshotCodec(source) => Some(source),
@@ -308,6 +315,12 @@ impl From<NamespaceError> for CommitError {
 impl From<CommitRecordError> for CommitError {
     fn from(error: CommitRecordError) -> Self {
         Self::CommitCodec(error)
+    }
+}
+
+impl From<CommitClosureError> for CommitError {
+    fn from(error: CommitClosureError) -> Self {
+        Self::CommitClosure(error)
     }
 }
 
@@ -740,14 +753,17 @@ impl<'a> CommitService<'a> {
         observed_revisions: &mut BTreeSet<ArtifactRevisionId>,
         plan: &mut CommandPlan,
     ) -> Result<(), CommitError> {
-        let row_digest = commit_member_row_digest(path, member)?;
-        operation.member_digest = advance_commit_member_rolling_digest(
-            operation.member_digest,
+        let closure = plan_member_closure(
+            operation.member_cursor.as_ref(),
             operation.member_count,
-            row_digest,
+            operation.member_digest,
+            path,
+            member,
         );
-        operation.member_count = checked_add(operation.member_count, 1, "member_count")?;
-        operation.member_cursor = Some(path.clone());
+        let closure = closure?;
+        operation.member_digest = closure.digest;
+        operation.member_count = closure.count;
+        operation.member_cursor = Some(closure.cursor);
         plan.put_absent(
             MetadataFamily::CommitMember,
             commit_member_key(context.root_id, operation.commit_id, path),
@@ -871,14 +887,15 @@ impl<'a> CommitService<'a> {
         for row in rows {
             let revision = decode_commit_revision_ref_key(&prefix, &row.key)?;
             RevisionRefRecord::decode(&row.value)?;
-            next.revision_digest = advance_commit_revision_rolling_digest(
-                next.revision_digest,
+            let closure = plan_commit_revision(
+                next.revision_cursor,
                 next.revision_seal_count,
+                next.revision_digest,
                 revision,
                 &row.value,
-            );
-            next.revision_seal_count =
-                checked_add(next.revision_seal_count, 1, "revision_seal_count")?;
+            )?;
+            next.revision_digest = closure.digest;
+            next.revision_seal_count = closure.count;
             if next.revision_seal_count > next.revision_ref_count {
                 return Err(CommitError::ClosureMismatch {
                     closure: "revision",
@@ -886,7 +903,7 @@ impl<'a> CommitService<'a> {
                     actual_count: next.revision_seal_count,
                 });
             }
-            next.revision_cursor = Some(revision);
+            next.revision_cursor = Some(closure.cursor);
         }
         if !has_more {
             if next.revision_seal_count != next.revision_ref_count {
@@ -962,17 +979,17 @@ impl<'a> CommitService<'a> {
                 }
                 .encode(),
             )?;
-            next.parent_digest = advance_commit_parent_rolling_digest(
-                next.parent_digest,
-                u64::from(next.parent_cursor),
-                parent_id,
-            );
-            next.parent_cursor =
+            let closure = plan_commit_parent(
+                next.commit_id,
                 next.parent_cursor
-                    .checked_add(1)
-                    .ok_or(CommitError::CounterOverflow {
-                        field: "parent_cursor",
-                    })?;
+                    .checked_sub(1)
+                    .map(|index| next.parent_commits[index as usize]),
+                next.parent_cursor,
+                next.parent_digest,
+                parent_id,
+            )?;
+            next.parent_digest = closure.digest;
+            next.parent_cursor = closure.count;
             candidates.push(BuildCommandCandidate {
                 plan: plan.clone(),
                 operation: next.clone(),
@@ -1274,15 +1291,15 @@ impl<'a> CommitService<'a> {
         if current_path.as_ref().map(|loaded| &loaded.record) != source_path.as_ref() {
             return Err(CommitError::HeadConflict);
         }
-        if current_path
-            .as_ref()
-            .is_some_and(|current| !current.record.typed_index_projection.is_empty())
-        {
-            return Err(CommitError::ClosureMismatch {
-                closure: "run manifest secondary index",
-                expected_count: 0,
-                actual_count: 1,
-            });
+        if let Some(current) = current_path.as_ref() {
+            let projection = TypedProjection::decode(&current.record.typed_index_projection)?;
+            if !projection.fields().is_empty() {
+                return Err(CommitError::ClosureMismatch {
+                    closure: "run manifest secondary index",
+                    expected_count: 0,
+                    actual_count: 1,
+                });
+            }
         }
 
         let member_key = commit_member_key(context.root_id, operation.commit_id, &path);
@@ -2803,27 +2820,30 @@ fn require_sealed(record: &CommitRecord, commit_id: CommitId) -> Result<(), Comm
 }
 
 fn add_consumer(record: &CommitRecord) -> Result<CommitRecord, CommitError> {
-    let mut next = record.clone();
-    next.consumer_count = checked_add(next.consumer_count, 1, "consumer_count")?;
-    next.consumer_epoch =
-        ConsumerEpoch::new(checked_add(next.consumer_epoch.get(), 1, "consumer_epoch")?);
-    next.last_zero_consumer_version = None;
-    Ok(next)
+    add_commit_consumer(record).map_err(|error| match error {
+        CommitConsumerMutationError::CountOverflow => CommitError::CounterOverflow {
+            field: "consumer_count",
+        },
+        CommitConsumerMutationError::EpochOverflow => CommitError::CounterOverflow {
+            field: "consumer_epoch",
+        },
+        CommitConsumerMutationError::CountUnderflow => CommitError::ConsumerCountUnderflow,
+    })
 }
 
 fn remove_consumer(
     record: &CommitRecord,
     zero_version: CommitVersion,
 ) -> Result<CommitRecord, CommitError> {
-    let mut next = record.clone();
-    next.consumer_count = next
-        .consumer_count
-        .checked_sub(1)
-        .ok_or(CommitError::ConsumerCountUnderflow)?;
-    next.consumer_epoch =
-        ConsumerEpoch::new(checked_add(next.consumer_epoch.get(), 1, "consumer_epoch")?);
-    next.last_zero_consumer_version = (next.consumer_count == 0).then_some(zero_version);
-    Ok(next)
+    remove_commit_consumer(record, zero_version).map_err(|error| match error {
+        CommitConsumerMutationError::CountOverflow => CommitError::CounterOverflow {
+            field: "consumer_count",
+        },
+        CommitConsumerMutationError::EpochOverflow => CommitError::CounterOverflow {
+            field: "consumer_epoch",
+        },
+        CommitConsumerMutationError::CountUnderflow => CommitError::ConsumerCountUnderflow,
+    })
 }
 
 fn remove_revision_reference(
@@ -2866,37 +2886,6 @@ fn decode_commit_revision_ref_key(
             .try_into()
             .expect("validated revision-id suffix width"),
     ))
-}
-
-/// Advance the sorted unique revision closure using the strict ref payload.
-pub fn advance_commit_revision_rolling_digest(
-    previous: [u8; SHA256_BYTES],
-    sequence: u64,
-    revision_id: ArtifactRevisionId,
-    revision_ref_payload: &[u8],
-) -> [u8; SHA256_BYTES] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"nokv.commit.revisions.v1\0");
-    hasher.update(previous);
-    hasher.update(sequence.to_be_bytes());
-    hasher.update(revision_id.as_bytes());
-    hasher.update((revision_ref_payload.len() as u32).to_be_bytes());
-    hasher.update(revision_ref_payload);
-    hasher.finalize().into()
-}
-
-/// Advance the strictly increasing direct-parent closure.
-pub fn advance_commit_parent_rolling_digest(
-    previous: [u8; SHA256_BYTES],
-    sequence: u64,
-    parent_id: CommitId,
-) -> [u8; SHA256_BYTES] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"nokv.commit.parents.v1\0");
-    hasher.update(previous);
-    hasher.update(sequence.to_be_bytes());
-    hasher.update(parent_id.as_bytes());
-    hasher.finalize().into()
 }
 
 /// Bind the public tree digest to the exact frozen `CommitMember` closure.

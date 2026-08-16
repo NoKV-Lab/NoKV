@@ -631,6 +631,7 @@ durable_enum! {
         Tag = 2,
         Lease = 3,
         ChildCommit = 4,
+        Snapshot = 5,
     }
 }
 
@@ -691,6 +692,8 @@ durable_enum! {
         Cleaning = 7,
         Cleaned = 8,
         Quarantined = 9,
+        DestinationBuilding = 10,
+        DestinationSealing = 11,
     }
 }
 
@@ -1087,6 +1090,7 @@ mod tests {
             (CommitConsumerKind::Tag, 2),
             (CommitConsumerKind::Lease, 3),
             (CommitConsumerKind::ChildCommit, 4),
+            (CommitConsumerKind::Snapshot, 5),
         ]);
         assert_durable_registry(&[
             (RestoreSourceKind::Snapshot, 1),
@@ -1127,6 +1131,8 @@ mod tests {
             (RestorePhase::Cleaning, 7),
             (RestorePhase::Cleaned, 8),
             (RestorePhase::Quarantined, 9),
+            (RestorePhase::DestinationBuilding, 10),
+            (RestorePhase::DestinationSealing, 11),
         ]);
         assert_durable_registry(&[
             (CommitRetirePhase::Claiming, 1),

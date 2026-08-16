@@ -15,23 +15,31 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, CommandDigest, CommitId, CommitState, CommitVersion, ConsumerEpoch,
-    GcClaimState, HistoryHoldState, NormalizedRelativePath, OperationId, OperationKind,
-    ReadVersion, ReferenceEpoch, RestorePhase, RevisionState, SnapshotId, SnapshotState,
-    WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
+    GcClaimState, Generation, HistoryHoldState, NormalizedRelativePath, OperationId, OperationKind,
+    PublishPhase, ReadVersion, ReferenceEpoch, RestorePhase, RevisionState, SnapshotId,
+    SnapshotState, WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState,
+    FIXED_ID_BYTES, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    artifact_revision_key, commit_key, commit_member_prefix, decode_commit_member_key,
-    decode_path_current_key, gc_candidate_key, lease_commit_consumer_key, operation_key,
-    path_child_prefix, path_current_key, path_revision_ref_key, restore_history_hold_key,
-    restore_member_key, restore_member_prefix, snapshot_ref_key, workspace_current_key,
-    workspace_incarnation_claim_key, SCHEMA_ID,
+    artifact_revision_key, child_commit_consumer_key, commit_key, commit_member_key,
+    commit_member_prefix, commit_revision_ref_key, commit_revision_ref_prefix,
+    decode_commit_member_key, decode_path_current_key, gc_candidate_key, lease_commit_consumer_key,
+    operation_key, path_child_prefix, path_current_key, path_revision_ref_key,
+    restore_history_hold_key, restore_member_key, restore_member_prefix,
+    snapshot_commit_consumer_key, snapshot_ref_key, workbench_commit_head_key,
+    workbench_head_commit_consumer_key, workspace_current_key, workspace_incarnation_claim_key,
+    SCHEMA_ID,
 };
 use super::commit::RUN_MANIFEST_PATH;
+use super::commit_closure::{
+    advance_commit_parent_rolling_digest, plan_commit_member, plan_commit_revision,
+};
 use super::commit_records::{
-    advance_commit_member_rolling_digest, commit_member_row_digest, CommitConsumerRecord,
-    CommitMemberRecord, CommitRecord, CommitRecordError,
+    add_commit_consumer, advance_commit_member_rolling_digest, commit_member_row_digest,
+    remove_commit_consumer, CommitConsumerMutationError, CommitConsumerRecord, CommitMemberRecord,
+    CommitRecord, CommitRecordError, WorkbenchCommitHeadRecord,
 };
 use super::engine::{
     CommandFit, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
@@ -44,14 +52,19 @@ use super::publication_records::{
     ArtifactRevisionRecord, GcCandidateRecord, PathEntry, PublicationRecordCodecError,
     RevisionRefRecord, WorkspaceIncarnationClaimRecord, WorkspaceRecord,
 };
+use super::publish_operation_records::{
+    PublishAuthority, PublishClaim, PublishOperationRecord, PublishRecordError,
+};
 use super::query_records::{
     secondary_index_key, ChangeEventKind, ChangeEventRecord, QueryFieldId, QueryRecordError,
     QueryScalar, SecondaryIndexRecord, TypedProjection,
 };
 use super::restore_records::{
-    RestoreManifestDescriptor, RestoreMemberRecord, RestoreOperationRecord, RestoreRecordError,
-    RestoreResult, RestoreSource, RestoreTerminalError, RestoreTerminalErrorKind,
-    RestoreTransition, MAX_RESTORE_TERMINAL_ERROR_BYTES,
+    RestoreCommitClosureProgress, RestoreCommitProvenance, RestoreCommitProvenanceV5,
+    RestoreDestinationBinding, RestoreManifestDescriptor, RestoreManifestIdentity,
+    RestoreManifestPublication, RestoreMemberRecord, RestoreOperationRecord, RestoreRecordError,
+    RestoreResult, RestoreSource, RestoreSourceCommitSeal, RestoreTerminalError,
+    RestoreTerminalErrorKind, RestoreTransition, MAX_RESTORE_TERMINAL_ERROR_BYTES,
 };
 use super::snapshot_records::{HistoryHoldRecord, SnapshotRecordError, SnapshotRefRecord};
 
@@ -69,6 +82,8 @@ const CAPACITY_EXCEEDED_MESSAGE: &str =
     "restore source member exceeds the serving metadata transaction budget";
 const CLEANUP_CAPACITY_EXCEEDED_MESSAGE: &str =
     "restore cleanup member exceeds the serving metadata transaction budget";
+const QUARANTINED_PUBLICATION_MESSAGE: &str =
+    "restore cleanup is blocked by a quarantined destination manifest publication";
 
 /// Caller selection before a snapshot read version is frozen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,11 +103,16 @@ pub struct RestoreInitialization {
 /// Atomic creation request for a destination workspace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeginRestoreRequest {
+    pub operation_id: OperationId,
     pub source_workbench_id: WorkbenchId,
     pub expected_source_workspace_incarnation_id: WorkspaceIncarnationId,
     pub source: RestoreSourceSelector,
     pub destination_workbench_id: WorkbenchId,
     pub destination_workspace_incarnation_id: WorkspaceIncarnationId,
+    pub destination_restore_manifest_identity: RestoreManifestIdentity,
+    /// First-writer commit-time proposal. A retry may propose a later clock
+    /// value; the durable operation always wins.
+    pub destination_committed_at_unix_seconds: u64,
     pub restore_manifest: RestoreManifestDescriptor,
 }
 
@@ -101,8 +121,22 @@ pub struct RestoreOperationRequest {
     pub operation_id: OperationId,
 }
 
+/// Exact destination commit and projection authority bound after source seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindRestoreDestinationRequest {
+    pub operation_id: OperationId,
+    pub binding: RestoreDestinationBinding,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CopyRestoreBatchRequest {
+    pub operation_id: OperationId,
+    pub limit: usize,
+}
+
+/// One bounded destination commit-closure step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreClosureBatchRequest {
     pub operation_id: OperationId,
     pub limit: usize,
 }
@@ -130,11 +164,36 @@ pub struct CopyRestoreBatchOutcome {
     pub source_eof: bool,
 }
 
+/// Progress returned by one bounded destination commit-member build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildRestoreCommitBatchOutcome {
+    pub command: RestoreCommandOutcome,
+    pub built_members: usize,
+    pub members_complete: bool,
+}
+
+/// Progress returned by one bounded destination revision-ref seal scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealRestoreCommitBatchOutcome {
+    pub command: RestoreCommandOutcome,
+    pub sealed_revisions: usize,
+    pub ready: bool,
+}
+
 /// Final publication result retained in the terminal operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompleteRestoreOutcome {
     pub command: RestoreCommandOutcome,
     pub result: RestoreResult,
+}
+
+/// Exact commit-owned source run manifest retained for destination projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreSourceRunManifest {
+    pub operation: RestoreOperationRecord,
+    pub source_commit_id: CommitId,
+    pub source_snapshot_read_version: Option<ReadVersion>,
+    pub path_entry: PathEntry,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +223,9 @@ pub enum RestoreError {
         lease_deadline_ms: u64,
     },
     SnapshotRetentionMismatch,
+    SnapshotCommitProvenanceMissing {
+        snapshot_id: SnapshotId,
+    },
     CommitMissing {
         commit_id: CommitId,
     },
@@ -178,7 +240,14 @@ pub enum RestoreError {
     OperationIdentityCollision {
         operation_id: OperationId,
     },
+    OperationIdentityMismatch {
+        expected: OperationId,
+        actual: OperationId,
+    },
     RestoreManifestBindingMismatch {
+        operation_id: OperationId,
+    },
+    DestinationBindingMismatch {
         operation_id: OperationId,
     },
     InvalidPhase {
@@ -232,6 +301,10 @@ pub enum RestoreError {
     ManifestBindingMismatch,
     RestoreManifestMissing,
     ManifestRevisionMismatch,
+    PublicationCleanupPending {
+        operation_id: OperationId,
+        phase: PublishPhase,
+    },
     DuplicateCommandKey {
         family: MetadataFamily,
     },
@@ -245,6 +318,7 @@ pub enum RestoreError {
     SnapshotCodec(SnapshotRecordError),
     RestoreCodec(RestoreRecordError),
     QueryRecord(QueryRecordError),
+    PublishCodec(PublishRecordError),
     Meta(MetaError),
 }
 
@@ -288,6 +362,10 @@ impl fmt::Display for RestoreError {
             Self::SnapshotRetentionMismatch => {
                 formatter.write_str("snapshot restore retention records are inconsistent")
             }
+            Self::SnapshotCommitProvenanceMissing { snapshot_id } => write!(
+                formatter,
+                "snapshot {snapshot_id} does not retain a sealed source commit"
+            ),
             Self::CommitMissing { commit_id } => {
                 write!(formatter, "commit {:02x?} does not exist", commit_id.as_bytes())
             }
@@ -309,9 +387,20 @@ impl fmt::Display for RestoreError {
                 "restore operation identity collision at {:02x?}",
                 operation_id.as_bytes()
             ),
+            Self::OperationIdentityMismatch { expected, actual } => write!(
+                formatter,
+                "restore operation identity {:02x?} does not match derived v2 identity {:02x?}",
+                actual.as_bytes(),
+                expected.as_bytes()
+            ),
             Self::RestoreManifestBindingMismatch { operation_id } => write!(
                 formatter,
                 "restore operation {:02x?} is bound to a different manifest descriptor",
+                operation_id.as_bytes()
+            ),
+            Self::DestinationBindingMismatch { operation_id } => write!(
+                formatter,
+                "restore operation {:02x?} is bound to different destination authority",
                 operation_id.as_bytes()
             ),
             Self::InvalidPhase { expected, actual } => {
@@ -388,6 +477,14 @@ impl fmt::Display for RestoreError {
             Self::ManifestRevisionMismatch => {
                 formatter.write_str("restore manifest revision descriptor does not match its entry")
             }
+            Self::PublicationCleanupPending {
+                operation_id,
+                phase,
+            } => write!(
+                formatter,
+                "destination manifest publication {:02x?} is {phase:?}; restore cleanup must wait for its terminal state",
+                operation_id.as_bytes()
+            ),
             Self::DuplicateCommandKey { family } => {
                 write!(formatter, "duplicate command key in {family:?}")
             }
@@ -403,6 +500,7 @@ impl fmt::Display for RestoreError {
             Self::SnapshotCodec(source) => source.fmt(formatter),
             Self::RestoreCodec(source) => source.fmt(formatter),
             Self::QueryRecord(source) => source.fmt(formatter),
+            Self::PublishCodec(source) => source.fmt(formatter),
             Self::Meta(source) => source.fmt(formatter),
         }
     }
@@ -416,6 +514,7 @@ impl std::error::Error for RestoreError {
             Self::SnapshotCodec(source) => Some(source),
             Self::RestoreCodec(source) => Some(source),
             Self::QueryRecord(source) => Some(source),
+            Self::PublishCodec(source) => Some(source),
             Self::Meta(source) => Some(source),
             _ => None,
         }
@@ -458,6 +557,12 @@ impl From<QueryRecordError> for RestoreError {
     }
 }
 
+impl From<PublishRecordError> for RestoreError {
+    fn from(source: PublishRecordError) -> Self {
+        Self::PublishCodec(source)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Loaded<T> {
     payload: Vec<u8>,
@@ -469,6 +574,117 @@ struct SourceMember {
     path: nokv_types::NormalizedRelativePath,
     entry: PathEntry,
     row_digest: [u8; SHA256_BYTES],
+}
+
+#[derive(Clone, Debug)]
+struct ScannedSourceMember {
+    path: NormalizedRelativePath,
+    row_digest: [u8; SHA256_BYTES],
+    materialized: Option<SourceMember>,
+}
+
+#[derive(Clone, Debug)]
+struct SourcePage {
+    members: Vec<ScannedSourceMember>,
+    eof: bool,
+}
+
+struct VerifiedRestoreManifestPublication {
+    publication: RestoreManifestPublication,
+    path_key: Vec<u8>,
+    path: Loaded<PathEntry>,
+    publish_key: Vec<u8>,
+    publish: Loaded<PublishOperationRecord>,
+    revision_key: Vec<u8>,
+    revision: Loaded<ArtifactRevisionRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct RestoreCleanupPublicationObservation {
+    key: Vec<u8>,
+    payload: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreCleanupPublicationDisposition {
+    Ready,
+    Pending {
+        operation_id: OperationId,
+        phase: PublishPhase,
+    },
+    Quarantined,
+}
+
+#[derive(Clone, Debug)]
+struct RestoreCleanupPublications {
+    observations: Vec<RestoreCleanupPublicationObservation>,
+    disposition: RestoreCleanupPublicationDisposition,
+}
+
+impl RestoreCleanupPublications {
+    fn add_predicates(&self, plan: &mut CommandPlan) -> Result<(), RestoreError> {
+        for observed in &self.observations {
+            plan.assert_value(
+                MetadataFamily::Operation,
+                observed.key.clone(),
+                observed.payload.clone(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn evidence_digest(&self) -> [u8; SHA256_BYTES] {
+        let mut digest = Sha256::new();
+        digest.update(b"nokv.restore.cleanup-publication-evidence.v1\0");
+        for observed in &self.observations {
+            digest.update(
+                u64::try_from(observed.key.len())
+                    .expect("metadata keys fit u64")
+                    .to_be_bytes(),
+            );
+            digest.update(&observed.key);
+            match &observed.payload {
+                Some(payload) => {
+                    digest.update([1]);
+                    digest.update(
+                        u64::try_from(payload.len())
+                            .expect("metadata values fit u64")
+                            .to_be_bytes(),
+                    );
+                    digest.update(payload);
+                }
+                None => digest.update([0]),
+            }
+        }
+        digest.finalize().into()
+    }
+}
+
+impl VerifiedRestoreManifestPublication {
+    fn add_predicates(&self, plan: &mut CommandPlan) -> Result<(), RestoreError> {
+        for (family, key, payload) in [
+            (
+                MetadataFamily::PathCurrent,
+                self.path_key.clone(),
+                self.path.payload.clone(),
+            ),
+            (
+                MetadataFamily::Operation,
+                self.publish_key.clone(),
+                self.publish.payload.clone(),
+            ),
+            (
+                MetadataFamily::ArtifactRevision,
+                self.revision_key.clone(),
+                self.revision.payload.clone(),
+            ),
+        ] {
+            if !plan.exact_keys.contains(&(family, key.clone())) {
+                plan.assert_value(family, key, Some(payload))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -592,6 +808,12 @@ pub fn begin_restore(
         request.destination_workspace_incarnation_id,
     )?;
     let operation_id = operation_id_from_identity(identity_digest);
+    if request.operation_id != operation_id {
+        return Err(RestoreError::OperationIdentityMismatch {
+            expected: operation_id,
+            actual: request.operation_id,
+        });
+    }
     let operation_key = operation_key(context.root_id, OperationKind::Restore, operation_id);
     if let Some(existing) = read_record(
         store,
@@ -603,6 +825,10 @@ pub fn begin_restore(
         if existing.record.identity_digest != identity_digest {
             return Err(RestoreError::OperationIdentityCollision { operation_id });
         }
+        let begin_provenance_matches = matches!(
+            &existing.record.commit_provenance,
+            RestoreCommitProvenance::V5(_)
+        );
         if existing.record.source_workbench_id != request.source_workbench_id
             || existing.record.source_workspace_incarnation_id
                 != request.expected_source_workspace_incarnation_id
@@ -611,6 +837,9 @@ pub fn begin_restore(
             || existing.record.restore_manifest != request.restore_manifest
             || existing.record.destination_workspace_incarnation_id
                 != request.destination_workspace_incarnation_id
+            || existing.record.destination_restore_manifest_identity
+                != Some(request.destination_restore_manifest_identity)
+            || !begin_provenance_matches
         {
             return Err(RestoreError::RestoreManifestBindingMismatch { operation_id });
         }
@@ -694,6 +923,54 @@ pub fn begin_restore(
             )
         }
     };
+    let source_commit_record = match (&source, &source_snapshot, &source_commit) {
+        (RestoreSource::Snapshot { snapshot_id, .. }, Some((_, snapshot)), None) => {
+            let commit_id = snapshot.record.source_commit_id.ok_or(
+                RestoreError::SnapshotCommitProvenanceMissing {
+                    snapshot_id: *snapshot_id,
+                },
+            )?;
+            let loaded = read_record(
+                store,
+                context,
+                MetadataFamily::Commit,
+                &commit_key(context.root_id, commit_id),
+                CommitRecord::decode,
+            )?
+            .ok_or(RestoreError::CommitMissing { commit_id })?;
+            if loaded.record.state != CommitState::Sealed {
+                return Err(RestoreError::CommitNotSealed {
+                    commit_id,
+                    state: loaded.record.state,
+                });
+            }
+            let snapshot_consumer = read_record(
+                store,
+                context,
+                MetadataFamily::CommitConsumer,
+                &snapshot_commit_consumer_key(context.root_id, commit_id, *snapshot_id),
+                CommitConsumerRecord::decode,
+            )?
+            .ok_or(RestoreError::SnapshotRetentionMismatch)?;
+            if loaded.record.consumer_count == 0
+                || snapshot_consumer.record.consumer_epoch_at_add > loaded.record.consumer_epoch
+            {
+                return Err(RestoreError::SnapshotRetentionMismatch);
+            }
+            loaded
+        }
+        (RestoreSource::Commit { .. }, None, Some((_, commit))) => commit.clone(),
+        _ => {
+            return Err(RestoreError::SourceClosureMismatch {
+                reason: "restore source retention shape is inconsistent".to_owned(),
+            })
+        }
+    };
+    if source_commit_record.record.source_workspace_incarnation_id
+        != source_workspace.record.incarnation_id
+    {
+        return Err(RestoreError::SourceWorkspaceMismatch);
+    }
 
     let destination_key = workspace_current_key(context.root_id, &request.destination_workbench_id);
     let previous_destination = read_record(
@@ -756,6 +1033,22 @@ pub fn begin_restore(
             workbench_id: claim.record.workbench_id,
         });
     }
+    let source_commit_id = match source {
+        RestoreSource::Snapshot { .. } => match &source_snapshot {
+            Some((_, snapshot)) => snapshot.record.source_commit_id.ok_or(
+                RestoreError::SnapshotCommitProvenanceMissing {
+                    snapshot_id: match source {
+                        RestoreSource::Snapshot { snapshot_id, .. } => snapshot_id,
+                        RestoreSource::Commit { .. } => unreachable!(),
+                    },
+                },
+            )?,
+            None => unreachable!("snapshot restore retained its snapshot row"),
+        },
+        RestoreSource::Commit { commit_id } => commit_id,
+    };
+    let parent_digest =
+        advance_commit_parent_rolling_digest([0; SHA256_BYTES], 0, source_commit_id);
     let operation = RestoreOperationRecord {
         operation_id,
         identity_digest,
@@ -765,10 +1058,46 @@ pub fn begin_restore(
         source,
         destination_workbench_id: request.destination_workbench_id.clone(),
         destination_workspace_incarnation_id: request.destination_workspace_incarnation_id,
+        destination_restore_manifest_identity: Some(request.destination_restore_manifest_identity),
         restore_manifest: request.restore_manifest.clone(),
+        commit_provenance: RestoreCommitProvenance::V5(Box::new(RestoreCommitProvenanceV5 {
+            source_commit: RestoreSourceCommitSeal {
+                commit_id: source_commit_id,
+                content_digest_uri: source_commit_record.record.content_digest_uri.clone(),
+                manifest_digest_uri: source_commit_record.record.manifest_digest_uri.clone(),
+                tree_manifest_revision_id: source_commit_record.record.tree_manifest_revision_id,
+                member_count: source_commit_record.record.member_count,
+                member_digest: source_commit_record.record.member_digest,
+                unique_revision_count: source_commit_record.record.unique_revision_count,
+                revision_digest: source_commit_record.record.revision_digest,
+                parent_digest: source_commit_record.record.parent_digest,
+            },
+            destination_committed_at_unix_seconds: request.destination_committed_at_unix_seconds,
+            destination_binding: None,
+            closure: RestoreCommitClosureProgress {
+                member_cursor: None,
+                member_count: 0,
+                member_digest: [0; SHA256_BYTES],
+                member_seal: None,
+                revision_ref_count: 0,
+                revision_cursor: None,
+                revision_seal_count: 0,
+                revision_digest: [0; SHA256_BYTES],
+                revision_seal: None,
+                parent_digest,
+                parent_seal: None,
+                cleanup_member_count: 0,
+                cleanup_revision_count: 0,
+            },
+            destination_head_generation: None,
+        })),
         phase: RestorePhase::Preparing,
         source_cursor: None,
         source_eof: false,
+        source_member_count: 0,
+        source_member_rolling_digest: [0; SHA256_BYTES],
+        source_member_seal: None,
+        source_matches_base_commit: None,
         next_member_sequence: 0,
         member_rolling_digest: [0; SHA256_BYTES],
         member_seal: None,
@@ -910,6 +1239,7 @@ pub fn start_restore_copy(
     }
     let loaded = load_operation(store, context, request.operation_id)?;
     require_phase(&loaded.record, RestorePhase::Preparing, "Preparing")?;
+    validate_source_retention(store, context, &loaded.record)?;
     let next = loaded
         .record
         .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)?;
@@ -964,13 +1294,16 @@ pub fn copy_restore_batch(
     if loaded.record.source_eof {
         return Err(RestoreError::SourceAlreadyExhausted);
     }
-    let (mut members, scanned_eof) =
-        scan_source_members(store, context, &loaded.record, request.limit)?;
-    let scanned_count = members.len();
+    let page = scan_source_members(store, context, &loaded.record, request.limit)?;
     let mut command_items = 2_usize;
     let mut revisions = BTreeSet::new();
-    let mut admitted = 0_usize;
-    for member in &members {
+    let mut admitted_raw = 0_usize;
+    let mut admitted_materialized = 0_usize;
+    for scanned in &page.members {
+        let Some(member) = scanned.materialized.as_ref() else {
+            admitted_raw += 1;
+            continue;
+        };
         let projection = TypedProjection::decode(&member.entry.typed_index_projection)?;
         let new_revision = revisions.insert(member.entry.artifact_revision_id);
         let additional = 3 + projection.fields().len() + usize::from(new_revision);
@@ -978,11 +1311,14 @@ pub fn copy_restore_batch(
             break;
         }
         command_items += additional;
-        admitted += 1;
+        admitted_raw += 1;
+        admitted_materialized += 1;
+        if admitted_materialized == request.limit {
+            break;
+        }
     }
-    members.truncate(admitted);
-    if scanned_count == 0 {
-        let planned = plan_copy_batch(store, context, &loaded, &[], scanned_eof, input_digest)?;
+    if page.members.is_empty() {
+        let planned = plan_copy_batch(store, context, &loaded, &[], page.eof, input_digest)?;
         let command = execute_restore_command(
             store,
             &planned.command.command,
@@ -998,13 +1334,13 @@ pub fn copy_restore_batch(
     }
 
     let mut selected = None;
-    for count in (1..=members.len()).rev() {
+    for count in (1..=admitted_raw).rev() {
         let planned = plan_copy_batch(
             store,
             context,
             &loaded,
-            &members[..count],
-            scanned_eof && count == scanned_count,
+            &page.members[..count],
+            page.eof && count == page.members.len(),
             input_digest,
         )?;
         if !command_fits(store, &planned.command.command)?
@@ -1047,10 +1383,23 @@ fn plan_copy_batch(
     store: &MetaShard,
     context: RootWriteContext,
     loaded: &Loaded<RestoreOperationRecord>,
-    members: &[SourceMember],
+    scanned_members: &[ScannedSourceMember],
     source_eof: bool,
     input_digest: [u8; SHA256_BYTES],
 ) -> Result<PlannedCopyBatch, RestoreError> {
+    let members = scanned_members
+        .iter()
+        .filter_map(|member| member.materialized.as_ref())
+        .collect::<Vec<_>>();
+    let raw_additional =
+        u64::try_from(scanned_members.len()).expect("restore raw batch length fits u64");
+    let next_source_count = loaded
+        .record
+        .source_member_count
+        .checked_add(raw_additional)
+        .ok_or(RestoreError::SourceClosureMismatch {
+            reason: "raw source member count overflow".to_owned(),
+        })?;
     let additional = u64::try_from(members.len()).expect("restore batch length fits u64");
     let next_sequence = loaded
         .record
@@ -1059,14 +1408,16 @@ fn plan_copy_batch(
         .ok_or(RestoreError::SourceClosureMismatch {
             reason: "member sequence overflow".to_owned(),
         })?;
-    if next_sequence > super::restore_records::MAX_RESTORE_MEMBERS {
+    if next_sequence > super::restore_records::MAX_RESTORE_MEMBERS
+        || next_source_count > super::restore_records::MAX_RESTORE_MEMBERS
+    {
         return Err(RestoreError::SourceClosureMismatch {
             reason: "source exceeds the restore member limit".to_owned(),
         });
     }
 
     let mut revision_occurrences = BTreeMap::<ArtifactRevisionId, u64>::new();
-    for member in members {
+    for member in &members {
         let count = revision_occurrences
             .entry(member.entry.artifact_revision_id)
             .or_default();
@@ -1124,10 +1475,23 @@ fn plan_copy_batch(
             })?;
         rolling = advance_commit_member_rolling_digest(rolling, sequence, member.row_digest);
     }
-    if let Some(last) = members.last() {
+    let mut source_rolling = next.source_member_rolling_digest;
+    for (offset, member) in scanned_members.iter().enumerate() {
+        let sequence = next
+            .source_member_count
+            .checked_add(u64::try_from(offset).expect("raw batch offset fits u64"))
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "raw source member sequence overflow".to_owned(),
+            })?;
+        source_rolling =
+            advance_commit_member_rolling_digest(source_rolling, sequence, member.row_digest);
+    }
+    if let Some(last) = scanned_members.last() {
         next.source_cursor = Some(last.path.clone());
     }
     next.source_eof = source_eof;
+    next.source_member_count = next_source_count;
+    next.source_member_rolling_digest = source_rolling;
     next.next_member_sequence = next_sequence;
     next.member_rolling_digest = rolling;
     next.validate()?;
@@ -1391,19 +1755,85 @@ fn maximum_cleanup_operation(
             .expect("the path type accepts its documented maximum byte length"),
     );
     ready.source_eof = true;
-    let member_seal = ready.member_rolling_digest;
+    // Preserve the independently accumulated raw-source closure. It may
+    // contain one or two provenance manifests that are deliberately absent
+    // from the ordinary RestoreMember ledger. Collapsing it to the
+    // materialized closure would make a commit source appear to diverge from
+    // its immutable CommitRecord and under-size snapshot cleanup records.
+    let source_member_seal = ready.source_member_rolling_digest;
     ready = ready.apply(
         RestorePhase::Copying,
-        RestoreTransition::SealSource { member_seal },
+        RestoreTransition::SealSource { source_member_seal },
     )?;
+    let RestoreCommitProvenance::V5(provenance) = &ready.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    let restore_identity = ready.destination_restore_manifest_identity.ok_or(
+        RestoreError::RestoreManifestBindingMismatch {
+            operation_id: ready.operation_id,
+        },
+    )?;
+    let mut destination_commit_bytes = provenance.source_commit.commit_id.into_bytes();
+    destination_commit_bytes[0] ^= 0xff;
+    let destination_commit_id = CommitId::from_bytes(destination_commit_bytes);
+    let mut run_operation_bytes = *restore_identity.publication_operation_id.as_bytes();
+    run_operation_bytes[0] ^= 0xff;
+    if run_operation_bytes == *ready.operation_id.as_bytes() {
+        run_operation_bytes[1] ^= 0xff;
+    }
+    let run_publication_operation_id = OperationId::from_bytes(run_operation_bytes);
+    let mut run_revision_bytes = *restore_identity.artifact_revision_id.as_bytes();
+    run_revision_bytes[0] ^= 0xff;
+    let run_revision_id = ArtifactRevisionId::from_bytes(run_revision_bytes);
+    let effective_content_digest_uri = if ready.source_matches_base_commit == Some(true) {
+        provenance.source_commit.content_digest_uri.clone()
+    } else {
+        commit_member_tree_digest_uri(ready.member_rolling_digest)
+    };
+    let binding = RestoreDestinationBinding {
+        destination_commit_id,
+        effective_content_digest_uri,
+        destination_projection_input_digest: [0x7a; SHA256_BYTES],
+        run_manifest_identity: RestoreManifestIdentity {
+            publication_operation_id: run_publication_operation_id,
+            artifact_revision_id: run_revision_id,
+        },
+        restore_manifest_identity: restore_identity,
+        manifests: None,
+    };
     ready = ready.apply(
         RestorePhase::SourceSealed,
-        RestoreTransition::MarkReady {
-            initialization_digest: [0; SHA256_BYTES],
+        RestoreTransition::BindDestination { binding },
+    )?;
+    let manifests = super::restore_records::RestoreDestinationManifests {
+        run_manifest: RestoreManifestPublication {
+            publication_operation_id: run_publication_operation_id,
+            workspace_incarnation_id: ready.destination_workspace_incarnation_id,
+            artifact_revision_id: run_revision_id,
+            body_digest_uri: commit_member_tree_digest_uri([0x41; SHA256_BYTES]),
+            manifest_digest_uri: commit_member_tree_digest_uri([0x42; SHA256_BYTES]),
+            logical_size: 1,
+            content_type: "application/json".to_owned(),
+        },
+        restore_manifest: RestoreManifestPublication {
+            publication_operation_id: restore_identity.publication_operation_id,
+            workspace_incarnation_id: ready.destination_workspace_incarnation_id,
+            artifact_revision_id: restore_identity.artifact_revision_id,
+            body_digest_uri: ready.restore_manifest.body_digest_uri.clone(),
+            manifest_digest_uri: commit_member_tree_digest_uri([0x43; SHA256_BYTES]),
+            logical_size: ready.restore_manifest.logical_size,
+            content_type: ready.restore_manifest.content_type.clone(),
+        },
+    };
+    ready = ready.apply(
+        RestorePhase::SourceSealed,
+        RestoreTransition::BeginDestinationBuilding {
+            initialization_digest: [0x44; SHA256_BYTES],
+            manifests,
         },
     )?;
     let aborting = ready.apply(
-        RestorePhase::Ready,
+        RestorePhase::DestinationBuilding,
         RestoreTransition::BeginAbort {
             terminal_error: maximum_cleanup_terminal_error(),
         },
@@ -1436,7 +1866,7 @@ pub fn seal_restore_source(
     let next = loaded.record.apply(
         RestorePhase::Copying,
         RestoreTransition::SealSource {
-            member_seal: loaded.record.member_rolling_digest,
+            source_member_seal: loaded.record.source_member_rolling_digest,
         },
     )?;
     let next_payload = next.encode()?;
@@ -1464,39 +1894,217 @@ pub fn seal_restore_source(
     )
 }
 
-/// Publish the stable restore manifest while the destination workspace remains
-/// hidden. The operation becomes `Ready` in the same command as the path
-/// change and its strong-reference updates.
+/// Bind the caller-authoritative destination commit and both destination-owned
+/// projections after the complete source closure is durable.
+pub fn bind_restore_destination(
+    store: &MetaShard,
+    context: RootWriteContext,
+    request: &BindRestoreDestinationRequest,
+) -> Result<RestoreCommandOutcome, RestoreError> {
+    let input_digest = bind_destination_input_digest(request);
+    if let Some(outcome) = replay_outcome(store, context, input_digest, Some(request.operation_id))?
+    {
+        return Ok(outcome);
+    }
+    let loaded = load_operation(store, context, request.operation_id)?;
+    require_phase(&loaded.record, RestorePhase::SourceSealed, "SourceSealed")?;
+    let RestoreCommitProvenance::V5(provenance) = &loaded.record.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    if let Some(existing) = &provenance.destination_binding {
+        if existing != &request.binding {
+            return Err(RestoreError::DestinationBindingMismatch {
+                operation_id: request.operation_id,
+            });
+        }
+        return Ok(RestoreCommandOutcome {
+            operation: loaded.record,
+            commit_version: commit_version_from_read(context.read_version)?,
+            replayed: true,
+            affected_members: 0,
+        });
+    }
+    let next = loaded.record.apply(
+        RestorePhase::SourceSealed,
+        RestoreTransition::BindDestination {
+            binding: request.binding.clone(),
+        },
+    )?;
+    let next_payload = next.encode()?;
+    let mut plan = CommandPlan::default();
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(
+            context.root_id,
+            OperationKind::Restore,
+            request.operation_id,
+        ),
+        loaded.payload,
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    plan.assert_value(
+        MetadataFamily::Commit,
+        commit_key(context.root_id, request.binding.destination_commit_id),
+        None,
+    )?;
+    plan.prefix_empty(
+        MetadataFamily::CommitMember,
+        commit_member_prefix(context.root_id, request.binding.destination_commit_id),
+    );
+    plan.prefix_empty(
+        MetadataFamily::RevisionRef,
+        commit_revision_ref_prefix(context.root_id, request.binding.destination_commit_id),
+    );
+    execute_plan(
+        store,
+        context,
+        plan,
+        input_digest,
+        next_payload,
+        None,
+        request.operation_id,
+        0,
+    )
+}
+
+/// Read the immutable source commit-owned run manifest held by an active
+/// restore. The caller cannot substitute a path, revision, or read view.
+///
+/// Snapshot restores deliberately use the base commit member rather than the
+/// possibly newer snapshot path: the base run manifest is the authority used
+/// to construct the destination-owned projection. The snapshot read version
+/// is returned only so the projection layer can label its frozen source view.
+pub fn read_restore_source_run_manifest(
+    store: &MetaShard,
+    context: RootWriteContext,
+    operation_id: OperationId,
+) -> Result<RestoreSourceRunManifest, RestoreError> {
+    let loaded = load_operation(store, context, operation_id)?;
+    if !matches!(
+        loaded.record.phase,
+        RestorePhase::SourceSealed
+            | RestorePhase::DestinationBuilding
+            | RestorePhase::DestinationSealing
+            | RestorePhase::Ready
+    ) {
+        return Err(RestoreError::InvalidPhase {
+            expected: "SourceSealed, DestinationBuilding, DestinationSealing, or Ready",
+            actual: loaded.record.phase,
+        });
+    }
+    validate_source_retention(store, context, &loaded.record)?;
+    let RestoreCommitProvenance::V5(provenance) = &loaded.record.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    let source_commit_id = provenance.source_commit.commit_id;
+    let path = NormalizedRelativePath::new(RUN_MANIFEST_PATH)
+        .expect("canonical run manifest path is normalized");
+    let member = read_record(
+        store,
+        context,
+        MetadataFamily::CommitMember,
+        &commit_member_key(context.root_id, source_commit_id, &path),
+        CommitMemberRecord::decode,
+    )?
+    .ok_or(RestoreError::SourceClosureMismatch {
+        reason: "source commit does not retain its run manifest member".to_owned(),
+    })?;
+    if member.record.artifact_revision_id != provenance.source_commit.tree_manifest_revision_id {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "source run manifest revision does not match the immutable base commit"
+                .to_owned(),
+        });
+    }
+    let path_entry = path_entry_from_commit_member(&member.record);
+    validate_destination_manifest_entry(&path_entry)?;
+    validate_manifest_revision(store, context, &path_entry)?;
+    let source_snapshot_read_version = match loaded.record.source {
+        RestoreSource::Snapshot { read_version, .. } => Some(read_version),
+        RestoreSource::Commit { .. } => None,
+    };
+    Ok(RestoreSourceRunManifest {
+        operation: loaded.record,
+        source_commit_id,
+        source_snapshot_read_version,
+        path_entry,
+    })
+}
+
+/// Install both already-published destination-owned manifests while the
+/// destination remains hidden, then begin bounded commit-closure construction.
 pub fn apply_restore_initialization(
     store: &MetaShard,
     context: RootWriteContext,
     request: RestoreOperationRequest,
 ) -> Result<RestoreCommandOutcome, RestoreError> {
     let loaded = load_operation(store, context, request.operation_id)?;
-    let manifest_path = restore_manifest_path();
-    let manifest = load_path(
+    if loaded.record.phase == RestorePhase::DestinationBuilding {
+        let initialization_digest = loaded.record.initialization_digest.ok_or_else(|| {
+            RestoreError::SourceClosureMismatch {
+                reason: "destination build is missing its initialization digest".to_owned(),
+            }
+        })?;
+        let input_digest = initialization_input_digest(request.operation_id, initialization_digest);
+        if let Some(outcome) =
+            replay_outcome(store, context, input_digest, Some(request.operation_id))?
+        {
+            return Ok(outcome);
+        }
+        return Ok(RestoreCommandOutcome {
+            operation: loaded.record,
+            commit_version: commit_version_from_read(context.read_version)?,
+            replayed: true,
+            affected_members: 0,
+        });
+    }
+    require_phase(&loaded.record, RestorePhase::SourceSealed, "SourceSealed")?;
+    let RestoreCommitProvenance::V5(provenance) = &loaded.record.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    let binding = provenance.destination_binding.as_ref().ok_or(
+        RestoreError::DestinationBindingMismatch {
+            operation_id: request.operation_id,
+        },
+    )?;
+    if binding.manifests.is_some() {
+        return Err(RestoreError::DestinationBindingMismatch {
+            operation_id: request.operation_id,
+        });
+    }
+    let run = load_restore_manifest_publication(
         store,
         context,
-        loaded.record.destination_workspace_incarnation_id,
-        &manifest_path,
-    )?
-    .ok_or(RestoreError::RestoreManifestMissing)?;
+        &loaded.record,
+        RUN_MANIFEST_PATH,
+        binding.run_manifest_identity,
+    )?;
+    let restore = load_restore_manifest_publication(
+        store,
+        context,
+        &loaded.record,
+        RESTORE_MANIFEST_PATH,
+        binding.restore_manifest_identity,
+    )?;
     let initialization = RestoreInitialization {
-        restore_manifest: manifest.record.clone(),
+        restore_manifest: restore.path.record.clone(),
     };
     validate_initialization(&initialization, &loaded.record)?;
-    let initialization_digest = restore_initialization_digest(&loaded.record, &initialization)?;
+    let manifests = super::restore_records::RestoreDestinationManifests {
+        run_manifest: run.publication.clone(),
+        restore_manifest: restore.publication.clone(),
+    };
+    let initialization_digest = restore_initialization_digest(&loaded.record, &manifests);
     let input_digest = initialization_input_digest(request.operation_id, initialization_digest);
     if let Some(outcome) = replay_outcome(store, context, input_digest, Some(request.operation_id))?
     {
         return Ok(outcome);
     }
-    require_phase(&loaded.record, RestorePhase::SourceSealed, "SourceSealed")?;
-    let revision = validate_manifest_revision(store, context, &initialization.restore_manifest)?;
     let next = loaded.record.apply(
         RestorePhase::SourceSealed,
-        RestoreTransition::MarkReady {
+        RestoreTransition::BeginDestinationBuilding {
             initialization_digest,
+            manifests,
         },
     )?;
     let next_payload = next.encode()?;
@@ -1512,23 +2120,8 @@ pub fn apply_restore_initialization(
         next_payload.clone(),
     )?;
     predicate_staging_workspace(store, context, &next, &mut plan)?;
-    plan.assert_value(
-        MetadataFamily::PathCurrent,
-        path_current_key(
-            context.root_id,
-            next.destination_workspace_incarnation_id,
-            &manifest_path,
-        ),
-        Some(manifest.payload),
-    )?;
-    plan.assert_value(
-        MetadataFamily::ArtifactRevision,
-        artifact_revision_key(
-            context.root_id,
-            initialization.restore_manifest.artifact_revision_id,
-        ),
-        Some(revision.payload),
-    )?;
+    run.add_predicates(&mut plan)?;
+    restore.add_predicates(&mut plan)?;
     execute_plan(
         store,
         context,
@@ -1541,8 +2134,296 @@ pub fn apply_restore_initialization(
     )
 }
 
-/// Publish the destination marker and release the exact source retention in
-/// one bounded command.
+/// Build a bounded canonical page of the hidden destination commit closure.
+/// CommitRecord remains absent throughout this phase.
+pub fn build_restore_commit_members(
+    store: &MetaShard,
+    context: RootWriteContext,
+    request: RestoreClosureBatchRequest,
+) -> Result<BuildRestoreCommitBatchOutcome, RestoreError> {
+    if !(1..=MAX_RESTORE_BATCH_MEMBERS).contains(&request.limit) {
+        return Err(RestoreError::InvalidBatchLimit {
+            requested: request.limit,
+            max: MAX_RESTORE_BATCH_MEMBERS,
+        });
+    }
+    let input_digest = batch_input_digest(
+        b"build-destination-commit-members",
+        request.operation_id,
+        request.limit,
+    );
+    if let Some(command) = replay_outcome(store, context, input_digest, Some(request.operation_id))?
+    {
+        return Ok(BuildRestoreCommitBatchOutcome {
+            built_members: command.affected_members as usize,
+            members_complete: command.operation.phase == RestorePhase::DestinationSealing,
+            command,
+        });
+    }
+    let loaded = load_operation(store, context, request.operation_id)?;
+    if loaded.record.phase == RestorePhase::DestinationSealing {
+        return Ok(BuildRestoreCommitBatchOutcome {
+            command: RestoreCommandOutcome {
+                operation: loaded.record,
+                commit_version: commit_version_from_read(context.read_version)?,
+                replayed: true,
+                affected_members: 0,
+            },
+            built_members: 0,
+            members_complete: true,
+        });
+    }
+    require_phase(
+        &loaded.record,
+        RestorePhase::DestinationBuilding,
+        "DestinationBuilding",
+    )?;
+    let (destination_commit_id, member_cursor) = match &loaded.record.commit_provenance {
+        RestoreCommitProvenance::V5(provenance) => {
+            let binding = provenance.destination_binding.as_ref().ok_or(
+                RestoreError::DestinationBindingMismatch {
+                    operation_id: request.operation_id,
+                },
+            )?;
+            (
+                binding.destination_commit_id,
+                provenance.closure.member_cursor.clone(),
+            )
+        }
+        RestoreCommitProvenance::MissingLegacyV4 => {
+            return Err(RestoreError::CommitRetentionMismatch);
+        }
+    };
+    let prefix = path_child_prefix(
+        context.root_id,
+        loaded.record.destination_workspace_incarnation_id,
+        None,
+    );
+    let marker = member_cursor.as_ref().map(|path| {
+        path_current_key(
+            context.root_id,
+            loaded.record.destination_workspace_incarnation_id,
+            path,
+        )
+    });
+    let mut rows = store.scan_prefix_at(
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        MetadataFamily::PathCurrent,
+        &prefix,
+        context.read_version,
+        marker.as_deref(),
+        request.limit + 1,
+    )?;
+    let has_more = rows.len() > request.limit;
+    if has_more {
+        rows.truncate(request.limit);
+    }
+
+    let mut selected = None;
+    for count in (0..=rows.len()).rev() {
+        if count == 0 && !rows.is_empty() {
+            break;
+        }
+        let planned = plan_restore_commit_member_batch(
+            store,
+            context,
+            &loaded,
+            destination_commit_id,
+            &rows[..count],
+            !has_more && count == rows.len(),
+            input_digest,
+        )?;
+        if command_fits(store, &planned.command)? {
+            selected = Some((planned, count));
+            break;
+        }
+    }
+    let Some((planned, built_members)) = selected else {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "one destination commit member exceeds the metadata command budget".to_owned(),
+        });
+    };
+    let command = execute_restore_command(
+        store,
+        &planned.command,
+        input_digest,
+        None,
+        request.operation_id,
+    )?;
+    debug_assert_eq!(command.operation, planned.operation);
+    Ok(BuildRestoreCommitBatchOutcome {
+        members_complete: command.operation.phase == RestorePhase::DestinationSealing,
+        command,
+        built_members,
+    })
+}
+
+/// Re-scan a bounded page of sorted destination commit RevisionRef rows and
+/// move to Ready only after the complete revision and single-parent seals are
+/// verified. CommitRecord is still absent.
+pub fn seal_restore_commit_revisions(
+    store: &MetaShard,
+    context: RootWriteContext,
+    request: RestoreClosureBatchRequest,
+) -> Result<SealRestoreCommitBatchOutcome, RestoreError> {
+    if !(1..=MAX_RESTORE_BATCH_MEMBERS).contains(&request.limit) {
+        return Err(RestoreError::InvalidBatchLimit {
+            requested: request.limit,
+            max: MAX_RESTORE_BATCH_MEMBERS,
+        });
+    }
+    let input_digest = batch_input_digest(
+        b"seal-destination-commit-revisions",
+        request.operation_id,
+        request.limit,
+    );
+    if let Some(command) = replay_outcome(store, context, input_digest, Some(request.operation_id))?
+    {
+        return Ok(SealRestoreCommitBatchOutcome {
+            sealed_revisions: command.affected_members as usize,
+            ready: command.operation.phase == RestorePhase::Ready,
+            command,
+        });
+    }
+    let loaded = load_operation(store, context, request.operation_id)?;
+    if loaded.record.phase == RestorePhase::Ready {
+        return Ok(SealRestoreCommitBatchOutcome {
+            command: RestoreCommandOutcome {
+                operation: loaded.record,
+                commit_version: commit_version_from_read(context.read_version)?,
+                replayed: true,
+                affected_members: 0,
+            },
+            sealed_revisions: 0,
+            ready: true,
+        });
+    }
+    require_phase(
+        &loaded.record,
+        RestorePhase::DestinationSealing,
+        "DestinationSealing",
+    )?;
+    let (destination_commit_id, revision_cursor) = match &loaded.record.commit_provenance {
+        RestoreCommitProvenance::V5(provenance) => {
+            let binding = provenance.destination_binding.as_ref().ok_or(
+                RestoreError::DestinationBindingMismatch {
+                    operation_id: request.operation_id,
+                },
+            )?;
+            (
+                binding.destination_commit_id,
+                provenance.closure.revision_cursor,
+            )
+        }
+        RestoreCommitProvenance::MissingLegacyV4 => {
+            return Err(RestoreError::CommitRetentionMismatch);
+        }
+    };
+    let prefix = commit_revision_ref_prefix(context.root_id, destination_commit_id);
+    let marker = revision_cursor
+        .map(|revision| commit_revision_ref_key(context.root_id, destination_commit_id, revision));
+    let mut rows = store.scan_prefix_at(
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        MetadataFamily::RevisionRef,
+        &prefix,
+        context.read_version,
+        marker.as_deref(),
+        request.limit + 1,
+    )?;
+    let has_more = rows.len() > request.limit;
+    if has_more {
+        rows.truncate(request.limit);
+    }
+    let mut next = loaded.record.clone();
+    {
+        let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+            unreachable!("phase validation excludes legacy operations");
+        };
+        for row in &rows {
+            let revision = decode_restore_commit_revision_ref_key(&prefix, &row.key)?;
+            RevisionRefRecord::decode(&row.value)?;
+            let step = plan_commit_revision(
+                provenance.closure.revision_cursor,
+                provenance.closure.revision_seal_count,
+                provenance.closure.revision_digest,
+                revision,
+                &row.value,
+            )
+            .map_err(|error| RestoreError::SourceClosureMismatch {
+                reason: error.to_string(),
+            })?;
+            provenance.closure.revision_cursor = Some(step.cursor);
+            provenance.closure.revision_seal_count = step.count;
+            provenance.closure.revision_digest = step.digest;
+        }
+    }
+    if !has_more {
+        verify_destination_commit_scaffolding(store, context, &next)?;
+        let (revision_seal, parent_seal) = match &next.commit_provenance {
+            RestoreCommitProvenance::V5(provenance) => {
+                if provenance.closure.revision_seal_count != provenance.closure.revision_ref_count {
+                    return Err(RestoreError::SourceClosureMismatch {
+                        reason: "destination revision-ref seal count is incomplete".to_owned(),
+                    });
+                }
+                (
+                    provenance.closure.revision_digest,
+                    provenance.closure.parent_digest,
+                )
+            }
+            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+        };
+        next = next.apply(
+            RestorePhase::DestinationSealing,
+            RestoreTransition::MarkReady {
+                revision_seal,
+                parent_seal,
+            },
+        )?;
+    } else {
+        next.validate()?;
+    }
+    let next_payload = next.encode()?;
+    let mut plan = CommandPlan::default();
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(
+            context.root_id,
+            OperationKind::Restore,
+            request.operation_id,
+        ),
+        loaded.payload,
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    plan.assert_value(
+        MetadataFamily::Commit,
+        commit_key(context.root_id, destination_commit_id),
+        None,
+    )?;
+    let command = execute_plan(
+        store,
+        context,
+        plan,
+        input_digest,
+        next_payload,
+        None,
+        request.operation_id,
+        u32::try_from(rows.len()).expect("bounded revision page fits u32"),
+    )?;
+    Ok(SealRestoreCommitBatchOutcome {
+        sealed_revisions: rows.len(),
+        ready: command.operation.phase == RestorePhase::Ready,
+        command,
+    })
+}
+
+/// Atomically publish the sealed destination commit, its first Workbench head,
+/// the visible workspace marker, and the parent-child retention handoff.
 pub fn complete_restore(
     store: &MetaShard,
     context: RootWriteContext,
@@ -1563,6 +2444,38 @@ pub fn complete_restore(
     }
     let loaded = load_operation(store, context, request.operation_id)?;
     require_phase(&loaded.record, RestorePhase::Ready, "Ready")?;
+    validate_source_retention(store, context, &loaded.record)?;
+    verify_destination_commit_scaffolding(store, context, &loaded.record)?;
+    let (
+        source_commit_id,
+        source_manifest_digest_uri,
+        binding,
+        closure,
+        destination_committed_at_unix_seconds,
+    ) = match &loaded.record.commit_provenance {
+        RestoreCommitProvenance::V5(provenance) => (
+            provenance.source_commit.commit_id,
+            provenance.source_commit.manifest_digest_uri.clone(),
+            provenance
+                .destination_binding
+                .as_ref()
+                .ok_or(RestoreError::DestinationBindingMismatch {
+                    operation_id: request.operation_id,
+                })?
+                .clone(),
+            provenance.closure.clone(),
+            provenance.destination_committed_at_unix_seconds,
+        ),
+        RestoreCommitProvenance::MissingLegacyV4 => {
+            return Err(RestoreError::CommitRetentionMismatch);
+        }
+    };
+    let manifests = binding
+        .manifests
+        .as_ref()
+        .ok_or(RestoreError::DestinationBindingMismatch {
+            operation_id: request.operation_id,
+        })?;
     let staging = load_staging_workspace(store, context, &loaded.record)?;
     let workspace_revision = staging
         .record
@@ -1585,6 +2498,7 @@ pub fn complete_restore(
         RestorePhase::Ready,
         RestoreTransition::Complete {
             result: result.clone(),
+            destination_head_generation: Generation::new(1).expect("one is non-zero"),
         },
     )?;
     let next_payload = next.encode()?;
@@ -1594,6 +2508,27 @@ pub fn complete_restore(
         state: WorkspaceState::Visible,
         owning_operation_id: None,
     };
+    let head_generation = Generation::new(1).expect("one is non-zero");
+    let destination_commit = CommitRecord {
+        source_workspace_incarnation_id: next.destination_workspace_incarnation_id,
+        content_digest_uri: binding.effective_content_digest_uri.clone(),
+        manifest_digest_uri: source_manifest_digest_uri,
+        tree_manifest_revision_id: manifests.run_manifest.artifact_revision_id,
+        tree_digest_uri: commit_member_tree_digest_uri(closure.member_digest),
+        member_count: closure.member_count,
+        member_digest: closure.member_digest,
+        unique_revision_count: closure.revision_ref_count,
+        revision_digest: closure.revision_digest,
+        parent_commits: vec![source_commit_id],
+        parent_digest: closure.parent_digest,
+        producer: None,
+        lineage_projection: Vec::new(),
+        consumer_count: 1,
+        consumer_epoch: ConsumerEpoch::new(1),
+        last_zero_consumer_version: None,
+        state: CommitState::Sealed,
+    };
+    destination_commit.validate()?;
     let mut plan = CommandPlan::default();
     plan.replace(
         MetadataFamily::Operation,
@@ -1611,14 +2546,50 @@ pub fn complete_restore(
         staging.payload,
         visible.encode()?,
     )?;
-    release_source_retention(store, context, &loaded.record, &mut plan)?;
+    plan.put_absent(
+        MetadataFamily::Commit,
+        commit_key(context.root_id, binding.destination_commit_id),
+        destination_commit.encode()?,
+    )?;
+    plan.put_absent(
+        MetadataFamily::WorkbenchCommitHead,
+        workbench_commit_head_key(context.root_id, next.destination_workspace_incarnation_id),
+        WorkbenchCommitHeadRecord {
+            commit_id: binding.destination_commit_id,
+            head_generation,
+        }
+        .encode(),
+    )?;
+    plan.put_absent(
+        MetadataFamily::CommitConsumer,
+        workbench_head_commit_consumer_key(
+            context.root_id,
+            binding.destination_commit_id,
+            next.destination_workspace_incarnation_id,
+        ),
+        CommitConsumerRecord {
+            consumer_epoch_at_add: ConsumerEpoch::new(1),
+        }
+        .encode(),
+    )?;
+    handoff_source_retention_to_child(
+        store,
+        context,
+        &loaded.record,
+        binding.destination_commit_id,
+        &mut plan,
+    )?;
+    let (run_publication, restore_publication) =
+        verify_destination_manifest_publications(store, context, &loaded.record)?;
+    run_publication.add_predicates(&mut plan)?;
+    restore_publication.add_predicates(&mut plan)?;
     plan.events
         .push(change_event_projection(&ChangeEventRecord {
             workbench_id: next.destination_workbench_id.clone(),
             workspace_incarnation_id: result.destination_workspace_incarnation_id,
             kind: ChangeEventKind::WorkspaceRestored,
             artifact_revision_id: None,
-            commit_id: None,
+            commit_id: Some(binding.destination_commit_id),
             operation_id: Some(request.operation_id),
             path: None,
             before: TypedProjection::empty(),
@@ -1634,6 +2605,10 @@ pub fn complete_restore(
                 (
                     QueryFieldId::new("restore.workspace_revision")?,
                     QueryScalar::Unsigned(result.destination_workspace_revision.get()),
+                ),
+                (
+                    QueryFieldId::new("restore.destination_committed_at")?,
+                    QueryScalar::Unsigned(destination_committed_at_unix_seconds),
                 ),
             ]))?,
         })?);
@@ -1668,10 +2643,13 @@ pub fn abort_restore(
         RestorePhase::Preparing
             | RestorePhase::Copying
             | RestorePhase::SourceSealed
+            | RestorePhase::DestinationBuilding
+            | RestorePhase::DestinationSealing
             | RestorePhase::Ready
     ) {
         return Err(RestoreError::InvalidPhase {
-            expected: "Preparing, Copying, SourceSealed, or Ready",
+            expected:
+                "Preparing, Copying, SourceSealed, DestinationBuilding, DestinationSealing, or Ready",
             actual: loaded.record.phase,
         });
     }
@@ -1776,6 +2754,15 @@ pub fn cleanup_restore_batch(
     }
     let loaded = load_operation(store, context, request.operation_id)?;
     require_phase(&loaded.record, RestorePhase::Cleaning, "Cleaning")?;
+    if restore_commit_cleanup_pending(&loaded.record) {
+        return cleanup_restore_commit_scaffolding_batch(
+            store,
+            context,
+            request,
+            loaded,
+            input_digest,
+        );
+    }
     if loaded.record.cleanup_member_cursor == loaded.record.next_member_sequence {
         return Ok(CopyRestoreBatchOutcome {
             command: RestoreCommandOutcome {
@@ -1886,6 +2873,208 @@ pub fn cleanup_restore_batch(
     })
 }
 
+fn restore_commit_cleanup_pending(operation: &RestoreOperationRecord) -> bool {
+    match &operation.commit_provenance {
+        RestoreCommitProvenance::MissingLegacyV4 => false,
+        RestoreCommitProvenance::V5(provenance) => {
+            provenance.closure.cleanup_revision_count != provenance.closure.revision_ref_count
+                || provenance.closure.cleanup_member_count != provenance.closure.member_count
+        }
+    }
+}
+
+fn cleanup_restore_commit_scaffolding_batch(
+    store: &MetaShard,
+    context: RootWriteContext,
+    request: CopyRestoreBatchRequest,
+    loaded: Loaded<RestoreOperationRecord>,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<CopyRestoreBatchOutcome, RestoreError> {
+    let (destination_commit_id, cleanup_revisions, remaining) =
+        match &loaded.record.commit_provenance {
+            RestoreCommitProvenance::V5(provenance) => {
+                let binding = provenance.destination_binding.as_ref().ok_or(
+                    RestoreError::DestinationBindingMismatch {
+                        operation_id: request.operation_id,
+                    },
+                )?;
+                if provenance.closure.cleanup_revision_count < provenance.closure.revision_ref_count
+                {
+                    (
+                        binding.destination_commit_id,
+                        true,
+                        provenance
+                            .closure
+                            .revision_ref_count
+                            .checked_sub(provenance.closure.cleanup_revision_count)
+                            .expect("validated cleanup cursor"),
+                    )
+                } else {
+                    (
+                        binding.destination_commit_id,
+                        false,
+                        provenance
+                            .closure
+                            .member_count
+                            .checked_sub(provenance.closure.cleanup_member_count)
+                            .expect("validated cleanup cursor"),
+                    )
+                }
+            }
+            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+        };
+    let limit = usize::try_from(remaining.min(request.limit as u64))
+        .expect("bounded cleanup count fits usize");
+    let (family, prefix) = if cleanup_revisions {
+        (
+            MetadataFamily::RevisionRef,
+            commit_revision_ref_prefix(context.root_id, destination_commit_id),
+        )
+    } else {
+        (
+            MetadataFamily::CommitMember,
+            commit_member_prefix(context.root_id, destination_commit_id),
+        )
+    };
+    let rows = store.scan_prefix_at(
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        family,
+        &prefix,
+        context.read_version,
+        None,
+        limit,
+    )?;
+    if rows.is_empty() {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: if cleanup_revisions {
+                "destination commit revision refs are missing before cleanup completed".to_owned()
+            } else {
+                "destination commit members are missing before cleanup completed".to_owned()
+            },
+        });
+    }
+    let mut next = loaded.record.clone();
+    let mut plan = CommandPlan::default();
+    if cleanup_revisions {
+        for row in &rows {
+            let revision_id = decode_restore_commit_revision_ref_key(&prefix, &row.key)?;
+            let reference = RevisionRefRecord::decode(&row.value)?;
+            let revision = load_available_revision(store, context, revision_id)?;
+            if reference.reference_epoch_at_add > revision.record.reference_epoch {
+                return Err(RestoreError::ReferenceEpochAhead {
+                    revision: revision_id,
+                });
+            }
+            let mut next_revision = revision.record.clone();
+            next_revision.reference_epoch =
+                increment_reference_epoch(next_revision.reference_epoch, revision_id)?;
+            next_revision.strong_reference_count = next_revision
+                .strong_reference_count
+                .checked_sub(1)
+                .ok_or(RestoreError::ReferenceCountUnderflow {
+                    revision: revision_id,
+                })?;
+            let zero_version = next_commit_version(context.read_version)?;
+            next_revision.last_zero_ref_version =
+                (next_revision.strong_reference_count == 0).then_some(zero_version);
+            plan.replace(
+                MetadataFamily::ArtifactRevision,
+                artifact_revision_key(context.root_id, revision_id),
+                revision.payload,
+                next_revision.encode()?,
+            )?;
+            plan.delete(
+                MetadataFamily::RevisionRef,
+                row.key.clone(),
+                row.value.clone(),
+            )?;
+            if next_revision.strong_reference_count == 0 {
+                plan.put_absent(
+                    MetadataFamily::GcCandidate,
+                    gc_candidate_key(context.root_id, revision_id, next_revision.reference_epoch),
+                    GcCandidateRecord {
+                        last_zero_ref_version: zero_version,
+                        claim_state: GcClaimState::Candidate,
+                        retry_count: 0,
+                        quarantine_evidence: None,
+                    }
+                    .encode()?,
+                )?;
+            }
+        }
+        let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.cleanup_revision_count = provenance
+            .closure
+            .cleanup_revision_count
+            .checked_add(u64::try_from(rows.len()).expect("bounded batch fits u64"))
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "destination revision cleanup cursor overflow".to_owned(),
+            })?;
+    } else {
+        for row in &rows {
+            let path = decode_commit_member_key(context.root_id, destination_commit_id, &row.key)
+                .ok_or(RestoreError::CorruptKey {
+                family: "CommitMember(destination)",
+            })?;
+            CommitMemberRecord::decode(&row.value).map_err(|error| {
+                RestoreError::CorruptSourceMember {
+                    family: "CommitMember(destination)",
+                    path: path.as_str().to_owned(),
+                    detail: error.to_string(),
+                }
+            })?;
+            plan.delete(
+                MetadataFamily::CommitMember,
+                row.key.clone(),
+                row.value.clone(),
+            )?;
+        }
+        let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.cleanup_member_count = provenance
+            .closure
+            .cleanup_member_count
+            .checked_add(u64::try_from(rows.len()).expect("bounded batch fits u64"))
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "destination member cleanup cursor overflow".to_owned(),
+            })?;
+    }
+    next.validate()?;
+    let next_payload = next.encode()?;
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(
+            context.root_id,
+            OperationKind::Restore,
+            request.operation_id,
+        ),
+        loaded.payload,
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    let command = execute_plan(
+        store,
+        context,
+        plan,
+        input_digest,
+        next_payload,
+        None,
+        request.operation_id,
+        u32::try_from(rows.len()).expect("bounded cleanup page fits u32"),
+    )?;
+    Ok(CopyRestoreBatchOutcome {
+        copied_members: rows.len(),
+        source_eof: !restore_commit_cleanup_pending(&command.operation)
+            && command.operation.cleanup_member_cursor == command.operation.next_member_sequence,
+        command,
+    })
+}
+
 fn plan_cleanup_capacity_quarantine(
     store: &MetaShard,
     context: RootWriteContext,
@@ -1962,6 +3151,135 @@ fn plan_cleanup_batch(
     })
 }
 
+fn inspect_restore_cleanup_publications(
+    store: &MetaShard,
+    context: RootWriteContext,
+    restore: &RestoreOperationRecord,
+) -> Result<RestoreCleanupPublications, RestoreError> {
+    let RestoreCommitProvenance::V5(provenance) = &restore.commit_provenance else {
+        return Ok(RestoreCleanupPublications {
+            observations: Vec::new(),
+            disposition: RestoreCleanupPublicationDisposition::Ready,
+        });
+    };
+    let Some(binding) = provenance.destination_binding.as_ref() else {
+        // RestoreStaging forward admission requires the late destination
+        // binding. No publisher can legally exist before it is installed.
+        return Ok(RestoreCleanupPublications {
+            observations: Vec::new(),
+            disposition: RestoreCleanupPublicationDisposition::Ready,
+        });
+    };
+    let expected = [
+        (RUN_MANIFEST_PATH, binding.run_manifest_identity),
+        (RESTORE_MANIFEST_PATH, binding.restore_manifest_identity),
+    ];
+    let mut observations = Vec::with_capacity(expected.len());
+    let mut pending = None;
+    let mut quarantined = false;
+    for (expected_path, identity) in expected {
+        let key = operation_key(
+            context.root_id,
+            OperationKind::Publish,
+            identity.publication_operation_id,
+        );
+        let payload = read_payload(store, context, MetadataFamily::Operation, &key)?;
+        let phase = match payload.as_deref() {
+            None => None,
+            Some(payload) => {
+                let publish = PublishOperationRecord::decode(payload)?;
+                let path = NormalizedRelativePath::new(expected_path)
+                    .expect("reserved destination manifest path is normalized");
+                if publish.operation_id != identity.publication_operation_id
+                    || publish.authority
+                        != (PublishAuthority::RestoreStaging {
+                            restore_operation_id: restore.operation_id,
+                        })
+                    || publish.workbench_id != restore.destination_workbench_id
+                    || publish.workspace_incarnation_id
+                        != restore.destination_workspace_incarnation_id
+                    || publish.path != path
+                    || publish.artifact_revision_id != identity.artifact_revision_id
+                    || publish.claim != PublishClaim::CreateOnly
+                {
+                    return Err(RestoreError::ManifestBindingMismatch);
+                }
+                Some(publish.phase)
+            }
+        };
+        match phase {
+            None | Some(PublishPhase::Published | PublishPhase::Cleaned) => {}
+            Some(PublishPhase::Quarantined) => quarantined = true,
+            Some(
+                phase @ (PublishPhase::Uploading
+                | PublishPhase::Finalizing
+                | PublishPhase::Aborting
+                | PublishPhase::Cleaning),
+            ) => {
+                pending.get_or_insert((identity.publication_operation_id, phase));
+            }
+        }
+        observations.push(RestoreCleanupPublicationObservation { key, payload });
+    }
+    // Keep the restore in Cleaning while any publisher can still make
+    // automatic cleanup progress. Moving to Quarantined first would revoke
+    // that publisher's cleanup authority and strand a mixed
+    // Quarantined+nonterminal pair.
+    let disposition = if let Some((operation_id, phase)) = pending {
+        RestoreCleanupPublicationDisposition::Pending {
+            operation_id,
+            phase,
+        }
+    } else if quarantined {
+        RestoreCleanupPublicationDisposition::Quarantined
+    } else {
+        RestoreCleanupPublicationDisposition::Ready
+    };
+    Ok(RestoreCleanupPublications {
+        observations,
+        disposition,
+    })
+}
+
+fn quarantine_restore_for_publication_cleanup(
+    store: &MetaShard,
+    context: RootWriteContext,
+    loaded: Loaded<RestoreOperationRecord>,
+    publications: &RestoreCleanupPublications,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<RestoreCommandOutcome, RestoreError> {
+    let next = loaded.record.apply(
+        RestorePhase::Cleaning,
+        RestoreTransition::Quarantine {
+            terminal_error: RestoreTerminalError {
+                kind: RestoreTerminalErrorKind::CleanupFailed,
+                message: QUARANTINED_PUBLICATION_MESSAGE.to_owned(),
+                evidence_digest: Some(publications.evidence_digest()),
+            },
+        },
+    )?;
+    let next_payload = next.encode()?;
+    let mut plan = CommandPlan::default();
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload,
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    publications.add_predicates(&mut plan)?;
+    execute_plan(
+        store,
+        context,
+        plan,
+        input_digest,
+        next_payload,
+        None,
+        next.operation_id,
+        0,
+    )
+}
+
 /// Retire the hidden marker and release source retention only after the member
 /// ledger is empty and its cleanup cursor proves the full closure was removed.
 pub fn finish_restore_cleanup(
@@ -1981,14 +3299,46 @@ pub fn finish_restore_cleanup(
             reason: "cleanup cursor has not consumed the full member closure".to_owned(),
         });
     }
+    let publications = inspect_restore_cleanup_publications(store, context, &loaded.record)?;
+    match publications.disposition {
+        RestoreCleanupPublicationDisposition::Ready => {}
+        RestoreCleanupPublicationDisposition::Pending {
+            operation_id,
+            phase,
+        } => {
+            return Err(RestoreError::PublicationCleanupPending {
+                operation_id,
+                phase,
+            });
+        }
+        RestoreCleanupPublicationDisposition::Quarantined => {
+            return quarantine_restore_for_publication_cleanup(
+                store,
+                context,
+                loaded,
+                &publications,
+                input_digest,
+            );
+        }
+    }
     let staging = load_staging_workspace(store, context, &loaded.record)?;
-    let manifest_path = restore_manifest_path();
-    let manifest = load_path(
-        store,
-        context,
-        loaded.record.destination_workspace_incarnation_id,
-        &manifest_path,
-    )?;
+    let manifest_paths = [
+        NormalizedRelativePath::new(RUN_MANIFEST_PATH)
+            .expect("canonical run manifest path is normalized"),
+        restore_manifest_path(),
+    ];
+    let manifests = manifest_paths
+        .iter()
+        .map(|path| {
+            load_path(
+                store,
+                context,
+                loaded.record.destination_workspace_incarnation_id,
+                path,
+            )
+            .map(|loaded| (path.clone(), loaded))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let next = loaded
         .record
         .apply(RestorePhase::Cleaning, RestoreTransition::FinishCleanup)?;
@@ -2020,15 +3370,41 @@ pub fn finish_restore_cleanup(
         MetadataFamily::RestoreMember,
         restore_member_prefix(context.root_id, request.operation_id),
     );
+    let destination_commit_id = match &loaded.record.commit_provenance {
+        RestoreCommitProvenance::V5(provenance) => provenance
+            .destination_binding
+            .as_ref()
+            .map(|binding| binding.destination_commit_id),
+        RestoreCommitProvenance::MissingLegacyV4 => None,
+    };
+    if let Some(destination_commit_id) = destination_commit_id {
+        plan.prefix_empty(
+            MetadataFamily::CommitMember,
+            commit_member_prefix(context.root_id, destination_commit_id),
+        );
+        plan.prefix_empty(
+            MetadataFamily::RevisionRef,
+            commit_revision_ref_prefix(context.root_id, destination_commit_id),
+        );
+        plan.assert_value(
+            MetadataFamily::Commit,
+            commit_key(context.root_id, destination_commit_id),
+            None,
+        )?;
+    }
+    publications.add_predicates(&mut plan)?;
     apply_path_changes(
         store,
         context,
         next.destination_workspace_incarnation_id,
-        vec![PathChange {
-            path: manifest_path,
-            before: manifest,
-            after: None,
-        }],
+        manifests
+            .into_iter()
+            .map(|(path, before)| PathChange {
+                path,
+                before,
+                after: None,
+            })
+            .collect(),
         &mut plan,
     )?;
     release_source_retention(store, context, &loaded.record, &mut plan)?;
@@ -2065,7 +3441,7 @@ fn scan_source_members(
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
     limit: usize,
-) -> Result<(Vec<SourceMember>, bool), RestoreError> {
+) -> Result<SourcePage, RestoreError> {
     validate_source_retention(store, context, operation)?;
     scan_source_page(
         store,
@@ -2082,7 +3458,7 @@ fn scan_source_page(
     operation: &RestoreOperationRecord,
     start_after: Option<&nokv_types::NormalizedRelativePath>,
     limit: usize,
-) -> Result<(Vec<SourceMember>, bool), RestoreError> {
+) -> Result<SourcePage, RestoreError> {
     let (family, prefix, marker, version) = match operation.source {
         RestoreSource::Snapshot { read_version, .. } => (
             MetadataFamily::PathCurrent,
@@ -2111,7 +3487,7 @@ fn scan_source_page(
     // skipped provenance rows (run manifest and restore manifest), so a
     // page never comes back empty with eof=false and the copy cursor
     // always advances.
-    let scanned = store.scan_prefix_at(
+    let mut scanned = store.scan_prefix_at(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -2121,25 +3497,26 @@ fn scan_source_page(
         marker.as_deref(),
         limit.saturating_add(3),
     )?;
-    let mut members = Vec::with_capacity(scanned.len().min(limit));
-    let mut visible = 0_usize;
-    for item in scanned {
-        let Some(member) = decode_source_member(context.root_id, operation, item)? else {
-            continue;
-        };
-        visible += 1;
-        if members.len() < limit {
-            members.push(member);
-        }
+    let maximum_raw = limit.saturating_add(2);
+    let has_more = scanned.len() > maximum_raw;
+    if has_more {
+        scanned.truncate(maximum_raw);
     }
-    Ok((members, visible <= limit))
+    let members = scanned
+        .into_iter()
+        .map(|item| decode_source_member(context.root_id, operation, item))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SourcePage {
+        members,
+        eof: !has_more,
+    })
 }
 
 fn decode_source_member(
     root_id: nokv_types::RootId,
     operation: &RestoreOperationRecord,
     item: MetadataScanItem,
-) -> Result<Option<SourceMember>, RestoreError> {
+) -> Result<ScannedSourceMember, RestoreError> {
     let (family, path, entry) = match operation.source {
         RestoreSource::Snapshot { .. } => {
             let path = decode_path_current_key(
@@ -2176,39 +3553,6 @@ fn decode_source_member(
             ("CommitMember", path, entry)
         }
     };
-    // Both manifest rows describe their own workbench, so copying either
-    // would leave the destination claiming foreign provenance. A snapshot
-    // restore skips them: the destination's provenance row is the fresh
-    // restore manifest its own RestoreStaging publish creates (CreateOnly,
-    // so a copied source row would collide with it anyway), and the run
-    // manifest's durable projection is the zero-byte "no projection"
-    // convention sealed by commit, which no canonical decode accepts.
-    // A sealed commit's member digest covers both rows, so a commit-source
-    // restore cannot skip them without breaking the closure seal.
-    if path.as_str() == RESTORE_MANIFEST_PATH {
-        return match operation.source {
-            RestoreSource::Snapshot { .. } => Ok(None),
-            RestoreSource::Commit { .. } => Err(RestoreError::ReservedPathInSource),
-        };
-    }
-    if path.as_str() == RUN_MANIFEST_PATH {
-        return match operation.source {
-            RestoreSource::Snapshot { .. } => Ok(None),
-            RestoreSource::Commit { .. } => Err(RestoreError::SourceClosureMismatch {
-                reason: format!(
-                    "commit closures seal the virtual run manifest member {RUN_MANIFEST_PATH}, \
-                     which commit-source restore cannot materialize"
-                ),
-            }),
-        };
-    }
-    TypedProjection::decode(&entry.typed_index_projection).map_err(|error| {
-        RestoreError::CorruptSourceMember {
-            family,
-            path: path.as_str().to_owned(),
-            detail: error.to_string(),
-        }
-    })?;
     let canonical_member = CommitMemberRecord {
         artifact_revision_id: entry.artifact_revision_id,
         path_generation: entry.generation,
@@ -2223,11 +3567,32 @@ fn decode_source_member(
         typed_projection: entry.typed_index_projection.clone(),
     };
     let row_digest = commit_member_row_digest(&path, &canonical_member)?;
-    Ok(Some(SourceMember {
-        path,
-        entry,
+    // Source-owned provenance is part of the frozen raw closure but is never
+    // materialized. The hidden destination publishes both manifests under its
+    // own identity before its immutable commit closure is built.
+    if matches!(path.as_str(), RESTORE_MANIFEST_PATH | RUN_MANIFEST_PATH) {
+        return Ok(ScannedSourceMember {
+            path,
+            row_digest,
+            materialized: None,
+        });
+    }
+    TypedProjection::decode(&entry.typed_index_projection).map_err(|error| {
+        RestoreError::CorruptSourceMember {
+            family,
+            path: path.as_str().to_owned(),
+            detail: error.to_string(),
+        }
+    })?;
+    Ok(ScannedSourceMember {
+        path: path.clone(),
         row_digest,
-    }))
+        materialized: Some(SourceMember {
+            path,
+            entry,
+            row_digest,
+        }),
+    })
 }
 
 fn verify_source_and_members(
@@ -2237,14 +3602,35 @@ fn verify_source_and_members(
 ) -> Result<(), RestoreError> {
     validate_source_retention(store, context, operation)?;
     let mut cursor = None;
-    let mut sequence = 0_u64;
-    let mut rolling = [0; SHA256_BYTES];
+    let mut source_sequence = 0_u64;
+    let mut source_rolling = [0; SHA256_BYTES];
+    let mut materialized_sequence = 0_u64;
+    let mut materialized_rolling = [0; SHA256_BYTES];
     loop {
         // 253 keeps scan_source_page's limit + 3 probe window within the
         // metadata layer's 256-item scan bound.
-        let (members, eof) = scan_source_page(store, context, operation, cursor.as_ref(), 253)?;
-        for source in members {
-            let member_key = restore_member_key(context.root_id, operation.operation_id, sequence);
+        let page = scan_source_page(store, context, operation, cursor.as_ref(), 253)?;
+        for source in page.members {
+            source_rolling = advance_commit_member_rolling_digest(
+                source_rolling,
+                source_sequence,
+                source.row_digest,
+            );
+            source_sequence = source_sequence.checked_add(1).ok_or_else(|| {
+                RestoreError::SourceClosureMismatch {
+                    reason: "raw source member count overflow".to_owned(),
+                }
+            })?;
+            cursor = Some(source.path.clone());
+
+            let Some(materialized) = source.materialized else {
+                continue;
+            };
+            let member_key = restore_member_key(
+                context.root_id,
+                operation.operation_id,
+                materialized_sequence,
+            );
             let restored = read_record(
                 store,
                 context,
@@ -2253,32 +3639,38 @@ fn verify_source_and_members(
                 RestoreMemberRecord::decode,
             )?
             .ok_or_else(|| RestoreError::SourceClosureMismatch {
-                reason: format!("restore member sequence {sequence} is missing"),
+                reason: format!("restore member sequence {materialized_sequence} is missing"),
             })?;
-            if restored.record.destination_path != source.path
-                || restored.record.artifact_revision_id != source.entry.artifact_revision_id
-                || restored.record.path_generation != source.entry.generation
-                || restored.record.row_digest != source.row_digest
+            if restored.record.destination_path != materialized.path
+                || restored.record.artifact_revision_id != materialized.entry.artifact_revision_id
+                || restored.record.path_generation != materialized.entry.generation
+                || restored.record.row_digest != materialized.row_digest
             {
                 return Err(RestoreError::SourceClosureMismatch {
-                    reason: format!("restore member sequence {sequence} does not match its source"),
+                    reason: format!(
+                        "restore member sequence {materialized_sequence} does not match its source"
+                    ),
                 });
             }
-            rolling = advance_commit_member_rolling_digest(rolling, sequence, source.row_digest);
-            sequence =
-                sequence
-                    .checked_add(1)
-                    .ok_or_else(|| RestoreError::SourceClosureMismatch {
-                        reason: "source member count overflow".to_owned(),
-                    })?;
-            cursor = Some(source.path);
+            materialized_rolling = advance_commit_member_rolling_digest(
+                materialized_rolling,
+                materialized_sequence,
+                materialized.row_digest,
+            );
+            materialized_sequence = materialized_sequence.checked_add(1).ok_or_else(|| {
+                RestoreError::SourceClosureMismatch {
+                    reason: "materialized member count overflow".to_owned(),
+                }
+            })?;
         }
-        if eof {
+        if page.eof {
             break;
         }
     }
-    if sequence != operation.next_member_sequence
-        || rolling != operation.member_rolling_digest
+    if source_sequence != operation.source_member_count
+        || source_rolling != operation.source_member_rolling_digest
+        || materialized_sequence != operation.next_member_sequence
+        || materialized_rolling != operation.member_rolling_digest
         || cursor != operation.source_cursor
     {
         return Err(RestoreError::SourceClosureMismatch {
@@ -2287,7 +3679,7 @@ fn verify_source_and_members(
         });
     }
     let member_prefix = restore_member_prefix(context.root_id, operation.operation_id);
-    let last_member_key = sequence
+    let last_member_key = materialized_sequence
         .checked_sub(1)
         .map(|last| restore_member_key(context.root_id, operation.operation_id, last));
     if !store
@@ -2307,14 +3699,6 @@ fn verify_source_and_members(
             reason: "member ledger contains rows past the sealed source count".to_owned(),
         });
     }
-    if let RestoreSource::Commit { commit_id } = operation.source {
-        let commit = load_commit(store, context, commit_id)?;
-        if commit.record.member_count != sequence || commit.record.member_digest != rolling {
-            return Err(RestoreError::SourceClosureMismatch {
-                reason: "commit member seal does not match its canonical member rows".to_owned(),
-            });
-        }
-    }
     Ok(())
 }
 
@@ -2323,6 +3707,10 @@ fn validate_source_retention(
     context: RootWriteContext,
     operation: &RestoreOperationRecord,
 ) -> Result<(), RestoreError> {
+    let RestoreCommitProvenance::V5(provenance) = &operation.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    let frozen_commit = &provenance.source_commit;
     match operation.source {
         RestoreSource::Snapshot {
             snapshot_id,
@@ -2350,9 +3738,31 @@ fn validate_source_retention(
                 HistoryHoldRecord::decode,
             )?
             .ok_or(RestoreError::SnapshotRetentionMismatch)?;
+            let source_commit_id = snapshot
+                .record
+                .source_commit_id
+                .ok_or(RestoreError::SnapshotRetentionMismatch)?;
+            if source_commit_id != frozen_commit.commit_id {
+                return Err(RestoreError::SnapshotRetentionMismatch);
+            }
+            let commit = load_commit(store, context, source_commit_id)?;
+            let snapshot_consumer = read_record(
+                store,
+                context,
+                MetadataFamily::CommitConsumer,
+                &snapshot_commit_consumer_key(context.root_id, source_commit_id, snapshot_id),
+                CommitConsumerRecord::decode,
+            )?
+            .ok_or(RestoreError::SnapshotRetentionMismatch)?;
             if snapshot.record.state != SnapshotState::Active
                 || snapshot.record.consumer_count == 0
                 || snapshot.record.read_version != read_version
+                || commit.record.state != CommitState::Sealed
+                || commit.record.source_workspace_incarnation_id
+                    != operation.source_workspace_incarnation_id
+                || commit.record.consumer_count == 0
+                || snapshot_consumer.record.consumer_epoch_at_add > commit.record.consumer_epoch
+                || !source_commit_matches_seal(&commit.record, frozen_commit)
                 || hold.record.read_version != read_version
                 || hold.record.source_snapshot_id != Some(snapshot_id)
                 || hold.record.state != HistoryHoldState::Active
@@ -2373,14 +3783,29 @@ fn validate_source_retention(
             )?
             .ok_or(RestoreError::CommitRetentionMismatch)?;
             if commit.record.state != CommitState::Sealed
+                || commit.record.source_workspace_incarnation_id
+                    != operation.source_workspace_incarnation_id
                 || commit.record.consumer_count == 0
+                || commit_id != frozen_commit.commit_id
                 || consumer.record.consumer_epoch_at_add > commit.record.consumer_epoch
+                || !source_commit_matches_seal(&commit.record, frozen_commit)
             {
                 return Err(RestoreError::CommitRetentionMismatch);
             }
         }
     }
     Ok(())
+}
+
+fn source_commit_matches_seal(commit: &CommitRecord, seal: &RestoreSourceCommitSeal) -> bool {
+    commit.content_digest_uri == seal.content_digest_uri
+        && commit.manifest_digest_uri == seal.manifest_digest_uri
+        && commit.tree_manifest_revision_id == seal.tree_manifest_revision_id
+        && commit.member_count == seal.member_count
+        && commit.member_digest == seal.member_digest
+        && commit.unique_revision_count == seal.unique_revision_count
+        && commit.revision_digest == seal.revision_digest
+        && commit.parent_digest == seal.parent_digest
 }
 
 fn path_entry_from_commit_member(member: &CommitMemberRecord) -> PathEntry {
@@ -2685,6 +4110,108 @@ fn apply_reference_delta(
     }
 }
 
+fn handoff_source_retention_to_child(
+    store: &MetaShard,
+    context: RootWriteContext,
+    operation: &RestoreOperationRecord,
+    destination_commit_id: CommitId,
+    plan: &mut CommandPlan,
+) -> Result<(), RestoreError> {
+    let RestoreCommitProvenance::V5(provenance) = &operation.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    let source_commit_id = provenance.source_commit.commit_id;
+    let source_key = commit_key(context.root_id, source_commit_id);
+    let source = read_record(
+        store,
+        context,
+        MetadataFamily::Commit,
+        &source_key,
+        CommitRecord::decode,
+    )?
+    .ok_or(RestoreError::CommitMissing {
+        commit_id: source_commit_id,
+    })?;
+    if source.record.state != CommitState::Sealed
+        || !source_commit_matches_seal(&source.record, &provenance.source_commit)
+    {
+        return Err(RestoreError::CommitRetentionMismatch);
+    }
+    let child_key =
+        child_commit_consumer_key(context.root_id, source_commit_id, destination_commit_id);
+    if read_payload(store, context, MetadataFamily::CommitConsumer, &child_key)?.is_some() {
+        return Err(RestoreError::CommitRetentionMismatch);
+    }
+
+    let next_source = match operation.source {
+        RestoreSource::Snapshot { .. } => {
+            let next =
+                add_commit_consumer(&source.record).map_err(map_commit_consumer_mutation_error)?;
+            release_source_retention(store, context, operation, plan)?;
+            next
+        }
+        RestoreSource::Commit { commit_id } => {
+            if commit_id != source_commit_id {
+                return Err(RestoreError::CommitRetentionMismatch);
+            }
+            let lease_key =
+                lease_commit_consumer_key(context.root_id, commit_id, operation.operation_id);
+            let lease = read_record(
+                store,
+                context,
+                MetadataFamily::CommitConsumer,
+                &lease_key,
+                CommitConsumerRecord::decode,
+            )?
+            .ok_or(RestoreError::CommitRetentionMismatch)?;
+            if lease.record.consumer_epoch_at_add > source.record.consumer_epoch {
+                return Err(RestoreError::CommitRetentionMismatch);
+            }
+            let removed =
+                remove_commit_consumer(&source.record, next_commit_version(context.read_version)?)
+                    .map_err(map_commit_consumer_mutation_error)?;
+            let next = add_commit_consumer(&removed).map_err(map_commit_consumer_mutation_error)?;
+            plan.delete(MetadataFamily::CommitConsumer, lease_key, lease.payload)?;
+            next
+        }
+    };
+    plan.replace(
+        MetadataFamily::Commit,
+        source_key,
+        source.payload,
+        next_source.encode()?,
+    )?;
+    plan.put_absent(
+        MetadataFamily::CommitConsumer,
+        child_key,
+        CommitConsumerRecord {
+            consumer_epoch_at_add: next_source.consumer_epoch,
+        }
+        .encode(),
+    )?;
+    Ok(())
+}
+
+fn map_commit_consumer_mutation_error(error: CommitConsumerMutationError) -> RestoreError {
+    match error {
+        CommitConsumerMutationError::CountOverflow => RestoreError::ConsumerCountOverflow,
+        CommitConsumerMutationError::CountUnderflow => RestoreError::ConsumerCountUnderflow,
+        CommitConsumerMutationError::EpochOverflow => RestoreError::ConsumerEpochOverflow,
+    }
+}
+
+fn commit_member_tree_digest_uri(digest: [u8; SHA256_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut uri = String::with_capacity("sha256:".len() + SHA256_BYTES * 2);
+    uri.push_str("sha256:");
+    for byte in digest {
+        uri.push(char::from(HEX[usize::from(byte >> 4)]));
+        uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    uri
+}
+
 fn release_source_retention(
     store: &MetaShard,
     context: RootWriteContext,
@@ -2973,6 +4500,440 @@ fn require_phase(
     }
 }
 
+fn plan_restore_commit_member_batch(
+    store: &MetaShard,
+    context: RootWriteContext,
+    loaded: &Loaded<RestoreOperationRecord>,
+    destination_commit_id: CommitId,
+    rows: &[MetadataScanItem],
+    source_eof: bool,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<PlannedRestoreCommand, RestoreError> {
+    let mut next = loaded.record.clone();
+    let mut plan = CommandPlan::default();
+    let mut batch_revisions = BTreeSet::new();
+    plan.assert_value(
+        MetadataFamily::Commit,
+        commit_key(context.root_id, destination_commit_id),
+        None,
+    )?;
+
+    for row in rows {
+        let path = decode_path_current_key(
+            context.root_id,
+            next.destination_workspace_incarnation_id,
+            &row.key,
+        )
+        .ok_or(RestoreError::CorruptKey {
+            family: "PathCurrent(destination)",
+        })?;
+        let entry = PathEntry::decode(&row.value)?;
+        TypedProjection::decode(&entry.typed_index_projection)?;
+        let member = CommitMemberRecord {
+            artifact_revision_id: entry.artifact_revision_id,
+            path_generation: entry.generation,
+            body_digest_uri: entry.body_digest_uri.clone(),
+            manifest_digest_uri: entry.manifest_digest_uri.clone(),
+            logical_size: entry.logical_size,
+            dependency_count: entry.dependency_count,
+            dependency_depth: entry.dependency_depth,
+            content_type: entry.content_type.clone(),
+            producer: entry.producer.clone(),
+            manifest_id: entry.manifest_id.clone(),
+            typed_projection: entry.typed_index_projection.clone(),
+        };
+        let step = {
+            let RestoreCommitProvenance::V5(provenance) = &next.commit_provenance else {
+                return Err(RestoreError::CommitRetentionMismatch);
+            };
+            plan_commit_member(
+                provenance.closure.member_cursor.as_ref(),
+                provenance.closure.member_count,
+                provenance.closure.member_digest,
+                &path,
+                &member,
+            )
+            .map_err(|error| RestoreError::SourceClosureMismatch {
+                reason: error.to_string(),
+            })?
+        };
+        plan.assert_value(
+            MetadataFamily::PathCurrent,
+            row.key.clone(),
+            Some(row.value.clone()),
+        )?;
+        plan.put_absent(
+            MetadataFamily::CommitMember,
+            commit_member_key(context.root_id, destination_commit_id, &path),
+            member.encode()?,
+        )?;
+        {
+            let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+                unreachable!("phase validation excludes legacy operations");
+            };
+            provenance.closure.member_cursor = Some(step.cursor);
+            provenance.closure.member_count = step.count;
+            provenance.closure.member_digest = step.digest;
+        }
+
+        if !batch_revisions.insert(entry.artifact_revision_id) {
+            continue;
+        }
+        let ref_key = commit_revision_ref_key(
+            context.root_id,
+            destination_commit_id,
+            entry.artifact_revision_id,
+        );
+        if let Some(reference) = read_record(
+            store,
+            context,
+            MetadataFamily::RevisionRef,
+            &ref_key,
+            RevisionRefRecord::decode,
+        )? {
+            let revision = load_available_revision(store, context, entry.artifact_revision_id)?;
+            if reference.record.reference_epoch_at_add > revision.record.reference_epoch {
+                return Err(RestoreError::ReferenceEpochAhead {
+                    revision: entry.artifact_revision_id,
+                });
+            }
+            plan.assert_value(
+                MetadataFamily::RevisionRef,
+                ref_key,
+                Some(reference.payload),
+            )?;
+            plan.assert_value(
+                MetadataFamily::ArtifactRevision,
+                artifact_revision_key(context.root_id, entry.artifact_revision_id),
+                Some(revision.payload),
+            )?;
+            continue;
+        }
+        let revision = load_available_revision(store, context, entry.artifact_revision_id)?;
+        if revision.record.logical_size != entry.logical_size
+            || revision.record.body_digest_uri != entry.body_digest_uri
+            || revision.record.manifest_digest_uri != entry.manifest_digest_uri
+            || revision.record.dependency_count != entry.dependency_count
+            || revision.record.dependency_depth != entry.dependency_depth
+            || revision.record.content_type != entry.content_type
+        {
+            return Err(RestoreError::ManifestRevisionMismatch);
+        }
+        let next_epoch =
+            increment_reference_epoch(revision.record.reference_epoch, entry.artifact_revision_id)?;
+        let mut next_revision = revision.record.clone();
+        next_revision.reference_epoch = next_epoch;
+        next_revision.strong_reference_count = next_revision
+            .strong_reference_count
+            .checked_add(1)
+            .ok_or(RestoreError::ReferenceCountOverflow {
+                revision: entry.artifact_revision_id,
+            })?;
+        next_revision.last_zero_ref_version = None;
+        plan.replace(
+            MetadataFamily::ArtifactRevision,
+            artifact_revision_key(context.root_id, entry.artifact_revision_id),
+            revision.payload,
+            next_revision.encode()?,
+        )?;
+        plan.put_absent(
+            MetadataFamily::RevisionRef,
+            ref_key,
+            RevisionRefRecord {
+                reference_epoch_at_add: next_epoch,
+            }
+            .encode()?,
+        )?;
+        let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+            unreachable!("phase validation excludes legacy operations");
+        };
+        provenance.closure.revision_ref_count = provenance
+            .closure
+            .revision_ref_count
+            .checked_add(1)
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "destination revision-ref count overflow".to_owned(),
+            })?;
+    }
+
+    if source_eof {
+        let (run, restore) = verify_destination_manifest_publications(store, context, &next)?;
+        run.add_predicates(&mut plan)?;
+        restore.add_predicates(&mut plan)?;
+        let member_seal = match &next.commit_provenance {
+            RestoreCommitProvenance::V5(provenance) => provenance.closure.member_digest,
+            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+        };
+        next = next.apply(
+            RestorePhase::DestinationBuilding,
+            RestoreTransition::BeginDestinationSealing { member_seal },
+        )?;
+    } else {
+        next.validate()?;
+    }
+    let next_payload = next.encode()?;
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload.clone(),
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    Ok(PlannedRestoreCommand {
+        command: build_restore_command(
+            context,
+            plan,
+            input_digest,
+            next_payload,
+            u32::try_from(rows.len()).expect("bounded member page fits u32"),
+        ),
+        operation: next,
+    })
+}
+
+fn verify_destination_manifest_publications(
+    store: &MetaShard,
+    context: RootWriteContext,
+    operation: &RestoreOperationRecord,
+) -> Result<
+    (
+        VerifiedRestoreManifestPublication,
+        VerifiedRestoreManifestPublication,
+    ),
+    RestoreError,
+> {
+    let RestoreCommitProvenance::V5(provenance) = &operation.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    let binding = provenance.destination_binding.as_ref().ok_or(
+        RestoreError::DestinationBindingMismatch {
+            operation_id: operation.operation_id,
+        },
+    )?;
+    let manifests = binding
+        .manifests
+        .as_ref()
+        .ok_or(RestoreError::DestinationBindingMismatch {
+            operation_id: operation.operation_id,
+        })?;
+    let run = load_restore_manifest_publication(
+        store,
+        context,
+        operation,
+        RUN_MANIFEST_PATH,
+        binding.run_manifest_identity,
+    )?;
+    let restore = load_restore_manifest_publication(
+        store,
+        context,
+        operation,
+        RESTORE_MANIFEST_PATH,
+        binding.restore_manifest_identity,
+    )?;
+    if run.publication != manifests.run_manifest
+        || restore.publication != manifests.restore_manifest
+    {
+        return Err(RestoreError::ManifestBindingMismatch);
+    }
+    Ok((run, restore))
+}
+
+fn verify_destination_commit_scaffolding(
+    store: &MetaShard,
+    context: RootWriteContext,
+    operation: &RestoreOperationRecord,
+) -> Result<(), RestoreError> {
+    let RestoreCommitProvenance::V5(provenance) = &operation.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    let binding = provenance.destination_binding.as_ref().ok_or(
+        RestoreError::DestinationBindingMismatch {
+            operation_id: operation.operation_id,
+        },
+    )?;
+    if read_payload(
+        store,
+        context,
+        MetadataFamily::Commit,
+        &commit_key(context.root_id, binding.destination_commit_id),
+    )?
+    .is_some()
+    {
+        return Err(RestoreError::DestinationBindingMismatch {
+            operation_id: operation.operation_id,
+        });
+    }
+    let member_marker = provenance
+        .closure
+        .member_cursor
+        .as_ref()
+        .map(|path| commit_member_key(context.root_id, binding.destination_commit_id, path));
+    if !store
+        .scan_prefix_at(
+            context.root_id,
+            context.placement_generation,
+            context.owner_epoch,
+            MetadataFamily::CommitMember,
+            &commit_member_prefix(context.root_id, binding.destination_commit_id),
+            context.read_version,
+            member_marker.as_deref(),
+            1,
+        )?
+        .is_empty()
+    {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "destination commit member closure contains rows past its seal".to_owned(),
+        });
+    }
+    let path_marker = provenance.closure.member_cursor.as_ref().map(|path| {
+        path_current_key(
+            context.root_id,
+            operation.destination_workspace_incarnation_id,
+            path,
+        )
+    });
+    if !store
+        .scan_prefix_at(
+            context.root_id,
+            context.placement_generation,
+            context.owner_epoch,
+            MetadataFamily::PathCurrent,
+            &path_child_prefix(
+                context.root_id,
+                operation.destination_workspace_incarnation_id,
+                None,
+            ),
+            context.read_version,
+            path_marker.as_deref(),
+            1,
+        )?
+        .is_empty()
+    {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "hidden destination contains a path past the commit member seal".to_owned(),
+        });
+    }
+    verify_destination_manifest_publications(store, context, operation)?;
+    Ok(())
+}
+
+fn decode_restore_commit_revision_ref_key(
+    prefix: &[u8],
+    key: &[u8],
+) -> Result<ArtifactRevisionId, RestoreError> {
+    if !key.starts_with(prefix) || key.len() != prefix.len() + FIXED_ID_BYTES {
+        return Err(RestoreError::CorruptKey {
+            family: "RevisionRef(Commit)",
+        });
+    }
+    Ok(ArtifactRevisionId::from_bytes(
+        key[prefix.len()..]
+            .try_into()
+            .expect("validated revision-id suffix width"),
+    ))
+}
+
+fn load_restore_manifest_publication(
+    store: &MetaShard,
+    context: RootWriteContext,
+    restore: &RestoreOperationRecord,
+    path: &str,
+    expected: RestoreManifestIdentity,
+) -> Result<VerifiedRestoreManifestPublication, RestoreError> {
+    let path = NormalizedRelativePath::new(path).expect("reserved manifest path is normalized");
+    let path_key = path_current_key(
+        context.root_id,
+        restore.destination_workspace_incarnation_id,
+        &path,
+    );
+    let loaded_path = read_record(
+        store,
+        context,
+        MetadataFamily::PathCurrent,
+        &path_key,
+        PathEntry::decode,
+    )?
+    .ok_or(RestoreError::RestoreManifestMissing)?;
+    validate_destination_manifest_entry(&loaded_path.record)?;
+    if loaded_path.record.artifact_revision_id != expected.artifact_revision_id {
+        return Err(RestoreError::ManifestBindingMismatch);
+    }
+
+    let publish_key = operation_key(
+        context.root_id,
+        OperationKind::Publish,
+        expected.publication_operation_id,
+    );
+    let publish = read_record(
+        store,
+        context,
+        MetadataFamily::Operation,
+        &publish_key,
+        PublishOperationRecord::decode,
+    )?
+    .ok_or(RestoreError::ManifestBindingMismatch)?;
+    let result = publish
+        .record
+        .result
+        .as_ref()
+        .ok_or(RestoreError::ManifestBindingMismatch)?;
+    if publish.record.phase != PublishPhase::Published
+        || publish.record.authority
+            != (PublishAuthority::RestoreStaging {
+                restore_operation_id: restore.operation_id,
+            })
+        || publish.record.workbench_id != restore.destination_workbench_id
+        || publish.record.workspace_incarnation_id != restore.destination_workspace_incarnation_id
+        || publish.record.path != path
+        || publish.record.artifact_revision_id != expected.artifact_revision_id
+        || publish.record.claim != PublishClaim::CreateOnly
+        || result.path_generation != loaded_path.record.generation
+        || result.logical_size != loaded_path.record.logical_size
+        || result.body_digest_uri != loaded_path.record.body_digest_uri
+    {
+        return Err(RestoreError::ManifestBindingMismatch);
+    }
+
+    let revision_key = artifact_revision_key(context.root_id, expected.artifact_revision_id);
+    let revision = validate_manifest_revision(store, context, &loaded_path.record)?;
+    Ok(VerifiedRestoreManifestPublication {
+        publication: RestoreManifestPublication {
+            publication_operation_id: expected.publication_operation_id,
+            workspace_incarnation_id: restore.destination_workspace_incarnation_id,
+            artifact_revision_id: expected.artifact_revision_id,
+            body_digest_uri: loaded_path.record.body_digest_uri.clone(),
+            manifest_digest_uri: loaded_path.record.manifest_digest_uri.clone(),
+            logical_size: loaded_path.record.logical_size,
+            content_type: loaded_path.record.content_type.clone(),
+        },
+        path_key,
+        path: loaded_path,
+        publish_key,
+        publish,
+        revision_key,
+        revision,
+    })
+}
+
+fn validate_destination_manifest_entry(manifest: &PathEntry) -> Result<(), RestoreError> {
+    manifest.encode()?;
+    // Commit's virtual run-manifest member historically seals an empty byte
+    // string for the semantically empty projection.  This is immutable source
+    // data, so read it through the durable-record decoder instead of requiring
+    // a newly published PathEntry's canonical projection encoding.
+    let projection = TypedProjection::decode_stored(&manifest.typed_index_projection)?;
+    if manifest.logical_size == 0
+        || manifest.content_type != "application/json"
+        || manifest.dependency_count != 0
+        || manifest.dependency_depth != 0
+        || manifest.manifest_id.is_some()
+        || !projection.fields().is_empty()
+    {
+        return Err(RestoreError::ManifestBindingMismatch);
+    }
+    Ok(())
+}
+
 fn validate_initialization(
     initialization: &RestoreInitialization,
     operation: &RestoreOperationRecord,
@@ -3000,7 +4961,10 @@ fn validate_manifest_revision(
     let revision = load_available_revision(store, context, manifest.artifact_revision_id)?;
     if revision.record.logical_size != manifest.logical_size
         || revision.record.body_digest_uri != manifest.body_digest_uri
+        || revision.record.manifest_digest_uri != manifest.manifest_digest_uri
         || revision.record.content_type != manifest.content_type
+        || revision.record.dependency_count != manifest.dependency_count
+        || revision.record.dependency_depth != manifest.dependency_depth
     {
         return Err(RestoreError::ManifestRevisionMismatch);
     }
@@ -3261,6 +5225,26 @@ fn restore_selector_identity_digest(
     Ok(hasher.finalize().into())
 }
 
+/// Derive the frozen cross-layer v2 restore operation identity.
+pub fn restore_operation_id(
+    root_id: nokv_types::RootId,
+    source_workbench_id: &WorkbenchId,
+    source_workspace_incarnation_id: WorkspaceIncarnationId,
+    source: RestoreSourceSelector,
+    destination_workbench_id: &WorkbenchId,
+    destination_workspace_incarnation_id: WorkspaceIncarnationId,
+) -> Result<OperationId, RestoreError> {
+    restore_selector_identity_digest(
+        root_id,
+        source_workbench_id,
+        source_workspace_incarnation_id,
+        source,
+        destination_workbench_id,
+        destination_workspace_incarnation_id,
+    )
+    .map(operation_id_from_identity)
+}
+
 fn restore_source_matches_selector(
     durable: RestoreSource,
     requested: RestoreSourceSelector,
@@ -3283,17 +5267,14 @@ fn restore_source_matches_selector(
 
 fn restore_initialization_digest(
     operation: &RestoreOperationRecord,
-    initialization: &RestoreInitialization,
-) -> Result<[u8; SHA256_BYTES], RestoreError> {
-    let encoded = initialization.restore_manifest.encode()?;
+    manifests: &super::restore_records::RestoreDestinationManifests,
+) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.restore.initialization.v3\0");
+    hasher.update(b"nokv.restore.initialization.v4\0");
     hasher.update(operation.identity_digest);
-    hasher.update(1_u32.to_be_bytes());
-    hasher.update([1]);
-    hash_u32_bytes(&mut hasher, RESTORE_MANIFEST_PATH.as_bytes())?;
-    hash_u32_bytes(&mut hasher, &encoded)?;
-    Ok(hasher.finalize().into())
+    hash_manifest_publication(&mut hasher, &manifests.run_manifest);
+    hash_manifest_publication(&mut hasher, &manifests.restore_manifest);
+    hasher.finalize().into()
 }
 
 fn operation_id_from_identity(identity_digest: [u8; SHA256_BYTES]) -> OperationId {
@@ -3309,8 +5290,9 @@ fn begin_request_digest(
     request: &BeginRestoreRequest,
 ) -> [u8; SHA256_BYTES] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.restore.begin.v4\0");
+    hasher.update(b"nokv.restore.begin.v5\0");
     hasher.update(root_id.as_bytes());
+    hasher.update(request.operation_id.as_bytes());
     hash_digest_bytes(&mut hasher, request.source_workbench_id.as_bytes());
     hasher.update(request.expected_source_workspace_incarnation_id.as_bytes());
     match request.source {
@@ -3325,6 +5307,18 @@ fn begin_request_digest(
     }
     hash_digest_bytes(&mut hasher, request.destination_workbench_id.as_bytes());
     hasher.update(request.destination_workspace_incarnation_id.as_bytes());
+    hasher.update(
+        request
+            .destination_restore_manifest_identity
+            .publication_operation_id
+            .as_bytes(),
+    );
+    hasher.update(
+        request
+            .destination_restore_manifest_identity
+            .artifact_revision_id
+            .as_bytes(),
+    );
     hash_digest_bytes(
         &mut hasher,
         request.restore_manifest.body_digest_uri.as_bytes(),
@@ -3343,6 +5337,44 @@ fn operation_input_digest(domain: &[u8], operation_id: OperationId) -> [u8; SHA2
     hash_digest_bytes(&mut hasher, domain);
     hasher.update(operation_id.as_bytes());
     hasher.finalize().into()
+}
+
+fn bind_destination_input_digest(request: &BindRestoreDestinationRequest) -> [u8; SHA256_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.restore.bind-destination.v1\0");
+    hasher.update(request.operation_id.as_bytes());
+    hasher.update(request.binding.destination_commit_id.as_bytes());
+    hash_digest_bytes(
+        &mut hasher,
+        request.binding.effective_content_digest_uri.as_bytes(),
+    );
+    hasher.update(request.binding.destination_projection_input_digest);
+    hash_manifest_identity(&mut hasher, &request.binding.run_manifest_identity);
+    hash_manifest_identity(&mut hasher, &request.binding.restore_manifest_identity);
+    match &request.binding.manifests {
+        None => hasher.update([0]),
+        Some(manifests) => {
+            hasher.update([1]);
+            hash_manifest_publication(&mut hasher, &manifests.run_manifest);
+            hash_manifest_publication(&mut hasher, &manifests.restore_manifest);
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn hash_manifest_identity(hasher: &mut Sha256, identity: &RestoreManifestIdentity) {
+    hasher.update(identity.publication_operation_id.as_bytes());
+    hasher.update(identity.artifact_revision_id.as_bytes());
+}
+
+fn hash_manifest_publication(hasher: &mut Sha256, publication: &RestoreManifestPublication) {
+    hasher.update(publication.publication_operation_id.as_bytes());
+    hasher.update(publication.workspace_incarnation_id.as_bytes());
+    hasher.update(publication.artifact_revision_id.as_bytes());
+    hash_digest_bytes(hasher, publication.body_digest_uri.as_bytes());
+    hash_digest_bytes(hasher, publication.manifest_digest_uri.as_bytes());
+    hasher.update(publication.logical_size.to_be_bytes());
+    hash_digest_bytes(hasher, publication.content_type.as_bytes());
 }
 
 fn batch_input_digest(
@@ -3422,7 +5454,11 @@ mod tests {
     use super::super::namespace::{
         create_visible_workspace, get_visible_path_at, get_visible_workspace_at, RootReadContext,
     };
-    use super::super::snapshot::{mint_snapshot, MintSnapshotRequest};
+    use super::super::remove::{remove_path, RemovePathRequest};
+    use super::super::snapshot::{
+        mint_snapshot, retire_snapshot, MintSnapshotRequest, RetireSnapshotRequest,
+        SnapshotSelector,
+    };
     use super::*;
 
     fn sha256_digest_uri(digest: [u8; SHA256_BYTES]) -> String {
@@ -3467,6 +5503,23 @@ mod tests {
 
     fn workbench(value: &str) -> WorkbenchId {
         WorkbenchId::new(value).unwrap()
+    }
+
+    fn derived_operation_identity(request: &BeginRestoreRequest) -> OperationId {
+        restore_operation_id(
+            root(),
+            &request.source_workbench_id,
+            request.expected_source_workspace_incarnation_id,
+            request.source,
+            &request.destination_workbench_id,
+            request.destination_workspace_incarnation_id,
+        )
+        .unwrap()
+    }
+
+    fn bind_operation_identity(mut request: BeginRestoreRequest) -> BeginRestoreRequest {
+        request.operation_id = derived_operation_identity(&request);
+        request
     }
 
     fn write_context(
@@ -3585,6 +5638,90 @@ mod tests {
         store.execute(&command).unwrap();
     }
 
+    fn replace_present(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        family: MetadataFamily,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
+        let context = write_context(store, counter, owner_epoch);
+        let expected = read_payload(store, context, family, &key)
+            .unwrap()
+            .expect("test row exists");
+        let command = MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: root(),
+            logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
+            placement_generation: placement(),
+            owner_epoch,
+            request_id: context.request_id,
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: context.read_version,
+            root_fence_action: RootFenceAction::RequireActive,
+            predicates: vec![CommandPredicate::Value {
+                family,
+                key: key.clone(),
+                expected: Some(expected),
+            }],
+            mutations: vec![CommandMutation::Put {
+                family,
+                key: key.clone(),
+                value,
+            }],
+            history_projection: vec![HistoryProjection { family, key }],
+            event_projection: Vec::new(),
+            deterministic_result: Vec::new(),
+        }
+        .seal();
+        store.execute(&command).unwrap();
+    }
+
+    fn delete_present(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        family: MetadataFamily,
+        key: Vec<u8>,
+    ) {
+        let context = write_context(store, counter, owner_epoch);
+        let expected = read_payload(store, context, family, &key)
+            .unwrap()
+            .expect("test row exists");
+        let command = MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: root(),
+            logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
+            placement_generation: placement(),
+            owner_epoch,
+            request_id: context.request_id,
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: context.read_version,
+            root_fence_action: RootFenceAction::RequireActive,
+            predicates: vec![CommandPredicate::Value {
+                family,
+                key: key.clone(),
+                expected: Some(expected),
+            }],
+            mutations: vec![CommandMutation::Delete {
+                family,
+                key: key.clone(),
+            }],
+            history_projection: vec![HistoryProjection { family, key }],
+            event_projection: Vec::new(),
+            deterministic_result: Vec::new(),
+        }
+        .seal();
+        store.execute(&command).unwrap();
+    }
+
     fn artifact_record(
         logical_size: u64,
         body_digest_uri: String,
@@ -3615,6 +5752,7 @@ mod tests {
     struct SeededSource {
         source_workbench: WorkbenchId,
         source_incarnation: WorkspaceIncarnationId,
+        source_commit_id: CommitId,
         source_revision: ArtifactRevisionId,
         manifest_revision: ArtifactRevisionId,
         initialization: RestoreInitialization,
@@ -3723,9 +5861,23 @@ mod tests {
             }
             put_absent(store, counter, owner_epoch, rows);
         }
+        let source_commit_id = CommitId::from_bytes([0xc0; SHA256_BYTES]);
+        drive_commit_wire_calls(
+            store,
+            counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            source_commit_id,
+            operation(0xe1),
+            operation(0xe2),
+            revision(22),
+            br#"{"schema":"nokv.workbench.run_manifest.v1"}"#,
+        );
         SeededSource {
             source_workbench,
             source_incarnation,
+            source_commit_id,
             source_revision,
             manifest_revision,
             initialization: RestoreInitialization {
@@ -3754,7 +5906,7 @@ mod tests {
         source: &SeededSource,
     ) -> SnapshotId {
         let snapshot_id = SnapshotId::new(42);
-        mint_snapshot(
+        let minted = mint_snapshot(
             store,
             write_context(store, counter, owner_epoch),
             &MintSnapshotRequest {
@@ -3766,6 +5918,10 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(
+            minted.snapshot.record.source_commit_id,
+            Some(source.source_commit_id)
+        );
         snapshot_id
     }
 
@@ -3829,55 +5985,207 @@ mod tests {
         destination: &str,
         destination_incarnation: WorkspaceIncarnationId,
     ) -> RestoreCommandOutcome {
-        begin_restore(
-            store,
-            write_context(store, counter, owner_epoch),
-            &BeginRestoreRequest {
-                source_workbench_id: source.source_workbench.clone(),
-                expected_source_workspace_incarnation_id: source.source_incarnation,
-                source: RestoreSourceSelector::Snapshot(snapshot_id),
-                destination_workbench_id: workbench(destination),
-                destination_workspace_incarnation_id: destination_incarnation,
-                restore_manifest: restore_manifest_descriptor(&source.initialization),
-            },
-        )
-        .unwrap()
+        let request = snapshot_restore_request(
+            source,
+            snapshot_id,
+            destination,
+            destination_incarnation,
+            0xd1,
+        );
+        begin_restore(store, write_context(store, counter, owner_epoch), &request).unwrap()
     }
 
-    fn publish_restore_manifest_for_test(
+    fn snapshot_restore_request(
+        source: &SeededSource,
+        snapshot_id: SnapshotId,
+        destination: &str,
+        destination_incarnation: WorkspaceIncarnationId,
+        _destination_commit_fill: u8,
+    ) -> BeginRestoreRequest {
+        bind_operation_identity(BeginRestoreRequest {
+            operation_id: OperationId::from_bytes([0; 16]),
+            source_workbench_id: source.source_workbench.clone(),
+            expected_source_workspace_incarnation_id: source.source_incarnation,
+            source: RestoreSourceSelector::Snapshot(snapshot_id),
+            destination_workbench_id: workbench(destination),
+            destination_workspace_incarnation_id: destination_incarnation,
+            destination_restore_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationId::from_bytes([0xf2; 16]),
+                artifact_revision_id: revision(0xe4),
+            },
+            destination_committed_at_unix_seconds: 1,
+            restore_manifest: restore_manifest_descriptor(&source.initialization),
+        })
+    }
+
+    fn publish_destination_manifests_for_test(
         store: &MetaShard,
         counter: &mut u128,
         owner_epoch: OwnerEpoch,
         operation_id: OperationId,
-        initialization: &RestoreInitialization,
     ) {
-        let context = write_context(store, counter, owner_epoch);
-        let loaded = load_operation(store, context, operation_id).unwrap();
-        let mut plan = CommandPlan::default();
-        predicate_staging_workspace(store, context, &loaded.record, &mut plan).unwrap();
-        apply_path_changes(
+        const RUN_BODY: &[u8] = br#"{"schema":"nokv.workbench.run_manifest.v1"}"#;
+        const RESTORE_BODY: &[u8] = br#"{"schema":"nokv.workbench.restore_manifest.v1"}"#;
+        let operation = get_restore(
             store,
-            context,
-            loaded.record.destination_workspace_incarnation_id,
-            vec![PathChange {
-                path: restore_manifest_path(),
-                before: None,
-                after: Some(initialization.restore_manifest.clone()),
-            }],
-            &mut plan,
-        )
-        .unwrap();
-        execute_plan(
-            store,
-            context,
-            plan,
-            operation_input_digest(b"test-manifest-publication", operation_id),
-            loaded.payload,
-            None,
+            write_context(store, counter, owner_epoch),
             operation_id,
-            0,
+        )
+        .unwrap()
+        .unwrap();
+        let RestoreCommitProvenance::V5(provenance) = &operation.commit_provenance else {
+            unreachable!();
+        };
+        let binding = provenance.destination_binding.as_ref().unwrap();
+        for (path, identity, body) in [
+            (RUN_MANIFEST_PATH, binding.run_manifest_identity, RUN_BODY),
+            (
+                RESTORE_MANIFEST_PATH,
+                binding.restore_manifest_identity,
+                RESTORE_BODY,
+            ),
+        ] {
+            let (staged, manifest) = single_object_rows(identity.artifact_revision_id, body);
+            let publish = wire_publish_operation(
+                identity.publication_operation_id,
+                identity.artifact_revision_id,
+                &operation.destination_workbench_id,
+                operation.destination_workspace_incarnation_id,
+                NormalizedRelativePath::new(path).unwrap(),
+                PublishAuthority::RestoreStaging {
+                    restore_operation_id: operation_id,
+                },
+                owner_epoch,
+                &staged,
+                &manifest,
+            );
+            let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
+            drive_publish_wire_calls(
+                store,
+                counter,
+                owner_epoch,
+                publish,
+                &staged,
+                &manifest,
+                PublishedArtifact {
+                    logical_size: body.len() as u64,
+                    body_digest_uri: body_digest_uri(body),
+                    manifest_digest_uri,
+                    content_type: "application/json".to_owned(),
+                    producer: None,
+                    manifest_id: None,
+                    typed_index_projection: TypedProjection::empty().encode().unwrap(),
+                },
+            );
+        }
+    }
+
+    fn prepare_cleanup_with_uploading_run_publication(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        destination: &str,
+        destination_incarnation: WorkspaceIncarnationId,
+    ) -> (
+        SeededSource,
+        SnapshotId,
+        OperationId,
+        PublishOperationRecord,
+    ) {
+        const RUN_BODY: &[u8] = br#"{"schema":"nokv.workbench.run_manifest.v1"}"#;
+        let source = seed_source(store, counter, owner_epoch, 1);
+        let snapshot_id = mint_source_snapshot(store, counter, owner_epoch, &source);
+        let begun = begin_snapshot_restore(
+            store,
+            counter,
+            owner_epoch,
+            &source,
+            snapshot_id,
+            destination,
+            destination_incarnation,
+        );
+        let operation_id = begun.operation.operation_id;
+        start_restore_copy(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
         )
         .unwrap();
+        copy_all(store, counter, owner_epoch, operation_id);
+        let sealed = seal_restore_source(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        let binding = destination_binding_for_test(&sealed.operation, 0xd8);
+        let run_identity = binding.run_manifest_identity;
+        bind_restore_destination(
+            store,
+            write_context(store, counter, owner_epoch),
+            &BindRestoreDestinationRequest {
+                operation_id,
+                binding,
+            },
+        )
+        .unwrap();
+
+        let (staged, manifest) = single_object_rows(run_identity.artifact_revision_id, RUN_BODY);
+        let publish = wire_publish_operation(
+            run_identity.publication_operation_id,
+            run_identity.artifact_revision_id,
+            &workbench(destination),
+            destination_incarnation,
+            NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
+            PublishAuthority::RestoreStaging {
+                restore_operation_id: operation_id,
+            },
+            owner_epoch,
+            &staged,
+            &manifest,
+        );
+        let uploading = PublicationService::new(store)
+            .begin_publish(BeginPublishRequest {
+                context: publication_context(store, counter, owner_epoch),
+                operation: publish,
+            })
+            .unwrap()
+            .operation;
+
+        abort_restore(
+            store,
+            write_context(store, counter, owner_epoch),
+            &AbortRestoreRequest {
+                operation_id,
+                terminal_error: RestoreTerminalError {
+                    kind: RestoreTerminalErrorKind::AbortedByCaller,
+                    message: "cancelled with a live destination publisher".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+        )
+        .unwrap();
+        start_restore_cleanup(
+            store,
+            write_context(store, counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        loop {
+            let cleanup = cleanup_restore_batch(
+                store,
+                write_context(store, counter, owner_epoch),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap();
+            if cleanup.source_eof {
+                break;
+            }
+        }
+        (source, snapshot_id, operation_id, uploading)
     }
 
     fn restore_manifest_descriptor(
@@ -3888,6 +6196,176 @@ mod tests {
             logical_size: initialization.restore_manifest.logical_size,
             content_type: initialization.restore_manifest.content_type.clone(),
         }
+    }
+
+    fn destination_binding_for_test(
+        operation: &RestoreOperationRecord,
+        _destination_commit_fill: u8,
+    ) -> RestoreDestinationBinding {
+        let RestoreCommitProvenance::V5(provenance) = &operation.commit_provenance else {
+            unreachable!();
+        };
+        let restore_manifest_identity = operation.destination_restore_manifest_identity.unwrap();
+        let mut run_operation = *restore_manifest_identity
+            .publication_operation_id
+            .as_bytes();
+        run_operation[0] ^= 0x80;
+        if run_operation == *operation.operation_id.as_bytes() {
+            run_operation[1] ^= 0x80;
+        }
+        let mut run_revision = *restore_manifest_identity.artifact_revision_id.as_bytes();
+        run_revision[0] ^= 0x80;
+        let effective_content_digest_uri = if operation.source_matches_base_commit == Some(true) {
+            provenance.source_commit.content_digest_uri.clone()
+        } else {
+            commit_member_tree_digest_uri(operation.member_rolling_digest)
+        };
+        let destination_commit_id = workbench_commit_identity_for_test(
+            &operation.destination_workbench_id,
+            &effective_content_digest_uri,
+            &provenance.source_commit.manifest_digest_uri,
+        );
+        assert_ne!(destination_commit_id, provenance.source_commit.commit_id);
+        RestoreDestinationBinding {
+            destination_commit_id,
+            effective_content_digest_uri,
+            destination_projection_input_digest: [0x72; SHA256_BYTES],
+            run_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationId::from_bytes(run_operation),
+                artifact_revision_id: ArtifactRevisionId::from_bytes(run_revision),
+            },
+            restore_manifest_identity,
+            manifests: None,
+        }
+    }
+
+    fn workbench_commit_identity_for_test(
+        workbench_id: &WorkbenchId,
+        content_digest_uri: &str,
+        manifest_digest_uri: &str,
+    ) -> CommitId {
+        let mut identity = Sha256::new();
+        identity.update(b"nokv.workbench.commit_identity.v1\0");
+        for value in [
+            workbench_id.as_bytes(),
+            content_digest_uri.as_bytes(),
+            manifest_digest_uri.as_bytes(),
+        ] {
+            identity.update(
+                u64::try_from(value.len())
+                    .expect("test identity input fits u64")
+                    .to_be_bytes(),
+            );
+            identity.update(value);
+        }
+        CommitId::from_bytes(identity.finalize().into())
+    }
+
+    fn detach_commit_head_for_retirement_test(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        workspace_incarnation_id: WorkspaceIncarnationId,
+        commit_id: CommitId,
+    ) {
+        let context = write_context(store, counter, owner_epoch);
+        let head_key = workbench_commit_head_key(root(), workspace_incarnation_id);
+        let head_payload = read_payload(
+            store,
+            context,
+            MetadataFamily::WorkbenchCommitHead,
+            &head_key,
+        )
+        .unwrap()
+        .unwrap();
+        let head = WorkbenchCommitHeadRecord::decode(&head_payload).unwrap();
+        assert_eq!(head.commit_id, commit_id);
+        let commit_key_bytes = commit_key(root(), commit_id);
+        let commit_payload =
+            read_payload(store, context, MetadataFamily::Commit, &commit_key_bytes)
+                .unwrap()
+                .unwrap();
+        let commit = CommitRecord::decode(&commit_payload).unwrap();
+        let next =
+            remove_commit_consumer(&commit, next_commit_version(context.read_version).unwrap())
+                .unwrap();
+        let consumer_key =
+            workbench_head_commit_consumer_key(root(), commit_id, workspace_incarnation_id);
+        let consumer_payload = read_payload(
+            store,
+            context,
+            MetadataFamily::CommitConsumer,
+            &consumer_key,
+        )
+        .unwrap()
+        .unwrap();
+        store
+            .execute(
+                &MetadataCommand {
+                    schema_id: SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                        [10; FIXED_ID_BYTES],
+                    )),
+                    placement_generation: placement(),
+                    owner_epoch,
+                    request_id: context.request_id,
+                    command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                    read_version: context.read_version,
+                    root_fence_action: RootFenceAction::RequireActive,
+                    predicates: vec![
+                        CommandPredicate::Value {
+                            family: MetadataFamily::Commit,
+                            key: commit_key_bytes.clone(),
+                            expected: Some(commit_payload),
+                        },
+                        CommandPredicate::Value {
+                            family: MetadataFamily::WorkbenchCommitHead,
+                            key: head_key.clone(),
+                            expected: Some(head_payload),
+                        },
+                        CommandPredicate::Value {
+                            family: MetadataFamily::CommitConsumer,
+                            key: consumer_key.clone(),
+                            expected: Some(consumer_payload),
+                        },
+                    ],
+                    mutations: vec![
+                        CommandMutation::Put {
+                            family: MetadataFamily::Commit,
+                            key: commit_key_bytes.clone(),
+                            value: next.encode().unwrap(),
+                        },
+                        CommandMutation::Delete {
+                            family: MetadataFamily::WorkbenchCommitHead,
+                            key: head_key.clone(),
+                        },
+                        CommandMutation::Delete {
+                            family: MetadataFamily::CommitConsumer,
+                            key: consumer_key.clone(),
+                        },
+                    ],
+                    history_projection: vec![
+                        HistoryProjection {
+                            family: MetadataFamily::Commit,
+                            key: commit_key_bytes,
+                        },
+                        HistoryProjection {
+                            family: MetadataFamily::WorkbenchCommitHead,
+                            key: head_key,
+                        },
+                        HistoryProjection {
+                            family: MetadataFamily::CommitConsumer,
+                            key: consumer_key,
+                        },
+                    ],
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .unwrap();
     }
 
     fn copy_all(
@@ -3932,19 +6410,94 @@ mod tests {
             RestoreOperationRequest { operation_id },
         )
         .unwrap();
-        publish_restore_manifest_for_test(
+        drive_sealed_to_ready(store, counter, owner_epoch, operation_id, initialization);
+    }
+
+    fn drive_sealed_to_ready(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        operation_id: OperationId,
+        initialization: &RestoreInitialization,
+    ) {
+        let sealed = get_restore(
             store,
-            counter,
-            owner_epoch,
+            write_context(store, counter, owner_epoch),
             operation_id,
-            initialization,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            restore_manifest_descriptor(initialization),
+            sealed.restore_manifest
         );
+        bind_restore_destination(
+            store,
+            write_context(store, counter, owner_epoch),
+            &BindRestoreDestinationRequest {
+                operation_id,
+                binding: destination_binding_for_test(&sealed, 0xd8),
+            },
+        )
+        .unwrap();
+        publish_destination_manifests_for_test(store, counter, owner_epoch, operation_id);
         apply_restore_initialization(
             store,
             write_context(store, counter, owner_epoch),
             RestoreOperationRequest { operation_id },
         )
         .unwrap();
+        loop {
+            let built = build_restore_commit_members(
+                store,
+                write_context(store, counter, owner_epoch),
+                RestoreClosureBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap();
+            if built.members_complete {
+                break;
+            }
+        }
+        loop {
+            let sealed = seal_restore_commit_revisions(
+                store,
+                write_context(store, counter, owner_epoch),
+                RestoreClosureBatchRequest {
+                    operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap();
+            if sealed.ready {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn restore_operation_v2_matches_the_sdk_golden_vector() {
+        let operation_id = restore_operation_id(
+            RootId::from_bytes([1; 16]),
+            &WorkbenchId::new("source-run").unwrap(),
+            WorkspaceIncarnationId::from_bytes([2; 16]),
+            RestoreSourceSelector::Snapshot(SnapshotId::new(7)),
+            &WorkbenchId::new("restored-run").unwrap(),
+            WorkspaceIncarnationId::from_bytes([
+                0xd6, 0x67, 0x1c, 0x11, 0x22, 0xc9, 0xf8, 0x73, 0x9e, 0x03, 0xfe, 0xc7, 0x75, 0x20,
+                0xaa, 0xed,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            operation_id,
+            OperationId::from_bytes([
+                0x9b, 0x21, 0xea, 0xbe, 0x08, 0xd0, 0x35, 0x6d, 0x55, 0x16, 0x8e, 0xf1, 0x62, 0x15,
+                0x6e, 0xe6,
+            ])
+        );
     }
 
     #[test]
@@ -3961,14 +6514,20 @@ mod tests {
             begin_restore(
                 &store,
                 write_context(&store, &mut counter, owner_epoch),
-                &BeginRestoreRequest {
+                &bind_operation_identity(BeginRestoreRequest {
+                    operation_id: OperationId::from_bytes([0; 16]),
                     source_workbench_id: source.source_workbench.clone(),
                     expected_source_workspace_incarnation_id: source.source_incarnation,
                     source: RestoreSourceSelector::Snapshot(snapshot_id),
                     destination_workbench_id: destination.clone(),
                     destination_workspace_incarnation_id: source.source_incarnation,
+                    destination_restore_manifest_identity: RestoreManifestIdentity {
+                        publication_operation_id: OperationId::from_bytes([0xf2; 16]),
+                        artifact_revision_id: source.manifest_revision,
+                    },
+                    destination_committed_at_unix_seconds: 1,
                     restore_manifest: restore_manifest_descriptor(&source.initialization),
-                },
+                }),
             ),
             Err(RestoreError::DestinationIncarnationClaimed {
                 incarnation_id: source.source_incarnation,
@@ -3983,6 +6542,654 @@ mod tests {
     }
 
     #[test]
+    fn begin_retry_reuses_first_writer_time_and_defers_destination_authority() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 1);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let request = snapshot_restore_request(
+            &source,
+            snapshot_id,
+            "first-writer-time",
+            incarnation(30),
+            0xd8,
+        );
+        let mut wrong_operation_id = request.clone();
+        wrong_operation_id.operation_id = OperationId::from_bytes([0xee; 16]);
+        assert_eq!(
+            begin_restore(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                &wrong_operation_id,
+            ),
+            Err(RestoreError::OperationIdentityMismatch {
+                expected: request.operation_id,
+                actual: wrong_operation_id.operation_id,
+            })
+        );
+        assert!(get_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            request.operation_id,
+        )
+        .unwrap()
+        .is_none());
+        let begin_context = write_context(&store, &mut counter, owner_epoch);
+        let begun = begin_restore(&store, begin_context, &request).unwrap();
+
+        let restored = get_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            begun.operation.operation_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            restored.destination_restore_manifest_identity,
+            Some(request.destination_restore_manifest_identity)
+        );
+        assert_eq!(restored.restore_manifest, request.restore_manifest);
+        let RestoreCommitProvenance::V5(pre_bind) = &restored.commit_provenance else {
+            unreachable!();
+        };
+        assert_eq!(pre_bind.destination_committed_at_unix_seconds, 1);
+        assert!(pre_bind.destination_binding.is_none());
+
+        let mut later_clock_retry = request.clone();
+        later_clock_retry.destination_committed_at_unix_seconds = 99;
+        assert_eq!(
+            derived_operation_identity(&later_clock_retry),
+            derived_operation_identity(&request)
+        );
+        assert_eq!(
+            begin_request_digest(root(), &later_clock_retry),
+            begin_request_digest(root(), &request)
+        );
+        let replay = begin_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &later_clock_retry,
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, begun.operation);
+        let RestoreCommitProvenance::V5(provenance) = &replay.operation.commit_provenance else {
+            unreachable!();
+        };
+        assert_eq!(provenance.destination_committed_at_unix_seconds, 1);
+
+        assert!(matches!(
+            &replay.operation.commit_provenance,
+            RestoreCommitProvenance::V5(provenance)
+                if provenance.destination_binding.is_none()
+        ));
+
+        let mut wrong_restore_identity = request;
+        wrong_restore_identity
+            .destination_restore_manifest_identity
+            .artifact_revision_id = revision(0xf3);
+        assert_eq!(
+            derived_operation_identity(&wrong_restore_identity),
+            derived_operation_identity(&later_clock_retry)
+        );
+        assert_ne!(
+            begin_request_digest(root(), &wrong_restore_identity),
+            begin_request_digest(root(), &later_clock_retry)
+        );
+        assert_eq!(
+            begin_restore(&store, begin_context, &wrong_restore_identity),
+            Err(RestoreError::RequestInputMismatch)
+        );
+    }
+
+    #[test]
+    fn mutated_snapshot_seals_against_base_commit_then_late_binds_exact_destination() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 1);
+        replace_source_projection(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source,
+            TypedProjection::new(BTreeMap::from([(
+                QueryFieldId::new("source.class").unwrap(),
+                QueryScalar::String("mutated-after-base-commit".to_owned()),
+            )]))
+            .unwrap(),
+        );
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source,
+            snapshot_id,
+            "mutated-snapshot-restore",
+            incarnation(31),
+        );
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        copy_all(
+            &store,
+            &mut counter,
+            owner_epoch,
+            begun.operation.operation_id,
+        );
+        let sealed = seal_restore_source(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        assert_eq!(sealed.operation.source_matches_base_commit, Some(false));
+        assert_eq!(
+            sealed.operation.member_seal,
+            Some(sealed.operation.member_rolling_digest)
+        );
+
+        let binding = destination_binding_for_test(&sealed.operation, 0xd8);
+        let bind_request = BindRestoreDestinationRequest {
+            operation_id: begun.operation.operation_id,
+            binding: binding.clone(),
+        };
+        let bound = bind_restore_destination(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &bind_request,
+        )
+        .unwrap();
+        assert!(!bound.replayed);
+        let RestoreCommitProvenance::V5(provenance) = &bound.operation.commit_provenance else {
+            unreachable!();
+        };
+        assert_eq!(provenance.destination_binding.as_ref(), Some(&binding));
+
+        let replay = bind_restore_destination(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &bind_request,
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, bound.operation);
+
+        let mut different = bind_request;
+        different.binding.destination_projection_input_digest = [0x76; SHA256_BYTES];
+        assert_ne!(
+            bind_destination_input_digest(&different),
+            bind_destination_input_digest(&BindRestoreDestinationRequest {
+                operation_id: begun.operation.operation_id,
+                binding,
+            })
+        );
+        assert_eq!(
+            bind_restore_destination(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                &different,
+            ),
+            Err(RestoreError::DestinationBindingMismatch {
+                operation_id: begun.operation.operation_id,
+            })
+        );
+    }
+
+    #[test]
+    fn snapshot_begin_rejects_missing_or_ahead_commit_consumer() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 1);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let request = snapshot_restore_request(
+            &source,
+            snapshot_id,
+            "retention-begin",
+            incarnation(30),
+            0xd9,
+        );
+        let consumer_key =
+            snapshot_commit_consumer_key(root(), source.source_commit_id, snapshot_id);
+        let original = read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitConsumer,
+            &consumer_key,
+        )
+        .unwrap()
+        .unwrap();
+        replace_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::CommitConsumer,
+            consumer_key.clone(),
+            CommitConsumerRecord {
+                consumer_epoch_at_add: ConsumerEpoch::new(u64::MAX),
+            }
+            .encode(),
+        );
+        assert_eq!(
+            begin_restore(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                &request,
+            ),
+            Err(RestoreError::SnapshotRetentionMismatch)
+        );
+
+        replace_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::CommitConsumer,
+            consumer_key.clone(),
+            original,
+        );
+        delete_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::CommitConsumer,
+            consumer_key,
+        );
+        assert_eq!(
+            begin_restore(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                &request,
+            ),
+            Err(RestoreError::SnapshotRetentionMismatch)
+        );
+    }
+
+    #[test]
+    fn snapshot_resume_rejects_commit_id_or_immutable_seal_drift() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 1);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let request = snapshot_restore_request(
+            &source,
+            snapshot_id,
+            "retention-resume",
+            incarnation(30),
+            0xda,
+        );
+        let begun = begin_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &request,
+        )
+        .unwrap();
+        let snapshot_key = snapshot_ref_key(root(), source.source_incarnation, snapshot_id);
+        let snapshot = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::SnapshotRef,
+            &snapshot_key,
+            SnapshotRefRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        let mut drifted_snapshot = snapshot.record.clone();
+        drifted_snapshot.source_commit_id = Some(CommitId::from_bytes([0xee; SHA256_BYTES]));
+        replace_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::SnapshotRef,
+            snapshot_key.clone(),
+            drifted_snapshot.encode().unwrap(),
+        );
+        assert_eq!(
+            start_restore_copy(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                RestoreOperationRequest {
+                    operation_id: begun.operation.operation_id,
+                },
+            ),
+            Err(RestoreError::SnapshotRetentionMismatch)
+        );
+
+        replace_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::SnapshotRef,
+            snapshot_key,
+            snapshot.record.encode().unwrap(),
+        );
+        let commit_key = commit_key(root(), source.source_commit_id);
+        let commit = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key,
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        let mut drifted_commit = commit.record;
+        drifted_commit.member_digest = [0xef; SHA256_BYTES];
+        replace_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::Commit,
+            commit_key,
+            drifted_commit.encode().unwrap(),
+        );
+        assert_eq!(
+            start_restore_copy(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                RestoreOperationRequest {
+                    operation_id: begun.operation.operation_id,
+                },
+            ),
+            Err(RestoreError::SnapshotRetentionMismatch)
+        );
+    }
+
+    #[test]
+    fn held_source_run_manifest_read_is_commit_owned_and_survives_snapshot_lease_expiry() {
+        let mut counter = 950_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 1);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source,
+            snapshot_id,
+            "held-run-manifest",
+            incarnation(39),
+        );
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        copy_all(
+            &store,
+            &mut counter,
+            owner_epoch,
+            begun.operation.operation_id,
+        );
+        seal_restore_source(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+
+        let held = read_restore_source_run_manifest(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            begun.operation.operation_id,
+        )
+        .unwrap();
+        assert_eq!(held.source_commit_id, source.source_commit_id);
+        let RestoreCommitProvenance::V5(provenance) = &held.operation.commit_provenance else {
+            unreachable!();
+        };
+        assert_eq!(
+            held.path_entry.artifact_revision_id,
+            provenance.source_commit.tree_manifest_revision_id
+        );
+        assert!(held.source_snapshot_read_version.is_some());
+
+        store
+            .observe_lease_clock(root(), placement(), owner_epoch, 2_000_000)
+            .unwrap();
+        assert!(read_restore_source_run_manifest(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            begun.operation.operation_id,
+        )
+        .is_ok());
+
+        delete_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::CommitConsumer,
+            snapshot_commit_consumer_key(root(), source.source_commit_id, snapshot_id),
+        );
+        assert_eq!(
+            read_restore_source_run_manifest(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                begun.operation.operation_id,
+            ),
+            Err(RestoreError::SnapshotRetentionMismatch)
+        );
+    }
+
+    #[test]
+    fn empty_ordinary_restore_commits_exactly_two_destination_manifests() {
+        let mut counter = 975_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 0);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let destination = workbench("empty-restored");
+        let destination_incarnation = incarnation(40);
+        let completed = drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source.source_workbench,
+            source.source_incarnation,
+            snapshot_id,
+            &destination,
+            destination_incarnation,
+            operation(0x73),
+            revision(0x74),
+            1,
+        );
+        assert_eq!(completed.result.member_count, 0);
+        let receipt = completed
+            .command
+            .operation
+            .destination_commit_receipt()
+            .unwrap();
+        let commit = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), receipt.destination_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(commit.record.member_count, 2);
+        assert_eq!(commit.record.unique_revision_count, 2);
+        let head = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::WorkbenchCommitHead,
+            &workbench_commit_head_key(root(), destination_incarnation),
+            WorkbenchCommitHeadRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(head.record.commit_id, receipt.destination_commit_id);
+        assert_eq!(head.record.head_generation, Generation::new(1).unwrap());
+        assert!(
+            get_visible_workspace_at(&store, read_context(&store, owner_epoch), &destination,)
+                .unwrap()
+                .is_some()
+        );
+        for path in [RUN_MANIFEST_PATH, RESTORE_MANIFEST_PATH] {
+            assert!(get_visible_path_at(
+                &store,
+                read_context(&store, owner_epoch),
+                &destination,
+                &NormalizedRelativePath::new(path).unwrap(),
+            )
+            .unwrap()
+            .is_some());
+        }
+    }
+
+    #[test]
+    fn retiring_restored_destination_releases_its_parent_child_consumer() {
+        let mut counter = 980_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 0);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let destination = workbench("retired-restore");
+        let destination_incarnation = incarnation(41);
+        let completed = drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source.source_workbench,
+            source.source_incarnation,
+            snapshot_id,
+            &destination,
+            destination_incarnation,
+            operation(0x76),
+            revision(0x77),
+            1,
+        );
+        let destination_commit_id = completed
+            .command
+            .operation
+            .destination_commit_receipt()
+            .unwrap()
+            .destination_commit_id;
+        let parent_consumer_key =
+            child_commit_consumer_key(root(), source.source_commit_id, destination_commit_id);
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitConsumer,
+            &parent_consumer_key,
+        )
+        .unwrap()
+        .is_some());
+        let parent_before_retire = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), source.source_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Commit retirement requires every external consumer to be detached.
+        // This helper mirrors commit.rs' retirement test boundary and is not a
+        // production workspace-lifecycle shortcut.
+        detach_commit_head_for_retirement_test(
+            &store,
+            &mut counter,
+            owner_epoch,
+            destination_incarnation,
+            destination_commit_id,
+        );
+        let zero_consumer_destination = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), destination_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(zero_consumer_destination.record.consumer_count, 0);
+        let retire_operation_id = operation(0x78);
+        let service = CommitService::new(&store);
+        let mut retired = service
+            .begin_retirement(BeginCommitRetirementRequest {
+                context: write_context(&store, &mut counter, owner_epoch),
+                operation_id: retire_operation_id,
+                commit_id: destination_commit_id,
+                expected_consumer_epoch: zero_consumer_destination.record.consumer_epoch,
+            })
+            .unwrap();
+        while retired.operation.phase != CommitRetirePhase::Complete {
+            retired = service
+                .release_retired_commit(BuildCommitStepRequest {
+                    context: write_context(&store, &mut counter, owner_epoch),
+                    operation_id: retire_operation_id,
+                    limit: MAX_COMMIT_MEMBER_BATCH_ROWS,
+                })
+                .unwrap();
+        }
+        let destination_commit = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), destination_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(destination_commit.record.state, CommitState::Retired);
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitConsumer,
+            &parent_consumer_key,
+        )
+        .unwrap()
+        .is_none());
+        let parent_after_retire = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), source.source_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parent_after_retire.record.consumer_count + 1,
+            parent_before_retire.record.consumer_count
+        );
+        assert_eq!(
+            parent_after_retire.record.consumer_epoch.get(),
+            parent_before_retire.record.consumer_epoch.get() + 1
+        );
+        assert!(parent_after_retire
+            .record
+            .last_zero_consumer_version
+            .is_none());
+    }
+
+    #[test]
     fn large_snapshot_restore_survives_reopen_and_replays_publication() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("restore-meta");
@@ -3993,32 +7200,61 @@ mod tests {
         let source = seed_source(&store, &mut counter, initial_owner, 300);
         let snapshot_id = mint_source_snapshot(&store, &mut counter, initial_owner, &source);
         let begin_context = write_context(&store, &mut counter, initial_owner);
-        let begin_request = BeginRestoreRequest {
+        let begin_request = bind_operation_identity(BeginRestoreRequest {
+            operation_id: OperationId::from_bytes([0; 16]),
             source_workbench_id: source.source_workbench.clone(),
             expected_source_workspace_incarnation_id: source.source_incarnation,
             source: RestoreSourceSelector::Snapshot(snapshot_id),
             destination_workbench_id: workbench("destination"),
             destination_workspace_incarnation_id: incarnation(30),
+            destination_restore_manifest_identity: RestoreManifestIdentity {
+                publication_operation_id: OperationId::from_bytes([0xf2; 16]),
+                artifact_revision_id: revision(0xe4),
+            },
+            destination_committed_at_unix_seconds: 1,
             restore_manifest: restore_manifest_descriptor(&source.initialization),
-        };
+        });
         let begun = begin_restore(&store, begin_context, &begin_request).unwrap();
         let begin_replay = begin_restore(&store, begin_context, &begin_request).unwrap();
         assert!(begin_replay.replayed);
         assert_eq!(begin_replay.operation, begun.operation);
         assert!(begun.operation.initialization_digest.is_none());
+        let mut later_clock_retry = begin_request.clone();
+        later_clock_retry.destination_committed_at_unix_seconds = 99;
+        assert_eq!(
+            begin_request_digest(root(), &later_clock_retry),
+            begin_request_digest(root(), &begin_request)
+        );
+        let later_clock_replay = begin_restore(
+            &store,
+            write_context(&store, &mut counter, initial_owner),
+            &later_clock_retry,
+        )
+        .unwrap();
+        assert!(later_clock_replay.replayed);
+        assert_eq!(later_clock_replay.operation, begun.operation);
+        let RestoreCommitProvenance::V5(provenance) =
+            &later_clock_replay.operation.commit_provenance
+        else {
+            unreachable!();
+        };
+        assert_eq!(provenance.destination_committed_at_unix_seconds, 1);
         let operation_id = begun.operation.operation_id;
         let mut wrong_descriptor = begin_request.clone();
         wrong_descriptor.restore_manifest.body_digest_uri = format!("sha256:{}", "cd".repeat(32));
-        assert!(matches!(
+        assert_ne!(
+            begin_request_digest(root(), &wrong_descriptor),
+            begin_request_digest(root(), &begin_request)
+        );
+        assert_eq!(derived_operation_identity(&wrong_descriptor), operation_id);
+        assert_eq!(
             begin_restore(
                 &store,
                 write_context(&store, &mut counter, initial_owner),
                 &wrong_descriptor,
             ),
-            Err(RestoreError::RestoreManifestBindingMismatch {
-                operation_id: actual,
-            }) if actual == operation_id
-        ));
+            Err(RestoreError::RestoreManifestBindingMismatch { operation_id })
+        );
         start_restore_copy(
             &store,
             write_context(&store, &mut counter, initial_owner),
@@ -4096,19 +7332,13 @@ mod tests {
             validate_initialization(&wrong_initialization, &sealed.operation),
             Err(RestoreError::ManifestBindingMismatch)
         );
-        publish_restore_manifest_for_test(
+        drive_sealed_to_ready(
             &store,
             &mut counter,
             initial_owner,
             operation_id,
             &source.initialization,
         );
-        apply_restore_initialization(
-            &store,
-            write_context(&store, &mut counter, initial_owner),
-            RestoreOperationRequest { operation_id },
-        )
-        .unwrap();
         assert!(get_visible_workspace_at(
             &store,
             read_context(&store, initial_owner),
@@ -4123,14 +7353,36 @@ mod tests {
             RestoreOperationRequest { operation_id },
         )
         .unwrap();
+        let source_commit_after_complete = read_record(
+            &store,
+            write_context(&store, &mut counter, initial_owner),
+            MetadataFamily::Commit,
+            &commit_key(root(), source.source_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
         let complete_replay = complete_restore(
             &store,
             complete_context,
             RestoreOperationRequest { operation_id },
         )
         .unwrap();
+        let source_commit_after_replay = read_record(
+            &store,
+            write_context(&store, &mut counter, initial_owner),
+            MetadataFamily::Commit,
+            &commit_key(root(), source.source_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
         assert!(complete_replay.command.replayed);
         assert_eq!(complete_replay.result, completed.result);
+        assert_eq!(
+            source_commit_after_replay.record,
+            source_commit_after_complete.record
+        );
         assert_eq!(completed.result.member_count, 300);
         store
             .observe_lease_clock(root(), placement(), initial_owner, 2_000_000)
@@ -4173,7 +7425,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(manifest.artifact_revision_id, source.manifest_revision);
+        assert_eq!(manifest.artifact_revision_id, revision(0xe4));
         let hold = read_payload(
             &store,
             write_context(&store, &mut counter, initial_owner),
@@ -4476,6 +7728,220 @@ mod tests {
     }
 
     #[test]
+    fn finish_cleanup_waits_for_live_manifest_publisher_then_accepts_cleaned() {
+        let mut counter = 1_975_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let (_source, _snapshot_id, operation_id, uploading) =
+            prepare_cleanup_with_uploading_run_publication(
+                &store,
+                &mut counter,
+                owner_epoch,
+                "publisher-pending",
+                incarnation(36),
+            );
+
+        assert_eq!(
+            finish_restore_cleanup(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                RestoreOperationRequest { operation_id },
+            ),
+            Err(RestoreError::PublicationCleanupPending {
+                operation_id: uploading.operation_id,
+                phase: PublishPhase::Uploading,
+            })
+        );
+        assert_eq!(
+            get_restore(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                operation_id,
+            )
+            .unwrap()
+            .unwrap()
+            .phase,
+            RestorePhase::Cleaning
+        );
+
+        let service = PublicationService::new(&store);
+        let aborting = service
+            .take_over_orphaned_publish(TakeOverOrphanedPublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                expected_operation: uploading,
+                observed_now_ms: 2_000_000,
+                maximum_clock_skew_ms: 0,
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::ActivityLeaseExpired,
+                    message: "publisher lease expired during restore cleanup".to_owned(),
+                    evidence_digest: None,
+                },
+            })
+            .unwrap()
+            .operation;
+        let cleaning = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                expected_operation: aborting,
+                transition: PublishTransition::BeginCleaning,
+            })
+            .unwrap()
+            .operation;
+        let cleaned_publication = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                expected_operation: cleaning,
+                transition: PublishTransition::FinishCleanup,
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(cleaned_publication.phase, PublishPhase::Cleaned);
+
+        let cleaned = finish_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert_eq!(cleaned.operation.phase, RestorePhase::Cleaned);
+    }
+
+    #[test]
+    fn finish_cleanup_rejects_manifest_publisher_identity_drift() {
+        let mut counter = 1_980_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let (source, _snapshot_id, operation_id, uploading) =
+            prepare_cleanup_with_uploading_run_publication(
+                &store,
+                &mut counter,
+                owner_epoch,
+                "publisher-drift",
+                incarnation(37),
+            );
+        let expected_key = operation_key(root(), OperationKind::Publish, uploading.operation_id);
+        let mut wrong = uploading;
+        wrong.operation_id = operation(0xaa);
+        seal_publish_operation(&mut wrong);
+        replace_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::Operation,
+            expected_key,
+            wrong.encode().unwrap(),
+        );
+
+        assert_eq!(
+            finish_restore_cleanup(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                RestoreOperationRequest { operation_id },
+            ),
+            Err(RestoreError::ManifestBindingMismatch)
+        );
+        let snapshot = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::SnapshotRef,
+            &snapshot_ref_key(root(), source.source_incarnation, SnapshotId::new(42)),
+            SnapshotRefRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.record.consumer_count, 1);
+    }
+
+    #[test]
+    fn quarantined_manifest_publisher_quarantines_restore_without_releasing_source() {
+        let mut counter = 1_985_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let (source, snapshot_id, operation_id, uploading) =
+            prepare_cleanup_with_uploading_run_publication(
+                &store,
+                &mut counter,
+                owner_epoch,
+                "publisher-quarantined",
+                incarnation(38),
+            );
+        let service = PublicationService::new(&store);
+        let aborting = service
+            .take_over_orphaned_publish(TakeOverOrphanedPublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                expected_operation: uploading,
+                observed_now_ms: 2_000_000,
+                maximum_clock_skew_ms: 0,
+                terminal_error: PublishTerminalError {
+                    kind: PublishTerminalErrorKind::ActivityLeaseExpired,
+                    message: "publisher lease expired during restore cleanup".to_owned(),
+                    evidence_digest: None,
+                },
+            })
+            .unwrap()
+            .operation;
+        let cleaning = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                expected_operation: aborting,
+                transition: PublishTransition::BeginCleaning,
+            })
+            .unwrap()
+            .operation;
+        let quarantined_publication = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter, owner_epoch),
+                expected_operation: cleaning,
+                transition: PublishTransition::Quarantine {
+                    terminal_error: PublishTerminalError {
+                        kind: PublishTerminalErrorKind::CleanupFailed,
+                        message: "provider cleanup requires reconciliation".to_owned(),
+                        evidence_digest: Some([0x91; SHA256_BYTES]),
+                    },
+                },
+            })
+            .unwrap()
+            .operation;
+        assert_eq!(quarantined_publication.phase, PublishPhase::Quarantined);
+
+        let quarantined = finish_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert_eq!(quarantined.operation.phase, RestorePhase::Quarantined);
+        assert!(quarantined
+            .operation
+            .terminal_error
+            .as_ref()
+            .unwrap()
+            .evidence_digest
+            .is_some());
+        let snapshot = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::SnapshotRef,
+            &snapshot_ref_key(root(), source.source_incarnation, snapshot_id),
+            SnapshotRefRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.record.consumer_count, 1);
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::HistoryHold,
+            &restore_history_hold_key(root(), operation_id),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
     fn abort_wins_ready_race_and_cleanup_releases_every_reference() {
         let mut counter = 2000_u128;
         let store = crate::workspace::test_support::memory(shard()).unwrap();
@@ -4573,7 +8039,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             source_revision.record.strong_reference_count,
-            source.paths.len() as u64
+            source.paths.len() as u64 + 1
         );
         let removed_index_key = secondary_index_key(
             root(),
@@ -4629,69 +8095,34 @@ mod tests {
         let current_owner = owner(1);
         activate_root(&store, &mut counter, current_owner);
         let source = seed_source(&store, &mut counter, current_owner, 3);
-        let commit_id = CommitId::from_bytes([44; SHA256_BYTES]);
-        let mut rolling = [0; SHA256_BYTES];
-        let mut member_rows = Vec::new();
-        for (sequence, path) in source.paths.iter().enumerate() {
-            let member = CommitMemberRecord {
-                artifact_revision_id: source.source_revision,
-                path_generation: Generation::new(1).unwrap(),
-                body_digest_uri: "sha256:source".to_owned(),
-                manifest_digest_uri: "sha256:manifest".to_owned(),
-                logical_size: 1,
-                dependency_count: 0,
-                dependency_depth: 0,
-                content_type: "text/plain".to_owned(),
-                producer: Some("test".to_owned()),
-                manifest_id: None,
-                typed_projection: TypedProjection::empty().encode().unwrap(),
-            };
-            let row_digest = commit_member_row_digest(path, &member).unwrap();
-            rolling = advance_commit_member_rolling_digest(rolling, sequence as u64, row_digest);
-            member_rows.push((
-                MetadataFamily::CommitMember,
-                super::super::codec::commit_member_key(root(), commit_id, path),
-                member.encode().unwrap(),
-            ));
-        }
-        let current_version =
-            CommitVersion::new(store.current_read_version().unwrap().get()).unwrap();
-        let commit = CommitRecord {
-            source_workspace_incarnation_id: source.source_incarnation,
-            content_digest_uri: "sha256:content".to_owned(),
-            manifest_digest_uri: "sha256:manifest".to_owned(),
-            tree_manifest_revision_id: source.source_revision,
-            tree_digest_uri: "sha256:tree".to_owned(),
-            member_count: source.paths.len() as u64,
-            member_digest: rolling,
-            unique_revision_count: 1,
-            revision_digest: [1; SHA256_BYTES],
-            parent_commits: Vec::new(),
-            parent_digest: [0; SHA256_BYTES],
-            producer: Some("test".to_owned()),
-            lineage_projection: Vec::new(),
-            consumer_count: 0,
-            consumer_epoch: ConsumerEpoch::ZERO,
-            last_zero_consumer_version: Some(current_version),
-            state: CommitState::Sealed,
-        };
-        member_rows.push((
+        let commit_id = source.source_commit_id;
+        let initial_commit = read_record(
+            &store,
+            write_context(&store, &mut counter, current_owner),
             MetadataFamily::Commit,
-            commit_key(root(), commit_id),
-            commit.encode().unwrap(),
-        ));
-        put_absent(&store, &mut counter, current_owner, member_rows);
+            &commit_key(root(), commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(initial_commit.record.consumer_count, 1);
         let begun = begin_restore(
             &store,
             write_context(&store, &mut counter, current_owner),
-            &BeginRestoreRequest {
+            &bind_operation_identity(BeginRestoreRequest {
+                operation_id: OperationId::from_bytes([0; 16]),
                 source_workbench_id: source.source_workbench.clone(),
                 expected_source_workspace_incarnation_id: source.source_incarnation,
                 source: RestoreSourceSelector::Commit(commit_id),
                 destination_workbench_id: workbench("from-commit"),
                 destination_workspace_incarnation_id: incarnation(33),
+                destination_restore_manifest_identity: RestoreManifestIdentity {
+                    publication_operation_id: OperationId::from_bytes([0xf2; 16]),
+                    artifact_revision_id: revision(0xe4),
+                },
+                destination_committed_at_unix_seconds: 1,
                 restore_manifest: restore_manifest_descriptor(&source.initialization),
-            },
+            }),
         )
         .unwrap();
         let operation_id = begun.operation.operation_id;
@@ -4702,7 +8133,7 @@ mod tests {
             operation_id,
             &source.initialization,
         );
-        complete_restore(
+        let completed = complete_restore(
             &store,
             write_context(&store, &mut counter, current_owner),
             RestoreOperationRequest { operation_id },
@@ -4717,8 +8148,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(commit.record.consumer_count, 0);
-        assert!(commit.record.last_zero_consumer_version.is_some());
+        assert_eq!(commit.record.consumer_count, 2);
+        assert_eq!(
+            commit.record.consumer_epoch.get(),
+            initial_commit.record.consumer_epoch.get() + 3
+        );
+        assert!(commit.record.last_zero_consumer_version.is_none());
         assert!(read_payload(
             &store,
             write_context(&store, &mut counter, current_owner),
@@ -4727,6 +8162,25 @@ mod tests {
         )
         .unwrap()
         .is_none());
+        let destination_commit_id = completed
+            .command
+            .operation
+            .destination_commit_receipt()
+            .unwrap()
+            .destination_commit_id;
+        let child = read_record(
+            &store,
+            write_context(&store, &mut counter, current_owner),
+            MetadataFamily::CommitConsumer,
+            &child_commit_consumer_key(root(), commit_id, destination_commit_id),
+            CommitConsumerRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            child.record.consumer_epoch_at_add,
+            commit.record.consumer_epoch
+        );
     }
 
     // ------------------------------------------------------------------
@@ -4736,27 +8190,27 @@ mod tests {
     // ------------------------------------------------------------------
 
     use nokv_types::{
-        BuildCommitPhase, NormalizedRelativePath, PublishPhase, SnapshotAliasName,
-        StagedCleanupState, StagedProviderState,
+        BuildCommitPhase, CommitRetirePhase, NormalizedRelativePath, PublishPhase,
+        SnapshotAliasName, StagedCleanupState, StagedProviderState,
     };
 
     use super::super::build_commit_records::CommitManifestCondition;
     use super::super::codec::object_block_key;
     use super::super::commit::{
-        BeginBuildCommitRequest, BuildCommitStepRequest, CommitService,
-        MAX_COMMIT_MEMBER_BATCH_ROWS, MAX_COMMIT_PARENT_BATCH_ROWS, MAX_COMMIT_REVISION_BATCH_ROWS,
-        RUN_MANIFEST_PATH,
+        BeginBuildCommitRequest, BeginCommitRetirementRequest, BuildCommitStepRequest,
+        CommitService, MAX_COMMIT_MEMBER_BATCH_ROWS, MAX_COMMIT_PARENT_BATCH_ROWS,
+        MAX_COMMIT_REVISION_BATCH_ROWS, RUN_MANIFEST_PATH,
     };
     use super::super::publication::{
         dependency_owner_digest, manifest_rows_digest, seal_publish_operation,
         staged_object_ledger_digest, BeginPublishRequest, FinalizePublishRequest, ManifestRowInput,
         MarkObjectsUploadedBatchRequest, PublicationContext, PublicationService, PublishedArtifact,
         StageManifestBatchRequest, StageObjectsBatchRequest, StagedObjectUpdate,
-        TransitionPublishRequest,
+        TakeOverOrphanedPublishRequest, TransitionPublishRequest,
     };
     use super::super::publish_operation_records::{
         ArtifactManifestRow, PublishAuthority, PublishClaim, PublishOperationRecord,
-        PublishTransition, StagedObjectRecord,
+        PublishTerminalError, PublishTerminalErrorKind, PublishTransition, StagedObjectRecord,
     };
 
     fn operation(fill: u8) -> OperationId {
@@ -4995,6 +8449,31 @@ mod tests {
         run_manifest_body: &[u8],
     ) {
         let commits = CommitService::new(store);
+        let existing_head = read_record(
+            store,
+            write_context(store, counter, owner_epoch),
+            MetadataFamily::WorkbenchCommitHead,
+            &workbench_commit_head_key(root(), source_incarnation),
+            WorkbenchCommitHeadRecord::decode,
+        )
+        .unwrap();
+        let existing_run_manifest = get_visible_path_at(
+            store,
+            read_context(store, owner_epoch),
+            source_workbench,
+            &NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
+        )
+        .unwrap();
+        let run_manifest_condition = match existing_run_manifest {
+            Some(path) => CommitManifestCondition::ReplaceOnly {
+                expected_generation: path.generation,
+            },
+            None => CommitManifestCondition::CreateOnly,
+        };
+        let parent_commits = existing_head
+            .as_ref()
+            .map(|head| vec![head.record.commit_id])
+            .unwrap_or_default();
         let begun = commits
             .begin_build(BeginBuildCommitRequest {
                 context: write_context(store, counter, owner_epoch),
@@ -5006,19 +8485,21 @@ mod tests {
                 manifest_digest_uri: body_digest_uri(run_manifest_body),
                 projection_input_digest: [0; SHA256_BYTES],
                 tree_manifest_revision_id: tree_manifest_revision,
-                replace: false,
-                run_manifest_condition: CommitManifestCondition::CreateOnly,
+                replace: existing_head.is_some(),
+                run_manifest_condition,
                 committed_at_unix_seconds: 1_700_000_000,
-                expected_head_generation: None,
+                expected_head_generation: existing_head
+                    .as_ref()
+                    .map(|head| head.record.head_generation),
                 producer: None,
                 lineage_projection: Vec::new(),
-                parent_commits: Vec::new(),
+                parent_commits,
             })
             .unwrap();
         assert!(begun.operation.commit_staged_run_manifest.is_none());
 
         let (staged, manifest) = single_object_rows(tree_manifest_revision, run_manifest_body);
-        let publish = wire_publish_operation(
+        let mut publish = wire_publish_operation(
             run_manifest_publish_operation_id,
             tree_manifest_revision,
             source_workbench,
@@ -5031,6 +8512,15 @@ mod tests {
             &staged,
             &manifest,
         );
+        publish.claim = match run_manifest_condition {
+            CommitManifestCondition::CreateOnly => PublishClaim::CreateOnly,
+            CommitManifestCondition::ReplaceOnly {
+                expected_generation,
+            } => PublishClaim::ReplaceOnly {
+                expected_generation,
+            },
+        };
+        seal_publish_operation(&mut publish);
         let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
         drive_publish_wire_calls(
             store,
@@ -5117,18 +8607,24 @@ mod tests {
         let begun = begin_restore(
             store,
             write_context(store, counter, owner_epoch),
-            &BeginRestoreRequest {
+            &bind_operation_identity(BeginRestoreRequest {
+                operation_id: OperationId::from_bytes([0; 16]),
                 source_workbench_id: source_workbench.clone(),
                 expected_source_workspace_incarnation_id: source_incarnation,
                 source: RestoreSourceSelector::Snapshot(snapshot_id),
                 destination_workbench_id: destination_workbench.clone(),
                 destination_workspace_incarnation_id: destination_incarnation,
+                destination_restore_manifest_identity: RestoreManifestIdentity {
+                    publication_operation_id: restore_manifest_publish_operation_id,
+                    artifact_revision_id: restore_manifest_revision,
+                },
+                destination_committed_at_unix_seconds: 1,
                 restore_manifest: RestoreManifestDescriptor {
                     body_digest_uri: body_digest_uri(restore_manifest_body),
                     logical_size: restore_manifest_body.len() as u64,
                     content_type: "application/json".to_owned(),
                 },
-            },
+            }),
         )
         .unwrap();
         let restore_operation_id = begun.operation.operation_id;
@@ -5164,41 +8660,75 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("seal_restore_source failed: {error}"));
 
-        // RestoreStaging publish of metadata/restore_manifest.json into the
-        // hidden destination workspace.
-        let (staged, manifest) =
-            single_object_rows(restore_manifest_revision, restore_manifest_body);
-        let publish = wire_publish_operation(
-            restore_manifest_publish_operation_id,
-            restore_manifest_revision,
-            destination_workbench,
-            destination_incarnation,
-            NormalizedRelativePath::new(RESTORE_MANIFEST_PATH).unwrap(),
-            PublishAuthority::RestoreStaging {
-                restore_operation_id,
-            },
-            owner_epoch,
-            &staged,
-            &manifest,
-        );
-        let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
-        let published = drive_publish_wire_calls(
+        let sealed = get_restore(
             store,
-            counter,
-            owner_epoch,
-            publish,
-            &staged,
-            &manifest,
-            PublishedArtifact {
-                logical_size: restore_manifest_body.len() as u64,
-                body_digest_uri: body_digest_uri(restore_manifest_body),
-                manifest_digest_uri,
-                content_type: "application/json".to_owned(),
-                producer: None,
-                manifest_id: None,
-                typed_index_projection: TypedProjection::empty().encode().unwrap(),
+            write_context(store, counter, owner_epoch),
+            restore_operation_id,
+        )
+        .unwrap()
+        .unwrap();
+        let binding = destination_binding_for_test(&sealed, 0xd9);
+        bind_restore_destination(
+            store,
+            write_context(store, counter, owner_epoch),
+            &BindRestoreDestinationRequest {
+                operation_id: restore_operation_id,
+                binding: binding.clone(),
             },
-        );
+        )
+        .unwrap_or_else(|error| panic!("bind_restore_destination failed: {error}"));
+
+        let run_manifest_body: &[u8] =
+            br#"{"schema":"nokv.workbench.run_manifest.v1","restored":true}"#;
+        let mut restore_publication_revision = None;
+        for (path, identity, body) in [
+            (
+                RUN_MANIFEST_PATH,
+                binding.run_manifest_identity,
+                run_manifest_body,
+            ),
+            (
+                RESTORE_MANIFEST_PATH,
+                binding.restore_manifest_identity,
+                restore_manifest_body,
+            ),
+        ] {
+            let (staged, manifest) = single_object_rows(identity.artifact_revision_id, body);
+            let publish = wire_publish_operation(
+                identity.publication_operation_id,
+                identity.artifact_revision_id,
+                destination_workbench,
+                destination_incarnation,
+                NormalizedRelativePath::new(path).unwrap(),
+                PublishAuthority::RestoreStaging {
+                    restore_operation_id,
+                },
+                owner_epoch,
+                &staged,
+                &manifest,
+            );
+            let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
+            let published = drive_publish_wire_calls(
+                store,
+                counter,
+                owner_epoch,
+                publish,
+                &staged,
+                &manifest,
+                PublishedArtifact {
+                    logical_size: body.len() as u64,
+                    body_digest_uri: body_digest_uri(body),
+                    manifest_digest_uri,
+                    content_type: "application/json".to_owned(),
+                    producer: None,
+                    manifest_id: None,
+                    typed_index_projection: TypedProjection::empty().encode().unwrap(),
+                },
+            );
+            if path == RESTORE_MANIFEST_PATH {
+                restore_publication_revision = Some(published.result.workspace_revision);
+            }
+        }
 
         apply_restore_initialization(
             store,
@@ -5208,6 +8738,34 @@ mod tests {
             },
         )
         .unwrap_or_else(|error| panic!("apply_restore_initialization failed: {error}"));
+        loop {
+            let built = build_restore_commit_members(
+                store,
+                write_context(store, counter, owner_epoch),
+                RestoreClosureBatchRequest {
+                    operation_id: restore_operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap_or_else(|error| panic!("build_restore_commit_members failed: {error}"));
+            if built.members_complete {
+                break;
+            }
+        }
+        loop {
+            let sealed = seal_restore_commit_revisions(
+                store,
+                write_context(store, counter, owner_epoch),
+                RestoreClosureBatchRequest {
+                    operation_id: restore_operation_id,
+                    limit: MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .unwrap_or_else(|error| panic!("seal_restore_commit_revisions failed: {error}"));
+            if sealed.ready {
+                break;
+            }
+        }
         let completed = complete_restore(
             store,
             write_context(store, counter, owner_epoch),
@@ -5216,11 +8774,9 @@ mod tests {
             },
         )
         .unwrap_or_else(|error| panic!("complete_restore failed: {error}"));
-        // The staging publish reports the exact revision complete_restore
-        // installs.
         assert_eq!(
-            published.result.workspace_revision,
-            completed.result.destination_workspace_revision
+            completed.result.destination_workspace_revision.get(),
+            restore_publication_revision.unwrap().get()
         );
         completed
     }
@@ -5268,13 +8824,14 @@ mod tests {
         // workbench_commit: run-manifest CommitStaging publish + full build.
         let run_manifest_body: &[u8] =
             br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/note.txt"]}"#;
+        let source_commit_id = CommitId::from_bytes([0x42; SHA256_BYTES]);
         drive_commit_wire_calls(
             &store,
             &mut counter,
             owner_epoch,
             &source_workbench,
             source_incarnation,
-            CommitId::from_bytes([0x42; SHA256_BYTES]),
+            source_commit_id,
             operation(0x31),
             operation(0x32),
             revision(0x12),
@@ -5323,6 +8880,74 @@ mod tests {
             completed.result.destination_workspace_revision,
             WorkspaceRevision::new(1)
         );
+        let receipt = completed
+            .command
+            .operation
+            .destination_commit_receipt()
+            .unwrap();
+        let destination_commit = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), receipt.destination_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        let source_commit = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), source_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        let RestoreCommitProvenance::V5(provenance) =
+            &completed.command.operation.commit_provenance
+        else {
+            unreachable!();
+        };
+        let binding = provenance.destination_binding.as_ref().unwrap();
+        let manifests = binding.manifests.as_ref().unwrap();
+        assert_eq!(
+            destination_commit.record.content_digest_uri,
+            binding.effective_content_digest_uri
+        );
+        assert_eq!(
+            destination_commit.record.manifest_digest_uri,
+            source_commit.record.manifest_digest_uri
+        );
+        assert_eq!(
+            destination_commit.record.tree_manifest_revision_id,
+            manifests.run_manifest.artifact_revision_id
+        );
+        assert_eq!(
+            destination_commit.record.parent_commits,
+            vec![source_commit_id]
+        );
+        assert_eq!(source_commit.record.consumer_count, 3);
+        let source_child = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitConsumer,
+            &child_commit_consumer_key(root(), source_commit_id, receipt.destination_commit_id),
+            CommitConsumerRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            source_child.record.consumer_epoch_at_add,
+            source_commit.record.consumer_epoch
+        );
+        assert_eq!(
+            receipt.destination_commit_id,
+            workbench_commit_identity_for_test(
+                &destination_workbench,
+                &destination_commit.record.content_digest_uri,
+                &destination_commit.record.manifest_digest_uri,
+            )
+        );
 
         // The destination is visible and contains the restored note.
         let destination = get_visible_workspace_at(
@@ -5345,9 +8970,8 @@ mod tests {
         assert_eq!(restored_note.body_digest_uri, body_digest_uri(note_body));
         assert_eq!(restored_note.logical_size, note_body.len() as u64);
 
-        // The source's run manifest names the source workbench and must not
-        // follow the content into the destination; the destination's
-        // provenance row is its restore manifest.
+        // Source-owned provenance is not copied. The restore publishes a new
+        // destination-owned run manifest and restore manifest instead.
         assert!(get_visible_path_at(
             &store,
             read_context(&store, owner_epoch),
@@ -5355,7 +8979,7 @@ mod tests {
             &NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
         )
         .unwrap()
-        .is_none());
+        .is_some());
         assert!(get_visible_path_at(
             &store,
             read_context(&store, owner_epoch),
@@ -5470,13 +9094,13 @@ mod tests {
             &NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
         )
         .unwrap()
-        .is_none());
+        .is_some());
     }
 
-    /// A restored workbench must itself be restorable: after recommitting
-    /// the destination, its snapshot source carries BOTH provenance rows
-    /// (its own restore manifest and the new run manifest), and a one-row
-    /// copy limit forces each onto page boundaries of its own.
+    /// A restored workbench must remain snapshot-restorable after ordinary
+    /// dirty mutations without an intervening recommit. Its restore-created
+    /// head supplies lineage while the snapshot closure supplies current
+    /// content.
     #[test]
     fn snapshot_restore_chains_from_a_restored_workbench() {
         let mut counter = 0_u128;
@@ -5494,6 +9118,7 @@ mod tests {
         )
         .unwrap();
         let note_revision = revision(0x11);
+        let note_body: &[u8] = b"chained restore evidence";
         publish_text_file(
             &store,
             &mut counter,
@@ -5501,17 +9126,18 @@ mod tests {
             &first,
             first_incarnation,
             "input/note.txt",
-            b"chained restore evidence",
+            note_body,
             note_revision,
             operation(0x21),
         );
+        let first_commit_id = CommitId::from_bytes([0x45; SHA256_BYTES]);
         drive_commit_wire_calls(
             &store,
             &mut counter,
             owner_epoch,
             &first,
             first_incarnation,
-            CommitId::from_bytes([0x45; SHA256_BYTES]),
+            first_commit_id,
             operation(0x31),
             operation(0x32),
             revision(0x12),
@@ -5533,7 +9159,7 @@ mod tests {
 
         let second = workbench("chain-b");
         let second_incarnation = incarnation(30);
-        drive_snapshot_restore_to_visible(
+        let first_completed = drive_snapshot_restore_to_visible(
             &store,
             &mut counter,
             owner_epoch,
@@ -5547,20 +9173,52 @@ mod tests {
             MAX_RESTORE_BATCH_MEMBERS,
         );
 
-        // Recommit the restored workbench, then snapshot it: its path state
-        // now holds input/note.txt plus both provenance rows.
-        drive_commit_wire_calls(
+        let second_base_commit_id = first_completed
+            .command
+            .operation
+            .destination_commit_receipt()
+            .unwrap()
+            .destination_commit_id;
+
+        // Mutate the restored workbench without recommitting: publish the
+        // renamed destination and another dirty path, then remove the old
+        // source name. The existing restore-created head remains the snapshot
+        // lineage authority while the snapshot closure is deliberately dirty.
+        let renamed_revision = revision(0x14);
+        publish_text_file(
             &store,
             &mut counter,
             owner_epoch,
             &second,
             second_incarnation,
-            CommitId::from_bytes([0x46; SHA256_BYTES]),
+            "renamed/note.txt",
+            note_body,
+            renamed_revision,
             operation(0x51),
-            operation(0x52),
-            revision(0x14),
-            br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/note.txt"],"hop":2}"#,
         );
+        let dirty_revision = revision(0x15);
+        let dirty_body: &[u8] = b"dirty after restore without recommit";
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &second,
+            second_incarnation,
+            "output/dirty.txt",
+            dirty_body,
+            dirty_revision,
+            operation(0x52),
+        );
+        remove_path(
+            &store,
+            RemovePathRequest {
+                context: write_context(&store, &mut counter, owner_epoch),
+                workbench_id: second.clone(),
+                path: NormalizedRelativePath::new("input/note.txt").unwrap(),
+                expected_generation: Generation::new(1).unwrap(),
+            },
+        )
+        .unwrap();
         let second_snapshot = SnapshotId::new(433);
         mint_snapshot(
             &store,
@@ -5587,19 +9245,42 @@ mod tests {
             &third,
             third_incarnation,
             operation(0x61),
-            revision(0x15),
+            revision(0x16),
             1,
         );
-        assert_eq!(completed.result.member_count, 1);
+        assert_eq!(
+            completed.command.operation.source_matches_base_commit,
+            Some(false)
+        );
+        assert_eq!(completed.result.member_count, 2);
         let restored_note = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &third,
+            &NormalizedRelativePath::new("renamed/note.txt").unwrap(),
+        )
+        .unwrap()
+        .expect("chained destination contains renamed/note.txt");
+        assert_eq!(restored_note.artifact_revision_id, renamed_revision);
+        assert_eq!(restored_note.body_digest_uri, body_digest_uri(note_body));
+        let restored_dirty = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &third,
+            &NormalizedRelativePath::new("output/dirty.txt").unwrap(),
+        )
+        .unwrap()
+        .expect("chained destination contains dirty output");
+        assert_eq!(restored_dirty.artifact_revision_id, dirty_revision);
+        assert_eq!(restored_dirty.body_digest_uri, body_digest_uri(dirty_body));
+        assert!(get_visible_path_at(
             &store,
             read_context(&store, owner_epoch),
             &third,
             &NormalizedRelativePath::new("input/note.txt").unwrap(),
         )
         .unwrap()
-        .expect("chained destination contains input/note.txt");
-        assert_eq!(restored_note.artifact_revision_id, note_revision);
+        .is_none());
         assert!(get_visible_path_at(
             &store,
             read_context(&store, owner_epoch),
@@ -5607,7 +9288,7 @@ mod tests {
             &NormalizedRelativePath::new(RUN_MANIFEST_PATH).unwrap(),
         )
         .unwrap()
-        .is_none());
+        .is_some());
         assert!(get_visible_path_at(
             &store,
             read_context(&store, owner_epoch),
@@ -5616,6 +9297,150 @@ mod tests {
         )
         .unwrap()
         .is_some());
+
+        let third_receipt = completed
+            .command
+            .operation
+            .destination_commit_receipt()
+            .unwrap();
+        let third_commit = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), third_receipt.destination_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        let second_base_commit = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), second_base_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            third_commit.record.parent_commits,
+            vec![second_base_commit_id]
+        );
+        assert_ne!(
+            third_commit.record.content_digest_uri,
+            second_base_commit.record.content_digest_uri
+        );
+        let third_head = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::WorkbenchCommitHead,
+            &workbench_commit_head_key(root(), third_incarnation),
+            WorkbenchCommitHeadRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            third_head.record.commit_id,
+            third_receipt.destination_commit_id
+        );
+        assert_eq!(
+            third_head.record.head_generation,
+            Generation::new(1).unwrap()
+        );
+
+        // A, B, and C retain independent mutable path state.
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &first,
+            &NormalizedRelativePath::new("input/note.txt").unwrap(),
+        )
+        .unwrap()
+        .is_some());
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &second,
+            &NormalizedRelativePath::new("input/note.txt").unwrap(),
+        )
+        .unwrap()
+        .is_none());
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &third,
+            third_incarnation,
+            "output/c-only.txt",
+            b"only-c",
+            revision(0x17),
+            operation(0x71),
+        );
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &second,
+            &NormalizedRelativePath::new("output/c-only.txt").unwrap(),
+        )
+        .unwrap()
+        .is_none());
+
+        retire_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &RetireSnapshotRequest {
+                workbench_id: second.clone(),
+                selector: SnapshotSelector::Id(second_snapshot),
+                retire_annotation: None,
+            },
+        )
+        .unwrap();
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitConsumer,
+            &snapshot_commit_consumer_key(root(), second_base_commit_id, second_snapshot),
+        )
+        .unwrap()
+        .is_none());
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitConsumer,
+            &child_commit_consumer_key(root(), first_commit_id, second_base_commit_id),
+        )
+        .unwrap()
+        .is_some());
+        let second_to_third_child = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitConsumer,
+            &child_commit_consumer_key(
+                root(),
+                second_base_commit_id,
+                third_receipt.destination_commit_id,
+            ),
+            CommitConsumerRecord::decode,
+        )
+        .unwrap()
+        .expect("C must retain B's base commit after B's snapshot retires");
+        let second_after_snapshot_retire = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), second_base_commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second_after_snapshot_retire.record.consumer_count, 2);
+        assert_eq!(
+            second_after_snapshot_retire.record.consumer_epoch.get(),
+            second_to_third_child.record.consumer_epoch_at_add.get() + 1
+        );
+        assert!(second_after_snapshot_retire
+            .record
+            .last_zero_consumer_version
+            .is_none());
     }
 
     /// A genuinely undecodable stored projection must surface as a typed
@@ -5637,29 +9462,68 @@ mod tests {
         )
         .unwrap();
         let bad_path = nokv_types::NormalizedRelativePath::new("input/bad.txt").unwrap();
-        let bad_entry = PathEntry {
-            generation: Generation::new(1).unwrap(),
-            artifact_revision_id: revision(0x11),
-            body_digest_uri: format!("sha256:{:064x}", 0xbad),
-            manifest_digest_uri: format!("sha256:{:064x}", 0xbad + 1),
-            logical_size: 3,
-            dependency_count: 0,
-            dependency_depth: 0,
-            content_type: "text/plain".to_owned(),
-            producer: None,
-            manifest_id: None,
-            typed_index_projection: vec![0xff, 0xff],
-        };
-        put_absent(
+        publish_text_file(
             &store,
             &mut counter,
             owner_epoch,
-            vec![(
-                MetadataFamily::PathCurrent,
-                path_current_key(root(), source_incarnation, &bad_path),
-                bad_entry.encode().unwrap(),
-            )],
+            &source_workbench,
+            source_incarnation,
+            bad_path.as_str(),
+            b"bad",
+            revision(0x11),
+            operation(0x21),
         );
+        drive_commit_wire_calls(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            CommitId::from_bytes([0x43; SHA256_BYTES]),
+            operation(0x31),
+            operation(0x32),
+            revision(0x12),
+            br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/bad.txt"]}"#,
+        );
+        let context = write_context(&store, &mut counter, owner_epoch);
+        let loaded = load_path(&store, context, source_incarnation, &bad_path)
+            .unwrap()
+            .unwrap();
+        let mut bad_entry = loaded.record;
+        bad_entry.typed_index_projection = vec![0xff, 0xff];
+        let key = path_current_key(root(), source_incarnation, &bad_path);
+        let command = MetadataCommand {
+            schema_id: SCHEMA_ID.to_owned(),
+            root_id: root(),
+            logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
+            placement_generation: placement(),
+            owner_epoch,
+            request_id: context.request_id,
+            command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+            read_version: context.read_version,
+            root_fence_action: RootFenceAction::RequireActive,
+            predicates: vec![CommandPredicate::Value {
+                family: MetadataFamily::PathCurrent,
+                key: key.clone(),
+                expected: Some(loaded.payload),
+            }],
+            mutations: vec![CommandMutation::Put {
+                family: MetadataFamily::PathCurrent,
+                key: key.clone(),
+                value: bad_entry.encode().unwrap(),
+            }],
+            history_projection: vec![HistoryProjection {
+                family: MetadataFamily::PathCurrent,
+                key,
+            }],
+            event_projection: Vec::new(),
+            deterministic_result: Vec::new(),
+        }
+        .seal();
+        store.execute(&command).unwrap();
         let snapshot_id = SnapshotId::new(431);
         mint_snapshot(
             &store,
@@ -5677,18 +9541,24 @@ mod tests {
         let begun = begin_restore(
             &store,
             write_context(&store, &mut counter, owner_epoch),
-            &BeginRestoreRequest {
+            &bind_operation_identity(BeginRestoreRequest {
+                operation_id: OperationId::from_bytes([0; 16]),
                 source_workbench_id: source_workbench.clone(),
                 expected_source_workspace_incarnation_id: source_incarnation,
                 source: RestoreSourceSelector::Snapshot(snapshot_id),
                 destination_workbench_id: workbench("corrupt-restored"),
                 destination_workspace_incarnation_id: incarnation(30),
+                destination_restore_manifest_identity: RestoreManifestIdentity {
+                    publication_operation_id: operation(0x15),
+                    artifact_revision_id: revision(0x14),
+                },
+                destination_committed_at_unix_seconds: 1,
                 restore_manifest: RestoreManifestDescriptor {
                     body_digest_uri: format!("sha256:{:064x}", 0xcafe),
                     logical_size: 2,
                     content_type: "application/json".to_owned(),
                 },
-            },
+            }),
         )
         .unwrap();
         start_restore_copy(
@@ -5724,11 +9594,10 @@ mod tests {
             .starts_with("restore source member input/bad.txt has a corrupt PathCurrent record"));
     }
 
-    /// A sealed commit's member digest covers the virtual run-manifest
-    /// member, so commit-source restore must reject it with a typed closure
-    /// error instead of a raw codec failure.
+    /// A sealed source commit's raw closure includes its run manifest, while
+    /// materialization deliberately omits that source-owned projection.
     #[test]
-    fn commit_source_restore_rejects_virtual_run_manifest_member() {
+    fn commit_source_restore_seals_but_does_not_materialize_the_source_run_manifest() {
         let mut counter = 0_u128;
         let owner_epoch = owner(1);
         let store = crate::workspace::test_support::memory(shard()).unwrap();
@@ -5771,18 +9640,24 @@ mod tests {
         let begun = begin_restore(
             &store,
             write_context(&store, &mut counter, owner_epoch),
-            &BeginRestoreRequest {
+            &bind_operation_identity(BeginRestoreRequest {
+                operation_id: OperationId::from_bytes([0; 16]),
                 source_workbench_id: source_workbench.clone(),
                 expected_source_workspace_incarnation_id: source_incarnation,
                 source: RestoreSourceSelector::Commit(commit_id),
                 destination_workbench_id: workbench("commit-restored"),
                 destination_workspace_incarnation_id: incarnation(30),
+                destination_restore_manifest_identity: RestoreManifestIdentity {
+                    publication_operation_id: operation(0x15),
+                    artifact_revision_id: revision(0x14),
+                },
+                destination_committed_at_unix_seconds: 1,
                 restore_manifest: RestoreManifestDescriptor {
                     body_digest_uri: format!("sha256:{:064x}", 0xcafe),
                     logical_size: 2,
                     content_type: "application/json".to_owned(),
                 },
-            },
+            }),
         )
         .unwrap();
         start_restore_copy(
@@ -5793,7 +9668,7 @@ mod tests {
             },
         )
         .unwrap();
-        let error = copy_restore_batch(
+        let copied = copy_restore_batch(
             &store,
             write_context(&store, &mut counter, owner_epoch),
             CopyRestoreBatchRequest {
@@ -5801,13 +9676,66 @@ mod tests {
                 limit: MAX_RESTORE_BATCH_MEMBERS,
             },
         )
-        .unwrap_err();
-        let RestoreError::SourceClosureMismatch { reason } = &error else {
-            panic!("expected SourceClosureMismatch, got {error:?}");
-        };
-        assert!(
-            reason.contains("virtual run manifest member"),
-            "reason: {reason}"
+        .unwrap();
+        assert!(copied.source_eof);
+        assert_eq!(copied.copied_members, 1);
+        assert_eq!(copied.command.operation.source_member_count, 2);
+        assert_eq!(copied.command.operation.next_member_sequence, 1);
+
+        let source_commit = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (
+                copied.command.operation.source_member_count,
+                copied.command.operation.source_member_rolling_digest,
+            ),
+            (
+                source_commit.record.member_count,
+                source_commit.record.member_digest,
+            ),
+            "commit-source raw restore closure must exactly match the immutable commit",
         );
+
+        let sealed = seal_restore_source(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        assert_eq!(sealed.operation.phase, RestorePhase::SourceSealed);
+        assert_eq!(
+            sealed.operation.source_member_seal,
+            Some(source_commit.record.member_digest)
+        );
+        let materialized = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::RestoreMember,
+            &restore_member_key(root(), begun.operation.operation_id, 0),
+            RestoreMemberRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            materialized.record.destination_path.as_str(),
+            "input/note.txt"
+        );
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::RestoreMember,
+            &restore_member_key(root(), begun.operation.operation_id, 1),
+        )
+        .unwrap()
+        .is_none());
     }
 }

@@ -100,6 +100,14 @@ pub struct CommitConsumerRecord {
     pub consumer_epoch_at_add: ConsumerEpoch,
 }
 
+/// Overflow/underflow while updating one commit's exact consumer lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitConsumerMutationError {
+    CountOverflow,
+    CountUnderflow,
+    EpochOverflow,
+}
+
 /// Strict commit payload encode, decode, or invariant failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitRecordError {
@@ -605,6 +613,43 @@ impl CommitConsumerRecord {
     }
 }
 
+pub(crate) fn add_commit_consumer(
+    record: &CommitRecord,
+) -> Result<CommitRecord, CommitConsumerMutationError> {
+    let mut next = record.clone();
+    next.consumer_count = next
+        .consumer_count
+        .checked_add(1)
+        .ok_or(CommitConsumerMutationError::CountOverflow)?;
+    next.consumer_epoch = ConsumerEpoch::new(
+        next.consumer_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(CommitConsumerMutationError::EpochOverflow)?,
+    );
+    next.last_zero_consumer_version = None;
+    Ok(next)
+}
+
+pub(crate) fn remove_commit_consumer(
+    record: &CommitRecord,
+    zero_version: CommitVersion,
+) -> Result<CommitRecord, CommitConsumerMutationError> {
+    let mut next = record.clone();
+    next.consumer_count = next
+        .consumer_count
+        .checked_sub(1)
+        .ok_or(CommitConsumerMutationError::CountUnderflow)?;
+    next.consumer_epoch = ConsumerEpoch::new(
+        next.consumer_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(CommitConsumerMutationError::EpochOverflow)?,
+    );
+    next.last_zero_consumer_version = (next.consumer_count == 0).then_some(zero_version);
+    Ok(next)
+}
+
 fn encode_commit_pointer(commit_id: CommitId, generation: Generation) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(1 + CommitId::BYTE_WIDTH + 8);
     encoded.push(COMMIT_VALUE_FORMAT_VERSION);
@@ -1036,6 +1081,28 @@ mod tests {
         assert_eq!(
             CommitConsumerRecord::decode(&consumer.encode()).unwrap(),
             consumer
+        );
+    }
+
+    #[test]
+    fn commit_consumer_lifetime_updates_share_one_checked_primitive() {
+        let record = commit_record();
+        let retained = add_commit_consumer(&record).unwrap();
+        assert_eq!(retained.consumer_count, 3);
+        assert_eq!(retained.consumer_epoch, ConsumerEpoch::new(5));
+        assert_eq!(retained.last_zero_consumer_version, None);
+
+        let zero_version = CommitVersion::new(17).unwrap();
+        let mut one = retained;
+        one.consumer_count = 1;
+        let released = remove_commit_consumer(&one, zero_version).unwrap();
+        assert_eq!(released.consumer_count, 0);
+        assert_eq!(released.consumer_epoch, ConsumerEpoch::new(6));
+        assert_eq!(released.last_zero_consumer_version, Some(zero_version));
+
+        assert_eq!(
+            remove_commit_consumer(&released, zero_version),
+            Err(CommitConsumerMutationError::CountUnderflow)
         );
     }
 
