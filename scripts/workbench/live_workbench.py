@@ -47,6 +47,14 @@ INTERNAL_KEYS = {
     "destination_root",
     "workspace_incarnation_id",
 }
+OPTIONAL_SCOPE_RESULT_PAIRS = (
+    ("stat-input-root", "stat-input-root-empty-path"),
+    ("list-input", "list-input-empty-path"),
+    ("grep-input", "grep-input-empty-path"),
+    ("search", "search-empty-path"),
+    ("aggregate", "aggregate-empty-path"),
+    ("catalog", "catalog-empty-path"),
+)
 
 
 class NotQualified(RuntimeError):
@@ -138,11 +146,21 @@ def reconstruction_bytes() -> bytes:
     return (canonical_json(value) + "\n").encode()
 
 
+def phase_one_workbench_ids(config: Config) -> dict[str, str]:
+    def fixture_id(operation: str) -> str:
+        suffix = digest(f"{config.root_id}\0{operation}".encode())[:12]
+        return f"phase1-{operation}-{suffix}"
+
+    return {operation: fixture_id(operation) for operation in ("put", "append", "commit")}
+
+
 def tool_plan(config: Config) -> list[ToolStep]:
     wb, restored, snapshot = config.workbench, config.restored, config.snapshot
+    phase_one = phase_one_workbench_ids(config)
     raw = scan_bytes("raw", 0).decode()
     replacement = scan_bytes("raw", 1).decode()
     commit_digest = "sha256:" + digest(reconstruction_bytes())
+    implicit_commit_digest = "sha256:" + digest(b"phase1 implicit commit\n")
     return [
         ToolStep("create", "workbench_create", {"id": wb}),
         ToolStep(
@@ -150,6 +168,25 @@ def tool_plan(config: Config) -> list[ToolStep]:
             "workbench_put_file",
             {"id": wb, "section": "input", "path": "scan.json", "text": raw,
              "content_type": "application/json", "replace": False},
+        ),
+        ToolStep(
+            "implicit-put",
+            "workbench_put_file",
+            {"id": phase_one["put"], "section": "outputs", "path": "a.txt",
+             "text": "first needle\n", "content_type": "text/plain", "replace": False},
+        ),
+        ToolStep(
+            "implicit-put-replay",
+            "workbench_put_file",
+            {"id": phase_one["put"], "section": "outputs", "path": "a.txt",
+             "text": "first needle\n", "content_type": "text/plain", "replace": False},
+            "AlreadyExists",
+        ),
+        ToolStep(
+            "implicit-put-second",
+            "workbench_put_file",
+            {"id": phase_one["put"], "section": "outputs", "path": "b.txt",
+             "text": "second NEEDLE\n", "content_type": "text/plain", "replace": False},
         ),
         ToolStep(
             "create-only-error",
@@ -171,6 +208,12 @@ def tool_plan(config: Config) -> list[ToolStep]:
              "text": "ptychography reconstruction started\n", "content_type": "text/plain"},
         ),
         ToolStep(
+            "implicit-append",
+            "workbench_append",
+            {"id": phase_one["append"], "section": "logs", "path": "events.log",
+             "text": "implicit append\n", "content_type": "text/plain"},
+        ),
+        ToolStep(
             "read-input",
             "workbench_read",
             {"id": wb, "section": "input", "path": "scan.json",
@@ -182,15 +225,38 @@ def tool_plan(config: Config) -> list[ToolStep]:
             {"id": wb, "section": "input", "path": "scan.json"},
         ),
         ToolStep(
+            "stat-input-root", "workbench_stat", {"id": wb, "section": "input"}
+        ),
+        ToolStep(
+            "stat-input-root-empty-path", "workbench_stat",
+            {"id": wb, "section": "input", "path": ""},
+        ),
+        ToolStep(
             "list-input",
             "workbench_list",
             {"id": wb, "section": "input", "limit": 100},
+        ),
+        ToolStep(
+            "list-input-empty-path", "workbench_list",
+            {"id": wb, "section": "input", "path": "", "limit": 100},
         ),
         ToolStep(
             "grep-input",
             "workbench_grep",
             {"id": wb, "section": "input", "pattern": "PTYCHOGRAPHY", "glob": "*.json",
              "recursive": True, "limit": 10},
+        ),
+        ToolStep(
+            "grep-input-empty-path",
+            "workbench_grep",
+            {"id": wb, "section": "input", "path": "", "pattern": "PTYCHOGRAPHY",
+             "glob": "*.json", "recursive": True, "limit": 10},
+        ),
+        ToolStep(
+            "grep-phase1-page-1",
+            "workbench_grep",
+            {"id": phase_one["put"], "section": "outputs", "pattern": "NeEdLe",
+             "glob": "*.txt", "recursive": True, "limit": 1},
         ),
         ToolStep(
             "edit-input",
@@ -201,15 +267,28 @@ def tool_plan(config: Config) -> list[ToolStep]:
         ),
         ToolStep("search", "workbench_search", {"id": wb, "limit": 10}),
         ToolStep(
+            "search-empty-path", "workbench_search", {"id": wb, "path": "", "limit": 10}
+        ),
+        ToolStep(
             "aggregate",
             "workbench_aggregate",
             {"id": wb, "measures": [{"name": "artifacts", "op": "count"}],
              "limit": 100},
         ),
         ToolStep(
+            "aggregate-empty-path",
+            "workbench_aggregate",
+            {"id": wb, "path": "", "measures": [{"name": "artifacts", "op": "count"}],
+             "limit": 100},
+        ),
+        ToolStep(
             "catalog",
             "workbench_catalog",
             {"id": wb, "include_facets": True},
+        ),
+        ToolStep(
+            "catalog-empty-path", "workbench_catalog",
+            {"id": wb, "path": "", "include_facets": True},
         ),
         ToolStep(
             "commit",
@@ -226,6 +305,20 @@ def tool_plan(config: Config) -> list[ToolStep]:
              "manifest": {"dataset": "ptychography-scan",
                           "model": "scientific-reconstruction", "task": "ptychography"},
              "content_digest_uri": commit_digest, "replace": False},
+        ),
+        ToolStep(
+            "implicit-commit",
+            "workbench_commit",
+            {"id": phase_one["commit"],
+             "manifest": {"fixture": "phase1-implicit-commit", "phase": 1},
+             "content_digest_uri": implicit_commit_digest, "replace": False},
+        ),
+        ToolStep(
+            "implicit-commit-replay",
+            "workbench_commit",
+            {"id": phase_one["commit"],
+             "manifest": {"fixture": "phase1-implicit-commit", "phase": 1},
+             "content_digest_uri": implicit_commit_digest, "replace": False},
         ),
         ToolStep(
             "read-run-manifest",
@@ -287,7 +380,7 @@ def tool_plan(config: Config) -> list[ToolStep]:
         ToolStep(
             "find",
             "workbench_find",
-            {"committed": True, "manifest_pattern": "ptychography",
+            {"committed": True, "manifest_pattern": "PtYcHoGrApHy",
              "include_manifest": True, "limit": 100},
         ),
         ToolStep(
@@ -526,7 +619,106 @@ def document(result: dict[str, Any], label: str) -> dict[str, Any]:
     return items[0]["value"]
 
 
-def assert_results(results: dict[str, dict[str, Any]], config: Config) -> None:
+def assert_phase_one_results(
+    results: dict[str, dict[str, Any]], config: Config,
+) -> dict[str, Any]:
+    scope_digests: dict[str, str] = {}
+    for omitted, explicit_empty in OPTIONAL_SCOPE_RESULT_PAIRS:
+        if results[omitted] != results[explicit_empty]:
+            raise WorkflowFailure(
+                f"optional scope path differs between {omitted} and {explicit_empty}"
+            )
+        scope_digests[omitted] = digest(canonical_json(results[omitted]).encode())
+
+    phase_one = phase_one_workbench_ids(config)
+    implicit_put = results["implicit-put"]
+    implicit_put_second = results["implicit-put-second"]
+    if implicit_put.get("workbench_id") != phase_one["put"] \
+            or implicit_put.get("generation") != 1 \
+            or implicit_put.get("replace") is not False \
+            or implicit_put_second.get("workbench_id") != phase_one["put"] \
+            or implicit_put_second.get("generation") != 1 \
+            or implicit_put_second.get("replace") is not False \
+            or results["implicit-put-replay"].get("code") != "AlreadyExists":
+        raise WorkflowFailure("implicit put did not create one path-native Workbench")
+
+    implicit_append = results["implicit-append"]
+    if implicit_append.get("workbench_id") != phase_one["append"] \
+            or implicit_append.get("created") is not True \
+            or implicit_append.get("generation") != 1:
+        raise WorkflowFailure("implicit append did not create one path-native Workbench")
+
+    implicit_commit = results["implicit-commit"]
+    implicit_commit_replay = results["implicit-commit-replay"]
+    if implicit_commit.get("workbench_id") != phase_one["commit"] \
+            or implicit_commit.get("idempotent_replay") is not False \
+            or implicit_commit_replay.get("workbench_id") != phase_one["commit"] \
+            or implicit_commit_replay.get("idempotent_replay") is not True \
+            or implicit_commit.get("commit_identity") != \
+            implicit_commit_replay.get("commit_identity"):
+        raise WorkflowFailure("implicit commit exact replay did not converge")
+
+    matches = results["find"].get("matches")
+    if not isinstance(matches, list) or not any(
+        match.get("workbench_id") == config.workbench
+        and match.get("committed") is True
+        and match.get("commit_identity_verified") is True
+        for match in matches
+        if isinstance(match, dict)
+    ):
+        raise WorkflowFailure("mixed-case manifest find omitted the committed Workbench")
+
+    first_page = results["grep-phase1-page-1"]
+    second_page = results["grep-phase1-page-2"]
+    first_matches = first_page.get("matches")
+    second_matches = second_page.get("matches")
+    cursor = first_page.get("next_cursor")
+    if not isinstance(first_matches, list) or len(first_matches) != 1 \
+            or not isinstance(second_matches, list) or len(second_matches) != 1 \
+            or not isinstance(cursor, str) or not cursor \
+            or first_page.get("truncated") is not True \
+            or second_page.get("next_cursor") is not None \
+            or second_page.get("truncated") is not False:
+        raise WorkflowFailure("grep continuation did not return two bounded terminal pages")
+    first_paths = {match.get("path") for match in first_matches if isinstance(match, dict)}
+    second_paths = {match.get("path") for match in second_matches if isinstance(match, dict)}
+    expected_paths = {
+        f"{config.workbench_root}/{phase_one['put']}/outputs/a.txt",
+        f"{config.workbench_root}/{phase_one['put']}/outputs/b.txt",
+    }
+    if len(first_paths) != 1 or len(second_paths) != 1 \
+            or first_paths.intersection(second_paths) \
+            or first_paths.union(second_paths) != expected_paths:
+        raise WorkflowFailure("grep continuation pages overlap or omit fixture paths")
+
+    matched_ids = sorted({
+        match["workbench_id"] for match in matches
+        if isinstance(match, dict) and isinstance(match.get("workbench_id"), str)
+    })
+    return {
+        "schema": SCHEMA,
+        "checks": {
+            "C04": {
+                "status": "PASS",
+                "workbench_ids": phase_one,
+                "implicit_commit_identity": implicit_commit.get("commit_identity"),
+            },
+            "C05": {"status": "PASS", "result_sha256": scope_digests},
+            "C15": {
+                "status": "PASS", "manifest_pattern": "PtYcHoGrApHy",
+                "matched_workbench_ids": matched_ids,
+            },
+            "T08": {
+                "status": "PASS", "matched_paths": sorted(expected_paths),
+                "page_one_cursor_sha256": digest(cursor.encode()),
+            },
+        },
+    }
+
+
+def assert_results(
+    results: dict[str, dict[str, Any]], config: Config,
+) -> dict[str, Any]:
     put, replacement = results["put-input"], results["replace-input"]
     if put.get("digest_uri") != "sha256:" + digest(scan_bytes("raw", 0)):
         raise WorkflowFailure("put digest differs from exact input bytes")
@@ -602,6 +794,7 @@ def assert_results(results: dict[str, dict[str, Any]], config: Config) -> None:
         for row in retired_rows
     ):
         raise WorkflowFailure("snapshot list did not retain the retired state")
+    return assert_phase_one_results(results, config)
 
 
 def endpoint(endpoint_value: str) -> tuple[str, int]:
@@ -625,6 +818,9 @@ def validate(config: Config, live: bool) -> None:
             raise NotQualified(f"invalid Workbench identifier: {value}")
     if config.workbench == config.restored:
         raise NotQualified("source and destination Workbench ids must differ")
+    phase_one_ids = set(phase_one_workbench_ids(config).values())
+    if phase_one_ids.intersection((config.workbench, config.restored)):
+        raise NotQualified("Phase 1 fixture ids must differ from configured Workbench ids")
     if not config.etcd or not config.bucket or not config.object_endpoint:
         raise NotQualified("etcd endpoint, object endpoint, and bucket are required")
     if (config.access_key is None) != (config.secret_key is None):
@@ -709,6 +905,15 @@ def transfer(config: Config, evidence: Evidence) -> None:
         raise WorkflowFailure("collect did not return success")
 
 
+def grep_continuation_step(first_step: ToolStep, first_result: dict[str, Any]) -> ToolStep:
+    cursor = first_result.get("next_cursor")
+    if first_result.get("truncated") is not True or not isinstance(cursor, str) or not cursor:
+        raise WorkflowFailure("grep page one did not return a continuation cursor")
+    arguments = dict(first_step.arguments)
+    arguments["cursor"] = cursor
+    return ToolStep("grep-phase1-page-2", first_step.name, arguments)
+
+
 def run_live(config: Config, evidence: Evidence, steps: list[ToolStep]) -> None:
     provision = completed_process(evidence, "provision", provision_command(config), config)
     if json.loads(provision.stdout).get("lifecycle") != "active":
@@ -735,9 +940,12 @@ def run_live(config: Config, evidence: Evidence, steps: list[ToolStep]) -> None:
         results: dict[str, dict[str, Any]] = {}
         for step in steps:
             results[step.label] = session.call(step)
+            if step.label == "grep-phase1-page-1":
+                continuation = grep_continuation_step(step, results[step.label])
+                results[continuation.label] = session.call(continuation)
             if step.label == "edit-input":
                 transfer(config, evidence)
-        assert_results(results, config)
+        evidence.json("phase1-contracts.json", assert_results(results, config))
     finally:
         if session is not None:
             if session.process.stdin is not None:
@@ -806,6 +1014,10 @@ def plan(config: Config, steps: list[ToolStep]) -> dict[str, Any]:
             "collect": redact_argv(collect_command(config, sandbox / "reconstruction.json")),
         },
         "tool_steps": [dataclasses.asdict(step) for step in steps],
+        "dynamic_tool_steps": [
+            {"label": "grep-phase1-page-2",
+             "cursor_from": "grep-phase1-page-1.next_cursor"}
+        ],
         "tool_coverage": {"expected": sorted(WORKBENCH_TOOLS), "planned": sorted(coverage),
                           "count": len(coverage), "complete": coverage == WORKBENCH_TOOLS},
     }
