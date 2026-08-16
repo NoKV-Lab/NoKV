@@ -5,11 +5,12 @@ use crate::store::validate_logical_shard_record;
 use crate::LogicalShardLease;
 use crate::{
     CheckpointRef, ControlError, LogRef, LogSegmentRef, LogicalShardId, LogicalShardRecord,
-    LogicalShardState, NodeId, OwnerEpoch, PlacementGeneration, RootId, RootPlacement,
-    RootPlacementLifecycle,
+    LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RootId,
+    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
 };
 
 const ROOT_PLACEMENT_CODEC_VERSION: u8 = 1;
+const ROOT_OBJECT_NAMESPACE_CODEC_VERSION: u8 = 1;
 const LOGICAL_SHARD_RECORD_CODEC_VERSION: u8 = 1;
 #[cfg(any(feature = "etcd", test))]
 const OWNER_SESSION_CODEC_VERSION: u8 = 1;
@@ -22,6 +23,14 @@ struct RootPlacementWire {
     logical_shard_id: String,
     placement_generation: u64,
     lifecycle: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootObjectNamespaceBindingWire {
+    version: u8,
+    root_id: String,
+    object_namespace_id: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -110,6 +119,42 @@ pub fn decode_root_placement(bytes: &[u8]) -> Result<RootPlacement, ControlError
         ));
     }
     Ok(placement)
+}
+
+pub fn encode_root_object_namespace_binding(
+    binding: &RootObjectNamespaceBinding,
+) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&RootObjectNamespaceBindingWire {
+        version: ROOT_OBJECT_NAMESPACE_CODEC_VERSION,
+        root_id: encode_fixed_id(binding.root_id.as_bytes()),
+        object_namespace_id: encode_fixed_id(binding.object_namespace_id.as_bytes()),
+    })
+    .map_err(codec_error)
+}
+
+pub fn decode_root_object_namespace_binding(
+    bytes: &[u8],
+) -> Result<RootObjectNamespaceBinding, ControlError> {
+    let wire: RootObjectNamespaceBindingWire =
+        serde_json::from_slice(bytes).map_err(codec_error)?;
+    require_version(
+        "root object namespace binding",
+        wire.version,
+        ROOT_OBJECT_NAMESPACE_CODEC_VERSION,
+    )?;
+    let binding = RootObjectNamespaceBinding {
+        root_id: RootId::from_bytes(decode_fixed_id(&wire.root_id, "root id")?),
+        object_namespace_id: ObjectNamespaceId::from_bytes(decode_fixed_id(
+            &wire.object_namespace_id,
+            "object namespace id",
+        )?),
+    };
+    if encode_root_object_namespace_binding(&binding)?.as_slice() != bytes {
+        return Err(ControlError::Codec(
+            "root object namespace binding input is not canonical".to_owned(),
+        ));
+    }
+    Ok(binding)
 }
 
 pub fn encode_logical_shard_record(record: &LogicalShardRecord) -> Result<Vec<u8>, ControlError> {
@@ -373,6 +418,13 @@ mod tests {
         }
     }
 
+    fn object_namespace_binding() -> RootObjectNamespaceBinding {
+        RootObjectNamespaceBinding {
+            root_id: root_id(1),
+            object_namespace_id: ObjectNamespaceId::from_bytes([3; 16]),
+        }
+    }
+
     fn serving_record() -> LogicalShardRecord {
         LogicalShardRecord {
             logical_shard_id: shard_id(2),
@@ -409,6 +461,14 @@ mod tests {
             decode_root_placement(&encode_root_placement(&placement).unwrap()).unwrap(),
             placement
         );
+        let binding = object_namespace_binding();
+        assert_eq!(
+            decode_root_object_namespace_binding(
+                &encode_root_object_namespace_binding(&binding).unwrap()
+            )
+            .unwrap(),
+            binding
+        );
 
         let record = serving_record();
         assert_eq!(
@@ -422,6 +482,10 @@ mod tests {
         assert_eq!(
             encode_root_placement(&placement()).unwrap(),
             br#"{"version":1,"root_id":"01010101010101010101010101010101","logical_shard_id":"02020202020202020202020202020202","placement_generation":1,"lifecycle":1}"#
+        );
+        assert_eq!(
+            encode_root_object_namespace_binding(&object_namespace_binding()).unwrap(),
+            br#"{"version":1,"root_id":"01010101010101010101010101010101","object_namespace_id":"03030303030303030303030303030303"}"#
         );
         assert_eq!(
             encode_logical_shard_record(&LogicalShardRecord::unassigned(shard_id(2))).unwrap(),

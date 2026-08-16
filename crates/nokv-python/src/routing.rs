@@ -9,7 +9,7 @@ use std::sync::Arc;
 use nokv_client::{
     ClientError, ControlRouteResolver, EtcdRouteOptions, RouteResolver, StaticRouteResolver,
 };
-use nokv_protocol::{LogicalShardIdentity, RootIdentity, RootRoute};
+use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -20,6 +20,7 @@ enum ConfiguredRouting {
     Static {
         endpoint: SocketAddr,
         logical_shard_id: LogicalShardIdentity,
+        object_namespace_id: ObjectNamespaceIdentity,
         placement_generation: u64,
         owner_epoch: u64,
     },
@@ -41,6 +42,7 @@ impl PythonRoutingConfig {
     fn static_route(
         endpoint: &str,
         logical_shard_id: &str,
+        object_namespace_id: &str,
         placement_generation: u64,
         owner_epoch: u64,
     ) -> PyResult<Self> {
@@ -49,9 +51,12 @@ impl PythonRoutingConfig {
         })?;
         let logical_shard_id =
             LogicalShardIdentity(parse_fixed_hex("logical_shard_id", logical_shard_id)?);
+        let object_namespace_id =
+            ObjectNamespaceIdentity(parse_fixed_hex("object_namespace_id", object_namespace_id)?);
         RootRoute {
             root_id: RootIdentity([0; 16]),
             logical_shard_id,
+            object_namespace_id,
             placement_generation,
             owner_epoch,
         }
@@ -61,6 +66,7 @@ impl PythonRoutingConfig {
             routing: ConfiguredRouting::Static {
                 endpoint,
                 logical_shard_id,
+                object_namespace_id,
                 placement_generation,
                 owner_epoch,
             },
@@ -94,12 +100,14 @@ impl PythonRoutingConfig {
             ConfiguredRouting::Static {
                 endpoint,
                 logical_shard_id,
+                object_namespace_id,
                 placement_generation,
                 owner_epoch,
             } => Ok(Arc::new(StaticRouteResolver::new(
                 RootRoute {
                     root_id,
                     logical_shard_id: *logical_shard_id,
+                    object_namespace_id: *object_namespace_id,
                     placement_generation: *placement_generation,
                     owner_epoch: *owner_epoch,
                 },
@@ -122,8 +130,14 @@ mod tests {
 
     #[test]
     fn static_configuration_builds_the_exact_root_route() {
-        let config =
-            PythonRoutingConfig::static_route("127.0.0.1:17750", &"22".repeat(16), 7, 9).unwrap();
+        let config = PythonRoutingConfig::static_route(
+            "127.0.0.1:17750",
+            &"22".repeat(16),
+            &"33".repeat(16),
+            7,
+            9,
+        )
+        .unwrap();
         let root_id = RootIdentity([0x11; 16]);
         let resolver = config.build(root_id).unwrap();
         let resolved = resolver.resolve(root_id, false).unwrap();
@@ -131,6 +145,10 @@ mod tests {
         assert_eq!(
             resolved.route.logical_shard_id,
             LogicalShardIdentity([0x22; 16])
+        );
+        assert_eq!(
+            resolved.route.object_namespace_id,
+            ObjectNamespaceIdentity([0x33; 16])
         );
         assert_eq!(resolved.route.placement_generation, 7);
         assert_eq!(resolved.route.owner_epoch, 9);
@@ -140,8 +158,14 @@ mod tests {
     #[test]
     fn static_configuration_rejects_invalid_fences() {
         Python::initialize();
-        let error = PythonRoutingConfig::static_route("127.0.0.1:17750", &"22".repeat(16), 0, 9)
-            .unwrap_err();
+        let error = PythonRoutingConfig::static_route(
+            "127.0.0.1:17750",
+            &"22".repeat(16),
+            &"33".repeat(16),
+            0,
+            9,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("placement_generation"));
     }
 

@@ -78,17 +78,21 @@ impl ClientError {
         match self {
             Self::Transport(error) => error.retryable(),
             Self::Rpc(error) => error.retryable,
-            Self::RetryExhausted { .. }
-            | Self::InvalidOptions(_)
+            Self::Object(error) => error.retryable(),
+            Self::ArtifactUpload(error) => error.retryable(),
+            Self::ArtifactPublishFailed {
+                source,
+                abort_failure,
+                ..
+            } => abort_failure.is_none() && source.retryable(),
+            Self::RetryExhausted { last_error, .. } => last_error.retryable(),
+            Self::ArtifactReadFenceChanged => true,
+            Self::InvalidOptions(_)
             | Self::InvalidRoute(_)
             | Self::Protocol(_)
             | Self::ResponseMismatch(_)
             | Self::MissingCapabilities(_)
-            | Self::ArtifactIntegrity(_)
-            | Self::ArtifactReadFenceChanged
-            | Self::Object(_)
-            | Self::ArtifactUpload(_)
-            | Self::ArtifactPublishFailed { .. } => false,
+            | Self::ArtifactIntegrity(_) => false,
         }
     }
 

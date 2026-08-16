@@ -14,8 +14,8 @@ use nokv_control::{
 use nokv_meta::workspace as meta;
 use nokv_meta_holt::{HoltOptions, HoltStore, TreeBinding};
 use nokv_meta_store::TxnStore;
-use nokv_protocol::{LogicalShardIdentity, RootIdentity, RootRoute};
-use nokv_types::{CommandDigest, RequestId, RootActivationState, SHA256_BYTES};
+use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
+use nokv_types::{CommandDigest, ObjectNamespaceId, RequestId, RootActivationState, SHA256_BYTES};
 
 use crate::{
     MetadataWorkspaceRequestExecutor, RootOwnerRegistry, ServerError, WorkspaceRequestExecutor,
@@ -46,8 +46,12 @@ pub enum LeaseMode {
 pub struct RootAttach {
     /// Root whose persisted placement must point at this shard.
     pub root_id: RootId,
+    /// Immutable object namespace loaded from the root's control binding.
+    pub object_namespace_id: ObjectNamespaceId,
     /// Idempotency key for the durable fence installation.
     pub install_id: RequestId,
+    /// Idempotency key for upgrading a legacy unbound Holt fence.
+    pub bind_object_namespace_id: RequestId,
     /// Idempotency key for the durable transition to Active.
     pub activate_id: RequestId,
 }
@@ -287,9 +291,12 @@ fn validate_boot(boot: &ShardBoot) -> Result<(), ServerError> {
     }
     let mut roots = BTreeSet::new();
     for root in &boot.roots {
-        if root.install_id == root.activate_id {
+        if root.install_id == root.bind_object_namespace_id
+            || root.install_id == root.activate_id
+            || root.bind_object_namespace_id == root.activate_id
+        {
             return Err(ServerError::InvalidBootstrap(format!(
-                "root {:?} install and activate request ids must differ",
+                "root {:?} install, namespace-bind, and activate request ids must differ",
                 root.root_id
             )));
         }
@@ -318,6 +325,20 @@ fn load_placements(
                 ))
             })?;
             validate_serving_placement(&placement)?;
+            let binding = control
+                .get_root_object_namespace_binding(&root.root_id)?
+                .ok_or_else(|| {
+                    ServerError::InvalidBootstrap(format!(
+                        "root {:?} object namespace binding does not exist",
+                        root.root_id
+                    ))
+                })?;
+            if binding.object_namespace_id != root.object_namespace_id {
+                return Err(ServerError::InvalidBootstrap(format!(
+                    "root {:?} object namespace differs from its control binding",
+                    root.root_id
+                )));
+            }
             if placement.logical_shard_id != shard_id {
                 return Err(ServerError::InvalidBootstrap(format!(
                     "root {:?} belongs to logical shard {:?}, requested {:?}",
@@ -527,10 +548,15 @@ fn validate_meta_shard(
     }
 }
 
-fn root_route(placement: &RootPlacement, lease: &LogicalShardLease) -> RootRoute {
+fn root_route(
+    placement: &RootPlacement,
+    object_namespace_id: ObjectNamespaceId,
+    lease: &LogicalShardLease,
+) -> RootRoute {
     RootRoute {
         root_id: RootIdentity::from(placement.root_id),
         logical_shard_id: LogicalShardIdentity::from(placement.logical_shard_id),
+        object_namespace_id: ObjectNamespaceIdentity::from(object_namespace_id),
         placement_generation: placement.placement_generation.get(),
         owner_epoch: lease.owner_epoch.get(),
     }
@@ -567,22 +593,44 @@ fn attach_root(
         None => execute_fence_command(
             meta,
             placement,
+            root.object_namespace_id,
             lease,
             root.install_id,
             meta::RootFenceAction::Install,
             b"nokv.root-fence.install.v1".to_vec(),
         )?,
-        Some(fence) => validate_existing_fence(placement, fence)?,
+        Some(fence) => validate_existing_fence(placement, root.object_namespace_id, fence)?,
     }
 
     let fence = meta.root_fence(placement.root_id)?.ok_or_else(|| {
         ServerError::InvalidBootstrap("root fence install produced no durable fence".to_owned())
     })?;
-    validate_existing_fence(placement, fence)?;
+    validate_existing_fence(placement, root.object_namespace_id, fence)?;
+    if fence.object_namespace_id.is_none() {
+        execute_fence_command(
+            meta,
+            placement,
+            root.object_namespace_id,
+            lease,
+            root.bind_object_namespace_id,
+            meta::RootFenceAction::BindObjectNamespace {
+                expected: fence.activation_state,
+            },
+            b"nokv.root-fence.bind-object-namespace.v1".to_vec(),
+        )?;
+    }
+
+    let fence = meta.root_fence(placement.root_id)?.ok_or_else(|| {
+        ServerError::InvalidBootstrap(
+            "root fence namespace bind produced no durable fence".to_owned(),
+        )
+    })?;
+    validate_bound_fence(placement, root.object_namespace_id, fence)?;
     if fence.activation_state == RootActivationState::Installing {
         execute_fence_command(
             meta,
             placement,
+            root.object_namespace_id,
             lease,
             root.activate_id,
             meta::RootFenceAction::Transition {
@@ -596,14 +644,14 @@ fn attach_root(
     let active = meta
         .root_fence(placement.root_id)?
         .ok_or_else(|| ServerError::InvalidBootstrap("active root fence disappeared".to_owned()))?;
-    validate_existing_fence(placement, active)?;
+    validate_bound_fence(placement, root.object_namespace_id, active)?;
     if active.activation_state != RootActivationState::Active {
         return Err(ServerError::InvalidBootstrap(format!(
             "root fence is {:?}, expected Active",
             active.activation_state
         )));
     }
-    let route = root_route(placement, lease);
+    let route = root_route(placement, root.object_namespace_id, lease);
     let installed_executor: Arc<dyn WorkspaceRequestExecutor> = executor.clone();
     registry.install(route, installed_executor)?;
     Ok(route)
@@ -611,10 +659,14 @@ fn attach_root(
 
 fn validate_existing_fence(
     placement: &RootPlacement,
+    object_namespace_id: ObjectNamespaceId,
     fence: meta::RootFence,
 ) -> Result<(), ServerError> {
     if fence.logical_shard_id != placement.logical_shard_id
         || fence.placement_generation != placement.placement_generation
+        || fence
+            .object_namespace_id
+            .is_some_and(|actual| actual != object_namespace_id)
     {
         return Err(ServerError::InvalidBootstrap(
             "root fence placement does not match the control-plane placement".to_owned(),
@@ -632,9 +684,24 @@ fn validate_existing_fence(
     Ok(())
 }
 
+fn validate_bound_fence(
+    placement: &RootPlacement,
+    object_namespace_id: ObjectNamespaceId,
+    fence: meta::RootFence,
+) -> Result<(), ServerError> {
+    validate_existing_fence(placement, object_namespace_id, fence)?;
+    if fence.object_namespace_id != Some(object_namespace_id) {
+        return Err(ServerError::InvalidBootstrap(
+            "root fence has no durable object namespace binding".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn execute_fence_command(
     meta: &meta::MetaShard,
     placement: &RootPlacement,
+    object_namespace_id: ObjectNamespaceId,
     lease: &LogicalShardLease,
     request_id: RequestId,
     action: meta::RootFenceAction,
@@ -644,6 +711,7 @@ fn execute_fence_command(
         schema_id: meta::SCHEMA_ID.to_owned(),
         root_id: placement.root_id,
         logical_shard_id: placement.logical_shard_id,
+        object_namespace_id: Some(object_namespace_id),
         placement_generation: placement.placement_generation,
         owner_epoch: lease.owner_epoch,
         request_id,
@@ -771,6 +839,12 @@ mod tests {
         root_id: RootId,
         logical_shard_id: nokv_types::LogicalShardId,
     ) {
+        control
+            .create_root_object_namespace_binding(nokv_control::RootObjectNamespaceBinding {
+                root_id,
+                object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([10; 16]),
+            })
+            .unwrap();
         let provisioning = control
             .create_root_placement(RootPlacement {
                 root_id,
@@ -803,8 +877,10 @@ mod tests {
     fn root_attach(root_id: RootId, seed: u8) -> RootAttach {
         RootAttach {
             root_id,
+            object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([10; 16]),
             install_id: request_id(seed),
-            activate_id: request_id(seed.saturating_add(1)),
+            bind_object_namespace_id: request_id(seed.saturating_add(1)),
+            activate_id: request_id(seed.saturating_add(2)),
         }
     }
 
@@ -1332,6 +1408,7 @@ mod tests {
         execute_fence_command(
             first.meta(),
             &future_root_two,
+            nokv_types::ObjectNamespaceId::from_bytes([10; 16]),
             first.lease(),
             request_id(61),
             meta::RootFenceAction::Install,
@@ -1649,6 +1726,111 @@ mod tests {
         let record = control.get_logical_shard(&shard()).unwrap().unwrap();
         assert_eq!(record.owner_epoch, Some(first_epoch));
         assert_eq!(record.state, LogicalShardState::Unassigned);
+    }
+
+    #[test]
+    fn legacy_unbound_root_fence_is_bound_once_during_successor_reopen() {
+        use nokv_meta_store::{Commit, Key, Mutation, TxnStore, WriteTxn};
+
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let first = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .unwrap();
+        let first_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+
+        // Recreate the exact v1 fence bytes that predate object namespace
+        // binding. The control placement and owner epoch remain untouched.
+        let catalog = meta::keyspaces()
+            .iter()
+            .map(|definition| TreeBinding::new(definition.id, definition.name));
+        let holt =
+            HoltStore::open(HoltOptions::file(&database, catalog, meta::store_limits())).unwrap();
+        let root_fence_keyspace = meta::keyspaces()
+            .iter()
+            .find(|definition| definition.name == "root_fence")
+            .unwrap()
+            .id;
+        let legacy = meta::RootFence {
+            logical_shard_id: shard(),
+            object_namespace_id: None,
+            placement_generation: PlacementGeneration::new(2).unwrap(),
+            activation_state: RootActivationState::Active,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            holt.commit(WriteTxn {
+                checks: Vec::new(),
+                mutations: vec![Mutation::Put {
+                    key: Key::new(root_fence_keyspace, root_id.as_bytes().to_vec()),
+                    value: legacy,
+                }],
+            })
+            .unwrap(),
+            Commit::Applied
+        );
+        drop(holt);
+
+        let owner = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("successor").unwrap(),
+                    endpoint: "127.0.0.1:9030".to_owned(),
+                    previous_epoch: Some(first_epoch),
+                },
+                recovery: empty_recovery(),
+                roots: vec![root_attach(root_id, 71)],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(owner.lease().owner_epoch.get(), first_epoch.get() + 1);
+        assert_eq!(
+            owner
+                .meta()
+                .root_fence(root_id)
+                .unwrap()
+                .unwrap()
+                .object_namespace_id,
+            Some(nokv_types::ObjectNamespaceId::from_bytes([10; 16]))
+        );
+        owner.release().unwrap();
+    }
+
+    #[test]
+    fn wrong_control_object_namespace_is_rejected_before_epoch_or_holt_creation() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let before = control.get_logical_shard(&shard()).unwrap().unwrap();
+        let mut boot = acquire_boot(database.clone(), &[root_id]);
+        boot.roots[0].object_namespace_id = nokv_types::ObjectNamespaceId::from_bytes([0x44; 16]);
+
+        let error = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            boot,
+        )
+        .err()
+        .expect("control namespace mismatch must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("object namespace differs from its control binding"));
+        assert_eq!(control.get_logical_shard(&shard()).unwrap(), Some(before));
+        assert!(!database.exists());
     }
 
     #[test]

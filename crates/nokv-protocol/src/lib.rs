@@ -57,8 +57,9 @@ pub use response::{
 pub use types::{
     AppendSegment, ArtifactDescriptor, ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange,
     CommitIdentity, ContentType, Digest, DigestUri, FieldValue, LogicalShardIdentity,
-    ObjectIdentity, OperationIdentity, OperationKind, OperationToken, PageRequest, PathMetadata,
-    PublicationAuthority, PublishCondition, RelativePath, RequestIdentity, RootIdentity, RootRoute,
-    ScalarValue, SnapshotAlias, SnapshotSelector, StagedObject, Tag, WorkbenchName,
-    WorkspaceCapability, WorkspaceIdentity, WorkspacePath, WorkspaceReadView,
+    ObjectIdentity, ObjectNamespaceIdentity, OperationIdentity, OperationKind, OperationToken,
+    PageRequest, PathMetadata, PublicationAuthority, PublishCondition, RelativePath,
+    RequestIdentity, RootIdentity, RootRoute, ScalarValue, SnapshotAlias, SnapshotSelector,
+    StagedObject, Tag, WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
+    WorkspaceReadView,
 };

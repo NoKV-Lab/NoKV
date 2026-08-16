@@ -17,6 +17,7 @@ from local_wal_recovery_gate import (
     CRASH_STAGES,
     WorkflowFailure,
     main,
+    object_args,
     validate_concurrent_evidence,
     validate_stage_evidence,
 )
@@ -69,6 +70,11 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
             "python3 scripts/workbench/local_wal_recovery_gate.py",
             "--build",
             "--evidence-dir \"$RECOVERY_EVIDENCE_DIR\"",
+            "--object-endpoint http://127.0.0.1:9000",
+            "--object-bucket nokv-local-wal-recovery-gate",
+            "bash scripts/workbench/start_rustfs.sh",
+            "NOKV_WORKBENCH_RUSTFS_VOLUME: nokv-local-wal-recovery-rustfs-data",
+            "docker volume rm -f nokv-local-wal-recovery-rustfs-data",
             "sha256sum --check",
             "if: ${{ always() && steps.local_wal_recovery.outcome != 'skipped' }}",
             "if-no-files-found: error",
@@ -127,6 +133,18 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(WorkflowFailure, "without a diagnostic"):
             validate_concurrent_evidence(evidence)
+
+    def test_gate_uses_a_real_object_profile_for_namespace_admission(self) -> None:
+        arguments = object_args(
+            "before-local-fence",
+            "http://127.0.0.1:9000",
+            "nokv-recovery",
+            "release-gate",
+        )
+        self.assertIn("http://127.0.0.1:9000", arguments)
+        self.assertIn("nokv-recovery", arguments)
+        self.assertIn("release-gate/before-local-fence", arguments)
+        self.assertNotIn("http://127.0.0.1:1", arguments)
 
     def test_each_stage_converges_to_the_same_recovery_epoch(self) -> None:
         for stage in CRASH_STAGES:

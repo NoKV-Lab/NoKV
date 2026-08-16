@@ -6,19 +6,27 @@
 //! Object-provider composition for the custom Agent CLI.
 
 use nokv_object::{
-    ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, LocalHotTier,
-    LocalHotTierOptions, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange,
-    S3ArtifactStore, S3ArtifactStoreOptions, TieredArtifactStore, TieredArtifactStoreOptions,
+    ensure_object_namespace, load_object_namespace, verify_object_namespace, ArtifactObjectStore,
+    ArtifactStoreCapabilities, ImmutableCreateOutcome, LocalHotTier, LocalHotTierOptions,
+    ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange, S3ArtifactStore,
+    S3ArtifactStoreOptions, TieredArtifactStore, TieredArtifactStoreOptions,
 };
+use nokv_types::ObjectNamespaceId;
 
 use super::cli::ObjectConfig;
 
 type CachedS3Store = TieredArtifactStore<LocalHotTier, S3ArtifactStore>;
 
 #[derive(Clone, Debug)]
-pub enum CliObjectStore {
+enum CliObjectStoreInner {
     S3(S3ArtifactStore),
     CachedS3(CachedS3Store),
+}
+
+#[derive(Clone, Debug)]
+pub struct CliObjectStore {
+    inner: CliObjectStoreInner,
+    namespace_id: Option<ObjectNamespaceId>,
 }
 
 impl CliObjectStore {
@@ -65,15 +73,21 @@ impl CliObjectStore {
         .map_err(|error| error.to_string())?;
 
         let Some(cache_root) = &config.hot_cache_dir else {
-            return Ok(Self::S3(durable));
+            return Ok(Self {
+                inner: CliObjectStoreInner::S3(durable),
+                namespace_id: None,
+            });
         };
         let hot = LocalHotTier::new(LocalHotTierOptions::new(cache_root, config.hot_cache_bytes))
             .map_err(|error| error.to_string())?;
-        Ok(Self::CachedS3(TieredArtifactStore::new(
-            hot,
-            durable,
-            TieredArtifactStoreOptions::default(),
-        )))
+        Ok(Self {
+            inner: CliObjectStoreInner::CachedS3(TieredArtifactStore::new(
+                hot,
+                durable,
+                TieredArtifactStoreOptions::default(),
+            )),
+            namespace_id: None,
+        })
     }
 
     /// Verify the immutable object semantics required by every Agent tool
@@ -90,13 +104,40 @@ impl CliObjectStore {
         }
         Ok(())
     }
+
+    pub fn bind(mut self, expected: ObjectNamespaceId) -> Result<Self, String> {
+        verify_object_namespace(self.durable(), expected).map_err(|error| error.to_string())?;
+        self.namespace_id = Some(expected);
+        Ok(self)
+    }
+
+    pub fn load_namespace(&self) -> Result<Option<ObjectNamespaceId>, String> {
+        load_object_namespace(self.durable()).map_err(|error| error.to_string())
+    }
+
+    pub fn ensure_namespace(&self, namespace_id: ObjectNamespaceId) -> Result<(), String> {
+        ensure_object_namespace(self.durable(), namespace_id)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn durable(&self) -> &S3ArtifactStore {
+        match &self.inner {
+            CliObjectStoreInner::S3(store) => store,
+            CliObjectStoreInner::CachedS3(store) => store.durable(),
+        }
+    }
 }
 
 impl ArtifactObjectStore for CliObjectStore {
+    fn object_namespace(&self) -> Option<ObjectNamespaceId> {
+        self.namespace_id
+    }
+
     fn capabilities(&self) -> ArtifactStoreCapabilities {
-        match self {
-            Self::S3(store) => store.capabilities(),
-            Self::CachedS3(store) => store.capabilities(),
+        match &self.inner {
+            CliObjectStoreInner::S3(store) => store.capabilities(),
+            CliObjectStoreInner::CachedS3(store) => store.capabilities(),
         }
     }
 
@@ -105,30 +146,30 @@ impl ArtifactObjectStore for CliObjectStore {
         key: &ObjectKey,
         bytes: &[u8],
     ) -> Result<ImmutableCreateOutcome, ObjectError> {
-        match self {
-            Self::S3(store) => store.create_immutable(key, bytes),
-            Self::CachedS3(store) => store.create_immutable(key, bytes),
+        match &self.inner {
+            CliObjectStoreInner::S3(store) => store.create_immutable(key, bytes),
+            CliObjectStoreInner::CachedS3(store) => store.create_immutable(key, bytes),
         }
     }
 
     fn read(&self, key: &ObjectKey, range: Option<ObjectRange>) -> Result<Vec<u8>, ObjectError> {
-        match self {
-            Self::S3(store) => store.read(key, range),
-            Self::CachedS3(store) => store.read(key, range),
+        match &self.inner {
+            CliObjectStoreInner::S3(store) => store.read(key, range),
+            CliObjectStoreInner::CachedS3(store) => store.read(key, range),
         }
     }
 
     fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
-        match self {
-            Self::S3(store) => store.head(key),
-            Self::CachedS3(store) => store.head(key),
+        match &self.inner {
+            CliObjectStoreInner::S3(store) => store.head(key),
+            CliObjectStoreInner::CachedS3(store) => store.head(key),
         }
     }
 
     fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
-        match self {
-            Self::S3(store) => store.delete(key),
-            Self::CachedS3(store) => store.delete(key),
+        match &self.inner {
+            CliObjectStoreInner::S3(store) => store.delete(key),
+            CliObjectStoreInner::CachedS3(store) => store.delete(key),
         }
     }
 }

@@ -13,8 +13,8 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitVersion, GcClaimState, Generation,
-    LogicalShardId, OperationId, OperationKind, OwnerEpoch, PlacementGeneration, PublishPhase,
-    ReadVersion, ReferenceEpoch, RequestId, RestorePhase, RevisionState, RootId,
+    LogicalShardId, ObjectNamespaceId, OperationId, OperationKind, OwnerEpoch, PlacementGeneration,
+    PublishPhase, ReadVersion, ReferenceEpoch, RequestId, RestorePhase, RevisionState, RootId,
     StagedCleanupState, StagedProviderState, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
@@ -67,6 +67,7 @@ const _: () = assert!(
 pub struct PublicationContext {
     pub root_id: RootId,
     pub logical_shard_id: LogicalShardId,
+    pub object_namespace_id: ObjectNamespaceId,
     pub placement_generation: PlacementGeneration,
     pub owner_epoch: OwnerEpoch,
     pub request_id: RequestId,
@@ -2631,6 +2632,7 @@ impl PublicationService<'_> {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
+            object_namespace_id: Some(context.object_namespace_id),
             placement_generation: context.placement_generation,
             owner_epoch: context.owner_epoch,
             request_id: context.request_id,
@@ -2871,6 +2873,7 @@ impl PublicationService<'_> {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
+            object_namespace_id: Some(context.object_namespace_id),
             placement_generation: context.placement_generation,
             owner_epoch: context.owner_epoch,
             request_id: context.request_id,
@@ -3848,6 +3851,7 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES])),
             placement_generation: placement(),
             owner_epoch: owner(),
             request_id,
@@ -3926,6 +3930,7 @@ mod tests {
                 &store,
                 root(),
                 shard(),
+                ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
                 placement(),
                 owner(),
                 next_request(counter),
@@ -3947,6 +3952,7 @@ mod tests {
             store,
             root(),
             shard(),
+            ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
             placement(),
             owner(),
             next_request(counter),
@@ -3962,6 +3968,7 @@ mod tests {
         PublicationContext {
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
             placement_generation: placement(),
             owner_epoch,
             request_id: next_request(counter),
@@ -3977,6 +3984,7 @@ mod tests {
         PublicationContext {
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
             placement_generation: placement(),
             owner_epoch,
             request_id,
@@ -4831,6 +4839,9 @@ mod tests {
                         schema_id: SCHEMA_ID.to_owned(),
                         root_id: root(),
                         logical_shard_id: shard(),
+                        object_namespace_id: Some(ObjectNamespaceId::from_bytes(
+                            [10; FIXED_ID_BYTES],
+                        )),
                         placement_generation: placement(),
                         owner_epoch: owner(),
                         request_id: next_request(&mut counter),
@@ -5611,7 +5622,7 @@ mod tests {
         assert_eq!(replaced.result.path_generation, Generation::new(2).unwrap());
         let replace_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(replace_bytes, 11_799_402);
+        assert_eq!(replace_bytes, 11_799_434);
 
         let removed = remove_path(
             &store,
@@ -5620,6 +5631,7 @@ mod tests {
                     &store,
                     root(),
                     shard(),
+                    ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
                     placement(),
                     owner(),
                     next_request(&mut counter),
@@ -5634,7 +5646,7 @@ mod tests {
         assert_eq!(removed.removed_artifact_revision_id, revision(216));
         let remove_bytes =
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes);
-        assert_eq!(remove_bytes, 11_793_043);
+        assert_eq!(remove_bytes, 11_793_075);
     }
 
     #[test]
@@ -5698,6 +5710,7 @@ mod tests {
                     &store,
                     root(),
                     shard(),
+                    ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
                     placement(),
                     owner(),
                     next_request(&mut counter),
@@ -5788,7 +5801,7 @@ mod tests {
 
         assert_eq!(
             capture.with_last_commit(crate::workspace::test_support::transaction_bytes),
-            9_860_675
+            9_860_707
         );
     }
 
@@ -6725,6 +6738,7 @@ mod tests {
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES])),
                     placement_generation: placement(),
                     owner_epoch: owner(),
                     request_id: request(*counter),
@@ -6936,6 +6950,7 @@ mod tests {
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES])),
                     placement_generation: placement(),
                     owner_epoch: owner(),
                     request_id: request(*counter),

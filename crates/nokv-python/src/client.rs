@@ -13,6 +13,7 @@ use nokv_client::{
     ArtifactPublishOptions, ArtifactPublishOutcome, ClientError, ClientOptions, FramedTcpOptions,
     FramedTcpTransport, RouteResolver, WorkspaceClient,
 };
+use nokv_object::ArtifactObjectStore;
 use nokv_protocol::{
     AggregateRequest, ArtifactRevisionIdentity, CatalogRequest, ContentType,
     CreateWorkspaceRequest, FindWorkspacesRequest, GetPathRequest, OperationIdentity, PageRequest,
@@ -57,7 +58,7 @@ struct CollectedFile {
 #[pyclass(name = "Client")]
 pub(crate) struct PythonWorkspaceClient {
     client: Arc<RustWorkspaceClient>,
-    objects: Arc<ConfiguredObjectStore>,
+    objects: Arc<nokv_object::BoundArtifactStore<ConfiguredObjectStore>>,
 }
 
 #[pymethods]
@@ -98,6 +99,15 @@ impl PythonWorkspaceClient {
             WorkspaceClient::new(root_id, transport, resolver, ClientOptions { max_attempts })
                 .map_err(value_error)?;
         let objects = object_store.build().map_err(value_error)?;
+        let preflight = py
+            .detach(|| client.preflight(std::iter::empty()))
+            .map_err(runtime_error)?;
+        let namespace_id = preflight.value.route.object_namespace_id.into();
+        if objects.is_memory() {
+            nokv_object::ensure_object_namespace(&objects, namespace_id).map_err(value_error)?;
+        }
+        let objects =
+            nokv_object::BoundArtifactStore::open(objects, namespace_id).map_err(value_error)?;
         Ok(Self {
             client: Arc::new(client),
             objects: Arc::new(objects),
@@ -790,7 +800,7 @@ fn is_read_version_conflict(error: &ClientError) -> bool {
 
 fn materialize_workspace(
     client: &RustWorkspaceClient,
-    objects: &ConfiguredObjectStore,
+    objects: &dyn ArtifactObjectStore,
     workbench: WorkbenchName,
     prefix: Option<RelativePath>,
     local_directory: &Path,
@@ -850,7 +860,7 @@ fn materialize_workspace(
 #[allow(clippy::too_many_arguments)]
 fn collect_workspace(
     client: &RustWorkspaceClient,
-    objects: &ConfiguredObjectStore,
+    objects: &dyn ArtifactObjectStore,
     local_directory: &Path,
     workbench: WorkbenchName,
     prefix: Option<RelativePath>,

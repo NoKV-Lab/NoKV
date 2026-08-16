@@ -10,7 +10,7 @@ use crate::request::WorkspaceRpcRequest;
 use crate::response::WorkspaceRpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v2";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v3";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -87,18 +87,19 @@ mod tests {
     use crate::{
         ArtifactDescriptor, ArtifactRevisionIdentity, CommitIdentity, CommitPreparation,
         CommitRequest, ContentType, CreateWorkspaceRequest, Digest, DigestUri, GetSnapshotRequest,
-        LogicalShardIdentity, OperationIdentity, OperationKind, OperationProgress, OperationState,
-        OperationStatus, OperationToken, PathListEntry, PathMetadata, PathPage, PublishCondition,
-        RelativePath, RequestIdentity, RootIdentity, RootRoute, SnapshotAlias, SnapshotSelector,
-        WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
-        WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceRequest, WorkspaceResult,
-        WorkspaceRpcOutcome, WorkspaceSummary,
+        LogicalShardIdentity, ObjectNamespaceIdentity, OperationIdentity, OperationKind,
+        OperationProgress, OperationState, OperationStatus, OperationToken, PathListEntry,
+        PathMetadata, PathPage, PublishCondition, RelativePath, RequestIdentity, RootIdentity,
+        RootRoute, SnapshotAlias, SnapshotSelector, WorkbenchName, WorkspaceCapability,
+        WorkspaceIdentity, WorkspacePath, WorkspacePreflightRequest, WorkspacePreflightResult,
+        WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceSummary,
     };
 
     fn route() -> RootRoute {
         RootRoute {
             root_id: RootIdentity([1; 16]),
             logical_shard_id: LogicalShardIdentity([2; 16]),
+            object_namespace_id: ObjectNamespaceIdentity([8; 16]),
             placement_generation: 7,
             owner_epoch: 11,
         }
@@ -117,6 +118,7 @@ mod tests {
 
     #[test]
     fn request_round_trips_with_exact_schema() {
+        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v3");
         let expected = request();
         let encoded = encode_request(&expected).unwrap();
         assert!(encoded
