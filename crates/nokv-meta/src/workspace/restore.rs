@@ -5109,7 +5109,7 @@ fn replay_outcome(
     input_digest: [u8; SHA256_BYTES],
     operation_id: Option<OperationId>,
 ) -> Result<Option<RestoreCommandOutcome>, RestoreError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -6642,6 +6642,37 @@ mod tests {
             begin_restore(&store, begin_context, &wrong_restore_identity),
             Err(RestoreError::RequestInputMismatch)
         );
+    }
+
+    #[test]
+    fn restore_exact_replay_rejects_a_missing_recovery_binding() {
+        let mut counter = 0_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 1);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let request_value = snapshot_restore_request(
+            &source,
+            snapshot_id,
+            "recovery-binding",
+            incarnation(30),
+            0xd8,
+        );
+        let context = write_context(&store, &mut counter, owner_epoch);
+        begin_restore(&store, context, &request_value).unwrap();
+        let dedupe = store
+            .lookup_request(root(), placement(), owner_epoch, context.request_id)
+            .unwrap()
+            .unwrap();
+        store
+            .replace_recovery_header_for_test(dedupe.recovery_lsn, None)
+            .unwrap();
+
+        assert!(matches!(
+            begin_restore(&store, context, &request_value),
+            Err(RestoreError::Meta(MetaError::CorruptRecord { .. }))
+        ));
     }
 
     #[test]

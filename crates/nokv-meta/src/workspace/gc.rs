@@ -1800,7 +1800,7 @@ fn replay_operation_outcome(
     input_digest: [u8; SHA256_BYTES],
     operation_id: OperationId,
 ) -> Result<Option<GcCommandOutcome>, GcError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -1810,11 +1810,7 @@ fn replay_operation_outcome(
         return Ok(None);
     };
     Ok(Some(decode_operation_outcome(
-        MetadataCommandResult {
-            commit_version: replay.commit_version,
-            deterministic_result: replay.deterministic_result,
-            replayed: true,
-        },
+        replay,
         input_digest,
         operation_id,
     )?))
@@ -1827,7 +1823,7 @@ fn replay_candidate_clear_outcome(
     revision: ArtifactRevisionId,
     epoch: ReferenceEpoch,
 ) -> Result<Option<GcCandidateClearOutcome>, GcError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -1837,11 +1833,7 @@ fn replay_candidate_clear_outcome(
         return Ok(None);
     };
     Ok(Some(decode_candidate_clear_outcome(
-        MetadataCommandResult {
-            commit_version: replay.commit_version,
-            deterministic_result: replay.deterministic_result,
-            replayed: true,
-        },
+        replay,
         input_digest,
         revision,
         epoch,
@@ -1853,7 +1845,7 @@ fn replay_history_barrier_outcome(
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
 ) -> Result<Option<GcHistoryBarrierOutcome>, GcError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -1862,14 +1854,7 @@ fn replay_history_barrier_outcome(
     else {
         return Ok(None);
     };
-    Ok(Some(decode_history_barrier_outcome(
-        MetadataCommandResult {
-            commit_version: replay.commit_version,
-            deterministic_result: replay.deterministic_result,
-            replayed: true,
-        },
-        input_digest,
-    )?))
+    Ok(Some(decode_history_barrier_outcome(replay, input_digest)?))
 }
 
 fn encode_operation_result(
@@ -2564,6 +2549,37 @@ mod tests {
                 floor: 2,
             })
         );
+    }
+
+    #[test]
+    fn gc_exact_replay_rejects_a_corrupted_recovery_binding() {
+        let mut counter = 1;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        initialize_store(&store, &mut counter);
+        let fixture = seed_fixture(&store, &mut counter, false, false);
+        let service = GcService::new(&store);
+        let context = write_context(&store, &mut counter);
+        let request = ClaimGcRequest {
+            context,
+            artifact_revision_id: fixture.target,
+            reference_epoch: fixture.epoch,
+        };
+        service.claim(request.clone()).unwrap();
+        let dedupe = store
+            .lookup_request(root(), placement(), owner_epoch(), context.request_id)
+            .unwrap()
+            .unwrap();
+        store
+            .replace_recovery_header_for_test(
+                dedupe.recovery_lsn,
+                Some(b"tampered GC recovery header".to_vec()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            service.claim(request),
+            Err(GcError::Meta(MetaError::CorruptRecord { .. }))
+        ));
     }
 
     #[test]

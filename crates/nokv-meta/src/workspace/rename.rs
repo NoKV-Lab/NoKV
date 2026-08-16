@@ -181,7 +181,7 @@ pub fn rename_path(
     }
 
     let input_digest = rename_input_digest(&request);
-    if let Some(replay) = store.lookup_request(
+    if let Some(replay) = store.lookup_request_result(
         request.context.root_id,
         request.context.placement_generation,
         request.context.owner_epoch,
@@ -997,6 +997,27 @@ mod tests {
             ChangeEventKind::ArtifactPublished
         );
         assert_eq!(changes.events[1].event.path.as_ref(), Some(&destination()));
+    }
+
+    #[test]
+    fn rename_exact_replay_rejects_missing_or_tampered_recovery_binding() {
+        for replacement in [None, Some(b"tampered recovery header".to_vec())] {
+            let (store, _, _, _) = ready_store();
+            let rename = rename_request(&store, request(5));
+            rename_path(&store, rename.clone()).unwrap();
+            let dedupe = store
+                .lookup_request(root(), placement(), owner(), request(5))
+                .unwrap()
+                .unwrap();
+            store
+                .replace_recovery_header_for_test(dedupe.recovery_lsn, replacement)
+                .unwrap();
+
+            assert!(matches!(
+                rename_path(&store, rename),
+                Err(RenamePathError::Meta(MetaError::CorruptRecord { .. }))
+            ));
+        }
     }
 
     fn put_destination(store: &MetaShard, path: &PathEntry) {

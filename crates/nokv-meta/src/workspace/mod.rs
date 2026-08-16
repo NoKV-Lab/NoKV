@@ -79,7 +79,8 @@ pub use commit_records::{
 pub use engine::MetadataReadStatsSession;
 pub use engine::{
     store_limits, CommandMutation, CommandPredicate, EventProjection, HistoryProjection, MetaError,
-    MetaShard, MetadataCommand, MetadataCommandResult, MetadataScanItem, RootFenceAction,
+    MetaShard, MetadataCommand, MetadataCommandResult, MetadataScanItem, RecoveryFsckReport,
+    RootFenceAction,
 };
 pub use gc::{
     gc_operation_id, AdvanceGcDeletionBatchRequest, BeginGcDeletionRequest, ClaimGcRequest,
@@ -148,7 +149,8 @@ pub use query_records::{
 pub use read_stats::{MetadataReadStats, MetadataReadStatsSessionError};
 pub use records::{CommandDedupeRecord, CurrentValue, HistoryValue, RecordCodecError, RootFence};
 pub use recovery::{
-    RecoveryCodecError, RecoveryMutationV1, RecoveryOutboxRecord, RecoveryResultV1, RecoveryState,
+    RecoveryCodecError, RecoveryMutationV1, RecoveryOutboxRecord, RecoveryOutboxSegment,
+    RecoveryResultV1, RecoveryState, MAX_RECOVERY_SEGMENT_BYTES, MAX_RECOVERY_SEGMENT_RECORDS,
     RECOVERY_CHAIN_DIGEST_BYTES, RECOVERY_OUTBOX_VALUE_FORMAT_VERSION,
 };
 pub use remove::{remove_path, RemovePathError, RemovePathOutcome, RemovePathRequest};

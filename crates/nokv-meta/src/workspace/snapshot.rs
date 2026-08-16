@@ -1552,7 +1552,7 @@ fn replay_outcome(
     context: RootWriteContext,
     input_digest: [u8; SHA256_BYTES],
 ) -> Result<Option<SnapshotWriteOutcome>, SnapshotError> {
-    let Some(replay) = store.lookup_request(
+    let Some(replay) = store.lookup_request_result(
         context.root_id,
         context.placement_generation,
         context.owner_epoch,
@@ -2591,6 +2591,33 @@ mod tests {
             get(&store, &name, SnapshotSelector::Alias(alias("checkpoint")),).snapshot_id,
             SnapshotId::new(11)
         );
+    }
+
+    #[test]
+    fn snapshot_exact_replay_rejects_a_missing_recovery_binding() {
+        let store = ready_store();
+        let name = workbench("recovery-binding");
+        create_workspace(&store, 3, &name, 3);
+        let request_value = MintSnapshotRequest {
+            workbench_id: name,
+            snapshot_id: SnapshotId::new(11),
+            alias: None,
+            lease_deadline_ms: 100,
+            annotation: b"exact".to_vec(),
+        };
+        mint_snapshot(&store, write_context(&store, 4), &request_value).unwrap();
+        let dedupe = store
+            .lookup_request(root(), placement(), owner(), request(4))
+            .unwrap()
+            .unwrap();
+        store
+            .replace_recovery_header_for_test(dedupe.recovery_lsn, None)
+            .unwrap();
+
+        assert!(matches!(
+            mint_snapshot(&store, write_context(&store, 4), &request_value),
+            Err(SnapshotError::Meta(MetaError::CorruptRecord { .. }))
+        ));
     }
 
     #[test]

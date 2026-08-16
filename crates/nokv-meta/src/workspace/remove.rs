@@ -180,7 +180,7 @@ pub fn remove_path(
         return Err(RemovePathError::ReservedManifest);
     }
     let input_digest = remove_input_digest(&request);
-    if let Some(replay) = store.lookup_request(
+    if let Some(replay) = store.lookup_request_result(
         request.context.root_id,
         request.context.placement_generation,
         request.context.owner_epoch,
@@ -913,6 +913,25 @@ mod tests {
             changes.events[0].event.artifact_revision_id,
             Some(revision())
         );
+    }
+
+    #[test]
+    fn remove_exact_replay_rejects_a_missing_recovery_binding() {
+        let (store, _) = ready_store(1);
+        let request_value = removal_request(&store, request(5));
+        remove_path(&store, request_value.clone()).unwrap();
+        let dedupe = store
+            .lookup_request(root(), placement(), owner(), request(5))
+            .unwrap()
+            .unwrap();
+        store
+            .replace_recovery_header_for_test(dedupe.recovery_lsn, None)
+            .unwrap();
+
+        assert!(matches!(
+            remove_path(&store, request_value),
+            Err(RemovePathError::Meta(MetaError::CorruptRecord { .. }))
+        ));
     }
 
     #[test]
