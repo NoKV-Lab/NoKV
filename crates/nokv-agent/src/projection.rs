@@ -246,6 +246,41 @@ pub fn verify_run_manifest_v1(bytes: &[u8]) -> Result<VerifiedRunManifestV1, Pro
     })
 }
 
+/// Rebuild a committed run-manifest projection for a restored destination.
+///
+/// The source envelope is accepted only as canonical v1 input. Its user
+/// manifest and content commitments are retained, while all Workbench-owned
+/// binding fields are rebuilt for the destination through the one canonical
+/// run-manifest builder.
+pub fn build_restored_run_manifest_v1(
+    source_run_manifest: &[u8],
+    destination_workbench_id: &WorkbenchId,
+    destination_workbench_path: &str,
+    destination_commit_identity: [u8; 32],
+    destination_committed_at_unix_seconds: u64,
+) -> Result<Vec<u8>, ProjectionError> {
+    let source = verify_run_manifest_v1(source_run_manifest)?;
+    if source.workbench_id == *destination_workbench_id {
+        return Err(ProjectionError::new(
+            "restore destination workbench must differ from its source",
+        ));
+    }
+    if destination_committed_at_unix_seconds == 0 {
+        return Err(ProjectionError::new(
+            "destination committed_at_unix_seconds must be greater than zero",
+        ));
+    }
+    build_run_manifest_v1(
+        destination_workbench_id,
+        destination_workbench_path,
+        &source.content_digest_uri,
+        &source.canonical_manifest,
+        &source.manifest_digest_uri,
+        destination_commit_identity,
+        destination_committed_at_unix_seconds,
+    )
+}
+
 pub fn build_restore_manifest_v1(
     operation_id: [u8; 16],
     source_workbench_id: &WorkbenchId,
@@ -655,6 +690,177 @@ mod tests {
             verify_run_manifest_v1(&first).unwrap().commit_identity,
             verify_run_manifest_v1(&second).unwrap().commit_identity
         );
+    }
+
+    #[test]
+    fn restored_run_manifest_rebinds_source_content_to_the_destination() {
+        let source_id = workbench("source");
+        let destination_id = workbench("destination");
+        let source_manifest = br#"{"nested":{"a":1,"b":2},"task":"ptycho"}"#;
+        let manifest_digest_uri = digest_uri(source_manifest);
+        let content_digest_uri = format!("sha256:{}", "44".repeat(32));
+        let source_commit_identity =
+            workbench_commit_identity(&source_id, &content_digest_uri, &manifest_digest_uri);
+        let source = build_run_manifest_v1(
+            &source_id,
+            "/agents/test/wb/source",
+            &content_digest_uri,
+            source_manifest,
+            &manifest_digest_uri,
+            source_commit_identity,
+            1_700_000_000,
+        )
+        .unwrap();
+        let destination_commit_identity =
+            workbench_commit_identity(&destination_id, &content_digest_uri, &manifest_digest_uri);
+
+        let restored = build_restored_run_manifest_v1(
+            &source,
+            &destination_id,
+            "/agents/test/wb/destination",
+            destination_commit_identity,
+            1_800_000_000,
+        )
+        .unwrap();
+        let verified = verify_run_manifest_v1(&restored).unwrap();
+
+        assert_eq!(verified.workbench_id, destination_id);
+        assert_eq!(verified.workbench_path, "/agents/test/wb/destination");
+        assert_eq!(verified.commit_identity, destination_commit_identity);
+        assert_eq!(verified.committed_at_unix_seconds, 1_800_000_000);
+        assert_eq!(verified.content_digest_uri, content_digest_uri);
+        assert_eq!(verified.manifest_digest_uri, manifest_digest_uri);
+        assert_eq!(verified.canonical_manifest, source_manifest);
+        assert_ne!(verified.commit_identity, source_commit_identity);
+        assert_ne!(restored, source);
+    }
+
+    #[test]
+    fn restored_run_manifest_is_deterministic_and_destination_owned() {
+        let source_id = workbench("source");
+        let source_manifest = br#"{"task":"ptycho"}"#;
+        let manifest_digest_uri = digest_uri(source_manifest);
+        let content_digest_uri = format!("sha256:{}", "55".repeat(32));
+        let source_commit_identity =
+            workbench_commit_identity(&source_id, &content_digest_uri, &manifest_digest_uri);
+        let source = build_run_manifest_v1(
+            &source_id,
+            "/agents/test/wb/source",
+            &content_digest_uri,
+            source_manifest,
+            &manifest_digest_uri,
+            source_commit_identity,
+            1,
+        )
+        .unwrap();
+        let first_destination_id = workbench("destination-one");
+        let first_destination_commit_identity = workbench_commit_identity(
+            &first_destination_id,
+            &content_digest_uri,
+            &manifest_digest_uri,
+        );
+        let second_destination_id = workbench("destination-two");
+        let second_destination_commit_identity = workbench_commit_identity(
+            &second_destination_id,
+            &content_digest_uri,
+            &manifest_digest_uri,
+        );
+
+        let first = build_restored_run_manifest_v1(
+            &source,
+            &first_destination_id,
+            "/agents/test/wb/destination-one",
+            first_destination_commit_identity,
+            2,
+        )
+        .unwrap();
+        let replay = build_restored_run_manifest_v1(
+            &source,
+            &first_destination_id,
+            "/agents/test/wb/destination-one",
+            first_destination_commit_identity,
+            2,
+        )
+        .unwrap();
+        let second = build_restored_run_manifest_v1(
+            &source,
+            &second_destination_id,
+            "/agents/test/wb/destination-two",
+            second_destination_commit_identity,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(first, replay);
+        assert_ne!(first, second);
+        assert_ne!(
+            first_destination_commit_identity,
+            second_destination_commit_identity
+        );
+    }
+
+    #[test]
+    fn restored_run_manifest_rejects_untrusted_source_or_destination_inputs() {
+        let source_id = workbench("source");
+        let destination_id = workbench("destination");
+        let source_manifest = br#"{"task":"ptycho"}"#;
+        let manifest_digest_uri = digest_uri(source_manifest);
+        let content_digest_uri = format!("sha256:{}", "66".repeat(32));
+        let source_commit_identity =
+            workbench_commit_identity(&source_id, &content_digest_uri, &manifest_digest_uri);
+        let source = build_run_manifest_v1(
+            &source_id,
+            "/agents/test/wb/source",
+            &content_digest_uri,
+            source_manifest,
+            &manifest_digest_uri,
+            source_commit_identity,
+            1,
+        )
+        .unwrap();
+        let destination_commit_identity =
+            workbench_commit_identity(&destination_id, &content_digest_uri, &manifest_digest_uri);
+
+        assert!(build_restored_run_manifest_v1(
+            &source,
+            &destination_id,
+            "/agents/test/wb/destination",
+            [9; 32],
+            2,
+        )
+        .is_err());
+        assert!(build_restored_run_manifest_v1(
+            &source,
+            &source_id,
+            "/agents/test/wb/source",
+            source_commit_identity,
+            2,
+        )
+        .is_err());
+        assert!(build_restored_run_manifest_v1(
+            &source,
+            &destination_id,
+            "/agents/test/wb/destination",
+            destination_commit_identity,
+            0,
+        )
+        .is_err());
+        assert!(build_restored_run_manifest_v1(
+            br#"{ "not": "canonical" }"#,
+            &destination_id,
+            "/agents/test/wb/destination",
+            destination_commit_identity,
+            2,
+        )
+        .is_err());
+        assert!(build_restored_run_manifest_v1(
+            br#"{"not":"a run manifest"}"#,
+            &destination_id,
+            "/agents/test/wb/destination",
+            destination_commit_identity,
+            2,
+        )
+        .is_err());
     }
 
     #[test]
