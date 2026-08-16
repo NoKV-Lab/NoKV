@@ -19,10 +19,11 @@ use nokv_protocol::{
     GetOperationRequest, GetPathRequest, LogicalShardIdentity, MarkArtifactObjectsUploadedRequest,
     ObjectIdentity, ObjectUploadProof, OperationIdentity, OperationKind, OperationResult,
     OperationState, OperationStatus, OperationToken, PageRequest, PathMetadata, PathReadResult,
-    PublicationAuthority, PublishCondition, PublishResult, RootRoute, StageArtifactManifestRequest,
-    StageArtifactObjectsRequest, StagedObject, WorkspacePath, WorkspaceReadView, WorkspaceRequest,
-    WorkspaceResult, MAX_ARTIFACT_DEPENDENCY_DEPTH, MAX_ARTIFACT_DEPENDENCY_OWNERS,
-    MAX_ARTIFACT_PUBLISH_BATCH_ROWS, MAX_ARTIFACT_READ_PLAN_ROWS,
+    PublicationAuthority, PublishCondition, PublishResult, ReadRestoreSourceRunManifestRequest,
+    RootRoute, StageArtifactManifestRequest, StageArtifactObjectsRequest, StagedObject,
+    WorkspacePath, WorkspaceReadView, WorkspaceRequest, WorkspaceResult,
+    MAX_ARTIFACT_DEPENDENCY_DEPTH, MAX_ARTIFACT_DEPENDENCY_OWNERS, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
+    MAX_ARTIFACT_READ_PLAN_ROWS,
 };
 use nokv_types::{ArtifactRevisionId, LogicalShardId, RootId};
 use sha2::{Digest as _, Sha256};
@@ -904,6 +905,29 @@ where
         unreachable!("validated max_attempts is non-zero")
     }
 
+    /// Materializes the immutable source commit run manifest retained by one
+    /// restore operation. The operation, rather than a caller-selected path or
+    /// read view, is the authority for every metadata and read-plan page.
+    pub(crate) fn read_restore_source_run_manifest_artifact(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        operation_id: OperationIdentity,
+    ) -> Result<ArtifactReadOutcome, ClientError> {
+        for attempt in 1..=self.max_attempts() {
+            match self.read_restore_source_run_manifest_artifact_once(store, operation_id) {
+                Err(error) if error.retryable() && attempt < self.max_attempts() => {}
+                Err(error) if error.retryable() => {
+                    return Err(ClientError::RetryExhausted {
+                        attempts: attempt,
+                        last_error: Box::new(error),
+                    });
+                }
+                result => return result,
+            }
+        }
+        unreachable!("validated max_attempts is non-zero")
+    }
+
     fn begin_publish_on_shard(
         &self,
         logical_shard: LogicalShardIdentity,
@@ -1143,6 +1167,85 @@ where
         })
     }
 
+    fn read_restore_source_run_manifest_artifact_once(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        operation_id: OperationIdentity,
+    ) -> Result<ArtifactReadOutcome, ClientError> {
+        let route = self.resolve_artifact_route()?;
+        require_object_namespace(store, route)?;
+        let metadata =
+            self.load_restore_source_run_manifest_metadata(route.logical_shard_id, operation_id)?;
+        let logical_len = metadata.descriptor.logical_size;
+        let output_len = usize::try_from(logical_len).map_err(|_| {
+            ClientError::ArtifactIntegrity(
+                "restore source run manifest length is not addressable".to_owned(),
+            )
+        })?;
+        if logical_len == 0 {
+            return Err(ClientError::ArtifactIntegrity(
+                "restore source run manifest must not be empty".to_owned(),
+            ));
+        }
+
+        let mut bytes = Vec::with_capacity(output_len);
+        let mut stats = ArtifactReadStats::default();
+        let mut complete_rows = BTreeMap::<u64, ArtifactManifestRow>::new();
+        let mut offset = 0_u64;
+        while offset < logical_len {
+            let window_len_u64 = (logical_len - offset).min(ARTIFACT_READ_WINDOW_BYTES);
+            let window_len = usize::try_from(window_len_u64).map_err(|_| {
+                ClientError::ArtifactIntegrity(
+                    "restore source read window length is not addressable".to_owned(),
+                )
+            })?;
+            let loaded = self.load_restore_source_run_manifest_range_rows(
+                route.logical_shard_id,
+                operation_id,
+                ByteRange {
+                    offset,
+                    length: window_len_u64,
+                },
+                &metadata,
+            )?;
+            let window = window_from_rows(
+                self.root_id(),
+                route.logical_shard_id,
+                &loaded.metadata,
+                &loaded.rows,
+                offset,
+                window_len,
+            )?;
+            let read = read_artifact_window(store, None, &window, offset, window_len)?;
+            bytes.extend_from_slice(&read.bytes);
+            merge_read_stats(&mut stats, read.stats);
+            for row in loaded.rows {
+                match complete_rows.entry(row.object_index) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(row);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &row => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(ClientError::ArtifactReadFenceChanged);
+                    }
+                }
+            }
+            offset = offset.checked_add(window_len_u64).ok_or_else(|| {
+                ClientError::ArtifactIntegrity("full-read offset overflows".to_owned())
+            })?;
+        }
+
+        let rows = complete_rows.into_values().collect::<Vec<_>>();
+        let manifest =
+            manifest_from_rows(self.root_id(), route.logical_shard_id, &metadata, &rows)?;
+        verify_artifact_bytes(&manifest, &bytes)?;
+        Ok(ArtifactReadOutcome {
+            metadata,
+            bytes,
+            stats,
+        })
+    }
+
     fn read_artifact_range_once(
         &self,
         store: &dyn ArtifactObjectStore,
@@ -1203,6 +1306,88 @@ where
         validate_path_result(&result, target, None)?;
         result.metadata.ok_or_else(|| {
             ClientError::ResponseMismatch("artifact read omitted path metadata".to_owned())
+        })
+    }
+
+    fn load_restore_source_run_manifest_metadata(
+        &self,
+        logical_shard: LogicalShardIdentity,
+        operation_id: OperationIdentity,
+    ) -> Result<PathMetadata, ClientError> {
+        let result = self
+            .execute_on_logical_shard(
+                self.new_request_id(),
+                WorkspaceRequest::ReadRestoreSourceRunManifest(
+                    ReadRestoreSourceRunManifestRequest {
+                        operation_id,
+                        range: None,
+                        plan_page: None,
+                    },
+                ),
+                logical_shard,
+            )?
+            .map(expect_restore_source_run_manifest)?
+            .value;
+        validate_restore_source_run_manifest_result(&result, None)?;
+        result.metadata.ok_or_else(|| {
+            ClientError::ResponseMismatch(
+                "restore source run manifest read omitted path metadata".to_owned(),
+            )
+        })
+    }
+
+    fn load_restore_source_run_manifest_range_rows(
+        &self,
+        logical_shard: LogicalShardIdentity,
+        operation_id: OperationIdentity,
+        range: ByteRange,
+        expected_metadata: &PathMetadata,
+    ) -> Result<LoadedRangeRows, ClientError> {
+        let mut cursor = None;
+        let mut seen_cursors = BTreeSet::new();
+        let mut rows = Vec::new();
+        loop {
+            let result = self
+                .execute_on_logical_shard(
+                    self.new_request_id(),
+                    WorkspaceRequest::ReadRestoreSourceRunManifest(
+                        ReadRestoreSourceRunManifestRequest {
+                            operation_id,
+                            range: Some(range),
+                            plan_page: Some(PageRequest {
+                                cursor: cursor.clone(),
+                                limit: MAX_ARTIFACT_READ_PLAN_ROWS as u32,
+                            }),
+                        },
+                    ),
+                    logical_shard,
+                )?
+                .map(expect_restore_source_run_manifest)?
+                .value;
+            validate_restore_source_run_manifest_result(&result, Some(range))?;
+            let page_metadata = result.metadata.ok_or_else(|| {
+                ClientError::ResponseMismatch(
+                    "restore source range plan omitted path metadata".to_owned(),
+                )
+            })?;
+            if &page_metadata != expected_metadata {
+                return Err(ClientError::ArtifactReadFenceChanged);
+            }
+            append_range_page(&mut rows, result.blocks)?;
+            let Some(next_cursor) = result.next_cursor else {
+                break;
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(ClientError::ArtifactIntegrity(
+                    "restore source range-plan cursor loop detected".to_owned(),
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+        validate_range_coverage(&rows, range)?;
+        Ok(LoadedRangeRows {
+            metadata: expected_metadata.clone(),
+            rows,
         })
     }
 
@@ -1305,6 +1490,43 @@ fn validate_path_result(
         }
         Some(_) if result.blocks.is_empty() => Err(ClientError::ArtifactIntegrity(
             "range-plan page contains no manifest rows".to_owned(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_restore_source_run_manifest_result(
+    result: &PathReadResult,
+    expected_range: Option<ByteRange>,
+) -> Result<(), ClientError> {
+    if result.not_modified {
+        return Err(ClientError::ResponseMismatch(
+            "restore source run manifest returned not-modified".to_owned(),
+        ));
+    }
+    if result.range != expected_range {
+        return Err(ClientError::ResponseMismatch(
+            "restore source run manifest range differs from its request".to_owned(),
+        ));
+    }
+    let metadata = result.metadata.as_ref().ok_or_else(|| {
+        ClientError::ResponseMismatch(
+            "restore source run manifest omitted path metadata".to_owned(),
+        )
+    })?;
+    if metadata.path.path.as_str() != "metadata/run_manifest.json" {
+        return Err(ClientError::ResponseMismatch(
+            "restore source read returned a different canonical path".to_owned(),
+        ));
+    }
+    match expected_range {
+        None if !result.blocks.is_empty() || result.next_cursor.is_some() => {
+            Err(ClientError::ResponseMismatch(
+                "restore source metadata response included a read plan".to_owned(),
+            ))
+        }
+        Some(_) if result.blocks.is_empty() => Err(ClientError::ArtifactIntegrity(
+            "restore source range-plan page contains no manifest rows".to_owned(),
         )),
         _ => Ok(()),
     }
@@ -1928,6 +2150,17 @@ fn expect_path(result: WorkspaceResult) -> Result<nokv_protocol::PathReadResult,
         WorkspaceResult::Path(path) => Ok(path),
         _ => Err(ClientError::ResponseMismatch(
             "expected path result".to_owned(),
+        )),
+    }
+}
+
+fn expect_restore_source_run_manifest(
+    result: WorkspaceResult,
+) -> Result<PathReadResult, ClientError> {
+    match result {
+        WorkspaceResult::RestoreSourceRunManifest(value) => Ok(value),
+        _ => Err(ClientError::ResponseMismatch(
+            "expected restore_source_run_manifest result".to_owned(),
         )),
     }
 }

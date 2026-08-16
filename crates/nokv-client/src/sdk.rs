@@ -9,18 +9,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nokv_protocol::{
     decode_response, encode_request, AbortArtifactPublishRequest, AggregateRequest,
-    AggregateResult, BeginArtifactPublishRequest, CatalogRequest, CatalogResult, ChangePage,
-    ChangePageRequest, CommitRequest, CompleteArtifactPublishRequest, CreateWorkspaceRequest,
-    ErrorCode, FinalizeRestoreRequest, FindWorkspacesRequest, FindWorkspacesResult,
-    GetOperationRequest, GetPathRequest, GetSnapshotRequest, GetWorkspaceRequest, ListPathsRequest,
-    ListSnapshotsRequest, LogicalShardIdentity, MarkArtifactObjectsUploadedRequest,
-    MintSnapshotRequest, OperationStatus, PathPage, PathReadResult, PrepareRestoreRequest,
-    PublishResult, RemovePathRequest, RemovePathResult, RenewSnapshotRequest, RequestIdentity,
-    RestorePreparation, RestoreResult, RetireSnapshotRequest, RootIdentity, RootRoute,
-    SearchRequest, SearchResult, SnapshotPage, SnapshotResult, StageArtifactManifestRequest,
-    StageArtifactObjectsRequest, WorkspaceCapability, WorkspacePreflightRequest,
-    WorkspacePreflightResult, WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome,
-    WorkspaceRpcRequest, WorkspaceSummary,
+    AggregateResult, BeginArtifactPublishRequest, BindRestoreDestinationRequest, CatalogRequest,
+    CatalogResult, ChangePage, ChangePageRequest, CommitRequest, CompleteArtifactPublishRequest,
+    CreateWorkspaceRequest, ErrorCode, FinalizeRestoreRequest, FindWorkspacesRequest,
+    FindWorkspacesResult, GetOperationRequest, GetPathRequest, GetSnapshotRequest,
+    GetWorkspaceRequest, ListPathsRequest, ListSnapshotsRequest, LogicalShardIdentity,
+    MarkArtifactObjectsUploadedRequest, MintSnapshotRequest, OperationStatus, PathPage,
+    PathReadResult, PrepareRestoreRequest, PublishResult, ReadRestoreSourceRunManifestRequest,
+    RemovePathRequest, RemovePathResult, RenewSnapshotRequest, RequestIdentity, RestorePreparation,
+    RestoreResult, RetireSnapshotRequest, RootIdentity, RootRoute, SearchRequest, SearchResult,
+    SnapshotPage, SnapshotResult, StageArtifactManifestRequest, StageArtifactObjectsRequest,
+    WorkspaceCapability, WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceRequest,
+    WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceSummary,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -472,6 +472,26 @@ where
             .map(expect_restore_prepared)
     }
 
+    pub fn bind_restore_destination(
+        &self,
+        request_id: RequestIdentity,
+        request: BindRestoreDestinationRequest,
+    ) -> Result<ClientCall<RestorePreparation>, ClientError> {
+        self.execute(
+            request_id,
+            WorkspaceRequest::BindRestoreDestination(request),
+        )?
+        .map(expect_restore_prepared)
+    }
+
+    pub fn read_restore_source_run_manifest(
+        &self,
+        request: ReadRestoreSourceRunManifestRequest,
+    ) -> Result<ClientCall<PathReadResult>, ClientError> {
+        self.execute_read(WorkspaceRequest::ReadRestoreSourceRunManifest(request))?
+            .map(expect_restore_source_run_manifest)
+    }
+
     pub fn finalize_restore(
         &self,
         request_id: RequestIdentity,
@@ -641,6 +661,12 @@ expect_result!(
     RestorePreparation,
     "restore_prepared"
 );
+expect_result!(
+    expect_restore_source_run_manifest,
+    RestoreSourceRunManifest,
+    PathReadResult,
+    "restore_source_run_manifest"
+);
 expect_result!(expect_restored, Restored, RestoreResult, "restored");
 expect_result!(expect_search, Search, SearchResult, "search");
 expect_result!(expect_aggregate, Aggregate, AggregateResult, "aggregate");
@@ -660,7 +686,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use nokv_protocol::{
-        decode_request, encode_response, ConflictKind, ErrorCode, LogicalShardIdentity, RpcFailure,
+        decode_request, encode_response, ArtifactDescriptor, ArtifactRevisionIdentity,
+        BindRestoreDestinationRequest, CommitIdentity, ConflictKind, ContentType, Digest,
+        DigestUri, ErrorCode, LogicalShardIdentity, OperationIdentity, PathMetadata,
+        PathReadResult, ReadRestoreSourceRunManifestRequest, RelativePath,
+        RestoreDestinationBinding, RestoreManifestIdentity, RestorePreparation,
+        RestoreSourceCommitBinding, RpcFailure, WorkbenchName, WorkspaceIdentity, WorkspacePath,
         WorkspaceRpcResponse,
     };
 
@@ -702,6 +733,41 @@ mod tests {
                 .expect("script contains one response per request");
             encode_response(&response)
                 .map_err(|error| crate::TransportError::new(error.to_string(), false))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LossyRestoreReadTransport {
+        requests: Mutex<Vec<WorkspaceRpcRequest>>,
+        result: PathReadResult,
+    }
+
+    impl RpcTransport for LossyRestoreReadTransport {
+        fn round_trip(
+            &self,
+            _endpoint: SocketAddr,
+            request: &[u8],
+        ) -> Result<Vec<u8>, crate::TransportError> {
+            let request = decode_request(request)
+                .map_err(|error| crate::TransportError::new(error.to_string(), false))?;
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            if requests.len() == 1 {
+                return Err(crate::TransportError::new(
+                    "injected restore-held read response loss",
+                    true,
+                ));
+            }
+            encode_response(&WorkspaceRpcResponse {
+                route: request.route,
+                request_id: request.request_id,
+                commit_version: None,
+                replayed: true,
+                outcome: WorkspaceRpcOutcome::Success(Box::new(
+                    WorkspaceResult::RestoreSourceRunManifest(self.result.clone()),
+                )),
+            })
+            .map_err(|error| crate::TransportError::new(error.to_string(), false))
         }
     }
 
@@ -797,6 +863,149 @@ mod tests {
             *client.transport.endpoints.lock().unwrap(),
             vec![resolved(7, 4107).endpoint]
         );
+    }
+
+    #[test]
+    fn restore_held_source_read_response_loss_reuses_the_exact_request() {
+        let operation_id = OperationIdentity([0x44; 16]);
+        let result = PathReadResult {
+            not_modified: false,
+            metadata: Some(PathMetadata {
+                path: WorkspacePath {
+                    workbench: WorkbenchName::new("source-run").unwrap(),
+                    path: RelativePath::new("metadata/run_manifest.json").unwrap(),
+                },
+                workspace_incarnation_id: WorkspaceIdentity([0x45; 16]),
+                workspace_revision: 9,
+                generation: 1,
+                artifact_revision_id: ArtifactRevisionIdentity([0x46; 16]),
+                dependency_count: 0,
+                dependency_depth: 0,
+                descriptor: ArtifactDescriptor {
+                    logical_size: 12,
+                    body_digest: DigestUri::new(format!("sha256:{}", "47".repeat(32))).unwrap(),
+                    manifest_digest: DigestUri::new(format!("sha256:{}", "48".repeat(32))).unwrap(),
+                    content_type: ContentType::new("application/json").unwrap(),
+                    producer: None,
+                    manifest_identity: None,
+                    index_fields: Vec::new(),
+                },
+            }),
+            range: None,
+            blocks: Vec::new(),
+            next_cursor: None,
+        };
+        let transport = LossyRestoreReadTransport {
+            requests: Mutex::new(Vec::new()),
+            result: result.clone(),
+        };
+        let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        let call = client
+            .read_restore_source_run_manifest(ReadRestoreSourceRunManifestRequest {
+                operation_id,
+                range: None,
+                plan_page: None,
+            })
+            .unwrap();
+        assert!(call.replayed);
+        assert_eq!(call.value, result);
+        let requests = client.transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].request_id, requests[1].request_id);
+        assert_eq!(requests[0].operation, requests[1].operation);
+        assert!(matches!(
+            &requests[0].operation,
+            WorkspaceRequest::ReadRestoreSourceRunManifest(request)
+                if request.operation_id == operation_id
+        ));
+    }
+
+    #[test]
+    fn typed_restore_destination_bind_maps_the_exact_preparation() {
+        let request_id = RequestIdentity([0x50; 16]);
+        let operation_id = OperationIdentity([0x51; 16]);
+        let run_identity = RestoreManifestIdentity {
+            publication_operation_id: OperationIdentity([0x52; 16]),
+            artifact_revision_id: ArtifactRevisionIdentity([0x53; 16]),
+        };
+        let restore_identity = RestoreManifestIdentity {
+            publication_operation_id: OperationIdentity([0x54; 16]),
+            artifact_revision_id: ArtifactRevisionIdentity([0x55; 16]),
+        };
+        let source_commit = RestoreSourceCommitBinding {
+            commit_id: CommitIdentity([0x56; 32]),
+            content_digest: DigestUri::new(format!("sha256:{}", "57".repeat(32))).unwrap(),
+            manifest_digest: DigestUri::new(format!("sha256:{}", "58".repeat(32))).unwrap(),
+            tree_manifest_revision_id: ArtifactRevisionIdentity([0x59; 16]),
+            member_count: 2,
+            member_digest: Digest([0x5a; 32]),
+        };
+        let bind = BindRestoreDestinationRequest {
+            operation_id,
+            destination_commit_id: CommitIdentity([0x5b; 32]),
+            effective_content_digest: source_commit.content_digest.clone(),
+            destination_run_manifest_projection_input_digest: Digest([0x5c; 32]),
+            destination_run_manifest_identity: run_identity,
+            destination_restore_manifest_identity: restore_identity,
+        };
+        let preparation = RestorePreparation {
+            operation_id,
+            destination_workbench: WorkbenchName::new("destination-run").unwrap(),
+            destination_workspace_incarnation_id: WorkspaceIdentity([0x5d; 16]),
+            source_commit: source_commit.clone(),
+            destination_committed_at_unix_seconds: 1_700_000_999,
+            source_member_count: 2,
+            source_member_digest: source_commit.member_digest,
+            materialized_member_count: 1,
+            materialized_member_digest: Digest([0x5e; 32]),
+            source_matches_base_commit: true,
+            destination_binding: Some(Box::new(RestoreDestinationBinding {
+                destination_commit_id: bind.destination_commit_id,
+                effective_content_digest: bind.effective_content_digest.clone(),
+                destination_run_manifest_projection_input_digest: bind
+                    .destination_run_manifest_projection_input_digest,
+                destination_run_manifest_identity: run_identity,
+                destination_restore_manifest_identity: restore_identity,
+                destination_manifests: None,
+            })),
+        };
+        let response = WorkspaceRpcResponse {
+            route: route(7),
+            request_id,
+            commit_version: Some(23),
+            replayed: true,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::RestorePrepared(
+                preparation.clone(),
+            ))),
+        };
+        let transport = ScriptedTransport::new(vec![response]);
+        let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        let call = client
+            .bind_restore_destination(request_id, bind.clone())
+            .unwrap();
+        assert_eq!(call.value, preparation);
+        assert!(call.replayed);
+        let requests = client.transport.requests.lock().unwrap();
+        assert!(matches!(
+            &requests[0].operation,
+            WorkspaceRequest::BindRestoreDestination(actual) if actual == &bind
+        ));
     }
 
     #[test]
