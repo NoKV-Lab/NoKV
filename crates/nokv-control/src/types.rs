@@ -1,7 +1,7 @@
 use std::fmt;
 
 pub use nokv_types::{
-    LogicalShardId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RootId,
+    AgentId, LogicalShardId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RootId,
     RootPlacementLifecycle,
 };
 
@@ -85,6 +85,17 @@ pub struct RootPlacement {
 pub struct RootObjectNamespaceBinding {
     pub root_id: RootId,
     pub object_namespace_id: ObjectNamespaceId,
+}
+
+/// Immutable admission binding from one root to its stable Agent principal.
+///
+/// Presentation paths and process identities never participate in this
+/// authority. One Agent may own multiple roots, but one root can never be
+/// rebound to a different Agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootAgentBinding {
+    pub root_id: RootId,
+    pub agent_id: AgentId,
 }
 
 /// Durable ownership and recovery state for one logical metadata shard.

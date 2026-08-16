@@ -14,8 +14,9 @@ mod store;
 mod types;
 
 pub use codec::{
-    decode_logical_shard_record, decode_root_object_namespace_binding, decode_root_placement,
-    encode_logical_shard_record, encode_root_object_namespace_binding, encode_root_placement,
+    decode_logical_shard_record, decode_root_agent_binding, decode_root_object_namespace_binding,
+    decode_root_placement, encode_logical_shard_record, encode_root_agent_binding,
+    encode_root_object_namespace_binding, encode_root_placement,
 };
 pub use errors::ControlError;
 #[cfg(feature = "etcd")]
@@ -23,8 +24,8 @@ pub use etcd::EtcdControlStore;
 pub use options::EtcdControlStoreOptions;
 pub use store::{ControlStore, InMemoryControlStore};
 pub use types::{
-    CheckpointRef, LogRef, LogSegmentRef, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    LogicalShardState, NodeId, NodeIdError, ObjectNamespaceId, OwnerEpoch, PlacementGeneration,
-    RecoveryPublication, RootId, RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
-    UnknownLogicalShardState,
+    AgentId, CheckpointRef, LogRef, LogSegmentRef, LogicalShardId, LogicalShardLease,
+    LogicalShardRecord, LogicalShardState, NodeId, NodeIdError, ObjectNamespaceId, OwnerEpoch,
+    PlacementGeneration, RecoveryPublication, RootAgentBinding, RootId, RootObjectNamespaceBinding,
+    RootPlacement, RootPlacementLifecycle, UnknownLogicalShardState,
 };

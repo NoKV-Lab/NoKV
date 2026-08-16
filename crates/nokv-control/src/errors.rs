@@ -10,6 +10,9 @@ pub enum ControlError {
     InvalidEndpoint(String),
     RootPlacementNotFound(RootId),
     RootPlacementAlreadyExists(RootId),
+    RootAgentAlreadyBound {
+        root_id: RootId,
+    },
     RootObjectNamespaceAlreadyBound {
         root_id: RootId,
         existing: ObjectNamespaceId,
@@ -80,6 +83,9 @@ impl fmt::Display for ControlError {
             }
             Self::RootPlacementAlreadyExists(root_id) => {
                 write!(formatter, "root placement {root_id:?} already exists")
+            }
+            Self::RootAgentAlreadyBound { root_id, .. } => {
+                write!(formatter, "root {root_id:?} is already bound to another Agent")
             }
             Self::RootObjectNamespaceAlreadyBound { root_id, .. } => write!(
                 formatter,

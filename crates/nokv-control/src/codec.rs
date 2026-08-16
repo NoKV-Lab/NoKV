@@ -4,12 +4,14 @@ use crate::store::validate_logical_shard_record;
 #[cfg(any(feature = "etcd", test))]
 use crate::LogicalShardLease;
 use crate::{
-    CheckpointRef, ControlError, LogRef, LogSegmentRef, LogicalShardId, LogicalShardRecord,
-    LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RootId,
-    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
+    AgentId, CheckpointRef, ControlError, LogRef, LogSegmentRef, LogicalShardId,
+    LogicalShardRecord, LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch,
+    PlacementGeneration, RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement,
+    RootPlacementLifecycle,
 };
 
 const ROOT_PLACEMENT_CODEC_VERSION: u8 = 1;
+const ROOT_AGENT_BINDING_CODEC_VERSION: u8 = 1;
 const ROOT_OBJECT_NAMESPACE_CODEC_VERSION: u8 = 1;
 const LOGICAL_SHARD_RECORD_CODEC_VERSION: u8 = 1;
 #[cfg(any(feature = "etcd", test))]
@@ -23,6 +25,14 @@ struct RootPlacementWire {
     logical_shard_id: String,
     placement_generation: u64,
     lifecycle: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootAgentBindingWire {
+    version: u8,
+    root_id: String,
+    agent_id: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,6 +129,34 @@ pub fn decode_root_placement(bytes: &[u8]) -> Result<RootPlacement, ControlError
         ));
     }
     Ok(placement)
+}
+
+pub fn encode_root_agent_binding(binding: &RootAgentBinding) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&RootAgentBindingWire {
+        version: ROOT_AGENT_BINDING_CODEC_VERSION,
+        root_id: encode_fixed_id(binding.root_id.as_bytes()),
+        agent_id: encode_fixed_id(binding.agent_id.as_bytes()),
+    })
+    .map_err(codec_error)
+}
+
+pub fn decode_root_agent_binding(bytes: &[u8]) -> Result<RootAgentBinding, ControlError> {
+    let wire: RootAgentBindingWire = serde_json::from_slice(bytes).map_err(codec_error)?;
+    require_version(
+        "root Agent binding",
+        wire.version,
+        ROOT_AGENT_BINDING_CODEC_VERSION,
+    )?;
+    let binding = RootAgentBinding {
+        root_id: RootId::from_bytes(decode_fixed_id(&wire.root_id, "root id")?),
+        agent_id: AgentId::from_bytes(decode_fixed_id(&wire.agent_id, "Agent id")?),
+    };
+    if encode_root_agent_binding(&binding)?.as_slice() != bytes {
+        return Err(ControlError::Codec(
+            "root Agent binding input is not canonical".to_owned(),
+        ));
+    }
+    Ok(binding)
 }
 
 pub fn encode_root_object_namespace_binding(
@@ -425,6 +463,13 @@ mod tests {
         }
     }
 
+    fn agent_binding() -> RootAgentBinding {
+        RootAgentBinding {
+            root_id: root_id(1),
+            agent_id: AgentId::from_bytes([4; 16]),
+        }
+    }
+
     fn serving_record() -> LogicalShardRecord {
         LogicalShardRecord {
             logical_shard_id: shard_id(2),
@@ -469,6 +514,11 @@ mod tests {
             .unwrap(),
             binding
         );
+        let binding = agent_binding();
+        assert_eq!(
+            decode_root_agent_binding(&encode_root_agent_binding(&binding).unwrap()).unwrap(),
+            binding
+        );
 
         let record = serving_record();
         assert_eq!(
@@ -488,6 +538,10 @@ mod tests {
             br#"{"version":1,"root_id":"01010101010101010101010101010101","object_namespace_id":"03030303030303030303030303030303"}"#
         );
         assert_eq!(
+            encode_root_agent_binding(&agent_binding()).unwrap(),
+            br#"{"version":1,"root_id":"01010101010101010101010101010101","agent_id":"04040404040404040404040404040404"}"#
+        );
+        assert_eq!(
             encode_logical_shard_record(&LogicalShardRecord::unassigned(shard_id(2))).unwrap(),
             br#"{"version":1,"logical_shard_id":"02020202020202020202020202020202","owner":null,"owner_epoch":null,"lease_id":0,"state":1,"endpoint":null,"checkpoint":null,"log":null,"durable_lsn":0}"#
         );
@@ -498,6 +552,26 @@ mod tests {
         let bytes = br#"{"version":99,"root_id":"01010101010101010101010101010101","logical_shard_id":"02020202020202020202020202020202","placement_generation":1,"lifecycle":1}"#;
         assert!(matches!(
             decode_root_placement(bytes),
+            Err(ControlError::Codec(_))
+        ));
+
+        let bytes = br#"{"version":99,"root_id":"01010101010101010101010101010101","agent_id":"04040404040404040404040404040404"}"#;
+        assert!(matches!(
+            decode_root_agent_binding(bytes),
+            Err(ControlError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn agent_binding_codec_rejects_noncanonical_or_unknown_fields() {
+        let uppercase = br#"{"version":1,"root_id":"01010101010101010101010101010101","agent_id":"ABABABABABABABABABABABABABABABAB"}"#;
+        assert!(matches!(
+            decode_root_agent_binding(uppercase),
+            Err(ControlError::Codec(_))
+        ));
+        let unknown = br#"{"version":1,"root_id":"01010101010101010101010101010101","agent_id":"04040404040404040404040404040404","extra":true}"#;
+        assert!(matches!(
+            decode_root_agent_binding(unknown),
             Err(ControlError::Codec(_))
         ));
     }

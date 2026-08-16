@@ -4,13 +4,24 @@ use std::sync::Mutex;
 use crate::types::endpoint_is_canonical;
 use crate::{
     CheckpointRef, ControlError, LogRef, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication, RootId, RootObjectNamespaceBinding,
-    RootPlacement, RootPlacementLifecycle,
+    LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication, RootAgentBinding, RootId,
+    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
 };
 
 /// Durable control-plane operations, split between immutable root placement
 /// and physical logical-shard ownership.
 pub trait ControlStore: Send + Sync {
+    /// Create the immutable Agent authority for a root. An exact replay is
+    /// idempotent; the root can never be rebound to another Agent.
+    fn create_root_agent_binding(
+        &self,
+        binding: RootAgentBinding,
+    ) -> Result<RootAgentBinding, ControlError>;
+    fn get_root_agent_binding(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootAgentBinding>, ControlError>;
+
     /// Create the immutable object namespace identity for a root. An exact
     /// replay is idempotent; a different identity is never adopted.
     fn create_root_object_namespace_binding(
@@ -95,6 +106,7 @@ pub trait ControlStore: Send + Sync {
 
 #[derive(Default)]
 struct InMemoryState {
+    root_agents: BTreeMap<RootId, RootAgentBinding>,
     root_object_namespaces: BTreeMap<RootId, RootObjectNamespaceBinding>,
     root_placements: BTreeMap<RootId, RootPlacement>,
     logical_shards: BTreeMap<LogicalShardId, LogicalShardRecord>,
@@ -114,6 +126,31 @@ impl InMemoryControlStore {
 }
 
 impl ControlStore for InMemoryControlStore {
+    fn create_root_agent_binding(
+        &self,
+        binding: RootAgentBinding,
+    ) -> Result<RootAgentBinding, ControlError> {
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        if let Some(current) = state.root_agents.get(&binding.root_id) {
+            if *current == binding {
+                return Ok(binding);
+            }
+            return Err(ControlError::RootAgentAlreadyBound {
+                root_id: binding.root_id,
+            });
+        }
+        state.root_agents.insert(binding.root_id, binding);
+        Ok(binding)
+    }
+
+    fn get_root_agent_binding(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootAgentBinding>, ControlError> {
+        let state = self.state.lock().expect("control store mutex poisoned");
+        Ok(state.root_agents.get(root_id).copied())
+    }
+
     fn create_root_object_namespace_binding(
         &self,
         binding: RootObjectNamespaceBinding,
@@ -1070,8 +1107,10 @@ fn durable_tail_digest(record: &LogicalShardRecord) -> Result<Option<String>, St
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
-    use crate::{LogSegmentRef, PlacementGeneration};
+    use crate::{AgentId, LogSegmentRef, PlacementGeneration};
 
     fn root_id(value: u8) -> RootId {
         RootId::from_bytes([value; 16])
@@ -1090,6 +1129,63 @@ mod tests {
             root_id: root_id(root),
             object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([namespace; 16]),
         }
+    }
+
+    fn agent_binding(root: u8, agent: u8) -> RootAgentBinding {
+        RootAgentBinding {
+            root_id: root_id(root),
+            agent_id: AgentId::from_bytes([agent; 16]),
+        }
+    }
+
+    #[test]
+    fn root_agent_binding_is_immutable_and_exact_replay_is_idempotent() {
+        let store = InMemoryControlStore::new();
+        let binding = agent_binding(1, 7);
+        assert_eq!(store.create_root_agent_binding(binding).unwrap(), binding);
+        assert_eq!(store.create_root_agent_binding(binding).unwrap(), binding);
+        assert!(matches!(
+            store.create_root_agent_binding(agent_binding(1, 8)),
+            Err(ControlError::RootAgentAlreadyBound { .. })
+        ));
+        assert_eq!(
+            store.get_root_agent_binding(&root_id(1)).unwrap(),
+            Some(binding)
+        );
+    }
+
+    #[test]
+    fn concurrent_root_agent_claims_admit_exactly_one_agent() {
+        let store = Arc::new(InMemoryControlStore::new());
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for agent in [7, 8] {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.create_root_agent_binding(agent_binding(1, agent))
+            }));
+        }
+        barrier.wait();
+
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(ControlError::RootAgentAlreadyBound { .. })))
+                .count(),
+            1
+        );
+        let admitted = results.into_iter().find_map(Result::ok).unwrap();
+        assert_eq!(
+            store.get_root_agent_binding(&root_id(1)).unwrap(),
+            Some(admitted)
+        );
     }
 
     #[test]

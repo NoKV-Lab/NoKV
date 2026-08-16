@@ -4,9 +4,10 @@ use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp
 use tokio::runtime::{Builder, Runtime};
 
 use crate::codec::{
-    decode_logical_shard_record, decode_owner_session, decode_root_object_namespace_binding,
-    decode_root_placement, encode_logical_shard_record, encode_owner_session,
-    encode_root_object_namespace_binding, encode_root_placement,
+    decode_logical_shard_record, decode_owner_session, decode_root_agent_binding,
+    decode_root_object_namespace_binding, decode_root_placement, encode_logical_shard_record,
+    encode_owner_session, encode_root_agent_binding, encode_root_object_namespace_binding,
+    encode_root_placement,
 };
 use crate::store::{
     prepare_mark_serving, prepare_owner_acquisition, prepare_owner_release,
@@ -15,8 +16,8 @@ use crate::store::{
 };
 use crate::{
     ControlError, EtcdControlStoreOptions, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    NodeId, OwnerEpoch, RecoveryPublication, RootId, RootObjectNamespaceBinding, RootPlacement,
-    RootPlacementLifecycle,
+    NodeId, OwnerEpoch, RecoveryPublication, RootAgentBinding, RootId, RootObjectNamespaceBinding,
+    RootPlacement, RootPlacementLifecycle,
 };
 
 pub struct EtcdControlStore {
@@ -74,6 +75,50 @@ impl EtcdControlStore {
 }
 
 impl ControlStore for EtcdControlStore {
+    fn create_root_agent_binding(
+        &self,
+        binding: RootAgentBinding,
+    ) -> Result<RootAgentBinding, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        self.block_on(async move {
+            let key = options.root_agent_key(&binding.root_id);
+            let encoded = encode_root_agent_binding(&binding)?;
+            let txn = Txn::new()
+                .when(vec![Compare::version(key.clone(), CompareOp::Equal, 0)])
+                .and_then(vec![TxnOp::put(key, encoded, None)]);
+            if client.txn(txn).await.map_err(etcd_backend)?.succeeded() {
+                return Ok(binding);
+            }
+            let current = fetch_root_agent_binding(&mut client, &options, &binding.root_id)
+                .await?
+                .ok_or_else(|| {
+                    ControlError::Backend(
+                        "root Agent binding disappeared after create conflict".to_owned(),
+                    )
+                })?;
+            if current == binding {
+                Ok(current)
+            } else {
+                Err(ControlError::RootAgentAlreadyBound {
+                    root_id: binding.root_id,
+                })
+            }
+        })
+    }
+
+    fn get_root_agent_binding(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootAgentBinding>, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let root_id = *root_id;
+        self.block_on(
+            async move { fetch_root_agent_binding(&mut client, &options, &root_id).await },
+        )
+    }
+
     fn create_root_object_namespace_binding(
         &self,
         binding: RootObjectNamespaceBinding,
@@ -585,6 +630,34 @@ impl ControlStore for EtcdControlStore {
     }
 }
 
+async fn fetch_root_agent_binding(
+    client: &mut Client,
+    options: &EtcdControlStoreOptions,
+    root_id: &RootId,
+) -> Result<Option<RootAgentBinding>, ControlError> {
+    let key = options.root_agent_key(root_id);
+    let response = client.get(key.clone(), None).await.map_err(etcd_backend)?;
+    let Some(kv) = response.kvs().first() else {
+        return Ok(None);
+    };
+    let binding = decode_root_agent_binding(kv.value())?;
+    validate_root_agent_binding_entry(options, root_id, kv.key(), binding).map(Some)
+}
+
+fn validate_root_agent_binding_entry(
+    options: &EtcdControlStoreOptions,
+    root_id: &RootId,
+    stored_key: &[u8],
+    binding: RootAgentBinding,
+) -> Result<RootAgentBinding, ControlError> {
+    if binding.root_id != *root_id || stored_key != options.root_agent_key(root_id) {
+        return Err(ControlError::Codec(
+            "root Agent binding key and value identities differ".to_owned(),
+        ));
+    }
+    Ok(binding)
+}
+
 async fn fetch_root_object_namespace_binding(
     client: &mut Client,
     options: &EtcdControlStoreOptions,
@@ -1045,4 +1118,42 @@ fn lease_id_i64(lease_id: u64) -> Result<i64, ControlError> {
 
 fn etcd_backend(error: etcd_client::Error) -> ControlError {
     ControlError::Backend(format!("etcd: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AgentId;
+
+    fn root(fill: u8) -> RootId {
+        RootId::from_bytes([fill; 16])
+    }
+
+    fn binding(root_fill: u8) -> RootAgentBinding {
+        RootAgentBinding {
+            root_id: root(root_fill),
+            agent_id: AgentId::from_bytes([7; 16]),
+        }
+    }
+
+    #[test]
+    fn root_agent_binding_entry_requires_exact_key_and_value_root_identity() {
+        let options =
+            EtcdControlStoreOptions::new(["http://127.0.0.1:2379"]).with_key_prefix("/nokv/test");
+        let requested = root(1);
+        let key = options.root_agent_key(&requested);
+
+        assert_eq!(
+            validate_root_agent_binding_entry(&options, &requested, &key, binding(1)).unwrap(),
+            binding(1)
+        );
+        assert!(matches!(
+            validate_root_agent_binding_entry(&options, &requested, b"wrong-key", binding(1)),
+            Err(ControlError::Codec(_))
+        ));
+        assert!(matches!(
+            validate_root_agent_binding_entry(&options, &requested, &key, binding(2)),
+            Err(ControlError::Codec(_))
+        ));
+    }
 }

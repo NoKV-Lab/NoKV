@@ -84,6 +84,16 @@ impl EtcdControlStoreOptions {
     }
 
     #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn root_agent_key(&self, root_id: &RootId) -> Vec<u8> {
+        format!(
+            "{}/root-agents/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(root_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
+    #[cfg(any(feature = "etcd", test))]
     pub(crate) fn root_object_namespace_key(&self, root_id: &RootId) -> Vec<u8> {
         format!(
             "{}/root-object-namespaces/{}",
@@ -167,6 +177,10 @@ mod tests {
         assert_eq!(
             String::from_utf8(options.root_object_namespace_key(&root_id(0x01))).unwrap(),
             "/nokv/test/root-object-namespaces/01010101010101010101010101010101"
+        );
+        assert_eq!(
+            String::from_utf8(options.root_agent_key(&root_id(0x01))).unwrap(),
+            "/nokv/test/root-agents/01010101010101010101010101010101"
         );
         assert_eq!(
             String::from_utf8(options.logical_shard_record_key(&shard_id(0x02))).unwrap(),

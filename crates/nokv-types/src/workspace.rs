@@ -83,6 +83,14 @@ macro_rules! fixed_bytes_type {
 }
 
 fixed_bytes_type!(
+    /// Stable identity for one Agent principal admitted to a [`RootId`].
+    ///
+    /// This identity is deployment-owned and independent of presentation paths,
+    /// process identities, endpoints, and credentials.
+    AgentId,
+    FIXED_ID_BYTES
+);
+fixed_bytes_type!(
     /// Globally unique identity for one persisted logical metadata shard.
     LogicalShardId,
     FIXED_ID_BYTES
@@ -909,6 +917,7 @@ mod tests {
         let digest_bytes = std::array::from_fn(|index| (index as u8).wrapping_mul(3));
 
         let root = RootId::from_bytes(bytes);
+        let agent = AgentId::from_bytes(bytes);
         let shard = LogicalShardId::from_bytes(bytes);
         let object_namespace = ObjectNamespaceId::from_bytes(bytes);
         let workspace = WorkspaceIncarnationId::from_bytes(bytes);
@@ -919,6 +928,8 @@ mod tests {
         let command_digest = CommandDigest::from_bytes(digest_bytes);
 
         assert_eq!(root.as_bytes(), &bytes);
+        assert_eq!(agent.as_bytes(), &bytes);
+        assert_eq!(agent.into_bytes(), bytes);
         assert_eq!(shard.as_bytes(), &bytes);
         assert_eq!(object_namespace.as_bytes(), &bytes);
         assert_eq!(workspace.as_bytes(), &bytes);
@@ -931,6 +942,7 @@ mod tests {
         assert_eq!(object_namespace.into_bytes(), bytes);
         assert_eq!(commit.into_bytes(), digest_bytes);
         assert_eq!(std::mem::size_of::<RootId>(), FIXED_ID_BYTES);
+        assert_eq!(std::mem::size_of::<AgentId>(), FIXED_ID_BYTES);
         assert_eq!(std::mem::size_of::<LogicalShardId>(), FIXED_ID_BYTES);
         assert_eq!(
             std::mem::size_of::<WorkspaceIncarnationId>(),
@@ -942,6 +954,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<CommitId>(), SHA256_BYTES);
         assert_eq!(std::mem::size_of::<CommandDigest>(), SHA256_BYTES);
         assert_eq!(LogicalShardId::BYTE_WIDTH, FIXED_ID_BYTES);
+        assert_eq!(AgentId::BYTE_WIDTH, FIXED_ID_BYTES);
         assert_eq!(CommitId::BYTE_WIDTH, SHA256_BYTES);
     }
 

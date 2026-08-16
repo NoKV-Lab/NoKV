@@ -7,7 +7,7 @@
 pub mod workspace;
 
 pub use workspace::{
-    ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitConsumerKind, CommitId,
+    AgentId, ArtifactRevisionId, BuildCommitPhase, CommandDigest, CommitConsumerKind, CommitId,
     CommitRetirePhase, CommitState, CommitVersion, ConsumerEpoch, DurableNameError, GcClaimState,
     GcPhase, Generation, HistoryHoldKind, HistoryHoldState, LogicalShardId, NormalizedRelativePath,
     NormalizedRelativePathError, ObjectNamespaceId, OperationId, OperationKind, OwnerEpoch,
