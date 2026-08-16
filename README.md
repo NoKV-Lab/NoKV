@@ -329,6 +329,9 @@ brew upgrade nokv
 nokv version --json
 ```
 
+The Formula keeps Homebrew `version_scheme 1` so the corrected pre-1.0 release
+line upgrades cleanly from the earlier `1.0.0` Formula.
+
 The Formula version follows the stable NoKV release tag and the `crates/nokv`
 package version, not Holt, Rust, or protobuf. Every NoKV release carries its
 own `Cargo.lock` and embeds the exact Holt version, source, and checksum in the

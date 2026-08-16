@@ -26,6 +26,7 @@ TAP_MARKER_SCHEMA = "nokv.homebrew.public_tap.v1"
 SOURCE_REPOSITORY = "NoKV-Lab/NoKV"
 TAP_REPOSITORY = "NoKV-Lab/homebrew-tap"
 WORKBENCH_TOOL_COUNT = 18
+HOMEBREW_VERSION_SCHEME = 1
 STABLE_TAG = re.compile(
     r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
     re.ASCII,
@@ -490,6 +491,7 @@ class Nokv < Formula
   url {_ruby_string(values["url"])}
   sha256 {_ruby_string(values["source_sha"])}
   license "Apache-2.0"
+  version_scheme {HOMEBREW_VERSION_SCHEME}
 
   depends_on "protobuf" => :build
   depends_on "rust" => :build

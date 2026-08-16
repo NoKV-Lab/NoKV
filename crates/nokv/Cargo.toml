@@ -1,6 +1,6 @@
 [package]
 name = "nokv"
-version = "1.0.0"
+version = "0.10.0"
 description = "Custom CLI and MCP wiring for NoKV Agent workspaces."
 edition.workspace = true
 rust-version.workspace = true

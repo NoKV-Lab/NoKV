@@ -23,7 +23,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import homebrew_source_release as release  # noqa: E402
 
 
-HOLT_CHECKSUM = "c0e62dad7ce341d1e1995cc0034cb347d0e562e444b2354f8418410e2ba770e4"
+HOLT_CHECKSUM = "de964ee5f86d1ffba48f3213c97754bf80ea4289d5084419a4385a687c6818a4"
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 
 
@@ -53,7 +53,7 @@ resolver = "2"
 
 [workspace.dependencies]
 nokv = { path = "crates/nokv", version = "1.0.0" }
-holt = { version = "=0.8.4", default-features = false }
+holt = { version = "=0.8.5", default-features = false }
 """,
     )
     write(
@@ -73,7 +73,7 @@ version = 4
 
 [[package]]
 name = "holt"
-version = "0.8.4"
+version = "0.8.5"
 source = "{REGISTRY}"
 checksum = "{HOLT_CHECKSUM}"
 
@@ -111,6 +111,7 @@ class StableTagTest(unittest.TestCase):
     def test_accepts_only_canonical_stable_tags(self) -> None:
         for tag, version in {
             "v0.1.0": "0.1.0",
+            "v0.10.0": "0.10.0",
             "v1.0.0": "1.0.0",
             "v12.345.6789": "12.345.6789",
         }.items():
@@ -154,7 +155,7 @@ class RepositoryValidationTest(unittest.TestCase):
         self.assertRegex(metadata.commit, r"^[0-9a-f]{40}$")
         self.assertRegex(metadata.tree, r"^[0-9a-f]{40}$")
         self.assertRegex(metadata.cargo_lock_sha256, r"^[0-9a-f]{64}$")
-        self.assertEqual(metadata.holt.version, "0.8.4")
+        self.assertEqual(metadata.holt.version, "0.8.5")
         self.assertEqual(metadata.holt.source, REGISTRY)
         self.assertEqual(metadata.holt.checksum, HOLT_CHECKSUM)
         self.assertEqual(metadata.workbench.tool_count, 18)
@@ -194,7 +195,7 @@ class RepositoryValidationTest(unittest.TestCase):
             root = repository_fixture(Path(directory))
             manifest = root / "Cargo.toml"
             manifest.write_text(
-                manifest.read_text(encoding="utf-8").replace("=0.8.4", "=0.8.3"),
+                manifest.read_text(encoding="utf-8").replace("=0.8.5", "=0.8.4"),
                 encoding="utf-8",
             )
             run("git", "add", ".", cwd=root)
@@ -265,6 +266,7 @@ class SourceArchiveTest(unittest.TestCase):
         self.assertNotIn("on_arm", formula)
         self.assertNotIn("on_intel", formula)
         self.assertNotIn('  version "1.0.0"', formula)
+        self.assertIn("  version_scheme 1", formula)
         self.assertIn('depends_on "rust" => :build', formula)
         self.assertIn('depends_on "protobuf" => :build', formula)
         self.assertIn('"cargo", "install", *std_cargo_args(path: "crates/nokv")', formula)
@@ -303,7 +305,7 @@ class InstalledIdentityTest(unittest.TestCase):
             "commit": "a" * 40,
             "cargo_lock_sha256": "b" * 64,
             "holt": {
-                "version": "0.8.4",
+                "version": "0.8.5",
                 "source": REGISTRY,
                 "checksum": HOLT_CHECKSUM,
             },
@@ -403,6 +405,7 @@ class PublicTapAndWorkflowTest(unittest.TestCase):
         self.assertIn("NoKV-Lab/homebrew-tap", workflow)
         self.assertIn("create-github-app-token", workflow)
         self.assertIn("gh pr create", workflow)
+        self.assertIn("--latest", workflow)
         self.assertIn("Fail closed unless the tap is public", workflow)
         self.assertIn('"$private" != "false"', workflow)
         self.assertIn('"$visibility" != "public"', workflow)
