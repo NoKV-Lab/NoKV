@@ -9,7 +9,7 @@ use nokv_object::{
     plan_artifact_upload, read_artifact_window, upload_artifact_from_plan, verify_artifact_bytes,
     ArtifactBlock, ArtifactBlockCache, ArtifactKeyspace, ArtifactManifest, ArtifactObjectStore,
     ArtifactReadStats, ArtifactReadWindow, ArtifactUploadOptions, ArtifactUploadPlan,
-    ArtifactUploadStats, ObjectKey, DEFAULT_ARTIFACT_BLOCK_SIZE,
+    ArtifactUploadStats, ObjectError, ObjectKey, DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
 use nokv_protocol::{
     parse_sha256_digest_uri, seal_artifact_publish_plan, sha256_digest_uri,
@@ -19,7 +19,7 @@ use nokv_protocol::{
     GetOperationRequest, GetPathRequest, LogicalShardIdentity, MarkArtifactObjectsUploadedRequest,
     ObjectIdentity, ObjectUploadProof, OperationIdentity, OperationKind, OperationResult,
     OperationState, OperationStatus, OperationToken, PageRequest, PathMetadata, PathReadResult,
-    PublicationAuthority, PublishCondition, PublishResult, StageArtifactManifestRequest,
+    PublicationAuthority, PublishCondition, PublishResult, RootRoute, StageArtifactManifestRequest,
     StageArtifactObjectsRequest, StagedObject, WorkspacePath, WorkspaceReadView, WorkspaceRequest,
     WorkspaceResult, MAX_ARTIFACT_DEPENDENCY_DEPTH, MAX_ARTIFACT_DEPENDENCY_OWNERS,
     MAX_ARTIFACT_PUBLISH_BATCH_ROWS, MAX_ARTIFACT_READ_PLAN_ROWS,
@@ -198,6 +198,7 @@ where
         }
 
         let route = self.resolve_artifact_route()?;
+        require_object_namespace(store, route)?;
         let logical_shard = route.logical_shard_id;
         let object_plan = plan_artifact_upload(
             ArtifactUploadOptions::new(
@@ -602,6 +603,7 @@ where
         delta: &[u8],
     ) -> Result<ArtifactAppendOutcome, ClientError> {
         let route = self.resolve_artifact_route()?;
+        require_object_namespace(store, route)?;
         let logical_shard = route.logical_shard_id;
         let metadata = match self.load_artifact_metadata(
             logical_shard,
@@ -858,11 +860,11 @@ where
     ) -> Result<ArtifactReadOutcome, ClientError> {
         for attempt in 1..=self.max_attempts() {
             match self.read_artifact_once(store, cache, target.clone(), view.clone()) {
-                Err(ClientError::ArtifactReadFenceChanged) if attempt < self.max_attempts() => {}
-                Err(ClientError::ArtifactReadFenceChanged) => {
+                Err(error) if error.retryable() && attempt < self.max_attempts() => {}
+                Err(error) if error.retryable() => {
                     return Err(ClientError::RetryExhausted {
                         attempts: attempt,
-                        last_error: Box::new(ClientError::ArtifactReadFenceChanged),
+                        last_error: Box::new(error),
                     });
                 }
                 result => return result,
@@ -889,11 +891,11 @@ where
                 offset,
                 len,
             ) {
-                Err(ClientError::ArtifactReadFenceChanged) if attempt < self.max_attempts() => {}
-                Err(ClientError::ArtifactReadFenceChanged) => {
+                Err(error) if error.retryable() && attempt < self.max_attempts() => {}
+                Err(error) if error.retryable() => {
                     return Err(ClientError::RetryExhausted {
                         attempts: attempt,
-                        last_error: Box::new(ClientError::ArtifactReadFenceChanged),
+                        last_error: Box::new(error),
                     });
                 }
                 result => return result,
@@ -1066,6 +1068,7 @@ where
         view: WorkspaceReadView,
     ) -> Result<ArtifactReadOutcome, ClientError> {
         let route = self.resolve_artifact_route()?;
+        require_object_namespace(store, route)?;
         let metadata =
             self.load_artifact_metadata(route.logical_shard_id, &target, view.clone())?;
         let logical_len = metadata.descriptor.logical_size;
@@ -1150,6 +1153,7 @@ where
         len: usize,
     ) -> Result<ArtifactReadOutcome, ClientError> {
         let route = self.resolve_artifact_route()?;
+        require_object_namespace(store, route)?;
         let length = u64::try_from(len).map_err(|_| {
             ClientError::ArtifactIntegrity("requested range length exceeds u64".to_owned())
         })?;
@@ -1444,6 +1448,20 @@ fn merge_read_stats(total: &mut ArtifactReadStats, next: ArtifactReadStats) {
     total.store_reads = total.store_reads.saturating_add(next.store_reads);
     total.store_read_bytes = total.store_read_bytes.saturating_add(next.store_read_bytes);
     total.verified_blocks = total.verified_blocks.saturating_add(next.verified_blocks);
+}
+
+fn require_object_namespace(
+    store: &dyn ArtifactObjectStore,
+    route: RootRoute,
+) -> Result<(), ClientError> {
+    let expected: nokv_types::ObjectNamespaceId = route.object_namespace_id.into();
+    match store.object_namespace() {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(ObjectError::ObjectNamespaceMismatch { expected, actual }.into()),
+        None => Err(ClientError::InvalidOptions(
+            "artifact object store was not verified against the root route namespace".to_owned(),
+        )),
+    }
 }
 
 fn stream_artifact_digest(
@@ -2423,6 +2441,8 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         creates: AtomicUsize,
         deletes: AtomicUsize,
+        reads: AtomicUsize,
+        temporary_read_failures: AtomicUsize,
         fail_create_at: Option<usize>,
         corrupt_reads: AtomicBool,
     }
@@ -2434,13 +2454,23 @@ mod tests {
                 events,
                 creates: AtomicUsize::new(0),
                 deletes: AtomicUsize::new(0),
+                reads: AtomicUsize::new(0),
+                temporary_read_failures: AtomicUsize::new(0),
                 fail_create_at,
                 corrupt_reads: AtomicBool::new(false),
             }
         }
+
+        fn fail_next_reads(&self, count: usize) {
+            self.temporary_read_failures.store(count, Ordering::SeqCst);
+        }
     }
 
     impl ArtifactObjectStore for RecordingStore {
+        fn object_namespace(&self) -> Option<nokv_types::ObjectNamespaceId> {
+            Some(nokv_types::ObjectNamespaceId::from_bytes([8; 16]))
+        }
+
         fn capabilities(&self) -> ArtifactStoreCapabilities {
             self.inner.capabilities()
         }
@@ -2453,7 +2483,10 @@ mod tests {
             self.events.lock().unwrap().push("object_create");
             let attempt = self.creates.fetch_add(1, Ordering::SeqCst);
             if self.fail_create_at == Some(attempt) {
-                return Err(ObjectError::Backend("injected upload failure".to_owned()));
+                return Err(ObjectError::backend_failure(
+                    "injected upload failure",
+                    false,
+                ));
             }
             self.inner.create_immutable(key, bytes)
         }
@@ -2463,6 +2496,19 @@ mod tests {
             key: &ObjectKey,
             range: Option<ObjectRange>,
         ) -> Result<Vec<u8>, ObjectError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self
+                .temporary_read_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ObjectError::backend_failure(
+                    "request failed for endpoint=http://127.0.0.1:9000 bucket=private",
+                    true,
+                ));
+            }
             let mut bytes = self.inner.read(key, range)?;
             if self.corrupt_reads.load(Ordering::SeqCst) && !bytes.is_empty() {
                 bytes[0] ^= 0xff;
@@ -2484,6 +2530,7 @@ mod tests {
         RootRoute {
             root_id: RootIdentity([1; 16]),
             logical_shard_id: LogicalShardIdentity([2; 16]),
+            object_namespace_id: nokv_protocol::ObjectNamespaceIdentity([8; 16]),
             placement_generation: 3,
             owner_epoch: 4,
         }
@@ -3179,6 +3226,71 @@ mod tests {
             state.operation.as_ref().unwrap().state,
             OperationState::Aborting
         );
+    }
+
+    #[test]
+    fn raw_object_store_is_rejected_before_metadata_or_object_mutation() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = MemoryArtifactStore::new();
+
+        let error = client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .expect_err("unverified stores must fail closed");
+
+        assert!(matches!(error, ClientError::InvalidOptions(message)
+            if message.contains("not verified against the root route namespace")));
+        assert!(inspector.state().attempts.is_empty());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn temporary_object_read_is_retried_and_recovers() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+
+        let reads_before = store.reads.load(Ordering::SeqCst);
+        store.fail_next_reads(1);
+        let read = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .expect("a temporary backend failure must be retried");
+
+        assert_eq!(read.bytes, b"abcdefgh");
+        assert!(store.reads.load(Ordering::SeqCst) >= reads_before + 3);
+    }
+
+    #[test]
+    fn exhausted_object_read_preserves_retryability_without_provider_details() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+
+        store.fail_next_reads(ClientOptions::default().max_attempts as usize);
+        let error = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .expect_err("all object reads are temporarily unavailable");
+
+        assert!(matches!(
+            error,
+            ClientError::RetryExhausted { attempts, .. }
+                if attempts == ClientOptions::default().max_attempts
+        ));
+        assert!(error.retryable());
+        let message = error.to_string();
+        assert!(!message.contains("127.0.0.1"));
+        assert!(!message.contains("private"));
+        assert!(message.contains("artifact object backend is unavailable"));
     }
 
     #[test]

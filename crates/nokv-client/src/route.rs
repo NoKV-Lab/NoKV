@@ -13,7 +13,7 @@ use nokv_control::{ControlStore, LogicalShardState, RootPlacementLifecycle};
 #[cfg(feature = "etcd")]
 use nokv_control::{EtcdControlStore, EtcdControlStoreOptions};
 #[cfg(feature = "control")]
-use nokv_protocol::LogicalShardIdentity;
+use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity};
 use nokv_protocol::{RootIdentity, RootRoute};
 #[cfg(feature = "control")]
 use nokv_types::RootId;
@@ -138,6 +138,16 @@ impl ControlRouteResolver {
                 placement.lifecycle
             )));
         }
+        let object_namespace = self
+            .store
+            .get_root_object_namespace_binding(&root_id)
+            .map_err(control_error)?
+            .ok_or_else(|| invalid_route("root object namespace binding does not exist"))?;
+        if object_namespace.root_id != root_id {
+            return Err(invalid_route(
+                "object namespace binding identity differs from root placement",
+            ));
+        }
 
         let shard = self
             .store
@@ -171,6 +181,9 @@ impl ControlRouteResolver {
             RootRoute {
                 root_id: root_identity,
                 logical_shard_id: LogicalShardIdentity::from(placement.logical_shard_id),
+                object_namespace_id: ObjectNamespaceIdentity::from(
+                    object_namespace.object_namespace_id,
+                ),
                 placement_generation: placement.placement_generation.get(),
                 owner_epoch: owner_epoch.get(),
             },
@@ -269,7 +282,7 @@ mod control_tests {
     use super::*;
     use nokv_control::{
         InMemoryControlStore, LogicalShardId, NodeId, PlacementGeneration, RecoveryPublication,
-        RootPlacement,
+        RootObjectNamespaceBinding, RootPlacement,
     };
 
     fn id(value: u8) -> [u8; 16] {
@@ -287,6 +300,12 @@ mod control_tests {
         let root_id = RootId::from_bytes(id(1));
         let logical_shard_id = LogicalShardId::from_bytes(id(2));
         store.create_logical_shard(logical_shard_id).unwrap();
+        store
+            .create_root_object_namespace_binding(RootObjectNamespaceBinding {
+                root_id,
+                object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(id(8)),
+            })
+            .unwrap();
         let provisioning = store
             .create_root_placement(RootPlacement {
                 root_id,

@@ -27,7 +27,17 @@ The checked-in integration assets are deliberately small:
 - `local_wal_recovery_gate_test.py` freezes the gate's crash-stage and terminal
   evidence contract. Its fault process is the bench-owned
   `nokv-local-wal-recovery-fault` binary, not a production CLI test hook.
-- `start_rustfs.sh` starts the optional local S3-compatible artifact backend.
+- `object_namespace_recovery_gate.py` owns an isolated real etcd member and a
+  digest-pinned RustFS container. It records deterministic PhyMat evidence,
+  kills and reopens the owner, rejects a healthy wrong prefix, and proves the
+  retryable outage/recovery contract over one long-lived MCP process.
+- `object_namespace_recovery_gate_test.py` freezes those terminal assertions
+  and the independent GitHub Actions evidence-upload contract.
+- `start_rustfs.sh` starts the optional local S3-compatible artifact backend
+  with a digest-pinned image and bounded AWS CLI readiness attempts. It uses a
+  Docker-managed volume by default so RustFS's non-root UID owns `/data` on
+  Linux and macOS alike. `NOKV_WORKBENCH_RUSTFS_DATA_DIR` opts into a host bind
+  mount; that directory must be writable by UID/GID `10001:10001`.
 
 Build and validate the product directly:
 
@@ -37,6 +47,7 @@ cargo test --workspace
 python3 scripts/workbench/workbench_contract_test.py
 python3 scripts/workbench/live_workbench_test.py
 python3 scripts/workbench/local_wal_recovery_gate_test.py
+python3 scripts/workbench/object_namespace_recovery_gate_test.py
 ```
 
 Register the built binary in any MCP-compatible Agent runtime as a stdio MCP
@@ -120,7 +131,9 @@ process log, crash-boundary record, binary digest, and terminal result:
 python3 scripts/workbench/local_wal_recovery_gate.py \
   --build \
   --target-dir target/local-wal-recovery-gate/build \
-  --evidence-dir target/local-wal-recovery-gate/evidence/run-01
+  --evidence-dir target/local-wal-recovery-gate/evidence/run-01 \
+  --object-endpoint http://127.0.0.1:9000 \
+  --object-bucket nokv-local-wal-recovery-gate
 ```
 
 The two mandatory boundaries are:
@@ -139,7 +152,38 @@ path until the gate sends `SIGKILL`. Retry begins only after the lease-attached
 session key disappears. The real CLI must reopen the path, preserve the
 metadata probe, and publish `Serving(2)`; observing epoch 3 is a hard `FAIL`.
 
-This gate isolates control/local-WAL recovery and intentionally performs no
-object I/O. RustFS/S3 publication and reads remain the responsibility of
-`live_workbench.py`. Missing local etcd dependencies report `NOT QUALIFIED`;
-an invariant violation reports `FAIL`.
+This gate isolates control/local-WAL recovery and performs only the namespace
+marker admission required by the production CLI. RustFS/S3 payload publication,
+wrong-prefix isolation, outage retryability, and PhyMat recovery remain the
+responsibility of the independent gate below. Missing dependencies report
+`NOT QUALIFIED`; an invariant violation reports `FAIL`.
+
+## Object-namespace and PhyMat recovery evidence
+
+The independent live gate requires local `etcd`, `etcdctl`, Docker, and the AWS
+CLI. It starts and cleans up its own digest-pinned RustFS container:
+
+```bash
+python3 scripts/workbench/object_namespace_recovery_gate.py \
+  --build \
+  --target-dir target/object-namespace-recovery/build \
+  --evidence-dir target/object-namespace-recovery/evidence/run-01
+```
+
+The deterministic PhyMat fixture represents structure intake, ML-potential
+screening, a converged DFT relaxation, thermodynamic evidence, and their
+provenance digest. It is a release-gate workload, not a scientific validation
+of the fixture values. The gate requires all of the following:
+
+1. a `SIGKILL`ed owner loses its lease and the same Holt directory reopens at
+   exactly the next stable epoch;
+2. structure and relaxation bytes remain exact after the restart;
+3. a second healthy RustFS prefix has its own marker and is rejected before
+   changing workspace metadata, the first root's control record, or payloads;
+4. a live MCP read during a RustFS outage exhausts the configured attempts as
+   redacted `ObjectUnavailable` with `retryable: true`;
+5. the same logical read succeeds with exact PhyMat evidence after RustFS is
+   restarted.
+
+GitHub Actions runs this as the separate `object-namespace-recovery` job and
+uploads its complete evidence directory even on failure.

@@ -1406,6 +1406,7 @@ impl LifecycleRunner {
         Ok(meta::RootWriteContext {
             root_id: self.root_id(),
             logical_shard_id: self.logical_shard_id(),
+            object_namespace_id: self.object_namespace_id(),
             placement_generation: self.placement_generation(),
             owner_epoch: self.owner_epoch(),
             request_id,
@@ -1422,6 +1423,7 @@ impl LifecycleRunner {
         Ok(meta::PublicationContext {
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
+            object_namespace_id: context.object_namespace_id,
             placement_generation: context.placement_generation,
             owner_epoch: context.owner_epoch,
             request_id: context.request_id,
@@ -1459,6 +1461,7 @@ impl LifecycleRunner {
             .root_fence(self.root_id())?
             .ok_or_else(|| LifecycleError::OwnerLost("root fence is missing".to_owned()))?;
         if fence.logical_shard_id != self.logical_shard_id()
+            || fence.object_namespace_id != Some(self.object_namespace_id())
             || fence.placement_generation != self.placement_generation()
             || fence.activation_state != RootActivationState::Active
         {
@@ -1475,6 +1478,10 @@ impl LifecycleRunner {
 
     fn logical_shard_id(&self) -> nokv_types::LogicalShardId {
         self.route.logical_shard_id.into()
+    }
+
+    fn object_namespace_id(&self) -> nokv_types::ObjectNamespaceId {
+        self.route.object_namespace_id.into()
     }
 
     fn placement_generation(&self) -> PlacementGeneration {
@@ -1807,6 +1814,8 @@ mod tests {
         RootRoute {
             root_id: root().into(),
             logical_shard_id: shard().into(),
+            object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES])
+                .into(),
             placement_generation: placement().get(),
             owner_epoch: owner().get(),
         }
@@ -1835,6 +1844,9 @@ mod tests {
             schema_id: meta::SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
             placement_generation: placement(),
             owner_epoch: owner(),
             request_id: RequestId::from_bytes([request; FIXED_ID_BYTES]),
@@ -2497,6 +2509,7 @@ mod tests {
                 &store,
                 root(),
                 shard(),
+                nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
                 placement(),
                 owner(),
                 RequestId::from_bytes([3; FIXED_ID_BYTES]),
@@ -2554,6 +2567,9 @@ mod tests {
                 context: meta::PublicationContext {
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
+                        [10; FIXED_ID_BYTES],
+                    ),
                     placement_generation: placement(),
                     owner_epoch: owner(),
                     request_id: RequestId::from_bytes([4; FIXED_ID_BYTES]),
@@ -2567,6 +2583,9 @@ mod tests {
                 context: meta::PublicationContext {
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
+                        [10; FIXED_ID_BYTES],
+                    ),
                     placement_generation: placement(),
                     owner_epoch: owner(),
                     request_id: RequestId::from_bytes([5; FIXED_ID_BYTES]),
@@ -2603,6 +2622,9 @@ mod tests {
                 context: meta::PublicationContext {
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
+                        [10; FIXED_ID_BYTES],
+                    ),
                     placement_generation: placement(),
                     owner_epoch: owner(),
                     request_id: RequestId::from_bytes([6; FIXED_ID_BYTES]),
@@ -2705,6 +2727,9 @@ mod tests {
             meta::PublicationContext {
                 root_id: root(),
                 logical_shard_id: shard(),
+                object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
+                    [10; FIXED_ID_BYTES],
+                ),
                 placement_generation: placement(),
                 owner_epoch: owner(),
                 request_id: RequestId::from_bytes([request; FIXED_ID_BYTES]),
@@ -2741,6 +2766,7 @@ mod tests {
                 &store,
                 root(),
                 shard(),
+                nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
                 placement(),
                 owner(),
                 RequestId::from_bytes([3; FIXED_ID_BYTES]),
@@ -2996,6 +3022,9 @@ mod tests {
             meta::PublicationContext {
                 root_id: root(),
                 logical_shard_id: shard(),
+                object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes(
+                    [10; FIXED_ID_BYTES],
+                ),
                 placement_generation: placement(),
                 owner_epoch: owner(),
                 request_id: RequestId::from_bytes([request; FIXED_ID_BYTES]),
@@ -3032,6 +3061,7 @@ mod tests {
                 &store,
                 root(),
                 shard(),
+                nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
                 placement(),
                 owner(),
                 RequestId::from_bytes([3; FIXED_ID_BYTES]),
@@ -3163,6 +3193,9 @@ mod tests {
                     schema_id: meta::SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                        [10; FIXED_ID_BYTES],
+                    )),
                     placement_generation: placement(),
                     owner_epoch: owner(),
                     request_id: RequestId::from_bytes([0xEE; FIXED_ID_BYTES]),

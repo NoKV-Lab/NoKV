@@ -2298,6 +2298,9 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
             placement_generation: placement(),
             owner_epoch: owner(),
             request_id,
@@ -2363,6 +2366,9 @@ mod tests {
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: root(),
                     logical_shard_id: shard(),
+                    object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                        [10; FIXED_ID_BYTES],
+                    )),
                     placement_generation: placement(),
                     owner_epoch: owner(),
                     request_id: request(request_fill),
@@ -3721,6 +3727,9 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
             placement_generation: placement(),
             owner_epoch: owner(),
             request_id: request(6),

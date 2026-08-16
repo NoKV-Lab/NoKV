@@ -1,16 +1,21 @@
 use std::fmt;
 
 use nokv_types::{
-    CommandDigest, CommitVersion, LogicalShardId, PlacementGeneration, RootActivationState,
+    CommandDigest, CommitVersion, LogicalShardId, ObjectNamespaceId, PlacementGeneration,
+    RootActivationState,
 };
 
 /// Initial value format for every durable workspace record.
 pub const VALUE_FORMAT_VERSION: u8 = 1;
+const ROOT_FENCE_VALUE_FORMAT_VERSION: u8 = 2;
 
 /// Installed shard-local placement fence for one Agent root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RootFence {
     pub logical_shard_id: LogicalShardId,
+    /// `None` is decoded only from the pre-namespace v1 format. New roots are
+    /// written bound; legacy roots must bind before a route can be installed.
+    pub object_namespace_id: Option<ObjectNamespaceId>,
     pub placement_generation: PlacementGeneration,
     pub activation_state: RootActivationState,
 }
@@ -130,9 +135,23 @@ impl std::error::Error for RecordCodecError {}
 
 impl RootFence {
     pub fn encode(&self) -> Result<Vec<u8>, RecordCodecError> {
-        let mut encoded = Vec::with_capacity(1 + LogicalShardId::BYTE_WIDTH + 8 + 1);
-        encoded.push(VALUE_FORMAT_VERSION);
+        let mut encoded = Vec::with_capacity(
+            1 + LogicalShardId::BYTE_WIDTH
+                + self
+                    .object_namespace_id
+                    .map_or(0, |_| ObjectNamespaceId::BYTE_WIDTH)
+                + 8
+                + 1,
+        );
+        encoded.push(if self.object_namespace_id.is_some() {
+            ROOT_FENCE_VALUE_FORMAT_VERSION
+        } else {
+            VALUE_FORMAT_VERSION
+        });
         encoded.extend_from_slice(self.logical_shard_id.as_bytes());
+        if let Some(object_namespace_id) = self.object_namespace_id {
+            encoded.extend_from_slice(object_namespace_id.as_bytes());
+        }
         encoded.extend_from_slice(&self.placement_generation.get().to_be_bytes());
         encoded.push(self.activation_state.into());
         Ok(encoded)
@@ -140,8 +159,21 @@ impl RootFence {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, RecordCodecError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        let version = decoder.u8("value_format_version")?;
+        if version != VALUE_FORMAT_VERSION && version != ROOT_FENCE_VALUE_FORMAT_VERSION {
+            return Err(RecordCodecError::UnsupportedValueVersion {
+                actual: version,
+                expected: ROOT_FENCE_VALUE_FORMAT_VERSION,
+            });
+        }
         let logical_shard_id = LogicalShardId::from_bytes(decoder.fixed("logical_shard_id")?);
+        let object_namespace_id = if version == ROOT_FENCE_VALUE_FORMAT_VERSION {
+            Some(ObjectNamespaceId::from_bytes(
+                decoder.fixed("object_namespace_id")?,
+            ))
+        } else {
+            None
+        };
         let placement_generation = PlacementGeneration::new(decoder.u64("placement_generation")?)
             .map_err(|_| RecordCodecError::ZeroScalar {
             field: "placement_generation",
@@ -157,6 +189,7 @@ impl RootFence {
         decoder.finish()?;
         Ok(Self {
             logical_shard_id,
+            object_namespace_id,
             placement_generation,
             activation_state,
         })
@@ -346,14 +379,15 @@ impl<'a> Decoder<'a> {
     }
 
     fn require_value_version(&mut self) -> Result<(), RecordCodecError> {
+        self.require_version(VALUE_FORMAT_VERSION)
+    }
+
+    fn require_version(&mut self, expected: u8) -> Result<(), RecordCodecError> {
         let actual = self.u8("value_format_version")?;
-        if actual == VALUE_FORMAT_VERSION {
+        if actual == expected {
             Ok(())
         } else {
-            Err(RecordCodecError::UnsupportedValueVersion {
-                actual,
-                expected: VALUE_FORMAT_VERSION,
-            })
+            Err(RecordCodecError::UnsupportedValueVersion { actual, expected })
         }
     }
 
@@ -453,12 +487,14 @@ mod tests {
     fn root_fence_codec_has_frozen_golden_bytes() {
         let record = RootFence {
             logical_shard_id: LogicalShardId::from_bytes([0x11; 16]),
+            object_namespace_id: Some(ObjectNamespaceId::from_bytes([0x22; 16])),
             placement_generation: PlacementGeneration::new(0x0102_0304_0506_0708).unwrap(),
             activation_state: RootActivationState::Active,
         };
         let expected = [
-            &[VALUE_FORMAT_VERSION][..],
+            &[ROOT_FENCE_VALUE_FORMAT_VERSION][..],
             &[0x11; 16],
+            &[0x22; 16],
             &0x0102_0304_0506_0708_u64.to_be_bytes(),
             &[2],
         ]
@@ -468,6 +504,20 @@ mod tests {
         assert_eq!(RootFence::decode(&expected).unwrap(), record);
         assert_every_proper_prefix_is_truncated(&expected, RootFence::decode);
         assert_trailing_byte_is_rejected(expected, RootFence::decode);
+    }
+
+    #[test]
+    fn root_fence_decodes_and_preserves_the_v1_unbound_format() {
+        let legacy = [
+            &[VALUE_FORMAT_VERSION][..],
+            &[0x11; 16],
+            &0x0102_0304_0506_0708_u64.to_be_bytes(),
+            &[2],
+        ]
+        .concat();
+        let decoded = RootFence::decode(&legacy).unwrap();
+        assert_eq!(decoded.object_namespace_id, None);
+        assert_eq!(decoded.encode().unwrap(), legacy);
     }
 
     #[test]
@@ -554,6 +604,7 @@ mod tests {
     fn every_codec_rejects_unknown_value_version() {
         let root_fence = RootFence {
             logical_shard_id: LogicalShardId::from_bytes([1; 16]),
+            object_namespace_id: Some(ObjectNamespaceId::from_bytes([2; 16])),
             placement_generation: PlacementGeneration::new(1).unwrap(),
             activation_state: RootActivationState::Active,
         };
@@ -581,7 +632,8 @@ mod tests {
             history.encode().unwrap(),
             dedupe.encode().unwrap(),
         ];
-        for value in &mut values {
+        values[0][0] = ROOT_FENCE_VALUE_FORMAT_VERSION + 1;
+        for value in &mut values[1..] {
             value[0] = VALUE_FORMAT_VERSION + 1;
         }
         values[3][0] = 3;
@@ -617,6 +669,7 @@ mod tests {
     fn codec_rejects_unknown_enum_zero_scalars_and_optional_tags() {
         let record = RootFence {
             logical_shard_id: LogicalShardId::from_bytes([1; 16]),
+            object_namespace_id: Some(ObjectNamespaceId::from_bytes([2; 16])),
             placement_generation: PlacementGeneration::new(1).unwrap(),
             activation_state: RootActivationState::Active,
         };
@@ -632,7 +685,8 @@ mod tests {
         );
 
         let mut zero_generation = record.encode().unwrap();
-        zero_generation[1 + LogicalShardId::BYTE_WIDTH..1 + LogicalShardId::BYTE_WIDTH + 8].fill(0);
+        let generation_offset = 1 + LogicalShardId::BYTE_WIDTH + ObjectNamespaceId::BYTE_WIDTH;
+        zero_generation[generation_offset..generation_offset + 8].fill(0);
         assert_eq!(
             RootFence::decode(&zero_generation),
             Err(RecordCodecError::ZeroScalar {

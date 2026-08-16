@@ -507,6 +507,7 @@ mod tests {
         RootRoute {
             root_id: RootIdentity([1; 16]),
             logical_shard_id: LogicalShardIdentity([2; 16]),
+            object_namespace_id: nokv_protocol::ObjectNamespaceIdentity([8; 16]),
             placement_generation: 3,
             owner_epoch,
         }
@@ -570,6 +571,7 @@ mod tests {
                         schema_id: meta::SCHEMA_ID.to_owned(),
                         root_id: installed.root_id.into(),
                         logical_shard_id: shard_id,
+                        object_namespace_id: Some(installed.object_namespace_id.into()),
                         placement_generation: nokv_types::PlacementGeneration::new(
                             installed.placement_generation,
                         )

@@ -11,6 +11,7 @@ mod artifact;
 mod cache;
 mod digest;
 mod local_hot;
+mod namespace;
 mod store;
 mod tiered;
 
@@ -26,6 +27,10 @@ pub use cache::{
     ArtifactBlockCache, ArtifactCacheStats, MemoryArtifactCache, MemoryArtifactCacheOptions,
 };
 pub use local_hot::{LocalHotTier, LocalHotTierOptions, LocalHotTierStats};
+pub use namespace::{
+    ensure_object_namespace, load_object_namespace, verify_object_namespace, BoundArtifactStore,
+    OBJECT_NAMESPACE_MARKER_KEY,
+};
 pub use store::{
     ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, MemoryArtifactStore,
     MemoryArtifactStoreStats, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange,

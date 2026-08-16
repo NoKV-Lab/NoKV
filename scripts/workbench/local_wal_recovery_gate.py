@@ -7,9 +7,10 @@ before and after the local Holt owner fence is advanced. The driver is killed,
 its lease-backed etcd session is allowed to expire, and the real ``nokv`` CLI
 must reopen the same metadata path without consuming epoch three.
 
-Artifact storage is deliberately not exercised here; the object arguments are
-an unreachable, unsigned S3 configuration used only to compose the CLI. The
-separate live Workbench gate owns RustFS/S3 qualification.
+Artifact payload behavior is deliberately not exercised here. The production
+CLI still admits the configured namespace against its durable marker before it
+can own metadata, so this gate receives a real S3-compatible profile. The
+separate live object-namespace gate owns RustFS outage and payload assertions.
 """
 
 from __future__ import annotations
@@ -253,17 +254,16 @@ def control_args(binary: Path, root_id: str, endpoint: str, prefix: str) -> list
     ]
 
 
-def object_args(stage: str) -> list[str]:
-    # These arguments compose the product CLI but no gate operation performs
-    # object I/O. RustFS/S3 behavior belongs to the separate live Workbench gate.
+def object_args(stage: str, endpoint: str, bucket: str, root: str) -> list[str]:
+    # Only the namespace marker is read or created. Artifact publication and
+    # outage behavior belong to the separate object-namespace recovery gate.
     return [
         "--object-bucket",
-        "nokv-local-wal-recovery-gate",
+        bucket,
         "--object-endpoint",
-        "http://127.0.0.1:1",
+        endpoint,
         "--object-root",
-        f"local-wal-recovery/{stage}",
-        "--object-skip-signature",
+        f"{root.rstrip('/')}/{stage}",
     ]
 
 
@@ -297,6 +297,9 @@ def run_stage(
     etcd_endpoint: str,
     evidence: Path,
     seed: str,
+    object_endpoint: str,
+    object_bucket: str,
+    object_root: str,
     timeout: float,
 ) -> dict[str, object]:
     stage_dir = evidence / stage
@@ -310,12 +313,12 @@ def run_stage(
     record_key = f"{prefix}/logical-shards/{shard_id}"
     session_key = f"{prefix}/sessions/{shard_id}"
     common = control_args(binary, root_id, etcd_endpoint, prefix)
-    objects = object_args(stage)
+    objects = object_args(stage, object_endpoint, object_bucket, object_root)
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*common, "provision", shard_id]
+        provision_command = [*common, *objects, "provision", shard_id]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -512,6 +515,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--etcd-bin", type=Path, default=shutil.which("etcd"))
     parser.add_argument("--etcdctl-bin", type=Path, default=shutil.which("etcdctl"))
     parser.add_argument("--seed", default="issue450-e2-kill-retry-v1")
+    parser.add_argument("--object-endpoint")
+    parser.add_argument("--object-bucket")
+    parser.add_argument("--object-root", default="local-wal-recovery")
     parser.add_argument("--timeout", type=float, default=30.0)
     return parser.parse_args(argv)
 
@@ -526,6 +532,8 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         raise NotQualified("a real etcd binary is required")
     if args.etcdctl_bin is None or not Path(args.etcdctl_bin).is_file():
         raise NotQualified("etcdctl is required")
+    if not args.object_endpoint or not args.object_bucket:
+        raise NotQualified("a real object endpoint and bucket are required")
     if args.timeout <= 0:
         raise WorkflowFailure("--timeout must be positive")
 
@@ -590,6 +598,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                     etcd_endpoint=endpoint,
                     evidence=evidence,
                     seed=args.seed,
+                    object_endpoint=args.object_endpoint,
+                    object_bucket=args.object_bucket,
+                    object_root=args.object_root,
                     timeout=args.timeout,
                 )
             )
@@ -614,7 +625,12 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             "platform": platform.platform(),
             "python": platform.python_version(),
             "etcd": etcd_version,
-            "object_profile": "not exercised; unreachable unsigned S3 composition only",
+            "object_profile": {
+                "endpoint": args.object_endpoint,
+                "bucket": args.object_bucket,
+                "root": args.object_root,
+                "scope": "namespace marker admission only; payload I/O is qualified separately",
+            },
         },
         "binaries": {
             "nokv": {"path": str(binary), "sha256": digest_file(binary)},

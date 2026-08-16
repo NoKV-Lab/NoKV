@@ -4,13 +4,24 @@ use std::sync::Mutex;
 use crate::types::endpoint_is_canonical;
 use crate::{
     CheckpointRef, ControlError, LogRef, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication, RootId, RootPlacement,
-    RootPlacementLifecycle,
+    LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication, RootId, RootObjectNamespaceBinding,
+    RootPlacement, RootPlacementLifecycle,
 };
 
 /// Durable control-plane operations, split between immutable root placement
 /// and physical logical-shard ownership.
 pub trait ControlStore: Send + Sync {
+    /// Create the immutable object namespace identity for a root. An exact
+    /// replay is idempotent; a different identity is never adopted.
+    fn create_root_object_namespace_binding(
+        &self,
+        binding: RootObjectNamespaceBinding,
+    ) -> Result<RootObjectNamespaceBinding, ControlError>;
+    fn get_root_object_namespace_binding(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootObjectNamespaceBinding>, ControlError>;
+
     fn create_root_placement(
         &self,
         placement: RootPlacement,
@@ -84,6 +95,7 @@ pub trait ControlStore: Send + Sync {
 
 #[derive(Default)]
 struct InMemoryState {
+    root_object_namespaces: BTreeMap<RootId, RootObjectNamespaceBinding>,
     root_placements: BTreeMap<RootId, RootPlacement>,
     logical_shards: BTreeMap<LogicalShardId, LogicalShardRecord>,
     owner_sessions: BTreeMap<LogicalShardId, LogicalShardLease>,
@@ -102,6 +114,35 @@ impl InMemoryControlStore {
 }
 
 impl ControlStore for InMemoryControlStore {
+    fn create_root_object_namespace_binding(
+        &self,
+        binding: RootObjectNamespaceBinding,
+    ) -> Result<RootObjectNamespaceBinding, ControlError> {
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        if let Some(current) = state.root_object_namespaces.get(&binding.root_id) {
+            if *current == binding {
+                return Ok(binding);
+            }
+            return Err(ControlError::RootObjectNamespaceAlreadyBound {
+                root_id: binding.root_id,
+                existing: current.object_namespace_id,
+                requested: binding.object_namespace_id,
+            });
+        }
+        state
+            .root_object_namespaces
+            .insert(binding.root_id, binding);
+        Ok(binding)
+    }
+
+    fn get_root_object_namespace_binding(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootObjectNamespaceBinding>, ControlError> {
+        let state = self.state.lock().expect("control store mutex poisoned");
+        Ok(state.root_object_namespaces.get(root_id).copied())
+    }
+
     fn create_root_placement(
         &self,
         placement: RootPlacement,
@@ -1042,6 +1083,37 @@ mod tests {
 
     fn node(value: &str) -> NodeId {
         NodeId::new(value).unwrap()
+    }
+
+    fn object_namespace(root: u8, namespace: u8) -> RootObjectNamespaceBinding {
+        RootObjectNamespaceBinding {
+            root_id: root_id(root),
+            object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([namespace; 16]),
+        }
+    }
+
+    #[test]
+    fn object_namespace_binding_is_immutable_and_exact_replay_is_idempotent() {
+        let store = InMemoryControlStore::new();
+        let binding = object_namespace(1, 7);
+        assert_eq!(
+            store.create_root_object_namespace_binding(binding).unwrap(),
+            binding
+        );
+        assert_eq!(
+            store.create_root_object_namespace_binding(binding).unwrap(),
+            binding
+        );
+        assert!(matches!(
+            store.create_root_object_namespace_binding(object_namespace(1, 8)),
+            Err(ControlError::RootObjectNamespaceAlreadyBound { .. })
+        ));
+        assert_eq!(
+            store
+                .get_root_object_namespace_binding(&root_id(1))
+                .unwrap(),
+            Some(binding)
+        );
     }
 
     fn initial_placement(root: u8, shard: u8) -> RootPlacement {

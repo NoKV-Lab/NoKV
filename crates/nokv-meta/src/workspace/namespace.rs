@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use nokv_types::{
-    CommandDigest, CommitVersion, LogicalShardId, NormalizedRelativePath, OwnerEpoch,
-    PlacementGeneration, ReadVersion, RequestId, RootId, WorkbenchId, WorkspaceIncarnationId,
-    WorkspaceRevision, WorkspaceState, SHA256_BYTES,
+    CommandDigest, CommitVersion, LogicalShardId, NormalizedRelativePath, ObjectNamespaceId,
+    OwnerEpoch, PlacementGeneration, ReadVersion, RequestId, RootId, WorkbenchId,
+    WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState, SHA256_BYTES,
 };
 
 use super::codec::{
@@ -85,6 +85,7 @@ impl RootReadContext {
 pub struct RootWriteContext {
     pub root_id: RootId,
     pub logical_shard_id: LogicalShardId,
+    pub object_namespace_id: ObjectNamespaceId,
     pub placement_generation: PlacementGeneration,
     pub owner_epoch: OwnerEpoch,
     pub request_id: RequestId,
@@ -97,6 +98,7 @@ impl RootWriteContext {
         store: &MetaShard,
         root_id: RootId,
         logical_shard_id: LogicalShardId,
+        object_namespace_id: ObjectNamespaceId,
         placement_generation: PlacementGeneration,
         owner_epoch: OwnerEpoch,
         request_id: RequestId,
@@ -104,6 +106,7 @@ impl RootWriteContext {
         Ok(Self {
             root_id,
             logical_shard_id,
+            object_namespace_id,
             placement_generation,
             owner_epoch,
             request_id,
@@ -330,6 +333,7 @@ pub fn create_visible_workspace(
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
+        object_namespace_id: Some(context.object_namespace_id),
         placement_generation: context.placement_generation,
         owner_epoch: context.owner_epoch,
         request_id: context.request_id,
@@ -976,6 +980,7 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(2),
             logical_shard_id: shard(1),
+            object_namespace_id: Some(ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES])),
             placement_generation: placement(),
             owner_epoch: owner(),
             request_id,
@@ -1015,6 +1020,7 @@ mod tests {
             store,
             root(2),
             shard(1),
+            ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
             placement(),
             owner(),
             request(request_fill),
@@ -1059,6 +1065,7 @@ mod tests {
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,
+                    object_namespace_id: Some(context.object_namespace_id),
                     placement_generation: context.placement_generation,
                     owner_epoch: context.owner_epoch,
                     request_id: context.request_id,
@@ -1346,6 +1353,7 @@ mod tests {
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,
+                    object_namespace_id: Some(context.object_namespace_id),
                     placement_generation: context.placement_generation,
                     owner_epoch: context.owner_epoch,
                     request_id: context.request_id,
@@ -1746,6 +1754,7 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: context.root_id,
             logical_shard_id: context.logical_shard_id,
+            object_namespace_id: Some(context.object_namespace_id),
             placement_generation: context.placement_generation,
             owner_epoch: context.owner_epoch,
             request_id: context.request_id,
