@@ -74,14 +74,25 @@ same durable namespace marker.
 
 ## Required Bucket Behavior
 
-Before serving writes, verify:
+Before serving business writes, NoKV runs endpoint-specific write-conformance
+admission using reserved, unreferenced system keys. The current v1 profile
+verifies:
 
-- the configured identity can put, head, range-read, and delete inside the
-  exact NoKV prefix;
-- multipart upload, completion, abort, and completed-object head behave as
-  expected;
-- a repeated immutable put cannot silently replace different bytes;
-- ranged reads return exact byte windows and integrity evidence;
+- a fresh single-PUT create-if-absent;
+- an exact-byte replay and a different-byte collision;
+- whole-object readback and an exact ranged read;
+- a concurrent different-byte create race with exactly one stored winner.
+
+The admission receipt is scoped to the exact provider handle and exercised
+single-PUT profile: the handle owns an immutable connection profile, and the
+receipt records the maximum object size exercised by the probe. A provider
+name or a static `true` capability is insufficient; another handle or a block
+above that profile is rejected. Multipart upload, completion, and abort are not
+qualified by admission v1 and must remain fail-closed until a separate endpoint
+probe covers them.
+
+The deployment must additionally ensure:
+
 - timeout and retry settings preserve ambiguous outcomes for reconciliation;
 - lifecycle policies cannot delete reachable NoKV objects independently;
 - bucket listing is not required for metadata recovery or reachability.
@@ -111,6 +122,14 @@ the pinned RustFS image runs as non-root UID/GID `10001:10001`. An explicit
 directory is already writable by the container user. CI gates use isolated
 named volumes; the gate or workflow cleanup removes them after qualification.
 
+## Compatibility Evidence
+
+One executed compatibility probe against Homebrew MinIO
+`RELEASE.2025-09-06T17-38-46Z` was classified as inconclusive and stopped
+before business publication. That result applies only to the exercised binary,
+configuration, and run; it is not a claim about every MinIO release or
+deployment.
+
 ## Failure Semantics
 
 Publication follows object-first, metadata-last ordering:
@@ -126,10 +145,11 @@ The system does not infer success from a later bucket listing.
 
 Temporary provider failures remain retryable across the object, client, and
 Workbench error boundaries. After bounded attempts, callers receive
-`ObjectUnavailable` with `retryable: true` and an attempt count. Public errors
-do not include endpoint, bucket, prefix, or physical object keys. Immutable
-create and delete operations with ambiguous completion remain reconciliation
-cases rather than blind retries.
+`ObjectUnavailable` with `retryable: true` and an attempt count. Public
+provider-admission errors and ambiguous create/delete errors do not include
+endpoint, bucket, prefix, or physical object keys. Immutable create and delete
+operations with ambiguous completion remain reconciliation cases rather than
+blind retries.
 
 ## Existing Roots
 
@@ -162,7 +182,7 @@ ended. It must never be replaced by implicit adoption.
 
 ## Qualification
 
-RustFS qualification covers:
+Full RustFS qualification still requires:
 
 - single and multipart publication;
 - exact and ranged reads;
@@ -179,3 +199,7 @@ RustFS qualification covers:
 
 Retain raw evidence using [Benchmarks](./benchmarks.md) and
 [Workspace Acceptance](./development/workspace-acceptance.md).
+An endpoint admission receipt qualifies only the exercised single-PUT and
+range-read contract. It does not by itself qualify multipart behavior, exact
+crash recovery, process restart, owner replacement, or ambiguous-completion
+reconciliation.

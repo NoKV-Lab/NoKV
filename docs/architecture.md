@@ -155,9 +155,20 @@ continuations retain one exact root read version. Live continuations may move
 to a newer root read version only while the target workspace incarnation and
 revision remain unchanged; target drift fails closed, and an initial bounded
 collection may restart in full but never merges workspace revisions. This
-contract is gated by protocol schema `nokv.workspace.rpc.v4`; v3 first added
-the provider-neutral object namespace identity to every root route, and there
-is no legacy response decoder.
+contract is gated by operation schema `nokv.workspace.rpc.v6`; v3 first added
+the provider-neutral object namespace identity to every root route.
+
+Each TCP connection starts with the fixed-width, schema-neutral transport
+handshake v1. The client offers one exact operation schema, and the server
+accepts only `nokv.workspace.rpc.v6`; the handshake version remains stable when
+the operation schema changes. For upgrade diagnostics, the server recognizes
+only operation-first envelopes from the public v2 client and the post-tag v3
+client. It parses a bounded route/request header, ignores the operation, emits
+one schema-readable failure, and closes without dispatch. The v2 client gets
+its exact v2 failure envelope; the v3 client gets a v6 failure envelope so its
+decoder reports the v6/v3 schema mismatch. Unknown legacy schemas, malformed
+envelopes, and malformed handshakes fail closed. This is a read-only rejection
+path, not a legacy response decoder or operation fallback.
 
 Secondary-index queries run at one read version and filter every result by the
 matching visible incarnation. Object bodies are read only when the selected
