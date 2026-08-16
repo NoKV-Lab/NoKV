@@ -291,6 +291,9 @@ USAGE:
 CLIENT ROUTING:
   --root-id HEX32
   --metadata-address HOST:PORT --logical-shard-id HEX32 --object-namespace-id HEX32
+    --placement-generation N --owner-epoch N
+  static routing is a point-in-time pin and cannot refresh after placement changes or owner restarts
+  use --etcd-endpoint for self-refreshing routing
   --etcd-endpoint URL [--etcd-endpoint URL ...]
 
 AGENT PRESENTATION:

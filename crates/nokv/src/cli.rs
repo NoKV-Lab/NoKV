@@ -37,8 +37,8 @@ pub struct StaticRoutingConfig {
     pub metadata_address: SocketAddr,
     pub logical_shard_id: Option<String>,
     pub object_namespace_id: Option<String>,
-    pub placement_generation: u64,
-    pub owner_epoch: u64,
+    pub placement_generation: Option<u64>,
+    pub owner_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,8 +181,8 @@ impl Default for StaticRoutingConfig {
                 .expect("default metadata address is valid"),
             logical_shard_id: None,
             object_namespace_id: None,
-            placement_generation: 1,
-            owner_epoch: 1,
+            placement_generation: None,
+            owner_epoch: None,
         }
     }
 }
@@ -264,15 +264,17 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             }
             "--placement-generation" => {
                 select_routing(&mut routing_kind, RoutingKind::Static)?;
-                static_routing.placement_generation = parse_number(
+                static_routing.placement_generation = Some(parse_number(
                     "--placement-generation",
                     next_value(&mut arguments, &argument)?,
-                )?;
+                )?);
             }
             "--owner-epoch" => {
                 select_routing(&mut routing_kind, RoutingKind::Static)?;
-                static_routing.owner_epoch =
-                    parse_number("--owner-epoch", next_value(&mut arguments, &argument)?)?;
+                static_routing.owner_epoch = Some(parse_number(
+                    "--owner-epoch",
+                    next_value(&mut arguments, &argument)?,
+                )?);
             }
             "--etcd-endpoint" => {
                 select_routing(&mut routing_kind, RoutingKind::Etcd)?;
@@ -577,8 +579,8 @@ mod tests {
             panic!("static route expected");
         };
         assert_eq!(route.logical_shard_id.as_deref(), Some("02"));
-        assert_eq!(route.placement_generation, 7);
-        assert_eq!(route.owner_epoch, 9);
+        assert_eq!(route.placement_generation, Some(7));
+        assert_eq!(route.owner_epoch, Some(9));
         assert_eq!(
             parsed.command,
             Command::Workbench {

@@ -20,6 +20,16 @@ use nokv_types::RootId;
 
 use crate::ClientError;
 
+/// Describes where a resolver obtains a route after a refresh request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RouteRefreshMode {
+    /// Reloads route state from an authoritative control source.
+    Authoritative,
+    /// Observes only caller-supplied replacement snapshots.
+    CallerManaged,
+}
+
 /// One persisted routing fence plus the current physical owner endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedRoute {
@@ -38,6 +48,12 @@ impl ResolvedRoute {
 
 /// Resolves a root to its persisted logical-shard placement.
 pub trait RouteResolver: Send + Sync {
+    /// Existing resolvers are authoritative by contract unless they explicitly
+    /// identify themselves as caller-managed snapshots.
+    fn refresh_mode(&self) -> RouteRefreshMode {
+        RouteRefreshMode::Authoritative
+    }
+
     fn resolve(&self, root_id: RootIdentity, refresh: bool) -> Result<ResolvedRoute, ClientError>;
 }
 
@@ -45,12 +61,20 @@ impl<T> RouteResolver for Arc<T>
 where
     T: RouteResolver + ?Sized,
 {
+    fn refresh_mode(&self) -> RouteRefreshMode {
+        (**self).refresh_mode()
+    }
+
     fn resolve(&self, root_id: RootIdentity, refresh: bool) -> Result<ResolvedRoute, ClientError> {
         (**self).resolve(root_id, refresh)
     }
 }
 
-/// Resolver for single-route deployments and tests.
+/// Caller-managed point-in-time route for single-owner deployments and tests.
+///
+/// Resolving with `refresh = true` observes a concurrent [`Self::replace`], but
+/// never discovers placement or ownership by itself. Long-running clients need
+/// a control-plane-backed resolver.
 #[derive(Clone, Debug)]
 pub struct StaticRouteResolver {
     resolved: Arc<RwLock<ResolvedRoute>>,
@@ -81,6 +105,10 @@ impl StaticRouteResolver {
 }
 
 impl RouteResolver for StaticRouteResolver {
+    fn refresh_mode(&self) -> RouteRefreshMode {
+        RouteRefreshMode::CallerManaged
+    }
+
     fn resolve(&self, root_id: RootIdentity, _refresh: bool) -> Result<ResolvedRoute, ClientError> {
         let resolved = *self
             .resolved
@@ -194,6 +222,10 @@ impl ControlRouteResolver {
 
 #[cfg(feature = "control")]
 impl RouteResolver for ControlRouteResolver {
+    fn refresh_mode(&self) -> RouteRefreshMode {
+        RouteRefreshMode::Authoritative
+    }
+
     fn resolve(&self, root_id: RootIdentity, refresh: bool) -> Result<ResolvedRoute, ClientError> {
         if refresh {
             self.cached
