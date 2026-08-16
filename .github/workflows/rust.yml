@@ -26,13 +26,15 @@ jobs:
             scripts/workbench/workbench_contract.py \
             scripts/workbench/live_workbench.py \
             scripts/workbench/local_wal_recovery_gate.py \
-            scripts/workbench/object_namespace_recovery_gate.py
+            scripts/workbench/object_namespace_recovery_gate.py \
+            scripts/workbench/restore_composition_gate.py
           python3 scripts/workbench/pre423_contract_ledger.py
           python3 scripts/workbench/pre423_contract_ledger_test.py
           python3 scripts/workbench/workbench_contract_test.py
           python3 scripts/workbench/live_workbench_test.py
           python3 scripts/workbench/local_wal_recovery_gate_test.py
           python3 scripts/workbench/object_namespace_recovery_gate_test.py
+          python3 scripts/workbench/restore_composition_gate_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
       - name: Check Homebrew release safety
