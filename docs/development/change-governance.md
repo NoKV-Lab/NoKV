@@ -48,13 +48,16 @@ proposed diff and can otherwise weaken the check that evaluates itself.
 The required status set is:
 
 - `nokv-workspace`;
+- `object-namespace-recovery`;
 - `workbench-contract`;
 - `signoff`;
 - `change-governance/large-change-review`.
 
-The Docker `image` check is intentionally absent from the required set. It
-continues in the background and reports failures, but its runtime does not
-delay a merge.
+Every validation job that runs for each pull-request head is required. The
+Docker `image` check is the only CI exception: it continues in the background
+and reports failures, but its runtime does not delay a merge. `sync-project` is
+project-board automation, does not run on `synchronize`, and is not a merge
+validation or required check.
 
 During initial rollout, the custom governance context is added to branch
 protection before the universal review rule is removed. Verified open PRs at

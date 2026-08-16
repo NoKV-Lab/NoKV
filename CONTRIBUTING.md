@@ -120,8 +120,9 @@ and run `git diff --check`.
   bots, non-core reviewers, duplicate reviewers, dismissed reviews, and
   approvals on older commits do not count. The governance status fails closed
   if it cannot verify these facts.
-- Administrators remain subject to required status checks. The Docker image
-  workflow runs in the background but is deliberately not a required check.
+- Administrators remain subject to every required status check. All per-head PR
+  validation jobs are required except Docker image, which runs in the
+  background without delaying merge. Project-board automation is not CI.
 - Keep each PR scoped to one logical boundary. Do not mix metadata model,
   Holt layout, object-store, docs, benchmark, or unrelated refactors.
 - Every non-merge commit must include a `Signed-off-by` trailer matching the Developer Certificate of Origin in [`DCO`](./DCO).
