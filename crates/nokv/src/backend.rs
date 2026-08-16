@@ -33,6 +33,7 @@ const RUN_MANIFEST_PATH: &str = "metadata/run_manifest.json";
 const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const CURSOR_VERSION: &[u8] = b"nokv.workspace.cursor\0";
+const GREP_CURSOR_VERSION: &[u8] = b"nokv.workspace.grep-cursor.v2\0";
 const LIST_CURSOR_VERSION: &[u8] = b"nokv.workspace.list-cursor.v3\0";
 const QUERY_SERVER_PAGE_LIMIT: u32 = wire::MAX_QUERY_PAGE_LIMIT;
 const CONSISTENT_READ_MAX_ATTEMPTS: u32 = 3;
@@ -45,6 +46,11 @@ pub struct CliWorkbenchBackend {
     client: CliWorkspaceClient,
     objects: Arc<CliObjectStore>,
     max_artifact_bytes: usize,
+}
+
+struct WorkspaceAdmission {
+    workspace: wire::WorkspaceSummary,
+    created: bool,
 }
 
 impl CliWorkbenchBackend {
@@ -83,6 +89,49 @@ impl CliWorkbenchBackend {
             Err(error) if rpc_code(&error) == Some(wire::ErrorCode::NotFound) => Ok(None),
             Err(error) => Err(map_client_error(error)),
         }
+    }
+
+    fn create_or_observe_workbench(
+        &self,
+        workbench_id: &WorkbenchId,
+    ) -> Result<WorkspaceAdmission, agent::BackendError> {
+        if let Some(workspace) = self.optional_workspace(workbench_id)? {
+            return Ok(WorkspaceAdmission {
+                workspace,
+                created: false,
+            });
+        }
+        let incarnation = wire::WorkspaceIdentity(self.fresh_fixed_identity(
+            b"nokv.cli.workspace-incarnation\0",
+            &[workbench_id.as_bytes()],
+        ));
+        let created = self.client.create_workspace(
+            self.client.new_request_id(),
+            wire::CreateWorkspaceRequest {
+                workbench: workbench_name(workbench_id)?,
+                workspace_incarnation_id: incarnation,
+            },
+        );
+        let replayed = match created {
+            Ok(call) => call.replayed,
+            Err(error) if rpc_code(&error) == Some(wire::ErrorCode::AlreadyExists) => {
+                return Ok(WorkspaceAdmission {
+                    workspace: self.workspace(workbench_id)?,
+                    created: false,
+                });
+            }
+            Err(error) => return Err(map_client_error(error)),
+        };
+        let workspace = self.workspace(workbench_id)?;
+        if workspace.workspace_incarnation_id != incarnation {
+            return Err(protocol_mismatch(
+                "created workbench resolved to a different incarnation",
+            ));
+        }
+        Ok(WorkspaceAdmission {
+            workspace,
+            created: !replayed,
+        })
     }
 
     fn resolved_view(
@@ -185,35 +234,8 @@ impl CliWorkbenchBackend {
 
 impl agent::WorkbenchBackend for CliWorkbenchBackend {
     fn create_workbench(&self, workbench_id: &WorkbenchId) -> Result<bool, agent::BackendError> {
-        if self.optional_workspace(workbench_id)?.is_some() {
-            return Ok(false);
-        }
-        let incarnation = wire::WorkspaceIdentity(self.fresh_fixed_identity(
-            b"nokv.cli.workspace-incarnation\0",
-            &[workbench_id.as_bytes()],
-        ));
-        let created = self.client.create_workspace(
-            self.client.new_request_id(),
-            wire::CreateWorkspaceRequest {
-                workbench: workbench_name(workbench_id)?,
-                workspace_incarnation_id: incarnation,
-            },
-        );
-        let replayed = match created {
-            Ok(call) => call.replayed,
-            Err(error) if rpc_code(&error) == Some(wire::ErrorCode::AlreadyExists) => {
-                self.workspace(workbench_id)?;
-                return Ok(false);
-            }
-            Err(error) => return Err(map_client_error(error)),
-        };
-        let authoritative = self.workspace(workbench_id)?;
-        if authoritative.workspace_incarnation_id != incarnation {
-            return Err(protocol_mismatch(
-                "created workbench resolved to a different incarnation",
-            ));
-        }
-        Ok(!replayed)
+        self.create_or_observe_workbench(workbench_id)
+            .map(|admission| admission.created)
     }
 
     fn stat(
@@ -495,7 +517,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
         &self,
         request: agent::PublishRequest,
     ) -> Result<agent::PublishOutcome, agent::BackendError> {
-        let workspace = self.workspace(&request.path.workbench_id)?;
+        self.ensure_artifact_size(&request.body)?;
         let full_path = full_path(&request.path)?;
         let body_digest = Sha256::digest(&request.body);
         let condition = match request.condition {
@@ -513,6 +535,11 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
             } => expected_generation.to_be_bytes(),
             wire::PublishCondition::Append { .. } => unreachable!("facade publish has no append"),
         };
+        let content_type =
+            wire::ContentType::new(request.content_type.clone()).map_err(protocol_input)?;
+        let workspace = self
+            .create_or_observe_workbench(&request.path.workbench_id)?
+            .workspace;
         let operation_id = wire::OperationIdentity(self.fresh_fixed_identity(
             b"nokv.cli.artifact-operation\0",
             &[
@@ -536,7 +563,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
             revision_id,
             workspace_path(&request.path)?,
             condition,
-            wire::ContentType::new(request.content_type.clone()).map_err(protocol_input)?,
+            content_type,
         );
         let outcome = self.publish_artifact(options, &request.body)?;
         let publication = outcome.publication.value;
@@ -565,10 +592,23 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 self.max_artifact_bytes
             )));
         }
-        let workspace = self.workspace(&request.path.workbench_id)?;
         let full_path = full_path(&request.path)?;
+        let create_content_type =
+            wire::ContentType::new(request.create_content_type).map_err(protocol_input)?;
+        let content_type = request
+            .content_type
+            .map(wire::ContentType::new)
+            .transpose()
+            .map_err(protocol_input)?;
+        let workspace = self
+            .create_or_observe_workbench(&request.path.workbench_id)?
+            .workspace;
         let delta_digest: [u8; 32] = Sha256::digest(&request.delta).into();
-        let content_type_identity = request.content_type.as_deref().unwrap_or("").as_bytes();
+        let content_type_identity = content_type
+            .as_ref()
+            .map(wire::ContentType::as_str)
+            .unwrap_or("")
+            .as_bytes();
         let operation_id = wire::OperationIdentity(self.fresh_fixed_identity(
             b"nokv.cli.append-operation\0",
             &[
@@ -590,11 +630,10 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
             operation_id,
             revision_id,
             workspace_path(&request.path)?,
-            wire::ContentType::new(request.create_content_type).map_err(protocol_input)?,
+            create_content_type,
         );
-        if let Some(content_type) = request.content_type {
-            options = options
-                .with_content_type(wire::ContentType::new(content_type).map_err(protocol_input)?);
+        if let Some(content_type) = content_type {
+            options = options.with_content_type(content_type);
         }
         if let Some(max_logical_size) = request.max_logical_size {
             options = options.with_max_logical_size(max_logical_size);
@@ -629,11 +668,17 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
         request: agent::GrepCandidateRequest,
     ) -> Result<agent::GrepCandidatePage, agent::BackendError> {
         let prefix = full_path_optional(&request.scope)?;
+        let scope_digest = grep_scope_digest(
+            &request.scope.workbench_id,
+            prefix.as_ref(),
+            request.recursive,
+        );
         let cursor = request
             .cursor
             .as_deref()
-            .map(|cursor| decode_cursor("grep", cursor))
+            .map(|cursor| decode_grep_cursor(cursor, scope_digest))
             .transpose()?;
+        let expected_read_version = cursor.as_ref().map(|cursor| cursor.read_version);
         let call = self
             .client
             .list_paths(wire::ListPathsRequest {
@@ -641,13 +686,19 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 prefix: prefix.as_ref().map(relative_path).transpose()?,
                 recursive: request.recursive,
                 view: wire::WorkspaceReadView::Live,
-                expected_read_version: None,
+                expected_read_version,
                 page: wire::PageRequest {
-                    cursor,
+                    cursor: cursor.map(|cursor| cursor.server_cursor),
                     limit: page_limit(request.limit)?,
                 },
             })
             .map_err(map_client_error)?;
+        if expected_read_version.is_some_and(|expected| expected != call.value.read_version) {
+            return Err(protocol_mismatch(
+                "grep candidate page escaped its requested read-version fence",
+            ));
+        }
+        let read_version = call.value.read_version;
         let mut candidates = Vec::new();
         for entry in call.value.entries {
             validate_response_workbench(entry.path(), &request.scope.workbench_id)?;
@@ -660,7 +711,11 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                     ));
                 }
             };
-            let cursor_after = encode_cursor("grep", metadata.path.path.as_str().as_bytes());
+            let cursor_after = encode_grep_cursor(
+                read_version,
+                scope_digest,
+                metadata.path.path.as_str().as_bytes(),
+            );
             candidates.push(agent::GrepCandidate {
                 path: scoped_path(&metadata.path)?,
                 cursor_after,
@@ -672,7 +727,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 .value
                 .next_cursor
                 .as_deref()
-                .map(|cursor| encode_cursor("grep", cursor)),
+                .map(|cursor| encode_grep_cursor(read_version, scope_digest, cursor)),
         })
     }
 
@@ -866,12 +921,10 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 .map_err(domain_input)?;
             let manifest_projection =
                 self.read_run_manifest(&discovered.workspace, &workbench_id)?;
-            let manifest = manifest_projection
+            let canonical_manifest = manifest_projection
                 .as_ref()
-                .map(|projection| &projection.verified.envelope);
-            if request.manifest_pattern.as_ref().is_some_and(|pattern| {
-                manifest.is_none_or(|manifest| !json_contains_literal(manifest, pattern))
-            }) {
+                .map(|projection| projection.verified.canonical_envelope.as_slice());
+            if !find_request_matches_canonical_manifest(&request, canonical_manifest) {
                 continue;
             }
             workbenches.push(agent::WorkbenchSummary {
@@ -959,7 +1012,9 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
             Err(CommitWorkflowError::BuildManifest(error)) => return Err(error),
         }
 
-        let workspace = self.workspace(&request.workbench_id)?;
+        let workspace = self
+            .create_or_observe_workbench(&request.workbench_id)?
+            .workspace;
         let current_manifest = self.read_run_manifest(&workspace, &request.workbench_id)?;
         let manifest_matches = current_manifest
             .as_ref()
@@ -1850,6 +1905,78 @@ struct ListCursor {
     anchor: NormalizedRelativePath,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GrepCursor {
+    read_version: u64,
+    server_cursor: Vec<u8>,
+}
+
+fn grep_scope_digest(
+    workbench_id: &WorkbenchId,
+    prefix: Option<&NormalizedRelativePath>,
+    recursive: bool,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.workspace.grep-scope.v1\0");
+    hash_len64(&mut hasher, workbench_id.as_bytes());
+    match prefix {
+        None => hasher.update([0]),
+        Some(prefix) => {
+            hasher.update([1]);
+            hash_len64(&mut hasher, prefix.as_str().as_bytes());
+        }
+    }
+    hasher.update([u8::from(recursive)]);
+    hasher.finalize().into()
+}
+
+fn encode_grep_cursor(read_version: u64, scope_digest: [u8; 32], server_cursor: &[u8]) -> String {
+    let mut encoded = Vec::with_capacity(
+        GREP_CURSOR_VERSION.len() + 8 + scope_digest.len() + server_cursor.len(),
+    );
+    encoded.extend_from_slice(GREP_CURSOR_VERSION);
+    encoded.extend_from_slice(&read_version.to_be_bytes());
+    encoded.extend_from_slice(&scope_digest);
+    encoded.extend_from_slice(server_cursor);
+    URL_SAFE_NO_PAD.encode(encoded)
+}
+
+fn decode_grep_cursor(
+    cursor: &str,
+    expected_scope_digest: [u8; 32],
+) -> Result<GrepCursor, agent::BackendError> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|error| invalid_state("grep cursor is not canonical base64url", error))?;
+    let payload = decoded.strip_prefix(GREP_CURSOR_VERSION).ok_or_else(|| {
+        invalid_backend_input("grep cursor does not use the current scope-bound schema")
+    })?;
+    let (read_version, payload) = payload
+        .split_first_chunk::<8>()
+        .ok_or_else(|| invalid_backend_input("grep cursor omits its read version"))?;
+    let read_version = u64::from_be_bytes(*read_version);
+    if read_version == 0 {
+        return Err(invalid_backend_input(
+            "grep cursor read version must be greater than zero",
+        ));
+    }
+    let (scope_digest, server_cursor) = payload
+        .split_first_chunk::<32>()
+        .ok_or_else(|| invalid_backend_input("grep cursor omits its scope digest"))?;
+    if scope_digest != &expected_scope_digest {
+        return Err(invalid_backend_input(
+            "grep cursor belongs to a different workbench, prefix, or recursion mode",
+        ));
+    }
+    if server_cursor.is_empty() {
+        return Err(invalid_backend_input("grep cursor omits its server anchor"));
+    }
+    Ok(GrepCursor {
+        read_version,
+        server_cursor: server_cursor.to_vec(),
+    })
+}
+
 fn list_scope_digest(
     workbench_id: &WorkbenchId,
     prefix: Option<&NormalizedRelativePath>,
@@ -1984,15 +2111,22 @@ fn list_server_page_limit(limit: usize, candidate_count: usize, first_page: bool
         .expect("protocol page limit fits u32")
 }
 
-fn json_contains_literal(value: &Value, pattern: &str) -> bool {
+fn find_request_matches_canonical_manifest(
+    request: &agent::FindRequest,
+    canonical_manifest: Option<&[u8]>,
+) -> bool {
+    let Some(pattern) = request.manifest_pattern.as_deref() else {
+        return true;
+    };
+    let Some(bytes) = canonical_manifest else {
+        return false;
+    };
     if pattern.is_empty() {
         return true;
     }
-    serde_json::to_vec(value).is_ok_and(|bytes| {
-        bytes
-            .windows(pattern.len())
-            .any(|window| window == pattern.as_bytes())
-    })
+    bytes
+        .windows(pattern.len())
+        .any(|window| window.eq_ignore_ascii_case(pattern.as_bytes()))
 }
 
 fn digest_prefix(digest: [u8; 32]) -> [u8; 16] {
@@ -2279,6 +2413,17 @@ mod tests {
         })
     }
 
+    fn already_exists_failure() -> wire::WorkspaceRpcOutcome {
+        wire::WorkspaceRpcOutcome::Failure(wire::RpcFailure {
+            code: wire::ErrorCode::AlreadyExists,
+            message: "workbench already exists".to_owned(),
+            retryable: false,
+            conflict: Some(wire::ConflictKind::Workspace),
+            current_generation: None,
+            route_hint: None,
+        })
+    }
+
     fn success(result: wire::WorkspaceResult) -> wire::WorkspaceRpcOutcome {
         wire::WorkspaceRpcOutcome::Success(Box::new(result))
     }
@@ -2402,6 +2547,43 @@ mod tests {
                 index_fields: Vec::new(),
             },
         })
+    }
+
+    fn workspace_summary(workbench: &str, incarnation: [u8; 16]) -> wire::WorkspaceSummary {
+        wire::WorkspaceSummary {
+            workbench: wire::WorkbenchName::new(workbench).unwrap(),
+            workspace_incarnation_id: wire::WorkspaceIdentity(incarnation),
+            workspace_revision: 0,
+            commit_head: None,
+            commit_head_generation: None,
+        }
+    }
+
+    fn publish_request(condition: agent::PublishCondition) -> agent::PublishRequest {
+        agent::PublishRequest {
+            path: scoped_full_path(
+                &WorkbenchId::new("implicit-publish").unwrap(),
+                "outputs/result.json",
+            )
+            .unwrap(),
+            body: br#"{"status":"ok"}"#.to_vec(),
+            content_type: JSON_CONTENT_TYPE.to_owned(),
+            condition,
+        }
+    }
+
+    fn append_request() -> agent::AppendRequest {
+        agent::AppendRequest {
+            path: scoped_full_path(
+                &WorkbenchId::new("implicit-append").unwrap(),
+                "logs/events.jsonl",
+            )
+            .unwrap(),
+            delta: b"{}\n".to_vec(),
+            content_type: None,
+            create_content_type: "application/jsonl".to_owned(),
+            max_logical_size: None,
+        }
     }
 
     fn catalog_field(field_id: &str) -> wire::CatalogField {
@@ -2580,6 +2762,75 @@ mod tests {
     }
 
     #[test]
+    fn grep_cursor_is_bound_to_workbench_prefix_recursion_and_read_version() {
+        let scope = scoped_outputs();
+        let prefix = full_path_optional(&scope).unwrap().unwrap();
+        let scope_digest = grep_scope_digest(&scope.workbench_id, Some(&prefix), true);
+        let cursor = encode_grep_cursor(41, scope_digest, b"outputs/a.txt");
+
+        assert_eq!(
+            decode_grep_cursor(&cursor, scope_digest).unwrap(),
+            GrepCursor {
+                read_version: 41,
+                server_cursor: b"outputs/a.txt".to_vec(),
+            }
+        );
+        let non_recursive = grep_scope_digest(&scope.workbench_id, Some(&prefix), false);
+        assert!(decode_grep_cursor(&cursor, non_recursive).is_err());
+        assert!(
+            decode_grep_cursor(&encode_cursor("grep", b"outputs/a.txt"), scope_digest).is_err()
+        );
+    }
+
+    #[test]
+    fn grep_continuation_sends_the_cursor_read_version_fence() {
+        let scope = scoped_outputs();
+        let prefix = full_path_optional(&scope).unwrap().unwrap();
+        let scope_digest = grep_scope_digest(&scope.workbench_id, Some(&prefix), true);
+        let cursor = encode_grep_cursor(41, scope_digest, b"outputs/a.txt");
+        let (backend, requests, server) = scripted_backend(vec![success(
+            wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: vec![wire_artifact("outputs/b.txt")],
+                next_cursor: None,
+                read_version: 41,
+            }),
+        )]);
+
+        let page = agent::WorkbenchBackend::grep_candidates(
+            &backend,
+            agent::GrepCandidateRequest {
+                scope,
+                recursive: true,
+                cursor: Some(cursor),
+                limit: 1,
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(
+            decode_grep_cursor(&page.candidates[0].cursor_after, scope_digest).unwrap(),
+            GrepCursor {
+                read_version: 41,
+                server_cursor: b"outputs/b.txt".to_vec(),
+            }
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let wire::WorkspaceRequest::ListPaths(list) = &requests[0].operation else {
+            panic!("grep continuation must call list_paths");
+        };
+        assert_eq!(list.expected_read_version, Some(41));
+        assert_eq!(
+            list.page.cursor.as_deref(),
+            Some(b"outputs/a.txt".as_slice())
+        );
+        assert!(list.recursive);
+    }
+
+    #[test]
     fn list_cursor_is_bound_to_workbench_prefix_view_and_breaks_the_old_schema() {
         let workbench = WorkbenchId::new("run-42").unwrap();
         let outputs = NormalizedRelativePath::new("outputs".to_owned()).unwrap();
@@ -2618,6 +2869,188 @@ mod tests {
         assert!(query_page_limit(257).is_err());
         assert_eq!(page_limit(1_000).unwrap(), 1_000);
         assert_eq!(list_server_page_limit(1_000, 0, true), 1_000);
+    }
+
+    #[test]
+    fn publish_implicitly_admits_a_missing_workbench_before_provider_use() {
+        let (backend, requests, server) = scripted_backend(vec![
+            not_found_failure(),
+            already_exists_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "implicit-publish",
+                [5; 16],
+            ))),
+        ]);
+
+        let error = agent::WorkbenchBackend::publish(
+            &backend,
+            publish_request(agent::PublishCondition::CreateOnly),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.kind, agent::BackendErrorKind::InvalidState);
+        assert!(error.message.contains("not verified"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(
+            requests[0].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[1].operation,
+            wire::WorkspaceRequest::CreateWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[2].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+    }
+
+    #[test]
+    fn append_implicitly_admits_a_missing_workbench_before_provider_use() {
+        let (backend, requests, server) = scripted_backend(vec![
+            not_found_failure(),
+            already_exists_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "implicit-append",
+                [6; 16],
+            ))),
+        ]);
+
+        let error = agent::WorkbenchBackend::append(&backend, append_request()).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.kind, agent::BackendErrorKind::InvalidState);
+        assert!(error.message.contains("not verified"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(
+            requests[0].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[1].operation,
+            wire::WorkspaceRequest::CreateWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[2].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+    }
+
+    #[test]
+    fn commit_recovers_identity_before_implicitly_admitting_a_missing_workbench() {
+        let request = commit_request();
+        let (backend, requests, server) = scripted_backend(vec![
+            not_found_failure(),
+            not_found_failure(),
+            already_exists_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "clock-stable-run",
+                [7; 16],
+            ))),
+            not_found_failure(),
+            not_found_failure(),
+            not_found_failure(),
+        ]);
+
+        let error = agent::WorkbenchBackend::commit(&backend, request).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.kind, agent::BackendErrorKind::NotFound);
+
+        let requests = requests.lock().unwrap();
+        assert!(matches!(
+            requests[0].operation,
+            wire::WorkspaceRequest::GetOperation(_)
+        ));
+        assert!(matches!(
+            requests[1].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[2].operation,
+            wire::WorkspaceRequest::CreateWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[3].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+        assert!(matches!(
+            requests[4].operation,
+            wire::WorkspaceRequest::GetPath(_)
+        ));
+        assert!(matches!(
+            requests[5].operation,
+            wire::WorkspaceRequest::GetOperation(_)
+        ));
+        assert!(matches!(
+            requests[6].operation,
+            wire::WorkspaceRequest::Commit(_)
+        ));
+    }
+
+    #[test]
+    fn manifest_literal_matching_is_ascii_case_insensitive_for_nested_json() {
+        let manifest = json!({
+            "Manifest": {
+                "NestedKey": "MiXeD-Value",
+                "unicode": "Straße",
+            },
+        });
+        let canonical_manifest = agent::canonical_json_bytes(&manifest).unwrap();
+        let request = |pattern: &str| agent::FindRequest {
+            committed: None,
+            manifest_pattern: Some(pattern.to_owned()),
+            include_manifest: false,
+            cursor: None,
+            limit: 1,
+        };
+
+        assert!(find_request_matches_canonical_manifest(
+            &request("MANIFEST"),
+            Some(&canonical_manifest),
+        ));
+        assert!(find_request_matches_canonical_manifest(
+            &request(r#""nestedkey":"mixed-value""#),
+            Some(&canonical_manifest),
+        ));
+        assert!(!find_request_matches_canonical_manifest(
+            &request("mixed.*value"),
+            Some(&canonical_manifest),
+        ));
+        assert!(!find_request_matches_canonical_manifest(
+            &request("STRASSE"),
+            Some(&canonical_manifest),
+        ));
+        assert!(!find_request_matches_canonical_manifest(&request(""), None,));
+    }
+
+    #[test]
+    fn manifest_literal_matching_is_independent_of_projection_and_page_cursor() {
+        let manifest = json!({"manifest": {"Task": "DiFfErEnT"}});
+        let canonical_manifest = agent::canonical_json_bytes(&manifest).unwrap();
+        let page_two = encode_cursor("find", b"page-two");
+
+        for include_manifest in [false, true] {
+            for cursor in [None, Some(page_two.clone())] {
+                let request = agent::FindRequest {
+                    committed: Some(true),
+                    manifest_pattern: Some("different".to_owned()),
+                    include_manifest,
+                    cursor: cursor.clone(),
+                    limit: 1,
+                };
+
+                assert!(find_request_matches_canonical_manifest(
+                    &request,
+                    Some(&canonical_manifest),
+                ));
+                assert_eq!(request.include_manifest, include_manifest);
+                assert_eq!(request.cursor, cursor);
+            }
+        }
+        assert_eq!(decode_cursor("find", &page_two).unwrap(), b"page-two");
     }
 
     #[test]
