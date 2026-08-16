@@ -274,10 +274,10 @@ The deterministic object-first, dual-manifest-published, pre-Complete crash
 point is not currently injectable through a public boundary. The gate records
 that phase as `NOT QUALIFIED`; a timed sleep followed by `SIGKILL` is not
 accepted as evidence. The 8/16-caller exact-replay matrix and full release/GC
-drain remain later phases. The `workbench-contract` job currently compiles and
-unit-tests this gate only; it must not claim a live pass until the scoped
-mutation CLI exists and the isolated live command is enabled as its own
-non-Docker-Image required check.
+drain remain later phases. The `workbench-contract` job compiles and unit-tests
+the gate, while the required `nokv-workspace` job runs the isolated live
+composition against pinned RustFS and uploads its complete evidence. This is a
+runtime contract gate, not the background Docker Image build.
 
 ### Pre-#423 capability mapping
 

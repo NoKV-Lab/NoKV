@@ -214,6 +214,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Qualify restored Workbench composition
+        id: restore_composition
+        shell: bash
+        env:
+          RESTORE_COMPOSITION_EVIDENCE_DIR: ${{ runner.temp }}/restore-composition/evidence
+        run: |
+          set -euo pipefail
+          python3 scripts/workbench/restore_composition_gate.py \
+            --nokv-bin target/debug/nokv \
+            --target-dir target \
+            --evidence-dir "$RESTORE_COMPOSITION_EVIDENCE_DIR" \
+            --seed "restore-composition-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --timeout 60
+          jq -e '.restore_composition.status == "PASS"' \
+            "$RESTORE_COMPOSITION_EVIDENCE_DIR/qualification.json"
+          jq -e '.partial_publication_recovery.status == "NOT QUALIFIED"' \
+            "$RESTORE_COMPOSITION_EVIDENCE_DIR/qualification.json"
+
+      - name: Upload restore composition evidence
+        if: ${{ always() && steps.restore_composition.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: restore-composition-${{ github.sha }}
+          path: ${{ runner.temp }}/restore-composition
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Remove pinned RustFS
         if: ${{ always() }}
         shell: bash
