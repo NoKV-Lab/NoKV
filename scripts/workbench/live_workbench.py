@@ -155,6 +155,26 @@ def phase_one_workbench_ids(config: Config) -> dict[str, str]:
     return {operation: fixture_id(operation) for operation in ("put", "append", "commit")}
 
 
+def authority_configs(config: Config) -> tuple[Config, Config]:
+    """Build one legitimate peer and one wrong-principal replay for the same shard."""
+
+    def derived_id(domain: bytes, value: str) -> str:
+        return digest(domain + b"\0" + value.encode())[:32]
+
+    peer = dataclasses.replace(
+        config,
+        root_id=derived_id(b"nokv.workbench.authority.peer.root.v1", config.root_id),
+        agent_id=derived_id(b"nokv.workbench.authority.peer.agent.v1", config.agent_id),
+        agent_name="authority-peer",
+    )
+    mismatch = dataclasses.replace(
+        peer,
+        root_id=config.root_id,
+        agent_name="authority-mismatch",
+    )
+    return peer, mismatch
+
+
 def tool_plan(config: Config) -> list[ToolStep]:
     wb, restored, snapshot = config.workbench, config.restored, config.snapshot
     phase_one = phase_one_workbench_ids(config)
@@ -523,6 +543,41 @@ def completed_process(
     return result
 
 
+def expected_failure_process(
+    evidence: Evidence,
+    label: str,
+    command: list[str],
+    config: Config,
+    stdin: str,
+) -> subprocess.CompletedProcess[str]:
+    started = now()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=config.repo,
+            input=stdin,
+            text=True,
+            capture_output=True,
+            timeout=config.timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        evidence.line("processes.jsonl", {
+            "schema": SCHEMA, "label": label, "argv": redact_argv(command),
+            "started_at": started, "finished_at": now(), "timed_out": True,
+            "stdout": error.stdout or "", "stderr": error.stderr or "",
+        })
+        raise WorkflowFailure(f"{label} timed out instead of failing closed") from error
+    evidence.line("processes.jsonl", {
+        "schema": SCHEMA, "label": label, "argv": redact_argv(command),
+        "started_at": started, "finished_at": now(), "returncode": result.returncode,
+        "stdout": result.stdout, "stderr": result.stderr,
+    })
+    if result.returncode == 0:
+        raise WorkflowFailure(f"{label} unexpectedly succeeded")
+    return result
+
+
 class Mcp:
     def __init__(self, process: subprocess.Popen[str], evidence: Evidence, attempt: int,
                  timeout: float) -> None:
@@ -719,6 +774,52 @@ def assert_phase_one_results(
     }
 
 
+def assert_authority_results(
+    results: dict[str, dict[str, Any]],
+    mismatch: subprocess.CompletedProcess[str],
+    config: Config,
+    peer: Config,
+) -> dict[str, Any]:
+    if results["peer-read-before-create"].get("code") != "NotFound":
+        raise WorkflowFailure("peer RootId observed the primary Workbench before creation")
+    peer_put = results["peer-put"]
+    if peer_put.get("workbench_id") != config.workbench \
+            or peer_put.get("generation") != 1 \
+            or peer_put.get("replace") is not False:
+        raise WorkflowFailure("peer RootId did not create an independent same-name Workbench")
+    peer_document = document(results["peer-read"], "peer authority read")
+    reconnect_document = document(
+        results["peer-reconnect-read"], "peer authority reconnect read"
+    )
+    primary_document = document(
+        results["primary-read-after-peer-write"], "primary authority read"
+    )
+    if peer_document != {"authority": "peer"} or reconnect_document != peer_document:
+        raise WorkflowFailure("peer Agent binding did not survive an exact reconnect")
+    if primary_document.get("state") != "post-snapshot" \
+            or "authority" in primary_document:
+        raise WorkflowFailure("RootId isolation allowed a peer write into the primary Workbench")
+
+    combined_error = f"{mismatch.stdout}\n{mismatch.stderr}"
+    if mismatch.returncode == 0 \
+            or mismatch.stdout.strip() \
+            or "already bound to another Agent" not in combined_error \
+            or "jsonrpc" in combined_error.lower():
+        raise WorkflowFailure("wrong AgentId was not rejected before MCP initialization")
+    if config.agent_id in combined_error or peer.agent_id in combined_error:
+        raise WorkflowFailure("Agent binding mismatch disclosed a stable Agent identity")
+    return {
+        "schema": SCHEMA,
+        "status": "PASS",
+        "contract_id": "C06",
+        "workbench_id": config.workbench,
+        "distinct_root_count": 2,
+        "same_logical_shard": True,
+        "peer_reconnect": "PASS",
+        "wrong_agent_admission": "rejected-before-initialize",
+    }
+
+
 def assert_results(
     results: dict[str, dict[str, Any]], config: Config,
 ) -> dict[str, Any]:
@@ -828,6 +929,12 @@ def validate(config: Config, live: bool) -> None:
         raise NotQualified("Phase 1 fixture ids must differ from configured Workbench ids")
     if not config.etcd or not config.bucket or not config.object_endpoint:
         raise NotQualified("etcd endpoint, object endpoint, and bucket are required")
+    peer, mismatch = authority_configs(config)
+    if peer.root_id == config.root_id or peer.agent_id == config.agent_id \
+            or peer.shard_id != config.shard_id \
+            or mismatch.root_id != config.root_id \
+            or mismatch.agent_id != peer.agent_id:
+        raise NotQualified("authority probe identities do not form two isolated roots")
     if (config.access_key is None) != (config.secret_key is None):
         raise NotQualified("object access and secret keys must be supplied together")
     if not live:
@@ -864,14 +971,15 @@ def require_running(label: str, process: subprocess.Popen[str]) -> None:
         raise WorkflowFailure(f"{label} exited before live qualification ({process.returncode})")
 
 
-def start_mcp(config: Config, evidence: Evidence, server: subprocess.Popen[str]) \
+def start_mcp(config: Config, evidence: Evidence, server: subprocess.Popen[str],
+              label: str = "mcp", attempt_offset: int = 0) \
         -> tuple[Mcp, TextIO]:
-    deadline, last_error, attempt = time.monotonic() + config.timeout, "", 0
+    deadline, last_error, attempt = time.monotonic() + config.timeout, "", attempt_offset
     while time.monotonic() < deadline:
         attempt += 1
         if server.poll() is not None:
             raise WorkflowFailure(f"serve exited during startup ({server.returncode})")
-        stderr = (evidence.root / f"mcp.stderr.attempt-{attempt}.log").open("w")
+        stderr = (evidence.root / f"{label}.stderr.attempt-{attempt}.log").open("w")
         process = subprocess.Popen(
             mcp_command(config), cwd=config.repo, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=stderr, text=True, bufsize=1,
@@ -890,7 +998,7 @@ def start_mcp(config: Config, evidence: Evidence, server: subprocess.Popen[str])
                 raise WorkflowFailure("unexpected MCP initialize result")
             session.notify("notifications/initialized")
             evidence.line("processes.jsonl", {
-                "schema": SCHEMA, "label": "mcp", "argv": redact_argv(mcp_command(config)),
+                "schema": SCHEMA, "label": label, "argv": redact_argv(mcp_command(config)),
                 "pid": process.pid, "attempt": attempt, "started_at": now(),
             })
             return session, stderr
@@ -900,6 +1008,27 @@ def start_mcp(config: Config, evidence: Evidence, server: subprocess.Popen[str])
             stderr.close()
             time.sleep(0.25)
     raise WorkflowFailure(f"MCP startup failed: {last_error}")
+
+
+def close_mcp(session: Mcp | None, stderr: TextIO | None, evidence: Evidence,
+              label: str) -> None:
+    try:
+        if session is not None:
+            if session.process.stdin is not None:
+                try:
+                    session.process.stdin.close()
+                except OSError as error:
+                    evidence.line("processes.jsonl", {
+                        "schema": SCHEMA, "label": f"{label}-stdin-close",
+                        "finished_at": now(), "error": str(error),
+                    })
+            evidence.line("processes.jsonl", {
+                "schema": SCHEMA, "label": f"{label}-exit",
+                "returncode": stop(session.process), "finished_at": now(),
+            })
+    finally:
+        if stderr is not None:
+            stderr.close()
 
 
 def transfer(config: Config, evidence: Evidence) -> None:
@@ -924,10 +1053,93 @@ def grep_continuation_step(first_step: ToolStep, first_result: dict[str, Any]) -
     return ToolStep("grep-phase1-page-2", first_step.name, arguments)
 
 
+def run_authority_probe(
+    config: Config,
+    evidence: Evidence,
+    server: subprocess.Popen[str],
+    primary: Mcp,
+) -> dict[str, Any]:
+    peer, mismatch_config = authority_configs(config)
+    peer_stderr: TextIO | None = None
+    peer_session: Mcp | None = None
+    reconnect_stderr: TextIO | None = None
+    reconnect_session: Mcp | None = None
+    results: dict[str, dict[str, Any]] = {}
+    peer_payload = canonical_json({"authority": "peer"}) + "\n"
+    try:
+        peer_session, peer_stderr = start_mcp(
+            peer, evidence, server, "mcp-authority-peer", 100
+        )
+        listed = peer_session.request("tools/list")
+        tools = listed.get("result", {}).get("tools")
+        if not isinstance(tools, list):
+            raise WorkflowFailure("peer tools/list did not return a tools array")
+        validate_tool_contract(tools)
+        results["peer-read-before-create"] = peer_session.call(ToolStep(
+            "peer-read-before-create", "workbench_read",
+            {"id": config.workbench, "section": "input", "path": "scan.json"},
+            "NotFound",
+        ))
+        results["peer-put"] = peer_session.call(ToolStep(
+            "peer-put", "workbench_put_file",
+            {
+                "id": config.workbench, "section": "input", "path": "scan.json",
+                "text": peer_payload, "content_type": "application/json",
+                "replace": False,
+            },
+        ))
+        results["peer-read"] = peer_session.call(ToolStep(
+            "peer-read", "workbench_read",
+            {"id": config.workbench, "section": "input", "path": "scan.json"},
+        ))
+    finally:
+        close_mcp(peer_session, peer_stderr, evidence, "mcp-authority-peer")
+
+    try:
+        reconnect_session, reconnect_stderr = start_mcp(
+            peer, evidence, server, "mcp-authority-reconnect", 200
+        )
+        results["peer-reconnect-read"] = reconnect_session.call(ToolStep(
+            "peer-reconnect-read", "workbench_read",
+            {"id": config.workbench, "section": "input", "path": "scan.json"},
+        ))
+    finally:
+        close_mcp(
+            reconnect_session, reconnect_stderr, evidence, "mcp-authority-reconnect"
+        )
+
+    results["primary-read-after-peer-write"] = primary.call(ToolStep(
+        "primary-read-after-peer-write", "workbench_read",
+        {"id": config.workbench, "section": "input", "path": "scan.json"},
+    ))
+    initialize = canonical_json({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "nokv-authority-negative", "version": "1"},
+        },
+    }) + "\n"
+    mismatch = expected_failure_process(
+        evidence,
+        "mcp-authority-mismatch",
+        mcp_command(mismatch_config),
+        mismatch_config,
+        initialize,
+    )
+    return assert_authority_results(results, mismatch, config, peer)
+
+
 def run_live(config: Config, evidence: Evidence, steps: list[ToolStep]) -> None:
     provision = completed_process(evidence, "provision", provision_command(config), config)
     if json.loads(provision.stdout).get("lifecycle") != "active":
         raise WorkflowFailure("provision did not activate root placement")
+    peer, _ = authority_configs(config)
+    peer_provision = completed_process(
+        evidence, "provision-authority-peer", provision_command(peer), peer
+    )
+    if json.loads(peer_provision.stdout).get("lifecycle") != "active":
+        raise WorkflowFailure("peer provision did not activate root placement")
     serve_out = (evidence.root / "serve.stdout.log").open("w")
     serve_err = (evidence.root / "serve.stderr.log").open("w")
     server = subprocess.Popen(
@@ -956,27 +1168,15 @@ def run_live(config: Config, evidence: Evidence, steps: list[ToolStep]) -> None:
             if step.label == "edit-input":
                 transfer(config, evidence)
         phase_one_evidence = assert_results(results, config)
+        authority_evidence = run_authority_probe(config, evidence, server, session)
         require_running("mcp", session.process)
         require_running("serve", server)
         evidence.json("phase1-contracts.json", phase_one_evidence)
+        evidence.json("authority-contracts.json", authority_evidence)
     finally:
         try:
-            if session is not None:
-                if session.process.stdin is not None:
-                    try:
-                        session.process.stdin.close()
-                    except OSError as error:
-                        evidence.line("processes.jsonl", {
-                            "schema": SCHEMA, "label": "mcp-stdin-close",
-                            "finished_at": now(), "error": str(error),
-                        })
-                evidence.line("processes.jsonl", {
-                    "schema": SCHEMA, "label": "mcp-exit",
-                    "returncode": stop(session.process), "finished_at": now(),
-                })
+            close_mcp(session, mcp_err, evidence, "mcp")
         finally:
-            if mcp_err is not None:
-                mcp_err.close()
             try:
                 evidence.line("processes.jsonl", {
                     "schema": SCHEMA, "label": "serve-exit", "returncode": stop(server),
@@ -1025,14 +1225,18 @@ def environment(config: Config) -> dict[str, Any]:
 def plan(config: Config, steps: list[ToolStep]) -> dict[str, Any]:
     sandbox = config.evidence / "sandbox"
     coverage = planned_tool_coverage(steps)
+    peer, mismatch = authority_configs(config)
     return {
         "schema": SCHEMA, "mode": "dry-run" if config.dry_run else "live",
         "commands": {
             "build": ["cargo", "build", "-p", "nokv", "--bin", "nokv"]
             if config.build else None,
             "provision": redact_argv(provision_command(config)),
+            "provision_authority_peer": redact_argv(provision_command(peer)),
             "serve": redact_argv(server_command(config)),
             "mcp": redact_argv(mcp_command(config)),
+            "mcp_authority_peer": redact_argv(mcp_command(peer)),
+            "mcp_authority_mismatch": redact_argv(mcp_command(mismatch)),
             "materialize": redact_argv(materialize_command(config, sandbox / "scan.json")),
             "collect": redact_argv(collect_command(config, sandbox / "reconstruction.json")),
         },
