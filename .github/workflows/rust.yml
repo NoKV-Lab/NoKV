@@ -35,6 +35,9 @@ jobs:
       - name: Check Homebrew release safety
         run: python3 scripts/release/test_homebrew_source_release.py
 
+      - name: Check pull request governance policy
+        run: python3 scripts/ci/pr_change_governance_test.py
+
   nokv-workspace:
     runs-on: ubuntu-latest
     timeout-minutes: 30

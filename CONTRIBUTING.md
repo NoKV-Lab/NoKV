@@ -24,7 +24,8 @@ does not implement a POSIX filesystem, FUSE frontend, or inode/dentry model.
 2. **Architecture:** [Product Design](docs/product-design.md) and
    [Metadata Schema](docs/metadata-schema.md).
 3. **Engineering rules:** [Code Contract](docs/development/code_contract.md)
-   and [PR Review Checklist](docs/development/pr_review_checklist.md).
+   [PR Review Checklist](docs/development/pr_review_checklist.md), and
+   [Change Governance](docs/development/change-governance.md).
 
 ### Make your first contribution
 
@@ -112,6 +113,16 @@ and run `git diff --check`.
 - Link related issue(s).
 - Include docs updates when behavior/config/CLI changes.
 - Keep PRs small enough for focused review.
+- A PR with 5,000 or fewer GitHub-reported changed lines (additions plus
+  deletions) does not require a review.
+- A PR with more than 5,000 changed lines requires one core maintainer other
+  than the current-head pusher to approve the exact current head. Authors,
+  bots, non-core reviewers, duplicate reviewers, dismissed reviews, and
+  approvals on older commits do not count. The governance status fails closed
+  if it cannot verify these facts.
+- Administrators remain subject to every required status check. All per-head PR
+  validation jobs are required except Docker image, which runs in the
+  background without delaying merge. Project-board automation is not CI.
 - Keep each PR scoped to one logical boundary. Do not mix metadata model,
   Holt layout, object-store, docs, benchmark, or unrelated refactors.
 - Every non-merge commit must include a `Signed-off-by` trailer matching the Developer Certificate of Origin in [`DCO`](./DCO).
