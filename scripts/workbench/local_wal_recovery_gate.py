@@ -527,6 +527,9 @@ def run_concurrent_stage(
     etcd_endpoint: str,
     evidence: Path,
     seed: str,
+    object_endpoint: str,
+    object_bucket: str,
+    object_root: str,
     timeout: float,
 ) -> dict[str, object]:
     stage = CONCURRENT_STAGE
@@ -538,12 +541,12 @@ def run_concurrent_stage(
     prefix = f"/nokv/local-wal-recovery/{fixed_id(seed, stage)}"
     record_key = f"{prefix}/logical-shards/{shard_id}"
     common = control_args(binary, root_id, etcd_endpoint, prefix)
-    objects = object_args(stage)
+    objects = object_args(stage, object_endpoint, object_bucket, object_root)
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*common, "provision", shard_id]
+        provision_command = [*common, *objects, "provision", shard_id]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -793,6 +796,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                 etcd_endpoint=endpoint,
                 evidence=evidence,
                 seed=args.seed,
+                object_endpoint=args.object_endpoint,
+                object_bucket=args.object_bucket,
+                object_root=args.object_root,
                 timeout=args.timeout,
             )
         )

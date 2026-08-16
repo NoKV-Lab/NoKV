@@ -11,6 +11,7 @@ import signal
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from local_wal_recovery_gate import (
     CONCURRENT_STAGE,
@@ -18,6 +19,7 @@ from local_wal_recovery_gate import (
     WorkflowFailure,
     main,
     object_args,
+    run_concurrent_stage,
     validate_concurrent_evidence,
     validate_stage_evidence,
 )
@@ -145,6 +147,65 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
         self.assertIn("nokv-recovery", arguments)
         self.assertIn("release-gate/before-local-fence", arguments)
         self.assertNotIn("http://127.0.0.1:1", arguments)
+
+    def test_concurrent_stage_threads_object_profile_into_provision(self) -> None:
+        object_arguments = [
+            "--object-bucket",
+            "nokv-recovery",
+            "--object-endpoint",
+            "http://127.0.0.1:9000",
+            "--object-root",
+            "release-gate/concurrent-takeover",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch(
+                    "local_wal_recovery_gate.object_args",
+                    return_value=object_arguments,
+                ) as object_args_mock,
+                mock.patch(
+                    "local_wal_recovery_gate.run",
+                    side_effect=WorkflowFailure("stop after provision"),
+                ) as run_mock,
+                self.assertRaisesRegex(WorkflowFailure, "stop after provision"),
+            ):
+                run_concurrent_stage(
+                    repo=REPO,
+                    binary=Path("/tmp/nokv"),
+                    etcdctl=Path("/tmp/etcdctl"),
+                    etcd_endpoint="http://127.0.0.1:2379",
+                    evidence=Path(directory),
+                    seed="object-profile-contract",
+                    object_endpoint="http://127.0.0.1:9000",
+                    object_bucket="nokv-recovery",
+                    object_root="release-gate",
+                    timeout=1,
+                )
+
+        object_args_mock.assert_called_once_with(
+            CONCURRENT_STAGE,
+            "http://127.0.0.1:9000",
+            "nokv-recovery",
+            "release-gate",
+        )
+        provision_command = run_mock.call_args.args[0]
+        self.assertEqual(
+            provision_command,
+            [
+                "/tmp/nokv",
+                "--root-id",
+                provision_command[2],
+                "--etcd-endpoint",
+                "http://127.0.0.1:2379",
+                "--etcd-key-prefix",
+                provision_command[6],
+                "--etcd-lease-ttl-seconds",
+                "2",
+                *object_arguments,
+                "provision",
+                provision_command[-1],
+            ],
+        )
 
     def test_each_stage_converges_to_the_same_recovery_epoch(self) -> None:
         for stage in CRASH_STAGES:
