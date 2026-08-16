@@ -285,12 +285,12 @@ mod tests {
                         manifest_digest: DigestUri::new(format!("sha256:{}", "31".repeat(32)))
                             .unwrap(),
                         tree_manifest_revision_id: ArtifactRevisionIdentity([0x32; 16]),
-                        member_count: 0,
-                        member_digest: Digest([0; 32]),
+                        member_count: 1,
+                        member_digest: Digest([0x35; 32]),
                     },
                     destination_committed_at_unix_seconds: 1_700_000_000,
-                    source_member_count: 0,
-                    source_member_digest: Digest([0; 32]),
+                    source_member_count: 1,
+                    source_member_digest: Digest([0x35; 32]),
                     materialized_member_count: 0,
                     materialized_member_digest: Digest([0; 32]),
                     source_matches_base_commit: true,
@@ -358,8 +358,8 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(complete_v5_golden.finalize()),
             [
-                112, 11, 7, 236, 110, 64, 3, 160, 92, 62, 237, 117, 13, 87, 193, 173, 214, 252, 37,
-                85, 113, 91, 86, 78, 24, 81, 107, 18, 186, 104, 169, 3,
+                89, 113, 224, 16, 107, 15, 199, 143, 227, 235, 150, 227, 227, 53, 198, 143, 94,
+                152, 105, 166, 107, 135, 252, 120, 10, 123, 107, 227, 115, 226, 15, 176,
             ],
             "update only for an intentional restore-v5 wire change"
         );

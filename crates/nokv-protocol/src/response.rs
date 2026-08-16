@@ -975,6 +975,11 @@ impl RestoreOperationPreparation {
                 materialized_member_count,
                 materialized_member_digest,
             )?;
+            validate_materialized_member_subset(
+                "operation.restore_preparation.materialized_members",
+                source_member_count,
+                materialized_member_count,
+            )?;
             validate_source_commit_match(
                 &self.source_commit,
                 source_member_count,
@@ -1027,6 +1032,11 @@ impl RestorePreparation {
             self.materialized_member_count,
             self.materialized_member_digest,
         )?;
+        validate_materialized_member_subset(
+            "restore_prepared.materialized_members",
+            self.source_member_count,
+            self.materialized_member_count,
+        )?;
         validate_source_commit_match(
             &self.source_commit,
             self.source_member_count,
@@ -1056,6 +1066,25 @@ fn validate_restore_member_seal(
         return Err(ProtocolError::invalid(
             field,
             "zero member count and zero digest must be present together",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_materialized_member_subset(
+    field: &'static str,
+    source_member_count: u64,
+    materialized_member_count: u64,
+) -> Result<(), ProtocolError> {
+    let skipped_provenance_members = source_member_count
+        .checked_sub(materialized_member_count)
+        .ok_or_else(|| {
+            ProtocolError::invalid(field, "cannot contain rows absent from the raw source")
+        })?;
+    if !(1..=2).contains(&skipped_provenance_members) {
+        return Err(ProtocolError::invalid(
+            field,
+            "must omit the source run manifest and at most one restore manifest",
         ));
     }
     Ok(())
@@ -1807,7 +1836,7 @@ mod tests {
             destination_committed_at_unix_seconds: 1_700_000_000,
             source_member_count: Some(2),
             source_member_digest: Some(Digest([0x15; 32])),
-            materialized_member_count: Some(4),
+            materialized_member_count: Some(1),
             materialized_member_digest: Some(Digest([0x18; 32])),
             source_matches_base_commit: Some(true),
             destination_binding: Some(Box::new(RestoreDestinationBinding {
@@ -1921,9 +1950,9 @@ mod tests {
                 commit_head: Some(CommitIdentity([0x19; 32])),
                 commit_head_generation: Some(1),
             },
-            member_count: 4,
+            member_count: 1,
             member_digest: Digest([0x18; 32]),
-            metadata_rows_copied: 4,
+            metadata_rows_copied: 1,
             object_bytes_copied: 0,
         }));
         status.validate().unwrap();
@@ -1950,6 +1979,24 @@ mod tests {
 
         preparation.source_member_count = Some(2);
         assert!(preparation.validate().is_err());
+    }
+
+    #[test]
+    fn restore_materialized_members_are_a_subset_of_the_raw_source() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_member_count = Some(2);
+        preparation.source_member_digest = Some(Digest([0x15; 32]));
+        preparation.materialized_member_count = Some(3);
+        preparation.materialized_member_digest = Some(Digest([0x18; 32]));
+
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "operation.restore_preparation.materialized_members",
+                ..
+            })
+        ));
     }
 
     #[test]
