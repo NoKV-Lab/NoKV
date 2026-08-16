@@ -142,6 +142,76 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Qualify live Workbench contracts
+        id: live_workbench
+        shell: bash
+        env:
+          LIVE_WORKBENCH_ROOT: ${{ runner.temp }}/live-workbench
+        run: |
+          set -euo pipefail
+          endpoint=http://127.0.0.1:22379
+          peer=http://127.0.0.1:22380
+          mkdir -p "$LIVE_WORKBENCH_ROOT"
+          etcd \
+            --name nokv-live-workbench \
+            --data-dir "$LIVE_WORKBENCH_ROOT/etcd-data" \
+            --listen-client-urls "$endpoint" \
+            --advertise-client-urls "$endpoint" \
+            --listen-peer-urls "$peer" \
+            --initial-advertise-peer-urls "$peer" \
+            --initial-cluster "nokv-live-workbench=$peer" \
+            --initial-cluster-state new \
+            --log-level warn \
+            >"$LIVE_WORKBENCH_ROOT/etcd.log" 2>&1 &
+          etcd_pid=$!
+          trap 'kill "$etcd_pid" >/dev/null 2>&1 || true; wait "$etcd_pid" >/dev/null 2>&1 || true' EXIT
+          ready=false
+          for _ in $(seq 1 60); do
+            if etcdctl --endpoints "$endpoint" endpoint health >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$etcd_pid" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.25
+          done
+          if [[ "$ready" != true ]]; then
+            cat "$LIVE_WORKBENCH_ROOT/etcd.log"
+            exit 1
+          fi
+          python3 scripts/workbench/live_workbench.py \
+            --nokv-bin target/debug/nokv \
+            --evidence-dir "$LIVE_WORKBENCH_ROOT/evidence" \
+            --metadata-dir "$LIVE_WORKBENCH_ROOT/metadata" \
+            --root-id 11111111111111111111111111111111 \
+            --agent-id 44444444444444444444444444444444 \
+            --agent-name ci-agent \
+            --logical-shard-id 22222222222222222222222222222222 \
+            --etcd-endpoint "$endpoint" \
+            --etcd-key-prefix "/nokv/control/live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --server-bind 127.0.0.1:17750 \
+            --advertise-endpoint 127.0.0.1:17750 \
+            --object-endpoint http://127.0.0.1:9000 \
+            --object-bucket nokv-local-wal-recovery-gate \
+            --object-root "live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --object-access-key-id rustfsadmin \
+            --object-secret-access-key rustfsadmin \
+            --command-timeout-seconds 45
+          jq -e '.workbench_workflow.status == "PASS"' \
+            "$LIVE_WORKBENCH_ROOT/evidence/qualification.json"
+          jq -e '.acceptance_gates["0"].status == "NOT QUALIFIED"' \
+            "$LIVE_WORKBENCH_ROOT/evidence/qualification.json"
+
+      - name: Upload live Workbench evidence
+        if: ${{ always() && steps.live_workbench.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: live-workbench-${{ github.sha }}
+          path: ${{ runner.temp }}/live-workbench
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Remove pinned RustFS
         if: ${{ always() }}
         shell: bash

@@ -314,6 +314,31 @@ def object_args(stage: str, endpoint: str, bucket: str, root: str) -> list[str]:
     ]
 
 
+def server_command(
+    common: list[str],
+    objects: list[str],
+    port: int,
+    node: str,
+    metadata_option: str,
+    metadata: Path,
+) -> list[str]:
+    if "--agent-id" in common:
+        raise WorkflowFailure("shard serve command must not carry one AgentId")
+    return [
+        *common,
+        *objects,
+        "--bind",
+        f"127.0.0.1:{port}",
+        "--advertise-endpoint",
+        f"127.0.0.1:{port}",
+        "--node-id",
+        node,
+        metadata_option,
+        str(metadata),
+        "serve",
+    ]
+
+
 def decode_control_record(
     etcdctl: Path,
     endpoint: str,
@@ -355,17 +380,19 @@ def run_stage(
     ready_path = stage_dir / "fault-ready.json"
     config_path = stage_dir / "fault-config.json"
     root_id = fixed_id(seed, f"{stage}:root")
+    agent_id = fixed_id(seed, f"{stage}:agent")
     shard_id = fixed_id(seed, f"{stage}:shard")
     prefix = f"/nokv/local-wal-recovery/{fixed_id(seed, stage)}"
     record_key = f"{prefix}/logical-shards/{shard_id}"
     session_key = f"{prefix}/sessions/{shard_id}"
     common = control_args(binary, root_id, etcd_endpoint, prefix)
+    agent_common = [*common, "--agent-id", agent_id]
     objects = object_args(stage, object_endpoint, object_bucket, object_root)
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*common, *objects, "provision", shard_id]
+        provision_command = [*agent_common, *objects, "provision", shard_id]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -373,24 +400,24 @@ def run_stage(
         first_port = free_port()
         first_log = (stage_dir / "owner-e1.log").open("w")
         logs.append(first_log)
-        first_command = [
-            *common,
-            *objects,
-            "--bind",
-            f"127.0.0.1:{first_port}",
-            "--advertise-endpoint",
-            f"127.0.0.1:{first_port}",
-            "--node-id",
+        first_command = server_command(
+            common,
+            objects,
+            first_port,
             f"gate-{stage}-e1",
             "--metadata-create",
             metadata,
-            "serve",
-        ]
+        )
         first = start_process(first_command, repo, first_log)
         processes.append(first)
         wait_tcp(first, first_port, timeout)
 
-        client = [*common, "--workbench-root", "/agents/issue450/wb", *objects]
+        client = [
+            *agent_common,
+            "--workbench-root",
+            "/agents/issue450/wb",
+            *objects,
+        ]
         create_command = [
             *client,
             "workbench",
@@ -448,19 +475,14 @@ def run_stage(
         retry_port = free_port()
         retry_log = (stage_dir / "owner-e2-retry.log").open("w")
         logs.append(retry_log)
-        retry_command = [
-            *common,
-            *objects,
-            "--bind",
-            f"127.0.0.1:{retry_port}",
-            "--advertise-endpoint",
-            f"127.0.0.1:{retry_port}",
-            "--node-id",
+        retry_command = server_command(
+            common,
+            objects,
+            retry_port,
             f"gate-{stage}-retry",
             "--metadata-reopen",
             metadata,
-            "serve",
-        ]
+        )
         retry = start_process(retry_command, repo, retry_log)
         processes.append(retry)
         wait_tcp(retry, retry_port, timeout)
@@ -537,16 +559,18 @@ def run_concurrent_stage(
     stage_dir.mkdir(parents=True)
     metadata = stage_dir / "metadata"
     root_id = fixed_id(seed, f"{stage}:root")
+    agent_id = fixed_id(seed, f"{stage}:agent")
     shard_id = fixed_id(seed, f"{stage}:shard")
     prefix = f"/nokv/local-wal-recovery/{fixed_id(seed, stage)}"
     record_key = f"{prefix}/logical-shards/{shard_id}"
     common = control_args(binary, root_id, etcd_endpoint, prefix)
+    agent_common = [*common, "--agent-id", agent_id]
     objects = object_args(stage, object_endpoint, object_bucket, object_root)
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*common, *objects, "provision", shard_id]
+        provision_command = [*agent_common, *objects, "provision", shard_id]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -554,24 +578,24 @@ def run_concurrent_stage(
         incumbent_port = free_port()
         incumbent_log = (stage_dir / "owner-incumbent.log").open("w")
         logs.append(incumbent_log)
-        incumbent_command = [
-            *common,
-            *objects,
-            "--bind",
-            f"127.0.0.1:{incumbent_port}",
-            "--advertise-endpoint",
-            f"127.0.0.1:{incumbent_port}",
-            "--node-id",
+        incumbent_command = server_command(
+            common,
+            objects,
+            incumbent_port,
             f"gate-{stage}-incumbent",
             "--metadata-create",
             metadata,
-            "serve",
-        ]
+        )
         incumbent = start_process(incumbent_command, repo, incumbent_log)
         processes.append(incumbent)
         wait_tcp(incumbent, incumbent_port, timeout)
 
-        client = [*common, "--workbench-root", "/agents/issue450/wb", *objects]
+        client = [
+            *agent_common,
+            "--workbench-root",
+            "/agents/issue450/wb",
+            *objects,
+        ]
         create_command = [
             *client,
             "workbench",
@@ -589,19 +613,14 @@ def run_concurrent_stage(
         # The incumbent keeps serving throughout. A second process now asks to
         # reopen the very directory the incumbent holds open.
         challenger_port = free_port()
-        challenger_command = [
-            *common,
-            *objects,
-            "--bind",
-            f"127.0.0.1:{challenger_port}",
-            "--advertise-endpoint",
-            f"127.0.0.1:{challenger_port}",
-            "--node-id",
+        challenger_command = server_command(
+            common,
+            objects,
+            challenger_port,
             f"gate-{stage}-challenger",
             "--metadata-reopen",
             metadata,
-            "serve",
-        ]
+        )
         challenger = subprocess.Popen(
             [str(item) for item in challenger_command],
             cwd=repo,

@@ -134,6 +134,8 @@ def validate_gate_evidence(evidence: dict[str, object]) -> None:
         raise WorkflowFailure("wrong object profile mutated the owner control record")
     if namespace.get("metadata_mutation_blocked") is not True:
         raise WorkflowFailure("wrong object profile mutated workspace metadata")
+    if namespace.get("agent_identity_redacted") is not True:
+        raise WorkflowFailure("wrong object profile error leaked an AgentId")
     if namespace.get("wrong_profile_objects") != 1:
         raise WorkflowFailure("wrong object profile contains payload objects")
 
@@ -536,6 +538,8 @@ def server_command(
     metadata_option: str,
     metadata: Path,
 ) -> list[str]:
+    if "--agent-id" in common:
+        raise WorkflowFailure("shard serve command must not carry one AgentId")
     return [
         *common,
         *objects,
@@ -743,8 +747,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         raise NotQualified("built nokv binary is required")
 
     root_id = fixed_id(args.seed, "root")
+    agent_id = fixed_id(args.seed, "agent")
     shard_id = fixed_id(args.seed, "shard")
     other_root_id = fixed_id(args.seed, "wrong-root")
+    other_agent_id = fixed_id(args.seed, "wrong-agent")
     other_shard_id = fixed_id(args.seed, "wrong-shard")
     prefix = f"/nokv/object-namespace-gate/{fixed_id(args.seed, 'control')}"
     other_prefix = f"/nokv/object-namespace-gate/{fixed_id(args.seed, 'other-control')}"
@@ -849,9 +855,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         )
 
         common = control_args(binary, root_id, etcd_endpoint, prefix)
+        agent_common = [*common, "--agent-id", agent_id]
         objects = object_args(s3_endpoint, bucket, object_root, access_key, secret_key)
         provision = run(
-            [*common, *objects, "provision", shard_id],
+            [*agent_common, *objects, "provision", shard_id],
             cwd=repo,
             timeout=args.timeout,
             evidence=evidence,
@@ -877,7 +884,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             raise WorkflowFailure(f"first owner did not reach Serving(1): {first_control}")
 
         client = [
-            *common,
+            *agent_common,
             "--max-attempts",
             "3",
             "--workbench-root",
@@ -1022,11 +1029,12 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         )
 
         other_common = control_args(binary, other_root_id, etcd_endpoint, other_prefix)
+        other_agent_common = [*other_common, "--agent-id", other_agent_id]
         wrong_objects = object_args(
             s3_endpoint, bucket, wrong_object_root, access_key, secret_key
         )
         run(
-            [*other_common, *wrong_objects, "provision", other_shard_id],
+            [*other_agent_common, *wrong_objects, "provision", other_shard_id],
             cwd=repo,
             timeout=args.timeout,
             evidence=evidence,
@@ -1036,7 +1044,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             Path(args.etcdctl_bin), etcd_endpoint, owner_key, repo, args.timeout
         )
         wrong_client = [
-            *common,
+            *agent_common,
             "--max-attempts",
             "3",
             "--workbench-root",
@@ -1063,6 +1071,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         mismatch_rejected = (
             mismatch.returncode != 0
             and "object namespace does not match root placement" in mismatch.stderr
+        )
+        agent_identity_redacted = (
+            agent_id not in mismatch.stderr and other_agent_id not in mismatch.stderr
         )
         metadata_mutation_blocked = False
         if mismatch_rejected:
@@ -1205,6 +1216,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                 "mismatch_rejected": mismatch_rejected,
                 "control_record_unchanged": before_mismatch == after_mismatch,
                 "metadata_mutation_blocked": metadata_mutation_blocked,
+                "agent_identity_redacted": agent_identity_redacted,
                 "wrong_profile_objects": wrong_profile_objects,
             },
             "restart": {

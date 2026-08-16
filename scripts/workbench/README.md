@@ -81,12 +81,15 @@ python3 scripts/workbench/live_workbench.py \
 
 A live run consumes already-running etcd and S3-compatible services.
 Credentials may be supplied with `NOKV_LIVE_S3_ACCESS_KEY_ID` and
-`NOKV_LIVE_S3_SECRET_ACCESS_KEY`; evidence hashes and redacts secrets.
+`NOKV_LIVE_S3_SECRET_ACCESS_KEY`; evidence records only their presence and
+redacts secret values without retaining a digest verifier.
 
 ```bash
 python3 scripts/workbench/live_workbench.py \
   --build \
   --root-id 11111111111111111111111111111111 \
+  --agent-id 44444444444444444444444444444444 \
+  --agent-name research-agent \
   --logical-shard-id 22222222222222222222222222222222 \
   --etcd-endpoint http://127.0.0.1:2379 \
   --object-endpoint http://127.0.0.1:9000 \
@@ -104,7 +107,10 @@ an interrupted `Recovering` epoch. It does not qualify another directory, a
 copied/rolled-back namespace, cross-host failover, or a non-empty shared
 checkpoint/log frontier. The harness always calls `nokv provision`, starts
 `nokv serve` with exactly one of `--metadata-create` or `--metadata-reopen`,
-and starts `nokv ... --workbench-root /agents/{agent}/wb mcp`. The scientific
+and starts `nokv ... --agent-id {stable-id} --workbench-root
+/agents/{agent-name}/wb mcp`. `--agent-id` is the durable Root admission
+identity and must not be derived from the presentation name or path;
+`--agent-name` only selects the human-facing projection. The scientific
 step uses the explicit `materialize` and `collect` commands; its local sandbox
 is not a NoKV namespace. Keep the configured Workbench root stable across
 restarts because canonical v1 manifest presentation paths are replay-bound;

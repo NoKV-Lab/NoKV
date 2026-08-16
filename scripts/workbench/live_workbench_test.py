@@ -13,6 +13,7 @@ from pathlib import Path
 import live_workbench as harness
 
 
+REPO = Path(__file__).resolve().parents[2]
 REQUIRED_FIRST_OCCURRENCE_ORDER = [
     "workbench_create",
     "workbench_put_file",
@@ -46,12 +47,32 @@ def config(evidence_dir: Path) -> harness.Config:
 
 
 class LiveWorkbenchTest(unittest.TestCase):
+    def test_required_rust_job_runs_live_workbench_and_retains_evidence(self) -> None:
+        workflow = (REPO / ".github/workflows/rust.yml").read_text(encoding="utf-8")
+        for required in (
+            "id: live_workbench",
+            "python3 scripts/workbench/live_workbench.py",
+            "--nokv-bin target/debug/nokv",
+            "--agent-id 44444444444444444444444444444444",
+            "jq -e '.workbench_workflow.status == \"PASS\"'",
+            "jq -e '.acceptance_gates[\"0\"].status == \"NOT QUALIFIED\"'",
+            "live-workbench-${{ github.sha }}",
+            "if: ${{ always() && steps.live_workbench.outcome != 'skipped' }}",
+            "if-no-files-found: error",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, workflow)
+        live_start = workflow.index("id: live_workbench")
+        rustfs_cleanup = workflow.index("- name: Remove pinned RustFS")
+        self.assertLess(live_start, rustfs_cleanup)
+
     def test_default_workflow_evidence_is_runtime_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             current = config(Path(directory) / "evidence")
             encoded = harness.canonical_json(
                 {
-                    "agent": current.agent,
+                    "agent_name": current.agent_name,
+                    "agent_id": current.agent_id,
                     "node": current.node,
                     "object_root": current.object_root,
                     "plan": harness.plan(current, harness.tool_plan(current)),
@@ -62,6 +83,34 @@ class LiveWorkbenchTest(unittest.TestCase):
             ).lower()
 
         self.assertNotIn("lingtai", encoded)
+
+    def test_agent_identity_is_durable_and_distinct_from_presentation_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            current = harness.parse_args([
+                "--dry-run", "--evidence-dir", str(Path(directory) / "evidence"),
+                "--agent-name", "display-only", "--agent-id", "aa" * 16,
+            ])
+        self.assertEqual(current.agent_name, "display-only")
+        self.assertEqual(current.agent_id, "aa" * 16)
+        self.assertEqual(current.workbench_root, "/agents/display-only/wb")
+        for command in (
+            harness.provision_command(current),
+            harness.mcp_command(current),
+            harness.materialize_command(current, Path(directory) / "input.json"),
+            harness.collect_command(current, Path(directory) / "output.json"),
+        ):
+            self.assertEqual(command[command.index("--agent-id") + 1], "aa" * 16)
+        self.assertNotIn("--agent-id", harness.server_command(current))
+
+    def test_agent_identity_must_be_canonical_fixed_hex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            current = config(Path(directory) / "evidence")
+        for invalid in ("aa", "AA" * 16, "gg" * 16):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(harness.NotQualified, "AgentId"):
+                    harness.validate(
+                        harness.dataclasses.replace(current, agent_id=invalid), live=False
+                    )
 
     def test_plan_covers_exact_eighteen_tools_in_dependency_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -195,13 +244,26 @@ class LiveWorkbenchTest(unittest.TestCase):
         for forbidden in ("fuse", "posix", "fsspec", "inode", "dentry", "yanex"):
             self.assertNotIn(forbidden, encoded)
 
-    def test_secret_values_are_hashed_and_not_retained(self) -> None:
+    def test_secret_values_are_redacted_without_an_offline_verifier(self) -> None:
         secret = "do-not-record-this-secret"
         redacted = harness.redact_argv(
             ["nokv", "--object-secret-access-key", secret, "mcp"]
         )
         self.assertNotIn(secret, redacted)
-        self.assertTrue(redacted[2].startswith("<redacted:sha256:"))
+        self.assertEqual(redacted[2], "<redacted>")
+        self.assertNotIn(harness.digest(secret.encode()), harness.canonical_json(redacted))
+
+    def test_early_process_exit_cannot_be_qualified_as_live(self) -> None:
+        class Process:
+            def __init__(self, returncode: int | None) -> None:
+                self.returncode = returncode
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        harness.require_running("serve", Process(None))
+        with self.assertRaisesRegex(harness.WorkflowFailure, "mcp exited"):
+            harness.require_running("mcp", Process(1))
 
     def test_nested_internal_storage_identity_is_rejected(self) -> None:
         with self.assertRaises(harness.WorkflowFailure):

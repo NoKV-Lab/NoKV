@@ -74,7 +74,8 @@ class Config:
     metadata_mode: str
     root_id: str
     shard_id: str
-    agent: str
+    agent_name: str
+    agent_id: str
     workbench: str
     restored: str
     snapshot: str
@@ -95,7 +96,7 @@ class Config:
 
     @property
     def workbench_root(self) -> str:
-        return f"/agents/{self.agent}/wb"
+        return f"/agents/{self.agent_name}/wb"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -425,14 +426,16 @@ def object_args(config: Config) -> list[str]:
 
 
 def client_args(config: Config) -> list[str]:
-    return [str(config.binary), *control_args(config), "--workbench-root",
-            config.workbench_root, *object_args(config)]
+    return [str(config.binary), *control_args(config), "--agent-id", config.agent_id,
+            "--workbench-root", config.workbench_root, *object_args(config)]
 
 
 def provision_command(config: Config) -> list[str]:
     return [
         str(config.binary),
         *control_args(config),
+        "--agent-id",
+        config.agent_id,
         *object_args(config),
         "provision",
         config.shard_id,
@@ -466,7 +469,7 @@ def redact_argv(argv: Iterable[str]) -> list[str]:
     output, redact_next = [], False
     for argument in argv:
         if redact_next:
-            output.append(f"<redacted:sha256:{digest(argument.encode())[:12]}>")
+            output.append("<redacted>")
             redact_next = False
         else:
             output.append(argument)
@@ -813,7 +816,9 @@ def endpoint(endpoint_value: str) -> tuple[str, int]:
 def validate(config: Config, live: bool) -> None:
     if not HEX_ID.fullmatch(config.root_id) or not HEX_ID.fullmatch(config.shard_id):
         raise NotQualified("root and logical shard ids must be 32 lowercase hex characters")
-    for value in (config.agent, config.workbench, config.restored):
+    if not HEX_ID.fullmatch(config.agent_id):
+        raise NotQualified("AgentId must be 32 lowercase hex characters")
+    for value in (config.agent_name, config.workbench, config.restored):
         if not WORKBENCH_ID.fullmatch(value):
             raise NotQualified(f"invalid Workbench identifier: {value}")
     if config.workbench == config.restored:
@@ -852,6 +857,11 @@ def stop(process: subprocess.Popen[str]) -> int | None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=5)
     return process.returncode
+
+
+def require_running(label: str, process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        raise WorkflowFailure(f"{label} exited before live qualification ({process.returncode})")
 
 
 def start_mcp(config: Config, evidence: Evidence, server: subprocess.Popen[str]) \
@@ -945,23 +955,36 @@ def run_live(config: Config, evidence: Evidence, steps: list[ToolStep]) -> None:
                 results[continuation.label] = session.call(continuation)
             if step.label == "edit-input":
                 transfer(config, evidence)
-        evidence.json("phase1-contracts.json", assert_results(results, config))
+        phase_one_evidence = assert_results(results, config)
+        require_running("mcp", session.process)
+        require_running("serve", server)
+        evidence.json("phase1-contracts.json", phase_one_evidence)
     finally:
-        if session is not None:
-            if session.process.stdin is not None:
-                session.process.stdin.close()
-            evidence.line("processes.jsonl", {
-                "schema": SCHEMA, "label": "mcp-exit", "returncode": stop(session.process),
-                "finished_at": now(),
-            })
-        if mcp_err is not None:
-            mcp_err.close()
-        evidence.line("processes.jsonl", {
-            "schema": SCHEMA, "label": "serve-exit", "returncode": stop(server),
-            "finished_at": now(),
-        })
-        serve_out.close()
-        serve_err.close()
+        try:
+            if session is not None:
+                if session.process.stdin is not None:
+                    try:
+                        session.process.stdin.close()
+                    except OSError as error:
+                        evidence.line("processes.jsonl", {
+                            "schema": SCHEMA, "label": "mcp-stdin-close",
+                            "finished_at": now(), "error": str(error),
+                        })
+                evidence.line("processes.jsonl", {
+                    "schema": SCHEMA, "label": "mcp-exit",
+                    "returncode": stop(session.process), "finished_at": now(),
+                })
+        finally:
+            if mcp_err is not None:
+                mcp_err.close()
+            try:
+                evidence.line("processes.jsonl", {
+                    "schema": SCHEMA, "label": "serve-exit", "returncode": stop(server),
+                    "finished_at": now(),
+                })
+            finally:
+                serve_out.close()
+                serve_err.close()
 
 
 def shell_output(command: list[str], cwd: Path) -> str | None:
@@ -987,14 +1010,14 @@ def environment(config: Config) -> dict[str, Any]:
                    "sha256": digest_file(binary)},
         "config": {
             "root_id": config.root_id, "logical_shard_id": config.shard_id,
-            "agent": config.agent, "workbench_root": config.workbench_root,
+            "agent_name": config.agent_name, "agent_id": config.agent_id,
+            "workbench_root": config.workbench_root,
             "workbench": config.workbench, "restored_workbench": config.restored,
             "etcd": config.etcd, "metadata": str(config.metadata),
             "metadata_mode": config.metadata_mode, "bind": config.bind,
             "object_endpoint": config.object_endpoint, "object_bucket": config.bucket,
             "object_root": config.object_root, "access_key_present": config.access_key is not None,
-            "secret_key_sha256": digest(config.secret_key.encode())
-            if config.secret_key is not None else None,
+            "secret_key_present": config.secret_key is not None,
         },
     }
 
@@ -1057,7 +1080,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--root-id", default=os.getenv("NOKV_LIVE_ROOT_ID", "11" * 16))
     parser.add_argument("--logical-shard-id",
                         default=os.getenv("NOKV_LIVE_LOGICAL_SHARD_ID", "22" * 16))
-    parser.add_argument("--agent-id", default="research-agent")
+    parser.add_argument("--agent-name", default="research-agent")
+    parser.add_argument("--agent-id", default=os.getenv("NOKV_LIVE_AGENT_ID", "44" * 16))
     parser.add_argument("--workbench-id", default="ptychography-run")
     parser.add_argument("--restored-workbench-id", default="ptychography-run-restored")
     parser.add_argument("--snapshot-name", default="ptychography-frozen")
@@ -1084,7 +1108,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         args.object_endpoint = args.object_endpoint or "http://127.0.0.1:9000"
     evidence = args.evidence_dir or (
         repo / "target/workbench-live/evidence" /
-        f"gate0-{args.agent_id}-{args.workbench_id}-{args.root_id[:8]}"
+        f"gate0-{args.agent_name}-{args.workbench_id}-{args.root_id[:8]}"
     )
     metadata = args.metadata_dir or (
         repo / "target/workbench-live/metadata" /
@@ -1092,7 +1116,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     return Config(
         repo, args.nokv_bin.resolve(), evidence.resolve(), metadata.resolve(),
-        args.metadata_mode, args.root_id, args.logical_shard_id, args.agent_id,
+        args.metadata_mode, args.root_id, args.logical_shard_id, args.agent_name,
+        args.agent_id,
         args.workbench_id, args.restored_workbench_id, args.snapshot_name, tuple(etcd),
         args.etcd_key_prefix, args.server_bind, args.advertise_endpoint,
         args.node_id or f"workbench-{args.root_id[:8]}", args.object_bucket,

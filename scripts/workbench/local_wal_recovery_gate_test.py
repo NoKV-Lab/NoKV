@@ -17,9 +17,12 @@ from local_wal_recovery_gate import (
     CONCURRENT_STAGE,
     CRASH_STAGES,
     WorkflowFailure,
+    control_args,
+    fixed_id,
     main,
     object_args,
     run_concurrent_stage,
+    server_command,
     validate_concurrent_evidence,
     validate_stage_evidence,
 )
@@ -94,6 +97,43 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
             ("before-local-fence", "after-local-fence"),
         )
 
+    def test_every_root_has_a_distinct_canonical_agent_fixture(self) -> None:
+        seed = "agent-admission-contract"
+        agent_ids: set[str] = set()
+        for stage in (*CRASH_STAGES, CONCURRENT_STAGE):
+            agent_id = fixed_id(seed, f"{stage}:agent")
+            self.assertRegex(agent_id, r"^[0-9a-f]{32}$")
+            self.assertNotEqual(agent_id, fixed_id(seed, f"{stage}:root"))
+            agent_ids.add(agent_id)
+        self.assertEqual(len(agent_ids), len(CRASH_STAGES) + 1)
+
+    def test_shard_server_control_args_have_no_single_agent_identity(self) -> None:
+        arguments = control_args(
+            Path("/tmp/nokv"),
+            "11" * 16,
+            "http://127.0.0.1:2379",
+            "/nokv/local-wal-recovery/test",
+        )
+        self.assertNotIn("--agent-id", arguments)
+        command = server_command(
+            arguments,
+            ["--object-root", "gate/root"],
+            19000,
+            "gate-owner",
+            "--metadata-create",
+            Path("/tmp/metadata"),
+        )
+        self.assertNotIn("--agent-id", command)
+        with self.assertRaisesRegex(WorkflowFailure, "must not carry"):
+            server_command(
+                [*arguments, "--agent-id", "22" * 16],
+                ["--object-root", "gate/root"],
+                19000,
+                "gate-owner",
+                "--metadata-create",
+                Path("/tmp/metadata"),
+            )
+
     def test_a_live_owner_keeps_a_second_process_out(self) -> None:
         validate_concurrent_evidence(valid_concurrent_evidence())
 
@@ -149,6 +189,9 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
         self.assertNotIn("http://127.0.0.1:1", arguments)
 
     def test_concurrent_stage_threads_object_profile_into_provision(self) -> None:
+        seed = "object-profile-contract"
+        expected_agent_id = fixed_id(seed, f"{CONCURRENT_STAGE}:agent")
+        self.assertRegex(expected_agent_id, r"^[0-9a-f]{32}$")
         object_arguments = [
             "--object-bucket",
             "nokv-recovery",
@@ -175,7 +218,7 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
                     etcdctl=Path("/tmp/etcdctl"),
                     etcd_endpoint="http://127.0.0.1:2379",
                     evidence=Path(directory),
-                    seed="object-profile-contract",
+                    seed=seed,
                     object_endpoint="http://127.0.0.1:9000",
                     object_bucket="nokv-recovery",
                     object_root="release-gate",
@@ -189,6 +232,7 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
             "release-gate",
         )
         provision_command = run_mock.call_args.args[0]
+        self.assertNotEqual(provision_command[2], expected_agent_id)
         self.assertEqual(
             provision_command,
             [
@@ -201,6 +245,8 @@ class LocalWalRecoveryGateContractTests(unittest.TestCase):
                 provision_command[6],
                 "--etcd-lease-ttl-seconds",
                 "2",
+                "--agent-id",
+                expected_agent_id,
                 *object_arguments,
                 "provision",
                 provision_command[-1],
