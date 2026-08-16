@@ -1587,8 +1587,11 @@ fn snapshot_concurrent(error: &meta::SnapshotError) -> bool {
 }
 
 fn restore_concurrent(error: &meta::RestoreError) -> bool {
-    matches!(error, meta::RestoreError::ConcurrentMutation)
-        || matches!(error, meta::RestoreError::Meta(source) if concurrent_meta(source))
+    matches!(
+        error,
+        meta::RestoreError::ConcurrentMutation
+            | meta::RestoreError::PublicationCleanupPending { .. }
+    ) || matches!(error, meta::RestoreError::Meta(source) if concurrent_meta(source))
 }
 
 fn commit_concurrent(error: &meta::CommitError) -> bool {
@@ -1630,6 +1633,28 @@ mod tests {
         let error = meta::MetaError::ReadStabilityExhausted { attempts: 4 };
         assert!(concurrent_meta(&error));
         assert!(retryable_lifecycle(&LifecycleError::Meta(error)));
+    }
+
+    #[test]
+    fn restore_cleanup_waits_are_retryable_without_hiding_terminal_corruption() {
+        let operation_id = OperationId::from_bytes([0x71; FIXED_ID_BYTES]);
+        assert!(restore_concurrent(
+            &meta::RestoreError::PublicationCleanupPending {
+                operation_id,
+                phase: PublishPhase::Uploading,
+            }
+        ));
+
+        assert!(!restore_concurrent(&meta::RestoreError::InvalidPhase {
+            expected: "Cleaning",
+            actual: RestorePhase::Quarantined,
+        }));
+        assert!(!restore_concurrent(
+            &meta::RestoreError::OperationIdentityMismatch {
+                expected: operation_id,
+                actual: OperationId::from_bytes([0x72; FIXED_ID_BYTES]),
+            }
+        ));
     }
 
     struct FakeArtifactStore {
