@@ -34,7 +34,8 @@ pub use snapshot_workflow::{
 pub use transport::{FramedTcpOptions, FramedTcpTransport, RpcTransport};
 pub use workbench_workflow::{
     CommitRecoveryRequest, CommitWorkflowError, CommitWorkflowIdentities, CommitWorkflowOptions,
-    CommitWorkflowOutcome, CommitWorkflowRequest, RestoreManifestIdentities,
-    RestoreRecoveryRequest, RestoreWorkflowError, RestoreWorkflowIdentities,
-    RestoreWorkflowOptions, RestoreWorkflowOutcome, RestoreWorkflowRequest,
+    CommitWorkflowOutcome, CommitWorkflowRequest, RestoreDestinationPlan,
+    RestoreManifestIdentities, RestoreManifestPublication, RestoreRecoveryRequest,
+    RestoreWorkflowError, RestoreWorkflowIdentities, RestoreWorkflowOptions,
+    RestoreWorkflowOutcome, RestoreWorkflowRequest,
 };

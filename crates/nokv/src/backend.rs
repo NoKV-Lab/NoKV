@@ -16,6 +16,7 @@ use nokv_agent as agent;
 use nokv_client::{
     ArtifactAppendOptions, ArtifactPublishOptions, ClientError, CommitRecoveryRequest,
     CommitWorkflowError, CommitWorkflowIdentities, CommitWorkflowOptions, CommitWorkflowRequest,
+    RestoreDestinationPlan, RestoreManifestIdentities, RestoreManifestPublication,
     RestoreRecoveryRequest, RestoreWorkflowError, RestoreWorkflowIdentities,
     RestoreWorkflowOptions, RestoreWorkflowRequest, SnapshotMintOptions, SnapshotRenewOptions,
     SnapshotRetireOptions,
@@ -1278,131 +1279,152 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
     ) -> Result<agent::RestoreOutcome, agent::BackendError> {
         let destination_workbench = workbench_name(&request.destination_workbench_id)?;
         let destination = self.optional_workspace(&request.destination_workbench_id)?;
-        let manifest_path =
-            scoped_full_path(&request.destination_workbench_id, RESTORE_MANIFEST_PATH)?;
-        let manifest_target = workspace_path(&manifest_path)?;
-        let (identities, manifest_identities, workflow_request, canonical_manifest, snapshot_id) =
-            match destination {
-                Some(destination) => {
-                    let projection = self
-                        .read_restore_manifest(&destination, &request.destination_workbench_id)?;
-                    let verified = &projection.verified;
-                    if verified.source_workbench_id != request.source_workbench_id
-                        || verified.source_path != request.source_workbench_path
-                        || verified.destination_workbench_id != request.destination_workbench_id
-                        || verified.destination_path != request.destination_workbench_path
-                        || matches!(
-                            request.selector,
-                            agent::SnapshotSelector::Id(snapshot_id)
-                                if snapshot_id != verified.snapshot_id
-                        )
-                    {
-                        return Err(agent::BackendError::conflict(
-                            "existing destination restore manifest belongs to different provenance",
-                        ));
-                    }
-                    let identities = RestoreWorkflowIdentities {
-                        operation_id: wire::OperationIdentity(verified.operation_id),
-                        destination_workspace_incarnation_id: destination.workspace_incarnation_id,
-                    };
-                    let manifest_identities = identities
-                        .manifest_identities(self.client.root_id(), &verified.envelope_digest_uri);
-                    if projection.metadata.artifact_revision_id != manifest_identities.revision_id {
-                        return Err(protocol_mismatch(
-                            "restore manifest revision does not match its deterministic operation",
-                        ));
-                    }
-                    let recovery = RestoreRecoveryRequest {
-                        source_workbench: workbench_name(&verified.source_workbench_id)?,
-                        source: wire::RestoreSource::Snapshot(wire::SnapshotSelector::Id(
-                            verified.snapshot_id,
-                        )),
-                        destination_workbench: destination.workbench.clone(),
-                        destination_workspace_incarnation_id: destination.workspace_incarnation_id,
-                        restore_manifest: wire::RestoreManifestDescriptor {
-                            body_digest: projection.metadata.descriptor.body_digest.clone(),
-                            logical_size: projection.metadata.descriptor.logical_size,
-                            content_type: projection.metadata.descriptor.content_type.clone(),
-                        },
-                    };
-                    (
-                        identities,
-                        manifest_identities,
-                        RestoreWorkflowRequest::Recover(recovery),
-                        projection.verified.canonical_envelope.clone(),
+        let (
+            identities,
+            destination_restore_manifest_identity,
+            workflow_request,
+            canonical_restore_manifest,
+            snapshot_id,
+        ) = match destination {
+            Some(destination) => {
+                let projection =
+                    self.read_restore_manifest(&destination, &request.destination_workbench_id)?;
+                let verified = &projection.verified;
+                if verified.source_workbench_id != request.source_workbench_id
+                    || verified.source_path != request.source_workbench_path
+                    || verified.destination_workbench_id != request.destination_workbench_id
+                    || verified.destination_path != request.destination_workbench_path
+                    || matches!(
+                        request.selector,
+                        agent::SnapshotSelector::Id(snapshot_id)
+                            if snapshot_id != verified.snapshot_id
+                    )
+                {
+                    return Err(agent::BackendError::conflict(
+                        "existing destination restore manifest belongs to different provenance",
+                    ));
+                }
+                let identities = RestoreWorkflowIdentities {
+                    operation_id: wire::OperationIdentity(verified.operation_id),
+                    destination_workspace_incarnation_id: destination.workspace_incarnation_id,
+                };
+                let manifest_identities = identities
+                    .manifest_identities(self.client.root_id(), &verified.envelope_digest_uri);
+                let destination_restore_manifest_identity =
+                    restore_manifest_identity(manifest_identities);
+                if projection.metadata.artifact_revision_id != manifest_identities.revision_id {
+                    return Err(protocol_mismatch(
+                        "restore manifest revision does not match its deterministic operation",
+                    ));
+                }
+                let recovery = RestoreRecoveryRequest {
+                    source_workbench: workbench_name(&verified.source_workbench_id)?,
+                    source: wire::RestoreSource::Snapshot(wire::SnapshotSelector::Id(
                         verified.snapshot_id,
-                    )
-                }
-                None => {
-                    let source_workspace = self.workspace(&request.source_workbench_id)?;
-                    let snapshot =
-                        self.snapshot(&request.source_workbench_id, &request.selector)?;
-                    if snapshot.state != agent::SnapshotLifecycleState::Alive {
-                        return Err(snapshot_expired(
-                            &request.source_workbench_id,
-                            snapshot.snapshot_id,
-                        ));
-                    }
-                    let identities = RestoreWorkflowIdentities::derive_snapshot(
-                        self.client.root_id(),
-                        &source_workspace.workbench,
-                        source_workspace.workspace_incarnation_id,
-                        snapshot.snapshot_id,
-                        &destination_workbench,
-                    );
-                    let canonical_manifest = agent::build_restore_manifest_v1(
-                        identities.operation_id.0,
-                        &request.source_workbench_id,
-                        &request.source_workbench_path,
-                        &request.destination_workbench_id,
-                        &request.destination_workbench_path,
-                        snapshot.snapshot_id,
-                    )
-                    .map_err(|error| {
-                        invalid_state("facade supplied invalid restore provenance", error)
+                    )),
+                    destination_workbench: destination.workbench.clone(),
+                    destination_workspace_incarnation_id: destination.workspace_incarnation_id,
+                    destination_restore_manifest_identity,
+                    restore_manifest: wire::RestoreManifestDescriptor {
+                        body_digest: projection.metadata.descriptor.body_digest.clone(),
+                        logical_size: projection.metadata.descriptor.logical_size,
+                        content_type: projection.metadata.descriptor.content_type.clone(),
+                    },
+                };
+                (
+                    identities,
+                    destination_restore_manifest_identity,
+                    RestoreWorkflowRequest::Recover(recovery),
+                    projection.verified.canonical_envelope.clone(),
+                    verified.snapshot_id,
+                )
+            }
+            None => {
+                let source_workspace = self.workspace(&request.source_workbench_id)?;
+                let snapshot = self.snapshot(&request.source_workbench_id, &request.selector)?;
+                let identities = RestoreWorkflowIdentities::derive_snapshot(
+                    self.client.root_id(),
+                    &source_workspace.workbench,
+                    source_workspace.workspace_incarnation_id,
+                    snapshot.snapshot_id,
+                    &destination_workbench,
+                );
+                let canonical_manifest = agent::build_restore_manifest_v1(
+                    identities.operation_id.0,
+                    &request.source_workbench_id,
+                    &request.source_workbench_path,
+                    &request.destination_workbench_id,
+                    &request.destination_workbench_path,
+                    snapshot.snapshot_id,
+                )
+                .map_err(|error| {
+                    invalid_state("facade supplied invalid restore provenance", error)
+                })?;
+                let verified =
+                    agent::verify_restore_manifest_v1(&canonical_manifest).map_err(|error| {
+                        invalid_state("canonical restore manifest is invalid", error)
                     })?;
-                    let verified = agent::verify_restore_manifest_v1(&canonical_manifest).map_err(
-                        |error| invalid_state("canonical restore manifest is invalid", error),
-                    )?;
-                    self.ensure_artifact_size(&canonical_manifest)?;
-                    let manifest_identities = identities
-                        .manifest_identities(self.client.root_id(), &verified.envelope_digest_uri);
-                    let prepare = wire::PrepareRestoreRequest {
-                        source_workbench: source_workspace.workbench,
-                        source_workspace_incarnation_id: source_workspace.workspace_incarnation_id,
-                        source: wire::RestoreSource::Snapshot(wire::SnapshotSelector::Id(
-                            snapshot.snapshot_id,
-                        )),
-                        destination_workbench: destination_workbench.clone(),
-                        destination_workspace_incarnation_id: identities
-                            .destination_workspace_incarnation_id,
-                        restore_manifest: wire::RestoreManifestDescriptor {
-                            body_digest: wire::DigestUri::new(verified.envelope_digest_uri.clone())
-                                .map_err(protocol_input)?,
-                            logical_size: canonical_manifest.len() as u64,
-                            content_type: wire::ContentType::new(JSON_CONTENT_TYPE.to_owned())
-                                .map_err(protocol_input)?,
-                        },
-                    };
-                    (
-                        identities,
-                        manifest_identities,
-                        RestoreWorkflowRequest::Fresh(prepare),
-                        canonical_manifest,
+                self.ensure_artifact_size(&canonical_manifest)?;
+                let manifest_identities = identities
+                    .manifest_identities(self.client.root_id(), &verified.envelope_digest_uri);
+                let destination_restore_manifest_identity =
+                    restore_manifest_identity(manifest_identities);
+                let prepare = wire::PrepareRestoreRequest {
+                    operation_id: identities.operation_id,
+                    source_workbench: source_workspace.workbench,
+                    source_workspace_incarnation_id: source_workspace.workspace_incarnation_id,
+                    source: wire::RestoreSource::Snapshot(wire::SnapshotSelector::Id(
                         snapshot.snapshot_id,
-                    )
-                }
-            };
+                    )),
+                    destination_workbench: destination_workbench.clone(),
+                    destination_workspace_incarnation_id: identities
+                        .destination_workspace_incarnation_id,
+                    destination_restore_manifest_identity,
+                    restore_manifest: wire::RestoreManifestDescriptor {
+                        body_digest: wire::DigestUri::new(verified.envelope_digest_uri.clone())
+                            .map_err(protocol_input)?,
+                        logical_size: canonical_manifest.len() as u64,
+                        content_type: wire::ContentType::new(JSON_CONTENT_TYPE.to_owned())
+                            .map_err(protocol_input)?,
+                    },
+                };
+                (
+                    identities,
+                    destination_restore_manifest_identity,
+                    RestoreWorkflowRequest::Fresh(prepare),
+                    canonical_manifest,
+                    snapshot.snapshot_id,
+                )
+            }
+        };
+        let root_id = self.client.root_id();
+        let source_workbench_id = request.source_workbench_id.clone();
+        let source_workbench_path = request.source_workbench_path.clone();
+        let destination_workbench_id = request.destination_workbench_id.clone();
+        let destination_workbench_path = request.destination_workbench_path.clone();
+        let max_artifact_bytes = self.max_artifact_bytes;
         let workflow = self
             .client
             .restore_workflow(
                 self.objects.as_ref(),
                 RestoreWorkflowOptions {
                     identities,
-                    manifest_identities,
                     request: workflow_request,
-                    manifest_target,
-                    manifest_bytes: canonical_manifest,
+                },
+                move |preparation, source_run_manifest| {
+                    build_restore_destination_plan(
+                        root_id,
+                        preparation,
+                        source_run_manifest,
+                        &source_workbench_id,
+                        &source_workbench_path,
+                        &destination_workbench_id,
+                        &destination_workbench_path,
+                        snapshot_id,
+                        destination_restore_manifest_identity,
+                        &canonical_restore_manifest,
+                        max_artifact_bytes,
+                    )
                 },
             )
             .map_err(map_restore_workflow_error)?;
@@ -1516,6 +1538,165 @@ struct RunManifestProjection {
 struct RestoreManifestProjection {
     metadata: wire::PathMetadata,
     verified: agent::VerifiedRestoreManifestV1,
+}
+
+fn restore_manifest_identity(
+    identities: RestoreManifestIdentities,
+) -> wire::RestoreManifestIdentity {
+    wire::RestoreManifestIdentity {
+        publication_operation_id: identities.publish_operation_id,
+        artifact_revision_id: identities.revision_id,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_restore_destination_plan(
+    root_id: wire::RootIdentity,
+    preparation: &wire::RestorePreparation,
+    source_run_manifest: &[u8],
+    source_workbench_id: &WorkbenchId,
+    source_workbench_path: &str,
+    destination_workbench_id: &WorkbenchId,
+    destination_workbench_path: &str,
+    snapshot_id: u64,
+    destination_restore_manifest_identity: wire::RestoreManifestIdentity,
+    canonical_restore_manifest: &[u8],
+    max_artifact_bytes: usize,
+) -> Result<RestoreDestinationPlan, ClientError> {
+    let source = agent::verify_run_manifest_v1(source_run_manifest).map_err(|error| {
+        ClientError::ResponseMismatch(format!(
+            "restore-held source run manifest violates the canonical v1 projection: {error}"
+        ))
+    })?;
+    if source.workbench_id != *source_workbench_id
+        || source.workbench_path != source_workbench_path
+        || source.content_digest_uri != preparation.source_commit.content_digest.as_str()
+        || source.manifest_digest_uri != preparation.source_commit.manifest_digest.as_str()
+        || source.commit_identity != preparation.source_commit.commit_id.0
+    {
+        return Err(ClientError::ResponseMismatch(
+            "restore-held source run manifest differs from its durable commit binding".to_owned(),
+        ));
+    }
+
+    let restore =
+        agent::verify_restore_manifest_v1(canonical_restore_manifest).map_err(|error| {
+            ClientError::ResponseMismatch(format!(
+                "destination restore manifest violates the canonical v1 projection: {error}"
+            ))
+        })?;
+    if restore.operation_id != preparation.operation_id.0
+        || restore.source_workbench_id != *source_workbench_id
+        || restore.source_path != source_workbench_path
+        || restore.destination_workbench_id != *destination_workbench_id
+        || restore.destination_path != destination_workbench_path
+        || restore.snapshot_id != snapshot_id
+        || preparation.destination_workbench.as_str() != destination_workbench_id.as_str()
+    {
+        return Err(ClientError::ResponseMismatch(
+            "destination restore manifest differs from the durable restore provenance".to_owned(),
+        ));
+    }
+    let expected_restore_manifest_identity = restore_manifest_identity(
+        RestoreWorkflowIdentities {
+            operation_id: preparation.operation_id,
+            destination_workspace_incarnation_id: preparation.destination_workspace_incarnation_id,
+        }
+        .manifest_identities(root_id, &restore.envelope_digest_uri),
+    );
+    if destination_restore_manifest_identity != expected_restore_manifest_identity {
+        return Err(ClientError::ResponseMismatch(
+            "destination restore manifest identity differs from its operation and canonical envelope"
+                .to_owned(),
+        ));
+    }
+
+    let effective_content_digest = agent::restore_effective_content_digest_uri_v1(
+        preparation.source_commit.content_digest.as_str(),
+        preparation.source_matches_base_commit,
+        preparation.materialized_member_digest.0,
+    )
+    .map_err(|error| {
+        ClientError::ResponseMismatch(format!(
+            "durable restore content commitment is invalid: {error}"
+        ))
+    })?;
+    let destination_commit_identity = agent::workbench_commit_identity(
+        destination_workbench_id,
+        &effective_content_digest,
+        &source.manifest_digest_uri,
+    );
+    let destination_commit_id = wire::CommitIdentity(destination_commit_identity);
+    let destination_run_manifest_identities =
+        CommitWorkflowIdentities::derive(root_id, destination_commit_id);
+    let destination_run_manifest_identity = wire::RestoreManifestIdentity {
+        publication_operation_id: destination_run_manifest_identities.manifest_publish_operation_id,
+        artifact_revision_id: destination_run_manifest_identities.tree_manifest_revision_id,
+    };
+    let destination_run_manifest = agent::build_restored_run_manifest_v1(
+        source_run_manifest,
+        destination_workbench_id,
+        destination_workbench_path,
+        &effective_content_digest,
+        destination_commit_identity,
+        preparation.destination_committed_at_unix_seconds,
+    )
+    .map_err(|error| {
+        ClientError::ResponseMismatch(format!(
+            "destination run manifest projection could not be rebuilt: {error}"
+        ))
+    })?;
+    if destination_run_manifest.len() > max_artifact_bytes
+        || canonical_restore_manifest.len() > max_artifact_bytes
+    {
+        return Err(ClientError::InvalidOptions(format!(
+            "restore-owned manifest exceeds the {max_artifact_bytes}-byte artifact limit"
+        )));
+    }
+    let destination_run_manifest_projection_input_digest =
+        wire::Digest(agent::run_manifest_projection_input_digest_v1(
+            destination_workbench_id,
+            destination_workbench_path,
+            &effective_content_digest,
+            &source.canonical_manifest,
+            &source.manifest_digest_uri,
+            destination_commit_identity,
+        ));
+    let content_type =
+        wire::ContentType::new(JSON_CONTENT_TYPE.to_owned()).map_err(ClientError::from)?;
+    let run_manifest_target = wire::WorkspacePath {
+        workbench: preparation.destination_workbench.clone(),
+        path: wire::RelativePath::new(RUN_MANIFEST_PATH.to_owned()).map_err(ClientError::from)?,
+    };
+    let restore_manifest_target = wire::WorkspacePath {
+        workbench: preparation.destination_workbench.clone(),
+        path: wire::RelativePath::new(RESTORE_MANIFEST_PATH.to_owned())
+            .map_err(ClientError::from)?,
+    };
+
+    Ok(RestoreDestinationPlan {
+        binding: wire::BindRestoreDestinationRequest {
+            operation_id: preparation.operation_id,
+            destination_commit_id,
+            effective_content_digest: wire::DigestUri::new(effective_content_digest)
+                .map_err(ClientError::from)?,
+            destination_run_manifest_projection_input_digest,
+            destination_run_manifest_identity,
+            destination_restore_manifest_identity,
+        },
+        run_manifest: RestoreManifestPublication {
+            identity: destination_run_manifest_identity,
+            target: run_manifest_target,
+            content_type: content_type.clone(),
+            bytes: destination_run_manifest,
+        },
+        restore_manifest: RestoreManifestPublication {
+            identity: destination_restore_manifest_identity,
+            target: restore_manifest_target,
+            content_type,
+            bytes: canonical_restore_manifest.to_vec(),
+        },
+    })
 }
 
 fn canonical_commit_envelope(
@@ -2520,18 +2701,6 @@ fn resource_exhausted(message: impl Into<String>) -> agent::BackendError {
     )
 }
 
-fn snapshot_expired(workbench_id: &WorkbenchId, snapshot_id: u64) -> agent::BackendError {
-    agent::BackendError::new(
-        agent::BackendErrorKind::SnapshotExpired,
-        "snapshot is not alive",
-        false,
-        json!({
-            "workbench_id": workbench_id.as_str(),
-            "snapshot_id": snapshot_id,
-        }),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -2807,6 +2976,474 @@ mod tests {
             encode_lowercase_hex(&Sha256::digest(bytes))
         ))
         .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct RestorePlanFixture {
+        root_id: wire::RootIdentity,
+        source_workbench_id: WorkbenchId,
+        source_workbench_path: String,
+        destination_workbench_id: WorkbenchId,
+        destination_workbench_path: String,
+        snapshot_id: u64,
+        preparation: wire::RestorePreparation,
+        source_run_manifest: Vec<u8>,
+        restore_manifest_identity: wire::RestoreManifestIdentity,
+        restore_manifest: Vec<u8>,
+    }
+
+    impl RestorePlanFixture {
+        fn build(&self) -> Result<RestoreDestinationPlan, ClientError> {
+            build_restore_destination_plan(
+                self.root_id,
+                &self.preparation,
+                &self.source_run_manifest,
+                &self.source_workbench_id,
+                &self.source_workbench_path,
+                &self.destination_workbench_id,
+                &self.destination_workbench_path,
+                self.snapshot_id,
+                self.restore_manifest_identity,
+                &self.restore_manifest,
+                16 * 1024,
+            )
+        }
+    }
+
+    fn restore_plan_fixture(
+        source_matches_base_commit: bool,
+        materialized_member_digest: wire::Digest,
+    ) -> RestorePlanFixture {
+        let root_id = test_route().root_id;
+        let source_workbench_id = WorkbenchId::new("source-run").unwrap();
+        let source_workbench_path = "/agents/test/wb/source-run".to_owned();
+        let destination_workbench_id = WorkbenchId::new("destination-run").unwrap();
+        let destination_workbench_path = "/agents/test/wb/destination-run".to_owned();
+        let source_manifest = agent::canonical_json_bytes(&json!({
+            "model": "viking",
+            "steps": [1, 2],
+        }))
+        .unwrap();
+        let source_manifest_digest = digest_uri(&source_manifest);
+        let source_content_digest =
+            wire::DigestUri::new(format!("sha256:{}", "ab".repeat(32))).unwrap();
+        let source_commit_identity = agent::workbench_commit_identity(
+            &source_workbench_id,
+            source_content_digest.as_str(),
+            source_manifest_digest.as_str(),
+        );
+        let source_run_manifest = agent::build_run_manifest_v1(
+            &source_workbench_id,
+            &source_workbench_path,
+            source_content_digest.as_str(),
+            &source_manifest,
+            source_manifest_digest.as_str(),
+            source_commit_identity,
+            1_700_000_000,
+        )
+        .unwrap();
+        let source_commit_id = wire::CommitIdentity(source_commit_identity);
+        let source_workbench = wire::WorkbenchName::new(source_workbench_id.as_str()).unwrap();
+        let destination_workbench =
+            wire::WorkbenchName::new(destination_workbench_id.as_str()).unwrap();
+        let source_incarnation = wire::WorkspaceIdentity([0x21; 16]);
+        let snapshot_id = 7;
+        let restore_identities = RestoreWorkflowIdentities::derive_snapshot(
+            root_id,
+            &source_workbench,
+            source_incarnation,
+            snapshot_id,
+            &destination_workbench,
+        );
+        let restore_manifest = agent::build_restore_manifest_v1(
+            restore_identities.operation_id.0,
+            &source_workbench_id,
+            &source_workbench_path,
+            &destination_workbench_id,
+            &destination_workbench_path,
+            snapshot_id,
+        )
+        .unwrap();
+        let restore_digest = digest_uri(&restore_manifest);
+        let restore_manifest_identity = restore_manifest_identity(
+            restore_identities.manifest_identities(root_id, restore_digest.as_str()),
+        );
+        let base_member_count = 3;
+        let base_member_digest = wire::Digest([0x31; 32]);
+        let (source_member_count, source_member_digest) = if source_matches_base_commit {
+            (base_member_count, base_member_digest)
+        } else {
+            (base_member_count + 1, wire::Digest([0x32; 32]))
+        };
+        let preparation = wire::RestorePreparation {
+            operation_id: restore_identities.operation_id,
+            destination_workbench,
+            destination_workspace_incarnation_id: restore_identities
+                .destination_workspace_incarnation_id,
+            source_commit: wire::RestoreSourceCommitBinding {
+                commit_id: source_commit_id,
+                content_digest: source_content_digest,
+                manifest_digest: source_manifest_digest,
+                tree_manifest_revision_id: CommitWorkflowIdentities::derive(
+                    root_id,
+                    source_commit_id,
+                )
+                .tree_manifest_revision_id,
+                member_count: base_member_count,
+                member_digest: base_member_digest,
+            },
+            destination_committed_at_unix_seconds: 1_800_000_000,
+            source_member_count,
+            source_member_digest,
+            materialized_member_count: source_member_count - 1,
+            materialized_member_digest,
+            source_matches_base_commit,
+            destination_binding: None,
+        };
+        RestorePlanFixture {
+            root_id,
+            source_workbench_id,
+            source_workbench_path,
+            destination_workbench_id,
+            destination_workbench_path,
+            snapshot_id,
+            preparation,
+            source_run_manifest,
+            restore_manifest_identity,
+            restore_manifest,
+        }
+    }
+
+    #[test]
+    fn clean_restore_plan_preserves_content_and_uses_standard_commit_identities() {
+        let fixture = restore_plan_fixture(true, wire::Digest([0x41; 32]));
+        let plan = fixture.build().unwrap();
+        let source = agent::verify_run_manifest_v1(&fixture.source_run_manifest).unwrap();
+        let expected_commit = agent::workbench_commit_identity(
+            &fixture.destination_workbench_id,
+            &source.content_digest_uri,
+            &source.manifest_digest_uri,
+        );
+        let expected_identities = CommitWorkflowIdentities::derive(
+            fixture.root_id,
+            wire::CommitIdentity(expected_commit),
+        );
+
+        assert_eq!(
+            plan.binding.effective_content_digest.as_str(),
+            source.content_digest_uri
+        );
+        assert_eq!(plan.binding.destination_commit_id.0, expected_commit);
+        assert_eq!(
+            plan.run_manifest.identity.publication_operation_id,
+            expected_identities.manifest_publish_operation_id
+        );
+        assert_eq!(
+            plan.run_manifest.identity.artifact_revision_id,
+            expected_identities.tree_manifest_revision_id
+        );
+        assert_ne!(plan.run_manifest.identity, plan.restore_manifest.identity);
+        let restored = agent::verify_run_manifest_v1(&plan.run_manifest.bytes).unwrap();
+        assert_eq!(restored.workbench_id, fixture.destination_workbench_id);
+        assert_eq!(restored.workbench_path, fixture.destination_workbench_path);
+        assert_eq!(restored.commit_identity, expected_commit);
+        assert_eq!(
+            restored.committed_at_unix_seconds,
+            fixture.preparation.destination_committed_at_unix_seconds
+        );
+        assert_eq!(
+            plan.binding
+                .destination_run_manifest_projection_input_digest,
+            wire::Digest(agent::run_manifest_projection_input_digest_v1(
+                &fixture.destination_workbench_id,
+                &fixture.destination_workbench_path,
+                &source.content_digest_uri,
+                &source.canonical_manifest,
+                &source.manifest_digest_uri,
+                expected_commit,
+            ))
+        );
+    }
+
+    #[test]
+    fn dirty_restore_plan_binds_the_materialized_seal_and_replays_deterministically() {
+        let fixture = restore_plan_fixture(false, wire::Digest([0x51; 32]));
+        let first = fixture.build().unwrap();
+        let replay = fixture.build().unwrap();
+        let clean = restore_plan_fixture(true, wire::Digest([0x51; 32]))
+            .build()
+            .unwrap();
+        let changed = restore_plan_fixture(false, wire::Digest([0x52; 32]))
+            .build()
+            .unwrap();
+
+        assert_eq!(first, replay);
+        assert_ne!(
+            first.binding.effective_content_digest,
+            fixture.preparation.source_commit.content_digest
+        );
+        assert_ne!(
+            first.binding.destination_commit_id,
+            clean.binding.destination_commit_id
+        );
+        assert_ne!(
+            first.binding.destination_commit_id,
+            changed.binding.destination_commit_id
+        );
+        assert_ne!(first.run_manifest.bytes, changed.run_manifest.bytes);
+    }
+
+    #[test]
+    fn restore_plan_rejects_source_projection_or_commit_binding_mismatch() {
+        let fixture = restore_plan_fixture(true, wire::Digest([0x41; 32]));
+        let mut wrong_commit = fixture.clone();
+        wrong_commit.preparation.source_commit.commit_id = wire::CommitIdentity([0xee; 32]);
+        let mut wrong_content = fixture.clone();
+        wrong_content.preparation.source_commit.content_digest =
+            wire::DigestUri::new(format!("sha256:{}", "ee".repeat(32))).unwrap();
+        let mut wrong_manifest = fixture.clone();
+        wrong_manifest.preparation.source_commit.manifest_digest =
+            wire::DigestUri::new(format!("sha256:{}", "dd".repeat(32))).unwrap();
+        let mut wrong_source_path = fixture.clone();
+        let source = agent::verify_run_manifest_v1(&fixture.source_run_manifest).unwrap();
+        wrong_source_path.source_run_manifest = agent::build_run_manifest_v1(
+            &fixture.source_workbench_id,
+            "/agents/test/wb/wrong-source",
+            &source.content_digest_uri,
+            &source.canonical_manifest,
+            &source.manifest_digest_uri,
+            source.commit_identity,
+            source.committed_at_unix_seconds,
+        )
+        .unwrap();
+
+        for error in [
+            wrong_commit.build().unwrap_err(),
+            wrong_content.build().unwrap_err(),
+            wrong_manifest.build().unwrap_err(),
+            wrong_source_path.build().unwrap_err(),
+        ] {
+            assert!(matches!(error, ClientError::ResponseMismatch(_)));
+        }
+    }
+
+    #[test]
+    fn restore_plan_rejects_manifest_provenance_drift_before_binding() {
+        let fixture = restore_plan_fixture(true, wire::Digest([0x41; 32]));
+        let cases = [
+            agent::build_restore_manifest_v1(
+                fixture.preparation.operation_id.0,
+                &fixture.source_workbench_id,
+                &fixture.source_workbench_path,
+                &fixture.destination_workbench_id,
+                "/agents/test/wb/wrong-path",
+                fixture.snapshot_id,
+            )
+            .unwrap(),
+            agent::build_restore_manifest_v1(
+                fixture.preparation.operation_id.0,
+                &fixture.source_workbench_id,
+                &fixture.source_workbench_path,
+                &WorkbenchId::new("wrong-destination").unwrap(),
+                &fixture.destination_workbench_path,
+                fixture.snapshot_id,
+            )
+            .unwrap(),
+            agent::build_restore_manifest_v1(
+                fixture.preparation.operation_id.0,
+                &fixture.source_workbench_id,
+                &fixture.source_workbench_path,
+                &fixture.destination_workbench_id,
+                &fixture.destination_workbench_path,
+                fixture.snapshot_id + 1,
+            )
+            .unwrap(),
+            agent::build_restore_manifest_v1(
+                [0xee; 16],
+                &fixture.source_workbench_id,
+                &fixture.source_workbench_path,
+                &fixture.destination_workbench_id,
+                &fixture.destination_workbench_path,
+                fixture.snapshot_id,
+            )
+            .unwrap(),
+        ];
+
+        for manifest in cases {
+            let mut drifted = fixture.clone();
+            drifted.restore_manifest = manifest;
+            assert!(matches!(
+                drifted.build().unwrap_err(),
+                ClientError::ResponseMismatch(_)
+            ));
+        }
+
+        let mut wrong_identity = fixture;
+        wrong_identity
+            .restore_manifest_identity
+            .artifact_revision_id = wire::ArtifactRevisionIdentity([0xee; 16]);
+        assert!(matches!(
+            wrong_identity.build().unwrap_err(),
+            ClientError::ResponseMismatch(_)
+        ));
+    }
+
+    #[test]
+    fn restored_timestamp_changes_only_the_destination_projection_envelope() {
+        let fixture = restore_plan_fixture(true, wire::Digest([0x41; 32]));
+        let first = fixture.build().unwrap();
+        let mut later = fixture.clone();
+        later.preparation.destination_committed_at_unix_seconds += 1;
+        let later = later.build().unwrap();
+
+        assert_eq!(first.binding, later.binding);
+        assert_ne!(first.run_manifest.bytes, later.run_manifest.bytes);
+        assert_eq!(
+            agent::verify_run_manifest_v1(&later.run_manifest.bytes)
+                .unwrap()
+                .committed_at_unix_seconds,
+            fixture.preparation.destination_committed_at_unix_seconds + 1
+        );
+    }
+
+    fn prepare_restore_request(fixture: &RestorePlanFixture) -> wire::PrepareRestoreRequest {
+        wire::PrepareRestoreRequest {
+            operation_id: fixture.preparation.operation_id,
+            source_workbench: wire::WorkbenchName::new(fixture.source_workbench_id.as_str())
+                .unwrap(),
+            source_workspace_incarnation_id: wire::WorkspaceIdentity([0x21; 16]),
+            source: wire::RestoreSource::Snapshot(wire::SnapshotSelector::Id(fixture.snapshot_id)),
+            destination_workbench: fixture.preparation.destination_workbench.clone(),
+            destination_workspace_incarnation_id: fixture
+                .preparation
+                .destination_workspace_incarnation_id,
+            destination_restore_manifest_identity: fixture.restore_manifest_identity,
+            restore_manifest: wire::RestoreManifestDescriptor {
+                body_digest: digest_uri(&fixture.restore_manifest),
+                logical_size: fixture.restore_manifest.len() as u64,
+                content_type: wire::ContentType::new(JSON_CONTENT_TYPE).unwrap(),
+            },
+        }
+    }
+
+    fn running_restore_status(fixture: &RestorePlanFixture) -> wire::OperationStatus {
+        let request = prepare_restore_request(fixture);
+        wire::OperationStatus {
+            token: wire::OperationToken {
+                operation_id: fixture.preparation.operation_id,
+                state_digest: wire::Digest([0x61; 32]),
+            },
+            kind: wire::OperationKind::Restore,
+            commit_preparation: None,
+            restore_preparation: Some(Box::new(wire::RestoreOperationPreparation {
+                request,
+                source_snapshot_read_version: Some(41),
+                source_commit: fixture.preparation.source_commit.clone(),
+                destination_committed_at_unix_seconds: fixture
+                    .preparation
+                    .destination_committed_at_unix_seconds,
+                source_member_count: Some(fixture.preparation.source_member_count),
+                source_member_digest: Some(fixture.preparation.source_member_digest),
+                materialized_member_count: Some(fixture.preparation.materialized_member_count),
+                materialized_member_digest: Some(fixture.preparation.materialized_member_digest),
+                source_matches_base_commit: Some(fixture.preparation.source_matches_base_commit),
+                destination_binding: None,
+            })),
+            state: wire::OperationState::Running,
+            progress: wire::OperationProgress {
+                completed_rows: fixture.preparation.source_member_count,
+                total_rows: Some(fixture.preparation.source_member_count),
+                completed_bytes: 0,
+                total_bytes: Some(0),
+            },
+            result: None,
+            failure: None,
+        }
+    }
+
+    fn assert_expired_snapshot_enters_hidden_restore_durable_replay(
+        selector: agent::SnapshotSelector,
+        alias: Option<wire::SnapshotAlias>,
+    ) {
+        let fixture = restore_plan_fixture(true, wire::Digest([0x41; 32]));
+        let mut source_workspace = workspace_summary("source-run", [0x21; 16]);
+        source_workspace.workspace_revision = 9;
+        // The live source may advance after Begin. Recovery binds the frozen
+        // numeric snapshot and incarnation, never the later live head.
+        source_workspace.commit_head = Some(wire::CommitIdentity([0x99; 32]));
+        source_workspace.commit_head_generation = Some(2);
+        let expired_snapshot = wire::SnapshotResult {
+            snapshot_id: fixture.snapshot_id,
+            workbench: wire::WorkbenchName::new("source-run").unwrap(),
+            workspace_incarnation_id: wire::WorkspaceIdentity([0x21; 16]),
+            read_version: 41,
+            lease_deadline_ms: 1,
+            alias,
+            annotation: b"null".to_vec(),
+            retire_annotation: None,
+            status: wire::SnapshotStatus::Expired,
+            consumer_count: 1,
+        };
+        let running = running_restore_status(&fixture);
+        let (backend, requests, server) = scripted_backend(vec![
+            not_found_failure(),
+            success(wire::WorkspaceResult::Workspace(source_workspace)),
+            success(wire::WorkspaceResult::Snapshot(expired_snapshot)),
+            success(wire::WorkspaceResult::Operation(running.clone())),
+            success(wire::WorkspaceResult::RestorePrepared(
+                fixture.preparation.clone(),
+            )),
+            success(wire::WorkspaceResult::Operation(running)),
+        ]);
+
+        let error = agent::WorkbenchBackend::restore(
+            &backend,
+            agent::RestoreRequest {
+                source_workbench_id: fixture.source_workbench_id.clone(),
+                source_workbench_path: fixture.source_workbench_path.clone(),
+                selector,
+                destination_workbench_id: fixture.destination_workbench_id.clone(),
+                destination_workbench_path: fixture.destination_workbench_path.clone(),
+            },
+        )
+        .unwrap_err();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 6, "unexpected requests: {requests:#?}");
+        assert_eq!(error.kind, agent::BackendErrorKind::InvalidState);
+        assert!(error.message.contains("object store was not verified"));
+        let wire::WorkspaceRequest::PrepareRestore(actual_prepare) = &requests[4].operation else {
+            panic!("hidden recovery must replay the exact prepare request");
+        };
+        assert_eq!(actual_prepare, &prepare_restore_request(&fixture));
+        assert!(matches!(
+            requests[5].operation,
+            wire::WorkspaceRequest::GetOperation(_)
+        ));
+        assert!(!requests.iter().any(|request| matches!(
+            request.operation,
+            wire::WorkspaceRequest::ReadRestoreSourceRunManifest(_)
+                | wire::WorkspaceRequest::BindRestoreDestination(_)
+                | wire::WorkspaceRequest::FinalizeRestore(_)
+        )));
+        drop(requests);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn expired_snapshot_id_enters_hidden_restore_durable_replay() {
+        assert_expired_snapshot_enters_hidden_restore_durable_replay(
+            agent::SnapshotSelector::Id(7),
+            None,
+        );
+    }
+
+    #[test]
+    fn expired_snapshot_alias_resolves_to_hidden_restore_durable_replay() {
+        assert_expired_snapshot_enters_hidden_restore_durable_replay(
+            agent::SnapshotSelector::Name("checkpoint".to_owned()),
+            Some(wire::SnapshotAlias::new("checkpoint").unwrap()),
+        );
     }
 
     fn terminal_commit_replay_fixture(
