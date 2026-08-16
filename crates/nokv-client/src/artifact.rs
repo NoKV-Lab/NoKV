@@ -260,22 +260,76 @@ where
         descriptor: ArtifactDescriptor,
         bytes: &[u8],
     ) -> Result<ArtifactPublishOutcome, ClientError> {
+        let mut upload_stats = ArtifactUploadStats::default();
+        for attempt in 1..=self.max_attempts() {
+            match self.publish_artifact_plan_once(
+                store,
+                logical_shard,
+                operation_id,
+                artifact_revision_id,
+                &target,
+                &authority,
+                &condition,
+                &object_plan,
+                &staged_objects,
+                &manifest_rows,
+                &dependencies,
+                &descriptor,
+                bytes,
+                &mut upload_stats,
+            ) {
+                Err(error)
+                    if should_resume_artifact_publication(&error)
+                        && attempt < self.max_attempts() =>
+                {
+                    continue;
+                }
+                Err(error) if should_resume_artifact_publication(&error) => {
+                    return Err(ClientError::RetryExhausted {
+                        attempts: attempt,
+                        last_error: Box::new(error),
+                    });
+                }
+                result => return result,
+            }
+        }
+        unreachable!("validated max_attempts is non-zero")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_artifact_plan_once(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        logical_shard: LogicalShardIdentity,
+        operation_id: OperationIdentity,
+        artifact_revision_id: ArtifactRevisionIdentity,
+        target: &WorkspacePath,
+        authority: &PublicationAuthority,
+        condition: &PublishCondition,
+        object_plan: &ArtifactUploadPlan,
+        staged_objects: &[StagedObject],
+        manifest_rows: &[ArtifactManifestRow],
+        dependencies: &[ArtifactRevisionIdentity],
+        descriptor: &ArtifactDescriptor,
+        bytes: &[u8],
+        upload_stats: &mut ArtifactUploadStats,
+    ) -> Result<ArtifactPublishOutcome, ClientError> {
         let seals =
-            seal_artifact_publish_plan(artifact_revision_id, &staged_objects, &manifest_rows)?;
+            seal_artifact_publish_plan(artifact_revision_id, staged_objects, manifest_rows)?;
         descriptor.validate()?;
         let begin = self.begin_publish_on_shard(
             logical_shard,
             BeginArtifactPublishRequest {
                 operation_id,
                 artifact_revision_id,
-                target,
-                authority,
-                condition,
+                target: target.clone(),
+                authority: *authority,
+                condition: *condition,
                 staged_object_count: seals.staged_object_count,
                 staged_object_seal: seals.staged_object_seal,
                 manifest_row_count: seals.manifest_row_count,
                 manifest_seal: seals.manifest_seal,
-                dependency_owner_revision_ids: dependencies.clone(),
+                dependency_owner_revision_ids: dependencies.to_vec(),
             },
         );
         let (mut token, resume, begin_replayed) = match begin {
@@ -340,7 +394,7 @@ where
                                 commit_version,
                                 replayed: true,
                             },
-                            upload_stats: ArtifactUploadStats::default(),
+                            upload_stats: *upload_stats,
                         });
                     }
                     OperationState::Aborting
@@ -380,13 +434,10 @@ where
             }
             Err(source) if is_definitive_append_race(&source) => return Err(source),
             Err(source) => {
-                return Err(self.failed_publication(
-                    logical_shard,
-                    operation_id,
-                    None,
+                return Err(publication_failure_without_abort(
                     ArtifactPublishStage::Begin,
                     source,
-                ));
+                ))
             }
         };
 
@@ -414,31 +465,34 @@ where
                     }
                 },
                 Err(source) => {
-                    return Err(self.failed_publication(
+                    return Err(self.failed_or_resumable_publication(
                         logical_shard,
                         operation_id,
-                        Some(token),
+                        token,
                         ArtifactPublishStage::StageObjects,
                         source,
-                    ));
+                    ))
                 }
             }
         }
 
-        let upload = match upload_artifact_from_plan(store, &object_plan, bytes) {
-            Ok(upload) => upload,
-            Err(source) => {
-                return Err(self.failed_publication(
-                    logical_shard,
-                    operation_id,
-                    Some(token),
-                    ArtifactPublishStage::UploadObjects,
-                    ClientError::ArtifactUpload(Box::new(source)),
-                ));
-            }
-        };
+        if resume.uploaded_object_cursor == 0 {
+            let upload = match upload_artifact_from_plan(store, object_plan, bytes) {
+                Ok(upload) => upload,
+                Err(source) => {
+                    return Err(self.failed_or_resumable_publication(
+                        logical_shard,
+                        operation_id,
+                        token,
+                        ArtifactPublishStage::UploadObjects,
+                        ClientError::ArtifactUpload(Box::new(source)),
+                    ));
+                }
+            };
+            accumulate_upload_stats(upload_stats, upload.stats);
+        }
 
-        let upload_proofs = upload_proofs(&staged_objects);
+        let upload_proofs = upload_proofs(staged_objects);
         for batch in
             upload_proofs[resume.uploaded_object_cursor..].chunks(MAX_ARTIFACT_PUBLISH_BATCH_ROWS)
         {
@@ -463,13 +517,13 @@ where
                     }
                 },
                 Err(source) => {
-                    return Err(self.failed_publication(
+                    return Err(self.failed_or_resumable_publication(
                         logical_shard,
                         operation_id,
-                        Some(token),
+                        token,
                         ArtifactPublishStage::MarkObjectsUploaded,
                         source,
-                    ));
+                    ))
                 }
             }
         }
@@ -479,7 +533,7 @@ where
             let request = StageArtifactManifestRequest {
                 token,
                 rows: batch.to_vec(),
-                dependency_owner_revision_ids: dependencies.clone(),
+                dependency_owner_revision_ids: dependencies.to_vec(),
             };
             match self.publish_status_on_shard(
                 logical_shard,
@@ -498,20 +552,20 @@ where
                     }
                 },
                 Err(source) => {
-                    return Err(self.failed_publication(
+                    return Err(self.failed_or_resumable_publication(
                         logical_shard,
                         operation_id,
-                        Some(token),
+                        token,
                         ArtifactPublishStage::StageManifest,
                         source,
-                    ));
+                    ))
                 }
             }
         }
 
         let complete = CompleteArtifactPublishRequest {
             token,
-            artifact: descriptor,
+            artifact: descriptor.clone(),
         };
         let complete_result = self.execute_on_logical_shard(
             self.new_request_id(),
@@ -523,19 +577,19 @@ where
             Err(source) => match self.recover_completed_publish(logical_shard, operation_id) {
                 Ok(Some(recovered)) => recovered,
                 Ok(None) => {
-                    return Err(self.failed_publication(
+                    return Err(self.failed_or_resumable_publication(
                         logical_shard,
                         operation_id,
-                        Some(token),
+                        token,
                         ArtifactPublishStage::Complete,
                         source,
                     ));
                 }
                 Err(recovery_error) => {
-                    return Err(self.failed_publication(
+                    return Err(self.failed_or_resumable_publication(
                         logical_shard,
                         operation_id,
-                        Some(token),
+                        token,
                         ArtifactPublishStage::Complete,
                         recovery_error,
                     ));
@@ -546,7 +600,7 @@ where
 
         Ok(ArtifactPublishOutcome {
             publication,
-            upload_stats: upload.stats,
+            upload_stats: *upload_stats,
         })
     }
 
@@ -953,6 +1007,21 @@ where
             stage,
             source: Box::new(source),
             abort_failure,
+        }
+    }
+
+    fn failed_or_resumable_publication(
+        &self,
+        logical_shard: LogicalShardIdentity,
+        operation_id: OperationIdentity,
+        token: OperationToken,
+        stage: ArtifactPublishStage,
+        source: ClientError,
+    ) -> ClientError {
+        if should_resume_artifact_publication(&source) {
+            publication_failure_without_abort(stage, source)
+        } else {
+            self.failed_publication(logical_shard, operation_id, Some(token), stage, source)
         }
     }
 
@@ -1797,6 +1866,32 @@ struct PublishResume {
     completed_rows: u64,
 }
 
+fn should_resume_artifact_publication(error: &ClientError) -> bool {
+    error.retryable()
+        || error.rpc_failure().is_some_and(|failure| {
+            failure.code == ErrorCode::Conflict
+                && failure.conflict == Some(nokv_protocol::ConflictKind::OperationState)
+        })
+}
+
+fn publication_failure_without_abort(
+    stage: ArtifactPublishStage,
+    source: ClientError,
+) -> ClientError {
+    ClientError::ArtifactPublishFailed {
+        stage,
+        source: Box::new(source),
+        abort_failure: None,
+    }
+}
+
+fn accumulate_upload_stats(total: &mut ArtifactUploadStats, next: ArtifactUploadStats) {
+    total.blocks = total.blocks.saturating_add(next.blocks);
+    total.bytes = total.bytes.saturating_add(next.bytes);
+    total.created = total.created.saturating_add(next.created);
+    total.replayed = total.replayed.saturating_add(next.replayed);
+}
+
 fn running_publish_resume(
     status: OperationStatus,
     operation_id: OperationIdentity,
@@ -1977,6 +2072,7 @@ mod tests {
         change_fence_on_second_page_once: bool,
         fence_changed: bool,
         append_begin_conflicts: usize,
+        advance_stage_before_response_once: bool,
     }
 
     impl ScriptedArtifactTransport {
@@ -2001,6 +2097,7 @@ mod tests {
                     change_fence_on_second_page_once: false,
                     fence_changed: false,
                     append_begin_conflicts: 0,
+                    advance_stage_before_response_once: false,
                 })),
                 events,
             }
@@ -2020,6 +2117,13 @@ mod tests {
 
         fn conflict_append_begins(&self, count: usize) {
             self.state.lock().unwrap().append_begin_conflicts = count;
+        }
+
+        fn advance_stage_before_response_once(&self) {
+            self.state
+                .lock()
+                .unwrap()
+                .advance_stage_before_response_once = true;
         }
     }
 
@@ -2132,6 +2236,61 @@ mod tests {
                     .map_err(|error| TransportError::new(error.to_string(), false));
             }
 
+            if let WorkspaceRequest::StageArtifactObjects(stage) = &request.operation {
+                if state.advance_stage_before_response_once {
+                    state.advance_stage_before_response_once = false;
+                    state.stage_applies = state.stage_applies.saturating_add(1);
+                    state.staged_objects.extend(stage.objects.clone());
+                    let staged_object_count = state
+                        .begin
+                        .as_ref()
+                        .expect("stage follows begin")
+                        .staged_object_count;
+                    let manifest_row_count = state
+                        .begin
+                        .as_ref()
+                        .expect("stage follows begin")
+                        .manifest_row_count;
+                    let status = OperationStatus {
+                        token: state.next_token(stage.token.operation_id),
+                        kind: OperationKind::ArtifactPublish,
+                        commit_preparation: None,
+                        restore_preparation: None,
+                        state: OperationState::Running,
+                        progress: OperationProgress {
+                            completed_rows: u64::from(staged_object_count),
+                            total_rows: Some(
+                                u64::from(staged_object_count)
+                                    .saturating_mul(2)
+                                    .saturating_add(u64::from(manifest_row_count)),
+                            ),
+                            completed_bytes: 0,
+                            total_bytes: None,
+                        },
+                        result: None,
+                        failure: None,
+                    };
+                    state.operation = Some(status);
+                    let response = WorkspaceRpcResponse {
+                        route: request.route,
+                        request_id: request.request_id,
+                        commit_version: None,
+                        replayed: false,
+                        outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                            code: ErrorCode::Conflict,
+                            message: "operation token state digest is stale".to_owned(),
+                            retryable: false,
+                            conflict: Some(ConflictKind::OperationState),
+                            current_generation: None,
+                            route_hint: None,
+                        }),
+                    };
+                    state.replay.insert(request.request_id, response.clone());
+                    return encode_response(&response)
+                        .map_err(|error| TransportError::new(error.to_string(), false));
+                }
+            }
+
             self.events.lock().unwrap().push(label);
             state.commit_version = state.commit_version.saturating_add(1);
             let result = apply_request(&mut state, &request)?;
@@ -2181,6 +2340,11 @@ mod tests {
                 // terminal record rather than a fresh running one.
                 if let Some(status) = state.replayable_terminal_status(begin.operation_id) {
                     return Ok(WorkspaceResult::Operation(status));
+                }
+                if state.begin.as_ref() == Some(begin) {
+                    if let Some(status) = state.operation.clone() {
+                        return Ok(WorkspaceResult::Operation(status));
+                    }
                 }
                 state.begin = Some(begin.clone());
                 state.staged_objects.clear();
@@ -3049,6 +3213,40 @@ mod tests {
         assert_eq!(stage_attempts.len(), 2);
         assert_eq!(stage_attempts[0], stage_attempts[1]);
         assert_eq!(state.stage_applies, 1);
+    }
+
+    #[test]
+    fn concurrent_progress_reloads_the_durable_cursor_without_aborting() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        inspector.advance_stage_before_response_once();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+
+        let outcome = client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+
+        assert_eq!(outcome.publication.value.logical_size, 8);
+        let state = inspector.state();
+        assert_eq!(
+            state
+                .attempts
+                .iter()
+                .filter(|(label, _)| *label == "begin")
+                .count(),
+            2,
+            "the losing caller must reload the exact durable operation"
+        );
+        assert_eq!(
+            state.stage_applies, 1,
+            "the durable cursor must skip the stage completed by the winner"
+        );
+        assert_eq!(
+            state.abort_applies, 0,
+            "a stale token proves concurrent progress, not publication failure"
+        );
     }
 
     #[test]

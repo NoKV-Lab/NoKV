@@ -129,6 +129,14 @@ Required evidence:
 
 ## Gate 4: Snapshot, Commit, And Restore
 
+The path-native whole-Workbench fork runner is
+[`scripts/workbench/fork_restore_recovery_gate.py`](../../scripts/workbench/fork_restore_recovery_gate.py).
+It owns isolated real etcd and digest-pinned RustFS instances, injects
+post-commit response loss, reopens the same Holt directory at the next owner
+epoch, and retains object-inventory evidence. It does not qualify inode/dentry
+subtree restore or in-place rollback; neither operation is part of the
+supported namespace contract.
+
 Required evidence:
 
 - snapshot mint creates a leased history hold at one read version;
@@ -145,6 +153,15 @@ Required evidence:
   visibility command;
 - retries after process loss, owner loss, or response loss converge to the same
   terminal result;
+- every durable restore and restore-manifest publication phase is reentrant;
+  exact concurrent callers converge to one operation without aborting work
+  advanced by another caller;
+- a restored Workbench is independently writable, can be recommitted and used
+  as a later restore source, and preserves its original revision closure after
+  the source snapshot is retired and the source Workbench diverges;
+- object-provider inventory proves restore copies zero payload bytes, adds only
+  the destination restore-manifest object, and never overwrites source payload
+  objects, including the exact 1 GiB qualification profile;
 - after A succeeds and B replaces it, exact retry of A returns A's original
   terminal result for both original `replace=false` and `replace=true`, without
   reading the current workspace head or run-manifest path;

@@ -600,6 +600,14 @@ impl MetadataWorkspaceRequestExecutor {
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::PrepareRestoreRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        retry_restore_preparation_progress(|| self.prepare_restore_once(rpc, request))
+    }
+
+    fn prepare_restore_once(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::PrepareRestoreRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let source_workbench = workbench_id(&request.source_workbench)?;
         let source = match &request.source {
@@ -638,6 +646,22 @@ impl MetadataWorkspaceRequestExecutor {
         )
         .map_err(restore_failure)?;
 
+        // A replayed begin result is an immutable receipt for the claim step,
+        // not the authority for the current workflow phase. Another caller may
+        // already have advanced the shared restore while this request was in
+        // flight, so orchestration must resume from the durable operation row.
+        let observe_context = self.write_context(
+            rpc.route,
+            derived_request_id(rpc.request_id, b"restore-observe-progress", 0),
+        )?;
+        let observed_commit_version = types::CommitVersion::new(observe_context.read_version.get())
+            .map_err(|error| internal(error.to_string()))?;
+        outcome.operation =
+            meta::get_restore(&self.meta, observe_context, outcome.operation.operation_id)
+                .map_err(restore_failure)?
+                .ok_or_else(|| internal("claimed restore disappeared before preparation"))?;
+        outcome.commit_version = observed_commit_version;
+
         if let Some(failure) = restore_terminal_failure(&outcome.operation) {
             return Err(failure);
         }
@@ -653,26 +677,22 @@ impl MetadataWorkspaceRequestExecutor {
                     operation_id: outcome.operation.operation_id,
                 },
             )
-            .map_err(restore_failure)?;
+            .map_err(restore_preparation_step_failure)?;
         }
 
-        let mut batch = 0_u64;
         while outcome.operation.phase == types::RestorePhase::Copying
             && !outcome.operation.source_eof
         {
             let before = outcome.operation.next_member_sequence;
             let copied = meta::copy_restore_batch(
                 &self.meta,
-                self.write_context(
-                    rpc.route,
-                    derived_request_id(rpc.request_id, b"restore-copy", batch),
-                )?,
+                self.write_context(rpc.route, restore_copy_request_id(rpc.request_id, before))?,
                 meta::CopyRestoreBatchRequest {
                     operation_id: outcome.operation.operation_id,
                     limit: meta::MAX_RESTORE_BATCH_MEMBERS,
                 },
             )
-            .map_err(restore_failure)?;
+            .map_err(restore_preparation_step_failure)?;
             outcome = copied.command;
             if let Some(failure) = restore_terminal_failure(&outcome.operation) {
                 return Err(failure);
@@ -680,9 +700,6 @@ impl MetadataWorkspaceRequestExecutor {
             if !outcome.operation.source_eof && outcome.operation.next_member_sequence == before {
                 return Err(internal("restore copier made no durable progress"));
             }
-            batch = batch
-                .checked_add(1)
-                .ok_or_else(|| internal("restore batch counter overflow"))?;
         }
         if outcome.operation.phase == types::RestorePhase::Copying && outcome.operation.source_eof {
             outcome = meta::seal_restore_source(
@@ -695,7 +712,7 @@ impl MetadataWorkspaceRequestExecutor {
                     operation_id: outcome.operation.operation_id,
                 },
             )
-            .map_err(restore_failure)?;
+            .map_err(restore_preparation_step_failure)?;
         }
         let preparation = sealed_restore_preparation(&outcome.operation)?;
         Ok(ExecutedRequest {
@@ -712,50 +729,105 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let operation_id: types::OperationId = request.operation_id.into();
-        let applied = meta::apply_restore_initialization(
-            &self.meta,
-            self.write_context(
-                rpc.route,
-                derived_request_id(rpc.request_id, b"restore-apply-initialization", 0),
-            )?,
-            meta::RestoreOperationRequest { operation_id },
-        )
-        .map_err(restore_failure)?;
-        if applied.operation.phase != types::RestorePhase::Ready {
-            return Err(operation_terminal_failure(
-                "restore initialization did not reach Ready",
-            ));
+        let already_ready = match self.restore_phase(rpc, operation_id)? {
+            Some(types::RestorePhase::Complete) => {
+                return self
+                    .completed_restore_replay(rpc, operation_id)?
+                    .ok_or_else(|| internal("complete restore disappeared during replay"));
+            }
+            Some(types::RestorePhase::Ready) => true,
+            _ => false,
+        };
+        if !already_ready {
+            match meta::apply_restore_initialization(
+                &self.meta,
+                self.write_context(
+                    rpc.route,
+                    derived_request_id(rpc.request_id, b"restore-apply-initialization", 0),
+                )?,
+                meta::RestoreOperationRequest { operation_id },
+            ) {
+                Ok(applied) if applied.operation.phase == types::RestorePhase::Ready => {}
+                Ok(_) => {
+                    return Err(operation_terminal_failure(
+                        "restore initialization did not reach Ready",
+                    ));
+                }
+                Err(error) => match self.restore_phase(rpc, operation_id)? {
+                    Some(types::RestorePhase::Complete) => {
+                        return self
+                            .completed_restore_replay(rpc, operation_id)?
+                            .ok_or_else(|| internal("complete restore disappeared during replay"));
+                    }
+                    Some(types::RestorePhase::Ready) => {
+                        // Another exact finalizer durably installed the
+                        // publication while this request was in flight.
+                        // Continue from that authoritative phase.
+                    }
+                    _ => return Err(restore_failure(error)),
+                },
+            }
         }
-        let completed = meta::complete_restore(
+        let completed = match meta::complete_restore(
             &self.meta,
             self.write_context(
                 rpc.route,
                 derived_request_id(rpc.request_id, b"restore-complete", 0),
             )?,
             meta::RestoreOperationRequest { operation_id },
+        ) {
+            Ok(completed) => completed,
+            Err(error) => {
+                if let Some(replayed) = self.completed_restore_replay(rpc, operation_id)? {
+                    return Ok(replayed);
+                }
+                return Err(restore_failure(error));
+            }
+        };
+        restored_response(
+            &completed.command.operation,
+            &completed.result,
+            Some(completed.command.commit_version.get()),
+            completed.command.replayed,
         )
-        .map_err(restore_failure)?;
-        let result = completed.result;
-        Ok(ExecutedRequest {
-            result: protocol::WorkspaceResult::Restored(protocol::RestoreResult {
-                operation_id: request.operation_id,
-                destination: protocol::WorkspaceSummary {
-                    workbench: protocol_workbench(
-                        &completed.command.operation.destination_workbench_id,
-                    )?,
-                    workspace_incarnation_id: result.destination_workspace_incarnation_id.into(),
-                    workspace_revision: result.destination_workspace_revision.get(),
-                    commit_head: None,
-                    commit_head_generation: None,
-                },
-                member_count: result.member_count,
-                member_digest: protocol::Digest(result.member_digest),
-                metadata_rows_copied: result.member_count,
-                object_bytes_copied: 0,
-            }),
-            commit_version: Some(completed.command.commit_version.get()),
-            replayed: completed.command.replayed,
-        })
+    }
+
+    fn completed_restore_replay(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        operation_id: types::OperationId,
+    ) -> Result<Option<ExecutedRequest>, protocol::RpcFailure> {
+        let context = self.write_context(
+            rpc.route,
+            derived_request_id(rpc.request_id, b"restore-terminal-replay", 0),
+        )?;
+        let Some(operation) =
+            meta::get_restore(&self.meta, context, operation_id).map_err(restore_failure)?
+        else {
+            return Ok(None);
+        };
+        if operation.phase != types::RestorePhase::Complete {
+            return Ok(None);
+        }
+        let result = operation
+            .result
+            .as_ref()
+            .ok_or_else(|| internal("complete restore operation has no durable result"))?;
+        restored_response(&operation, result, None, true).map(Some)
+    }
+
+    fn restore_phase(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        operation_id: types::OperationId,
+    ) -> Result<Option<types::RestorePhase>, protocol::RpcFailure> {
+        let context = self.write_context(
+            rpc.route,
+            derived_request_id(rpc.request_id, b"restore-observe-phase", 0),
+        )?;
+        meta::get_restore(&self.meta, context, operation_id)
+            .map(|operation| operation.map(|operation| operation.phase))
+            .map_err(restore_failure)
     }
 
     fn search(
@@ -1096,7 +1168,24 @@ impl MetadataWorkspaceRequestExecutor {
                 )
                 .map_err(restore_failure)?
                 .ok_or_else(|| not_found("restore operation does not exist"))?;
-                if restore.phase != types::RestorePhase::SourceSealed
+                let terminal_publication_replay = if matches!(
+                    restore.phase,
+                    types::RestorePhase::Ready | types::RestorePhase::Complete
+                ) {
+                    match self.load_publish_operation(
+                        rpc.route,
+                        read.read_version,
+                        request.operation_id,
+                    ) {
+                        Ok(_) => true,
+                        Err(failure) if failure.code == protocol::ErrorCode::NotFound => false,
+                        Err(failure) => return Err(failure),
+                    }
+                } else {
+                    false
+                };
+                if (restore.phase != types::RestorePhase::SourceSealed
+                    && !terminal_publication_replay)
                     || restore.destination_workbench_id != workbench
                     || path.as_str() != meta::RESTORE_MANIFEST_PATH
                     || !matches!(request.condition, protocol::PublishCondition::CreateOnly)
@@ -1318,23 +1407,40 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let transition_id = derived_request_id(rpc.request_id, b"publish-complete-transition", 0);
-        let transition = if let Some(outcome) = self.replayed_publish(rpc.route, transition_id)? {
-            outcome
-        } else {
-            let operation = self.heartbeat_publish_operation(
-                rpc,
-                request.token,
-                b"publish-heartbeat-complete-transition",
-            )?;
-            let context = self.publication_context(rpc.route, transition_id)?;
-            meta::PublicationService::new(&self.meta)
-                .transition_publish(meta::TransitionPublishRequest {
-                    context,
-                    expected_operation: operation,
-                    transition: meta::PublishTransition::BeginFinalization,
-                })
-                .map_err(publication_failure)?
-        };
+        let finalizing_operation =
+            if let Some(outcome) = self.replayed_publish(rpc.route, transition_id)? {
+                outcome.operation
+            } else {
+                let operation = self.heartbeat_publish_operation(
+                    rpc,
+                    request.token,
+                    b"publish-heartbeat-complete-transition",
+                )?;
+                match operation.phase {
+                    types::PublishPhase::Uploading => {
+                        let context = self.publication_context(rpc.route, transition_id)?;
+                        meta::PublicationService::new(&self.meta)
+                            .transition_publish(meta::TransitionPublishRequest {
+                                context,
+                                expected_operation: operation,
+                                transition: meta::PublishTransition::BeginFinalization,
+                            })
+                            .map_err(publication_failure)?
+                            .operation
+                    }
+                    types::PublishPhase::Finalizing => operation,
+                    phase => {
+                        return Err(failure(
+                            protocol::ErrorCode::PreconditionFailed,
+                            format!(
+                            "artifact publication is {phase:?}, expected Uploading or Finalizing"
+                        ),
+                            false,
+                            Some(protocol::ConflictKind::OperationState),
+                        ));
+                    }
+                }
+            };
         let finalize_id = derived_request_id(rpc.request_id, b"publish-complete-finalize", 0);
         if let Some(replayed) = self.replayed_publish(rpc.route, finalize_id)? {
             let result = replayed.operation.result.clone().ok_or_else(|| {
@@ -1348,8 +1454,8 @@ impl MetadataWorkspaceRequestExecutor {
             );
         }
         let finalizing_token = protocol::OperationToken {
-            operation_id: transition.operation.operation_id.into(),
-            state_digest: publish_state_digest(&transition.operation)?,
+            operation_id: finalizing_operation.operation_id.into(),
+            state_digest: publish_state_digest(&finalizing_operation)?,
         };
         let finalizing_operation = self.heartbeat_publish_operation(
             rpc,
@@ -2914,6 +3020,13 @@ fn derived_request_id(
     types::RequestId::from_bytes(bytes)
 }
 
+fn restore_copy_request_id(
+    request_id: protocol::RequestIdentity,
+    next_member_sequence: u64,
+) -> types::RequestId {
+    derived_request_id(request_id, b"restore-copy", next_member_sequence)
+}
+
 fn require_publish_token(
     operation: &meta::PublishOperationRecord,
     token: protocol::OperationToken,
@@ -3244,6 +3357,32 @@ fn build_commit_response(
         )?),
         commit_version: Some(outcome.commit_version.get()),
         replayed: outcome.replayed,
+    })
+}
+
+fn restored_response(
+    operation: &meta::RestoreOperationRecord,
+    result: &meta::RestoreResult,
+    commit_version: Option<u64>,
+    replayed: bool,
+) -> Result<ExecutedRequest, protocol::RpcFailure> {
+    Ok(ExecutedRequest {
+        result: protocol::WorkspaceResult::Restored(protocol::RestoreResult {
+            operation_id: operation.operation_id.into(),
+            destination: protocol::WorkspaceSummary {
+                workbench: protocol_workbench(&operation.destination_workbench_id)?,
+                workspace_incarnation_id: result.destination_workspace_incarnation_id.into(),
+                workspace_revision: result.destination_workspace_revision.get(),
+                commit_head: None,
+                commit_head_generation: None,
+            },
+            member_count: result.member_count,
+            member_digest: protocol::Digest(result.member_digest),
+            metadata_rows_copied: result.member_count,
+            object_bytes_copied: 0,
+        }),
+        commit_version,
+        replayed,
     })
 }
 
@@ -3719,6 +3858,20 @@ fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
     }
 }
 
+fn restore_preparation_step_failure(error: meta::RestoreError) -> protocol::RpcFailure {
+    match error {
+        meta::RestoreError::InvalidPhase { .. } | meta::RestoreError::SourceAlreadyExhausted => {
+            failure(
+                protocol::ErrorCode::Conflict,
+                error.to_string(),
+                true,
+                Some(protocol::ConflictKind::OperationState),
+            )
+        }
+        other => restore_failure(other),
+    }
+}
+
 fn publication_failure(error: meta::PublicationError) -> protocol::RpcFailure {
     match error {
         meta::PublicationError::Meta(source) => meta_failure(source),
@@ -3921,6 +4074,22 @@ fn retry_internal_metadata_conflicts<T>(
         }
     }
     unreachable!("internal metadata retry bound is non-zero")
+}
+
+fn retry_restore_preparation_progress<T>(
+    mut execute: impl FnMut() -> Result<T, protocol::RpcFailure>,
+) -> Result<T, protocol::RpcFailure> {
+    for attempt in 1..=MAX_INTERNAL_METADATA_ATTEMPTS {
+        match execute() {
+            Err(failure)
+                if failure.code == protocol::ErrorCode::Conflict
+                    && failure.retryable
+                    && failure.conflict == Some(protocol::ConflictKind::OperationState)
+                    && attempt < MAX_INTERNAL_METADATA_ATTEMPTS => {}
+            result => return result,
+        }
+    }
+    unreachable!("internal restore progress retry bound is non-zero")
 }
 
 fn invalid_argument(message: impl Into<String>) -> protocol::RpcFailure {
@@ -4574,6 +4743,122 @@ mod tests {
         store.execute(&command).unwrap();
     }
 
+    fn put_shared_revision_paths(
+        store: &meta::MetaShard,
+        workbench_incarnation: types::WorkspaceIncarnationId,
+        total_paths: usize,
+    ) {
+        assert!(total_paths > 0);
+        put_visible_path(store, workbench_incarnation);
+        if total_paths == 1 {
+            return;
+        }
+
+        let revision = types::ArtifactRevisionId::from_bytes([9; types::FIXED_ID_BYTES]);
+        let revision_key = meta::artifact_revision_key(root(), revision);
+        let read_version = store.current_read_version().unwrap();
+        let revision_payload = store
+            .read_at(
+                root(),
+                placement(),
+                owner(1),
+                meta::MetadataFamily::ArtifactRevision,
+                &revision_key,
+                read_version,
+            )
+            .unwrap()
+            .expect("seeded revision exists");
+        let mut revision_record = meta::ArtifactRevisionRecord::decode(&revision_payload).unwrap();
+        revision_record.strong_reference_count = u64::try_from(total_paths).unwrap();
+        revision_record.reference_epoch = types::ReferenceEpoch::new(2);
+
+        let mut predicates = vec![meta::CommandPredicate::Value {
+            family: meta::MetadataFamily::ArtifactRevision,
+            key: revision_key.clone(),
+            expected: Some(revision_payload),
+        }];
+        let mut mutations = vec![meta::CommandMutation::Put {
+            family: meta::MetadataFamily::ArtifactRevision,
+            key: revision_key.clone(),
+            value: revision_record.encode().unwrap(),
+        }];
+        for index in 1..total_paths {
+            let path = types::NormalizedRelativePath::new(format!("outputs/shared-{index:03}.bin"))
+                .unwrap();
+            let path_key = meta::path_current_key(root(), workbench_incarnation, &path);
+            let reference_key =
+                meta::path_revision_ref_key(root(), workbench_incarnation, &path, revision);
+            let path_record = meta::PathEntry {
+                generation: types::Generation::new(1).unwrap(),
+                artifact_revision_id: revision,
+                body_digest_uri: "sha256:body".to_owned(),
+                manifest_digest_uri: "sha256:manifest".to_owned(),
+                logical_size: 0,
+                dependency_count: 0,
+                dependency_depth: 0,
+                content_type: "application/octet-stream".to_owned(),
+                producer: Some("executor-test".to_owned()),
+                manifest_id: Some("manifest-1".to_owned()),
+                typed_index_projection: meta::TypedProjection::empty().encode().unwrap(),
+            };
+            predicates.extend([
+                meta::CommandPredicate::Value {
+                    family: meta::MetadataFamily::PathCurrent,
+                    key: path_key.clone(),
+                    expected: None,
+                },
+                meta::CommandPredicate::Value {
+                    family: meta::MetadataFamily::RevisionRef,
+                    key: reference_key.clone(),
+                    expected: None,
+                },
+            ]);
+            mutations.extend([
+                meta::CommandMutation::Put {
+                    family: meta::MetadataFamily::PathCurrent,
+                    key: path_key,
+                    value: path_record.encode().unwrap(),
+                },
+                meta::CommandMutation::Put {
+                    family: meta::MetadataFamily::RevisionRef,
+                    key: reference_key,
+                    value: meta::RevisionRefRecord {
+                        reference_epoch_at_add: types::ReferenceEpoch::new(2),
+                    }
+                    .encode()
+                    .unwrap(),
+                },
+            ]);
+        }
+        store
+            .execute(
+                &meta::MetadataCommand {
+                    schema_id: meta::SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
+                    placement_generation: placement(),
+                    owner_epoch: owner(1),
+                    request_id: request_id(203),
+                    command_digest: types::CommandDigest::from_bytes([0; types::SHA256_BYTES]),
+                    read_version,
+                    root_fence_action: meta::RootFenceAction::RequireActive,
+                    predicates,
+                    mutations,
+                    history_projection: vec![meta::HistoryProjection {
+                        family: meta::MetadataFamily::ArtifactRevision,
+                        key: revision_key,
+                    }],
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .unwrap();
+    }
+
     fn corrupt_visible_path_revision(store: &meta::MetaShard) {
         let revision = types::ArtifactRevisionId::from_bytes([9; types::FIXED_ID_BYTES]);
         let key = meta::artifact_revision_key(root(), revision);
@@ -4847,6 +5132,20 @@ mod tests {
             derived_request_id(request, b"commit-members", 0),
             derived_request_id(request, b"commit-revisions", 0)
         );
+    }
+
+    #[test]
+    fn restore_copy_request_identity_tracks_the_durable_cursor() {
+        let request = protocol::RequestIdentity([8; types::FIXED_ID_BYTES]);
+        let first = restore_copy_request_id(request, 0);
+        let exact_retry = restore_copy_request_id(request, 0);
+        let advanced = restore_copy_request_id(
+            request,
+            u64::try_from(meta::MAX_RESTORE_BATCH_MEMBERS).unwrap(),
+        );
+
+        assert_eq!(exact_retry, first);
+        assert_ne!(advanced, first);
     }
 
     fn ready_restore_operation() -> meta::RestoreOperationRecord {
@@ -6460,6 +6759,363 @@ mod tests {
         let failure = executor.execute(&wrong_incarnation).unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::Conflict);
         assert_eq!(failure.conflict, Some(protocol::ConflictKind::Workspace));
+    }
+
+    #[test]
+    fn concurrent_identical_fork_preparations_share_one_operation_and_source_hold() {
+        let (store, executor) = ready_executor();
+        let source = protocol::WorkbenchName::new("fork-source").unwrap();
+        let source_incarnation = protocol::WorkspaceIdentity([91; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&create_request(90, source.as_str(), 91, 1))
+            .unwrap();
+        put_shared_revision_paths(&store, source_incarnation.into(), 64);
+        executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([92; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::MintSnapshot(
+                    protocol::MintSnapshotRequest {
+                        workbench: source.clone(),
+                        workspace_incarnation_id: source_incarnation,
+                        snapshot_id: 7,
+                        lease_deadline_ms: 10_000,
+                        alias: None,
+                        annotation: Vec::new(),
+                    },
+                ),
+            })
+            .unwrap();
+
+        let prepare = |request_fill| protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::PrepareRestore(
+                protocol::PrepareRestoreRequest {
+                    source_workbench: source.clone(),
+                    source_workspace_incarnation_id: source_incarnation,
+                    source: protocol::RestoreSource::Snapshot(protocol::SnapshotSelector::Id(7)),
+                    destination_workbench: protocol::WorkbenchName::new("fork-destination")
+                        .unwrap(),
+                    destination_workspace_incarnation_id: protocol::WorkspaceIdentity(
+                        [93; types::FIXED_ID_BYTES],
+                    ),
+                    restore_manifest: protocol::RestoreManifestDescriptor {
+                        body_digest: protocol::sha256_digest_uri(protocol::Digest(
+                            [94; types::SHA256_BYTES],
+                        )),
+                        logical_size: 2,
+                        content_type: protocol::ContentType::new("application/json").unwrap(),
+                    },
+                },
+            ),
+        };
+        let first = prepare(95);
+        let second = prepare(96);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let (first_outcome, second_outcome) = std::thread::scope(|scope| {
+            let first_executor = executor.clone();
+            let first_barrier = Arc::clone(&barrier);
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                first_executor.execute(&first)
+            });
+            let second_executor = executor.clone();
+            let second_barrier = Arc::clone(&barrier);
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                second_executor.execute(&second)
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let first_outcome = first_outcome.unwrap();
+        let second_outcome = second_outcome.unwrap();
+        assert_eq!(first_outcome.result, second_outcome.result);
+        let exact_replay = executor.execute(&prepare(95)).unwrap();
+        assert_eq!(exact_replay.result, first_outcome.result);
+        let protocol::WorkspaceResult::RestorePrepared(prepared) = first_outcome.result else {
+            panic!("prepare restore returned the wrong result variant");
+        };
+        assert_eq!(prepared.destination_workbench.as_str(), "fork-destination");
+        assert_eq!(prepared.member_count, 64);
+
+        let snapshot = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([97; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::GetSnapshot(protocol::GetSnapshotRequest {
+                    workbench: source,
+                    selector: protocol::SnapshotSelector::Id(7),
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Snapshot(snapshot) = snapshot.result else {
+            panic!("snapshot lookup returned the wrong result variant");
+        };
+        assert_eq!(snapshot.consumer_count, 1);
+    }
+
+    #[test]
+    fn completed_fork_replays_its_exact_manifest_publication_and_finalize() {
+        let (store, executor) = ready_executor();
+        let source = protocol::WorkbenchName::new("fork-replay-source").unwrap();
+        let source_incarnation = protocol::WorkspaceIdentity([0xa1; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&create_request(0xa0, source.as_str(), 0xa1, 1))
+            .unwrap();
+        executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xa2; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::MintSnapshot(
+                    protocol::MintSnapshotRequest {
+                        workbench: source.clone(),
+                        workspace_incarnation_id: source_incarnation,
+                        snapshot_id: 11,
+                        lease_deadline_ms: 10_000,
+                        alias: None,
+                        annotation: Vec::new(),
+                    },
+                ),
+            })
+            .unwrap();
+
+        let body_digest =
+            protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([0x7b]).into()));
+        let content_type = protocol::ContentType::new("application/json").unwrap();
+        let destination = protocol::WorkbenchName::new("fork-replay-destination").unwrap();
+        let destination_incarnation = protocol::WorkspaceIdentity([0xa3; types::FIXED_ID_BYTES]);
+        let prepared = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xa4; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::PrepareRestore(
+                    protocol::PrepareRestoreRequest {
+                        source_workbench: source,
+                        source_workspace_incarnation_id: source_incarnation,
+                        source: protocol::RestoreSource::Snapshot(protocol::SnapshotSelector::Id(
+                            11,
+                        )),
+                        destination_workbench: destination.clone(),
+                        destination_workspace_incarnation_id: destination_incarnation,
+                        restore_manifest: protocol::RestoreManifestDescriptor {
+                            body_digest: body_digest.clone(),
+                            logical_size: 1,
+                            content_type: content_type.clone(),
+                        },
+                    },
+                ),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::RestorePrepared(prepared) = prepared.result else {
+            panic!("prepare restore returned the wrong result variant");
+        };
+
+        let publish_operation = protocol::OperationIdentity([0xa5; types::FIXED_ID_BYTES]);
+        let artifact_revision = protocol::ArtifactRevisionIdentity([0xa6; types::FIXED_ID_BYTES]);
+        let object_key = meta::object_block_key(
+            shard(),
+            root(),
+            types::ArtifactRevisionId::from(artifact_revision),
+            0,
+        );
+        let staged_objects = vec![protocol::StagedObject {
+            sequence: 0,
+            object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
+            expected_length: 1,
+            expected_digest: body_digest.clone(),
+            multipart_token: None,
+        }];
+        let manifest_rows = vec![protocol::ArtifactManifestRow {
+            object_index: 0,
+            physical_object_index: 0,
+            logical_offset: 0,
+            physical_owner_revision_id: artifact_revision,
+            object_identity: protocol::ObjectIdentity::new(object_key).unwrap(),
+            object_offset: 0,
+            length: 1,
+            digest: body_digest.clone(),
+            append_segment: None,
+        }];
+        let seals = protocol::seal_artifact_publish_plan(
+            artifact_revision,
+            &staged_objects,
+            &manifest_rows,
+        )
+        .unwrap();
+        let begin_request = protocol::BeginArtifactPublishRequest {
+            operation_id: publish_operation,
+            artifact_revision_id: artifact_revision,
+            target: protocol::WorkspacePath {
+                workbench: destination,
+                path: protocol::RelativePath::new(meta::RESTORE_MANIFEST_PATH).unwrap(),
+            },
+            authority: protocol::PublicationAuthority::RestoreStaging {
+                restore_operation_id: prepared.operation_id,
+            },
+            condition: protocol::PublishCondition::CreateOnly,
+            staged_object_count: seals.staged_object_count,
+            staged_object_seal: seals.staged_object_seal,
+            manifest_row_count: seals.manifest_row_count,
+            manifest_seal: seals.manifest_seal,
+            dependency_owner_revision_ids: Vec::new(),
+        };
+        let begun = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xa7; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::BeginArtifactPublish(begin_request.clone()),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(begun) = begun.result else {
+            panic!("begin publication returned the wrong result variant");
+        };
+        let staged = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xac; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::StageArtifactObjects(
+                    protocol::StageArtifactObjectsRequest {
+                        token: begun.token,
+                        objects: staged_objects,
+                    },
+                ),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(staged) = staged.result else {
+            panic!("stage publication returned the wrong result variant");
+        };
+        let marked = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xad; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
+                    protocol::MarkArtifactObjectsUploadedRequest {
+                        token: staged.token,
+                        objects: vec![protocol::ObjectUploadProof {
+                            sequence: 0,
+                            observed_length: 1,
+                            observed_digest: body_digest.clone(),
+                        }],
+                    },
+                ),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(marked) = marked.result else {
+            panic!("mark publication returned the wrong result variant");
+        };
+        let manifested = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xae; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::StageArtifactManifest(
+                    protocol::StageArtifactManifestRequest {
+                        token: marked.token,
+                        rows: manifest_rows,
+                        dependency_owner_revision_ids: Vec::new(),
+                    },
+                ),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(manifested) = manifested.result else {
+            panic!("manifest publication returned the wrong result variant");
+        };
+        let expected = executor
+            .load_publish_operation(
+                route(1),
+                store.current_read_version().unwrap(),
+                publish_operation,
+            )
+            .unwrap();
+        require_publish_token(&expected, manifested.token).unwrap();
+        let finalizing = meta::PublicationService::new(&store)
+            .transition_publish(meta::TransitionPublishRequest {
+                context: executor
+                    .publication_context(route(1), request_id(0xb1))
+                    .unwrap(),
+                expected_operation: expected,
+                transition: meta::PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let finalizing_token = protocol::OperationToken {
+            operation_id: publish_operation,
+            state_digest: publish_state_digest(&finalizing).unwrap(),
+        };
+        executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xa8; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::CompleteArtifactPublish(
+                    protocol::CompleteArtifactPublishRequest {
+                        token: finalizing_token,
+                        artifact: protocol::ArtifactDescriptor {
+                            logical_size: 1,
+                            body_digest,
+                            manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
+                            content_type,
+                            producer: None,
+                            manifest_identity: None,
+                            index_fields: Vec::new(),
+                        },
+                    },
+                ),
+            })
+            .unwrap();
+        let ready = meta::apply_restore_initialization(
+            &store,
+            executor.write_context(route(1), request_id(0xb2)).unwrap(),
+            meta::RestoreOperationRequest {
+                operation_id: types::OperationId::from(prepared.operation_id),
+            },
+        )
+        .unwrap();
+        assert_eq!(ready.operation.phase, types::RestorePhase::Ready);
+        let finalize = |request_fill| protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::FinalizeRestore(
+                protocol::FinalizeRestoreRequest {
+                    operation_id: prepared.operation_id,
+                },
+            ),
+        };
+        let completed = executor.execute(&finalize(0xa9)).unwrap();
+
+        let replayed_publish = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xaa; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::BeginArtifactPublish(begin_request.clone()),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(replayed_publish) = replayed_publish.result else {
+            panic!("replayed begin returned the wrong result variant");
+        };
+        assert_eq!(replayed_publish.state, protocol::OperationState::Succeeded);
+
+        let replayed_finalize = executor.execute(&finalize(0xab)).unwrap();
+        assert_eq!(replayed_finalize.result, completed.result);
+        assert!(replayed_finalize.replayed);
+
+        let mut forbidden_new_publication = begin_request;
+        forbidden_new_publication.operation_id =
+            protocol::OperationIdentity([0xaf; types::FIXED_ID_BYTES]);
+        let rejected = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xb0; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::BeginArtifactPublish(
+                    forbidden_new_publication,
+                ),
+            })
+            .unwrap_err();
+        assert_eq!(rejected.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(
+            rejected.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
     }
 
     #[test]

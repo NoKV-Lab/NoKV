@@ -25,11 +25,13 @@ jobs:
             scripts/workbench/workbench_contract.py \
             scripts/workbench/live_workbench.py \
             scripts/workbench/local_wal_recovery_gate.py \
-            scripts/workbench/object_namespace_recovery_gate.py
+            scripts/workbench/object_namespace_recovery_gate.py \
+            scripts/workbench/fork_restore_recovery_gate.py
           python3 scripts/workbench/workbench_contract_test.py
           python3 scripts/workbench/live_workbench_test.py
           python3 scripts/workbench/local_wal_recovery_gate_test.py
           python3 scripts/workbench/object_namespace_recovery_gate_test.py
+          python3 scripts/workbench/fork_restore_recovery_gate_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
       - name: Check Homebrew release safety
@@ -205,5 +207,68 @@ jobs:
         with:
           name: object-namespace-recovery-${{ github.sha }}
           path: ${{ runner.temp }}/object-namespace-recovery-evidence
+          if-no-files-found: error
+          retention-days: 7
+
+  fork-restore-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ETCD_VERSION: v3.7.1
+      ETCD_LINUX_AMD64_SHA256: e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9
+      RUSTFS_IMAGE: rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install pinned etcd
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
+          install_dir="$RUNNER_TEMP/etcd-$ETCD_VERSION"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz"
+          echo "$ETCD_LINUX_AMD64_SHA256  $archive" | sha256sum --check
+          mkdir -p "$install_dir"
+          tar -xzf "$archive" -C "$install_dir" --strip-components=1
+          echo "$install_dir" >>"$GITHUB_PATH"
+          "$install_dir/etcd" --version
+          "$install_dir/etcdctl" version
+
+      - name: Qualify path-native fork restore and retry
+        id: fork_restore_recovery
+        shell: bash
+        env:
+          FORK_RESTORE_EVIDENCE_DIR: ${{ runner.temp }}/fork-restore-recovery-evidence
+        run: |
+          set -euo pipefail
+          aws --version
+          docker --version
+          python3 scripts/workbench/fork_restore_recovery_gate.py \
+            --build \
+            --target-dir target \
+            --rustfs-image "$RUSTFS_IMAGE" \
+            --fixture-files 64 \
+            --evidence-dir "$FORK_RESTORE_EVIDENCE_DIR" \
+            --timeout 60
+
+      - name: Upload fork restore recovery evidence
+        if: ${{ always() && steps.fork_restore_recovery.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fork-restore-recovery-${{ github.sha }}
+          path: ${{ runner.temp }}/fork-restore-recovery-evidence
           if-no-files-found: error
           retention-days: 7

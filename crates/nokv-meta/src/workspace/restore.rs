@@ -3419,10 +3419,19 @@ mod tests {
         RootActivationState, RootId, FIXED_ID_BYTES,
     };
 
+    use super::super::gc::{ClaimGcRequest, GcError, GcService};
     use super::super::namespace::{
         create_visible_workspace, get_visible_path_at, get_visible_workspace_at, RootReadContext,
     };
-    use super::super::snapshot::{mint_snapshot, MintSnapshotRequest};
+    use super::super::query::{
+        find_workspaces_at, search_paths_at, CommittedFilter, FindWorkspacesRequest, QueryOperand,
+        QueryOperator, QueryPredicate, QueryScope, SearchRequest, MAX_QUERY_PAGE_SIZE,
+    };
+    use super::super::remove::{remove_path, RemovePathRequest};
+    use super::super::snapshot::{
+        mint_snapshot, retire_snapshot, MintSnapshotRequest, RetireSnapshotRequest,
+        SnapshotSelector as SnapshotLifecycleSelector,
+    };
     use super::*;
 
     fn sha256_digest_uri(digest: [u8; SHA256_BYTES]) -> String {
@@ -4242,6 +4251,226 @@ mod tests {
     }
 
     #[test]
+    fn owner_change_at_publication_fences_stale_worker_and_new_owner_completes() {
+        let mut counter = 1_500_u128;
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        let first_owner = owner(1);
+        activate_root(&store, &mut counter, first_owner);
+        let source = seed_source(&store, &mut counter, first_owner, 3);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, first_owner, &source);
+        let destination = workbench("owner-move-ready");
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            first_owner,
+            &source,
+            snapshot_id,
+            destination.as_str(),
+            incarnation(32),
+        );
+        drive_to_ready(
+            &store,
+            &mut counter,
+            first_owner,
+            begun.operation.operation_id,
+            &source.initialization,
+        );
+        let stale = write_context(&store, &mut counter, first_owner);
+        let second_owner = owner(2);
+        store
+            .advance_owner_epoch(Some(first_owner), second_owner)
+            .unwrap();
+
+        assert!(matches!(
+            complete_restore(
+                &store,
+                stale,
+                RestoreOperationRequest {
+                    operation_id: begun.operation.operation_id,
+                },
+            ),
+            Err(RestoreError::Meta(MetaError::OwnerEpochMismatch { .. }))
+        ));
+        assert!(
+            get_visible_workspace_at(&store, read_context(&store, second_owner), &destination,)
+                .unwrap()
+                .is_none()
+        );
+
+        let completed = complete_restore(
+            &store,
+            write_context(&store, &mut counter, second_owner),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.command.operation.phase, RestorePhase::Complete);
+        assert_eq!(completed.result.member_count, 3);
+        assert!(
+            get_visible_workspace_at(&store, read_context(&store, second_owner), &destination,)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cleanup_response_loss_replays_before_owner_change_and_new_owner_finishes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-replay-owner-move");
+        let mut counter = 1_700_u128;
+        let first_owner = owner(1);
+        let store = crate::workspace::test_support::initialize_file(&path, shard()).unwrap();
+        activate_root(&store, &mut counter, first_owner);
+        let source = seed_source(&store, &mut counter, first_owner, 3);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, first_owner, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            first_owner,
+            &source,
+            snapshot_id,
+            "cleanup-owner-move",
+            incarnation(33),
+        );
+        let operation_id = begun.operation.operation_id;
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, first_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        copy_restore_batch(
+            &store,
+            write_context(&store, &mut counter, first_owner),
+            CopyRestoreBatchRequest {
+                operation_id,
+                limit: 2,
+            },
+        )
+        .unwrap();
+        abort_restore(
+            &store,
+            write_context(&store, &mut counter, first_owner),
+            &AbortRestoreRequest {
+                operation_id,
+                terminal_error: RestoreTerminalError {
+                    kind: RestoreTerminalErrorKind::AbortedByCaller,
+                    message: "exercise cleanup replay".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+        )
+        .unwrap();
+        start_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, first_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        let cleanup_context = write_context(&store, &mut counter, first_owner);
+        let cleaned_once = cleanup_restore_batch(
+            &store,
+            cleanup_context,
+            CopyRestoreBatchRequest {
+                operation_id,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(cleaned_once.copied_members, 1);
+        drop(store);
+
+        let reopened = crate::workspace::test_support::open_file(&path, shard()).unwrap();
+        let replay = cleanup_restore_batch(
+            &reopened,
+            cleanup_context,
+            CopyRestoreBatchRequest {
+                operation_id,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert!(replay.command.replayed);
+        assert_eq!(replay.command.operation.cleanup_member_cursor, 1);
+        let source_revision = read_record(
+            &reopened,
+            write_context(&reopened, &mut counter, first_owner),
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), source.source_revision),
+            ArtifactRevisionRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source_revision.record.strong_reference_count, 4);
+
+        let stale = write_context(&reopened, &mut counter, first_owner);
+        let second_owner = owner(2);
+        reopened
+            .advance_owner_epoch(Some(first_owner), second_owner)
+            .unwrap();
+        assert!(matches!(
+            cleanup_restore_batch(
+                &reopened,
+                stale,
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: 1,
+                },
+            ),
+            Err(RestoreError::Meta(MetaError::OwnerEpochMismatch { .. }))
+        ));
+        loop {
+            let current = get_restore(
+                &reopened,
+                write_context(&reopened, &mut counter, second_owner),
+                operation_id,
+            )
+            .unwrap()
+            .unwrap();
+            if current.cleanup_member_cursor == current.next_member_sequence {
+                break;
+            }
+            cleanup_restore_batch(
+                &reopened,
+                write_context(&reopened, &mut counter, second_owner),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: 1,
+                },
+            )
+            .unwrap();
+        }
+        let cleaned = finish_restore_cleanup(
+            &reopened,
+            write_context(&reopened, &mut counter, second_owner),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert_eq!(cleaned.operation.phase, RestorePhase::Cleaned);
+        let source_revision = read_record(
+            &reopened,
+            write_context(&reopened, &mut counter, second_owner),
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), source.source_revision),
+            ArtifactRevisionRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source_revision.record.strong_reference_count, 3);
+        let snapshot = read_record(
+            &reopened,
+            write_context(&reopened, &mut counter, second_owner),
+            MetadataFamily::SnapshotRef,
+            &snapshot_ref_key(root(), source.source_incarnation, snapshot_id),
+            SnapshotRefRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.record.consumer_count, 0);
+    }
+
+    #[test]
     fn large_snapshot_member_copies_replays_and_releases_retention_after_abort() {
         let mut counter = 1900_u128;
         let store = crate::workspace::test_support::memory(shard()).unwrap();
@@ -4741,7 +4970,7 @@ mod tests {
     };
 
     use super::super::build_commit_records::CommitManifestCondition;
-    use super::super::codec::object_block_key;
+    use super::super::codec::{artifact_manifest_prefix, object_block_key};
     use super::super::commit::{
         BeginBuildCommitRequest, BuildCommitStepRequest, CommitService,
         MAX_COMMIT_MEMBER_BATCH_ROWS, MAX_COMMIT_PARENT_BATCH_ROWS, MAX_COMMIT_REVISION_BATCH_ROWS,
@@ -4752,7 +4981,7 @@ mod tests {
         staged_object_ledger_digest, BeginPublishRequest, FinalizePublishRequest, ManifestRowInput,
         MarkObjectsUploadedBatchRequest, PublicationContext, PublicationService, PublishedArtifact,
         StageManifestBatchRequest, StageObjectsBatchRequest, StagedObjectUpdate,
-        TransitionPublishRequest,
+        TransitionPublishRequest, MAX_PUBLICATION_BATCH_ROWS,
     };
     use super::super::publish_operation_records::{
         ArtifactManifestRow, PublishAuthority, PublishClaim, PublishOperationRecord,
@@ -4810,6 +5039,49 @@ mod tests {
                 append_segment: None,
             },
         }];
+        (staged, manifest)
+    }
+
+    fn multi_object_rows(
+        artifact_revision_id: ArtifactRevisionId,
+        block_size: u64,
+        block_count: u32,
+    ) -> (Vec<StagedObjectRecord>, Vec<ManifestRowInput>) {
+        let mut staged = Vec::with_capacity(block_count as usize);
+        let mut manifest = Vec::with_capacity(block_count as usize);
+        for object_index in 0..block_count {
+            let marker = format!("nokv-path-native-cow-block-{object_index:06}");
+            let digest_uri = body_digest_uri(marker.as_bytes());
+            let object_key = object_block_key(
+                shard(),
+                root(),
+                artifact_revision_id,
+                u64::from(object_index),
+            );
+            staged.push(StagedObjectRecord {
+                artifact_revision_id,
+                object_sequence: object_index,
+                object_key: object_key.clone(),
+                multipart_upload_id: None,
+                expected_length: block_size,
+                expected_digest_uri: digest_uri.clone(),
+                provider_state: StagedProviderState::Planned,
+                cleanup_state: StagedCleanupState::Owned,
+            });
+            manifest.push(ManifestRowInput {
+                object_index: u64::from(object_index),
+                row: ArtifactManifestRow {
+                    physical_owner_revision_id: artifact_revision_id,
+                    physical_object_index: u64::from(object_index),
+                    object_key,
+                    logical_offset: u64::from(object_index) * block_size,
+                    offset: 0,
+                    length: block_size,
+                    digest_uri,
+                    append_segment: None,
+                },
+            });
+        }
         (staged, manifest)
     }
 
@@ -4881,15 +5153,18 @@ mod tests {
             })
             .unwrap()
             .operation;
-        let operation = service
-            .stage_objects_batch(StageObjectsBatchRequest {
-                context: publication_context(store, counter, owner_epoch),
-                expected_operation: operation,
-                staged_objects: staged.to_vec(),
-            })
-            .unwrap()
-            .operation;
-        let uploads = staged
+        let mut operation = operation;
+        for batch in staged.chunks(MAX_PUBLICATION_BATCH_ROWS) {
+            operation = service
+                .stage_objects_batch(StageObjectsBatchRequest {
+                    context: publication_context(store, counter, owner_epoch),
+                    expected_operation: operation,
+                    staged_objects: batch.to_vec(),
+                })
+                .unwrap()
+                .operation;
+        }
+        let uploads: Vec<StagedObjectUpdate> = staged
             .iter()
             .cloned()
             .map(|expected| {
@@ -4898,23 +5173,27 @@ mod tests {
                 StagedObjectUpdate { expected, next }
             })
             .collect();
-        let operation = service
-            .mark_objects_uploaded_batch(MarkObjectsUploadedBatchRequest {
-                context: publication_context(store, counter, owner_epoch),
-                expected_operation: operation,
-                staged_object_updates: uploads,
-            })
-            .unwrap()
-            .operation;
-        let operation = service
-            .stage_manifest_batch(StageManifestBatchRequest {
-                context: publication_context(store, counter, owner_epoch),
-                expected_operation: operation,
-                manifest_rows: manifest.to_vec(),
-                dependency_owner_revision_ids: Vec::new(),
-            })
-            .unwrap()
-            .operation;
+        for batch in uploads.chunks(MAX_PUBLICATION_BATCH_ROWS) {
+            operation = service
+                .mark_objects_uploaded_batch(MarkObjectsUploadedBatchRequest {
+                    context: publication_context(store, counter, owner_epoch),
+                    expected_operation: operation,
+                    staged_object_updates: batch.to_vec(),
+                })
+                .unwrap()
+                .operation;
+        }
+        for batch in manifest.chunks(MAX_PUBLICATION_BATCH_ROWS) {
+            operation = service
+                .stage_manifest_batch(StageManifestBatchRequest {
+                    context: publication_context(store, counter, owner_epoch),
+                    expected_operation: operation,
+                    manifest_rows: batch.to_vec(),
+                    dependency_owner_revision_ids: Vec::new(),
+                })
+                .unwrap()
+                .operation;
+        }
         let operation = service
             .transition_publish(TransitionPublishRequest {
                 context: publication_context(store, counter, owner_epoch),
@@ -4973,6 +5252,58 @@ mod tests {
                 manifest_digest_uri,
                 content_type: "text/plain".to_owned(),
                 producer: Some("issue-429".to_owned()),
+                manifest_id: None,
+                typed_index_projection: TypedProjection::empty().encode().unwrap(),
+            },
+        );
+    }
+
+    /// Replaces one visible path through the production publication state
+    /// machine. A forked destination must diverge through this ordinary path;
+    /// restore cannot install a second write implementation.
+    #[allow(clippy::too_many_arguments)]
+    fn replace_text_file(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        target_workbench: &WorkbenchId,
+        target_incarnation: WorkspaceIncarnationId,
+        path: &str,
+        expected_generation: Generation,
+        body: &[u8],
+        file_revision: ArtifactRevisionId,
+        publish_operation_id: OperationId,
+    ) {
+        let (staged, manifest) = single_object_rows(file_revision, body);
+        let mut publish = wire_publish_operation(
+            publish_operation_id,
+            file_revision,
+            target_workbench,
+            target_incarnation,
+            NormalizedRelativePath::new(path).unwrap(),
+            PublishAuthority::Visible,
+            owner_epoch,
+            &staged,
+            &manifest,
+        );
+        publish.claim = PublishClaim::ReplaceOnly {
+            expected_generation,
+        };
+        seal_publish_operation(&mut publish);
+        let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
+        drive_publish_wire_calls(
+            store,
+            counter,
+            owner_epoch,
+            publish,
+            &staged,
+            &manifest,
+            PublishedArtifact {
+                logical_size: body.len() as u64,
+                body_digest_uri: body_digest_uri(body),
+                manifest_digest_uri,
+                content_type: "text/plain".to_owned(),
+                producer: Some("path-native-fork-acceptance".to_owned()),
                 manifest_id: None,
                 typed_index_projection: TypedProjection::empty().encode().unwrap(),
             },
@@ -5223,6 +5554,130 @@ mod tests {
             completed.result.destination_workspace_revision
         );
         completed
+    }
+
+    /// PR #407's full-profile fixture was one GiB split into 256 four-MiB
+    /// objects. The path-native model keeps that acceptance invariant without
+    /// materializing a GiB in the test process: production publication seals
+    /// all 256 physical rows, while restore adds only another reference to the
+    /// same revision and global manifest.
+    #[test]
+    fn one_gibibyte_multiblock_artifact_forks_without_data_copy() {
+        const BLOCK_SIZE: u64 = 4 * 1024 * 1024;
+        const BLOCK_COUNT: u32 = 256;
+        const LOGICAL_SIZE: u64 = BLOCK_SIZE * BLOCK_COUNT as u64;
+
+        let mut counter = 60_000_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = workbench("gib-source");
+        let source_incarnation = incarnation(60);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &source,
+            source_incarnation,
+        )
+        .unwrap();
+        let large_revision = revision(0x60);
+        let (staged, manifest) = multi_object_rows(large_revision, BLOCK_SIZE, BLOCK_COUNT);
+        let publish = wire_publish_operation(
+            operation(0x61),
+            large_revision,
+            &source,
+            source_incarnation,
+            NormalizedRelativePath::new("outputs/cow-large.bin").unwrap(),
+            PublishAuthority::Visible,
+            owner_epoch,
+            &staged,
+            &manifest,
+        );
+        let manifest_digest_uri = sha256_digest_uri(publish.manifest_seal);
+        drive_publish_wire_calls(
+            &store,
+            &mut counter,
+            owner_epoch,
+            publish,
+            &staged,
+            &manifest,
+            PublishedArtifact {
+                logical_size: LOGICAL_SIZE,
+                body_digest_uri: body_digest_uri(b"one-gibibyte-cow-fixture"),
+                manifest_digest_uri,
+                content_type: "application/octet-stream".to_owned(),
+                producer: Some("path-native-cow-acceptance".to_owned()),
+                manifest_id: None,
+                typed_index_projection: TypedProjection::empty().encode().unwrap(),
+            },
+        );
+        let snapshot_id = SnapshotId::new(4_070);
+        mint_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &MintSnapshotRequest {
+                workbench_id: source.clone(),
+                snapshot_id,
+                alias: None,
+                lease_deadline_ms: 1_000_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let destination = workbench("gib-destination");
+        let destination_incarnation = incarnation(61);
+        let completed = drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source,
+            source_incarnation,
+            snapshot_id,
+            &destination,
+            destination_incarnation,
+            operation(0x62),
+            revision(0x62),
+            MAX_RESTORE_BATCH_MEMBERS,
+        );
+        assert_eq!(completed.result.member_count, 1);
+
+        for workbench in [&source, &destination] {
+            let entry = get_visible_path_at(
+                &store,
+                read_context(&store, owner_epoch),
+                workbench,
+                &NormalizedRelativePath::new("outputs/cow-large.bin").unwrap(),
+            )
+            .unwrap()
+            .expect("large COW path remains visible");
+            assert_eq!(entry.artifact_revision_id, large_revision);
+            assert_eq!(entry.logical_size, LOGICAL_SIZE);
+        }
+        let revision = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), large_revision),
+            ArtifactRevisionRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(revision.record.block_count, u64::from(BLOCK_COUNT));
+        assert_eq!(revision.record.strong_reference_count, 2);
+        let manifest_rows = store
+            .scan_prefix_at(
+                root(),
+                placement(),
+                owner_epoch,
+                MetadataFamily::ArtifactManifest,
+                &artifact_manifest_prefix(root(), large_revision),
+                store.current_read_version().unwrap(),
+                None,
+                BLOCK_COUNT as usize + 1,
+            )
+            .unwrap();
+        assert_eq!(manifest_rows.len(), BLOCK_COUNT as usize);
     }
 
     /// Issue #429: create -> put_file(input/note.txt) -> commit ->
@@ -5809,5 +6264,929 @@ mod tests {
             reason.contains("virtual run manifest member"),
             "reason: {reason}"
         );
+    }
+
+    /// Path-native equivalent of PR #407's clone/divergence acceptance: the
+    /// restored workbench initially owns an exact reference to the source's
+    /// immutable revision, then ordinary replacement mints an independent
+    /// revision without changing the source.
+    #[test]
+    fn restored_workbench_is_a_writable_zero_copy_fork() {
+        let mut counter = 10_000_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+
+        let source_workbench = workbench("cow-source");
+        let source_incarnation = incarnation(10);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &source_workbench,
+            source_incarnation,
+        )
+        .unwrap();
+        let source_revision = revision(0x71);
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            "input/model.bin",
+            b"shared-base",
+            source_revision,
+            operation(0x72),
+        );
+        let snapshot_id = SnapshotId::new(701);
+        mint_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &MintSnapshotRequest {
+                workbench_id: source_workbench.clone(),
+                snapshot_id,
+                alias: None,
+                lease_deadline_ms: 86_400_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let destination_workbench = workbench("cow-destination");
+        let destination_incarnation = incarnation(30);
+        let completed = drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            snapshot_id,
+            &destination_workbench,
+            destination_incarnation,
+            operation(0x73),
+            revision(0x74),
+            1,
+        );
+        assert_eq!(completed.result.member_count, 1);
+
+        let path = NormalizedRelativePath::new("input/model.bin").unwrap();
+        let source_before = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &source_workbench,
+            &path,
+        )
+        .unwrap()
+        .unwrap();
+        let destination_before = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+            &path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source_before.artifact_revision_id, source_revision);
+        assert_eq!(destination_before.artifact_revision_id, source_revision);
+        assert_eq!(
+            source_before.body_digest_uri,
+            destination_before.body_digest_uri
+        );
+
+        let shared = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), source_revision),
+            ArtifactRevisionRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(shared.record.strong_reference_count, 2);
+
+        let destination_revision = revision(0x75);
+        replace_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &destination_workbench,
+            destination_incarnation,
+            "input/model.bin",
+            Generation::new(1).unwrap(),
+            b"destination-delta",
+            destination_revision,
+            operation(0x76),
+        );
+
+        let source_after = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &source_workbench,
+            &path,
+        )
+        .unwrap()
+        .unwrap();
+        let destination_after = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+            &path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source_after.artifact_revision_id, source_revision);
+        assert_eq!(source_after.generation, Generation::new(1).unwrap());
+        assert_eq!(
+            source_after.body_digest_uri,
+            body_digest_uri(b"shared-base")
+        );
+        assert_eq!(destination_after.artifact_revision_id, destination_revision);
+        assert_eq!(destination_after.generation, Generation::new(2).unwrap());
+        assert_eq!(
+            destination_after.body_digest_uri,
+            body_digest_uri(b"destination-delta")
+        );
+
+        let source_owner = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), source_revision),
+            ArtifactRevisionRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        let destination_owner = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), destination_revision),
+            ArtifactRevisionRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source_owner.record.strong_reference_count, 1);
+        assert_eq!(destination_owner.record.strong_reference_count, 1);
+    }
+
+    /// Path-native equivalent of the old source-delete/ForkBinding tests. A
+    /// historical source row may lose its live reference, but the snapshot
+    /// hold blocks GC until restore creates a direct destination RevisionRef.
+    #[test]
+    fn restored_revision_outlives_source_removal_and_snapshot_retirement() {
+        let mut counter = 11_000_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+
+        let source_workbench = workbench("retired-source");
+        let source_incarnation = incarnation(11);
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &source_workbench,
+            source_incarnation,
+        )
+        .unwrap();
+        let source_revision = revision(0x81);
+        publish_text_file(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            "outputs/result.bin",
+            b"historical-result",
+            source_revision,
+            operation(0x82),
+        );
+        let snapshot_id = SnapshotId::new(801);
+        mint_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &MintSnapshotRequest {
+                workbench_id: source_workbench.clone(),
+                snapshot_id,
+                alias: None,
+                lease_deadline_ms: 86_400_000,
+                annotation: Vec::new(),
+            },
+        )
+        .unwrap();
+        let path = NormalizedRelativePath::new("outputs/result.bin").unwrap();
+        remove_path(
+            &store,
+            RemovePathRequest {
+                context: write_context(&store, &mut counter, owner_epoch),
+                workbench_id: source_workbench.clone(),
+                path: path.clone(),
+                expected_generation: Generation::new(1).unwrap(),
+            },
+        )
+        .unwrap();
+        assert!(get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &source_workbench,
+            &path,
+        )
+        .unwrap()
+        .is_none());
+
+        let zero_ref = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), source_revision),
+            ArtifactRevisionRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(zero_ref.record.strong_reference_count, 0);
+        assert!(matches!(
+            GcService::new(&store).claim(ClaimGcRequest {
+                context: write_context(&store, &mut counter, owner_epoch),
+                artifact_revision_id: source_revision,
+                reference_epoch: zero_ref.record.reference_epoch,
+            }),
+            Err(GcError::UnsafeHistoryFloor { .. })
+        ));
+
+        let destination_workbench = workbench("retired-source-fork");
+        drive_snapshot_restore_to_visible(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            snapshot_id,
+            &destination_workbench,
+            incarnation(31),
+            operation(0x83),
+            revision(0x84),
+            1,
+        );
+        let restored = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+            &path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.artifact_revision_id, source_revision);
+        assert_eq!(
+            restored.body_digest_uri,
+            body_digest_uri(b"historical-result")
+        );
+
+        retire_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &RetireSnapshotRequest {
+                workbench_id: source_workbench.clone(),
+                selector: SnapshotLifecycleSelector::Id(snapshot_id),
+                retire_annotation: Some(b"fork published".to_vec()),
+            },
+        )
+        .unwrap();
+        let still_restored = get_visible_path_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+            &path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(still_restored.artifact_revision_id, source_revision);
+        let retained = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::ArtifactRevision,
+            &artifact_revision_key(root(), source_revision),
+            ArtifactRevisionRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained.record.strong_reference_count, 1);
+        assert!(retained.record.reference_epoch > zero_ref.record.reference_epoch);
+    }
+
+    /// The source snapshot is a construction fence only. It cannot retire
+    /// while a restore consumes it, and becomes independently retireable as
+    /// soon as the destination owns exact revision references.
+    #[test]
+    fn snapshot_retirement_is_fenced_until_fork_publication() {
+        let mut counter = 12_000_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 3);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source,
+            snapshot_id,
+            "retention-destination",
+            incarnation(32),
+        );
+
+        assert!(matches!(
+            retire_snapshot(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                &RetireSnapshotRequest {
+                    workbench_id: source.source_workbench.clone(),
+                    selector: SnapshotLifecycleSelector::Id(snapshot_id),
+                    retire_annotation: None,
+                },
+            ),
+            Err(super::super::snapshot::SnapshotError::ForkRetentionActive {
+                snapshot_id: actual,
+                consumer_count: 1,
+            }) if actual == snapshot_id
+        ));
+
+        drive_to_ready(
+            &store,
+            &mut counter,
+            owner_epoch,
+            begun.operation.operation_id,
+            &source.initialization,
+        );
+        complete_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        let retired = retire_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &RetireSnapshotRequest {
+                workbench_id: source.source_workbench,
+                selector: SnapshotLifecycleSelector::Id(snapshot_id),
+                retire_annotation: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(retired.snapshot.record.state, SnapshotState::Retired);
+    }
+
+    /// Staged PathCurrent and SecondaryIndex rows may exist for many commands,
+    /// but every public namespace and query surface must continue to derive
+    /// visibility from WorkspaceCurrent.
+    #[test]
+    fn fork_staging_is_hidden_from_namespace_discovery_and_query() {
+        let mut counter = 13_000_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 3);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let destination = workbench("hidden-fork");
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source,
+            snapshot_id,
+            destination.as_str(),
+            incarnation(33),
+        );
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        copy_restore_batch(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            CopyRestoreBatchRequest {
+                operation_id: begun.operation.operation_id,
+                limit: MAX_RESTORE_BATCH_MEMBERS,
+            },
+        )
+        .unwrap();
+
+        let request = SearchRequest {
+            scope: QueryScope::Root,
+            path_prefix: None,
+            predicates: vec![QueryPredicate {
+                field_id: QueryFieldId::new("source.class").unwrap(),
+                operator: QueryOperator::Equal,
+                operand: QueryOperand::Scalar(QueryScalar::String("seed".to_owned())),
+            }],
+            projection: Vec::new(),
+            sort: Vec::new(),
+            facets: Vec::new(),
+            cursor: None,
+            limit: MAX_QUERY_PAGE_SIZE,
+        };
+        let before = search_paths_at(&store, read_context(&store, owner_epoch), &request).unwrap();
+        assert_eq!(before.hits.len(), 3);
+        assert!(before
+            .hits
+            .iter()
+            .all(|hit| hit.workbench_id == source.source_workbench));
+        assert!(
+            get_visible_workspace_at(&store, read_context(&store, owner_epoch), &destination,)
+                .unwrap()
+                .is_none()
+        );
+        let discovered = find_workspaces_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &FindWorkspacesRequest {
+                committed: CommittedFilter::Any,
+                cursor: None,
+                limit: MAX_QUERY_PAGE_SIZE,
+            },
+        )
+        .unwrap();
+        assert!(discovered
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.workbench_id != destination));
+
+        seal_restore_source(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        publish_restore_manifest_for_test(
+            &store,
+            &mut counter,
+            owner_epoch,
+            begun.operation.operation_id,
+            &source.initialization,
+        );
+        apply_restore_initialization(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        complete_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+
+        let after = search_paths_at(&store, read_context(&store, owner_epoch), &request).unwrap();
+        assert_eq!(after.hits.len(), 6);
+        assert_eq!(
+            after
+                .hits
+                .iter()
+                .filter(|hit| hit.workbench_id == destination)
+                .count(),
+            3
+        );
+    }
+
+    /// A conflicting destination is rejected before the operation, staging
+    /// incarnation, source consumer, or restore HistoryHold can be installed.
+    #[test]
+    fn destination_conflict_has_no_partial_fork_state() {
+        let mut counter = 14_000_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 1);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let destination = workbench("occupied-destination");
+        create_visible_workspace(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &destination,
+            incarnation(34),
+        )
+        .unwrap();
+        let request = BeginRestoreRequest {
+            source_workbench_id: source.source_workbench.clone(),
+            expected_source_workspace_incarnation_id: source.source_incarnation,
+            source: RestoreSourceSelector::Snapshot(snapshot_id),
+            destination_workbench_id: destination.clone(),
+            destination_workspace_incarnation_id: incarnation(35),
+            restore_manifest: restore_manifest_descriptor(&source.initialization),
+        };
+        let identity = restore_selector_identity_digest(
+            root(),
+            &request.source_workbench_id,
+            request.expected_source_workspace_incarnation_id,
+            request.source,
+            &request.destination_workbench_id,
+            request.destination_workspace_incarnation_id,
+        )
+        .unwrap();
+        let operation_id = operation_id_from_identity(identity);
+        assert_eq!(
+            begin_restore(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                &request,
+            ),
+            Err(RestoreError::DestinationExists {
+                workbench_id: destination,
+            })
+        );
+        let snapshot = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::SnapshotRef,
+            &snapshot_ref_key(root(), source.source_incarnation, snapshot_id),
+            SnapshotRefRecord::decode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.record.consumer_count, 0);
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::HistoryHold,
+            &restore_history_hold_key(root(), operation_id),
+        )
+        .unwrap()
+        .is_none());
+        assert!(get_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            operation_id,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// Losing the terminal response and reopening Holt must replay the exact
+    /// visibility result instead of creating a second destination generation.
+    #[test]
+    fn terminal_fork_response_loss_replays_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("terminal-fork-replay");
+        let mut counter = 15_000_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::initialize_file(&path, shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 2);
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source,
+            snapshot_id,
+            "terminal-replay",
+            incarnation(36),
+        );
+        drive_to_ready(
+            &store,
+            &mut counter,
+            owner_epoch,
+            begun.operation.operation_id,
+            &source.initialization,
+        );
+        let terminal_context = write_context(&store, &mut counter, owner_epoch);
+        let completed = complete_restore(
+            &store,
+            terminal_context,
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        drop(store);
+
+        let reopened = crate::workspace::test_support::open_file(&path, shard()).unwrap();
+        let replay = complete_restore(
+            &reopened,
+            terminal_context,
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        assert!(replay.command.replayed);
+        assert_eq!(replay.result, completed.result);
+        let destination = get_visible_workspace_at(
+            &reopened,
+            read_context(&reopened, owner_epoch),
+            &workbench("terminal-replay"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            destination.workspace_revision,
+            completed.result.destination_workspace_revision
+        );
+    }
+
+    /// Replaces PR #407's detached-root crash barriers with the durable
+    /// path-native phase boundaries. Every committed nonterminal phase must
+    /// reopen with the destination hidden and converge under the same logical
+    /// operation, including abort cleanup.
+    #[test]
+    fn every_durable_fork_phase_reopens_hidden_and_converges() {
+        let directory = tempdir().unwrap();
+        for (index, crash_phase) in [
+            RestorePhase::Preparing,
+            RestorePhase::Copying,
+            RestorePhase::SourceSealed,
+            RestorePhase::Ready,
+            RestorePhase::Aborting,
+            RestorePhase::Cleaning,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = directory.path().join(format!("phase-{index}"));
+            let mut counter = 20_000_u128 + (index as u128) * 1_000;
+            let owner_epoch = owner(1);
+            let store = crate::workspace::test_support::initialize_file(&path, shard()).unwrap();
+            activate_root(&store, &mut counter, owner_epoch);
+            let source = seed_source(&store, &mut counter, owner_epoch, 5);
+            let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+            let destination_name = format!("phase-destination-{index}");
+            let destination = workbench(&destination_name);
+            let begun = begin_snapshot_restore(
+                &store,
+                &mut counter,
+                owner_epoch,
+                &source,
+                snapshot_id,
+                &destination_name,
+                incarnation(40 + index as u8),
+            );
+            let operation_id = begun.operation.operation_id;
+            match crash_phase {
+                RestorePhase::Preparing => {}
+                RestorePhase::Copying => {
+                    start_restore_copy(
+                        &store,
+                        write_context(&store, &mut counter, owner_epoch),
+                        RestoreOperationRequest { operation_id },
+                    )
+                    .unwrap();
+                    let copied = copy_restore_batch(
+                        &store,
+                        write_context(&store, &mut counter, owner_epoch),
+                        CopyRestoreBatchRequest {
+                            operation_id,
+                            limit: 2,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(copied.copied_members, 2);
+                    assert!(!copied.source_eof);
+                }
+                RestorePhase::SourceSealed => {
+                    start_restore_copy(
+                        &store,
+                        write_context(&store, &mut counter, owner_epoch),
+                        RestoreOperationRequest { operation_id },
+                    )
+                    .unwrap();
+                    copy_all(&store, &mut counter, owner_epoch, operation_id);
+                    seal_restore_source(
+                        &store,
+                        write_context(&store, &mut counter, owner_epoch),
+                        RestoreOperationRequest { operation_id },
+                    )
+                    .unwrap();
+                }
+                RestorePhase::Ready => drive_to_ready(
+                    &store,
+                    &mut counter,
+                    owner_epoch,
+                    operation_id,
+                    &source.initialization,
+                ),
+                RestorePhase::Aborting | RestorePhase::Cleaning => {
+                    start_restore_copy(
+                        &store,
+                        write_context(&store, &mut counter, owner_epoch),
+                        RestoreOperationRequest { operation_id },
+                    )
+                    .unwrap();
+                    copy_restore_batch(
+                        &store,
+                        write_context(&store, &mut counter, owner_epoch),
+                        CopyRestoreBatchRequest {
+                            operation_id,
+                            limit: 2,
+                        },
+                    )
+                    .unwrap();
+                    abort_restore(
+                        &store,
+                        write_context(&store, &mut counter, owner_epoch),
+                        &AbortRestoreRequest {
+                            operation_id,
+                            terminal_error: RestoreTerminalError {
+                                kind: RestoreTerminalErrorKind::AbortedByCaller,
+                                message: format!("phase-{index} crash fixture"),
+                                evidence_digest: None,
+                            },
+                        },
+                    )
+                    .unwrap();
+                    if crash_phase == RestorePhase::Cleaning {
+                        start_restore_cleanup(
+                            &store,
+                            write_context(&store, &mut counter, owner_epoch),
+                            RestoreOperationRequest { operation_id },
+                        )
+                        .unwrap();
+                        let cleaned = cleanup_restore_batch(
+                            &store,
+                            write_context(&store, &mut counter, owner_epoch),
+                            CopyRestoreBatchRequest {
+                                operation_id,
+                                limit: 1,
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(cleaned.copied_members, 1);
+                    }
+                }
+                RestorePhase::Complete | RestorePhase::Cleaned | RestorePhase::Quarantined => {
+                    unreachable!("only nonterminal crash phases are enumerated")
+                }
+            }
+            assert_eq!(
+                get_restore(
+                    &store,
+                    write_context(&store, &mut counter, owner_epoch),
+                    operation_id,
+                )
+                .unwrap()
+                .unwrap()
+                .phase,
+                crash_phase
+            );
+            assert!(get_visible_workspace_at(
+                &store,
+                read_context(&store, owner_epoch),
+                &destination,
+            )
+            .unwrap()
+            .is_none());
+            drop(store);
+
+            let reopened = crate::workspace::test_support::open_file(&path, shard()).unwrap();
+            let reopened_operation = get_restore(
+                &reopened,
+                write_context(&reopened, &mut counter, owner_epoch),
+                operation_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(reopened_operation.phase, crash_phase);
+            assert!(get_visible_workspace_at(
+                &reopened,
+                read_context(&reopened, owner_epoch),
+                &destination,
+            )
+            .unwrap()
+            .is_none());
+
+            match crash_phase {
+                RestorePhase::Preparing => {
+                    drive_to_ready(
+                        &reopened,
+                        &mut counter,
+                        owner_epoch,
+                        operation_id,
+                        &source.initialization,
+                    );
+                }
+                RestorePhase::Copying => {
+                    copy_all(&reopened, &mut counter, owner_epoch, operation_id);
+                    seal_restore_source(
+                        &reopened,
+                        write_context(&reopened, &mut counter, owner_epoch),
+                        RestoreOperationRequest { operation_id },
+                    )
+                    .unwrap();
+                    publish_restore_manifest_for_test(
+                        &reopened,
+                        &mut counter,
+                        owner_epoch,
+                        operation_id,
+                        &source.initialization,
+                    );
+                    apply_restore_initialization(
+                        &reopened,
+                        write_context(&reopened, &mut counter, owner_epoch),
+                        RestoreOperationRequest { operation_id },
+                    )
+                    .unwrap();
+                }
+                RestorePhase::SourceSealed => {
+                    publish_restore_manifest_for_test(
+                        &reopened,
+                        &mut counter,
+                        owner_epoch,
+                        operation_id,
+                        &source.initialization,
+                    );
+                    apply_restore_initialization(
+                        &reopened,
+                        write_context(&reopened, &mut counter, owner_epoch),
+                        RestoreOperationRequest { operation_id },
+                    )
+                    .unwrap();
+                }
+                RestorePhase::Ready => {}
+                RestorePhase::Aborting | RestorePhase::Cleaning => {
+                    if crash_phase == RestorePhase::Aborting {
+                        start_restore_cleanup(
+                            &reopened,
+                            write_context(&reopened, &mut counter, owner_epoch),
+                            RestoreOperationRequest { operation_id },
+                        )
+                        .unwrap();
+                    }
+                    loop {
+                        let current = get_restore(
+                            &reopened,
+                            write_context(&reopened, &mut counter, owner_epoch),
+                            operation_id,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        if current.cleanup_member_cursor == current.next_member_sequence {
+                            break;
+                        }
+                        cleanup_restore_batch(
+                            &reopened,
+                            write_context(&reopened, &mut counter, owner_epoch),
+                            CopyRestoreBatchRequest {
+                                operation_id,
+                                limit: 1,
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let cleaned = finish_restore_cleanup(
+                        &reopened,
+                        write_context(&reopened, &mut counter, owner_epoch),
+                        RestoreOperationRequest { operation_id },
+                    )
+                    .unwrap();
+                    assert_eq!(cleaned.operation.phase, RestorePhase::Cleaned);
+                    assert!(get_visible_workspace_at(
+                        &reopened,
+                        read_context(&reopened, owner_epoch),
+                        &destination,
+                    )
+                    .unwrap()
+                    .is_none());
+                    let source_owner = read_record(
+                        &reopened,
+                        write_context(&reopened, &mut counter, owner_epoch),
+                        MetadataFamily::ArtifactRevision,
+                        &artifact_revision_key(root(), source.source_revision),
+                        ArtifactRevisionRecord::decode,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(source_owner.record.strong_reference_count, 5);
+                    continue;
+                }
+                RestorePhase::Complete | RestorePhase::Cleaned | RestorePhase::Quarantined => {
+                    unreachable!()
+                }
+            }
+            let completed = complete_restore(
+                &reopened,
+                write_context(&reopened, &mut counter, owner_epoch),
+                RestoreOperationRequest { operation_id },
+            )
+            .unwrap();
+            assert_eq!(completed.command.operation.phase, RestorePhase::Complete);
+            assert!(get_visible_workspace_at(
+                &reopened,
+                read_context(&reopened, owner_epoch),
+                &destination,
+            )
+            .unwrap()
+            .is_some());
+        }
     }
 }

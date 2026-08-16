@@ -33,6 +33,13 @@ The checked-in integration assets are deliberately small:
   retryable outage/recovery contract over one long-lived MCP process.
 - `object_namespace_recovery_gate_test.py` freezes those terminal assertions
   and the independent GitHub Actions evidence-upload contract.
+- `fork_restore_recovery_gate.py` qualifies path-native, whole-Workbench
+  fork-to-restore against isolated real etcd and digest-pinned RustFS. It
+  injects response loss, kills and reopens the owner, races exact concurrent
+  forks, chains a nested fork, retires the source snapshot, and inventories
+  immutable objects to prove zero-copy reuse.
+- `fork_restore_recovery_gate_test.py` freezes the fault classifier, 1 GiB
+  profile, terminal evidence, and independent GitHub Actions job contract.
 - `start_rustfs.sh` starts the optional local S3-compatible artifact backend
   with a digest-pinned image and bounded AWS CLI readiness attempts. It uses a
   Docker-managed volume by default so RustFS's non-root UID owns `/data` on
@@ -48,6 +55,7 @@ python3 scripts/workbench/workbench_contract_test.py
 python3 scripts/workbench/live_workbench_test.py
 python3 scripts/workbench/local_wal_recovery_gate_test.py
 python3 scripts/workbench/object_namespace_recovery_gate_test.py
+python3 scripts/workbench/fork_restore_recovery_gate_test.py
 ```
 
 Register the built binary in any MCP-compatible Agent runtime as a stdio MCP
@@ -187,3 +195,35 @@ of the fixture values. The gate requires all of the following:
 
 GitHub Actions runs this as the separate `object-namespace-recovery` job and
 uploads its complete evidence directory even on failure.
+
+## Path-native fork-to-restore recovery evidence
+
+The fork gate exercises the supported whole-Workbench restore contract. It
+does not restore an inode/dentry subtree and does not mutate an existing
+destination in place. The destination must be absent, receives a fresh hidden
+incarnation, and becomes visible only after its path closure and restore
+manifest are complete.
+
+The live gate requires local `etcd`, `etcdctl`, Docker, and the AWS CLI. Its
+default 64-file profile crosses the restore copy-batch boundary in CI;
+`--require-full` fixes the profile at 256 files of 4 MiB, exactly 1 GiB of
+logical artifact data:
+
+```bash
+python3 scripts/workbench/fork_restore_recovery_gate.py \
+  --build \
+  --target-dir target/fork-restore-recovery/build \
+  --fixture-files 256 \
+  --require-full \
+  --evidence-dir target/fork-restore-recovery/evidence/run-01
+```
+
+The gate drops the real owner response after `prepare_restore` and again after
+`finalize_restore`, sends `SIGKILL`, waits for the etcd session to disappear,
+and retries against the same Holt directory at the next owner epoch. It also
+requires sixteen identical concurrent requests to converge to one operation,
+chains a fork from a recommitted fork, retires and diverges the source, and
+proves every fork adds only its restore-manifest object while overwriting no
+source payload object. GitHub Actions runs the bounded profile as the separate
+`fork-restore-recovery` job and retains the complete evidence directory even
+on failure.
