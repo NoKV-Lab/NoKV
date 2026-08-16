@@ -7,14 +7,22 @@
 //! visibility, revision reachability, metadata transactions, and GC policy live
 //! in `nokv-meta`.
 
+mod admission;
 mod artifact;
 mod cache;
 mod digest;
 mod local_hot;
 mod namespace;
+#[cfg(test)]
+mod provider_admission_test;
 mod store;
 mod tiered;
 
+pub use admission::{
+    admit_artifact_provider, AdmittedCreateMode, ProviderAdmissionCapability,
+    ProviderAdmissionError, ProviderAdmissionProfile, ProviderAdmissionReceipt,
+    ProviderHandleIdentity, MAX_SINGLE_PUT_ADMISSION_BYTES, PROVIDER_ADMISSION_CONTRACT_VERSION,
+};
 pub use artifact::{
     cleanup_staged_artifact, plan_artifact_read, plan_artifact_upload, read_artifact,
     read_artifact_range, read_artifact_window, upload_artifact_from_plan, verify_artifact_bytes,

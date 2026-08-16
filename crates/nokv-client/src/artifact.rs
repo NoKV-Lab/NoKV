@@ -198,6 +198,8 @@ where
             ));
         }
 
+        require_provider_admission(store, options.block_size)?;
+
         let route = self.resolve_artifact_route()?;
         require_object_namespace(store, route)?;
         let logical_shard = route.logical_shard_id;
@@ -261,6 +263,7 @@ where
         descriptor: ArtifactDescriptor,
         bytes: &[u8],
     ) -> Result<ArtifactPublishOutcome, ClientError> {
+        require_provider_admission(store, object_plan.block_size)?;
         let seals =
             seal_artifact_publish_plan(artifact_revision_id, &staged_objects, &manifest_rows)?;
         descriptor.validate()?;
@@ -565,6 +568,7 @@ where
         options: ArtifactAppendOptions,
         delta: &[u8],
     ) -> Result<ArtifactAppendOutcome, ClientError> {
+        require_provider_admission(store, options.block_size)?;
         for attempt in 0..self.max_attempts() {
             let (operation_id, artifact_revision_id) = append_attempt_identities(
                 options.operation_id,
@@ -1686,6 +1690,34 @@ fn require_object_namespace(
     }
 }
 
+fn require_provider_admission(
+    store: &dyn ArtifactObjectStore,
+    block_size: usize,
+) -> Result<(), ClientError> {
+    // Keep zero-size validation owned by the upload planner. Every positive
+    // block must fit the endpoint payload actually exercised by admission.
+    if block_size == 0 {
+        return Ok(());
+    }
+    let receipt = store
+        .provider_admission_receipt()
+        .ok_or(ObjectError::ProviderAdmissionRequired)?;
+    if !receipt.is_bound_to_store(store) {
+        return Err(ObjectError::ProviderAdmissionRequired.into());
+    }
+    if block_size > receipt.max_verified_object_bytes() {
+        return Err(ObjectError::ProviderAdmissionBlockSizeExceeded {
+            requested: block_size,
+            admitted: receipt.max_verified_object_bytes(),
+        }
+        .into());
+    }
+    if !receipt.admits_store(store, block_size) {
+        return Err(ObjectError::ProviderAdmissionRequired.into());
+    }
+    Ok(())
+}
+
 fn stream_artifact_digest(
     store: &dyn ArtifactObjectStore,
     manifest: &ArtifactManifest,
@@ -2172,8 +2204,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use nokv_object::{
-        ArtifactStoreCapabilities, ImmutableCreateOutcome, MemoryArtifactStore,
-        ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectRange,
+        admit_artifact_provider, ArtifactStoreCapabilities, ImmutableCreateOutcome,
+        MemoryArtifactStore, ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectRange,
+        ProviderAdmissionProfile, ProviderAdmissionReceipt,
     };
     use nokv_protocol::{
         decode_request, encode_response, ConflictKind, OperationProgress, PathReadResult,
@@ -2708,6 +2741,14 @@ mod tests {
             self.inner.capabilities()
         }
 
+        fn provider_handle_identity(&self) -> nokv_object::ProviderHandleIdentity {
+            self.inner.provider_handle_identity()
+        }
+
+        fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+            self.inner.provider_admission_receipt()
+        }
+
         fn create_immutable(
             &self,
             key: &ObjectKey,
@@ -2755,6 +2796,82 @@ mod tests {
 
         fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
             self.deletes.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(key)
+        }
+    }
+
+    struct AdmissionOverrideStore {
+        inner: RecordingStore,
+        receipt: Option<ProviderAdmissionReceipt>,
+    }
+
+    impl AdmissionOverrideStore {
+        fn unadmitted(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                inner: RecordingStore::new(events, None),
+                receipt: None,
+            }
+        }
+
+        fn admitted_for(
+            events: Arc<Mutex<Vec<&'static str>>>,
+            max_verified_object_bytes: usize,
+        ) -> Self {
+            let inner = RecordingStore::new(events, None);
+            let receipt = admit_artifact_provider(
+                &inner,
+                ProviderAdmissionProfile::single_put(max_verified_object_bytes).unwrap(),
+            )
+            .unwrap();
+            inner.events.lock().unwrap().clear();
+            inner.creates.store(0, Ordering::SeqCst);
+            inner.deletes.store(0, Ordering::SeqCst);
+            inner.reads.store(0, Ordering::SeqCst);
+            Self {
+                inner,
+                receipt: Some(receipt),
+            }
+        }
+    }
+
+    impl ArtifactObjectStore for AdmissionOverrideStore {
+        fn object_namespace(&self) -> Option<nokv_types::ObjectNamespaceId> {
+            self.inner.object_namespace()
+        }
+
+        fn capabilities(&self) -> ArtifactStoreCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn provider_handle_identity(&self) -> nokv_object::ProviderHandleIdentity {
+            self.inner.provider_handle_identity()
+        }
+
+        fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+            self.receipt.as_ref()
+        }
+
+        fn create_immutable(
+            &self,
+            key: &ObjectKey,
+            bytes: &[u8],
+        ) -> Result<ImmutableCreateOutcome, ObjectError> {
+            self.inner.create_immutable(key, bytes)
+        }
+
+        fn read(
+            &self,
+            key: &ObjectKey,
+            range: Option<ObjectRange>,
+        ) -> Result<Vec<u8>, ObjectError> {
+            self.inner.read(key, range)
+        }
+
+        fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
+            self.inner.head(key)
+        }
+
+        fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
             self.inner.delete(key)
         }
     }
@@ -2807,6 +2924,69 @@ mod tests {
             ContentType::new("text/plain").unwrap(),
         )
         .with_block_size(block_size)
+    }
+
+    #[test]
+    fn provider_admission_is_required_before_begin_publish_rpc() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = AdmissionOverrideStore::unadmitted(Arc::clone(&events));
+
+        assert!(matches!(
+            client
+                .publish_artifact(&store, publish_options(4), b"abcdefgh")
+                .unwrap_err(),
+            ClientError::Object(ObjectError::ProviderAdmissionRequired)
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn block_size_above_admission_is_rejected_before_begin_publish_rpc() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = AdmissionOverrideStore::admitted_for(Arc::clone(&events), 4);
+
+        assert!(matches!(
+            client
+                .publish_artifact(&store, publish_options(5), b"abcdefgh")
+                .unwrap_err(),
+            ClientError::Object(ObjectError::ProviderAdmissionBlockSizeExceeded {
+                requested: 5,
+                admitted: 4,
+            })
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_receipt_from_provider_a_cannot_admit_provider_b() {
+        let source_events = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingStore::new(source_events, None);
+        let foreign_receipt =
+            admit_artifact_provider(&source, ProviderAdmissionProfile::single_put(4).unwrap())
+                .unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = AdmissionOverrideStore {
+            inner: RecordingStore::new(Arc::clone(&events), None),
+            receipt: Some(foreign_receipt),
+        };
+
+        assert!(matches!(
+            client
+                .publish_artifact(&store, publish_options(4), b"abcdefgh")
+                .unwrap_err(),
+            ClientError::Object(ObjectError::ProviderAdmissionRequired)
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(store.inner.creates.load(Ordering::SeqCst), 0);
     }
 
     #[test]

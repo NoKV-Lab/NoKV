@@ -85,7 +85,7 @@ pub struct ArtifactUpload {
     pub stats: ArtifactUploadStats,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ArtifactUploadFailure {
     pub source: Box<ObjectError>,
     pub staged: StagedArtifactObjects,
@@ -138,7 +138,7 @@ pub struct ArtifactCleanupOutcome {
     pub absent: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ArtifactCleanupFailure {
     pub outcome: ArtifactCleanupOutcome,
     pub failed_key: ObjectKey,
@@ -899,6 +899,17 @@ impl fmt::Display for ArtifactUploadFailure {
     }
 }
 
+impl fmt::Debug for ArtifactUploadFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactUploadFailure")
+            .field("staged_objects", &self.staged.len())
+            .field("stats", &self.stats)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
 impl std::error::Error for ArtifactUploadFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.source.as_ref())
@@ -909,9 +920,19 @@ impl fmt::Display for ArtifactCleanupFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "artifact cleanup stopped at {} after {} attempts: {}",
-            self.failed_key, self.outcome.attempted, self.source
+            "artifact cleanup stopped after {} attempts: {}",
+            self.outcome.attempted, self.source
         )
+    }
+}
+
+impl fmt::Debug for ArtifactCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactCleanupFailure")
+            .field("outcome", &self.outcome)
+            .field("source", &self.source)
+            .finish()
     }
 }
 

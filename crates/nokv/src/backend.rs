@@ -2520,7 +2520,8 @@ fn map_client_error(error: ClientError) -> agent::BackendError {
         }
         return mapped;
     }
-    let kind = if object_failure(&error) {
+    let is_object_failure = object_failure(&error);
+    let kind = if is_object_failure {
         agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
     } else {
         match &error {
@@ -2540,9 +2541,14 @@ fn map_client_error(error: ClientError) -> agent::BackendError {
             ClientError::Rpc(_) => unreachable!("RPC failures returned above"),
         }
     };
+    let message = if is_object_failure {
+        "artifact object operation failed".to_owned()
+    } else {
+        error.to_string()
+    };
     let mut mapped = agent::BackendError::new(
         kind,
-        error.to_string(),
+        message,
         error.retryable(),
         json!({"source": "nokv-client"}),
     );
@@ -3898,8 +3904,11 @@ mod tests {
         .unwrap_err();
         server.join().unwrap();
 
-        assert_eq!(error.kind, agent::BackendErrorKind::InvalidState);
-        assert!(error.message.contains("not verified"));
+        assert_eq!(
+            error.kind,
+            agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
+        );
+        assert_eq!(error.message, "artifact object operation failed");
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(matches!(
@@ -3930,8 +3939,11 @@ mod tests {
         let error = agent::WorkbenchBackend::append(&backend, append_request()).unwrap_err();
         server.join().unwrap();
 
-        assert_eq!(error.kind, agent::BackendErrorKind::InvalidState);
-        assert!(error.message.contains("not verified"));
+        assert_eq!(
+            error.kind,
+            agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
+        );
+        assert_eq!(error.message, "artifact object operation failed");
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(matches!(
@@ -4616,6 +4628,47 @@ mod tests {
         assert_eq!(mapped.details["attempts"], 3);
         assert!(!mapped.message.contains("127.0.0.1"));
         assert!(!mapped.message.contains("private"));
+    }
+
+    #[test]
+    fn ambiguous_provider_outcomes_are_redacted_across_the_agent_boundary() {
+        let key = nokv_object::ObjectKey::new("nokv/system/sentinel-private-key").unwrap();
+        let errors = [
+            nokv_object::ObjectError::ObjectNotFound { key: key.clone() },
+            nokv_object::ObjectError::ImmutableCollision {
+                key: key.clone(),
+                expected_sha256: "sentinel-expected-digest".to_owned(),
+                actual_sha256: "sentinel-actual-digest".to_owned(),
+            },
+            nokv_object::ObjectError::DigestMismatch {
+                key: key.clone(),
+                expected_sha256: "sentinel-expected-digest".to_owned(),
+                actual_sha256: "sentinel-actual-digest".to_owned(),
+            },
+            nokv_object::ObjectError::InvalidManifest(
+                "endpoint=https://sentinel.invalid bucket=sentinel-private key=nokv/system"
+                    .to_owned(),
+            ),
+            nokv_object::ObjectError::CreateAmbiguous {
+                key: key.clone(),
+                detail: "endpoint=https://sentinel.invalid bucket=sentinel-private".to_owned(),
+            },
+            nokv_object::ObjectError::DeleteAmbiguous {
+                key,
+                detail: "endpoint=https://sentinel.invalid bucket=sentinel-private".to_owned(),
+            },
+        ];
+        for error in errors {
+            let mapped = map_client_error(ClientError::Object(error));
+            assert_eq!(
+                mapped.kind,
+                agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
+            );
+            assert!(!mapped.message.contains("sentinel"));
+            assert!(!mapped.message.contains("endpoint"));
+            assert!(!mapped.message.contains("bucket"));
+            assert!(!mapped.message.contains("nokv/system"));
+        }
     }
 
     #[test]

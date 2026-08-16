@@ -101,7 +101,10 @@ impl PythonWorkspaceClient {
         let client =
             WorkspaceClient::new(root_id, transport, resolver, ClientOptions { max_attempts })
                 .map_err(value_error)?;
-        let objects = object_store.build().map_err(value_error)?;
+        let object_store = (*object_store).clone();
+        let objects = py
+            .detach(move || object_store.build())
+            .map_err(value_error)?;
         let preflight = py
             .detach(|| client.preflight(std::iter::empty()))
             .map_err(runtime_error)?;
