@@ -204,6 +204,7 @@ impl PythonWorkspaceClient {
                     recursive,
                     view: WorkspaceReadView::Live,
                     expected_read_version,
+                    workspace_continuation_fence: None,
                     page: PageRequest { cursor, limit },
                 })
             })
@@ -746,6 +747,7 @@ fn list_all_paths_with(
                 recursive: true,
                 view: WorkspaceReadView::Live,
                 expected_read_version: read_version,
+                workspace_continuation_fence: None,
                 page: PageRequest {
                     cursor: cursor.clone(),
                     limit: PageRequest::MAX_LIMIT,

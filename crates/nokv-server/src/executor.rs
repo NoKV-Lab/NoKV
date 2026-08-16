@@ -314,8 +314,24 @@ impl MetadataWorkspaceRequestExecutor {
             ));
         }
         let workspace = meta::get_visible_workspace_at(&self.meta, context, &workbench)
-            .map_err(namespace_failure)?
-            .ok_or_else(|| not_found("workbench does not exist"))?;
+            .map_err(namespace_failure)?;
+        // The marker comparison and path scan share this exact RootReadContext.
+        if let Some(fence) = &request.workspace_continuation_fence {
+            let matches = workspace.as_ref().is_some_and(|workspace| {
+                workspace.incarnation_id
+                    == types::WorkspaceIncarnationId::from(fence.workspace_incarnation_id)
+                    && workspace.workspace_revision.get() == fence.workspace_revision
+            });
+            if !matches {
+                return Err(failure(
+                    protocol::ErrorCode::PreconditionFailed,
+                    "list_paths workspace continuation fence no longer matches the visible workbench",
+                    false,
+                    Some(protocol::ConflictKind::Workspace),
+                ));
+            }
+        }
+        let workspace = workspace.ok_or_else(|| not_found("workbench does not exist"))?;
         let prefix = request.prefix.as_ref().map(relative_path).transpose()?;
         let marker = request
             .page
@@ -4271,17 +4287,20 @@ mod tests {
         assert!(!failure.retryable);
     }
 
-    fn replace_visible_workspace_incarnation(
+    fn replace_visible_workspace_marker(
         store: &meta::MetaShard,
         workbench: &str,
         previous_incarnation: types::WorkspaceIncarnationId,
+        previous_revision: types::WorkspaceRevision,
         replacement_incarnation: types::WorkspaceIncarnationId,
+        replacement_revision: types::WorkspaceRevision,
+        request_sequence: u8,
     ) {
         let workbench = types::WorkbenchId::new(workbench).unwrap();
         let key = meta::workspace_current_key(root(), &workbench);
         let previous = meta::WorkspaceRecord {
             incarnation_id: previous_incarnation,
-            workspace_revision: types::WorkspaceRevision::ZERO,
+            workspace_revision: previous_revision,
             state: types::WorkspaceState::Visible,
             owning_operation_id: None,
         }
@@ -4289,7 +4308,7 @@ mod tests {
         .unwrap();
         let replacement = meta::WorkspaceRecord {
             incarnation_id: replacement_incarnation,
-            workspace_revision: types::WorkspaceRevision::ZERO,
+            workspace_revision: replacement_revision,
             state: types::WorkspaceState::Visible,
             owning_operation_id: None,
         }
@@ -4306,7 +4325,7 @@ mod tests {
                     )),
                     placement_generation: placement(),
                     owner_epoch: owner(1),
-                    request_id: request_id(249),
+                    request_id: request_id(request_sequence),
                     command_digest: types::CommandDigest::from_bytes([0; types::SHA256_BYTES]),
                     read_version: store.current_read_version().unwrap(),
                     root_fence_action: meta::RootFenceAction::RequireActive,
@@ -5171,11 +5190,14 @@ mod tests {
             .expect("commit status carries durable preparation");
         assert_eq!(first_status.state, protocol::OperationState::Running);
 
-        replace_visible_workspace_incarnation(
+        replace_visible_workspace_marker(
             &store,
             "commit-time-test",
             original_incarnation,
+            types::WorkspaceRevision::ZERO,
             replacement_incarnation,
+            types::WorkspaceRevision::ZERO,
+            249,
         );
         let mut replay = commit_request(52);
         let protocol::WorkspaceRequest::Commit(commit) = &mut replay.operation else {
@@ -5288,6 +5310,7 @@ mod tests {
                 recursive: true,
                 view: protocol::WorkspaceReadView::Live,
                 expected_read_version: None,
+                workspace_continuation_fence: None,
                 page: protocol::PageRequest {
                     cursor: None,
                     limit: 10,
@@ -5313,6 +5336,7 @@ mod tests {
                 recursive: true,
                 view: protocol::WorkspaceReadView::Live,
                 expected_read_version: Some(paths.read_version + 1),
+                workspace_continuation_fence: None,
                 page: protocol::PageRequest {
                     cursor: None,
                     limit: 10,
@@ -5358,6 +5382,7 @@ mod tests {
                         recursive,
                         view: protocol::WorkspaceReadView::Live,
                         expected_read_version,
+                        workspace_continuation_fence: None,
                         page: protocol::PageRequest { cursor, limit },
                     }),
                 })
@@ -5389,6 +5414,7 @@ mod tests {
                     recursive: true,
                     view: protocol::WorkspaceReadView::Live,
                     expected_read_version: None,
+                    workspace_continuation_fence: None,
                     page: protocol::PageRequest {
                         cursor: first.next_cursor.clone(),
                         limit: 2,
@@ -5443,6 +5469,7 @@ mod tests {
                     recursive: false,
                     view: protocol::WorkspaceReadView::Live,
                     expected_read_version: Some(first.read_version),
+                    workspace_continuation_fence: None,
                     page: protocol::PageRequest {
                         cursor: Some(b"outputs/a/deep.bin".to_vec()),
                         limit: 2,
@@ -5455,6 +5482,82 @@ mod tests {
             invalid_level.message,
             "list_paths cursor does not belong to the requested listing level"
         );
+    }
+
+    #[test]
+    fn live_list_workspace_fence_ignores_unrelated_writes_but_rejects_target_changes() {
+        let (store, executor) = ready_executor();
+        let incarnation = types::WorkspaceIncarnationId::from_bytes([0x35; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&create_request(0x35, "fenced-list", 0x35, 1))
+            .unwrap();
+        put_path_projection_rows(&store, incarnation, &["outputs/a", "outputs/b"]);
+        let fence = protocol::WorkspaceContinuationFence {
+            workspace_incarnation_id: protocol::WorkspaceIdentity([0x35; types::FIXED_ID_BYTES]),
+            workspace_revision: 0,
+        };
+        let list = |request_fill: u8,
+                    cursor: Option<Vec<u8>>,
+                    fence: protocol::WorkspaceContinuationFence| {
+            executor.execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::ListPaths(protocol::ListPathsRequest {
+                    workbench: protocol::WorkbenchName::new("fenced-list").unwrap(),
+                    prefix: Some(protocol::RelativePath::new("outputs").unwrap()),
+                    recursive: true,
+                    view: protocol::WorkspaceReadView::Live,
+                    expected_read_version: None,
+                    workspace_continuation_fence: Some(fence),
+                    page: protocol::PageRequest { cursor, limit: 1 },
+                }),
+            })
+        };
+
+        let first = list(0x36, None, fence.clone()).unwrap();
+        let protocol::WorkspaceResult::Paths(first) = first.result else {
+            panic!("list_paths returned the wrong result variant");
+        };
+        let first_cursor = first.next_cursor.clone();
+        executor
+            .execute(&create_request(0x37, "unrelated", 0x37, 1))
+            .unwrap();
+        let second = list(0x38, first_cursor.clone(), fence.clone()).unwrap();
+        let protocol::WorkspaceResult::Paths(second) = second.result else {
+            panic!("list_paths returned the wrong result variant");
+        };
+        assert_eq!(second.entries[0].path().path.as_str(), "outputs/b");
+        assert!(second.read_version > first.read_version);
+
+        replace_visible_workspace_marker(
+            &store,
+            "fenced-list",
+            incarnation,
+            types::WorkspaceRevision::ZERO,
+            incarnation,
+            types::WorkspaceRevision::new(1),
+            250,
+        );
+        let stale_revision = list(0x39, first_cursor, fence.clone()).unwrap_err();
+        assert_eq!(stale_revision.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(
+            stale_revision.conflict,
+            Some(protocol::ConflictKind::Workspace)
+        );
+
+        let replacement = types::WorkspaceIncarnationId::from_bytes([0x45; types::FIXED_ID_BYTES]);
+        replace_visible_workspace_marker(
+            &store,
+            "fenced-list",
+            incarnation,
+            types::WorkspaceRevision::new(1),
+            replacement,
+            types::WorkspaceRevision::ZERO,
+            251,
+        );
+        let rebound = list(0x3a, None, fence).unwrap_err();
+        assert_eq!(rebound.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(rebound.conflict, Some(protocol::ConflictKind::Workspace));
     }
 
     #[test]
@@ -5491,6 +5594,7 @@ mod tests {
                         recursive: false,
                         view: protocol::WorkspaceReadView::Live,
                         expected_read_version: read_version,
+                        workspace_continuation_fence: None,
                         page: protocol::PageRequest { cursor, limit: 1 },
                     }),
                 })
@@ -5532,6 +5636,7 @@ mod tests {
                         recursive,
                         view: protocol::WorkspaceReadView::Live,
                         expected_read_version: None,
+                        workspace_continuation_fence: None,
                         page: protocol::PageRequest {
                             cursor: None,
                             limit: 10,

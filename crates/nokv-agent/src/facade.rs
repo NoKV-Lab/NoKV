@@ -9,12 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::{
-    canonical_json_bytes, projection::digest_uri, projection::lowercase_hex,
-    verify_run_manifest_v1, workbench_commit_identity, AgentError, WorkbenchToolHandler,
+    canonical_json_bytes, projection::digest_uri, projection::hash_length_prefixed,
+    projection::lowercase_hex, verify_run_manifest_v1, workbench_commit_identity, AgentError,
+    WorkbenchToolHandler,
 };
 use base64::Engine;
 use nokv_types::{NormalizedRelativePath, WorkbenchId};
 use serde_json::{json, Map, Number, Value};
+use sha2::{Digest, Sha256};
 
 pub const WORKBENCH_SECTIONS: [Section; 5] = [
     Section::Input,
@@ -285,6 +287,8 @@ pub struct AppendOutcome {
 pub struct GrepCandidateRequest {
     pub scope: ScopedPath,
     pub recursive: bool,
+    /// Facade-owned commitment to the exact pattern and basename-glob semantics.
+    pub query_commitment: [u8; 32],
     pub cursor: Option<String>,
     pub limit: usize,
 }
@@ -1102,6 +1106,8 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             ));
         }
         let limit = optional_usize(arguments, "limit")?.unwrap_or(100);
+        let recursive = required_bool(arguments, "recursive")?;
+        let query_commitment = grep_query_commitment(&scope, &patterns, glob, recursive);
         let mut cursor = optional_string(arguments, "cursor")?.map(str::to_owned);
         let mut matches = Vec::new();
         let mut matched_files = 0_usize;
@@ -1110,7 +1116,8 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
         loop {
             let page = self.backend.grep_candidates(GrepCandidateRequest {
                 scope: scope.clone(),
-                recursive: required_bool(arguments, "recursive")?,
+                recursive,
+                query_commitment,
                 cursor: cursor.clone(),
                 limit: 300,
             })?;
@@ -1198,7 +1205,7 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             "relative_path": relative_path_value(&scope),
             "path": self.projected_path(&scope),
             "pattern": required_string(arguments, "pattern")?,
-            "recursive": required_bool(arguments, "recursive")?,
+            "recursive": recursive,
             "matches": matches,
             "files_scanned": files_scanned,
             "next_cursor": next_cursor,
@@ -2181,6 +2188,48 @@ fn parse_grep_patterns(arguments: &Value) -> Result<Vec<String>, AgentError> {
         )));
     }
     Ok(patterns)
+}
+
+fn grep_query_commitment(
+    scope: &ScopedPath,
+    patterns: &[String],
+    glob: Option<&str>,
+    recursive: bool,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nokv.workbench.grep-query.v1\0");
+    hash_length_prefixed(&mut hasher, scope.workbench_id.as_str().as_bytes());
+    match scope.section {
+        Some(section) => {
+            hasher.update([1]);
+            hash_length_prefixed(&mut hasher, section.as_str().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    match &scope.relative_path {
+        Some(path) => {
+            hasher.update([1]);
+            hash_length_prefixed(&mut hasher, path.as_str().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update([u8::from(recursive)]);
+    hasher.update(
+        u64::try_from(patterns.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for pattern in patterns {
+        hash_length_prefixed(&mut hasher, pattern.as_bytes());
+    }
+    match glob {
+        Some(glob) => {
+            hasher.update([1]);
+            hash_length_prefixed(&mut hasher, glob.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.finalize().into()
 }
 
 fn glob_matches(pattern: &str, text: &str) -> bool {

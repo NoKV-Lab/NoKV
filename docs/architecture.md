@@ -150,12 +150,14 @@ each when its requested limit is larger. The metadata listing may merge an
 exact-prefix point read only after descendant EOF, while the Workbench adapter
 exposes only direct children and drops that self row.
 There is no per-entry metadata fanout. The returned cursor is bound to the
-workbench scope, read view, read version, and child anchor. Resuming after
-live-state drift fails closed;
-an initial bounded collection may restart in full but never merges versions.
-The breaking ordered-list response is gated by protocol schema
-`nokv.workspace.rpc.v3`; v3 adds the provider-neutral object namespace identity
-to every root route, and there is no legacy response decoder.
+workbench scope, read view, continuation fence, and child anchor. Snapshot
+continuations retain one exact root read version. Live continuations may move
+to a newer root read version only while the target workspace incarnation and
+revision remain unchanged; target drift fails closed, and an initial bounded
+collection may restart in full but never merges workspace revisions. This
+contract is gated by protocol schema `nokv.workspace.rpc.v4`; v3 first added
+the provider-neutral object namespace identity to every root route, and there
+is no legacy response decoder.
 
 Secondary-index queries run at one read version and filter every result by the
 matching visible incarnation. Object bodies are read only when the selected

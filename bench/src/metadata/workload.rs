@@ -61,6 +61,7 @@ impl Harness {
                 recursive,
                 view: WorkspaceReadView::Live,
                 expected_read_version,
+                workspace_continuation_fence: None,
                 page: PageRequest { cursor, limit },
             }),
         })

@@ -10,7 +10,7 @@ use crate::request::WorkspaceRpcRequest;
 use crate::response::WorkspaceRpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v3";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v4";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -87,12 +87,13 @@ mod tests {
     use crate::{
         ArtifactDescriptor, ArtifactRevisionIdentity, CommitIdentity, CommitPreparation,
         CommitRequest, ContentType, CreateWorkspaceRequest, Digest, DigestUri, GetSnapshotRequest,
-        LogicalShardIdentity, ObjectNamespaceIdentity, OperationIdentity, OperationKind,
-        OperationProgress, OperationState, OperationStatus, OperationToken, PathListEntry,
-        PathMetadata, PathPage, PublishCondition, RelativePath, RequestIdentity, RootIdentity,
-        RootRoute, SnapshotAlias, SnapshotSelector, WorkbenchName, WorkspaceCapability,
-        WorkspaceIdentity, WorkspacePath, WorkspacePreflightRequest, WorkspacePreflightResult,
-        WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceSummary,
+        ListPathsRequest, LogicalShardIdentity, ObjectNamespaceIdentity, OperationIdentity,
+        OperationKind, OperationProgress, OperationState, OperationStatus, OperationToken,
+        PageRequest, PathListEntry, PathMetadata, PathPage, PublishCondition, RelativePath,
+        RequestIdentity, RootIdentity, RootRoute, SnapshotAlias, SnapshotSelector, WorkbenchName,
+        WorkspaceCapability, WorkspaceContinuationFence, WorkspaceIdentity, WorkspacePath,
+        WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceReadView, WorkspaceRequest,
+        WorkspaceResult, WorkspaceRpcOutcome, WorkspaceSummary,
     };
 
     fn route() -> RootRoute {
@@ -118,7 +119,7 @@ mod tests {
 
     #[test]
     fn request_round_trips_with_exact_schema() {
-        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v3");
+        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v4");
         let expected = request();
         let encoded = encode_request(&expected).unwrap();
         assert!(encoded
@@ -208,6 +209,34 @@ mod tests {
     }
 
     #[test]
+    fn live_list_workspace_continuation_fence_round_trips() {
+        let expected = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([9; 16]),
+            operation: WorkspaceRequest::ListPaths(ListPathsRequest {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                prefix: Some(RelativePath::new("outputs").unwrap()),
+                recursive: true,
+                view: WorkspaceReadView::Live,
+                expected_read_version: None,
+                workspace_continuation_fence: Some(WorkspaceContinuationFence {
+                    workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                    workspace_revision: 7,
+                }),
+                page: PageRequest {
+                    cursor: Some(b"outputs/a".to_vec()),
+                    limit: 10,
+                },
+            }),
+        };
+
+        assert_eq!(
+            decode_request(&encode_request(&expected).unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn response_round_trips() {
         let expected = WorkspaceRpcResponse {
             route: route(),
@@ -278,12 +307,37 @@ mod tests {
     #[test]
     fn schema_mismatch_fails_closed() {
         let encoded = rmp_serde::to_vec_named(&Frame {
-            schema: "nokv.workspace.rpc.v1".to_owned(),
+            schema: "nokv.workspace.rpc.v3".to_owned(),
             payload: request(),
         })
         .unwrap();
         assert!(matches!(
             decode_request(&encoded),
+            Err(ProtocolError::SchemaMismatch { .. })
+        ));
+
+        let response = WorkspaceRpcResponse {
+            route: route(),
+            request_id: RequestIdentity([3; 16]),
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Workspace(
+                WorkspaceSummary {
+                    workbench: WorkbenchName::new("run-42").unwrap(),
+                    workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                    workspace_revision: 0,
+                    commit_head: None,
+                    commit_head_generation: None,
+                },
+            ))),
+        };
+        let encoded = rmp_serde::to_vec_named(&Frame {
+            schema: "nokv.workspace.rpc.v3".to_owned(),
+            payload: response,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_response(&encoded),
             Err(ProtocolError::SchemaMismatch { .. })
         ));
     }

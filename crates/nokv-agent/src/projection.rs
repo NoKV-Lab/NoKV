@@ -472,7 +472,7 @@ pub(crate) fn digest_uri(bytes: &[u8]) -> String {
     format!("sha256:{}", lowercase_hex(&digest))
 }
 
-fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+pub(crate) fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(value);
 }

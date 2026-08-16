@@ -31,6 +31,7 @@ struct FakeState {
     create_error: Option<BackendError>,
     stat_views: Vec<ReadView>,
     list_requests: Vec<ListRequest>,
+    grep_requests: Vec<GrepCandidateRequest>,
     read_requests: Vec<ReadRequest>,
     search_requests: Vec<SearchRequest>,
     aggregate_requests: Vec<AggregateRequest>,
@@ -279,7 +280,8 @@ impl WorkbenchBackend for FakeBackend {
         &self,
         request: GrepCandidateRequest,
     ) -> Result<GrepCandidatePage, BackendError> {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.grep_requests.push(request.clone());
         let prefix = request.scope.logical_path();
         let mut paths = state
             .files
@@ -1479,6 +1481,29 @@ fn grep_treats_patterns_as_case_insensitive_literals_and_globs_as_basenames() {
         "/agents/test/wb/wb-grep/outputs/nested/报告.txt"
     );
     assert_eq!(result["matches"][0]["line_number"], 1);
+}
+
+#[test]
+fn grep_cursor_commitment_is_derived_from_patterns_and_glob() {
+    let backend = FakeBackend::default();
+    let handler = test_handler(backend.clone());
+    for arguments in [
+        json!({"id": "wb-grep", "pattern": "alpha", "glob": "*.txt", "recursive": true}),
+        json!({"id": "wb-grep", "pattern": "beta", "glob": "*.txt", "recursive": true}),
+        json!({"id": "wb-grep", "pattern": "alpha", "glob": "*.log", "recursive": true}),
+    ] {
+        run(&handler, "workbench_grep", arguments).unwrap();
+    }
+
+    let state = backend.lock();
+    let commitments = state
+        .grep_requests
+        .iter()
+        .map(|request| request.query_commitment)
+        .collect::<Vec<_>>();
+    assert_eq!(commitments.len(), 3);
+    assert_ne!(commitments[0], commitments[1]);
+    assert_ne!(commitments[0], commitments[2]);
 }
 
 #[test]

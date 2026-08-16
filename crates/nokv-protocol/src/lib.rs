@@ -42,8 +42,8 @@ pub use request::{
     QueryScope, ReconcileQuarantinedArtifactPublishRequest, RemovePathRequest,
     RenewSnapshotRequest, RestoreManifestDescriptor, RestoreSource, RetireSnapshotRequest,
     SearchRequest, SortDirection, SortField, StageArtifactManifestRequest,
-    StageArtifactObjectsRequest, WorkspacePreflightRequest, WorkspaceRequest, WorkspaceRpcRequest,
-    MAX_QUERY_PAGE_LIMIT,
+    StageArtifactObjectsRequest, WorkspaceContinuationFence, WorkspacePreflightRequest,
+    WorkspaceRequest, WorkspaceRpcRequest, MAX_QUERY_PAGE_LIMIT,
 };
 pub use response::{
     AggregateGroup, AggregateResult, CatalogField, CatalogResult, ChangeEvent, ChangeKind,

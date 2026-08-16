@@ -247,12 +247,22 @@ impl GetPathRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Stable target-workspace state that authorizes a live page continuation at a
+/// newer root read version.
+pub struct WorkspaceContinuationFence {
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub workspace_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ListPathsRequest {
     pub workbench: WorkbenchName,
     pub prefix: Option<crate::types::RelativePath>,
     pub recursive: bool,
     pub view: WorkspaceReadView,
     pub expected_read_version: Option<u64>,
+    pub workspace_continuation_fence: Option<WorkspaceContinuationFence>,
     pub page: PageRequest,
 }
 
@@ -265,10 +275,27 @@ impl ListPathsRequest {
                 "must be greater than zero",
             ));
         }
-        if self.page.cursor.is_some() && self.expected_read_version.is_none() {
+        if self.expected_read_version.is_some() && self.workspace_continuation_fence.is_some() {
+            return Err(ProtocolError::invalid(
+                "list_paths.workspace_continuation_fence",
+                "must not be combined with expected_read_version",
+            ));
+        }
+        if matches!(self.view, WorkspaceReadView::Snapshot(_))
+            && self.workspace_continuation_fence.is_some()
+        {
+            return Err(ProtocolError::invalid(
+                "list_paths.workspace_continuation_fence",
+                "is only valid for live workspace reads",
+            ));
+        }
+        if self.page.cursor.is_some()
+            && self.expected_read_version.is_none()
+            && self.workspace_continuation_fence.is_none()
+        {
             return Err(ProtocolError::invalid(
                 "list_paths.expected_read_version",
-                "is required when continuing from a page cursor",
+                "or workspace_continuation_fence is required when continuing from a page cursor",
             ));
         }
         self.page.validate("list_paths.page")
@@ -1298,6 +1325,7 @@ mod tests {
             recursive: true,
             view: WorkspaceReadView::Live,
             expected_read_version: Some(0),
+            workspace_continuation_fence: None,
             page: PageRequest {
                 cursor: None,
                 limit: 1,
@@ -1321,6 +1349,7 @@ mod tests {
             recursive: true,
             view: WorkspaceReadView::Live,
             expected_read_version: None,
+            workspace_continuation_fence: None,
             page: PageRequest {
                 cursor: Some(b"next".to_vec()),
                 limit: 1,
@@ -1331,6 +1360,64 @@ mod tests {
             request.validate(),
             Err(ProtocolError::InvalidField {
                 field: "list_paths.expected_read_version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn list_paths_accepts_a_workspace_fence_for_live_continuations() {
+        let request = ListPathsRequest {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            prefix: None,
+            recursive: true,
+            view: WorkspaceReadView::Live,
+            expected_read_version: None,
+            workspace_continuation_fence: Some(WorkspaceContinuationFence {
+                workspace_incarnation_id: WorkspaceIdentity([7; 16]),
+                workspace_revision: 3,
+            }),
+            page: PageRequest {
+                cursor: Some(b"next".to_vec()),
+                limit: 1,
+            },
+        };
+
+        request.validate().unwrap();
+    }
+
+    #[test]
+    fn list_paths_rejects_ambiguous_or_snapshot_workspace_fences() {
+        let fence = WorkspaceContinuationFence {
+            workspace_incarnation_id: WorkspaceIdentity([7; 16]),
+            workspace_revision: 3,
+        };
+        let mut request = ListPathsRequest {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            prefix: None,
+            recursive: true,
+            view: WorkspaceReadView::Live,
+            expected_read_version: Some(9),
+            workspace_continuation_fence: Some(fence.clone()),
+            page: PageRequest {
+                cursor: Some(b"next".to_vec()),
+                limit: 1,
+            },
+        };
+
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "list_paths.workspace_continuation_fence",
+                ..
+            })
+        ));
+        request.expected_read_version = None;
+        request.view = WorkspaceReadView::Snapshot(SnapshotSelector::Id(9));
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "list_paths.workspace_continuation_fence",
                 ..
             })
         ));

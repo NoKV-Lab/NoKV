@@ -33,12 +33,22 @@ const RUN_MANIFEST_PATH: &str = "metadata/run_manifest.json";
 const RESTORE_MANIFEST_PATH: &str = "metadata/restore_manifest.json";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const CURSOR_VERSION: &[u8] = b"nokv.workspace.cursor\0";
-const GREP_CURSOR_VERSION: &[u8] = b"nokv.workspace.grep-cursor.v2\0";
-const LIST_CURSOR_VERSION: &[u8] = b"nokv.workspace.list-cursor.v3\0";
+const GREP_CURSOR_VERSION: &[u8] = b"nokv.workspace.grep-cursor.v3\0";
+const LIST_CURSOR_VERSION: &[u8] = b"nokv.workspace.list-cursor.v4\0";
+const GREP_CURSOR_MAX_ENCODED_BYTES: usize = base64_encoded_upper_bound(
+    GREP_CURSOR_VERSION.len() + 16 + 8 + 32 + NormalizedRelativePath::MAX_BYTES,
+);
+const LIST_CURSOR_MAX_ENCODED_BYTES: usize = base64_encoded_upper_bound(
+    LIST_CURSOR_VERSION.len() + 1 + 24 + 32 + NormalizedRelativePath::MAX_BYTES,
+);
 const QUERY_SERVER_PAGE_LIMIT: u32 = wire::MAX_QUERY_PAGE_LIMIT;
 const CONSISTENT_READ_MAX_ATTEMPTS: u32 = 3;
 
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+const fn base64_encoded_upper_bound(raw_bytes: usize) -> usize {
+    raw_bytes.saturating_add(2) / 3 * 4
+}
 
 /// Concrete Workbench backend used by the custom CLI and MCP adapter.
 #[derive(Clone)]
@@ -278,6 +288,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 recursive: false,
                 view: resolved_view,
                 expected_read_version: None,
+                workspace_continuation_fence: None,
                 page: wire::PageRequest {
                     cursor: None,
                     limit: 1,
@@ -320,14 +331,33 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
             .min(wire::PageRequest::MAX_LIMIT as usize);
         let view = self.resolved_view(&request.path.workbench_id, &request.view)?;
         let prefix = full_path_optional(&request.path)?;
-        let scope_digest =
-            list_scope_digest(&request.path.workbench_id, prefix.as_ref(), &request.view);
+        let scope_digest = list_scope_digest(
+            self.client.root_id(),
+            &request.path.workbench_id,
+            prefix.as_ref(),
+            &request.view,
+        );
         let supplied_cursor = request.cursor.is_some();
         let decoded_cursor = request
             .cursor
             .as_deref()
             .map(|cursor| decode_list_cursor(cursor, scope_digest))
             .transpose()?;
+        if let Some(cursor) = &decoded_cursor {
+            let valid_for_view = matches!(
+                (&request.view, &cursor.fence),
+                (agent::ReadView::Live, ListContinuationFence::Workspace(_))
+                    | (
+                        agent::ReadView::Snapshot(_),
+                        ListContinuationFence::ReadVersion(_)
+                    )
+            );
+            if !valid_for_view {
+                return Err(invalid_backend_input(
+                    "list cursor fence does not match the requested read view",
+                ));
+            }
+        }
         let after = decoded_cursor.as_ref().map(|cursor| &cursor.anchor);
         let max_attempts = if supplied_cursor {
             1
@@ -336,6 +366,24 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
         };
 
         'attempt: for attempt in 1..=max_attempts {
+            let mut continuation_fence = match decoded_cursor.as_ref() {
+                Some(cursor) => Some(cursor.fence.clone()),
+                None if matches!(&request.view, agent::ReadView::Live) => {
+                    let workspace = self.workspace(&request.path.workbench_id)?;
+                    if workspace.workbench.as_str() != request.path.workbench_id.as_str() {
+                        return Err(protocol_mismatch(
+                            "get_workspace returned a different workbench for list pagination",
+                        ));
+                    }
+                    Some(ListContinuationFence::Workspace(
+                        wire::WorkspaceContinuationFence {
+                            workspace_incarnation_id: workspace.workspace_incarnation_id,
+                            workspace_revision: workspace.workspace_revision,
+                        },
+                    ))
+                }
+                None => None,
+            };
             let mut candidates = BTreeMap::<NormalizedRelativePath, agent::ListEntry>::new();
             if prefix.is_none() {
                 for section in agent::WORKBENCH_SECTIONS {
@@ -358,23 +406,31 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 }
             }
 
-            let mut read_version = decoded_cursor.as_ref().map(|cursor| cursor.read_version);
             let mut scan_cursor = after.map(|path| path.as_str().as_bytes().to_vec());
             let mut seen_server_cursors = BTreeSet::new();
             let mut first_server_page = true;
             if let Some(cursor) = scan_cursor.clone() {
                 seen_server_cursors.insert(cursor);
             }
-            loop {
+            let read_version = loop {
                 let requested_cursor = scan_cursor.clone();
                 let requested_limit =
                     list_server_page_limit(limit, candidates.len(), first_server_page);
+                let expected_read_version = match continuation_fence.as_ref() {
+                    Some(ListContinuationFence::ReadVersion(read_version)) => Some(*read_version),
+                    _ => None,
+                };
+                let workspace_continuation_fence = match continuation_fence.as_ref() {
+                    Some(ListContinuationFence::Workspace(fence)) => Some(fence.clone()),
+                    _ => None,
+                };
                 let call = match self.client.list_paths(wire::ListPathsRequest {
                     workbench: workbench_name(&request.path.workbench_id)?,
                     prefix: prefix.as_ref().map(relative_path).transpose()?,
                     recursive: false,
                     view: view.clone(),
-                    expected_read_version: read_version,
+                    expected_read_version,
+                    workspace_continuation_fence,
                     page: wire::PageRequest {
                         cursor: requested_cursor.clone(),
                         limit: requested_limit,
@@ -384,19 +440,23 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                     Err(error)
                         if !supplied_cursor
                             && attempt < max_attempts
-                            && is_read_version_conflict(&error) =>
+                            && is_continuation_fence_conflict(&error) =>
                     {
                         continue 'attempt;
                     }
                     Err(error) => return Err(map_client_error(error)),
                 };
                 first_server_page = false;
-                if read_version.is_some_and(|expected| expected != call.value.read_version) {
+                let page_read_version = call.value.read_version;
+                if expected_read_version.is_some_and(|expected| expected != page_read_version) {
                     return Err(protocol_mismatch(
                         "list_paths returned a page outside the requested read-version fence",
                     ));
                 }
-                read_version.get_or_insert(call.value.read_version);
+                if continuation_fence.is_none() {
+                    continuation_fence =
+                        Some(ListContinuationFence::ReadVersion(page_read_version));
+                }
                 if call.value.entries.len()
                     > usize::try_from(requested_limit)
                         .expect("protocol page limit always fits usize")
@@ -456,12 +516,14 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                             .is_some_and(|cutoff| last >= cutoff)
                     });
                 if exhausted || covered_union_cutoff {
-                    break;
+                    break page_read_version;
                 }
                 scan_cursor = next_server_cursor;
-            }
+            };
 
-            let read_version = read_version.expect("every list attempt performs one RPC");
+            let continuation_fence = continuation_fence
+                .as_ref()
+                .expect("every list attempt establishes a continuation fence");
             let has_more = candidates.len() > limit;
             let mut ordered = candidates.into_iter().collect::<Vec<_>>();
             ordered.truncate(limit);
@@ -469,7 +531,7 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
                 .then(|| {
                     ordered
                         .last()
-                        .map(|(path, _)| encode_list_cursor(read_version, scope_digest, path))
+                        .map(|(path, _)| encode_list_cursor(continuation_fence, scope_digest, path))
                 })
                 .flatten();
             return Ok(agent::ListPage {
@@ -669,66 +731,94 @@ impl agent::WorkbenchBackend for CliWorkbenchBackend {
     ) -> Result<agent::GrepCandidatePage, agent::BackendError> {
         let prefix = full_path_optional(&request.scope)?;
         let scope_digest = grep_scope_digest(
+            self.client.root_id(),
             &request.scope.workbench_id,
             prefix.as_ref(),
             request.recursive,
+            request.query_commitment,
         );
         let cursor = request
             .cursor
             .as_deref()
             .map(|cursor| decode_grep_cursor(cursor, scope_digest))
             .transpose()?;
-        let expected_read_version = cursor.as_ref().map(|cursor| cursor.read_version);
-        let call = self
-            .client
-            .list_paths(wire::ListPathsRequest {
+        let supplied_cursor = cursor.is_some();
+        let max_attempts = if supplied_cursor {
+            1
+        } else {
+            CONSISTENT_READ_MAX_ATTEMPTS
+        };
+        for attempt in 1..=max_attempts {
+            let fence = match cursor.as_ref() {
+                Some(cursor) => cursor.fence.clone(),
+                None => {
+                    let workspace = self.workspace(&request.scope.workbench_id)?;
+                    if workspace.workbench.as_str() != request.scope.workbench_id.as_str() {
+                        return Err(protocol_mismatch(
+                            "get_workspace returned a different workbench for grep pagination",
+                        ));
+                    }
+                    wire::WorkspaceContinuationFence {
+                        workspace_incarnation_id: workspace.workspace_incarnation_id,
+                        workspace_revision: workspace.workspace_revision,
+                    }
+                }
+            };
+            let call = match self.client.list_paths(wire::ListPathsRequest {
                 workbench: workbench_name(&request.scope.workbench_id)?,
                 prefix: prefix.as_ref().map(relative_path).transpose()?,
                 recursive: request.recursive,
                 view: wire::WorkspaceReadView::Live,
-                expected_read_version,
+                expected_read_version: None,
+                workspace_continuation_fence: Some(fence.clone()),
                 page: wire::PageRequest {
-                    cursor: cursor.map(|cursor| cursor.server_cursor),
+                    cursor: cursor.as_ref().map(|cursor| cursor.server_cursor.clone()),
                     limit: page_limit(request.limit)?,
                 },
-            })
-            .map_err(map_client_error)?;
-        if expected_read_version.is_some_and(|expected| expected != call.value.read_version) {
-            return Err(protocol_mismatch(
-                "grep candidate page escaped its requested read-version fence",
-            ));
-        }
-        let read_version = call.value.read_version;
-        let mut candidates = Vec::new();
-        for entry in call.value.entries {
-            validate_response_workbench(entry.path(), &request.scope.workbench_id)?;
-            let metadata = match entry {
-                wire::PathListEntry::Artifact(metadata) => metadata,
-                wire::PathListEntry::Prefix(_) if !request.recursive => continue,
-                wire::PathListEntry::Prefix(_) => {
-                    return Err(protocol_mismatch(
-                        "recursive list_paths returned an implicit prefix",
-                    ));
+            }) {
+                Ok(call) => call,
+                Err(error)
+                    if !supplied_cursor
+                        && attempt < max_attempts
+                        && is_continuation_fence_conflict(&error) =>
+                {
+                    continue;
                 }
+                Err(error) => return Err(map_client_error(error)),
             };
-            let cursor_after = encode_grep_cursor(
-                read_version,
-                scope_digest,
-                metadata.path.path.as_str().as_bytes(),
-            );
-            candidates.push(agent::GrepCandidate {
-                path: scoped_path(&metadata.path)?,
-                cursor_after,
+            let mut candidates = Vec::new();
+            for entry in call.value.entries {
+                validate_response_workbench(entry.path(), &request.scope.workbench_id)?;
+                let metadata = match entry {
+                    wire::PathListEntry::Artifact(metadata) => metadata,
+                    wire::PathListEntry::Prefix(_) if !request.recursive => continue,
+                    wire::PathListEntry::Prefix(_) => {
+                        return Err(protocol_mismatch(
+                            "recursive list_paths returned an implicit prefix",
+                        ));
+                    }
+                };
+                let cursor_after = encode_grep_cursor(
+                    &fence,
+                    scope_digest,
+                    metadata.path.path.as_str().as_bytes(),
+                );
+                candidates.push(agent::GrepCandidate {
+                    path: scoped_path(&metadata.path)?,
+                    cursor_after,
+                });
+            }
+            return Ok(agent::GrepCandidatePage {
+                candidates,
+                next_cursor: call
+                    .value
+                    .next_cursor
+                    .as_deref()
+                    .map(|cursor| encode_grep_cursor(&fence, scope_digest, cursor)),
             });
         }
-        Ok(agent::GrepCandidatePage {
-            candidates,
-            next_cursor: call
-                .value
-                .next_cursor
-                .as_deref()
-                .map(|cursor| encode_grep_cursor(read_version, scope_digest, cursor)),
-        })
+
+        unreachable!("consistent read attempt count is non-zero")
     }
 
     fn search(
@@ -1901,23 +1991,34 @@ fn lease_deadline(lease_millis: u64) -> Result<u64, agent::BackendError> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ListCursor {
-    read_version: u64,
+    fence: ListContinuationFence,
     anchor: NormalizedRelativePath,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GrepCursor {
-    read_version: u64,
+    fence: wire::WorkspaceContinuationFence,
     server_cursor: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ListContinuationFence {
+    // Snapshot pages stay pinned to one historical root read version.
+    ReadVersion(u64),
+    // Live pages may advance the root version while this workspace stays exact.
+    Workspace(wire::WorkspaceContinuationFence),
+}
+
 fn grep_scope_digest(
+    root_id: wire::RootIdentity,
     workbench_id: &WorkbenchId,
     prefix: Option<&NormalizedRelativePath>,
     recursive: bool,
+    query_commitment: [u8; 32],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.workspace.grep-scope.v1\0");
+    hasher.update(b"nokv.workspace.grep-scope.v2\0");
+    hasher.update(root_id.0);
     hash_len64(&mut hasher, workbench_id.as_bytes());
     match prefix {
         None => hasher.update([0]),
@@ -1927,15 +2028,21 @@ fn grep_scope_digest(
         }
     }
     hasher.update([u8::from(recursive)]);
+    hasher.update(query_commitment);
     hasher.finalize().into()
 }
 
-fn encode_grep_cursor(read_version: u64, scope_digest: [u8; 32], server_cursor: &[u8]) -> String {
+fn encode_grep_cursor(
+    fence: &wire::WorkspaceContinuationFence,
+    scope_digest: [u8; 32],
+    server_cursor: &[u8],
+) -> String {
     let mut encoded = Vec::with_capacity(
-        GREP_CURSOR_VERSION.len() + 8 + scope_digest.len() + server_cursor.len(),
+        GREP_CURSOR_VERSION.len() + 16 + 8 + scope_digest.len() + server_cursor.len(),
     );
     encoded.extend_from_slice(GREP_CURSOR_VERSION);
-    encoded.extend_from_slice(&read_version.to_be_bytes());
+    encoded.extend_from_slice(&fence.workspace_incarnation_id.0);
+    encoded.extend_from_slice(&fence.workspace_revision.to_be_bytes());
     encoded.extend_from_slice(&scope_digest);
     encoded.extend_from_slice(server_cursor);
     URL_SAFE_NO_PAD.encode(encoded)
@@ -1945,21 +2052,23 @@ fn decode_grep_cursor(
     cursor: &str,
     expected_scope_digest: [u8; 32],
 ) -> Result<GrepCursor, agent::BackendError> {
+    if cursor.len() > GREP_CURSOR_MAX_ENCODED_BYTES {
+        return Err(invalid_backend_input(
+            "grep cursor exceeds the maximum encoded path cursor length",
+        ));
+    }
     let decoded = URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|error| invalid_state("grep cursor is not canonical base64url", error))?;
     let payload = decoded.strip_prefix(GREP_CURSOR_VERSION).ok_or_else(|| {
         invalid_backend_input("grep cursor does not use the current scope-bound schema")
     })?;
-    let (read_version, payload) = payload
+    let (workspace_incarnation_id, payload) = payload
+        .split_first_chunk::<16>()
+        .ok_or_else(|| invalid_backend_input("grep cursor omits its workspace incarnation"))?;
+    let (workspace_revision, payload) = payload
         .split_first_chunk::<8>()
-        .ok_or_else(|| invalid_backend_input("grep cursor omits its read version"))?;
-    let read_version = u64::from_be_bytes(*read_version);
-    if read_version == 0 {
-        return Err(invalid_backend_input(
-            "grep cursor read version must be greater than zero",
-        ));
-    }
+        .ok_or_else(|| invalid_backend_input("grep cursor omits its workspace revision"))?;
     let (scope_digest, server_cursor) = payload
         .split_first_chunk::<32>()
         .ok_or_else(|| invalid_backend_input("grep cursor omits its scope digest"))?;
@@ -1972,18 +2081,23 @@ fn decode_grep_cursor(
         return Err(invalid_backend_input("grep cursor omits its server anchor"));
     }
     Ok(GrepCursor {
-        read_version,
+        fence: wire::WorkspaceContinuationFence {
+            workspace_incarnation_id: wire::WorkspaceIdentity(*workspace_incarnation_id),
+            workspace_revision: u64::from_be_bytes(*workspace_revision),
+        },
         server_cursor: server_cursor.to_vec(),
     })
 }
 
 fn list_scope_digest(
+    root_id: wire::RootIdentity,
     workbench_id: &WorkbenchId,
     prefix: Option<&NormalizedRelativePath>,
     view: &agent::ReadView,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.workspace.list-scope.v1\0");
+    hasher.update(b"nokv.workspace.list-scope.v2\0");
+    hasher.update(root_id.0);
     hash_len64(&mut hasher, workbench_id.as_bytes());
     match prefix {
         None => hasher.update([0]),
@@ -2007,15 +2121,25 @@ fn list_scope_digest(
 }
 
 fn encode_list_cursor(
-    read_version: u64,
+    fence: &ListContinuationFence,
     scope_digest: [u8; 32],
     anchor: &NormalizedRelativePath,
 ) -> String {
     let mut encoded = Vec::with_capacity(
-        LIST_CURSOR_VERSION.len() + 8 + scope_digest.len() + anchor.as_str().len(),
+        LIST_CURSOR_VERSION.len() + 1 + 24 + scope_digest.len() + anchor.as_str().len(),
     );
     encoded.extend_from_slice(LIST_CURSOR_VERSION);
-    encoded.extend_from_slice(&read_version.to_be_bytes());
+    match fence {
+        ListContinuationFence::ReadVersion(read_version) => {
+            encoded.push(0);
+            encoded.extend_from_slice(&read_version.to_be_bytes());
+        }
+        ListContinuationFence::Workspace(fence) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&fence.workspace_incarnation_id.0);
+            encoded.extend_from_slice(&fence.workspace_revision.to_be_bytes());
+        }
+    }
     encoded.extend_from_slice(&scope_digest);
     encoded.extend_from_slice(anchor.as_str().as_bytes());
     URL_SAFE_NO_PAD.encode(encoded)
@@ -2025,21 +2149,55 @@ fn decode_list_cursor(
     cursor: &str,
     expected_scope_digest: [u8; 32],
 ) -> Result<ListCursor, agent::BackendError> {
+    if cursor.len() > LIST_CURSOR_MAX_ENCODED_BYTES {
+        return Err(invalid_backend_input(
+            "list cursor exceeds the maximum encoded path cursor length",
+        ));
+    }
     let decoded = URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|error| invalid_state("list cursor is not canonical base64url", error))?;
     let payload = decoded.strip_prefix(LIST_CURSOR_VERSION).ok_or_else(|| {
         invalid_backend_input("list cursor does not use the current scope-bound schema")
     })?;
-    let (read_version, payload) = payload
-        .split_first_chunk::<8>()
-        .ok_or_else(|| invalid_backend_input("list cursor omits its read version"))?;
-    let read_version = u64::from_be_bytes(*read_version);
-    if read_version == 0 {
-        return Err(invalid_backend_input(
-            "list cursor read version must be greater than zero",
-        ));
-    }
+    let (&kind, payload) = payload
+        .split_first()
+        .ok_or_else(|| invalid_backend_input("list cursor omits its fence kind"))?;
+    let (fence, payload) = match kind {
+        0 => {
+            let (read_version, payload) = payload
+                .split_first_chunk::<8>()
+                .ok_or_else(|| invalid_backend_input("list cursor omits its read version"))?;
+            let read_version = u64::from_be_bytes(*read_version);
+            if read_version == 0 {
+                return Err(invalid_backend_input(
+                    "list cursor read version must be greater than zero",
+                ));
+            }
+            (ListContinuationFence::ReadVersion(read_version), payload)
+        }
+        1 => {
+            let (workspace_incarnation_id, payload) =
+                payload.split_first_chunk::<16>().ok_or_else(|| {
+                    invalid_backend_input("list cursor omits its workspace incarnation")
+                })?;
+            let (workspace_revision, payload) = payload
+                .split_first_chunk::<8>()
+                .ok_or_else(|| invalid_backend_input("list cursor omits its workspace revision"))?;
+            (
+                ListContinuationFence::Workspace(wire::WorkspaceContinuationFence {
+                    workspace_incarnation_id: wire::WorkspaceIdentity(*workspace_incarnation_id),
+                    workspace_revision: u64::from_be_bytes(*workspace_revision),
+                }),
+                payload,
+            )
+        }
+        _ => {
+            return Err(invalid_backend_input(
+                "list cursor has an unknown fence kind",
+            ))
+        }
+    };
     let (scope_digest, anchor) = payload
         .split_first_chunk::<32>()
         .ok_or_else(|| invalid_backend_input("list cursor omits its scope digest"))?;
@@ -2051,10 +2209,7 @@ fn decode_list_cursor(
     let anchor = String::from_utf8(anchor.to_vec())
         .map_err(|error| invalid_state("list cursor anchor is not valid UTF-8", error))?;
     let anchor = NormalizedRelativePath::new(anchor).map_err(domain_input)?;
-    Ok(ListCursor {
-        read_version,
-        anchor,
-    })
+    Ok(ListCursor { fence, anchor })
 }
 
 fn encode_cursor(kind: &str, payload: &[u8]) -> String {
@@ -2157,6 +2312,16 @@ fn is_read_version_conflict(error: &ClientError) -> bool {
     rpc_failure(error).is_some_and(|failure| {
         failure.code == wire::ErrorCode::PreconditionFailed
             && failure.conflict == Some(wire::ConflictKind::ReadVersion)
+    })
+}
+
+fn is_continuation_fence_conflict(error: &ClientError) -> bool {
+    rpc_failure(error).is_some_and(|failure| {
+        failure.code == wire::ErrorCode::PreconditionFailed
+            && matches!(
+                failure.conflict,
+                Some(wire::ConflictKind::ReadVersion | wire::ConflictKind::Workspace)
+            )
     })
 }
 
@@ -2397,6 +2562,17 @@ mod tests {
             message: "read version changed".to_owned(),
             retryable: false,
             conflict: Some(wire::ConflictKind::ReadVersion),
+            current_generation: None,
+            route_hint: None,
+        })
+    }
+
+    fn workspace_fence_failure() -> wire::WorkspaceRpcOutcome {
+        wire::WorkspaceRpcOutcome::Failure(wire::RpcFailure {
+            code: wire::ErrorCode::PreconditionFailed,
+            message: "workspace revision changed".to_owned(),
+            retryable: false,
+            conflict: Some(wire::ConflictKind::Workspace),
             current_generation: None,
             route_hint: None,
         })
@@ -2762,37 +2938,122 @@ mod tests {
     }
 
     #[test]
-    fn grep_cursor_is_bound_to_workbench_prefix_recursion_and_read_version() {
+    fn grep_cursor_is_bound_to_workbench_prefix_recursion_and_workspace_revision() {
         let scope = scoped_outputs();
         let prefix = full_path_optional(&scope).unwrap().unwrap();
-        let scope_digest = grep_scope_digest(&scope.workbench_id, Some(&prefix), true);
-        let cursor = encode_grep_cursor(41, scope_digest, b"outputs/a.txt");
+        let query_commitment = [9; 32];
+        let scope_digest = grep_scope_digest(
+            test_route().root_id,
+            &scope.workbench_id,
+            Some(&prefix),
+            true,
+            query_commitment,
+        );
+        let fence = wire::WorkspaceContinuationFence {
+            workspace_incarnation_id: wire::WorkspaceIdentity([5; 16]),
+            workspace_revision: 1,
+        };
+        let cursor = encode_grep_cursor(&fence, scope_digest, b"outputs/a.txt");
 
         assert_eq!(
             decode_grep_cursor(&cursor, scope_digest).unwrap(),
             GrepCursor {
-                read_version: 41,
+                fence,
                 server_cursor: b"outputs/a.txt".to_vec(),
             }
         );
-        let non_recursive = grep_scope_digest(&scope.workbench_id, Some(&prefix), false);
+        let non_recursive = grep_scope_digest(
+            test_route().root_id,
+            &scope.workbench_id,
+            Some(&prefix),
+            false,
+            query_commitment,
+        );
         assert!(decode_grep_cursor(&cursor, non_recursive).is_err());
+        let different_query = grep_scope_digest(
+            test_route().root_id,
+            &scope.workbench_id,
+            Some(&prefix),
+            true,
+            [10; 32],
+        );
+        assert!(decode_grep_cursor(&cursor, different_query).is_err());
         assert!(
             decode_grep_cursor(&encode_cursor("grep", b"outputs/a.txt"), scope_digest).is_err()
+        );
+        let mut legacy = b"nokv.workspace.grep-cursor.v2\0".to_vec();
+        legacy.extend_from_slice(&41_u64.to_be_bytes());
+        legacy.extend_from_slice(&scope_digest);
+        legacy.extend_from_slice(b"outputs/a.txt");
+        assert!(decode_grep_cursor(&URL_SAFE_NO_PAD.encode(legacy), scope_digest).is_err());
+        assert!(
+            decode_grep_cursor(&"A".repeat(GREP_CURSOR_MAX_ENCODED_BYTES + 1), scope_digest,)
+                .is_err()
         );
     }
 
     #[test]
-    fn grep_continuation_sends_the_cursor_read_version_fence() {
+    fn public_cursor_scopes_are_bound_to_the_storage_root() {
         let scope = scoped_outputs();
         let prefix = full_path_optional(&scope).unwrap().unwrap();
-        let scope_digest = grep_scope_digest(&scope.workbench_id, Some(&prefix), true);
-        let cursor = encode_grep_cursor(41, scope_digest, b"outputs/a.txt");
+        let workbench = &scope.workbench_id;
+        let query_commitment = [9; 32];
+        let root_a = wire::RootIdentity([1; 16]);
+        let root_b = wire::RootIdentity([2; 16]);
+
+        assert_ne!(
+            grep_scope_digest(root_a, workbench, Some(&prefix), true, query_commitment),
+            grep_scope_digest(root_b, workbench, Some(&prefix), true, query_commitment),
+        );
+        assert_ne!(
+            list_scope_digest(root_a, workbench, Some(&prefix), &agent::ReadView::Live),
+            list_scope_digest(root_b, workbench, Some(&prefix), &agent::ReadView::Live),
+        );
+        let root_a_scope =
+            grep_scope_digest(root_a, workbench, Some(&prefix), true, query_commitment);
+        let root_b_scope =
+            grep_scope_digest(root_b, workbench, Some(&prefix), true, query_commitment);
+        let fence = wire::WorkspaceContinuationFence {
+            workspace_incarnation_id: wire::WorkspaceIdentity([7; 16]),
+            workspace_revision: 3,
+        };
+        let cursor = encode_grep_cursor(&fence, root_a_scope, b"outputs/a.txt");
+        assert!(decode_grep_cursor(&cursor, root_b_scope).is_err());
+        let root_a_list =
+            list_scope_digest(root_a, workbench, Some(&prefix), &agent::ReadView::Live);
+        let root_b_list =
+            list_scope_digest(root_b, workbench, Some(&prefix), &agent::ReadView::Live);
+        let anchor = NormalizedRelativePath::new("outputs/a.txt").unwrap();
+        let cursor = encode_list_cursor(
+            &ListContinuationFence::Workspace(fence),
+            root_a_list,
+            &anchor,
+        );
+        assert!(decode_list_cursor(&cursor, root_b_list).is_err());
+    }
+
+    #[test]
+    fn grep_continuation_sends_the_cursor_workspace_fence() {
+        let scope = scoped_outputs();
+        let prefix = full_path_optional(&scope).unwrap().unwrap();
+        let query_commitment = [9; 32];
+        let scope_digest = grep_scope_digest(
+            test_route().root_id,
+            &scope.workbench_id,
+            Some(&prefix),
+            true,
+            query_commitment,
+        );
+        let fence = wire::WorkspaceContinuationFence {
+            workspace_incarnation_id: wire::WorkspaceIdentity([5; 16]),
+            workspace_revision: 1,
+        };
+        let cursor = encode_grep_cursor(&fence, scope_digest, b"outputs/a.txt");
         let (backend, requests, server) = scripted_backend(vec![success(
             wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: vec![wire_artifact("outputs/b.txt")],
                 next_cursor: None,
-                read_version: 41,
+                read_version: 99,
             }),
         )]);
 
@@ -2801,6 +3062,7 @@ mod tests {
             agent::GrepCandidateRequest {
                 scope,
                 recursive: true,
+                query_commitment,
                 cursor: Some(cursor),
                 limit: 1,
             },
@@ -2813,7 +3075,7 @@ mod tests {
         assert_eq!(
             decode_grep_cursor(&page.candidates[0].cursor_after, scope_digest).unwrap(),
             GrepCursor {
-                read_version: 41,
+                fence: fence.clone(),
                 server_cursor: b"outputs/b.txt".to_vec(),
             }
         );
@@ -2822,7 +3084,8 @@ mod tests {
         let wire::WorkspaceRequest::ListPaths(list) = &requests[0].operation else {
             panic!("grep continuation must call list_paths");
         };
-        assert_eq!(list.expected_read_version, Some(41));
+        assert_eq!(list.expected_read_version, None);
+        assert_eq!(list.workspace_continuation_fence, Some(fence));
         assert_eq!(
             list.page.cursor.as_deref(),
             Some(b"outputs/a.txt".as_slice())
@@ -2831,27 +3094,120 @@ mod tests {
     }
 
     #[test]
+    fn grep_page_two_survives_an_unrelated_read_version_advance() {
+        let (backend, requests, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "run-42", [5; 16],
+            ))),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: vec![wire_artifact("outputs/a.txt")],
+                next_cursor: Some(b"outputs/a.txt".to_vec()),
+                read_version: 41,
+            })),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: vec![wire_artifact("outputs/b.txt")],
+                next_cursor: None,
+                read_version: 99,
+            })),
+        ]);
+        let scope = scoped_outputs();
+        let query_commitment = [9; 32];
+        let first = agent::WorkbenchBackend::grep_candidates(
+            &backend,
+            agent::GrepCandidateRequest {
+                scope: scope.clone(),
+                recursive: true,
+                query_commitment,
+                cursor: None,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        let second = agent::WorkbenchBackend::grep_candidates(
+            &backend,
+            agent::GrepCandidateRequest {
+                scope,
+                recursive: true,
+                query_commitment,
+                cursor: first.next_cursor,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            first.candidates[0]
+                .path
+                .relative_path
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "a.txt"
+        );
+        assert_eq!(
+            second.candidates[0]
+                .path
+                .relative_path
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "b.txt"
+        );
+        let requests = requests.lock().unwrap();
+        let lists = requests
+            .iter()
+            .filter_map(|request| match &request.operation {
+                wire::WorkspaceRequest::ListPaths(list) => Some(list),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lists.len(), 2);
+        assert_eq!(
+            lists[0].workspace_continuation_fence,
+            lists[1].workspace_continuation_fence
+        );
+        assert_eq!(lists[0].expected_read_version, None);
+        assert_eq!(lists[1].expected_read_version, None);
+    }
+
+    #[test]
     fn list_cursor_is_bound_to_workbench_prefix_view_and_breaks_the_old_schema() {
         let workbench = WorkbenchId::new("run-42").unwrap();
         let outputs = NormalizedRelativePath::new("outputs".to_owned()).unwrap();
         let anchor = NormalizedRelativePath::new("outputs/a".to_owned()).unwrap();
-        let scope = list_scope_digest(&workbench, Some(&outputs), &agent::ReadView::Live);
-        let cursor = encode_list_cursor(7, scope, &anchor);
+        let scope = list_scope_digest(
+            test_route().root_id,
+            &workbench,
+            Some(&outputs),
+            &agent::ReadView::Live,
+        );
+        let fence = ListContinuationFence::Workspace(wire::WorkspaceContinuationFence {
+            workspace_incarnation_id: wire::WorkspaceIdentity([5; 16]),
+            workspace_revision: 1,
+        });
+        let cursor = encode_list_cursor(&fence, scope, &anchor);
         assert_eq!(
             decode_list_cursor(&cursor, scope).unwrap(),
-            ListCursor {
-                read_version: 7,
-                anchor,
-            }
+            ListCursor { fence, anchor }
         );
 
         let snapshot_scope = list_scope_digest(
+            test_route().root_id,
             &workbench,
             Some(&outputs),
             &agent::ReadView::Snapshot(agent::SnapshotSelector::Name("checkpoint".to_owned())),
         );
         assert!(decode_list_cursor(&cursor, snapshot_scope).is_err());
         assert!(decode_list_cursor(&encode_cursor("list", b"outputs/a"), scope).is_err());
+        let mut legacy = b"nokv.workspace.list-cursor.v3\0".to_vec();
+        legacy.extend_from_slice(&7_u64.to_be_bytes());
+        legacy.extend_from_slice(&scope);
+        legacy.extend_from_slice(b"outputs/a");
+        assert!(decode_list_cursor(&URL_SAFE_NO_PAD.encode(legacy), scope).is_err());
+        assert!(
+            decode_list_cursor(&"A".repeat(LIST_CURSOR_MAX_ENCODED_BYTES + 1), scope,).is_err()
+        );
     }
 
     #[test]
@@ -3055,13 +3411,16 @@ mod tests {
 
     #[test]
     fn virtual_only_list_still_performs_one_authoritative_path_read() {
-        let (backend, requests, server) = scripted_backend(vec![success(
-            wire::WorkspaceResult::Paths(wire::PathPage {
+        let (backend, requests, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "run-42", [5; 16],
+            ))),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: Vec::new(),
                 next_cursor: None,
                 read_version: 41,
-            }),
-        )]);
+            })),
+        ]);
         let page =
             agent::WorkbenchBackend::list(&backend, list_request(scoped_root(), None)).unwrap();
         server.join().unwrap();
@@ -3070,11 +3429,16 @@ mod tests {
         assert_eq!(page.entries.len(), 1);
         assert!(page.next_cursor.is_some());
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let wire::WorkspaceRequest::ListPaths(list) = &requests[0].operation else {
-            panic!("only request must be list_paths");
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            requests[0].operation,
+            wire::WorkspaceRequest::GetWorkspace(_)
+        ));
+        let wire::WorkspaceRequest::ListPaths(list) = &requests[1].operation else {
+            panic!("second request must be list_paths");
         };
         assert_eq!(list.expected_read_version, None);
+        assert!(list.workspace_continuation_fence.is_some());
         assert!(!list.recursive);
         assert_eq!(list.page.limit, 2);
     }
@@ -3082,6 +3446,9 @@ mod tests {
     #[test]
     fn root_list_merges_authoritative_children_with_virtual_sections_without_skipping() {
         let (backend, requests, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "run-42", [5; 16],
+            ))),
             success(wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: ["a", "b", "c"].map(wire_prefix).to_vec(),
                 next_cursor: Some(b"c".to_vec()),
@@ -3090,7 +3457,7 @@ mod tests {
             success(wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: ["c", "z"].map(wire_prefix).to_vec(),
                 next_cursor: None,
-                read_version: 41,
+                read_version: 42,
             })),
         ]);
 
@@ -3136,18 +3503,65 @@ mod tests {
         assert_eq!(lists[0].page.limit, 3);
         assert_eq!(lists[1].page.cursor.as_deref(), Some(b"b".as_slice()));
         assert_eq!(lists[1].page.limit, 3);
+        assert_eq!(lists[1].expected_read_version, None);
+        assert_eq!(
+            lists[1].workspace_continuation_fence,
+            lists[0].workspace_continuation_fence
+        );
+    }
+
+    #[test]
+    fn snapshot_list_continuation_keeps_the_exact_read_version_fence() {
+        let (backend, requests, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: ["outputs/a", "outputs/b"].map(wire_prefix).to_vec(),
+                next_cursor: Some(b"outputs/b".to_vec()),
+                read_version: 41,
+            })),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
+                entries: vec![wire_prefix("outputs/c")],
+                next_cursor: None,
+                read_version: 41,
+            })),
+        ]);
+        let mut request = list_request(scoped_outputs(), None);
+        request.view =
+            agent::ReadView::Snapshot(agent::SnapshotSelector::Name("checkpoint".to_owned()));
+        request.limit = 1;
+        let first = agent::WorkbenchBackend::list(&backend, request.clone()).unwrap();
+        request.cursor = first.next_cursor;
+        let second = agent::WorkbenchBackend::list(&backend, request).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(first.read_version, 41);
+        assert_eq!(second.read_version, 41);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let lists = requests
+            .iter()
+            .map(|request| match &request.operation {
+                wire::WorkspaceRequest::ListPaths(list) => list,
+                _ => panic!("snapshot list must not probe the live workspace"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lists[0].expected_read_version, None);
+        assert_eq!(lists[0].workspace_continuation_fence, None);
         assert_eq!(lists[1].expected_read_version, Some(41));
+        assert_eq!(lists[1].workspace_continuation_fence, None);
     }
 
     #[test]
     fn prefixed_list_exposes_direct_children_but_not_the_exact_prefix_artifact() {
-        let (backend, _, server) = scripted_backend(vec![success(wire::WorkspaceResult::Paths(
-            wire::PathPage {
+        let (backend, _, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "run-42", [5; 16],
+            ))),
+            success(wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: vec![wire_prefix("outputs/child"), wire_artifact("outputs")],
                 next_cursor: None,
                 read_version: 41,
-            },
-        ))]);
+            })),
+        ]);
         let mut request = list_request(scoped_outputs(), None);
         request.limit = 10;
         let page = agent::WorkbenchBackend::list(&backend, request).unwrap();
@@ -3169,12 +3583,18 @@ mod tests {
     #[test]
     fn live_list_discards_a_drifted_attempt_and_restarts_from_page_one() {
         let (backend, requests, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "run-42", [5; 16],
+            ))),
             success(wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: vec![wire_prefix("outputs/a")],
                 next_cursor: Some(b"page-2".to_vec()),
                 read_version: 7,
             })),
-            read_version_failure(),
+            workspace_fence_failure(),
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "run-42", [5; 16],
+            ))),
             success(wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: Vec::new(),
                 next_cursor: None,
@@ -3197,15 +3617,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(lists.len(), 3);
         assert_eq!(lists[0].expected_read_version, None);
-        assert_eq!(lists[1].expected_read_version, Some(7));
+        assert_eq!(lists[1].expected_read_version, None);
         assert_eq!(lists[1].page.cursor.as_deref(), Some(b"page-2".as_slice()));
         assert_eq!(lists[2].expected_read_version, None);
         assert!(lists[2].page.cursor.is_none());
+        assert_eq!(
+            lists[0].workspace_continuation_fence,
+            lists[1].workspace_continuation_fence
+        );
     }
 
     #[test]
     fn list_rejects_a_server_cursor_cycle() {
         let (backend, _, server) = scripted_backend(vec![
+            success(wire::WorkspaceResult::Workspace(workspace_summary(
+                "run-42", [5; 16],
+            ))),
             success(wire::WorkspaceResult::Paths(wire::PathPage {
                 entries: vec![wire_prefix("outputs/a")],
                 next_cursor: Some(b"cursor-a".to_vec()),
@@ -3258,13 +3685,22 @@ mod tests {
     fn user_list_cursor_staleness_fails_without_an_automatic_restart() {
         let path = scoped_outputs();
         let prefix = full_path_optional(&path).unwrap().unwrap();
-        let scope = list_scope_digest(&path.workbench_id, Some(&prefix), &agent::ReadView::Live);
+        let scope = list_scope_digest(
+            test_route().root_id,
+            &path.workbench_id,
+            Some(&prefix),
+            &agent::ReadView::Live,
+        );
+        let fence = ListContinuationFence::Workspace(wire::WorkspaceContinuationFence {
+            workspace_incarnation_id: wire::WorkspaceIdentity([5; 16]),
+            workspace_revision: 1,
+        });
         let cursor = encode_list_cursor(
-            7,
+            &fence,
             scope,
             &NormalizedRelativePath::new("outputs/old".to_owned()).unwrap(),
         );
-        let (backend, requests, server) = scripted_backend(vec![read_version_failure()]);
+        let (backend, requests, server) = scripted_backend(vec![workspace_fence_failure()]);
         let error =
             agent::WorkbenchBackend::list(&backend, list_request(path, Some(cursor))).unwrap_err();
         server.join().unwrap();
@@ -3275,7 +3711,14 @@ mod tests {
         let wire::WorkspaceRequest::ListPaths(list) = &requests[0].operation else {
             panic!("only request must be list_paths");
         };
-        assert_eq!(list.expected_read_version, Some(7));
+        assert_eq!(list.expected_read_version, None);
+        assert_eq!(
+            list.workspace_continuation_fence,
+            Some(wire::WorkspaceContinuationFence {
+                workspace_incarnation_id: wire::WorkspaceIdentity([5; 16]),
+                workspace_revision: 1,
+            })
+        );
         assert_eq!(list.page.cursor.as_deref(), Some(b"outputs/old".as_slice()));
     }
 

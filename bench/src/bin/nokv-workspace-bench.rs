@@ -104,6 +104,7 @@ fn sample_request() -> Result<WorkspaceRpcRequest, String> {
             recursive: false,
             view: WorkspaceReadView::Live,
             expected_read_version: None,
+            workspace_continuation_fence: None,
             page: PageRequest {
                 cursor: None,
                 limit: 100,
