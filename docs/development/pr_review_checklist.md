@@ -9,6 +9,17 @@ Findings come first, ordered by severity. Passing tests does not excuse weaker
 metadata atomicity, object publication, retention, ownership fencing, package
 boundaries, or Workbench behavior.
 
+## Merge Governance
+
+- If additions plus deletions exceed 5,000 lines, does one core maintainer
+  other than the current-head pusher approve the exact current head commit?
+- Did a new push make every older approval ineligible?
+- If additions plus deletions exceed 5,000 lines, does the protected
+  `change-governance/large-change-review` status pass?
+- Is the change actually reviewable as one logical boundary even if the formal
+  approval count and status checks pass?
+- Are every required status and review conversation complete before merge?
+
 ## Scope And Architecture
 
 - Does the change implement only the workspace architecture?
