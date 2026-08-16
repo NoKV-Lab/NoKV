@@ -16,11 +16,12 @@ use nokv_protocol::{
     GetWorkspaceRequest, ListPathsRequest, ListSnapshotsRequest, LogicalShardIdentity,
     MarkArtifactObjectsUploadedRequest, MintSnapshotRequest, OperationStatus, PathPage,
     PathReadResult, PrepareRestoreRequest, PublishResult, ReadRestoreSourceRunManifestRequest,
-    RemovePathRequest, RemovePathResult, RenewSnapshotRequest, RequestIdentity, RestorePreparation,
-    RestoreResult, RetireSnapshotRequest, RootIdentity, RootRoute, SearchRequest, SearchResult,
-    SnapshotPage, SnapshotResult, StageArtifactManifestRequest, StageArtifactObjectsRequest,
-    WorkspaceCapability, WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceRequest,
-    WorkspaceResult, WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceSummary,
+    RemovePathRequest, RemovePathResult, RenamePathRequest, RenamePathResult, RenewSnapshotRequest,
+    RequestIdentity, RestorePreparation, RestoreResult, RetireSnapshotRequest, RootIdentity,
+    RootRoute, SearchRequest, SearchResult, SnapshotPage, SnapshotResult,
+    StageArtifactManifestRequest, StageArtifactObjectsRequest, WorkspaceCapability,
+    WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceRequest, WorkspaceResult,
+    WorkspaceRpcOutcome, WorkspaceRpcRequest, WorkspaceSummary,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -351,6 +352,29 @@ where
             .map(expect_removed)
     }
 
+    pub fn rename_path(
+        &self,
+        request_id: RequestIdentity,
+        request: RenamePathRequest,
+    ) -> Result<ClientCall<RenamePathResult>, ClientError> {
+        let expected_source = request.source.clone();
+        let expected_destination = request.destination.clone();
+        let expected_generation = request.expected_generation;
+        let call = self
+            .execute(request_id, WorkspaceRequest::RenamePath(request))?
+            .map(expect_renamed)?;
+        if call.value.source != expected_source
+            || call.value.destination != expected_destination
+            || call.value.generation != expected_generation
+        {
+            return Err(ClientError::ResponseMismatch(
+                "rename result does not match the exact source, destination, and generation"
+                    .to_owned(),
+            ));
+        }
+        Ok(call)
+    }
+
     pub fn begin_artifact_publish(
         &self,
         request_id: RequestIdentity,
@@ -650,6 +674,7 @@ expect_result!(
 expect_result!(expect_workspace, Workspace, WorkspaceSummary, "workspace");
 expect_result!(expect_path, Path, PathReadResult, "path");
 expect_result!(expect_paths, Paths, PathPage, "paths");
+expect_result!(expect_renamed, Renamed, RenamePathResult, "renamed");
 expect_result!(expect_removed, Removed, RemovePathResult, "removed");
 expect_result!(expect_operation, Operation, OperationStatus, "operation");
 expect_result!(expect_published, Published, PublishResult, "published");
@@ -766,6 +791,41 @@ mod tests {
                 outcome: WorkspaceRpcOutcome::Success(Box::new(
                     WorkspaceResult::RestoreSourceRunManifest(self.result.clone()),
                 )),
+            })
+            .map_err(|error| crate::TransportError::new(error.to_string(), false))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LossyRenameTransport {
+        requests: Mutex<Vec<WorkspaceRpcRequest>>,
+        result: RenamePathResult,
+    }
+
+    impl RpcTransport for LossyRenameTransport {
+        fn round_trip(
+            &self,
+            _endpoint: SocketAddr,
+            request: &[u8],
+        ) -> Result<Vec<u8>, crate::TransportError> {
+            let request = decode_request(request)
+                .map_err(|error| crate::TransportError::new(error.to_string(), false))?;
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            if requests.len() == 1 {
+                return Err(crate::TransportError::new(
+                    "injected rename response loss",
+                    true,
+                ));
+            }
+            encode_response(&WorkspaceRpcResponse {
+                route: request.route,
+                request_id: request.request_id,
+                commit_version: Some(19),
+                replayed: true,
+                outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Renamed(
+                    self.result.clone(),
+                ))),
             })
             .map_err(|error| crate::TransportError::new(error.to_string(), false))
         }
@@ -925,6 +985,107 @@ mod tests {
             &requests[0].operation,
             WorkspaceRequest::ReadRestoreSourceRunManifest(request)
                 if request.operation_id == operation_id
+        ));
+    }
+
+    #[test]
+    fn rename_response_loss_reuses_the_caller_supplied_request_identity() {
+        let request_id = RequestIdentity([0x3a; 16]);
+        let source = WorkspacePath {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            path: RelativePath::new("outputs/a.bin").unwrap(),
+        };
+        let destination = WorkspacePath {
+            workbench: source.workbench.clone(),
+            path: RelativePath::new("outputs/b.bin").unwrap(),
+        };
+        let request = RenamePathRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            expected_generation: 7,
+        };
+        let result = RenamePathResult {
+            source,
+            destination,
+            workspace_revision: 3,
+            generation: 7,
+            artifact_revision_id: ArtifactRevisionIdentity([0x3b; 16]),
+        };
+        let transport = LossyRenameTransport {
+            requests: Mutex::new(Vec::new()),
+            result: result.clone(),
+        };
+        let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        let call = client.rename_path(request_id, request.clone()).unwrap();
+        assert!(call.replayed);
+        assert_eq!(call.value, result);
+        let requests = client.transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].request_id, request_id);
+        assert_eq!(requests[0], requests[1]);
+        assert!(matches!(
+            &requests[0].operation,
+            WorkspaceRequest::RenamePath(actual) if actual == &request
+        ));
+    }
+
+    #[test]
+    fn rename_result_cannot_drift_from_the_exact_request() {
+        let request_id = RequestIdentity([0x3c; 16]);
+        let source = WorkspacePath {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            path: RelativePath::new("outputs/a.bin").unwrap(),
+        };
+        let destination = WorkspacePath {
+            workbench: source.workbench.clone(),
+            path: RelativePath::new("outputs/b.bin").unwrap(),
+        };
+        let response = WorkspaceRpcResponse {
+            route: route(7),
+            request_id,
+            commit_version: Some(20),
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Renamed(
+                RenamePathResult {
+                    source: source.clone(),
+                    destination: WorkspacePath {
+                        workbench: source.workbench.clone(),
+                        path: RelativePath::new("outputs/other.bin").unwrap(),
+                    },
+                    workspace_revision: 4,
+                    generation: 7,
+                    artifact_revision_id: ArtifactRevisionIdentity([0x3d; 16]),
+                },
+            ))),
+        };
+        let transport = ScriptedTransport::new(vec![response]);
+        let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.rename_path(
+                request_id,
+                RenamePathRequest {
+                    source,
+                    destination,
+                    expected_generation: 7,
+                },
+            ),
+            Err(ClientError::ResponseMismatch(_))
         ));
     }
 

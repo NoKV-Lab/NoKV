@@ -23,6 +23,7 @@ mod read_stats;
 mod records;
 mod recovery;
 mod remove;
+mod rename;
 mod restore;
 mod restore_records;
 mod snapshot;
@@ -151,6 +152,7 @@ pub use recovery::{
     RECOVERY_CHAIN_DIGEST_BYTES, RECOVERY_OUTBOX_VALUE_FORMAT_VERSION,
 };
 pub use remove::{remove_path, RemovePathError, RemovePathOutcome, RemovePathRequest};
+pub use rename::{rename_path, RenamePathError, RenamePathOutcome, RenamePathRequest};
 pub use restore::{
     abort_restore, apply_restore_initialization, begin_restore, bind_restore_destination,
     build_restore_commit_members, cleanup_restore_batch, complete_restore, copy_restore_batch,

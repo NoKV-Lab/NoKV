@@ -54,6 +54,7 @@ pub enum WorkspaceRequest {
     GetWorkspace(GetWorkspaceRequest),
     GetPath(GetPathRequest),
     ListPaths(ListPathsRequest),
+    RenamePath(RenamePathRequest),
     RemovePath(RemovePathRequest),
     BeginArtifactPublish(BeginArtifactPublishRequest),
     StageArtifactObjects(StageArtifactObjectsRequest),
@@ -88,6 +89,7 @@ impl WorkspaceRequest {
             Self::GetWorkspace(request) => request.validate(),
             Self::GetPath(request) => request.validate(),
             Self::ListPaths(request) => request.validate(),
+            Self::RenamePath(request) => request.validate(),
             Self::RemovePath(request) => request.validate(),
             Self::BeginArtifactPublish(request) => request.validate(),
             Self::StageArtifactObjects(request) => request.validate(),
@@ -311,6 +313,53 @@ impl ListPathsRequest {
 pub struct RemovePathRequest {
     pub target: WorkspacePath,
     pub expected_generation: u64,
+}
+
+/// One generation-fenced, create-only move inside one Workbench incarnation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenamePathRequest {
+    pub source: WorkspacePath,
+    pub destination: WorkspacePath,
+    pub expected_generation: u64,
+}
+
+impl RenamePathRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.source.workbench != self.destination.workbench {
+            return Err(ProtocolError::invalid(
+                "rename_path.destination.workbench",
+                "must equal source.workbench",
+            ));
+        }
+        if self.source.path == self.destination.path {
+            return Err(ProtocolError::invalid(
+                "rename_path.destination.path",
+                "must differ from source.path",
+            ));
+        }
+        if self.expected_generation == 0 {
+            return Err(ProtocolError::invalid(
+                "rename_path.expected_generation",
+                "must be greater than zero",
+            ));
+        }
+        for (field, path) in [
+            ("rename_path.source.path", &self.source.path),
+            ("rename_path.destination.path", &self.destination.path),
+        ] {
+            if matches!(
+                path.as_str(),
+                "metadata/run_manifest.json" | "metadata/restore_manifest.json"
+            ) {
+                return Err(ProtocolError::invalid(
+                    field,
+                    "canonical Workbench manifests are lifecycle-owned and cannot be renamed",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RemovePathRequest {
@@ -1726,6 +1775,74 @@ mod tests {
                     field: "remove_path.target.path",
                     ..
                 })
+            ));
+        }
+    }
+
+    fn rename_request(source: &str, destination: &str) -> RenamePathRequest {
+        RenamePathRequest {
+            source: WorkspacePath {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                path: crate::RelativePath::new(source).unwrap(),
+            },
+            destination: WorkspacePath {
+                workbench: WorkbenchName::new("run-42").unwrap(),
+                path: crate::RelativePath::new(destination).unwrap(),
+            },
+            expected_generation: 7,
+        }
+    }
+
+    #[test]
+    fn rename_path_is_same_workbench_create_only_shape_and_fences_reserved_manifests() {
+        rename_request("outputs/a.bin", "outputs/b.bin")
+            .validate()
+            .unwrap();
+
+        let same_path = rename_request("outputs/a.bin", "outputs/a.bin");
+        assert!(matches!(
+            same_path.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "rename_path.destination.path",
+                ..
+            })
+        ));
+
+        let mut cross_workbench = rename_request("outputs/a.bin", "outputs/b.bin");
+        cross_workbench.destination.workbench = WorkbenchName::new("other").unwrap();
+        assert!(matches!(
+            cross_workbench.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "rename_path.destination.workbench",
+                ..
+            })
+        ));
+
+        let mut zero_generation = rename_request("outputs/a.bin", "outputs/b.bin");
+        zero_generation.expected_generation = 0;
+        assert!(matches!(
+            zero_generation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "rename_path.expected_generation",
+                ..
+            })
+        ));
+
+        for (source, destination, field) in [
+            (
+                "metadata/run_manifest.json",
+                "outputs/b.bin",
+                "rename_path.source.path",
+            ),
+            (
+                "outputs/a.bin",
+                "metadata/restore_manifest.json",
+                "rename_path.destination.path",
+            ),
+        ] {
+            assert!(matches!(
+                rename_request(source, destination).validate(),
+                Err(ProtocolError::InvalidField { field: actual, .. }) if actual == field
             ));
         }
     }

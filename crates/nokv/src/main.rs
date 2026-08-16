@@ -30,7 +30,7 @@ use nokv_types::{NormalizedRelativePath, WorkbenchId};
 use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
-use cli::{Command, Invocation};
+use cli::{Command, Invocation, WorkspacePathCommand};
 #[cfg(feature = "etcd")]
 use object_store::CliObjectStore;
 
@@ -121,6 +121,7 @@ fn run() -> Result<(), String> {
                 content_type.as_deref(),
             )
         }
+        Command::WorkspacePath(command) => run_workspace_path(&invocation, command),
     }
 }
 
@@ -246,6 +247,173 @@ fn build_handler(invocation: &Invocation) -> Result<CliHandler, String> {
         workbench_root,
     )
     .map_err(agent_error)
+}
+
+fn build_workspace_path_client(
+    invocation: &Invocation,
+) -> Result<connection::CliWorkspaceClient, String> {
+    let admission = configured_agent_admission(invocation)?;
+    #[cfg(feature = "etcd")]
+    {
+        let control = connect_control(admission.route)?;
+        after_agent_root_admission(
+            control.as_ref(),
+            admission.root_id,
+            admission.agent_id,
+            || {
+                let client =
+                    connection::connect(&invocation.client).map_err(|error| error.to_string())?;
+                client
+                    .preflight([nokv_protocol::WorkspaceCapability::WorkspacePathV1])
+                    .map_err(|error| format!("workspace preflight failed: {error}"))?;
+                Ok(client)
+            },
+        )
+    }
+    #[cfg(not(feature = "etcd"))]
+    {
+        let ConfiguredAgentAdmission {
+            route,
+            root_id,
+            agent_id,
+        } = admission;
+        let _ = (route, root_id, agent_id);
+        Err("workspace-path commands require the nokv etcd feature".to_owned())
+    }
+}
+
+fn run_workspace_path(
+    invocation: &Invocation,
+    command: &WorkspacePathCommand,
+) -> Result<(), String> {
+    let (request_id, operation) = match command {
+        WorkspacePathCommand::Rename {
+            workbench,
+            section,
+            source,
+            destination,
+            expected_generation,
+            request_id,
+        } => (
+            nokv_protocol::RequestIdentity(*request_id),
+            nokv_protocol::WorkspaceRequest::RenamePath(nokv_protocol::RenamePathRequest {
+                source: canonical_workspace_path(workbench, section, source)?,
+                destination: canonical_workspace_path(workbench, section, destination)?,
+                expected_generation: *expected_generation,
+            }),
+        ),
+        WorkspacePathCommand::Remove {
+            workbench,
+            section,
+            path,
+            expected_generation,
+            request_id,
+        } => (
+            nokv_protocol::RequestIdentity(*request_id),
+            nokv_protocol::WorkspaceRequest::RemovePath(nokv_protocol::RemovePathRequest {
+                target: canonical_workspace_path(workbench, section, path)?,
+                expected_generation: *expected_generation,
+            }),
+        ),
+    };
+    let client = build_workspace_path_client(invocation)?;
+    match operation {
+        nokv_protocol::WorkspaceRequest::RenamePath(request) => {
+            let call = client
+                .rename_path(request_id, request.clone())
+                .map_err(|error| error.to_string())?;
+            print_json(&rename_path_json(request_id, &request, &call)?)
+        }
+        nokv_protocol::WorkspaceRequest::RemovePath(request) => {
+            let call = client
+                .remove_path(request_id, request.clone())
+                .map_err(|error| error.to_string())?;
+            print_json(&remove_path_json(request_id, &request, &call)?)
+        }
+        _ => unreachable!("workspace-path CLI constructs only path mutations"),
+    }
+}
+
+fn canonical_workspace_path(
+    workbench: &str,
+    section: &str,
+    path: &str,
+) -> Result<nokv_protocol::WorkspacePath, String> {
+    let section = parse_section(section)?;
+    let relative = NormalizedRelativePath::new(path).map_err(|error| error.to_string())?;
+    if relative.components().next() == Some(section.as_str()) {
+        return Err(format!(
+            "path is relative to section {section}; remove the duplicated section prefix"
+        ));
+    }
+    let canonical = NormalizedRelativePath::new(format!("{section}/{relative}"))
+        .map_err(|error| error.to_string())?;
+    if matches!(
+        canonical.as_str(),
+        "metadata/run_manifest.json" | "metadata/restore_manifest.json"
+    ) {
+        return Err(format!(
+            "{} is a reserved Workbench projection and cannot be changed by workspace-path",
+            canonical.as_str()
+        ));
+    }
+    Ok(nokv_protocol::WorkspacePath {
+        workbench: nokv_protocol::WorkbenchName::new(workbench)
+            .map_err(|error| error.to_string())?,
+        path: nokv_protocol::RelativePath::new(canonical.as_str())
+            .map_err(|error| error.to_string())?,
+    })
+}
+
+fn rename_path_json(
+    request_id: nokv_protocol::RequestIdentity,
+    request: &nokv_protocol::RenamePathRequest,
+    call: &nokv_client::ClientCall<nokv_protocol::RenamePathResult>,
+) -> Result<Value, String> {
+    let commit_version = call
+        .commit_version
+        .ok_or_else(|| "rename response omitted its metadata commit version".to_owned())?;
+    Ok(json!({
+        "status": "success",
+        "operation": "rename",
+        "request_id": encode_lowercase_hex(&request_id.0),
+        "workbench_id": call.value.source.workbench.as_str(),
+        "path": call.value.source.path.as_str(),
+        "destination_path": call.value.destination.path.as_str(),
+        "previous_generation": request.expected_generation,
+        "generation": call.value.generation,
+        "idempotent_replay": call.replayed,
+        "workspace_revision": call.value.workspace_revision,
+        "artifact_revision_id": encode_lowercase_hex(&call.value.artifact_revision_id.0),
+        "commit_version": commit_version,
+    }))
+}
+
+fn remove_path_json(
+    request_id: nokv_protocol::RequestIdentity,
+    request: &nokv_protocol::RemovePathRequest,
+    call: &nokv_client::ClientCall<nokv_protocol::RemovePathResult>,
+) -> Result<Value, String> {
+    let commit_version = call
+        .commit_version
+        .ok_or_else(|| "remove response omitted its metadata commit version".to_owned())?;
+    let revision = call
+        .value
+        .removed_artifact_revision_id
+        .ok_or_else(|| "successful remove response omitted its artifact revision".to_owned())?;
+    Ok(json!({
+        "status": "success",
+        "operation": "remove",
+        "request_id": encode_lowercase_hex(&request_id.0),
+        "workbench_id": request.target.workbench.as_str(),
+        "path": request.target.path.as_str(),
+        "previous_generation": request.expected_generation,
+        "generation": request.expected_generation,
+        "idempotent_replay": call.replayed,
+        "workspace_revision": call.value.workspace_revision,
+        "removed_artifact_revision_id": encode_lowercase_hex(&revision.0),
+        "commit_version": commit_version,
+    }))
 }
 
 fn materialize(
@@ -380,6 +548,8 @@ USAGE:
   nokv [connection/object options] mcp
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--content-type TYPE]
+  nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
+  nokv [route/agent options] workspace-path remove <workbench> <section> <path> --expected-generation N --request-id HEX32
   nokv --root-id HEX32 --agent-id HEX32 --etcd-endpoint URL provision <logical-shard-id-hex32> [adoption options]
   nokv [owner options] serve
   nokv schema
@@ -388,7 +558,7 @@ USAGE:
 
 AGENT CONTROL ROUTING:
   --root-id HEX32
-  --agent-id HEX32 is required by provision, workbench, mcp, materialize, and collect
+  --agent-id HEX32 is required by provision, workbench, mcp, materialize, collect, and workspace-path
   AgentId is a durable deployment identity used to prevent root misconfiguration; it is not an authentication credential
   --etcd-endpoint URL [--etcd-endpoint URL ...]
 
@@ -396,6 +566,8 @@ AGENT PRESENTATION:
   --workbench-root /agents/AGENT_NAME/wb is required by workbench, collect, and mcp
   keep this presentation root stable: it shapes responses and canonical v1 manifest paths
   RootId remains the only storage/routing identity; the presentation root never enters Holt keys
+  workspace-path is a custom CLI surface; it does not add to the fixed 18 Workbench tools
+  workspace-path requires an explicit lowercase HEX32 request id for exact cross-process replay
 
 OWNER:
   provision first binds RootId to an explicit AgentId, then creates namespace, shard, and affinity
@@ -837,6 +1009,88 @@ mod tests {
         assert_eq!(path.logical_path(), "outputs/result.json");
         assert!(scoped_artifact("run-1", "tmp", "result.json").is_err());
         assert!(scoped_artifact("run-1", "outputs", "../result.json").is_err());
+    }
+
+    #[test]
+    fn workspace_path_maps_sections_without_accepting_reserved_or_duplicated_paths() {
+        let path = canonical_workspace_path("run-42", "outputs", "result.json").unwrap();
+        assert_eq!(path.workbench.as_str(), "run-42");
+        assert_eq!(path.path.as_str(), "outputs/result.json");
+        assert!(canonical_workspace_path("run-42", "outputs", "outputs/result.json").is_err());
+        assert!(canonical_workspace_path("run-42", "metadata", "run_manifest.json").is_err());
+        assert!(canonical_workspace_path("run-42", "tmp", "result.json").is_err());
+    }
+
+    #[test]
+    fn workspace_path_json_is_exact_and_replay_auditable() {
+        let request_id = nokv_protocol::RequestIdentity([0xab; 16]);
+        let source = canonical_workspace_path("run-42", "outputs", "a.bin").unwrap();
+        let destination = canonical_workspace_path("run-42", "outputs", "b.bin").unwrap();
+        let rename = nokv_protocol::RenamePathRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            expected_generation: 7,
+        };
+        let rename_call = nokv_client::ClientCall {
+            value: nokv_protocol::RenamePathResult {
+                source: source.clone(),
+                destination,
+                workspace_revision: 9,
+                generation: 7,
+                artifact_revision_id: nokv_protocol::ArtifactRevisionIdentity([0xcd; 16]),
+            },
+            commit_version: Some(11),
+            replayed: true,
+        };
+        assert_eq!(
+            rename_path_json(request_id, &rename, &rename_call).unwrap(),
+            json!({
+                "status": "success",
+                "operation": "rename",
+                "request_id": "abababababababababababababababab",
+                "workbench_id": "run-42",
+                "path": "outputs/a.bin",
+                "destination_path": "outputs/b.bin",
+                "previous_generation": 7,
+                "generation": 7,
+                "idempotent_replay": true,
+                "workspace_revision": 9,
+                "artifact_revision_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                "commit_version": 11,
+            })
+        );
+
+        let remove = nokv_protocol::RemovePathRequest {
+            target: source,
+            expected_generation: 7,
+        };
+        let remove_call = nokv_client::ClientCall {
+            value: nokv_protocol::RemovePathResult {
+                removed: true,
+                workspace_revision: 10,
+                removed_artifact_revision_id: Some(nokv_protocol::ArtifactRevisionIdentity(
+                    [0xef; 16],
+                )),
+            },
+            commit_version: Some(12),
+            replayed: false,
+        };
+        assert_eq!(
+            remove_path_json(request_id, &remove, &remove_call).unwrap(),
+            json!({
+                "status": "success",
+                "operation": "remove",
+                "request_id": "abababababababababababababababab",
+                "workbench_id": "run-42",
+                "path": "outputs/a.bin",
+                "previous_generation": 7,
+                "generation": 7,
+                "idempotent_replay": false,
+                "workspace_revision": 10,
+                "removed_artifact_revision_id": "efefefefefefefefefefefefefefefef",
+                "commit_version": 12,
+            })
+        );
     }
 
     #[test]

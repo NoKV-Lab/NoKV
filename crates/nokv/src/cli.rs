@@ -108,6 +108,7 @@ pub enum Command {
         replace: bool,
         content_type: Option<String>,
     },
+    WorkspacePath(WorkspacePathCommand),
     Provision {
         logical_shard_id: String,
         adopt_legacy_object_namespace: bool,
@@ -122,6 +123,25 @@ pub enum Command {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspacePathCommand {
+    Rename {
+        workbench: String,
+        section: String,
+        source: String,
+        destination: String,
+        expected_generation: u64,
+        request_id: [u8; 16],
+    },
+    Remove {
+        workbench: String,
+        section: String,
+        path: String,
+        expected_generation: u64,
+        request_id: [u8; 16],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliError {
     MissingValue(String),
     MissingArgument(&'static str),
@@ -131,6 +151,7 @@ pub enum CliError {
     UnexpectedArgument(String),
     InvalidNumber { option: &'static str, value: String },
     InvalidAddress { option: &'static str, value: String },
+    InvalidRequestId(String),
     MixedRoutingOptions,
     MixedMetadataStoreOptions,
 }
@@ -152,6 +173,10 @@ impl fmt::Display for CliError {
             Self::InvalidAddress { option, value } => {
                 write!(formatter, "{option} has invalid socket address {value:?}")
             }
+            Self::InvalidRequestId(value) => write!(
+                formatter,
+                "--request-id must be exactly 32 lowercase hexadecimal characters, got {value:?}"
+            ),
             Self::MixedRoutingOptions => formatter.write_str(
                 "static metadata routing options and etcd routing options cannot be combined",
             ),
@@ -388,6 +413,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             | Command::Mcp
             | Command::Materialize { .. }
             | Command::Collect { .. }
+            | Command::WorkspacePath(_)
             | Command::Provision { .. }
     ) && agent_id.is_none()
     {
@@ -462,6 +488,7 @@ fn parse_command(
             ),
         }),
         "collect" => parse_collect(arguments),
+        "workspace-path" => parse_workspace_path(arguments),
         "provision" => parse_provision(arguments),
         "serve" => Ok(Command::Serve),
         "schema" => Ok(Command::Schema),
@@ -469,6 +496,76 @@ fn parse_command(
         "help" => Ok(Command::Help),
         _ => Err(CliError::UnknownCommand(command)),
     }
+}
+
+fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let operation = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("workspace-path operation"))?;
+    let workbench = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("workbench id"))?;
+    let section = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("section"))?;
+    let first_path = arguments
+        .next()
+        .ok_or(CliError::MissingArgument("workspace path"))?;
+    let destination = match operation.as_str() {
+        "rename" => Some(
+            arguments
+                .next()
+                .ok_or(CliError::MissingArgument("destination workspace path"))?,
+        ),
+        "remove" => None,
+        _ => {
+            return Err(CliError::UnknownCommand(format!(
+                "workspace-path {operation}"
+            )))
+        }
+    };
+
+    let mut expected_generation = None;
+    let mut request_id = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--expected-generation" if expected_generation.is_none() => {
+                expected_generation = Some(parse_number(
+                    "--expected-generation",
+                    next_value(arguments, &argument)?,
+                )?);
+            }
+            "--request-id" if request_id.is_none() => {
+                request_id = Some(parse_request_id(next_value(arguments, &argument)?)?);
+            }
+            "--expected-generation" | "--request-id" => {
+                return Err(CliError::UnexpectedArgument(argument));
+            }
+            _ if argument.starts_with("--") => return Err(CliError::UnknownOption(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    let expected_generation =
+        expected_generation.ok_or(CliError::MissingOption("--expected-generation"))?;
+    let request_id = request_id.ok_or(CliError::MissingOption("--request-id"))?;
+
+    Ok(Command::WorkspacePath(match destination {
+        Some(destination) => WorkspacePathCommand::Rename {
+            workbench,
+            section,
+            source: first_path,
+            destination,
+            expected_generation,
+            request_id,
+        },
+        None => WorkspacePathCommand::Remove {
+            workbench,
+            section,
+            path: first_path,
+            expected_generation,
+            request_id,
+        },
+    }))
 }
 
 fn parse_provision(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -562,6 +659,31 @@ fn parse_address(option: &'static str, value: String) -> Result<SocketAddr, CliE
         .map_err(|_| CliError::InvalidAddress { option, value })
 }
 
+fn parse_request_id(value: String) -> Result<[u8; 16], CliError> {
+    if value.len() != 32
+        || !value
+            .as_bytes()
+            .iter()
+            .copied()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(CliError::InvalidRequestId(value));
+    }
+    let mut decoded = [0_u8; 16];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+    }
+    Ok(decoded)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("parse_request_id validates lowercase hexadecimal bytes"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +762,97 @@ mod tests {
                 replace: true,
                 content_type: Some("application/octet-stream".to_owned()),
             }
+        );
+    }
+
+    #[test]
+    fn workspace_path_mutations_require_exact_replay_inputs() {
+        let parsed = parse(args(&[
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "workspace-path",
+            "rename",
+            "run-42",
+            "outputs",
+            "a.bin",
+            "b.bin",
+            "--expected-generation",
+            "7",
+            "--request-id",
+            "abababababababababababababababab",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::WorkspacePath(WorkspacePathCommand::Rename {
+                workbench: "run-42".to_owned(),
+                section: "outputs".to_owned(),
+                source: "a.bin".to_owned(),
+                destination: "b.bin".to_owned(),
+                expected_generation: 7,
+                request_id: [0xab; 16],
+            })
+        );
+
+        let removed = parse(args(&[
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "workspace-path",
+            "remove",
+            "run-42",
+            "logs",
+            "run.log",
+            "--request-id",
+            "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            "--expected-generation",
+            "3",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            removed.command,
+            Command::WorkspacePath(WorkspacePathCommand::Remove {
+                expected_generation: 3,
+                request_id,
+                ..
+            }) if request_id == [0xcd; 16]
+        ));
+    }
+
+    #[test]
+    fn workspace_path_rejects_missing_or_malformed_request_identity() {
+        let prefix = [
+            "--root-id",
+            "11111111111111111111111111111111",
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--etcd-endpoint",
+            "http://127.0.0.1:2379",
+            "workspace-path",
+            "remove",
+            "run-42",
+            "outputs",
+            "a.bin",
+            "--expected-generation",
+            "7",
+        ];
+        assert_eq!(
+            parse(args(&prefix)),
+            Err(CliError::MissingOption("--request-id"))
+        );
+
+        let mut malformed = prefix.to_vec();
+        malformed.extend(["--request-id", "ABC"]);
+        assert_eq!(
+            parse(args(&malformed)),
+            Err(CliError::InvalidRequestId("ABC".to_owned()))
         );
     }
 
@@ -867,6 +1080,21 @@ mod tests {
                 "outputs",
                 "/tmp/result.bin",
                 "result.bin",
+            ]),
+            args(&[
+                "--root-id",
+                "11111111111111111111111111111111",
+                "--etcd-endpoint",
+                "http://127.0.0.1:2379",
+                "workspace-path",
+                "remove",
+                "run-1",
+                "outputs",
+                "result.bin",
+                "--expected-generation",
+                "1",
+                "--request-id",
+                "abababababababababababababababab",
             ]),
             args(&[
                 "--root-id",

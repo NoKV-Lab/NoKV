@@ -10,7 +10,7 @@ use crate::request::WorkspaceRpcRequest;
 use crate::response::WorkspaceRpcResponse;
 
 /// The exact and only accepted wire schema.
-pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v5";
+pub const WORKSPACE_PROTOCOL_SCHEMA: &str = "nokv.workspace.rpc.v6";
 /// Exact schema for the versioned workspace RPC preflight exchange.
 pub const WORKSPACE_PREFLIGHT_SCHEMA: &str = "nokv.workspace.rpc_preflight.v1";
 /// Exact schema for the advertised workspace RPC capability set.
@@ -96,12 +96,13 @@ mod tests {
         ObjectNamespaceIdentity, OperationIdentity, OperationKind, OperationProgress,
         OperationState, OperationStatus, OperationToken, PageRequest, PathListEntry, PathMetadata,
         PathPage, PathReadResult, PrepareRestoreRequest, PublishCondition,
-        ReadRestoreSourceRunManifestRequest, RelativePath, RequestIdentity,
-        RestoreManifestDescriptor, RestoreManifestIdentity, RestorePreparation, RestoreSource,
-        RestoreSourceCommitBinding, RootIdentity, RootRoute, SnapshotAlias, SnapshotSelector,
-        WorkbenchName, WorkspaceCapability, WorkspaceContinuationFence, WorkspaceIdentity,
-        WorkspacePath, WorkspacePreflightRequest, WorkspacePreflightResult, WorkspaceReadView,
-        WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome, WorkspaceSummary,
+        ReadRestoreSourceRunManifestRequest, RelativePath, RenamePathRequest, RenamePathResult,
+        RequestIdentity, RestoreManifestDescriptor, RestoreManifestIdentity, RestorePreparation,
+        RestoreSource, RestoreSourceCommitBinding, RootIdentity, RootRoute, SnapshotAlias,
+        SnapshotSelector, WorkbenchName, WorkspaceCapability, WorkspaceContinuationFence,
+        WorkspaceIdentity, WorkspacePath, WorkspacePreflightRequest, WorkspacePreflightResult,
+        WorkspaceReadView, WorkspaceRequest, WorkspaceResult, WorkspaceRpcOutcome,
+        WorkspaceSummary,
     };
     use sha2::{Digest as _, Sha256};
 
@@ -128,13 +129,58 @@ mod tests {
 
     #[test]
     fn request_round_trips_with_exact_schema() {
-        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v5");
+        assert_eq!(WORKSPACE_PROTOCOL_SCHEMA, "nokv.workspace.rpc.v6");
         let expected = request();
         let encoded = encode_request(&expected).unwrap();
         assert!(encoded
             .windows(WORKSPACE_PROTOCOL_SCHEMA.len())
             .any(|window| window == WORKSPACE_PROTOCOL_SCHEMA.as_bytes()));
         assert_eq!(decode_request(&encoded).unwrap(), expected);
+    }
+
+    #[test]
+    fn rename_path_request_and_result_round_trip_under_v6() {
+        let source = WorkspacePath {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            path: RelativePath::new("outputs/a.bin").unwrap(),
+        };
+        let destination = WorkspacePath {
+            workbench: source.workbench.clone(),
+            path: RelativePath::new("outputs/b.bin").unwrap(),
+        };
+        let request = WorkspaceRpcRequest {
+            route: route(),
+            request_id: RequestIdentity([0x0a; 16]),
+            operation: WorkspaceRequest::RenamePath(RenamePathRequest {
+                source: source.clone(),
+                destination: destination.clone(),
+                expected_generation: 7,
+            }),
+        };
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+
+        let response = WorkspaceRpcResponse {
+            route: route(),
+            request_id: request.request_id,
+            commit_version: Some(11),
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Renamed(
+                RenamePathResult {
+                    source,
+                    destination,
+                    workspace_revision: 3,
+                    generation: 7,
+                    artifact_revision_id: ArtifactRevisionIdentity([0x0b; 16]),
+                },
+            ))),
+        };
+        assert_eq!(
+            decode_response(&encode_response(&response).unwrap()).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -201,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_v5_late_binding_and_source_manifest_read_round_trip() {
+    fn restore_v6_late_binding_and_source_manifest_read_round_trip() {
         let restore_identity = RestoreManifestIdentity {
             publication_operation_id: OperationIdentity([0x21; 16]),
             artifact_revision_id: ArtifactRevisionIdentity([0x22; 16]),
@@ -229,10 +275,10 @@ mod tests {
         assert_eq!(
             <[u8; 32]>::from(Sha256::digest(&encoded_prepare)),
             [
-                28, 238, 115, 109, 64, 218, 24, 81, 50, 136, 168, 153, 22, 248, 227, 135, 85, 198,
-                66, 144, 250, 45, 180, 116, 53, 12, 208, 24, 202, 32, 63, 37,
+                95, 140, 61, 227, 242, 14, 161, 200, 101, 192, 139, 77, 59, 10, 5, 164, 32, 14,
+                164, 158, 0, 186, 184, 77, 22, 97, 238, 100, 49, 18, 161, 74,
             ],
-            "update only for an intentional restore-v5 wire change"
+            "update only for an intentional restore-v6 wire change"
         );
 
         let bind = WorkspaceRpcRequest {
@@ -344,7 +390,7 @@ mod tests {
             source_manifest
         );
 
-        let mut complete_v5_golden = Sha256::new();
+        let mut complete_v6_golden = Sha256::new();
         for encoded in [
             encoded_prepare,
             encoded_bind,
@@ -352,16 +398,16 @@ mod tests {
             encoded_prepared,
             encoded_source_manifest,
         ] {
-            complete_v5_golden.update((encoded.len() as u64).to_be_bytes());
-            complete_v5_golden.update(encoded);
+            complete_v6_golden.update((encoded.len() as u64).to_be_bytes());
+            complete_v6_golden.update(encoded);
         }
         assert_eq!(
-            <[u8; 32]>::from(complete_v5_golden.finalize()),
+            <[u8; 32]>::from(complete_v6_golden.finalize()),
             [
-                89, 113, 224, 16, 107, 15, 199, 143, 227, 235, 150, 227, 227, 53, 198, 143, 94,
-                152, 105, 166, 107, 135, 252, 120, 10, 123, 107, 227, 115, 226, 15, 176,
+                242, 54, 151, 121, 179, 83, 66, 173, 89, 250, 81, 51, 123, 71, 180, 77, 84, 86,
+                202, 12, 255, 250, 28, 251, 49, 62, 179, 107, 233, 73, 219, 40,
             ],
-            "update only for an intentional restore-v5 wire change"
+            "update only for an intentional restore-v6 wire change"
         );
     }
 
@@ -481,15 +527,15 @@ mod tests {
     #[test]
     fn schema_mismatch_fails_closed() {
         let encoded = rmp_serde::to_vec_named(&Frame {
-            schema: "nokv.workspace.rpc.v4".to_owned(),
+            schema: "nokv.workspace.rpc.v5".to_owned(),
             payload: request(),
         })
         .unwrap();
         assert_eq!(
             decode_request(&encoded),
             Err(ProtocolError::SchemaMismatch {
-                actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v5",
+                actual: "nokv.workspace.rpc.v5".to_owned(),
+                expected: "nokv.workspace.rpc.v6",
             })
         );
 
@@ -542,7 +588,7 @@ mod tests {
             decode_request(&actual_v4),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v5",
+                expected: "nokv.workspace.rpc.v6",
             })
         );
 
@@ -570,7 +616,7 @@ mod tests {
             decode_response(&encoded),
             Err(ProtocolError::SchemaMismatch {
                 actual: "nokv.workspace.rpc.v4".to_owned(),
-                expected: "nokv.workspace.rpc.v5",
+                expected: "nokv.workspace.rpc.v6",
             })
         );
     }

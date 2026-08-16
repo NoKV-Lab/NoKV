@@ -80,6 +80,7 @@ pub enum WorkspaceResult {
     Workspace(WorkspaceSummary),
     Path(PathReadResult),
     Paths(PathPage),
+    Renamed(RenamePathResult),
     Removed(RemovePathResult),
     Operation(OperationStatus),
     Published(PublishResult),
@@ -103,6 +104,7 @@ impl WorkspaceResult {
             Self::Workspace(workspace) => workspace.validate(),
             Self::Path(path) => path.validate(),
             Self::Paths(paths) => paths.validate(),
+            Self::Renamed(renamed) => renamed.validate(),
             Self::Removed(removed) => removed.validate(),
             Self::Operation(operation) => operation.validate(),
             Self::Published(published) => published.validate(),
@@ -422,6 +424,47 @@ pub struct RemovePathResult {
     pub removed: bool,
     pub workspace_revision: u64,
     pub removed_artifact_revision_id: Option<ArtifactRevisionIdentity>,
+}
+
+/// Deterministic result of one atomic path move.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenamePathResult {
+    pub source: WorkspacePath,
+    pub destination: WorkspacePath,
+    pub workspace_revision: u64,
+    pub generation: u64,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+}
+
+impl RenamePathResult {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.source.workbench != self.destination.workbench {
+            return Err(ProtocolError::invalid(
+                "renamed.destination.workbench",
+                "must equal source.workbench",
+            ));
+        }
+        if self.source.path == self.destination.path {
+            return Err(ProtocolError::invalid(
+                "renamed.destination.path",
+                "must differ from source.path",
+            ));
+        }
+        if self.workspace_revision == 0 {
+            return Err(ProtocolError::invalid(
+                "renamed.workspace_revision",
+                "must be greater than zero",
+            ));
+        }
+        if self.generation == 0 {
+            return Err(ProtocolError::invalid(
+                "renamed.generation",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl RemovePathResult {
@@ -1706,6 +1749,34 @@ fn validate_cursor(field: &'static str, cursor: Option<&[u8]>) -> Result<(), Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_result_binds_both_paths_and_positive_generations() {
+        let source = WorkspacePath {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            path: crate::RelativePath::new("outputs/a.bin").unwrap(),
+        };
+        let mut result = RenamePathResult {
+            source: source.clone(),
+            destination: WorkspacePath {
+                workbench: source.workbench.clone(),
+                path: crate::RelativePath::new("outputs/b.bin").unwrap(),
+            },
+            workspace_revision: 1,
+            generation: 7,
+            artifact_revision_id: ArtifactRevisionIdentity([9; 16]),
+        };
+        result.validate().unwrap();
+
+        result.destination.path = source.path;
+        assert!(matches!(
+            result.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "renamed.destination.path",
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn catalog_requires_a_positive_read_version() {

@@ -79,6 +79,7 @@ impl MetadataWorkspaceRequestExecutor {
             protocol::WorkspaceRequest::GetWorkspace(get) => self.get_workspace(request, get),
             protocol::WorkspaceRequest::GetPath(get) => self.get_path(request, get),
             protocol::WorkspaceRequest::ListPaths(list) => self.list_paths(request, list),
+            protocol::WorkspaceRequest::RenamePath(rename) => self.rename_path(request, rename),
             protocol::WorkspaceRequest::RemovePath(remove) => self.remove_path(request, remove),
             protocol::WorkspaceRequest::BeginArtifactPublish(begin) => {
                 self.begin_artifact_publish(request, begin)
@@ -410,6 +411,39 @@ impl MetadataWorkspaceRequestExecutor {
                 removed: true,
                 workspace_revision: outcome.workspace_revision.get(),
                 removed_artifact_revision_id: Some(outcome.removed_artifact_revision_id.into()),
+            }),
+            commit_version: Some(outcome.commit_version.get()),
+            replayed: outcome.replayed,
+        })
+    }
+
+    fn rename_path(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::RenamePathRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        let step_id = derived_request_id(rpc.request_id, b"rename-path", 0);
+        let workbench_id = workbench_id(&request.source.workbench)?;
+        let outcome = meta::rename_path(
+            &self.meta,
+            meta::RenamePathRequest {
+                context: self.write_context(rpc.route, step_id)?,
+                workbench_id,
+                source: relative_path(&request.source.path)?,
+                destination: relative_path(&request.destination.path)?,
+                expected_generation: types::Generation::new(request.expected_generation)
+                    .map_err(|error| invalid_argument(error.to_string()))?,
+            },
+        )
+        .map_err(rename_path_failure)?;
+        Ok(ExecutedRequest {
+            result: protocol::WorkspaceResult::Renamed(protocol::RenamePathResult {
+                source: request.source.clone(),
+                destination: request.destination.clone(),
+                workspace_revision: outcome.workspace_revision.get(),
+                generation: outcome.generation.get(),
+                artifact_revision_id: outcome.artifact_revision_id.into(),
             }),
             commit_version: Some(outcome.commit_version.get()),
             replayed: outcome.replayed,
@@ -4307,6 +4341,55 @@ fn remove_path_failure(error: meta::RemovePathError) -> protocol::RpcFailure {
     }
 }
 
+fn rename_path_failure(error: meta::RenamePathError) -> protocol::RpcFailure {
+    match error {
+        meta::RenamePathError::Meta(source) => meta_failure(source),
+        meta::RenamePathError::WorkspaceNotFound
+        | meta::RenamePathError::SourceNotFound
+        | meta::RenamePathError::RevisionNotFound { .. } => not_found(error.to_string()),
+        meta::RenamePathError::DestinationAlreadyExists => failure(
+            protocol::ErrorCode::AlreadyExists,
+            error.to_string(),
+            false,
+            Some(protocol::ConflictKind::PathGeneration),
+        ),
+        meta::RenamePathError::GenerationMismatch { actual, .. } => conflict(
+            protocol::ConflictKind::PathGeneration,
+            error.to_string(),
+            Some(actual),
+        ),
+        meta::RenamePathError::WorkspaceUnavailable => {
+            conflict(protocol::ConflictKind::Workspace, error.to_string(), None)
+        }
+        meta::RenamePathError::ConcurrentMutation => failure(
+            protocol::ErrorCode::Conflict,
+            error.to_string(),
+            true,
+            Some(protocol::ConflictKind::PathGeneration),
+        ),
+        meta::RenamePathError::RequestInputMismatch => failure(
+            protocol::ErrorCode::RequestReplayMismatch,
+            error.to_string(),
+            false,
+            None,
+        ),
+        meta::RenamePathError::SamePath => invalid_argument(error.to_string()),
+        meta::RenamePathError::RevisionUnavailable { .. }
+        | meta::RenamePathError::ReservedManifest => failure(
+            protocol::ErrorCode::PreconditionFailed,
+            error.to_string(),
+            false,
+            None,
+        ),
+        meta::RenamePathError::RecordCodec(_)
+        | meta::RenamePathError::QueryRecord(_)
+        | meta::RenamePathError::WorkspaceRevisionOverflow
+        | meta::RenamePathError::RevisionReferenceMissing
+        | meta::RenamePathError::RevisionReferenceEpochAhead
+        | meta::RenamePathError::DeterministicResultMismatch { .. } => internal(error.to_string()),
+    }
+}
+
 fn snapshot_failure(error: meta::SnapshotError) -> protocol::RpcFailure {
     match error {
         meta::SnapshotError::Meta(source) => meta_failure(source),
@@ -7887,6 +7970,98 @@ mod tests {
         };
         let failure = executor.execute(&reused).unwrap_err();
         assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
+    }
+
+    #[test]
+    fn rename_path_crosses_one_atomic_metadata_command_and_replays() {
+        let (store, executor) = ready_executor();
+        let incarnation = types::WorkspaceIncarnationId::from_bytes([63; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&create_request(63, "rename-test", 63, 1))
+            .unwrap();
+        put_visible_path(&store, incarnation);
+        let source = protocol::WorkspacePath {
+            workbench: protocol::WorkbenchName::new("rename-test").unwrap(),
+            path: protocol::RelativePath::new("outputs/result.bin").unwrap(),
+        };
+        let destination = protocol::WorkspacePath {
+            workbench: source.workbench.clone(),
+            path: protocol::RelativePath::new("outputs/moved.bin").unwrap(),
+        };
+        let request = protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([64; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::RenamePath(protocol::RenamePathRequest {
+                source: source.clone(),
+                destination: destination.clone(),
+                expected_generation: 1,
+            }),
+        };
+
+        let renamed = executor.execute(&request).unwrap();
+        assert!(!renamed.replayed);
+        let protocol::WorkspaceResult::Renamed(result) = &renamed.result else {
+            panic!("rename returned the wrong result variant");
+        };
+        assert_eq!(result.source, source);
+        assert_eq!(result.destination, destination);
+        assert_eq!(result.workspace_revision, 1);
+        assert_eq!(result.generation, 1);
+        assert_eq!(
+            result.artifact_revision_id,
+            types::ArtifactRevisionId::from_bytes([9; types::FIXED_ID_BYTES]).into()
+        );
+
+        let replayed = executor.execute(&request).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.result, renamed.result);
+        assert_eq!(replayed.commit_version, renamed.commit_version);
+
+        let context =
+            meta::RootReadContext::current(&store, root(), placement(), owner(1)).unwrap();
+        assert_eq!(
+            meta::get_visible_path_at(
+                &store,
+                context,
+                &types::WorkbenchId::new("rename-test").unwrap(),
+                &types::NormalizedRelativePath::new("outputs/result.bin").unwrap(),
+            )
+            .unwrap(),
+            None
+        );
+        assert!(meta::get_visible_path_at(
+            &store,
+            context,
+            &types::WorkbenchId::new("rename-test").unwrap(),
+            &types::NormalizedRelativePath::new("outputs/moved.bin").unwrap(),
+        )
+        .unwrap()
+        .is_some());
+
+        let reused = protocol::WorkspaceRpcRequest {
+            operation: protocol::WorkspaceRequest::RenamePath(protocol::RenamePathRequest {
+                source,
+                destination: protocol::WorkspacePath {
+                    workbench: protocol::WorkbenchName::new("rename-test").unwrap(),
+                    path: protocol::RelativePath::new("outputs/other.bin").unwrap(),
+                },
+                expected_generation: 1,
+            }),
+            ..request
+        };
+        let failure = executor.execute(&reused).unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::RequestReplayMismatch);
+    }
+
+    #[test]
+    fn rename_destination_conflict_is_a_typed_already_exists_failure() {
+        let failure = rename_path_failure(meta::RenamePathError::DestinationAlreadyExists);
+        assert_eq!(failure.code, protocol::ErrorCode::AlreadyExists);
+        assert_eq!(
+            failure.conflict,
+            Some(protocol::ConflictKind::PathGeneration)
+        );
+        assert!(!failure.retryable);
     }
 
     #[test]
