@@ -112,6 +112,12 @@ impl MetadataWorkspaceRequestExecutor {
             protocol::WorkspaceRequest::PrepareRestore(prepare) => {
                 self.prepare_restore(request, prepare)
             }
+            protocol::WorkspaceRequest::BindRestoreDestination(bind) => {
+                self.bind_restore_destination(request, bind)
+            }
+            protocol::WorkspaceRequest::ReadRestoreSourceRunManifest(read) => {
+                self.read_restore_source_run_manifest(request, read)
+            }
             protocol::WorkspaceRequest::FinalizeRestore(finalize) => {
                 self.finalize_restore(request, finalize)
             }
@@ -616,7 +622,6 @@ impl MetadataWorkspaceRequestExecutor {
         rpc: &protocol::WorkspaceRpcRequest,
         request: &protocol::PrepareRestoreRequest,
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
-        self.claim_mutation(rpc)?;
         let source_workbench = workbench_id(&request.source_workbench)?;
         let source = match &request.source {
             protocol::RestoreSource::Snapshot(protocol::SnapshotSelector::Id(snapshot_id)) => {
@@ -631,20 +636,41 @@ impl MetadataWorkspaceRequestExecutor {
                 meta::RestoreSourceSelector::Commit((*commit_id).into())
             }
         };
+        let destination_workbench = workbench_id(&request.destination_workbench)?;
+        let source_workspace_incarnation_id = request.source_workspace_incarnation_id.into();
+        let destination_workspace_incarnation_id =
+            request.destination_workspace_incarnation_id.into();
+        let route = route_parts(rpc.route)?;
+        let expected_operation_id = meta::restore_operation_id(
+            route.root_id,
+            &source_workbench,
+            source_workspace_incarnation_id,
+            source,
+            &destination_workbench,
+            destination_workspace_incarnation_id,
+        )
+        .map_err(restore_failure)?;
+        if types::OperationId::from(request.operation_id) != expected_operation_id {
+            return Err(invalid_argument(
+                "restore operation identity does not match the deterministic source/destination selector",
+            ));
+        }
+        self.claim_mutation(rpc)?;
         let begin_id = derived_request_id(rpc.request_id, b"restore-begin", 0);
         let mut outcome = meta::begin_restore(
             &self.meta,
             self.write_context(rpc.route, begin_id)?,
             &meta::BeginRestoreRequest {
+                operation_id: request.operation_id.into(),
                 source_workbench_id: source_workbench,
-                expected_source_workspace_incarnation_id: request
-                    .source_workspace_incarnation_id
-                    .into(),
+                expected_source_workspace_incarnation_id: source_workspace_incarnation_id,
                 source,
-                destination_workbench_id: workbench_id(&request.destination_workbench)?,
-                destination_workspace_incarnation_id: request
-                    .destination_workspace_incarnation_id
-                    .into(),
+                destination_workbench_id: destination_workbench,
+                destination_workspace_incarnation_id,
+                destination_restore_manifest_identity: restore_manifest_identity(
+                    request.destination_restore_manifest_identity,
+                ),
+                destination_committed_at_unix_seconds: commit_time_unix_seconds(&self.meta)?,
                 restore_manifest: meta::RestoreManifestDescriptor {
                     body_digest_uri: request.restore_manifest.body_digest.as_str().to_owned(),
                     logical_size: request.restore_manifest.logical_size,
@@ -653,13 +679,24 @@ impl MetadataWorkspaceRequestExecutor {
             },
         )
         .map_err(restore_failure)?;
-
+        let durable = meta::get_restore(
+            &self.meta,
+            self.write_context(
+                rpc.route,
+                derived_request_id(rpc.request_id, b"restore-prepare-load", 0),
+            )?,
+            outcome.operation.operation_id,
+        )
+        .map_err(restore_failure)?
+        .ok_or_else(|| internal("begun restore operation is not durably readable"))?;
+        restore_replay_lineage_matches(&outcome.operation, &durable)?;
+        outcome.operation = durable;
         if let Some(failure) = restore_terminal_failure(&outcome.operation) {
             return Err(failure);
         }
 
         if outcome.operation.phase == types::RestorePhase::Preparing {
-            outcome = meta::start_restore_copy(
+            let started = meta::start_restore_copy(
                 &self.meta,
                 self.write_context(
                     rpc.route,
@@ -670,13 +707,24 @@ impl MetadataWorkspaceRequestExecutor {
                 },
             )
             .map_err(restore_failure)?;
+            if let Some(failure) = restore_terminal_failure(&started.operation) {
+                return Err(failure);
+            }
+            if !restore_step_advances(
+                &outcome.operation,
+                &started.operation,
+                started.replayed,
+                "restore copy start",
+            )? {
+                return Err(internal("restore copy start replay did not reach Copying"));
+            }
+            outcome = started;
         }
 
         let mut batch = 0_u64;
         while outcome.operation.phase == types::RestorePhase::Copying
             && !outcome.operation.source_eof
         {
-            let before = outcome.operation.next_member_sequence;
             let copied = meta::copy_restore_batch(
                 &self.meta,
                 self.write_context(
@@ -689,19 +737,31 @@ impl MetadataWorkspaceRequestExecutor {
                 },
             )
             .map_err(restore_failure)?;
-            outcome = copied.command;
-            if let Some(failure) = restore_terminal_failure(&outcome.operation) {
+            if let Some(failure) = restore_terminal_failure(&copied.command.operation) {
                 return Err(failure);
             }
-            if !outcome.operation.source_eof && outcome.operation.next_member_sequence == before {
-                return Err(internal("restore copier made no durable progress"));
+            if copied.command.operation.phase != types::RestorePhase::Copying
+                || copied.source_eof != copied.command.operation.source_eof
+            {
+                return Err(internal(
+                    "restore copy batch returned an inconsistent phase or EOF projection",
+                ));
+            }
+            let advances = restore_step_advances(
+                &outcome.operation,
+                &copied.command.operation,
+                copied.command.replayed,
+                "restore copier",
+            )?;
+            if advances {
+                outcome = copied.command;
             }
             batch = batch
                 .checked_add(1)
                 .ok_or_else(|| internal("restore batch counter overflow"))?;
         }
         if outcome.operation.phase == types::RestorePhase::Copying && outcome.operation.source_eof {
-            outcome = meta::seal_restore_source(
+            let sealed = meta::seal_restore_source(
                 &self.meta,
                 self.write_context(
                     rpc.route,
@@ -712,12 +772,151 @@ impl MetadataWorkspaceRequestExecutor {
                 },
             )
             .map_err(restore_failure)?;
+            if let Some(failure) = restore_terminal_failure(&sealed.operation) {
+                return Err(failure);
+            }
+            if !restore_step_advances(
+                &outcome.operation,
+                &sealed.operation,
+                sealed.replayed,
+                "restore source sealer",
+            )? {
+                return Err(internal(
+                    "restore source-seal replay did not reach SourceSealed",
+                ));
+            }
+            outcome = sealed;
         }
         let preparation = sealed_restore_preparation(&outcome.operation)?;
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::RestorePrepared(preparation),
             commit_version: Some(outcome.commit_version.get()),
             replayed: outcome.replayed,
+        })
+    }
+
+    fn bind_restore_destination(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::BindRestoreDestinationRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        let operation_id: types::OperationId = request.operation_id.into();
+        let outcome = meta::bind_restore_destination(
+            &self.meta,
+            self.write_context(
+                rpc.route,
+                derived_request_id(rpc.request_id, b"restore-bind-destination", 0),
+            )?,
+            &meta::BindRestoreDestinationRequest {
+                operation_id,
+                binding: meta::RestoreDestinationBinding {
+                    destination_commit_id: request.destination_commit_id.into(),
+                    effective_content_digest_uri: request
+                        .effective_content_digest
+                        .as_str()
+                        .to_owned(),
+                    destination_projection_input_digest: request
+                        .destination_run_manifest_projection_input_digest
+                        .0,
+                    run_manifest_identity: restore_manifest_identity(
+                        request.destination_run_manifest_identity,
+                    ),
+                    restore_manifest_identity: restore_manifest_identity(
+                        request.destination_restore_manifest_identity,
+                    ),
+                    // Object-first publication installs the two actual
+                    // descriptors later. The bind RPC only freezes intent.
+                    manifests: None,
+                },
+            },
+        )
+        .map_err(restore_failure)?;
+        if let Some(failure) = restore_terminal_failure(&outcome.operation) {
+            return Err(failure);
+        }
+        Ok(ExecutedRequest {
+            result: protocol::WorkspaceResult::RestorePrepared(sealed_restore_preparation(
+                &outcome.operation,
+            )?),
+            commit_version: Some(outcome.commit_version.get()),
+            replayed: outcome.replayed,
+        })
+    }
+
+    fn read_restore_source_run_manifest(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::ReadRestoreSourceRunManifestRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        let context = self.write_context(
+            rpc.route,
+            derived_request_id(rpc.request_id, b"restore-read-source-run-manifest", 0),
+        )?;
+        let retained = meta::read_restore_source_run_manifest(
+            &self.meta,
+            context,
+            request.operation_id.into(),
+        )
+        .map_err(restore_failure)?;
+        let provenance = restore_commit_provenance(&retained.operation)?;
+        if retained.source_commit_id != provenance.source_commit.commit_id
+            || retained.path_entry.artifact_revision_id
+                != provenance.source_commit.tree_manifest_revision_id
+        {
+            return Err(internal(
+                "restore-held source run manifest does not match its frozen base commit",
+            ));
+        }
+        let workbench = protocol_workbench(&retained.operation.source_workbench_id)?;
+        let path = types::NormalizedRelativePath::new(RUN_MANIFEST_PATH)
+            .expect("canonical run manifest path is normalized");
+        let artifact_revision_id = retained.path_entry.artifact_revision_id;
+        let metadata = Self::path_metadata(
+            &workbench,
+            meta::WorkspaceRecord {
+                incarnation_id: retained.operation.source_workspace_incarnation_id,
+                // Commit-owned members are not one live workspace revision.
+                workspace_revision: types::WorkspaceRevision::ZERO,
+                state: types::WorkspaceState::Visible,
+                owning_operation_id: None,
+            },
+            path,
+            retained.path_entry,
+        )?;
+        let (blocks, next_cursor) = match request.range {
+            None => (Vec::new(), None),
+            Some(range) => {
+                let end = range
+                    .offset
+                    .checked_add(range.length)
+                    .expect("protocol validation rejected range overflow");
+                if end > metadata.descriptor.logical_size {
+                    return Err(invalid_argument(
+                        "requested byte range exceeds the source run manifest logical size",
+                    ));
+                }
+                self.manifest_read_plan(
+                    read_context_from_write(context),
+                    artifact_revision_id,
+                    range,
+                    request
+                        .plan_page
+                        .as_ref()
+                        .expect("protocol validation requires ranged plan pagination"),
+                )?
+            }
+        };
+        Ok(ExecutedRequest {
+            result: protocol::WorkspaceResult::RestoreSourceRunManifest(protocol::PathReadResult {
+                not_modified: false,
+                metadata: Some(metadata),
+                range: request.range,
+                blocks,
+                next_cursor,
+            }),
+            commit_version: None,
+            replayed: false,
         })
     }
 
@@ -728,18 +927,160 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let operation_id: types::OperationId = request.operation_id.into();
-        let applied = meta::apply_restore_initialization(
+        let mut operation = meta::get_restore(
             &self.meta,
             self.write_context(
                 rpc.route,
-                derived_request_id(rpc.request_id, b"restore-apply-initialization", 0),
+                derived_request_id(rpc.request_id, b"restore-finalize-load", 0),
             )?,
-            meta::RestoreOperationRequest { operation_id },
+            operation_id,
         )
-        .map_err(restore_failure)?;
-        if applied.operation.phase != types::RestorePhase::Ready {
+        .map_err(restore_failure)?
+        .ok_or_else(|| not_found("restore operation does not exist"))?;
+        if let Some(failure) = restore_terminal_failure(&operation) {
+            return Err(failure);
+        }
+        if operation.phase == types::RestorePhase::Complete {
+            return restored_response(&operation, None, true);
+        }
+        if operation.phase == types::RestorePhase::SourceSealed {
+            let initialized = meta::apply_restore_initialization(
+                &self.meta,
+                self.write_context(
+                    rpc.route,
+                    derived_request_id(rpc.request_id, b"restore-apply-initialization", 0),
+                )?,
+                meta::RestoreOperationRequest { operation_id },
+            )
+            .map_err(restore_failure)?;
+            if let Some(failure) = restore_terminal_failure(&initialized.operation) {
+                return Err(failure);
+            }
+            if initialized.operation.phase != types::RestorePhase::DestinationBuilding
+                || !restore_step_advances(
+                    &operation,
+                    &initialized.operation,
+                    initialized.replayed,
+                    "restore destination initialization",
+                )?
+            {
+                return Err(internal(
+                    "restore initialization did not reach DestinationBuilding",
+                ));
+            }
+            operation = initialized.operation;
+        }
+
+        let mut batch = 0_u64;
+        while operation.phase == types::RestorePhase::DestinationBuilding {
+            let before = restore_commit_member_progress(&operation)?;
+            let built = meta::build_restore_commit_members(
+                &self.meta,
+                self.write_context(
+                    rpc.route,
+                    derived_request_id(rpc.request_id, b"restore-build-commit-members", batch),
+                )?,
+                meta::RestoreClosureBatchRequest {
+                    operation_id,
+                    limit: meta::MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .map_err(restore_failure)?;
+            if let Some(failure) = restore_terminal_failure(&built.command.operation) {
+                return Err(failure);
+            }
+            if !matches!(
+                built.command.operation.phase,
+                types::RestorePhase::DestinationBuilding | types::RestorePhase::DestinationSealing
+            ) || built.members_complete
+                != (built.command.operation.phase == types::RestorePhase::DestinationSealing)
+            {
+                return Err(internal(
+                    "restore destination commit-member completion projection is inconsistent",
+                ));
+            }
+            let advances = restore_step_advances(
+                &operation,
+                &built.command.operation,
+                built.command.replayed,
+                "restore destination commit-member builder",
+            )?;
+            if advances {
+                let after = restore_commit_member_progress(&built.command.operation)?;
+                if built.command.operation.phase == types::RestorePhase::DestinationBuilding
+                    && (built.built_members == 0 || after <= before)
+                {
+                    return Err(internal(
+                        "restore destination commit-member builder made no durable progress",
+                    ));
+                }
+                operation = built.command.operation;
+            } else if !built.command.replayed {
+                return Err(internal(
+                    "restore destination commit-member builder did not advance",
+                ));
+            }
+            batch = batch
+                .checked_add(1)
+                .ok_or_else(|| internal("restore commit-member batch counter overflow"))?;
+        }
+
+        batch = 0;
+        while operation.phase == types::RestorePhase::DestinationSealing {
+            let before = restore_revision_seal_progress(&operation)?;
+            let sealed = meta::seal_restore_commit_revisions(
+                &self.meta,
+                self.write_context(
+                    rpc.route,
+                    derived_request_id(rpc.request_id, b"restore-seal-commit-revisions", batch),
+                )?,
+                meta::RestoreClosureBatchRequest {
+                    operation_id,
+                    limit: meta::MAX_RESTORE_BATCH_MEMBERS,
+                },
+            )
+            .map_err(restore_failure)?;
+            if let Some(failure) = restore_terminal_failure(&sealed.command.operation) {
+                return Err(failure);
+            }
+            if !matches!(
+                sealed.command.operation.phase,
+                types::RestorePhase::DestinationSealing | types::RestorePhase::Ready
+            ) || sealed.ready != (sealed.command.operation.phase == types::RestorePhase::Ready)
+            {
+                return Err(internal(
+                    "restore destination revision completion projection is inconsistent",
+                ));
+            }
+            let advances = restore_step_advances(
+                &operation,
+                &sealed.command.operation,
+                sealed.command.replayed,
+                "restore destination revision sealer",
+            )?;
+            if advances {
+                let after = restore_revision_seal_progress(&sealed.command.operation)?;
+                if sealed.command.operation.phase == types::RestorePhase::DestinationSealing
+                    && (sealed.sealed_revisions == 0 || after <= before)
+                {
+                    return Err(internal(
+                        "restore destination revision sealer made no durable progress",
+                    ));
+                }
+                operation = sealed.command.operation;
+            } else if !sealed.command.replayed {
+                return Err(internal(
+                    "restore destination revision sealer did not advance",
+                ));
+            }
+            batch = batch
+                .checked_add(1)
+                .ok_or_else(|| internal("restore revision-seal batch counter overflow"))?;
+        }
+
+        if operation.phase != types::RestorePhase::Ready {
             return Err(operation_terminal_failure(
-                "restore initialization did not reach Ready",
+                "restore finalization did not reach Ready",
             ));
         }
         let completed = meta::complete_restore(
@@ -751,27 +1092,11 @@ impl MetadataWorkspaceRequestExecutor {
             meta::RestoreOperationRequest { operation_id },
         )
         .map_err(restore_failure)?;
-        let result = completed.result;
-        Ok(ExecutedRequest {
-            result: protocol::WorkspaceResult::Restored(protocol::RestoreResult {
-                operation_id: request.operation_id,
-                destination: protocol::WorkspaceSummary {
-                    workbench: protocol_workbench(
-                        &completed.command.operation.destination_workbench_id,
-                    )?,
-                    workspace_incarnation_id: result.destination_workspace_incarnation_id.into(),
-                    workspace_revision: result.destination_workspace_revision.get(),
-                    commit_head: None,
-                    commit_head_generation: None,
-                },
-                member_count: result.member_count,
-                member_digest: protocol::Digest(result.member_digest),
-                metadata_rows_copied: result.member_count,
-                object_bytes_copied: 0,
-            }),
-            commit_version: Some(completed.command.commit_version.get()),
-            replayed: completed.command.replayed,
-        })
+        restored_response(
+            &completed.command.operation,
+            Some(completed.command.commit_version.get()),
+            completed.command.replayed,
+        )
     }
 
     fn search(
@@ -1112,14 +1437,39 @@ impl MetadataWorkspaceRequestExecutor {
                 )
                 .map_err(restore_failure)?
                 .ok_or_else(|| not_found("restore operation does not exist"))?;
+                let provenance = restore_commit_provenance(&restore)?;
+                let binding = provenance.destination_binding.as_ref().ok_or_else(|| {
+                    failure(
+                        protocol::ErrorCode::PreconditionFailed,
+                        "restore-staging publication requires late-bound destination authority",
+                        false,
+                        Some(protocol::ConflictKind::OperationState),
+                    )
+                })?;
+                let expected_identity = match path.as_str() {
+                    RUN_MANIFEST_PATH => binding.run_manifest_identity,
+                    meta::RESTORE_MANIFEST_PATH => binding.restore_manifest_identity,
+                    _ => {
+                        return Err(failure(
+                            protocol::ErrorCode::PreconditionFailed,
+                            "restore-staging publication is not a destination-owned manifest",
+                            false,
+                            Some(protocol::ConflictKind::OperationState),
+                        ))
+                    }
+                };
                 if restore.phase != types::RestorePhase::SourceSealed
                     || restore.destination_workbench_id != workbench
-                    || path.as_str() != meta::RESTORE_MANIFEST_PATH
+                    || binding.manifests.is_some()
+                    || types::OperationId::from(request.operation_id)
+                        != expected_identity.publication_operation_id
+                    || types::ArtifactRevisionId::from(request.artifact_revision_id)
+                        != expected_identity.artifact_revision_id
                     || !matches!(request.condition, protocol::PublishCondition::CreateOnly)
                 {
                     return Err(failure(
                         protocol::ErrorCode::PreconditionFailed,
-                        "restore-staging publication does not match its sealed destination",
+                        "restore-staging publication does not match its sealed destination authority",
                         false,
                         Some(protocol::ConflictKind::OperationState),
                     ));
@@ -3279,9 +3629,360 @@ fn restore_terminal_failure(
         types::RestorePhase::Preparing
         | types::RestorePhase::Copying
         | types::RestorePhase::SourceSealed
+        | types::RestorePhase::DestinationBuilding
+        | types::RestorePhase::DestinationSealing
         | types::RestorePhase::Ready
         | types::RestorePhase::Complete => None,
     }
+}
+
+fn restore_manifest_identity(
+    identity: protocol::RestoreManifestIdentity,
+) -> meta::RestoreManifestIdentity {
+    meta::RestoreManifestIdentity {
+        publication_operation_id: identity.publication_operation_id.into(),
+        artifact_revision_id: identity.artifact_revision_id.into(),
+    }
+}
+
+fn protocol_restore_manifest_identity(
+    identity: meta::RestoreManifestIdentity,
+) -> protocol::RestoreManifestIdentity {
+    protocol::RestoreManifestIdentity {
+        publication_operation_id: identity.publication_operation_id.into(),
+        artifact_revision_id: identity.artifact_revision_id.into(),
+    }
+}
+
+fn restore_commit_provenance(
+    operation: &meta::RestoreOperationRecord,
+) -> Result<&meta::RestoreCommitProvenanceV5, protocol::RpcFailure> {
+    let meta::RestoreCommitProvenance::V5(provenance) = &operation.commit_provenance else {
+        return Err(internal(
+            "legacy restore operation has no v5 commit provenance",
+        ));
+    };
+    Ok(provenance)
+}
+
+fn restore_active_position(
+    operation: &meta::RestoreOperationRecord,
+) -> Result<(u8, u64, bool), protocol::RpcFailure> {
+    let position = match operation.phase {
+        types::RestorePhase::Preparing => (0, 0, false),
+        types::RestorePhase::Copying => (1, operation.source_member_count, operation.source_eof),
+        types::RestorePhase::SourceSealed => (2, 0, false),
+        types::RestorePhase::DestinationBuilding => (
+            3,
+            restore_commit_provenance(operation)?.closure.member_count,
+            false,
+        ),
+        types::RestorePhase::DestinationSealing => (
+            4,
+            restore_commit_provenance(operation)?
+                .closure
+                .revision_seal_count,
+            false,
+        ),
+        types::RestorePhase::Ready => (5, 0, false),
+        types::RestorePhase::Complete => (6, 0, false),
+        types::RestorePhase::Aborting
+        | types::RestorePhase::Cleaning
+        | types::RestorePhase::Cleaned
+        | types::RestorePhase::Quarantined => {
+            return Err(operation_terminal_failure(
+                "terminal restore state cannot be ordered as active progress",
+            ));
+        }
+    };
+    Ok(position)
+}
+
+fn optional_restore_seal_matches(
+    first: Option<[u8; types::SHA256_BYTES]>,
+    second: Option<[u8; types::SHA256_BYTES]>,
+) -> bool {
+    !matches!((first, second), (Some(first), Some(second)) if first != second)
+}
+
+fn restore_replay_lineage_matches(
+    current: &meta::RestoreOperationRecord,
+    candidate: &meta::RestoreOperationRecord,
+) -> Result<(), protocol::RpcFailure> {
+    current
+        .validate()
+        .map_err(|error| internal(format!("invalid durable restore state: {error}")))?;
+    candidate
+        .validate()
+        .map_err(|error| internal(format!("invalid replayed restore state: {error}")))?;
+    let current_provenance = restore_commit_provenance(current)?;
+    let candidate_provenance = restore_commit_provenance(candidate)?;
+    let bindings_match = match (
+        current_provenance.destination_binding.as_ref(),
+        candidate_provenance.destination_binding.as_ref(),
+    ) {
+        (Some(current), Some(candidate)) => {
+            current.destination_commit_id == candidate.destination_commit_id
+                && current.effective_content_digest_uri == candidate.effective_content_digest_uri
+                && current.destination_projection_input_digest
+                    == candidate.destination_projection_input_digest
+                && current.run_manifest_identity == candidate.run_manifest_identity
+                && current.restore_manifest_identity == candidate.restore_manifest_identity
+                && !matches!(
+                    (&current.manifests, &candidate.manifests),
+                    (Some(current), Some(candidate)) if current != candidate
+                )
+        }
+        _ => true,
+    };
+    let immutable_identity_matches = current.operation_id == candidate.operation_id
+        && current.identity_digest == candidate.identity_digest
+        && current.source_workbench_id == candidate.source_workbench_id
+        && current.source_workspace_incarnation_id == candidate.source_workspace_incarnation_id
+        && current.source == candidate.source
+        && current.destination_workbench_id == candidate.destination_workbench_id
+        && current.destination_workspace_incarnation_id
+            == candidate.destination_workspace_incarnation_id
+        && current.destination_restore_manifest_identity
+            == candidate.destination_restore_manifest_identity
+        && current.restore_manifest == candidate.restore_manifest
+        && current_provenance.source_commit == candidate_provenance.source_commit
+        && current_provenance.destination_committed_at_unix_seconds
+            == candidate_provenance.destination_committed_at_unix_seconds
+        && current_provenance.closure.parent_digest == candidate_provenance.closure.parent_digest
+        && bindings_match;
+    let known_seals_match =
+        optional_restore_seal_matches(current.source_member_seal, candidate.source_member_seal)
+            && optional_restore_seal_matches(current.member_seal, candidate.member_seal)
+            && optional_restore_seal_matches(
+                current_provenance.closure.member_seal,
+                candidate_provenance.closure.member_seal,
+            )
+            && optional_restore_seal_matches(
+                current_provenance.closure.revision_seal,
+                candidate_provenance.closure.revision_seal,
+            )
+            && optional_restore_seal_matches(
+                current_provenance.closure.parent_seal,
+                candidate_provenance.closure.parent_seal,
+            );
+    let initialization_matches = !matches!(
+        (current.initialization_digest, candidate.initialization_digest),
+        (Some(current), Some(candidate)) if current != candidate
+    );
+    let result_matches = !matches!(
+        (&current.result, &candidate.result),
+        (Some(current), Some(candidate)) if current != candidate
+    );
+    if !immutable_identity_matches
+        || !known_seals_match
+        || !initialization_matches
+        || !result_matches
+    {
+        return Err(internal(
+            "replayed restore step does not match the durable operation lineage",
+        ));
+    }
+    Ok(())
+}
+
+/// Returns true only when `candidate` may replace the caller's current durable
+/// projection. Exact-request replay can yield an older command receipt; that
+/// receipt is valid evidence but must never move local progress backwards.
+fn restore_step_advances(
+    current: &meta::RestoreOperationRecord,
+    candidate: &meta::RestoreOperationRecord,
+    replayed: bool,
+    step: &'static str,
+) -> Result<bool, protocol::RpcFailure> {
+    restore_replay_lineage_matches(current, candidate)?;
+    let current_provenance = restore_commit_provenance(current)?;
+    let candidate_provenance = restore_commit_provenance(candidate)?;
+    let progress_not_after =
+        |earlier: &meta::RestoreOperationRecord,
+         earlier_provenance: &meta::RestoreCommitProvenanceV5,
+         later: &meta::RestoreOperationRecord,
+         later_provenance: &meta::RestoreCommitProvenanceV5| {
+            earlier.source_member_count <= later.source_member_count
+                && earlier.next_member_sequence <= later.next_member_sequence
+                && earlier_provenance.closure.member_count <= later_provenance.closure.member_count
+                && earlier_provenance.closure.revision_ref_count
+                    <= later_provenance.closure.revision_ref_count
+                && earlier_provenance.closure.revision_seal_count
+                    <= later_provenance.closure.revision_seal_count
+                && (earlier.source_member_count != later.source_member_count
+                    || (earlier.source_cursor == later.source_cursor
+                        && earlier.source_member_rolling_digest
+                            == later.source_member_rolling_digest))
+                && (earlier.next_member_sequence != later.next_member_sequence
+                    || earlier.member_rolling_digest == later.member_rolling_digest)
+                && (earlier_provenance.closure.member_count
+                    != later_provenance.closure.member_count
+                    || (earlier_provenance.closure.member_cursor
+                        == later_provenance.closure.member_cursor
+                        && earlier_provenance.closure.member_digest
+                            == later_provenance.closure.member_digest))
+                && (earlier_provenance.closure.revision_seal_count
+                    != later_provenance.closure.revision_seal_count
+                    || (earlier_provenance.closure.revision_cursor
+                        == later_provenance.closure.revision_cursor
+                        && earlier_provenance.closure.revision_digest
+                            == later_provenance.closure.revision_digest))
+        };
+    match restore_active_position(candidate)?.cmp(&restore_active_position(current)?) {
+        std::cmp::Ordering::Less
+            if replayed
+                && progress_not_after(
+                    candidate,
+                    candidate_provenance,
+                    current,
+                    current_provenance,
+                ) =>
+        {
+            Ok(false)
+        }
+        std::cmp::Ordering::Equal if replayed && candidate == current => Ok(false),
+        std::cmp::Ordering::Greater
+            if progress_not_after(current, current_provenance, candidate, candidate_provenance) =>
+        {
+            Ok(true)
+        }
+        std::cmp::Ordering::Less if replayed => Err(internal(format!(
+            "{step} replay is older in phase but not a monotonic durable prefix"
+        ))),
+        std::cmp::Ordering::Greater => Err(internal(format!(
+            "{step} advanced phase with non-monotonic restore progress"
+        ))),
+        std::cmp::Ordering::Less => Err(internal(format!(
+            "{step} returned a non-replayed restore state older than durable progress"
+        ))),
+        std::cmp::Ordering::Equal => {
+            Err(internal(format!("{step} made no durable restore progress")))
+        }
+    }
+}
+
+fn restore_commit_member_progress(
+    operation: &meta::RestoreOperationRecord,
+) -> Result<u64, protocol::RpcFailure> {
+    Ok(restore_commit_provenance(operation)?.closure.member_count)
+}
+
+fn restore_revision_seal_progress(
+    operation: &meta::RestoreOperationRecord,
+) -> Result<u64, protocol::RpcFailure> {
+    Ok(restore_commit_provenance(operation)?
+        .closure
+        .revision_seal_count)
+}
+
+fn protocol_restore_result(
+    operation: &meta::RestoreOperationRecord,
+) -> Result<protocol::RestoreResult, protocol::RpcFailure> {
+    let complete = operation
+        .result
+        .as_ref()
+        .ok_or_else(|| internal("complete restore operation has no result"))?;
+    let commit_receipt = operation
+        .destination_commit_receipt()
+        .map_err(|error| internal(format!("invalid terminal restore receipt: {error}")))?;
+    Ok(protocol::RestoreResult {
+        operation_id: operation.operation_id.into(),
+        destination: protocol::WorkspaceSummary {
+            workbench: protocol::WorkbenchName::new(operation.destination_workbench_id.as_str())
+                .map_err(|error| internal(error.to_string()))?,
+            workspace_incarnation_id: complete.destination_workspace_incarnation_id.into(),
+            workspace_revision: complete.destination_workspace_revision.get(),
+            commit_head: Some(commit_receipt.destination_commit_id.into()),
+            commit_head_generation: Some(commit_receipt.destination_head_generation.get()),
+        },
+        member_count: complete.member_count,
+        member_digest: protocol::Digest(complete.member_digest),
+        metadata_rows_copied: complete.member_count,
+        object_bytes_copied: 0,
+    })
+}
+
+fn restored_response(
+    operation: &meta::RestoreOperationRecord,
+    commit_version: Option<u64>,
+    replayed: bool,
+) -> Result<ExecutedRequest, protocol::RpcFailure> {
+    Ok(ExecutedRequest {
+        result: protocol::WorkspaceResult::Restored(protocol_restore_result(operation)?),
+        commit_version,
+        replayed,
+    })
+}
+
+fn protocol_restore_source_commit(
+    source: &meta::RestoreSourceCommitSeal,
+) -> Result<protocol::RestoreSourceCommitBinding, protocol::RpcFailure> {
+    Ok(protocol::RestoreSourceCommitBinding {
+        commit_id: source.commit_id.into(),
+        content_digest: protocol::DigestUri::new(source.content_digest_uri.clone())
+            .map_err(|error| internal(error.to_string()))?,
+        manifest_digest: protocol::DigestUri::new(source.manifest_digest_uri.clone())
+            .map_err(|error| internal(error.to_string()))?,
+        tree_manifest_revision_id: source.tree_manifest_revision_id.into(),
+        member_count: source.member_count,
+        member_digest: protocol::Digest(source.member_digest),
+    })
+}
+
+fn protocol_restore_manifest_binding(
+    manifest: &meta::RestoreManifestPublication,
+) -> Result<protocol::RestoreManifestBinding, protocol::RpcFailure> {
+    Ok(protocol::RestoreManifestBinding {
+        publication_operation_id: manifest.publication_operation_id.into(),
+        workspace_incarnation_id: manifest.workspace_incarnation_id.into(),
+        artifact_revision_id: manifest.artifact_revision_id.into(),
+        descriptor: protocol::ArtifactDescriptor {
+            logical_size: manifest.logical_size,
+            body_digest: protocol::DigestUri::new(manifest.body_digest_uri.clone())
+                .map_err(|error| internal(error.to_string()))?,
+            manifest_digest: protocol::DigestUri::new(manifest.manifest_digest_uri.clone())
+                .map_err(|error| internal(error.to_string()))?,
+            content_type: protocol::ContentType::new(manifest.content_type.clone())
+                .map_err(|error| internal(error.to_string()))?,
+            producer: None,
+            manifest_identity: None,
+            index_fields: Vec::new(),
+        },
+    })
+}
+
+fn protocol_restore_destination_binding(
+    binding: &meta::RestoreDestinationBinding,
+) -> Result<protocol::RestoreDestinationBinding, protocol::RpcFailure> {
+    Ok(protocol::RestoreDestinationBinding {
+        destination_commit_id: binding.destination_commit_id.into(),
+        effective_content_digest: protocol::DigestUri::new(
+            binding.effective_content_digest_uri.clone(),
+        )
+        .map_err(|error| internal(error.to_string()))?,
+        destination_run_manifest_projection_input_digest: protocol::Digest(
+            binding.destination_projection_input_digest,
+        ),
+        destination_run_manifest_identity: protocol_restore_manifest_identity(
+            binding.run_manifest_identity,
+        ),
+        destination_restore_manifest_identity: protocol_restore_manifest_identity(
+            binding.restore_manifest_identity,
+        ),
+        destination_manifests: binding
+            .manifests
+            .as_ref()
+            .map(|manifests| {
+                Ok(protocol::RestoreDestinationManifestBindings {
+                    run_manifest: protocol_restore_manifest_binding(&manifests.run_manifest)?,
+                    restore_manifest: protocol_restore_manifest_binding(
+                        &manifests.restore_manifest,
+                    )?,
+                })
+            })
+            .transpose()?,
+    })
 }
 
 fn restore_operation_preparation(
@@ -3299,15 +4000,49 @@ fn restore_operation_preparation(
             (protocol::RestoreSource::Commit(commit_id.into()), None)
         }
     };
-    let (sealed_member_count, sealed_member_digest) = match operation.member_seal {
-        Some(digest) => (
-            Some(operation.next_member_sequence),
-            Some(protocol::Digest(digest)),
+    let provenance = restore_commit_provenance(operation)?;
+    let sealed_source =
+        match (
+            operation.source_member_seal,
+            operation.member_seal,
+            operation.source_matches_base_commit,
+        ) {
+            (None, None, None) => None,
+            (Some(source_digest), Some(materialized_digest), Some(source_matches_base_commit)) => {
+                Some((
+                    operation.source_member_count,
+                    protocol::Digest(source_digest),
+                    operation.next_member_sequence,
+                    protocol::Digest(materialized_digest),
+                    source_matches_base_commit,
+                ))
+            }
+            _ => return Err(internal(
+                "restore source and materialized seals are only valid as one complete projection",
+            )),
+        };
+    let (
+        source_member_count,
+        source_member_digest,
+        materialized_member_count,
+        materialized_member_digest,
+        source_matches_base_commit,
+    ) = match sealed_source {
+        Some((source_count, source_digest, materialized_count, materialized_digest, matches)) => (
+            Some(source_count),
+            Some(source_digest),
+            Some(materialized_count),
+            Some(materialized_digest),
+            Some(matches),
         ),
-        None => (None, None),
+        None => (None, None, None, None, None),
     };
+    let destination_restore_manifest_identity = operation
+        .destination_restore_manifest_identity
+        .ok_or_else(|| internal("v5 restore has no restore-manifest publication identity"))?;
     Ok(protocol::RestoreOperationPreparation {
         request: protocol::PrepareRestoreRequest {
+            operation_id: operation.operation_id.into(),
             source_workbench: protocol_workbench(&operation.source_workbench_id)?,
             source_workspace_incarnation_id: operation.source_workspace_incarnation_id.into(),
             source,
@@ -3315,6 +4050,9 @@ fn restore_operation_preparation(
             destination_workspace_incarnation_id: operation
                 .destination_workspace_incarnation_id
                 .into(),
+            destination_restore_manifest_identity: protocol_restore_manifest_identity(
+                destination_restore_manifest_identity,
+            ),
             restore_manifest: protocol::RestoreManifestDescriptor {
                 body_digest: protocol::DigestUri::new(
                     operation.restore_manifest.body_digest_uri.clone(),
@@ -3328,8 +4066,19 @@ fn restore_operation_preparation(
             },
         },
         source_snapshot_read_version,
-        sealed_member_count,
-        sealed_member_digest,
+        source_commit: protocol_restore_source_commit(&provenance.source_commit)?,
+        destination_committed_at_unix_seconds: provenance.destination_committed_at_unix_seconds,
+        source_member_count,
+        source_member_digest,
+        materialized_member_count,
+        materialized_member_digest,
+        source_matches_base_commit,
+        destination_binding: provenance
+            .destination_binding
+            .as_ref()
+            .map(protocol_restore_destination_binding)
+            .transpose()?
+            .map(Box::new),
     })
 }
 
@@ -3339,6 +4088,8 @@ fn sealed_restore_preparation(
     if !matches!(
         operation.phase,
         types::RestorePhase::SourceSealed
+            | types::RestorePhase::DestinationBuilding
+            | types::RestorePhase::DestinationSealing
             | types::RestorePhase::Ready
             | types::RestorePhase::Complete
     ) {
@@ -3346,15 +4097,36 @@ fn sealed_restore_preparation(
             "restore preparation did not reach a sealed phase",
         ));
     }
-    let member_digest = operation
+    if !operation.source_eof {
+        return Err(internal("sealed restore source has not reached EOF"));
+    }
+    let provenance = restore_commit_provenance(operation)?;
+    let source_member_digest = operation
+        .source_member_seal
+        .ok_or_else(|| internal("sealed restore has no source member digest"))?;
+    let materialized_member_digest = operation
         .member_seal
-        .ok_or_else(|| internal("sealed restore has no member digest"))?;
+        .ok_or_else(|| internal("sealed restore has no materialized member digest"))?;
+    let source_matches_base_commit = operation
+        .source_matches_base_commit
+        .ok_or_else(|| internal("sealed restore has no base-commit comparison"))?;
     Ok(protocol::RestorePreparation {
         operation_id: operation.operation_id.into(),
         destination_workbench: protocol_workbench(&operation.destination_workbench_id)?,
         destination_workspace_incarnation_id: operation.destination_workspace_incarnation_id.into(),
-        member_count: operation.next_member_sequence,
-        member_digest: protocol::Digest(member_digest),
+        source_commit: protocol_restore_source_commit(&provenance.source_commit)?,
+        destination_committed_at_unix_seconds: provenance.destination_committed_at_unix_seconds,
+        source_member_count: operation.source_member_count,
+        source_member_digest: protocol::Digest(source_member_digest),
+        materialized_member_count: operation.next_member_sequence,
+        materialized_member_digest: protocol::Digest(materialized_member_digest),
+        source_matches_base_commit,
+        destination_binding: provenance
+            .destination_binding
+            .as_ref()
+            .map(protocol_restore_destination_binding)
+            .transpose()?
+            .map(Box::new),
     })
 }
 
@@ -3365,38 +4137,16 @@ fn restore_operation_status(
         types::RestorePhase::Preparing
         | types::RestorePhase::Copying
         | types::RestorePhase::SourceSealed
+        | types::RestorePhase::DestinationBuilding
+        | types::RestorePhase::DestinationSealing
         | types::RestorePhase::Ready => (protocol::OperationState::Running, None, None),
-        types::RestorePhase::Complete => {
-            let complete = operation
-                .result
-                .as_ref()
-                .ok_or_else(|| internal("complete restore operation has no result"))?;
-            (
-                protocol::OperationState::Succeeded,
-                Some(protocol::OperationResult::Restore(
-                    protocol::RestoreResult {
-                        operation_id: operation.operation_id.into(),
-                        destination: protocol::WorkspaceSummary {
-                            workbench: protocol::WorkbenchName::new(
-                                operation.destination_workbench_id.as_str(),
-                            )
-                            .map_err(|error| internal(error.to_string()))?,
-                            workspace_incarnation_id: complete
-                                .destination_workspace_incarnation_id
-                                .into(),
-                            workspace_revision: complete.destination_workspace_revision.get(),
-                            commit_head: None,
-                            commit_head_generation: None,
-                        },
-                        member_count: complete.member_count,
-                        member_digest: protocol::Digest(complete.member_digest),
-                        metadata_rows_copied: complete.member_count,
-                        object_bytes_copied: 0,
-                    },
-                )),
-                None,
-            )
-        }
+        types::RestorePhase::Complete => (
+            protocol::OperationState::Succeeded,
+            Some(protocol::OperationResult::Restore(protocol_restore_result(
+                operation,
+            )?)),
+            None,
+        ),
         types::RestorePhase::Aborting | types::RestorePhase::Cleaning => {
             (protocol::OperationState::Aborting, None, None)
         }
@@ -3564,6 +4314,12 @@ fn snapshot_failure(error: meta::SnapshotError) -> protocol::RpcFailure {
         | meta::SnapshotError::SnapshotMissing { .. }
         | meta::SnapshotError::AliasMissing { .. }
         | meta::SnapshotError::ConsumerMissing { .. } => not_found(error.to_string()),
+        meta::SnapshotError::WorkspaceNotCommitted { .. } => failure(
+            protocol::ErrorCode::PreconditionFailed,
+            "snapshot requires a committed workbench head",
+            false,
+            Some(protocol::ConflictKind::CommitHead),
+        ),
         meta::SnapshotError::SnapshotAlreadyExists { .. }
         | meta::SnapshotError::SnapshotIdAlreadyClaimed { .. } => failure(
             protocol::ErrorCode::AlreadyExists,
@@ -3612,6 +4368,18 @@ fn snapshot_failure(error: meta::SnapshotError) -> protocol::RpcFailure {
             false,
             Some(protocol::ConflictKind::SnapshotLifecycle),
         ),
+        meta::SnapshotError::SourceCommitMissing
+        | meta::SnapshotError::SourceCommitUnavailable { .. }
+        | meta::SnapshotError::SourceCommitBindingMismatch
+        | meta::SnapshotError::SourceCommitConsumerMissing
+        | meta::SnapshotError::SourceCommitConsumerMismatch
+        | meta::SnapshotError::CommitConsumerCountOverflow
+        | meta::SnapshotError::CommitConsumerCountUnderflow
+        | meta::SnapshotError::CommitConsumerEpochOverflow
+        | meta::SnapshotError::CommitVersionOverflow
+        | meta::SnapshotError::CommitCodec(_) => {
+            internal("snapshot source commit metadata is inconsistent")
+        }
         meta::SnapshotError::AliasProjectionMismatch
         | meta::SnapshotError::ConsumerCountOverflow
         | meta::SnapshotError::ConsumerEpochOverflow
@@ -3681,14 +4449,25 @@ fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
             false,
             Some(protocol::ConflictKind::SnapshotLifecycle),
         ),
+        meta::RestoreError::SnapshotCommitProvenanceMissing { .. } => failure(
+            protocol::ErrorCode::PreconditionFailed,
+            "legacy snapshot has no sealed commit provenance; commit the source workbench and mint a new snapshot",
+            false,
+            Some(protocol::ConflictKind::OperationState),
+        ),
         meta::RestoreError::RequestInputMismatch
-        | meta::RestoreError::RestoreManifestBindingMismatch { .. } => failure(
+        | meta::RestoreError::RestoreManifestBindingMismatch { .. }
+        | meta::RestoreError::DestinationBindingMismatch { .. } => failure(
             protocol::ErrorCode::RequestReplayMismatch,
-            error.to_string(),
+            "restore request is bound to different durable inputs",
             false,
             None,
         ),
-        meta::RestoreError::ConcurrentMutation => failure(
+        meta::RestoreError::OperationIdentityMismatch { .. } => invalid_argument(
+            "restore operation identity does not match the deterministic source/destination selector",
+        ),
+        meta::RestoreError::ConcurrentMutation
+        | meta::RestoreError::PublicationCleanupPending { .. } => failure(
             protocol::ErrorCode::Conflict,
             error.to_string(),
             true,
@@ -3731,6 +4510,7 @@ fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
         | meta::RestoreError::CommitCodec(_)
         | meta::RestoreError::SnapshotCodec(_)
         | meta::RestoreError::RestoreCodec(_)
+        | meta::RestoreError::PublishCodec(_)
         | meta::RestoreError::QueryRecord(_) => internal(error.to_string()),
     }
 }
@@ -4109,6 +4889,102 @@ mod tests {
             .unwrap();
         let executor = MetadataWorkspaceRequestExecutor::new(Arc::clone(&store));
         (store, executor)
+    }
+
+    fn install_snapshot_committed_head(
+        store: &meta::MetaShard,
+        workspace_incarnation_id: types::WorkspaceIncarnationId,
+        identity_fill: u8,
+    ) {
+        let commit_id = types::CommitId::from_bytes([identity_fill; types::SHA256_BYTES]);
+        let commit = meta::CommitRecord {
+            source_workspace_incarnation_id: workspace_incarnation_id,
+            content_digest_uri: format!("sha256:{}", "11".repeat(types::SHA256_BYTES)),
+            manifest_digest_uri: format!("sha256:{}", "22".repeat(types::SHA256_BYTES)),
+            tree_manifest_revision_id: types::ArtifactRevisionId::from_bytes(
+                [identity_fill.wrapping_add(1); types::FIXED_ID_BYTES],
+            ),
+            tree_digest_uri: format!("sha256:{}", "44".repeat(types::SHA256_BYTES)),
+            member_count: 0,
+            member_digest: [0; types::SHA256_BYTES],
+            unique_revision_count: 1,
+            revision_digest: [0x55; types::SHA256_BYTES],
+            parent_commits: Vec::new(),
+            parent_digest: [0; types::SHA256_BYTES],
+            producer: Some("snapshot-executor-test".to_owned()),
+            lineage_projection: Vec::new(),
+            consumer_count: 1,
+            consumer_epoch: types::ConsumerEpoch::new(1),
+            last_zero_consumer_version: None,
+            state: types::CommitState::Sealed,
+        };
+        let head = meta::WorkbenchCommitHeadRecord {
+            commit_id,
+            head_generation: types::Generation::new(1).unwrap(),
+        };
+        let commit_key = meta::commit_key(root(), commit_id);
+        let consumer_key =
+            meta::workbench_head_commit_consumer_key(root(), commit_id, workspace_incarnation_id);
+        let head_key = meta::workbench_commit_head_key(root(), workspace_incarnation_id);
+        store
+            .execute(
+                &meta::MetadataCommand {
+                    schema_id: meta::SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
+                    placement_generation: placement(),
+                    owner_epoch: owner(1),
+                    request_id: request_id(identity_fill.wrapping_add(64)),
+                    command_digest: types::CommandDigest::from_bytes([0; types::SHA256_BYTES]),
+                    read_version: store.current_read_version().unwrap(),
+                    root_fence_action: meta::RootFenceAction::RequireActive,
+                    predicates: vec![
+                        meta::CommandPredicate::Value {
+                            family: meta::MetadataFamily::Commit,
+                            key: commit_key.clone(),
+                            expected: None,
+                        },
+                        meta::CommandPredicate::Value {
+                            family: meta::MetadataFamily::CommitConsumer,
+                            key: consumer_key.clone(),
+                            expected: None,
+                        },
+                        meta::CommandPredicate::Value {
+                            family: meta::MetadataFamily::WorkbenchCommitHead,
+                            key: head_key.clone(),
+                            expected: None,
+                        },
+                    ],
+                    mutations: vec![
+                        meta::CommandMutation::Put {
+                            family: meta::MetadataFamily::Commit,
+                            key: commit_key,
+                            value: commit.encode().unwrap(),
+                        },
+                        meta::CommandMutation::Put {
+                            family: meta::MetadataFamily::CommitConsumer,
+                            key: consumer_key,
+                            value: meta::CommitConsumerRecord {
+                                consumer_epoch_at_add: types::ConsumerEpoch::new(1),
+                            }
+                            .encode(),
+                        },
+                        meta::CommandMutation::Put {
+                            family: meta::MetadataFamily::WorkbenchCommitHead,
+                            key: head_key,
+                            value: head.encode(),
+                        },
+                    ],
+                    history_projection: Vec::new(),
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -4868,16 +5744,76 @@ mod tests {
         );
     }
 
-    fn ready_restore_operation() -> meta::RestoreOperationRecord {
+    fn restore_destination_manifests() -> meta::RestoreDestinationManifests {
         let destination_incarnation =
             types::WorkspaceIncarnationId::from_bytes([0x52; types::FIXED_ID_BYTES]);
-        let member_digest = [0x33; types::SHA256_BYTES];
+        meta::RestoreDestinationManifests {
+            run_manifest: meta::RestoreManifestPublication {
+                publication_operation_id: types::OperationId::from_bytes(
+                    [0x54; types::FIXED_ID_BYTES],
+                ),
+                workspace_incarnation_id: destination_incarnation,
+                artifact_revision_id: types::ArtifactRevisionId::from_bytes(
+                    [0x64; types::FIXED_ID_BYTES],
+                ),
+                body_digest_uri: format!("sha256:{}", "77".repeat(types::SHA256_BYTES)),
+                manifest_digest_uri: format!("sha256:{}", "78".repeat(types::SHA256_BYTES)),
+                logical_size: 1,
+                content_type: meta::RESTORE_MANIFEST_CONTENT_TYPE.to_owned(),
+            },
+            restore_manifest: meta::RestoreManifestPublication {
+                publication_operation_id: types::OperationId::from_bytes(
+                    [0x55; types::FIXED_ID_BYTES],
+                ),
+                workspace_incarnation_id: destination_incarnation,
+                artifact_revision_id: types::ArtifactRevisionId::from_bytes(
+                    [0x65; types::FIXED_ID_BYTES],
+                ),
+                body_digest_uri: format!("sha256:{}", "00".repeat(types::SHA256_BYTES)),
+                manifest_digest_uri: format!("sha256:{}", "79".repeat(types::SHA256_BYTES)),
+                logical_size: 2,
+                content_type: meta::RESTORE_MANIFEST_CONTENT_TYPE.to_owned(),
+            },
+        }
+    }
+
+    fn restore_destination_binding(
+        manifests: Option<meta::RestoreDestinationManifests>,
+    ) -> meta::RestoreDestinationBinding {
+        meta::RestoreDestinationBinding {
+            destination_commit_id: types::CommitId::from_bytes([0x63; types::SHA256_BYTES]),
+            effective_content_digest_uri: format!("sha256:{}", "11".repeat(types::SHA256_BYTES)),
+            destination_projection_input_digest: [0x66; types::SHA256_BYTES],
+            run_manifest_identity: meta::RestoreManifestIdentity {
+                publication_operation_id: types::OperationId::from_bytes(
+                    [0x54; types::FIXED_ID_BYTES],
+                ),
+                artifact_revision_id: types::ArtifactRevisionId::from_bytes(
+                    [0x64; types::FIXED_ID_BYTES],
+                ),
+            },
+            restore_manifest_identity: meta::RestoreManifestIdentity {
+                publication_operation_id: types::OperationId::from_bytes(
+                    [0x55; types::FIXED_ID_BYTES],
+                ),
+                artifact_revision_id: types::ArtifactRevisionId::from_bytes(
+                    [0x65; types::FIXED_ID_BYTES],
+                ),
+            },
+            manifests,
+        }
+    }
+
+    fn source_sealed_restore_operation() -> meta::RestoreOperationRecord {
+        let destination_incarnation =
+            types::WorkspaceIncarnationId::from_bytes([0x52; types::FIXED_ID_BYTES]);
         let mut identity_digest = [0x11; types::SHA256_BYTES];
         identity_digest[..types::FIXED_ID_BYTES].fill(0x41);
-        meta::RestoreOperationRecord {
+        let source_commit_id = types::CommitId::from_bytes([0x61; types::SHA256_BYTES]);
+        let operation = meta::RestoreOperationRecord {
             operation_id: types::OperationId::from_bytes([0x41; types::FIXED_ID_BYTES]),
             identity_digest,
-            initialization_digest: Some([0x22; types::SHA256_BYTES]),
+            initialization_digest: None,
             source_workbench_id: types::WorkbenchId::new("restore-source").unwrap(),
             source_workspace_incarnation_id: types::WorkspaceIncarnationId::from_bytes(
                 [0x42; types::FIXED_ID_BYTES],
@@ -4888,46 +5824,523 @@ mod tests {
             },
             destination_workbench_id: types::WorkbenchId::new("restore-destination").unwrap(),
             destination_workspace_incarnation_id: destination_incarnation,
+            destination_restore_manifest_identity: Some(meta::RestoreManifestIdentity {
+                publication_operation_id: types::OperationId::from_bytes(
+                    [0x55; types::FIXED_ID_BYTES],
+                ),
+                artifact_revision_id: types::ArtifactRevisionId::from_bytes(
+                    [0x65; types::FIXED_ID_BYTES],
+                ),
+            }),
             restore_manifest: meta::RestoreManifestDescriptor {
                 body_digest_uri: format!("sha256:{}", "00".repeat(32)),
                 logical_size: 2,
                 content_type: meta::RESTORE_MANIFEST_CONTENT_TYPE.to_owned(),
             },
-            phase: types::RestorePhase::Ready,
-            source_cursor: None,
+            commit_provenance: meta::RestoreCommitProvenance::V5(Box::new(
+                meta::RestoreCommitProvenanceV5 {
+                    source_commit: meta::RestoreSourceCommitSeal {
+                        commit_id: source_commit_id,
+                        content_digest_uri: format!("sha256:{}", "11".repeat(types::SHA256_BYTES)),
+                        manifest_digest_uri: format!("sha256:{}", "12".repeat(types::SHA256_BYTES)),
+                        tree_manifest_revision_id: types::ArtifactRevisionId::from_bytes(
+                            [0x62; types::FIXED_ID_BYTES],
+                        ),
+                        member_count: 2,
+                        member_digest: [0x70; types::SHA256_BYTES],
+                        unique_revision_count: 1,
+                        revision_digest: [0x73; types::SHA256_BYTES],
+                        parent_digest: [0; types::SHA256_BYTES],
+                    },
+                    destination_committed_at_unix_seconds: 1,
+                    destination_binding: None,
+                    closure: meta::RestoreCommitClosureProgress {
+                        member_cursor: None,
+                        member_count: 0,
+                        member_digest: [0; types::SHA256_BYTES],
+                        member_seal: None,
+                        revision_ref_count: 0,
+                        revision_cursor: None,
+                        revision_seal_count: 0,
+                        revision_digest: [0; types::SHA256_BYTES],
+                        revision_seal: None,
+                        parent_digest: meta::advance_commit_parent_rolling_digest(
+                            [0; types::SHA256_BYTES],
+                            0,
+                            source_commit_id,
+                        ),
+                        parent_seal: None,
+                        cleanup_member_count: 0,
+                        cleanup_revision_count: 0,
+                    },
+                    destination_head_generation: None,
+                },
+            )),
+            phase: types::RestorePhase::SourceSealed,
+            source_cursor: Some(types::NormalizedRelativePath::new("outputs/result").unwrap()),
             source_eof: true,
-            next_member_sequence: 0,
-            member_rolling_digest: member_digest,
-            member_seal: Some(member_digest),
+            source_member_count: 2,
+            source_member_rolling_digest: [0x70; types::SHA256_BYTES],
+            source_member_seal: Some([0x70; types::SHA256_BYTES]),
+            source_matches_base_commit: Some(true),
+            next_member_sequence: 1,
+            member_rolling_digest: [0x71; types::SHA256_BYTES],
+            member_seal: Some([0x71; types::SHA256_BYTES]),
             cleanup_member_cursor: 0,
             result: None,
             terminal_error: None,
+        };
+        operation.validate().unwrap();
+        operation
+    }
+
+    fn destination_building_restore_operation() -> meta::RestoreOperationRecord {
+        let mut operation = bound_source_sealed_restore_operation();
+        operation.initialization_digest = Some([0x67; types::SHA256_BYTES]);
+        operation.phase = types::RestorePhase::DestinationBuilding;
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut operation.commit_provenance else {
+            unreachable!();
+        };
+        provenance.destination_binding = Some(restore_destination_binding(Some(
+            restore_destination_manifests(),
+        )));
+        provenance.closure.member_cursor =
+            Some(types::NormalizedRelativePath::new("outputs/result").unwrap());
+        provenance.closure.member_count = 3;
+        provenance.closure.member_digest = [0x74; types::SHA256_BYTES];
+        provenance.closure.revision_ref_count = 2;
+        operation.validate().unwrap();
+        operation
+    }
+
+    fn bound_source_sealed_restore_operation() -> meta::RestoreOperationRecord {
+        let mut operation = source_sealed_restore_operation();
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut operation.commit_provenance else {
+            unreachable!();
+        };
+        provenance.destination_binding = Some(restore_destination_binding(None));
+        operation.validate().unwrap();
+        operation
+    }
+
+    fn destination_sealing_restore_operation() -> meta::RestoreOperationRecord {
+        let mut operation = destination_building_restore_operation();
+        operation.phase = types::RestorePhase::DestinationSealing;
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut operation.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.member_seal = Some([0x74; types::SHA256_BYTES]);
+        provenance.closure.revision_cursor = Some(types::ArtifactRevisionId::from_bytes(
+            [0x65; types::FIXED_ID_BYTES],
+        ));
+        provenance.closure.revision_seal_count = 2;
+        provenance.closure.revision_digest = [0x75; types::SHA256_BYTES];
+        operation.validate().unwrap();
+        operation
+    }
+
+    fn ready_restore_operation() -> meta::RestoreOperationRecord {
+        let mut operation = destination_sealing_restore_operation();
+        operation.phase = types::RestorePhase::Ready;
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut operation.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.revision_seal = Some([0x75; types::SHA256_BYTES]);
+        provenance.closure.parent_seal = Some(provenance.closure.parent_digest);
+        operation.validate().unwrap();
+        operation
+    }
+
+    fn copying_restore_operation(
+        source_member_count: u64,
+        materialized_member_count: u64,
+        source_eof: bool,
+        digest_fill: u8,
+    ) -> meta::RestoreOperationRecord {
+        let mut operation = source_sealed_restore_operation();
+        operation.phase = types::RestorePhase::Copying;
+        operation.source_eof = source_eof;
+        operation.source_member_count = source_member_count;
+        operation.source_cursor = (source_member_count > 0).then(|| {
+            types::NormalizedRelativePath::new(format!("input/{source_member_count:04}")).unwrap()
+        });
+        operation.source_member_rolling_digest = if source_member_count == 0 {
+            [0; types::SHA256_BYTES]
+        } else {
+            [digest_fill; types::SHA256_BYTES]
+        };
+        operation.source_member_seal = None;
+        operation.source_matches_base_commit = None;
+        operation.next_member_sequence = materialized_member_count;
+        operation.member_rolling_digest = if materialized_member_count == 0 {
+            [0; types::SHA256_BYTES]
+        } else {
+            [0x71; types::SHA256_BYTES]
+        };
+        operation.member_seal = None;
+        operation.validate().unwrap();
+        operation
+    }
+
+    fn complete_restore_operation() -> meta::RestoreOperationRecord {
+        let ready = ready_restore_operation();
+        ready
+            .apply(
+                types::RestorePhase::Ready,
+                meta::RestoreTransition::Complete {
+                    result: meta::RestoreResult {
+                        destination_workspace_incarnation_id: ready
+                            .destination_workspace_incarnation_id,
+                        destination_workspace_revision: types::WorkspaceRevision::new(1),
+                        member_count: 1,
+                        member_digest: [0x71; types::SHA256_BYTES],
+                    },
+                    destination_head_generation: types::Generation::new(1).unwrap(),
+                },
+            )
+            .unwrap()
+    }
+
+    fn install_restore_operation(
+        store: &meta::MetaShard,
+        operation: &meta::RestoreOperationRecord,
+        request_fill: u8,
+        later_live_head: Option<meta::WorkbenchCommitHeadRecord>,
+    ) {
+        let operation_key = meta::operation_key(
+            root(),
+            types::OperationKind::Restore,
+            operation.operation_id,
+        );
+        let mut predicates = vec![meta::CommandPredicate::Value {
+            family: meta::MetadataFamily::Operation,
+            key: operation_key.clone(),
+            expected: None,
+        }];
+        let mut mutations = vec![meta::CommandMutation::Put {
+            family: meta::MetadataFamily::Operation,
+            key: operation_key,
+            value: operation.encode().unwrap(),
+        }];
+        if let Some(head) = later_live_head {
+            let head_key = meta::workbench_commit_head_key(
+                root(),
+                operation.destination_workspace_incarnation_id,
+            );
+            predicates.push(meta::CommandPredicate::Value {
+                family: meta::MetadataFamily::WorkbenchCommitHead,
+                key: head_key.clone(),
+                expected: None,
+            });
+            mutations.push(meta::CommandMutation::Put {
+                family: meta::MetadataFamily::WorkbenchCommitHead,
+                key: head_key,
+                value: head.encode(),
+            });
+        }
+        store
+            .execute(
+                &meta::MetadataCommand {
+                    schema_id: meta::SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    object_namespace_id: Some(types::ObjectNamespaceId::from_bytes(
+                        [10; types::FIXED_ID_BYTES],
+                    )),
+                    placement_generation: placement(),
+                    owner_epoch: owner(1),
+                    request_id: request_id(request_fill),
+                    command_digest: types::CommandDigest::from_bytes([0; types::SHA256_BYTES]),
+                    read_version: store.current_read_version().unwrap(),
+                    root_fence_action: meta::RootFenceAction::RequireActive,
+                    predicates,
+                    mutations,
+                    history_projection: Vec::new(),
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .unwrap();
+    }
+
+    fn restore_rpc(
+        request_fill: u8,
+        operation: protocol::WorkspaceRequest,
+    ) -> protocol::WorkspaceRpcRequest {
+        protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+            operation,
         }
     }
 
     #[test]
-    fn sealed_restore_preparation_is_stable_through_ready_and_complete() {
-        let mut operation = ready_restore_operation();
-        let destination_incarnation = operation.destination_workspace_incarnation_id;
-        let member_digest = operation.member_rolling_digest;
-        operation.validate().unwrap();
-        let ready = sealed_restore_preparation(&operation).unwrap();
+    fn sealed_restore_preparation_replays_through_destination_construction() {
+        let pre_bind = source_sealed_restore_operation();
+        let source_sealed = bound_source_sealed_restore_operation();
+        let destination_building = destination_building_restore_operation();
+        let destination_sealing = destination_sealing_restore_operation();
+        let ready = ready_restore_operation();
+        let complete = ready
+            .apply(
+                types::RestorePhase::Ready,
+                meta::RestoreTransition::Complete {
+                    result: meta::RestoreResult {
+                        destination_workspace_incarnation_id: ready
+                            .destination_workspace_incarnation_id,
+                        destination_workspace_revision: types::WorkspaceRevision::new(1),
+                        member_count: 1,
+                        member_digest: [0x71; types::SHA256_BYTES],
+                    },
+                    destination_head_generation: types::Generation::new(1).unwrap(),
+                },
+            )
+            .unwrap();
 
-        operation.phase = types::RestorePhase::Complete;
-        operation.result = Some(meta::RestoreResult {
-            destination_workspace_incarnation_id: destination_incarnation,
-            destination_workspace_revision: types::WorkspaceRevision::new(1),
-            member_count: 0,
-            member_digest,
-        });
-        operation.validate().unwrap();
-        let complete = sealed_restore_preparation(&operation).unwrap();
+        let expected = sealed_restore_preparation(&source_sealed).unwrap();
+        for operation in [
+            &destination_building,
+            &destination_sealing,
+            &ready,
+            &complete,
+        ] {
+            let projected = sealed_restore_preparation(operation).unwrap();
+            assert!(projected
+                .destination_binding
+                .as_ref()
+                .and_then(|binding| binding.destination_manifests.as_ref())
+                .is_some());
+            let mut without_actual_manifests = projected;
+            without_actual_manifests
+                .destination_binding
+                .as_mut()
+                .unwrap()
+                .destination_manifests = None;
+            assert_eq!(without_actual_manifests, expected);
+        }
+        assert_eq!(expected.operation_id.0, [0x41; types::FIXED_ID_BYTES]);
+        assert_eq!(
+            expected.destination_workbench.as_str(),
+            "restore-destination"
+        );
+        assert_eq!(expected.source_member_count, 2);
+        assert_eq!(
+            expected.source_member_digest,
+            protocol::Digest([0x70; types::SHA256_BYTES])
+        );
+        assert_eq!(expected.materialized_member_count, 1);
+        assert_eq!(
+            expected.materialized_member_digest,
+            protocol::Digest([0x71; types::SHA256_BYTES])
+        );
+        assert!(expected.source_matches_base_commit);
+        assert!(expected.destination_binding.is_some());
 
-        assert_eq!(ready, complete);
-        assert_eq!(ready.operation_id.0, [0x41; types::FIXED_ID_BYTES]);
-        assert_eq!(ready.destination_workbench.as_str(), "restore-destination");
-        assert_eq!(ready.member_count, 0);
-        assert_eq!(ready.member_digest, protocol::Digest(member_digest));
+        let pre_bind = sealed_restore_preparation(&pre_bind).unwrap();
+        assert!(pre_bind.destination_binding.is_none());
+        assert_eq!(pre_bind.source_member_digest, expected.source_member_digest);
+        assert_eq!(
+            pre_bind.materialized_member_digest,
+            expected.materialized_member_digest
+        );
+        assert_eq!(
+            pre_bind.destination_committed_at_unix_seconds,
+            expected.destination_committed_at_unix_seconds
+        );
+    }
+
+    #[test]
+    fn destination_restore_construction_is_running_and_nonterminal() {
+        for operation in [
+            destination_building_restore_operation(),
+            destination_sealing_restore_operation(),
+        ] {
+            assert!(restore_terminal_failure(&operation).is_none());
+            let status = restore_operation_status(&operation).unwrap();
+            assert_eq!(status.state, protocol::OperationState::Running);
+            assert!(status.result.is_none());
+            assert!(status.failure.is_none());
+            assert_eq!(status.progress.completed_rows, 1);
+            assert_eq!(status.progress.total_rows, Some(1));
+        }
+    }
+
+    #[test]
+    fn whole_rpc_restore_replay_never_regresses_copy_build_or_seal_progress() {
+        let copy_first = copying_restore_operation(1, 1, false, 0x81);
+        let copy_later = copying_restore_operation(2, 1, false, 0x82);
+        assert!(!restore_step_advances(&copy_later, &copy_first, true, "copy").unwrap());
+        assert!(restore_step_advances(&copy_first, &copy_later, true, "copy").unwrap());
+        assert!(restore_step_advances(&copy_later, &copy_first, false, "copy").is_err());
+
+        let build_first = destination_building_restore_operation();
+        let mut build_later = build_first.clone();
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut build_later.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.closure.member_cursor =
+            Some(types::NormalizedRelativePath::new("zzzz/final").unwrap());
+        provenance.closure.member_count = 4;
+        provenance.closure.member_digest = [0x76; types::SHA256_BYTES];
+        provenance.closure.revision_ref_count = 3;
+        build_later.validate().unwrap();
+        assert!(!restore_step_advances(&build_later, &build_first, true, "build").unwrap());
+
+        let sealing = destination_sealing_restore_operation();
+        assert!(restore_step_advances(&build_first, &sealing, true, "build boundary").unwrap());
+        assert!(!restore_step_advances(&sealing, &build_first, true, "build boundary").unwrap());
+
+        let mut seal_first = sealing.clone();
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut seal_first.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.closure.revision_cursor = Some(types::ArtifactRevisionId::from_bytes(
+            [0x64; types::FIXED_ID_BYTES],
+        ));
+        provenance.closure.revision_seal_count = 1;
+        provenance.closure.revision_digest = [0x76; types::SHA256_BYTES];
+        seal_first.validate().unwrap();
+        assert!(!restore_step_advances(&sealing, &seal_first, true, "seal").unwrap());
+
+        let ready = ready_restore_operation();
+        assert!(restore_step_advances(&sealing, &ready, true, "seal boundary").unwrap());
+        assert!(!restore_step_advances(&ready, &sealing, true, "seal boundary").unwrap());
+
+        let mut incompatible = copy_first.clone();
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut incompatible.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.source_commit.manifest_digest_uri =
+            format!("sha256:{}", "99".repeat(types::SHA256_BYTES));
+        incompatible.validate().unwrap();
+        assert!(restore_step_advances(&copy_first, &incompatible, true, "copy").is_err());
+    }
+
+    #[test]
+    fn restored_response_uses_the_terminal_commit_receipt_only() {
+        let complete = complete_restore_operation();
+        let response = restored_response(&complete, Some(77), true).unwrap();
+        let protocol::WorkspaceResult::Restored(restored) = response.result else {
+            panic!("expected restored response");
+        };
+        let receipt = complete.destination_commit_receipt().unwrap();
+        assert_eq!(
+            restored.destination.commit_head,
+            Some(receipt.destination_commit_id.into())
+        );
+        assert_eq!(
+            restored.destination.commit_head_generation,
+            Some(receipt.destination_head_generation.get())
+        );
+        assert_ne!(
+            restored.destination.commit_head,
+            Some(types::CommitId::from_bytes([0x99; types::SHA256_BYTES]).into())
+        );
+        assert_eq!(restored.member_count, 1);
+        assert_eq!(restored.metadata_rows_copied, 1);
+        assert_eq!(response.commit_version, Some(77));
+        assert!(response.replayed);
+    }
+
+    #[test]
+    fn restore_dispatcher_rejects_missing_and_wrong_phase_held_reads() {
+        let (store, executor) = ready_executor();
+        let missing = executor
+            .execute(&restore_rpc(
+                0xd0,
+                protocol::WorkspaceRequest::ReadRestoreSourceRunManifest(
+                    protocol::ReadRestoreSourceRunManifestRequest {
+                        operation_id: protocol::OperationIdentity([0xd1; types::FIXED_ID_BYTES]),
+                        range: None,
+                        plan_page: None,
+                    },
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(missing.code, protocol::ErrorCode::NotFound);
+
+        let copying = copying_restore_operation(1, 1, false, 0x81);
+        install_restore_operation(&store, &copying, 0xd2, None);
+        let wrong_phase = executor
+            .execute(&restore_rpc(
+                0xd3,
+                protocol::WorkspaceRequest::ReadRestoreSourceRunManifest(
+                    protocol::ReadRestoreSourceRunManifestRequest {
+                        operation_id: copying.operation_id.into(),
+                        range: None,
+                        plan_page: None,
+                    },
+                ),
+            ))
+            .unwrap_err();
+        assert_eq!(wrong_phase.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(
+            wrong_phase.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+    }
+
+    #[test]
+    fn finalize_dispatcher_replays_receipt_after_live_head_changes_and_rejects_abort() {
+        let (store, executor) = ready_executor();
+        let complete = complete_restore_operation();
+        let later_head = meta::WorkbenchCommitHeadRecord {
+            commit_id: types::CommitId::from_bytes([0x99; types::SHA256_BYTES]),
+            head_generation: types::Generation::new(7).unwrap(),
+        };
+        install_restore_operation(&store, &complete, 0xd4, Some(later_head));
+        let finalize = restore_rpc(
+            0xd5,
+            protocol::WorkspaceRequest::FinalizeRestore(protocol::FinalizeRestoreRequest {
+                operation_id: complete.operation_id.into(),
+            }),
+        );
+        for _ in 0..2 {
+            let response = executor.execute(&finalize).unwrap();
+            assert!(response.replayed);
+            let protocol::WorkspaceResult::Restored(restored) = response.result else {
+                panic!("finalize returned the wrong result variant");
+            };
+            let receipt = complete.destination_commit_receipt().unwrap();
+            assert_eq!(
+                restored.destination.commit_head,
+                Some(receipt.destination_commit_id.into())
+            );
+            assert_eq!(
+                restored.destination.commit_head_generation,
+                Some(receipt.destination_head_generation.get())
+            );
+        }
+
+        let (store, executor) = ready_executor();
+        let ready = ready_restore_operation();
+        let aborting = ready
+            .apply(
+                types::RestorePhase::Ready,
+                meta::RestoreTransition::BeginAbort {
+                    terminal_error: meta::RestoreTerminalError {
+                        kind: meta::RestoreTerminalErrorKind::AbortedByCaller,
+                        message: "restore was aborted concurrently".to_owned(),
+                        evidence_digest: None,
+                    },
+                },
+            )
+            .unwrap();
+        install_restore_operation(&store, &aborting, 0xd6, None);
+        let failure = executor
+            .execute(&restore_rpc(
+                0xd7,
+                protocol::WorkspaceRequest::FinalizeRestore(protocol::FinalizeRestoreRequest {
+                    operation_id: aborting.operation_id.into(),
+                }),
+            ))
+            .unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::OperationFailed);
+        assert_eq!(failure.message, "restore was aborted concurrently");
     }
 
     #[test]
@@ -4946,12 +6359,19 @@ mod tests {
                 },
             )
             .unwrap();
-        let cleaning = aborting
+        let mut cleaning = aborting
             .apply(
                 types::RestorePhase::Aborting,
                 meta::RestoreTransition::BeginCleaning,
             )
             .unwrap();
+        cleaning.cleanup_member_cursor = cleaning.next_member_sequence;
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut cleaning.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.cleanup_member_count = provenance.closure.member_count;
+        provenance.closure.cleanup_revision_count = provenance.closure.revision_ref_count;
+        cleaning.validate().unwrap();
         let cleaned = cleaning
             .apply(
                 types::RestorePhase::Cleaning,
@@ -5014,6 +6434,36 @@ mod tests {
         assert_eq!(claimed.code, protocol::ErrorCode::AlreadyExists);
         assert_eq!(claimed.conflict, Some(protocol::ConflictKind::Workspace));
         assert!(!claimed.retryable);
+
+        let cleanup_pending = restore_failure(meta::RestoreError::PublicationCleanupPending {
+            operation_id: types::OperationId::from_bytes([0x91; types::FIXED_ID_BYTES]),
+            phase: types::PublishPhase::Cleaning,
+        });
+        assert_eq!(cleanup_pending.code, protocol::ErrorCode::Conflict);
+        assert_eq!(
+            cleanup_pending.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+        assert!(cleanup_pending.retryable);
+    }
+
+    #[test]
+    fn legacy_snapshot_restore_requires_new_commit_provenance() {
+        let failure = restore_failure(meta::RestoreError::SnapshotCommitProvenanceMissing {
+            snapshot_id: types::SnapshotId::new(9_876_543),
+        });
+
+        assert_eq!(failure.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(
+            failure.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.message,
+            "legacy snapshot has no sealed commit provenance; commit the source workbench and mint a new snapshot"
+        );
+        assert!(!failure.message.contains("9876543"));
     }
 
     #[test]
@@ -6441,10 +7891,15 @@ mod tests {
 
     #[test]
     fn snapshot_lifecycle_uses_visible_incarnation_and_lists_terminal_states() {
-        let (_store, executor) = ready_executor();
+        let (store, executor) = ready_executor();
         executor
             .execute(&create_request(70, "snapshot-test", 71, 1))
             .unwrap();
+        install_snapshot_committed_head(
+            &store,
+            types::WorkspaceIncarnationId::from_bytes([71; types::FIXED_ID_BYTES]),
+            0xD0,
+        );
         let workbench = protocol::WorkbenchName::new("snapshot-test").unwrap();
         let incarnation = protocol::WorkspaceIdentity([71; types::FIXED_ID_BYTES]);
         let alias = protocol::SnapshotAlias::new("checkpoint").unwrap();
@@ -6573,6 +8028,11 @@ mod tests {
         executor
             .execute(&create_request(80, "snapshot-alias-test", 81, 1))
             .unwrap();
+        install_snapshot_committed_head(
+            &store,
+            types::WorkspaceIncarnationId::from_bytes([81; types::FIXED_ID_BYTES]),
+            0xD1,
+        );
         let workbench = protocol::WorkbenchName::new("snapshot-alias-test").unwrap();
         let incarnation = protocol::WorkspaceIdentity([81; types::FIXED_ID_BYTES]);
         let alias = protocol::SnapshotAlias::new("latest").unwrap();
@@ -6681,6 +8141,55 @@ mod tests {
                 Some(protocol::ConflictKind::SnapshotLifecycle)
             );
             assert!(!failure.retryable);
+        }
+    }
+
+    #[test]
+    fn snapshot_requires_a_committed_head_without_leaking_workbench_identity() {
+        let failure = snapshot_failure(meta::SnapshotError::WorkspaceNotCommitted {
+            workbench_id: types::WorkbenchId::new("private-agent-workbench").unwrap(),
+        });
+
+        assert_eq!(failure.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(failure.conflict, Some(protocol::ConflictKind::CommitHead));
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.message,
+            "snapshot requires a committed workbench head"
+        );
+        assert!(!failure.message.contains("private-agent-workbench"));
+    }
+
+    #[test]
+    fn snapshot_source_commit_corruption_is_sanitized() {
+        let failures = [
+            meta::SnapshotError::SourceCommitMissing,
+            meta::SnapshotError::SourceCommitUnavailable {
+                state: types::CommitState::Retiring,
+            },
+            meta::SnapshotError::SourceCommitBindingMismatch,
+            meta::SnapshotError::SourceCommitConsumerMissing,
+            meta::SnapshotError::SourceCommitConsumerMismatch,
+            meta::SnapshotError::CommitConsumerCountOverflow,
+            meta::SnapshotError::CommitConsumerCountUnderflow,
+            meta::SnapshotError::CommitConsumerEpochOverflow,
+            meta::SnapshotError::CommitVersionOverflow,
+            meta::SnapshotError::CommitCodec(meta::CommitRecordError::EmptyField {
+                field: "physical/key/private-agent",
+            }),
+        ];
+
+        for error in failures {
+            let failure = snapshot_failure(error);
+            assert_eq!(failure.code, protocol::ErrorCode::Internal);
+            assert_eq!(
+                failure.message,
+                "snapshot source commit metadata is inconsistent"
+            );
+            assert!(!failure.retryable);
+            assert!(failure.conflict.is_none());
+            assert!(!failure.message.contains("private-agent"));
+            assert!(!failure.message.contains("Retiring"));
         }
     }
 
