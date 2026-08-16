@@ -1674,9 +1674,7 @@ fn parse_read_scope(arguments: &Value, allow_empty_path: bool) -> Result<ScopedP
     let section = optional_string(arguments, "section")?
         .map(Section::parse)
         .transpose()?;
-    let relative_path = optional_string(arguments, "path")?
-        .map(parse_relative_path)
-        .transpose()?;
+    let relative_path = parse_optional_scope_path(arguments)?;
     if !allow_empty_path && relative_path.is_none() {
         return Err(AgentError::invalid_arguments("path is required"));
     }
@@ -1700,9 +1698,7 @@ fn parse_query_scope(arguments: &Value) -> Result<QueryScope, AgentError> {
     let section = optional_string(arguments, "section")?
         .map(Section::parse)
         .transpose()?;
-    let path = optional_string(arguments, "path")?
-        .map(parse_relative_path)
-        .transpose()?;
+    let path = parse_optional_scope_path(arguments)?;
     if let (Some(section), Some(path)) = (section, &path) {
         reject_duplicated_section(section, path)?;
     }
@@ -1735,6 +1731,15 @@ fn indexed_scoped_path(hit: &SearchHit) -> Result<ScopedPath, AgentError> {
 fn parse_relative_path(value: &str) -> Result<NormalizedRelativePath, AgentError> {
     NormalizedRelativePath::new(value.to_owned())
         .map_err(|error| AgentError::invalid_arguments(error.to_string()))
+}
+
+fn parse_optional_scope_path(
+    arguments: &Value,
+) -> Result<Option<NormalizedRelativePath>, AgentError> {
+    optional_string(arguments, "path")?
+        .filter(|path| !path.is_empty())
+        .map(parse_relative_path)
+        .transpose()
 }
 
 fn reject_duplicated_section(

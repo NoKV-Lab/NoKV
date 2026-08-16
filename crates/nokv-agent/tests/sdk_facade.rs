@@ -1017,6 +1017,122 @@ fn logical_workbench_root_is_presentation_not_storage_identity() {
 }
 
 #[test]
+fn empty_optional_scope_path_is_equivalent_to_omission() {
+    let backend = FakeBackend::default();
+    let handler = test_handler(backend.clone());
+    run(
+        &handler,
+        "workbench_create",
+        json!({"id": "wb-empty-scope"}),
+    )
+    .unwrap();
+
+    let scoped_cases = [
+        (
+            "workbench_list",
+            json!({"id": "wb-empty-scope", "section": "outputs"}),
+        ),
+        (
+            "workbench_stat",
+            json!({"id": "wb-empty-scope", "section": "outputs"}),
+        ),
+        (
+            "workbench_grep",
+            json!({
+                "id": "wb-empty-scope", "section": "outputs",
+                "pattern": "needle", "recursive": true
+            }),
+        ),
+        (
+            "workbench_search",
+            json!({"id": "wb-empty-scope", "section": "outputs"}),
+        ),
+        (
+            "workbench_aggregate",
+            json!({
+                "id": "wb-empty-scope", "section": "outputs",
+                "measures": [{"name": "artifacts", "op": "count"}]
+            }),
+        ),
+        (
+            "workbench_catalog",
+            json!({"id": "wb-empty-scope", "section": "outputs"}),
+        ),
+    ];
+
+    for (tool, omitted) in scoped_cases {
+        let mut explicit_empty = omitted.clone();
+        explicit_empty
+            .as_object_mut()
+            .unwrap()
+            .insert("path".to_owned(), Value::String(String::new()));
+        let omitted_result = run(&handler, tool, omitted).unwrap();
+        let empty_result = run(&handler, tool, explicit_empty).unwrap();
+        assert_eq!(empty_result, omitted_result, "{tool}");
+    }
+
+    let state = backend.lock();
+    assert_eq!(state.list_requests[0].path, state.list_requests[1].path);
+    assert_eq!(
+        state.search_requests[0].scope,
+        state.search_requests[1].scope
+    );
+    assert_eq!(
+        state.aggregate_requests[0].scope,
+        state.aggregate_requests[1].scope
+    );
+    assert_eq!(
+        state.catalog_requests[0].scope,
+        state.catalog_requests[1].scope
+    );
+}
+
+#[test]
+fn empty_required_artifact_paths_remain_invalid() {
+    let backend = FakeBackend::default();
+    let handler = test_handler(backend.clone());
+    run(
+        &handler,
+        "workbench_create",
+        json!({"id": "wb-empty-required"}),
+    )
+    .unwrap();
+
+    for (tool, arguments) in [
+        (
+            "workbench_put_file",
+            json!({
+                "id": "wb-empty-required", "section": "outputs", "path": "", "text": "x"
+            }),
+        ),
+        (
+            "workbench_append",
+            json!({
+                "id": "wb-empty-required", "section": "logs", "path": "", "text": "x"
+            }),
+        ),
+        (
+            "workbench_edit",
+            json!({
+                "id": "wb-empty-required", "section": "outputs", "path": "",
+                "old_string": "x", "new_string": "y"
+            }),
+        ),
+        (
+            "workbench_read",
+            json!({"id": "wb-empty-required", "section": "outputs", "path": ""}),
+        ),
+    ] {
+        let error = run(&handler, tool, arguments)
+            .expect_err("an empty required artifact path must fail closed");
+        assert_eq!(error.code, "InvalidArguments", "{tool}");
+    }
+
+    assert_eq!(backend.publish_calls(), 0);
+    assert_eq!(backend.append_calls(), 0);
+}
+
+#[test]
 fn path_jail_and_put_modes_fail_closed() {
     let backend = FakeBackend::default();
     let handler = test_handler(backend.clone());
