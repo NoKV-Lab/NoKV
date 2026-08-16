@@ -98,7 +98,8 @@ SPDX-License-Identifier: Apache-2.0
   [Workspace Acceptance](./development/workspace-acceptance.md).
 - Development: [Code Contract](./development/code_contract.md),
   [`nokv-agent` Handbook](./development/nokv-agent.md),
-  [PR Review Checklist](./development/pr_review_checklist.md), and
+  [PR Review Checklist](./development/pr_review_checklist.md),
+  [Change Governance](./development/change-governance.md), and
   [Path-Native Metadata Comparison](./development/path-native-metadata-comparison.md).
 - Storage architecture: [Metadata Store Interface](./development/metadata-store-interface.md).
 - Collaboration record: [NoKV x LingTai](./announcements/nokv-lingtai-design-partner.md)

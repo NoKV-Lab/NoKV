@@ -24,7 +24,8 @@ does not implement a POSIX filesystem, FUSE frontend, or inode/dentry model.
 2. **Architecture:** [Product Design](docs/product-design.md) and
    [Metadata Schema](docs/metadata-schema.md).
 3. **Engineering rules:** [Code Contract](docs/development/code_contract.md)
-   and [PR Review Checklist](docs/development/pr_review_checklist.md).
+   [PR Review Checklist](docs/development/pr_review_checklist.md), and
+   [Change Governance](docs/development/change-governance.md).
 
 ### Make your first contribution
 
@@ -112,6 +113,14 @@ and run `git diff --check`.
 - Link related issue(s).
 - Include docs updates when behavior/config/CLI changes.
 - Keep PRs small enough for focused review.
+- Every PR requires two approving reviews. A new push dismisses prior
+  approvals, the last pusher cannot supply the final approval, a CODEOWNER must
+  approve, and administrators are subject to the same branch protection.
+- A PR with more than 10,000 GitHub-reported changed lines (additions plus
+  deletions) requires two distinct human approvals on the exact current head.
+  Authors, bots, duplicate reviewers, dismissed reviews, and approvals on older
+  commits do not count. The governance status fails closed if it cannot verify
+  these facts.
 - Keep each PR scoped to one logical boundary. Do not mix metadata model,
   Holt layout, object-store, docs, benchmark, or unrelated refactors.
 - Every non-merge commit must include a `Signed-off-by` trailer matching the Developer Certificate of Origin in [`DCO`](./DCO).

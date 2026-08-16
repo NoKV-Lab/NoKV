@@ -1,0 +1,95 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Change Governance
+
+on:
+  pull_request_target:
+    branches: [ "main" ]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - review_requested
+      - review_request_removed
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+# The target workflow is loaded from the protected default branch. It never
+# checks out or executes pull-request code. The policy and its tests are fetched
+# from the exact base SHA, then a status is published on the PR head SHA.
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: change-governance-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  large-change-review:
+    if: github.event.pull_request != null && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      STATUS_CONTEXT: change-governance/large-change-review
+    steps:
+      - name: Require two current human approvals for large changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          post_status() {
+            local state="$1"
+            local description="$2"
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state="$state" \
+              -f context="$STATUS_CONTEXT" \
+              -f description="$description" \
+              -f target_url="$RUN_URL" >/dev/null
+          }
+
+          fetch_base_file() {
+            local repository_path="$1"
+            local destination="$2"
+            gh api \
+              "repos/$GITHUB_REPOSITORY/contents/$repository_path?ref=$BASE_SHA" \
+              --jq .content | base64 --decode >"$destination"
+          }
+
+          post_status pending "Evaluating changed lines and current-head human approvals."
+
+          set +e
+          (
+            set -euo pipefail
+            policy_dir="$RUNNER_TEMP/nokv-change-governance"
+            mkdir -p "$policy_dir"
+            fetch_base_file \
+              scripts/ci/pr_change_governance.py \
+              "$policy_dir/pr_change_governance.py"
+            fetch_base_file \
+              scripts/ci/pr_change_governance_test.py \
+              "$policy_dir/pr_change_governance_test.py"
+            python3 "$policy_dir/pr_change_governance_test.py"
+            python3 "$policy_dir/pr_change_governance.py" \
+              --repository "$GITHUB_REPOSITORY" \
+              --pull-request "$PR_NUMBER"
+          )
+          policy_result=$?
+          set -e
+
+          if [[ "$policy_result" -eq 0 ]]; then
+            post_status success "Change-size and reviewer policy passed."
+          else
+            post_status failure "Change policy failed or could not be evaluated."
+          fi
+          exit "$policy_result"

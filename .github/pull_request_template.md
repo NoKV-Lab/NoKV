@@ -35,6 +35,15 @@ Closes | Fixes | Relates to #
 - [ ] Any breaking change is intentional and documented.
 - [ ] No compatibility shim, deprecated alias, or forwarding wrapper was added without a removal condition.
 
+## Change Size And Review
+
+- [ ] I checked GitHub's additions plus deletions for this pull request.
+- [ ] If the total is more than 10,000 lines, at least two distinct human
+      reviewers approved the exact current head commit. The author, bots,
+      duplicate reviewers, dismissed reviews, and stale approvals do not count.
+- [ ] This change is still small enough for a focused review; approval count is
+      not being used to justify mixed package or lifecycle boundaries.
+
 ## Code Contract (Code Changes Only)
 
 - [ ] Not applicable; this is a docs/config-only change.

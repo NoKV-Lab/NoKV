@@ -1,0 +1,12 @@
+# Copyright 2024-2026 The NoKV Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+# Every production, test, documentation, and workflow change must notify the
+# repository maintainers. All listed owners have direct write access.
+* @wchwawa @feichai0017 @zzzzwc
+
+# Keep governance-sensitive paths explicit even though the global rule covers
+# them. The last matching rule is authoritative in GitHub CODEOWNERS parsing.
+/.github/ @wchwawa @feichai0017 @zzzzwc
+/scripts/ci/ @wchwawa @feichai0017 @zzzzwc
+/docs/development/ @wchwawa @feichai0017 @zzzzwc
