@@ -35,6 +35,8 @@ lint:
 	cargo clippy --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --all-targets --features read-stats -- -D warnings
 
 workbench-test:
+	python3 scripts/workbench/pre423_contract_ledger.py
+	python3 scripts/workbench/pre423_contract_ledger_test.py
 	python3 scripts/workbench/workbench_contract_test.py
 	python3 scripts/workbench/live_workbench_test.py
 
@@ -50,6 +52,8 @@ verify:
 	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta --features metadata-read-stats
 	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-meta-holt --features read-stats
 	cargo test --manifest-path $(NOKV_MANIFEST) -p nokv-bench --features metadata-read-stats
+	python3 scripts/workbench/pre423_contract_ledger.py
+	python3 scripts/workbench/pre423_contract_ledger_test.py
 	python3 scripts/workbench/workbench_contract_test.py
 	python3 scripts/workbench/live_workbench_test.py
 	python3 scripts/ci/pr_change_governance_test.py

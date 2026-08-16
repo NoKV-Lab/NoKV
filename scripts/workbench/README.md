@@ -12,6 +12,10 @@ filesystem frontend.
 
 The checked-in integration assets are deliberately small:
 
+- `pre423_contract_ledger.json` is the 47-item machine-readable behavior and
+  migration-decision ledger for the pre-#423 recovery effort;
+  `pre423_contract_ledger.py` and its unit test keep stable ids, class and
+  disposition policy, evidence, ownership, and required gates complete.
 - `workbench_contract.py` verifies an MCP `tools/list` response against the
   exact Rust-owned schema at
   `crates/nokv-agent/workbench_contract_schema.json`.
@@ -44,6 +48,8 @@ Build and validate the product directly:
 ```bash
 cargo build -p nokv --bin nokv
 cargo test --workspace
+python3 scripts/workbench/pre423_contract_ledger.py
+python3 scripts/workbench/pre423_contract_ledger_test.py
 python3 scripts/workbench/workbench_contract_test.py
 python3 scripts/workbench/live_workbench_test.py
 python3 scripts/workbench/local_wal_recovery_gate_test.py
