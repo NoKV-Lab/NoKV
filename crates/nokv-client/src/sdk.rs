@@ -781,14 +781,18 @@ mod tests {
         }
     }
 
-    fn route(owner_epoch: u64) -> RootRoute {
+    fn route_with_fences(placement_generation: u64, owner_epoch: u64) -> RootRoute {
         RootRoute {
             root_id: RootIdentity([1; 16]),
             logical_shard_id: LogicalShardIdentity([2; 16]),
             object_namespace_id: nokv_protocol::ObjectNamespaceIdentity([8; 16]),
-            placement_generation: 3,
+            placement_generation,
             owner_epoch,
         }
+    }
+
+    fn route(owner_epoch: u64) -> RootRoute {
+        route_with_fences(3, owner_epoch)
     }
 
     fn resolved(owner_epoch: u64, port: u16) -> ResolvedRoute {
@@ -941,6 +945,55 @@ mod tests {
                  configured \
                  placement_generation=3 owner_epoch=7, owner hint requires \
                  placement_generation=3 owner_epoch=8; replace the route snapshot or use an \
+                 authoritative control-plane resolver"
+                    .to_owned()
+            )
+        );
+        assert_eq!(client.transport.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unchanged_static_route_reports_fresh_placement_generation_mismatch() {
+        let request_id = RequestIdentity([13; 16]);
+        let configured = route_with_fences(1, 1);
+        let hint = route_with_fences(2, 1);
+        let endpoint = SocketAddr::from(([127, 0, 0, 1], 4107));
+        let response = WorkspaceRpcResponse {
+            route: configured,
+            request_id,
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                code: ErrorCode::NotOwner,
+                message: "placement activated".to_owned(),
+                retryable: true,
+                conflict: Some(ConflictKind::RootPlacement),
+                current_generation: None,
+                route_hint: Some(hint),
+            }),
+        };
+        let transport = ScriptedTransport::new(vec![response]);
+        let resolver: Arc<dyn RouteResolver> =
+            Arc::new(StaticRouteResolver::new(configured, endpoint).unwrap());
+        let client = WorkspaceClient::new(
+            configured.root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        let error = client
+            .create_workspace(request_id, create_request())
+            .expect_err("the pre-activation generation cannot refresh itself");
+
+        assert_eq!(
+            error,
+            ClientError::InvalidRoute(
+                "NotOwner refresh returned the unchanged caller-managed route and endpoint; \
+                 configured \
+                 placement_generation=1 owner_epoch=1, owner hint requires \
+                 placement_generation=2 owner_epoch=1; replace the route snapshot or use an \
                  authoritative control-plane resolver"
                     .to_owned()
             )
