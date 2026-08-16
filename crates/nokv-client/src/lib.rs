@@ -26,7 +26,7 @@ pub use error::{ArtifactPublishStage, ClientError, TransportError};
 pub use route::ControlRouteResolver;
 #[cfg(feature = "etcd")]
 pub use route::EtcdRouteOptions;
-pub use route::{ResolvedRoute, RouteResolver, StaticRouteResolver};
+pub use route::{ResolvedRoute, RouteRefreshMode, RouteResolver, StaticRouteResolver};
 pub use sdk::{ClientCall, ClientOptions, WorkspaceClient};
 pub use snapshot_workflow::{
     SnapshotMintOptions, SnapshotRenewOptions, SnapshotRetireOptions, SnapshotRetireOutcome,

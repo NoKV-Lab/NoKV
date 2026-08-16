@@ -142,13 +142,19 @@ fn static_route_resolver(
         "--object-namespace-id",
         config.object_namespace_id.as_deref(),
     )?);
+    let placement_generation = config
+        .placement_generation
+        .ok_or(ConnectionError::MissingOption("--placement-generation"))?;
+    let owner_epoch = config
+        .owner_epoch
+        .ok_or(ConnectionError::MissingOption("--owner-epoch"))?;
     let resolver = StaticRouteResolver::new(
         RootRoute {
             root_id,
             logical_shard_id,
             object_namespace_id,
-            placement_generation: config.placement_generation,
-            owner_epoch: config.owner_epoch,
+            placement_generation,
+            owner_epoch,
         },
         config.metadata_address,
     )?;
@@ -236,8 +242,8 @@ mod tests {
                 metadata_address: "127.0.0.1:17750".parse().expect("test address is valid"),
                 logical_shard_id: Some(identity(0x22)),
                 object_namespace_id: Some(identity(0x33)),
-                placement_generation: 7,
-                owner_epoch: 9,
+                placement_generation: Some(7),
+                owner_epoch: Some(9),
             }),
             ..ClientConfig::default()
         }
@@ -288,6 +294,48 @@ mod tests {
         assert!(matches!(
             connect(&config),
             Err(ConnectionError::MissingOption("--logical-shard-id"))
+        ));
+    }
+
+    #[test]
+    fn parsed_static_route_requires_explicit_fences_before_connecting() {
+        let root_id = identity(0x11);
+        let logical_shard_id = identity(0x22);
+        let object_namespace_id = identity(0x33);
+        let parse = |extra: &[&str]| {
+            crate::cli::parse(
+                [
+                    "--root-id",
+                    root_id.as_str(),
+                    "--metadata-address",
+                    "127.0.0.1:17750",
+                    "--logical-shard-id",
+                    logical_shard_id.as_str(),
+                    "--object-namespace-id",
+                    object_namespace_id.as_str(),
+                ]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .chain([
+                    "--workbench-root",
+                    "/agents/test/wb",
+                    "workbench",
+                    "workbench_create",
+                    r#"{"id":"run-1"}"#,
+                ])
+                .map(str::to_owned),
+            )
+            .unwrap()
+            .client
+        };
+
+        assert!(matches!(
+            connect(&parse(&["--owner-epoch", "1"])),
+            Err(ConnectionError::MissingOption("--placement-generation"))
+        ));
+        assert!(matches!(
+            connect(&parse(&["--placement-generation", "2"])),
+            Err(ConnectionError::MissingOption("--owner-epoch"))
         ));
     }
 

@@ -24,7 +24,7 @@ use nokv_protocol::{
 };
 use sha2::{Digest as _, Sha256};
 
-use crate::{ClientError, ResolvedRoute, RouteResolver, RpcTransport};
+use crate::{ClientError, ResolvedRoute, RouteRefreshMode, RouteResolver, RpcTransport};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientOptions {
@@ -181,6 +181,7 @@ where
     ) -> Result<ClientCall<WorkspaceResult>, ClientError> {
         let mut resolved = self.routes.resolve(self.root_id, false)?;
         validate_resolved_route(resolved, self.root_id, expected_shard)?;
+        let refresh_mode = self.routes.refresh_mode();
 
         for attempt in 1..=self.options.max_attempts {
             let request = WorkspaceRpcRequest {
@@ -251,6 +252,14 @@ where
                                 resolved.route,
                                 "refreshed route",
                             )?;
+                            if refreshed == resolved
+                                && refresh_mode == RouteRefreshMode::CallerManaged
+                            {
+                                return Err(unchanged_not_owner_route(
+                                    resolved.route,
+                                    failure.route_hint,
+                                ));
+                            }
                             if let Some(hint) = failure.route_hint {
                                 validate_refreshed_route(refreshed.route, hint)?;
                             }
@@ -573,6 +582,23 @@ fn validate_refreshed_route(refreshed: RootRoute, hint: RootRoute) -> Result<(),
     Ok(())
 }
 
+fn unchanged_not_owner_route(configured: RootRoute, hint: Option<RootRoute>) -> ClientError {
+    let mismatch = hint.map_or_else(String::new, |hint| {
+        format!(
+            "; configured placement_generation={} owner_epoch={}, owner hint requires \
+             placement_generation={} owner_epoch={}",
+            configured.placement_generation,
+            configured.owner_epoch,
+            hint.placement_generation,
+            hint.owner_epoch
+        )
+    });
+    ClientError::InvalidRoute(format!(
+        "NotOwner refresh returned the unchanged caller-managed route and endpoint{mismatch}; \
+         replace the route snapshot or use an authoritative control-plane resolver"
+    ))
+}
+
 fn validate_route_continuity(
     candidate: RootRoute,
     current: RootRoute,
@@ -702,6 +728,28 @@ mod tests {
                 .expect("script contains one response per request");
             encode_response(&response)
                 .map_err(|error| crate::TransportError::new(error.to_string(), false))
+        }
+    }
+
+    struct ReplacingTransport {
+        inner: ScriptedTransport,
+        resolver: StaticRouteResolver,
+        replacement: Mutex<Option<ResolvedRoute>>,
+    }
+
+    impl RpcTransport for ReplacingTransport {
+        fn round_trip(
+            &self,
+            endpoint: SocketAddr,
+            request: &[u8],
+        ) -> Result<Vec<u8>, crate::TransportError> {
+            let response = self.inner.round_trip(endpoint, request)?;
+            if let Some(replacement) = self.replacement.lock().unwrap().take() {
+                self.resolver
+                    .replace(replacement.route, replacement.endpoint)
+                    .map_err(|error| crate::TransportError::new(error.to_string(), false))?;
+            }
+            Ok(response)
         }
     }
 
@@ -852,6 +900,152 @@ mod tests {
             vec![resolved(7, 4107).endpoint, resolved(8, 4108).endpoint]
         );
         assert_eq!(*refreshes.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn unchanged_static_route_reports_the_not_owner_fence_mismatch() {
+        let request_id = RequestIdentity([10; 16]);
+        let response = WorkspaceRpcResponse {
+            route: route(7),
+            request_id,
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                code: ErrorCode::NotOwner,
+                message: "owner changed".to_owned(),
+                retryable: true,
+                conflict: Some(ConflictKind::RootPlacement),
+                current_generation: None,
+                route_hint: Some(route(8)),
+            }),
+        };
+        let transport = ScriptedTransport::new(vec![response]);
+        let resolver: Arc<dyn RouteResolver> =
+            Arc::new(StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap());
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        let error = client
+            .create_workspace(request_id, create_request())
+            .expect_err("a pinned stale route cannot refresh itself");
+
+        assert_eq!(
+            error,
+            ClientError::InvalidRoute(
+                "NotOwner refresh returned the unchanged caller-managed route and endpoint; \
+                 configured \
+                 placement_generation=3 owner_epoch=7, owner hint requires \
+                 placement_generation=3 owner_epoch=8; replace the route snapshot or use an \
+                 authoritative control-plane resolver"
+                    .to_owned()
+            )
+        );
+        assert_eq!(client.transport.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unchanged_authoritative_route_preserves_the_older_hint_diagnostic() {
+        let request_id = RequestIdentity([11; 16]);
+        let response = WorkspaceRpcResponse {
+            route: route(7),
+            request_id,
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                code: ErrorCode::NotOwner,
+                message: "owner changed".to_owned(),
+                retryable: true,
+                conflict: Some(ConflictKind::RootPlacement),
+                current_generation: None,
+                route_hint: Some(route(8)),
+            }),
+        };
+        let transport = ScriptedTransport::new(vec![response]);
+        let refreshes = Arc::new(Mutex::new(Vec::new()));
+        let resolver = ScriptedResolver {
+            initial: resolved(7, 4107),
+            refreshed: resolved(7, 4107),
+            refreshes: Arc::clone(&refreshes),
+        };
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        let error = client
+            .create_workspace(request_id, create_request())
+            .expect_err("an authoritative resolver behind the owner hint must fail closed");
+
+        assert_eq!(
+            error,
+            ClientError::InvalidRoute(
+                "refreshed route is older than the NotOwner placement hint".to_owned()
+            )
+        );
+        assert_eq!(client.transport.requests.lock().unwrap().len(), 1);
+        assert_eq!(*refreshes.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn caller_managed_route_can_observe_a_concurrent_replacement() {
+        let request_id = RequestIdentity([12; 16]);
+        let first = WorkspaceRpcResponse {
+            route: route(7),
+            request_id,
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                code: ErrorCode::NotOwner,
+                message: "owner changed".to_owned(),
+                retryable: true,
+                conflict: Some(ConflictKind::RootPlacement),
+                current_generation: None,
+                route_hint: Some(route(8)),
+            }),
+        };
+        let second = WorkspaceRpcResponse {
+            route: route(8),
+            request_id,
+            commit_version: Some(12),
+            replayed: true,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(workspace_result())),
+        };
+        let resolver = StaticRouteResolver::new(route(7), resolved(7, 4107).endpoint).unwrap();
+        let transport = ReplacingTransport {
+            inner: ScriptedTransport::new(vec![first, second]),
+            resolver: resolver.clone(),
+            replacement: Mutex::new(Some(resolved(8, 4108))),
+        };
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        let result = client
+            .create_workspace(request_id, create_request())
+            .unwrap();
+
+        assert!(result.replayed);
+        let requests = client.transport.inner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].request_id, requests[1].request_id);
+        assert_eq!(requests[0].route.owner_epoch, 7);
+        assert_eq!(requests[1].route.owner_epoch, 8);
+        assert_eq!(
+            *client.transport.inner.endpoints.lock().unwrap(),
+            vec![resolved(7, 4107).endpoint, resolved(8, 4108).endpoint]
+        );
     }
 
     #[test]
