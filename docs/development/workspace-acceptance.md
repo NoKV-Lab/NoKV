@@ -179,10 +179,19 @@ The real-etcd local-WAL epoch runner is
 [`scripts/workbench/local_wal_recovery_gate.py`](../../scripts/workbench/local_wal_recovery_gate.py).
 Its bench-owned fault process acquires the real control lease and holds the
 same Holt authority; the production CLI contains no fault-only admission path.
+The independent object-provider runner is
+[`scripts/workbench/object_namespace_recovery_gate.py`](../../scripts/workbench/object_namespace_recovery_gate.py).
+It owns real etcd and digest-pinned RustFS instances and retains its raw process
+and MCP evidence separately from the epoch-boundary runner.
 
 Required evidence:
 
 - root placement is persisted before the first write;
+- every root has one immutable control-plane `ObjectNamespaceId` binding, the
+  configured bucket/prefix exposes the same durable marker, and Holt fences the
+  same identity before installing a route;
+- a missing or different marker fails closed, while endpoint changes that
+  resolve to the same durable marker do not create a new logical namespace;
 - a populated root stays on one logical shard;
 - routing never hashes a filename or recomputes placement with modulo shard
   count;
@@ -200,6 +209,13 @@ Required evidence:
 - the epoch kill/retry record names the exact NoKV commit and dirty state,
   binary digests, etcd version, control records, local crash epoch, commands,
   process exits, and terminal metadata probe.
+- the object-provider record proves healthy wrong-prefix rejection occurs
+  before workspace metadata, owner-control, or payload mutation, a `SIGKILL`
+  restart preserves exact payloads, temporary outage is reported as redacted
+  and retryable, and the same logical request succeeds after provider recovery;
+- the simulated PhyMat gate retains exact structure, ML-potential screening,
+  DFT relaxation, thermodynamic fields, and their provenance digest across
+  owner and provider restarts.
 
 ## Gate 7: SDK, CLI, MCP, And Package Boundaries
 

@@ -13,9 +13,9 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use nokv_protocol::{
-    decode_request, encode_request, ListPathsRequest, LogicalShardIdentity, PageRequest,
-    RequestIdentity, RootIdentity, RootRoute, WorkbenchName, WorkspaceReadView, WorkspaceRequest,
-    WorkspaceRpcRequest, WORKSPACE_PROTOCOL_SCHEMA,
+    decode_request, encode_request, ListPathsRequest, LogicalShardIdentity,
+    ObjectNamespaceIdentity, PageRequest, RequestIdentity, RootIdentity, RootRoute, WorkbenchName,
+    WorkspaceReadView, WorkspaceRequest, WorkspaceRpcRequest, WORKSPACE_PROTOCOL_SCHEMA,
 };
 use serde_json::json;
 
@@ -93,6 +93,7 @@ fn sample_request() -> Result<WorkspaceRpcRequest, String> {
         route: RootRoute {
             root_id: RootIdentity([1; 16]),
             logical_shard_id: LogicalShardIdentity([2; 16]),
+            object_namespace_id: ObjectNamespaceIdentity([8; 16]),
             placement_generation: 1,
             owner_epoch: 1,
         },

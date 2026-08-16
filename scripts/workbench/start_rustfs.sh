@@ -6,10 +6,8 @@ if [ "$#" -ne 0 ]; then
   exit 1
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-data_root="${NOKV_WORKBENCH_DATA_ROOT:-${repo_root}/target/workbench-live}"
 container="${NOKV_WORKBENCH_RUSTFS_CONTAINER:-nokv-workbench-rustfs}"
-image="${NOKV_WORKBENCH_RUSTFS_IMAGE:-rustfs/rustfs:latest}"
+image="${NOKV_WORKBENCH_RUSTFS_IMAGE:-rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab}"
 host="${NOKV_WORKBENCH_RUSTFS_HOST:-127.0.0.1}"
 port="${NOKV_WORKBENCH_RUSTFS_PORT:-9000}"
 console_port="${NOKV_WORKBENCH_RUSTFS_CONSOLE_PORT:-9001}"
@@ -17,7 +15,14 @@ access_key="${NOKV_WORKBENCH_S3_ACCESS_KEY_ID:-rustfsadmin}"
 secret_key="${NOKV_WORKBENCH_S3_SECRET_ACCESS_KEY:-rustfsadmin}"
 bucket="${NOKV_WORKBENCH_S3_BUCKET:-nokv-workbench-live}"
 endpoint="${NOKV_WORKBENCH_S3_ENDPOINT:-http://${host}:${port}}"
-rustfs_data="${NOKV_WORKBENCH_RUSTFS_DATA_DIR:-${data_root}/rustfs}"
+rustfs_data="${NOKV_WORKBENCH_RUSTFS_DATA_DIR:-}"
+rustfs_volume="${NOKV_WORKBENCH_RUSTFS_VOLUME:-${container}-data}"
+storage="docker volume ${rustfs_volume}"
+
+if [ -n "${rustfs_data}" ] && [ -n "${NOKV_WORKBENCH_RUSTFS_VOLUME:-}" ]; then
+  echo "set only one of NOKV_WORKBENCH_RUSTFS_DATA_DIR or NOKV_WORKBENCH_RUSTFS_VOLUME" >&2
+  exit 1
+fi
 
 if ! command -v aws >/dev/null 2>&1; then
   echo "aws CLI is required to create and verify the RustFS bucket" >&2
@@ -28,9 +33,18 @@ export AWS_ACCESS_KEY_ID="${access_key}"
 export AWS_SECRET_ACCESS_KEY="${secret_key}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 export AWS_EC2_METADATA_DISABLED=true
+export AWS_MAX_ATTEMPTS=1
+
+aws_s3() {
+  aws \
+    --cli-connect-timeout 1 \
+    --cli-read-timeout 2 \
+    --endpoint-url "${endpoint}" \
+    "$@"
+}
 
 endpoint_ready=0
-if aws --endpoint-url "${endpoint}" s3api list-buckets >/dev/null 2>&1; then
+if aws_s3 s3api list-buckets >/dev/null 2>&1; then
   endpoint_ready=1
 fi
 
@@ -40,7 +54,14 @@ if [ "${endpoint_ready}" != "1" ]; then
     exit 1
   fi
 
-  mkdir -p "${rustfs_data}"
+  if [ -n "${rustfs_data}" ]; then
+    mkdir -p "${rustfs_data}"
+    mount_args=(-v "${rustfs_data}:/data")
+    storage="${rustfs_data}"
+  else
+    docker volume create "${rustfs_volume}" >/dev/null
+    mount_args=(-v "${rustfs_volume}:/data")
+  fi
 
   if docker container inspect "${container}" >/dev/null 2>&1; then
     if [ "$(docker inspect -f '{{.State.Running}}' "${container}")" != "true" ]; then
@@ -54,21 +75,29 @@ if [ "${endpoint_ready}" != "1" ]; then
       -e "RUSTFS_ACCESS_KEY=${access_key}" \
       -e "RUSTFS_SECRET_KEY=${secret_key}" \
       -e "RUSTFS_CONSOLE_ENABLE=true" \
-      -v "${rustfs_data}:/data" \
+      "${mount_args[@]}" \
       "${image}" \
       --address :9000 \
       --console-enable \
-      --access-key "${access_key}" \
-      --secret-key "${secret_key}" \
       /data >/dev/null
   fi
 fi
 
 ready=0
 for _ in $(seq 1 60); do
-  if aws --endpoint-url "${endpoint}" s3api list-buckets >/dev/null 2>&1; then
+  if aws_s3 s3api list-buckets >/dev/null 2>&1; then
     ready=1
     break
+  fi
+  if docker container inspect "${container}" >/dev/null 2>&1; then
+    state="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "${container}")"
+    case "${state}" in
+      exited\ *|dead\ *)
+        echo "RustFS container exited before readiness (${state})" >&2
+        docker logs --tail 80 "${container}" >&2 || true
+        exit 1
+        ;;
+    esac
   fi
   sleep 1
 done
@@ -79,8 +108,8 @@ if [ "${ready}" != "1" ]; then
   exit 1
 fi
 
-if ! aws --endpoint-url "${endpoint}" s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
-  aws --endpoint-url "${endpoint}" s3api create-bucket --bucket "${bucket}" >/dev/null
+if ! aws_s3 s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+  aws_s3 s3api create-bucket --bucket "${bucket}" >/dev/null
 fi
 
 cat <<EOF
@@ -88,5 +117,5 @@ NoKV Workbench RustFS ready
   container: ${container}
   endpoint:  ${endpoint}
   bucket:    ${bucket}
-  data:      ${rustfs_data}
+  storage:   ${storage}
 EOF

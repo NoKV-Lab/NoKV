@@ -4,8 +4,9 @@ use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp
 use tokio::runtime::{Builder, Runtime};
 
 use crate::codec::{
-    decode_logical_shard_record, decode_owner_session, decode_root_placement,
-    encode_logical_shard_record, encode_owner_session, encode_root_placement,
+    decode_logical_shard_record, decode_owner_session, decode_root_object_namespace_binding,
+    decode_root_placement, encode_logical_shard_record, encode_owner_session,
+    encode_root_object_namespace_binding, encode_root_placement,
 };
 use crate::store::{
     prepare_mark_serving, prepare_owner_acquisition, prepare_owner_release,
@@ -14,7 +15,8 @@ use crate::store::{
 };
 use crate::{
     ControlError, EtcdControlStoreOptions, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    NodeId, OwnerEpoch, RecoveryPublication, RootId, RootPlacement, RootPlacementLifecycle,
+    NodeId, OwnerEpoch, RecoveryPublication, RootId, RootObjectNamespaceBinding, RootPlacement,
+    RootPlacementLifecycle,
 };
 
 pub struct EtcdControlStore {
@@ -72,6 +74,54 @@ impl EtcdControlStore {
 }
 
 impl ControlStore for EtcdControlStore {
+    fn create_root_object_namespace_binding(
+        &self,
+        binding: RootObjectNamespaceBinding,
+    ) -> Result<RootObjectNamespaceBinding, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        self.block_on(async move {
+            let key = options.root_object_namespace_key(&binding.root_id);
+            let encoded = encode_root_object_namespace_binding(&binding)?;
+            let txn = Txn::new()
+                .when(vec![Compare::version(key.clone(), CompareOp::Equal, 0)])
+                .and_then(vec![TxnOp::put(key, encoded, None)]);
+            if client.txn(txn).await.map_err(etcd_backend)?.succeeded() {
+                return Ok(binding);
+            }
+            let current =
+                fetch_root_object_namespace_binding(&mut client, &options, &binding.root_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ControlError::Backend(
+                            "root object namespace binding disappeared after create conflict"
+                                .to_owned(),
+                        )
+                    })?;
+            if current == binding {
+                Ok(current)
+            } else {
+                Err(ControlError::RootObjectNamespaceAlreadyBound {
+                    root_id: binding.root_id,
+                    existing: current.object_namespace_id,
+                    requested: binding.object_namespace_id,
+                })
+            }
+        })
+    }
+
+    fn get_root_object_namespace_binding(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootObjectNamespaceBinding>, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let root_id = *root_id;
+        self.block_on(async move {
+            fetch_root_object_namespace_binding(&mut client, &options, &root_id).await
+        })
+    }
+
     fn create_root_placement(
         &self,
         placement: RootPlacement,
@@ -533,6 +583,25 @@ impl ControlStore for EtcdControlStore {
             }
         })
     }
+}
+
+async fn fetch_root_object_namespace_binding(
+    client: &mut Client,
+    options: &EtcdControlStoreOptions,
+    root_id: &RootId,
+) -> Result<Option<RootObjectNamespaceBinding>, ControlError> {
+    let key = options.root_object_namespace_key(root_id);
+    let response = client.get(key.clone(), None).await.map_err(etcd_backend)?;
+    let Some(kv) = response.kvs().first() else {
+        return Ok(None);
+    };
+    let binding = decode_root_object_namespace_binding(kv.value())?;
+    if binding.root_id != *root_id || kv.key() != key.as_slice() {
+        return Err(ControlError::Codec(
+            "root object namespace key and value identities differ".to_owned(),
+        ));
+    }
+    Ok(Some(binding))
 }
 
 async fn fetch_root_placement(

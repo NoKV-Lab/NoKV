@@ -337,7 +337,13 @@ def client_args(config: Config) -> list[str]:
 
 
 def provision_command(config: Config) -> list[str]:
-    return [str(config.binary), *control_args(config), "provision", config.shard_id]
+    return [
+        str(config.binary),
+        *control_args(config),
+        *object_args(config),
+        "provision",
+        config.shard_id,
+    ]
 
 
 def server_command(config: Config) -> list[str]:

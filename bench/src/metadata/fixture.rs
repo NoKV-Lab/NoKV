@@ -18,8 +18,9 @@ use nokv_protocol::{LogicalShardIdentity, RootIdentity, RootRoute, WorkbenchName
 use nokv_server::MetadataWorkspaceRequestExecutor;
 use nokv_types::{
     ArtifactRevisionId, CommandDigest, Generation, LogicalShardId, NormalizedRelativePath,
-    OwnerEpoch, PlacementGeneration, ReferenceEpoch, RequestId, RevisionState, RootActivationState,
-    RootId, WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, FIXED_ID_BYTES, SHA256_BYTES,
+    ObjectNamespaceId, OwnerEpoch, PlacementGeneration, ReferenceEpoch, RequestId, RevisionState,
+    RootActivationState, RootId, WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision,
+    FIXED_ID_BYTES, SHA256_BYTES,
 };
 
 use super::options::MetadataOptions;
@@ -93,6 +94,7 @@ impl Harness {
                 &meta,
                 identity.root,
                 identity.shard,
+                identity.object_namespace,
                 identity.placement,
                 identity.owner,
                 request_id(options.seed, 3),
@@ -122,6 +124,7 @@ impl Harness {
         let route = RootRoute {
             root_id: RootIdentity(*identity.root.as_bytes()),
             logical_shard_id: LogicalShardIdentity(*identity.shard.as_bytes()),
+            object_namespace_id: identity.object_namespace.into(),
             placement_generation: identity.placement.get(),
             owner_epoch: identity.owner.get(),
         };
@@ -144,6 +147,7 @@ impl Harness {
 struct Identities {
     shard: LogicalShardId,
     root: RootId,
+    object_namespace: ObjectNamespaceId,
     placement: PlacementGeneration,
     owner: OwnerEpoch,
 }
@@ -153,6 +157,7 @@ impl Identities {
         Ok(Self {
             shard: LogicalShardId::from_bytes(fixed_id(seed, 1)),
             root: RootId::from_bytes(fixed_id(seed, 2)),
+            object_namespace: ObjectNamespaceId::from_bytes(fixed_id(seed, 3)),
             placement: PlacementGeneration::new(1).map_err(|error| error.to_string())?,
             owner: OwnerEpoch::new(1).map_err(|error| error.to_string())?,
         })
@@ -171,6 +176,7 @@ fn execute_fence(
                 schema_id: SCHEMA_ID.to_owned(),
                 root_id: identity.root,
                 logical_shard_id: identity.shard,
+                object_namespace_id: Some(identity.object_namespace),
                 placement_generation: identity.placement,
                 owner_epoch: identity.owner,
                 request_id,
@@ -210,6 +216,7 @@ fn finish_fixture_workspace(
         store,
         identity.root,
         identity.shard,
+        identity.object_namespace,
         identity.placement,
         identity.owner,
         request_id,
@@ -221,6 +228,7 @@ fn finish_fixture_workspace(
                 schema_id: SCHEMA_ID.to_owned(),
                 root_id: context.root_id,
                 logical_shard_id: context.logical_shard_id,
+                object_namespace_id: Some(context.object_namespace_id),
                 placement_generation: context.placement_generation,
                 owner_epoch: context.owner_epoch,
                 request_id: context.request_id,
@@ -267,6 +275,7 @@ fn seed_paths(
             store,
             identity.root,
             identity.shard,
+            identity.object_namespace,
             identity.placement,
             identity.owner,
             request_id(seed, request_sequence),
@@ -356,6 +365,7 @@ fn seed_paths(
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,
+                    object_namespace_id: Some(context.object_namespace_id),
                     placement_generation: context.placement_generation,
                     owner_epoch: context.owner_epoch,
                     request_id: context.request_id,

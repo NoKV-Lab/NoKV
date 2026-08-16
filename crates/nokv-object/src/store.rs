@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use nokv_types::ObjectNamespaceId;
 use opendal::blocking::Operator as BlockingOperator;
 use opendal::options::WriteOptions;
 use opendal::services::S3;
@@ -85,6 +86,16 @@ pub enum ObjectError {
     InvalidManifest(String),
     MissingBucket,
     MissingRegion,
+    ObjectNamespaceUninitialized,
+    InvalidObjectNamespaceMarker,
+    UnsupportedObjectNamespaceMarkerVersion {
+        actual: u8,
+        expected: u8,
+    },
+    ObjectNamespaceMismatch {
+        expected: ObjectNamespaceId,
+        actual: ObjectNamespaceId,
+    },
     CreateAmbiguous {
         key: ObjectKey,
         detail: String,
@@ -93,7 +104,10 @@ pub enum ObjectError {
         key: ObjectKey,
         detail: String,
     },
-    Backend(String),
+    Backend {
+        detail: String,
+        retryable: bool,
+    },
 }
 
 /// Immutable durable-object boundary.
@@ -101,6 +115,14 @@ pub enum ObjectError {
 /// `create_immutable` may create a missing key or accept an exact-byte replay.
 /// It must never replace different bytes at an existing key.
 pub trait ArtifactObjectStore {
+    /// Durable identity of the physical bucket/prefix after verification.
+    ///
+    /// Raw provider handles return `None`; callers that combine object bytes
+    /// with metadata must use a verified namespace-bound store.
+    fn object_namespace(&self) -> Option<ObjectNamespaceId> {
+        None
+    }
+
     fn capabilities(&self) -> ArtifactStoreCapabilities;
 
     fn create_immutable(
@@ -124,6 +146,10 @@ impl<T> ArtifactObjectStore for Arc<T>
 where
     T: ArtifactObjectStore + ?Sized,
 {
+    fn object_namespace(&self) -> Option<ObjectNamespaceId> {
+        (**self).object_namespace()
+    }
+
     fn capabilities(&self) -> ArtifactStoreCapabilities {
         (**self).capabilities()
     }
@@ -415,10 +441,10 @@ impl S3ArtifactStore {
         }
 
         let operator = Operator::new(builder)
-            .map_err(ObjectError::backend)?
+            .map_err(ObjectError::opendal_backend)?
             .finish();
         let _runtime_guard = OPENDAL_RUNTIME.enter();
-        let operator = BlockingOperator::new(operator).map_err(ObjectError::backend)?;
+        let operator = BlockingOperator::new(operator).map_err(ObjectError::opendal_backend)?;
         Ok(Self { operator })
     }
 
@@ -511,7 +537,7 @@ impl ArtifactObjectStore for S3ArtifactStore {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 Err(ObjectError::ObjectNotFound { key: key.clone() })
             }
-            Err(error) => Err(ObjectError::backend(error)),
+            Err(error) => Err(ObjectError::opendal_backend(error)),
         }
     }
 
@@ -522,7 +548,7 @@ impl ArtifactObjectStore for S3ArtifactStore {
                 size: metadata.content_length(),
             })),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(ObjectError::backend(error)),
+            Err(error) => Err(ObjectError::opendal_backend(error)),
         }
     }
 
@@ -604,12 +630,34 @@ fn immutable_collision(key: &ObjectKey, expected: &[u8], actual: &[u8]) -> Objec
 }
 
 impl ObjectError {
+    pub fn backend_failure(detail: impl Into<String>, retryable: bool) -> Self {
+        Self::Backend {
+            detail: detail.into(),
+            retryable,
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Backend {
+                retryable: true,
+                ..
+            }
+        )
+    }
+
     pub(crate) fn backend(error: impl fmt::Display) -> Self {
-        Self::Backend(error.to_string())
+        Self::backend_failure(error.to_string(), false)
+    }
+
+    pub(crate) fn opendal_backend(error: opendal::Error) -> Self {
+        let retryable = error.is_temporary();
+        Self::backend_failure(error.to_string(), retryable)
     }
 
     pub(crate) fn poisoned(error: impl fmt::Display) -> Self {
-        Self::Backend(format!("artifact object lock poisoned: {error}"))
+        Self::backend_failure(format!("artifact object lock poisoned: {error}"), false)
     }
 }
 
@@ -653,13 +701,26 @@ impl fmt::Display for ObjectError {
             Self::InvalidManifest(detail) => write!(formatter, "invalid artifact manifest: {detail}"),
             Self::MissingBucket => formatter.write_str("S3 bucket is required"),
             Self::MissingRegion => formatter.write_str("S3 region is required"),
+            Self::ObjectNamespaceUninitialized => {
+                formatter.write_str("artifact object namespace is not initialized")
+            }
+            Self::InvalidObjectNamespaceMarker => {
+                formatter.write_str("artifact object namespace marker is invalid")
+            }
+            Self::UnsupportedObjectNamespaceMarkerVersion { actual, expected } => write!(
+                formatter,
+                "unsupported artifact object namespace marker version {actual}; expected {expected}"
+            ),
+            Self::ObjectNamespaceMismatch { .. } => {
+                formatter.write_str("artifact object namespace does not match root placement")
+            }
             Self::CreateAmbiguous { key, detail } => {
                 write!(formatter, "immutable create outcome is ambiguous for {key}: {detail}")
             }
             Self::DeleteAmbiguous { key, detail } => {
                 write!(formatter, "delete outcome is ambiguous for {key}: {detail}")
             }
-            Self::Backend(detail) => write!(formatter, "artifact object backend error: {detail}"),
+            Self::Backend { .. } => formatter.write_str("artifact object backend is unavailable"),
         }
     }
 }

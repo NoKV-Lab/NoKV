@@ -83,6 +83,16 @@ impl EtcdControlStoreOptions {
         .into_bytes()
     }
 
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn root_object_namespace_key(&self, root_id: &RootId) -> Vec<u8> {
+        format!(
+            "{}/root-object-namespaces/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(root_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
     #[cfg(feature = "etcd")]
     pub(crate) fn root_placements_prefix(&self) -> Vec<u8> {
         format!("{}/roots/", self.normalized_key_prefix()).into_bytes()
@@ -153,6 +163,10 @@ mod tests {
         assert_eq!(
             String::from_utf8(options.root_placement_key(&root_id(0x01))).unwrap(),
             "/nokv/test/roots/01010101010101010101010101010101"
+        );
+        assert_eq!(
+            String::from_utf8(options.root_object_namespace_key(&root_id(0x01))).unwrap(),
+            "/nokv/test/root-object-namespaces/01010101010101010101010101010101"
         );
         assert_eq!(
             String::from_utf8(options.logical_shard_record_key(&shard_id(0x02))).unwrap(),

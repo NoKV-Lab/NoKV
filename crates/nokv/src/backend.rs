@@ -2040,30 +2040,47 @@ fn map_client_error(error: ClientError) -> agent::BackendError {
         }
         return mapped;
     }
-    let kind = match &error {
-        ClientError::Protocol(_)
-        | ClientError::ResponseMismatch(_)
-        | ClientError::MissingCapabilities(_)
-        | ClientError::ArtifactIntegrity(_)
-        | ClientError::ArtifactReadFenceChanged => agent::BackendErrorKind::InvalidState,
-        ClientError::Transport(_) => agent::BackendErrorKind::Other("Transport".to_owned()),
-        ClientError::Object(_) | ClientError::ArtifactUpload(_) => {
-            agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
+    let kind = if object_failure(&error) {
+        agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
+    } else {
+        match &error {
+            ClientError::Protocol(_)
+            | ClientError::ResponseMismatch(_)
+            | ClientError::MissingCapabilities(_)
+            | ClientError::ArtifactIntegrity(_)
+            | ClientError::ArtifactReadFenceChanged => agent::BackendErrorKind::InvalidState,
+            ClientError::Transport(_) => agent::BackendErrorKind::Other("Transport".to_owned()),
+            ClientError::Object(_) | ClientError::ArtifactUpload(_) => unreachable!(),
+            ClientError::InvalidOptions(_) | ClientError::InvalidRoute(_) => {
+                agent::BackendErrorKind::InvalidState
+            }
+            ClientError::ArtifactPublishFailed { .. } | ClientError::RetryExhausted { .. } => {
+                agent::BackendErrorKind::Other("ClientFailure".to_owned())
+            }
+            ClientError::Rpc(_) => unreachable!("RPC failures returned above"),
         }
-        ClientError::InvalidOptions(_) | ClientError::InvalidRoute(_) => {
-            agent::BackendErrorKind::InvalidState
-        }
-        ClientError::ArtifactPublishFailed { .. } | ClientError::RetryExhausted { .. } => {
-            agent::BackendErrorKind::Other("ClientFailure".to_owned())
-        }
-        ClientError::Rpc(_) => unreachable!("RPC failures returned above"),
     };
-    agent::BackendError::new(
+    let mut mapped = agent::BackendError::new(
         kind,
         error.to_string(),
         error.retryable(),
         json!({"source": "nokv-client"}),
-    )
+    );
+    if let Some(attempts) = retry_attempts(&error) {
+        if let Value::Object(details) = &mut mapped.details {
+            details.insert("attempts".to_owned(), json!(attempts));
+        }
+    }
+    mapped
+}
+
+fn object_failure(error: &ClientError) -> bool {
+    match error {
+        ClientError::Object(_) | ClientError::ArtifactUpload(_) => true,
+        ClientError::ArtifactPublishFailed { source, .. } => object_failure(source),
+        ClientError::RetryExhausted { last_error, .. } => object_failure(last_error),
+        _ => false,
+    }
 }
 
 fn retry_attempts(error: &ClientError) -> Option<u32> {
@@ -2234,6 +2251,7 @@ mod tests {
         wire::RootRoute {
             root_id: wire::RootIdentity([1; 16]),
             logical_shard_id: wire::LogicalShardIdentity([2; 16]),
+            object_namespace_id: wire::ObjectNamespaceIdentity([8; 16]),
             placement_generation: 3,
             owner_epoch: 4,
         }
@@ -3048,6 +3066,27 @@ mod tests {
         assert!(mapped.retryable);
         assert_eq!(mapped.details["attempts"], 5);
         assert_eq!(mapped.details["current_generation"], 9);
+    }
+
+    #[test]
+    fn exhausted_temporary_object_failure_remains_typed_retryable_and_redacted() {
+        let mapped = map_client_error(ClientError::RetryExhausted {
+            attempts: 3,
+            last_error: Box::new(ClientError::Object(
+                nokv_object::ObjectError::backend_failure(
+                    "endpoint=http://127.0.0.1:9000 bucket=private",
+                    true,
+                ),
+            )),
+        });
+        assert_eq!(
+            mapped.kind,
+            agent::BackendErrorKind::Other("ObjectUnavailable".to_owned())
+        );
+        assert!(mapped.retryable);
+        assert_eq!(mapped.details["attempts"], 3);
+        assert!(!mapped.message.contains("127.0.0.1"));
+        assert!(!mapped.message.contains("private"));
     }
 
     #[test]

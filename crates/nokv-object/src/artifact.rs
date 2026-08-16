@@ -92,6 +92,12 @@ pub struct ArtifactUploadFailure {
     pub stats: ArtifactUploadStats,
 }
 
+impl ArtifactUploadFailure {
+    pub fn retryable(&self) -> bool {
+        self.source.retryable()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactBlockRead {
     pub key: ObjectKey,

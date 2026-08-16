@@ -242,9 +242,15 @@ where
                         if should_refresh {
                             if let Some(hint) = failure.route_hint {
                                 validate_route(hint, self.root_id, expected_shard)?;
+                                validate_route_continuity(hint, resolved.route, "NotOwner hint")?;
                             }
                             let refreshed = self.routes.resolve(self.root_id, true)?;
                             validate_resolved_route(refreshed, self.root_id, expected_shard)?;
+                            validate_route_continuity(
+                                refreshed.route,
+                                resolved.route,
+                                "refreshed route",
+                            )?;
                             if let Some(hint) = failure.route_hint {
                                 validate_refreshed_route(refreshed.route, hint)?;
                             }
@@ -567,6 +573,26 @@ fn validate_refreshed_route(refreshed: RootRoute, hint: RootRoute) -> Result<(),
     Ok(())
 }
 
+fn validate_route_continuity(
+    candidate: RootRoute,
+    current: RootRoute,
+    source: &str,
+) -> Result<(), ClientError> {
+    if candidate.root_id != current.root_id
+        || candidate.logical_shard_id != current.logical_shard_id
+    {
+        return Err(ClientError::InvalidRoute(format!(
+            "{source} changes immutable root or logical-shard identity"
+        )));
+    }
+    if candidate.object_namespace_id != current.object_namespace_id {
+        return Err(ClientError::InvalidRoute(format!(
+            "{source} changes immutable object namespace identity"
+        )));
+    }
+    Ok(())
+}
+
 fn exhausted_or_last<T>(
     attempts: u32,
     max_attempts: u32,
@@ -711,6 +737,7 @@ mod tests {
         RootRoute {
             root_id: RootIdentity([1; 16]),
             logical_shard_id: LogicalShardIdentity([2; 16]),
+            object_namespace_id: nokv_protocol::ObjectNamespaceIdentity([8; 16]),
             placement_generation: 3,
             owner_epoch,
         }
@@ -825,6 +852,58 @@ mod tests {
             vec![resolved(7, 4107).endpoint, resolved(8, 4108).endpoint]
         );
         assert_eq!(*refreshes.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn not_owner_refresh_cannot_change_the_root_object_namespace() {
+        let request_id = RequestIdentity([10; 16]);
+        let mut drifted = route(8);
+        drifted.object_namespace_id = nokv_protocol::ObjectNamespaceIdentity([9; 16]);
+        let first = WorkspaceRpcResponse {
+            route: route(7),
+            request_id,
+            commit_version: None,
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                code: ErrorCode::NotOwner,
+                message: "owner changed".to_owned(),
+                retryable: true,
+                conflict: Some(ConflictKind::RootPlacement),
+                current_generation: None,
+                route_hint: Some(drifted),
+            }),
+        };
+        let second = WorkspaceRpcResponse {
+            route: drifted,
+            request_id,
+            commit_version: Some(12),
+            replayed: true,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(workspace_result())),
+        };
+        let transport = ScriptedTransport::new(vec![first, second]);
+        let refreshes = Arc::new(Mutex::new(Vec::new()));
+        let resolver = ScriptedResolver {
+            initial: resolved(7, 4107),
+            refreshed: ResolvedRoute::new(drifted, SocketAddr::from(([127, 0, 0, 1], 4108)))
+                .unwrap(),
+            refreshes: Arc::clone(&refreshes),
+        };
+        let client = WorkspaceClient::new(
+            route(7).root_id,
+            transport,
+            resolver,
+            ClientOptions::default(),
+        )
+        .unwrap();
+
+        let error = client
+            .create_workspace(request_id, create_request())
+            .expect_err("object namespace identity is immutable for one root");
+
+        assert!(matches!(error, ClientError::InvalidRoute(message)
+            if message.contains("object namespace")));
+        assert_eq!(client.transport.requests.lock().unwrap().len(), 1);
+        assert_eq!(*refreshes.lock().unwrap(), vec![false]);
     }
 
     #[test]

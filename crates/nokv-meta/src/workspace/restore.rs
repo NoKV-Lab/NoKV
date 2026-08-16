@@ -3077,6 +3077,7 @@ fn build_restore_command(
         schema_id: SCHEMA_ID.to_owned(),
         root_id: context.root_id,
         logical_shard_id: context.logical_shard_id,
+        object_namespace_id: Some(context.object_namespace_id),
         placement_generation: context.placement_generation,
         owner_epoch: context.owner_epoch,
         request_id: context.request_id,
@@ -3477,6 +3478,7 @@ mod tests {
             store,
             root(),
             shard(),
+            nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
             placement(),
             owner_epoch,
             request(counter),
@@ -3503,6 +3505,9 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
             placement_generation: placement(),
             owner_epoch,
             request_id,
@@ -3561,6 +3566,9 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
             placement_generation: placement(),
             owner_epoch,
             request_id: request(counter),
@@ -3781,6 +3789,9 @@ mod tests {
                 schema_id: SCHEMA_ID.to_owned(),
                 root_id: root(),
                 logical_shard_id: shard(),
+                object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                    [10; FIXED_ID_BYTES],
+                )),
                 placement_generation: placement(),
                 owner_epoch,
                 request_id: context.request_id,
@@ -4764,6 +4775,7 @@ mod tests {
         PublicationContext {
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
             placement_generation: placement(),
             owner_epoch,
             request_id: request(counter),

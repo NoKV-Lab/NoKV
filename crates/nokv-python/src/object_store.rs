@@ -99,6 +99,12 @@ impl PythonObjectStoreConfig {
     }
 }
 
+impl ConfiguredObjectStore {
+    pub(crate) fn is_memory(&self) -> bool {
+        matches!(self, Self::Memory(_))
+    }
+}
+
 impl PythonObjectStoreConfig {
     pub(crate) fn build(&self) -> Result<ConfiguredObjectStore, ObjectError> {
         match &self.options {

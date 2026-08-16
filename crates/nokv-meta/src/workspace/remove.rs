@@ -403,6 +403,7 @@ pub fn remove_path(
         schema_id: SCHEMA_ID.to_owned(),
         root_id: request.context.root_id,
         logical_shard_id: request.context.logical_shard_id,
+        object_namespace_id: Some(request.context.object_namespace_id),
         placement_generation: request.context.placement_generation,
         owner_epoch: request.context.owner_epoch,
         request_id: request.context.request_id,
@@ -623,7 +624,16 @@ mod tests {
     }
 
     fn write_context(store: &MetaShard, request_id: RequestId) -> RootWriteContext {
-        RootWriteContext::current(store, root(), shard(), placement(), owner(), request_id).unwrap()
+        RootWriteContext::current(
+            store,
+            root(),
+            shard(),
+            nokv_types::ObjectNamespaceId::from_bytes([10; FIXED_ID_BYTES]),
+            placement(),
+            owner(),
+            request_id,
+        )
+        .unwrap()
     }
 
     fn fence_command(
@@ -635,6 +645,9 @@ mod tests {
             schema_id: SCHEMA_ID.to_owned(),
             root_id: root(),
             logical_shard_id: shard(),
+            object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                [10; FIXED_ID_BYTES],
+            )),
             placement_generation: placement(),
             owner_epoch: owner(),
             request_id,
@@ -753,6 +766,7 @@ mod tests {
                     schema_id: SCHEMA_ID.to_owned(),
                     root_id: context.root_id,
                     logical_shard_id: context.logical_shard_id,
+                    object_namespace_id: Some(context.object_namespace_id),
                     placement_generation: context.placement_generation,
                     owner_epoch: context.owner_epoch,
                     request_id: context.request_id,
