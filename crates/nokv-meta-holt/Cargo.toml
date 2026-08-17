@@ -17,6 +17,7 @@ test-support = []
 [dependencies]
 holt.workspace = true
 nokv-meta-store.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 nokv-meta-store = { workspace = true, features = ["test-support"] }

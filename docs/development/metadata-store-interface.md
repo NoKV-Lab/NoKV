@@ -430,11 +430,15 @@ pub enum StoreConfig {
 pub enum OpenMode {
     New,
     Existing,
+    RecoverLog,
 }
 ```
 
 `New` requires an empty namespace. `Existing` requires the exact supported
 physical layout, workspace schema marker, and logical-shard identity.
+`RecoverLog` creates or resumes a local authority from the exact receipt-bound
+shared-log frontier stored in Control; it never falls back to `New` or
+`Existing` based on path existence.
 
 The current CLI and server expose only the Holt local profile as an explicit
 new or existing filesystem path. Provider-neutral `StoreConfig`, persistent
@@ -524,11 +528,16 @@ that becomes Active later requires an owner restart until runtime attachment is
 implemented.
 
 The current Holt-only bootstrap admits a first `New` owner, an epoch-zero
-`Existing` retry, an exact live-session `Resume`, and same-namespace
-`Existing` restart after owner loss. A live session, non-empty shared recovery
-frontier, local/control epoch mismatch, or store validation failure remains
-fail-closed. Bootstrap does not yet select provider construction from a
-provider-neutral persistent configuration.
+`Existing` retry, an exact live-session `Resume`, same-namespace `Existing`
+restart after owner loss, and `RecoverLog` from a strict receipt-directed log
+frontier. Existing and recovery paths prove the local durable chain against
+Control both before and after owner acquisition. `RecoverLog` can resume a
+verified local-ahead state left by pending replay or owner activation; a digest
+divergence, stale lease, live prior session, malformed receipt, ambiguous
+cleanup, or uninitialized replacement remains fail-closed. A Control
+checkpoint still requires a published bounded Holt install API and is not
+admitted by the default build. Bootstrap does not yet select provider
+construction from a provider-neutral persistent configuration.
 
 In the target runtime, open mode does not decide successor admission.
 `StoreProfile::authority` and the server's qualification policy decide whether

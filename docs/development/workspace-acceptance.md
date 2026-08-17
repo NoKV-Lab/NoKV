@@ -129,6 +129,12 @@ Required evidence:
 
 ## Gate 4: Snapshot, Commit, And Restore
 
+The restart/composition runner is
+[`scripts/workbench/restore_composition_gate.py`](../../scripts/workbench/restore_composition_gate.py).
+It owns real etcd and digest-pinned RustFS, uses a feature-only bench owner for
+the exact fault boundary, and always reopens with an independently built
+default `nokv` binary.
+
 Required evidence:
 
 - snapshot mint creates a leased history hold at one read version;
@@ -145,6 +151,17 @@ Required evidence:
   visibility command;
 - retries after process loss, owner loss, or response loss converge to the same
   terminal result;
+- the pre-Complete owner-loss boundary is reached only after both exact
+  destination manifest publications and their durable restore binding exist,
+  while member-build and revision-seal progress are both zero;
+- the fault owner writes create-new, file-synced, parent-directory-synced
+  evidence and exits with code 86; validation failure exits 87, and no timed
+  signal is accepted as phase evidence;
+- after the fault session expires, the default successor observes the
+  destination hidden, the restore Running, and both publication operations
+  Succeeded through real operation reads before exact replay;
+- replay retains the restore operation and destination commit identities,
+  changes no object inventory, and then completes the A-to-B-to-C composition;
 - after A succeeds and B replaces it, exact retry of A returns A's original
   terminal result for both original `replace=false` and `replace=true`, without
   reading the current workspace head or run-manifest path;
@@ -206,6 +223,14 @@ Required evidence:
 - local-WAL restart kills `Recovering(E+1)` both before and after the local
   owner fence advances, waits for the lease-attached etcd session to disappear,
   and proves retry reaches `Serving(E+1)` without allocating `E+2`;
+- graceful `SIGINT`/`SIGTERM` stops RPC admission, drains accepted connections
+  while lease renewal remains active, joins lifecycle workers, and releases the
+  exact owner before process exit; owner loss or release failure remains an
+  error instead of being reclassified as graceful shutdown;
+- the real graceful-shutdown stage uses a ten-second lease but requires exit 0
+  and a linearizable proof of session deletion within four seconds, then
+  immediately reopens the same Holt authority and reads the deterministic
+  nonempty payload byte-for-byte, so lease TTL expiry cannot satisfy the gate;
 - the epoch kill/retry record names the exact NoKV commit and dirty state,
   binary digests, etcd version, control records, local crash epoch, commands,
   process exits, and terminal metadata probe.
@@ -216,6 +241,15 @@ Required evidence:
 - the simulated PhyMat gate retains exact structure, ML-potential screening,
   DFT relaxation, thermodynamic fields, and their provenance digest across
   owner and provider restarts.
+- restore crash qualification records exact socket readiness, lease-session
+  loss, bounded MCP `ClientFailure`, controlled exit, both binary digests, and
+  the two authoritative publication reads; its access-key identifier and
+  secret value are both redacted;
+- within this workspace, `restore-crash-test-support` is enabled only by the
+  Cargo-publish-disabled bench package. The feature exists on `nokv-server` so
+  the bench can install its exact-operation barrier, while default server and
+  CLI builds contain no fault hook, flag, environment branch, or arbitrary
+  executor injection surface.
 
 ## Gate 7: SDK, CLI, MCP, And Package Boundaries
 
@@ -275,5 +309,6 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 python3 scripts/workbench/workbench_contract_test.py
+python3 scripts/workbench/restore_composition_gate_test.py
 git diff --check
 ```

@@ -7,18 +7,21 @@ before and after the local Holt owner fence is advanced. The driver is killed,
 its lease-backed etcd session is allowed to expire, and the real ``nokv`` CLI
 must reopen the same metadata path without consuming epoch three.
 
-Artifact payload behavior is deliberately not exercised here. The production
-CLI still admits the configured namespace against its durable marker before it
-can own metadata, so this gate receives a real S3-compatible profile. The
-separate live object-namespace gate owns RustFS outage and payload assertions.
+The two crash boundaries exercise only namespace admission. A separate
+graceful-shutdown stage writes one deterministic nonempty payload, sends
+``SIGTERM`` under a ten-second lease, requires exact session deletion within
+four seconds, immediately reopens the same metadata path, and reads the old
+bytes exactly. RustFS outage behavior remains in the object-namespace gate.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -31,13 +34,17 @@ from pathlib import Path
 from typing import Any, Sequence, TextIO
 
 
-SCHEMA = "nokv.local_wal_recovery_gate.v1"
+SCHEMA = "nokv.local_wal_recovery_gate.v2"
 CRASH_STAGES = ("before-local-fence", "after-local-fence")
 # Reopening admits a successor only because the local authority directory is
 # itself the mutex. The crash stages prove sequential handover; this one proves
 # the exclusion that replaced the blanket successor refusal, and proves it
 # across real processes rather than two calls inside one.
 CONCURRENT_STAGE = "concurrent-takeover"
+GRACEFUL_STAGE = "graceful-owner-shutdown"
+GRACEFUL_TTL_SECONDS = 10
+GRACEFUL_RELEASE_DEADLINE_SECONDS = 4.0
+GRACEFUL_PAYLOAD = b"graceful-shutdown-proof\n"
 
 
 class NotQualified(RuntimeError):
@@ -97,7 +104,9 @@ def validate_stage_evidence(evidence: dict[str, object]) -> None:
             f"{evidence.get('fault_exit_code')!r}"
         )
     if evidence.get("session_absent_before_retry") is not True:
-        raise WorkflowFailure(f"{stage} killed owner session remained live before retry")
+        raise WorkflowFailure(
+            f"{stage} killed owner session remained live before retry"
+        )
     if evidence.get("final_state") != "Serving":
         raise WorkflowFailure(
             f"{stage} retry ended in {evidence.get('final_state')!r}, expected Serving"
@@ -117,7 +126,9 @@ def validate_concurrent_evidence(evidence: dict[str, object]) -> None:
             f"{evidence.get('loser_exit_code')!r}"
         )
     if not str(evidence.get("loser_stderr") or "").strip():
-        raise WorkflowFailure(f"{CONCURRENT_STAGE} second owner failed without a diagnostic")
+        raise WorkflowFailure(
+            f"{CONCURRENT_STAGE} second owner failed without a diagnostic"
+        )
     # The whole point of the stage: the refusal must land before the control
     # plane is touched, so the record is byte-identical across the attempt and
     # no owner epoch was spent on a takeover that never happened.
@@ -132,12 +143,73 @@ def validate_concurrent_evidence(evidence: dict[str, object]) -> None:
             f"{CONCURRENT_STAGE} incumbent was not Serving(1): {before!r}"
         )
     if evidence.get("incumbent_alive_after") is not True:
-        raise WorkflowFailure(f"{CONCURRENT_STAGE} incumbent did not survive the takeover")
+        raise WorkflowFailure(
+            f"{CONCURRENT_STAGE} incumbent did not survive the takeover"
+        )
     probe = evidence.get("metadata_probe")
     if not isinstance(probe, dict) or probe.get("status") != "success":
         raise WorkflowFailure(
             f"{CONCURRENT_STAGE} incumbent stopped serving after the refused takeover"
         )
+
+
+def validate_graceful_evidence(evidence: dict[str, object]) -> None:
+    if evidence.get("stage") != GRACEFUL_STAGE:
+        raise WorkflowFailure(f"unknown graceful stage {evidence.get('stage')!r}")
+    if evidence.get("signal") != "SIGTERM":
+        raise WorkflowFailure(f"{GRACEFUL_STAGE} did not use SIGTERM")
+    if evidence.get("lease_ttl_seconds") != GRACEFUL_TTL_SECONDS:
+        raise WorkflowFailure(f"{GRACEFUL_STAGE} did not use the exact long lease TTL")
+    if evidence.get("release_deadline_seconds") != GRACEFUL_RELEASE_DEADLINE_SECONDS:
+        raise WorkflowFailure(f"{GRACEFUL_STAGE} changed the exact release deadline")
+    owner_exit_code = evidence.get("owner_exit_code")
+    if isinstance(owner_exit_code, bool) or owner_exit_code != 0:
+        raise WorkflowFailure(
+            f"{GRACEFUL_STAGE} owner did not exit cleanly: "
+            f"{evidence.get('owner_exit_code')!r}"
+        )
+    shutdown_elapsed = evidence.get("shutdown_elapsed_seconds")
+    session_elapsed = evidence.get("session_removed_elapsed_seconds")
+    if (
+        isinstance(shutdown_elapsed, bool)
+        or not isinstance(shutdown_elapsed, (int, float))
+        or isinstance(session_elapsed, bool)
+        or not isinstance(session_elapsed, (int, float))
+        or not math.isfinite(float(shutdown_elapsed))
+        or not math.isfinite(float(session_elapsed))
+        or shutdown_elapsed < 0
+        or session_elapsed < shutdown_elapsed
+        or session_elapsed > GRACEFUL_RELEASE_DEADLINE_SECONDS
+    ):
+        raise WorkflowFailure(
+            f"{GRACEFUL_STAGE} exceeded or invalidated the release deadline: "
+            f"exit={shutdown_elapsed!r}, session={session_elapsed!r}"
+        )
+    if GRACEFUL_RELEASE_DEADLINE_SECONDS >= GRACEFUL_TTL_SECONDS / 2:
+        raise WorkflowFailure(
+            "graceful release deadline could be confused with lease expiry"
+        )
+    if evidence.get("session_absent_before_reopen") is not True:
+        raise WorkflowFailure(f"{GRACEFUL_STAGE} session was still live before reopen")
+    if evidence.get("reopen_started_after_session_absent") is not True:
+        raise WorkflowFailure(f"{GRACEFUL_STAGE} reopened before session removal")
+    if evidence.get("reopen_owner_epoch") != 2:
+        raise WorkflowFailure(
+            f"{GRACEFUL_STAGE} reopen did not acquire owner epoch 2: "
+            f"{evidence.get('reopen_owner_epoch')!r}"
+        )
+    expected = evidence.get("payload_expected_base64")
+    observed = evidence.get("payload_observed_base64")
+    if expected != base64.b64encode(GRACEFUL_PAYLOAD).decode() or observed != expected:
+        raise WorkflowFailure(f"{GRACEFUL_STAGE} payload bytes changed across reopen")
+    probe = evidence.get("metadata_probe")
+    if (
+        not isinstance(probe, dict)
+        or probe.get("status") != "success"
+        or probe.get("bytes_encoding") != "base64"
+        or probe.get("bytes") != observed
+    ):
+        raise WorkflowFailure(f"{GRACEFUL_STAGE} terminal byte read did not succeed")
 
 
 def run(
@@ -158,7 +230,9 @@ def run(
     if check and result.returncode != 0:
         rendered = " ".join(str(item) for item in argv)
         output = (result.stderr or result.stdout).strip()
-        raise WorkflowFailure(f"command failed ({result.returncode}): {rendered}\n{output}")
+        raise WorkflowFailure(
+            f"command failed ({result.returncode}): {rendered}\n{output}"
+        )
     return result
 
 
@@ -168,7 +242,9 @@ def free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def stop(process: subprocess.Popen[bytes] | None, sig: signal.Signals = signal.SIGKILL) -> None:
+def stop(
+    process: subprocess.Popen[bytes] | None, sig: signal.Signals = signal.SIGKILL
+) -> None:
     if process is None or process.poll() is not None:
         return
     os.kill(process.pid, sig)
@@ -183,7 +259,9 @@ def wait_tcp(process: subprocess.Popen[bytes], port: int, timeout: float) -> Non
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise WorkflowFailure(f"server exited before readiness with {process.returncode}")
+            raise WorkflowFailure(
+                f"server exited before readiness with {process.returncode}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
@@ -201,7 +279,9 @@ def wait_exit(process: subprocess.Popen[bytes], timeout: float) -> int:
         ) from error
 
 
-def wait_json(path: Path, process: subprocess.Popen[bytes], timeout: float) -> dict[str, Any]:
+def wait_json(
+    path: Path, process: subprocess.Popen[bytes], timeout: float
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     while time.monotonic() < deadline:
@@ -264,7 +344,9 @@ def wait_etcd(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise WorkflowFailure(f"etcd exited before readiness with {process.returncode}")
+            raise WorkflowFailure(
+                f"etcd exited before readiness with {process.returncode}"
+            )
         result = run(
             [etcdctl, f"--endpoints={endpoint}", "endpoint", "health"],
             cwd=cwd,
@@ -277,7 +359,9 @@ def wait_etcd(
     raise WorkflowFailure(f"etcd did not become healthy at {endpoint}")
 
 
-def start_process(argv: Sequence[os.PathLike[str] | str], cwd: Path, log: TextIO) -> subprocess.Popen[bytes]:
+def start_process(
+    argv: Sequence[os.PathLike[str] | str], cwd: Path, log: TextIO
+) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [str(item) for item in argv],
         cwd=cwd,
@@ -287,7 +371,15 @@ def start_process(argv: Sequence[os.PathLike[str] | str], cwd: Path, log: TextIO
     )
 
 
-def control_args(binary: Path, root_id: str, endpoint: str, prefix: str) -> list[str]:
+def control_args(
+    binary: Path,
+    root_id: str,
+    endpoint: str,
+    prefix: str,
+    lease_ttl_seconds: int = 2,
+) -> list[str]:
+    if lease_ttl_seconds <= 0:
+        raise WorkflowFailure("etcd lease TTL must be positive")
     return [
         str(binary),
         "--root-id",
@@ -297,7 +389,7 @@ def control_args(binary: Path, root_id: str, endpoint: str, prefix: str) -> list
         "--etcd-key-prefix",
         prefix,
         "--etcd-lease-ttl-seconds",
-        "2",
+        str(lease_ttl_seconds),
     ]
 
 
@@ -311,6 +403,31 @@ def object_args(stage: str, endpoint: str, bucket: str, root: str) -> list[str]:
         endpoint,
         "--object-root",
         f"{root.rstrip('/')}/{stage}",
+    ]
+
+
+def server_command(
+    common: list[str],
+    objects: list[str],
+    port: int,
+    node: str,
+    metadata_option: str,
+    metadata: Path,
+) -> list[str]:
+    if "--agent-id" in common:
+        raise WorkflowFailure("shard serve command must not carry one AgentId")
+    return [
+        *common,
+        *objects,
+        "--bind",
+        f"127.0.0.1:{port}",
+        "--advertise-endpoint",
+        f"127.0.0.1:{port}",
+        "--node-id",
+        node,
+        metadata_option,
+        str(metadata),
+        "serve",
     ]
 
 
@@ -328,7 +445,9 @@ def decode_control_record(
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as error:
-        raise WorkflowFailure(f"decode logical-shard control record: {error}") from error
+        raise WorkflowFailure(
+            f"decode logical-shard control record: {error}"
+        ) from error
     if not isinstance(value, dict):
         raise WorkflowFailure("logical-shard control record is not an object")
     return value
@@ -355,17 +474,19 @@ def run_stage(
     ready_path = stage_dir / "fault-ready.json"
     config_path = stage_dir / "fault-config.json"
     root_id = fixed_id(seed, f"{stage}:root")
+    agent_id = fixed_id(seed, f"{stage}:agent")
     shard_id = fixed_id(seed, f"{stage}:shard")
     prefix = f"/nokv/local-wal-recovery/{fixed_id(seed, stage)}"
     record_key = f"{prefix}/logical-shards/{shard_id}"
     session_key = f"{prefix}/sessions/{shard_id}"
     common = control_args(binary, root_id, etcd_endpoint, prefix)
+    agent_common = [*common, "--agent-id", agent_id]
     objects = object_args(stage, object_endpoint, object_bucket, object_root)
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*common, *objects, "provision", shard_id]
+        provision_command = [*agent_common, *objects, "provision", shard_id]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -373,24 +494,24 @@ def run_stage(
         first_port = free_port()
         first_log = (stage_dir / "owner-e1.log").open("w")
         logs.append(first_log)
-        first_command = [
-            *common,
-            *objects,
-            "--bind",
-            f"127.0.0.1:{first_port}",
-            "--advertise-endpoint",
-            f"127.0.0.1:{first_port}",
-            "--node-id",
+        first_command = server_command(
+            common,
+            objects,
+            first_port,
             f"gate-{stage}-e1",
             "--metadata-create",
             metadata,
-            "serve",
-        ]
+        )
         first = start_process(first_command, repo, first_log)
         processes.append(first)
         wait_tcp(first, first_port, timeout)
 
-        client = [*common, "--workbench-root", "/agents/issue450/wb", *objects]
+        client = [
+            *agent_common,
+            "--workbench-root",
+            "/agents/issue450/wb",
+            *objects,
+        ]
         create_command = [
             *client,
             "workbench",
@@ -434,9 +555,15 @@ def run_stage(
             etcdctl, etcd_endpoint, record_key, cwd=repo, timeout=timeout
         )
         if recovering.get("owner_epoch") != 2 or recovering.get("state") != 2:
-            raise WorkflowFailure(f"fault driver did not retain Recovering(2): {recovering}")
-        if not etcd_value(etcdctl, etcd_endpoint, session_key, cwd=repo, timeout=timeout):
-            raise WorkflowFailure("fault driver published its boundary without a live session")
+            raise WorkflowFailure(
+                f"fault driver did not retain Recovering(2): {recovering}"
+            )
+        if not etcd_value(
+            etcdctl, etcd_endpoint, session_key, cwd=repo, timeout=timeout
+        ):
+            raise WorkflowFailure(
+                "fault driver published its boundary without a live session"
+            )
 
         stop(fault)
         fault_exit_code = fault.returncode
@@ -448,19 +575,14 @@ def run_stage(
         retry_port = free_port()
         retry_log = (stage_dir / "owner-e2-retry.log").open("w")
         logs.append(retry_log)
-        retry_command = [
-            *common,
-            *objects,
-            "--bind",
-            f"127.0.0.1:{retry_port}",
-            "--advertise-endpoint",
-            f"127.0.0.1:{retry_port}",
-            "--node-id",
+        retry_command = server_command(
+            common,
+            objects,
+            retry_port,
             f"gate-{stage}-retry",
             "--metadata-reopen",
             metadata,
-            "serve",
-        ]
+        )
         retry = start_process(retry_command, repo, retry_log)
         processes.append(retry)
         wait_tcp(retry, retry_port, timeout)
@@ -477,7 +599,9 @@ def run_stage(
         )
         stop(retry)
         retry_exit_code = retry.returncode
-        state_name = "Serving" if final.get("state") == 3 else f"state-{final.get('state')}"
+        state_name = (
+            "Serving" if final.get("state") == 3 else f"state-{final.get('state')}"
+        )
         result: dict[str, object] = {
             "stage": stage,
             "previous_owner_epoch": 1,
@@ -519,6 +643,208 @@ def run_stage(
             log.close()
 
 
+def run_graceful_stage(
+    *,
+    repo: Path,
+    binary: Path,
+    etcdctl: Path,
+    etcd_endpoint: str,
+    evidence: Path,
+    seed: str,
+    object_endpoint: str,
+    object_bucket: str,
+    object_root: str,
+    timeout: float,
+) -> dict[str, object]:
+    stage = GRACEFUL_STAGE
+    stage_dir = evidence / stage
+    stage_dir.mkdir(parents=True)
+    metadata = stage_dir / "metadata"
+    root_id = fixed_id(seed, f"{stage}:root")
+    agent_id = fixed_id(seed, f"{stage}:agent")
+    shard_id = fixed_id(seed, f"{stage}:shard")
+    prefix = f"/nokv/local-wal-recovery/{fixed_id(seed, stage)}"
+    record_key = f"{prefix}/logical-shards/{shard_id}"
+    session_key = f"{prefix}/sessions/{shard_id}"
+    common = control_args(
+        binary,
+        root_id,
+        etcd_endpoint,
+        prefix,
+        GRACEFUL_TTL_SECONDS,
+    )
+    agent_common = [*common, "--agent-id", agent_id]
+    objects = object_args(stage, object_endpoint, object_bucket, object_root)
+    processes: list[subprocess.Popen[bytes]] = []
+    logs: list[TextIO] = []
+
+    try:
+        provision_command = [*agent_common, *objects, "provision", shard_id]
+        provision = run(provision_command, cwd=repo, timeout=timeout)
+        (stage_dir / "provision.stdout.log").write_text(provision.stdout)
+        (stage_dir / "provision.stderr.log").write_text(provision.stderr)
+
+        owner_port = free_port()
+        owner_log = (stage_dir / "owner-e1.log").open("w")
+        logs.append(owner_log)
+        owner_command = server_command(
+            common,
+            objects,
+            owner_port,
+            f"gate-{stage}-e1",
+            "--metadata-create",
+            metadata,
+        )
+        owner = start_process(owner_command, repo, owner_log)
+        processes.append(owner)
+        wait_tcp(owner, owner_port, timeout)
+
+        client = [
+            *agent_common,
+            "--workbench-root",
+            "/agents/issue450/wb",
+            *objects,
+        ]
+        create_command = [
+            *client,
+            "workbench",
+            "workbench_create",
+            canonical_json({"id": "graceful-proof"}),
+        ]
+        create = json.loads(run(create_command, cwd=repo, timeout=timeout).stdout)
+        put_command = [
+            *client,
+            "workbench",
+            "workbench_put_file",
+            canonical_json(
+                {
+                    "id": "graceful-proof",
+                    "section": "outputs",
+                    "path": "owner.txt",
+                    "text": GRACEFUL_PAYLOAD.decode(),
+                    "content_type": "text/plain",
+                    "replace": False,
+                }
+            ),
+        ]
+        put = json.loads(run(put_command, cwd=repo, timeout=timeout).stdout)
+        initial = decode_control_record(
+            etcdctl, etcd_endpoint, record_key, cwd=repo, timeout=timeout
+        )
+        if initial.get("owner_epoch") != 1 or initial.get("state") != 3:
+            raise WorkflowFailure(f"graceful owner did not reach Serving(1): {initial}")
+        if not etcd_value(
+            etcdctl, etcd_endpoint, session_key, cwd=repo, timeout=timeout
+        ):
+            raise WorkflowFailure("graceful owner did not hold a live lease session")
+
+        shutdown_started = time.monotonic()
+        os.kill(owner.pid, signal.SIGTERM)
+        try:
+            owner_exit_code = int(owner.wait(timeout=GRACEFUL_RELEASE_DEADLINE_SECONDS))
+        except subprocess.TimeoutExpired as error:
+            raise WorkflowFailure(
+                f"graceful owner did not exit within "
+                f"{GRACEFUL_RELEASE_DEADLINE_SECONDS:.1f}s"
+            ) from error
+        shutdown_elapsed = time.monotonic() - shutdown_started
+        session_absent = not bool(
+            etcd_value(etcdctl, etcd_endpoint, session_key, cwd=repo, timeout=timeout)
+        )
+        session_removed_elapsed = time.monotonic() - shutdown_started
+        if owner_exit_code != 0:
+            raise WorkflowFailure(
+                f"graceful owner did not exit cleanly: {owner_exit_code}"
+            )
+        if not session_absent:
+            raise WorkflowFailure(
+                "graceful owner session remained live after clean exit"
+            )
+        if session_removed_elapsed > GRACEFUL_RELEASE_DEADLINE_SECONDS:
+            raise WorkflowFailure(
+                f"graceful owner session removal took {session_removed_elapsed:.3f}s, "
+                f"exceeding {GRACEFUL_RELEASE_DEADLINE_SECONDS:.1f}s"
+            )
+
+        retry_port = free_port()
+        retry_log = (stage_dir / "owner-e2-reopen.log").open("w")
+        logs.append(retry_log)
+        retry_command = server_command(
+            common,
+            objects,
+            retry_port,
+            f"gate-{stage}-e2",
+            "--metadata-reopen",
+            metadata,
+        )
+        retry = start_process(retry_command, repo, retry_log)
+        processes.append(retry)
+        wait_tcp(retry, retry_port, timeout)
+        read_command = [
+            *client,
+            "workbench",
+            "workbench_read",
+            canonical_json(
+                {
+                    "id": "graceful-proof",
+                    "section": "outputs",
+                    "path": "owner.txt",
+                    "format": "bytes",
+                    "limit": len(GRACEFUL_PAYLOAD),
+                }
+            ),
+        ]
+        metadata_probe = json.loads(run(read_command, cwd=repo, timeout=timeout).stdout)
+        reopened = decode_control_record(
+            etcdctl, etcd_endpoint, record_key, cwd=repo, timeout=timeout
+        )
+        stop(retry, signal.SIGTERM)
+        retry_exit_code = retry.returncode
+
+        expected_payload = base64.b64encode(GRACEFUL_PAYLOAD).decode()
+        result: dict[str, object] = {
+            "stage": stage,
+            "signal": "SIGTERM",
+            "lease_ttl_seconds": GRACEFUL_TTL_SECONDS,
+            "release_deadline_seconds": GRACEFUL_RELEASE_DEADLINE_SECONDS,
+            "owner_exit_code": owner_exit_code,
+            "shutdown_elapsed_seconds": shutdown_elapsed,
+            "session_removed_elapsed_seconds": session_removed_elapsed,
+            "session_absent_before_reopen": session_absent,
+            "reopen_started_after_session_absent": True,
+            "reopen_owner_epoch": reopened.get("owner_epoch"),
+            "payload_expected_base64": expected_payload,
+            "payload_observed_base64": metadata_probe.get("bytes"),
+            "metadata_probe": metadata_probe,
+            "initial_control_record": initial,
+            "reopened_control_record": reopened,
+            "create_result": create,
+            "put_result": put,
+            "etcd_prefix": prefix,
+            "logical_shard_id": shard_id,
+            "metadata_path": str(metadata),
+            "process_exit_codes": {
+                "owner_e1": owner_exit_code,
+                "owner_e2_reopen": retry_exit_code,
+            },
+            "commands": {
+                "provision": [str(item) for item in provision_command],
+                "owner_e1": [str(item) for item in owner_command],
+                "create": [str(item) for item in create_command],
+                "put": [str(item) for item in put_command],
+                "owner_e2_reopen": [str(item) for item in retry_command],
+                "terminal_byte_read": [str(item) for item in read_command],
+            },
+        }
+        validate_graceful_evidence(result)
+        return result
+    finally:
+        for process in reversed(processes):
+            stop(process)
+        for log in logs:
+            log.close()
+
+
 def run_concurrent_stage(
     *,
     repo: Path,
@@ -537,16 +863,18 @@ def run_concurrent_stage(
     stage_dir.mkdir(parents=True)
     metadata = stage_dir / "metadata"
     root_id = fixed_id(seed, f"{stage}:root")
+    agent_id = fixed_id(seed, f"{stage}:agent")
     shard_id = fixed_id(seed, f"{stage}:shard")
     prefix = f"/nokv/local-wal-recovery/{fixed_id(seed, stage)}"
     record_key = f"{prefix}/logical-shards/{shard_id}"
     common = control_args(binary, root_id, etcd_endpoint, prefix)
+    agent_common = [*common, "--agent-id", agent_id]
     objects = object_args(stage, object_endpoint, object_bucket, object_root)
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[TextIO] = []
 
     try:
-        provision_command = [*common, *objects, "provision", shard_id]
+        provision_command = [*agent_common, *objects, "provision", shard_id]
         provision = run(provision_command, cwd=repo, timeout=timeout)
         (stage_dir / "provision.stdout.log").write_text(provision.stdout)
         (stage_dir / "provision.stderr.log").write_text(provision.stderr)
@@ -554,24 +882,24 @@ def run_concurrent_stage(
         incumbent_port = free_port()
         incumbent_log = (stage_dir / "owner-incumbent.log").open("w")
         logs.append(incumbent_log)
-        incumbent_command = [
-            *common,
-            *objects,
-            "--bind",
-            f"127.0.0.1:{incumbent_port}",
-            "--advertise-endpoint",
-            f"127.0.0.1:{incumbent_port}",
-            "--node-id",
+        incumbent_command = server_command(
+            common,
+            objects,
+            incumbent_port,
             f"gate-{stage}-incumbent",
             "--metadata-create",
             metadata,
-            "serve",
-        ]
+        )
         incumbent = start_process(incumbent_command, repo, incumbent_log)
         processes.append(incumbent)
         wait_tcp(incumbent, incumbent_port, timeout)
 
-        client = [*common, "--workbench-root", "/agents/issue450/wb", *objects]
+        client = [
+            *agent_common,
+            "--workbench-root",
+            "/agents/issue450/wb",
+            *objects,
+        ]
         create_command = [
             *client,
             "workbench",
@@ -589,19 +917,14 @@ def run_concurrent_stage(
         # The incumbent keeps serving throughout. A second process now asks to
         # reopen the very directory the incumbent holds open.
         challenger_port = free_port()
-        challenger_command = [
-            *common,
-            *objects,
-            "--bind",
-            f"127.0.0.1:{challenger_port}",
-            "--advertise-endpoint",
-            f"127.0.0.1:{challenger_port}",
-            "--node-id",
+        challenger_command = server_command(
+            common,
+            objects,
+            challenger_port,
             f"gate-{stage}-challenger",
             "--metadata-reopen",
             metadata,
-            "serve",
-        ]
+        )
         challenger = subprocess.Popen(
             [str(item) for item in challenger_command],
             cwd=repo,
@@ -789,6 +1112,20 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                 )
             )
         stages.append(
+            run_graceful_stage(
+                repo=repo,
+                binary=binary,
+                etcdctl=Path(args.etcdctl_bin),
+                etcd_endpoint=endpoint,
+                evidence=evidence,
+                seed=args.seed,
+                object_endpoint=args.object_endpoint,
+                object_bucket=args.object_bucket,
+                object_root=args.object_root,
+                timeout=args.timeout,
+            )
+        )
+        stages.append(
             run_concurrent_stage(
                 repo=repo,
                 binary=binary,
@@ -806,7 +1143,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         stop(etcd, signal.SIGTERM)
         etcd_log.close()
 
-    git_head = run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=args.timeout).stdout.strip()
+    git_head = run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, timeout=args.timeout
+    ).stdout.strip()
     git_status = run(
         ["git", "status", "--porcelain=v1"], cwd=repo, timeout=args.timeout
     ).stdout.splitlines()
@@ -838,8 +1177,11 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             "recovery_epoch": 2,
             "retry_must_not_allocate_epoch": 3,
             "session_must_expire_before_retry": True,
+            "graceful_session_must_be_released_before_retry": True,
+            "graceful_release_deadline_seconds": GRACEFUL_RELEASE_DEADLINE_SECONDS,
+            "graceful_lease_ttl_seconds": GRACEFUL_TTL_SECONDS,
             "concurrent_takeover_must_not_touch_control": True,
-            "stages": [*CRASH_STAGES, CONCURRENT_STAGE],
+            "stages": [*CRASH_STAGES, GRACEFUL_STAGE, CONCURRENT_STAGE],
         },
         "stages": stages,
     }

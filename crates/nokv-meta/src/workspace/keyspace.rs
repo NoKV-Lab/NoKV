@@ -59,10 +59,13 @@ pub enum MetadataFamily {
     GcCandidate = 0x15,
     GcBarrier = 0x16,
     WorkspaceIncarnationClaim = 0x17,
+    GenericIndexCurrent = 0x19,
+    GenericIndexGeneration = 0x1a,
+    CommitGenericIndexMember = 0x1b,
 }
 
 impl MetadataFamily {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 23] = [
         Self::WorkspaceCurrent,
         Self::PathCurrent,
         Self::ArtifactRevision,
@@ -83,6 +86,9 @@ impl MetadataFamily {
         Self::GcCandidate,
         Self::GcBarrier,
         Self::WorkspaceIncarnationClaim,
+        Self::GenericIndexCurrent,
+        Self::GenericIndexGeneration,
+        Self::CommitGenericIndexMember,
     ];
 
     /// Storage-neutral keyspace used by transaction-store requests.
@@ -118,6 +124,9 @@ impl MetadataFamily {
             0x15 => Some(Self::GcCandidate),
             0x16 => Some(Self::GcBarrier),
             0x17 => Some(Self::WorkspaceIncarnationClaim),
+            0x19 => Some(Self::GenericIndexCurrent),
+            0x1a => Some(Self::GenericIndexGeneration),
+            0x1b => Some(Self::CommitGenericIndexMember),
             _ => None,
         }
     }
@@ -145,11 +154,14 @@ impl MetadataFamily {
             Self::GcCandidate => "gc_candidate",
             Self::GcBarrier => "gc_barrier",
             Self::WorkspaceIncarnationClaim => "workspace_incarnation_claim",
+            Self::GenericIndexCurrent => "generic_index_current",
+            Self::GenericIndexGeneration => "generic_index_generation",
+            Self::CommitGenericIndexMember => "commit_generic_index_member",
         }
     }
 }
 
-const KEYSPACES: [KeyspaceDef; 26] = [
+const KEYSPACES: [KeyspaceDef; 29] = [
     SYSTEM,
     ROOT_FENCE,
     COMMAND_DEDUPE,
@@ -176,6 +188,9 @@ const KEYSPACES: [KeyspaceDef; 26] = [
     KeyspaceDef::new(0x0215, "gc_candidate"),
     KeyspaceDef::new(0x0216, "gc_barrier"),
     KeyspaceDef::new(0x0217, "workspace_incarnation_claim"),
+    KeyspaceDef::new(0x0219, "generic_index_current"),
+    KeyspaceDef::new(0x021a, "generic_index_generation"),
+    KeyspaceDef::new(0x021b, "commit_generic_index_member"),
 ];
 
 /// Exact logical keyspace catalog for the current workspace schema.
@@ -191,7 +206,7 @@ mod tests {
 
     #[test]
     fn catalog_has_unique_ids_and_names() {
-        assert_eq!(keyspaces().len(), 26);
+        assert_eq!(keyspaces().len(), 29);
         let ids = keyspaces()
             .iter()
             .map(|definition| definition.id)
@@ -239,6 +254,9 @@ mod tests {
                 (0x0215, "gc_candidate"),
                 (0x0216, "gc_barrier"),
                 (0x0217, "workspace_incarnation_claim"),
+                (0x0219, "generic_index_current"),
+                (0x021a, "generic_index_generation"),
+                (0x021b, "commit_generic_index_member"),
             ]
         );
     }

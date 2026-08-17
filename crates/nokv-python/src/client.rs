@@ -7,23 +7,25 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nokv_client::{
-    ArtifactPublishOptions, ArtifactPublishOutcome, ClientError, ClientOptions, FramedTcpOptions,
-    FramedTcpTransport, RouteResolver, WorkspaceClient,
+    ArtifactPublishOptions, ArtifactPublishOutcome, ArtifactRangeBatchRequest, ClientError,
+    ClientOptions, FramedTcpOptions, FramedTcpTransport, RouteResolver, SnapshotMintOptions,
+    SnapshotRenewOptions, SnapshotRetireOptions, WorkspaceClient,
 };
 use nokv_object::ArtifactObjectStore;
 use nokv_protocol::{
-    AggregateRequest, ArtifactRevisionIdentity, CatalogRequest, ContentType,
-    CreateWorkspaceRequest, FindWorkspacesRequest, GetPathRequest, OperationIdentity, PageRequest,
-    PathListEntry, PathMetadata, PathPage, PublishCondition, QueryScope, RelativePath,
-    RemovePathRequest, RootIdentity, SearchRequest, WorkbenchName, WorkspaceIdentity,
+    AggregateRequest, ArtifactRevisionIdentity, ByteRange, CatalogRequest, ContentType,
+    CreateWorkspaceRequest, FindWorkspacesRequest, GetPathRequest, GetWorkspaceRequest,
+    OperationIdentity, PageRequest, PathListEntry, PathMetadata, PathPage, PublishCondition,
+    QueryProfile, QueryScope, RelativePath, RemovePathRequest, RenamePathRequest, RootIdentity,
+    SearchRequest, SnapshotAlias, SnapshotSelector, WorkbenchName, WorkspaceIdentity,
     WorkspacePath, WorkspaceReadView,
 };
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyFileExistsError, PyFileNotFoundError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::local_adapter::{
     collect_local_files, create_materialized_file, join_remote_path, materialized_relative_path,
@@ -34,12 +36,16 @@ use crate::python_value::{
     aggregate_result_to_py, catalog_result_to_py, find_workspaces_result_to_py, hex,
     parse_aggregates, parse_field_specs, parse_fixed_hex, parse_predicates, parse_sort,
     path_metadata_to_py, path_page_to_py, publish_outcome_to_py, read_outcome_to_py,
-    search_result_to_py, workspace_summary_to_py, PythonAggregateSpec, PythonFieldSpec,
-    PythonPredicateSpec, PythonSortSpec,
+    search_result_to_py, snapshot_result_to_py, workspace_summary_to_py, PythonAggregateSpec,
+    PythonFieldSpec, PythonPredicateSpec, PythonSortSpec,
 };
 use crate::routing::PythonRoutingConfig;
 
 type RustWorkspaceClient = WorkspaceClient<FramedTcpTransport, Arc<dyn RouteResolver>>;
+type PythonRangeBatchRequest = (String, Vec<(u64, u64)>, Option<u64>, Option<u64>);
+
+const DEFAULT_SNAPSHOT_LEASE_SECONDS: u64 = 7 * 24 * 60 * 60;
+const MAX_SNAPSHOT_LEASE_SECONDS: u64 = 90 * 24 * 60 * 60;
 
 #[derive(Clone, Debug)]
 struct MaterializedFile {
@@ -71,7 +77,8 @@ impl PythonWorkspaceClient {
         max_attempts = 3,
         connect_timeout_ms = 5_000,
         read_timeout_ms = 30_000,
-        write_timeout_ms = 30_000
+        write_timeout_ms = 30_000,
+        handshake_timeout_ms = 5_000
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -83,10 +90,12 @@ impl PythonWorkspaceClient {
         connect_timeout_ms: u64,
         read_timeout_ms: u64,
         write_timeout_ms: u64,
+        handshake_timeout_ms: u64,
     ) -> PyResult<Self> {
         let root_id = RootIdentity(parse_fixed_hex("root_id", root_id)?);
         let transport = FramedTcpTransport::new(FramedTcpOptions {
             connect_timeout: Duration::from_millis(connect_timeout_ms),
+            handshake_timeout: Duration::from_millis(handshake_timeout_ms),
             read_timeout: Duration::from_millis(read_timeout_ms),
             write_timeout: Duration::from_millis(write_timeout_ms),
         })
@@ -98,7 +107,10 @@ impl PythonWorkspaceClient {
         let client =
             WorkspaceClient::new(root_id, transport, resolver, ClientOptions { max_attempts })
                 .map_err(value_error)?;
-        let objects = object_store.build().map_err(value_error)?;
+        let object_store = (*object_store).clone();
+        let objects = py
+            .detach(move || object_store.build())
+            .map_err(value_error)?;
         let preflight = py
             .detach(|| client.preflight(std::iter::empty()))
             .map_err(runtime_error)?;
@@ -146,25 +158,29 @@ impl PythonWorkspaceClient {
         Ok(dict)
     }
 
+    #[pyo3(signature = (workbench, path, snapshot_id = None))]
     fn stat<'py>(
         &self,
         py: Python<'py>,
         workbench: &str,
         path: &str,
+        snapshot_id: Option<u64>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let target = parse_workspace_path(workbench, path)?;
+        let view = parse_read_view(snapshot_id)?;
         let client = Arc::clone(&self.client);
         let result = py
             .detach(move || {
                 client.get_path(GetPathRequest {
                     target,
-                    view: WorkspaceReadView::Live,
+                    view,
+                    expected_read_version: None,
                     range: None,
                     plan_page: None,
                     if_none_match: None,
                 })
             })
-            .map_err(runtime_error)?;
+            .map_err(client_error)?;
         let metadata = result.value.metadata.ok_or_else(|| {
             PyRuntimeError::new_err("metadata response omitted the requested path")
         })?;
@@ -173,13 +189,45 @@ impl PythonWorkspaceClient {
         Ok(dict)
     }
 
+    #[pyo3(signature = (workbench, path, snapshot_id = None))]
+    fn exists(
+        &self,
+        py: Python<'_>,
+        workbench: &str,
+        path: &str,
+        snapshot_id: Option<u64>,
+    ) -> PyResult<bool> {
+        let target = parse_workspace_path(workbench, path)?;
+        let view = parse_read_view(snapshot_id)?;
+        let client = Arc::clone(&self.client);
+        py.detach(move || {
+            match client.get_path(GetPathRequest {
+                target,
+                view,
+                expected_read_version: None,
+                range: None,
+                plan_page: None,
+                if_none_match: None,
+            }) {
+                Ok(_) => Ok(true),
+                Err(error)
+                    if client_error_code(&error) == Some(nokv_protocol::ErrorCode::NotFound) =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(client_error(error)),
+            }
+        })
+    }
+
     #[pyo3(signature = (
         workbench,
         prefix = None,
         recursive = false,
         cursor = None,
         limit = 1_000,
-        expected_read_version = None
+        expected_read_version = None,
+        snapshot_id = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn list<'py>(
@@ -191,10 +239,12 @@ impl PythonWorkspaceClient {
         cursor: Option<Vec<u8>>,
         limit: u32,
         expected_read_version: Option<u64>,
+        snapshot_id: Option<u64>,
     ) -> PyResult<Bound<'py, PyDict>> {
         validate_list_page_fence(cursor.as_deref(), expected_read_version)?;
         let workbench = parse_workbench(workbench)?;
         let prefix = parse_optional_relative_path(prefix)?;
+        let view = parse_read_view(snapshot_id)?;
         let client = Arc::clone(&self.client);
         let result = py
             .detach(move || {
@@ -202,12 +252,13 @@ impl PythonWorkspaceClient {
                     workbench,
                     prefix,
                     recursive,
-                    view: WorkspaceReadView::Live,
+                    view,
                     expected_read_version,
+                    workspace_continuation_fence: None,
                     page: PageRequest { cursor, limit },
                 })
             })
-            .map_err(runtime_error)?;
+            .map_err(client_error)?;
         let dict = path_page_to_py(py, &result.value)?;
         set_call_metadata(&dict, result.commit_version, result.replayed)?;
         Ok(dict)
@@ -233,7 +284,7 @@ impl PythonWorkspaceClient {
                     },
                 )
             })
-            .map_err(runtime_error)?;
+            .map_err(client_error)?;
         let dict = PyDict::new(py);
         dict.set_item("removed", result.value.removed)?;
         dict.set_item("workspace_revision", result.value.workspace_revision)?;
@@ -241,6 +292,43 @@ impl PythonWorkspaceClient {
             Some(identity) => dict.set_item("removed_artifact_revision_id", hex(&identity.0))?,
             None => dict.set_item("removed_artifact_revision_id", py.None())?,
         }
+        set_call_metadata(&dict, result.commit_version, result.replayed)?;
+        Ok(dict)
+    }
+
+    fn rename<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        source: &str,
+        destination: &str,
+        expected_generation: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let source = parse_workspace_path(workbench, source)?;
+        let destination = parse_workspace_path(workbench, destination)?;
+        let request_id = self.client.new_request_id();
+        let client = Arc::clone(&self.client);
+        let result = py
+            .detach(move || {
+                client.rename_path(
+                    request_id,
+                    RenamePathRequest {
+                        source,
+                        destination,
+                        expected_generation,
+                    },
+                )
+            })
+            .map_err(client_error)?;
+        let dict = PyDict::new(py);
+        dict.set_item("source", result.value.source.path.as_str())?;
+        dict.set_item("destination", result.value.destination.path.as_str())?;
+        dict.set_item("workspace_revision", result.value.workspace_revision)?;
+        dict.set_item("generation", result.value.generation)?;
+        dict.set_item(
+            "artifact_revision_id",
+            hex(&result.value.artifact_revision_id.0),
+        )?;
         set_call_metadata(&dict, result.commit_version, result.replayed)?;
         Ok(dict)
     }
@@ -293,7 +381,7 @@ impl PythonWorkspaceClient {
         let objects = Arc::clone(&self.objects);
         let outcome = py
             .detach(move || client.publish_artifact(objects.as_ref(), options, &data))
-            .map_err(runtime_error)?;
+            .map_err(client_error)?;
         publish_outcome_to_py(py, &outcome)
     }
 
@@ -342,34 +430,34 @@ impl PythonWorkspaceClient {
         let local_file = PathBuf::from(local_file);
         let client = Arc::clone(&self.client);
         let objects = Arc::clone(&self.objects);
-        let outcome = py
-            .detach(move || {
-                let bytes = read_regular_file(&local_file)?;
-                client
-                    .publish_artifact(objects.as_ref(), options, &bytes)
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(PyRuntimeError::new_err)?;
+        let outcome = py.detach(move || {
+            let bytes = read_regular_file(&local_file).map_err(runtime_error)?;
+            client
+                .publish_artifact(objects.as_ref(), options, &bytes)
+                .map_err(client_error)
+        })?;
         publish_outcome_to_py(py, &outcome)
     }
 
+    #[pyo3(signature = (workbench, path, snapshot_id = None))]
     fn read<'py>(
         &self,
         py: Python<'py>,
         workbench: &str,
         path: &str,
+        snapshot_id: Option<u64>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let target = parse_workspace_path(workbench, path)?;
+        let view = parse_read_view(snapshot_id)?;
         let client = Arc::clone(&self.client);
         let objects = Arc::clone(&self.objects);
         let outcome = py
-            .detach(move || {
-                client.read_artifact(objects.as_ref(), None, target, WorkspaceReadView::Live)
-            })
-            .map_err(runtime_error)?;
+            .detach(move || client.read_artifact(objects.as_ref(), None, target, view))
+            .map_err(client_error)?;
         read_outcome_to_py(py, &outcome)
     }
 
+    #[pyo3(signature = (workbench, path, offset, length, snapshot_id = None))]
     fn read_range<'py>(
         &self,
         py: Python<'py>,
@@ -377,23 +465,169 @@ impl PythonWorkspaceClient {
         path: &str,
         offset: u64,
         length: usize,
+        snapshot_id: Option<u64>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let target = parse_workspace_path(workbench, path)?;
+        let view = parse_read_view(snapshot_id)?;
         let client = Arc::clone(&self.client);
         let objects = Arc::clone(&self.objects);
         let outcome = py
             .detach(move || {
-                client.read_artifact_range(
-                    objects.as_ref(),
-                    None,
-                    target,
-                    WorkspaceReadView::Live,
-                    offset,
-                    length,
-                )
+                client.read_artifact_range(objects.as_ref(), None, target, view, offset, length)
             })
-            .map_err(runtime_error)?;
+            .map_err(client_error)?;
         read_outcome_to_py(py, &outcome)
+    }
+
+    #[pyo3(signature = (workbench, requests, snapshot_id = None))]
+    fn read_ranges_batch<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        requests: Vec<PythonRangeBatchRequest>,
+        snapshot_id: Option<u64>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let workbench = parse_workbench(workbench)?;
+        let view = parse_read_view(snapshot_id)?;
+        let requests = requests
+            .into_iter()
+            .map(|(path, ranges, expected_generation, max_gap_bytes)| {
+                let ranges = ranges
+                    .into_iter()
+                    .map(|(offset, length)| ByteRange { offset, length })
+                    .collect();
+                Ok(ArtifactRangeBatchRequest {
+                    target: WorkspacePath {
+                        workbench: workbench.clone(),
+                        path: parse_relative_path(&path)?,
+                    },
+                    ranges,
+                    expected_generation,
+                    max_gap_bytes: max_gap_bytes.unwrap_or(0),
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let client = Arc::clone(&self.client);
+        let objects = Arc::clone(&self.objects);
+        let outcome = py
+            .detach(move || {
+                client.read_artifact_ranges_batch(objects.as_ref(), None, requests, view)
+            })
+            .map_err(client_error)?;
+        let outer = PyList::empty(py);
+        for item in outcome.items {
+            let inner = PyList::empty(py);
+            for bytes in item.ranges {
+                inner.append(PyBytes::new(py, &bytes))?;
+            }
+            outer.append(inner)?;
+        }
+        Ok(outer)
+    }
+
+    #[pyo3(signature = (
+        workbench,
+        lease_ttl_seconds = DEFAULT_SNAPSHOT_LEASE_SECONDS,
+        alias = None,
+        annotation = None
+    ))]
+    fn snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        lease_ttl_seconds: u64,
+        alias: Option<&str>,
+        annotation: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let workbench = parse_workbench(workbench)?;
+        let alias = alias
+            .map(|value| SnapshotAlias::new(value.to_owned()).map_err(value_error))
+            .transpose()?;
+        let lease_deadline_ms = snapshot_deadline_ms(lease_ttl_seconds)?;
+        let client = Arc::clone(&self.client);
+        let outcome = py
+            .detach(move || {
+                let workspace = client.get_workspace(GetWorkspaceRequest {
+                    workbench: workbench.clone(),
+                })?;
+                client.mint_snapshot_workflow(SnapshotMintOptions {
+                    workbench,
+                    workspace_incarnation_id: workspace.value.workspace_incarnation_id,
+                    lease_deadline_ms,
+                    alias,
+                    annotation: annotation.unwrap_or_default(),
+                })
+            })
+            .map_err(client_error)?;
+        let dict = snapshot_result_to_py(py, &outcome.value)?;
+        set_call_metadata(&dict, outcome.commit_version, outcome.replayed)?;
+        Ok(dict)
+    }
+
+    #[pyo3(signature = (
+        workbench,
+        snapshot_id,
+        lease_ttl_seconds = DEFAULT_SNAPSHOT_LEASE_SECONDS
+    ))]
+    fn renew_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        snapshot_id: u64,
+        lease_ttl_seconds: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let options = SnapshotRenewOptions {
+            workbench: parse_workbench(workbench)?,
+            selector: parse_snapshot_selector(snapshot_id)?,
+            lease_deadline_ms: snapshot_deadline_ms(lease_ttl_seconds)?,
+        };
+        let client = Arc::clone(&self.client);
+        let outcome = py
+            .detach(move || client.renew_snapshot_workflow(options))
+            .map_err(client_error)?;
+        let dict = snapshot_result_to_py(py, &outcome.value)?;
+        set_call_metadata(&dict, outcome.commit_version, outcome.replayed)?;
+        Ok(dict)
+    }
+
+    #[pyo3(signature = (workbench, snapshot_id, annotation = None))]
+    fn retire_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+        snapshot_id: u64,
+        annotation: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let options = SnapshotRetireOptions {
+            workbench: parse_workbench(workbench)?,
+            selector: parse_snapshot_selector(snapshot_id)?,
+            retire_annotation: annotation,
+        };
+        let client = Arc::clone(&self.client);
+        let outcome = py
+            .detach(move || client.retire_snapshot_workflow(options))
+            .map_err(client_error)?;
+        let dict = snapshot_result_to_py(py, &outcome.snapshot)?;
+        dict.set_item("retired", outcome.retired)?;
+        set_call_metadata(&dict, outcome.commit_version, outcome.replayed)?;
+        Ok(dict)
+    }
+
+    fn list_snapshots<'py>(
+        &self,
+        py: Python<'py>,
+        workbench: &str,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let workbench = parse_workbench(workbench)?;
+        let client = Arc::clone(&self.client);
+        let snapshots = py
+            .detach(move || client.list_all_snapshots(workbench))
+            .map_err(client_error)?;
+        let list = PyList::empty(py);
+        for snapshot in snapshots {
+            list.append(snapshot_result_to_py(py, &snapshot)?)?;
+        }
+        Ok(list)
     }
 
     /// Search root-wide or within one live workspace.
@@ -419,6 +653,7 @@ impl PythonWorkspaceClient {
         limit: u32,
     ) -> PyResult<Bound<'py, PyDict>> {
         let request = SearchRequest {
+            profile: QueryProfile::ArtifactV1,
             scope: parse_query_scope(workbench)?,
             predicates: parse_predicates(predicates.unwrap_or_default())?,
             projection: projection.unwrap_or_default(),
@@ -458,6 +693,7 @@ impl PythonWorkspaceClient {
         limit: u32,
     ) -> PyResult<Bound<'py, PyDict>> {
         let request = AggregateRequest {
+            profile: QueryProfile::ArtifactV1,
             scope: parse_query_scope(workbench)?,
             predicates: parse_predicates(predicates.unwrap_or_default())?,
             group_by: group_by.unwrap_or_default(),
@@ -486,8 +722,13 @@ impl PythonWorkspaceClient {
         let result = py
             .detach(move || {
                 client.catalog(CatalogRequest {
+                    profile: QueryProfile::ArtifactV1,
                     scope: QueryScope::Root { path_prefix: None },
+                    path_match: nokv_protocol::CatalogPathMatch::Prefix,
                     field_prefix,
+                    // The direct Python catalog ABI exposes fields, not facet
+                    // buckets, so requesting them would silently discard data.
+                    include_facets: false,
                     page: PageRequest { cursor, limit },
                 })
             })
@@ -525,16 +766,18 @@ impl PythonWorkspaceClient {
 
     /// Materialize one live workspace prefix into a new local directory tree.
     /// Existing local files are never overwritten and symlinks are rejected.
-    #[pyo3(signature = (workbench, local_directory, prefix = None))]
+    #[pyo3(signature = (workbench, local_directory, prefix = None, snapshot_id = None))]
     fn materialize<'py>(
         &self,
         py: Python<'py>,
         workbench: &str,
         local_directory: &str,
         prefix: Option<&str>,
+        snapshot_id: Option<u64>,
     ) -> PyResult<Bound<'py, PyList>> {
         let workbench = parse_workbench(workbench)?;
         let prefix = parse_optional_relative_path(prefix)?;
+        let view = parse_read_view(snapshot_id)?;
         let local_directory = PathBuf::from(local_directory);
         let client = Arc::clone(&self.client);
         let objects = Arc::clone(&self.objects);
@@ -545,6 +788,7 @@ impl PythonWorkspaceClient {
                     objects.as_ref(),
                     workbench,
                     prefix,
+                    view,
                     &local_directory,
                 )
             })
@@ -674,6 +918,36 @@ fn parse_optional_relative_path(raw: Option<&str>) -> PyResult<Option<RelativePa
     raw.map(parse_relative_path).transpose()
 }
 
+fn parse_snapshot_selector(snapshot_id: u64) -> PyResult<SnapshotSelector> {
+    if snapshot_id == 0 {
+        return Err(value_error("snapshot_id must be greater than zero"));
+    }
+    Ok(SnapshotSelector::Id(snapshot_id))
+}
+
+fn parse_read_view(snapshot_id: Option<u64>) -> PyResult<WorkspaceReadView> {
+    snapshot_id
+        .map(parse_snapshot_selector)
+        .transpose()
+        .map(|selector| selector.map_or(WorkspaceReadView::Live, WorkspaceReadView::Snapshot))
+}
+
+fn snapshot_deadline_ms(lease_ttl_seconds: u64) -> PyResult<u64> {
+    if !(1..=MAX_SNAPSHOT_LEASE_SECONDS).contains(&lease_ttl_seconds) {
+        return Err(value_error(format!(
+            "lease_ttl_seconds must be between 1 and {MAX_SNAPSHOT_LEASE_SECONDS}"
+        )));
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(value_error)?
+        .as_millis();
+    let now_ms = u64::try_from(now_ms).map_err(value_error)?;
+    now_ms
+        .checked_add(lease_ttl_seconds.saturating_mul(1_000))
+        .ok_or_else(|| value_error("snapshot lease deadline overflows u64"))
+}
+
 fn parse_workspace_path(workbench: &str, path: &str) -> PyResult<WorkspacePath> {
     Ok(WorkspacePath {
         workbench: parse_workbench(workbench)?,
@@ -723,8 +997,9 @@ fn list_all_paths(
     client: &RustWorkspaceClient,
     workbench: WorkbenchName,
     prefix: Option<RelativePath>,
+    view: WorkspaceReadView,
 ) -> Result<Vec<PathMetadata>, String> {
-    list_all_paths_with(workbench, prefix, |request| {
+    list_all_paths_with(workbench, prefix, view, |request| {
         client.list_paths(request).map(|call| call.value)
     })
 }
@@ -732,6 +1007,7 @@ fn list_all_paths(
 fn list_all_paths_with(
     workbench: WorkbenchName,
     prefix: Option<RelativePath>,
+    view: WorkspaceReadView,
     mut list_page: impl FnMut(nokv_protocol::ListPathsRequest) -> Result<PathPage, ClientError>,
 ) -> Result<Vec<PathMetadata>, String> {
     'attempt: for attempt in 1..=3 {
@@ -744,8 +1020,9 @@ fn list_all_paths_with(
                 workbench: workbench.clone(),
                 prefix: prefix.clone(),
                 recursive: true,
-                view: WorkspaceReadView::Live,
+                view: view.clone(),
                 expected_read_version: read_version,
+                workspace_continuation_fence: None,
                 page: PageRequest {
                     cursor: cursor.clone(),
                     limit: PageRequest::MAX_LIMIT,
@@ -803,10 +1080,11 @@ fn materialize_workspace(
     objects: &dyn ArtifactObjectStore,
     workbench: WorkbenchName,
     prefix: Option<RelativePath>,
+    view: WorkspaceReadView,
     local_directory: &Path,
 ) -> Result<Vec<MaterializedFile>, String> {
     let root = prepare_materialize_root(local_directory)?;
-    let entries = list_all_paths(client, workbench, prefix.clone())?;
+    let entries = list_all_paths(client, workbench, prefix.clone(), view.clone())?;
     let mut destinations = BTreeSet::new();
     let mut plan = Vec::with_capacity(entries.len());
     for metadata in entries {
@@ -825,12 +1103,7 @@ fn materialize_workspace(
         let mut materialized = Vec::with_capacity(plan.len());
         for (expected, relative) in plan {
             let read = client
-                .read_artifact(
-                    objects,
-                    None,
-                    expected.path.clone(),
-                    WorkspaceReadView::Live,
-                )
+                .read_artifact(objects, None, expected.path.clone(), view.clone())
                 .map_err(|error| error.to_string())?;
             if read.metadata != expected {
                 return Err(format!(
@@ -918,6 +1191,36 @@ fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
+fn client_error(error: ClientError) -> PyErr {
+    match client_error_code(&error) {
+        Some(nokv_protocol::ErrorCode::NotFound) => PyFileNotFoundError::new_err(error.to_string()),
+        Some(nokv_protocol::ErrorCode::AlreadyExists) => {
+            PyFileExistsError::new_err(error.to_string())
+        }
+        _ => PyRuntimeError::new_err(error.to_string()),
+    }
+}
+
+fn client_error_code(error: &ClientError) -> Option<nokv_protocol::ErrorCode> {
+    match error {
+        ClientError::Rpc(failure) => Some(failure.code),
+        ClientError::ArtifactPublishFailed { source, .. }
+        | ClientError::RetryExhausted {
+            last_error: source, ..
+        } => client_error_code(source),
+        ClientError::InvalidOptions(_)
+        | ClientError::InvalidRoute(_)
+        | ClientError::Transport(_)
+        | ClientError::Protocol(_)
+        | ClientError::ResponseMismatch(_)
+        | ClientError::MissingCapabilities(_)
+        | ClientError::ArtifactIntegrity(_)
+        | ClientError::ArtifactReadFenceChanged
+        | ClientError::Object(_)
+        | ClientError::ArtifactUpload(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -980,10 +1283,15 @@ mod tests {
             }),
         ]);
         let mut requests = Vec::new();
-        let entries = list_all_paths_with(WorkbenchName::new("run-42").unwrap(), None, |request| {
-            requests.push(request);
-            responses.pop_front().expect("one scripted list response")
-        })
+        let entries = list_all_paths_with(
+            WorkbenchName::new("run-42").unwrap(),
+            None,
+            WorkspaceReadView::Live,
+            |request| {
+                requests.push(request);
+                responses.pop_front().expect("one scripted list response")
+            },
+        )
         .unwrap();
 
         assert!(entries.is_empty());
@@ -1001,10 +1309,15 @@ mod tests {
     #[test]
     fn full_path_listing_does_not_retry_other_preconditions() {
         let mut calls = 0;
-        let error = list_all_paths_with(WorkbenchName::new("run-42").unwrap(), None, |_| {
-            calls += 1;
-            Err(read_version_failure(None))
-        })
+        let error = list_all_paths_with(
+            WorkbenchName::new("run-42").unwrap(),
+            None,
+            WorkspaceReadView::Live,
+            |_| {
+                calls += 1;
+                Err(read_version_failure(None))
+            },
+        )
         .unwrap_err();
 
         assert_eq!(calls, 1);
@@ -1021,5 +1334,26 @@ mod tests {
         validate_list_page_fence(Some(b"page-2"), Some(7)).unwrap();
         validate_list_page_fence(None, None).unwrap();
         validate_list_page_fence(None, Some(7)).unwrap();
+    }
+
+    #[test]
+    fn snapshot_read_views_reject_zero_and_preserve_the_exact_selector() {
+        assert_eq!(parse_read_view(None).unwrap(), WorkspaceReadView::Live);
+        assert_eq!(
+            parse_read_view(Some(17)).unwrap(),
+            WorkspaceReadView::Snapshot(SnapshotSelector::Id(17))
+        );
+        assert!(parse_read_view(Some(0))
+            .unwrap_err()
+            .to_string()
+            .contains("greater than zero"));
+    }
+
+    #[test]
+    fn snapshot_deadlines_enforce_the_workbench_lease_bound() {
+        assert!(snapshot_deadline_ms(1).is_ok());
+        assert!(snapshot_deadline_ms(DEFAULT_SNAPSHOT_LEASE_SECONDS).is_ok());
+        assert!(snapshot_deadline_ms(0).is_err());
+        assert!(snapshot_deadline_ms(MAX_SNAPSHOT_LEASE_SECONDS + 1).is_err());
     }
 }

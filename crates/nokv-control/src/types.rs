@@ -1,7 +1,7 @@
 use std::fmt;
 
 pub use nokv_types::{
-    LogicalShardId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RootId,
+    AgentId, LogicalShardId, ObjectNamespaceId, OwnerEpoch, PlacementGeneration, RootId,
     RootPlacementLifecycle,
 };
 
@@ -40,6 +40,9 @@ pub struct CheckpointRef {
     pub image_digest: String,
     /// Digest of the logical metadata state at `lsn`.
     pub digest: String,
+    /// Provider-neutral, strict object receipt used to locate and verify the
+    /// manifest and every chunk without object listing.
+    pub receipt: Vec<u8>,
 }
 
 /// One immutable segment in the ordered shared-log chain.
@@ -49,6 +52,9 @@ pub struct LogSegmentRef {
     pub first_lsn: u64,
     pub last_lsn: u64,
     pub digest: String,
+    /// Provider-neutral, strict object receipt used to locate and verify the
+    /// manifest and every chunk without object listing.
+    pub receipt: Vec<u8>,
 }
 
 /// Complete ordered shared-log chain above the retained checkpoint.
@@ -65,6 +71,25 @@ pub struct RecoveryPublication {
     pub checkpoint: Option<CheckpointRef>,
     pub log: Option<LogRef>,
     pub durable_lsn: u64,
+}
+
+/// Durable intent for one immutable recovery-log upload.
+///
+/// The opaque plan is produced by `nokv-object` and must be persisted before
+/// its first object create. Control keeps the typed boundary fields so the
+/// final recovery publication can be checked without depending on the object
+/// package or provider coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryUploadIntent {
+    pub object_namespace_id: ObjectNamespaceId,
+    pub first_lsn: u64,
+    pub last_lsn: u64,
+    pub previous_chain_digest: String,
+    pub last_chain_digest: String,
+    pub segment_digest: String,
+    pub manifest_key: String,
+    pub receipt: Vec<u8>,
+    pub plan: Vec<u8>,
 }
 
 /// Durable, immutable root-to-logical-shard affinity plus its CAS fence.
@@ -85,6 +110,17 @@ pub struct RootPlacement {
 pub struct RootObjectNamespaceBinding {
     pub root_id: RootId,
     pub object_namespace_id: ObjectNamespaceId,
+}
+
+/// Immutable admission binding from one root to its stable Agent principal.
+///
+/// Presentation paths and process identities never participate in this
+/// authority. One Agent may own multiple roots, but one root can never be
+/// rebound to a different Agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootAgentBinding {
+    pub root_id: RootId,
+    pub agent_id: AgentId,
 }
 
 /// Durable ownership and recovery state for one logical metadata shard.
@@ -108,6 +144,9 @@ pub struct LogicalShardRecord {
     pub checkpoint: Option<CheckpointRef>,
     pub log: Option<LogRef>,
     pub durable_lsn: u64,
+    /// Exact object plan installed before the first immutable create and
+    /// cleared atomically with the corresponding recovery publication.
+    pub pending_recovery_upload: Option<RecoveryUploadIntent>,
 }
 
 /// Exact owner fence presented to every owner-only mutation.
@@ -216,6 +255,7 @@ impl LogicalShardRecord {
             checkpoint: None,
             log: None,
             durable_lsn: 0,
+            pending_recovery_upload: None,
         }
     }
 }

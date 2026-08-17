@@ -5,11 +5,15 @@
 
 //! Object-provider composition for the custom Agent CLI.
 
+use std::sync::{Arc, OnceLock};
+
 use nokv_object::{
-    ensure_object_namespace, load_object_namespace, verify_object_namespace, ArtifactObjectStore,
-    ArtifactStoreCapabilities, ImmutableCreateOutcome, LocalHotTier, LocalHotTierOptions,
-    ObjectDeleteOutcome, ObjectError, ObjectInfo, ObjectKey, ObjectRange, S3ArtifactStore,
-    S3ArtifactStoreOptions, TieredArtifactStore, TieredArtifactStoreOptions,
+    admit_artifact_provider, ensure_object_namespace, load_object_namespace,
+    verify_object_namespace, ArtifactObjectStore, ArtifactStoreCapabilities,
+    ImmutableCreateOutcome, LocalHotTier, LocalHotTierOptions, ObjectDeleteOutcome, ObjectError,
+    ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionError, ProviderAdmissionProfile,
+    ProviderAdmissionReceipt, ProviderHandleIdentity, S3ArtifactStore, S3ArtifactStoreOptions,
+    TieredArtifactStore, TieredArtifactStoreOptions, DEFAULT_ARTIFACT_BLOCK_SIZE,
 };
 use nokv_types::ObjectNamespaceId;
 
@@ -27,6 +31,7 @@ enum CliObjectStoreInner {
 pub struct CliObjectStore {
     inner: CliObjectStoreInner,
     namespace_id: Option<ObjectNamespaceId>,
+    admission: Arc<OnceLock<Result<ProviderAdmissionReceipt, ProviderAdmissionError>>>,
 }
 
 impl CliObjectStore {
@@ -76,6 +81,7 @@ impl CliObjectStore {
             return Ok(Self {
                 inner: CliObjectStoreInner::S3(durable),
                 namespace_id: None,
+                admission: Arc::new(OnceLock::new()),
             });
         };
         let hot = LocalHotTier::new(LocalHotTierOptions::new(cache_root, config.hot_cache_bytes))
@@ -87,22 +93,27 @@ impl CliObjectStore {
                 TieredArtifactStoreOptions::default(),
             )),
             namespace_id: None,
+            admission: Arc::new(OnceLock::new()),
         })
     }
 
     /// Verify the immutable object semantics required by every Agent tool
     /// before the CLI advertises its MCP surface.
     pub fn validate_agent_capabilities(&self) -> Result<(), String> {
-        let capabilities = self.capabilities();
-        if !capabilities.atomic_create_if_absent {
-            return Err(
-                "object provider does not support atomic immutable create-if-absent".to_owned(),
-            );
+        self.cache_admission(|store| {
+            let profile = ProviderAdmissionProfile::single_put(DEFAULT_ARTIFACT_BLOCK_SIZE)?;
+            admit_artifact_provider(store, profile)
+        })
+    }
+
+    fn cache_admission(
+        &self,
+        probe: impl FnOnce(&S3ArtifactStore) -> Result<ProviderAdmissionReceipt, ProviderAdmissionError>,
+    ) -> Result<(), String> {
+        match self.admission.get_or_init(|| probe(self.durable())) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.to_string()),
         }
-        if !capabilities.range_read {
-            return Err("object provider does not support verified range reads".to_owned());
-        }
-        Ok(())
     }
 
     pub fn bind(mut self, expected: ObjectNamespaceId) -> Result<Self, String> {
@@ -141,6 +152,14 @@ impl ArtifactObjectStore for CliObjectStore {
         }
     }
 
+    fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+        self.durable().provider_handle_identity()
+    }
+
+    fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+        self.admission.get().and_then(|result| result.as_ref().ok())
+    }
+
     fn create_immutable(
         &self,
         key: &ObjectKey,
@@ -176,6 +195,8 @@ impl ArtifactObjectStore for CliObjectStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -207,14 +228,36 @@ mod tests {
     }
 
     #[test]
-    fn configured_s3_exposes_required_agent_capabilities() {
+    fn configured_s3_is_not_admitted_by_static_capability_flags() {
         let config = ObjectConfig {
             bucket: Some("artifacts".to_owned()),
             ..ObjectConfig::default()
         };
-        CliObjectStore::build(&config)
-            .unwrap()
-            .validate_agent_capabilities()
-            .unwrap();
+        let store = CliObjectStore::build(&config).unwrap();
+        assert!(store.capabilities().atomic_create_if_absent);
+        assert!(store.capabilities().range_read);
+        assert!(store.provider_admission_receipt().is_none());
+    }
+
+    #[test]
+    fn one_provider_handle_runs_admission_at_most_once_even_after_failure() {
+        let config = ObjectConfig {
+            bucket: Some("artifacts".to_owned()),
+            ..ObjectConfig::default()
+        };
+        let store = CliObjectStore::build(&config).unwrap();
+        let calls = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            let error = store
+                .cache_admission(|_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(ProviderAdmissionError::Inconclusive)
+                })
+                .unwrap_err();
+            assert!(error.contains("inconclusive"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(store.provider_admission_receipt().is_none());
     }
 }

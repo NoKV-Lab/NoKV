@@ -17,12 +17,20 @@ from object_namespace_recovery_gate import (
     WorkflowFailure,
     aws_command,
     aws_environment,
+    control_args,
+    execute,
+    fixed_id,
+    parse_args,
     phymat_documents,
     run,
     rustfs_container_command,
+    server_command,
     validate_gate_evidence,
     wait_rustfs,
+    TYPED_SCENARIOS,
+    TYPED_SUPPORTED_SCENARIOS,
 )
+import pre423_contract_ledger
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -38,6 +46,7 @@ def valid_evidence() -> dict[str, object]:
             "mismatch_rejected": True,
             "control_record_unchanged": True,
             "metadata_mutation_blocked": True,
+            "agent_identity_redacted": True,
             "wrong_profile_objects": 1,
         },
         "restart": {
@@ -69,6 +78,136 @@ def valid_evidence() -> dict[str, object]:
 
 
 class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
+    def test_typed_scenarios_cover_the_provider_recovery_profile_without_overclaiming(
+        self,
+    ) -> None:
+        ledger = pre423_contract_ledger.load_ledger()
+        expected = {
+            scenario
+            for item in ledger["items"]
+            for gate in item["required_gates"]
+            for expectation in (
+                pre423_contract_ledger.resolve_gate_expectation(
+                    ledger, item["id"], gate
+                ),
+            )
+            if "object-namespace-recovery" in expectation["allowed_producers"]
+            for scenario in expectation["scenarios"]
+        }
+        self.assertEqual(set(TYPED_SCENARIOS), expected)
+        self.assertEqual(
+            TYPED_SUPPORTED_SCENARIOS,
+            {"c06.root-binding-survives-provider-restart"},
+        )
+
+    def test_wrong_root_has_its_own_canonical_agent_fixture(self) -> None:
+        seed = "agent-admission-contract"
+        root_agent = fixed_id(seed, "agent")
+        wrong_root_agent = fixed_id(seed, "wrong-agent")
+        self.assertRegex(root_agent, r"^[0-9a-f]{32}$")
+        self.assertRegex(wrong_root_agent, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(root_agent, wrong_root_agent)
+        self.assertNotIn(
+            root_agent,
+            {fixed_id(seed, "root"), fixed_id(seed, "wrong-root")},
+        )
+        self.assertNotIn(
+            wrong_root_agent,
+            {fixed_id(seed, "root"), fixed_id(seed, "wrong-root")},
+        )
+
+    def test_shard_server_command_has_no_single_agent_identity(self) -> None:
+        common = control_args(
+            Path("/tmp/nokv"),
+            "11" * 16,
+            "http://127.0.0.1:2379",
+            "/nokv/object-namespace-gate/test",
+        )
+        command = server_command(
+            common,
+            ["--object-root", "gate/root"],
+            19000,
+            "gate-owner",
+            "--metadata-create",
+            Path("/tmp/metadata"),
+        )
+        self.assertNotIn("--agent-id", command)
+        with self.assertRaisesRegex(WorkflowFailure, "must not carry"):
+            server_command(
+                [*common, "--agent-id", "22" * 16],
+                ["--object-root", "gate/root"],
+                19000,
+                "gate-owner",
+                "--metadata-create",
+                Path("/tmp/metadata"),
+            )
+
+    def test_primary_root_provision_uses_a_distinct_stable_agent_id(self) -> None:
+        seed = "agent-admission-contract"
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            executable = temporary_path / "executable"
+            executable.touch()
+            args = parse_args(
+                [
+                    "--repo",
+                    str(REPO),
+                    "--evidence-dir",
+                    str(temporary_path / "evidence"),
+                    "--binary",
+                    str(executable),
+                    "--etcd-bin",
+                    str(executable),
+                    "--etcdctl-bin",
+                    str(executable),
+                    "--docker-bin",
+                    str(executable),
+                    "--aws-bin",
+                    str(executable),
+                    "--seed",
+                    seed,
+                ]
+            )
+            recorded: list[tuple[list[str], str | None]] = []
+
+            def fake_run(
+                argv: list[object], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                command = [str(item) for item in argv]
+                label = kwargs.get("label")
+                recorded.append((command, label if isinstance(label, str) else None))
+                if label == "provision":
+                    raise WorkflowFailure("stop after provision")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            process = mock.Mock()
+            process.poll.return_value = None
+            with (
+                mock.patch("object_namespace_recovery_gate.run", side_effect=fake_run),
+                mock.patch(
+                    "object_namespace_recovery_gate.start_process",
+                    return_value=process,
+                ),
+                mock.patch(
+                    "object_namespace_recovery_gate.free_port",
+                    side_effect=range(19000, 19006),
+                ),
+                mock.patch("object_namespace_recovery_gate.wait_etcd"),
+                mock.patch("object_namespace_recovery_gate.wait_rustfs"),
+                mock.patch("object_namespace_recovery_gate.stop_process"),
+                mock.patch("object_namespace_recovery_gate.capture_rustfs_log"),
+                self.assertRaisesRegex(WorkflowFailure, "stop after provision"),
+            ):
+                execute(args)
+
+        provision = next(command for command, label in recorded if label == "provision")
+        expected_agent_id = fixed_id(seed, "agent")
+        self.assertRegex(expected_agent_id, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(expected_agent_id, fixed_id(seed, "root"))
+        self.assertEqual(
+            provision[provision.index("--agent-id") + 1], expected_agent_id
+        )
+
     def test_rustfs_image_is_digest_pinned(self) -> None:
         self.assertIn("@sha256:", PINNED_RUSTFS_IMAGE)
         self.assertNotIn(":latest", PINNED_RUSTFS_IMAGE)
@@ -120,7 +259,9 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
     def test_live_gate_bounds_each_aws_readiness_attempt(self) -> None:
         environment = aws_environment("access", "secret")
         self.assertEqual(environment["AWS_MAX_ATTEMPTS"], "1")
-        command = aws_command(Path("/usr/bin/aws"), "http://127.0.0.1:9000", "s3api", "list-buckets")
+        command = aws_command(
+            Path("/usr/bin/aws"), "http://127.0.0.1:9000", "s3api", "list-buckets"
+        )
         self.assertIn("--cli-connect-timeout", command)
         self.assertEqual(command[command.index("--cli-connect-timeout") + 1], "1")
         self.assertIn("--cli-read-timeout", command)
@@ -133,7 +274,7 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
             "id: object_namespace_recovery",
             "python3 scripts/workbench/object_namespace_recovery_gate.py",
             "python3 scripts/workbench/object_namespace_recovery_gate_test.py",
-            "--evidence-dir \"$OBJECT_RECOVERY_EVIDENCE_DIR\"",
+            '--evidence-dir "$OBJECT_RECOVERY_EVIDENCE_DIR"',
             "object-namespace-recovery-${{ github.sha }}",
             "if-no-files-found: error",
         ):
@@ -196,6 +337,12 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
             evidence["namespace"][field] = value  # type: ignore[index]
             with self.assertRaises(WorkflowFailure):
                 validate_gate_evidence(evidence)
+
+    def test_wrong_profile_error_must_not_leak_either_agent_identity(self) -> None:
+        evidence = valid_evidence()
+        evidence["namespace"]["agent_identity_redacted"] = False  # type: ignore[index]
+        with self.assertRaisesRegex(WorkflowFailure, "AgentId"):
+            validate_gate_evidence(evidence)
 
     def test_restart_must_wait_for_lease_and_advance_once(self) -> None:
         evidence = valid_evidence()

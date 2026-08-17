@@ -22,8 +22,11 @@ use super::publication_records::{
     MAX_PRODUCER_BYTES,
 };
 
-/// Only supported value format for commit-owned payloads.
-pub const COMMIT_VALUE_FORMAT_VERSION: u8 = 2;
+/// Current value format for the commit header itself.
+pub const COMMIT_RECORD_VALUE_FORMAT_VERSION: u8 = 3;
+/// Stable v2 value format for commit members, consumers, heads, and tags.
+pub const COMMIT_AUXILIARY_VALUE_FORMAT_VERSION: u8 = 2;
+const LEGACY_COMMIT_RECORD_VALUE_FORMAT_VERSION: u8 = 2;
 
 /// A commit can name at most this many direct parent commits.
 pub const MAX_PARENT_COMMITS: u32 = 64;
@@ -55,6 +58,8 @@ pub struct CommitRecord {
     /// Strictly increasing root-global parent identities.
     pub parent_commits: Vec<CommitId>,
     pub parent_digest: [u8; SHA256_BYTES],
+    pub generic_index_count: u64,
+    pub generic_index_digest: [u8; SHA256_BYTES],
     pub producer: Option<String>,
     /// Canonical typed lineage projection.
     pub lineage_projection: Vec<u8>,
@@ -98,6 +103,14 @@ pub struct TagRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitConsumerRecord {
     pub consumer_epoch_at_add: ConsumerEpoch,
+}
+
+/// Overflow/underflow while updating one commit's exact consumer lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitConsumerMutationError {
+    CountOverflow,
+    CountUnderflow,
+    EpochOverflow,
 }
 
 /// Strict commit payload encode, decode, or invariant failure.
@@ -247,7 +260,7 @@ impl CommitRecord {
     pub fn encode(&self) -> Result<Vec<u8>, CommitRecordError> {
         self.validate()?;
         let mut encoded = Vec::new();
-        encoded.push(COMMIT_VALUE_FORMAT_VERSION);
+        encoded.push(COMMIT_RECORD_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(self.source_workspace_incarnation_id.as_bytes());
         put_bounded_string(
             &mut encoded,
@@ -281,6 +294,8 @@ impl CommitRecord {
             encoded.extend_from_slice(parent.as_bytes());
         }
         encoded.extend_from_slice(&self.parent_digest);
+        encoded.extend_from_slice(&self.generic_index_count.to_be_bytes());
+        encoded.extend_from_slice(&self.generic_index_digest);
         put_optional_string(
             &mut encoded,
             "producer",
@@ -302,7 +317,10 @@ impl CommitRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, CommitRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        let value_version = decoder.require_version(&[
+            LEGACY_COMMIT_RECORD_VALUE_FORMAT_VERSION,
+            COMMIT_RECORD_VALUE_FORMAT_VERSION,
+        ])?;
         let source_workspace_incarnation_id =
             WorkspaceIncarnationId::from_bytes(decoder.fixed("source_workspace_incarnation_id")?);
         let content_digest_uri =
@@ -330,6 +348,15 @@ impl CommitRecord {
             parent_commits.push(CommitId::from_bytes(decoder.fixed("parent_commit_id")?));
         }
         let parent_digest = decoder.fixed("parent_digest")?;
+        let (generic_index_count, generic_index_digest) =
+            if value_version == COMMIT_RECORD_VALUE_FORMAT_VERSION {
+                (
+                    decoder.u64("generic_index_count")?,
+                    decoder.fixed("generic_index_digest")?,
+                )
+            } else {
+                (0, [0; SHA256_BYTES])
+            };
         let producer = decoder.optional_string("producer", MAX_COMMIT_PRODUCER_BYTES)?;
         let lineage_projection =
             decoder.bounded_bytes("lineage_projection", MAX_COMMIT_LINEAGE_BYTES)?;
@@ -352,6 +379,8 @@ impl CommitRecord {
             revision_digest,
             parent_commits,
             parent_digest,
+            generic_index_count,
+            generic_index_digest,
             producer,
             lineage_projection,
             consumer_count,
@@ -387,6 +416,12 @@ fn validate_closure_seals(record: &CommitRecord) -> Result<(), CommitRecordError
         return Err(CommitRecordError::InvalidClosureSeal {
             closure: "parent",
             reason: "the empty parent set and zero rolling digest must appear together",
+        });
+    }
+    if (record.generic_index_count == 0) != (record.generic_index_digest == [0; SHA256_BYTES]) {
+        return Err(CommitRecordError::InvalidClosureSeal {
+            closure: "generic index",
+            reason: "the zero count and zero rolling digest must appear together",
         });
     }
     Ok(())
@@ -441,7 +476,7 @@ impl CommitMemberRecord {
     pub fn encode(&self) -> Result<Vec<u8>, CommitRecordError> {
         self.validate()?;
         let mut encoded = Vec::new();
-        encoded.push(COMMIT_VALUE_FORMAT_VERSION);
+        encoded.push(COMMIT_AUXILIARY_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(self.artifact_revision_id.as_bytes());
         encoded.extend_from_slice(&self.path_generation.get().to_be_bytes());
         put_bounded_string(
@@ -488,7 +523,7 @@ impl CommitMemberRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, CommitRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_version(&[COMMIT_AUXILIARY_VALUE_FORMAT_VERSION])?;
         let artifact_revision_id =
             ArtifactRevisionId::from_bytes(decoder.fixed("artifact_revision_id")?);
         let path_generation = decoder.generation("path_generation")?;
@@ -589,14 +624,14 @@ impl TagRecord {
 impl CommitConsumerRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(1 + 8);
-        encoded.push(COMMIT_VALUE_FORMAT_VERSION);
+        encoded.push(COMMIT_AUXILIARY_VALUE_FORMAT_VERSION);
         encoded.extend_from_slice(&self.consumer_epoch_at_add.get().to_be_bytes());
         encoded
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, CommitRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version()?;
+        decoder.require_version(&[COMMIT_AUXILIARY_VALUE_FORMAT_VERSION])?;
         let consumer_epoch_at_add = ConsumerEpoch::new(decoder.u64("consumer_epoch_at_add")?);
         decoder.finish()?;
         Ok(Self {
@@ -605,9 +640,46 @@ impl CommitConsumerRecord {
     }
 }
 
+pub(crate) fn add_commit_consumer(
+    record: &CommitRecord,
+) -> Result<CommitRecord, CommitConsumerMutationError> {
+    let mut next = record.clone();
+    next.consumer_count = next
+        .consumer_count
+        .checked_add(1)
+        .ok_or(CommitConsumerMutationError::CountOverflow)?;
+    next.consumer_epoch = ConsumerEpoch::new(
+        next.consumer_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(CommitConsumerMutationError::EpochOverflow)?,
+    );
+    next.last_zero_consumer_version = None;
+    Ok(next)
+}
+
+pub(crate) fn remove_commit_consumer(
+    record: &CommitRecord,
+    zero_version: CommitVersion,
+) -> Result<CommitRecord, CommitConsumerMutationError> {
+    let mut next = record.clone();
+    next.consumer_count = next
+        .consumer_count
+        .checked_sub(1)
+        .ok_or(CommitConsumerMutationError::CountUnderflow)?;
+    next.consumer_epoch = ConsumerEpoch::new(
+        next.consumer_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(CommitConsumerMutationError::EpochOverflow)?,
+    );
+    next.last_zero_consumer_version = (next.consumer_count == 0).then_some(zero_version);
+    Ok(next)
+}
+
 fn encode_commit_pointer(commit_id: CommitId, generation: Generation) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(1 + CommitId::BYTE_WIDTH + 8);
-    encoded.push(COMMIT_VALUE_FORMAT_VERSION);
+    encoded.push(COMMIT_AUXILIARY_VALUE_FORMAT_VERSION);
     encoded.extend_from_slice(commit_id.as_bytes());
     encoded.extend_from_slice(&generation.get().to_be_bytes());
     encoded
@@ -618,7 +690,7 @@ fn decode_commit_pointer(
     generation_field: &'static str,
 ) -> Result<(CommitId, Generation), CommitRecordError> {
     let mut decoder = Decoder::new(encoded);
-    decoder.require_value_version()?;
+    decoder.require_version(&[COMMIT_AUXILIARY_VALUE_FORMAT_VERSION])?;
     let commit_id = CommitId::from_bytes(decoder.fixed("commit_id")?);
     let generation = decoder.generation(generation_field)?;
     decoder.finish()?;
@@ -778,14 +850,16 @@ impl<'a> Decoder<'a> {
         Self { input, offset: 0 }
     }
 
-    fn require_value_version(&mut self) -> Result<(), CommitRecordError> {
+    fn require_version(&mut self, supported: &[u8]) -> Result<u8, CommitRecordError> {
         let actual = self.u8("value_format_version")?;
-        if actual == COMMIT_VALUE_FORMAT_VERSION {
-            Ok(())
+        if supported.contains(&actual) {
+            Ok(actual)
         } else {
             Err(CommitRecordError::UnsupportedValueVersion {
                 actual,
-                expected: COMMIT_VALUE_FORMAT_VERSION,
+                expected: *supported
+                    .last()
+                    .expect("every commit decoder supports at least one version"),
             })
         }
     }
@@ -906,6 +980,8 @@ mod tests {
             revision_digest: [6; SHA256_BYTES],
             parent_commits: vec![commit_id(7), commit_id(8)],
             parent_digest: [9; SHA256_BYTES],
+            generic_index_count: 2,
+            generic_index_digest: [0x0a; SHA256_BYTES],
             producer: Some("agent-runtime".to_owned()),
             lineage_projection: vec![10, 11, 12],
             consumer_count: 2,
@@ -913,6 +989,61 @@ mod tests {
             last_zero_consumer_version: None,
             state: CommitState::Sealed,
         }
+    }
+
+    fn encode_legacy_v2_commit(record: &CommitRecord) -> Vec<u8> {
+        let mut encoded = vec![LEGACY_COMMIT_RECORD_VALUE_FORMAT_VERSION];
+        encoded.extend_from_slice(record.source_workspace_incarnation_id.as_bytes());
+        put_bounded_string(
+            &mut encoded,
+            "content_digest_uri",
+            &record.content_digest_uri,
+            MAX_COMMIT_DIGEST_URI_BYTES,
+        )
+        .unwrap();
+        put_bounded_string(
+            &mut encoded,
+            "manifest_digest_uri",
+            &record.manifest_digest_uri,
+            MAX_COMMIT_DIGEST_URI_BYTES,
+        )
+        .unwrap();
+        encoded.extend_from_slice(record.tree_manifest_revision_id.as_bytes());
+        put_bounded_string(
+            &mut encoded,
+            "tree_digest_uri",
+            &record.tree_digest_uri,
+            MAX_COMMIT_DIGEST_URI_BYTES,
+        )
+        .unwrap();
+        encoded.extend_from_slice(&record.member_count.to_be_bytes());
+        encoded.extend_from_slice(&record.member_digest);
+        encoded.extend_from_slice(&record.unique_revision_count.to_be_bytes());
+        encoded.extend_from_slice(&record.revision_digest);
+        encoded.extend_from_slice(&(record.parent_commits.len() as u32).to_be_bytes());
+        for parent in &record.parent_commits {
+            encoded.extend_from_slice(parent.as_bytes());
+        }
+        encoded.extend_from_slice(&record.parent_digest);
+        put_optional_string(
+            &mut encoded,
+            "producer",
+            record.producer.as_deref(),
+            MAX_COMMIT_PRODUCER_BYTES,
+        )
+        .unwrap();
+        put_bounded_bytes(
+            &mut encoded,
+            "lineage_projection",
+            &record.lineage_projection,
+            MAX_COMMIT_LINEAGE_BYTES,
+        )
+        .unwrap();
+        encoded.extend_from_slice(&record.consumer_count.to_be_bytes());
+        encoded.extend_from_slice(&record.consumer_epoch.get().to_be_bytes());
+        put_optional_commit_version(&mut encoded, record.last_zero_consumer_version);
+        encoded.push(record.state.into());
+        encoded
     }
 
     #[test]
@@ -935,6 +1066,19 @@ mod tests {
             CommitRecord::decode(&trailing),
             Err(CommitRecordError::TrailingBytes { count: 1 })
         );
+    }
+
+    #[test]
+    fn commit_v2_dual_decode_does_not_claim_a_generic_index_closure() {
+        let mut expected = commit_record();
+        expected.generic_index_count = 0;
+        expected.generic_index_digest = [0; SHA256_BYTES];
+        let legacy = encode_legacy_v2_commit(&expected);
+        let decoded = CommitRecord::decode(&legacy).unwrap();
+        assert_eq!(decoded, expected);
+        let upgraded = decoded.encode().unwrap();
+        assert_eq!(upgraded[0], COMMIT_RECORD_VALUE_FORMAT_VERSION);
+        assert_ne!(legacy, upgraded);
     }
 
     #[test]
@@ -980,12 +1124,12 @@ mod tests {
         let encoded = record.encode().unwrap();
         assert_eq!(CommitMemberRecord::decode(&encoded).unwrap(), record);
         let mut previous_layout = encoded;
-        previous_layout[0] = COMMIT_VALUE_FORMAT_VERSION - 1;
+        previous_layout[0] = COMMIT_AUXILIARY_VALUE_FORMAT_VERSION - 1;
         assert_eq!(
             CommitMemberRecord::decode(&previous_layout),
             Err(CommitRecordError::UnsupportedValueVersion {
-                actual: COMMIT_VALUE_FORMAT_VERSION - 1,
-                expected: COMMIT_VALUE_FORMAT_VERSION,
+                actual: COMMIT_AUXILIARY_VALUE_FORMAT_VERSION - 1,
+                expected: COMMIT_AUXILIARY_VALUE_FORMAT_VERSION,
             })
         );
 
@@ -1004,7 +1148,7 @@ mod tests {
             commit_id: commit_id(0x11),
             head_generation: Generation::new(0x0102_0304_0506_0708).unwrap(),
         };
-        let mut expected = vec![COMMIT_VALUE_FORMAT_VERSION];
+        let mut expected = vec![COMMIT_AUXILIARY_VALUE_FORMAT_VERSION];
         expected.extend_from_slice(&[0x11; SHA256_BYTES]);
         expected.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
         assert_eq!(head.encode(), expected);
@@ -1022,7 +1166,7 @@ mod tests {
         assert_eq!(
             consumer.encode(),
             vec![
-                COMMIT_VALUE_FORMAT_VERSION,
+                COMMIT_AUXILIARY_VALUE_FORMAT_VERSION,
                 0x01,
                 0x02,
                 0x03,
@@ -1036,6 +1180,28 @@ mod tests {
         assert_eq!(
             CommitConsumerRecord::decode(&consumer.encode()).unwrap(),
             consumer
+        );
+    }
+
+    #[test]
+    fn commit_consumer_lifetime_updates_share_one_checked_primitive() {
+        let record = commit_record();
+        let retained = add_commit_consumer(&record).unwrap();
+        assert_eq!(retained.consumer_count, 3);
+        assert_eq!(retained.consumer_epoch, ConsumerEpoch::new(5));
+        assert_eq!(retained.last_zero_consumer_version, None);
+
+        let zero_version = CommitVersion::new(17).unwrap();
+        let mut one = retained;
+        one.consumer_count = 1;
+        let released = remove_commit_consumer(&one, zero_version).unwrap();
+        assert_eq!(released.consumer_count, 0);
+        assert_eq!(released.consumer_epoch, ConsumerEpoch::new(6));
+        assert_eq!(released.last_zero_consumer_version, Some(zero_version));
+
+        assert_eq!(
+            remove_commit_consumer(&released, zero_version),
+            Err(CommitConsumerMutationError::CountUnderflow)
         );
     }
 

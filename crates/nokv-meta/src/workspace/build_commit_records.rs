@@ -25,8 +25,11 @@ use super::commit_records::{
 };
 use super::publication_records::MAX_CONTENT_TYPE_BYTES;
 
-/// Only supported value format for commit-operation payloads.
-pub const COMMIT_OPERATION_VALUE_FORMAT_VERSION: u8 = 5;
+/// Current value format for build-commit operations.
+pub const BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION: u8 = 6;
+/// Current value format for commit-retirement operations.
+pub const COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION: u8 = 6;
+const LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION: u8 = 5;
 /// Maximum reconciliation evidence retained with a terminal operation.
 pub const MAX_COMMIT_OPERATION_ERROR_BYTES: usize = 4 * 1024;
 
@@ -133,6 +136,20 @@ pub struct BuildCommitOperationRecord {
     pub member_cursor: Option<NormalizedRelativePath>,
     pub member_count: u64,
     pub member_digest: [u8; SHA256_BYTES],
+    /// The workspace path scan reaches EOF before Generic index ownership is
+    /// copied from the same frozen read version.
+    pub path_members_complete: bool,
+    /// Last non-root Generic index scope copied into the commit closure.
+    pub generic_index_cursor: Option<NormalizedRelativePath>,
+    pub generic_index_count: u64,
+    pub generic_index_digest: [u8; SHA256_BYTES],
+    pub generic_indexes_complete: bool,
+    /// Last Generic index member whose temporary build reference was
+    /// atomically transferred to the immutable commit owner.
+    pub generic_index_ref_cursor: Option<NormalizedRelativePath>,
+    pub generic_index_ref_count: u64,
+    pub generic_index_ref_digest: [u8; SHA256_BYTES],
+    pub generic_index_refs_complete: bool,
     pub members_complete: bool,
 
     /// Number of unique commit-owned `RevisionRef` rows created.
@@ -151,6 +168,7 @@ pub struct BuildCommitOperationRecord {
     /// Bounded cleanup progress. Rows are removed from the smallest remaining
     /// key, so counts are durable cursors even though deleted keys disappear.
     pub cleanup_member_count: u64,
+    pub cleanup_generic_index_count: u64,
     pub cleanup_revision_count: u64,
     pub cleanup_parent_count: u32,
     pub history_hold_released: bool,
@@ -171,7 +189,11 @@ pub struct CommitRetireOperationRecord {
     pub revision_digest: [u8; SHA256_BYTES],
     pub parent_commits: Vec<CommitId>,
     pub parent_digest: [u8; SHA256_BYTES],
+    pub generic_index_count: u64,
+    pub generic_index_digest: [u8; SHA256_BYTES],
     pub phase: CommitRetirePhase,
+    pub released_generic_index_count: u64,
+    pub released_generic_index_digest: [u8; SHA256_BYTES],
     pub released_member_count: u64,
     pub released_member_digest: [u8; SHA256_BYTES],
     pub released_revision_count: u64,
@@ -420,6 +442,72 @@ impl BuildCommitOperationRecord {
                 "member count and initial rolling digest are inconsistent",
             );
         }
+        if self.generic_index_count == 0 && self.generic_index_cursor.is_some() {
+            return invalid_build(
+                self.phase,
+                "Generic index cursor requires non-zero Generic index progress",
+            );
+        }
+        if (self.generic_index_count == 0) != (self.generic_index_digest == [0; SHA256_BYTES]) {
+            return invalid_build(
+                self.phase,
+                "Generic index count and rolling digest are inconsistent",
+            );
+        }
+        if (self.generic_index_count > 0 || self.generic_indexes_complete)
+            && !self.path_members_complete
+        {
+            return invalid_build(
+                self.phase,
+                "Generic index copying requires the path member scan to reach EOF",
+            );
+        }
+        if self.generic_index_ref_count > self.generic_index_count {
+            return Err(CommitOperationRecordError::CursorOutOfRange {
+                field: "generic_index_ref",
+                cursor: self.generic_index_ref_count,
+                count: self.generic_index_count,
+            });
+        }
+        if self.generic_index_ref_count == 0 && self.generic_index_ref_cursor.is_some() {
+            return invalid_build(
+                self.phase,
+                "Generic index ref cursor requires non-zero transfer progress",
+            );
+        }
+        if (self.generic_index_ref_count == 0)
+            != (self.generic_index_ref_digest == [0; SHA256_BYTES])
+        {
+            return invalid_build(
+                self.phase,
+                "Generic index ref count and rolling digest are inconsistent",
+            );
+        }
+        if self.generic_index_ref_count > 0 && !self.generic_indexes_complete {
+            return invalid_build(
+                self.phase,
+                "Generic index ref transfer requires the copied closure seal",
+            );
+        }
+        if self.generic_index_refs_complete
+            && (self.generic_index_ref_count != self.generic_index_count
+                || self.generic_index_ref_digest != self.generic_index_digest)
+        {
+            return invalid_build(
+                self.phase,
+                "Generic index ref transfer must cover the copied closure",
+            );
+        }
+        if self.members_complete
+            != (self.path_members_complete
+                && self.generic_indexes_complete
+                && self.generic_index_refs_complete)
+        {
+            return invalid_build(
+                self.phase,
+                "member completion must include both path and Generic index closures",
+            );
+        }
         if self.revision_seal_count == 0 && self.revision_cursor.is_some() {
             return invalid_build(self.phase, "revision cursor requires non-zero seal count");
         }
@@ -463,6 +551,13 @@ impl BuildCommitOperationRecord {
                 field: "cleanup_member",
                 cursor: self.cleanup_member_count,
                 count: self.member_count,
+            });
+        }
+        if self.cleanup_generic_index_count > self.generic_index_count {
+            return Err(CommitOperationRecordError::CursorOutOfRange {
+                field: "cleanup_generic_index",
+                cursor: self.cleanup_generic_index_count,
+                count: self.generic_index_count,
             });
         }
         if self.cleanup_revision_count > self.revision_ref_count {
@@ -514,6 +609,22 @@ impl BuildCommitOperationRecord {
             return invalid_build(
                 self.phase,
                 "member cleanup requires every commit revision ref released",
+            );
+        }
+        if self.cleanup_generic_index_count > 0
+            && self.cleanup_revision_count != self.revision_ref_count
+        {
+            return invalid_build(
+                self.phase,
+                "Generic index cleanup requires every commit revision ref released",
+            );
+        }
+        if self.cleanup_member_count > 0
+            && self.cleanup_generic_index_count != self.generic_index_count
+        {
+            return invalid_build(
+                self.phase,
+                "member cleanup requires every Generic index owner released",
             );
         }
 
@@ -581,6 +692,7 @@ impl BuildCommitOperationRecord {
                     || self.terminal_error.is_none()
                     || !self.history_hold_released
                     || self.cleanup_member_count != self.member_count
+                    || self.cleanup_generic_index_count != self.generic_index_count
                     || self.cleanup_revision_count != self.revision_ref_count
                     || self.cleanup_parent_count != self.parent_cursor
                 {
@@ -601,7 +713,7 @@ impl BuildCommitOperationRecord {
 
     pub fn encode(&self) -> Result<Vec<u8>, CommitOperationRecordError> {
         self.validate()?;
-        let mut out = vec![COMMIT_OPERATION_VALUE_FORMAT_VERSION];
+        let mut out = vec![BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION];
         out.extend_from_slice(self.operation_id.as_bytes());
         out.extend_from_slice(&self.identity_digest);
         out.extend_from_slice(&self.initialization_digest);
@@ -625,6 +737,15 @@ impl BuildCommitOperationRecord {
         put_optional_path(&mut out, self.member_cursor.as_ref());
         out.extend_from_slice(&self.member_count.to_be_bytes());
         out.extend_from_slice(&self.member_digest);
+        out.push(u8::from(self.path_members_complete));
+        put_optional_path(&mut out, self.generic_index_cursor.as_ref());
+        out.extend_from_slice(&self.generic_index_count.to_be_bytes());
+        out.extend_from_slice(&self.generic_index_digest);
+        out.push(u8::from(self.generic_indexes_complete));
+        put_optional_path(&mut out, self.generic_index_ref_cursor.as_ref());
+        out.extend_from_slice(&self.generic_index_ref_count.to_be_bytes());
+        out.extend_from_slice(&self.generic_index_ref_digest);
+        out.push(u8::from(self.generic_index_refs_complete));
         out.push(u8::from(self.members_complete));
         out.extend_from_slice(&self.revision_ref_count.to_be_bytes());
         put_optional_revision(&mut out, self.revision_cursor);
@@ -635,6 +756,7 @@ impl BuildCommitOperationRecord {
         out.extend_from_slice(&self.parent_digest);
         out.push(u8::from(self.parents_complete));
         out.extend_from_slice(&self.cleanup_member_count.to_be_bytes());
+        out.extend_from_slice(&self.cleanup_generic_index_count.to_be_bytes());
         out.extend_from_slice(&self.cleanup_revision_count.to_be_bytes());
         out.extend_from_slice(&self.cleanup_parent_count.to_be_bytes());
         out.push(u8::from(self.history_hold_released));
@@ -645,7 +767,10 @@ impl BuildCommitOperationRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, CommitOperationRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_version()?;
+        let value_version = decoder.require_version(&[
+            LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION,
+            BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION,
+        ])?;
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
         let identity_digest = decoder.fixed("identity_digest")?;
         let initialization_digest = decoder.fixed("initialization_digest")?;
@@ -680,7 +805,52 @@ impl BuildCommitOperationRecord {
         let member_cursor = decoder.optional_path()?;
         let member_count = decoder.u64("member_count")?;
         let member_digest = decoder.fixed("member_digest")?;
+        let (
+            path_members_complete,
+            generic_index_cursor,
+            generic_index_count,
+            generic_index_digest,
+            generic_indexes_complete,
+            generic_index_ref_cursor,
+            generic_index_ref_count,
+            generic_index_ref_digest,
+            generic_index_refs_complete,
+        ) = if value_version == BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION {
+            (
+                decoder.boolean("path_members_complete")?,
+                decoder.optional_path()?,
+                decoder.u64("generic_index_count")?,
+                decoder.fixed("generic_index_digest")?,
+                decoder.boolean("generic_indexes_complete")?,
+                decoder.optional_path()?,
+                decoder.u64("generic_index_ref_count")?,
+                decoder.fixed("generic_index_ref_digest")?,
+                decoder.boolean("generic_index_refs_complete")?,
+            )
+        } else {
+            (
+                false,
+                None,
+                0,
+                [0; SHA256_BYTES],
+                false,
+                None,
+                0,
+                [0; SHA256_BYTES],
+                false,
+            )
+        };
         let members_complete = decoder.boolean("members_complete")?;
+        let (path_members_complete, generic_indexes_complete, generic_index_refs_complete) =
+            if value_version == LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION {
+                (members_complete, members_complete, members_complete)
+            } else {
+                (
+                    path_members_complete,
+                    generic_indexes_complete,
+                    generic_index_refs_complete,
+                )
+            };
         let revision_ref_count = decoder.u64("revision_ref_count")?;
         let revision_cursor = decoder.optional_revision()?;
         let revision_seal_count = decoder.u64("revision_seal_count")?;
@@ -690,6 +860,12 @@ impl BuildCommitOperationRecord {
         let parent_digest = decoder.fixed("parent_digest")?;
         let parents_complete = decoder.boolean("parents_complete")?;
         let cleanup_member_count = decoder.u64("cleanup_member_count")?;
+        let cleanup_generic_index_count =
+            if value_version == BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION {
+                decoder.u64("cleanup_generic_index_count")?
+            } else {
+                0
+            };
         let cleanup_revision_count = decoder.u64("cleanup_revision_count")?;
         let cleanup_parent_count = decoder.u32("cleanup_parent_count")?;
         let history_hold_released = decoder.boolean("history_hold_released")?;
@@ -720,6 +896,15 @@ impl BuildCommitOperationRecord {
             member_cursor,
             member_count,
             member_digest,
+            path_members_complete,
+            generic_index_cursor,
+            generic_index_count,
+            generic_index_digest,
+            generic_indexes_complete,
+            generic_index_ref_cursor,
+            generic_index_ref_count,
+            generic_index_ref_digest,
+            generic_index_refs_complete,
             members_complete,
             revision_ref_count,
             revision_cursor,
@@ -730,6 +915,7 @@ impl BuildCommitOperationRecord {
             parent_digest,
             parents_complete,
             cleanup_member_count,
+            cleanup_generic_index_count,
             cleanup_revision_count,
             cleanup_parent_count,
             history_hold_released,
@@ -757,6 +943,12 @@ impl CommitRetireOperationRecord {
 
     pub fn validate(&self) -> Result<(), CommitOperationRecordError> {
         validate_parents(&self.parent_commits)?;
+        if (self.generic_index_count == 0) != (self.generic_index_digest == [0; SHA256_BYTES]) {
+            return invalid_retire(
+                self.phase,
+                "Generic index count and immutable digest are inconsistent",
+            );
+        }
         if self.identity_digest != self.canonical_identity_digest() {
             return Err(CommitOperationRecordError::IdentityDigestMismatch);
         }
@@ -775,7 +967,17 @@ impl CommitRetireOperationRecord {
             u64::from(self.released_parent_count),
             self.parent_commits.len() as u64,
         )?;
+        validate_release_cursor(
+            "released_generic_index",
+            self.released_generic_index_count,
+            self.generic_index_count,
+        )?;
         for (count, digest, reason) in [
+            (
+                self.released_generic_index_count,
+                self.released_generic_index_digest,
+                "released Generic index count and rolling digest are inconsistent",
+            ),
             (
                 self.released_member_count,
                 self.released_member_digest,
@@ -799,9 +1001,11 @@ impl CommitRetireOperationRecord {
         match self.phase {
             CommitRetirePhase::Claiming => {
                 if self.released_member_count != 0
+                    || self.released_generic_index_count != 0
                     || self.released_revision_count != 0
                     || self.released_parent_count != 0
                     || self.released_member_digest != [0; SHA256_BYTES]
+                    || self.released_generic_index_digest != [0; SHA256_BYTES]
                     || self.released_revision_digest != [0; SHA256_BYTES]
                     || self.released_parent_digest != [0; SHA256_BYTES]
                     || self.terminal_error.is_some()
@@ -817,16 +1021,18 @@ impl CommitRetireOperationRecord {
             }
             CommitRetirePhase::Complete => {
                 if self.released_member_count != self.member_count
+                    || self.released_generic_index_count != self.generic_index_count
                     || self.released_revision_count != self.revision_count
                     || self.released_parent_count as usize != self.parent_commits.len()
                     || self.released_member_digest != self.member_digest
+                    || self.released_generic_index_digest != self.generic_index_digest
                     || self.released_revision_digest != self.revision_digest
                     || self.released_parent_digest != self.parent_digest
                     || self.terminal_error.is_some()
                 {
                     return invalid_retire(
                         self.phase,
-                        "complete requires all three exact closure seals",
+                        "complete requires every exact closure seal",
                     );
                 }
             }
@@ -841,7 +1047,7 @@ impl CommitRetireOperationRecord {
 
     pub fn encode(&self) -> Result<Vec<u8>, CommitOperationRecordError> {
         self.validate()?;
-        let mut out = vec![COMMIT_OPERATION_VALUE_FORMAT_VERSION];
+        let mut out = vec![COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION];
         out.extend_from_slice(self.operation_id.as_bytes());
         out.extend_from_slice(&self.identity_digest);
         out.extend_from_slice(self.commit_id.as_bytes());
@@ -852,7 +1058,11 @@ impl CommitRetireOperationRecord {
         out.extend_from_slice(&self.revision_digest);
         put_parents(&mut out, &self.parent_commits);
         out.extend_from_slice(&self.parent_digest);
+        out.extend_from_slice(&self.generic_index_count.to_be_bytes());
+        out.extend_from_slice(&self.generic_index_digest);
         out.push(self.phase.into());
+        out.extend_from_slice(&self.released_generic_index_count.to_be_bytes());
+        out.extend_from_slice(&self.released_generic_index_digest);
         out.extend_from_slice(&self.released_member_count.to_be_bytes());
         out.extend_from_slice(&self.released_member_digest);
         out.extend_from_slice(&self.released_revision_count.to_be_bytes());
@@ -865,7 +1075,10 @@ impl CommitRetireOperationRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, CommitOperationRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_version()?;
+        let value_version = decoder.require_version(&[
+            LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION,
+            COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION,
+        ])?;
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
         let identity_digest = decoder.fixed("identity_digest")?;
         let commit_id = CommitId::from_bytes(decoder.fixed("commit_id")?);
@@ -876,7 +1089,25 @@ impl CommitRetireOperationRecord {
         let revision_digest = decoder.fixed("revision_digest")?;
         let parent_commits = decoder.parents()?;
         let parent_digest = decoder.fixed("parent_digest")?;
+        let (generic_index_count, generic_index_digest) =
+            if value_version == COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION {
+                (
+                    decoder.u64("generic_index_count")?,
+                    decoder.fixed("generic_index_digest")?,
+                )
+            } else {
+                (0, [0; SHA256_BYTES])
+            };
         let phase = decode_enum(decoder.u8("phase")?)?;
+        let (released_generic_index_count, released_generic_index_digest) =
+            if value_version == COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION {
+                (
+                    decoder.u64("released_generic_index_count")?,
+                    decoder.fixed("released_generic_index_digest")?,
+                )
+            } else {
+                (0, [0; SHA256_BYTES])
+            };
         let released_member_count = decoder.u64("released_member_count")?;
         let released_member_digest = decoder.fixed("released_member_digest")?;
         let released_revision_count = decoder.u64("released_revision_count")?;
@@ -896,7 +1127,11 @@ impl CommitRetireOperationRecord {
             revision_digest,
             parent_commits,
             parent_digest,
+            generic_index_count,
+            generic_index_digest,
             phase,
+            released_generic_index_count,
+            released_generic_index_digest,
             released_member_count,
             released_member_digest,
             released_revision_count,
@@ -1027,6 +1262,7 @@ fn require_no_cleanup(
     operation: &BuildCommitOperationRecord,
 ) -> Result<(), CommitOperationRecordError> {
     if operation.cleanup_member_count == 0
+        && operation.cleanup_generic_index_count == 0
         && operation.cleanup_revision_count == 0
         && operation.cleanup_parent_count == 0
     {
@@ -1042,6 +1278,15 @@ fn require_no_cleanup(
 fn validate_retire_release_order(
     operation: &CommitRetireOperationRecord,
 ) -> Result<(), CommitOperationRecordError> {
+    if operation.released_revision_count > 0
+        && (operation.released_generic_index_count != operation.generic_index_count
+            || operation.released_generic_index_digest != operation.generic_index_digest)
+    {
+        return invalid_retire(
+            operation.phase,
+            "revision release requires the exact Generic index seal",
+        );
+    }
     if operation.released_parent_count > 0
         && (operation.released_revision_count != operation.revision_count
             || operation.released_revision_digest != operation.revision_digest)
@@ -1238,14 +1483,16 @@ impl<'a> Decoder<'a> {
         Self { input, offset: 0 }
     }
 
-    fn require_version(&mut self) -> Result<(), CommitOperationRecordError> {
+    fn require_version(&mut self, supported: &[u8]) -> Result<u8, CommitOperationRecordError> {
         let actual = self.u8("value_format_version")?;
-        if actual == COMMIT_OPERATION_VALUE_FORMAT_VERSION {
-            Ok(())
+        if supported.contains(&actual) {
+            Ok(actual)
         } else {
             Err(CommitOperationRecordError::UnsupportedValueVersion {
                 actual,
-                expected: COMMIT_OPERATION_VALUE_FORMAT_VERSION,
+                expected: *supported
+                    .last()
+                    .expect("every commit-operation decoder supports at least one version"),
             })
         }
     }
@@ -1478,6 +1725,108 @@ impl<'a> Decoder<'a> {
 mod tests {
     use super::*;
 
+    fn legacy_v5_build_bytes(record: &BuildCommitOperationRecord) -> Vec<u8> {
+        let mut encoded = record.encode().unwrap();
+        let mut decoder = Decoder::new(&encoded);
+        decoder
+            .require_version(&[BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION])
+            .unwrap();
+        decoder.fixed::<16>("operation_id").unwrap();
+        decoder.fixed::<SHA256_BYTES>("identity_digest").unwrap();
+        decoder
+            .fixed::<SHA256_BYTES>("initialization_digest")
+            .unwrap();
+        decoder.string("workbench_id").unwrap();
+        decoder.fixed::<16>("source_workspace").unwrap();
+        decoder.u64("source_read_version").unwrap();
+        decoder.fixed::<SHA256_BYTES>("commit_id").unwrap();
+        decoder.optional_head().unwrap();
+        decoder.string("content_digest_uri").unwrap();
+        decoder.string("manifest_digest_uri").unwrap();
+        decoder
+            .fixed::<SHA256_BYTES>("projection_input_digest")
+            .unwrap();
+        decoder.fixed::<16>("tree_manifest_revision_id").unwrap();
+        decoder.boolean("replace").unwrap();
+        decoder.manifest_condition().unwrap();
+        decoder.u64("committed_at_unix_seconds").unwrap();
+        decoder.optional_manifest_binding().unwrap();
+        decoder.optional_string("producer").unwrap();
+        decoder.bytes("lineage_projection").unwrap();
+        decoder.parents().unwrap();
+        decoder.u8("phase").unwrap();
+        decoder.optional_path().unwrap();
+        decoder.u64("member_count").unwrap();
+        decoder.fixed::<SHA256_BYTES>("member_digest").unwrap();
+        let generic_start = decoder.offset;
+        decoder.boolean("path_members_complete").unwrap();
+        decoder.optional_path().unwrap();
+        decoder.u64("generic_index_count").unwrap();
+        decoder
+            .fixed::<SHA256_BYTES>("generic_index_digest")
+            .unwrap();
+        decoder.boolean("generic_indexes_complete").unwrap();
+        decoder.optional_path().unwrap();
+        decoder.u64("generic_index_ref_count").unwrap();
+        decoder
+            .fixed::<SHA256_BYTES>("generic_index_ref_digest")
+            .unwrap();
+        decoder.boolean("generic_index_refs_complete").unwrap();
+        let generic_end = decoder.offset;
+        decoder.boolean("members_complete").unwrap();
+        decoder.u64("revision_ref_count").unwrap();
+        decoder.optional_revision().unwrap();
+        decoder.u64("revision_seal_count").unwrap();
+        decoder.fixed::<SHA256_BYTES>("revision_digest").unwrap();
+        decoder.boolean("revisions_complete").unwrap();
+        decoder.u32("parent_cursor").unwrap();
+        decoder.fixed::<SHA256_BYTES>("parent_digest").unwrap();
+        decoder.boolean("parents_complete").unwrap();
+        decoder.u64("cleanup_member_count").unwrap();
+        let cleanup_start = decoder.offset;
+        decoder.u64("cleanup_generic_index_count").unwrap();
+        let cleanup_end = decoder.offset;
+        encoded.drain(cleanup_start..cleanup_end);
+        encoded.drain(generic_start..generic_end);
+        encoded[0] = LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION;
+        encoded
+    }
+
+    fn legacy_v5_retire_bytes(record: &CommitRetireOperationRecord) -> Vec<u8> {
+        let mut encoded = record.encode().unwrap();
+        let mut decoder = Decoder::new(&encoded);
+        decoder
+            .require_version(&[COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION])
+            .unwrap();
+        decoder.fixed::<16>("operation_id").unwrap();
+        decoder.fixed::<SHA256_BYTES>("identity_digest").unwrap();
+        decoder.fixed::<SHA256_BYTES>("commit_id").unwrap();
+        decoder.u64("claimed_consumer_epoch").unwrap();
+        decoder.u64("member_count").unwrap();
+        decoder.fixed::<SHA256_BYTES>("member_digest").unwrap();
+        decoder.u64("revision_count").unwrap();
+        decoder.fixed::<SHA256_BYTES>("revision_digest").unwrap();
+        decoder.parents().unwrap();
+        decoder.fixed::<SHA256_BYTES>("parent_digest").unwrap();
+        let closure_start = decoder.offset;
+        decoder.u64("generic_index_count").unwrap();
+        decoder
+            .fixed::<SHA256_BYTES>("generic_index_digest")
+            .unwrap();
+        let closure_end = decoder.offset;
+        decoder.u8("phase").unwrap();
+        let released_start = decoder.offset;
+        decoder.u64("released_generic_index_count").unwrap();
+        decoder
+            .fixed::<SHA256_BYTES>("released_generic_index_digest")
+            .unwrap();
+        let released_end = decoder.offset;
+        encoded.drain(released_start..released_end);
+        encoded.drain(closure_start..closure_end);
+        encoded[0] = LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION;
+        encoded
+    }
+
     fn build_record() -> BuildCommitOperationRecord {
         let mut record = BuildCommitOperationRecord {
             operation_id: OperationId::from_bytes([1; 16]),
@@ -1503,6 +1852,15 @@ mod tests {
             member_cursor: None,
             member_count: 0,
             member_digest: [0; SHA256_BYTES],
+            path_members_complete: false,
+            generic_index_cursor: None,
+            generic_index_count: 0,
+            generic_index_digest: [0; SHA256_BYTES],
+            generic_indexes_complete: false,
+            generic_index_ref_cursor: None,
+            generic_index_ref_count: 0,
+            generic_index_ref_digest: [0; SHA256_BYTES],
+            generic_index_refs_complete: false,
             members_complete: false,
             revision_ref_count: 0,
             revision_cursor: None,
@@ -1513,6 +1871,7 @@ mod tests {
             parent_digest: [0; SHA256_BYTES],
             parents_complete: false,
             cleanup_member_count: 0,
+            cleanup_generic_index_count: 0,
             cleanup_revision_count: 0,
             cleanup_parent_count: 0,
             history_hold_released: false,
@@ -1554,13 +1913,52 @@ mod tests {
         ));
 
         let mut previous = record.encode().unwrap();
-        previous[0] = COMMIT_OPERATION_VALUE_FORMAT_VERSION - 1;
+        previous[0] = LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION - 1;
         assert_eq!(
             BuildCommitOperationRecord::decode(&previous),
             Err(CommitOperationRecordError::UnsupportedValueVersion {
-                actual: COMMIT_OPERATION_VALUE_FORMAT_VERSION - 1,
-                expected: COMMIT_OPERATION_VALUE_FORMAT_VERSION,
+                actual: LEGACY_COMMIT_OPERATION_VALUE_FORMAT_VERSION - 1,
+                expected: BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION,
             })
+        );
+    }
+
+    #[test]
+    fn build_and_retire_v5_dual_decode_without_claiming_generic_closures() {
+        let build = build_record();
+        assert_eq!(
+            BuildCommitOperationRecord::decode(&legacy_v5_build_bytes(&build)).unwrap(),
+            build
+        );
+
+        let mut retire = CommitRetireOperationRecord {
+            operation_id: OperationId::from_bytes([7; 16]),
+            identity_digest: [0; SHA256_BYTES],
+            commit_id: CommitId::from_bytes([8; SHA256_BYTES]),
+            claimed_consumer_epoch: ConsumerEpoch::new(9),
+            member_count: 0,
+            member_digest: [0; SHA256_BYTES],
+            revision_count: 0,
+            revision_digest: [0; SHA256_BYTES],
+            parent_commits: vec![],
+            parent_digest: [0; SHA256_BYTES],
+            generic_index_count: 0,
+            generic_index_digest: [0; SHA256_BYTES],
+            phase: CommitRetirePhase::Complete,
+            released_generic_index_count: 0,
+            released_generic_index_digest: [0; SHA256_BYTES],
+            released_member_count: 0,
+            released_member_digest: [0; SHA256_BYTES],
+            released_revision_count: 0,
+            released_revision_digest: [0; SHA256_BYTES],
+            released_parent_count: 0,
+            released_parent_digest: [0; SHA256_BYTES],
+            terminal_error: None,
+        };
+        retire.seal_identity();
+        assert_eq!(
+            CommitRetireOperationRecord::decode(&legacy_v5_retire_bytes(&retire)).unwrap(),
+            retire
         );
     }
 
@@ -1632,7 +2030,11 @@ mod tests {
             revision_digest: [2; SHA256_BYTES],
             parent_commits: vec![CommitId::from_bytes([3; SHA256_BYTES])],
             parent_digest: [4; SHA256_BYTES],
+            generic_index_count: 0,
+            generic_index_digest: [0; SHA256_BYTES],
             phase: CommitRetirePhase::Complete,
+            released_generic_index_count: 0,
+            released_generic_index_digest: [0; SHA256_BYTES],
             released_member_count: 2,
             released_member_digest: [1; SHA256_BYTES],
             released_revision_count: 3,

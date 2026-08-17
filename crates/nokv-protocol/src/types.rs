@@ -6,9 +6,10 @@
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, CommitId, LogicalShardId, NormalizedRelativePath, ObjectNamespaceId,
-    OperationId, OwnerEpoch, PlacementGeneration, RequestId, RootId, SnapshotAliasName, SnapshotId,
-    TagName, WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES, SHA256_BYTES,
+    ArtifactRevisionId, CommitId, GenericIndexGenerationId, LogicalShardId, NormalizedRelativePath,
+    ObjectNamespaceId, OperationId, OwnerEpoch, PlacementGeneration, RequestId, RootId,
+    SnapshotAliasName, SnapshotId, TagName, WorkbenchId, WorkspaceIncarnationId, FIXED_ID_BYTES,
+    SHA256_BYTES,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
 
@@ -90,6 +91,12 @@ identity!(
     FIXED_ID_BYTES
 );
 identity!(
+    /// Never-reused immutable Generic custom-index generation identity.
+    GenericIndexGenerationIdentity,
+    GenericIndexGenerationId,
+    FIXED_ID_BYTES
+);
+identity!(
     /// Immutable commit identity.
     CommitIdentity,
     CommitId,
@@ -136,6 +143,7 @@ pub enum WorkspaceCapability {
     ArtifactRangeReadV1,
     ChangeFeedV1,
     CommitV1,
+    GenericCustomIndexV1,
     QueryV1,
     RestoreV1,
     SnapshotLeaseV1,
@@ -144,11 +152,12 @@ pub enum WorkspaceCapability {
 }
 
 impl WorkspaceCapability {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::ArtifactPublishV1,
         Self::ArtifactRangeReadV1,
         Self::ChangeFeedV1,
         Self::CommitV1,
+        Self::GenericCustomIndexV1,
         Self::QueryV1,
         Self::RestoreV1,
         Self::SnapshotLeaseV1,

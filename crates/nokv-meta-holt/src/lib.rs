@@ -11,6 +11,7 @@
 //! The `test-support` feature exposes an in-memory constructor plus explicit
 //! checkpoint and keyspace-stat probes to test and diagnostic packages.
 
+mod checkpoint;
 mod options;
 #[cfg(feature = "read-stats")]
 mod stats;
@@ -25,3 +26,7 @@ pub use store::HoltStore;
 
 #[cfg(test)]
 mod tests;
+pub use checkpoint::{
+    HoltFreshCheckpointInstaller, HoltRecoveryStagingAdoptionAuthority,
+    HoltRecoveryStagingIdentity, HOLT_CHECKPOINT_FORMAT_ID,
+};

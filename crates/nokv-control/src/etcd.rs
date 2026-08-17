@@ -4,19 +4,22 @@ use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp
 use tokio::runtime::{Builder, Runtime};
 
 use crate::codec::{
-    decode_logical_shard_record, decode_owner_session, decode_root_object_namespace_binding,
-    decode_root_placement, encode_logical_shard_record, encode_owner_session,
-    encode_root_object_namespace_binding, encode_root_placement,
+    decode_logical_shard_record, decode_owner_session, decode_root_agent_binding,
+    decode_root_object_namespace_binding, decode_root_placement, encode_logical_shard_record,
+    encode_owner_session, encode_root_agent_binding, encode_root_object_namespace_binding,
+    encode_root_placement,
 };
 use crate::store::{
     prepare_mark_serving, prepare_owner_acquisition, prepare_owner_release,
-    prepare_recovery_reacquisition, prepare_recovery_suspension, validate_new_root_placement,
-    validate_record_lease, validate_root_placement_update, ControlStore,
+    prepare_recovery_reacquisition, prepare_recovery_suspension, prepare_recovery_upload_abort,
+    prepare_recovery_upload_finalization, prepare_recovery_upload_intent,
+    validate_new_root_placement, validate_record_lease, validate_root_placement_update,
+    ControlStore,
 };
 use crate::{
     ControlError, EtcdControlStoreOptions, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    NodeId, OwnerEpoch, RecoveryPublication, RootId, RootObjectNamespaceBinding, RootPlacement,
-    RootPlacementLifecycle,
+    NodeId, OwnerEpoch, RecoveryPublication, RecoveryUploadIntent, RootAgentBinding, RootId,
+    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
 };
 
 pub struct EtcdControlStore {
@@ -32,7 +35,7 @@ struct StoredRootPlacement {
 
 struct StoredLogicalShard {
     record: LogicalShardRecord,
-    encoded: Vec<u8>,
+    mod_revision: i64,
 }
 
 struct StoredOwnerSession {
@@ -74,6 +77,50 @@ impl EtcdControlStore {
 }
 
 impl ControlStore for EtcdControlStore {
+    fn create_root_agent_binding(
+        &self,
+        binding: RootAgentBinding,
+    ) -> Result<RootAgentBinding, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        self.block_on(async move {
+            let key = options.root_agent_key(&binding.root_id);
+            let encoded = encode_root_agent_binding(&binding)?;
+            let txn = Txn::new()
+                .when(vec![Compare::version(key.clone(), CompareOp::Equal, 0)])
+                .and_then(vec![TxnOp::put(key, encoded, None)]);
+            if client.txn(txn).await.map_err(etcd_backend)?.succeeded() {
+                return Ok(binding);
+            }
+            let current = fetch_root_agent_binding(&mut client, &options, &binding.root_id)
+                .await?
+                .ok_or_else(|| {
+                    ControlError::Backend(
+                        "root Agent binding disappeared after create conflict".to_owned(),
+                    )
+                })?;
+            if current == binding {
+                Ok(current)
+            } else {
+                Err(ControlError::RootAgentAlreadyBound {
+                    root_id: binding.root_id,
+                })
+            }
+        })
+    }
+
+    fn get_root_agent_binding(
+        &self,
+        root_id: &RootId,
+    ) -> Result<Option<RootAgentBinding>, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let root_id = *root_id;
+        self.block_on(
+            async move { fetch_root_agent_binding(&mut client, &options, &root_id).await },
+        )
+    }
+
     fn create_root_object_namespace_binding(
         &self,
         binding: RootObjectNamespaceBinding,
@@ -483,7 +530,11 @@ impl ControlStore for EtcdControlStore {
             let session_key = options.logical_shard_session_key(&lease.logical_shard_id);
             let txn = Txn::new()
                 .when(vec![
-                    Compare::value(record_key.clone(), CompareOp::Equal, current.encoded),
+                    Compare::mod_revision(
+                        record_key.clone(),
+                        CompareOp::Equal,
+                        current.mod_revision,
+                    ),
                     Compare::value(session_key.clone(), CompareOp::Equal, session.encoded),
                     Compare::lease(session_key, CompareOp::Equal, lease_id_i64(lease.lease_id)?),
                 ])
@@ -495,9 +546,72 @@ impl ControlStore for EtcdControlStore {
             match client.txn(txn).await {
                 Ok(response) if response.succeeded() => Ok(next),
                 Ok(_) | Err(_) => {
-                    classify_mark_serving_failure(&mut client, &options, &lease, &next).await
+                    classify_owner_record_mutation_failure(&mut client, &options, &lease, &next)
+                        .await
                 }
             }
+        })
+    }
+
+    fn prepare_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        intent: RecoveryUploadIntent,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let lease = lease.clone();
+        self.block_on(async move {
+            let current = fetch_logical_shard(&mut client, &options, &lease.logical_shard_id)
+                .await?
+                .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+            let session = validate_owner_session(&mut client, &options, &lease).await?;
+            let next = prepare_recovery_upload_intent(&current.record, &lease, intent)?;
+            put_owner_record_cas(&mut client, &options, &lease, current, session, next).await
+        })
+    }
+
+    fn finalize_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        expected_intent: &RecoveryUploadIntent,
+        publication: RecoveryPublication,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let lease = lease.clone();
+        let expected_intent = expected_intent.clone();
+        self.block_on(async move {
+            let current = fetch_logical_shard(&mut client, &options, &lease.logical_shard_id)
+                .await?
+                .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+            let session = validate_owner_session(&mut client, &options, &lease).await?;
+            let next = prepare_recovery_upload_finalization(
+                &current.record,
+                &lease,
+                &expected_intent,
+                publication,
+            )?;
+            put_owner_record_cas(&mut client, &options, &lease, current, session, next).await
+        })
+    }
+
+    fn abort_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        expected_intent: &RecoveryUploadIntent,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut client = self.client.clone();
+        let options = self.options.clone();
+        let lease = lease.clone();
+        let expected_intent = expected_intent.clone();
+        self.block_on(async move {
+            let current = fetch_logical_shard(&mut client, &options, &lease.logical_shard_id)
+                .await?
+                .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+            let session = validate_owner_session(&mut client, &options, &lease).await?;
+            let next = prepare_recovery_upload_abort(&current.record, &lease, &expected_intent)?;
+            put_owner_record_cas(&mut client, &options, &lease, current, session, next).await
         })
     }
 
@@ -518,7 +632,7 @@ impl ControlStore for EtcdControlStore {
             let session_key = options.logical_shard_session_key(&lease.logical_shard_id);
             let txn = Txn::new()
                 .when(vec![
-                    Compare::value(record_key, CompareOp::Equal, current.encoded),
+                    Compare::mod_revision(record_key, CompareOp::Equal, current.mod_revision),
                     Compare::value(session_key.clone(), CompareOp::Equal, session.encoded),
                     Compare::lease(
                         session_key.clone(),
@@ -555,7 +669,11 @@ impl ControlStore for EtcdControlStore {
             let session_key = options.logical_shard_session_key(&lease.logical_shard_id);
             let txn = Txn::new()
                 .when(vec![
-                    Compare::value(record_key.clone(), CompareOp::Equal, current.encoded),
+                    Compare::mod_revision(
+                        record_key.clone(),
+                        CompareOp::Equal,
+                        current.mod_revision,
+                    ),
                     Compare::value(session_key.clone(), CompareOp::Equal, session.encoded),
                     Compare::lease(
                         session_key.clone(),
@@ -583,6 +701,34 @@ impl ControlStore for EtcdControlStore {
             }
         })
     }
+}
+
+async fn fetch_root_agent_binding(
+    client: &mut Client,
+    options: &EtcdControlStoreOptions,
+    root_id: &RootId,
+) -> Result<Option<RootAgentBinding>, ControlError> {
+    let key = options.root_agent_key(root_id);
+    let response = client.get(key.clone(), None).await.map_err(etcd_backend)?;
+    let Some(kv) = response.kvs().first() else {
+        return Ok(None);
+    };
+    let binding = decode_root_agent_binding(kv.value())?;
+    validate_root_agent_binding_entry(options, root_id, kv.key(), binding).map(Some)
+}
+
+fn validate_root_agent_binding_entry(
+    options: &EtcdControlStoreOptions,
+    root_id: &RootId,
+    stored_key: &[u8],
+    binding: RootAgentBinding,
+) -> Result<RootAgentBinding, ControlError> {
+    if binding.root_id != *root_id || stored_key != options.root_agent_key(root_id) {
+        return Err(ControlError::Codec(
+            "root Agent binding key and value identities differ".to_owned(),
+        ));
+    }
+    Ok(binding)
 }
 
 async fn fetch_root_object_namespace_binding(
@@ -688,9 +834,14 @@ async fn fetch_logical_shard(
             "logical shard value is not canonical".to_owned(),
         ));
     }
+    if kv.mod_revision() <= 0 {
+        return Err(ControlError::Codec(
+            "logical shard has an invalid etcd modification revision".to_owned(),
+        ));
+    }
     Ok(Some(StoredLogicalShard {
         record,
-        encoded: canonical,
+        mod_revision: kv.mod_revision(),
     }))
 }
 
@@ -719,9 +870,14 @@ async fn fetch_logical_shards(
                 "logical shard value is not canonical".to_owned(),
             ));
         }
+        if kv.mod_revision() <= 0 {
+            return Err(ControlError::Codec(
+                "logical shard has an invalid etcd modification revision".to_owned(),
+            ));
+        }
         records.push(StoredLogicalShard {
             record,
-            encoded: canonical,
+            mod_revision: kv.mod_revision(),
         });
     }
     records.sort_by_key(|stored| stored.record.logical_shard_id);
@@ -826,11 +982,7 @@ async fn install_owner(
     let session_key = options.logical_shard_session_key(&lease.logical_shard_id);
     let txn = Txn::new()
         .when(vec![
-            Compare::value(
-                record_key.clone(),
-                CompareOp::Equal,
-                current.encoded.clone(),
-            ),
+            Compare::mod_revision(record_key.clone(), CompareOp::Equal, current.mod_revision),
             Compare::create_revision(session_key.clone(), CompareOp::Equal, 0),
             Compare::value(
                 options.root_placement_key(&placement.placement.root_id),
@@ -941,7 +1093,36 @@ async fn classify_acquire_failure(
     ))
 }
 
-async fn classify_mark_serving_failure(
+async fn put_owner_record_cas(
+    client: &mut Client,
+    options: &EtcdControlStoreOptions,
+    lease: &LogicalShardLease,
+    current: StoredLogicalShard,
+    session: StoredOwnerSession,
+    next: LogicalShardRecord,
+) -> Result<LogicalShardRecord, ControlError> {
+    let record_key = options.logical_shard_record_key(&lease.logical_shard_id);
+    let session_key = options.logical_shard_session_key(&lease.logical_shard_id);
+    let txn = Txn::new()
+        .when(vec![
+            Compare::mod_revision(record_key.clone(), CompareOp::Equal, current.mod_revision),
+            Compare::value(session_key.clone(), CompareOp::Equal, session.encoded),
+            Compare::lease(session_key, CompareOp::Equal, lease_id_i64(lease.lease_id)?),
+        ])
+        .and_then(vec![TxnOp::put(
+            record_key,
+            encode_logical_shard_record(&next)?,
+            None,
+        )]);
+    match client.txn(txn).await {
+        Ok(response) if response.succeeded() => Ok(next),
+        Ok(_) | Err(_) => {
+            classify_owner_record_mutation_failure(client, options, lease, &next).await
+        }
+    }
+}
+
+async fn classify_owner_record_mutation_failure(
     client: &mut Client,
     options: &EtcdControlStoreOptions,
     lease: &LogicalShardLease,
@@ -1045,4 +1226,190 @@ fn lease_id_i64(lease_id: u64) -> Result<i64, ControlError> {
 
 fn etcd_backend(error: etcd_client::Error) -> ControlError {
     ControlError::Backend(format!("etcd: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use etcd_client::DeleteOptions;
+
+    use super::*;
+    use crate::{AgentId, PlacementGeneration, RootPlacementLifecycle};
+
+    fn root(fill: u8) -> RootId {
+        RootId::from_bytes([fill; 16])
+    }
+
+    fn binding(root_fill: u8) -> RootAgentBinding {
+        RootAgentBinding {
+            root_id: root(root_fill),
+            agent_id: AgentId::from_bytes([7; 16]),
+        }
+    }
+
+    fn shard(fill: u8) -> LogicalShardId {
+        LogicalShardId::from_bytes([fill; 16])
+    }
+
+    #[test]
+    fn root_agent_binding_entry_requires_exact_key_and_value_root_identity() {
+        let options =
+            EtcdControlStoreOptions::new(["http://127.0.0.1:2379"]).with_key_prefix("/nokv/test");
+        let requested = root(1);
+        let key = options.root_agent_key(&requested);
+
+        assert_eq!(
+            validate_root_agent_binding_entry(&options, &requested, &key, binding(1)).unwrap(),
+            binding(1)
+        );
+        assert!(matches!(
+            validate_root_agent_binding_entry(&options, &requested, b"wrong-key", binding(1)),
+            Err(ControlError::Codec(_))
+        ));
+        assert!(matches!(
+            validate_root_agent_binding_entry(&options, &requested, &key, binding(2)),
+            Err(ControlError::Codec(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires NOKV_TEST_ETCD_ENDPOINT"]
+    fn logical_shard_revision_cas_rejects_aba_and_classifies_exact_readback() {
+        let endpoint = std::env::var("NOKV_TEST_ETCD_ENDPOINT")
+            .expect("NOKV_TEST_ETCD_ENDPOINT must name an isolated test etcd endpoint");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("/nokv/test/revision-cas-{}-{nonce}", std::process::id());
+        let options = EtcdControlStoreOptions::new([endpoint]).with_key_prefix(prefix.clone());
+        let store = EtcdControlStore::connect(options.clone()).unwrap();
+        let logical_shard_id = shard(3);
+        store.create_logical_shard(logical_shard_id).unwrap();
+        store
+            .create_root_placement(RootPlacement {
+                root_id: root(4),
+                logical_shard_id,
+                placement_generation: PlacementGeneration::new(1).unwrap(),
+                lifecycle: RootPlacementLifecycle::Provisioning,
+            })
+            .unwrap();
+        let lease = store
+            .acquire_owner(
+                &logical_shard_id,
+                NodeId::new("node-a").unwrap(),
+                "node-a:7000".to_owned(),
+            )
+            .unwrap();
+
+        let mut client = store.client.clone();
+        let current = store
+            .block_on(fetch_logical_shard(
+                &mut client,
+                &options,
+                &logical_shard_id,
+            ))
+            .unwrap()
+            .unwrap();
+        let session = store
+            .block_on(validate_owner_session(&mut client, &options, &lease))
+            .unwrap();
+        let next = prepare_mark_serving(
+            &current.record,
+            &lease,
+            RecoveryPublication {
+                checkpoint: None,
+                log: None,
+                durable_lsn: 0,
+            },
+        )
+        .unwrap();
+
+        let mut interposed = current.record.clone();
+        interposed.endpoint = Some("node-a:7001".to_owned());
+        let record_key = options.logical_shard_record_key(&logical_shard_id);
+        let original = encode_logical_shard_record(&current.record).unwrap();
+        store
+            .block_on(async {
+                client
+                    .put(
+                        record_key.clone(),
+                        encode_logical_shard_record(&interposed)?,
+                        None,
+                    )
+                    .await
+                    .map_err(etcd_backend)?;
+                client
+                    .put(record_key.clone(), original, None)
+                    .await
+                    .map_err(etcd_backend)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = store
+            .block_on(put_owner_record_cas(
+                &mut client,
+                &options,
+                &lease,
+                current,
+                session,
+                next.clone(),
+            ))
+            .expect_err("a stale modification revision must reject A-to-B-to-A");
+        assert!(matches!(error, ControlError::Backend(_)));
+
+        store
+            .block_on(async {
+                client
+                    .put(record_key, encode_logical_shard_record(&next)?, None)
+                    .await
+                    .map_err(etcd_backend)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .block_on(classify_owner_record_mutation_failure(
+                    &mut client,
+                    &options,
+                    &lease,
+                    &next,
+                ))
+                .unwrap(),
+            next,
+            "an exact committed state with the live session is a lost-response success"
+        );
+
+        let session_key = options.logical_shard_session_key(&logical_shard_id);
+        store
+            .block_on(async {
+                client
+                    .delete(session_key, None)
+                    .await
+                    .map_err(etcd_backend)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.block_on(classify_owner_record_mutation_failure(
+                &mut client,
+                &options,
+                &lease,
+                &next,
+            )),
+            Err(ControlError::StaleLease(_))
+        ));
+
+        store
+            .block_on(async {
+                client
+                    .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+                    .await
+                    .map_err(etcd_backend)?;
+                Ok(())
+            })
+            .unwrap();
+    }
 }

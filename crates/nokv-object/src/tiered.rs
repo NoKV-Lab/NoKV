@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     ArtifactObjectStore, ArtifactStoreCapabilities, ImmutableCreateOutcome, ObjectDeleteOutcome,
-    ObjectError, ObjectInfo, ObjectKey, ObjectRange,
+    ObjectError, ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionReceipt,
+    ProviderHandleIdentity,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +110,14 @@ where
 {
     fn capabilities(&self) -> ArtifactStoreCapabilities {
         self.durable.capabilities()
+    }
+
+    fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+        self.durable.provider_handle_identity()
+    }
+
+    fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+        self.durable.provider_admission_receipt()
     }
 
     fn create_immutable(

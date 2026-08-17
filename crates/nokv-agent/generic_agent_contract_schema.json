@@ -1,0 +1,162 @@
+{
+  "schema": "nokv.agent.generic.mcp_input_schemas.v1",
+  "inputSchemas": {
+    "ls": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string"},
+        "cursor": {"type": ["string", "null"]},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+      },
+      "additionalProperties": false
+    },
+    "stat": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "catalog": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string"},
+        "field_prefix": {"type": ["string", "null"]},
+        "include_facets": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "read": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string"},
+        "format": {"type": "string", "enum": ["structured", "bytes"]},
+        "cursor": {"type": ["string", "null"]},
+        "offset": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 300}
+      },
+      "additionalProperties": false
+    },
+    "aggregate": {
+      "type": "object",
+      "required": ["path", "measures"],
+      "properties": {
+        "path": {"type": "string"},
+        "predicates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["field", "op"],
+            "properties": {
+              "field": {"type": "string"},
+              "op": {"type": "string", "enum": ["eq", "ne", "in", "prefix", "suffix", "contains", "gt", "gte", "lt", "lte", "exists", "not_exists"]},
+              "value": {
+                "anyOf": [
+                  {"type": "string"},
+                  {"type": "integer", "minimum": 0},
+                  {"type": "number"},
+                  {"type": "boolean"},
+                  {"type": "array", "items": {"type": ["string", "integer", "number", "boolean"]}},
+                  {"type": "null"}
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "group_by": {"type": "array", "items": {"type": "string"}},
+        "measures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "op"],
+            "properties": {
+              "name": {"type": "string"},
+              "op": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"]},
+              "field": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+          }
+        },
+        "sort": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["field"],
+            "properties": {
+              "field": {"type": "string"},
+              "direction": {"type": "string", "enum": ["asc", "desc"]}
+            },
+            "additionalProperties": false
+          }
+        },
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+      },
+      "additionalProperties": false
+    },
+    "find": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string"},
+        "predicates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["field", "op"],
+            "properties": {
+              "field": {"type": "string"},
+              "op": {"type": "string", "enum": ["eq", "ne", "in", "prefix", "suffix", "contains", "gt", "gte", "lt", "lte", "exists", "not_exists"]},
+              "value": {
+                "anyOf": [
+                  {"type": "string"},
+                  {"type": "integer", "minimum": 0},
+                  {"type": "number"},
+                  {"type": "boolean"},
+                  {"type": "array", "items": {"type": ["string", "integer", "number", "boolean"]}},
+                  {"type": "null"}
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "sort": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["field"],
+            "properties": {
+              "field": {"type": "string"},
+              "direction": {"type": "string", "enum": ["asc", "desc"]}
+            },
+            "additionalProperties": false
+          }
+        },
+        "fields": {"type": "array", "items": {"type": "string"}},
+        "facets": {"type": "array", "items": {"type": "string"}},
+        "cursor": {"type": ["string", "null"]},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 10}
+      },
+      "additionalProperties": false
+    },
+    "grep": {
+      "type": "object",
+      "required": ["path", "pattern", "recursive"],
+      "properties": {
+        "path": {"type": "string"},
+        "pattern": {"type": "string"},
+        "patterns": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
+        "glob": {"type": ["string", "null"]},
+        "recursive": {"type": "boolean"},
+        "cursor": {"type": ["string", "null"]},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 300}
+      },
+      "additionalProperties": false
+    }
+  }
+}

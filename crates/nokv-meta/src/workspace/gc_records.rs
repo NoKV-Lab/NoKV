@@ -8,8 +8,8 @@
 use std::fmt;
 
 use nokv_types::{
-    ArtifactRevisionId, CommitVersion, GcPhase, OperationId, ReadVersion, ReferenceEpoch,
-    SHA256_BYTES,
+    ArtifactRevisionId, CommitVersion, GcPhase, GenericIndexGenerationId, OperationId, ReadVersion,
+    ReferenceEpoch, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -60,6 +60,62 @@ pub struct GcOperationRecord {
     pub quarantine_evidence: Option<Vec<u8>>,
 }
 
+/// Recoverable metadata-payload collection for one exact Generic index
+/// generation epoch. The immutable header remains outside this record as the
+/// permanent generation identity tombstone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericIndexGcOperationRecord {
+    pub operation_id: OperationId,
+    pub identity_digest: [u8; SHA256_BYTES],
+    pub generation_id: GenericIndexGenerationId,
+    pub reference_epoch: ReferenceEpoch,
+    pub last_zero_reference_version: CommitVersion,
+    pub safe_history_floor: ReadVersion,
+    pub expected_capability_digest: [u8; SHA256_BYTES],
+    pub expected_row_count: u64,
+    pub expected_row_digest: [u8; SHA256_BYTES],
+    pub phase: GenericIndexGcPhase,
+    /// Last contiguous generation-row sequence validated and removed.
+    pub row_cursor: Option<u64>,
+    pub scanned_row_count: u64,
+    pub row_rolling_digest: [u8; SHA256_BYTES],
+    pub rows_complete: bool,
+    /// Last append-receipt first sequence validated and removed.
+    pub receipt_cursor: Option<u64>,
+    pub deleted_receipt_count: u64,
+    pub receipts_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenericIndexGcPhase {
+    Retiring,
+    Retired,
+}
+
+impl From<GenericIndexGcPhase> for u8 {
+    fn from(value: GenericIndexGcPhase) -> Self {
+        match value {
+            GenericIndexGcPhase::Retiring => 1,
+            GenericIndexGcPhase::Retired => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for GenericIndexGcPhase {
+    type Error = GcRecordError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Retiring),
+            2 => Ok(Self::Retired),
+            value => Err(GcRecordError::UnknownDiscriminant {
+                type_name: "GenericIndexGcPhase",
+                value,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GcTransition {
     BeginDeleting,
@@ -99,6 +155,7 @@ pub enum GcRecordError {
         max: usize,
     },
     IdentityDigestMismatch,
+    GenericIndexGcIdentityDigestMismatch,
     ZeroReferenceEpoch,
     UnsafeHistoryFloor {
         last_zero: u64,
@@ -132,6 +189,9 @@ pub enum GcRecordError {
         from: GcPhase,
         to: GcPhase,
     },
+    InvalidGenericIndexGcProgress {
+        reason: &'static str,
+    },
     Truncated {
         field: &'static str,
         needed: usize,
@@ -161,6 +221,9 @@ impl fmt::Display for GcRecordError {
             Self::IdentityDigestMismatch => {
                 formatter.write_str("GC operation identity digest does not match immutable fields")
             }
+            Self::GenericIndexGcIdentityDigestMismatch => formatter.write_str(
+                "Generic index GC operation identity digest does not match immutable fields",
+            ),
             Self::ZeroReferenceEpoch => {
                 formatter.write_str("GC operation reference epoch must be non-zero")
             }
@@ -201,6 +264,9 @@ impl fmt::Display for GcRecordError {
             }
             Self::InvalidPhaseTransition { from, to } => {
                 write!(formatter, "invalid GC transition {from:?} -> {to:?}")
+            }
+            Self::InvalidGenericIndexGcProgress { reason } => {
+                write!(formatter, "invalid Generic index GC progress: {reason}")
             }
             Self::Truncated {
                 field,
@@ -542,6 +608,186 @@ impl GcOperationRecord {
     }
 }
 
+impl GenericIndexGcOperationRecord {
+    pub fn seal_identity(&mut self) {
+        self.identity_digest = self.canonical_identity_digest();
+    }
+
+    pub fn canonical_identity_digest(&self) -> [u8; SHA256_BYTES] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"nokv.gc.generic-index.operation.identity\0");
+        hasher.update(self.operation_id.as_bytes());
+        hasher.update(self.generation_id.as_bytes());
+        hasher.update(self.reference_epoch.get().to_be_bytes());
+        hasher.update(self.last_zero_reference_version.get().to_be_bytes());
+        hasher.update(self.safe_history_floor.get().to_be_bytes());
+        hasher.update(self.expected_capability_digest);
+        hasher.update(self.expected_row_count.to_be_bytes());
+        hasher.update(self.expected_row_digest);
+        hasher.finalize().into()
+    }
+
+    pub fn validate(&self) -> Result<(), GcRecordError> {
+        if self.identity_digest != self.canonical_identity_digest() {
+            return Err(GcRecordError::GenericIndexGcIdentityDigestMismatch);
+        }
+        if self.reference_epoch == ReferenceEpoch::ZERO {
+            return Err(GcRecordError::ZeroReferenceEpoch);
+        }
+        if self.safe_history_floor.get() <= self.last_zero_reference_version.get() {
+            return Err(GcRecordError::UnsafeHistoryFloor {
+                last_zero: self.last_zero_reference_version.get(),
+                floor: self.safe_history_floor.get(),
+            });
+        }
+        if self.scanned_row_count > self.expected_row_count {
+            return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                reason: "scanned row count exceeds the immutable generation closure",
+            });
+        }
+        if self.row_cursor.is_some() != (self.scanned_row_count > 0) {
+            return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                reason: "row cursor presence must match non-zero scan progress",
+            });
+        }
+        if self.row_cursor.is_some_and(|cursor| {
+            cursor
+                .checked_add(1)
+                .is_none_or(|count| count != self.scanned_row_count)
+        }) {
+            return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                reason: "row cursor must identify the contiguous zero-based row closure",
+            });
+        }
+        if self.scanned_row_count == 0 && self.row_rolling_digest != [0; SHA256_BYTES] {
+            return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                reason: "zero row progress requires the canonical empty rolling digest",
+            });
+        }
+        if self.rows_complete
+            && (self.scanned_row_count != self.expected_row_count
+                || self.row_rolling_digest != self.expected_row_digest)
+        {
+            return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                reason: "completed rows must match the immutable generation closure",
+            });
+        }
+        if !self.rows_complete
+            && (self.expected_row_count == 0 || self.scanned_row_count == self.expected_row_count)
+        {
+            return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                reason: "an exhausted row closure must be marked complete",
+            });
+        }
+        if self.receipt_cursor.is_some() != (self.deleted_receipt_count > 0) {
+            return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                reason: "receipt cursor presence must match non-zero receipt progress",
+            });
+        }
+        if !self.rows_complete
+            && (self.receipt_cursor.is_some()
+                || self.deleted_receipt_count != 0
+                || self.receipts_complete)
+        {
+            return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                reason: "append receipts cannot be collected before row closure verification",
+            });
+        }
+        match self.phase {
+            GenericIndexGcPhase::Retiring if self.receipts_complete => {
+                return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                    reason: "a fully collected operation must be retired",
+                });
+            }
+            GenericIndexGcPhase::Retired if !self.rows_complete || !self.receipts_complete => {
+                return Err(GcRecordError::InvalidGenericIndexGcProgress {
+                    reason: "a retired operation requires complete row and receipt cleanup",
+                });
+            }
+            GenericIndexGcPhase::Retiring | GenericIndexGcPhase::Retired => {}
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, GcRecordError> {
+        self.validate()?;
+        let mut encoded = Vec::new();
+        encoded.push(GC_VALUE_FORMAT_VERSION);
+        encoded.extend_from_slice(self.operation_id.as_bytes());
+        encoded.extend_from_slice(&self.identity_digest);
+        encoded.extend_from_slice(self.generation_id.as_bytes());
+        encoded.extend_from_slice(&self.reference_epoch.get().to_be_bytes());
+        encoded.extend_from_slice(&self.last_zero_reference_version.get().to_be_bytes());
+        encoded.extend_from_slice(&self.safe_history_floor.get().to_be_bytes());
+        encoded.extend_from_slice(&self.expected_capability_digest);
+        encoded.extend_from_slice(&self.expected_row_count.to_be_bytes());
+        encoded.extend_from_slice(&self.expected_row_digest);
+        encoded.push(self.phase.into());
+        put_optional_u64(&mut encoded, self.row_cursor);
+        encoded.extend_from_slice(&self.scanned_row_count.to_be_bytes());
+        encoded.extend_from_slice(&self.row_rolling_digest);
+        encoded.push(u8::from(self.rows_complete));
+        put_optional_u64(&mut encoded, self.receipt_cursor);
+        encoded.extend_from_slice(&self.deleted_receipt_count.to_be_bytes());
+        encoded.push(u8::from(self.receipts_complete));
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, GcRecordError> {
+        let mut decoder = Decoder::new(encoded);
+        decoder.require_value_version()?;
+        let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
+        let identity_digest = decoder.fixed("identity_digest")?;
+        let generation_id = GenericIndexGenerationId::from_bytes(decoder.fixed("generation_id")?);
+        let reference_epoch = ReferenceEpoch::new(decoder.u64("reference_epoch")?);
+        let last_zero_reference_version =
+            CommitVersion::new(decoder.u64("last_zero_reference_version")?).map_err(|_| {
+                GcRecordError::InvalidGenericIndexGcProgress {
+                    reason: "last-zero reference version must be non-zero",
+                }
+            })?;
+        let safe_history_floor =
+            ReadVersion::new(decoder.u64("safe_history_floor")?).map_err(|_| {
+                GcRecordError::InvalidGenericIndexGcProgress {
+                    reason: "safe history floor must be non-zero",
+                }
+            })?;
+        let expected_capability_digest = decoder.fixed("expected_capability_digest")?;
+        let expected_row_count = decoder.u64("expected_row_count")?;
+        let expected_row_digest = decoder.fixed("expected_row_digest")?;
+        let phase = GenericIndexGcPhase::try_from(decoder.u8("phase")?)?;
+        let row_cursor = decoder.optional_u64("row_cursor")?;
+        let scanned_row_count = decoder.u64("scanned_row_count")?;
+        let row_rolling_digest = decoder.fixed("row_rolling_digest")?;
+        let rows_complete = decoder.boolean("rows_complete")?;
+        let receipt_cursor = decoder.optional_u64("receipt_cursor")?;
+        let deleted_receipt_count = decoder.u64("deleted_receipt_count")?;
+        let receipts_complete = decoder.boolean("receipts_complete")?;
+        decoder.finish()?;
+        let record = Self {
+            operation_id,
+            identity_digest,
+            generation_id,
+            reference_epoch,
+            last_zero_reference_version,
+            safe_history_floor,
+            expected_capability_digest,
+            expected_row_count,
+            expected_row_digest,
+            phase,
+            row_cursor,
+            scanned_row_count,
+            row_rolling_digest,
+            rows_complete,
+            receipt_cursor,
+            deleted_receipt_count,
+            receipts_complete,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+}
+
 impl GcTransition {
     fn target_phase(&self, current: GcPhase) -> GcPhase {
         match self {
@@ -559,6 +805,16 @@ fn put_optional_position(encoded: &mut Vec<u8>, position: Option<ManifestPositio
         Some(position) => {
             encoded.push(1);
             encoded.extend_from_slice(&position.object_index.to_be_bytes());
+        }
+    }
+}
+
+fn put_optional_u64(encoded: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => encoded.push(0),
+        Some(value) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&value.to_be_bytes());
         }
     }
 }
@@ -656,6 +912,22 @@ impl<'a> Decoder<'a> {
             1 => Ok(Some(ManifestPosition {
                 object_index: self.u64("manifest_cursor.object_index")?,
             })),
+            value => Err(GcRecordError::InvalidOptionalTag { field, value }),
+        }
+    }
+
+    fn optional_u64(&mut self, field: &'static str) -> Result<Option<u64>, GcRecordError> {
+        match self.u8(field)? {
+            0 => Ok(None),
+            1 => self.u64(field).map(Some),
+            value => Err(GcRecordError::InvalidOptionalTag { field, value }),
+        }
+    }
+
+    fn boolean(&mut self, field: &'static str) -> Result<bool, GcRecordError> {
+        match self.u8(field)? {
+            0 => Ok(false),
+            1 => Ok(true),
             value => Err(GcRecordError::InvalidOptionalTag { field, value }),
         }
     }
@@ -855,5 +1127,41 @@ mod tests {
                 value: 0xff,
             })
         );
+    }
+
+    #[test]
+    fn generic_index_gc_progress_round_trips_and_requires_a_strict_floor() {
+        let mut operation = GenericIndexGcOperationRecord {
+            operation_id: OperationId::from_bytes([9; 16]),
+            identity_digest: [0; SHA256_BYTES],
+            generation_id: GenericIndexGenerationId::from_bytes([8; 16]),
+            reference_epoch: ReferenceEpoch::new(4),
+            last_zero_reference_version: CommitVersion::new(5).unwrap(),
+            safe_history_floor: ReadVersion::new(6).unwrap(),
+            expected_capability_digest: [7; SHA256_BYTES],
+            expected_row_count: 2,
+            expected_row_digest: [6; SHA256_BYTES],
+            phase: GenericIndexGcPhase::Retiring,
+            row_cursor: None,
+            scanned_row_count: 0,
+            row_rolling_digest: [0; SHA256_BYTES],
+            rows_complete: false,
+            receipt_cursor: None,
+            deleted_receipt_count: 0,
+            receipts_complete: false,
+        };
+        operation.seal_identity();
+        let encoded = operation.encode().unwrap();
+        assert_eq!(
+            GenericIndexGcOperationRecord::decode(&encoded).unwrap(),
+            operation
+        );
+
+        operation.safe_history_floor = ReadVersion::new(5).unwrap();
+        operation.seal_identity();
+        assert!(matches!(
+            operation.validate(),
+            Err(GcRecordError::UnsafeHistoryFloor { .. })
+        ));
     }
 }

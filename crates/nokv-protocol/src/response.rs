@@ -6,13 +6,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ProtocolError, RpcFailure};
-use crate::request::{CommitRequest, PrepareRestoreRequest, QueryOperator};
+use crate::request::{
+    CommitRequest, GenericIndexFieldValues, PrepareRestoreRequest, QueryOperator,
+    MAX_GENERIC_INDEX_ABORT_ROWS, MAX_GENERIC_INDEX_APPEND_ROWS,
+};
 use crate::types::{
-    validate_capability_set, validate_field_id, ArtifactDescriptor, ArtifactManifestRow,
-    ArtifactRevisionIdentity, ByteRange, CommitIdentity, Digest, DigestUri, FieldValue,
-    OperationIdentity, OperationKind, OperationToken, PathMetadata, RequestIdentity, RootRoute,
-    ScalarValue, SnapshotAlias, WorkbenchName, WorkspaceCapability, WorkspaceIdentity,
-    WorkspacePath,
+    validate_capability_set, validate_field_id, validate_optional_text, ArtifactDescriptor,
+    ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange, CommitIdentity, ContentType, Digest,
+    DigestUri, FieldValue, GenericIndexGenerationIdentity, OperationIdentity, OperationKind,
+    OperationToken, PathMetadata, RequestIdentity, RootRoute, ScalarValue, SnapshotAlias,
+    WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
 };
 use crate::{WORKSPACE_CAPABILITY_SCHEMA, WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA};
 
@@ -37,19 +40,47 @@ impl WorkspaceRpcResponse {
             ));
         }
         if let WorkspaceRpcOutcome::Success(result) = &self.outcome {
-            if let WorkspaceResult::Preflight(preflight) = result.as_ref() {
-                if preflight.route != self.route {
+            match result.as_ref() {
+                WorkspaceResult::Preflight(preflight) => {
+                    if preflight.route != self.route {
+                        return Err(ProtocolError::invalid(
+                            "preflight.route",
+                            "must equal the response envelope route",
+                        ));
+                    }
+                    if self.commit_version.is_some() || self.replayed {
+                        return Err(ProtocolError::invalid(
+                            "preflight",
+                            "must not report a metadata commit or replay",
+                        ));
+                    }
+                }
+                WorkspaceResult::GenericIndexRegistration(registration)
+                    if self.commit_version.is_some()
+                        && self.commit_version != Some(registration.last_transition_version) =>
+                {
                     return Err(ProtocolError::invalid(
-                        "preflight.route",
-                        "must equal the response envelope route",
+                        "generic_index.last_transition_version",
+                        "does not match the response commit version",
                     ));
                 }
-                if self.commit_version.is_some() || self.replayed {
+                WorkspaceResult::GenericIndexAppend(append)
+                    if self.commit_version != Some(append.receipt.commit_version) =>
+                {
                     return Err(ProtocolError::invalid(
-                        "preflight",
-                        "must not report a metadata commit or replay",
+                        "generic_index.append.receipt.commit_version",
+                        "does not match the response commit version",
                     ));
                 }
+                WorkspaceResult::GenericIndexAbort(abort)
+                    if self.commit_version != Some(abort.registration.last_transition_version) =>
+                {
+                    return Err(ProtocolError::invalid(
+                        "generic_index.abort.last_transition_version",
+                        "does not match the response commit version",
+                    ));
+                }
+                _ => {}
             }
         }
         self.outcome.validate()
@@ -80,6 +111,7 @@ pub enum WorkspaceResult {
     Workspace(WorkspaceSummary),
     Path(PathReadResult),
     Paths(PathPage),
+    Renamed(RenamePathResult),
     Removed(RemovePathResult),
     Operation(OperationStatus),
     Published(PublishResult),
@@ -87,7 +119,11 @@ pub enum WorkspaceResult {
     Snapshot(SnapshotResult),
     Snapshots(SnapshotPage),
     RestorePrepared(RestorePreparation),
+    RestoreSourceRunManifest(PathReadResult),
     Restored(RestoreResult),
+    GenericIndexRegistration(GenericIndexRegistrationStatus),
+    GenericIndexAppend(GenericIndexAppendResult),
+    GenericIndexAbort(GenericIndexAbortResult),
     Search(SearchResult),
     Aggregate(AggregateResult),
     Catalog(CatalogResult),
@@ -102,6 +138,7 @@ impl WorkspaceResult {
             Self::Workspace(workspace) => workspace.validate(),
             Self::Path(path) => path.validate(),
             Self::Paths(paths) => paths.validate(),
+            Self::Renamed(renamed) => renamed.validate(),
             Self::Removed(removed) => removed.validate(),
             Self::Operation(operation) => operation.validate(),
             Self::Published(published) => published.validate(),
@@ -109,7 +146,13 @@ impl WorkspaceResult {
             Self::Snapshot(snapshot) => snapshot.validate(),
             Self::Snapshots(snapshots) => snapshots.validate(),
             Self::RestorePrepared(prepared) => prepared.validate(),
+            Self::RestoreSourceRunManifest(manifest) => {
+                manifest.validate_restore_source_run_manifest()
+            }
             Self::Restored(restored) => restored.validate(),
+            Self::GenericIndexRegistration(registration) => registration.validate(),
+            Self::GenericIndexAppend(append) => append.validate(),
+            Self::GenericIndexAbort(abort) => abort.validate(),
             Self::Search(search) => search.validate(),
             Self::Aggregate(aggregate) => aggregate.validate(),
             Self::Catalog(catalog) => catalog.validate(),
@@ -303,6 +346,47 @@ impl PathReadResult {
         }
         Ok(())
     }
+
+    fn validate_restore_source_run_manifest(&self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.not_modified {
+            return Err(ProtocolError::invalid(
+                "restore_source_run_manifest",
+                "cannot be not-modified without a conditional request",
+            ));
+        }
+        let metadata = self
+            .metadata
+            .as_ref()
+            .expect("ordinary path validation requires metadata");
+        if metadata.path.path.as_str() != "metadata/run_manifest.json"
+            || metadata.dependency_count != 0
+            || metadata.dependency_depth != 0
+            || metadata.descriptor.logical_size == 0
+            || metadata.descriptor.content_type.as_str() != "application/json"
+            || metadata.descriptor.producer.is_some()
+            || metadata.descriptor.manifest_identity.is_some()
+            || !metadata.descriptor.index_fields.is_empty()
+        {
+            return Err(ProtocolError::invalid(
+                "restore_source_run_manifest.metadata",
+                "must be the dependency-free canonical JSON run manifest",
+            ));
+        }
+        crate::parse_sha256_digest_uri(&metadata.descriptor.body_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "restore_source_run_manifest.metadata.body_digest",
+                error.to_string(),
+            )
+        })?;
+        crate::parse_sha256_digest_uri(&metadata.descriptor.manifest_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "restore_source_run_manifest.metadata.manifest_digest",
+                error.to_string(),
+            )
+        })?;
+        Ok(())
+    }
 }
 
 /// One item in an ordered path listing.
@@ -377,6 +461,47 @@ pub struct RemovePathResult {
     pub removed: bool,
     pub workspace_revision: u64,
     pub removed_artifact_revision_id: Option<ArtifactRevisionIdentity>,
+}
+
+/// Deterministic result of one atomic path move.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenamePathResult {
+    pub source: WorkspacePath,
+    pub destination: WorkspacePath,
+    pub workspace_revision: u64,
+    pub generation: u64,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+}
+
+impl RenamePathResult {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.source.workbench != self.destination.workbench {
+            return Err(ProtocolError::invalid(
+                "renamed.destination.workbench",
+                "must equal source.workbench",
+            ));
+        }
+        if self.source.path == self.destination.path {
+            return Err(ProtocolError::invalid(
+                "renamed.destination.path",
+                "must differ from source.path",
+            ));
+        }
+        if self.workspace_revision == 0 {
+            return Err(ProtocolError::invalid(
+                "renamed.workspace_revision",
+                "must be greater than zero",
+            ));
+        }
+        if self.generation == 0 {
+            return Err(ProtocolError::invalid(
+                "renamed.generation",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl RemovePathResult {
@@ -611,14 +736,239 @@ pub struct RestoreResult {
     pub object_bytes_copied: u64,
 }
 
+/// Exact immutable source commit resolved for one restore operation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreSourceCommitBinding {
+    pub commit_id: CommitIdentity,
+    pub content_digest: DigestUri,
+    pub manifest_digest: DigestUri,
+    pub tree_manifest_revision_id: ArtifactRevisionIdentity,
+    pub member_count: u64,
+    pub member_digest: Digest,
+}
+
+impl RestoreSourceCommitBinding {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        crate::parse_sha256_digest_uri(&self.content_digest).map_err(|error| {
+            ProtocolError::invalid("restore.source_commit.content_digest", error.to_string())
+        })?;
+        crate::parse_sha256_digest_uri(&self.manifest_digest).map_err(|error| {
+            ProtocolError::invalid("restore.source_commit.manifest_digest", error.to_string())
+        })?;
+        validate_restore_member_seal(
+            "restore.source_commit.members",
+            self.member_count,
+            self.member_digest,
+        )
+    }
+}
+
+/// Immutable destination manifest publication bound to one restore.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreManifestBinding {
+    pub publication_operation_id: OperationIdentity,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+    pub descriptor: ArtifactDescriptor,
+}
+
+impl RestoreManifestBinding {
+    fn validate(&self, field: &'static str) -> Result<(), ProtocolError> {
+        self.descriptor.validate()?;
+        if self.descriptor.logical_size == 0 {
+            return Err(ProtocolError::invalid(
+                field,
+                "canonical JSON manifest must not be empty",
+            ));
+        }
+        crate::parse_sha256_digest_uri(&self.descriptor.body_digest)
+            .map_err(|error| ProtocolError::invalid(field, error.to_string()))?;
+        crate::parse_sha256_digest_uri(&self.descriptor.manifest_digest)
+            .map_err(|error| ProtocolError::invalid(field, error.to_string()))?;
+        if self.descriptor.content_type.as_str() != "application/json"
+            || self.descriptor.producer.is_some()
+            || self.descriptor.manifest_identity.is_some()
+            || !self.descriptor.index_fields.is_empty()
+        {
+            return Err(ProtocolError::invalid(
+                field,
+                "restore-owned manifest must be dependency-free canonical JSON metadata",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Both destination-owned canonical manifests. They become durable together;
+/// neither binding is independently optional.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreDestinationManifestBindings {
+    pub run_manifest: RestoreManifestBinding,
+    pub restore_manifest: RestoreManifestBinding,
+}
+
+impl RestoreDestinationManifestBindings {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.run_manifest
+            .validate("operation.restore_preparation.destination_manifests.run_manifest")?;
+        self.restore_manifest
+            .validate("operation.restore_preparation.destination_manifests.restore_manifest")?;
+        Ok(())
+    }
+}
+
+/// Durable late-bound destination commit intent. Expected publication
+/// identities are frozen before object-first publication; final bindings only
+/// appear after both manifests have been accepted.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreDestinationBinding {
+    pub destination_commit_id: CommitIdentity,
+    pub effective_content_digest: DigestUri,
+    pub destination_run_manifest_projection_input_digest: Digest,
+    pub destination_run_manifest_identity: crate::request::RestoreManifestIdentity,
+    pub destination_restore_manifest_identity: crate::request::RestoreManifestIdentity,
+    pub destination_manifests: Option<RestoreDestinationManifestBindings>,
+}
+
+impl RestoreDestinationBinding {
+    fn validate(
+        &self,
+        request: &PrepareRestoreRequest,
+        source_commit: &RestoreSourceCommitBinding,
+        source_matches_base_commit: bool,
+    ) -> Result<(), ProtocolError> {
+        self.validate_common(
+            request.operation_id,
+            request.destination_workspace_incarnation_id,
+            source_commit,
+            source_matches_base_commit,
+        )?;
+        if self.destination_restore_manifest_identity
+            != request.destination_restore_manifest_identity
+        {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.destination_restore_manifest_identity",
+                "does not match the durable prepare request",
+            ));
+        }
+        if let Some(manifests) = &self.destination_manifests {
+            if manifests.restore_manifest.descriptor.body_digest
+                != request.restore_manifest.body_digest
+                || manifests.restore_manifest.descriptor.logical_size
+                    != request.restore_manifest.logical_size
+                || manifests.restore_manifest.descriptor.content_type
+                    != request.restore_manifest.content_type
+            {
+                return Err(ProtocolError::invalid(
+                    "operation.restore_preparation.destination_binding.destination_manifests",
+                    "restore manifest does not exactly match the durable prepare descriptor",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_common(
+        &self,
+        restore_operation_id: OperationIdentity,
+        destination_workspace_incarnation_id: WorkspaceIdentity,
+        source_commit: &RestoreSourceCommitBinding,
+        source_matches_base_commit: bool,
+    ) -> Result<(), ProtocolError> {
+        crate::parse_sha256_digest_uri(&self.effective_content_digest).map_err(|error| {
+            ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.effective_content_digest",
+                error.to_string(),
+            )
+        })?;
+        if self.destination_commit_id == source_commit.commit_id {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.destination_commit_id",
+                "must differ from the source commit",
+            ));
+        }
+        if source_matches_base_commit
+            != (self.effective_content_digest == source_commit.content_digest)
+        {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.effective_content_digest",
+                "must preserve the base content digest exactly for a clean source and use a distinct materialized digest otherwise",
+            ));
+        }
+        if self.destination_run_manifest_projection_input_digest == Digest([0; 32]) {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.destination_run_manifest_projection_input_digest",
+                "must not be the zero digest",
+            ));
+        }
+        if self
+            .destination_run_manifest_identity
+            .publication_operation_id
+            == self
+                .destination_restore_manifest_identity
+                .publication_operation_id
+            || self.destination_run_manifest_identity.artifact_revision_id
+                == self
+                    .destination_restore_manifest_identity
+                    .artifact_revision_id
+            || restore_operation_id
+                == self
+                    .destination_run_manifest_identity
+                    .publication_operation_id
+            || restore_operation_id
+                == self
+                    .destination_restore_manifest_identity
+                    .publication_operation_id
+        {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding.destination_manifests",
+                "restore, run-manifest, and restore-manifest operations and revisions must remain distinct",
+            ));
+        }
+        if let Some(manifests) = &self.destination_manifests {
+            manifests.validate()?;
+            let run_identity = self.destination_run_manifest_identity;
+            let restore_identity = self.destination_restore_manifest_identity;
+            if manifests.run_manifest.publication_operation_id
+                != run_identity.publication_operation_id
+                || manifests.run_manifest.artifact_revision_id != run_identity.artifact_revision_id
+                || manifests.restore_manifest.publication_operation_id
+                    != restore_identity.publication_operation_id
+                || manifests.restore_manifest.artifact_revision_id
+                    != restore_identity.artifact_revision_id
+                || manifests.run_manifest.workspace_incarnation_id
+                    != destination_workspace_incarnation_id
+                || manifests.restore_manifest.workspace_incarnation_id
+                    != destination_workspace_incarnation_id
+            {
+                return Err(ProtocolError::invalid(
+                    "operation.restore_preparation.destination_binding.destination_manifests",
+                    "do not exactly match the durable identities and destination incarnation",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RestorePreparation {
     pub operation_id: OperationIdentity,
     pub destination_workbench: WorkbenchName,
     pub destination_workspace_incarnation_id: WorkspaceIdentity,
-    pub member_count: u64,
-    pub member_digest: Digest,
+    pub source_commit: RestoreSourceCommitBinding,
+    pub destination_committed_at_unix_seconds: u64,
+    pub source_member_count: u64,
+    pub source_member_digest: Digest,
+    pub materialized_member_count: u64,
+    pub materialized_member_digest: Digest,
+    pub source_matches_base_commit: bool,
+    pub destination_binding: Option<Box<RestoreDestinationBinding>>,
 }
 
 /// Durable restore inputs returned by operation lookup. A client may use this
@@ -629,13 +979,20 @@ pub struct RestorePreparation {
 pub struct RestoreOperationPreparation {
     pub request: PrepareRestoreRequest,
     pub source_snapshot_read_version: Option<u64>,
-    pub sealed_member_count: Option<u64>,
-    pub sealed_member_digest: Option<Digest>,
+    pub source_commit: RestoreSourceCommitBinding,
+    pub destination_committed_at_unix_seconds: u64,
+    pub source_member_count: Option<u64>,
+    pub source_member_digest: Option<Digest>,
+    pub materialized_member_count: Option<u64>,
+    pub materialized_member_digest: Option<Digest>,
+    pub source_matches_base_commit: Option<bool>,
+    pub destination_binding: Option<Box<RestoreDestinationBinding>>,
 }
 
 impl RestoreOperationPreparation {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.request.validate()?;
+        self.source_commit.validate()?;
         match (&self.request.source, self.source_snapshot_read_version) {
             (crate::request::RestoreSource::Snapshot(_), Some(version)) if version != 0 => {}
             (crate::request::RestoreSource::Commit(_), None) => {}
@@ -646,10 +1003,90 @@ impl RestoreOperationPreparation {
                 ));
             }
         }
-        if self.sealed_member_count.is_some() != self.sealed_member_digest.is_some() {
+        if let crate::request::RestoreSource::Commit(commit_id) = &self.request.source {
+            if *commit_id != self.source_commit.commit_id {
+                return Err(ProtocolError::invalid(
+                    "operation.restore_preparation.source_commit",
+                    "does not match the requested source commit",
+                ));
+            }
+        }
+        if self.destination_committed_at_unix_seconds == 0 {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_committed_at_unix_seconds",
+                "must be greater than zero",
+            ));
+        }
+        let seal_fields_present = [
+            self.source_member_count.is_some(),
+            self.source_member_digest.is_some(),
+            self.materialized_member_count.is_some(),
+            self.materialized_member_digest.is_some(),
+            self.source_matches_base_commit.is_some(),
+        ];
+        if seal_fields_present.iter().any(|present| *present)
+            && seal_fields_present.iter().any(|present| !*present)
+        {
             return Err(ProtocolError::invalid(
                 "operation.restore_preparation",
-                "sealed member count and digest must be present together",
+                "raw and materialized source seals and their base-commit comparison must be present together",
+            ));
+        }
+        if let (
+            Some(source_member_count),
+            Some(source_member_digest),
+            Some(materialized_member_count),
+            Some(materialized_member_digest),
+            Some(source_matches_base_commit),
+        ) = (
+            self.source_member_count,
+            self.source_member_digest,
+            self.materialized_member_count,
+            self.materialized_member_digest,
+            self.source_matches_base_commit,
+        ) {
+            validate_restore_member_seal(
+                "operation.restore_preparation.source_members",
+                source_member_count,
+                source_member_digest,
+            )?;
+            validate_restore_member_seal(
+                "operation.restore_preparation.materialized_members",
+                materialized_member_count,
+                materialized_member_digest,
+            )?;
+            validate_materialized_member_subset(
+                "operation.restore_preparation.materialized_members",
+                source_member_count,
+                materialized_member_count,
+            )?;
+            validate_source_commit_match(
+                &self.source_commit,
+                source_member_count,
+                source_member_digest,
+                source_matches_base_commit,
+            )?;
+            if matches!(
+                self.request.source,
+                crate::request::RestoreSource::Commit(_)
+            ) && !source_matches_base_commit
+            {
+                return Err(ProtocolError::invalid(
+                    "operation.restore_preparation.source_matches_base_commit",
+                    "must be true for a direct commit source",
+                ));
+            }
+            if let Some(binding) = &self.destination_binding {
+                binding.validate(
+                    &self.request,
+                    &self.source_commit,
+                    source_matches_base_commit,
+                )?;
+            }
+        } else if self.destination_binding.is_some() {
+            return Err(ProtocolError::invalid(
+                "operation.restore_preparation.destination_binding",
+                "cannot precede the sealed raw and materialized source closures",
             ));
         }
         Ok(())
@@ -658,17 +1095,363 @@ impl RestoreOperationPreparation {
 
 impl RestorePreparation {
     fn validate(&self) -> Result<(), ProtocolError> {
+        self.source_commit.validate()?;
+        if self.destination_committed_at_unix_seconds == 0 {
+            return Err(ProtocolError::invalid(
+                "restore_prepared.destination_committed_at_unix_seconds",
+                "must be greater than zero",
+            ));
+        }
+        validate_restore_member_seal(
+            "restore_prepared.source_members",
+            self.source_member_count,
+            self.source_member_digest,
+        )?;
+        validate_restore_member_seal(
+            "restore_prepared.materialized_members",
+            self.materialized_member_count,
+            self.materialized_member_digest,
+        )?;
+        validate_materialized_member_subset(
+            "restore_prepared.materialized_members",
+            self.source_member_count,
+            self.materialized_member_count,
+        )?;
+        validate_source_commit_match(
+            &self.source_commit,
+            self.source_member_count,
+            self.source_member_digest,
+            self.source_matches_base_commit,
+        )?;
+        if let Some(binding) = &self.destination_binding {
+            // The compact prepare response does not repeat the prepare
+            // descriptor; operation lookup performs that final exact check.
+            binding.validate_common(
+                self.operation_id,
+                self.destination_workspace_incarnation_id,
+                &self.source_commit,
+                self.source_matches_base_commit,
+            )?;
+        }
         Ok(())
     }
+}
+
+fn validate_restore_member_seal(
+    field: &'static str,
+    member_count: u64,
+    member_digest: Digest,
+) -> Result<(), ProtocolError> {
+    if (member_count == 0) != (member_digest == Digest([0; 32])) {
+        return Err(ProtocolError::invalid(
+            field,
+            "zero member count and zero digest must be present together",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_materialized_member_subset(
+    field: &'static str,
+    source_member_count: u64,
+    materialized_member_count: u64,
+) -> Result<(), ProtocolError> {
+    let skipped_provenance_members = source_member_count
+        .checked_sub(materialized_member_count)
+        .ok_or_else(|| {
+            ProtocolError::invalid(field, "cannot contain rows absent from the raw source")
+        })?;
+    if !(1..=2).contains(&skipped_provenance_members) {
+        return Err(ProtocolError::invalid(
+            field,
+            "must omit the source run manifest and at most one restore manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_commit_match(
+    source_commit: &RestoreSourceCommitBinding,
+    source_member_count: u64,
+    source_member_digest: Digest,
+    source_matches_base_commit: bool,
+) -> Result<(), ProtocolError> {
+    let exact_match = source_member_count == source_commit.member_count
+        && source_member_digest == source_commit.member_digest;
+    if source_matches_base_commit != exact_match {
+        return Err(ProtocolError::invalid(
+            "restore.source_matches_base_commit",
+            "must equal the exact raw-source/base-commit member seal comparison",
+        ));
+    }
+    Ok(())
 }
 
 impl RestoreResult {
     fn validate(&self) -> Result<(), ProtocolError> {
         self.destination.validate()?;
+        if self.destination.commit_head.is_none()
+            || self.destination.commit_head_generation.is_none()
+        {
+            return Err(ProtocolError::invalid(
+                "restore.destination.commit_head",
+                "a successful restore must return its committed destination head",
+            ));
+        }
+        validate_restore_member_seal("restore.members", self.member_count, self.member_digest)?;
         if self.object_bytes_copied != 0 {
             return Err(ProtocolError::invalid(
                 "restore.object_bytes_copied",
                 "same-shard restore is zero-copy",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Public phase of one recoverable Generic custom-index registration.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericIndexRegistrationPhase {
+    Preparing,
+    Appending,
+    Sealing,
+    Publishing,
+    Complete,
+    Aborting,
+    Cleaning,
+    Cleaned,
+    Quarantined,
+}
+
+/// Exact durable registration state returned by begin, finalize, and get.
+/// The generation and both digests fence cursor reuse and pointer ABA.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexRegistrationStatus {
+    pub operation_id: OperationIdentity,
+    pub generation_id: GenericIndexGenerationIdentity,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub index_path: Option<crate::RelativePath>,
+    pub source_read_version: u64,
+    pub last_transition_version: u64,
+    pub expected_current_generation: Option<u64>,
+    pub capability_digest: Digest,
+    pub declared_row_count: u64,
+    pub appended_row_count: u64,
+    pub row_digest: Digest,
+    pub phase: GenericIndexRegistrationPhase,
+    pub published_pointer_generation: Option<u64>,
+    pub terminal_error: Option<String>,
+}
+
+impl GenericIndexRegistrationStatus {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.source_read_version == 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.source_read_version",
+                "must be greater than zero",
+            ));
+        }
+        if self.last_transition_version == 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.last_transition_version",
+                "must be greater than zero",
+            ));
+        }
+        let next_pointer_generation = match self.expected_current_generation {
+            None => 1,
+            Some(generation) => {
+                crate::types::require_generation(
+                    "generic_index.expected_current_generation",
+                    generation,
+                )?;
+                generation.checked_add(1).ok_or_else(|| {
+                    ProtocolError::invalid(
+                        "generic_index.expected_current_generation",
+                        "cannot advance beyond u64::MAX",
+                    )
+                })?
+            }
+        };
+        if self.appended_row_count > self.declared_row_count {
+            return Err(ProtocolError::invalid(
+                "generic_index.appended_row_count",
+                "exceeds declared row count",
+            ));
+        }
+        if self.appended_row_count == 0 && self.row_digest != Digest([0; 32]) {
+            return Err(ProtocolError::invalid(
+                "generic_index.row_digest",
+                "must use the canonical empty digest before any row is appended",
+            ));
+        }
+        validate_optional_text(
+            "generic_index.terminal_error",
+            self.terminal_error.as_deref(),
+            1_024,
+        )?;
+        if self.terminal_error.as_deref() == Some("") {
+            return Err(ProtocolError::invalid(
+                "generic_index.terminal_error",
+                "must not be empty",
+            ));
+        }
+        if self.phase == GenericIndexRegistrationPhase::Preparing && self.appended_row_count != 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.appended_row_count",
+                "must be zero while preparing",
+            ));
+        }
+        if matches!(
+            self.phase,
+            GenericIndexRegistrationPhase::Sealing
+                | GenericIndexRegistrationPhase::Publishing
+                | GenericIndexRegistrationPhase::Complete
+        ) && self.appended_row_count != self.declared_row_count
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.appended_row_count",
+                "must equal declared row count after append closes",
+            ));
+        }
+        match self.phase {
+            GenericIndexRegistrationPhase::Complete => {
+                if self.published_pointer_generation != Some(next_pointer_generation)
+                    || self.terminal_error.is_some()
+                {
+                    return Err(ProtocolError::invalid(
+                        "generic_index.registration",
+                        "complete state requires the exact successor pointer and no error",
+                    ));
+                }
+            }
+            GenericIndexRegistrationPhase::Quarantined => {
+                if self.published_pointer_generation.is_some() || self.terminal_error.is_none() {
+                    return Err(ProtocolError::invalid(
+                        "generic_index.registration",
+                        "quarantined state requires an error and forbids publication",
+                    ));
+                }
+            }
+            _ => {
+                if self.published_pointer_generation.is_some() || self.terminal_error.is_some() {
+                    return Err(ProtocolError::invalid(
+                        "generic_index.registration",
+                        "non-terminal state forbids publication and terminal errors",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Immutable receipt for one append batch, sufficient for exact response-loss
+/// replay without rereading removed generation rows.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexAppendReceipt {
+    pub first_sequence: u64,
+    pub row_count: u32,
+    pub commit_version: u64,
+    pub input_digest: Digest,
+    pub resulting_row_count: u64,
+    pub resulting_row_digest: Digest,
+}
+
+impl GenericIndexAppendReceipt {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.row_count == 0 || self.row_count as usize > MAX_GENERIC_INDEX_APPEND_ROWS {
+            return Err(ProtocolError::invalid(
+                "generic_index.append.receipt.row_count",
+                format!("must be between 1 and {MAX_GENERIC_INDEX_APPEND_ROWS}"),
+            ));
+        }
+        if self.commit_version == 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.append.receipt.commit_version",
+                "must be greater than zero",
+            ));
+        }
+        let expected_row_count = self
+            .first_sequence
+            .checked_add(u64::from(self.row_count))
+            .ok_or_else(|| {
+                ProtocolError::invalid(
+                    "generic_index.append.receipt.first_sequence",
+                    "range overflows",
+                )
+            })?;
+        if self.resulting_row_count != expected_row_count {
+            return Err(ProtocolError::invalid(
+                "generic_index.append.receipt.resulting_row_count",
+                "does not close the appended sequence range",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexAppendResult {
+    pub registration: GenericIndexRegistrationStatus,
+    pub receipt: GenericIndexAppendReceipt,
+}
+
+impl GenericIndexAppendResult {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.registration.validate()?;
+        self.receipt.validate()?;
+        if self.registration.appended_row_count != self.receipt.resulting_row_count
+            || self.registration.row_digest != self.receipt.resulting_row_digest
+            || self.registration.last_transition_version != self.receipt.commit_version
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.append",
+                "receipt does not match the resulting registration state",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexAbortResult {
+    pub registration: GenericIndexRegistrationStatus,
+    pub removed_rows: u32,
+    pub removed_receipts: u32,
+    pub cleanup_complete: bool,
+}
+
+impl GenericIndexAbortResult {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.registration.validate()?;
+        if self.removed_rows > MAX_GENERIC_INDEX_ABORT_ROWS
+            || self.removed_receipts > MAX_GENERIC_INDEX_ABORT_ROWS
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.abort.removed",
+                format!("exceeds {MAX_GENERIC_INDEX_ABORT_ROWS}"),
+            ));
+        }
+        if self.removed_receipts != 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.abort.removed_receipts",
+                "append receipts are retained for exact response-loss replay",
+            ));
+        }
+        let expected_phase = if self.cleanup_complete {
+            GenericIndexRegistrationPhase::Cleaned
+        } else {
+            GenericIndexRegistrationPhase::Cleaning
+        };
+        if self.registration.phase != expected_phase {
+            return Err(ProtocolError::invalid(
+                "generic_index.abort.cleanup_complete",
+                "does not match the registration cleanup phase",
             ));
         }
         Ok(())
@@ -869,12 +1652,29 @@ impl OperationStatus {
                 if preparation.request.destination_workbench != result.destination.workbench
                     || preparation.request.destination_workspace_incarnation_id
                         != result.destination.workspace_incarnation_id
-                    || preparation.sealed_member_count != Some(result.member_count)
-                    || preparation.sealed_member_digest != Some(result.member_digest)
+                    || preparation.materialized_member_count != Some(result.member_count)
+                    || preparation.materialized_member_digest != Some(result.member_digest)
                 {
                     return Err(ProtocolError::invalid(
                         "operation.restore_preparation",
                         "does not match the terminal restore result",
+                    ));
+                }
+                let destination_binding =
+                    preparation.destination_binding.as_ref().ok_or_else(|| {
+                        ProtocolError::invalid(
+                            "operation.restore_preparation.destination_binding",
+                            "is required for a terminal restore result",
+                        )
+                    })?;
+                if destination_binding.destination_manifests.is_none()
+                    || result.destination.commit_head
+                        != Some(destination_binding.destination_commit_id)
+                    || result.destination.commit_head_generation != Some(1)
+                {
+                    return Err(ProtocolError::invalid(
+                        "operation.restore_preparation.destination_binding",
+                        "does not contain the final manifest bindings and generation-one destination commit receipt",
                     ));
                 }
             }
@@ -906,6 +1706,127 @@ impl SearchHit {
             field.validate()?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericNamespaceKind {
+    Directory,
+    Artifact,
+}
+
+/// Compact immutable artifact fields for one generic namespace row. The row
+/// remains root-independent and deliberately carries no presentation path.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericNamespaceArtifact {
+    pub generation: u64,
+    pub logical_size: u64,
+    pub body_digest: DigestUri,
+    pub content_type: ContentType,
+    pub producer: Option<String>,
+    pub manifest_identity: Option<String>,
+}
+
+impl GenericNamespaceArtifact {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        crate::types::require_generation("generic_namespace.generation", self.generation)?;
+        crate::parse_sha256_digest_uri(&self.body_digest).map_err(|error| {
+            ProtocolError::invalid("generic_namespace.body_digest", error.to_string())
+        })?;
+        crate::types::validate_optional_text(
+            "generic_namespace.producer",
+            self.producer.as_deref(),
+            ArtifactDescriptor::MAX_PRODUCER_BYTES,
+        )?;
+        crate::types::validate_optional_text(
+            "generic_namespace.manifest_identity",
+            self.manifest_identity.as_deref(),
+            ArtifactDescriptor::MAX_MANIFEST_IDENTITY_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericNamespaceHit {
+    pub workbench: WorkbenchName,
+    /// `None` names the visible Workbench directory; every other value is
+    /// canonical relative to that Workbench.
+    pub relative_path: Option<crate::RelativePath>,
+    pub kind: GenericNamespaceKind,
+    pub artifact: Option<GenericNamespaceArtifact>,
+    pub projection: Vec<FieldValue>,
+    /// Generic-only ordered, duplicate-preserving values. ArtifactV1 rows use
+    /// [`SearchHit`] and therefore cannot acquire this field accidentally.
+    pub indexed_values: Vec<GenericIndexFieldValues>,
+}
+
+impl GenericNamespaceHit {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.projection.len() > 64 {
+            return Err(ProtocolError::invalid(
+                "generic_namespace.projection",
+                "exceeds 64 fields",
+            ));
+        }
+        match (self.kind, &self.relative_path, &self.artifact) {
+            (GenericNamespaceKind::Directory, _, None) => {}
+            (GenericNamespaceKind::Artifact, Some(_), Some(artifact)) => artifact.validate()?,
+            (GenericNamespaceKind::Artifact, None, _) => {
+                return Err(ProtocolError::invalid(
+                    "generic_namespace.relative_path",
+                    "artifact rows require a relative path",
+                ));
+            }
+            (GenericNamespaceKind::Directory, _, Some(_))
+            | (GenericNamespaceKind::Artifact, Some(_), None) => {
+                return Err(ProtocolError::invalid(
+                    "generic_namespace.artifact",
+                    "must be present exactly for artifact rows",
+                ));
+            }
+        }
+        for field in &self.projection {
+            field.validate()?;
+        }
+        if self.indexed_values.len() > crate::MAX_GENERIC_INDEX_ROW_FIELDS {
+            return Err(ProtocolError::invalid(
+                "generic_namespace.indexed_values",
+                format!("exceeds {} fields", crate::MAX_GENERIC_INDEX_ROW_FIELDS),
+            ));
+        }
+        for values in &self.indexed_values {
+            values.validate_at("generic_namespace.indexed_values")?;
+        }
+        if self
+            .indexed_values
+            .windows(2)
+            .any(|pair| pair[0].field_id >= pair[1].field_id)
+        {
+            return Err(ProtocolError::invalid(
+                "generic_namespace.indexed_values",
+                "must be strictly sorted by field_id without duplicates",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "row", content = "value", rename_all = "snake_case")]
+pub enum SearchRow {
+    Artifact(SearchHit),
+    GenericNamespace(GenericNamespaceHit),
+}
+
+impl SearchRow {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Artifact(hit) => hit.validate(),
+            Self::GenericNamespace(hit) => hit.validate(),
+        }
     }
 }
 
@@ -956,7 +1877,8 @@ impl FacetResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SearchResult {
-    pub hits: Vec<SearchHit>,
+    pub hits: Vec<SearchRow>,
+    pub match_count: u64,
     pub facets: Vec<FacetResult>,
     pub next_cursor: Option<Vec<u8>>,
     pub read_version: u64,
@@ -966,6 +1888,12 @@ impl SearchResult {
     fn validate(&self) -> Result<(), ProtocolError> {
         if self.hits.len() > 1_000 {
             return Err(ProtocolError::invalid("search.hits", "exceeds 1000 rows"));
+        }
+        if self.match_count < self.hits.len() as u64 {
+            return Err(ProtocolError::invalid(
+                "search.match_count",
+                "is smaller than returned row count",
+            ));
         }
         if self.facets.len() > 16 {
             return Err(ProtocolError::invalid("search.facets", "exceeds 16 fields"));
@@ -1013,6 +1941,9 @@ impl AggregateGroup {
 #[serde(deny_unknown_fields)]
 pub struct AggregateResult {
     pub groups: Vec<AggregateGroup>,
+    pub input_match_count: u64,
+    pub row_count: u64,
+    pub group_count: u64,
     pub next_cursor: Option<Vec<u8>>,
     pub read_version: u64,
 }
@@ -1023,6 +1954,18 @@ impl AggregateResult {
             return Err(ProtocolError::invalid(
                 "aggregate.groups",
                 "exceeds 1000 rows",
+            ));
+        }
+        if self.row_count > self.input_match_count {
+            return Err(ProtocolError::invalid(
+                "aggregate.row_count",
+                "exceeds input match count",
+            ));
+        }
+        if self.group_count < self.groups.len() as u64 {
+            return Err(ProtocolError::invalid(
+                "aggregate.group_count",
+                "is smaller than returned group count",
             ));
         }
         if self.read_version == 0 {
@@ -1044,6 +1987,14 @@ impl AggregateResult {
 pub struct CatalogField {
     pub field_id: String,
     pub scalar_type: String,
+    /// Exact observed scalar types for a Generic custom field. A declared
+    /// zero-row field has an empty list while retaining `scalar_type` as the
+    /// compatibility summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scalar_types: Vec<String>,
+    /// True only for a field declared by a Generic custom-index generation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub generic_custom: bool,
     pub operators: Vec<QueryOperator>,
     pub sortable: bool,
     pub facetable: bool,
@@ -1051,16 +2002,66 @@ pub struct CatalogField {
 }
 
 impl CatalogField {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
         validate_field_id("catalog.field_id", &self.field_id)?;
         validate_field_id("catalog.scalar_type", &self.scalar_type)?;
-        if self.operators.is_empty() {
+        if !self.generic_custom && self.operators.is_empty() {
             return Err(ProtocolError::invalid(
                 "catalog.operators",
                 "must not be empty",
             ));
         }
+        if !self.generic_custom && !self.scalar_types.is_empty() {
+            return Err(ProtocolError::invalid(
+                "catalog.scalar_types",
+                "is only valid for Generic custom fields",
+            ));
+        }
+        if self.generic_custom {
+            let summary_rank = generic_catalog_scalar_type_rank(&self.scalar_type)?;
+            let mut previous = None;
+            for scalar_type in &self.scalar_types {
+                let rank = generic_catalog_scalar_type_rank(scalar_type)?;
+                if previous.is_some_and(|previous| previous >= rank) {
+                    return Err(ProtocolError::invalid(
+                        "catalog.scalar_types",
+                        "must be strictly sorted in canonical scalar-type order without duplicates",
+                    ));
+                }
+                previous = Some(rank);
+            }
+            if self.scalar_types.first().is_some_and(|first| {
+                generic_catalog_scalar_type_rank(first).ok() != Some(summary_rank)
+            }) {
+                return Err(ProtocolError::invalid(
+                    "catalog.scalar_type",
+                    "must summarize the first observed Generic scalar type",
+                ));
+            }
+        }
+        if self.generic_custom && self.operators.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ProtocolError::invalid(
+                "catalog.operators",
+                "must be strictly sorted in canonical order without duplicates",
+            ));
+        }
         Ok(())
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn generic_catalog_scalar_type_rank(value: &str) -> Result<u8, ProtocolError> {
+    match value {
+        "unsigned" => Ok(1),
+        "float" => Ok(2),
+        "string" => Ok(3),
+        _ => Err(ProtocolError::invalid(
+            "catalog.scalar_types",
+            "contains a scalar type unsupported by Generic custom indexes",
+        )),
     }
 }
 
@@ -1068,6 +2069,7 @@ impl CatalogField {
 #[serde(deny_unknown_fields)]
 pub struct CatalogResult {
     pub fields: Vec<CatalogField>,
+    pub facets: Vec<FacetResult>,
     pub next_cursor: Option<Vec<u8>>,
     pub read_version: u64,
 }
@@ -1080,6 +2082,12 @@ impl CatalogResult {
                 "exceeds 1000 rows",
             ));
         }
+        if self.facets.len() > 16 {
+            return Err(ProtocolError::invalid(
+                "catalog.facets",
+                "exceeds 16 fields",
+            ));
+        }
         if self.read_version == 0 {
             return Err(ProtocolError::invalid(
                 "catalog.read_version",
@@ -1089,6 +2097,9 @@ impl CatalogResult {
         validate_cursor("catalog.next_cursor", self.next_cursor.as_deref())?;
         for field in &self.fields {
             field.validate()?;
+        }
+        for facet in &self.facets {
+            facet.validate()?;
         }
         Ok(())
     }
@@ -1237,9 +2248,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn renamed_result_binds_both_paths_and_positive_generations() {
+        let source = WorkspacePath {
+            workbench: WorkbenchName::new("run-42").unwrap(),
+            path: crate::RelativePath::new("outputs/a.bin").unwrap(),
+        };
+        let mut result = RenamePathResult {
+            source: source.clone(),
+            destination: WorkspacePath {
+                workbench: source.workbench.clone(),
+                path: crate::RelativePath::new("outputs/b.bin").unwrap(),
+            },
+            workspace_revision: 1,
+            generation: 7,
+            artifact_revision_id: ArtifactRevisionIdentity([9; 16]),
+        };
+        result.validate().unwrap();
+
+        result.destination.path = source.path;
+        assert!(matches!(
+            result.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "renamed.destination.path",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn catalog_requires_a_positive_read_version() {
         let mut result = CatalogResult {
             fields: Vec::new(),
+            facets: Vec::new(),
             next_cursor: None,
             read_version: 0,
         };
@@ -1320,6 +2360,81 @@ mod tests {
         }
     }
 
+    fn restore_descriptor(body_byte: &str) -> ArtifactDescriptor {
+        ArtifactDescriptor {
+            logical_size: 128,
+            body_digest: DigestUri::new(format!("sha256:{}", body_byte.repeat(32))).unwrap(),
+            manifest_digest: DigestUri::new(format!("sha256:{}", "cd".repeat(32))).unwrap(),
+            content_type: crate::ContentType::new("application/json").unwrap(),
+            producer: None,
+            manifest_identity: None,
+            index_fields: Vec::new(),
+        }
+    }
+
+    fn restore_operation_preparation(destination: &WorkbenchName) -> RestoreOperationPreparation {
+        let source_commit = RestoreSourceCommitBinding {
+            commit_id: CommitIdentity([0x11; 32]),
+            content_digest: DigestUri::new(format!("sha256:{}", "12".repeat(32))).unwrap(),
+            manifest_digest: DigestUri::new(format!("sha256:{}", "13".repeat(32))).unwrap(),
+            tree_manifest_revision_id: ArtifactRevisionIdentity([0x14; 16]),
+            member_count: 2,
+            member_digest: Digest([0x15; 32]),
+        };
+        let restore_identity = crate::request::RestoreManifestIdentity {
+            publication_operation_id: OperationIdentity([0x16; 16]),
+            artifact_revision_id: ArtifactRevisionIdentity([0x17; 16]),
+        };
+        RestoreOperationPreparation {
+            request: PrepareRestoreRequest {
+                operation_id: OperationIdentity([1; 16]),
+                source_workbench: WorkbenchName::new("source").unwrap(),
+                source_workspace_incarnation_id: WorkspaceIdentity([3; 16]),
+                source: crate::request::RestoreSource::Snapshot(crate::SnapshotSelector::Id(7)),
+                destination_workbench: destination.clone(),
+                destination_workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                destination_restore_manifest_identity: restore_identity,
+                restore_manifest: crate::request::RestoreManifestDescriptor {
+                    body_digest: DigestUri::new(format!("sha256:{}", "ab".repeat(32))).unwrap(),
+                    logical_size: 128,
+                    content_type: crate::ContentType::new("application/json").unwrap(),
+                },
+            },
+            source_snapshot_read_version: Some(9),
+            source_commit: source_commit.clone(),
+            destination_committed_at_unix_seconds: 1_700_000_000,
+            source_member_count: Some(2),
+            source_member_digest: Some(Digest([0x15; 32])),
+            materialized_member_count: Some(1),
+            materialized_member_digest: Some(Digest([0x18; 32])),
+            source_matches_base_commit: Some(true),
+            destination_binding: Some(Box::new(RestoreDestinationBinding {
+                destination_commit_id: CommitIdentity([0x19; 32]),
+                effective_content_digest: source_commit.content_digest.clone(),
+                destination_run_manifest_projection_input_digest: Digest([0x1a; 32]),
+                destination_run_manifest_identity: crate::request::RestoreManifestIdentity {
+                    publication_operation_id: OperationIdentity([0x1b; 16]),
+                    artifact_revision_id: ArtifactRevisionIdentity([0x1c; 16]),
+                },
+                destination_restore_manifest_identity: restore_identity,
+                destination_manifests: Some(RestoreDestinationManifestBindings {
+                    run_manifest: RestoreManifestBinding {
+                        publication_operation_id: OperationIdentity([0x1b; 16]),
+                        workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                        artifact_revision_id: ArtifactRevisionIdentity([0x1c; 16]),
+                        descriptor: restore_descriptor("de"),
+                    },
+                    restore_manifest: RestoreManifestBinding {
+                        publication_operation_id: restore_identity.publication_operation_id,
+                        workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                        artifact_revision_id: restore_identity.artifact_revision_id,
+                        descriptor: restore_descriptor("ab"),
+                    },
+                }),
+            })),
+        }
+    }
+
     #[test]
     fn commit_status_requires_exact_durable_preparation() {
         let mut status = running_status(OperationKind::Commit);
@@ -1391,23 +2506,7 @@ mod tests {
     fn restore_status_requires_durable_identity_source_and_seal() {
         let destination = WorkbenchName::new("destination").unwrap();
         let mut status = running_status(OperationKind::Restore);
-        status.restore_preparation = Some(Box::new(RestoreOperationPreparation {
-            request: PrepareRestoreRequest {
-                source_workbench: WorkbenchName::new("source").unwrap(),
-                source_workspace_incarnation_id: WorkspaceIdentity([3; 16]),
-                source: crate::request::RestoreSource::Snapshot(crate::SnapshotSelector::Id(7)),
-                destination_workbench: destination.clone(),
-                destination_workspace_incarnation_id: WorkspaceIdentity([4; 16]),
-                restore_manifest: crate::request::RestoreManifestDescriptor {
-                    body_digest: DigestUri::new(format!("sha256:{}", "ab".repeat(32))).unwrap(),
-                    logical_size: 128,
-                    content_type: crate::ContentType::new("application/json").unwrap(),
-                },
-            },
-            source_snapshot_read_version: Some(9),
-            sealed_member_count: Some(2),
-            sealed_member_digest: Some(Digest([5; 32])),
-        }));
+        status.restore_preparation = Some(Box::new(restore_operation_preparation(&destination)));
         status.validate().unwrap();
 
         status.state = OperationState::Succeeded;
@@ -1417,12 +2516,12 @@ mod tests {
                 workbench: destination,
                 workspace_incarnation_id: WorkspaceIdentity([4; 16]),
                 workspace_revision: 1,
-                commit_head: None,
-                commit_head_generation: None,
+                commit_head: Some(CommitIdentity([0x19; 32])),
+                commit_head_generation: Some(1),
             },
-            member_count: 2,
-            member_digest: Digest([5; 32]),
-            metadata_rows_copied: 2,
+            member_count: 1,
+            member_digest: Digest([0x18; 32]),
+            metadata_rows_copied: 1,
             object_bytes_copied: 0,
         }));
         status.validate().unwrap();
@@ -1431,7 +2530,175 @@ mod tests {
             .restore_preparation
             .as_mut()
             .unwrap()
-            .sealed_member_count = Some(3);
+            .materialized_member_count = Some(3);
         assert!(status.validate().is_err());
+    }
+
+    #[test]
+    fn restore_operation_preparation_uses_phase_aware_complete_seals() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_member_count = None;
+        preparation.source_member_digest = None;
+        preparation.materialized_member_count = None;
+        preparation.materialized_member_digest = None;
+        preparation.source_matches_base_commit = None;
+        preparation.destination_binding = None;
+        preparation.validate().unwrap();
+
+        preparation.source_member_count = Some(2);
+        assert!(preparation.validate().is_err());
+    }
+
+    #[test]
+    fn restore_materialized_members_are_a_subset_of_the_raw_source() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_member_count = Some(2);
+        preparation.source_member_digest = Some(Digest([0x15; 32]));
+        preparation.materialized_member_count = Some(3);
+        preparation.materialized_member_digest = Some(Digest([0x18; 32]));
+
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "operation.restore_preparation.materialized_members",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_source_match_is_recomputed_from_the_base_commit_seal() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_matches_base_commit = Some(false);
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "restore.source_matches_base_commit",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dirty_restore_requires_a_distinct_effective_content_digest() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_member_digest = Some(Digest([0x44; 32]));
+        preparation.source_matches_base_commit = Some(false);
+        assert!(preparation.validate().is_err());
+
+        preparation
+            .destination_binding
+            .as_mut()
+            .unwrap()
+            .effective_content_digest =
+            DigestUri::new(format!("sha256:{}", "45".repeat(32))).unwrap();
+        preparation.validate().unwrap();
+    }
+
+    #[test]
+    fn direct_commit_restore_forbids_dirty_source_semantics() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.request.source =
+            crate::request::RestoreSource::Commit(preparation.source_commit.commit_id);
+        preparation.source_snapshot_read_version = None;
+        preparation.source_member_digest = Some(Digest([0x44; 32]));
+        preparation.source_matches_base_commit = Some(false);
+        preparation
+            .destination_binding
+            .as_mut()
+            .unwrap()
+            .effective_content_digest =
+            DigestUri::new(format!("sha256:{}", "45".repeat(32))).unwrap();
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "operation.restore_preparation.source_matches_base_commit",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn final_restore_manifests_exact_bind_expected_identities_and_incarnation() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation
+            .destination_binding
+            .as_mut()
+            .unwrap()
+            .destination_manifests
+            .as_mut()
+            .unwrap()
+            .run_manifest
+            .workspace_incarnation_id = WorkspaceIdentity([0x46; 16]);
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "operation.restore_preparation.destination_binding.destination_manifests",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn source_commit_binding_rejects_noncanonical_member_seals() {
+        let destination = WorkbenchName::new("destination").unwrap();
+        let mut preparation = restore_operation_preparation(&destination);
+        preparation.source_commit.member_count = 0;
+        assert!(matches!(
+            preparation.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "restore.source_commit.members",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn successful_restore_result_requires_a_committed_destination() {
+        let result = RestoreResult {
+            operation_id: OperationIdentity([1; 16]),
+            destination: WorkspaceSummary {
+                workbench: WorkbenchName::new("destination").unwrap(),
+                workspace_incarnation_id: WorkspaceIdentity([4; 16]),
+                workspace_revision: 1,
+                commit_head: None,
+                commit_head_generation: None,
+            },
+            member_count: 0,
+            member_digest: Digest([0; 32]),
+            metadata_rows_copied: 0,
+            object_bytes_copied: 0,
+        };
+        assert!(matches!(
+            result.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "restore.destination.commit_head",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_source_run_manifest_response_cannot_claim_not_modified() {
+        let result = WorkspaceResult::RestoreSourceRunManifest(PathReadResult {
+            not_modified: true,
+            metadata: None,
+            range: None,
+            blocks: Vec::new(),
+            next_cursor: None,
+        });
+        assert!(matches!(
+            result.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "restore_source_run_manifest",
+                ..
+            })
+        ));
     }
 }

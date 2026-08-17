@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Transport-free 18-tool Workbench facade.
+//! Transport-free Workbench and generic Agent facades.
 //!
 //! This crate owns the frozen tool schemas, argument validation, stable error
 //! envelope, and dispatch into an SDK-backed handler. It does not own metadata
@@ -17,13 +17,17 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 mod facade;
+mod generic;
 mod projection;
 
 pub use facade::*;
+pub use generic::*;
 pub use projection::*;
 
 pub const WORKBENCH_CONTRACT_SCHEMA: &str = "nokv.workbench.mcp_input_schemas.v1";
 pub const WORKBENCH_TOOL_COUNT: usize = 18;
+pub const GENERIC_AGENT_CONTRACT_SCHEMA: &str = "nokv.agent.generic.mcp_input_schemas.v1";
+pub const GENERIC_AGENT_TOOL_COUNT: usize = 7;
 
 const TOOL_DESCRIPTIONS: [(&str, &str); WORKBENCH_TOOL_COUNT] = [
     (
@@ -100,6 +104,37 @@ const TOOL_DESCRIPTIONS: [(&str, &str); WORKBENCH_TOOL_COUNT] = [
     ),
 ];
 
+const GENERIC_AGENT_TOOL_DESCRIPTIONS: [(&str, &str); GENERIC_AGENT_TOOL_COUNT] = [
+    (
+        "ls",
+        "List direct children to discover paths. Not recursive; use stat for one path details.",
+    ),
+    (
+        "stat",
+        "Inspect a single path compact card: counts, body, schema, sample, catalog, and indexed values. Use read for file body content.",
+    ),
+    (
+        "catalog",
+        "Discover field ids for find predicates, projections, sort, facets, and aggregate group or measure fields.",
+    ),
+    (
+        "read",
+        "Read file body content. Structured mode returns JSON, YAML, or text records; bytes mode returns byte ranges.",
+    ),
+    (
+        "aggregate",
+        "Compute summary rows using catalog field ids: count, sum, avg, min, max, group, filter, and sort.",
+    ),
+    (
+        "find",
+        "Search paths with catalog field predicates and project fields. Use read for body content and stat for schema or sample.",
+    ),
+    (
+        "grep",
+        "Search file bodies for case-insensitive literal substrings and return matching lines with line numbers. patterns adds OR alternatives to pattern (at most 16); glob filters file names. Scope path to one directory or file when known.",
+    ),
+];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentToolDefinition {
     pub name: String,
@@ -129,6 +164,15 @@ impl AgentError {
         Self {
             code: "UnknownTool".to_owned(),
             message: format!("unknown Workbench tool {name}"),
+            retryable: false,
+            details: json!({"tool": name}),
+        }
+    }
+
+    pub fn unknown_generic_agent_tool(name: &str) -> Self {
+        Self {
+            code: "UnknownTool".to_owned(),
+            message: format!("unknown Agent tool {name}"),
             retryable: false,
             details: json!({"tool": name}),
         }
@@ -173,7 +217,23 @@ pub trait WorkbenchToolHandler: Send + Sync {
     fn execute(&self, name: &str, arguments: &Value) -> Result<Value, AgentError>;
 }
 
+/// SDK-backed execution boundary for the explicit seven-tool generic Agent
+/// profile. Its arguments use the frozen path-native contract, independently
+/// of the 18-tool Workbench profile.
+pub trait GenericAgentToolHandler: Send + Sync {
+    fn execute(&self, name: &str, arguments: &Value) -> Result<Value, AgentError>;
+}
+
 impl<F> WorkbenchToolHandler for F
+where
+    F: Fn(&str, &Value) -> Result<Value, AgentError> + Send + Sync,
+{
+    fn execute(&self, name: &str, arguments: &Value) -> Result<Value, AgentError> {
+        self(name, arguments)
+    }
+}
+
+impl<F> GenericAgentToolHandler for F
 where
     F: Fn(&str, &Value) -> Result<Value, AgentError> + Send + Sync,
 {
@@ -198,6 +258,22 @@ pub fn tool_definitions() -> Vec<AgentToolDefinition> {
         .collect()
 }
 
+pub fn generic_agent_tool_definitions() -> Vec<AgentToolDefinition> {
+    let contract = generic_agent_contract();
+    GENERIC_AGENT_TOOL_DESCRIPTIONS
+        .iter()
+        .map(|(name, description)| AgentToolDefinition {
+            name: (*name).to_owned(),
+            description,
+            parameters: contract
+                .input_schemas
+                .get(*name)
+                .expect("validated generic Agent contract contains every tool")
+                .clone(),
+        })
+        .collect()
+}
+
 pub fn validate_tool_arguments(name: &str, arguments: &Value) -> Result<(), AgentError> {
     let schema = contract()
         .input_schemas
@@ -213,6 +289,27 @@ pub fn execute_tool(
     arguments: &Value,
 ) -> Result<Value, AgentError> {
     validate_tool_arguments(name, arguments)?;
+    handler.execute(name, arguments)
+}
+
+pub fn validate_generic_agent_tool_arguments(
+    name: &str,
+    arguments: &Value,
+) -> Result<(), AgentError> {
+    let schema = generic_agent_contract()
+        .input_schemas
+        .get(name)
+        .ok_or_else(|| AgentError::unknown_generic_agent_tool(name))?;
+    validate_schema(schema, arguments, "$")
+        .map_err(|message| AgentError::invalid_arguments(format!("{name}: {message}")))
+}
+
+pub fn execute_generic_agent_tool(
+    handler: &impl GenericAgentToolHandler,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, AgentError> {
+    validate_generic_agent_tool_arguments(name, arguments)?;
     handler.execute(name, arguments)
 }
 
@@ -245,6 +342,33 @@ fn contract() -> &'static ContractAsset {
         assert_eq!(
             actual, expected,
             "checked-in Workbench contract must contain exactly 18 tools"
+        );
+        contract
+    })
+}
+
+fn generic_agent_contract() -> &'static ContractAsset {
+    static CONTRACT: OnceLock<ContractAsset> = OnceLock::new();
+    CONTRACT.get_or_init(|| {
+        let contract: ContractAsset =
+            serde_json::from_str(include_str!("../generic_agent_contract_schema.json"))
+                .expect("checked-in generic Agent contract must be valid JSON");
+        assert_eq!(
+            contract.schema, GENERIC_AGENT_CONTRACT_SCHEMA,
+            "checked-in generic Agent contract schema marker differs"
+        );
+        let expected = GENERIC_AGENT_TOOL_DESCRIPTIONS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect::<BTreeSet<_>>();
+        let actual = contract
+            .input_schemas
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "checked-in generic Agent contract tool set differs"
         );
         contract
     })

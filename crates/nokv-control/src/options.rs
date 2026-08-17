@@ -6,6 +6,7 @@ use crate::{LogicalShardId, RootId};
 
 const DEFAULT_ETCD_KEY_PREFIX: &str = "/nokv/control";
 const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
+const MAX_ETCD_KEY_PREFIX_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EtcdControlStoreOptions {
@@ -65,6 +66,12 @@ impl EtcdControlStoreOptions {
                 "etcd key prefix must not be empty".to_owned(),
             ));
         }
+        if self.normalized_key_prefix().len() > MAX_ETCD_KEY_PREFIX_BYTES {
+            return Err(ControlError::InvalidOptions(format!(
+                "etcd key prefix is {} bytes; maximum is {MAX_ETCD_KEY_PREFIX_BYTES}",
+                self.normalized_key_prefix().len()
+            )));
+        }
         if self.lease_ttl_seconds <= 0 {
             return Err(ControlError::InvalidOptions(
                 "etcd lease TTL must be positive".to_owned(),
@@ -77,6 +84,16 @@ impl EtcdControlStoreOptions {
     pub(crate) fn root_placement_key(&self, root_id: &RootId) -> Vec<u8> {
         format!(
             "{}/roots/{}",
+            self.normalized_key_prefix(),
+            encode_fixed_id(root_id.as_bytes())
+        )
+        .into_bytes()
+    }
+
+    #[cfg(any(feature = "etcd", test))]
+    pub(crate) fn root_agent_key(&self, root_id: &RootId) -> Vec<u8> {
+        format!(
+            "{}/root-agents/{}",
             self.normalized_key_prefix(),
             encode_fixed_id(root_id.as_bytes())
         )
@@ -153,6 +170,12 @@ mod tests {
                 .validate(),
             Err(ControlError::InvalidOptions(_))
         ));
+        assert!(matches!(
+            EtcdControlStoreOptions::new(["http://127.0.0.1:2379"])
+                .with_key_prefix("x".repeat(MAX_ETCD_KEY_PREFIX_BYTES + 1))
+                .validate(),
+            Err(ControlError::InvalidOptions(_))
+        ));
     }
 
     #[test]
@@ -167,6 +190,10 @@ mod tests {
         assert_eq!(
             String::from_utf8(options.root_object_namespace_key(&root_id(0x01))).unwrap(),
             "/nokv/test/root-object-namespaces/01010101010101010101010101010101"
+        );
+        assert_eq!(
+            String::from_utf8(options.root_agent_key(&root_id(0x01))).unwrap(),
+            "/nokv/test/root-agents/01010101010101010101010101010101"
         );
         assert_eq!(
             String::from_utf8(options.logical_shard_record_key(&shard_id(0x02))).unwrap(),

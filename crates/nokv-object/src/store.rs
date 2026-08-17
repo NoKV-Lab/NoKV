@@ -8,6 +8,7 @@ use opendal::options::WriteOptions;
 use opendal::services::S3;
 use opendal::{ErrorKind, Operator};
 
+use crate::admission::{ProviderAdmissionReceipt, ProviderHandleIdentity};
 use crate::digest::{hex, sha256};
 
 pub const DEFAULT_S3_MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
@@ -56,7 +57,7 @@ pub struct ArtifactStoreCapabilities {
     pub atomic_create_if_absent: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ObjectError {
     EmptyKey,
     AbsoluteKey,
@@ -96,6 +97,12 @@ pub enum ObjectError {
         expected: ObjectNamespaceId,
         actual: ObjectNamespaceId,
     },
+    AtomicCreateUnsupported,
+    ProviderAdmissionRequired,
+    ProviderAdmissionBlockSizeExceeded {
+        requested: usize,
+        admitted: usize,
+    },
     CreateAmbiguous {
         key: ObjectKey,
         detail: String,
@@ -114,7 +121,7 @@ pub enum ObjectError {
 ///
 /// `create_immutable` may create a missing key or accept an exact-byte replay.
 /// It must never replace different bytes at an existing key.
-pub trait ArtifactObjectStore {
+pub trait ArtifactObjectStore: Send + Sync {
     /// Durable identity of the physical bucket/prefix after verification.
     ///
     /// Raw provider handles return `None`; callers that combine object bytes
@@ -124,6 +131,20 @@ pub trait ArtifactObjectStore {
     }
 
     fn capabilities(&self) -> ArtifactStoreCapabilities;
+
+    /// Process-local identity of this concrete provider handle and immutable
+    /// connection profile. Implementations that can move or clone must store
+    /// an explicit [`ProviderHandleIdentity`] and preserve it across clones.
+    fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+        let address = std::ptr::from_ref(self).cast::<()>() as usize;
+        ProviderHandleIdentity::from_handle_address(address)
+    }
+
+    /// Receipt from an endpoint write-conformance probe for this exact handle.
+    /// Raw remote providers are unadmitted until composition records one.
+    fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+        None
+    }
 
     fn create_immutable(
         &self,
@@ -152,6 +173,14 @@ where
 
     fn capabilities(&self) -> ArtifactStoreCapabilities {
         (**self).capabilities()
+    }
+
+    fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+        (**self).provider_handle_identity()
+    }
+
+    fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+        (**self).provider_admission_receipt()
     }
 
     fn create_immutable(
@@ -244,9 +273,11 @@ impl Default for ArtifactStoreCapabilities {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MemoryArtifactStore {
     state: Arc<Mutex<MemoryArtifactStoreState>>,
+    handle_identity: ProviderHandleIdentity,
+    admission_receipt: Arc<ProviderAdmissionReceipt>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -280,9 +311,31 @@ impl MemoryArtifactStore {
     }
 }
 
+impl Default for MemoryArtifactStore {
+    fn default() -> Self {
+        let handle_identity = ProviderHandleIdentity::new();
+        Self {
+            state: Arc::new(Mutex::new(MemoryArtifactStoreState::default())),
+            handle_identity,
+            admission_receipt: Arc::new(ProviderAdmissionReceipt::trusted_in_process(
+                handle_identity,
+                usize::MAX,
+            )),
+        }
+    }
+}
+
 impl ArtifactObjectStore for MemoryArtifactStore {
     fn capabilities(&self) -> ArtifactStoreCapabilities {
         ArtifactStoreCapabilities::default()
+    }
+
+    fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+        self.handle_identity
+    }
+
+    fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+        Some(self.admission_receipt.as_ref())
     }
 
     fn create_immutable(
@@ -412,6 +465,7 @@ impl S3ArtifactStoreOptions {
 #[derive(Clone, Debug)]
 pub struct S3ArtifactStore {
     operator: BlockingOperator,
+    handle_identity: ProviderHandleIdentity,
 }
 
 impl S3ArtifactStore {
@@ -445,7 +499,10 @@ impl S3ArtifactStore {
             .finish();
         let _runtime_guard = OPENDAL_RUNTIME.enter();
         let operator = BlockingOperator::new(operator).map_err(ObjectError::opendal_backend)?;
-        Ok(Self { operator })
+        Ok(Self {
+            operator,
+            handle_identity: ProviderHandleIdentity::new(),
+        })
     }
 
     fn read_existing_for_replay(
@@ -474,6 +531,10 @@ impl ArtifactObjectStore for S3ArtifactStore {
             multipart_create: true,
             atomic_create_if_absent: true,
         }
+    }
+
+    fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+        self.handle_identity
     }
 
     fn create_immutable(
@@ -666,7 +727,9 @@ impl fmt::Display for ObjectError {
         match self {
             Self::EmptyKey => formatter.write_str("object key is empty"),
             Self::AbsoluteKey => formatter.write_str("object key must be relative"),
-            Self::EmptyKeyComponent => formatter.write_str("object key contains an empty component"),
+            Self::EmptyKeyComponent => {
+                formatter.write_str("object key contains an empty component")
+            }
             Self::ParentTraversal => formatter.write_str("object key contains '..'"),
             Self::CurrentDirectory => formatter.write_str("object key contains '.'"),
             Self::BackslashInKey => {
@@ -681,24 +744,10 @@ impl fmt::Display for ObjectError {
                 formatter,
                 "invalid object range offset={offset} len={len} object_size={object_size:?}"
             ),
-            Self::ObjectNotFound { key } => write!(formatter, "object not found: {key}"),
-            Self::ImmutableCollision {
-                key,
-                expected_sha256,
-                actual_sha256,
-            } => write!(
-                formatter,
-                "immutable object collision at {key}: expected sha256={expected_sha256}, actual sha256={actual_sha256}"
-            ),
-            Self::DigestMismatch {
-                key,
-                expected_sha256,
-                actual_sha256,
-            } => write!(
-                formatter,
-                "artifact block digest mismatch at {key}: expected sha256={expected_sha256}, actual sha256={actual_sha256}"
-            ),
-            Self::InvalidManifest(detail) => write!(formatter, "invalid artifact manifest: {detail}"),
+            Self::ObjectNotFound { .. } => formatter.write_str("artifact object was not found"),
+            Self::ImmutableCollision { .. } => formatter.write_str("immutable object collision"),
+            Self::DigestMismatch { .. } => formatter.write_str("artifact object digest mismatch"),
+            Self::InvalidManifest(_) => formatter.write_str("artifact manifest is invalid"),
             Self::MissingBucket => formatter.write_str("S3 bucket is required"),
             Self::MissingRegion => formatter.write_str("S3 region is required"),
             Self::ObjectNamespaceUninitialized => {
@@ -714,14 +763,32 @@ impl fmt::Display for ObjectError {
             Self::ObjectNamespaceMismatch { .. } => {
                 formatter.write_str("artifact object namespace does not match root placement")
             }
-            Self::CreateAmbiguous { key, detail } => {
-                write!(formatter, "immutable create outcome is ambiguous for {key}: {detail}")
+            Self::AtomicCreateUnsupported => formatter
+                .write_str("artifact object provider does not support atomic create-if-absent"),
+            Self::ProviderAdmissionRequired => formatter
+                .write_str("artifact object provider has no valid write-conformance admission"),
+            Self::ProviderAdmissionBlockSizeExceeded {
+                requested,
+                admitted,
+            } => write!(
+                formatter,
+                "artifact block size {requested} exceeds admitted provider limit {admitted}"
+            ),
+            Self::CreateAmbiguous { .. } => {
+                formatter.write_str("immutable create outcome is ambiguous")
             }
-            Self::DeleteAmbiguous { key, detail } => {
-                write!(formatter, "delete outcome is ambiguous for {key}: {detail}")
-            }
+            Self::DeleteAmbiguous { .. } => formatter.write_str("delete outcome is ambiguous"),
             Self::Backend { .. } => formatter.write_str("artifact object backend is unavailable"),
         }
+    }
+}
+
+impl fmt::Debug for ObjectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ObjectError")
+            .field(&self.to_string())
+            .finish()
     }
 }
 

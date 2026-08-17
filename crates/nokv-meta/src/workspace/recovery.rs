@@ -24,8 +24,14 @@ const LEGACY_RECOVERY_OUTBOX_VALUE_FORMAT_VERSION: u8 = 2;
 pub const RECOVERY_CHAIN_DIGEST_BYTES: usize = 32;
 const MAX_ITEMS: usize = 256;
 pub(crate) const MAX_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_RECOVERY_SEGMENT_BYTES: usize = MAX_RECOVERY_BYTES;
+pub const MAX_RECOVERY_SEGMENT_RECORDS: usize = 1024;
 const GENESIS_DOMAIN: &[u8] = b"nokv.metadata.recovery.genesis.v1\0";
 const CHAIN_DOMAIN: &[u8] = b"nokv.metadata.recovery.chain.v1\0";
+const SEGMENT_DOMAIN: &[u8] = b"nokv.metadata.recovery.segment.v1\0";
+const RECOVERY_SEGMENT_MAGIC: &[u8; 8] = b"NOKVRSG1";
+const RECOVERY_SEGMENT_FORMAT_VERSION: u8 = 1;
+const RECOVERY_SEGMENT_FIXED_BYTES: usize = 8 + 1 + 16 + 8 + 8 + 32 + 32 + 32 + 4;
 const STORAGE_HEADER_VERSION: u8 = 1;
 const STORAGE_CHUNK_VERSION: u8 = 1;
 const LEGACY_STORAGE_HEADER_KEY_TAG: u8 = 0;
@@ -128,6 +134,24 @@ pub struct RecoveryState {
     pub chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
 }
 
+/// One bounded, canonical slice of the authoritative recovery outbox.
+///
+/// Segments carry no second mutation format. Every record is the exact
+/// transaction-committed [`RecoveryOutboxRecord`] and replay routes those
+/// records through the ordinary [`MetaShard`](super::engine::MetaShard) write
+/// entrypoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryOutboxSegment {
+    format_version: u8,
+    pub logical_shard_id: LogicalShardId,
+    pub first_lsn: u64,
+    pub last_lsn: u64,
+    pub previous_chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
+    pub last_chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
+    pub records: Vec<RecoveryOutboxRecord>,
+    pub segment_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecoveryStorageHeader {
     logical_length: u64,
@@ -169,6 +193,24 @@ pub enum RecoveryCodecError {
         count: usize,
     },
     ChainDigestMismatch,
+    EmptySegment,
+    DuplicateRecoveryLsn {
+        lsn: u64,
+    },
+    RecoveryLsnGap {
+        expected: u64,
+        actual: u64,
+    },
+    RecoveryLsnRegression {
+        previous: u64,
+        actual: u64,
+    },
+    UnexpectedLogicalShard {
+        expected: LogicalShardId,
+        actual: LogicalShardId,
+    },
+    SegmentHeaderMismatch,
+    SegmentDigestMismatch,
 }
 
 impl fmt::Display for RecoveryCodecError {
@@ -201,6 +243,26 @@ impl fmt::Display for RecoveryCodecError {
                 write!(formatter, "recovery value has {count} trailing bytes")
             }
             Self::ChainDigestMismatch => formatter.write_str("recovery chain digest mismatch"),
+            Self::EmptySegment => formatter.write_str("recovery segment is empty"),
+            Self::DuplicateRecoveryLsn { lsn } => {
+                write!(formatter, "recovery segment contains duplicate LSN {lsn}")
+            }
+            Self::RecoveryLsnGap { expected, actual } => write!(
+                formatter,
+                "recovery segment expected LSN {expected}, found {actual}"
+            ),
+            Self::RecoveryLsnRegression { previous, actual } => write!(
+                formatter,
+                "recovery segment LSN regressed from {previous} to {actual}"
+            ),
+            Self::UnexpectedLogicalShard { expected, actual } => write!(
+                formatter,
+                "recovery command targets logical shard {actual:?}, expected {expected:?}"
+            ),
+            Self::SegmentHeaderMismatch => {
+                formatter.write_str("recovery segment header does not match its records")
+            }
+            Self::SegmentDigestMismatch => formatter.write_str("recovery segment digest mismatch"),
         }
     }
 }
@@ -312,6 +374,204 @@ impl RecoveryOutboxRecord {
             return Err(RecoveryCodecError::ChainDigestMismatch);
         }
         Ok(record)
+    }
+
+    pub fn verify(&self) -> Result<(), RecoveryCodecError> {
+        self.encode().map(|_| ())
+    }
+}
+
+impl RecoveryOutboxSegment {
+    pub fn seal(
+        logical_shard_id: LogicalShardId,
+        records: Vec<RecoveryOutboxRecord>,
+    ) -> Result<Self, RecoveryCodecError> {
+        let encoded_records = validate_segment_records(logical_shard_id, &records)?;
+        let first = records.first().ok_or(RecoveryCodecError::EmptySegment)?;
+        let last = records
+            .last()
+            .expect("validated non-empty recovery segment");
+        let encoded_length = recovery_segment_encoded_length(&encoded_records)?;
+        if encoded_length > MAX_RECOVERY_SEGMENT_BYTES {
+            return Err(RecoveryCodecError::LengthBound {
+                field: "recovery_segment",
+                length: encoded_length,
+                max: MAX_RECOVERY_SEGMENT_BYTES,
+            });
+        }
+        let segment_digest = recovery_segment_digest(
+            logical_shard_id,
+            first.recovery_lsn,
+            last.recovery_lsn,
+            first.previous_chain_digest,
+            last.chain_digest,
+            &encoded_records,
+        );
+        Ok(Self {
+            format_version: RECOVERY_SEGMENT_FORMAT_VERSION,
+            logical_shard_id,
+            first_lsn: first.recovery_lsn,
+            last_lsn: last.recovery_lsn,
+            previous_chain_digest: first.previous_chain_digest,
+            last_chain_digest: last.chain_digest,
+            records,
+            segment_digest,
+        })
+    }
+
+    pub fn verify(&self) -> Result<(), RecoveryCodecError> {
+        if self.format_version != RECOVERY_SEGMENT_FORMAT_VERSION {
+            return Err(RecoveryCodecError::UnsupportedVersion {
+                actual: self.format_version,
+                expected: RECOVERY_SEGMENT_FORMAT_VERSION,
+            });
+        }
+        let expected = Self::seal(self.logical_shard_id, self.records.clone())?;
+        if self.first_lsn != expected.first_lsn
+            || self.last_lsn != expected.last_lsn
+            || self.previous_chain_digest != expected.previous_chain_digest
+            || self.last_chain_digest != expected.last_chain_digest
+        {
+            return Err(RecoveryCodecError::SegmentHeaderMismatch);
+        }
+        if self.segment_digest != expected.segment_digest {
+            return Err(RecoveryCodecError::SegmentDigestMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn verify_follows(
+        &self,
+        boundary: RecoveryState,
+    ) -> Result<RecoveryState, RecoveryCodecError> {
+        self.verify()?;
+        let expected_lsn = boundary.applied_recovery_lsn.checked_add(1).ok_or(
+            RecoveryCodecError::InvalidValue {
+                field: "recovery_segment_boundary_lsn",
+            },
+        )?;
+        if self.first_lsn != expected_lsn {
+            return Err(if self.first_lsn == boundary.applied_recovery_lsn {
+                RecoveryCodecError::DuplicateRecoveryLsn {
+                    lsn: self.first_lsn,
+                }
+            } else if self.first_lsn < expected_lsn {
+                RecoveryCodecError::RecoveryLsnRegression {
+                    previous: boundary.applied_recovery_lsn,
+                    actual: self.first_lsn,
+                }
+            } else {
+                RecoveryCodecError::RecoveryLsnGap {
+                    expected: expected_lsn,
+                    actual: self.first_lsn,
+                }
+            });
+        }
+        if self.previous_chain_digest != boundary.chain_digest {
+            return Err(RecoveryCodecError::ChainDigestMismatch);
+        }
+        Ok(RecoveryState {
+            applied_recovery_lsn: self.last_lsn,
+            chain_digest: self.last_chain_digest,
+        })
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, RecoveryCodecError> {
+        self.verify()?;
+        let encoded_records = self
+            .records
+            .iter()
+            .map(RecoveryOutboxRecord::encode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let encoded_length = recovery_segment_encoded_length(&encoded_records)?;
+        let mut encoded = Vec::with_capacity(encoded_length);
+        encoded.extend_from_slice(RECOVERY_SEGMENT_MAGIC);
+        encoded.push(self.format_version);
+        encoded.extend_from_slice(self.logical_shard_id.as_bytes());
+        encoded.extend_from_slice(&self.first_lsn.to_be_bytes());
+        encoded.extend_from_slice(&self.last_lsn.to_be_bytes());
+        encoded.extend_from_slice(&self.previous_chain_digest);
+        encoded.extend_from_slice(&self.last_chain_digest);
+        encoded.extend_from_slice(&self.segment_digest);
+        encoded.extend_from_slice(
+            &u32_len("recovery_segment_records", encoded_records.len())?.to_be_bytes(),
+        );
+        for record in encoded_records {
+            encoded.extend_from_slice(
+                &u32_len("recovery_segment_record", record.len())?.to_be_bytes(),
+            );
+            encoded.extend_from_slice(&record);
+        }
+        debug_assert_eq!(encoded.len(), encoded_length);
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, RecoveryCodecError> {
+        if encoded.len() > MAX_RECOVERY_SEGMENT_BYTES {
+            return Err(RecoveryCodecError::LengthBound {
+                field: "recovery_segment",
+                length: encoded.len(),
+                max: MAX_RECOVERY_SEGMENT_BYTES,
+            });
+        }
+        let mut decoder = Decoder::new(encoded);
+        let magic: [u8; 8] = decoder.fixed("recovery_segment_magic")?;
+        if &magic != RECOVERY_SEGMENT_MAGIC {
+            return Err(RecoveryCodecError::InvalidValue {
+                field: "recovery_segment_magic",
+            });
+        }
+        let format_version = decoder.u8("recovery_segment_format_version")?;
+        if format_version != RECOVERY_SEGMENT_FORMAT_VERSION {
+            return Err(RecoveryCodecError::UnsupportedVersion {
+                actual: format_version,
+                expected: RECOVERY_SEGMENT_FORMAT_VERSION,
+            });
+        }
+        let logical_shard_id = LogicalShardId::from_bytes(decoder.fixed("logical_shard_id")?);
+        let first_lsn = decoder.u64("first_lsn")?;
+        let last_lsn = decoder.u64("last_lsn")?;
+        let previous_chain_digest = decoder.fixed("previous_chain_digest")?;
+        let last_chain_digest = decoder.fixed("last_chain_digest")?;
+        let segment_digest = decoder.fixed("segment_digest")?;
+        let record_count = decoder.u32("recovery_segment_records")? as usize;
+        if record_count == 0 {
+            return Err(RecoveryCodecError::EmptySegment);
+        }
+        if record_count > MAX_RECOVERY_SEGMENT_RECORDS {
+            return Err(RecoveryCodecError::LengthBound {
+                field: "recovery_segment_records",
+                length: record_count,
+                max: MAX_RECOVERY_SEGMENT_RECORDS,
+            });
+        }
+        let mut records = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            let record_length = decoder.u32("recovery_segment_record")? as usize;
+            if record_length > MAX_RECOVERY_BYTES {
+                return Err(RecoveryCodecError::LengthBound {
+                    field: "recovery_segment_record",
+                    length: record_length,
+                    max: MAX_RECOVERY_BYTES,
+                });
+            }
+            records.push(RecoveryOutboxRecord::decode(
+                decoder.take("recovery_segment_record", record_length)?,
+            )?);
+        }
+        decoder.finish()?;
+        let expected = Self::seal(logical_shard_id, records)?;
+        if first_lsn != expected.first_lsn
+            || last_lsn != expected.last_lsn
+            || previous_chain_digest != expected.previous_chain_digest
+            || last_chain_digest != expected.last_chain_digest
+        {
+            return Err(RecoveryCodecError::SegmentHeaderMismatch);
+        }
+        if segment_digest != expected.segment_digest {
+            return Err(RecoveryCodecError::SegmentDigestMismatch);
+        }
+        Ok(expected)
     }
 }
 
@@ -906,6 +1166,110 @@ fn decode_storage_chunk(
         });
     }
     Ok(data)
+}
+
+fn validate_segment_records(
+    logical_shard_id: LogicalShardId,
+    records: &[RecoveryOutboxRecord],
+) -> Result<Vec<Vec<u8>>, RecoveryCodecError> {
+    if records.is_empty() {
+        return Err(RecoveryCodecError::EmptySegment);
+    }
+    if records.len() > MAX_RECOVERY_SEGMENT_RECORDS {
+        return Err(RecoveryCodecError::LengthBound {
+            field: "recovery_segment_records",
+            length: records.len(),
+            max: MAX_RECOVERY_SEGMENT_RECORDS,
+        });
+    }
+    let mut encoded_records = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        if let RecoveryMutationV1::MetadataCommand { command, .. } = &record.mutation {
+            if command.logical_shard_id != logical_shard_id {
+                return Err(RecoveryCodecError::UnexpectedLogicalShard {
+                    expected: logical_shard_id,
+                    actual: command.logical_shard_id,
+                });
+            }
+        }
+        let encoded = record.encode()?;
+        if let Some(previous) = index.checked_sub(1).map(|previous| &records[previous]) {
+            let expected =
+                previous
+                    .recovery_lsn
+                    .checked_add(1)
+                    .ok_or(RecoveryCodecError::InvalidValue {
+                        field: "recovery_lsn",
+                    })?;
+            if record.recovery_lsn != expected {
+                return Err(if record.recovery_lsn == previous.recovery_lsn {
+                    RecoveryCodecError::DuplicateRecoveryLsn {
+                        lsn: record.recovery_lsn,
+                    }
+                } else if record.recovery_lsn < expected {
+                    RecoveryCodecError::RecoveryLsnRegression {
+                        previous: previous.recovery_lsn,
+                        actual: record.recovery_lsn,
+                    }
+                } else {
+                    RecoveryCodecError::RecoveryLsnGap {
+                        expected,
+                        actual: record.recovery_lsn,
+                    }
+                });
+            }
+            if record.previous_chain_digest != previous.chain_digest {
+                return Err(RecoveryCodecError::ChainDigestMismatch);
+            }
+        }
+        encoded_records.push(encoded);
+    }
+    Ok(encoded_records)
+}
+
+fn recovery_segment_encoded_length(
+    encoded_records: &[Vec<u8>],
+) -> Result<usize, RecoveryCodecError> {
+    encoded_records
+        .iter()
+        .try_fold(RECOVERY_SEGMENT_FIXED_BYTES, |length, record| {
+            length
+                .checked_add(4)
+                .and_then(|length| length.checked_add(record.len()))
+                .ok_or(RecoveryCodecError::LengthOverflow {
+                    field: "recovery_segment",
+                    length: usize::MAX,
+                })
+        })
+}
+
+pub(crate) fn recovery_segment_record_budget(record_limit: usize) -> usize {
+    MAX_RECOVERY_SEGMENT_BYTES.saturating_sub(
+        RECOVERY_SEGMENT_FIXED_BYTES
+            .saturating_add(4_usize.saturating_mul(record_limit.min(MAX_RECOVERY_SEGMENT_RECORDS))),
+    )
+}
+
+fn recovery_segment_digest(
+    logical_shard_id: LogicalShardId,
+    first_lsn: u64,
+    last_lsn: u64,
+    previous_chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
+    last_chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
+    encoded_records: &[Vec<u8>],
+) -> [u8; RECOVERY_CHAIN_DIGEST_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(SEGMENT_DOMAIN);
+    hasher.update(logical_shard_id.as_bytes());
+    hasher.update(first_lsn.to_be_bytes());
+    hasher.update(last_lsn.to_be_bytes());
+    hasher.update(previous_chain_digest);
+    hasher.update(last_chain_digest);
+    hasher.update((encoded_records.len() as u64).to_be_bytes());
+    for record in encoded_records {
+        hash_bytes(&mut hasher, record);
+    }
+    hasher.finalize().into()
 }
 
 fn recovery_chain_digest(
@@ -1519,6 +1883,98 @@ mod tests {
         assert!(matches!(
             assemble_recovery_storage(&header, chunks),
             Err(RecoveryCodecError::UnsupportedVersion { .. })
+        ));
+    }
+
+    fn owner_record(
+        recovery_lsn: u64,
+        previous_chain_digest: [u8; RECOVERY_CHAIN_DIGEST_BYTES],
+        expected: Option<u64>,
+        next: u64,
+    ) -> RecoveryOutboxRecord {
+        let expected = expected.map(|value| OwnerEpoch::new(value).unwrap());
+        let next = OwnerEpoch::new(next).unwrap();
+        RecoveryOutboxRecord::new(
+            recovery_lsn,
+            previous_chain_digest,
+            RecoveryMutationV1::AdvanceOwnerEpoch { expected, next },
+            RecoveryResultV1::OwnerEpoch {
+                applied_owner_epoch: next,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recovery_segment_codec_round_trips_one_canonical_chain() {
+        let logical_shard_id = LogicalShardId::from_bytes([9; 16]);
+        let first = owner_record(1, recovery_genesis_digest(logical_shard_id), None, 1);
+        let second = owner_record(2, first.chain_digest, Some(1), 2);
+        let segment =
+            RecoveryOutboxSegment::seal(logical_shard_id, vec![first.clone(), second.clone()])
+                .unwrap();
+
+        assert_eq!(segment.first_lsn, 1);
+        assert_eq!(segment.last_lsn, 2);
+        assert_eq!(segment.previous_chain_digest, first.previous_chain_digest);
+        assert_eq!(segment.last_chain_digest, second.chain_digest);
+        assert_eq!(segment.records, vec![first, second]);
+        assert_eq!(
+            segment
+                .verify_follows(RecoveryState {
+                    applied_recovery_lsn: 0,
+                    chain_digest: recovery_genesis_digest(logical_shard_id),
+                })
+                .unwrap(),
+            RecoveryState {
+                applied_recovery_lsn: 2,
+                chain_digest: segment.last_chain_digest,
+            }
+        );
+
+        let encoded = segment.encode().unwrap();
+        assert_eq!(RecoveryOutboxSegment::decode(&encoded).unwrap(), segment);
+    }
+
+    #[test]
+    fn recovery_segment_rejects_duplicate_gap_tamper_and_oversize() {
+        let logical_shard_id = LogicalShardId::from_bytes([9; 16]);
+        let first = owner_record(1, recovery_genesis_digest(logical_shard_id), None, 1);
+        let duplicate = owner_record(1, first.chain_digest, Some(1), 2);
+        assert!(matches!(
+            RecoveryOutboxSegment::seal(logical_shard_id, vec![first.clone(), duplicate]),
+            Err(RecoveryCodecError::DuplicateRecoveryLsn { lsn: 1 })
+        ));
+
+        let gap = owner_record(3, first.chain_digest, Some(1), 2);
+        assert!(matches!(
+            RecoveryOutboxSegment::seal(logical_shard_id, vec![first.clone(), gap]),
+            Err(RecoveryCodecError::RecoveryLsnGap {
+                expected: 2,
+                actual: 3
+            })
+        ));
+
+        let segment = RecoveryOutboxSegment::seal(logical_shard_id, vec![first]).unwrap();
+        assert_eq!(
+            segment.verify_follows(RecoveryState {
+                applied_recovery_lsn: 0,
+                chain_digest: [0xff; RECOVERY_CHAIN_DIGEST_BYTES],
+            }),
+            Err(RecoveryCodecError::ChainDigestMismatch)
+        );
+        let mut tampered = segment.encode().unwrap();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x40;
+        assert!(RecoveryOutboxSegment::decode(&tampered).is_err());
+
+        let oversized = vec![0; MAX_RECOVERY_SEGMENT_BYTES + 1];
+        assert!(matches!(
+            RecoveryOutboxSegment::decode(&oversized),
+            Err(RecoveryCodecError::LengthBound {
+                field: "recovery_segment",
+                ..
+            })
         ));
     }
 }

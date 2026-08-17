@@ -12,6 +12,7 @@ homepage.workspace = true
 [features]
 default = []
 etcd = ["nokv-control/etcd"]
+restore-crash-test-support = []
 
 [dependencies]
 nokv-control.workspace = true
@@ -21,6 +22,8 @@ nokv-meta-store.workspace = true
 nokv-object.workspace = true
 nokv-protocol.workspace = true
 nokv-types.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
