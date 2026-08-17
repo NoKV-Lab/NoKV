@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_an_exact_v6_hello_before_the_operation_frame() {
+    fn sends_an_exact_v9_hello_before_the_operation_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         let expected_request = [7_u8; 48];

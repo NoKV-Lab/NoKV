@@ -32,6 +32,7 @@ impl Harness {
                     path: RelativePath::new(path).map_err(|error| error.to_string())?,
                 },
                 view: WorkspaceReadView::Live,
+                expected_read_version: None,
                 range: None,
                 plan_page: None,
                 if_none_match: None,

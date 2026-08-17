@@ -21,7 +21,7 @@ use nokv_protocol::{
     OperationState, OperationStatus, OperationToken, PageRequest, PathMetadata, PathReadResult,
     PublicationAuthority, PublishCondition, PublishResult, ReadRestoreSourceRunManifestRequest,
     RootRoute, StageArtifactManifestRequest, StageArtifactObjectsRequest, StagedObject,
-    WorkspacePath, WorkspaceReadView, WorkspaceRequest, WorkspaceResult,
+    WorkspaceIdentity, WorkspacePath, WorkspaceReadView, WorkspaceRequest, WorkspaceResult,
     MAX_ARTIFACT_DEPENDENCY_DEPTH, MAX_ARTIFACT_DEPENDENCY_OWNERS, MAX_ARTIFACT_PUBLISH_BATCH_ROWS,
     MAX_ARTIFACT_READ_PLAN_ROWS,
 };
@@ -33,6 +33,15 @@ use crate::{
 };
 
 const ARTIFACT_READ_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum number of artifacts in one bounded range-batch attempt.
+pub const MAX_ARTIFACT_RANGE_BATCH_REQUESTS: usize = 128;
+/// Maximum total number of caller ranges in one bounded range-batch attempt.
+pub const MAX_ARTIFACT_RANGE_BATCH_RANGES: usize = 4_096;
+/// Maximum total bytes returned by one bounded range-batch attempt.
+pub const MAX_ARTIFACT_RANGE_BATCH_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum total bytes fetched after per-artifact gap coalescing.
+pub const MAX_ARTIFACT_RANGE_BATCH_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Complete caller-owned identity and metadata for one immutable publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,6 +179,55 @@ pub struct ArtifactAppendOutcome {
 pub struct ArtifactReadOutcome {
     pub metadata: PathMetadata,
     pub bytes: Vec<u8>,
+    pub stats: ArtifactReadStats,
+}
+
+/// Complete path authority required before reading immutable artifact objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactReadAuthority {
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub workspace_revision: u64,
+    pub artifact_revision_id: ArtifactRevisionIdentity,
+    pub generation: u64,
+}
+
+impl From<&PathMetadata> for ArtifactReadAuthority {
+    fn from(metadata: &PathMetadata) -> Self {
+        Self {
+            workspace_incarnation_id: metadata.workspace_incarnation_id,
+            workspace_revision: metadata.workspace_revision,
+            artifact_revision_id: metadata.artifact_revision_id,
+            generation: metadata.generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpectedArtifactReadFence {
+    Generation(u64),
+    Authority(ArtifactReadAuthority),
+}
+
+/// Ordered ranges for one path-native artifact inside a bounded batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactRangeBatchRequest {
+    pub target: WorkspacePath,
+    pub ranges: Vec<ByteRange>,
+    pub expected_generation: Option<u64>,
+    pub max_gap_bytes: u64,
+}
+
+/// Ordered range results for one artifact request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactRangeBatchItem {
+    pub metadata: PathMetadata,
+    pub ranges: Vec<Vec<u8>>,
+}
+
+/// Complete all-or-error result of one bounded range-batch attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactRangeBatchOutcome {
+    pub items: Vec<ArtifactRangeBatchItem>,
     pub stats: ArtifactReadStats,
 }
 
@@ -863,8 +921,103 @@ where
         target: WorkspacePath,
         view: WorkspaceReadView,
     ) -> Result<ArtifactReadOutcome, ClientError> {
+        self.read_artifact_with_expected_fence(store, cache, target, view, None)
+    }
+
+    /// Read one complete artifact only if its authoritative generation matches.
+    ///
+    /// The generation is checked against the frozen path metadata before any
+    /// object read. Empty artifacts still pass through canonical manifest and
+    /// body-digest validation; callers cannot use this as a metadata-only
+    /// shortcut.
+    pub fn read_artifact_at_generation(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        cache: Option<&dyn ArtifactBlockCache>,
+        target: WorkspacePath,
+        view: WorkspaceReadView,
+        expected_generation: u64,
+    ) -> Result<ArtifactReadOutcome, ClientError> {
+        if expected_generation == 0 {
+            return Err(ClientError::InvalidOptions(
+                "expected artifact generation must be greater than zero".to_owned(),
+            ));
+        }
+        self.read_artifact_with_expected_fence(
+            store,
+            cache,
+            target,
+            view,
+            Some(ExpectedArtifactReadFence::Generation(expected_generation)),
+        )
+    }
+
+    /// Read one complete artifact only if its full path authority matches.
+    ///
+    /// The authority is checked after the metadata point read and before any
+    /// manifest or object read, including for a canonical empty artifact.
+    pub fn read_artifact_at_authority(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        cache: Option<&dyn ArtifactBlockCache>,
+        target: WorkspacePath,
+        view: WorkspaceReadView,
+        expected_authority: ArtifactReadAuthority,
+    ) -> Result<ArtifactReadOutcome, ClientError> {
+        if expected_authority.generation == 0 {
+            return Err(ClientError::InvalidOptions(
+                "expected artifact generation must be greater than zero".to_owned(),
+            ));
+        }
+        self.read_artifact_with_expected_fence(
+            store,
+            cache,
+            target,
+            view,
+            Some(ExpectedArtifactReadFence::Authority(expected_authority)),
+        )
+    }
+
+    /// Resolve metadata only if the current path has the exact authority.
+    ///
+    /// This is a bounded preflight for callers that must enforce a logical
+    /// size policy before invoking [`Self::read_artifact_at_authority`]. The
+    /// full read repeats the same fence before touching immutable objects.
+    pub fn artifact_metadata_at_authority(
+        &self,
+        target: WorkspacePath,
+        view: WorkspaceReadView,
+        expected_authority: ArtifactReadAuthority,
+    ) -> Result<PathMetadata, ClientError> {
+        if expected_authority.generation == 0 {
+            return Err(ClientError::InvalidOptions(
+                "expected artifact generation must be greater than zero".to_owned(),
+            ));
+        }
+        let route = self.resolve_artifact_route()?;
+        let metadata = self.load_artifact_metadata(route.logical_shard_id, &target, view)?;
+        if ArtifactReadAuthority::from(&metadata) != expected_authority {
+            return Err(ClientError::ArtifactReadFenceChanged);
+        }
+        Ok(metadata)
+    }
+
+    fn read_artifact_with_expected_fence(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        cache: Option<&dyn ArtifactBlockCache>,
+        target: WorkspacePath,
+        view: WorkspaceReadView,
+        expected_fence: Option<ExpectedArtifactReadFence>,
+    ) -> Result<ArtifactReadOutcome, ClientError> {
         for attempt in 1..=self.max_attempts() {
-            match self.read_artifact_once(store, cache, target.clone(), view.clone()) {
+            match self.read_artifact_once(
+                store,
+                cache,
+                target.clone(),
+                view.clone(),
+                expected_fence,
+            ) {
                 Err(error) if error.retryable() && attempt < self.max_attempts() => {}
                 Err(error) if error.retryable() => {
                     return Err(ClientError::RetryExhausted {
@@ -896,6 +1049,34 @@ where
                 offset,
                 len,
             ) {
+                Err(error) if error.retryable() && attempt < self.max_attempts() => {}
+                Err(error) if error.retryable() => {
+                    return Err(ClientError::RetryExhausted {
+                        attempts: attempt,
+                        last_error: Box::new(error),
+                    });
+                }
+                result => return result,
+            }
+        }
+        unreachable!("validated max_attempts is non-zero")
+    }
+
+    /// Reads ordered ranges from path-native artifacts through one bounded SDK
+    /// attempt. Every unique target is resolved to authoritative metadata once
+    /// per attempt. This fences all windows of that artifact to one generation
+    /// and revision, but does not claim a global snapshot across distinct live
+    /// targets. Use a snapshot read view when callers need a shared frozen view.
+    pub fn read_artifact_ranges_batch(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        cache: Option<&dyn ArtifactBlockCache>,
+        requests: Vec<ArtifactRangeBatchRequest>,
+        view: WorkspaceReadView,
+    ) -> Result<ArtifactRangeBatchOutcome, ClientError> {
+        validate_artifact_range_batch_shape(&requests)?;
+        for attempt in 1..=self.max_attempts() {
+            match self.read_artifact_ranges_batch_once(store, cache, &requests, view.clone()) {
                 Err(error) if error.retryable() && attempt < self.max_attempts() => {}
                 Err(error) if error.retryable() => {
                     return Err(ClientError::RetryExhausted {
@@ -1094,11 +1275,24 @@ where
         cache: Option<&dyn ArtifactBlockCache>,
         target: WorkspacePath,
         view: WorkspaceReadView,
+        expected_fence: Option<ExpectedArtifactReadFence>,
     ) -> Result<ArtifactReadOutcome, ClientError> {
         let route = self.resolve_artifact_route()?;
         require_object_namespace(store, route)?;
         let metadata =
             self.load_artifact_metadata(route.logical_shard_id, &target, view.clone())?;
+        let fence_matches = match expected_fence {
+            None => true,
+            Some(ExpectedArtifactReadFence::Generation(generation)) => {
+                metadata.generation == generation
+            }
+            Some(ExpectedArtifactReadFence::Authority(authority)) => {
+                ArtifactReadAuthority::from(&metadata) == authority
+            }
+        };
+        if !fence_matches {
+            return Err(ClientError::ArtifactReadFenceChanged);
+        }
         let logical_len = metadata.descriptor.logical_size;
         let output_len = usize::try_from(logical_len).map_err(|_| {
             ClientError::ArtifactIntegrity("artifact length is not addressable".to_owned())
@@ -1106,7 +1300,8 @@ where
         if logical_len == 0 {
             let manifest =
                 manifest_from_rows(self.root_id(), route.logical_shard_id, &metadata, &[])?;
-            verify_artifact_bytes(&manifest, &[])?;
+            verify_artifact_bytes(&manifest, &[])
+                .map_err(|error| ClientError::ArtifactIntegrity(error.to_string()))?;
             return Ok(ArtifactReadOutcome {
                 metadata,
                 bytes: Vec::new(),
@@ -1163,7 +1358,8 @@ where
         let rows = complete_rows.into_values().collect::<Vec<_>>();
         let manifest =
             manifest_from_rows(self.root_id(), route.logical_shard_id, &metadata, &rows)?;
-        verify_artifact_bytes(&manifest, &bytes)?;
+        verify_artifact_bytes(&manifest, &bytes)
+            .map_err(|error| ClientError::ArtifactIntegrity(error.to_string()))?;
         Ok(ArtifactReadOutcome {
             metadata,
             bytes,
@@ -1242,7 +1438,8 @@ where
         let rows = complete_rows.into_values().collect::<Vec<_>>();
         let manifest =
             manifest_from_rows(self.root_id(), route.logical_shard_id, &metadata, &rows)?;
-        verify_artifact_bytes(&manifest, &bytes)?;
+        verify_artifact_bytes(&manifest, &bytes)
+            .map_err(|error| ClientError::ArtifactIntegrity(error.to_string()))?;
         Ok(ArtifactReadOutcome {
             metadata,
             bytes,
@@ -1287,6 +1484,149 @@ where
         })
     }
 
+    fn read_artifact_ranges_batch_once(
+        &self,
+        store: &dyn ArtifactObjectStore,
+        cache: Option<&dyn ArtifactBlockCache>,
+        requests: &[ArtifactRangeBatchRequest],
+        view: WorkspaceReadView,
+    ) -> Result<ArtifactRangeBatchOutcome, ClientError> {
+        let route = self.resolve_artifact_route()?;
+        require_object_namespace(store, route)?;
+
+        let mut frozen = Vec::<(WorkspacePath, PathMetadata)>::new();
+        let mut planned = Vec::with_capacity(requests.len());
+        let mut planned_read_bytes = 0_u64;
+        for request in requests {
+            let metadata = match frozen.iter().find(|(target, _)| target == &request.target) {
+                Some((_, metadata)) => metadata.clone(),
+                None => {
+                    let metadata = self.load_artifact_metadata(
+                        route.logical_shard_id,
+                        &request.target,
+                        view.clone(),
+                    )?;
+                    frozen.push((request.target.clone(), metadata.clone()));
+                    metadata
+                }
+            };
+            if request
+                .expected_generation
+                .is_some_and(|expected| expected != metadata.generation)
+            {
+                return Err(ClientError::ArtifactReadFenceChanged);
+            }
+            validate_ranges_within_artifact(request, metadata.descriptor.logical_size)?;
+            let merged = coalesce_artifact_ranges(&request.ranges, request.max_gap_bytes)?;
+            for range in &merged {
+                planned_read_bytes =
+                    planned_read_bytes
+                        .checked_add(range.length())
+                        .ok_or_else(|| {
+                            ClientError::InvalidOptions(
+                                "range batch coalesced read bytes overflow u64".to_owned(),
+                            )
+                        })?;
+                if planned_read_bytes > MAX_ARTIFACT_RANGE_BATCH_READ_BYTES {
+                    return Err(ClientError::InvalidOptions(format!(
+                        "range batch coalesced reads exceed {MAX_ARTIFACT_RANGE_BATCH_READ_BYTES} bytes"
+                    )));
+                }
+            }
+            planned.push(PlannedArtifactRangeBatchItem {
+                request,
+                metadata,
+                merged,
+            });
+        }
+
+        let mut items = Vec::with_capacity(planned.len());
+        let mut total_stats = ArtifactReadStats::default();
+        for item in planned {
+            let mut outputs = vec![None; item.request.ranges.len()];
+            for merged in item.merged {
+                let len = usize::try_from(merged.length()).map_err(|_| {
+                    ClientError::InvalidOptions(
+                        "coalesced range length is not addressable".to_owned(),
+                    )
+                })?;
+                let loaded = self.load_artifact_range_rows(
+                    route.logical_shard_id,
+                    &item.request.target,
+                    view.clone(),
+                    ByteRange {
+                        offset: merged.offset,
+                        length: merged.length(),
+                    },
+                    Some(&item.metadata),
+                )?;
+                let window = window_from_rows(
+                    self.root_id(),
+                    route.logical_shard_id,
+                    &loaded.metadata,
+                    &loaded.rows,
+                    merged.offset,
+                    len,
+                )?;
+                let read = read_artifact_window(store, cache, &window, merged.offset, len)?;
+                if read.bytes.len() != len {
+                    return Err(ClientError::ArtifactIntegrity(format!(
+                        "coalesced range returned {} bytes, expected {len}",
+                        read.bytes.len()
+                    )));
+                }
+                merge_read_stats(&mut total_stats, read.stats);
+                for member in merged.members {
+                    let range = item.request.ranges[member];
+                    let start = usize::try_from(range.offset - merged.offset).map_err(|_| {
+                        ClientError::ArtifactIntegrity(
+                            "range scatter offset is not addressable".to_owned(),
+                        )
+                    })?;
+                    let range_len = usize::try_from(range.length).map_err(|_| {
+                        ClientError::ArtifactIntegrity(
+                            "range scatter length is not addressable".to_owned(),
+                        )
+                    })?;
+                    let end = start.checked_add(range_len).ok_or_else(|| {
+                        ClientError::ArtifactIntegrity(
+                            "range scatter end overflows usize".to_owned(),
+                        )
+                    })?;
+                    let bytes = read.bytes.get(start..end).ok_or_else(|| {
+                        ClientError::ArtifactIntegrity(
+                            "coalesced range omitted requested scatter bytes".to_owned(),
+                        )
+                    })?;
+                    if outputs[member].replace(bytes.to_vec()).is_some() {
+                        return Err(ClientError::ArtifactIntegrity(
+                            "range batch produced one result slot twice".to_owned(),
+                        ));
+                    }
+                }
+            }
+            let ranges = outputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, output)| {
+                    output.ok_or_else(|| {
+                        ClientError::ArtifactIntegrity(format!(
+                            "range batch omitted result slot {index}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            items.push(ArtifactRangeBatchItem {
+                metadata: item.metadata,
+                ranges,
+            });
+        }
+        Ok(ArtifactRangeBatchOutcome {
+            items,
+            stats: total_stats,
+        })
+    }
+
     fn load_artifact_metadata(
         &self,
         logical_shard: LogicalShardIdentity,
@@ -1299,6 +1639,7 @@ where
                 WorkspaceRequest::GetPath(GetPathRequest {
                     target: target.clone(),
                     view,
+                    expected_read_version: None,
                     range: None,
                     plan_page: None,
                     if_none_match: None,
@@ -1415,6 +1756,7 @@ where
                     WorkspaceRequest::GetPath(GetPathRequest {
                         target: target.clone(),
                         view: view.clone(),
+                        expected_read_version: None,
                         range: Some(range),
                         plan_page: Some(PageRequest {
                             cursor: cursor.clone(),
@@ -1456,6 +1798,143 @@ where
             rows,
         })
     }
+}
+
+struct PlannedArtifactRangeBatchItem<'a> {
+    request: &'a ArtifactRangeBatchRequest,
+    metadata: PathMetadata,
+    merged: Vec<CoalescedArtifactRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoalescedArtifactRange {
+    offset: u64,
+    end: u64,
+    members: Vec<usize>,
+}
+
+impl CoalescedArtifactRange {
+    fn length(&self) -> u64 {
+        self.end - self.offset
+    }
+}
+
+fn validate_artifact_range_batch_shape(
+    requests: &[ArtifactRangeBatchRequest],
+) -> Result<(), ClientError> {
+    if requests.is_empty() {
+        return Err(ClientError::InvalidOptions(
+            "range batch must contain at least one artifact request".to_owned(),
+        ));
+    }
+    if requests.len() > MAX_ARTIFACT_RANGE_BATCH_REQUESTS {
+        return Err(ClientError::InvalidOptions(format!(
+            "range batch contains {} artifact requests, maximum is {MAX_ARTIFACT_RANGE_BATCH_REQUESTS}",
+            requests.len()
+        )));
+    }
+    let mut range_count = 0_usize;
+    let mut output_bytes = 0_u64;
+    for request in requests {
+        if request.ranges.is_empty() {
+            return Err(ClientError::InvalidOptions(format!(
+                "range batch request for {:?} has no ranges",
+                request.target.path.as_str()
+            )));
+        }
+        if request.expected_generation == Some(0) {
+            return Err(ClientError::InvalidOptions(
+                "range batch expected generation must be greater than zero".to_owned(),
+            ));
+        }
+        range_count = range_count
+            .checked_add(request.ranges.len())
+            .ok_or_else(|| {
+                ClientError::InvalidOptions("range batch range count overflows usize".to_owned())
+            })?;
+        if range_count > MAX_ARTIFACT_RANGE_BATCH_RANGES {
+            return Err(ClientError::InvalidOptions(format!(
+                "range batch contains {range_count} ranges, maximum is {MAX_ARTIFACT_RANGE_BATCH_RANGES}"
+            )));
+        }
+        for range in &request.ranges {
+            range.validate()?;
+            output_bytes = output_bytes.checked_add(range.length).ok_or_else(|| {
+                ClientError::InvalidOptions("range batch output bytes overflow u64".to_owned())
+            })?;
+            if output_bytes > MAX_ARTIFACT_RANGE_BATCH_OUTPUT_BYTES {
+                return Err(ClientError::InvalidOptions(format!(
+                    "range batch output exceeds {MAX_ARTIFACT_RANGE_BATCH_OUTPUT_BYTES} bytes"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ranges_within_artifact(
+    request: &ArtifactRangeBatchRequest,
+    logical_size: u64,
+) -> Result<(), ClientError> {
+    for range in &request.ranges {
+        let end = range.offset.checked_add(range.length).ok_or_else(|| {
+            ClientError::InvalidOptions("range offset plus length overflows u64".to_owned())
+        })?;
+        if end > logical_size {
+            return Err(ClientError::InvalidOptions(format!(
+                "range [{}, {end}) exceeds artifact {:?} length {logical_size}",
+                range.offset,
+                request.target.path.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn coalesce_artifact_ranges(
+    ranges: &[ByteRange],
+    max_gap_bytes: u64,
+) -> Result<Vec<CoalescedArtifactRange>, ClientError> {
+    let mut ordered = ranges
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, range)| {
+            let end = range.offset.checked_add(range.length).ok_or_else(|| {
+                ClientError::InvalidOptions("range offset plus length overflows u64".to_owned())
+            })?;
+            Ok((range.offset, end, index))
+        })
+        .collect::<Result<Vec<_>, ClientError>>()?;
+    ordered.sort_by_key(|(offset, end, index)| (*offset, *end, *index));
+
+    let mut merged = Vec::<CoalescedArtifactRange>::new();
+    for (offset, end, index) in ordered {
+        let append = merged.last_mut().is_some_and(|current| {
+            let gap = offset.saturating_sub(current.end);
+            let candidate_end = current.end.max(end);
+            gap <= max_gap_bytes && candidate_end - current.offset <= ARTIFACT_READ_WINDOW_BYTES
+        });
+        if append {
+            let current = merged
+                .last_mut()
+                .expect("append decision requires one coalesced range");
+            current.end = current.end.max(end);
+            current.members.push(index);
+        } else {
+            if end - offset > ARTIFACT_READ_WINDOW_BYTES {
+                return Err(ClientError::InvalidOptions(format!(
+                    "one range exceeds the {ARTIFACT_READ_WINDOW_BYTES}-byte SDK read window"
+                )));
+            }
+            merged.push(CoalescedArtifactRange {
+                offset,
+                end,
+                members: vec![index],
+            });
+        }
+    }
+    Ok(merged)
 }
 
 struct LoadedRangeRows {
@@ -2038,7 +2517,9 @@ fn manifest_from_rows(
         sha256: body_digest.0,
         blocks: blocks_from_rows(root_id, logical_shard_id, rows)?,
     };
-    manifest.validate()?;
+    manifest
+        .validate()
+        .map_err(|error| ClientError::ArtifactIntegrity(error.to_string()))?;
     Ok(manifest)
 }
 
@@ -2241,6 +2722,7 @@ mod tests {
         stage_applies: usize,
         abort_applies: usize,
         change_fence_on_second_page_once: bool,
+        change_fence_on_every_range: bool,
         fence_changed: bool,
         append_begin_conflicts: usize,
     }
@@ -2265,6 +2747,7 @@ mod tests {
                     stage_applies: 0,
                     abort_applies: 0,
                     change_fence_on_second_page_once: false,
+                    change_fence_on_every_range: false,
                     fence_changed: false,
                     append_begin_conflicts: 0,
                 })),
@@ -2278,6 +2761,10 @@ mod tests {
 
         fn change_fence_on_second_page_once(&self) {
             self.state.lock().unwrap().change_fence_on_second_page_once = true;
+        }
+
+        fn change_fence_on_every_range(&self) {
+            self.state.lock().unwrap().change_fence_on_every_range = true;
         }
 
         fn lose_complete_responses(&self) {
@@ -2630,6 +3117,11 @@ mod tests {
                         metadata.generation = metadata.generation.saturating_add(1);
                     }
                 }
+                if state.change_fence_on_every_range {
+                    if let Some(metadata) = stored.metadata.as_mut() {
+                        metadata.generation = metadata.generation.saturating_add(1);
+                    }
+                }
                 let range_end = range
                     .offset
                     .checked_add(range.length)
@@ -2711,6 +3203,7 @@ mod tests {
         temporary_read_failures: AtomicUsize,
         fail_create_at: Option<usize>,
         corrupt_reads: AtomicBool,
+        short_reads: AtomicBool,
     }
 
     impl RecordingStore {
@@ -2724,6 +3217,7 @@ mod tests {
                 temporary_read_failures: AtomicUsize::new(0),
                 fail_create_at,
                 corrupt_reads: AtomicBool::new(false),
+                short_reads: AtomicBool::new(false),
             }
         }
 
@@ -2786,6 +3280,9 @@ mod tests {
             let mut bytes = self.inner.read(key, range)?;
             if self.corrupt_reads.load(Ordering::SeqCst) && !bytes.is_empty() {
                 bytes[0] ^= 0xff;
+            }
+            if self.short_reads.load(Ordering::SeqCst) && !bytes.is_empty() {
+                bytes.pop();
             }
             Ok(bytes)
         }
@@ -3731,6 +4228,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_full_read_classifies_a_noncanonical_descriptor_as_artifact_integrity() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), &[])
+            .unwrap();
+        inspector
+            .state()
+            .path
+            .as_mut()
+            .and_then(|path| path.metadata.as_mut())
+            .expect("published path has metadata")
+            .descriptor
+            .body_digest = sha256_digest_uri(Digest([0x07; 32]));
+
+        let error = client
+            .read_artifact(&store, None, target(), WorkspaceReadView::Live)
+            .expect_err("empty descriptor with a non-empty digest must fail closed");
+
+        assert!(matches!(error, ClientError::ArtifactIntegrity(_)));
+        assert!(!error.retryable());
+    }
+
+    #[test]
     fn reads_reject_a_physical_index_that_disagrees_with_the_immutable_key() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
@@ -3780,5 +4304,364 @@ mod tests {
                 .count()
                 >= 6
         );
+    }
+
+    fn batch_request(
+        ranges: Vec<ByteRange>,
+        expected_generation: Option<u64>,
+        max_gap_bytes: u64,
+    ) -> ArtifactRangeBatchRequest {
+        ArtifactRangeBatchRequest {
+            target: target(),
+            ranges,
+            expected_generation,
+            max_gap_bytes,
+        }
+    }
+
+    #[test]
+    fn full_read_authority_rejects_same_generation_aba_before_object_reads() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"same bytes")
+            .unwrap();
+        let expected = {
+            let state = inspector.state();
+            let metadata = state
+                .path
+                .as_ref()
+                .and_then(|path| path.metadata.as_ref())
+                .expect("published artifact has path metadata");
+            ArtifactReadAuthority::from(metadata)
+        };
+        {
+            let mut state = inspector.state();
+            let metadata = state
+                .path
+                .as_mut()
+                .and_then(|path| path.metadata.as_mut())
+                .expect("published artifact has mutable path metadata");
+            metadata.workspace_incarnation_id = WorkspaceIdentity([0xa1; 16]);
+            metadata.workspace_revision = metadata.workspace_revision.saturating_add(1);
+            metadata.artifact_revision_id = ArtifactRevisionIdentity([0xa2; 16]);
+            assert_eq!(metadata.generation, expected.generation);
+        }
+        let reads_before = store.reads.load(Ordering::SeqCst);
+
+        let error = client
+            .read_artifact_at_authority(&store, None, target(), WorkspaceReadView::Live, expected)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ClientError::RetryExhausted { last_error, .. }
+                if matches!(*last_error, ClientError::ArtifactReadFenceChanged)
+        ));
+        assert_eq!(store.reads.load(Ordering::SeqCst), reads_before);
+    }
+
+    #[test]
+    fn range_batch_preserves_request_range_order_duplicates_and_overlaps() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
+            .unwrap();
+
+        let outcome = client
+            .read_artifact_ranges_batch(
+                &store,
+                None,
+                vec![batch_request(
+                    vec![
+                        ByteRange {
+                            offset: 6,
+                            length: 2,
+                        },
+                        ByteRange {
+                            offset: 0,
+                            length: 3,
+                        },
+                        ByteRange {
+                            offset: 2,
+                            length: 4,
+                        },
+                        ByteRange {
+                            offset: 0,
+                            length: 3,
+                        },
+                    ],
+                    Some(1),
+                    2,
+                )],
+                WorkspaceReadView::Live,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.items.len(), 1);
+        assert_eq!(
+            outcome.items[0].ranges,
+            vec![
+                b"gh".to_vec(),
+                b"abc".to_vec(),
+                b"cdef".to_vec(),
+                b"abc".to_vec()
+            ]
+        );
+        assert_eq!(outcome.items[0].metadata.generation, 1);
+    }
+
+    #[test]
+    fn range_batch_rejects_empty_zero_overflow_and_out_of_bounds_inputs() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+
+        for requests in [
+            Vec::new(),
+            vec![batch_request(Vec::new(), None, 0)],
+            vec![batch_request(
+                vec![ByteRange {
+                    offset: 0,
+                    length: 0,
+                }],
+                None,
+                0,
+            )],
+            vec![batch_request(
+                vec![ByteRange {
+                    offset: u64::MAX,
+                    length: 2,
+                }],
+                None,
+                0,
+            )],
+            vec![batch_request(
+                vec![ByteRange {
+                    offset: 7,
+                    length: 2,
+                }],
+                None,
+                0,
+            )],
+        ] {
+            assert!(client
+                .read_artifact_ranges_batch(&store, None, requests, WorkspaceReadView::Live,)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn range_batch_rejects_generation_drift_across_merged_windows() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
+            .unwrap();
+        inspector.change_fence_on_every_range();
+
+        let error = client
+            .read_artifact_ranges_batch(
+                &store,
+                None,
+                vec![batch_request(
+                    vec![ByteRange {
+                        offset: 0,
+                        length: 2,
+                    }],
+                    Some(1),
+                    0,
+                )],
+                WorkspaceReadView::Live,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::RetryExhausted { last_error, .. }
+                if matches!(*last_error, ClientError::ArtifactReadFenceChanged)
+        ));
+    }
+
+    #[test]
+    fn range_batch_short_provider_read_fails_instead_of_truncating_output() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+        store.short_reads.store(true, Ordering::SeqCst);
+
+        assert!(client
+            .read_artifact_ranges_batch(
+                &store,
+                None,
+                vec![batch_request(
+                    vec![ByteRange {
+                        offset: 0,
+                        length: 3,
+                    }],
+                    None,
+                    0,
+                )],
+                WorkspaceReadView::Live,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn range_batch_retries_the_whole_bounded_attempt_and_exhausts_cleanly() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+        store.fail_next_reads(ClientOptions::default().max_attempts as usize);
+
+        let error = client
+            .read_artifact_ranges_batch(
+                &store,
+                None,
+                vec![batch_request(
+                    vec![ByteRange {
+                        offset: 0,
+                        length: 3,
+                    }],
+                    None,
+                    0,
+                )],
+                WorkspaceReadView::Live,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::RetryExhausted { attempts, .. }
+                if attempts == ClientOptions::default().max_attempts
+        ));
+    }
+
+    #[test]
+    fn range_batch_max_gap_coalesces_only_inside_the_declared_bound() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let inspector = transport.clone();
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefghijkl")
+            .unwrap();
+
+        let ranges = vec![
+            ByteRange {
+                offset: 0,
+                length: 2,
+            },
+            ByteRange {
+                offset: 4,
+                length: 2,
+            },
+        ];
+        inspector.state().attempts.clear();
+        client
+            .read_artifact_ranges_batch(
+                &store,
+                None,
+                vec![batch_request(ranges.clone(), None, 2)],
+                WorkspaceReadView::Live,
+            )
+            .unwrap();
+        assert_eq!(
+            inspector
+                .state()
+                .attempts
+                .iter()
+                .filter(|(label, _)| *label == "get_path")
+                .count(),
+            2,
+            "one metadata read plus one coalesced range plan"
+        );
+
+        inspector.state().attempts.clear();
+        client
+            .read_artifact_ranges_batch(
+                &store,
+                None,
+                vec![batch_request(ranges, None, 1)],
+                WorkspaceReadView::Live,
+            )
+            .unwrap();
+        assert_eq!(
+            inspector
+                .state()
+                .attempts
+                .iter()
+                .filter(|(label, _)| *label == "get_path")
+                .count(),
+            3,
+            "one metadata read plus two unmerged range plans"
+        );
+    }
+
+    #[test]
+    fn duplicate_target_checks_every_expected_generation_before_object_reads() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = ScriptedArtifactTransport::new(Arc::clone(&events), false);
+        let client = client(transport);
+        let store = RecordingStore::new(events, None);
+        client
+            .publish_artifact(&store, publish_options(4), b"abcdefgh")
+            .unwrap();
+        let reads_before = store.reads.load(Ordering::SeqCst);
+
+        let error = client
+            .read_artifact_ranges_batch(
+                &store,
+                None,
+                vec![
+                    batch_request(
+                        vec![ByteRange {
+                            offset: 0,
+                            length: 1,
+                        }],
+                        Some(1),
+                        0,
+                    ),
+                    batch_request(
+                        vec![ByteRange {
+                            offset: 1,
+                            length: 1,
+                        }],
+                        Some(2),
+                        0,
+                    ),
+                ],
+                WorkspaceReadView::Live,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::RetryExhausted {
+                attempts,
+                last_error,
+            } if attempts == ClientOptions::default().max_attempts
+                && matches!(*last_error, ClientError::ArtifactReadFenceChanged)
+        ));
+        assert_eq!(store.reads.load(Ordering::SeqCst), reads_before);
     }
 }

@@ -223,19 +223,19 @@ fn validate_schema(schema: &str) -> Result<(), HandshakeError> {
 mod tests {
     use super::*;
 
-    const V6: &str = "nokv.workspace.rpc.v6";
+    const V9: &str = "nokv.workspace.rpc.v9";
 
     #[test]
     fn client_hello_has_one_canonical_fixed_width_encoding() {
-        let hello = WorkspaceHandshake::new(HandshakeKind::ClientHello, V6).unwrap();
+        let hello = WorkspaceHandshake::new(HandshakeKind::ClientHello, V9).unwrap();
         let encoded = encode_handshake_frame(&hello).unwrap();
 
         let mut expected = [0_u8; HANDSHAKE_FRAME_BYTES];
         expected[..4].copy_from_slice(&(HANDSHAKE_PAYLOAD_BYTES as u32).to_be_bytes());
         expected[4..12].copy_from_slice(b"NOKVHS1\0");
         expected[12] = 1;
-        expected[13] = V6.len() as u8;
-        expected[20..20 + V6.len()].copy_from_slice(V6.as_bytes());
+        expected[13] = V9.len() as u8;
+        expected[20..20 + V9.len()].copy_from_slice(V9.as_bytes());
 
         assert_eq!(encoded, expected);
         assert_eq!(decode_handshake_frame(&encoded).unwrap(), hello);
@@ -248,7 +248,7 @@ mod tests {
             HandshakeKind::Accepted,
             HandshakeKind::Incompatible,
         ] {
-            let expected = WorkspaceHandshake::new(kind, V6).unwrap();
+            let expected = WorkspaceHandshake::new(kind, V9).unwrap();
             let encoded = encode_handshake_payload(&expected).unwrap();
             assert_eq!(decode_handshake_payload(&encoded).unwrap(), expected);
         }
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn decoder_rejects_every_noncanonical_fixed_field() {
         let canonical = encode_handshake_payload(
-            &WorkspaceHandshake::new(HandshakeKind::ClientHello, V6).unwrap(),
+            &WorkspaceHandshake::new(HandshakeKind::ClientHello, V9).unwrap(),
         )
         .unwrap();
 
@@ -299,7 +299,7 @@ mod tests {
         );
 
         let mut nonzero_padding = canonical;
-        nonzero_padding[16 + V6.len()] = 1;
+        nonzero_padding[16 + V9.len()] = 1;
         assert_eq!(
             decode_handshake_payload(&nonzero_padding),
             Err(HandshakeError::NonzeroPadding)
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn frame_decoder_requires_exact_length_prefix_and_payload_size() {
-        let hello = WorkspaceHandshake::new(HandshakeKind::ClientHello, V6).unwrap();
+        let hello = WorkspaceHandshake::new(HandshakeKind::ClientHello, V9).unwrap();
         let canonical = encode_handshake_frame(&hello).unwrap();
 
         assert_eq!(

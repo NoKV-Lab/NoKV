@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn post_tag_v3_gets_a_v6_failure_that_its_decoder_reports_as_schema_mismatch() {
+    fn post_tag_v3_gets_a_v9_failure_that_its_decoder_reports_as_schema_mismatch() {
         let route = v3_route();
         let request = request(LEGACY_V3_SCHEMA, route, "run-42");
         let response = legacy_rejection_response(&request).unwrap();

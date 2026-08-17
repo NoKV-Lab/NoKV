@@ -10,11 +10,13 @@ use std::fmt;
 
 use crate::{
     canonical_json_bytes, projection::digest_uri, projection::hash_length_prefixed,
-    projection::lowercase_hex, verify_run_manifest_v1, workbench_commit_identity, AgentError,
-    WorkbenchToolHandler,
+    projection::lowercase_hex, scan_agent_grep, verify_run_manifest_v1, workbench_commit_identity,
+    AgentError, AgentGrepScanRequest, GenericGrepScanLimits, WorkbenchToolHandler,
 };
 use base64::Engine;
-use nokv_types::{NormalizedRelativePath, WorkbenchId};
+use nokv_types::{
+    ArtifactRevisionId, NormalizedRelativePath, RootId, WorkbenchId, WorkspaceIncarnationId,
+};
 use serde_json::{json, Map, Number, Value};
 use sha2::{Digest, Sha256};
 
@@ -54,7 +56,7 @@ impl Section {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, AgentError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, AgentError> {
         match value {
             "input" => Ok(Self::Input),
             "scripts" => Ok(Self::Scripts),
@@ -206,6 +208,8 @@ pub struct StatRecord {
     pub path: ScopedPath,
     pub kind: ArtifactKind,
     pub artifact: Option<ArtifactMetadata>,
+    /// Exact storage authority for an artifact record; absent for virtual directories.
+    pub authority: Option<GrepCandidateAuthority>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -213,6 +217,16 @@ pub struct ArtifactBody {
     pub path: ScopedPath,
     pub metadata: ArtifactMetadata,
     pub bytes: Vec<u8>,
+}
+
+/// One bounded, path-native artifact inspection.
+///
+/// The backend owns the authoritative read and its view fence. Higher-level
+/// adapters may derive presentation-only summaries from these bytes, but do
+/// not reconstruct metadata or publication state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArtifactInspection {
+    pub artifact: ArtifactBody,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -285,7 +299,7 @@ pub struct AppendOutcome {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrepCandidateRequest {
-    pub scope: ScopedPath,
+    pub scope: QueryScope,
     pub recursive: bool,
     /// Facade-owned commitment to the exact pattern and basename-glob semantics.
     pub query_commitment: [u8; 32],
@@ -293,13 +307,41 @@ pub struct GrepCandidateRequest {
     pub limit: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GrepCandidate {
     pub path: ScopedPath,
-    pub cursor_after: String,
+    /// Authoritative metadata frozen by the candidate query.
+    pub metadata: ArtifactMetadata,
+    pub authority: GrepCandidateAuthority,
+    pub cursor_after: Option<String>,
 }
 
+impl GrepCandidate {
+    pub fn read_fence(&self) -> GrepCandidateReadFence {
+        GrepCandidateReadFence {
+            path: self.path.clone(),
+            authority: self.authority,
+        }
+    }
+}
+
+/// Storage authority of one candidate at the exact enumeration point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrepCandidateAuthority {
+    pub workspace_incarnation_id: WorkspaceIncarnationId,
+    pub workspace_revision: u64,
+    pub artifact_revision_id: ArtifactRevisionId,
+    pub generation: u64,
+}
+
+/// Compact immutable-body fence used by fresh scans and resumable cursors.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrepCandidateReadFence {
+    pub path: ScopedPath,
+    pub authority: GrepCandidateAuthority,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct GrepCandidatePage {
     pub candidates: Vec<GrepCandidate>,
     pub next_cursor: Option<String>,
@@ -312,8 +354,15 @@ pub struct QueryScope {
     pub path: Option<NormalizedRelativePath>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryProfile {
+    ArtifactV1,
+    GenericNamespaceV1 { presentation_path_root: String },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchRequest {
+    pub profile: QueryProfile,
     pub scope: QueryScope,
     pub predicates: Vec<QueryPredicate>,
     pub fields: Vec<String>,
@@ -329,6 +378,19 @@ pub struct SearchHit {
     pub path: NormalizedRelativePath,
     pub metadata: ArtifactMetadata,
     pub projection: BTreeMap<String, QueryValue>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenericNamespaceHit {
+    pub workbench_id: WorkbenchId,
+    pub relative_path: Option<NormalizedRelativePath>,
+    pub kind: ArtifactKind,
+    pub artifact: Option<ArtifactMetadata>,
+    /// Scalar compatibility projection for built-ins and first-value callers.
+    pub projection: BTreeMap<String, QueryValue>,
+    /// Ordered Generic custom values. Repeated values are significant and are
+    /// never collapsed into the scalar compatibility projection.
+    pub indexed_values: BTreeMap<String, Vec<QueryValue>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -348,6 +410,8 @@ pub struct FacetResult {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchPage {
     pub hits: Vec<SearchHit>,
+    pub namespace_hits: Vec<GenericNamespaceHit>,
+    pub match_count: u64,
     pub facets: Vec<FacetResult>,
     pub next_cursor: Option<String>,
     pub read_version: u64,
@@ -355,11 +419,13 @@ pub struct SearchPage {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregateRequest {
+    pub profile: QueryProfile,
     pub scope: QueryScope,
     pub predicates: Vec<QueryPredicate>,
     pub group_by: Vec<String>,
     pub measures: Vec<AggregateMeasure>,
     pub sort: Vec<QuerySort>,
+    pub cursor: Option<String>,
     pub limit: usize,
 }
 
@@ -372,20 +438,38 @@ pub struct AggregateRow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggregatePage {
     pub rows: Vec<AggregateRow>,
+    pub input_match_count: u64,
+    pub row_count: u64,
+    pub group_count: u64,
+    pub next_cursor: Option<String>,
     pub read_version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogRequest {
+    pub profile: QueryProfile,
     pub scope: QueryScope,
+    pub path_match: CatalogPathMatch,
     pub field_prefix: Option<String>,
     pub include_facets: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogPathMatch {
+    Prefix,
+    Exact,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogField {
     pub field: String,
+    /// Compatibility summary for callers that expect one scalar type.
     pub scalar_type: String,
+    /// Every observed scalar type for one Generic custom field. A declared
+    /// zero-row field intentionally has an empty vector.
+    pub scalar_types: Vec<String>,
+    /// Whether this row came from the declared Generic custom-index catalog.
+    pub generic_custom: bool,
     pub operators: Vec<String>,
     pub sortable: bool,
     pub facetable: bool,
@@ -395,6 +479,7 @@ pub struct CatalogField {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogResult {
     pub fields: Vec<CatalogField>,
+    pub facets: Vec<FacetResult>,
     pub read_version: u64,
 }
 
@@ -412,6 +497,9 @@ pub struct WorkbenchSummary {
     pub workbench_id: WorkbenchId,
     pub committed: bool,
     pub commit_id: Option<[u8; 32]>,
+    /// Exact count of virtual sections and authoritative direct children at
+    /// the page read version.
+    pub entry_count: usize,
     pub manifest_metadata: Option<ArtifactMetadata>,
     pub manifest: Option<Value>,
 }
@@ -532,6 +620,7 @@ pub enum BackendErrorKind {
     NotFound,
     AlreadyExists,
     Conflict,
+    ReadFenceChanged,
     SnapshotNotFound,
     SnapshotExpired,
     ForkRetentionActive,
@@ -545,6 +634,7 @@ impl BackendErrorKind {
             Self::NotFound => "NotFound",
             Self::AlreadyExists => "AlreadyExists",
             Self::Conflict => "Conflict",
+            Self::ReadFenceChanged => "ReadFenceChanged",
             Self::SnapshotNotFound => "SnapshotNotFound",
             Self::SnapshotExpired => "SnapshotExpired",
             Self::ForkRetentionActive => "ForkRetentionActive",
@@ -610,16 +700,45 @@ impl From<BackendError> for AgentError {
 /// This trait deliberately exposes complete operations rather than metadata
 /// keys, object-provider calls, routing, or publication state-machine steps.
 pub trait WorkbenchBackend: Send + Sync {
+    /// Storage authority for public cursor commitments.
+    fn storage_root_id(&self) -> RootId;
     fn create_workbench(&self, workbench_id: &WorkbenchId) -> Result<bool, BackendError>;
     fn stat(&self, path: &ScopedPath, view: &ReadView) -> Result<Option<StatRecord>, BackendError>;
+    /// Resolve one path at an exact authoritative root read version.
+    ///
+    /// Implementations must not satisfy this with a fresh live point read.
+    /// Implicit prefixes are proved by the same version-fenced namespace scan
+    /// that distinguishes them from missing paths and exact artifacts.
+    fn stat_at_read_version(
+        &self,
+        path: &ScopedPath,
+        read_version: u64,
+    ) -> Result<Option<StatRecord>, BackendError>;
     fn list(&self, request: ListRequest) -> Result<ListPage, BackendError>;
     fn read(&self, request: ReadRequest) -> Result<Option<ArtifactBody>, BackendError>;
+    fn inspect_artifact(
+        &self,
+        request: ReadRequest,
+    ) -> Result<Option<ArtifactInspection>, BackendError> {
+        self.read(request)
+            .map(|artifact| artifact.map(|artifact| ArtifactInspection { artifact }))
+    }
     fn publish(&self, request: PublishRequest) -> Result<PublishOutcome, BackendError>;
     fn append(&self, request: AppendRequest) -> Result<AppendOutcome, BackendError>;
     fn grep_candidates(
         &self,
         request: GrepCandidateRequest,
     ) -> Result<GrepCandidatePage, BackendError>;
+    /// Resolve the current descriptor only when the candidate authority still matches.
+    fn grep_candidate_metadata(
+        &self,
+        fence: &GrepCandidateReadFence,
+    ) -> Result<ArtifactMetadata, BackendError>;
+    /// Read exactly the immutable authority returned by `grep_candidates`.
+    fn read_grep_candidate(
+        &self,
+        fence: &GrepCandidateReadFence,
+    ) -> Result<ArtifactBody, BackendError>;
     fn search(&self, request: SearchRequest) -> Result<SearchPage, BackendError>;
     fn aggregate(&self, request: AggregateRequest) -> Result<AggregatePage, BackendError>;
     fn catalog(&self, request: CatalogRequest) -> Result<CatalogResult, BackendError>;
@@ -1094,109 +1213,51 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
 
     fn grep(&self, arguments: &Value) -> Result<Value, AgentError> {
         let scope = parse_read_scope(arguments, true)?;
-        let patterns = parse_grep_patterns(arguments)?;
-        let folded = patterns
-            .iter()
-            .map(|pattern| pattern.to_lowercase())
-            .collect::<Vec<_>>();
+        let query_scope = QueryScope {
+            workbench_id: Some(scope.workbench_id.clone()),
+            section: scope.section,
+            path: scope.relative_path.clone(),
+        };
+        let patterns = parse_workbench_grep_patterns(arguments)?;
         let glob = optional_string(arguments, "glob")?;
-        if glob.is_some_and(|glob| glob.contains('/') || glob.contains('\\')) {
+        validate_grep_glob(glob)?;
+        let limit = optional_usize(arguments, "limit")?.unwrap_or(100);
+        if limit == 0 {
             return Err(AgentError::invalid_arguments(
-                "glob must match a basename and cannot contain a path separator",
+                "grep limit must be greater than zero",
             ));
         }
-        let limit = optional_usize(arguments, "limit")?.unwrap_or(100);
         let recursive = required_bool(arguments, "recursive")?;
-        let query_commitment = grep_query_commitment(&scope, &patterns, glob, recursive);
-        let mut cursor = optional_string(arguments, "cursor")?.map(str::to_owned);
-        let mut matches = Vec::new();
-        let mut matched_files = 0_usize;
-        let mut files_scanned = 0_usize;
-        let mut next_cursor = None;
-        loop {
-            let page = self.backend.grep_candidates(GrepCandidateRequest {
-                scope: scope.clone(),
+        let query_commitment = grep_query_commitment(&query_scope, &patterns, glob, recursive);
+        let scan = scan_agent_grep(
+            &self.backend,
+            AgentGrepScanRequest {
+                storage_root_id: self.backend.storage_root_id(),
+                logical_root: &self.logical_root,
+                scope: query_scope,
+                patterns: &patterns,
+                glob,
                 recursive,
                 query_commitment,
-                cursor: cursor.clone(),
-                limit: 300,
-            })?;
-            let candidate_count = page.candidates.len();
-            let page_has_more = page.next_cursor.is_some();
-            for (candidate_index, candidate) in page.candidates.into_iter().enumerate() {
-                let basename = candidate
-                    .path
-                    .relative_path
-                    .as_ref()
-                    .and_then(|path| path.components().last())
-                    .unwrap_or_default();
-                if glob.is_some_and(|glob| !glob_matches(glob, basename)) {
-                    continue;
-                }
-                let Some(body) = self.backend.read(ReadRequest {
-                    path: candidate.path.clone(),
-                    view: ReadView::Live,
-                })?
-                else {
-                    continue;
-                };
-                files_scanned += 1;
-                let Ok(text) = std::str::from_utf8(&body.bytes) else {
-                    continue;
-                };
-                let mut line_matches = Vec::new();
-                for (index, line) in text.lines().enumerate() {
-                    let lower = line.to_lowercase();
-                    let matched = folded
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, pattern)| lower.contains(pattern.as_str()))
-                        .map(|(index, _)| patterns[index].clone())
-                        .collect::<Vec<_>>();
-                    if !matched.is_empty() {
-                        line_matches.push(json!({
-                            "line_number": index + 1,
-                            "line": line,
-                            "patterns": matched,
-                        }));
-                    }
-                }
-                if line_matches.is_empty() {
-                    continue;
-                }
-                matched_files += 1;
-                matches.extend(line_matches.into_iter().map(|line_match| {
-                    json!({
-                        "path": self.projected_path(&candidate.path),
-                        "section": candidate.path.section.map(Section::as_str),
-                        "relative_path": relative_path_value(&candidate.path),
-                        "line_number": line_match.get("line_number").cloned().unwrap_or(Value::Null),
-                        "snippet": line_match.get("line").cloned().unwrap_or(Value::Null),
-                    })
-                }));
-                if matched_files == limit {
-                    if candidate_index + 1 < candidate_count || page_has_more {
-                        next_cursor = Some(candidate.cursor_after);
-                    }
-                    break;
-                }
-            }
-            if matched_files == limit {
-                break;
-            }
-            let Some(next) = page.next_cursor else {
-                break;
-            };
-            if cursor.as_ref() == Some(&next) {
-                return Err(AgentError::backend(
-                    "BackendProtocolMismatch",
-                    "grep candidate cursor did not advance",
-                    true,
-                    json!({"cursor": next}),
-                ));
-            }
-            cursor = Some(next);
-        }
+                cursor: optional_string(arguments, "cursor")?,
+                limit,
+                scan_limits: GenericGrepScanLimits::default(),
+            },
+        )?;
+        let matches = scan
+            .matches
+            .into_iter()
+            .map(|match_| {
+                json!({
+                    "path": self.projected_path(&match_.path),
+                    "section": match_.path.section.map(Section::as_str),
+                    "relative_path": relative_path_value(&match_.path),
+                    "line_number": match_.line_number,
+                    "snippet": match_.snippet,
+                })
+            })
+            .collect::<Vec<_>>();
+        let truncated = scan.next_cursor.is_some();
         Ok(json!({
             "status": "success",
             "workbench_id": scope.workbench_id.as_str(),
@@ -1207,9 +1268,9 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
             "pattern": required_string(arguments, "pattern")?,
             "recursive": recursive,
             "matches": matches,
-            "files_scanned": files_scanned,
-            "next_cursor": next_cursor,
-            "truncated": next_cursor.is_some(),
+            "files_scanned": scan.files_scanned,
+            "next_cursor": scan.next_cursor,
+            "truncated": truncated,
         }))
     }
 
@@ -1217,6 +1278,7 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
         let scope = parse_query_scope(arguments)?;
         let projected_scope = self.query_path(&scope);
         let request = SearchRequest {
+            profile: QueryProfile::ArtifactV1,
             scope,
             predicates: parse_predicates(arguments)?,
             fields: parse_string_array(arguments, "fields")?,
@@ -1258,7 +1320,7 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
         Ok(json!({
             "status": "success",
             "path": projected_scope,
-            "match_count": hits.len(),
+            "match_count": page.match_count,
             "matches": hits,
             "facets": facets,
             "next_cursor": page.next_cursor,
@@ -1267,62 +1329,37 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
     }
 
     fn aggregate(&self, arguments: &Value) -> Result<Value, AgentError> {
-        const INPUT_COUNT_FIELD: &str = "__nokv_workbench_input_match_count";
         let scope = parse_query_scope(arguments)?;
         let projected_scope = self.query_path(&scope);
-        let mut measures = parse_measures(arguments)?;
-        if measures
-            .iter()
-            .any(|measure| measure.name == INPUT_COUNT_FIELD)
-        {
-            return Err(AgentError::invalid_arguments(format!(
-                "aggregate measure name {INPUT_COUNT_FIELD} is reserved"
-            )));
-        }
-        measures.push(AggregateMeasure {
-            name: INPUT_COUNT_FIELD.to_owned(),
-            operator: AggregateOperator::Count,
-            field: None,
-        });
         let request = AggregateRequest {
+            profile: QueryProfile::ArtifactV1,
             scope,
             predicates: parse_predicates(arguments)?,
             group_by: parse_string_array(arguments, "group_by")?,
-            measures,
+            measures: parse_measures(arguments)?,
             sort: parse_sort(arguments)?,
+            cursor: None,
             limit: optional_usize(arguments, "limit")?.unwrap_or(20),
         };
         let page = self.backend.aggregate(request)?;
-        let mut input_match_count = 0_u64;
         let groups = page
             .rows
             .iter()
-            .map(|row| -> Result<Value, AgentError> {
-                let count = row.measures.get(INPUT_COUNT_FIELD).ok_or_else(|| {
-                    AgentError::backend(
-                        "BackendProtocolMismatch",
-                        "aggregate backend omitted the hidden input count",
-                        true,
-                        json!({"measure": INPUT_COUNT_FIELD}),
-                    )
-                })?;
-                input_match_count = input_match_count.saturating_add(query_count_value(count)?);
-                let mut values = row.measures.clone();
-                values.remove(INPUT_COUNT_FIELD);
-                Ok(json!({
+            .map(|row| {
+                json!({
                     "key": query_map_value(&row.groups),
-                    "values": query_map_value(&values),
-                }))
+                    "values": query_map_value(&row.measures),
+                })
             })
-            .collect::<Result<Vec<_>, AgentError>>()?;
+            .collect::<Vec<_>>();
         Ok(json!({
             "status": "success",
             "path": projected_scope,
-            "input_match_count": input_match_count,
-            "row_count": input_match_count,
-            "group_count": groups.len(),
+            "input_match_count": page.input_match_count,
+            "row_count": page.row_count,
+            "group_count": page.group_count,
             "groups": groups,
-            "truncated": false,
+            "truncated": page.next_cursor.is_some(),
         }))
     }
 
@@ -1330,7 +1367,9 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
         let scope = parse_query_scope(arguments)?;
         let projected_scope = self.query_path(&scope);
         let result = self.backend.catalog(CatalogRequest {
+            profile: QueryProfile::ArtifactV1,
             scope,
+            path_match: CatalogPathMatch::Prefix,
             field_prefix: optional_string(arguments, "field_prefix")?.map(str::to_owned),
             include_facets: optional_bool(arguments, "include_facets")?.unwrap_or(false),
         })?;
@@ -1617,6 +1656,9 @@ impl<B: WorkbenchBackend> SdkWorkbenchToolHandler<B> {
 }
 
 pub fn normalize_logical_workbench_root(raw: &str) -> Result<String, AgentError> {
+    const MAX_BYTES: usize = 4096;
+    const MAX_COMPONENTS: usize = 64;
+
     if !raw.starts_with('/') {
         return Err(AgentError::invalid_arguments(
             "logical Workbench root must be absolute",
@@ -1644,7 +1686,18 @@ pub fn normalize_logical_workbench_root(raw: &str) -> Result<String, AgentError>
             "logical Workbench root must not be /",
         ));
     }
-    Ok(format!("/{}", components.join("/")))
+    if components.len() > MAX_COMPONENTS {
+        return Err(AgentError::invalid_arguments(format!(
+            "logical Workbench root must not exceed {MAX_COMPONENTS} components"
+        )));
+    }
+    let normalized = format!("/{}", components.join("/"));
+    if normalized.len() > MAX_BYTES {
+        return Err(AgentError::invalid_arguments(format!(
+            "logical Workbench root must not exceed {MAX_BYTES} bytes"
+        )));
+    }
+    Ok(normalized)
 }
 
 fn parse_workbench_id(arguments: &Value) -> Result<WorkbenchId, AgentError> {
@@ -1716,7 +1769,7 @@ fn parse_query_scope(arguments: &Value) -> Result<QueryScope, AgentError> {
     })
 }
 
-fn indexed_scoped_path(hit: &SearchHit) -> Result<ScopedPath, AgentError> {
+pub(crate) fn indexed_scoped_path(hit: &SearchHit) -> Result<ScopedPath, AgentError> {
     let raw = hit.path.as_str();
     let (first, remainder) = raw
         .split_once('/')
@@ -1913,7 +1966,7 @@ fn relative_path_value(path: &ScopedPath) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn projected_kind_name(kind: &ArtifactKind) -> &'static str {
+pub(crate) fn projected_kind_name(kind: &ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::Workbench | ArtifactKind::Section | ArtifactKind::Directory => "directory",
         ArtifactKind::Artifact => "file",
@@ -2027,7 +2080,9 @@ fn shape_structured_read(
     Ok(result)
 }
 
-fn structured_records(artifact: &ArtifactBody) -> Result<(&'static str, Vec<Value>), AgentError> {
+pub(crate) fn structured_records(
+    artifact: &ArtifactBody,
+) -> Result<(&'static str, Vec<Value>), AgentError> {
     let content_type = artifact.metadata.content_type.to_ascii_lowercase();
     let path = artifact.path.logical_path().to_ascii_lowercase();
     let parsed = if content_type.contains("json") || path.ends_with(".json") {
@@ -2073,11 +2128,11 @@ fn structured_records(artifact: &ArtifactBody) -> Result<(&'static str, Vec<Valu
     })
 }
 
-fn encode_cursor(kind: &str, offset: usize) -> String {
+pub(crate) fn encode_cursor(kind: &str, offset: usize) -> String {
     format!("{kind}:{offset}")
 }
 
-fn decode_cursor(cursor: &str, expected_kind: &str) -> Result<usize, AgentError> {
+pub(crate) fn decode_cursor(cursor: &str, expected_kind: &str) -> Result<usize, AgentError> {
     let (kind, value) = cursor
         .split_once(':')
         .ok_or_else(|| AgentError::invalid_arguments("cursor has an invalid shape"))?;
@@ -2097,14 +2152,17 @@ fn argument_object(arguments: &Value) -> Result<&Map<String, Value>, AgentError>
         .ok_or_else(|| AgentError::invalid_arguments("arguments must be an object"))
 }
 
-fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, AgentError> {
+pub(crate) fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, AgentError> {
     argument_object(arguments)?
         .get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| AgentError::invalid_arguments(format!("{name} must be a string")))
 }
 
-fn optional_string<'a>(arguments: &'a Value, name: &str) -> Result<Option<&'a str>, AgentError> {
+pub(crate) fn optional_string<'a>(
+    arguments: &'a Value,
+    name: &str,
+) -> Result<Option<&'a str>, AgentError> {
     match argument_object(arguments)?.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value)),
@@ -2114,14 +2172,14 @@ fn optional_string<'a>(arguments: &'a Value, name: &str) -> Result<Option<&'a st
     }
 }
 
-fn required_bool(arguments: &Value, name: &str) -> Result<bool, AgentError> {
+pub(crate) fn required_bool(arguments: &Value, name: &str) -> Result<bool, AgentError> {
     argument_object(arguments)?
         .get(name)
         .and_then(Value::as_bool)
         .ok_or_else(|| AgentError::invalid_arguments(format!("{name} must be a boolean")))
 }
 
-fn optional_bool(arguments: &Value, name: &str) -> Result<Option<bool>, AgentError> {
+pub(crate) fn optional_bool(arguments: &Value, name: &str) -> Result<Option<bool>, AgentError> {
     match argument_object(arguments)?.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
@@ -2131,7 +2189,7 @@ fn optional_bool(arguments: &Value, name: &str) -> Result<Option<bool>, AgentErr
     }
 }
 
-fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, AgentError> {
+pub(crate) fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, AgentError> {
     match argument_object(arguments)?.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value.as_u64().map(Some).ok_or_else(|| {
@@ -2140,7 +2198,7 @@ fn optional_u64(arguments: &Value, name: &str) -> Result<Option<u64>, AgentError
     }
 }
 
-fn optional_usize(arguments: &Value, name: &str) -> Result<Option<usize>, AgentError> {
+pub(crate) fn optional_usize(arguments: &Value, name: &str) -> Result<Option<usize>, AgentError> {
     optional_u64(arguments, name)?
         .map(|value| {
             usize::try_from(value).map_err(|_| {
@@ -2150,18 +2208,54 @@ fn optional_usize(arguments: &Value, name: &str) -> Result<Option<usize>, AgentE
         .transpose()
 }
 
-fn parse_grep_patterns(arguments: &Value) -> Result<Vec<String>, AgentError> {
-    let mut patterns = Vec::new();
+pub(crate) fn parse_grep_patterns(arguments: &Value) -> Result<Vec<String>, AgentError> {
     let primary = required_string(arguments, "pattern")?;
-    if primary.is_empty() {
-        return Err(AgentError::invalid_arguments(
-            "grep patterns must not be empty",
-        ));
+    let alternatives = parse_grep_alternatives(arguments)?;
+    let mut patterns = Vec::with_capacity(alternatives.len() + usize::from(!primary.is_empty()));
+    if !primary.is_empty() {
+        patterns.push(primary.to_owned());
     }
-    patterns.push(primary.to_owned());
+    patterns.extend(alternatives);
+    normalize_grep_patterns(patterns)
+}
+
+fn parse_workbench_grep_patterns(arguments: &Value) -> Result<Vec<String>, AgentError> {
+    let primary = required_string(arguments, "pattern")?;
+    let alternatives = parse_grep_alternatives(arguments)?;
+    if alternatives.is_empty() && primary.contains('|') {
+        let pipe_patterns = primary
+            .split('|')
+            .filter(|pattern| !pattern.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if pipe_patterns.is_empty() {
+            return normalize_grep_patterns(vec![primary.to_owned()]);
+        }
+        if pipe_patterns.len() > MAX_GREP_PATTERNS {
+            return Err(AgentError::invalid_arguments(format!(
+                "at most {MAX_GREP_PATTERNS} grep alternatives are allowed"
+            )));
+        }
+        return normalize_grep_patterns(pipe_patterns);
+    }
+    let mut patterns = Vec::with_capacity(alternatives.len() + usize::from(!primary.is_empty()));
+    if !primary.is_empty() {
+        patterns.push(primary.to_owned());
+    }
+    patterns.extend(alternatives);
+    normalize_grep_patterns(patterns)
+}
+
+fn parse_grep_alternatives(arguments: &Value) -> Result<Vec<String>, AgentError> {
     match argument_object(arguments)?.get("patterns") {
-        None => {}
+        None => Ok(Vec::new()),
         Some(Value::Array(values)) => {
+            if values.len() > MAX_GREP_PATTERNS {
+                return Err(AgentError::invalid_arguments(format!(
+                    "at most {MAX_GREP_PATTERNS} grep alternatives are allowed"
+                )));
+            }
+            let mut alternatives = Vec::with_capacity(values.len());
             for value in values {
                 let pattern = value.as_str().ok_or_else(|| {
                     AgentError::invalid_arguments("patterns must contain only strings")
@@ -2171,34 +2265,54 @@ fn parse_grep_patterns(arguments: &Value) -> Result<Vec<String>, AgentError> {
                         "grep patterns must not be empty",
                     ));
                 }
-                patterns.push(pattern.to_owned());
+                alternatives.push(pattern.to_owned());
             }
+            Ok(alternatives)
         }
-        Some(_) => {
-            return Err(AgentError::invalid_arguments(
-                "patterns must be an array of strings",
-            ));
-        }
+        Some(_) => Err(AgentError::invalid_arguments(
+            "patterns must be an array of strings",
+        )),
+    }
+}
+
+fn normalize_grep_patterns(mut patterns: Vec<String>) -> Result<Vec<String>, AgentError> {
+    if patterns.is_empty() || patterns.iter().any(String::is_empty) {
+        return Err(AgentError::invalid_arguments(
+            "grep patterns must not be empty",
+        ));
     }
     let mut seen = BTreeSet::new();
     patterns.retain(|pattern| seen.insert(pattern.to_lowercase()));
-    if patterns.len() > MAX_GREP_PATTERNS {
-        return Err(AgentError::invalid_arguments(format!(
-            "at most {MAX_GREP_PATTERNS} grep patterns are allowed"
-        )));
-    }
     Ok(patterns)
 }
 
-fn grep_query_commitment(
-    scope: &ScopedPath,
+pub(crate) fn validate_grep_glob(glob: Option<&str>) -> Result<(), AgentError> {
+    if glob.is_some_and(str::is_empty) {
+        return Err(AgentError::invalid_arguments("glob must not be empty"));
+    }
+    if glob.is_some_and(|glob| glob.contains('/') || glob.contains('\\')) {
+        return Err(AgentError::invalid_arguments(
+            "glob must match a basename and cannot contain a path separator",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn grep_query_commitment(
+    scope: &QueryScope,
     patterns: &[String],
     glob: Option<&str>,
     recursive: bool,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"nokv.workbench.grep-query.v1\0");
-    hash_length_prefixed(&mut hasher, scope.workbench_id.as_str().as_bytes());
+    hasher.update(b"nokv.workbench.grep-query.v2\0");
+    match &scope.workbench_id {
+        Some(workbench_id) => {
+            hasher.update([1]);
+            hash_length_prefixed(&mut hasher, workbench_id.as_str().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
     match scope.section {
         Some(section) => {
             hasher.update([1]);
@@ -2206,7 +2320,7 @@ fn grep_query_commitment(
         }
         None => hasher.update([0]),
     }
-    match &scope.relative_path {
+    match &scope.path {
         Some(path) => {
             hasher.update([1]);
             hash_length_prefixed(&mut hasher, path.as_str().as_bytes());
@@ -2232,7 +2346,7 @@ fn grep_query_commitment(
     hasher.finalize().into()
 }
 
-fn glob_matches(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, text: &str) -> bool {
     let text = text.chars().collect::<Vec<_>>();
     let mut previous = vec![false; text.len() + 1];
     previous[0] = true;
@@ -2253,7 +2367,7 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     previous[text.len()]
 }
 
-fn parse_string_array(arguments: &Value, name: &str) -> Result<Vec<String>, AgentError> {
+pub(crate) fn parse_string_array(arguments: &Value, name: &str) -> Result<Vec<String>, AgentError> {
     let Some(value) = argument_object(arguments)?.get(name) else {
         return Ok(Vec::new());
     };
@@ -2281,7 +2395,7 @@ fn parse_string_array(arguments: &Value, name: &str) -> Result<Vec<String>, Agen
     Ok(result)
 }
 
-fn parse_predicates(arguments: &Value) -> Result<Vec<QueryPredicate>, AgentError> {
+pub(crate) fn parse_predicates(arguments: &Value) -> Result<Vec<QueryPredicate>, AgentError> {
     let Some(value) = argument_object(arguments)?.get("predicates") else {
         return Ok(Vec::new());
     };
@@ -2377,7 +2491,7 @@ fn query_value_from_json(value: &Value) -> Result<QueryValue, AgentError> {
     }
 }
 
-fn parse_sort(arguments: &Value) -> Result<Vec<QuerySort>, AgentError> {
+pub(crate) fn parse_sort(arguments: &Value) -> Result<Vec<QuerySort>, AgentError> {
     let Some(value) = argument_object(arguments)?.get("sort") else {
         return Ok(Vec::new());
     };
@@ -2418,7 +2532,7 @@ fn parse_sort(arguments: &Value) -> Result<Vec<QuerySort>, AgentError> {
         .collect()
 }
 
-fn parse_measures(arguments: &Value) -> Result<Vec<AggregateMeasure>, AgentError> {
+pub(crate) fn parse_measures(arguments: &Value) -> Result<Vec<AggregateMeasure>, AgentError> {
     let values = argument_object(arguments)?
         .get("measures")
         .and_then(Value::as_array)
@@ -2478,26 +2592,13 @@ fn parse_measures(arguments: &Value) -> Result<Vec<AggregateMeasure>, AgentError
         .collect()
 }
 
-fn query_map_value(values: &BTreeMap<String, QueryValue>) -> Value {
+pub(crate) fn query_map_value(values: &BTreeMap<String, QueryValue>) -> Value {
     Value::Object(
         values
             .iter()
             .map(|(key, value)| (key.clone(), value.to_json()))
             .collect(),
     )
-}
-
-fn query_count_value(value: &QueryValue) -> Result<u64, AgentError> {
-    match value {
-        QueryValue::Unsigned(value) => Ok(*value),
-        QueryValue::Signed(value) if *value >= 0 => Ok(*value as u64),
-        _ => Err(AgentError::backend(
-            "BackendProtocolMismatch",
-            "aggregate backend returned a non-integer hidden count",
-            true,
-            json!({"value": value.to_json()}),
-        )),
-    }
 }
 
 struct VerifiedCommitProjection {

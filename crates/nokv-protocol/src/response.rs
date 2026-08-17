@@ -6,13 +6,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ProtocolError, RpcFailure};
-use crate::request::{CommitRequest, PrepareRestoreRequest, QueryOperator};
+use crate::request::{
+    CommitRequest, GenericIndexFieldValues, PrepareRestoreRequest, QueryOperator,
+    MAX_GENERIC_INDEX_ABORT_ROWS, MAX_GENERIC_INDEX_APPEND_ROWS,
+};
 use crate::types::{
-    validate_capability_set, validate_field_id, ArtifactDescriptor, ArtifactManifestRow,
-    ArtifactRevisionIdentity, ByteRange, CommitIdentity, Digest, DigestUri, FieldValue,
-    OperationIdentity, OperationKind, OperationToken, PathMetadata, RequestIdentity, RootRoute,
-    ScalarValue, SnapshotAlias, WorkbenchName, WorkspaceCapability, WorkspaceIdentity,
-    WorkspacePath,
+    validate_capability_set, validate_field_id, validate_optional_text, ArtifactDescriptor,
+    ArtifactManifestRow, ArtifactRevisionIdentity, ByteRange, CommitIdentity, ContentType, Digest,
+    DigestUri, FieldValue, GenericIndexGenerationIdentity, OperationIdentity, OperationKind,
+    OperationToken, PathMetadata, RequestIdentity, RootRoute, ScalarValue, SnapshotAlias,
+    WorkbenchName, WorkspaceCapability, WorkspaceIdentity, WorkspacePath,
 };
 use crate::{WORKSPACE_CAPABILITY_SCHEMA, WORKSPACE_PREFLIGHT_SCHEMA, WORKSPACE_PROTOCOL_SCHEMA};
 
@@ -37,19 +40,47 @@ impl WorkspaceRpcResponse {
             ));
         }
         if let WorkspaceRpcOutcome::Success(result) = &self.outcome {
-            if let WorkspaceResult::Preflight(preflight) = result.as_ref() {
-                if preflight.route != self.route {
+            match result.as_ref() {
+                WorkspaceResult::Preflight(preflight) => {
+                    if preflight.route != self.route {
+                        return Err(ProtocolError::invalid(
+                            "preflight.route",
+                            "must equal the response envelope route",
+                        ));
+                    }
+                    if self.commit_version.is_some() || self.replayed {
+                        return Err(ProtocolError::invalid(
+                            "preflight",
+                            "must not report a metadata commit or replay",
+                        ));
+                    }
+                }
+                WorkspaceResult::GenericIndexRegistration(registration)
+                    if self.commit_version.is_some()
+                        && self.commit_version != Some(registration.last_transition_version) =>
+                {
                     return Err(ProtocolError::invalid(
-                        "preflight.route",
-                        "must equal the response envelope route",
+                        "generic_index.last_transition_version",
+                        "does not match the response commit version",
                     ));
                 }
-                if self.commit_version.is_some() || self.replayed {
+                WorkspaceResult::GenericIndexAppend(append)
+                    if self.commit_version != Some(append.receipt.commit_version) =>
+                {
                     return Err(ProtocolError::invalid(
-                        "preflight",
-                        "must not report a metadata commit or replay",
+                        "generic_index.append.receipt.commit_version",
+                        "does not match the response commit version",
                     ));
                 }
+                WorkspaceResult::GenericIndexAbort(abort)
+                    if self.commit_version != Some(abort.registration.last_transition_version) =>
+                {
+                    return Err(ProtocolError::invalid(
+                        "generic_index.abort.last_transition_version",
+                        "does not match the response commit version",
+                    ));
+                }
+                _ => {}
             }
         }
         self.outcome.validate()
@@ -90,6 +121,9 @@ pub enum WorkspaceResult {
     RestorePrepared(RestorePreparation),
     RestoreSourceRunManifest(PathReadResult),
     Restored(RestoreResult),
+    GenericIndexRegistration(GenericIndexRegistrationStatus),
+    GenericIndexAppend(GenericIndexAppendResult),
+    GenericIndexAbort(GenericIndexAbortResult),
     Search(SearchResult),
     Aggregate(AggregateResult),
     Catalog(CatalogResult),
@@ -116,6 +150,9 @@ impl WorkspaceResult {
                 manifest.validate_restore_source_run_manifest()
             }
             Self::Restored(restored) => restored.validate(),
+            Self::GenericIndexRegistration(registration) => registration.validate(),
+            Self::GenericIndexAppend(append) => append.validate(),
+            Self::GenericIndexAbort(abort) => abort.validate(),
             Self::Search(search) => search.validate(),
             Self::Aggregate(aggregate) => aggregate.validate(),
             Self::Catalog(catalog) => catalog.validate(),
@@ -1172,6 +1209,255 @@ impl RestoreResult {
     }
 }
 
+/// Public phase of one recoverable Generic custom-index registration.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericIndexRegistrationPhase {
+    Preparing,
+    Appending,
+    Sealing,
+    Publishing,
+    Complete,
+    Aborting,
+    Cleaning,
+    Cleaned,
+    Quarantined,
+}
+
+/// Exact durable registration state returned by begin, finalize, and get.
+/// The generation and both digests fence cursor reuse and pointer ABA.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexRegistrationStatus {
+    pub operation_id: OperationIdentity,
+    pub generation_id: GenericIndexGenerationIdentity,
+    pub workspace_incarnation_id: WorkspaceIdentity,
+    pub index_path: Option<crate::RelativePath>,
+    pub source_read_version: u64,
+    pub last_transition_version: u64,
+    pub expected_current_generation: Option<u64>,
+    pub capability_digest: Digest,
+    pub declared_row_count: u64,
+    pub appended_row_count: u64,
+    pub row_digest: Digest,
+    pub phase: GenericIndexRegistrationPhase,
+    pub published_pointer_generation: Option<u64>,
+    pub terminal_error: Option<String>,
+}
+
+impl GenericIndexRegistrationStatus {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.source_read_version == 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.source_read_version",
+                "must be greater than zero",
+            ));
+        }
+        if self.last_transition_version == 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.last_transition_version",
+                "must be greater than zero",
+            ));
+        }
+        let next_pointer_generation = match self.expected_current_generation {
+            None => 1,
+            Some(generation) => {
+                crate::types::require_generation(
+                    "generic_index.expected_current_generation",
+                    generation,
+                )?;
+                generation.checked_add(1).ok_or_else(|| {
+                    ProtocolError::invalid(
+                        "generic_index.expected_current_generation",
+                        "cannot advance beyond u64::MAX",
+                    )
+                })?
+            }
+        };
+        if self.appended_row_count > self.declared_row_count {
+            return Err(ProtocolError::invalid(
+                "generic_index.appended_row_count",
+                "exceeds declared row count",
+            ));
+        }
+        if self.appended_row_count == 0 && self.row_digest != Digest([0; 32]) {
+            return Err(ProtocolError::invalid(
+                "generic_index.row_digest",
+                "must use the canonical empty digest before any row is appended",
+            ));
+        }
+        validate_optional_text(
+            "generic_index.terminal_error",
+            self.terminal_error.as_deref(),
+            1_024,
+        )?;
+        if self.terminal_error.as_deref() == Some("") {
+            return Err(ProtocolError::invalid(
+                "generic_index.terminal_error",
+                "must not be empty",
+            ));
+        }
+        if self.phase == GenericIndexRegistrationPhase::Preparing && self.appended_row_count != 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.appended_row_count",
+                "must be zero while preparing",
+            ));
+        }
+        if matches!(
+            self.phase,
+            GenericIndexRegistrationPhase::Sealing
+                | GenericIndexRegistrationPhase::Publishing
+                | GenericIndexRegistrationPhase::Complete
+        ) && self.appended_row_count != self.declared_row_count
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.appended_row_count",
+                "must equal declared row count after append closes",
+            ));
+        }
+        match self.phase {
+            GenericIndexRegistrationPhase::Complete => {
+                if self.published_pointer_generation != Some(next_pointer_generation)
+                    || self.terminal_error.is_some()
+                {
+                    return Err(ProtocolError::invalid(
+                        "generic_index.registration",
+                        "complete state requires the exact successor pointer and no error",
+                    ));
+                }
+            }
+            GenericIndexRegistrationPhase::Quarantined => {
+                if self.published_pointer_generation.is_some() || self.terminal_error.is_none() {
+                    return Err(ProtocolError::invalid(
+                        "generic_index.registration",
+                        "quarantined state requires an error and forbids publication",
+                    ));
+                }
+            }
+            _ => {
+                if self.published_pointer_generation.is_some() || self.terminal_error.is_some() {
+                    return Err(ProtocolError::invalid(
+                        "generic_index.registration",
+                        "non-terminal state forbids publication and terminal errors",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Immutable receipt for one append batch, sufficient for exact response-loss
+/// replay without rereading removed generation rows.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexAppendReceipt {
+    pub first_sequence: u64,
+    pub row_count: u32,
+    pub commit_version: u64,
+    pub input_digest: Digest,
+    pub resulting_row_count: u64,
+    pub resulting_row_digest: Digest,
+}
+
+impl GenericIndexAppendReceipt {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.row_count == 0 || self.row_count as usize > MAX_GENERIC_INDEX_APPEND_ROWS {
+            return Err(ProtocolError::invalid(
+                "generic_index.append.receipt.row_count",
+                format!("must be between 1 and {MAX_GENERIC_INDEX_APPEND_ROWS}"),
+            ));
+        }
+        if self.commit_version == 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.append.receipt.commit_version",
+                "must be greater than zero",
+            ));
+        }
+        let expected_row_count = self
+            .first_sequence
+            .checked_add(u64::from(self.row_count))
+            .ok_or_else(|| {
+                ProtocolError::invalid(
+                    "generic_index.append.receipt.first_sequence",
+                    "range overflows",
+                )
+            })?;
+        if self.resulting_row_count != expected_row_count {
+            return Err(ProtocolError::invalid(
+                "generic_index.append.receipt.resulting_row_count",
+                "does not close the appended sequence range",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexAppendResult {
+    pub registration: GenericIndexRegistrationStatus,
+    pub receipt: GenericIndexAppendReceipt,
+}
+
+impl GenericIndexAppendResult {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.registration.validate()?;
+        self.receipt.validate()?;
+        if self.registration.appended_row_count != self.receipt.resulting_row_count
+            || self.registration.row_digest != self.receipt.resulting_row_digest
+            || self.registration.last_transition_version != self.receipt.commit_version
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.append",
+                "receipt does not match the resulting registration state",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericIndexAbortResult {
+    pub registration: GenericIndexRegistrationStatus,
+    pub removed_rows: u32,
+    pub removed_receipts: u32,
+    pub cleanup_complete: bool,
+}
+
+impl GenericIndexAbortResult {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        self.registration.validate()?;
+        if self.removed_rows > MAX_GENERIC_INDEX_ABORT_ROWS
+            || self.removed_receipts > MAX_GENERIC_INDEX_ABORT_ROWS
+        {
+            return Err(ProtocolError::invalid(
+                "generic_index.abort.removed",
+                format!("exceeds {MAX_GENERIC_INDEX_ABORT_ROWS}"),
+            ));
+        }
+        if self.removed_receipts != 0 {
+            return Err(ProtocolError::invalid(
+                "generic_index.abort.removed_receipts",
+                "append receipts are retained for exact response-loss replay",
+            ));
+        }
+        let expected_phase = if self.cleanup_complete {
+            GenericIndexRegistrationPhase::Cleaned
+        } else {
+            GenericIndexRegistrationPhase::Cleaning
+        };
+        if self.registration.phase != expected_phase {
+            return Err(ProtocolError::invalid(
+                "generic_index.abort.cleanup_complete",
+                "does not match the registration cleanup phase",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationState {
@@ -1423,6 +1709,127 @@ impl SearchHit {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericNamespaceKind {
+    Directory,
+    Artifact,
+}
+
+/// Compact immutable artifact fields for one generic namespace row. The row
+/// remains root-independent and deliberately carries no presentation path.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericNamespaceArtifact {
+    pub generation: u64,
+    pub logical_size: u64,
+    pub body_digest: DigestUri,
+    pub content_type: ContentType,
+    pub producer: Option<String>,
+    pub manifest_identity: Option<String>,
+}
+
+impl GenericNamespaceArtifact {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        crate::types::require_generation("generic_namespace.generation", self.generation)?;
+        crate::parse_sha256_digest_uri(&self.body_digest).map_err(|error| {
+            ProtocolError::invalid("generic_namespace.body_digest", error.to_string())
+        })?;
+        crate::types::validate_optional_text(
+            "generic_namespace.producer",
+            self.producer.as_deref(),
+            ArtifactDescriptor::MAX_PRODUCER_BYTES,
+        )?;
+        crate::types::validate_optional_text(
+            "generic_namespace.manifest_identity",
+            self.manifest_identity.as_deref(),
+            ArtifactDescriptor::MAX_MANIFEST_IDENTITY_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenericNamespaceHit {
+    pub workbench: WorkbenchName,
+    /// `None` names the visible Workbench directory; every other value is
+    /// canonical relative to that Workbench.
+    pub relative_path: Option<crate::RelativePath>,
+    pub kind: GenericNamespaceKind,
+    pub artifact: Option<GenericNamespaceArtifact>,
+    pub projection: Vec<FieldValue>,
+    /// Generic-only ordered, duplicate-preserving values. ArtifactV1 rows use
+    /// [`SearchHit`] and therefore cannot acquire this field accidentally.
+    pub indexed_values: Vec<GenericIndexFieldValues>,
+}
+
+impl GenericNamespaceHit {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.projection.len() > 64 {
+            return Err(ProtocolError::invalid(
+                "generic_namespace.projection",
+                "exceeds 64 fields",
+            ));
+        }
+        match (self.kind, &self.relative_path, &self.artifact) {
+            (GenericNamespaceKind::Directory, _, None) => {}
+            (GenericNamespaceKind::Artifact, Some(_), Some(artifact)) => artifact.validate()?,
+            (GenericNamespaceKind::Artifact, None, _) => {
+                return Err(ProtocolError::invalid(
+                    "generic_namespace.relative_path",
+                    "artifact rows require a relative path",
+                ));
+            }
+            (GenericNamespaceKind::Directory, _, Some(_))
+            | (GenericNamespaceKind::Artifact, Some(_), None) => {
+                return Err(ProtocolError::invalid(
+                    "generic_namespace.artifact",
+                    "must be present exactly for artifact rows",
+                ));
+            }
+        }
+        for field in &self.projection {
+            field.validate()?;
+        }
+        if self.indexed_values.len() > crate::MAX_GENERIC_INDEX_ROW_FIELDS {
+            return Err(ProtocolError::invalid(
+                "generic_namespace.indexed_values",
+                format!("exceeds {} fields", crate::MAX_GENERIC_INDEX_ROW_FIELDS),
+            ));
+        }
+        for values in &self.indexed_values {
+            values.validate_at("generic_namespace.indexed_values")?;
+        }
+        if self
+            .indexed_values
+            .windows(2)
+            .any(|pair| pair[0].field_id >= pair[1].field_id)
+        {
+            return Err(ProtocolError::invalid(
+                "generic_namespace.indexed_values",
+                "must be strictly sorted by field_id without duplicates",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "row", content = "value", rename_all = "snake_case")]
+pub enum SearchRow {
+    Artifact(SearchHit),
+    GenericNamespace(GenericNamespaceHit),
+}
+
+impl SearchRow {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Artifact(hit) => hit.validate(),
+            Self::GenericNamespace(hit) => hit.validate(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FacetBucket {
@@ -1470,7 +1877,8 @@ impl FacetResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SearchResult {
-    pub hits: Vec<SearchHit>,
+    pub hits: Vec<SearchRow>,
+    pub match_count: u64,
     pub facets: Vec<FacetResult>,
     pub next_cursor: Option<Vec<u8>>,
     pub read_version: u64,
@@ -1480,6 +1888,12 @@ impl SearchResult {
     fn validate(&self) -> Result<(), ProtocolError> {
         if self.hits.len() > 1_000 {
             return Err(ProtocolError::invalid("search.hits", "exceeds 1000 rows"));
+        }
+        if self.match_count < self.hits.len() as u64 {
+            return Err(ProtocolError::invalid(
+                "search.match_count",
+                "is smaller than returned row count",
+            ));
         }
         if self.facets.len() > 16 {
             return Err(ProtocolError::invalid("search.facets", "exceeds 16 fields"));
@@ -1527,6 +1941,9 @@ impl AggregateGroup {
 #[serde(deny_unknown_fields)]
 pub struct AggregateResult {
     pub groups: Vec<AggregateGroup>,
+    pub input_match_count: u64,
+    pub row_count: u64,
+    pub group_count: u64,
     pub next_cursor: Option<Vec<u8>>,
     pub read_version: u64,
 }
@@ -1537,6 +1954,18 @@ impl AggregateResult {
             return Err(ProtocolError::invalid(
                 "aggregate.groups",
                 "exceeds 1000 rows",
+            ));
+        }
+        if self.row_count > self.input_match_count {
+            return Err(ProtocolError::invalid(
+                "aggregate.row_count",
+                "exceeds input match count",
+            ));
+        }
+        if self.group_count < self.groups.len() as u64 {
+            return Err(ProtocolError::invalid(
+                "aggregate.group_count",
+                "is smaller than returned group count",
             ));
         }
         if self.read_version == 0 {
@@ -1558,6 +1987,14 @@ impl AggregateResult {
 pub struct CatalogField {
     pub field_id: String,
     pub scalar_type: String,
+    /// Exact observed scalar types for a Generic custom field. A declared
+    /// zero-row field has an empty list while retaining `scalar_type` as the
+    /// compatibility summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scalar_types: Vec<String>,
+    /// True only for a field declared by a Generic custom-index generation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub generic_custom: bool,
     pub operators: Vec<QueryOperator>,
     pub sortable: bool,
     pub facetable: bool,
@@ -1565,16 +2002,66 @@ pub struct CatalogField {
 }
 
 impl CatalogField {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
         validate_field_id("catalog.field_id", &self.field_id)?;
         validate_field_id("catalog.scalar_type", &self.scalar_type)?;
-        if self.operators.is_empty() {
+        if !self.generic_custom && self.operators.is_empty() {
             return Err(ProtocolError::invalid(
                 "catalog.operators",
                 "must not be empty",
             ));
         }
+        if !self.generic_custom && !self.scalar_types.is_empty() {
+            return Err(ProtocolError::invalid(
+                "catalog.scalar_types",
+                "is only valid for Generic custom fields",
+            ));
+        }
+        if self.generic_custom {
+            let summary_rank = generic_catalog_scalar_type_rank(&self.scalar_type)?;
+            let mut previous = None;
+            for scalar_type in &self.scalar_types {
+                let rank = generic_catalog_scalar_type_rank(scalar_type)?;
+                if previous.is_some_and(|previous| previous >= rank) {
+                    return Err(ProtocolError::invalid(
+                        "catalog.scalar_types",
+                        "must be strictly sorted in canonical scalar-type order without duplicates",
+                    ));
+                }
+                previous = Some(rank);
+            }
+            if self.scalar_types.first().is_some_and(|first| {
+                generic_catalog_scalar_type_rank(first).ok() != Some(summary_rank)
+            }) {
+                return Err(ProtocolError::invalid(
+                    "catalog.scalar_type",
+                    "must summarize the first observed Generic scalar type",
+                ));
+            }
+        }
+        if self.generic_custom && self.operators.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ProtocolError::invalid(
+                "catalog.operators",
+                "must be strictly sorted in canonical order without duplicates",
+            ));
+        }
         Ok(())
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn generic_catalog_scalar_type_rank(value: &str) -> Result<u8, ProtocolError> {
+    match value {
+        "unsigned" => Ok(1),
+        "float" => Ok(2),
+        "string" => Ok(3),
+        _ => Err(ProtocolError::invalid(
+            "catalog.scalar_types",
+            "contains a scalar type unsupported by Generic custom indexes",
+        )),
     }
 }
 
@@ -1582,6 +2069,7 @@ impl CatalogField {
 #[serde(deny_unknown_fields)]
 pub struct CatalogResult {
     pub fields: Vec<CatalogField>,
+    pub facets: Vec<FacetResult>,
     pub next_cursor: Option<Vec<u8>>,
     pub read_version: u64,
 }
@@ -1594,6 +2082,12 @@ impl CatalogResult {
                 "exceeds 1000 rows",
             ));
         }
+        if self.facets.len() > 16 {
+            return Err(ProtocolError::invalid(
+                "catalog.facets",
+                "exceeds 16 fields",
+            ));
+        }
         if self.read_version == 0 {
             return Err(ProtocolError::invalid(
                 "catalog.read_version",
@@ -1603,6 +2097,9 @@ impl CatalogResult {
         validate_cursor("catalog.next_cursor", self.next_cursor.as_deref())?;
         for field in &self.fields {
             field.validate()?;
+        }
+        for facet in &self.facets {
+            facet.validate()?;
         }
         Ok(())
     }
@@ -1782,6 +2279,7 @@ mod tests {
     fn catalog_requires_a_positive_read_version() {
         let mut result = CatalogResult {
             fields: Vec::new(),
+            facets: Vec::new(),
             next_cursor: None,
             read_version: 0,
         };
