@@ -15,6 +15,11 @@ enum FakeBehavior {
     Unavailable,
     IgnoreConditional,
     LoseResponses,
+    /// The conditional create lands, the response is lost, and the store
+    /// reconciles the identical bytes before answering, so a fresh create is
+    /// observed as `Replayed` (the S3 adapter's behavior under transient
+    /// write errors).
+    LandedResponseReplayed,
 }
 
 #[derive(Debug)]
@@ -92,6 +97,10 @@ impl ArtifactObjectStore for FakeProvider {
                     detail: "endpoint=https://sentinel.invalid bucket=sentinel-bucket".to_owned(),
                 })
             }
+            FakeBehavior::LandedResponseReplayed => match self.apply_create(key, bytes) {
+                Ok(ImmutableCreateOutcome::Created) => Ok(ImmutableCreateOutcome::Replayed),
+                other => other,
+            },
         }
     }
 
@@ -126,6 +135,22 @@ impl ArtifactObjectStore for FakeProvider {
 
 fn profile() -> ProviderAdmissionProfile {
     ProviderAdmissionProfile::single_put(64).unwrap()
+}
+
+#[test]
+fn landed_creates_with_lost_responses_still_admit_atomic_create_if_absent() {
+    // Every fresh create lands but is reported as `Replayed` after
+    // reconciliation; the sequence, readback, and two-racer probes must still
+    // prove exactly-once ownership instead of rejecting the provider.
+    let store = FakeProvider::new(FakeBehavior::LandedResponseReplayed);
+    let receipt = admit_artifact_provider(&store, profile()).unwrap();
+    assert_eq!(
+        receipt.contract_version(),
+        PROVIDER_ADMISSION_CONTRACT_VERSION
+    );
+    assert!(receipt.range_read_verified());
+    assert!(!*store.overwrote_different_bytes.lock().unwrap());
+    assert!(store.objects.lock().unwrap().is_empty());
 }
 
 #[test]

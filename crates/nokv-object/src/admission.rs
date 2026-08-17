@@ -227,11 +227,13 @@ pub fn admit_artifact_provider(
     let result = (|| {
         let mut atomic_semantics_rejected = false;
 
+        // A fresh key must end with exactly these bytes durably present.
+        // `Replayed` is a valid first observation: the provider accepted the
+        // conditional create, lost the response, and reconciliation found the
+        // identical bytes. A provider that ignores the condition still fails
+        // the replay and collision steps below.
         let fresh = observe_create(store, &sequence_key, &a)?;
-        if !matches!(
-            fresh,
-            CreateObservation::Created | CreateObservation::ReconciledMatch
-        ) {
+        if !observation_confirms_own_bytes(fresh) {
             atomic_semantics_rejected = true;
         }
 
@@ -326,20 +328,15 @@ fn concurrent_create_has_one_winner(
         .1
         .map_err(|_| ProviderAdmissionError::Inconclusive)??;
 
-    let valid_outcomes = matches!(
-        (first, second),
-        (CreateObservation::Created, CreateObservation::Collision)
-            | (CreateObservation::Collision, CreateObservation::Created)
-            | (
-                CreateObservation::ReconciledMatch,
-                CreateObservation::ReconciledDifferent
-            )
-            | (
-                CreateObservation::ReconciledDifferent,
-                CreateObservation::ReconciledMatch
-            )
-    );
-    if !valid_outcomes {
+    // Exactly one racer may end up owning the key and the other must observe
+    // foreign bytes. Either side may have lost its response and reconciled,
+    // so the winner is any observation that confirms its own bytes and the
+    // loser is any observation of different bytes.
+    let winners = usize::from(observation_confirms_own_bytes(first))
+        + usize::from(observation_confirms_own_bytes(second));
+    let losers = usize::from(observation_sees_foreign_bytes(first))
+        + usize::from(observation_sees_foreign_bytes(second));
+    if winners != 1 || losers != 1 {
         return Ok(false);
     }
 
@@ -347,6 +344,22 @@ fn concurrent_create_has_one_winner(
         .read(key, None)
         .map_err(|error| classify_provider_error(&error))?;
     Ok(stored == a || stored == b)
+}
+
+fn observation_confirms_own_bytes(observation: CreateObservation) -> bool {
+    matches!(
+        observation,
+        CreateObservation::Created
+            | CreateObservation::Replayed
+            | CreateObservation::ReconciledMatch
+    )
+}
+
+fn observation_sees_foreign_bytes(observation: CreateObservation) -> bool {
+    matches!(
+        observation,
+        CreateObservation::Collision | CreateObservation::ReconciledDifferent
+    )
 }
 
 fn observe_create(
