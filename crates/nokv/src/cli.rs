@@ -86,15 +86,16 @@ pub enum MetadataStoreConfig {
 
 /// `serve --recovery-publication` selection.
 ///
-/// `Shared` uploads every applied outbox tail as immutable log segments plus
-/// control references before a response leaves the shard. `LocalOnly` keeps
-/// the exclusive local WAL as the only recovery authority and publishes
-/// nothing; it is the deployment shape to use until shared checkpoint
-/// compaction bounds the segment chain.
+/// `LocalOnly` is the resting state: the exclusive local Holt WAL is the only
+/// recovery authority and nothing is published to Control. `Shared` uploads
+/// every applied outbox tail as immutable log segments plus control
+/// references before a response leaves the shard; until shared checkpoint
+/// compaction bounds that segment chain it is an opt-in, and it is implied by
+/// `--metadata-recover-log`, which can only resume from a shared frontier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecoveryPublicationConfig {
-    #[default]
     Shared,
+    #[default]
     LocalOnly,
 }
 
@@ -291,7 +292,7 @@ impl Default for ServerConfig {
             node_id: None,
             metadata_store: None,
             lifecycle_interval_millis: DEFAULT_LIFECYCLE_INTERVAL_MILLIS,
-            recovery_publication: RecoveryPublicationConfig::Shared,
+            recovery_publication: RecoveryPublicationConfig::LocalOnly,
         }
     }
 }
@@ -300,6 +301,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     let mut arguments = arguments.into_iter();
     let mut client = ClientConfig::default();
     let mut server = ServerConfig::default();
+    let mut recovery_publication_explicit = false;
     let mut static_routing = StaticRoutingConfig::default();
     let mut etcd_routing = EtcdRoutingConfig::default();
     let mut routing_kind = None;
@@ -453,6 +455,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             }
             "--recovery-publication" => {
                 let value = next_value(&mut arguments, &argument)?;
+                recovery_publication_explicit = true;
                 server.recovery_publication = match value.as_str() {
                     "shared" => RecoveryPublicationConfig::Shared,
                     "local-only" => RecoveryPublicationConfig::LocalOnly,
@@ -469,13 +472,20 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
             _ => return Err(CliError::UnknownOption(argument)),
         }
     };
-    if server.recovery_publication == RecoveryPublicationConfig::LocalOnly
-        && matches!(
-            server.metadata_store,
-            Some(MetadataStoreConfig::RecoverLog(_))
-        )
-    {
-        return Err(CliError::LocalOnlyRecoverLog);
+    if matches!(
+        server.metadata_store,
+        Some(MetadataStoreConfig::RecoverLog(_))
+    ) {
+        // A shared-log successor resumes from a shared frontier, so shared
+        // publication is the only coherent choice: imply it when the caller
+        // said nothing, refuse it when the caller asked for local-only.
+        match (recovery_publication_explicit, server.recovery_publication) {
+            (false, _) => server.recovery_publication = RecoveryPublicationConfig::Shared,
+            (true, RecoveryPublicationConfig::LocalOnly) => {
+                return Err(CliError::LocalOnlyRecoverLog);
+            }
+            (true, RecoveryPublicationConfig::Shared) => {}
+        }
     }
     client.routing = match routing_kind.unwrap_or(RoutingKind::Static) {
         RoutingKind::Static => RoutingConfig::Static(static_routing),
@@ -1152,10 +1162,24 @@ mod tests {
     }
 
     #[test]
-    fn server_recovery_publication_defaults_to_shared_and_local_only_is_explicit() {
+    fn server_recovery_publication_defaults_to_local_only_and_shared_is_explicit() {
+        // A fresh or reopened owner runs on its exclusive Holt WAL alone unless
+        // shared publication is asked for. Publishing to Control is a switch,
+        // not the resting state.
+        for open in ["--metadata-create", "--metadata-reopen"] {
+            let parsed = parse(args(&[open, "/var/lib/nokv/shard.holt", "serve"])).unwrap();
+            assert_eq!(
+                parsed.server.recovery_publication,
+                RecoveryPublicationConfig::LocalOnly,
+                "{open} without --recovery-publication must be local-only"
+            );
+        }
+
         let shared = parse(args(&[
             "--metadata-reopen",
             "/var/lib/nokv/shard.holt",
+            "--recovery-publication",
+            "shared",
             "serve",
         ]))
         .unwrap();
@@ -1189,6 +1213,37 @@ mod tests {
                 option: "--recovery-publication",
                 value: "sometimes".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn recover_log_implies_shared_publication_unless_contradicted() {
+        // Recovering from the shared log installs a shared frontier, so the
+        // only coherent publication mode is shared. Leaving the option out
+        // must select it rather than trip over the local-only default.
+        let recovered = parse(args(&[
+            "--metadata-recover-log",
+            "/var/lib/nokv/recovered.holt",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            recovered.server.recovery_publication,
+            RecoveryPublicationConfig::Shared
+        );
+
+        // Saying so explicitly is fine.
+        let explicit = parse(args(&[
+            "--metadata-recover-log",
+            "/var/lib/nokv/recovered.holt",
+            "--recovery-publication",
+            "shared",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            explicit.server.recovery_publication,
+            RecoveryPublicationConfig::Shared
         );
 
         // A shared-log successor cannot be a local-only owner.

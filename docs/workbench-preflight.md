@@ -42,6 +42,27 @@ git diff --check
 The contract check proves only the exact 18 names and normalized input schemas.
 It does not qualify persistence, object I/O, failover, restore, or latency.
 
+## Default Deployment Shape
+
+A serving shard is one `nokv serve` process over one exclusive Holt store. That
+process is the metadata authority: it holds the owner lease, applies every
+metadata command to its local Holt WAL, and acknowledges once that WAL is
+durable. Nothing else has to be running for reads and writes to work.
+
+Control (etcd) is required, but for two narrow jobs: resolving which process
+owns a root, and fencing that ownership with an epoch. It is not on the write
+path and it does not hold metadata.
+
+Publishing the recovery log to Control (`--recovery-publication shared`) is
+an option, and an immature one: without checkpoint compaction the shared log
+chain grows without bound and the shard stops serving after roughly a hundred
+acknowledged publications. Leave it off unless you are qualifying the shared
+recovery path itself. It is switched on implicitly by
+`--metadata-recover-log`, which resumes a shard from a shared frontier.
+
+The corresponding invariant for operators: back up the Holt directory. In the
+default shape it is the only copy of the metadata.
+
 ## Live Contract Check
 
 Start `nokv mcp` with the same root, route, owner, and object configuration that
