@@ -7,22 +7,37 @@
 from __future__ import annotations
 
 import copy
+import json
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 
 from restore_composition_gate import (
+    BUILD_TIMEOUT_SECONDS,
+    Evidence,
     PINNED_RUSTFS_IMAGE,
     PRE423_ORACLE_REVISION,
     Config,
     WorkflowFailure,
+    build_timeout,
+    matching_mcp_structured_content,
     mutation_request_id,
     mutation_command,
     oracle_plan,
     qualification,
+    redact_argv,
+    start_process,
     validate_composition_evidence,
+    validate_fault_barrier_evidence,
+    validate_environment_evidence,
     validate_mutation_result,
+    validate_owner_loss_error,
+    TYPED_SCENARIOS,
 )
+import pre423_contract_ledger
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -34,6 +49,8 @@ def config(root: Path) -> Config:
         binary=root / "nokv",
         evidence=root / "evidence",
         target=root / "target",
+        fault_binary=root / "fault-target" / "debug" / "nokv-restore-crash-owner",
+        fault_target=root / "fault-target",
         etcd=Path("/usr/local/bin/etcd"),
         etcdctl=Path("/usr/local/bin/etcdctl"),
         docker=Path("/usr/local/bin/docker"),
@@ -183,13 +200,144 @@ def valid_evidence() -> dict[str, object]:
             "idempotent_replay": True,
         },
         "fault_injection": {
-            "status": "NOT QUALIFIED",
-            "reason": "No public object-first/pre-Complete crash boundary exists.",
+            "status": "PASS",
+            "reason": "Qualified exact pre-Complete owner-loss recovery.",
+            "arm_schema": "nokv.restore-crash.arm.v1",
+            "evidence_schema": "nokv.restore-crash.evidence.v1",
+            "run_id": "10" * 16,
+            "root_id": "20" * 16,
+            "destination_workspace_incarnation_id": "30" * 16,
+            "operation_id": "66" * 16,
+            "replay_operation_id": "66" * 16,
+            "destination_commit_id": "aa" * 32,
+            "replay_destination_commit_id": "aa" * 32,
+            "phase": "destination_building",
+            "durable_read_version": 7,
+            "owner_exit_code": 86,
+            "initial_owner_session_absent_before_fault": True,
+            "fault_owner_session_absent_before_reopen": True,
+            "destination_hidden_before_replay": True,
+            "operation_state_before_replay": "running",
+            "publication_states_before_replay": ["succeeded", "succeeded"],
+            "manifest_publication_operation_ids": ["ab" * 16, "cd" * 16],
+            "manifest_artifact_revision_ids": ["bc" * 16, "dc" * 16],
+            "manifest_bindings_exact": True,
+            "built_commit_members": 0,
+            "sealed_revisions": 0,
+            "manifest_objects_published_before_crash": 2,
+            "destination_generation": 1,
+            "interruption_label": "restore-b-pre-complete-crash",
+            "interrupted_oracle_label": "restore-b",
+            "replay_label": "restore-b",
+            "fault_owner_socket_ready": True,
+            "successor_owner_socket_ready": True,
+            "mcp_survived_fault_owner_exit": True,
+            "pre_replay_object_inventory_sha256": "de" * 32,
+            "post_replay_object_inventory_sha256": "de" * 32,
+            "object_inventory_stable_across_replay": True,
+            "client_failure": {
+                "status": "error",
+                "code": "ClientFailure",
+                "retryable": True,
+                "details": {"source": "nokv-client", "attempts": 3},
+            },
+            "idempotent_replay": True,
         },
     }
 
 
+def barrier_fixture() -> tuple[dict[str, object], dict[str, object]]:
+    def raw(value: str) -> list[int]:
+        return list(bytes.fromhex(value))
+
+    arm: dict[str, object] = {
+        "schema": "nokv.restore-crash.arm.v1",
+        "run_id": "10" * 16,
+        "root_id": raw("20" * 16),
+        "source_workbench": "composition-a",
+        "source_workspace_incarnation_id": raw("30" * 16),
+        "snapshot_id": 7,
+        "destination_workbench": "composition-b",
+        "destination_workspace_incarnation_id": raw("40" * 16),
+        "operation_id": raw("50" * 16),
+    }
+
+    def binding(operation: str, revision: str) -> dict[str, object]:
+        identity = {
+            "publication_operation_id": raw(operation),
+            "artifact_revision_id": raw(revision),
+        }
+        return {
+            "expected": identity,
+            "actual": {
+                "identity": copy.deepcopy(identity),
+                "workspace_incarnation_id": arm["destination_workspace_incarnation_id"],
+                "body_digest_uri": "sha256:" + "60" * 32,
+                "manifest_digest_uri": "sha256:" + "70" * 32,
+                "logical_size": 12,
+                "content_type": "application/json",
+            },
+        }
+
+    envelope: dict[str, object] = {
+        "schema": "nokv.restore-crash.evidence.v1",
+        "run_id": arm["run_id"],
+        "root_id": arm["root_id"],
+        "operation_id": arm["operation_id"],
+        "evidence": {
+            "route": {
+                "root_id": arm["root_id"],
+                "logical_shard_id": raw("80" * 16),
+                "object_namespace_id": raw("90" * 16),
+                "placement_generation": 1,
+                "owner_epoch": 2,
+            },
+            "operation_id": arm["operation_id"],
+            "durable_read_version": 9,
+            "phase": "destination_building",
+            "initialization_digest": raw("a0" * 32),
+            "destination_workspace_incarnation_id": arm[
+                "destination_workspace_incarnation_id"
+            ],
+            "destination_commit_id": raw("b0" * 32),
+            "run_manifest": binding("c0" * 16, "d0" * 16),
+            "restore_manifest": binding("e0" * 16, "f0" * 16),
+            "built_commit_members": 0,
+            "sealed_revisions": 0,
+        },
+    }
+    return arm, envelope
+
+
 class RestoreCompositionGateTest(unittest.TestCase):
+    def test_typed_scenarios_exactly_cover_restore_composition_profile(self) -> None:
+        ledger = pre423_contract_ledger.load_ledger()
+        expected = {
+            scenario
+            for item in ledger["items"]
+            for gate in item["required_gates"]
+            for expectation in (
+                pre423_contract_ledger.resolve_gate_expectation(
+                    ledger, item["id"], gate
+                ),
+            )
+            if "restore-composition" in expectation["allowed_producers"]
+            for scenario in expectation["scenarios"]
+        }
+        self.assertEqual(set(TYPED_SCENARIOS), expected)
+
+    def test_typed_mode_forbids_dry_run(self) -> None:
+        with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+            from restore_composition_gate import parse_args
+
+            parse_args(
+                [
+                    "--dry-run",
+                    "--qualification-result",
+                    "/tmp/producer-result.json",
+                ]
+            )
+
     def test_oracle_plan_preserves_dirty_nested_restore_without_recommit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             plan = oracle_plan(config(Path(temporary)))
@@ -351,18 +499,228 @@ class RestoreCompositionGateTest(unittest.TestCase):
         with self.assertRaisesRegex(WorkflowFailure, "retirement"):
             validate_composition_evidence(lost)
 
-    def test_fault_boundary_is_honestly_not_qualified_not_a_pass(self) -> None:
+    def test_fault_boundary_must_pass_before_the_gate_can_pass(self) -> None:
         record = qualification(
             composition="PASS",
             fault="NOT QUALIFIED",
-            reason="No public object-first/pre-Complete crash boundary exists.",
+            reason="Exact pre-Complete crash evidence was not executed.",
         )
-        self.assertEqual(record["overall_status"], "PASS")
+        self.assertEqual(record["overall_status"], "NOT QUALIFIED")
         self.assertEqual(record["restore_composition"]["status"], "PASS")
         self.assertEqual(
             record["partial_publication_recovery"]["status"], "NOT QUALIFIED"
         )
         self.assertNotEqual(record["partial_publication_recovery"]["status"], "PASS")
+
+    def test_environment_evidence_binds_both_independent_executables(self) -> None:
+        default_digest = "11" * 32
+        fault_digest = "22" * 32
+        value = {
+            "schema": "nokv.restore_composition_gate.v1",
+            "binary": {"path": "/tmp/nokv", "sha256": default_digest},
+            "fault_binary": {
+                "path": "/tmp/nokv-restore-crash-owner",
+                "sha256": fault_digest,
+            },
+        }
+        validate_environment_evidence(
+            value,
+            expected_binary_sha256=default_digest,
+            expected_fault_binary_sha256=fault_digest,
+        )
+
+        missing = copy.deepcopy(value)
+        del missing["fault_binary"]
+        with self.assertRaisesRegex(WorkflowFailure, "both executable identities"):
+            validate_environment_evidence(
+                missing,
+                expected_binary_sha256=default_digest,
+                expected_fault_binary_sha256=fault_digest,
+            )
+
+        drifted = copy.deepcopy(value)
+        drifted["fault_binary"]["sha256"] = "33" * 32
+        with self.assertRaisesRegex(WorkflowFailure, "fault owner digest drifted"):
+            validate_environment_evidence(
+                drifted,
+                expected_binary_sha256=default_digest,
+                expected_fault_binary_sha256=fault_digest,
+            )
+
+        reused = copy.deepcopy(value)
+        reused["fault_binary"]["sha256"] = default_digest
+        with self.assertRaisesRegex(WorkflowFailure, "independently built"):
+            validate_environment_evidence(
+                reused,
+                expected_binary_sha256=default_digest,
+                expected_fault_binary_sha256=default_digest,
+            )
+
+    def test_validation_rejects_fault_replay_drift_or_nonzero_closure(self) -> None:
+        drifted = valid_evidence()
+        drifted["fault_injection"]["replay_operation_id"] = "ef" * 16
+        with self.assertRaisesRegex(WorkflowFailure, "fault operation identity"):
+            validate_composition_evidence(drifted)
+
+        progressed = valid_evidence()
+        progressed["fault_injection"]["built_commit_members"] = 1
+        with self.assertRaisesRegex(WorkflowFailure, "zero closure progress"):
+            validate_composition_evidence(progressed)
+
+    def test_validation_rejects_fault_inventory_or_publication_regression(self) -> None:
+        drifted = valid_evidence()
+        drifted["fault_injection"]["post_replay_object_inventory_sha256"] = "ff" * 32
+        with self.assertRaisesRegex(WorkflowFailure, "object inventory"):
+            validate_composition_evidence(drifted)
+
+        unpublished = valid_evidence()
+        unpublished["fault_injection"]["publication_states_before_replay"] = [
+            "succeeded",
+            "running",
+        ]
+        with self.assertRaisesRegex(WorkflowFailure, "manifest publications"):
+            validate_composition_evidence(unpublished)
+
+        missing_failure = valid_evidence()
+        del missing_failure["fault_injection"]["client_failure"]
+        with self.assertRaisesRegex(WorkflowFailure, "bounded client failure"):
+            validate_composition_evidence(missing_failure)
+
+    def test_started_process_records_redacted_argv_and_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg = config(root)
+            evidence = Evidence(root / "evidence")
+            evidence.prepare()
+            with (root / "process.log").open("w", encoding="utf-8") as log:
+                process = start_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        "pass",
+                        "--object-access-key-id",
+                        "sentinel-access-key",
+                    ],
+                    cfg,
+                    log,
+                    evidence=evidence,
+                    label="test-owner",
+                )
+                self.assertEqual(process.wait(timeout=10), 0)
+            record = json.loads(
+                (evidence.root / "processes.jsonl").read_text(encoding="utf-8")
+            )
+        self.assertEqual(record["label"], "test-owner")
+        self.assertEqual(record["pid"], process.pid)
+        self.assertIn("started_at", record)
+        self.assertNotIn("sentinel-access-key", json.dumps(record))
+        self.assertEqual(record["argv"][-1], "<redacted>")
+
+    def test_required_workflow_runs_feature_tests_and_uploads_only_evidence(
+        self,
+    ) -> None:
+        workflow = (REPO / ".github" / "workflows" / "rust.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "cargo test -p nokv-server --features restore-crash-test-support",
+            workflow,
+        )
+        self.assertIn(
+            "cargo test -p nokv-bench --bin nokv-restore-crash-owner "
+            "--features restore-crash-test-support",
+            workflow,
+        )
+        self.assertIn(
+            '--fault-target-dir "${RUNNER_TEMP}/restore-composition-fault-target"',
+            workflow,
+        )
+        self.assertIn("path: ${{ runner.temp }}/restore-composition/evidence", workflow)
+        self.assertNotIn("path: ${{ runner.temp }}/restore-composition\n", workflow)
+
+    def test_fault_barrier_requires_exact_dual_manifest_binding(self) -> None:
+        arm, envelope = barrier_fixture()
+        summary = validate_fault_barrier_evidence(envelope, arm)
+        self.assertEqual(summary["phase"], "destination_building")
+        self.assertEqual(summary["built_commit_members"], 0)
+        self.assertEqual(summary["sealed_revisions"], 0)
+        self.assertEqual(
+            summary["manifest_publication_operation_ids"],
+            ["c0" * 16, "e0" * 16],
+        )
+
+        drifted = copy.deepcopy(envelope)
+        drifted["evidence"]["run_manifest"]["actual"]["identity"][
+            "artifact_revision_id"
+        ] = list(bytes.fromhex("01" * 16))
+        with self.assertRaisesRegex(WorkflowFailure, "binding is not exact"):
+            validate_fault_barrier_evidence(drifted, arm)
+
+    def test_only_bounded_client_failure_qualifies_owner_loss(self) -> None:
+        error = {
+            "status": "error",
+            "code": "ClientFailure",
+            "retryable": True,
+            "details": {"source": "nokv-client", "attempts": 3},
+        }
+        validate_owner_loss_error(error, "restore-b")
+        for field, value in (
+            ("code", "Transport"),
+            ("retryable", False),
+            ("details", {"source": "nokv-client", "attempts": 2}),
+        ):
+            invalid = copy.deepcopy(error)
+            invalid[field] = value
+            with self.assertRaisesRegex(WorkflowFailure, "bounded client failure"):
+                validate_owner_loss_error(invalid, "restore-b")
+
+    def test_owner_loss_requires_matching_text_and_structured_content(self) -> None:
+        error = {
+            "status": "error",
+            "code": "ClientFailure",
+            "retryable": True,
+            "details": {"source": "nokv-client", "attempts": 3},
+        }
+        result = {
+            "isError": True,
+            "content": [{"type": "text", "text": json.dumps(error)}],
+            "structuredContent": error,
+        }
+        self.assertEqual(matching_mcp_structured_content(result, "restore-b"), error)
+        drifted = copy.deepcopy(result)
+        drifted["structuredContent"]["retryable"] = False
+        with self.assertRaisesRegex(WorkflowFailure, "text and structured"):
+            matching_mcp_structured_content(drifted, "restore-b")
+
+    def test_build_timeout_is_independent_from_the_fault_deadline(self) -> None:
+        self.assertEqual(build_timeout(60.0), BUILD_TIMEOUT_SECONDS)
+        self.assertEqual(build_timeout(BUILD_TIMEOUT_SECONDS + 1), 1_201.0)
+        self.assertEqual(config(Path("/tmp/restore-gate-test")).timeout, 60.0)
+
+    def test_validation_requires_controlled_owner_and_socket_evidence(self) -> None:
+        for field in (
+            "fault_owner_socket_ready",
+            "successor_owner_socket_ready",
+            "mcp_survived_fault_owner_exit",
+        ):
+            missing = valid_evidence()
+            missing["fault_injection"][field] = False
+            with self.assertRaisesRegex(WorkflowFailure, "successor/replay boundary"):
+                validate_composition_evidence(missing)
+
+        unbound = valid_evidence()
+        unbound["fault_injection"]["interrupted_oracle_label"] = "restore-c"
+        with self.assertRaisesRegex(WorkflowFailure, "fault arm"):
+            validate_composition_evidence(unbound)
+
+    def test_malformed_fault_publication_ids_fail_closed(self) -> None:
+        malformed = valid_evidence()
+        malformed["fault_injection"]["manifest_publication_operation_ids"] = [
+            [],
+            "cd" * 16,
+        ]
+        with self.assertRaisesRegex(WorkflowFailure, "manifest publications"):
+            validate_composition_evidence(malformed)
 
     def test_validation_rejects_excluded_filesystem_or_layout_surfaces(self) -> None:
         evidence = valid_evidence()
@@ -376,10 +734,35 @@ class RestoreCompositionGateTest(unittest.TestCase):
         self.assertIn("@sha256:", PINNED_RUSTFS_IMAGE)
         self.assertNotIn(":latest", PINNED_RUSTFS_IMAGE)
 
+    def test_process_evidence_redacts_all_object_credential_identifiers(self) -> None:
+        redacted = redact_argv(
+            [
+                "docker",
+                "-e",
+                "RUSTFS_ACCESS_KEY=access-identifier",
+                "-e",
+                "RUSTFS_SECRET_KEY=secret-value",
+                "nokv",
+                "--object-access-key-id",
+                "access-identifier",
+                "--object-secret-access-key",
+                "secret-value",
+            ]
+        )
+        serialized = " ".join(redacted)
+        self.assertNotIn("access-identifier", serialized)
+        self.assertNotIn("secret-value", serialized)
+        self.assertIn("RUSTFS_ACCESS_KEY=<redacted>", redacted)
+        self.assertIn("RUSTFS_SECRET_KEY=<redacted>", redacted)
+        self.assertEqual(redacted[-2:], ["--object-secret-access-key", "<redacted>"])
+
     def test_rust_ci_freezes_the_gate_without_claiming_a_live_pass(self) -> None:
         workflow = (REPO / ".github/workflows/rust.yml").read_text(encoding="utf-8")
         self.assertIn("scripts/workbench/restore_composition_gate.py", workflow)
         self.assertIn("scripts/workbench/restore_composition_gate_test.py", workflow)
+        self.assertIn("--fault-target-dir", workflow)
+        self.assertIn('.partial_publication_recovery.status == "PASS"', workflow)
+        self.assertIn('.overall_status == "PASS"', workflow)
 
     def test_evidence_fixtures_are_independent(self) -> None:
         first = valid_evidence()

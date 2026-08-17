@@ -12,6 +12,7 @@ homepage.workspace = true
 [features]
 default = []
 etcd = ["nokv-control/etcd"]
+restore-crash-test-support = []
 
 [dependencies]
 nokv-control.workspace = true

@@ -1303,15 +1303,19 @@ dependencies = [
 name = "nokv-bench"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "nokv-client",
  "nokv-control",
  "nokv-meta",
  "nokv-meta-holt",
  "nokv-meta-store",
+ "nokv-object",
  "nokv-protocol",
  "nokv-server",
  "nokv-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

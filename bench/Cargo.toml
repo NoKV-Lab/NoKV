@@ -12,17 +12,28 @@ homepage.workspace = true
 
 [features]
 metadata-read-stats = ["nokv-meta/metadata-read-stats", "nokv-meta-holt/read-stats"]
+restore-crash-test-support = [
+    "nokv-server/restore-crash-test-support",
+    "dep:libc",
+    "dep:nokv-client",
+    "dep:nokv-object",
+    "dep:sha2",
+]
 
 [dependencies]
+libc = { version = "0.2", optional = true }
+nokv-client = { workspace = true, features = ["etcd"], optional = true }
 nokv-control = { workspace = true, features = ["etcd"] }
 nokv-meta.workspace = true
 nokv-meta-holt = { workspace = true, features = ["test-support"] }
 nokv-meta-store.workspace = true
+nokv-object = { workspace = true, optional = true }
 nokv-protocol.workspace = true
 nokv-server.workspace = true
 nokv-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
 
 [[bin]]
 name = "nokv-workspace-bench"
@@ -36,3 +47,8 @@ path = "src/bin/nokv-local-wal-recovery-fault.rs"
 name = "nokv-bench"
 path = "src/bin/nokv-bench.rs"
 required-features = ["metadata-read-stats"]
+
+[[bin]]
+name = "nokv-restore-crash-owner"
+path = "src/bin/nokv-restore-crash-owner.rs"
+required-features = ["restore-crash-test-support"]

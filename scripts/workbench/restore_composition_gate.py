@@ -38,6 +38,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence, TextIO
 
+from source_bound_producer import ProducerError, ScenarioContract
+from typed_live_qualification import load_live_context, publish_live_result
 
 SCHEMA = "nokv.restore_composition_gate.v1"
 PROTOCOL_VERSION = "2025-11-25"
@@ -46,10 +48,12 @@ PINNED_RUSTFS_IMAGE = (
     "rustfs/rustfs@sha256:"
     "e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
 )
+BUILD_TIMEOUT_SECONDS = 1_200.0
 EXCLUDED_SURFACES = frozenset(
     {"FUSE", "POSIX", "Yanex", "inode", "dentry", "physical layout"}
 )
-SECRET_FLAGS = {"--object-secret-access-key"}
+SECRET_FLAGS = {"--object-access-key-id", "--object-secret-access-key"}
+SECRET_ENV_PREFIXES = ("RUSTFS_ACCESS_KEY=", "RUSTFS_SECRET_KEY=")
 HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 MANDATORY_LABELS = (
     "create-a",
@@ -72,6 +76,23 @@ MANDATORY_LABELS = (
     "read-c-after-retire",
     "restore-c-terminal-replay",
 )
+TYPED_EVIDENCE_ROLES = ("producer-result", "qualification")
+TYPED_SCENARIOS = {
+    "t14.restored-destination-resnapshot": ScenarioContract(
+        "T14", "restore-composition"
+    ),
+    "t18.restore-independent-destination": ScenarioContract(
+        "T18", "restore-composition"
+    ),
+    "t18.restore-terminal-replay": ScenarioContract("T18", "restore-composition"),
+    "c20.hidden-staging-cow-independent-destination": ScenarioContract(
+        "C20", "restore-composition"
+    ),
+    "c20.restore-terminal-replay": ScenarioContract("C20", "restore-composition"),
+    "c21.restore-snapshot-restore-composition": ScenarioContract(
+        "C21", "restore-composition"
+    ),
+}
 
 
 class NotQualified(RuntimeError):
@@ -88,6 +109,8 @@ class Config:
     binary: Path
     evidence: Path
     target: Path
+    fault_binary: Path
+    fault_target: Path
     etcd: Path | None
     etcdctl: Path | None
     docker: Path | None
@@ -98,6 +121,7 @@ class Config:
     dry_run: bool
     timeout: float
     keep_resources: bool
+    qualification_result: Path | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -475,6 +499,21 @@ def _string(parent: dict[str, Any], key: str, label: str) -> str:
     return value
 
 
+def fixed_hex_value(value: Any, size: int, label: str) -> str:
+    if isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{size * 2}}}", value):
+        return value
+    if (
+        isinstance(value, list)
+        and len(value) == size
+        and all(
+            isinstance(byte, int) and not isinstance(byte, bool) and 0 <= byte <= 255
+            for byte in value
+        )
+    ):
+        return bytes(value).hex()
+    raise WorkflowFailure(f"{label} must be exactly {size} bytes")
+
+
 def _validate_run_manifest(
     manifest_value: dict[str, Any], workbench: str, label: str
 ) -> tuple[str, str]:
@@ -622,12 +661,96 @@ def validate_composition_evidence(evidence: dict[str, Any]) -> None:
     ):
         raise WorkflowFailure("terminal restore replay did not converge uniquely")
     fault = _mapping(evidence, "fault_injection")
-    if fault.get("status") not in {"PASS", "NOT QUALIFIED"}:
-        raise WorkflowFailure(
-            "partial-publication recovery is neither PASS nor NOT QUALIFIED"
+    if fault.get("status") != "PASS":
+        raise WorkflowFailure("partial-publication recovery is not PASS")
+    if (
+        fault.get("arm_schema") != "nokv.restore-crash.arm.v1"
+        or fault.get("evidence_schema") != "nokv.restore-crash.evidence.v1"
+        or not HEX_32.fullmatch(str(fault.get("run_id", "")))
+        or not HEX_32.fullmatch(str(fault.get("root_id", "")))
+        or not HEX_32.fullmatch(
+            str(fault.get("destination_workspace_incarnation_id", ""))
         )
-    if fault.get("status") == "NOT QUALIFIED" and not fault.get("reason"):
-        raise WorkflowFailure("NOT QUALIFIED fault evidence lacks a reason")
+        or fault.get("destination_generation") != 1
+        or fault.get("interruption_label") != "restore-b-pre-complete-crash"
+        or fault.get("interrupted_oracle_label") != "restore-b"
+        or fault.get("replay_label") != fault.get("interrupted_oracle_label")
+        or MANDATORY_LABELS[7] != fault.get("interrupted_oracle_label")
+    ):
+        raise WorkflowFailure(
+            "fault arm, root, destination, or generation is malformed"
+        )
+    operation_id = _string(fault, "operation_id", "fault_injection")
+    if (
+        not HEX_32.fullmatch(operation_id)
+        or fault.get("replay_operation_id") != operation_id
+    ):
+        raise WorkflowFailure("fault operation identity drifted during exact replay")
+    destination_commit_id = _string(fault, "destination_commit_id", "fault_injection")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", destination_commit_id)
+        or fault.get("replay_destination_commit_id") != destination_commit_id
+    ):
+        raise WorkflowFailure("fault destination commit identity drifted during replay")
+    if (
+        fault.get("phase") != "destination_building"
+        or not isinstance(fault.get("durable_read_version"), int)
+        or isinstance(fault.get("durable_read_version"), bool)
+        or fault["durable_read_version"] <= 0
+        or fault.get("built_commit_members") != 0
+        or fault.get("sealed_revisions") != 0
+    ):
+        raise WorkflowFailure("fault barrier lacks durable zero closure progress")
+    publication_ids = fault.get("manifest_publication_operation_ids")
+    revision_ids = fault.get("manifest_artifact_revision_ids")
+    if (
+        fault.get("publication_states_before_replay") != ["succeeded", "succeeded"]
+        or not isinstance(publication_ids, list)
+        or len(publication_ids) != 2
+        or not all(
+            isinstance(value, str) and HEX_32.fullmatch(value)
+            for value in publication_ids
+        )
+        or len(set(publication_ids)) != 2
+        or not isinstance(revision_ids, list)
+        or len(revision_ids) != 2
+        or not all(
+            isinstance(value, str) and HEX_32.fullmatch(value) for value in revision_ids
+        )
+        or len(set(revision_ids)) != 2
+        or fault.get("manifest_bindings_exact") is not True
+        or fault.get("manifest_objects_published_before_crash") != 2
+    ):
+        raise WorkflowFailure("fault manifest publications are incomplete or drifted")
+    pre_inventory = _string(
+        fault, "pre_replay_object_inventory_sha256", "fault_injection"
+    )
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", pre_inventory)
+        or fault.get("post_replay_object_inventory_sha256") != pre_inventory
+        or fault.get("object_inventory_stable_across_replay") is not True
+    ):
+        raise WorkflowFailure("fault object inventory drifted across exact replay")
+    if (
+        any(
+            fault.get(field) is not True
+            for field in (
+                "initial_owner_session_absent_before_fault",
+                "fault_owner_session_absent_before_reopen",
+                "destination_hidden_before_replay",
+                "idempotent_replay",
+                "fault_owner_socket_ready",
+                "successor_owner_socket_ready",
+                "mcp_survived_fault_owner_exit",
+            )
+        )
+        or fault.get("owner_exit_code") != 86
+        or fault.get("operation_state_before_replay") != "running"
+    ):
+        raise WorkflowFailure("fault successor/replay boundary is incomplete")
+    validate_owner_loss_error(
+        fault.get("client_failure"), "fault injection client failure"
+    )
 
 
 def qualification(
@@ -635,7 +758,7 @@ def qualification(
 ) -> dict[str, Any]:
     if composition == "FAIL" or fault == "FAIL":
         overall = "FAIL"
-    elif composition == "PASS":
+    elif composition == "PASS" and fault == "PASS":
         overall = "PASS"
     else:
         overall = "NOT QUALIFIED"
@@ -682,8 +805,9 @@ def redact_argv(argv: Iterable[os.PathLike[str] | str]) -> list[str]:
         if redact_next:
             output.append("<redacted>")
             redact_next = False
-        elif argument.startswith("RUSTFS_SECRET_KEY="):
-            output.append("RUSTFS_SECRET_KEY=<redacted>")
+        elif argument.startswith(SECRET_ENV_PREFIXES):
+            name = argument.split("=", 1)[0]
+            output.append(f"{name}=<redacted>")
         else:
             output.append(argument)
             redact_next = argument in SECRET_FLAGS
@@ -754,9 +878,15 @@ def free_port() -> int:
 
 
 def start_process(
-    argv: Sequence[os.PathLike[str] | str], config: Config, log: TextIO
+    argv: Sequence[os.PathLike[str] | str],
+    config: Config,
+    log: TextIO,
+    *,
+    evidence: Evidence,
+    label: str,
 ) -> subprocess.Popen[str]:
-    return subprocess.Popen(
+    started_at = now()
+    process = subprocess.Popen(
         [str(item) for item in argv],
         cwd=config.repo,
         stdin=subprocess.DEVNULL,
@@ -765,6 +895,17 @@ def start_process(
         text=True,
         start_new_session=True,
     )
+    evidence.line(
+        "processes.jsonl",
+        {
+            "schema": SCHEMA,
+            "label": label,
+            "argv": redact_argv(argv),
+            "pid": process.pid,
+            "started_at": started_at,
+        },
+    )
+    return process
 
 
 def stop_process(
@@ -921,6 +1062,101 @@ def owner_command(config: Config, runtime: Runtime) -> list[str]:
     ]
 
 
+def successor_owner_command(config: Config, runtime: Runtime) -> list[str]:
+    return [
+        *control_args(config, runtime),
+        *object_args(runtime),
+        "--bind",
+        f"127.0.0.1:{runtime.owner_port}",
+        "--advertise-endpoint",
+        f"127.0.0.1:{runtime.owner_port}",
+        "--node-id",
+        "restore-composition-successor",
+        "--metadata-reopen",
+        str(runtime.metadata),
+        "--lifecycle-interval-millis",
+        "100",
+        "serve",
+    ]
+
+
+def fault_route_args(config: Config, runtime: Runtime) -> list[str]:
+    return [
+        str(config.fault_binary),
+        "--etcd-endpoint",
+        runtime.etcd_endpoint,
+        "--etcd-key-prefix",
+        runtime.etcd_prefix,
+        "--lease-ttl-seconds",
+        "2",
+        "--root-id",
+        runtime.root_id,
+    ]
+
+
+def fault_arm_command(
+    config: Config,
+    runtime: Runtime,
+    *,
+    snapshot_id: int,
+    arm_file: Path,
+) -> list[str]:
+    return [
+        str(config.fault_binary),
+        "arm",
+        *fault_route_args(config, runtime)[1:],
+        "--run-id",
+        fixed_id(config.seed, "fault-run"),
+        "--source-workbench",
+        "composition-a",
+        "--snapshot-id",
+        str(snapshot_id),
+        "--destination-workbench",
+        "composition-b",
+        "--output",
+        str(arm_file),
+    ]
+
+
+def fault_owner_command(
+    config: Config,
+    runtime: Runtime,
+    *,
+    arm_file: Path,
+    evidence_file: Path,
+) -> list[str]:
+    return [
+        str(config.fault_binary),
+        "serve",
+        *fault_route_args(config, runtime)[1:],
+        "--node-id",
+        "restore-composition-fault-owner",
+        "--advertise-endpoint",
+        f"127.0.0.1:{runtime.owner_port}",
+        "--bind",
+        f"127.0.0.1:{runtime.owner_port}",
+        "--metadata-reopen",
+        str(runtime.metadata),
+        *object_args(runtime),
+        "--arm-file",
+        str(arm_file),
+        "--evidence-file",
+        str(evidence_file),
+    ]
+
+
+def fault_inspect_command(
+    config: Config, runtime: Runtime, operation_id: str
+) -> list[str]:
+    return [
+        str(config.fault_binary),
+        "inspect",
+        *fault_route_args(config, runtime)[1:],
+        "--operation-id",
+        operation_id,
+    ]
+
+
 class Mcp:
     def __init__(
         self,
@@ -1015,19 +1251,7 @@ class Mcp:
             "tools/call", {"name": name, "arguments": arguments}, label=label
         )
         result = response.get("result")
-        structured = (
-            result.get("structuredContent") if isinstance(result, dict) else None
-        )
-        if not isinstance(structured, dict):
-            raise WorkflowFailure(f"{label} lacks structuredContent")
-        try:
-            text_value = json.loads(result["content"][0]["text"])
-        except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise WorkflowFailure(
-                f"{label} lacks matching JSON text content"
-            ) from error
-        if text_value != structured:
-            raise WorkflowFailure(f"{label} text and structured results differ")
+        structured = matching_mcp_structured_content(result, label)
         is_error = result.get("isError") is True
         if expected_error is not None:
             if not is_error or structured.get("code") != expected_error:
@@ -1035,6 +1259,53 @@ class Mcp:
         elif is_error or structured.get("status") != "success":
             raise WorkflowFailure(f"{label} failed: {structured!r}")
         return structured
+
+    def call_until_owner_loss(
+        self,
+        label: str,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = self.request(
+            "tools/call", {"name": name, "arguments": arguments}, label=label
+        )
+        result = response.get("result")
+        if not isinstance(result, dict) or result.get("isError") is not True:
+            raise WorkflowFailure(
+                f"{label} did not return the bounded client failure after owner loss"
+            )
+        structured = matching_mcp_structured_content(result, label)
+        validate_owner_loss_error(structured, label)
+        return structured
+
+
+def matching_mcp_structured_content(value: Any, label: str) -> dict[str, Any]:
+    structured = value.get("structuredContent") if isinstance(value, dict) else None
+    if not isinstance(structured, dict):
+        raise WorkflowFailure(f"{label} lacks structuredContent")
+    try:
+        text_value = json.loads(value["content"][0]["text"])
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise WorkflowFailure(f"{label} lacks matching JSON text content") from error
+    if text_value != structured:
+        raise WorkflowFailure(f"{label} text and structured results differ")
+    return structured
+
+
+def validate_owner_loss_error(value: Any, label: str) -> None:
+    details = value.get("details") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("status") != "error"
+        or value.get("code") != "ClientFailure"
+        or value.get("retryable") is not True
+        or not isinstance(details, dict)
+        or details.get("source") != "nokv-client"
+        or details.get("attempts") != 3
+    ):
+        raise WorkflowFailure(
+            f"{label} did not return the bounded client failure after owner loss"
+        )
 
 
 def decode_bytes(result: dict[str, Any], label: str) -> bytes:
@@ -1193,6 +1464,286 @@ def parse_json_stdout(
     return value
 
 
+def load_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkflowFailure(f"{label} is not readable JSON") from error
+    if not isinstance(value, dict):
+        raise WorkflowFailure(f"{label} is not an object")
+    return value
+
+
+def validate_fault_arm(
+    arm: dict[str, Any],
+    *,
+    runtime: Runtime,
+    snapshot_id: int,
+    run_id: str,
+) -> str:
+    operation_id = fixed_hex_value(
+        arm.get("operation_id"), 16, "restore crash arm.operation_id"
+    )
+    if arm.get("schema") != "nokv.restore-crash.arm.v1" or arm.get("run_id") != run_id:
+        raise WorkflowFailure("restore crash arm schema or run identity differs")
+    if (
+        fixed_hex_value(arm.get("root_id"), 16, "restore crash arm.root_id")
+        != runtime.root_id
+        or arm.get("source_workbench") != "composition-a"
+        or arm.get("destination_workbench") != "composition-b"
+        or arm.get("snapshot_id") != snapshot_id
+    ):
+        raise WorkflowFailure(
+            "restore crash arm identities differ from the live workflow"
+        )
+    fixed_hex_value(
+        arm.get("source_workspace_incarnation_id"),
+        16,
+        "restore crash arm.source_workspace_incarnation_id",
+    )
+    fixed_hex_value(
+        arm.get("destination_workspace_incarnation_id"),
+        16,
+        "restore crash arm.destination_workspace_incarnation_id",
+    )
+    return operation_id
+
+
+def validate_fault_barrier_evidence(
+    envelope: dict[str, Any], arm: dict[str, Any]
+) -> dict[str, Any]:
+    if (
+        envelope.get("schema") != "nokv.restore-crash.evidence.v1"
+        or envelope.get("run_id") != arm.get("run_id")
+        or envelope.get("root_id") != arm.get("root_id")
+        or envelope.get("operation_id") != arm.get("operation_id")
+    ):
+        raise WorkflowFailure("restore crash evidence envelope differs from its arm")
+    value = _mapping(envelope, "evidence")
+    route = _mapping(value, "route")
+    operation_id = fixed_hex_value(
+        value.get("operation_id"), 16, "restore crash evidence.operation_id"
+    )
+    destination_id = fixed_hex_value(
+        value.get("destination_workspace_incarnation_id"),
+        16,
+        "restore crash evidence.destination_workspace_incarnation_id",
+    )
+    destination_commit_id = fixed_hex_value(
+        value.get("destination_commit_id"),
+        32,
+        "restore crash evidence.destination_commit_id",
+    )
+    if (
+        fixed_hex_value(route.get("root_id"), 16, "restore crash route.root_id")
+        != fixed_hex_value(arm.get("root_id"), 16, "restore crash arm.root_id")
+        or operation_id
+        != fixed_hex_value(
+            arm.get("operation_id"), 16, "restore crash arm.operation_id"
+        )
+        or destination_id
+        != fixed_hex_value(
+            arm.get("destination_workspace_incarnation_id"),
+            16,
+            "restore crash arm.destination_workspace_incarnation_id",
+        )
+        or value.get("phase") != "destination_building"
+        or not isinstance(value.get("durable_read_version"), int)
+        or isinstance(value.get("durable_read_version"), bool)
+        or value["durable_read_version"] <= 0
+        or value.get("built_commit_members") != 0
+        or value.get("sealed_revisions") != 0
+    ):
+        raise WorkflowFailure(
+            "restore crash barrier is not pristine DestinationBuilding"
+        )
+    publication_ids: list[str] = []
+    revision_ids: list[str] = []
+    for key in ("run_manifest", "restore_manifest"):
+        binding = _mapping(value, key)
+        expected = _mapping(binding, "expected")
+        actual = _mapping(binding, "actual")
+        identity = _mapping(actual, "identity")
+        if expected != identity:
+            raise WorkflowFailure(f"restore crash {key} binding is not exact")
+        publication_id = fixed_hex_value(
+            expected.get("publication_operation_id"),
+            16,
+            f"restore crash {key}.publication_operation_id",
+        )
+        revision_id = fixed_hex_value(
+            expected.get("artifact_revision_id"),
+            16,
+            f"restore crash {key}.artifact_revision_id",
+        )
+        if (
+            fixed_hex_value(
+                actual.get("workspace_incarnation_id"),
+                16,
+                f"restore crash {key}.workspace_incarnation_id",
+            )
+            != destination_id
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(actual.get("body_digest_uri", ""))
+            )
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(actual.get("manifest_digest_uri", ""))
+            )
+            or not isinstance(actual.get("logical_size"), int)
+            or isinstance(actual.get("logical_size"), bool)
+            or actual["logical_size"] <= 0
+            or actual.get("content_type") != "application/json"
+        ):
+            raise WorkflowFailure(f"restore crash {key} publication is malformed")
+        publication_ids.append(publication_id)
+        revision_ids.append(revision_id)
+    if len(set(publication_ids)) != 2:
+        raise WorkflowFailure("restore crash manifest publications are not distinct")
+    return {
+        "operation_id": operation_id,
+        "destination_commit_id": destination_commit_id,
+        "phase": value["phase"],
+        "durable_read_version": value["durable_read_version"],
+        "built_commit_members": value["built_commit_members"],
+        "sealed_revisions": value["sealed_revisions"],
+        "manifest_publication_operation_ids": publication_ids,
+        "manifest_artifact_revision_ids": revision_ids,
+        "manifest_bindings_exact": True,
+    }
+
+
+def validate_operation_inspection(
+    inspection: dict[str, Any],
+    *,
+    root_id: str,
+    operation_id: str,
+    kind: str,
+    state: str,
+    artifact_revision_id: str | None = None,
+    destination_workspace_incarnation_id: str | None = None,
+    destination_commit_id: str | None = None,
+) -> None:
+    operation = _mapping(inspection, "operation")
+    token = _mapping(operation, "token")
+    if (
+        inspection.get("schema") != "nokv.restore-crash.operation-inspection.v1"
+        or fixed_hex_value(
+            inspection.get("root_id"), 16, "operation inspection.root_id"
+        )
+        != root_id
+        or fixed_hex_value(
+            inspection.get("operation_id"), 16, "operation inspection.operation_id"
+        )
+        != operation_id
+        or fixed_hex_value(
+            token.get("operation_id"), 16, "operation inspection.token.operation_id"
+        )
+        != operation_id
+        or operation.get("kind") != kind
+        or operation.get("state") != state
+        or inspection.get("commit_version") is not None
+        or inspection.get("replayed") is not False
+    ):
+        raise WorkflowFailure(f"{kind} operation inspection differs")
+    if state == "running":
+        if operation.get("result") is not None or operation.get("failure") is not None:
+            raise WorkflowFailure(f"running {kind} operation is unexpectedly terminal")
+        return
+    result = _mapping(operation, "result")
+    terminal = _mapping(result, "result")
+    if state != "succeeded" or operation.get("failure") is not None:
+        raise WorkflowFailure(f"terminal {kind} operation is malformed")
+    if kind == "artifact_publish":
+        if (
+            result.get("kind") != "artifact_publish"
+            or fixed_hex_value(
+                terminal.get("operation_id"),
+                16,
+                "artifact publication result.operation_id",
+            )
+            != operation_id
+            or fixed_hex_value(
+                terminal.get("artifact_revision_id"),
+                16,
+                "artifact publication result.artifact_revision_id",
+            )
+            != artifact_revision_id
+        ):
+            raise WorkflowFailure(
+                "manifest publication operation is not exact and terminal"
+            )
+        return
+    if kind == "restore":
+        destination = _mapping(terminal, "destination")
+        if (
+            result.get("kind") != "restore"
+            or fixed_hex_value(
+                terminal.get("operation_id"), 16, "restore result.operation_id"
+            )
+            != operation_id
+            or fixed_hex_value(
+                destination.get("workspace_incarnation_id"),
+                16,
+                "restore result.destination.workspace_incarnation_id",
+            )
+            != destination_workspace_incarnation_id
+            or fixed_hex_value(
+                destination.get("commit_head"),
+                32,
+                "restore result.destination.commit_head",
+            )
+            != destination_commit_id
+        ):
+            raise WorkflowFailure("restore operation terminal receipt drifted")
+        return
+    raise WorkflowFailure(f"unsupported terminal operation kind {kind}")
+
+
+def validate_restore_inspection_binding(
+    inspection: dict[str, Any],
+    arm: dict[str, Any],
+    barrier_envelope: dict[str, Any],
+) -> None:
+    operation = _mapping(inspection, "operation")
+    preparation = _mapping(operation, "restore_preparation")
+    request = _mapping(preparation, "request")
+    binding = _mapping(preparation, "destination_binding")
+    evidence = _mapping(barrier_envelope, "evidence")
+    if (
+        request.get("operation_id") != arm.get("operation_id")
+        or request.get("destination_workspace_incarnation_id")
+        != arm.get("destination_workspace_incarnation_id")
+        or binding.get("destination_commit_id") != evidence.get("destination_commit_id")
+        or binding.get("destination_run_manifest_identity")
+        != _mapping(_mapping(evidence, "run_manifest"), "expected")
+        or binding.get("destination_restore_manifest_identity")
+        != _mapping(_mapping(evidence, "restore_manifest"), "expected")
+    ):
+        raise WorkflowFailure("restore operation durable destination binding drifted")
+    manifests = _mapping(binding, "destination_manifests")
+    for key in ("run_manifest", "restore_manifest"):
+        operation_manifest = _mapping(manifests, key)
+        actual = _mapping(_mapping(evidence, key), "actual")
+        descriptor = _mapping(operation_manifest, "descriptor")
+        if (
+            operation_manifest.get("publication_operation_id")
+            != _mapping(actual, "identity").get("publication_operation_id")
+            or operation_manifest.get("artifact_revision_id")
+            != _mapping(actual, "identity").get("artifact_revision_id")
+            or operation_manifest.get("workspace_incarnation_id")
+            != actual.get("workspace_incarnation_id")
+            or descriptor.get("body_digest") != actual.get("body_digest_uri")
+            or descriptor.get("manifest_digest") != actual.get("manifest_digest_uri")
+            or descriptor.get("logical_size") != actual.get("logical_size")
+            or descriptor.get("content_type") != actual.get("content_type")
+        ):
+            raise WorkflowFailure(f"restore operation {key} binding drifted")
+
+
+def inventory_digest(value: dict[str, dict[str, Any]]) -> str:
+    return sha256(canonical_json(value).encode())
+
+
 def validate_mutation_result(
     result: dict[str, Any], operation: str, workbench: str, request_id: str
 ) -> None:
@@ -1237,6 +1788,7 @@ def composition_evidence(
     b_frozen_payload: bytes,
     a_live_payload: bytes,
     b_live_after_nested_snapshot: bytes,
+    fault_injection: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema": SCHEMA,
@@ -1313,14 +1865,7 @@ def composition_evidence(
             == c_manifest.get("commit_identity"),
             "idempotent_replay": replay_c.get("idempotent_replay") is True,
         },
-        "fault_injection": {
-            "status": "NOT QUALIFIED",
-            "reason": (
-                "The public CLI has no deterministic object-first, dual-manifest-"
-                "published, pre-Complete crash barrier; a generic timed SIGKILL would "
-                "not prove this boundary."
-            ),
-        },
+        "fault_injection": fault_injection,
     }
 
 
@@ -1342,6 +1887,77 @@ def wait_etcd(config: Config, endpoint: str, process: subprocess.Popen[str]) -> 
             return
         time.sleep(0.1)
     raise WorkflowFailure("etcd did not become healthy")
+
+
+def owner_session_key(runtime: Runtime) -> str:
+    return f"{runtime.etcd_prefix.rstrip('/')}/sessions/{runtime.shard_id}"
+
+
+def read_owner_session(config: Config, runtime: Runtime) -> str:
+    assert config.etcdctl is not None
+    return run(
+        [
+            config.etcdctl,
+            f"--endpoints={runtime.etcd_endpoint}",
+            "get",
+            owner_session_key(runtime),
+            "--print-value-only",
+        ],
+        config=config,
+        check=True,
+        timeout=min(config.timeout, 5),
+    ).stdout.strip()
+
+
+def require_owner_session(config: Config, runtime: Runtime, label: str) -> None:
+    if not read_owner_session(config, runtime):
+        raise WorkflowFailure(f"{label} did not install its lease-attached session key")
+
+
+def wait_owner_session_absent(
+    config: Config, runtime: Runtime, label: str, deadline: float
+) -> None:
+    while time.monotonic() < deadline:
+        if not read_owner_session(config, runtime):
+            return
+        time.sleep(0.05)
+    raise WorkflowFailure(f"{label} session remained present after its lease TTL")
+
+
+def remaining(deadline: float, label: str) -> float:
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise WorkflowFailure(f"{label} exhausted the absolute fault deadline")
+    return value
+
+
+def wait_exact_exit(
+    process: subprocess.Popen[str], expected: int, timeout: float, label: str
+) -> int:
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise WorkflowFailure(
+            f"{label} did not reach its deterministic exit"
+        ) from error
+    if returncode != expected:
+        raise WorkflowFailure(f"{label} exited {returncode}, expected {expected}")
+    return returncode
+
+
+def build_timeout(runtime_timeout: float) -> float:
+    return max(runtime_timeout, BUILD_TIMEOUT_SECONDS)
+
+
+def close_mcp(mcp: Mcp | None) -> None:
+    if mcp is None:
+        return
+    if mcp.process.stdin is not None:
+        try:
+            mcp.process.stdin.close()
+        except OSError:
+            pass
+    stop_process(mcp.process)
 
 
 def wait_rustfs(
@@ -1388,7 +2004,13 @@ def workspace_path_capable(config: Config) -> bool:
         timeout=min(config.timeout, 10),
     )
     text = result.stdout + result.stderr
-    return result.returncode == 0 and "workspace-path" in text
+    return (
+        result.returncode == 0
+        and "workspace-path" in text
+        and "restore-crash" not in text
+        and "--arm-file" not in text
+        and "--evidence-file" not in text
+    )
 
 
 def start_mcp(
@@ -1397,8 +2019,10 @@ def start_mcp(
     evidence: Evidence,
     owner: subprocess.Popen[str],
     stderr: TextIO,
+    *,
+    deadline: float | None = None,
 ) -> Mcp:
-    deadline = time.monotonic() + config.timeout
+    deadline = deadline or time.monotonic() + config.timeout
     last_error = ""
     while time.monotonic() < deadline:
         if owner.poll() is not None:
@@ -1415,7 +2039,7 @@ def start_mcp(
             bufsize=1,
             start_new_session=True,
         )
-        mcp = Mcp(process, evidence, min(config.timeout, 10))
+        mcp = Mcp(process, evidence, min(remaining(deadline, "MCP startup"), 10))
         try:
             mcp.initialize()
             evidence.line(
@@ -1449,6 +2073,8 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
     ):
         if value is None or not value.is_file():
             raise NotQualified(f"{name} executable is required")
+    if config.target == config.fault_target:
+        raise NotQualified("default and fault-owner Cargo targets must be independent")
 
     if config.build:
         environment = os.environ.copy()
@@ -1459,16 +2085,41 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             evidence=evidence,
             label="build",
             env=environment,
-            timeout=max(config.timeout, 1200),
+            timeout=build_timeout(config.timeout),
+        )
+        fault_environment = os.environ.copy()
+        fault_environment["CARGO_TARGET_DIR"] = str(config.fault_target)
+        run(
+            [
+                "cargo",
+                "build",
+                "-p",
+                "nokv-bench",
+                "--bin",
+                "nokv-restore-crash-owner",
+                "--no-default-features",
+                "--features",
+                "restore-crash-test-support",
+            ],
+            config=config,
+            evidence=evidence,
+            label="build-fault-owner",
+            env=fault_environment,
+            timeout=build_timeout(config.timeout),
         )
     if not config.binary.is_file() or not os.access(config.binary, os.X_OK):
         raise NotQualified(f"nokv binary is missing or not executable: {config.binary}")
+    if not config.fault_binary.is_file() or not os.access(config.fault_binary, os.X_OK):
+        raise NotQualified(
+            f"feature-only restore crash owner is missing or not executable: {config.fault_binary}"
+        )
     if not workspace_path_capable(config):
         raise NotQualified(
             "nokv lacks the Workbench-scoped workspace-path rename/remove CLI required "
             "by the pre-#423 composition oracle"
         )
     binary_sha256 = digest_file(config.binary)
+    fault_binary_sha256 = digest_file(config.fault_binary)
 
     etcd_port, peer_port, s3_port, console_port, owner_port = (
         free_port() for _ in range(5)
@@ -1526,6 +2177,8 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             ],
             config,
             etcd_log,
+            evidence=evidence,
+            label="etcd-owner-control",
         )
         wait_etcd(config, runtime.etcd_endpoint, etcd_process)
         run(
@@ -1582,7 +2235,13 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
         provision_value = parse_json_stdout(provision, "provision")
         if provision_value.get("lifecycle") != "active":
             raise WorkflowFailure("provision did not activate root placement")
-        owner = start_process(owner_command(config, runtime), config, owner_log)
+        owner = start_process(
+            owner_command(config, runtime),
+            config,
+            owner_log,
+            evidence=evidence,
+            label="initial-owner",
+        )
         wait_tcp(owner, runtime.owner_port, config.timeout)
         mcp = start_mcp(config, runtime, evidence, owner, mcp_log)
 
@@ -1618,24 +2277,247 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
         mutate_a = plan["mutate-a-after-snapshot"]
         mcp.call(mutate_a.label, mutate_a.operation, mutate_a.arguments)
 
+        snapshot_a_id = snapshot_a.get("snapshot_id")
+        if (
+            not isinstance(snapshot_a_id, int)
+            or isinstance(snapshot_a_id, bool)
+            or snapshot_a_id <= 0
+        ):
+            raise WorkflowFailure("snapshot A lacks a positive snapshot identity")
+        arm_file = evidence.root / "restore-b-crash-arm.json"
+        barrier_file = evidence.root / "restore-b-crash-evidence.json"
+        arm_result = run(
+            fault_arm_command(
+                config,
+                runtime,
+                snapshot_id=snapshot_a_id,
+                arm_file=arm_file,
+            ),
+            config=config,
+            evidence=evidence,
+            label="arm-restore-b-crash",
+        )
+        arm = parse_json_stdout(arm_result, "arm-restore-b-crash")
+        if load_json_object(arm_file, "restore crash arm file") != arm:
+            raise WorkflowFailure("restore crash arm stdout/file identities differ")
+        run_id = fixed_id(config.seed, "fault-run")
+        restore_b_operation_id = validate_fault_arm(
+            arm,
+            runtime=runtime,
+            snapshot_id=snapshot_a_id,
+            run_id=run_id,
+        )
+
         before_b = inventory(
             config, runtime, evidence, "inventory-before-b", environment
         )
+        fault_deadline = time.monotonic() + config.timeout
+        require_owner_session(config, runtime, "initial owner")
+        close_mcp(mcp)
+        mcp = None
+        if stop_process(owner, signal.SIGTERM) is None:
+            raise WorkflowFailure("initial owner was absent before fault-owner handoff")
+        wait_owner_session_absent(config, runtime, "initial owner", fault_deadline)
+
+        owner = start_process(
+            fault_owner_command(
+                config,
+                runtime,
+                arm_file=arm_file,
+                evidence_file=barrier_file,
+            ),
+            config,
+            owner_log,
+            evidence=evidence,
+            label="fault-owner",
+        )
+        wait_tcp(
+            owner,
+            runtime.owner_port,
+            remaining(fault_deadline, "fault owner startup"),
+        )
+        fault_owner_socket_ready = True
+        evidence.line(
+            "processes.jsonl",
+            {
+                "schema": SCHEMA,
+                "label": "fault-owner-socket-ready",
+                "pid": owner.pid,
+                "address": f"127.0.0.1:{runtime.owner_port}",
+                "recorded_at": now(),
+            },
+        )
+        require_owner_session(config, runtime, "fault owner")
+        mcp = start_mcp(
+            config,
+            runtime,
+            evidence,
+            owner,
+            mcp_log,
+            deadline=fault_deadline,
+        )
         restore_b_step = plan["restore-b"]
+        fault_client_error = mcp.call_until_owner_loss(
+            "restore-b-pre-complete-crash",
+            restore_b_step.operation,
+            restore_b_step.arguments,
+        )
+        if mcp.process.poll() is not None:
+            raise WorkflowFailure("MCP exited with the restore crash owner")
+        mcp_survived_fault_owner_exit = True
+        fault_owner_exit_code = wait_exact_exit(
+            owner,
+            86,
+            remaining(fault_deadline, "restore crash owner exit"),
+            "restore crash owner",
+        )
+        evidence.line(
+            "processes.jsonl",
+            {
+                "schema": SCHEMA,
+                "label": "fault-owner-controlled-exit",
+                "pid": owner.pid,
+                "returncode": fault_owner_exit_code,
+                "recorded_at": now(),
+            },
+        )
+        close_mcp(mcp)
+        mcp = None
+
+        barrier_envelope = load_json_object(
+            barrier_file, "restore crash barrier evidence"
+        )
+        barrier_summary = validate_fault_barrier_evidence(barrier_envelope, arm)
+        after_crash_b = inventory(
+            config, runtime, evidence, "inventory-after-restore-b-crash", environment
+        )
+        b_changed = changed_objects(before_b, after_crash_b)
+        if len(b_changed) != 2:
+            raise WorkflowFailure(
+                "restore B crash boundary did not publish exactly two manifest objects"
+            )
+
+        wait_owner_session_absent(config, runtime, "fault owner", fault_deadline)
+        owner = start_process(
+            successor_owner_command(config, runtime),
+            config,
+            owner_log,
+            evidence=evidence,
+            label="successor-owner",
+        )
+        wait_tcp(
+            owner,
+            runtime.owner_port,
+            remaining(fault_deadline, "successor owner startup"),
+        )
+        successor_owner_socket_ready = True
+        evidence.line(
+            "processes.jsonl",
+            {
+                "schema": SCHEMA,
+                "label": "successor-owner-socket-ready",
+                "pid": owner.pid,
+                "address": f"127.0.0.1:{runtime.owner_port}",
+                "recorded_at": now(),
+            },
+        )
+        require_owner_session(config, runtime, "successor owner")
+        mcp = start_mcp(
+            config,
+            runtime,
+            evidence,
+            owner,
+            mcp_log,
+            deadline=fault_deadline,
+        )
+
+        hidden = mcp.call(
+            "find-b-hidden-before-replay",
+            "workbench_find",
+            {"include_manifest": False, "limit": 100},
+        )
+        hidden_matches = hidden.get("matches")
+        if (
+            not isinstance(hidden_matches, list)
+            or hidden.get("truncated") is not False
+            or hidden.get("next_cursor") is not None
+            or any(
+                isinstance(value, dict) and value.get("workbench_id") == "composition-b"
+                for value in hidden_matches
+            )
+        ):
+            raise WorkflowFailure("restore destination B became visible before replay")
+
+        restore_inspection = parse_json_stdout(
+            run(
+                fault_inspect_command(config, runtime, restore_b_operation_id),
+                config=config,
+                evidence=evidence,
+                label="inspect-running-restore-b",
+            ),
+            "inspect-running-restore-b",
+        )
+        validate_operation_inspection(
+            restore_inspection,
+            root_id=runtime.root_id,
+            operation_id=restore_b_operation_id,
+            kind="restore",
+            state="running",
+        )
+        validate_restore_inspection_binding(restore_inspection, arm, barrier_envelope)
+        publication_states: list[str] = []
+        barrier_value = _mapping(barrier_envelope, "evidence")
+        for key, operation_id in zip(
+            ("run_manifest", "restore_manifest"),
+            barrier_summary["manifest_publication_operation_ids"],
+            strict=True,
+        ):
+            binding = _mapping(barrier_value, key)
+            actual_identity = _mapping(_mapping(binding, "actual"), "identity")
+            inspection = parse_json_stdout(
+                run(
+                    fault_inspect_command(config, runtime, operation_id),
+                    config=config,
+                    evidence=evidence,
+                    label=f"inspect-{key}-publication",
+                ),
+                f"inspect-{key}-publication",
+            )
+            validate_operation_inspection(
+                inspection,
+                root_id=runtime.root_id,
+                operation_id=operation_id,
+                kind="artifact_publish",
+                state="succeeded",
+                artifact_revision_id=fixed_hex_value(
+                    actual_identity.get("artifact_revision_id"),
+                    16,
+                    f"restore crash {key}.artifact_revision_id",
+                ),
+            )
+            publication_states.append("succeeded")
+
+        pre_replay_inventory = inventory(
+            config, runtime, evidence, "inventory-before-restore-b-replay", environment
+        )
+        if pre_replay_inventory != after_crash_b:
+            raise WorkflowFailure(
+                "object inventory changed while waiting for successor reopen"
+            )
         restore_b = mcp.call(
-            restore_b_step.label, restore_b_step.operation, restore_b_step.arguments
+            restore_b_step.label,
+            restore_b_step.operation,
+            restore_b_step.arguments,
         )
         if (
             restore_b.get("state") != "complete"
-            or restore_b.get("idempotent_replay") is not False
+            or restore_b.get("idempotent_replay") is not True
+            or restore_b.get("operation_id") != restore_b_operation_id
         ):
-            raise WorkflowFailure("restore B did not return one fresh terminal receipt")
+            raise WorkflowFailure("restore B exact replay did not converge terminally")
         after_b = inventory(config, runtime, evidence, "inventory-after-b", environment)
-        b_changed = changed_objects(before_b, after_b)
-        if len(b_changed) != 2:
-            raise WorkflowFailure(
-                f"restore B must publish exactly two destination manifests, observed {len(b_changed)}"
-            )
+        if after_b != pre_replay_inventory:
+            raise WorkflowFailure("restore B exact replay changed object inventory")
         b_manifest = read_manifest(
             mcp, "read-b-run-manifest", "composition-b", "run_manifest.json"
         )
@@ -1657,6 +2539,77 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
         b_find = find_committed(
             b_find_result, "composition-b", b_manifest.get("commit_identity")
         )
+        if (
+            b_manifest.get("commit_identity")
+            != barrier_summary["destination_commit_id"]
+        ):
+            raise WorkflowFailure(
+                "restore B replay destination commit differs from crash evidence"
+            )
+        terminal_restore_inspection = parse_json_stdout(
+            run(
+                fault_inspect_command(config, runtime, restore_b_operation_id),
+                config=config,
+                evidence=evidence,
+                label="inspect-terminal-restore-b",
+            ),
+            "inspect-terminal-restore-b",
+        )
+        validate_operation_inspection(
+            terminal_restore_inspection,
+            root_id=runtime.root_id,
+            operation_id=restore_b_operation_id,
+            kind="restore",
+            state="succeeded",
+            destination_workspace_incarnation_id=fixed_hex_value(
+                arm.get("destination_workspace_incarnation_id"),
+                16,
+                "restore crash arm.destination_workspace_incarnation_id",
+            ),
+            destination_commit_id=barrier_summary["destination_commit_id"],
+        )
+        validate_restore_inspection_binding(
+            terminal_restore_inspection, arm, barrier_envelope
+        )
+        fault_injection = {
+            "status": "PASS",
+            "reason": "Qualified exact pre-Complete owner-loss recovery.",
+            "arm_schema": arm.get("schema"),
+            "evidence_schema": barrier_envelope.get("schema"),
+            "run_id": arm.get("run_id"),
+            "root_id": fixed_hex_value(
+                arm.get("root_id"), 16, "restore crash arm.root_id"
+            ),
+            "destination_workspace_incarnation_id": fixed_hex_value(
+                arm.get("destination_workspace_incarnation_id"),
+                16,
+                "restore crash arm.destination_workspace_incarnation_id",
+            ),
+            **barrier_summary,
+            "replay_operation_id": restore_b.get("operation_id"),
+            "replay_destination_commit_id": b_manifest.get("commit_identity"),
+            "destination_generation": restore_b.get("destination_generation"),
+            "interruption_label": "restore-b-pre-complete-crash",
+            "interrupted_oracle_label": restore_b_step.label,
+            "replay_label": restore_b_step.label,
+            "owner_exit_code": fault_owner_exit_code,
+            "fault_owner_socket_ready": fault_owner_socket_ready,
+            "successor_owner_socket_ready": successor_owner_socket_ready,
+            "mcp_survived_fault_owner_exit": mcp_survived_fault_owner_exit,
+            "initial_owner_session_absent_before_fault": True,
+            "fault_owner_session_absent_before_reopen": True,
+            "destination_hidden_before_replay": True,
+            "operation_state_before_replay": "running",
+            "publication_states_before_replay": publication_states,
+            "manifest_objects_published_before_crash": len(b_changed),
+            "pre_replay_object_inventory_sha256": inventory_digest(
+                pre_replay_inventory
+            ),
+            "post_replay_object_inventory_sha256": inventory_digest(after_b),
+            "object_inventory_stable_across_replay": after_b == pre_replay_inventory,
+            "idempotent_replay": restore_b.get("idempotent_replay") is True,
+            "client_failure": fault_client_error,
+        }
 
         prefix = client_args(config, runtime)
         rename_arguments = plan["rename-b"].arguments
@@ -1844,6 +2797,8 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             raise WorkflowFailure("RustFS was not running at terminal qualification")
         if digest_file(config.binary) != binary_sha256:
             raise WorkflowFailure("nokv binary changed during live qualification")
+        if digest_file(config.fault_binary) != fault_binary_sha256:
+            raise WorkflowFailure("restore crash owner changed during qualification")
 
         record = composition_evidence(
             a_commit=a_commit,
@@ -1870,6 +2825,7 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
             b_frozen_payload=b_frozen_payload,
             a_live_payload=a_live_payload,
             b_live_after_nested_snapshot=b_live_after_nested,
+            fault_injection=fault_injection,
         )
         validate_composition_evidence(record)
 
@@ -1893,19 +2849,16 @@ def execute(config: Config, evidence: Evidence) -> dict[str, Any]:
         if not isinstance(owner_record.get("owner_epoch"), int):
             raise WorkflowFailure("owner control record lacks owner_epoch")
         evidence.json("composition.json", record)
-        evidence.json(
-            "environment.json",
-            environment_evidence(config, runtime, owner_record, container),
+        environment = environment_evidence(config, runtime, owner_record, container)
+        validate_environment_evidence(
+            environment,
+            expected_binary_sha256=binary_sha256,
+            expected_fault_binary_sha256=fault_binary_sha256,
         )
+        evidence.json("environment.json", environment)
         return record
     finally:
-        if mcp is not None:
-            if mcp.process.stdin is not None:
-                try:
-                    mcp.process.stdin.close()
-                except OSError:
-                    pass
-            stop_process(mcp.process)
+        close_mcp(mcp)
         stop_process(owner)
         stop_process(etcd_process)
         mcp_log.close()
@@ -1958,6 +2911,10 @@ def environment_evidence(
             "sha256": digest_file(config.binary),
             "version": shell_fact(config, [config.binary, "version", "--json"]),
         },
+        "fault_binary": {
+            "path": str(config.fault_binary),
+            "sha256": digest_file(config.fault_binary),
+        },
         "provider": {
             "rustfs_image": config.rustfs_image,
             "container_image_id": shell_fact(
@@ -1978,6 +2935,43 @@ def environment_evidence(
         "python": sys.version,
         "platform": platform.platform(),
     }
+
+
+def validate_environment_evidence(
+    value: dict[str, Any],
+    *,
+    expected_binary_sha256: str,
+    expected_fault_binary_sha256: str,
+) -> None:
+    if value.get("schema") != SCHEMA:
+        raise WorkflowFailure("environment evidence uses an unexpected schema")
+    binary = value.get("binary")
+    fault_binary = value.get("fault_binary")
+    if not isinstance(binary, dict) or not isinstance(fault_binary, dict):
+        raise WorkflowFailure(
+            "environment evidence must bind both executable identities"
+        )
+    binary_sha256 = binary.get("sha256")
+    fault_binary_sha256 = fault_binary.get("sha256")
+    if (
+        not isinstance(binary.get("path"), str)
+        or not binary["path"]
+        or not isinstance(fault_binary.get("path"), str)
+        or not fault_binary["path"]
+        or not isinstance(binary_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", binary_sha256) is None
+        or not isinstance(fault_binary_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", fault_binary_sha256) is None
+    ):
+        raise WorkflowFailure("environment executable identities are malformed")
+    if binary_sha256 != expected_binary_sha256:
+        raise WorkflowFailure("environment default binary digest drifted")
+    if fault_binary_sha256 != expected_fault_binary_sha256:
+        raise WorkflowFailure("environment fault owner digest drifted")
+    if binary_sha256 == fault_binary_sha256:
+        raise WorkflowFailure(
+            "default and fault executables must be independently built"
+        )
 
 
 def plan_evidence(config: Config) -> dict[str, Any]:
@@ -2018,11 +3012,14 @@ def plan_evidence(config: Config) -> dict[str, Any]:
         "steps": [dataclasses.asdict(step) for step in steps],
         "workspace_path_mutations": mutations,
         "fault_injection": {
-            "status": "NOT QUALIFIED",
+            "status": "PLANNED",
             "reason": (
-                "No public deterministic object-first/pre-Complete barrier is available; "
-                "timed sleeps and generic SIGKILL are not evidence."
+                "Live mode uses the publish=false feature-only owner to exit at the "
+                "exact dual-manifest-published pre-Complete boundary; dry-run does not "
+                "execute it."
             ),
+            "fault_owner": str(config.fault_binary),
+            "default_successor": str(config.binary),
         },
         "future_phases": {
             "concurrent_exact_restore": [8, 16],
@@ -2036,7 +3033,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=repo)
     parser.add_argument("--nokv-bin", type=Path)
+    parser.add_argument("--qualification-result", type=Path)
     parser.add_argument("--target-dir", type=Path)
+    parser.add_argument("--fault-owner-bin", type=Path)
+    parser.add_argument("--fault-target-dir", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--etcd-bin", type=Path, default=shutil.which("etcd"))
     parser.add_argument("--etcdctl-bin", type=Path, default=shutil.which("etcdctl"))
@@ -2049,9 +3049,17 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--keep-resources", action="store_true")
     args = parser.parse_args(argv)
+    if args.qualification_result is not None and args.dry_run:
+        parser.error("--qualification-result cannot be combined with --dry-run")
     resolved_repo = args.repo.resolve()
     target = (args.target_dir or resolved_repo / "target").resolve()
     binary = (args.nokv_bin or target / "debug" / "nokv").resolve()
+    fault_target = (
+        args.fault_target_dir or target.parent / f"{target.name}-restore-crash"
+    ).resolve()
+    fault_binary = (
+        args.fault_owner_bin or fault_target / "debug" / "nokv-restore-crash-owner"
+    ).resolve()
     evidence = (
         args.evidence_dir
         or target
@@ -2064,6 +3072,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         binary=binary,
         evidence=evidence,
         target=target,
+        fault_binary=fault_binary,
+        fault_target=fault_target,
         etcd=args.etcd_bin.resolve() if args.etcd_bin else None,
         etcdctl=args.etcdctl_bin.resolve() if args.etcdctl_bin else None,
         docker=args.docker_bin.resolve() if args.docker_bin else None,
@@ -2074,6 +3084,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         dry_run=args.dry_run,
         timeout=args.timeout,
         keep_resources=args.keep_resources,
+        qualification_result=(
+            args.qualification_result.resolve() if args.qualification_result else None
+        ),
     )
 
 
@@ -2081,7 +3094,38 @@ def main(argv: list[str] | None = None) -> int:
     config = parse_args(argv)
     evidence = Evidence(config.evidence)
     prepared = False
+    typed_context = None
+
+    def finish(code: int, record: dict[str, Any]) -> int:
+        if typed_context is None or config.qualification_result is None:
+            return code
+        outcome = "PASS" if code == 0 else "NQ" if code == 3 else "FAIL"
+        try:
+            publish_live_result(
+                result_path=config.qualification_result,
+                context=typed_context,
+                outcome=outcome,
+                qualification=record,
+                evidence_roles=TYPED_EVIDENCE_ROLES,
+            )
+        except (OSError, ProducerError) as error:
+            print(f"FAIL: {error}", file=sys.stderr)
+            return 2
+        return code
+
     try:
+        if config.qualification_result is not None:
+            if config.evidence == config.qualification_result.parent:
+                raise ProducerError(
+                    "gate evidence must not overlap typed direct-child evidence"
+                )
+            typed_context = load_live_context(
+                producer_id="restore-composition",
+                scenarios=TYPED_SCENARIOS,
+                dependency_names=("etcd", "rustfs"),
+                product_binary=config.binary,
+                evidence_roles=TYPED_EVIDENCE_ROLES,
+            )
         evidence.prepare()
         prepared = True
         evidence.json("plan.json", plan_evidence(config))
@@ -2096,7 +3140,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             evidence.json("qualification.json", record)
             print(json.dumps(record, indent=2, sort_keys=True))
-            return 0
+            return finish(0, record)
         result = execute(config, evidence)
         transcript = digest_file(evidence.root / "mcp-transcript.jsonl")
         reason = str(_mapping(result, "fault_injection")["reason"])
@@ -2108,7 +3152,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         evidence.json("qualification.json", record)
         print(json.dumps(record, indent=2, sort_keys=True))
-        return 0
+        return finish(0, record)
     except NotQualified as error:
         record = qualification(
             composition="NOT QUALIFIED", fault="NOT QUALIFIED", reason=str(error)
@@ -2116,15 +3160,21 @@ def main(argv: list[str] | None = None) -> int:
         if prepared:
             evidence.json("qualification.json", record)
         print(json.dumps(record, indent=2, sort_keys=True))
-        return 3
-    except (WorkflowFailure, OSError, ValueError, json.JSONDecodeError) as error:
+        return finish(3, record)
+    except (
+        WorkflowFailure,
+        OSError,
+        ProducerError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         record = qualification(
             composition="FAIL", fault="NOT QUALIFIED", reason=str(error)
         )
         if prepared:
             evidence.json("qualification.json", record)
         print(json.dumps(record, indent=2, sort_keys=True))
-        return 2
+        return finish(2, record)
 
 
 if __name__ == "__main__":
