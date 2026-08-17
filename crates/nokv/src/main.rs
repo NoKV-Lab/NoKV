@@ -23,18 +23,20 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use nokv_agent::{
-    execute_tool, tool_definitions, ReadRequest, ReadView, ScopedPath, SdkWorkbenchToolHandler,
-    Section, WorkbenchBackend, WorkbenchToolHandler, WORKBENCH_CONTRACT_SCHEMA,
+    execute_tool, tool_definitions, ReadRequest, ReadView, ScopedPath, SdkGenericAgentToolHandler,
+    SdkWorkbenchToolHandler, Section, WorkbenchBackend, WorkbenchToolHandler,
+    WORKBENCH_CONTRACT_SCHEMA,
 };
 use nokv_types::{NormalizedRelativePath, WorkbenchId};
 use serde_json::{json, Value};
 
 use backend::CliWorkbenchBackend;
-use cli::{Command, Invocation, WorkspacePathCommand};
+use cli::{Command, Invocation, McpProfile, WorkspacePathCommand};
 #[cfg(feature = "etcd")]
 use object_store::CliObjectStore;
 
 type CliHandler = SdkWorkbenchToolHandler<CliWorkbenchBackend>;
+type CliGenericAgentHandler = SdkGenericAgentToolHandler<CliWorkbenchBackend>;
 
 #[cfg(feature = "etcd")]
 const WORKBENCH_REQUIRED_RPC_CAPABILITIES: [nokv_protocol::WorkspaceCapability; 8] = [
@@ -85,12 +87,24 @@ fn run() -> Result<(), String> {
             let result = execute_tool(&handler, tool, &arguments).map_err(agent_error)?;
             print_json(&result)
         }
-        Command::Mcp => {
-            let handler = build_handler(&invocation)?;
+        Command::Mcp { profile } => {
             let input = io::stdin();
             let output = io::stdout();
-            workbench_mcp::serve(&handler, BufReader::new(input.lock()), output.lock())
-                .map_err(|error| format!("MCP transport failed: {error}"))
+            match profile {
+                McpProfile::Workbench => {
+                    let handler = build_handler(&invocation)?;
+                    workbench_mcp::serve(&handler, BufReader::new(input.lock()), output.lock())
+                }
+                McpProfile::Agent => {
+                    let handler = build_generic_agent_handler(&invocation)?;
+                    workbench_mcp::serve_agent(
+                        &handler,
+                        BufReader::new(input.lock()),
+                        output.lock(),
+                    )
+                }
+            }
+            .map_err(|error| format!("MCP transport failed: {error}"))
         }
         Command::Materialize {
             workbench,
@@ -244,6 +258,19 @@ fn build_handler(invocation: &Invocation) -> Result<CliHandler, String> {
         invocation.client.max_artifact_bytes,
         usize::try_from(invocation.client.max_attempts)
             .map_err(|_| "--max-attempts does not fit this platform".to_owned())?,
+        workbench_root,
+    )
+    .map_err(agent_error)
+}
+
+fn build_generic_agent_handler(invocation: &Invocation) -> Result<CliGenericAgentHandler, String> {
+    let workbench_root = invocation
+        .workbench_root
+        .as_deref()
+        .ok_or_else(|| "--workbench-root is required for Agent-facing commands".to_owned())?;
+    SdkGenericAgentToolHandler::with_max_bytes(
+        build_backend(invocation)?,
+        invocation.client.max_artifact_bytes,
         workbench_root,
     )
     .map_err(agent_error)
@@ -545,7 +572,7 @@ NoKV Agent-workspace CLI
 
 USAGE:
   nokv [connection/object options] workbench <tool> '<json arguments>'
-  nokv [connection/object options] mcp
+  nokv [connection/object options] mcp [--profile workbench|agent]
   nokv [connection/object options] materialize <workbench> <section> <path> <destination>
   nokv [connection/object options] collect <workbench> <section> <source> <path> [--replace] [--content-type TYPE]
   nokv [route/agent options] workspace-path rename <workbench> <section> <source> <destination> --expected-generation N --request-id HEX32
@@ -566,6 +593,7 @@ AGENT PRESENTATION:
   --workbench-root /agents/AGENT_NAME/wb is required by workbench, collect, and mcp
   keep this presentation root stable: it shapes responses and canonical v1 manifest paths
   RootId remains the only storage/routing identity; the presentation root never enters Holt keys
+  mcp defaults to the 18-tool Workbench profile; --profile agent selects the seven path tools
   workspace-path is a custom CLI surface; it does not add to the fixed 18 Workbench tools
   workspace-path requires an explicit lowercase HEX32 request id for exact cross-process replay
 
@@ -579,6 +607,7 @@ OWNER:
   --handshake-timeout-millis N --max-inflight-connections N
   --metadata-create PATH starts the first standalone local-WAL owner
   --metadata-reopen PATH restarts the same exclusive local-WAL authority after lease loss
+  --metadata-recover-log PATH installs or resumes one exact receipt-directed shared-log frontier
 
 OBJECT DATA:
   --object-bucket NAME [--object-endpoint URL] [--object-root PREFIX]
@@ -746,10 +775,8 @@ fn join_lifecycle_workers(
 ) {
     for worker in workers {
         match worker.join() {
-            Ok(Err(error)) if !matches!(error, nokv_server::LifecycleError::OwnerLost(_)) => {
-                failures.push(format!("lifecycle worker failed: {error}"));
-            }
-            Ok(_) => {}
+            Ok(Err(error)) => failures.push(format!("lifecycle worker failed: {error}")),
+            Ok(Ok(())) => {}
             Err(_) => failures.push("lifecycle worker panicked".to_owned()),
         }
     }
@@ -757,7 +784,7 @@ fn join_lifecycle_workers(
 
 #[cfg(feature = "etcd")]
 fn run_server(invocation: &Invocation) -> Result<(), String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use nokv_control::{NodeId, RecoveryPublication, RootId};
@@ -770,6 +797,18 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     use sha2::{Digest, Sha256};
 
     static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    fn install_shutdown_signal() -> Result<Arc<AtomicBool>, String> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        for (name, signal) in [
+            ("SIGINT", signal_hook::consts::SIGINT),
+            ("SIGTERM", signal_hook::consts::SIGTERM),
+        ] {
+            signal_hook::flag::register(signal, Arc::clone(&shutdown))
+                .map_err(|error| format!("cannot install {name} shutdown handler: {error}"))?;
+        }
+        Ok(shutdown)
+    }
 
     fn request_id(domain: &[u8], root: RootId) -> RequestId {
         let mut hasher = Sha256::new();
@@ -795,17 +834,16 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         RequestId::from_bytes(id)
     }
 
+    let shutdown = install_shutdown_signal()?;
     let cli::RoutingConfig::Etcd(route) = &invocation.client.routing else {
         return Err("serve requires control-backed etcd routing".to_owned());
     };
-    let metadata = match invocation
-        .server
-        .metadata_store
-        .clone()
-        .ok_or_else(|| "serve requires --metadata-create or --metadata-reopen".to_owned())?
-    {
+    let metadata = match invocation.server.metadata_store.clone().ok_or_else(|| {
+        "serve requires --metadata-create, --metadata-reopen, or --metadata-recover-log".to_owned()
+    })? {
         cli::MetadataStoreConfig::Create(path) => OpenMode::New(path),
         cli::MetadataStoreConfig::Reopen(path) => OpenMode::Existing(path),
+        cli::MetadataStoreConfig::RecoverLog(path) => OpenMode::RecoverLog(path),
     };
     let node_id = NodeId::new(
         invocation
@@ -888,6 +926,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let owner = bootstrap_shard(
         Arc::clone(&control),
         Arc::clone(&registry),
+        objects.clone(),
         ShardBoot {
             shard_id: placement.logical_shard_id,
             open: metadata,
@@ -919,6 +958,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         .saturating_div(3)
         .max(1);
     let meta = Arc::clone(owner.meta());
+    let recovery = Arc::clone(owner.recovery_publisher());
     let owner_routes = owner.routes().to_vec();
     let server = WorkspaceServer::new(
         ServerOptions {
@@ -944,6 +984,7 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
             route,
             owner_loss.clone(),
             Arc::clone(&lifecycle_objects),
+            recovery.clone(),
             LifecycleRunnerOptions {
                 poll_interval: Duration::from_millis(invocation.server.lifecycle_interval_millis),
                 ..LifecycleRunnerOptions::default()
@@ -963,10 +1004,11 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
     let mut lifecycle_workers = Vec::with_capacity(lifecycles.len());
     for (index, lifecycle) in lifecycles.into_iter().enumerate() {
         let worker_owner_loss = owner_loss.clone();
+        let worker_shutdown = Arc::clone(&shutdown);
         let worker = std::thread::Builder::new()
             .name(format!("nokv-workspace-lifecycle-{index}"))
             .spawn(move || {
-                let result = lifecycle.run_until_owner_loss();
+                let result = lifecycle.run_until_owner_loss_or_shutdown(worker_shutdown.as_ref());
                 if result.is_err() {
                     worker_owner_loss.fail_closed();
                 }
@@ -986,8 +1028,10 @@ fn run_server(invocation: &Invocation) -> Result<(), String> {
         }
     }
 
-    let server_result = server.run();
-    owner_loss.fail_closed();
+    let server_result = server.run_until_shutdown(shutdown.as_ref());
+    if server_result.is_err() {
+        owner_loss.fail_closed();
+    }
 
     let mut failures = Vec::new();
     join_lifecycle_workers(lifecycle_workers, &mut failures);
@@ -1186,11 +1230,20 @@ mod tests {
                 "--logical-shard-id",
                 "not-a-valid-shard-id",
                 "mcp",
+                "--profile",
+                "agent",
             ]
             .into_iter()
             .map(str::to_owned),
         )
         .unwrap();
+
+        assert_eq!(
+            invocation.command,
+            Command::Mcp {
+                profile: McpProfile::Agent
+            }
+        );
 
         let error = configured_agent_admission(&invocation).unwrap_err();
         assert!(error.contains("durable etcd control"));

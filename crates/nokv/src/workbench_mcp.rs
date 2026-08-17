@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Line-delimited JSON-RPC transport for the exact Workbench tool contract.
+//! Line-delimited JSON-RPC transport for the explicit MCP tool profiles.
 //!
 //! This module deliberately knows nothing about metadata layout or object
 //! providers. Both the custom CLI and MCP dispatch through the same validated
@@ -11,7 +11,10 @@
 
 use std::io::{self, BufRead, Write};
 
-use nokv_agent::{execute_tool, tool_definitions, WorkbenchToolHandler};
+use nokv_agent::{
+    execute_generic_agent_tool, execute_tool, generic_agent_tool_definitions, tool_definitions,
+    AgentError, AgentToolDefinition, GenericAgentToolHandler, WorkbenchToolHandler,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -43,6 +46,59 @@ where
 
 pub fn serve(
     handler: &impl WorkbenchToolHandler,
+    reader: impl BufRead,
+    writer: impl Write,
+) -> io::Result<()> {
+    serve_workbench(handler, reader, writer)
+}
+
+pub fn serve_workbench(
+    handler: &impl WorkbenchToolHandler,
+    reader: impl BufRead,
+    writer: impl Write,
+) -> io::Result<()> {
+    serve_profile(&WorkbenchProfile(handler), reader, writer)
+}
+
+pub fn serve_agent(
+    handler: &impl GenericAgentToolHandler,
+    reader: impl BufRead,
+    writer: impl Write,
+) -> io::Result<()> {
+    serve_profile(&GenericAgentProfile(handler), reader, writer)
+}
+
+trait McpToolProfile {
+    fn definitions(&self) -> Vec<AgentToolDefinition>;
+    fn execute(&self, name: &str, arguments: &Value) -> Result<Value, AgentError>;
+}
+
+struct WorkbenchProfile<'a, H>(&'a H);
+
+impl<H: WorkbenchToolHandler> McpToolProfile for WorkbenchProfile<'_, H> {
+    fn definitions(&self) -> Vec<AgentToolDefinition> {
+        tool_definitions()
+    }
+
+    fn execute(&self, name: &str, arguments: &Value) -> Result<Value, AgentError> {
+        execute_tool(self.0, name, arguments)
+    }
+}
+
+struct GenericAgentProfile<'a, H>(&'a H);
+
+impl<H: GenericAgentToolHandler> McpToolProfile for GenericAgentProfile<'_, H> {
+    fn definitions(&self) -> Vec<AgentToolDefinition> {
+        generic_agent_tool_definitions()
+    }
+
+    fn execute(&self, name: &str, arguments: &Value) -> Result<Value, AgentError> {
+        execute_generic_agent_tool(self.0, name, arguments)
+    }
+}
+
+fn serve_profile(
+    profile: &impl McpToolProfile,
     mut reader: impl BufRead,
     mut writer: impl Write,
 ) -> io::Result<()> {
@@ -50,7 +106,7 @@ pub fn serve(
     while reader.read_line(&mut line)? != 0 {
         let request = line.trim();
         if !request.is_empty() {
-            if let Some(response) = handle_line(handler, request) {
+            if let Some(response) = handle_line(profile, request) {
                 serde_json::to_writer(&mut writer, &response)?;
                 writer.write_all(b"\n")?;
                 writer.flush()?;
@@ -61,7 +117,7 @@ pub fn serve(
     Ok(())
 }
 
-fn handle_line(handler: &impl WorkbenchToolHandler, encoded: &str) -> Option<Value> {
+fn handle_line(profile: &impl McpToolProfile, encoded: &str) -> Option<Value> {
     let raw = match serde_json::from_str::<Value>(encoded) {
         Ok(raw) => raw,
         Err(_) => return Some(error_response(None, -32700, "Parse error")),
@@ -96,7 +152,7 @@ fn handle_line(handler: &impl WorkbenchToolHandler, encoded: &str) -> Option<Val
         );
     };
 
-    let result = dispatch(handler, method, request.params);
+    let result = dispatch(profile, method, request.params);
     if notification {
         return None;
     }
@@ -111,7 +167,7 @@ fn response_unless_notification(notification: bool, response: Value) -> Option<V
 }
 
 fn dispatch(
-    handler: &impl WorkbenchToolHandler,
+    profile: &impl McpToolProfile,
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, (i64, String)> {
@@ -120,7 +176,8 @@ fn dispatch(
         "notifications/initialized" => Ok(json!({})),
         "ping" => Ok(json!({})),
         "tools/list" => {
-            let tools = tool_definitions()
+            let tools = profile
+                .definitions()
                 .into_iter()
                 .map(|tool| {
                     json!({
@@ -137,7 +194,7 @@ fn dispatch(
                 serde_json::from_value::<CallToolParams>(params.unwrap_or_else(|| json!({})))
                     .map_err(|error| (-32602, format!("Invalid params: {error}")))?;
             let arguments = params.arguments.unwrap_or_else(|| json!({}));
-            match execute_tool(handler, &params.name, &arguments) {
+            match profile.execute(&params.name, &arguments) {
                 Ok(value) => Ok(tool_result(value, false)),
                 Err(error) => Ok(tool_result(error.as_value(), true)),
             }
@@ -216,6 +273,22 @@ mod tests {
             .collect()
     }
 
+    fn exchange_agent(lines: &[&str]) -> Vec<Value> {
+        let input = format!("{}\n", lines.join("\n"));
+        let mut output = Vec::new();
+        serve_agent(
+            &handler,
+            BufReader::new(Cursor::new(input.into_bytes())),
+            &mut output,
+        )
+        .unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     #[test]
     fn initialize_negotiates_and_lists_exact_contract() {
         let responses = exchange(&[
@@ -233,6 +306,45 @@ mod tests {
             responses[1]["result"]["tools"][0]["name"],
             "workbench_create"
         );
+    }
+
+    #[test]
+    fn generic_agent_profile_lists_and_dispatches_exactly_seven_path_tools() {
+        let responses = exchange_agent(&[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ls","arguments":{"path":"/"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stat","arguments":{"path":"/"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"catalog","arguments":{"path":"/"}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"read","arguments":{"path":"/artifact"}}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"aggregate","arguments":{"path":"/","measures":[]}}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"find","arguments":{"path":"/"}}}"#,
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"grep","arguments":{"path":"/","pattern":"needle","recursive":true}}}"#,
+        ]);
+        assert_eq!(
+            responses[0]["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ls", "stat", "catalog", "read", "aggregate", "find", "grep"]
+        );
+        assert_eq!(
+            responses[0]["result"]["tools"][0]["inputSchema"],
+            generic_agent_tool_definitions()[0].parameters
+        );
+        for (response, name) in responses[1..].iter().zip([
+            "ls",
+            "stat",
+            "catalog",
+            "read",
+            "aggregate",
+            "find",
+            "grep",
+        ]) {
+            assert_eq!(response["result"]["structuredContent"]["tool"], name);
+            assert!(response["result"].get("isError").is_none());
+        }
     }
 
     #[test]

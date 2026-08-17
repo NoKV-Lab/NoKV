@@ -4,7 +4,7 @@
  */
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nokv_control::{
@@ -14,19 +14,30 @@ use nokv_control::{
 use nokv_meta::workspace as meta;
 use nokv_meta_holt::{HoltOptions, HoltStore, TreeBinding};
 use nokv_meta_store::TxnStore;
+use nokv_object::ArtifactObjectStore;
 use nokv_protocol::{LogicalShardIdentity, ObjectNamespaceIdentity, RootIdentity, RootRoute};
 use nokv_types::{CommandDigest, ObjectNamespaceId, RequestId, RootActivationState, SHA256_BYTES};
 
+use crate::recovery_installer::{
+    cleanup_pending_recovery_upload, install_durable_recovery_log, install_pending_recovery_upload,
+    validate_local_durable_recovery_prefix, validate_local_recovery_prefix,
+    validate_recovery_control_references, PendingRecoveryInstallOutcome,
+};
 use crate::{
-    MetadataWorkspaceRequestExecutor, RootOwnerRegistry, ServerError, WorkspaceRequestExecutor,
+    MetadataWorkspaceRequestExecutor, RecoveryPublisher, RecoveryPublishingExecutor,
+    RootOwnerRegistry, ServerError, WorkspaceRequestExecutor,
 };
 
-/// Explicit metadata-store opening mode. Startup never guesses from path
-/// existence and never falls back between new and existing stores.
+/// Explicit metadata-store opening mode. Startup never falls back between new,
+/// existing, and shared-log recovery. `RecoverLog` alone may distinguish a
+/// missing/empty install target from its own exact resumable target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenMode {
     New(PathBuf),
     Existing(PathBuf),
+    /// Create or resume a fresh local authority from the exact shared-log
+    /// receipts stored in Control.
+    RecoverLog(PathBuf),
 }
 
 /// Exact control-plane admission used by one logical-shard bootstrap.
@@ -81,6 +92,7 @@ pub struct ShardOwner {
     lease: LogicalShardLease,
     serving: LogicalShardRecord,
     meta: Arc<meta::MetaShard>,
+    recovery: Arc<RecoveryPublisher>,
     routes: Vec<RootRoute>,
 }
 
@@ -103,6 +115,10 @@ impl ShardOwner {
 
     pub fn routes(&self) -> &[RootRoute] {
         &self.routes
+    }
+
+    pub fn recovery_publisher(&self) -> &Arc<RecoveryPublisher> {
+        &self.recovery
     }
 
     pub(crate) fn is_for_registry(&self, registry: &Arc<RootOwnerRegistry>) -> bool {
@@ -136,6 +152,16 @@ impl ShardOwner {
             .registry
             .fail_closed_shard(LogicalShardIdentity::from(self.shard_id()))
             .err();
+        let publication = self.recovery.publish_current().map_err(ServerError::from);
+        if let Err(publication) = publication {
+            return match cleanup {
+                None => Err(publication),
+                Some(cleanup) => Err(ServerError::BootstrapRollback {
+                    primary: publication.to_string(),
+                    rollback: cleanup.to_string(),
+                }),
+            };
+        }
         match (self.control.release_owner(&self.lease), cleanup) {
             (Ok(record), None) => Ok(record),
             (Ok(_), Some(cleanup)) => Err(ServerError::BootstrapRollback {
@@ -156,25 +182,55 @@ impl ShardOwner {
 pub fn bootstrap_shard(
     control: Arc<dyn ControlStore>,
     registry: Arc<RootOwnerRegistry>,
+    recovery_objects: Arc<dyn ArtifactObjectStore>,
     boot: ShardBoot,
 ) -> Result<ShardOwner, ServerError> {
     validate_boot(&boot)?;
+    let expected_namespace = boot
+        .roots
+        .first()
+        .expect("validated bootstrap has at least one root")
+        .object_namespace_id;
+    if boot
+        .roots
+        .iter()
+        .any(|root| root.object_namespace_id != expected_namespace)
+    {
+        return Err(ServerError::InvalidBootstrap(
+            "one logical-shard owner cannot attach roots from different object namespaces"
+                .to_owned(),
+        ));
+    }
+    if recovery_objects.object_namespace() != Some(expected_namespace) {
+        return Err(ServerError::InvalidBootstrap(
+            "recovery object handle is not bound to the shard object namespace".to_owned(),
+        ));
+    }
     let placements = load_placements(control.as_ref(), boot.shard_id, &boot.roots)?;
-    let control_record = load_control_record(control.as_ref(), boot.shard_id, &boot.recovery)?;
     validate_open_lease(&boot.open, &boot.lease)?;
+    let control_record =
+        load_control_record(control.as_ref(), boot.shard_id, &boot.open, &boot.recovery)?;
 
     // Every new acquisition opens and validates the exclusive local authority
     // before it mutates the control epoch. This prevents a bad/missing/stale
     // local store from consuming an epoch that the store cannot install.
     // Exact live-session resumes retain their admission-before-open order.
-    let prepared_meta =
-        prepare_acquiring_meta(&boot.open, &boot.lease, boot.shard_id, &control_record)?;
+    let prepared_meta = prepare_acquiring_meta(
+        &boot.open,
+        &boot.lease,
+        boot.shard_id,
+        &control_record,
+        expected_namespace,
+        recovery_objects.as_ref(),
+    )?;
     let prepared_first_owner_path = match &boot.lease {
         LeaseMode::Acquire {
             previous_epoch: None,
             ..
         } if prepared_meta.is_some() => Some(match &boot.open {
-            OpenMode::New(path) | OpenMode::Existing(path) => path.clone(),
+            OpenMode::New(path) | OpenMode::Existing(path) | OpenMode::RecoverLog(path) => {
+                path.clone()
+            }
         }),
         _ => None,
     };
@@ -197,7 +253,7 @@ pub fn bootstrap_shard(
     let meta = match prepared_meta {
         Some(meta) => meta,
         None => {
-            let meta = match open_meta(boot.open, boot.shard_id) {
+            let meta = match open_meta(boot.open.clone(), boot.shard_id) {
                 Ok(meta) => meta,
                 Err(error) => {
                     return Err(rollback_bootstrap(
@@ -223,6 +279,26 @@ pub fn bootstrap_shard(
             meta
         }
     };
+    let _reconciled_control = match reconcile_acquired_recovery(
+        control.as_ref(),
+        &lease,
+        &boot.open,
+        expected_namespace,
+        recovery_objects.as_ref(),
+        &meta,
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            return Err(rollback_bootstrap(
+                error,
+                control.as_ref(),
+                &registry,
+                &routes,
+                &lease,
+                acquired,
+            ));
+        }
+    };
     if let Err(error) = activate_shard(&meta, &lease) {
         return Err(rollback_bootstrap(
             error,
@@ -234,9 +310,44 @@ pub fn bootstrap_shard(
         ));
     }
 
-    let executor = Arc::new(MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta)));
+    let recovery = match RecoveryPublisher::new(
+        Arc::clone(&control),
+        lease.clone(),
+        Arc::clone(&meta),
+        recovery_objects,
+    ) {
+        Ok(recovery) => Arc::new(recovery),
+        Err(error) => {
+            return Err(rollback_bootstrap(
+                ServerError::from(error),
+                control.as_ref(),
+                &registry,
+                &routes,
+                &lease,
+                acquired,
+            ));
+        }
+    };
+    if let Err(error) = recovery.publish_current() {
+        return Err(rollback_bootstrap(
+            ServerError::from(error),
+            control.as_ref(),
+            &registry,
+            &routes,
+            &lease,
+            acquired,
+        ));
+    }
+    let metadata_executor: Arc<dyn WorkspaceRequestExecutor> =
+        Arc::new(MetadataWorkspaceRequestExecutor::new(Arc::clone(&meta)));
+    let executor: Arc<dyn WorkspaceRequestExecutor> = Arc::new(RecoveryPublishingExecutor::new(
+        metadata_executor,
+        Arc::clone(&recovery),
+    ));
     for (placement, root) in placements.iter().zip(&boot.roots) {
-        match attach_root(&meta, &registry, &executor, placement, &lease, root) {
+        match attach_root(
+            &meta, &registry, &executor, &recovery, placement, &lease, root,
+        ) {
             Ok(route) => routes.push(route),
             Err(error) => {
                 return Err(rollback_bootstrap(
@@ -260,7 +371,27 @@ pub fn bootstrap_shard(
             acquired,
         ));
     }
-    let serving = match control.mark_serving(&lease, boot.recovery) {
+    let published = match recovery.publish_current() {
+        Ok(record) => record,
+        Err(error) => {
+            return Err(rollback_bootstrap(
+                ServerError::from(error),
+                control.as_ref(),
+                &registry,
+                &routes,
+                &lease,
+                acquired,
+            ));
+        }
+    };
+    let serving = match control.mark_serving(
+        &lease,
+        RecoveryPublication {
+            checkpoint: None,
+            log: None,
+            durable_lsn: published.durable_lsn,
+        },
+    ) {
         Ok(record) => record,
         Err(error) => {
             return Err(rollback_bootstrap(
@@ -279,6 +410,7 @@ pub fn bootstrap_shard(
         lease,
         serving,
         meta,
+        recovery,
         routes,
     })
 }
@@ -368,6 +500,13 @@ fn validate_open_lease(open: &OpenMode, lease: &LeaseMode) -> Result<(), ServerE
         )
         | (OpenMode::Existing(_), LeaseMode::Resume { .. }) => Ok(()),
         (
+            OpenMode::RecoverLog(_),
+            LeaseMode::Acquire {
+                previous_epoch: Some(_),
+                ..
+            },
+        ) => Ok(()),
+        (
             OpenMode::New(_),
             LeaseMode::Acquire {
                 previous_epoch: Some(previous),
@@ -381,6 +520,20 @@ fn validate_open_lease(open: &OpenMode, lease: &LeaseMode) -> Result<(), ServerE
                 "an exact owner resume must open its existing metadata store".to_owned(),
             ))
         }
+        (
+            OpenMode::RecoverLog(_),
+            LeaseMode::Acquire {
+                previous_epoch: None,
+                ..
+            },
+        ) => Err(ServerError::InvalidBootstrap(
+            "shared-log recovery requires a previously owned logical shard".to_owned(),
+        )),
+        (OpenMode::RecoverLog(_), LeaseMode::Resume { .. }) => {
+            Err(ServerError::InvalidBootstrap(
+                "an exact owner resume must reopen its existing metadata store".to_owned(),
+            ))
+        }
     }
 }
 
@@ -389,6 +542,8 @@ fn prepare_acquiring_meta(
     lease: &LeaseMode,
     logical_shard_id: nokv_types::LogicalShardId,
     control_record: &LogicalShardRecord,
+    object_namespace_id: ObjectNamespaceId,
+    recovery_objects: &dyn ArtifactObjectStore,
 ) -> Result<Option<Arc<meta::MetaShard>>, ServerError> {
     let LeaseMode::Acquire { previous_epoch, .. } = lease else {
         return Ok(None);
@@ -396,6 +551,16 @@ fn prepare_acquiring_meta(
 
     let meta = open_meta(open.clone(), logical_shard_id)?;
     validate_meta_shard(&meta, logical_shard_id)?;
+    match open {
+        OpenMode::RecoverLog(_) => {
+            validate_recovery_control_references(control_record, object_namespace_id, &meta)?;
+            install_durable_recovery_log(control_record, recovery_objects, &meta)?;
+            validate_local_durable_recovery_prefix(control_record, object_namespace_id, &meta)?;
+        }
+        OpenMode::New(_) | OpenMode::Existing(_) => {
+            validate_local_recovery_prefix(control_record, object_namespace_id, &meta)?;
+        }
+    }
     let local_epoch = meta.current_owner_epoch()?;
     match previous_epoch {
         None => {
@@ -440,22 +605,38 @@ fn prepare_acquiring_meta(
 fn load_control_record(
     control: &dyn ControlStore,
     shard_id: nokv_types::LogicalShardId,
+    open: &OpenMode,
     requested: &RecoveryPublication,
 ) -> Result<LogicalShardRecord, ServerError> {
     let shard = control
         .get_logical_shard(&shard_id)?
         .ok_or_else(|| ServerError::InvalidBootstrap("logical shard does not exist".to_owned()))?;
-    let persisted_nonempty =
-        shard.durable_lsn != 0 || shard.checkpoint.is_some() || shard.log.is_some();
-    let requested_nonempty =
-        requested.durable_lsn != 0 || requested.checkpoint.is_some() || requested.log.is_some();
-    if persisted_nonempty || requested_nonempty {
+    let persisted = recovery_publication(&shard);
+    if &persisted != requested {
         return Err(ServerError::InvalidBootstrap(format!(
-            "logical shard {:?} has an unverified shared recovery frontier (persisted LSN {}, requested LSN {}); checkpoint/log install, replay, and fsck are not implemented, so Serving is refused",
-            shard_id, shard.durable_lsn, requested.durable_lsn
+            "logical shard {:?} recovery commitment differs from control (persisted LSN {}, requested LSN {})",
+            shard_id, shard.durable_lsn, requested.durable_lsn,
+        )));
+    }
+    let persisted_nonempty = shard.durable_lsn != 0
+        || shard.checkpoint.is_some()
+        || shard.log.is_some()
+        || shard.pending_recovery_upload.is_some();
+    if matches!(open, OpenMode::New(_)) && persisted_nonempty {
+        return Err(ServerError::InvalidBootstrap(format!(
+            "new metadata store cannot adopt logical shard {:?} recovery frontier at LSN {}; reopen or install a verified checkpoint instead",
+            shard_id, shard.durable_lsn,
         )));
     }
     Ok(shard)
+}
+
+fn recovery_publication(record: &LogicalShardRecord) -> RecoveryPublication {
+    RecoveryPublication {
+        checkpoint: record.checkpoint.clone(),
+        log: record.log.clone(),
+        durable_lsn: record.durable_lsn,
+    }
 }
 
 fn validate_serving_placement(placement: &RootPlacement) -> Result<(), ServerError> {
@@ -508,30 +689,124 @@ fn admit_owner(
     }
 }
 
+fn reconcile_acquired_recovery(
+    control: &dyn ControlStore,
+    lease: &LogicalShardLease,
+    open: &OpenMode,
+    object_namespace_id: ObjectNamespaceId,
+    recovery_objects: &dyn ArtifactObjectStore,
+    meta: &meta::MetaShard,
+) -> Result<LogicalShardRecord, ServerError> {
+    let mut record = control.renew_owner(lease)?;
+    validate_control_record_lease(&record, lease)?;
+
+    if matches!(open, OpenMode::RecoverLog(_)) {
+        validate_recovery_control_references(&record, object_namespace_id, meta)?;
+        install_durable_recovery_log(&record, recovery_objects, meta)?;
+        validate_local_durable_recovery_prefix(&record, object_namespace_id, meta)?;
+        if let PendingRecoveryInstallOutcome::CleanupRequired { .. } =
+            install_pending_recovery_upload(&record, recovery_objects, meta)?
+        {
+            let expected_intent = record
+                .pending_recovery_upload
+                .as_ref()
+                .expect("typed pending abort requires an exact Control intent");
+            cleanup_pending_recovery_upload(&record, recovery_objects, meta)?;
+            record = control.abort_recovery_upload(lease, expected_intent)?;
+            validate_control_record_lease(&record, lease)?;
+            validate_recovery_control_references(&record, object_namespace_id, meta)?;
+            install_durable_recovery_log(&record, recovery_objects, meta)?;
+        }
+    }
+
+    validate_local_recovery_prefix(&record, object_namespace_id, meta)?;
+    Ok(record)
+}
+
+fn validate_control_record_lease(
+    record: &LogicalShardRecord,
+    lease: &LogicalShardLease,
+) -> Result<(), ServerError> {
+    if record.logical_shard_id != lease.logical_shard_id
+        || record.owner.as_ref() != Some(&lease.owner)
+        || record.owner_epoch != Some(lease.owner_epoch)
+        || record.lease_id != lease.lease_id
+    {
+        return Err(ServerError::InvalidBootstrap(
+            "post-admission Control record does not match the exact acquired lease".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn open_meta(
     mode: OpenMode,
     logical_shard_id: nokv_types::LogicalShardId,
 ) -> Result<Arc<meta::MetaShard>, ServerError> {
-    let catalog = || {
-        meta::keyspaces()
-            .iter()
-            .map(|definition| TreeBinding::new(definition.id, definition.name))
-    };
     match mode {
-        OpenMode::New(path) => {
-            let holt =
-                HoltStore::initialize(HoltOptions::file(path, catalog(), meta::store_limits()))?;
-            let store: Arc<dyn TxnStore> = Arc::new(holt);
-            Ok(Arc::new(meta::MetaShard::initialize(
-                store,
-                logical_shard_id,
-            )?))
+        OpenMode::New(path) => initialize_meta(path, logical_shard_id),
+        OpenMode::Existing(path) => open_existing_meta(path, logical_shard_id),
+        OpenMode::RecoverLog(path) => {
+            if recovery_path_is_missing_or_empty(&path)? {
+                initialize_meta(path, logical_shard_id)
+            } else {
+                open_existing_meta(path, logical_shard_id)
+            }
         }
-        OpenMode::Existing(path) => {
-            let holt = HoltStore::open(HoltOptions::file(path, catalog(), meta::store_limits()))?;
-            let store: Arc<dyn TxnStore> = Arc::new(holt);
-            Ok(Arc::new(meta::MetaShard::open(store, logical_shard_id)?))
-        }
+    }
+}
+
+fn metadata_catalog() -> impl Iterator<Item = TreeBinding> {
+    meta::keyspaces()
+        .iter()
+        .map(|definition| TreeBinding::new(definition.id, definition.name))
+}
+
+fn initialize_meta(
+    path: PathBuf,
+    logical_shard_id: nokv_types::LogicalShardId,
+) -> Result<Arc<meta::MetaShard>, ServerError> {
+    let holt = HoltStore::initialize(HoltOptions::file(
+        path,
+        metadata_catalog(),
+        meta::store_limits(),
+    ))?;
+    let store: Arc<dyn TxnStore> = Arc::new(holt);
+    Ok(Arc::new(meta::MetaShard::initialize(
+        store,
+        logical_shard_id,
+    )?))
+}
+
+fn open_existing_meta(
+    path: PathBuf,
+    logical_shard_id: nokv_types::LogicalShardId,
+) -> Result<Arc<meta::MetaShard>, ServerError> {
+    let holt = HoltStore::open(HoltOptions::file(
+        path,
+        metadata_catalog(),
+        meta::store_limits(),
+    ))?;
+    let store: Arc<dyn TxnStore> = Arc::new(holt);
+    Ok(Arc::new(meta::MetaShard::open(store, logical_shard_id)?))
+}
+
+fn recovery_path_is_missing_or_empty(path: &Path) -> Result<bool, ServerError> {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries
+            .next()
+            .transpose()
+            .map(|entry| entry.is_none())
+            .map_err(|source| ServerError::RecoveryPath {
+                path: path.to_path_buf(),
+                source,
+            }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        Err(source) => Err(ServerError::RecoveryPath {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -582,7 +857,8 @@ fn activate_shard(meta: &meta::MetaShard, lease: &LogicalShardLease) -> Result<(
 fn attach_root(
     meta: &meta::MetaShard,
     registry: &RootOwnerRegistry,
-    executor: &Arc<MetadataWorkspaceRequestExecutor>,
+    executor: &Arc<dyn WorkspaceRequestExecutor>,
+    recovery: &RecoveryPublisher,
     placement: &RootPlacement,
     lease: &LogicalShardLease,
     root: &RootAttach,
@@ -651,9 +927,9 @@ fn attach_root(
             active.activation_state
         )));
     }
+    recovery.publish_current()?;
     let route = root_route(placement, root.object_namespace_id, lease);
-    let installed_executor: Arc<dyn WorkspaceRequestExecutor> = executor.clone();
-    registry.install(route, installed_executor)?;
+    registry.install(route, Arc::clone(executor))?;
     Ok(route)
 }
 
@@ -781,16 +1057,479 @@ fn uninstall_routes(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     use nokv_control::{
-        InMemoryControlStore, LogRef, LogSegmentRef, LogicalShardState, PlacementGeneration,
-        RootPlacement,
+        ControlError, InMemoryControlStore, LogRef, LogSegmentRef, LogicalShardState,
+        PlacementGeneration, RootPlacement,
+    };
+    use nokv_object::{
+        ensure_object_namespace, ArtifactObjectStore, ArtifactStoreCapabilities,
+        BoundArtifactStore, ImmutableCreateOutcome, MemoryArtifactStore, ObjectDeleteOutcome,
+        ObjectError, ObjectInfo, ObjectKey, ObjectRange, ProviderAdmissionReceipt,
+        ProviderHandleIdentity,
     };
     use tempfile::TempDir;
 
     use super::*;
     use crate::{ServerOptions, WorkspaceServer};
+
+    #[derive(Clone)]
+    struct FailNextCreateStore {
+        inner: BoundArtifactStore<MemoryArtifactStore>,
+        fail_next_create: Arc<AtomicBool>,
+    }
+
+    #[derive(Clone)]
+    struct FailCreateAndDeleteStore {
+        inner: BoundArtifactStore<MemoryArtifactStore>,
+        create_attempts: Arc<AtomicUsize>,
+        fail_create_at: usize,
+        delete_attempts: Arc<AtomicUsize>,
+        fail_delete_at: Arc<AtomicUsize>,
+    }
+
+    impl FailCreateAndDeleteStore {
+        fn new(inner: BoundArtifactStore<MemoryArtifactStore>, fail_create_at: usize) -> Self {
+            Self {
+                inner,
+                create_attempts: Arc::new(AtomicUsize::new(0)),
+                fail_create_at,
+                delete_attempts: Arc::new(AtomicUsize::new(0)),
+                fail_delete_at: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn fail_delete_at(&self, attempt: usize) {
+            self.fail_delete_at.store(attempt, Ordering::SeqCst);
+        }
+    }
+
+    impl FailNextCreateStore {
+        fn new(inner: BoundArtifactStore<MemoryArtifactStore>) -> Self {
+            Self {
+                inner,
+                fail_next_create: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_create(&self) {
+            self.fail_next_create.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl ArtifactObjectStore for FailNextCreateStore {
+        fn object_namespace(&self) -> Option<ObjectNamespaceId> {
+            self.inner.object_namespace()
+        }
+
+        fn capabilities(&self) -> ArtifactStoreCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+            self.inner.provider_handle_identity()
+        }
+
+        fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+            self.inner.provider_admission_receipt()
+        }
+
+        fn create_immutable(
+            &self,
+            key: &ObjectKey,
+            bytes: &[u8],
+        ) -> Result<ImmutableCreateOutcome, ObjectError> {
+            if self.fail_next_create.swap(false, Ordering::SeqCst) {
+                return Err(ObjectError::Backend {
+                    detail: "injected definite recovery create failure".to_owned(),
+                    retryable: true,
+                });
+            }
+            self.inner.create_immutable(key, bytes)
+        }
+
+        fn read(
+            &self,
+            key: &ObjectKey,
+            range: Option<ObjectRange>,
+        ) -> Result<Vec<u8>, ObjectError> {
+            self.inner.read(key, range)
+        }
+
+        fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
+            self.inner.head(key)
+        }
+
+        fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
+            self.inner.delete(key)
+        }
+    }
+
+    impl ArtifactObjectStore for FailCreateAndDeleteStore {
+        fn object_namespace(&self) -> Option<ObjectNamespaceId> {
+            self.inner.object_namespace()
+        }
+
+        fn capabilities(&self) -> ArtifactStoreCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn provider_handle_identity(&self) -> ProviderHandleIdentity {
+            self.inner.provider_handle_identity()
+        }
+
+        fn provider_admission_receipt(&self) -> Option<&ProviderAdmissionReceipt> {
+            self.inner.provider_admission_receipt()
+        }
+
+        fn create_immutable(
+            &self,
+            key: &ObjectKey,
+            bytes: &[u8],
+        ) -> Result<ImmutableCreateOutcome, ObjectError> {
+            let attempt = self.create_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == self.fail_create_at {
+                return Err(ObjectError::Backend {
+                    detail: "injected partial recovery create failure".to_owned(),
+                    retryable: false,
+                });
+            }
+            self.inner.create_immutable(key, bytes)
+        }
+
+        fn read(
+            &self,
+            key: &ObjectKey,
+            range: Option<ObjectRange>,
+        ) -> Result<Vec<u8>, ObjectError> {
+            self.inner.read(key, range)
+        }
+
+        fn head(&self, key: &ObjectKey) -> Result<Option<ObjectInfo>, ObjectError> {
+            self.inner.head(key)
+        }
+
+        fn delete(&self, key: &ObjectKey) -> Result<ObjectDeleteOutcome, ObjectError> {
+            let attempt = self.delete_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == self.fail_delete_at.load(Ordering::SeqCst) {
+                return Err(ObjectError::DeleteAmbiguous {
+                    key: key.clone(),
+                    detail: "injected pending cleanup ambiguity".to_owned(),
+                });
+            }
+            self.inner.delete(key)
+        }
+    }
+
+    struct LoseFinalizeAckControlStore {
+        inner: Arc<InMemoryControlStore>,
+        lose_next_finalize_ack: AtomicBool,
+        fail_next_finalize_before_apply: AtomicBool,
+        logical_shard_override: Mutex<Option<LogicalShardRecord>>,
+        advance_before_successor: Mutex<Option<(Arc<RecoveryPublisher>, LogicalShardLease)>>,
+    }
+
+    impl LoseFinalizeAckControlStore {
+        fn new(inner: Arc<InMemoryControlStore>) -> Self {
+            Self {
+                inner,
+                lose_next_finalize_ack: AtomicBool::new(true),
+                fail_next_finalize_before_apply: AtomicBool::new(false),
+                logical_shard_override: Mutex::new(None),
+                advance_before_successor: Mutex::new(None),
+            }
+        }
+
+        fn with_read_override(
+            inner: Arc<InMemoryControlStore>,
+            record: LogicalShardRecord,
+        ) -> Self {
+            Self {
+                inner,
+                lose_next_finalize_ack: AtomicBool::new(false),
+                fail_next_finalize_before_apply: AtomicBool::new(false),
+                logical_shard_override: Mutex::new(Some(record)),
+                advance_before_successor: Mutex::new(None),
+            }
+        }
+
+        fn advance_before_successor(
+            inner: Arc<InMemoryControlStore>,
+            publisher: Arc<RecoveryPublisher>,
+            lease: LogicalShardLease,
+        ) -> Self {
+            Self {
+                inner,
+                lose_next_finalize_ack: AtomicBool::new(false),
+                fail_next_finalize_before_apply: AtomicBool::new(false),
+                logical_shard_override: Mutex::new(None),
+                advance_before_successor: Mutex::new(Some((publisher, lease))),
+            }
+        }
+
+        fn fail_finalize_before_apply(inner: Arc<InMemoryControlStore>) -> Self {
+            Self {
+                inner,
+                lose_next_finalize_ack: AtomicBool::new(false),
+                fail_next_finalize_before_apply: AtomicBool::new(true),
+                logical_shard_override: Mutex::new(None),
+                advance_before_successor: Mutex::new(None),
+            }
+        }
+    }
+
+    impl ControlStore for LoseFinalizeAckControlStore {
+        fn create_root_agent_binding(
+            &self,
+            binding: nokv_control::RootAgentBinding,
+        ) -> Result<nokv_control::RootAgentBinding, ControlError> {
+            self.inner.create_root_agent_binding(binding)
+        }
+
+        fn get_root_agent_binding(
+            &self,
+            root_id: &RootId,
+        ) -> Result<Option<nokv_control::RootAgentBinding>, ControlError> {
+            self.inner.get_root_agent_binding(root_id)
+        }
+
+        fn create_root_object_namespace_binding(
+            &self,
+            binding: nokv_control::RootObjectNamespaceBinding,
+        ) -> Result<nokv_control::RootObjectNamespaceBinding, ControlError> {
+            self.inner.create_root_object_namespace_binding(binding)
+        }
+
+        fn get_root_object_namespace_binding(
+            &self,
+            root_id: &RootId,
+        ) -> Result<Option<nokv_control::RootObjectNamespaceBinding>, ControlError> {
+            self.inner.get_root_object_namespace_binding(root_id)
+        }
+
+        fn create_root_placement(
+            &self,
+            placement: RootPlacement,
+        ) -> Result<RootPlacement, ControlError> {
+            self.inner.create_root_placement(placement)
+        }
+
+        fn get_root_placement(
+            &self,
+            root_id: &RootId,
+        ) -> Result<Option<RootPlacement>, ControlError> {
+            self.inner.get_root_placement(root_id)
+        }
+
+        fn list_root_placements(&self) -> Result<Vec<RootPlacement>, ControlError> {
+            self.inner.list_root_placements()
+        }
+
+        fn compare_and_set_root_placement(
+            &self,
+            expected: &RootPlacement,
+            next: RootPlacement,
+        ) -> Result<RootPlacement, ControlError> {
+            self.inner.compare_and_set_root_placement(expected, next)
+        }
+
+        fn create_logical_shard(
+            &self,
+            logical_shard_id: nokv_types::LogicalShardId,
+        ) -> Result<LogicalShardRecord, ControlError> {
+            self.inner.create_logical_shard(logical_shard_id)
+        }
+
+        fn get_logical_shard(
+            &self,
+            logical_shard_id: &nokv_types::LogicalShardId,
+        ) -> Result<Option<LogicalShardRecord>, ControlError> {
+            if let Some(record) = self
+                .logical_shard_override
+                .lock()
+                .expect("test logical-shard override lock must remain available")
+                .as_ref()
+                .filter(|record| &record.logical_shard_id == logical_shard_id)
+            {
+                return Ok(Some(record.clone()));
+            }
+            self.inner.get_logical_shard(logical_shard_id)
+        }
+
+        fn list_logical_shards(&self) -> Result<Vec<LogicalShardRecord>, ControlError> {
+            self.inner.list_logical_shards()
+        }
+
+        fn acquire_owner(
+            &self,
+            logical_shard_id: &nokv_types::LogicalShardId,
+            owner: NodeId,
+            endpoint: String,
+        ) -> Result<LogicalShardLease, ControlError> {
+            self.inner.acquire_owner(logical_shard_id, owner, endpoint)
+        }
+
+        fn acquire_successor(
+            &self,
+            logical_shard_id: &nokv_types::LogicalShardId,
+            expected_owner_epoch: nokv_control::OwnerEpoch,
+            owner: NodeId,
+            endpoint: String,
+        ) -> Result<LogicalShardLease, ControlError> {
+            if let Some((publisher, lease)) = self
+                .advance_before_successor
+                .lock()
+                .expect("test successor hook lock must remain available")
+                .take()
+            {
+                publisher
+                    .publish_current()
+                    .map_err(|error| ControlError::Backend(error.to_string()))?;
+                self.inner.release_owner(&lease)?;
+            }
+            self.inner
+                .acquire_successor(logical_shard_id, expected_owner_epoch, owner, endpoint)
+        }
+
+        fn reacquire_recovery(
+            &self,
+            logical_shard_id: &nokv_types::LogicalShardId,
+            recovery_epoch: nokv_control::OwnerEpoch,
+            owner: NodeId,
+            endpoint: String,
+        ) -> Result<LogicalShardLease, ControlError> {
+            self.inner
+                .reacquire_recovery(logical_shard_id, recovery_epoch, owner, endpoint)
+        }
+
+        fn renew_owner(
+            &self,
+            lease: &LogicalShardLease,
+        ) -> Result<LogicalShardRecord, ControlError> {
+            self.inner.renew_owner(lease)
+        }
+
+        fn mark_serving(
+            &self,
+            lease: &LogicalShardLease,
+            publication: RecoveryPublication,
+        ) -> Result<LogicalShardRecord, ControlError> {
+            self.inner.mark_serving(lease, publication)
+        }
+
+        fn prepare_recovery_upload(
+            &self,
+            lease: &LogicalShardLease,
+            intent: nokv_control::RecoveryUploadIntent,
+        ) -> Result<LogicalShardRecord, ControlError> {
+            self.inner.prepare_recovery_upload(lease, intent)
+        }
+
+        fn finalize_recovery_upload(
+            &self,
+            lease: &LogicalShardLease,
+            expected_intent: &nokv_control::RecoveryUploadIntent,
+            publication: RecoveryPublication,
+        ) -> Result<LogicalShardRecord, ControlError> {
+            if self
+                .fail_next_finalize_before_apply
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(ControlError::Backend(
+                    "injected recovery-finalize failure before apply".to_owned(),
+                ));
+            }
+            let applied =
+                self.inner
+                    .finalize_recovery_upload(lease, expected_intent, publication)?;
+            if self.lose_next_finalize_ack.swap(false, Ordering::SeqCst) {
+                return Err(ControlError::Backend(
+                    "injected recovery-finalize response loss".to_owned(),
+                ));
+            }
+            Ok(applied)
+        }
+
+        fn abort_recovery_upload(
+            &self,
+            lease: &LogicalShardLease,
+            expected_intent: &nokv_control::RecoveryUploadIntent,
+        ) -> Result<LogicalShardRecord, ControlError> {
+            self.inner.abort_recovery_upload(lease, expected_intent)
+        }
+
+        fn suspend_recovery(
+            &self,
+            lease: &LogicalShardLease,
+        ) -> Result<LogicalShardRecord, ControlError> {
+            self.inner.suspend_recovery(lease)
+        }
+
+        fn release_owner(
+            &self,
+            lease: &LogicalShardLease,
+        ) -> Result<LogicalShardRecord, ControlError> {
+            self.inner.release_owner(lease)
+        }
+    }
+
+    struct LeaseClockExecutor {
+        meta: Arc<meta::MetaShard>,
+        root_id: RootId,
+        placement_generation: PlacementGeneration,
+        owner_epoch: nokv_control::OwnerEpoch,
+    }
+
+    impl WorkspaceRequestExecutor for LeaseClockExecutor {
+        fn execute(
+            &self,
+            request: &nokv_protocol::WorkspaceRpcRequest,
+        ) -> Result<crate::ExecutedRequest, nokv_protocol::RpcFailure> {
+            self.meta
+                .observe_lease_clock(
+                    self.root_id,
+                    self.placement_generation,
+                    self.owner_epoch,
+                    41,
+                )
+                .expect("test lease-clock mutation must apply");
+            Ok(crate::ExecutedRequest {
+                result: nokv_protocol::WorkspaceResult::Preflight(
+                    nokv_protocol::WorkspacePreflightResult::new(request.route, []),
+                ),
+                commit_version: None,
+                replayed: false,
+            })
+        }
+    }
+
+    fn bootstrap_shard(
+        control: Arc<dyn ControlStore>,
+        registry: Arc<RootOwnerRegistry>,
+        boot: ShardBoot,
+    ) -> Result<ShardOwner, ServerError> {
+        static OBJECTS: OnceLock<Mutex<BTreeMap<ObjectNamespaceId, MemoryArtifactStore>>> =
+            OnceLock::new();
+        let namespace = boot
+            .roots
+            .first()
+            .expect("test bootstrap requires a root")
+            .object_namespace_id;
+        let raw = OBJECTS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("test recovery object map lock must remain available")
+            .entry(namespace)
+            .or_default()
+            .clone();
+        ensure_object_namespace(&raw, namespace).expect("install test object namespace");
+        let bound = BoundArtifactStore::open(raw, namespace).expect("bind test object namespace");
+        super::bootstrap_shard(control, registry, Arc::new(bound), boot)
+    }
 
     fn root(fill: u8) -> RootId {
         RootId::from_bytes([fill; nokv_types::FIXED_ID_BYTES])
@@ -826,12 +1565,21 @@ mod tests {
                     first_lsn: lsn,
                     last_lsn: lsn,
                     digest: digest.clone(),
+                    receipt: vec![1, 2, 3],
                 }],
                 durable_lsn: lsn,
                 digest,
             }),
             durable_lsn: lsn,
         }
+    }
+
+    fn current_recovery(control: &InMemoryControlStore) -> RecoveryPublication {
+        let record = control
+            .get_logical_shard(&shard())
+            .unwrap()
+            .expect("test logical shard must exist");
+        recovery_publication(&record)
     }
 
     fn add_active_root(
@@ -908,6 +1656,7 @@ mod tests {
     }
 
     fn resume_boot(
+        control: &InMemoryControlStore,
         path: PathBuf,
         lease: LogicalShardLease,
         roots: &[RootId],
@@ -917,7 +1666,7 @@ mod tests {
             shard_id: shard(),
             open: OpenMode::Existing(path),
             lease: LeaseMode::Resume { lease },
-            recovery: empty_recovery(),
+            recovery: current_recovery(control),
             roots: roots
                 .iter()
                 .enumerate()
@@ -935,6 +1684,13 @@ mod tests {
         control.clone()
     }
 
+    fn recovery_objects() -> Arc<BoundArtifactStore<MemoryArtifactStore>> {
+        let namespace = ObjectNamespaceId::from_bytes([10; nokv_types::FIXED_ID_BYTES]);
+        let raw = MemoryArtifactStore::new();
+        ensure_object_namespace(&raw, namespace).unwrap();
+        Arc::new(BoundArtifactStore::open(raw, namespace).unwrap())
+    }
+
     fn options() -> ServerOptions {
         ServerOptions {
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -944,6 +1700,130 @@ mod tests {
             lease_renew_interval: Duration::from_millis(10),
             max_inflight_connections: 8,
         }
+    }
+
+    #[test]
+    fn rpc_success_waits_for_object_first_recovery_publication_and_repairs_pending_intent() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let registry = Arc::new(RootOwnerRegistry::new());
+        let namespace = ObjectNamespaceId::from_bytes([10; nokv_types::FIXED_ID_BYTES]);
+        let raw = MemoryArtifactStore::new();
+        ensure_object_namespace(&raw, namespace).unwrap();
+        let bound = BoundArtifactStore::open(raw, namespace).unwrap();
+        let objects = FailNextCreateStore::new(bound);
+        let owner = super::bootstrap_shard(
+            as_control(&control),
+            Arc::clone(&registry),
+            Arc::new(objects.clone()),
+            acquire_boot(temporary.path().join("metadata"), &[root_id]),
+        )
+        .unwrap();
+        let route = owner.routes()[0];
+        let executor = RecoveryPublishingExecutor::new(
+            Arc::new(LeaseClockExecutor {
+                meta: Arc::clone(owner.meta()),
+                root_id,
+                placement_generation: PlacementGeneration::new(route.placement_generation).unwrap(),
+                owner_epoch: owner.lease().owner_epoch,
+            }),
+            Arc::clone(owner.recovery_publisher()),
+        );
+        let request = nokv_protocol::WorkspaceRpcRequest {
+            route,
+            request_id: nokv_protocol::RequestIdentity([0x71; nokv_types::FIXED_ID_BYTES]),
+            operation: nokv_protocol::WorkspaceRequest::Preflight(
+                nokv_protocol::WorkspacePreflightRequest::new([]),
+            ),
+        };
+
+        objects.fail_next_create();
+        let failure = executor.execute(&request).unwrap_err();
+        assert_eq!(failure.code, nokv_protocol::ErrorCode::ObjectUnavailable);
+        assert!(failure.retryable);
+        let interrupted = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert!(interrupted.pending_recovery_upload.is_some());
+        assert!(
+            interrupted.durable_lsn < owner.meta().recovery_state().unwrap().applied_recovery_lsn,
+            "an inner metadata success must not advance control after object creation failed"
+        );
+
+        let result = executor.execute(&request).unwrap();
+        assert!(matches!(
+            result.result,
+            nokv_protocol::WorkspaceResult::Preflight(_)
+        ));
+        let repaired = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert!(repaired.pending_recovery_upload.is_none());
+        assert_eq!(
+            repaired.durable_lsn,
+            owner.meta().recovery_state().unwrap().applied_recovery_lsn
+        );
+        assert!(repaired.log.as_ref().is_some_and(|log| log
+            .segments
+            .iter()
+            .all(|segment| !segment.receipt.is_empty())));
+        owner.release().unwrap();
+    }
+
+    #[test]
+    fn recovery_finalize_response_loss_reuses_the_same_epoch_and_exact_publication() {
+        let temporary = TempDir::new().unwrap();
+        let database = temporary.path().join("metadata");
+        let root_id = root(1);
+        let inner = active_control(&[root_id]);
+        let control = Arc::new(LoseFinalizeAckControlStore::new(Arc::clone(&inner)));
+        let namespace = ObjectNamespaceId::from_bytes([10; nokv_types::FIXED_ID_BYTES]);
+        let raw = MemoryArtifactStore::new();
+        ensure_object_namespace(&raw, namespace).unwrap();
+        let objects = Arc::new(BoundArtifactStore::open(raw, namespace).unwrap());
+
+        let error = super::bootstrap_shard(
+            control.clone(),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(database.clone(), &[root_id]),
+        )
+        .err()
+        .expect("injected finalization response loss must interrupt bootstrap");
+        assert!(error
+            .to_string()
+            .contains("injected recovery-finalize response loss"));
+        let interrupted = inner.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(interrupted.state, LogicalShardState::Recovering);
+        assert!(interrupted.pending_recovery_upload.is_none());
+        assert!(interrupted.durable_lsn > 0);
+        let recovery_epoch = interrupted.owner_epoch.unwrap();
+
+        let recovered = super::bootstrap_shard(
+            control,
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(database),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(recovery_epoch),
+                },
+                recovery: current_recovery(&inner),
+                roots: vec![root_attach(root_id, 73)],
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered.lease().owner_epoch, recovery_epoch);
+        assert!(recovered.serving_record().pending_recovery_upload.is_none());
+        assert_eq!(
+            recovered.serving_record().durable_lsn,
+            recovered
+                .meta()
+                .recovery_state()
+                .unwrap()
+                .applied_recovery_lsn
+        );
+        recovered.release().unwrap();
     }
 
     #[test]
@@ -1008,7 +1888,7 @@ mod tests {
         let reopened = bootstrap_shard(
             as_control(&control),
             Arc::clone(&registry),
-            resume_boot(database, lease.clone(), &[root_id], 5),
+            resume_boot(&control, database, lease.clone(), &[root_id], 5),
         )
         .unwrap();
 
@@ -1045,6 +1925,7 @@ mod tests {
         drop(first);
 
         let mut boot = resume_boot(
+            &control,
             temporary.path().join("replacement"),
             lease.clone(),
             &[root_id],
@@ -1112,7 +1993,7 @@ mod tests {
         let error = bootstrap_shard(
             as_control(&control),
             Arc::clone(&registry),
-            resume_boot(database, lease.clone(), &[root_id], 7),
+            resume_boot(&control, database, lease.clone(), &[root_id], 7),
         )
         .err()
         .unwrap();
@@ -1251,6 +2132,7 @@ mod tests {
 
         let mut acquire = acquire_boot(database.clone(), &[root_id]);
         acquire.open = OpenMode::Existing(database.clone());
+        acquire.recovery = current_recovery(&control);
         let error = bootstrap_shard(as_control(&control), Arc::clone(&registry), acquire)
             .err()
             .unwrap();
@@ -1262,7 +2144,7 @@ mod tests {
         let resumed = bootstrap_shard(
             as_control(&control),
             Arc::clone(&registry),
-            resume_boot(database, lease.clone(), &[root_id], 41),
+            resume_boot(&control, database, lease.clone(), &[root_id], 41),
         )
         .unwrap();
         assert_eq!(resumed.lease(), &lease);
@@ -1328,7 +2210,7 @@ mod tests {
                 endpoint: "127.0.0.1:9020".to_owned(),
                 previous_epoch: Some(first_epoch),
             },
-            recovery: empty_recovery(),
+            recovery: current_recovery(&control),
             roots: vec![root_attach(root_id, 33)],
         };
         let successor = bootstrap_shard(as_control(&control), Arc::clone(&registry), boot).unwrap();
@@ -1346,7 +2228,14 @@ mod tests {
         let record = control.get_logical_shard(&shard()).unwrap().unwrap();
         assert_eq!(record.state, LogicalShardState::Serving);
         assert_eq!(record.owner_epoch, Some(successor.lease().owner_epoch));
-        assert_eq!(record.durable_lsn, 0);
+        assert_eq!(
+            record.durable_lsn,
+            successor
+                .meta()
+                .recovery_state()
+                .unwrap()
+                .applied_recovery_lsn
+        );
         assert_eq!(registry.installed_root_count().unwrap(), 1);
         successor.release().unwrap();
     }
@@ -1376,7 +2265,7 @@ mod tests {
                     endpoint: "127.0.0.1:9020".to_owned(),
                     previous_epoch: Some(first.lease().owner_epoch),
                 },
-                recovery: empty_recovery(),
+                recovery: current_recovery(&control),
                 roots: vec![root_attach(root_id, 35)],
             },
         )
@@ -1431,7 +2320,7 @@ mod tests {
                     endpoint: "127.0.0.1:9015".to_owned(),
                     previous_epoch: Some(first_epoch),
                 },
-                recovery: empty_recovery(),
+                recovery: current_recovery(&control),
                 roots: vec![root_attach(roots[0], 47), root_attach(roots[1], 49)],
             },
         )
@@ -1488,7 +2377,7 @@ mod tests {
                     endpoint: "127.0.0.1:9020".to_owned(),
                     previous_epoch: Some(recovery_epoch),
                 },
-                recovery: empty_recovery(),
+                recovery: current_recovery(&control),
                 roots: vec![root_attach(roots[0], 51), root_attach(roots[1], 53)],
             },
         )
@@ -1543,7 +2432,7 @@ mod tests {
                     endpoint: "127.0.0.1:9020".to_owned(),
                     previous_epoch: Some(interrupted.owner_epoch),
                 },
-                recovery: empty_recovery(),
+                recovery: current_recovery(&control),
                 roots: vec![root_attach(root_id, 37)],
             },
         )
@@ -1597,7 +2486,7 @@ mod tests {
                     endpoint: "127.0.0.1:9020".to_owned(),
                     previous_epoch: Some(interrupted.owner_epoch),
                 },
-                recovery: empty_recovery(),
+                recovery: current_recovery(&control),
                 roots: vec![root_attach(root_id, 39)],
             },
         )
@@ -1637,9 +2526,8 @@ mod tests {
                 "127.0.0.1:9015".to_owned(),
             )
             .unwrap();
-        control
-            .mark_serving(&control_only, empty_recovery())
-            .unwrap();
+        let durable = current_recovery(&control);
+        control.mark_serving(&control_only, durable).unwrap();
         control.release_owner(&control_only).unwrap();
 
         let error = bootstrap_shard(
@@ -1653,7 +2541,7 @@ mod tests {
                     endpoint: "127.0.0.1:9020".to_owned(),
                     previous_epoch: Some(control_only.owner_epoch),
                 },
-                recovery: empty_recovery(),
+                recovery: current_recovery(&control),
                 roots: vec![root_attach(root_id, 43)],
             },
         )
@@ -1717,7 +2605,7 @@ mod tests {
                     endpoint: "127.0.0.1:9020".to_owned(),
                     previous_epoch: Some(first_epoch),
                 },
-                recovery: empty_recovery(),
+                recovery: current_recovery(&control),
                 roots: vec![root_attach(root_id, 45)],
             },
         )
@@ -1791,7 +2679,7 @@ mod tests {
                     endpoint: "127.0.0.1:9030".to_owned(),
                     previous_epoch: Some(first_epoch),
                 },
-                recovery: empty_recovery(),
+                recovery: current_recovery(&control),
                 roots: vec![root_attach(root_id, 71)],
             },
         )
@@ -1854,7 +2742,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_shared_frontier_is_rejected_before_successor_acquire() {
+    fn persisted_shared_frontier_requires_an_explicit_fresh_recovery_mode() {
         let temporary = TempDir::new().unwrap();
         let root_id = root(1);
         let control = active_control(&[root_id]);
@@ -1876,7 +2764,7 @@ mod tests {
             lease: LeaseMode::Acquire {
                 owner: NodeId::new("node-b").unwrap(),
                 endpoint: "127.0.0.1:9020".to_owned(),
-                previous_epoch: Some(lease.owner_epoch),
+                previous_epoch: None,
             },
             recovery,
             roots: vec![root_attach(root_id, 31)],
@@ -1887,7 +2775,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("unverified shared recovery frontier"));
+            .contains("new metadata store cannot adopt logical shard"));
         let record = control.get_logical_shard(&shard()).unwrap().unwrap();
         assert_eq!(record.state, LogicalShardState::Unassigned);
         assert_eq!(record.owner_epoch, Some(lease.owner_epoch));
@@ -2004,7 +2892,7 @@ mod tests {
         let error = bootstrap_shard(
             as_control(&control),
             Arc::clone(&registry),
-            resume_boot(database, lease.clone(), &roots, 21),
+            resume_boot(&control, database, lease.clone(), &roots, 21),
         )
         .err()
         .unwrap();
@@ -2056,6 +2944,683 @@ mod tests {
         for route in routes {
             assert!(!registry.contains_exact(route).unwrap());
         }
+    }
+
+    #[test]
+    fn recover_log_initializes_missing_and_empty_targets_from_exact_control_receipts() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let objects = recovery_objects();
+        let first = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(temporary.path().join("source"), &[root_id]),
+        )
+        .unwrap();
+        let mut previous_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+
+        for (index, create_empty) in [false, true].into_iter().enumerate() {
+            let target = temporary.path().join(format!("recovered-{index}"));
+            if create_empty {
+                std::fs::create_dir(&target).unwrap();
+            }
+            let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+            let owner = super::bootstrap_shard(
+                as_control(&control),
+                Arc::new(RootOwnerRegistry::new()),
+                objects.clone(),
+                ShardBoot {
+                    shard_id: shard(),
+                    open: OpenMode::RecoverLog(target),
+                    lease: LeaseMode::Acquire {
+                        owner: NodeId::new(format!("recovery-node-{index}")).unwrap(),
+                        endpoint: format!("127.0.0.1:90{}0", index + 2),
+                        previous_epoch: Some(previous_epoch),
+                    },
+                    recovery: recovery_publication(&record),
+                    roots: vec![root_attach(root_id, 80 + index as u8 * 3)],
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                owner.serving_record().durable_lsn,
+                owner.meta().recovery_state().unwrap().applied_recovery_lsn
+            );
+            assert!(owner.serving_record().durable_lsn >= record.durable_lsn);
+            previous_epoch = owner.lease().owner_epoch;
+            owner.release().unwrap();
+        }
+    }
+
+    #[test]
+    fn recover_log_opens_a_partial_nonempty_store_and_replays_only_the_missing_suffix() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let objects = recovery_objects();
+        let first = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(temporary.path().join("source"), &[root_id]),
+        )
+        .unwrap();
+        let previous_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+        let record = control.get_logical_shard(&shard()).unwrap().unwrap();
+        let durable_log = record.log.as_ref().unwrap();
+        assert!(durable_log.segments.len() >= 2);
+        let first_segment = durable_log.segments[0].clone();
+        let mut partial = record.clone();
+        partial.log = Some(LogRef {
+            segments: vec![first_segment.clone()],
+            durable_lsn: first_segment.last_lsn,
+            digest: first_segment.digest,
+        });
+        partial.durable_lsn = first_segment.last_lsn;
+        partial.pending_recovery_upload = None;
+        let target = temporary.path().join("partial");
+        let partial_meta = open_meta(OpenMode::New(target.clone()), shard()).unwrap();
+        install_durable_recovery_log(&partial, objects.as_ref(), partial_meta.as_ref()).unwrap();
+        let partial_state = partial_meta.recovery_state().unwrap();
+        drop(partial_meta);
+
+        let recovered = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::RecoverLog(target),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(previous_epoch),
+                },
+                recovery: recovery_publication(&record),
+                roots: vec![root_attach(root_id, 86)],
+            },
+        )
+        .unwrap();
+
+        assert!(
+            recovered
+                .meta()
+                .recovery_state()
+                .unwrap()
+                .applied_recovery_lsn
+                > partial_state.applied_recovery_lsn
+        );
+        recovered.release().unwrap();
+    }
+
+    #[test]
+    fn existing_preflight_rejects_behind_divergent_and_untrusted_control_without_side_effects() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let objects = recovery_objects();
+        let source_path = temporary.path().join("source");
+        let first = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(source_path.clone(), &[root_id]),
+        )
+        .unwrap();
+        let previous_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+        let before_control = control.get_logical_shard(&shard()).unwrap().unwrap();
+        let durable_log = before_control.log.as_ref().unwrap();
+        assert!(durable_log.segments.len() >= 2);
+
+        let first_segment = durable_log.segments[0].clone();
+        let mut partial = before_control.clone();
+        partial.log = Some(LogRef {
+            segments: vec![first_segment.clone()],
+            durable_lsn: first_segment.last_lsn,
+            digest: first_segment.digest,
+        });
+        partial.durable_lsn = first_segment.last_lsn;
+        partial.pending_recovery_upload = None;
+        let behind_path = temporary.path().join("behind");
+        let behind = open_meta(OpenMode::New(behind_path.clone()), shard()).unwrap();
+        install_durable_recovery_log(&partial, objects.as_ref(), behind.as_ref()).unwrap();
+        let before_behind = behind.recovery_state().unwrap();
+        drop(behind);
+        let behind_error = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::Existing(behind_path.clone()),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("behind-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(previous_epoch),
+                },
+                recovery: recovery_publication(&before_control),
+                roots: vec![root_attach(root_id, 95)],
+            },
+        )
+        .err()
+        .expect("a local authority behind Control must fail before acquisition");
+        assert!(behind_error.to_string().contains("ahead of local"));
+        assert_eq!(
+            control.get_logical_shard(&shard()).unwrap().unwrap(),
+            before_control
+        );
+        let behind = open_meta(OpenMode::Existing(behind_path), shard()).unwrap();
+        assert_eq!(behind.recovery_state().unwrap(), before_behind);
+        drop(behind);
+
+        let source = open_meta(OpenMode::Existing(source_path.clone()), shard()).unwrap();
+        let before_source = source.recovery_state().unwrap();
+        drop(source);
+        let mut invalid_records = Vec::new();
+
+        let mut wrong_digest = before_control.clone();
+        let log = wrong_digest.log.as_mut().unwrap();
+        log.digest = "ff".repeat(SHA256_BYTES);
+        log.segments.last_mut().unwrap().digest = "ff".repeat(SHA256_BYTES);
+        invalid_records.push(wrong_digest);
+
+        let mut garbage_log = before_control.clone();
+        garbage_log.log.as_mut().unwrap().segments[0].receipt = vec![0; 32];
+        invalid_records.push(garbage_log);
+
+        let mut foreign_log = before_control.clone();
+        foreign_log.log.as_mut().unwrap().segments[0].receipt[8 + 2] ^= 0x01;
+        invalid_records.push(foreign_log);
+
+        let mut garbage_checkpoint = before_control.clone();
+        garbage_checkpoint.checkpoint = Some(nokv_control::CheckpointRef {
+            object_key: "nokv/recovery/checkpoint".to_owned(),
+            lsn: 1,
+            image_bytes: 1,
+            image_digest: "00".repeat(SHA256_BYTES),
+            digest: "00".repeat(SHA256_BYTES),
+            receipt: vec![0; 32],
+        });
+        invalid_records.push(garbage_checkpoint);
+
+        for (index, invalid) in invalid_records.into_iter().enumerate() {
+            let control_view: Arc<dyn ControlStore> = Arc::new(
+                LoseFinalizeAckControlStore::with_read_override(control.clone(), invalid.clone()),
+            );
+            let error = super::bootstrap_shard(
+                control_view,
+                Arc::new(RootOwnerRegistry::new()),
+                objects.clone(),
+                ShardBoot {
+                    shard_id: shard(),
+                    open: OpenMode::Existing(source_path.clone()),
+                    lease: LeaseMode::Acquire {
+                        owner: NodeId::new(format!("invalid-node-{index}")).unwrap(),
+                        endpoint: format!("127.0.0.1:91{index}0"),
+                        previous_epoch: Some(previous_epoch),
+                    },
+                    recovery: recovery_publication(&invalid),
+                    roots: vec![root_attach(root_id, 100 + index as u8 * 3)],
+                },
+            )
+            .err()
+            .expect("invalid Control receipt or digest must fail before acquisition");
+            assert!(matches!(error, ServerError::RecoveryInstallation(_)));
+            assert_eq!(
+                control.get_logical_shard(&shard()).unwrap().unwrap(),
+                before_control
+            );
+            let source = open_meta(OpenMode::Existing(source_path.clone()), shard()).unwrap();
+            assert_eq!(source.recovery_state().unwrap(), before_source);
+            drop(source);
+        }
+    }
+
+    #[test]
+    fn recover_log_never_falls_back_to_initialize_for_a_nonempty_corrupt_path() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let objects = recovery_objects();
+        let first = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(temporary.path().join("source"), &[root_id]),
+        )
+        .unwrap();
+        let previous_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+        let before = control.get_logical_shard(&shard()).unwrap().unwrap();
+        let target = temporary.path().join("corrupt");
+        std::fs::create_dir(&target).unwrap();
+        let sentinel = target.join("not-a-holt-store");
+        std::fs::write(&sentinel, b"preserve me").unwrap();
+
+        let error = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::RecoverLog(target),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(previous_epoch),
+                },
+                recovery: recovery_publication(&before),
+                roots: vec![root_attach(root_id, 89)],
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(error, ServerError::Store(_)));
+        assert_eq!(
+            control.get_logical_shard(&shard()).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"preserve me");
+    }
+
+    #[test]
+    fn recover_log_cleans_partial_pending_objects_before_exact_abort_and_retries_ambiguity() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let namespace = ObjectNamespaceId::from_bytes([10; nokv_types::FIXED_ID_BYTES]);
+        let raw = MemoryArtifactStore::new();
+        ensure_object_namespace(&raw, namespace).unwrap();
+        let bound = BoundArtifactStore::open(raw, namespace).unwrap();
+        let objects = Arc::new(FailCreateAndDeleteStore::new(bound, 2));
+
+        let first_error = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(temporary.path().join("lost-source"), &[root_id]),
+        )
+        .err()
+        .expect("the second immutable create must leave a durable pending intent");
+        assert!(matches!(
+            first_error,
+            ServerError::RecoveryPublication(crate::RecoveryPublisherError::Object(
+                nokv_object::RecoveryLogSegmentError::Object(ObjectError::Backend { .. })
+            ))
+        ));
+        let interrupted = control.get_logical_shard(&shard()).unwrap().unwrap();
+        let pending = interrupted
+            .pending_recovery_upload
+            .clone()
+            .expect("partial create must retain exact cleanup authority");
+        let recovery_epoch = interrupted.owner_epoch.unwrap();
+        assert_eq!(interrupted.state, LogicalShardState::Recovering);
+
+        objects.fail_delete_at(2);
+        let recovered_path = temporary.path().join("recovered");
+        let boot = ShardBoot {
+            shard_id: shard(),
+            open: OpenMode::RecoverLog(recovered_path.clone()),
+            lease: LeaseMode::Acquire {
+                owner: NodeId::new("recovery-node").unwrap(),
+                endpoint: "127.0.0.1:9020".to_owned(),
+                previous_epoch: Some(recovery_epoch),
+            },
+            recovery: recovery_publication(&interrupted),
+            roots: vec![root_attach(root_id, 92)],
+        };
+        let cleanup_error = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            boot.clone(),
+        )
+        .err()
+        .expect("ambiguous cleanup must retain the pending intent");
+        assert!(cleanup_error
+            .to_string()
+            .contains("pending recovery cleanup failed"));
+        let retained = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert_eq!(retained.pending_recovery_upload.as_ref(), Some(&pending));
+        assert_eq!(retained.owner_epoch, Some(recovery_epoch));
+        let local = open_meta(OpenMode::Existing(recovered_path), shard()).unwrap();
+        assert_eq!(local.current_owner_epoch().unwrap(), None);
+        drop(local);
+
+        let recovered = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            boot,
+        )
+        .unwrap();
+        assert!(recovered.serving_record().pending_recovery_upload.is_none());
+        assert_eq!(recovered.lease().owner_epoch, recovery_epoch);
+        recovered.release().unwrap();
+    }
+
+    #[test]
+    fn recover_log_installs_a_complete_pending_object_before_publisher_finalizes_it() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let inner = active_control(&[root_id]);
+        let control: Arc<dyn ControlStore> = Arc::new(
+            LoseFinalizeAckControlStore::fail_finalize_before_apply(inner.clone()),
+        );
+        let objects = recovery_objects();
+
+        let first_error = super::bootstrap_shard(
+            control,
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(temporary.path().join("lost-source"), &[root_id]),
+        )
+        .err()
+        .expect("injected finalization failure must retain a complete pending object");
+        assert!(first_error
+            .to_string()
+            .contains("injected recovery-finalize failure before apply"));
+        let interrupted = inner.get_logical_shard(&shard()).unwrap().unwrap();
+        let pending = interrupted
+            .pending_recovery_upload
+            .as_ref()
+            .expect("complete pending object must retain its exact intent");
+        let receipt = nokv_object::RecoveryLogSegmentReceipt::decode(&pending.receipt).unwrap();
+        nokv_object::read_recovery_log_segment(objects.as_ref(), receipt.identity(), &receipt)
+            .unwrap();
+
+        let recovered = super::bootstrap_shard(
+            as_control(&inner),
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::RecoverLog(temporary.path().join("recovered")),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: interrupted.owner_epoch,
+                },
+                recovery: recovery_publication(&interrupted),
+                roots: vec![root_attach(root_id, 107)],
+            },
+        )
+        .unwrap();
+
+        assert!(recovered.serving_record().pending_recovery_upload.is_none());
+        assert!(recovered.serving_record().durable_lsn >= pending.last_lsn);
+        recovered.release().unwrap();
+    }
+
+    #[test]
+    fn recover_log_resumes_the_same_target_after_pending_replay_crashes_before_finalize() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let inner = active_control(&[root_id]);
+        let control: Arc<dyn ControlStore> = Arc::new(
+            LoseFinalizeAckControlStore::fail_finalize_before_apply(inner.clone()),
+        );
+        let objects = recovery_objects();
+        super::bootstrap_shard(
+            control,
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(temporary.path().join("lost-source"), &[root_id]),
+        )
+        .err()
+        .expect("injected finalization failure must retain pending recovery");
+        let interrupted = inner.get_logical_shard(&shard()).unwrap().unwrap();
+        let recovery_epoch = interrupted.owner_epoch.unwrap();
+        let target = temporary.path().join("recovered");
+        let meta = open_meta(OpenMode::RecoverLog(target.clone()), shard()).unwrap();
+        validate_recovery_control_references(
+            &interrupted,
+            root_attach(root_id, 120).object_namespace_id,
+            &meta,
+        )
+        .unwrap();
+        install_durable_recovery_log(&interrupted, objects.as_ref(), &meta).unwrap();
+        let lease = inner
+            .reacquire_recovery(
+                &shard(),
+                recovery_epoch,
+                NodeId::new("crashing-recovery-node").unwrap(),
+                "127.0.0.1:9120".to_owned(),
+            )
+            .unwrap();
+        let acquired = inner.renew_owner(&lease).unwrap();
+        assert!(matches!(
+            install_pending_recovery_upload(&acquired, objects.as_ref(), &meta).unwrap(),
+            PendingRecoveryInstallOutcome::Installed { .. }
+        ));
+        let replayed = meta.recovery_state().unwrap();
+        assert!(replayed.applied_recovery_lsn > acquired.durable_lsn);
+        inner.suspend_recovery(&lease).unwrap();
+        drop(meta);
+        let suspended = inner.get_logical_shard(&shard()).unwrap().unwrap();
+
+        let recovered = super::bootstrap_shard(
+            as_control(&inner),
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::RecoverLog(target),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("restarted-recovery-node").unwrap(),
+                    endpoint: "127.0.0.1:9121".to_owned(),
+                    previous_epoch: Some(recovery_epoch),
+                },
+                recovery: recovery_publication(&suspended),
+                roots: vec![root_attach(root_id, 123)],
+            },
+        )
+        .unwrap();
+        assert!(recovered.serving_record().pending_recovery_upload.is_none());
+        assert!(recovered.serving_record().durable_lsn >= replayed.applied_recovery_lsn);
+        recovered.release().unwrap();
+    }
+
+    #[test]
+    fn recover_log_resumes_the_same_target_after_activation_crashes_before_publication() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let objects = recovery_objects();
+        let first = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(temporary.path().join("source"), &[root_id]),
+        )
+        .unwrap();
+        let previous_epoch = first.lease().owner_epoch;
+        first.release().unwrap();
+        let durable = control.get_logical_shard(&shard()).unwrap().unwrap();
+        let target = temporary.path().join("recovered");
+        let meta = open_meta(OpenMode::RecoverLog(target.clone()), shard()).unwrap();
+        validate_recovery_control_references(
+            &durable,
+            root_attach(root_id, 126).object_namespace_id,
+            &meta,
+        )
+        .unwrap();
+        install_durable_recovery_log(&durable, objects.as_ref(), &meta).unwrap();
+        let lease = control
+            .acquire_successor(
+                &shard(),
+                previous_epoch,
+                NodeId::new("crashing-successor").unwrap(),
+                "127.0.0.1:9122".to_owned(),
+            )
+            .unwrap();
+        activate_shard(&meta, &lease).unwrap();
+        let activated = meta.recovery_state().unwrap();
+        assert!(activated.applied_recovery_lsn > durable.durable_lsn);
+        control.suspend_recovery(&lease).unwrap();
+        drop(meta);
+        let suspended = control.get_logical_shard(&shard()).unwrap().unwrap();
+
+        let recovered = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::RecoverLog(target),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("restarted-successor").unwrap(),
+                    endpoint: "127.0.0.1:9123".to_owned(),
+                    previous_epoch: Some(lease.owner_epoch),
+                },
+                recovery: recovery_publication(&suspended),
+                roots: vec![root_attach(root_id, 129)],
+            },
+        )
+        .unwrap();
+        assert!(recovered.serving_record().durable_lsn >= activated.applied_recovery_lsn);
+        recovered.release().unwrap();
+    }
+
+    #[test]
+    fn recover_log_reloads_and_installs_a_frontier_advanced_during_successor_acquisition() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let objects = recovery_objects();
+        let first = super::bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            objects.clone(),
+            acquire_boot(temporary.path().join("source"), &[root_id]),
+        )
+        .unwrap();
+        let route = first.routes()[0];
+        first
+            .meta()
+            .observe_lease_clock(
+                root_id,
+                PlacementGeneration::new(route.placement_generation).unwrap(),
+                first.lease().owner_epoch,
+                77,
+            )
+            .unwrap();
+        let advanced_local = first.meta().recovery_state().unwrap();
+        let initial = control.get_logical_shard(&shard()).unwrap().unwrap();
+        assert!(advanced_local.applied_recovery_lsn > initial.durable_lsn);
+        let previous_epoch = first.lease().owner_epoch;
+        let control_view: Arc<dyn ControlStore> =
+            Arc::new(LoseFinalizeAckControlStore::advance_before_successor(
+                control.clone(),
+                Arc::clone(first.recovery_publisher()),
+                first.lease().clone(),
+            ));
+
+        let recovered = super::bootstrap_shard(
+            control_view,
+            Arc::new(RootOwnerRegistry::new()),
+            objects,
+            ShardBoot {
+                shard_id: shard(),
+                open: OpenMode::RecoverLog(temporary.path().join("recovered")),
+                lease: LeaseMode::Acquire {
+                    owner: NodeId::new("node-b").unwrap(),
+                    endpoint: "127.0.0.1:9020".to_owned(),
+                    previous_epoch: Some(previous_epoch),
+                },
+                recovery: recovery_publication(&initial),
+                roots: vec![root_attach(root_id, 110)],
+            },
+        )
+        .unwrap();
+
+        assert!(
+            recovered
+                .meta()
+                .recovery_state()
+                .unwrap()
+                .applied_recovery_lsn
+                >= advanced_local.applied_recovery_lsn
+        );
+        assert_eq!(
+            recovered.serving_record().durable_lsn,
+            recovered
+                .meta()
+                .recovery_state()
+                .unwrap()
+                .applied_recovery_lsn
+        );
+        recovered.release().unwrap();
+        drop(first);
+    }
+
+    #[test]
+    fn stale_recovery_publisher_cannot_ack_after_a_successor_acquires_the_same_frontier() {
+        let temporary = TempDir::new().unwrap();
+        let root_id = root(1);
+        let control = active_control(&[root_id]);
+        let owner = bootstrap_shard(
+            as_control(&control),
+            Arc::new(RootOwnerRegistry::new()),
+            acquire_boot(temporary.path().join("metadata"), &[root_id]),
+        )
+        .unwrap();
+        let stale = Arc::clone(owner.recovery_publisher());
+        let previous_epoch = owner.lease().owner_epoch;
+        owner.release().unwrap();
+        let successor = control
+            .acquire_successor(
+                &shard(),
+                previous_epoch,
+                NodeId::new("node-b").unwrap(),
+                "127.0.0.1:9020".to_owned(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            stale.publish_current(),
+            Err(crate::RecoveryPublisherError::Control(
+                ControlError::NotOwner { .. }
+            ))
+        ));
+        control.suspend_recovery(&successor).unwrap();
+    }
+
+    #[test]
+    fn post_admission_record_must_match_every_acquired_lease_field() {
+        let lease = LogicalShardLease {
+            logical_shard_id: shard(),
+            owner: NodeId::new("node-a").unwrap(),
+            owner_epoch: OwnerEpoch::new(7).unwrap(),
+            lease_id: 11,
+        };
+        let mut record = LogicalShardRecord::unassigned(shard());
+        record.owner = Some(lease.owner.clone());
+        record.owner_epoch = Some(lease.owner_epoch);
+        record.lease_id = lease.lease_id;
+        record.state = LogicalShardState::Recovering;
+        record.endpoint = Some("127.0.0.1:9010".to_owned());
+        assert!(validate_control_record_lease(&record, &lease).is_ok());
+
+        let mut wrong_shard = record.clone();
+        wrong_shard.logical_shard_id = other_shard();
+        assert!(validate_control_record_lease(&wrong_shard, &lease).is_err());
+        let mut wrong_owner = record.clone();
+        wrong_owner.owner = Some(NodeId::new("node-b").unwrap());
+        assert!(validate_control_record_lease(&wrong_owner, &lease).is_err());
+        let mut wrong_epoch = record.clone();
+        wrong_epoch.owner_epoch = Some(OwnerEpoch::new(8).unwrap());
+        assert!(validate_control_record_lease(&wrong_epoch, &lease).is_err());
+        let mut wrong_lease = record;
+        wrong_lease.lease_id += 1;
+        assert!(validate_control_record_lease(&wrong_lease, &lease).is_err());
     }
 
     #[test]

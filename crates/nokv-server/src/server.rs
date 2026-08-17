@@ -20,6 +20,8 @@ use nokv_protocol::{
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
 use crate::{RootOwnerRegistry, ServerError, ShardOwner};
 
+static NEVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerOptions {
     pub bind: SocketAddr,
@@ -84,6 +86,10 @@ impl ConnectionLimiter {
                 Err(observed) => current = observed,
             }
         }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
     }
 }
 
@@ -182,56 +188,34 @@ impl WorkspaceServer {
     }
 
     pub fn run(&self) -> Result<(), ServerError> {
+        self.run_until_shutdown(&NEVER_SHUTDOWN)
+    }
+
+    /// Serve until graceful shutdown is requested, then stop accepting new
+    /// connections and drain every admitted connection while retaining and
+    /// renewing ownership.
+    pub fn run_until_shutdown(&self, shutdown: &AtomicBool) -> Result<(), ServerError> {
         let listener = TcpListener::bind(self.options.bind).map_err(ServerError::Bind)?;
-        self.serve(listener)
+        self.serve_until_shutdown(listener, shutdown)
     }
 
     pub fn serve(&self, listener: TcpListener) -> Result<(), ServerError> {
-        listener
-            .set_nonblocking(true)
-            .map_err(ServerError::Connection)?;
-        let mut next_renewal = Instant::now();
-        let connections = Arc::new(
-            ConnectionLimiter::new(self.options.max_inflight_connections)
-                .expect("validated connection maximum is nonzero"),
-        );
-        loop {
-            if self.owner_loss.is_lost() {
-                return Err(ServerError::InvalidBootstrap(
-                    "control-plane owner was lost".to_owned(),
-                ));
-            }
-            let now = Instant::now();
-            if now >= next_renewal {
-                self.renew_ownership()?;
-                next_renewal = Instant::now() + self.options.lease_renew_interval;
-            }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let Some(permit) = connections.try_acquire() else {
-                        drop(stream);
-                        continue;
-                    };
-                    stream
-                        .set_nonblocking(false)
-                        .map_err(ServerError::Connection)?;
-                    let registry = Arc::clone(&self.registry);
-                    let options = self.options;
-                    thread::Builder::new()
-                        .name("nokv-workspace-rpc".to_owned())
-                        .spawn(move || {
-                            let _permit = permit;
-                            let _ = serve_connection(stream, registry, options);
-                        })
-                        .map_err(ServerError::Connection)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    let until_renewal = next_renewal.saturating_duration_since(Instant::now());
-                    thread::sleep(until_renewal.min(Duration::from_millis(10)));
-                }
-                Err(error) => return Err(ServerError::Connection(error)),
-            }
-        }
+        self.serve_until_shutdown(listener, &NEVER_SHUTDOWN)
+    }
+
+    pub fn serve_until_shutdown(
+        &self,
+        listener: TcpListener,
+        shutdown: &AtomicBool,
+    ) -> Result<(), ServerError> {
+        serve_socket_loop(
+            listener,
+            self.options,
+            Arc::clone(&self.registry),
+            self.owner_loss.clone(),
+            shutdown,
+            || self.renew_ownership(),
+        )
     }
 
     pub fn dispatch_frame(&self, encoded: &[u8]) -> Result<Vec<u8>, ServerError> {
@@ -239,6 +223,90 @@ impl WorkspaceServer {
         let response = self.registry.dispatch_guarded(request)?;
         encode_response(response.response()).map_err(ServerError::Protocol)
     }
+}
+
+fn serve_socket_loop(
+    listener: TcpListener,
+    options: ServerOptions,
+    registry: Arc<RootOwnerRegistry>,
+    owner_loss: OwnerLossSignal,
+    shutdown: &AtomicBool,
+    mut renew_ownership: impl FnMut() -> Result<(), ServerError>,
+) -> Result<(), ServerError> {
+    options.validate()?;
+    listener
+        .set_nonblocking(true)
+        .map_err(ServerError::Connection)?;
+    let mut next_renewal = Instant::now();
+    let connections = Arc::new(
+        ConnectionLimiter::new(options.max_inflight_connections)
+            .expect("validated connection maximum is nonzero"),
+    );
+    loop {
+        require_owner_retained(&owner_loss)?;
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        let now = Instant::now();
+        if now >= next_renewal {
+            renew_ownership()?;
+            next_renewal = Instant::now() + options.lease_renew_interval;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                require_owner_retained(&owner_loss)?;
+                if shutdown.load(Ordering::Acquire) {
+                    drop(stream);
+                    continue;
+                }
+                let Some(permit) = connections.try_acquire() else {
+                    drop(stream);
+                    continue;
+                };
+                stream
+                    .set_nonblocking(false)
+                    .map_err(ServerError::Connection)?;
+                let registry = Arc::clone(&registry);
+                thread::Builder::new()
+                    .name("nokv-workspace-rpc".to_owned())
+                    .spawn(move || {
+                        let _permit = permit;
+                        let _ = serve_connection(stream, registry, options);
+                    })
+                    .map_err(ServerError::Connection)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                sleep_until_runtime_event(next_renewal);
+            }
+            Err(error) => return Err(ServerError::Connection(error)),
+        }
+    }
+
+    while connections.in_flight() != 0 {
+        require_owner_retained(&owner_loss)?;
+        let now = Instant::now();
+        if now >= next_renewal {
+            renew_ownership()?;
+            next_renewal = Instant::now() + options.lease_renew_interval;
+        }
+        sleep_until_runtime_event(next_renewal);
+    }
+    require_owner_retained(&owner_loss)
+}
+
+fn require_owner_retained(owner_loss: &OwnerLossSignal) -> Result<(), ServerError> {
+    if owner_loss.is_lost() {
+        Err(ServerError::InvalidBootstrap(
+            "control-plane owner was lost".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn sleep_until_runtime_event(next_renewal: Instant) {
+    let until_renewal = next_renewal.saturating_duration_since(Instant::now());
+    thread::sleep(until_renewal.min(Duration::from_millis(10)));
 }
 
 fn validate_ownership(
@@ -520,7 +588,7 @@ fn write_frame(writer: &mut impl Write, frame: &[u8]) -> Result<(), ServerError>
 mod tests {
     use std::io::Cursor;
     use std::net::Shutdown;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
 
     use nokv_protocol::{
@@ -740,16 +808,13 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_hello_gets_v6_incompatible_and_zero_dispatch() {
+    fn v7_hello_gets_v9_incompatible_and_zero_dispatch() {
         let (mut client, server) = streams();
         let (registry, executor) = registry();
         let serving = thread::spawn(move || serve_connection(server, registry, options()));
 
-        let hello = WorkspaceHandshake::new(
-            HandshakeKind::ClientHello,
-            crate::legacy_rejection::LEGACY_V3_SCHEMA,
-        )
-        .unwrap();
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, "nokv.workspace.rpc.v7").unwrap();
         client
             .write_all(&encode_handshake_frame(&hello).unwrap())
             .unwrap();
@@ -812,6 +877,94 @@ mod tests {
         assert!(limiter.try_acquire().is_none());
         drop(permit);
         assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn graceful_shutdown_before_accept_returns_without_admitting_a_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let shutdown = AtomicBool::new(true);
+        let owner_loss = OwnerLossSignal::default();
+        let (registry, _) = registry();
+        let renewals = AtomicUsize::new(0);
+
+        serve_socket_loop(listener, options(), registry, owner_loss, &shutdown, || {
+            renewals.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(renewals.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn graceful_shutdown_drains_accepted_connections_while_renewing_ownership() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let owner_loss = OwnerLossSignal::default();
+        let (registry, _) = registry();
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let mut runtime_options = options();
+        runtime_options.read_timeout = Duration::from_secs(5);
+        runtime_options.lease_renew_interval = Duration::from_millis(5);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_renewals = Arc::clone(&renewals);
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let (renewed_tx, renewed_rx) = mpsc::channel();
+        let serving = thread::spawn(move || {
+            let result = serve_socket_loop(
+                listener,
+                runtime_options,
+                registry,
+                owner_loss,
+                worker_shutdown.as_ref(),
+                || {
+                    let count = worker_renewals.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    renewed_tx.send(count).unwrap();
+                    Ok(())
+                },
+            );
+            completed_tx.send(()).unwrap();
+            result
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let hello =
+            WorkspaceHandshake::new(HandshakeKind::ClientHello, WORKSPACE_PROTOCOL_SCHEMA).unwrap();
+        client
+            .write_all(&encode_handshake_frame(&hello).unwrap())
+            .unwrap();
+        let mut accepted = [0_u8; HANDSHAKE_FRAME_BYTES];
+        client.read_exact(&mut accepted).unwrap();
+        assert_eq!(renewed_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        shutdown.store(true, AtomicOrdering::Release);
+
+        assert!(renewed_rx.recv_timeout(Duration::from_secs(1)).unwrap() > 1);
+        assert!(matches!(
+            completed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        client.shutdown(Shutdown::Both).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drain must finish after the accepted connection exits");
+        serving.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn owner_loss_precedes_an_already_requested_graceful_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let shutdown = AtomicBool::new(true);
+        let owner_loss = OwnerLossSignal::default();
+        owner_loss.fail_closed();
+        let (registry, _) = registry();
+
+        let error = serve_socket_loop(listener, options(), registry, owner_loss, &shutdown, || {
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("owner was lost"));
     }
 
     #[test]

@@ -19,6 +19,12 @@ pub enum ServerError {
     },
     Store(nokv_meta_store::StoreError),
     Meta(nokv_meta::workspace::MetaError),
+    RecoveryInstallation(crate::RecoveryInstallerError),
+    RecoveryPublication(crate::RecoveryPublisherError),
+    RecoveryPath {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     BootstrapRollback {
         primary: String,
         rollback: String,
@@ -76,6 +82,17 @@ impl fmt::Display for ServerError {
             }
             Self::Store(error) => write!(formatter, "metadata store failed: {error}"),
             Self::Meta(error) => write!(formatter, "metadata failed: {error}"),
+            Self::RecoveryInstallation(error) => {
+                write!(formatter, "recovery installation failed: {error}")
+            }
+            Self::RecoveryPublication(error) => {
+                write!(formatter, "recovery publication failed: {error}")
+            }
+            Self::RecoveryPath { path, source } => write!(
+                formatter,
+                "recovery metadata path {} cannot be inspected: {source}",
+                path.display()
+            ),
             Self::BootstrapRollback { primary, rollback } => write!(
                 formatter,
                 "logical-shard ownership failed: {primary}; cleanup also failed: {rollback}"
@@ -109,6 +126,18 @@ impl From<nokv_meta_store::StoreError> for ServerError {
 impl From<nokv_meta::workspace::MetaError> for ServerError {
     fn from(error: nokv_meta::workspace::MetaError) -> Self {
         Self::Meta(error)
+    }
+}
+
+impl From<crate::RecoveryInstallerError> for ServerError {
+    fn from(error: crate::RecoveryInstallerError) -> Self {
+        Self::RecoveryInstallation(error)
+    }
+}
+
+impl From<crate::RecoveryPublisherError> for ServerError {
+    fn from(error: crate::RecoveryPublisherError) -> Self {
+        Self::RecoveryPublication(error)
     }
 }
 

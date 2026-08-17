@@ -155,24 +155,43 @@ continuations retain one exact root read version. Live continuations may move
 to a newer root read version only while the target workspace incarnation and
 revision remain unchanged; target drift fails closed, and an initial bounded
 collection may restart in full but never merges workspace revisions. This
-contract is gated by operation schema `nokv.workspace.rpc.v6`; v3 first added
-the provider-neutral object namespace identity to every root route.
+contract is gated by operation schema `nokv.workspace.rpc.v9`; v7 added the
+exact read-version fence used by path point reads, v8 added the required typed
+`Prefix`/`Exact` catalog path match so an artifact cannot inherit fields from
+same-name descendants, and v9 adds an explicit query profile plus tagged query
+rows and authoritative search, aggregate, and catalog totals/facets. V3 first
+added the provider-neutral object namespace identity to every root route.
 
 Each TCP connection starts with the fixed-width, schema-neutral transport
 handshake v1. The client offers one exact operation schema, and the server
-accepts only `nokv.workspace.rpc.v6`; the handshake version remains stable when
+accepts only `nokv.workspace.rpc.v9`; the handshake version remains stable when
 the operation schema changes. For upgrade diagnostics, the server recognizes
 only operation-first envelopes from the public v2 client and the post-tag v3
 client. It parses a bounded route/request header, ignores the operation, emits
 one schema-readable failure, and closes without dispatch. The v2 client gets
-its exact v2 failure envelope; the v3 client gets a v6 failure envelope so its
-decoder reports the v6/v3 schema mismatch. Unknown legacy schemas, malformed
+its exact v2 failure envelope; the v3 client gets a v9 failure envelope so its
+decoder reports the v9/v3 schema mismatch. Unknown legacy schemas, malformed
 envelopes, and malformed handshakes fail closed. This is a read-only rejection
 path, not a legacy response decoder or operation fallback.
 
 Secondary-index queries run at one read version and filter every result by the
-matching visible incarnation. Object bodies are read only when the selected
-tool actually requires them.
+matching visible incarnation. `ArtifactV1` remains the default Workbench query
+contract. `GenericNamespaceV1` carries a bounded, normalized, display-only
+presentation root and materializes Workbench, section, implicit-directory, and
+artifact rows at that same read version. Its transient `path` scalar is the full
+presentation path, while row identity stays the canonical Workbench and relative
+path. An exact artifact wins over a same-name virtual directory without hiding
+descendants. Its cursor binds the profile, presentation root, storage root, read
+version, and query. Presentation paths are never persisted as metadata or used
+as storage authority.
+The generic catalog exposes the seven legacy built-ins plus declared durable
+custom indexes. Custom-index registration builds an immutable, paged generation
+behind one current-pointer CAS; rows retain ordered duplicate values and exact
+directory or artifact-revision binding. Commit, snapshot, restore, retirement,
+and reference GC carry the same sealed generation closure, so a dirty snapshot
+can be restored without an intervening commit and an old generation cannot be
+reused after reclamation. Object bodies are read only when the selected tool
+actually requires them.
 
 ## Publish Path
 
@@ -324,25 +343,34 @@ The two modes have separate SLOs and benchmark rows. Recovery uses checkpoint
 images plus the logical command log. Owner epoch prevents an old process from
 committing or deleting objects after failover.
 
-Current implementation status: only the `local` boundary is executable, using
-synchronous shard-local Holt WAL plus an in-store atomic, hash-chained recovery
-outbox. Remote outbox consumption/ACK, shared-log replication, checkpoint
-installation/replay, and fsck remain qualification work. Until those are
-implemented and verified, bootstrap rejects any non-zero or referenced Control
-recovery frontier before acquiring an owner or installing a route; it cannot
-mark such a shard `Serving` from an arbitrary local directory. With an empty
-shared frontier, `Reopen` can restart the same exclusive Holt namespace after
-the prior etcd session is gone. Startup first opens Holt under its lifetime
-directory lock, replays the WAL, validates schema/shard identity and the full
-recovery-outbox chain, and compares the local owner fence with the control
-record. A completed owner gets the next epoch. A crash while the control record
-is `Recovering` rebinds that same recovery epoch whether the local fence is its
-predecessor or already exact, so repeated crashes cannot create an epoch gap.
-A live session, stale local epoch, corrupt or uninitialized replacement, or
-non-empty shared recovery frontier remains fail-closed. A byte-for-byte copy
-may carry the same shard and epoch bits and cannot yet be distinguished from
-the original without a persistent provider identity; copied-directory and
-cross-host failover remain outside this qualification.
+Current implementation status: the local Holt WAL boundary and the
+object-backed shared-log boundary are executable. Every acknowledged metadata
+mutation first commits to the shard-local hash-chained recovery outbox. The
+shared boundary then persists an exact upload intent in Control, creates the
+receipt-addressed immutable chunks and manifest, and atomically publishes the
+new log frontier before returning. Control bounds both the logical chain and
+the canonical encoded record so an upload is rejected before its first object
+write if its pending or finalized etcd record cannot fit the admitted request
+budget.
+
+`Reopen` restarts the same exclusive Holt namespace. `RecoverLog` creates or
+resumes a local namespace from strict shared-log receipts. Both paths validate
+canonical receipts and prove the Control frontier is an exact prefix before
+owner acquisition, then renew and repeat the proof after acquisition before
+installing the owner fence. Complete pending uploads are replayed exactly;
+incomplete uploads retain their intent until every receipt-derived cleanup key
+is confirmed deleted or absent, after which an owner-fenced CAS may abort the
+intent. Ambiguous cleanup remains fail-closed. Crashes after pending replay or
+owner activation are resumable because a verified local-ahead prefix is not
+mistaken for divergence. A completed owner gets the next epoch; an unfinished
+`Recovering` owner rebinds the same epoch, so repeated crashes cannot create an
+epoch gap.
+
+Cold checkpoint installation is not yet admitted by the default product build:
+the pinned published Holt dependency does not expose the bounded borrowed
+checkpoint API. A Control checkpoint frontier therefore remains fail-closed in
+`RecoverLog`. Log truncation/compaction, copied-directory identity, cross-host
+checkpoint failover, and fsck also remain outside this qualification.
 
 Durable ledgers, not object listing, recover:
 

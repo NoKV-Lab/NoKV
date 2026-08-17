@@ -14,6 +14,8 @@ mod error;
 mod executor;
 mod legacy_rejection;
 mod lifecycle;
+mod recovery_installer;
+mod recovery_publisher;
 mod registry;
 mod server;
 mod service;
@@ -23,11 +25,25 @@ mod test_support;
 pub use bootstrap::{bootstrap_shard, LeaseMode, OpenMode, RootAttach, ShardBoot, ShardOwner};
 pub use error::ServerError;
 pub use executor::MetadataWorkspaceRequestExecutor;
+#[cfg(feature = "restore-crash-test-support")]
+pub use executor::{
+    RestoreInitializationBarrier, RestoreInitializationBarrierEvidence,
+    RestoreInitializationBarrierPhase, RestoreManifestBindingEvidence,
+    RestoreManifestPublicationEvidence,
+};
 pub use lifecycle::{
     ArtifactLifecycleDeleter, LifecycleAbsenceProof, LifecycleCycleReport,
     LifecycleDeleteDisposition, LifecycleDeleteError, LifecycleDeletePurpose,
-    LifecycleDeleteRequest, LifecycleError, LifecycleObjectDeleter, LifecycleRunner,
-    LifecycleRunnerOptions,
+    LifecycleDeleteRequest, LifecycleDurabilityBarrier, LifecycleError, LifecycleObjectDeleter,
+    LifecycleRunner, LifecycleRunnerOptions,
+};
+pub use recovery_installer::{
+    install_recovery_log, validate_local_recovery_prefix, LocalRecoveryPrefixReport,
+    RecoveryInstallationReport, RecoveryInstallerError, MAX_RECOVERY_INSTALL_PAYLOAD_BYTES,
+    MAX_RECOVERY_INSTALL_RECEIPT_BYTES, MAX_RECOVERY_INSTALL_SEGMENTS,
+};
+pub use recovery_publisher::{
+    RecoveryPublisher, RecoveryPublisherError, RecoveryPublishingExecutor,
 };
 pub use registry::RootOwnerRegistry;
 pub use server::{OwnerLossSignal, ServerHealth, ServerOptions, WorkspaceServer};

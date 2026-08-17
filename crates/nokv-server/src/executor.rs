@@ -34,17 +34,74 @@ const _: () = assert!(protocol::MAX_QUERY_PAGE_LIMIT as usize == meta::MAX_QUERY
 // reject the legacy 61..=64 gap at DTO-to-domain conversion as main does.
 const _: () =
     assert!(protocol::ArtifactDescriptor::MAX_INDEX_FIELDS >= meta::MAX_TYPED_PROJECTION_FIELDS);
-const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 9] = [
+const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 10] = [
     protocol::WorkspaceCapability::ArtifactPublishV1,
     protocol::WorkspaceCapability::ArtifactRangeReadV1,
     protocol::WorkspaceCapability::ChangeFeedV1,
     protocol::WorkspaceCapability::CommitV1,
+    protocol::WorkspaceCapability::GenericCustomIndexV1,
     protocol::WorkspaceCapability::QueryV1,
     protocol::WorkspaceCapability::RestoreV1,
     protocol::WorkspaceCapability::SnapshotLeaseV1,
     protocol::WorkspaceCapability::WorkspaceLifecycleV1,
     protocol::WorkspaceCapability::WorkspacePathV1,
 ];
+
+#[cfg(feature = "restore-crash-test-support")]
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreInitializationBarrierPhase {
+    DestinationBuilding,
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct RestoreManifestPublicationEvidence {
+    pub identity: protocol::RestoreManifestIdentity,
+    pub workspace_incarnation_id: protocol::WorkspaceIdentity,
+    pub body_digest_uri: String,
+    pub manifest_digest_uri: String,
+    pub logical_size: u64,
+    pub content_type: String,
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct RestoreManifestBindingEvidence {
+    pub expected: protocol::RestoreManifestIdentity,
+    pub actual: RestoreManifestPublicationEvidence,
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct RestoreInitializationBarrierEvidence {
+    pub route: protocol::RootRoute,
+    pub operation_id: protocol::OperationIdentity,
+    pub durable_read_version: u64,
+    pub phase: RestoreInitializationBarrierPhase,
+    pub initialization_digest: protocol::Digest,
+    pub destination_workspace_incarnation_id: protocol::WorkspaceIdentity,
+    pub destination_commit_id: protocol::CommitIdentity,
+    pub run_manifest: RestoreManifestBindingEvidence,
+    pub restore_manifest: RestoreManifestBindingEvidence,
+    pub built_commit_members: u64,
+    pub sealed_revisions: u64,
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+pub trait RestoreInitializationBarrier: Send + Sync {
+    fn reached(
+        &self,
+        evidence: Result<RestoreInitializationBarrierEvidence, protocol::RpcFailure>,
+    ) -> !;
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+#[derive(Clone)]
+struct RestoreInitializationBarrierRegistration {
+    target_operation_id: protocol::OperationIdentity,
+    barrier: Arc<dyn RestoreInitializationBarrier>,
+}
 
 /// Storage-neutral protocol adapter over one authoritative metadata shard.
 ///
@@ -53,11 +110,30 @@ const SUPPORTED_WORKSPACE_CAPABILITIES: [protocol::WorkspaceCapability; 9] = [
 #[derive(Clone)]
 pub struct MetadataWorkspaceRequestExecutor {
     meta: Arc<meta::MetaShard>,
+    #[cfg(feature = "restore-crash-test-support")]
+    restore_initialization_barrier: Option<RestoreInitializationBarrierRegistration>,
 }
 
 impl MetadataWorkspaceRequestExecutor {
     pub fn new(meta: Arc<meta::MetaShard>) -> Self {
-        Self { meta }
+        Self {
+            meta,
+            #[cfg(feature = "restore-crash-test-support")]
+            restore_initialization_barrier: None,
+        }
+    }
+
+    #[cfg(feature = "restore-crash-test-support")]
+    pub fn with_restore_initialization_barrier(
+        mut self,
+        target_operation_id: protocol::OperationIdentity,
+        barrier: Arc<dyn RestoreInitializationBarrier>,
+    ) -> Self {
+        self.restore_initialization_barrier = Some(RestoreInitializationBarrierRegistration {
+            target_operation_id,
+            barrier,
+        });
+        self
     }
 
     pub fn meta(&self) -> &Arc<meta::MetaShard> {
@@ -123,6 +199,21 @@ impl MetadataWorkspaceRequestExecutor {
                 self.finalize_restore(request, finalize)
             }
             protocol::WorkspaceRequest::GetOperation(get) => self.get_operation(request, get),
+            protocol::WorkspaceRequest::BeginGenericIndexRegistration(begin) => {
+                self.begin_generic_index_registration(request, begin)
+            }
+            protocol::WorkspaceRequest::AppendGenericIndexRows(append) => {
+                self.append_generic_index_rows(request, append)
+            }
+            protocol::WorkspaceRequest::FinalizeGenericIndexRegistration(finalize) => {
+                self.finalize_generic_index_registration(request, finalize)
+            }
+            protocol::WorkspaceRequest::AbortGenericIndexRegistration(abort) => {
+                self.abort_generic_index_registration(request, abort)
+            }
+            protocol::WorkspaceRequest::GetGenericIndexRegistration(get) => {
+                self.get_generic_index_registration(request, get)
+            }
             protocol::WorkspaceRequest::Search(search) => self.search(request, search),
             protocol::WorkspaceRequest::Aggregate(aggregate) => self.aggregate(request, aggregate),
             protocol::WorkspaceRequest::Catalog(catalog) => self.catalog(request, catalog),
@@ -227,22 +318,25 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let workbench = workbench_id(&request.target.workbench)?;
         let path = relative_path(&request.target.path)?;
-        let resolved = if matches!(&request.view, protocol::WorkspaceReadView::Live) {
-            let route = route_parts(rpc.route)?;
-            meta::get_current_visible_workspace_path(
-                &self.meta,
-                route.root_id,
-                route.placement_generation,
-                route.owner_epoch,
-                &workbench,
-                &path,
-            )
-        } else {
-            let context = self.workspace_read_context(rpc.route, &workbench, &request.view)?;
-            meta::get_visible_workspace_path_at(&self.meta, context, &workbench, &path)
+        let context = self.workspace_read_context(rpc.route, &workbench, &request.view)?;
+        if request
+            .expected_read_version
+            .is_some_and(|expected| expected != context.read_version.get())
+        {
+            return Err(failure(
+                protocol::ErrorCode::PreconditionFailed,
+                format!(
+                    "get_path expected read version {} does not match resolved read version {}",
+                    request.expected_read_version.expect("checked as present"),
+                    context.read_version.get()
+                ),
+                false,
+                Some(protocol::ConflictKind::ReadVersion),
+            ));
         }
-        .map_err(namespace_failure)?
-        .ok_or_else(|| not_found("workbench does not exist"))?;
+        let resolved = meta::get_visible_workspace_path_at(&self.meta, context, &workbench, &path)
+            .map_err(namespace_failure)?
+            .ok_or_else(|| not_found("workbench does not exist"))?;
         let Some(entry) = resolved.entry else {
             return Err(not_found("path does not exist"));
         };
@@ -961,16 +1055,15 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         self.claim_mutation(rpc)?;
         let operation_id: types::OperationId = request.operation_id.into();
-        let mut operation = meta::get_restore(
-            &self.meta,
-            self.write_context(
-                rpc.route,
-                derived_request_id(rpc.request_id, b"restore-finalize-load", 0),
-            )?,
-            operation_id,
-        )
-        .map_err(restore_failure)?
-        .ok_or_else(|| not_found("restore operation does not exist"))?;
+        let load_context = self.write_context(
+            rpc.route,
+            derived_request_id(rpc.request_id, b"restore-finalize-load", 0),
+        )?;
+        #[cfg(feature = "restore-crash-test-support")]
+        let mut durable_read_version = load_context.read_version.get();
+        let mut operation = meta::get_restore(&self.meta, load_context, operation_id)
+            .map_err(restore_failure)?
+            .ok_or_else(|| not_found("restore operation does not exist"))?;
         if let Some(failure) = restore_terminal_failure(&operation) {
             return Err(failure);
         }
@@ -1002,7 +1095,44 @@ impl MetadataWorkspaceRequestExecutor {
                     "restore initialization did not reach DestinationBuilding",
                 ));
             }
-            operation = initialized.operation;
+            #[cfg(feature = "restore-crash-test-support")]
+            {
+                let initialization_read_version =
+                    types::ReadVersion::new(initialized.commit_version.get()).map_err(|error| {
+                        internal(format!(
+                            "restore initialization commit version is not readable: {error}"
+                        ))
+                    })?;
+                let mut readback_context = self.write_context(
+                    rpc.route,
+                    derived_request_id(rpc.request_id, b"restore-initialization-readback", 0),
+                )?;
+                readback_context.read_version = initialization_read_version;
+                let durable = meta::get_restore(&self.meta, readback_context, operation_id)
+                    .map_err(restore_failure)?;
+                operation =
+                    authoritative_restore_initialization_readback(&initialized.operation, durable)?;
+                durable_read_version = initialized.commit_version.get();
+            }
+            #[cfg(not(feature = "restore-crash-test-support"))]
+            {
+                operation = initialized.operation;
+            }
+        }
+
+        #[cfg(feature = "restore-crash-test-support")]
+        if operation.phase == types::RestorePhase::DestinationBuilding {
+            if let Some(registration) = &self.restore_initialization_barrier {
+                let operation_id = protocol::OperationIdentity::from(operation.operation_id);
+                if operation_id == registration.target_operation_id {
+                    let evidence = restore_initialization_barrier_evidence(
+                        rpc.route,
+                        durable_read_version,
+                        &operation,
+                    );
+                    registration.barrier.reached(evidence);
+                }
+            }
         }
 
         let mut batch = 0_u64;
@@ -1133,6 +1263,155 @@ impl MetadataWorkspaceRequestExecutor {
         )
     }
 
+    fn begin_generic_index_registration(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::BeginGenericIndexRegistrationRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        let outcome = meta::GenericIndexRegistrationService::new(&self.meta)
+            .begin(meta::BeginGenericIndexRegistrationRequest {
+                context: self.write_context(
+                    rpc.route,
+                    derived_request_id(rpc.request_id, b"generic-index-begin", 0),
+                )?,
+                operation_id: request.operation_id.into(),
+                generation_id: request.generation_id.into(),
+                workbench_id: workbench_id(&request.workbench)?,
+                expected_workspace_incarnation_id: request.workspace_incarnation_id.into(),
+                index_path: request.index_path.as_ref().map(relative_path).transpose()?,
+                expected_current_generation: request
+                    .expected_current_generation
+                    .map(types::Generation::new)
+                    .transpose()
+                    .map_err(|error| invalid_argument(error.to_string()))?,
+                capabilities: request
+                    .capabilities
+                    .iter()
+                    .map(meta_generic_index_capability)
+                    .collect::<Result<_, _>>()?,
+                declared_row_count: request.declared_row_count,
+            })
+            .map_err(generic_index_failure)?;
+        generic_index_registration_response(request.operation_id, outcome)
+    }
+
+    fn append_generic_index_rows(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::AppendGenericIndexRowsRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        let outcome = meta::GenericIndexRegistrationService::new(&self.meta)
+            .append(meta::AppendGenericIndexRowsRequest {
+                context: self.write_context(
+                    rpc.route,
+                    derived_request_id(
+                        rpc.request_id,
+                        b"generic-index-append",
+                        request.first_sequence,
+                    ),
+                )?,
+                operation_id: request.operation_id.into(),
+                first_sequence: request.first_sequence,
+                rows: request
+                    .rows
+                    .iter()
+                    .map(meta_generic_index_row)
+                    .collect::<Result<_, _>>()?,
+            })
+            .map_err(generic_index_failure)?;
+        let result = protocol::GenericIndexAppendResult {
+            registration: generic_index_registration_status(
+                request.operation_id,
+                &outcome.command.operation,
+            )?,
+            receipt: protocol::GenericIndexAppendReceipt {
+                first_sequence: outcome.receipt.first_sequence,
+                row_count: outcome.receipt.row_count,
+                commit_version: outcome.receipt.commit_version.get(),
+                input_digest: protocol::Digest(outcome.receipt.input_digest),
+                resulting_row_count: outcome.receipt.resulting_row_count,
+                resulting_row_digest: protocol::Digest(outcome.receipt.resulting_row_digest),
+            },
+        };
+        Ok(ExecutedRequest {
+            result: protocol::WorkspaceResult::GenericIndexAppend(result),
+            commit_version: Some(outcome.command.commit_version.get()),
+            replayed: outcome.command.replayed,
+        })
+    }
+
+    fn finalize_generic_index_registration(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::FinalizeGenericIndexRegistrationRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        let outcome = meta::GenericIndexRegistrationService::new(&self.meta)
+            .finalize(meta::FinalizeGenericIndexRegistrationRequest {
+                context: self.write_context(
+                    rpc.route,
+                    derived_request_id(rpc.request_id, b"generic-index-finalize", 0),
+                )?,
+                operation_id: request.operation_id.into(),
+            })
+            .map_err(generic_index_failure)?;
+        generic_index_registration_response(request.operation_id, outcome)
+    }
+
+    fn abort_generic_index_registration(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::AbortGenericIndexRegistrationRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        self.claim_mutation(rpc)?;
+        let outcome = meta::GenericIndexRegistrationService::new(&self.meta)
+            .abort(meta::AbortGenericIndexRegistrationRequest {
+                context: self.write_context(
+                    rpc.route,
+                    derived_request_id(rpc.request_id, b"generic-index-abort", 0),
+                )?,
+                operation_id: request.operation_id.into(),
+                limit: request.limit as usize,
+            })
+            .map_err(generic_index_failure)?;
+        let result = protocol::GenericIndexAbortResult {
+            registration: generic_index_registration_status(
+                request.operation_id,
+                &outcome.command.operation,
+            )?,
+            removed_rows: u32::try_from(outcome.removed_rows)
+                .map_err(|_| internal("generic index removed-row count exceeds u32"))?,
+            removed_receipts: u32::try_from(outcome.removed_receipts)
+                .map_err(|_| internal("generic index removed-receipt count exceeds u32"))?,
+            cleanup_complete: outcome.cleanup_complete,
+        };
+        Ok(ExecutedRequest {
+            result: protocol::WorkspaceResult::GenericIndexAbort(result),
+            commit_version: Some(outcome.command.commit_version.get()),
+            replayed: outcome.command.replayed,
+        })
+    }
+
+    fn get_generic_index_registration(
+        &self,
+        rpc: &protocol::WorkspaceRpcRequest,
+        request: &protocol::GetGenericIndexRegistrationRequest,
+    ) -> Result<ExecutedRequest, protocol::RpcFailure> {
+        let operation = meta::GenericIndexRegistrationService::new(&self.meta)
+            .get(self.read_context(rpc.route)?, request.operation_id.into())
+            .map_err(generic_index_failure)?
+            .ok_or_else(|| not_found("Generic index registration does not exist"))?;
+        Ok(ExecutedRequest {
+            result: protocol::WorkspaceResult::GenericIndexRegistration(
+                generic_index_registration_status(request.operation_id, &operation)?,
+            ),
+            commit_version: None,
+            replayed: false,
+        })
+    }
+
     fn search(
         &self,
         rpc: &protocol::WorkspaceRpcRequest,
@@ -1140,7 +1419,9 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let context = self.read_context(rpc.route)?;
         let (scope, path_prefix) = query_scope(&request.scope)?;
+        let profile = query_profile(&request.profile)?;
         let query = meta::SearchRequest {
+            profile: profile.clone(),
             scope,
             path_prefix,
             predicates: query_predicates(&request.predicates)?,
@@ -1151,52 +1432,100 @@ impl MetadataWorkspaceRequestExecutor {
             limit: query_limit(request.page.limit),
         };
         let page = meta::search_paths_at(&self.meta, context, &query).map_err(query_failure)?;
-        let mut hits = Vec::with_capacity(page.hits.len());
-        for hit in page.hits {
-            let workbench = protocol_workbench(&hit.workbench_id)?;
-            let workspace = meta::get_visible_workspace_at(&self.meta, context, &hit.workbench_id)
-                .map_err(namespace_failure)?
-                .ok_or_else(|| internal("query hit references an invisible workbench"))?;
-            let visible =
-                meta::get_path_at_visible_workspace(&self.meta, context, &workspace, &hit.path)
+        let mut hits = Vec::with_capacity(page.hits.len() + page.namespace_hits.len());
+        match profile {
+            meta::QueryProfile::ArtifactV1 => {
+                if !page.namespace_hits.is_empty() {
+                    return Err(internal("artifact query returned generic namespace rows"));
+                }
+                for hit in page.hits {
+                    let workbench = protocol_workbench(&hit.workbench_id)?;
+                    let workspace =
+                        meta::get_visible_workspace_at(&self.meta, context, &hit.workbench_id)
+                            .map_err(namespace_failure)?
+                            .ok_or_else(|| {
+                                internal("query hit references an invisible workbench")
+                            })?;
+                    let visible = meta::get_path_at_visible_workspace(
+                        &self.meta, context, &workspace, &hit.path,
+                    )
                     .map_err(namespace_failure)?
                     .ok_or_else(|| internal("query hit references an invisible path"))?;
-            if visible.generation != hit.generation
-                || visible.body_digest_uri != hit.body_digest_uri
-                || visible.logical_size != hit.logical_size
-                || visible.content_type != hit.content_type
-                || visible.producer != hit.producer
-                || visible.manifest_id != hit.manifest_id
-            {
-                return Err(internal(
-                    "query hit does not match its authoritative visible path",
-                ));
+                    if visible.generation != hit.generation
+                        || visible.body_digest_uri != hit.body_digest_uri
+                        || visible.logical_size != hit.logical_size
+                        || visible.content_type != hit.content_type
+                        || visible.producer != hit.producer
+                        || visible.manifest_id != hit.manifest_id
+                    {
+                        return Err(internal(
+                            "query hit does not match its authoritative visible path",
+                        ));
+                    }
+                    hits.push(protocol::SearchRow::Artifact(protocol::SearchHit {
+                        metadata: Self::path_metadata(&workbench, workspace, hit.path, visible)?,
+                        projection: protocol_field_values(hit.projection),
+                    }));
+                }
             }
-            hits.push(protocol::SearchHit {
-                metadata: Self::path_metadata(&workbench, workspace, hit.path, visible)?,
-                projection: protocol_field_values(hit.projection),
-            });
+            meta::QueryProfile::GenericNamespaceV1 { .. } => {
+                if !page.hits.is_empty() {
+                    return Err(internal("generic namespace query returned artifact rows"));
+                }
+                for hit in page.namespace_hits {
+                    let artifact = hit
+                        .artifact
+                        .map(|artifact| {
+                            Ok(protocol::GenericNamespaceArtifact {
+                                generation: artifact.generation.get(),
+                                logical_size: artifact.logical_size,
+                                body_digest: protocol::DigestUri::new(artifact.body_digest_uri)
+                                    .map_err(|error| internal(error.to_string()))?,
+                                content_type: protocol::ContentType::new(artifact.content_type)
+                                    .map_err(|error| internal(error.to_string()))?,
+                                producer: artifact.producer,
+                                manifest_identity: artifact.manifest_id,
+                            })
+                        })
+                        .transpose()?;
+                    hits.push(protocol::SearchRow::GenericNamespace(
+                        protocol::GenericNamespaceHit {
+                            workbench: protocol_workbench(&hit.workbench_id)?,
+                            relative_path: hit
+                                .relative_path
+                                .map(|path| {
+                                    protocol::RelativePath::new(path.as_str())
+                                        .map_err(|error| internal(error.to_string()))
+                                })
+                                .transpose()?,
+                            kind: match hit.kind {
+                                meta::GenericNamespaceKind::Directory => {
+                                    protocol::GenericNamespaceKind::Directory
+                                }
+                                meta::GenericNamespaceKind::Artifact => {
+                                    protocol::GenericNamespaceKind::Artifact
+                                }
+                            },
+                            artifact,
+                            projection: protocol_field_values(hit.projection),
+                            indexed_values: hit
+                                .indexed_values
+                                .into_iter()
+                                .map(|(field_id, values)| protocol::GenericIndexFieldValues {
+                                    field_id: field_id.as_str().to_owned(),
+                                    values: values.into_iter().map(protocol_scalar).collect(),
+                                })
+                                .collect(),
+                        },
+                    ));
+                }
+            }
         }
-        let facets = page
-            .facets
-            .into_iter()
-            .map(|facet| protocol::FacetResult {
-                field_id: facet.field_id.as_str().to_owned(),
-                buckets: facet
-                    .buckets
-                    .into_iter()
-                    .map(|bucket| protocol::FacetBucket {
-                        value: protocol_scalar(bucket.value),
-                        count: bucket.count,
-                    })
-                    .collect(),
-                distinct_count: facet.distinct_count,
-                truncated: facet.truncated,
-            })
-            .collect();
+        let facets = protocol_facets(page.facets);
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Search(protocol::SearchResult {
                 hits,
+                match_count: page.match_count,
                 facets,
                 next_cursor: page.next_cursor,
                 read_version: page.read_version.get(),
@@ -1214,6 +1543,7 @@ impl MetadataWorkspaceRequestExecutor {
         let context = self.read_context(rpc.route)?;
         let (scope, path_prefix) = query_scope(&request.scope)?;
         let query = meta::AggregateRequest {
+            profile: query_profile(&request.profile)?,
             scope,
             path_prefix,
             predicates: query_predicates(&request.predicates)?,
@@ -1239,6 +1569,9 @@ impl MetadataWorkspaceRequestExecutor {
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Aggregate(protocol::AggregateResult {
                 groups,
+                input_match_count: page.input_match_count,
+                row_count: page.row_count,
+                group_count: page.group_count,
                 next_cursor: page.next_cursor,
                 read_version: page.read_version.get(),
             }),
@@ -1255,9 +1588,15 @@ impl MetadataWorkspaceRequestExecutor {
         let context = self.read_context(rpc.route)?;
         let (scope, path_prefix) = query_scope(&request.scope)?;
         let query = meta::CatalogRequest {
+            profile: query_profile(&request.profile)?,
             scope,
             path_prefix,
+            path_match: match request.path_match {
+                protocol::CatalogPathMatch::Prefix => meta::CatalogPathMatch::Prefix,
+                protocol::CatalogPathMatch::Exact => meta::CatalogPathMatch::Exact,
+            },
             field_prefix: request.field_prefix.clone(),
+            include_facets: request.include_facets,
             cursor: request.page.cursor.clone(),
             limit: query_limit(request.page.limit),
         };
@@ -1268,6 +1607,13 @@ impl MetadataWorkspaceRequestExecutor {
             .map(|field| protocol::CatalogField {
                 field_id: field.field_id.as_str().to_owned(),
                 scalar_type: scalar_type_name(field.scalar_type).to_owned(),
+                scalar_types: field
+                    .scalar_types
+                    .into_iter()
+                    .map(scalar_type_name)
+                    .map(str::to_owned)
+                    .collect(),
+                generic_custom: field.generic_custom,
                 operators: field
                     .operators
                     .into_iter()
@@ -1281,6 +1627,7 @@ impl MetadataWorkspaceRequestExecutor {
         Ok(ExecutedRequest {
             result: protocol::WorkspaceResult::Catalog(protocol::CatalogResult {
                 fields,
+                facets: protocol_facets(page.facets),
                 next_cursor: page.next_cursor,
                 read_version: page.read_version.get(),
             }),
@@ -1492,9 +1839,22 @@ impl MetadataWorkspaceRequestExecutor {
                         ))
                     }
                 };
-                if restore.phase != types::RestorePhase::SourceSealed
+                let existing_publish = self.find_publish_operation(
+                    rpc.route,
+                    read.read_version,
+                    request.operation_id,
+                )?;
+                let terminal_replay = existing_publish.as_ref().is_some_and(|operation| {
+                    operation.phase == types::PublishPhase::Published
+                        && operation.authority
+                            == meta::PublishAuthority::RestoreStaging {
+                                restore_operation_id: operation_id,
+                            }
+                });
+                let fresh_admission = restore.phase == types::RestorePhase::SourceSealed
+                    && binding.manifests.is_none();
+                if !fresh_admission && !terminal_replay
                     || restore.destination_workbench_id != workbench
-                    || binding.manifests.is_some()
                     || types::OperationId::from(request.operation_id)
                         != expected_identity.publication_operation_id
                     || types::ArtifactRevisionId::from(request.artifact_revision_id)
@@ -2623,10 +2983,20 @@ impl MetadataWorkspaceRequestExecutor {
         read_version: types::ReadVersion,
         operation_id: protocol::OperationIdentity,
     ) -> Result<meta::PublishOperationRecord, protocol::RpcFailure> {
+        self.find_publish_operation(route, read_version, operation_id)?
+            .ok_or_else(|| not_found("publish operation does not exist"))
+    }
+
+    fn find_publish_operation(
+        &self,
+        route: protocol::RootRoute,
+        read_version: types::ReadVersion,
+        operation_id: protocol::OperationIdentity,
+    ) -> Result<Option<meta::PublishOperationRecord>, protocol::RpcFailure> {
         let route = route_parts(route)?;
         let operation_id: types::OperationId = operation_id.into();
         let key = meta::operation_key(route.root_id, types::OperationKind::Publish, operation_id);
-        let payload = self
+        let Some(payload) = self
             .meta
             .read_at(
                 route.root_id,
@@ -2637,13 +3007,15 @@ impl MetadataWorkspaceRequestExecutor {
                 read_version,
             )
             .map_err(meta_failure)?
-            .ok_or_else(|| not_found("publish operation does not exist"))?;
+        else {
+            return Ok(None);
+        };
         let operation = meta::PublishOperationRecord::decode(&payload)
             .map_err(|error| internal(format!("invalid durable publish operation: {error}")))?;
         if operation.operation_id != operation_id {
             return Err(internal("publish operation key and payload disagree"));
         }
-        Ok(operation)
+        Ok(Some(operation))
     }
 
     fn heartbeat_publish_operation(
@@ -2867,6 +3239,147 @@ fn query_scope(
     }
 }
 
+fn meta_generic_index_capability(
+    capability: &protocol::GenericIndexFieldCapability,
+) -> Result<meta::GenericIndexFieldCapability, protocol::RpcFailure> {
+    Ok(meta::GenericIndexFieldCapability {
+        field: query_field_id(&capability.field_id)?,
+        operators: capability
+            .operators
+            .iter()
+            .copied()
+            .map(meta_generic_index_operator)
+            .collect(),
+        sortable: capability.sortable,
+        facetable: capability.facetable,
+    })
+}
+
+fn meta_generic_index_operator(operator: protocol::QueryOperator) -> meta::GenericIndexOperator {
+    match operator {
+        protocol::QueryOperator::Equal => meta::GenericIndexOperator::Equal,
+        protocol::QueryOperator::NotEqual => meta::GenericIndexOperator::NotEqual,
+        protocol::QueryOperator::In => meta::GenericIndexOperator::In,
+        protocol::QueryOperator::Greater => meta::GenericIndexOperator::Greater,
+        protocol::QueryOperator::GreaterOrEqual => meta::GenericIndexOperator::GreaterOrEqual,
+        protocol::QueryOperator::Less => meta::GenericIndexOperator::Less,
+        protocol::QueryOperator::LessOrEqual => meta::GenericIndexOperator::LessOrEqual,
+        protocol::QueryOperator::Prefix => meta::GenericIndexOperator::Prefix,
+        protocol::QueryOperator::Suffix => meta::GenericIndexOperator::Suffix,
+        protocol::QueryOperator::Contains => meta::GenericIndexOperator::Contains,
+        protocol::QueryOperator::Exists => meta::GenericIndexOperator::Exists,
+        protocol::QueryOperator::NotExists => meta::GenericIndexOperator::NotExists,
+    }
+}
+
+fn meta_generic_index_row(
+    row: &protocol::GenericIndexRow,
+) -> Result<meta::GenericIndexRowInput, protocol::RpcFailure> {
+    Ok(meta::GenericIndexRowInput {
+        relative_path: row.relative_path.as_ref().map(relative_path).transpose()?,
+        values: row
+            .values
+            .iter()
+            .map(|values| {
+                Ok(meta::GenericIndexFieldValues {
+                    field: query_field_id(&values.field_id)?,
+                    values: values
+                        .values
+                        .iter()
+                        .map(query_scalar)
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .collect::<Result<_, protocol::RpcFailure>>()?,
+    })
+}
+
+fn generic_index_registration_status(
+    operation_id: protocol::OperationIdentity,
+    operation: &meta::GenericIndexRegistrationOperationRecord,
+) -> Result<protocol::GenericIndexRegistrationStatus, protocol::RpcFailure> {
+    Ok(protocol::GenericIndexRegistrationStatus {
+        operation_id,
+        generation_id: operation.generation_id.into(),
+        workspace_incarnation_id: operation.workspace_incarnation_id.into(),
+        index_path: operation
+            .index_path
+            .as_ref()
+            .map(|path| protocol::RelativePath::new(path.as_str()))
+            .transpose()
+            .map_err(|error| internal(error.to_string()))?,
+        source_read_version: operation.source_read_version.get(),
+        last_transition_version: operation.last_transition_version.get(),
+        expected_current_generation: operation
+            .expected_current_generation
+            .map(types::Generation::get),
+        capability_digest: protocol::Digest(operation.capability_digest),
+        declared_row_count: operation.declared_row_count,
+        appended_row_count: operation.appended_row_count,
+        row_digest: protocol::Digest(operation.rolling_row_digest),
+        phase: match operation.phase {
+            types::GenericIndexRegistrationPhase::Preparing => {
+                protocol::GenericIndexRegistrationPhase::Preparing
+            }
+            types::GenericIndexRegistrationPhase::Appending => {
+                protocol::GenericIndexRegistrationPhase::Appending
+            }
+            types::GenericIndexRegistrationPhase::Sealing => {
+                protocol::GenericIndexRegistrationPhase::Sealing
+            }
+            types::GenericIndexRegistrationPhase::Publishing => {
+                protocol::GenericIndexRegistrationPhase::Publishing
+            }
+            types::GenericIndexRegistrationPhase::Complete => {
+                protocol::GenericIndexRegistrationPhase::Complete
+            }
+            types::GenericIndexRegistrationPhase::Aborting => {
+                protocol::GenericIndexRegistrationPhase::Aborting
+            }
+            types::GenericIndexRegistrationPhase::Cleaning => {
+                protocol::GenericIndexRegistrationPhase::Cleaning
+            }
+            types::GenericIndexRegistrationPhase::Cleaned => {
+                protocol::GenericIndexRegistrationPhase::Cleaned
+            }
+            types::GenericIndexRegistrationPhase::Quarantined => {
+                protocol::GenericIndexRegistrationPhase::Quarantined
+            }
+        },
+        published_pointer_generation: operation
+            .published_pointer_generation
+            .map(types::Generation::get),
+        terminal_error: operation.terminal_error.clone(),
+    })
+}
+
+fn generic_index_registration_response(
+    operation_id: protocol::OperationIdentity,
+    outcome: meta::GenericIndexRegistrationOutcome,
+) -> Result<ExecutedRequest, protocol::RpcFailure> {
+    Ok(ExecutedRequest {
+        result: protocol::WorkspaceResult::GenericIndexRegistration(
+            generic_index_registration_status(operation_id, &outcome.operation)?,
+        ),
+        commit_version: Some(outcome.commit_version.get()),
+        replayed: outcome.replayed,
+    })
+}
+
+fn query_profile(
+    profile: &protocol::QueryProfile,
+) -> Result<meta::QueryProfile, protocol::RpcFailure> {
+    match profile {
+        protocol::QueryProfile::ArtifactV1 => Ok(meta::QueryProfile::ArtifactV1),
+        protocol::QueryProfile::GenericCustomIndexV1 {
+            presentation_path_root,
+        } => Ok(meta::QueryProfile::GenericNamespaceV1 {
+            presentation_path_root: meta::PresentationPathRoot::new(presentation_path_root.clone())
+                .map_err(|error| invalid_argument(error.to_string()))?,
+        }),
+    }
+}
+
 fn query_field_id(value: &str) -> Result<meta::QueryFieldId, protocol::RpcFailure> {
     meta::QueryFieldId::new(value).map_err(|error| invalid_argument(error.to_string()))
 }
@@ -3059,6 +3572,25 @@ fn scalar_type_name(scalar_type: meta::QueryScalarType) -> &'static str {
 
 fn query_limit(limit: u32) -> usize {
     usize::try_from(limit).expect("u32 query limit always fits usize")
+}
+
+fn protocol_facets(facets: Vec<meta::FacetResult>) -> Vec<protocol::FacetResult> {
+    facets
+        .into_iter()
+        .map(|facet| protocol::FacetResult {
+            field_id: facet.field_id.as_str().to_owned(),
+            buckets: facet
+                .buckets
+                .into_iter()
+                .map(|bucket| protocol::FacetBucket {
+                    value: protocol_scalar(bucket.value),
+                    count: bucket.count,
+                })
+                .collect(),
+            distinct_count: facet.distinct_count,
+            truncated: facet.truncated,
+        })
+        .collect()
 }
 
 fn protocol_change_event(
@@ -3699,6 +4231,162 @@ fn restore_commit_provenance(
     Ok(provenance)
 }
 
+#[cfg(feature = "restore-crash-test-support")]
+fn restore_initialization_barrier_evidence(
+    route: protocol::RootRoute,
+    durable_read_version: u64,
+    operation: &meta::RestoreOperationRecord,
+) -> Result<RestoreInitializationBarrierEvidence, protocol::RpcFailure> {
+    if durable_read_version == 0 {
+        return Err(internal(
+            "restore initialization barrier requires a durable read version",
+        ));
+    }
+    operation.validate().map_err(|error| {
+        internal(format!(
+            "invalid restore initialization barrier state: {error}"
+        ))
+    })?;
+    if operation.phase != types::RestorePhase::DestinationBuilding {
+        return Err(internal(
+            "restore initialization barrier requires DestinationBuilding",
+        ));
+    }
+    let initialization_digest = operation.initialization_digest.ok_or_else(|| {
+        internal("restore initialization barrier requires an initialization digest")
+    })?;
+    let provenance = restore_commit_provenance(operation)?;
+    let binding = provenance
+        .destination_binding
+        .as_ref()
+        .ok_or_else(|| internal("restore initialization barrier requires a destination binding"))?;
+    let manifests = binding.manifests.as_ref().ok_or_else(|| {
+        internal("restore initialization barrier requires both actual destination manifests")
+    })?;
+    if !restore_closure_is_pristine(&provenance.closure) {
+        return Err(internal(
+            "restore initialization barrier requires zero destination closure progress",
+        ));
+    }
+    if binding.run_manifest_identity == binding.restore_manifest_identity {
+        return Err(internal(
+            "restore initialization barrier requires distinct manifest publication identities",
+        ));
+    }
+    if operation.destination_restore_manifest_identity != Some(binding.restore_manifest_identity) {
+        return Err(internal(
+            "restore initialization barrier restore-manifest reservation drifted",
+        ));
+    }
+    if manifests.restore_manifest.body_digest_uri != operation.restore_manifest.body_digest_uri
+        || manifests.restore_manifest.logical_size != operation.restore_manifest.logical_size
+        || manifests.restore_manifest.content_type != operation.restore_manifest.content_type
+    {
+        return Err(internal(
+            "restore initialization barrier restore-manifest descriptor drifted",
+        ));
+    }
+
+    let run_manifest = restore_manifest_barrier_evidence(
+        operation.destination_workspace_incarnation_id,
+        binding.run_manifest_identity,
+        &manifests.run_manifest,
+        "run manifest",
+    )?;
+    let restore_manifest = restore_manifest_barrier_evidence(
+        operation.destination_workspace_incarnation_id,
+        binding.restore_manifest_identity,
+        &manifests.restore_manifest,
+        "restore manifest",
+    )?;
+
+    Ok(RestoreInitializationBarrierEvidence {
+        route,
+        operation_id: operation.operation_id.into(),
+        durable_read_version,
+        phase: RestoreInitializationBarrierPhase::DestinationBuilding,
+        initialization_digest: protocol::Digest(initialization_digest),
+        destination_workspace_incarnation_id: operation.destination_workspace_incarnation_id.into(),
+        destination_commit_id: binding.destination_commit_id.into(),
+        run_manifest,
+        restore_manifest,
+        built_commit_members: provenance.closure.member_count,
+        sealed_revisions: provenance.closure.revision_seal_count,
+    })
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+fn authoritative_restore_initialization_readback(
+    command_outcome: &meta::RestoreOperationRecord,
+    durable: Option<meta::RestoreOperationRecord>,
+) -> Result<meta::RestoreOperationRecord, protocol::RpcFailure> {
+    let durable = durable
+        .ok_or_else(|| internal("restore initialization is not durably readable after commit"))?;
+    command_outcome.validate().map_err(|error| {
+        internal(format!(
+            "invalid restore initialization command outcome: {error}"
+        ))
+    })?;
+    durable.validate().map_err(|error| {
+        internal(format!(
+            "invalid restore initialization post-commit readback: {error}"
+        ))
+    })?;
+    if &durable != command_outcome {
+        return Err(internal(
+            "restore initialization post-commit readback does not exactly match the command outcome",
+        ));
+    }
+    Ok(durable)
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+fn restore_manifest_barrier_evidence(
+    destination_workspace_incarnation_id: types::WorkspaceIncarnationId,
+    expected: meta::RestoreManifestIdentity,
+    actual: &meta::RestoreManifestPublication,
+    label: &str,
+) -> Result<RestoreManifestBindingEvidence, protocol::RpcFailure> {
+    let actual_identity = meta::RestoreManifestIdentity {
+        publication_operation_id: actual.publication_operation_id,
+        artifact_revision_id: actual.artifact_revision_id,
+    };
+    if actual_identity != expected
+        || actual.workspace_incarnation_id != destination_workspace_incarnation_id
+    {
+        return Err(internal(format!(
+            "restore initialization barrier {label} actual binding drifted"
+        )));
+    }
+    Ok(RestoreManifestBindingEvidence {
+        expected: protocol_restore_manifest_identity(expected),
+        actual: RestoreManifestPublicationEvidence {
+            identity: protocol_restore_manifest_identity(actual_identity),
+            workspace_incarnation_id: actual.workspace_incarnation_id.into(),
+            body_digest_uri: actual.body_digest_uri.clone(),
+            manifest_digest_uri: actual.manifest_digest_uri.clone(),
+            logical_size: actual.logical_size,
+            content_type: actual.content_type.clone(),
+        },
+    })
+}
+
+#[cfg(feature = "restore-crash-test-support")]
+fn restore_closure_is_pristine(closure: &meta::RestoreCommitClosureProgress) -> bool {
+    closure.member_cursor.is_none()
+        && closure.member_count == 0
+        && closure.member_digest == [0; types::SHA256_BYTES]
+        && closure.member_seal.is_none()
+        && closure.revision_ref_count == 0
+        && closure.revision_cursor.is_none()
+        && closure.revision_seal_count == 0
+        && closure.revision_digest == [0; types::SHA256_BYTES]
+        && closure.revision_seal.is_none()
+        && closure.parent_seal.is_none()
+        && closure.cleanup_member_count == 0
+        && closure.cleanup_revision_count == 0
+}
+
 fn restore_active_position(
     operation: &meta::RestoreOperationRecord,
 ) -> Result<(u8, u64, bool), protocol::RpcFailure> {
@@ -4261,6 +4949,71 @@ fn namespace_failure(error: meta::NamespaceError) -> protocol::RpcFailure {
     }
 }
 
+fn generic_index_failure(error: meta::GenericIndexError) -> protocol::RpcFailure {
+    match error {
+        meta::GenericIndexError::Meta(source) => meta_failure(source),
+        meta::GenericIndexError::Namespace(source) => namespace_failure(source),
+        meta::GenericIndexError::WorkspaceMissing
+        | meta::GenericIndexError::RegistrationRootMissing
+        | meta::GenericIndexError::OperationMissing
+        | meta::GenericIndexError::GenerationMissing
+        | meta::GenericIndexError::RowPathMissing { .. } => not_found(error.to_string()),
+        meta::GenericIndexError::GenerationAlreadyExists => failure(
+            protocol::ErrorCode::AlreadyExists,
+            error.to_string(),
+            false,
+            Some(protocol::ConflictKind::OperationState),
+        ),
+        meta::GenericIndexError::OperationInputMismatch => failure(
+            protocol::ErrorCode::RequestReplayMismatch,
+            error.to_string(),
+            false,
+            None,
+        ),
+        meta::GenericIndexError::WorkspaceIncarnationMismatch => {
+            conflict(protocol::ConflictKind::Workspace, error.to_string(), None)
+        }
+        meta::GenericIndexError::CurrentPointerConflict => failure(
+            protocol::ErrorCode::Conflict,
+            error.to_string(),
+            false,
+            Some(protocol::ConflictKind::OperationState),
+        ),
+        meta::GenericIndexError::RegistrationRootIsArtifact
+        | meta::GenericIndexError::GenerationMismatch
+        | meta::GenericIndexError::InvalidPhase { .. }
+        | meta::GenericIndexError::AppendSequenceMismatch { .. }
+        | meta::GenericIndexError::AppendExceedsDeclaredRows => failure(
+            protocol::ErrorCode::PreconditionFailed,
+            error.to_string(),
+            false,
+            Some(protocol::ConflictKind::OperationState),
+        ),
+        meta::GenericIndexError::InvalidBatchLimit { .. }
+        | meta::GenericIndexError::EmptyAppendBatch
+        | meta::GenericIndexError::RowsNotStrictlyOrdered
+        | meta::GenericIndexError::UndeclaredField { .. }
+        | meta::GenericIndexError::PathJoinInvalid { .. } => invalid_argument(error.to_string()),
+        meta::GenericIndexError::ResourceExhausted { .. } => failure(
+            protocol::ErrorCode::ResourceExhausted,
+            error.to_string(),
+            false,
+            None,
+        ),
+        meta::GenericIndexError::Record(_)
+        | meta::GenericIndexError::WorkspaceCodec(_)
+        | meta::GenericIndexError::HoldCodec(_)
+        | meta::GenericIndexError::CurrentPointerMissing
+        | meta::GenericIndexError::CurrentReferenceMissing
+        | meta::GenericIndexError::RegistrationReferenceMissing
+        | meta::GenericIndexError::HistoryHoldMissing
+        | meta::GenericIndexError::HistoryHoldMismatch
+        | meta::GenericIndexError::CounterOverflow { .. }
+        | meta::GenericIndexError::ReplayResultMismatch
+        | meta::GenericIndexError::CorruptKey { .. } => internal(error.to_string()),
+    }
+}
+
 fn query_failure(error: meta::QueryError) -> protocol::RpcFailure {
     match error {
         meta::QueryError::Namespace(source) => namespace_failure(source),
@@ -4283,7 +5036,10 @@ fn query_failure(error: meta::QueryError) -> protocol::RpcFailure {
         | meta::QueryError::Projection { .. }
         | meta::QueryError::WorkspaceCodec { .. }
         | meta::QueryError::PathCodec { .. }
-        | meta::QueryError::CommitHeadCodec { .. } => internal(error.to_string()),
+        | meta::QueryError::CommitHeadCodec { .. }
+        | meta::QueryError::GenericIndexCodec { .. }
+        | meta::QueryError::GenericIndexClosureMismatch { .. }
+        | meta::QueryError::GenericIndexCapabilityConflict { .. } => internal(error.to_string()),
         meta::QueryError::InvalidLimit { .. }
         | meta::QueryError::BoundExceeded { .. }
         | meta::QueryError::InvalidPredicate { .. }
@@ -4291,6 +5047,8 @@ fn query_failure(error: meta::QueryError) -> protocol::RpcFailure {
         | meta::QueryError::FieldTypeConflict { .. }
         | meta::QueryError::InvalidAggregate { .. }
         | meta::QueryError::InvalidFieldPrefix { .. }
+        | meta::QueryError::InvalidPresentationPathRoot { .. }
+        | meta::QueryError::ExactCatalogRequiresPath
         | meta::QueryError::CursorTooLarge { .. }
         | meta::QueryError::InvalidCursor { .. } => invalid_argument(error.to_string()),
     }
@@ -4497,6 +5255,9 @@ fn snapshot_list_failure(error: meta::SnapshotListError) -> protocol::RpcFailure
 fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
     match error {
         meta::RestoreError::Meta(source) => meta_failure(source),
+        meta::RestoreError::GenericIndex(meta::GenericIndexError::Meta(source)) => {
+            meta_failure(source)
+        }
         meta::RestoreError::SourceWorkspaceMissing { .. } => failure(
             protocol::ErrorCode::NotFound,
             error.to_string(),
@@ -4569,7 +5330,8 @@ fn restore_failure(error: meta::RestoreError) -> protocol::RpcFailure {
         | meta::RestoreError::ReservedPathInSource
         | meta::RestoreError::RevisionUnavailable { .. }
         | meta::RestoreError::ManifestBindingMismatch
-        | meta::RestoreError::ManifestRevisionMismatch => failure(
+        | meta::RestoreError::ManifestRevisionMismatch
+        | meta::RestoreError::GenericIndex(_) => failure(
             protocol::ErrorCode::PreconditionFailed,
             error.to_string(),
             false,
@@ -4920,6 +5682,12 @@ mod tests {
         }
     }
 
+    fn generic_query_profile() -> protocol::QueryProfile {
+        protocol::QueryProfile::GenericCustomIndexV1 {
+            presentation_path_root: "/agents".to_owned(),
+        }
+    }
+
     fn fence_command(
         store: &meta::MetaShard,
         request_id: types::RequestId,
@@ -4994,6 +5762,8 @@ mod tests {
             revision_digest: [0x55; types::SHA256_BYTES],
             parent_commits: Vec::new(),
             parent_digest: [0; types::SHA256_BYTES],
+            generic_index_count: 0,
+            generic_index_digest: [0; types::SHA256_BYTES],
             producer: Some("snapshot-executor-test".to_owned()),
             lineage_projection: Vec::new(),
             consumer_count: 1,
@@ -5100,6 +5870,222 @@ mod tests {
         assert_eq!(store.current_read_version().unwrap(), version_before);
     }
 
+    #[test]
+    fn generic_index_zero_row_registration_replays_and_populates_declared_catalog() {
+        let (_store, executor) = ready_executor();
+        let workspace_incarnation_id = protocol::WorkspaceIdentity([0x31; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&create_request(0x30, "generic-index", 0x31, 1))
+            .unwrap();
+        let operation_id = protocol::OperationIdentity([0x32; types::FIXED_ID_BYTES]);
+        let begin = protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([0x33; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::BeginGenericIndexRegistration(
+                protocol::BeginGenericIndexRegistrationRequest {
+                    operation_id,
+                    generation_id: protocol::GenericIndexGenerationIdentity(
+                        [0x34; types::FIXED_ID_BYTES],
+                    ),
+                    workbench: protocol::WorkbenchName::new("generic-index").unwrap(),
+                    workspace_incarnation_id,
+                    index_path: None,
+                    expected_current_generation: None,
+                    capabilities: vec![protocol::GenericIndexFieldCapability {
+                        field_id: "experiment.labels".to_owned(),
+                        operators: vec![
+                            protocol::QueryOperator::Equal,
+                            protocol::QueryOperator::Exists,
+                        ],
+                        sortable: true,
+                        facetable: true,
+                    }],
+                    declared_row_count: 0,
+                },
+            ),
+        };
+        let begun = executor.execute(&begin).unwrap();
+        let begun_replay = executor.execute(&begin).unwrap();
+        assert!(!begun.replayed);
+        assert!(begun_replay.replayed);
+        assert_eq!(begun_replay.commit_version, begun.commit_version);
+
+        let finalize = protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([0x35; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::FinalizeGenericIndexRegistration(
+                protocol::FinalizeGenericIndexRegistrationRequest { operation_id },
+            ),
+        };
+        let finalized = executor.execute(&finalize).unwrap();
+        let finalized_replay = executor.execute(&finalize).unwrap();
+        assert!(finalized_replay.replayed);
+        assert_eq!(finalized_replay.commit_version, finalized.commit_version);
+        let protocol::WorkspaceResult::GenericIndexRegistration(status) = finalized.result else {
+            panic!("finalize returned the wrong result variant");
+        };
+        assert_eq!(
+            status.phase,
+            protocol::GenericIndexRegistrationPhase::Complete
+        );
+        assert_eq!(status.published_pointer_generation, Some(1));
+
+        let catalog = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x36; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Workspace {
+                        workbench: protocol::WorkbenchName::new("generic-index").unwrap(),
+                        path_prefix: None,
+                    },
+                    path_match: protocol::CatalogPathMatch::Prefix,
+                    field_prefix: Some("experiment".to_owned()),
+                    include_facets: false,
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 10,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Catalog(catalog) = catalog.result else {
+            panic!("catalog returned the wrong result variant");
+        };
+        assert_eq!(catalog.fields.len(), 1);
+        assert_eq!(catalog.fields[0].field_id, "experiment.labels");
+        assert!(catalog.fields[0].generic_custom);
+        assert!(catalog.fields[0].scalar_types.is_empty());
+    }
+
+    #[test]
+    fn generic_index_pointer_aba_conflict_is_a_nonretryable_operation_conflict() {
+        let failure = generic_index_failure(meta::GenericIndexError::CurrentPointerConflict);
+
+        assert_eq!(failure.code, protocol::ErrorCode::Conflict);
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.conflict,
+            Some(protocol::ConflictKind::OperationState)
+        );
+    }
+
+    #[test]
+    fn generic_index_append_replays_and_search_preserves_repeated_values() {
+        let (_store, executor) = ready_executor();
+        let workspace_incarnation_id = protocol::WorkspaceIdentity([0x41; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&create_request(0x40, "generic-values", 0x41, 1))
+            .unwrap();
+        let operation_id = protocol::OperationIdentity([0x42; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x43; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::BeginGenericIndexRegistration(
+                    protocol::BeginGenericIndexRegistrationRequest {
+                        operation_id,
+                        generation_id: protocol::GenericIndexGenerationIdentity(
+                            [0x44; types::FIXED_ID_BYTES],
+                        ),
+                        workbench: protocol::WorkbenchName::new("generic-values").unwrap(),
+                        workspace_incarnation_id,
+                        index_path: None,
+                        expected_current_generation: None,
+                        capabilities: vec![protocol::GenericIndexFieldCapability {
+                            field_id: "experiment.labels".to_owned(),
+                            operators: vec![protocol::QueryOperator::Equal],
+                            sortable: true,
+                            facetable: true,
+                        }],
+                        declared_row_count: 1,
+                    },
+                ),
+            })
+            .unwrap();
+        let append = protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([0x45; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::AppendGenericIndexRows(
+                protocol::AppendGenericIndexRowsRequest {
+                    operation_id,
+                    first_sequence: 0,
+                    rows: vec![protocol::GenericIndexRow {
+                        relative_path: Some(protocol::RelativePath::new("metadata").unwrap()),
+                        values: vec![protocol::GenericIndexFieldValues {
+                            field_id: "experiment.labels".to_owned(),
+                            values: vec![
+                                protocol::ScalarValue::String("alpha".to_owned()),
+                                protocol::ScalarValue::Unsigned(7),
+                                protocol::ScalarValue::String("alpha".to_owned()),
+                            ],
+                        }],
+                    }],
+                },
+            ),
+        };
+        let appended = executor.execute(&append).unwrap();
+        let appended_replay = executor.execute(&append).unwrap();
+        assert!(appended_replay.replayed);
+        assert_eq!(appended_replay.commit_version, appended.commit_version);
+        executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x46; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::FinalizeGenericIndexRegistration(
+                    protocol::FinalizeGenericIndexRegistrationRequest { operation_id },
+                ),
+            })
+            .unwrap();
+
+        let searched = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x47; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Workspace {
+                        workbench: protocol::WorkbenchName::new("generic-values").unwrap(),
+                        path_prefix: None,
+                    },
+                    predicates: vec![protocol::QueryPredicate {
+                        field_id: "experiment.labels".to_owned(),
+                        operator: protocol::QueryOperator::Equal,
+                        operand: protocol::QueryOperand::Scalar(protocol::ScalarValue::String(
+                            "alpha".to_owned(),
+                        )),
+                    }],
+                    projection: vec!["experiment.labels".to_owned()],
+                    sort: Vec::new(),
+                    facets: Vec::new(),
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 10,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Search(searched) = searched.result else {
+            panic!("search returned the wrong result variant");
+        };
+        assert_eq!(searched.hits.len(), 1);
+        let protocol::SearchRow::GenericNamespace(hit) = &searched.hits[0] else {
+            panic!("Generic custom-index search returned an ArtifactV1 row");
+        };
+        assert_eq!(
+            hit.indexed_values,
+            vec![protocol::GenericIndexFieldValues {
+                field_id: "experiment.labels".to_owned(),
+                values: vec![
+                    protocol::ScalarValue::String("alpha".to_owned()),
+                    protocol::ScalarValue::Unsigned(7),
+                    protocol::ScalarValue::String("alpha".to_owned()),
+                ],
+            }]
+        );
+    }
+
     fn create_request(
         request_fill: u8,
         workbench: &str,
@@ -5186,6 +6172,15 @@ mod tests {
             member_cursor: None,
             member_count: 0,
             member_digest: [0; types::SHA256_BYTES],
+            path_members_complete: false,
+            generic_index_cursor: None,
+            generic_index_count: 0,
+            generic_index_digest: [0; types::SHA256_BYTES],
+            generic_indexes_complete: false,
+            generic_index_ref_cursor: None,
+            generic_index_ref_count: 0,
+            generic_index_ref_digest: [0; types::SHA256_BYTES],
+            generic_index_refs_complete: false,
             members_complete: false,
             revision_ref_count: 0,
             revision_cursor: None,
@@ -5196,6 +6191,7 @@ mod tests {
             parent_digest: [0; types::SHA256_BYTES],
             parents_complete: false,
             cleanup_member_count: 0,
+            cleanup_generic_index_count: 0,
             cleanup_revision_count: 0,
             cleanup_parent_count: 0,
             history_hold_released: false,
@@ -5348,6 +6344,15 @@ mod tests {
             member_cursor: Some(member_path),
             member_count: 1,
             member_digest: [0x53; types::SHA256_BYTES],
+            path_members_complete: true,
+            generic_index_cursor: None,
+            generic_index_count: 0,
+            generic_index_digest: [0; types::SHA256_BYTES],
+            generic_indexes_complete: true,
+            generic_index_ref_cursor: None,
+            generic_index_ref_count: 0,
+            generic_index_ref_digest: [0; types::SHA256_BYTES],
+            generic_index_refs_complete: true,
             members_complete: true,
             revision_ref_count: 1,
             revision_cursor: Some(tree_revision_id),
@@ -5358,6 +6363,7 @@ mod tests {
             parent_digest: [0; types::SHA256_BYTES],
             parents_complete: true,
             cleanup_member_count: 0,
+            cleanup_generic_index_count: 0,
             cleanup_revision_count: 0,
             cleanup_parent_count: 0,
             history_hold_released: true,
@@ -5934,6 +6940,8 @@ mod tests {
                         unique_revision_count: 1,
                         revision_digest: [0x73; types::SHA256_BYTES],
                         parent_digest: [0; types::SHA256_BYTES],
+                        generic_index_count: 0,
+                        generic_index_digest: [0; types::SHA256_BYTES],
                     },
                     destination_committed_at_unix_seconds: 1,
                     destination_binding: None,
@@ -5941,6 +6949,11 @@ mod tests {
                         member_cursor: None,
                         member_count: 0,
                         member_digest: [0; types::SHA256_BYTES],
+                        path_members_complete: false,
+                        generic_index_cursor: None,
+                        generic_index_count: 0,
+                        generic_index_digest: [0; types::SHA256_BYTES],
+                        generic_indexes_complete: false,
                         member_seal: None,
                         revision_ref_count: 0,
                         revision_cursor: None,
@@ -5954,6 +6967,7 @@ mod tests {
                         ),
                         parent_seal: None,
                         cleanup_member_count: 0,
+                        cleanup_generic_index_count: 0,
                         cleanup_revision_count: 0,
                     },
                     destination_head_generation: None,
@@ -5961,6 +6975,12 @@ mod tests {
             )),
             phase: types::RestorePhase::SourceSealed,
             source_cursor: Some(types::NormalizedRelativePath::new("outputs/result").unwrap()),
+            source_paths_eof: true,
+            source_generic_index_cursor: None,
+            source_generic_index_count: 0,
+            source_generic_index_rolling_digest: [0; types::SHA256_BYTES],
+            source_generic_index_seal: Some([0; types::SHA256_BYTES]),
+            source_generic_indexes_match_base_commit: Some(true),
             source_eof: true,
             source_member_count: 2,
             source_member_rolling_digest: [0x70; types::SHA256_BYTES],
@@ -5970,6 +6990,7 @@ mod tests {
             member_rolling_digest: [0x71; types::SHA256_BYTES],
             member_seal: Some([0x71; types::SHA256_BYTES]),
             cleanup_member_cursor: 0,
+            cleanup_generic_index_cursor: 0,
             result: None,
             terminal_error: None,
         };
@@ -5996,6 +7017,535 @@ mod tests {
         operation
     }
 
+    #[cfg(feature = "restore-crash-test-support")]
+    fn pristine_destination_building_restore_operation() -> meta::RestoreOperationRecord {
+        let mut operation = bound_source_sealed_restore_operation();
+        operation.initialization_digest = Some([0x67; types::SHA256_BYTES]);
+        operation.phase = types::RestorePhase::DestinationBuilding;
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut operation.commit_provenance else {
+            unreachable!();
+        };
+        provenance.destination_binding = Some(restore_destination_binding(Some(
+            restore_destination_manifests(),
+        )));
+        operation.validate().unwrap();
+        operation
+    }
+
+    #[cfg(feature = "restore-crash-test-support")]
+    #[test]
+    fn restore_initialization_barrier_requires_two_actual_manifests_and_zero_closure_progress() {
+        let operation = pristine_destination_building_restore_operation();
+        let evidence = restore_initialization_barrier_evidence(route(1), 91, &operation).unwrap();
+
+        assert_eq!(
+            evidence.phase,
+            RestoreInitializationBarrierPhase::DestinationBuilding
+        );
+        assert_eq!(evidence.operation_id, operation.operation_id.into());
+        assert_eq!(evidence.durable_read_version, 91);
+        assert_eq!(evidence.built_commit_members, 0);
+        assert_eq!(evidence.sealed_revisions, 0);
+        assert_eq!(
+            evidence.run_manifest.expected,
+            evidence.run_manifest.actual.identity
+        );
+        assert_eq!(
+            evidence.restore_manifest.expected,
+            evidence.restore_manifest.actual.identity
+        );
+        assert_ne!(
+            evidence.run_manifest.actual.identity,
+            evidence.restore_manifest.actual.identity
+        );
+
+        let mut progressed = operation.clone();
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut progressed.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.closure.member_cursor =
+            Some(types::NormalizedRelativePath::new("outputs/result").unwrap());
+        provenance.closure.member_count = 1;
+        provenance.closure.member_digest = [0x44; types::SHA256_BYTES];
+        assert!(restore_initialization_barrier_evidence(route(1), 92, &progressed).is_err());
+
+        let mut missing_actual = operation;
+        let meta::RestoreCommitProvenance::V5(provenance) = &mut missing_actual.commit_provenance
+        else {
+            unreachable!();
+        };
+        provenance.destination_binding.as_mut().unwrap().manifests = None;
+        assert!(restore_initialization_barrier_evidence(route(1), 93, &missing_actual).is_err());
+    }
+
+    #[cfg(feature = "restore-crash-test-support")]
+    #[test]
+    fn restore_initialization_barrier_requires_an_exact_post_commit_readback() {
+        let committed = pristine_destination_building_restore_operation();
+        let durable =
+            authoritative_restore_initialization_readback(&committed, Some(committed.clone()))
+                .unwrap();
+        assert_eq!(durable, committed);
+
+        let mut drifted = committed.clone();
+        drifted.initialization_digest = Some([0x68; types::SHA256_BYTES]);
+        drifted.validate().unwrap();
+        let mismatch =
+            authoritative_restore_initialization_readback(&committed, Some(drifted)).unwrap_err();
+        assert!(mismatch.message.contains("post-commit readback"));
+
+        let missing = authoritative_restore_initialization_readback(&committed, None).unwrap_err();
+        assert!(missing.message.contains("durably readable"));
+    }
+
+    #[cfg(feature = "restore-crash-test-support")]
+    #[test]
+    fn every_concurrent_destination_building_request_stops_at_the_shared_barrier() {
+        struct OneShotTestBarrier {
+            state: std::sync::atomic::AtomicU8,
+            arrivals: std::sync::mpsc::Sender<(&'static str, RestoreInitializationBarrierEvidence)>,
+            winner_release: Arc<std::sync::Barrier>,
+        }
+
+        impl RestoreInitializationBarrier for OneShotTestBarrier {
+            fn reached(
+                &self,
+                evidence: Result<RestoreInitializationBarrierEvidence, protocol::RpcFailure>,
+            ) -> ! {
+                let evidence = evidence.expect("the exact target evidence must be valid");
+                match self.state.compare_exchange(
+                    0,
+                    1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        self.arrivals.send(("firing", evidence)).unwrap();
+                        self.winner_release.wait();
+                        panic!("simulate the winner terminating the owner");
+                    }
+                    Err(1) => {
+                        self.arrivals.send(("parked", evidence)).unwrap();
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                    Err(state) => panic!("unexpected one-shot barrier state {state}"),
+                }
+            }
+        }
+
+        let (store, executor) = ready_executor();
+        let operation = pristine_destination_building_restore_operation();
+        install_restore_operation(&store, &operation, 0xe0, None);
+        let (arrival_tx, arrival_rx) = std::sync::mpsc::channel();
+        let winner_release = Arc::new(std::sync::Barrier::new(2));
+        let executor = executor.with_restore_initialization_barrier(
+            operation.operation_id.into(),
+            Arc::new(OneShotTestBarrier {
+                state: std::sync::atomic::AtomicU8::new(0),
+                arrivals: arrival_tx,
+                winner_release: Arc::clone(&winner_release),
+            }),
+        );
+        let request =
+            protocol::WorkspaceRequest::FinalizeRestore(protocol::FinalizeRestoreRequest {
+                operation_id: operation.operation_id.into(),
+            });
+        let first_executor = executor.clone();
+        let first_request = restore_rpc(0xe1, request.clone());
+        let first = std::thread::spawn(move || first_executor.execute(&first_request));
+        let (first_state, first_evidence) = arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("first exact target must enter Firing");
+        assert_eq!(first_state, "firing");
+
+        let second_executor = executor.clone();
+        let second_request = restore_rpc(0xe2, request);
+        let second = std::thread::spawn(move || second_executor.execute(&second_request));
+        let (second_state, second_evidence) = arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("second exact target must park after Firing");
+        assert_eq!(second_state, "parked");
+        assert_eq!(first_evidence.operation_id, second_evidence.operation_id);
+        assert_eq!(first_evidence.built_commit_members, 0);
+        assert_eq!(second_evidence.built_commit_members, 0);
+
+        let persisted = meta::get_restore(
+            &store,
+            meta::RootWriteContext::current(
+                &store,
+                root(),
+                shard(),
+                types::ObjectNamespaceId::from_bytes([10; types::FIXED_ID_BYTES]),
+                placement(),
+                owner(1),
+                request_id(0xe3),
+            )
+            .unwrap(),
+            operation.operation_id,
+        )
+        .unwrap()
+        .unwrap();
+        let provenance = restore_commit_provenance(&persisted).unwrap();
+        assert!(restore_closure_is_pristine(&provenance.closure));
+
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        winner_release.wait();
+        assert!(first.join().is_err());
+        assert!(!second.is_finished());
+        drop(second);
+    }
+
+    #[cfg(feature = "restore-crash-test-support")]
+    #[test]
+    fn invalid_exact_target_evidence_enters_the_divergent_failure_path() {
+        struct InvalidEvidenceBarrier {
+            arrived: std::sync::mpsc::Sender<protocol::RpcFailure>,
+        }
+
+        impl RestoreInitializationBarrier for InvalidEvidenceBarrier {
+            fn reached(
+                &self,
+                evidence: Result<RestoreInitializationBarrierEvidence, protocol::RpcFailure>,
+            ) -> ! {
+                self.arrived
+                    .send(evidence.expect_err("progressed closure must be rejected"))
+                    .unwrap();
+                panic!("simulate the fault owner exiting 87");
+            }
+        }
+
+        let (store, executor) = ready_executor();
+        let operation = destination_building_restore_operation();
+        install_restore_operation(&store, &operation, 0xed, None);
+        let (arrival_tx, arrival_rx) = std::sync::mpsc::channel();
+        let executor = executor.with_restore_initialization_barrier(
+            operation.operation_id.into(),
+            Arc::new(InvalidEvidenceBarrier {
+                arrived: arrival_tx,
+            }),
+        );
+        let request = restore_rpc(
+            0xee,
+            protocol::WorkspaceRequest::FinalizeRestore(protocol::FinalizeRestoreRequest {
+                operation_id: operation.operation_id.into(),
+            }),
+        );
+        let worker = std::thread::spawn(move || executor.execute(&request));
+        let failure = arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("invalid exact target evidence must enter the barrier failure path");
+        assert!(failure
+            .message
+            .contains("zero destination closure progress"));
+        assert!(worker.join().is_err());
+    }
+
+    #[cfg(feature = "restore-crash-test-support")]
+    #[test]
+    fn non_target_destination_building_resume_bypasses_the_strict_barrier() {
+        struct OtherOperationBarrier;
+
+        impl RestoreInitializationBarrier for OtherOperationBarrier {
+            fn reached(
+                &self,
+                _evidence: Result<RestoreInitializationBarrierEvidence, protocol::RpcFailure>,
+            ) -> ! {
+                panic!("a non-target restore must not reach the crash barrier");
+            }
+        }
+
+        let (store, executor) = ready_executor();
+        let source_workbench = protocol::WorkbenchName::new("restore-source-live").unwrap();
+        let source_workspace_incarnation_id =
+            protocol::WorkspaceIdentity([0x91; types::FIXED_ID_BYTES]);
+        executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x80; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::CreateWorkspace(
+                    protocol::CreateWorkspaceRequest {
+                        workbench: source_workbench.clone(),
+                        workspace_incarnation_id: source_workspace_incarnation_id,
+                    },
+                ),
+            })
+            .unwrap();
+
+        let commit_operation_id = protocol::OperationIdentity([0x92; types::FIXED_ID_BYTES]);
+        let source_commit_id = protocol::CommitIdentity([0x93; types::SHA256_BYTES]);
+        let source_run_manifest_revision =
+            protocol::ArtifactRevisionIdentity([0x94; types::FIXED_ID_BYTES]);
+        let source_run_manifest_body =
+            protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([0x7b]).into()));
+        let source_content_digest =
+            protocol::DigestUri::new(format!("sha256:{}", "aa".repeat(types::SHA256_BYTES)))
+                .unwrap();
+        let commit_operation = protocol::WorkspaceRequest::Commit(protocol::CommitRequest {
+            operation_id: commit_operation_id,
+            workbench: source_workbench.clone(),
+            workspace_incarnation_id: source_workspace_incarnation_id,
+            commit_id: source_commit_id,
+            content_digest: source_content_digest.clone(),
+            manifest_digest: source_run_manifest_body,
+            projection_input_digest: protocol::Digest([0x96; types::SHA256_BYTES]),
+            tree_manifest_revision_id: source_run_manifest_revision,
+            replace: false,
+            run_manifest_condition: protocol::PublishCondition::CreateOnly,
+            expected_head_generation: None,
+            parents: Vec::new(),
+            producer: None,
+            lineage_projection: Vec::new(),
+        });
+        let first_commit = executor
+            .execute(&restore_rpc(0x81, commit_operation.clone()))
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(first_commit) = first_commit.result else {
+            panic!("initial commit request returned the wrong result variant");
+        };
+        assert_eq!(first_commit.state, protocol::OperationState::Running);
+        publish_one_byte_artifact(
+            &executor,
+            0x82,
+            protocol::OperationIdentity([0x95; types::FIXED_ID_BYTES]),
+            source_run_manifest_revision,
+            source_workbench.as_str(),
+            RUN_MANIFEST_PATH,
+            protocol::PublicationAuthority::CommitStaging {
+                commit_operation_id,
+            },
+            0x7b,
+        );
+        let completed_commit = executor
+            .execute(&restore_rpc(0x87, commit_operation))
+            .unwrap();
+        let protocol::WorkspaceResult::Operation(completed_commit) = completed_commit.result else {
+            panic!("completed commit returned the wrong result variant");
+        };
+        assert_eq!(completed_commit.state, protocol::OperationState::Succeeded);
+
+        let snapshot_id = 7;
+        executor
+            .execute(&restore_rpc(
+                0x88,
+                protocol::WorkspaceRequest::MintSnapshot(protocol::MintSnapshotRequest {
+                    workbench: source_workbench.clone(),
+                    workspace_incarnation_id: source_workspace_incarnation_id,
+                    snapshot_id,
+                    lease_deadline_ms: 1_000_000,
+                    alias: None,
+                    annotation: Vec::new(),
+                }),
+            ))
+            .unwrap();
+
+        let destination_workbench =
+            protocol::WorkbenchName::new("restore-destination-live").unwrap();
+        let destination_workspace_incarnation_id =
+            protocol::WorkspaceIdentity([0x97; types::FIXED_ID_BYTES]);
+        let restore_operation_id: protocol::OperationIdentity = meta::restore_operation_id(
+            root(),
+            &types::WorkbenchId::new(source_workbench.as_str()).unwrap(),
+            source_workspace_incarnation_id.into(),
+            meta::RestoreSourceSelector::Snapshot(types::SnapshotId::new(snapshot_id)),
+            &types::WorkbenchId::new(destination_workbench.as_str()).unwrap(),
+            destination_workspace_incarnation_id.into(),
+        )
+        .unwrap()
+        .into();
+        let destination_restore_manifest_identity = protocol::RestoreManifestIdentity {
+            publication_operation_id: protocol::OperationIdentity([0x98; types::FIXED_ID_BYTES]),
+            artifact_revision_id: protocol::ArtifactRevisionIdentity([0x99; types::FIXED_ID_BYTES]),
+        };
+        let restore_manifest_body =
+            protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([0x7d]).into()));
+        executor
+            .execute(&restore_rpc(
+                0x89,
+                protocol::WorkspaceRequest::PrepareRestore(protocol::PrepareRestoreRequest {
+                    operation_id: restore_operation_id,
+                    source_workbench: source_workbench.clone(),
+                    source_workspace_incarnation_id,
+                    source: protocol::RestoreSource::Snapshot(protocol::SnapshotSelector::Id(
+                        snapshot_id,
+                    )),
+                    destination_workbench: destination_workbench.clone(),
+                    destination_workspace_incarnation_id,
+                    destination_restore_manifest_identity,
+                    restore_manifest: protocol::RestoreManifestDescriptor {
+                        body_digest: restore_manifest_body,
+                        logical_size: 1,
+                        content_type: protocol::ContentType::new("application/json").unwrap(),
+                    },
+                }),
+            ))
+            .unwrap();
+
+        let destination_run_manifest_identity = protocol::RestoreManifestIdentity {
+            publication_operation_id: protocol::OperationIdentity([0x9a; types::FIXED_ID_BYTES]),
+            artifact_revision_id: protocol::ArtifactRevisionIdentity([0x9b; types::FIXED_ID_BYTES]),
+        };
+        let bind_request = protocol::BindRestoreDestinationRequest {
+            operation_id: restore_operation_id,
+            destination_commit_id: protocol::CommitIdentity([0x9c; types::SHA256_BYTES]),
+            effective_content_digest: source_content_digest,
+            destination_run_manifest_projection_input_digest: protocol::Digest(
+                [0x9d; types::SHA256_BYTES],
+            ),
+            destination_run_manifest_identity,
+            destination_restore_manifest_identity,
+        };
+        executor
+            .execute(&restore_rpc(
+                0x8a,
+                protocol::WorkspaceRequest::BindRestoreDestination(bind_request.clone()),
+            ))
+            .unwrap();
+        publish_one_byte_artifact(
+            &executor,
+            0xa0,
+            destination_run_manifest_identity.publication_operation_id,
+            destination_run_manifest_identity.artifact_revision_id,
+            destination_workbench.as_str(),
+            RUN_MANIFEST_PATH,
+            protocol::PublicationAuthority::RestoreStaging {
+                restore_operation_id,
+            },
+            0x7c,
+        );
+        publish_one_byte_artifact(
+            &executor,
+            0xa5,
+            destination_restore_manifest_identity.publication_operation_id,
+            destination_restore_manifest_identity.artifact_revision_id,
+            destination_workbench.as_str(),
+            meta::RESTORE_MANIFEST_PATH,
+            protocol::PublicationAuthority::RestoreStaging {
+                restore_operation_id,
+            },
+            0x7d,
+        );
+        let initialized = meta::apply_restore_initialization(
+            &store,
+            meta::RootWriteContext::current(
+                &store,
+                root(),
+                shard(),
+                types::ObjectNamespaceId::from_bytes([10; types::FIXED_ID_BYTES]),
+                placement(),
+                owner(1),
+                request_id(0xaa),
+            )
+            .unwrap(),
+            meta::RestoreOperationRequest {
+                operation_id: restore_operation_id.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            initialized.operation.phase,
+            types::RestorePhase::DestinationBuilding
+        );
+        assert!(restore_closure_is_pristine(
+            &restore_commit_provenance(&initialized.operation)
+                .unwrap()
+                .closure
+        ));
+
+        let replayed_run_manifest = publish_one_byte_artifact(
+            &executor,
+            0xcb,
+            destination_run_manifest_identity.publication_operation_id,
+            destination_run_manifest_identity.artifact_revision_id,
+            destination_workbench.as_str(),
+            RUN_MANIFEST_PATH,
+            protocol::PublicationAuthority::RestoreStaging {
+                restore_operation_id,
+            },
+            0x7c,
+        );
+        assert_eq!(replayed_run_manifest.logical_size, 1);
+
+        let bind_replay = executor
+            .execute(&restore_rpc(
+                0xd1,
+                protocol::WorkspaceRequest::BindRestoreDestination(bind_request.clone()),
+            ))
+            .expect("exact bind replay must resume DestinationBuilding");
+        assert!(bind_replay.replayed);
+        let protocol::WorkspaceResult::RestorePrepared(replayed_preparation) = bind_replay.result
+        else {
+            panic!("exact bind replay returned the wrong result variant");
+        };
+        assert_eq!(
+            replayed_preparation.destination_binding,
+            sealed_restore_preparation(&initialized.operation)
+                .unwrap()
+                .destination_binding
+        );
+
+        let mut mismatched_bind = bind_request;
+        mismatched_bind.destination_commit_id =
+            protocol::CommitIdentity([0xfe; types::SHA256_BYTES]);
+        let mismatch = executor
+            .execute(&restore_rpc(
+                0xd2,
+                protocol::WorkspaceRequest::BindRestoreDestination(mismatched_bind),
+            ))
+            .expect_err("mismatched bind replay must fail closed");
+        assert_eq!(mismatch.code, protocol::ErrorCode::RequestReplayMismatch);
+
+        let executor = executor.with_restore_initialization_barrier(
+            protocol::OperationIdentity([0xff; types::FIXED_ID_BYTES]),
+            Arc::new(OtherOperationBarrier),
+        );
+        let finalize = restore_rpc(
+            0xab,
+            protocol::WorkspaceRequest::FinalizeRestore(protocol::FinalizeRestoreRequest {
+                operation_id: restore_operation_id,
+            }),
+        );
+        let first = executor.execute(&finalize).unwrap();
+        let protocol::WorkspaceResult::Restored(first_result) = first.result else {
+            panic!("non-target finalize returned the wrong result variant");
+        };
+        assert!(!first.replayed);
+        let replay = executor.execute(&finalize).unwrap();
+        let protocol::WorkspaceResult::Restored(replay_result) = replay.result else {
+            panic!("non-target replay returned the wrong result variant");
+        };
+        assert!(replay.replayed);
+        assert_eq!(replay_result, first_result);
+
+        let persisted = meta::get_restore(
+            &store,
+            meta::RootWriteContext::current(
+                &store,
+                root(),
+                shard(),
+                types::ObjectNamespaceId::from_bytes([10; types::FIXED_ID_BYTES]),
+                placement(),
+                owner(1),
+                request_id(0xac),
+            )
+            .unwrap(),
+            restore_operation_id.into(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(persisted.phase, types::RestorePhase::Complete);
+        assert_eq!(
+            persisted
+                .destination_commit_receipt()
+                .unwrap()
+                .destination_commit_id,
+            types::CommitId::from_bytes([0x9c; types::SHA256_BYTES])
+        );
+    }
+
     fn bound_source_sealed_restore_operation() -> meta::RestoreOperationRecord {
         let mut operation = source_sealed_restore_operation();
         let meta::RestoreCommitProvenance::V5(provenance) = &mut operation.commit_provenance else {
@@ -6012,6 +7562,8 @@ mod tests {
         let meta::RestoreCommitProvenance::V5(provenance) = &mut operation.commit_provenance else {
             unreachable!();
         };
+        provenance.closure.path_members_complete = true;
+        provenance.closure.generic_indexes_complete = true;
         provenance.closure.member_seal = Some([0x74; types::SHA256_BYTES]);
         provenance.closure.revision_cursor = Some(types::ArtifactRevisionId::from_bytes(
             [0x65; types::FIXED_ID_BYTES],
@@ -6043,6 +7595,9 @@ mod tests {
         let mut operation = source_sealed_restore_operation();
         operation.phase = types::RestorePhase::Copying;
         operation.source_eof = source_eof;
+        operation.source_paths_eof = source_eof;
+        operation.source_generic_index_seal = source_eof.then_some([0; types::SHA256_BYTES]);
+        operation.source_generic_indexes_match_base_commit = source_eof.then_some(true);
         operation.source_member_count = source_member_count;
         operation.source_cursor = (source_member_count > 0).then(|| {
             types::NormalizedRelativePath::new(format!("input/{source_member_count:04}")).unwrap()
@@ -6156,6 +7711,160 @@ mod tests {
             request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
             operation,
         }
+    }
+
+    #[cfg(feature = "restore-crash-test-support")]
+    #[allow(clippy::too_many_arguments)]
+    fn publish_one_byte_artifact(
+        executor: &MetadataWorkspaceRequestExecutor,
+        first_request_fill: u8,
+        operation_id: protocol::OperationIdentity,
+        artifact_revision_id: protocol::ArtifactRevisionIdentity,
+        workbench: &str,
+        path: &str,
+        authority: protocol::PublicationAuthority,
+        byte: u8,
+    ) -> protocol::ArtifactDescriptor {
+        let revision_id: types::ArtifactRevisionId = artifact_revision_id.into();
+        let object_key = meta::object_block_key(shard(), root(), revision_id, 0);
+        let body_digest =
+            protocol::sha256_digest_uri(protocol::Digest(Sha256::digest([byte]).into()));
+        let staged_objects = vec![protocol::StagedObject {
+            sequence: 0,
+            object_identity: protocol::ObjectIdentity::new(object_key.clone()).unwrap(),
+            expected_length: 1,
+            expected_digest: body_digest.clone(),
+            multipart_token: None,
+        }];
+        let manifest_rows = vec![protocol::ArtifactManifestRow {
+            object_index: 0,
+            physical_object_index: 0,
+            logical_offset: 0,
+            physical_owner_revision_id: artifact_revision_id,
+            object_identity: protocol::ObjectIdentity::new(object_key).unwrap(),
+            object_offset: 0,
+            length: 1,
+            digest: body_digest.clone(),
+            append_segment: None,
+        }];
+        let seals = protocol::seal_artifact_publish_plan(
+            artifact_revision_id,
+            &staged_objects,
+            &manifest_rows,
+        )
+        .unwrap();
+        let artifact = protocol::ArtifactDescriptor {
+            logical_size: 1,
+            body_digest: body_digest.clone(),
+            manifest_digest: protocol::sha256_digest_uri(seals.manifest_seal),
+            content_type: protocol::ContentType::new("application/json").unwrap(),
+            producer: None,
+            manifest_identity: None,
+            index_fields: Vec::new(),
+        };
+        let target = protocol::WorkspacePath {
+            workbench: protocol::WorkbenchName::new(workbench).unwrap(),
+            path: protocol::RelativePath::new(path).unwrap(),
+        };
+        let operation_status = |result: ExecutedRequest| {
+            let protocol::WorkspaceResult::Operation(status) = result.result else {
+                panic!("artifact publication returned the wrong result variant");
+            };
+            status
+        };
+        let status = operation_status(
+            executor
+                .execute(&restore_rpc(
+                    first_request_fill,
+                    protocol::WorkspaceRequest::BeginArtifactPublish(
+                        protocol::BeginArtifactPublishRequest {
+                            operation_id,
+                            artifact_revision_id,
+                            target: target.clone(),
+                            authority,
+                            condition: protocol::PublishCondition::CreateOnly,
+                            staged_object_count: seals.staged_object_count,
+                            staged_object_seal: seals.staged_object_seal,
+                            manifest_row_count: seals.manifest_row_count,
+                            manifest_seal: seals.manifest_seal,
+                            dependency_owner_revision_ids: Vec::new(),
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        if status.state == protocol::OperationState::Succeeded {
+            let Some(protocol::OperationResult::ArtifactPublish(result)) = status.result else {
+                panic!("terminal artifact replay omitted its durable result");
+            };
+            assert_eq!(result.operation_id, operation_id);
+            assert_eq!(result.target, target);
+            assert_eq!(result.artifact_revision_id, artifact_revision_id);
+            assert_eq!(result.logical_size, artifact.logical_size);
+            assert_eq!(result.body_digest, artifact.body_digest);
+            return artifact;
+        }
+        assert_eq!(status.state, protocol::OperationState::Running);
+        let status = operation_status(
+            executor
+                .execute(&restore_rpc(
+                    first_request_fill.wrapping_add(1),
+                    protocol::WorkspaceRequest::StageArtifactObjects(
+                        protocol::StageArtifactObjectsRequest {
+                            token: status.token,
+                            objects: staged_objects,
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        let status = operation_status(
+            executor
+                .execute(&restore_rpc(
+                    first_request_fill.wrapping_add(2),
+                    protocol::WorkspaceRequest::MarkArtifactObjectsUploaded(
+                        protocol::MarkArtifactObjectsUploadedRequest {
+                            token: status.token,
+                            objects: vec![protocol::ObjectUploadProof {
+                                sequence: 0,
+                                observed_length: 1,
+                                observed_digest: body_digest,
+                            }],
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        let status = operation_status(
+            executor
+                .execute(&restore_rpc(
+                    first_request_fill.wrapping_add(3),
+                    protocol::WorkspaceRequest::StageArtifactManifest(
+                        protocol::StageArtifactManifestRequest {
+                            token: status.token,
+                            rows: manifest_rows,
+                            dependency_owner_revision_ids: Vec::new(),
+                        },
+                    ),
+                ))
+                .unwrap(),
+        );
+        let completed = executor
+            .execute(&restore_rpc(
+                first_request_fill.wrapping_add(4),
+                protocol::WorkspaceRequest::CompleteArtifactPublish(
+                    protocol::CompleteArtifactPublishRequest {
+                        token: status.token,
+                        artifact: artifact.clone(),
+                    },
+                ),
+            ))
+            .unwrap();
+        let protocol::WorkspaceResult::Published(published) = completed.result else {
+            panic!("artifact finalization returned the wrong result variant");
+        };
+        assert_eq!(published.target, target);
+        artifact
     }
 
     #[test]
@@ -6806,8 +8515,9 @@ mod tests {
             route: route(1),
             request_id: protocol::RequestIdentity([32; types::FIXED_ID_BYTES]),
             operation: protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
-                target,
+                target: target.clone(),
                 view: protocol::WorkspaceReadView::Live,
+                expected_read_version: None,
                 range: None,
                 plan_page: None,
                 if_none_match: None,
@@ -6859,6 +8569,22 @@ mod tests {
             vec![protocol::PathListEntry::Artifact(metadata)]
         );
         assert!(paths.next_cursor.is_none());
+
+        let stale_get = protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([35; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
+                target: target.clone(),
+                view: protocol::WorkspaceReadView::Live,
+                expected_read_version: Some(paths.read_version + 1),
+                range: None,
+                plan_page: None,
+                if_none_match: None,
+            }),
+        };
+        let failure = executor.execute(&stale_get).unwrap_err();
+        assert_eq!(failure.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(failure.conflict, Some(protocol::ConflictKind::ReadVersion));
 
         let stale_list = protocol::WorkspaceRpcRequest {
             route: route(1),
@@ -7223,7 +8949,7 @@ mod tests {
             protocol::ArtifactRevisionIdentity([0x52; types::FIXED_ID_BYTES]);
         let target = protocol::WorkspacePath {
             workbench: protocol::WorkbenchName::new("query-test").unwrap(),
-            path: protocol::RelativePath::new("outputs/result.bin").unwrap(),
+            path: protocol::RelativePath::new("outputs/dir/result.bin").unwrap(),
         };
         let index_fields = vec![protocol::FieldValue {
             field_id: "agent.score".to_owned(),
@@ -7289,6 +9015,7 @@ mod tests {
             route: route(1),
             request_id: protocol::RequestIdentity([0x55; types::FIXED_ID_BYTES]),
             operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                profile: protocol::QueryProfile::ArtifactV1,
                 scope: protocol::QueryScope::Root { path_prefix: None },
                 predicates: vec![protocol::QueryPredicate {
                     field_id: "agent.score".to_owned(),
@@ -7312,27 +9039,547 @@ mod tests {
             panic!("search returned the wrong result variant");
         };
         assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].projection, index_fields);
-        assert_eq!(
-            result.hits[0].metadata.descriptor.index_fields,
-            index_fields
-        );
-        assert_eq!(
-            result.hits[0].metadata.path.path.as_str(),
-            "outputs/result.bin"
-        );
+        let protocol::SearchRow::Artifact(hit) = &result.hits[0] else {
+            panic!("ArtifactV1 search returned a generic namespace row");
+        };
+        assert_eq!(hit.projection, index_fields);
+        assert_eq!(hit.metadata.descriptor.index_fields, index_fields);
+        assert_eq!(hit.metadata.path.path.as_str(), "outputs/dir/result.bin");
         assert!(result.next_cursor.is_none());
         assert!(result.read_version > 0);
+
+        let generic_search = protocol::WorkspaceRpcRequest {
+            route: route(1),
+            request_id: protocol::RequestIdentity([0x5a; types::FIXED_ID_BYTES]),
+            operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                profile: generic_query_profile(),
+                scope: protocol::QueryScope::Root { path_prefix: None },
+                predicates: Vec::new(),
+                projection: vec![
+                    "path".to_owned(),
+                    "name".to_owned(),
+                    "kind".to_owned(),
+                    "size_bytes".to_owned(),
+                    "body.content_type".to_owned(),
+                    "body.producer".to_owned(),
+                    "body.manifest_id".to_owned(),
+                ],
+                sort: vec![protocol::SortField {
+                    field_id: "path".to_owned(),
+                    direction: protocol::SortDirection::Ascending,
+                }],
+                facets: vec!["kind".to_owned(), "body.producer".to_owned()],
+                page: protocol::PageRequest {
+                    cursor: None,
+                    limit: 100,
+                },
+            }),
+        };
+        let generic = executor.execute(&generic_search).unwrap();
+        let protocol::WorkspaceResult::Search(generic) = generic.result else {
+            panic!("generic search returned the wrong result variant");
+        };
+        assert_eq!(generic.match_count, 8);
+        assert_eq!(generic.hits.len(), 8);
+        let generic_hits = generic
+            .hits
+            .iter()
+            .map(|row| match row {
+                protocol::SearchRow::GenericNamespace(hit) => hit,
+                protocol::SearchRow::Artifact(_) => {
+                    panic!("GenericNamespaceV1 search returned an ArtifactV1 row")
+                }
+            })
+            .collect::<Vec<_>>();
+        let paths = generic_hits
+            .iter()
+            .map(|hit| {
+                hit.projection
+                    .iter()
+                    .find(|field| field.field_id == "path")
+                    .map(|field| field.value.clone())
+                    .expect("every generic row projects its canonical path")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "/agents/query-test",
+                "/agents/query-test/input",
+                "/agents/query-test/logs",
+                "/agents/query-test/metadata",
+                "/agents/query-test/outputs",
+                "/agents/query-test/outputs/dir",
+                "/agents/query-test/outputs/dir/result.bin",
+                "/agents/query-test/scripts",
+            ]
+            .into_iter()
+            .map(|path| protocol::ScalarValue::String(path.to_owned()))
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            generic_hits
+                .iter()
+                .filter(|hit| hit.kind == protocol::GenericNamespaceKind::Directory)
+                .count(),
+            7
+        );
+        let artifact = generic_hits
+            .iter()
+            .find(|hit| hit.kind == protocol::GenericNamespaceKind::Artifact)
+            .expect("the published artifact must remain visible");
+        assert_eq!(
+            artifact
+                .relative_path
+                .as_ref()
+                .map(protocol::RelativePath::as_str),
+            Some("outputs/dir/result.bin")
+        );
+        let artifact_projection = artifact
+            .projection
+            .iter()
+            .map(|field| (field.field_id.as_str(), &field.value))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            artifact_projection.get("body.producer"),
+            Some(&&protocol::ScalarValue::String("executor-test".to_owned()))
+        );
+        assert_eq!(
+            artifact_projection.get("body.manifest_id"),
+            Some(&&protocol::ScalarValue::String("manifest-1".to_owned()))
+        );
+        assert_eq!(generic.facets.len(), 2);
+        let kind_facet = generic
+            .facets
+            .iter()
+            .find(|facet| facet.field_id == "kind")
+            .expect("kind facet must be returned");
+        assert_eq!(kind_facet.distinct_count, 2);
+        assert_eq!(
+            kind_facet
+                .buckets
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            8
+        );
+
+        let search_size = |request_fill: u8,
+                           profile: protocol::QueryProfile,
+                           field_id: &str,
+                           operator: protocol::QueryOperator,
+                           value: &str| {
+            executor.execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([request_fill; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                    profile,
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    predicates: vec![protocol::QueryPredicate {
+                        field_id: field_id.to_owned(),
+                        operator,
+                        operand: protocol::QueryOperand::Scalar(protocol::ScalarValue::String(
+                            value.to_owned(),
+                        )),
+                    }],
+                    projection: vec!["path".to_owned()],
+                    sort: Vec::new(),
+                    facets: Vec::new(),
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 100,
+                    },
+                }),
+            })
+        };
+        for (request_fill, operator, value, expected_matches) in [
+            (0x9d, protocol::QueryOperator::Prefix, "/agents", 8),
+            (
+                0x9e,
+                protocol::QueryOperator::Contains,
+                "agents/query-test",
+                8,
+            ),
+            (
+                0x9f,
+                protocol::QueryOperator::Suffix,
+                "agents/query-test",
+                1,
+            ),
+        ] {
+            let searched = search_size(
+                request_fill,
+                generic_query_profile(),
+                "path",
+                operator,
+                value,
+            )
+            .unwrap();
+            let protocol::WorkspaceResult::Search(searched) = searched.result else {
+                panic!("presentation-path search returned the wrong result variant");
+            };
+            assert_eq!(searched.match_count, expected_matches);
+            assert_eq!(searched.hits.len(), expected_matches as usize);
+        }
+        for (request_fill, operator) in [
+            (0xa1, protocol::QueryOperator::Equal),
+            (0xa2, protocol::QueryOperator::GreaterOrEqual),
+        ] {
+            let searched = search_size(
+                request_fill,
+                generic_query_profile(),
+                "size_bytes",
+                operator,
+                "0",
+            )
+            .unwrap();
+            let protocol::WorkspaceResult::Search(searched) = searched.result else {
+                panic!("numeric-string search returned the wrong result variant");
+            };
+            assert_eq!(searched.match_count, 8);
+            assert_eq!(searched.hits.len(), 8);
+        }
+        for (request_fill, invalid) in [(0xa3, "NaN"), (0xa4, "inf"), (0xa5, ""), (0xa6, "nope")] {
+            let failure = search_size(
+                request_fill,
+                generic_query_profile(),
+                "size_bytes",
+                protocol::QueryOperator::Equal,
+                invalid,
+            )
+            .unwrap_err();
+            assert_eq!(failure.code, protocol::ErrorCode::InvalidArgument);
+        }
+        let native_string_number = search_size(
+            0xa7,
+            protocol::QueryProfile::ArtifactV1,
+            "logical_size",
+            protocol::QueryOperator::Equal,
+            "0",
+        )
+        .unwrap_err();
+        assert_eq!(
+            native_string_number.code,
+            protocol::ErrorCode::InvalidArgument
+        );
+
+        let generic_count = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x5b; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    predicates: Vec::new(),
+                    group_by: Vec::new(),
+                    aggregates: vec![protocol::AggregateSpec {
+                        function: protocol::AggregateFunction::Count,
+                        field_id: None,
+                        result_id: "rows".to_owned(),
+                    }],
+                    sort: Vec::new(),
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 100,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Aggregate(generic_count) = generic_count.result else {
+            panic!("generic aggregate returned the wrong result variant");
+        };
+        assert_eq!(generic_count.input_match_count, 8);
+        assert_eq!(generic_count.row_count, 8);
+        assert_eq!(generic_count.group_count, 1);
+        assert_eq!(
+            generic_count.groups[0].values,
+            vec![protocol::FieldValue {
+                field_id: "rows".to_owned(),
+                value: protocol::ScalarValue::Unsigned(8),
+            }]
+        );
+
+        let grouped = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x5e; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    predicates: Vec::new(),
+                    group_by: vec!["body.producer".to_owned()],
+                    aggregates: vec![
+                        protocol::AggregateSpec {
+                            function: protocol::AggregateFunction::Count,
+                            field_id: None,
+                            result_id: "rows".to_owned(),
+                        },
+                        protocol::AggregateSpec {
+                            function: protocol::AggregateFunction::Sum,
+                            field_id: Some("size_bytes".to_owned()),
+                            result_id: "bytes".to_owned(),
+                        },
+                    ],
+                    sort: Vec::new(),
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 100,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Aggregate(grouped) = grouped.result else {
+            panic!("grouped generic aggregate returned the wrong result variant");
+        };
+        assert_eq!(grouped.input_match_count, 8);
+        assert_eq!(grouped.row_count, 1);
+        assert_eq!(grouped.group_count, 1);
+        assert_eq!(
+            grouped.groups[0].keys,
+            vec![protocol::FieldValue {
+                field_id: "body.producer".to_owned(),
+                value: protocol::ScalarValue::String("executor-test".to_owned()),
+            }]
+        );
+        assert!(grouped.groups[0]
+            .values
+            .iter()
+            .any(|field| field.field_id == "bytes"
+                && matches!(field.value, protocol::ScalarValue::Decimal(_))));
+
+        let grouped_paths = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xa8; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Aggregate(protocol::AggregateRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    predicates: Vec::new(),
+                    group_by: vec!["path".to_owned()],
+                    aggregates: vec![protocol::AggregateSpec {
+                        function: protocol::AggregateFunction::Count,
+                        field_id: None,
+                        result_id: "rows".to_owned(),
+                    }],
+                    sort: Vec::new(),
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 100,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Aggregate(grouped_paths) = grouped_paths.result else {
+            panic!("path-grouped generic aggregate returned the wrong result variant");
+        };
+        assert_eq!(grouped_paths.input_match_count, 8);
+        assert_eq!(grouped_paths.row_count, 8);
+        assert_eq!(grouped_paths.group_count, 8);
+        assert!(grouped_paths.groups.iter().any(|group| {
+            group.keys
+                == vec![protocol::FieldValue {
+                    field_id: "path".to_owned(),
+                    value: protocol::ScalarValue::String(
+                        "/agents/query-test/outputs/dir/result.bin".to_owned(),
+                    ),
+                }]
+        }));
+
+        let generic_catalog = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x5c; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    path_match: protocol::CatalogPathMatch::Prefix,
+                    field_prefix: None,
+                    include_facets: true,
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 100,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Catalog(generic_catalog) = generic_catalog.result else {
+            panic!("generic catalog returned the wrong result variant");
+        };
+        let generic_fields = generic_catalog
+            .fields
+            .iter()
+            .map(|field| field.field_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for builtin in [
+            "path",
+            "name",
+            "kind",
+            "size_bytes",
+            "body.content_type",
+            "body.producer",
+            "body.manifest_id",
+        ] {
+            assert!(generic_fields.contains(builtin), "missing {builtin}");
+        }
+        for native in [
+            "workbench_id",
+            "generation",
+            "logical_size",
+            "body_digest_uri",
+            "content_type",
+            "producer",
+            "manifest_id",
+        ] {
+            assert!(
+                !generic_fields.contains(native),
+                "leaked native field {native}"
+            );
+        }
+
+        let empty_prefix_catalog = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xa9; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    path_match: protocol::CatalogPathMatch::Prefix,
+                    field_prefix: Some(String::new()),
+                    include_facets: true,
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 100,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Catalog(empty_prefix_catalog) = empty_prefix_catalog.result
+        else {
+            panic!("empty-prefix generic catalog returned the wrong result variant");
+        };
+        assert_eq!(empty_prefix_catalog.fields, generic_catalog.fields);
+        assert_eq!(empty_prefix_catalog.facets, generic_catalog.facets);
+
+        let exact_catalog = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x5d; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Workspace {
+                        workbench: protocol::WorkbenchName::new("query-test").unwrap(),
+                        path_prefix: Some(
+                            protocol::RelativePath::new("outputs/dir/result.bin").unwrap(),
+                        ),
+                    },
+                    path_match: protocol::CatalogPathMatch::Exact,
+                    field_prefix: None,
+                    include_facets: true,
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 100,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Catalog(exact_catalog) = exact_catalog.result else {
+            panic!("exact generic catalog returned the wrong result variant");
+        };
+        assert!(exact_catalog.fields.is_empty());
+        assert!(exact_catalog.facets.is_empty());
+
+        let cursor_seed = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x5f; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                    profile: generic_query_profile(),
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    predicates: Vec::new(),
+                    projection: vec!["path".to_owned()],
+                    sort: vec![protocol::SortField {
+                        field_id: "path".to_owned(),
+                        direction: protocol::SortDirection::Ascending,
+                    }],
+                    facets: Vec::new(),
+                    page: protocol::PageRequest {
+                        cursor: None,
+                        limit: 1,
+                    },
+                }),
+            })
+            .unwrap();
+        let protocol::WorkspaceResult::Search(cursor_seed) = cursor_seed.result else {
+            panic!("cursor seed returned the wrong result variant");
+        };
+        let cursor = cursor_seed
+            .next_cursor
+            .expect("one-row generic search must return a continuation");
+        let presentation_root_drift = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0xaa; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                    profile: protocol::QueryProfile::GenericCustomIndexV1 {
+                        presentation_path_root: "/other-agents".to_owned(),
+                    },
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    predicates: Vec::new(),
+                    projection: vec!["path".to_owned()],
+                    sort: vec![protocol::SortField {
+                        field_id: "path".to_owned(),
+                        direction: protocol::SortDirection::Ascending,
+                    }],
+                    facets: Vec::new(),
+                    page: protocol::PageRequest {
+                        cursor: Some(cursor.clone()),
+                        limit: 1,
+                    },
+                }),
+            })
+            .unwrap_err();
+        assert_eq!(
+            presentation_root_drift.code,
+            protocol::ErrorCode::PreconditionFailed
+        );
+        assert_eq!(presentation_root_drift.conflict, None);
+
+        let profile_drift = executor
+            .execute(&protocol::WorkspaceRpcRequest {
+                route: route(1),
+                request_id: protocol::RequestIdentity([0x60; types::FIXED_ID_BYTES]),
+                operation: protocol::WorkspaceRequest::Search(protocol::SearchRequest {
+                    profile: protocol::QueryProfile::ArtifactV1,
+                    scope: protocol::QueryScope::Root { path_prefix: None },
+                    predicates: Vec::new(),
+                    projection: vec!["path".to_owned()],
+                    sort: vec![protocol::SortField {
+                        field_id: "path".to_owned(),
+                        direction: protocol::SortDirection::Ascending,
+                    }],
+                    facets: Vec::new(),
+                    page: protocol::PageRequest {
+                        cursor: Some(cursor),
+                        limit: 1,
+                    },
+                }),
+            })
+            .unwrap_err();
+        assert_eq!(profile_drift.code, protocol::ErrorCode::PreconditionFailed);
+        assert_eq!(profile_drift.conflict, None);
 
         let catalog = protocol::WorkspaceRpcRequest {
             route: route(1),
             request_id: protocol::RequestIdentity([0x56; types::FIXED_ID_BYTES]),
             operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                profile: protocol::QueryProfile::ArtifactV1,
                 scope: protocol::QueryScope::Workspace {
                     workbench: protocol::WorkbenchName::new("query-test").unwrap(),
                     path_prefix: None,
                 },
+                path_match: protocol::CatalogPathMatch::Prefix,
                 field_prefix: None,
+                include_facets: false,
                 page: protocol::PageRequest {
                     cursor: None,
                     limit: 1,
@@ -7355,11 +9602,14 @@ mod tests {
             route: route(1),
             request_id: protocol::RequestIdentity([0x59; types::FIXED_ID_BYTES]),
             operation: protocol::WorkspaceRequest::Catalog(protocol::CatalogRequest {
+                profile: protocol::QueryProfile::ArtifactV1,
                 scope: protocol::QueryScope::Workspace {
                     workbench: protocol::WorkbenchName::new("query-test").unwrap(),
                     path_prefix: None,
                 },
+                path_match: protocol::CatalogPathMatch::Prefix,
                 field_prefix: None,
+                include_facets: false,
                 page: protocol::PageRequest {
                     cursor: Some(cursor),
                     limit: 1,
@@ -8383,6 +10633,7 @@ mod tests {
             operation: protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
                 target: target.clone(),
                 view: protocol::WorkspaceReadView::Live,
+                expected_read_version: None,
                 range: None,
                 plan_page: None,
                 if_none_match: None,
@@ -8406,6 +10657,7 @@ mod tests {
             operation: protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
                 target: target.clone(),
                 view: protocol::WorkspaceReadView::Live,
+                expected_read_version: None,
                 range: Some(range),
                 plan_page: Some(protocol::PageRequest {
                     cursor: None,
@@ -8429,6 +10681,7 @@ mod tests {
             operation: protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
                 target: target.clone(),
                 view: protocol::WorkspaceReadView::Live,
+                expected_read_version: None,
                 range: Some(range),
                 plan_page: Some(protocol::PageRequest {
                     cursor: Some(cursor.clone()),
@@ -8452,6 +10705,7 @@ mod tests {
             operation: protocol::WorkspaceRequest::GetPath(protocol::GetPathRequest {
                 target,
                 view: protocol::WorkspaceReadView::Live,
+                expected_read_version: None,
                 range: Some(protocol::ByteRange {
                     offset: 1,
                     length: 512,

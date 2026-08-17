@@ -80,6 +80,7 @@ pub struct ServerConfig {
 pub enum MetadataStoreConfig {
     Create(PathBuf),
     Reopen(PathBuf),
+    RecoverLog(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,7 +98,9 @@ pub enum Command {
         tool: String,
         arguments: String,
     },
-    Mcp,
+    Mcp {
+        profile: McpProfile,
+    },
     Materialize {
         workbench: String,
         section: String,
@@ -124,6 +127,13 @@ pub enum Command {
         json: bool,
     },
     Help,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum McpProfile {
+    Agent,
+    #[default]
+    Workbench,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,6 +165,7 @@ pub enum CliError {
     UnexpectedArgument(String),
     InvalidNumber { option: &'static str, value: String },
     InvalidAddress { option: &'static str, value: String },
+    InvalidOption { option: &'static str, value: String },
     InvalidRequestId(String),
     MixedRoutingOptions,
     MixedMetadataStoreOptions,
@@ -177,6 +188,9 @@ impl fmt::Display for CliError {
             Self::InvalidAddress { option, value } => {
                 write!(formatter, "{option} has invalid socket address {value:?}")
             }
+            Self::InvalidOption { option, value } => {
+                write!(formatter, "{option} has invalid value {value:?}")
+            }
             Self::InvalidRequestId(value) => write!(
                 formatter,
                 "--request-id must be exactly 32 lowercase hexadecimal characters, got {value:?}"
@@ -185,7 +199,7 @@ impl fmt::Display for CliError {
                 "static metadata routing options and etcd routing options cannot be combined",
             ),
             Self::MixedMetadataStoreOptions => formatter
-                .write_str("--metadata-create and --metadata-reopen are mutually exclusive"),
+                .write_str("--metadata-create, --metadata-reopen, and --metadata-recover-log are mutually exclusive"),
         }
     }
 }
@@ -400,6 +414,15 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
                     )?)),
                 )?;
             }
+            "--metadata-recover-log" => {
+                select_metadata_store(
+                    &mut server.metadata_store,
+                    MetadataStoreConfig::RecoverLog(PathBuf::from(next_value(
+                        &mut arguments,
+                        &argument,
+                    )?)),
+                )?;
+            }
             "--lifecycle-interval-millis" => {
                 server.lifecycle_interval_millis = parse_number(
                     "--lifecycle-interval-millis",
@@ -420,7 +443,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     }
     if matches!(
         &command,
-        Command::Workbench { .. } | Command::Mcp | Command::Collect { .. }
+        Command::Workbench { .. } | Command::Mcp { .. } | Command::Collect { .. }
     ) && workbench_root.is_none()
     {
         return Err(CliError::MissingOption("--workbench-root"));
@@ -428,7 +451,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, 
     if matches!(
         &command,
         Command::Workbench { .. }
-            | Command::Mcp
+            | Command::Mcp { .. }
             | Command::Materialize { .. }
             | Command::Collect { .. }
             | Command::WorkspacePath(_)
@@ -488,7 +511,7 @@ fn parse_command(
                 .ok_or(CliError::MissingArgument("Workbench tool name"))?,
             arguments: arguments.next().unwrap_or_else(|| "{}".to_owned()),
         }),
-        "mcp" => Ok(Command::Mcp),
+        "mcp" => parse_mcp(arguments),
         "materialize" => Ok(Command::Materialize {
             workbench: arguments
                 .next()
@@ -514,6 +537,32 @@ fn parse_command(
         "help" => Ok(Command::Help),
         _ => Err(CliError::UnknownCommand(command)),
     }
+}
+
+fn parse_mcp(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
+    let mut profile = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--profile" if profile.is_none() => {
+                let value = next_value(arguments, &argument)?;
+                profile = Some(match value.as_str() {
+                    "agent" => McpProfile::Agent,
+                    "workbench" => McpProfile::Workbench,
+                    _ => {
+                        return Err(CliError::InvalidOption {
+                            option: "--profile",
+                            value,
+                        });
+                    }
+                });
+            }
+            "--profile" => return Err(CliError::UnexpectedArgument(argument)),
+            _ => return Err(CliError::UnexpectedArgument(argument)),
+        }
+    }
+    Ok(Command::Mcp {
+        profile: profile.unwrap_or_default(),
+    })
 }
 
 fn parse_workspace_path(arguments: &mut impl Iterator<Item = String>) -> Result<Command, CliError> {
@@ -922,6 +971,59 @@ mod tests {
         );
         assert_eq!(route.key_prefix, "/nokv/production");
         assert_eq!(route.lease_ttl_seconds, 10);
+        assert_eq!(
+            parsed.command,
+            Command::Mcp {
+                profile: McpProfile::Workbench
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_profile_is_explicit_and_defaults_to_workbench() {
+        let prefix = [
+            "--agent-id",
+            "44444444444444444444444444444444",
+            "--workbench-root",
+            "/agents/test/wb",
+        ];
+        for (suffix, expected) in [
+            (&["mcp"][..], McpProfile::Workbench),
+            (
+                &["mcp", "--profile", "workbench"][..],
+                McpProfile::Workbench,
+            ),
+            (&["mcp", "--profile", "agent"][..], McpProfile::Agent),
+        ] {
+            let parsed = parse(args(&prefix).into_iter().chain(args(suffix))).unwrap();
+            assert_eq!(parsed.command, Command::Mcp { profile: expected });
+        }
+
+        let invalid = parse(
+            args(&prefix)
+                .into_iter()
+                .chain(args(&["mcp", "--profile", "legacy"])),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid,
+            CliError::InvalidOption {
+                option: "--profile",
+                value: "legacy".to_owned(),
+            }
+        );
+        let duplicate = parse(args(&prefix).into_iter().chain(args(&[
+            "mcp",
+            "--profile",
+            "agent",
+            "--profile",
+            "workbench",
+        ])))
+        .unwrap_err();
+        assert_eq!(
+            duplicate,
+            CliError::UnexpectedArgument("--profile".to_owned())
+        );
     }
 
     #[test]
@@ -1036,6 +1138,29 @@ mod tests {
                 "/tmp/new.holt",
                 "--metadata-reopen",
                 "/tmp/existing.holt",
+                "serve",
+            ])),
+            Err(CliError::MixedMetadataStoreOptions)
+        );
+
+        let recovered = parse(args(&[
+            "--metadata-recover-log",
+            "/var/lib/nokv/recovered-shard.holt",
+            "serve",
+        ]))
+        .unwrap();
+        assert_eq!(
+            recovered.server.metadata_store,
+            Some(MetadataStoreConfig::RecoverLog(PathBuf::from(
+                "/var/lib/nokv/recovered-shard.holt"
+            )))
+        );
+        assert_eq!(
+            parse(args(&[
+                "--metadata-reopen",
+                "/tmp/existing.holt",
+                "--metadata-recover-log",
+                "/tmp/recovered.holt",
                 "serve",
             ])),
             Err(CliError::MixedMetadataStoreOptions)
