@@ -15,17 +15,20 @@ use std::fmt;
 
 use nokv_types::{
     ArtifactRevisionId, CommandDigest, CommitId, CommitState, CommitVersion, ConsumerEpoch,
-    GcClaimState, Generation, HistoryHoldState, NormalizedRelativePath, OperationId, OperationKind,
-    PublishPhase, ReadVersion, ReferenceEpoch, RestorePhase, RevisionState, SnapshotId,
-    SnapshotState, WorkbenchId, WorkspaceIncarnationId, WorkspaceRevision, WorkspaceState,
-    FIXED_ID_BYTES, SHA256_BYTES,
+    GcClaimState, Generation, GenericIndexReferenceKind, HistoryHoldState, NormalizedRelativePath,
+    OperationId, OperationKind, PublishPhase, ReadVersion, ReferenceEpoch, RestorePhase,
+    RevisionState, SnapshotId, SnapshotState, WorkbenchId, WorkspaceIncarnationId,
+    WorkspaceRevision, WorkspaceState, FIXED_ID_BYTES, SHA256_BYTES,
 };
 use sha2::{Digest, Sha256};
 
 use super::codec::{
-    artifact_revision_key, child_commit_consumer_key, commit_key, commit_member_key,
-    commit_member_prefix, commit_revision_ref_key, commit_revision_ref_prefix,
-    decode_commit_member_key, decode_path_current_key, gc_candidate_key, lease_commit_consumer_key,
+    artifact_revision_key, child_commit_consumer_key, commit_generic_index_member_key,
+    commit_generic_index_member_prefix, commit_key, commit_member_key, commit_member_prefix,
+    commit_revision_ref_key, commit_revision_ref_prefix, decode_commit_generic_index_member_key,
+    decode_commit_member_key, decode_generic_index_current_key, decode_path_current_key,
+    gc_candidate_key, generic_index_current_key, generic_index_current_prefix,
+    generic_index_generation_key, generic_index_generation_ref_key, lease_commit_consumer_key,
     operation_key, path_child_prefix, path_current_key, path_revision_ref_key,
     restore_history_hold_key, restore_member_key, restore_member_prefix,
     snapshot_commit_consumer_key, snapshot_ref_key, workbench_commit_head_key,
@@ -46,6 +49,17 @@ use super::engine::{
     MetaShard, MetadataCommand, MetadataScanItem, RootFenceAction,
 };
 use super::event_projection::change_event_projection;
+use super::generic_index::{
+    plan_add_generic_index_reference, plan_remove_generic_index_reference, GenericIndexError,
+    GenericIndexGenerationSeal, GenericIndexReferenceDelta,
+};
+use super::generic_index_records::{
+    advance_commit_generic_index_member_rolling_digest, commit_generic_index_member_row_digest,
+    generic_index_commit_owner_digest, generic_index_current_owner_digest,
+    verify_generic_index_generation_seal, CommitGenericIndexMemberRecord,
+    GenericIndexCurrentRecord, GenericIndexGenerationRecord, GenericIndexGenerationRefRecord,
+    GenericIndexRecordError,
+};
 use super::keyspace::MetadataFamily;
 use super::namespace::RootWriteContext;
 use super::publication_records::{
@@ -319,6 +333,7 @@ pub enum RestoreError {
     RestoreCodec(RestoreRecordError),
     QueryRecord(QueryRecordError),
     PublishCodec(PublishRecordError),
+    GenericIndex(GenericIndexError),
     Meta(MetaError),
 }
 
@@ -501,6 +516,7 @@ impl fmt::Display for RestoreError {
             Self::RestoreCodec(source) => source.fmt(formatter),
             Self::QueryRecord(source) => source.fmt(formatter),
             Self::PublishCodec(source) => source.fmt(formatter),
+            Self::GenericIndex(source) => source.fmt(formatter),
             Self::Meta(source) => source.fmt(formatter),
         }
     }
@@ -515,6 +531,7 @@ impl std::error::Error for RestoreError {
             Self::RestoreCodec(source) => Some(source),
             Self::QueryRecord(source) => Some(source),
             Self::PublishCodec(source) => Some(source),
+            Self::GenericIndex(source) => Some(source),
             Self::Meta(source) => Some(source),
             _ => None,
         }
@@ -563,6 +580,18 @@ impl From<PublishRecordError> for RestoreError {
     }
 }
 
+impl From<GenericIndexError> for RestoreError {
+    fn from(source: GenericIndexError) -> Self {
+        Self::GenericIndex(source)
+    }
+}
+
+impl From<GenericIndexRecordError> for RestoreError {
+    fn from(source: GenericIndexRecordError) -> Self {
+        Self::GenericIndex(GenericIndexError::from(source))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Loaded<T> {
     payload: Vec<u8>,
@@ -586,6 +615,18 @@ struct ScannedSourceMember {
 #[derive(Clone, Debug)]
 struct SourcePage {
     members: Vec<ScannedSourceMember>,
+    eof: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SourceGenericIndex {
+    scope: Option<NormalizedRelativePath>,
+    member: CommitGenericIndexMemberRecord,
+}
+
+#[derive(Clone, Debug)]
+struct SourceGenericIndexPage {
+    indexes: Vec<SourceGenericIndex>,
     eof: bool,
 }
 
@@ -720,6 +761,23 @@ struct PlannedCopyBatch {
 }
 
 impl CommandPlan {
+    fn merge_generic_index_reference_delta(
+        &mut self,
+        delta: GenericIndexReferenceDelta,
+    ) -> Result<(), RestoreError> {
+        for predicate in &delta.predicates {
+            if let CommandPredicate::Value { family, key, .. } = predicate {
+                if !self.exact_keys.insert((*family, key.clone())) {
+                    return Err(RestoreError::DuplicateCommandKey { family: *family });
+                }
+            }
+        }
+        self.predicates.extend(delta.predicates);
+        self.mutations.extend(delta.mutations);
+        self.history.extend(delta.history);
+        Ok(())
+    }
+
     fn assert_value(
         &mut self,
         family: MetadataFamily,
@@ -1071,6 +1129,8 @@ pub fn begin_restore(
                 unique_revision_count: source_commit_record.record.unique_revision_count,
                 revision_digest: source_commit_record.record.revision_digest,
                 parent_digest: source_commit_record.record.parent_digest,
+                generic_index_count: source_commit_record.record.generic_index_count,
+                generic_index_digest: source_commit_record.record.generic_index_digest,
             },
             destination_committed_at_unix_seconds: request.destination_committed_at_unix_seconds,
             destination_binding: None,
@@ -1078,6 +1138,11 @@ pub fn begin_restore(
                 member_cursor: None,
                 member_count: 0,
                 member_digest: [0; SHA256_BYTES],
+                path_members_complete: false,
+                generic_index_cursor: None,
+                generic_index_count: 0,
+                generic_index_digest: [0; SHA256_BYTES],
+                generic_indexes_complete: false,
                 member_seal: None,
                 revision_ref_count: 0,
                 revision_cursor: None,
@@ -1087,12 +1152,19 @@ pub fn begin_restore(
                 parent_digest,
                 parent_seal: None,
                 cleanup_member_count: 0,
+                cleanup_generic_index_count: 0,
                 cleanup_revision_count: 0,
             },
             destination_head_generation: None,
         })),
         phase: RestorePhase::Preparing,
         source_cursor: None,
+        source_paths_eof: false,
+        source_generic_index_cursor: None,
+        source_generic_index_count: 0,
+        source_generic_index_rolling_digest: [0; SHA256_BYTES],
+        source_generic_index_seal: None,
+        source_generic_indexes_match_base_commit: None,
         source_eof: false,
         source_member_count: 0,
         source_member_rolling_digest: [0; SHA256_BYTES],
@@ -1102,6 +1174,7 @@ pub fn begin_restore(
         member_rolling_digest: [0; SHA256_BYTES],
         member_seal: None,
         cleanup_member_cursor: 0,
+        cleanup_generic_index_cursor: 0,
         result: None,
         terminal_error: None,
     };
@@ -1150,6 +1223,13 @@ pub fn begin_restore(
             context.root_id,
             request.destination_workspace_incarnation_id,
             None,
+        ),
+    );
+    plan.prefix_empty(
+        MetadataFamily::GenericIndexCurrent,
+        generic_index_current_prefix(
+            context.root_id,
+            request.destination_workspace_incarnation_id,
         ),
     );
 
@@ -1294,6 +1374,9 @@ pub fn copy_restore_batch(
     if loaded.record.source_eof {
         return Err(RestoreError::SourceAlreadyExhausted);
     }
+    if loaded.record.source_paths_eof {
+        return copy_restore_generic_index_batch(store, context, request, loaded, input_digest);
+    }
     let page = scan_source_members(store, context, &loaded.record, request.limit)?;
     let mut command_items = 2_usize;
     let mut revisions = BTreeSet::new();
@@ -1376,6 +1459,150 @@ pub fn copy_restore_batch(
         copied_members: command.affected_members as usize,
         source_eof: command.operation.source_eof,
         command,
+    })
+}
+
+fn copy_restore_generic_index_batch(
+    store: &MetaShard,
+    context: RootWriteContext,
+    request: CopyRestoreBatchRequest,
+    loaded: Loaded<RestoreOperationRecord>,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<CopyRestoreBatchOutcome, RestoreError> {
+    let page = scan_source_generic_index_page(store, context, &loaded.record, request.limit)?;
+    let mut selected = None;
+    for count in (0..=page.indexes.len()).rev() {
+        if count == 0 && !page.indexes.is_empty() {
+            break;
+        }
+        let planned = plan_copy_generic_index_batch(
+            store,
+            context,
+            &loaded,
+            &page.indexes[..count],
+            page.eof && count == page.indexes.len(),
+            input_digest,
+        )?;
+        if command_fits(store, &planned.command)? {
+            selected = Some((planned, count));
+            break;
+        }
+    }
+    let Some((planned, copied_indexes)) = selected else {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "one Generic index pointer exceeds the metadata command budget".to_owned(),
+        });
+    };
+    let command = execute_restore_command(
+        store,
+        &planned.command,
+        input_digest,
+        None,
+        request.operation_id,
+    )?;
+    debug_assert_eq!(command.operation, planned.operation);
+    Ok(CopyRestoreBatchOutcome {
+        copied_members: copied_indexes,
+        source_eof: command.operation.source_eof,
+        command,
+    })
+}
+
+fn plan_copy_generic_index_batch(
+    store: &MetaShard,
+    context: RootWriteContext,
+    loaded: &Loaded<RestoreOperationRecord>,
+    indexes: &[SourceGenericIndex],
+    source_eof: bool,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<PlannedRestoreCommand, RestoreError> {
+    let mut next = loaded.record.clone();
+    let mut plan = CommandPlan::default();
+    for index in indexes {
+        let seal = GenericIndexGenerationSeal {
+            generation_id: index.member.generation_id,
+            capability_digest: index.member.capability_digest,
+            row_count: index.member.row_count,
+            row_digest: index.member.row_digest,
+        };
+        let delta = plan_add_generic_index_reference(
+            store,
+            context,
+            seal,
+            GenericIndexReferenceKind::Current,
+            generic_index_current_owner_digest(
+                next.destination_workspace_incarnation_id,
+                index.scope.as_ref(),
+            ),
+        )?;
+        plan.merge_generic_index_reference_delta(delta)?;
+        let current = GenericIndexCurrentRecord {
+            generation_id: index.member.generation_id,
+            pointer_generation: Generation::new(1).expect("one is non-zero"),
+            capability_digest: index.member.capability_digest,
+            row_count: index.member.row_count,
+            row_digest: index.member.row_digest,
+        };
+        plan.put_absent(
+            MetadataFamily::GenericIndexCurrent,
+            generic_index_current_key(
+                context.root_id,
+                next.destination_workspace_incarnation_id,
+                index.scope.as_ref(),
+            ),
+            current.encode().map_err(GenericIndexError::from)?,
+        )?;
+        let member_digest =
+            commit_generic_index_member_row_digest(index.scope.as_ref(), &index.member)
+                .map_err(GenericIndexError::from)?;
+        next.source_generic_index_rolling_digest =
+            advance_commit_generic_index_member_rolling_digest(
+                next.source_generic_index_rolling_digest,
+                member_digest,
+            );
+        next.source_generic_index_count = next
+            .source_generic_index_count
+            .checked_add(1)
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "source Generic index count overflow".to_owned(),
+            })?;
+        next.source_generic_index_cursor = index.scope.clone();
+    }
+    if source_eof {
+        next.source_generic_index_seal = Some(next.source_generic_index_rolling_digest);
+        let RestoreCommitProvenance::V5(provenance) = &next.commit_provenance else {
+            return Err(RestoreError::CommitRetentionMismatch);
+        };
+        let matches_base_commit = next.source_generic_index_count
+            == provenance.source_commit.generic_index_count
+            && next.source_generic_index_rolling_digest
+                == provenance.source_commit.generic_index_digest;
+        if matches!(next.source, RestoreSource::Commit { .. }) && !matches_base_commit {
+            return Err(RestoreError::SourceClosureMismatch {
+                reason: "commit Generic index closure does not match its immutable seal".to_owned(),
+            });
+        }
+        next.source_generic_indexes_match_base_commit = Some(matches_base_commit);
+        next.source_eof = true;
+    }
+    next.validate()?;
+    let next_payload = next.encode()?;
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload.clone(),
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    Ok(PlannedRestoreCommand {
+        command: build_restore_command(
+            context,
+            plan,
+            input_digest,
+            next_payload,
+            u32::try_from(indexes.len()).expect("bounded Generic index page fits u32"),
+        ),
+        operation: next,
     })
 }
 
@@ -1489,7 +1716,25 @@ fn plan_copy_batch(
     if let Some(last) = scanned_members.last() {
         next.source_cursor = Some(last.path.clone());
     }
-    next.source_eof = source_eof;
+    next.source_paths_eof = source_eof;
+    if source_eof {
+        let generic_page = scan_source_generic_index_page(store, context, &next, 1)?;
+        if generic_page.indexes.is_empty() && generic_page.eof {
+            next.source_generic_index_seal = Some([0; SHA256_BYTES]);
+            let RestoreCommitProvenance::V5(provenance) = &next.commit_provenance else {
+                return Err(RestoreError::CommitRetentionMismatch);
+            };
+            let matches_base_commit = provenance.source_commit.generic_index_count == 0
+                && provenance.source_commit.generic_index_digest == [0; SHA256_BYTES];
+            if matches!(next.source, RestoreSource::Commit { .. }) && !matches_base_commit {
+                return Err(RestoreError::SourceClosureMismatch {
+                    reason: "commit Generic index closure is missing before restore".to_owned(),
+                });
+            }
+            next.source_generic_indexes_match_base_commit = Some(matches_base_commit);
+            next.source_eof = true;
+        }
+    }
     next.source_member_count = next_source_count;
     next.source_member_rolling_digest = source_rolling;
     next.next_member_sequence = next_sequence;
@@ -1754,6 +1999,18 @@ fn maximum_cleanup_operation(
         NormalizedRelativePath::new("x".repeat(NormalizedRelativePath::MAX_BYTES))
             .expect("the path type accepts its documented maximum byte length"),
     );
+    ready.source_paths_eof = true;
+    let RestoreCommitProvenance::V5(provenance) = &ready.commit_provenance else {
+        return Err(RestoreError::CommitRetentionMismatch);
+    };
+    ready.source_generic_index_count = provenance.source_commit.generic_index_count;
+    ready.source_generic_index_rolling_digest = provenance.source_commit.generic_index_digest;
+    ready.source_generic_index_cursor = (ready.source_generic_index_count > 0).then(|| {
+        NormalizedRelativePath::new("x".repeat(NormalizedRelativePath::MAX_BYTES))
+            .expect("the path type accepts its documented maximum byte length")
+    });
+    ready.source_generic_index_seal = Some(ready.source_generic_index_rolling_digest);
+    ready.source_generic_indexes_match_base_commit = Some(true);
     ready.source_eof = true;
     // Preserve the independently accumulated raw-source closure. It may
     // contain one or two provenance manifests that are deliberately absent
@@ -1907,12 +2164,23 @@ pub fn bind_restore_destination(
         return Ok(outcome);
     }
     let loaded = load_operation(store, context, request.operation_id)?;
-    require_phase(&loaded.record, RestorePhase::SourceSealed, "SourceSealed")?;
+    if !matches!(
+        loaded.record.phase,
+        RestorePhase::SourceSealed
+            | RestorePhase::DestinationBuilding
+            | RestorePhase::DestinationSealing
+            | RestorePhase::Ready
+    ) {
+        return Err(RestoreError::InvalidPhase {
+            expected: "SourceSealed, DestinationBuilding, DestinationSealing, or Ready",
+            actual: loaded.record.phase,
+        });
+    }
     let RestoreCommitProvenance::V5(provenance) = &loaded.record.commit_provenance else {
         return Err(RestoreError::CommitRetentionMismatch);
     };
     if let Some(existing) = &provenance.destination_binding {
-        if existing != &request.binding {
+        if !destination_binding_matches_replay(existing, &request.binding) {
             return Err(RestoreError::DestinationBindingMismatch {
                 operation_id: request.operation_id,
             });
@@ -1923,6 +2191,9 @@ pub fn bind_restore_destination(
             replayed: true,
             affected_members: 0,
         });
+    }
+    if loaded.record.phase != RestorePhase::SourceSealed {
+        return Err(RestoreError::CommitRetentionMismatch);
     }
     let next = loaded.record.apply(
         RestorePhase::SourceSealed,
@@ -1953,6 +2224,10 @@ pub fn bind_restore_destination(
         commit_member_prefix(context.root_id, request.binding.destination_commit_id),
     );
     plan.prefix_empty(
+        MetadataFamily::CommitGenericIndexMember,
+        commit_generic_index_member_prefix(context.root_id, request.binding.destination_commit_id),
+    );
+    plan.prefix_empty(
         MetadataFamily::RevisionRef,
         commit_revision_ref_prefix(context.root_id, request.binding.destination_commit_id),
     );
@@ -1966,6 +2241,22 @@ pub fn bind_restore_destination(
         request.operation_id,
         0,
     )
+}
+
+fn destination_binding_matches_replay(
+    existing: &RestoreDestinationBinding,
+    request: &RestoreDestinationBinding,
+) -> bool {
+    existing.destination_commit_id == request.destination_commit_id
+        && existing.effective_content_digest_uri == request.effective_content_digest_uri
+        && existing.destination_projection_input_digest
+            == request.destination_projection_input_digest
+        && existing.run_manifest_identity == request.run_manifest_identity
+        && existing.restore_manifest_identity == request.restore_manifest_identity
+        && request
+            .manifests
+            .as_ref()
+            .is_none_or(|manifests| existing.manifests.as_ref() == Some(manifests))
 }
 
 /// Read the immutable source commit-owned run manifest held by an active
@@ -2178,22 +2469,34 @@ pub fn build_restore_commit_members(
         RestorePhase::DestinationBuilding,
         "DestinationBuilding",
     )?;
-    let (destination_commit_id, member_cursor) = match &loaded.record.commit_provenance {
-        RestoreCommitProvenance::V5(provenance) => {
-            let binding = provenance.destination_binding.as_ref().ok_or(
-                RestoreError::DestinationBindingMismatch {
-                    operation_id: request.operation_id,
-                },
-            )?;
-            (
-                binding.destination_commit_id,
-                provenance.closure.member_cursor.clone(),
-            )
-        }
-        RestoreCommitProvenance::MissingLegacyV4 => {
-            return Err(RestoreError::CommitRetentionMismatch);
-        }
-    };
+    let (destination_commit_id, member_cursor, path_members_complete) =
+        match &loaded.record.commit_provenance {
+            RestoreCommitProvenance::V5(provenance) => {
+                let binding = provenance.destination_binding.as_ref().ok_or(
+                    RestoreError::DestinationBindingMismatch {
+                        operation_id: request.operation_id,
+                    },
+                )?;
+                (
+                    binding.destination_commit_id,
+                    provenance.closure.member_cursor.clone(),
+                    provenance.closure.path_members_complete,
+                )
+            }
+            RestoreCommitProvenance::MissingLegacyV4 => {
+                return Err(RestoreError::CommitRetentionMismatch);
+            }
+        };
+    if path_members_complete {
+        return build_restore_commit_generic_index_members(
+            store,
+            context,
+            request,
+            loaded,
+            destination_commit_id,
+            input_digest,
+        );
+    }
     let prefix = path_child_prefix(
         context.root_id,
         loaded.record.destination_workspace_incarnation_id,
@@ -2257,6 +2560,211 @@ pub fn build_restore_commit_members(
         members_complete: command.operation.phase == RestorePhase::DestinationSealing,
         command,
         built_members,
+    })
+}
+
+fn build_restore_commit_generic_index_members(
+    store: &MetaShard,
+    context: RootWriteContext,
+    request: RestoreClosureBatchRequest,
+    loaded: Loaded<RestoreOperationRecord>,
+    destination_commit_id: CommitId,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<BuildRestoreCommitBatchOutcome, RestoreError> {
+    let (count, cursor) = match &loaded.record.commit_provenance {
+        RestoreCommitProvenance::V5(provenance) => (
+            provenance.closure.generic_index_count,
+            provenance.closure.generic_index_cursor.as_ref(),
+        ),
+        RestoreCommitProvenance::MissingLegacyV4 => {
+            return Err(RestoreError::CommitRetentionMismatch);
+        }
+    };
+    let prefix = generic_index_current_prefix(
+        context.root_id,
+        loaded.record.destination_workspace_incarnation_id,
+    );
+    let marker = (count > 0).then(|| {
+        generic_index_current_key(
+            context.root_id,
+            loaded.record.destination_workspace_incarnation_id,
+            cursor,
+        )
+    });
+    let mut rows = store.scan_prefix_at(
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        MetadataFamily::GenericIndexCurrent,
+        &prefix,
+        context.read_version,
+        marker.as_deref(),
+        request.limit + 1,
+    )?;
+    let has_more = rows.len() > request.limit;
+    if has_more {
+        rows.truncate(request.limit);
+    }
+    let mut selected = None;
+    for count in (0..=rows.len()).rev() {
+        if count == 0 && !rows.is_empty() {
+            break;
+        }
+        let planned = plan_restore_commit_generic_index_batch(
+            store,
+            context,
+            &loaded,
+            destination_commit_id,
+            &rows[..count],
+            !has_more && count == rows.len(),
+            input_digest,
+        )?;
+        if command_fits(store, &planned.command)? {
+            selected = Some((planned, count));
+            break;
+        }
+    }
+    let Some((planned, built_members)) = selected else {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason:
+                "one destination commit Generic index member exceeds the metadata command budget"
+                    .to_owned(),
+        });
+    };
+    let command = execute_restore_command(
+        store,
+        &planned.command,
+        input_digest,
+        None,
+        request.operation_id,
+    )?;
+    debug_assert_eq!(command.operation, planned.operation);
+    Ok(BuildRestoreCommitBatchOutcome {
+        members_complete: command.operation.phase == RestorePhase::DestinationSealing,
+        command,
+        built_members,
+    })
+}
+
+fn plan_restore_commit_generic_index_batch(
+    store: &MetaShard,
+    context: RootWriteContext,
+    loaded: &Loaded<RestoreOperationRecord>,
+    destination_commit_id: CommitId,
+    rows: &[MetadataScanItem],
+    source_eof: bool,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<PlannedRestoreCommand, RestoreError> {
+    let mut next = loaded.record.clone();
+    let mut plan = CommandPlan::default();
+    plan.assert_value(
+        MetadataFamily::Commit,
+        commit_key(context.root_id, destination_commit_id),
+        None,
+    )?;
+    for row in rows {
+        let scope = decode_generic_index_current_key(
+            context.root_id,
+            next.destination_workspace_incarnation_id,
+            &row.key,
+        )
+        .ok_or(RestoreError::CorruptKey {
+            family: "GenericIndexCurrent(destination)",
+        })?;
+        let current =
+            GenericIndexCurrentRecord::decode(&row.value).map_err(GenericIndexError::from)?;
+        let member = CommitGenericIndexMemberRecord {
+            generation_id: current.generation_id,
+            capability_digest: current.capability_digest,
+            row_count: current.row_count,
+            row_digest: current.row_digest,
+        };
+        let delta = plan_add_generic_index_reference(
+            store,
+            context,
+            GenericIndexGenerationSeal {
+                generation_id: member.generation_id,
+                capability_digest: member.capability_digest,
+                row_count: member.row_count,
+                row_digest: member.row_digest,
+            },
+            GenericIndexReferenceKind::Commit,
+            generic_index_commit_owner_digest(destination_commit_id),
+        )?;
+        plan.merge_generic_index_reference_delta(delta)?;
+        plan.assert_value(
+            MetadataFamily::GenericIndexCurrent,
+            row.key.clone(),
+            Some(row.value.clone()),
+        )?;
+        plan.put_absent(
+            MetadataFamily::CommitGenericIndexMember,
+            commit_generic_index_member_key(context.root_id, destination_commit_id, scope.as_ref()),
+            member.encode().map_err(GenericIndexError::from)?,
+        )?;
+        let member_digest = commit_generic_index_member_row_digest(scope.as_ref(), &member)
+            .map_err(GenericIndexError::from)?;
+        let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.generic_index_digest =
+            advance_commit_generic_index_member_rolling_digest(
+                provenance.closure.generic_index_digest,
+                member_digest,
+            );
+        provenance.closure.generic_index_count = provenance
+            .closure
+            .generic_index_count
+            .checked_add(1)
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "destination Generic index member count overflow".to_owned(),
+            })?;
+        provenance.closure.generic_index_cursor = scope;
+    }
+    if source_eof {
+        let member_seal = {
+            let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+                unreachable!();
+            };
+            if provenance.closure.generic_index_count != next.source_generic_index_count
+                || provenance.closure.generic_index_digest
+                    != next.source_generic_index_rolling_digest
+            {
+                return Err(RestoreError::SourceClosureMismatch {
+                    reason: "destination Generic index closure does not match the sealed source"
+                        .to_owned(),
+                });
+            }
+            provenance.closure.generic_indexes_complete = true;
+            provenance.closure.member_digest
+        };
+        let (run, restore) = verify_destination_manifest_publications(store, context, &next)?;
+        run.add_predicates(&mut plan)?;
+        restore.add_predicates(&mut plan)?;
+        next = next.apply(
+            RestorePhase::DestinationBuilding,
+            RestoreTransition::BeginDestinationSealing { member_seal },
+        )?;
+    } else {
+        next.validate()?;
+    }
+    let next_payload = next.encode()?;
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload.clone(),
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    Ok(PlannedRestoreCommand {
+        command: build_restore_command(
+            context,
+            plan,
+            input_digest,
+            next_payload,
+            u32::try_from(rows.len()).expect("bounded Generic index page fits u32"),
+        ),
+        operation: next,
     })
 }
 
@@ -2521,6 +3029,8 @@ pub fn complete_restore(
         revision_digest: closure.revision_digest,
         parent_commits: vec![source_commit_id],
         parent_digest: closure.parent_digest,
+        generic_index_count: closure.generic_index_count,
+        generic_index_digest: closure.generic_index_digest,
         producer: None,
         lineage_projection: Vec::new(),
         consumer_count: 1,
@@ -2748,7 +3258,10 @@ pub fn cleanup_restore_batch(
         return Ok(CopyRestoreBatchOutcome {
             copied_members: command.affected_members as usize,
             source_eof: command.operation.cleanup_member_cursor
-                == command.operation.next_member_sequence,
+                == command.operation.next_member_sequence
+                && command.operation.cleanup_generic_index_cursor
+                    == command.operation.source_generic_index_count
+                && !restore_commit_cleanup_pending(&command.operation),
             command,
         });
     }
@@ -2756,6 +3269,15 @@ pub fn cleanup_restore_batch(
     require_phase(&loaded.record, RestorePhase::Cleaning, "Cleaning")?;
     if restore_commit_cleanup_pending(&loaded.record) {
         return cleanup_restore_commit_scaffolding_batch(
+            store,
+            context,
+            request,
+            loaded,
+            input_digest,
+        );
+    }
+    if loaded.record.cleanup_generic_index_cursor != loaded.record.source_generic_index_count {
+        return cleanup_restore_generic_index_current_batch(
             store,
             context,
             request,
@@ -2873,14 +3395,125 @@ pub fn cleanup_restore_batch(
     })
 }
 
+fn cleanup_restore_generic_index_current_batch(
+    store: &MetaShard,
+    context: RootWriteContext,
+    request: CopyRestoreBatchRequest,
+    loaded: Loaded<RestoreOperationRecord>,
+    input_digest: [u8; SHA256_BYTES],
+) -> Result<CopyRestoreBatchOutcome, RestoreError> {
+    let remaining = loaded
+        .record
+        .source_generic_index_count
+        .checked_sub(loaded.record.cleanup_generic_index_cursor)
+        .expect("validated Generic index cleanup cursor");
+    let limit = usize::try_from(remaining.min(request.limit as u64))
+        .expect("bounded Generic index cleanup count fits usize");
+    let prefix = generic_index_current_prefix(
+        context.root_id,
+        loaded.record.destination_workspace_incarnation_id,
+    );
+    let rows = store.scan_prefix_at(
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        MetadataFamily::GenericIndexCurrent,
+        &prefix,
+        context.read_version,
+        None,
+        limit,
+    )?;
+    if rows.is_empty() {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "hidden Generic index pointers are missing before cleanup completed".to_owned(),
+        });
+    }
+    let mut next = loaded.record.clone();
+    let mut plan = CommandPlan::default();
+    for row in &rows {
+        let scope = decode_generic_index_current_key(
+            context.root_id,
+            next.destination_workspace_incarnation_id,
+            &row.key,
+        )
+        .ok_or(RestoreError::CorruptKey {
+            family: "GenericIndexCurrent(destination)",
+        })?;
+        let current =
+            GenericIndexCurrentRecord::decode(&row.value).map_err(GenericIndexError::from)?;
+        let delta = plan_remove_generic_index_reference(
+            store,
+            context,
+            GenericIndexGenerationSeal {
+                generation_id: current.generation_id,
+                capability_digest: current.capability_digest,
+                row_count: current.row_count,
+                row_digest: current.row_digest,
+            },
+            GenericIndexReferenceKind::Current,
+            generic_index_current_owner_digest(
+                next.destination_workspace_incarnation_id,
+                scope.as_ref(),
+            ),
+        )?;
+        plan.merge_generic_index_reference_delta(delta)?;
+        plan.delete(
+            MetadataFamily::GenericIndexCurrent,
+            row.key.clone(),
+            row.value.clone(),
+        )?;
+    }
+    next.cleanup_generic_index_cursor = next
+        .cleanup_generic_index_cursor
+        .checked_add(u64::try_from(rows.len()).expect("bounded batch fits u64"))
+        .ok_or_else(|| RestoreError::SourceClosureMismatch {
+            reason: "hidden Generic index cleanup cursor overflow".to_owned(),
+        })?;
+    next.validate()?;
+    let next_payload = next.encode()?;
+    plan.replace(
+        MetadataFamily::Operation,
+        operation_key(context.root_id, OperationKind::Restore, next.operation_id),
+        loaded.payload,
+        next_payload.clone(),
+    )?;
+    predicate_staging_workspace(store, context, &next, &mut plan)?;
+    let command = execute_plan(
+        store,
+        context,
+        plan,
+        input_digest,
+        next_payload,
+        None,
+        request.operation_id,
+        u32::try_from(rows.len()).expect("bounded cleanup page fits u32"),
+    )?;
+    Ok(CopyRestoreBatchOutcome {
+        copied_members: rows.len(),
+        source_eof: command.operation.cleanup_generic_index_cursor
+            == command.operation.source_generic_index_count
+            && command.operation.cleanup_member_cursor == command.operation.next_member_sequence,
+        command,
+    })
+}
+
 fn restore_commit_cleanup_pending(operation: &RestoreOperationRecord) -> bool {
     match &operation.commit_provenance {
         RestoreCommitProvenance::MissingLegacyV4 => false,
         RestoreCommitProvenance::V5(provenance) => {
             provenance.closure.cleanup_revision_count != provenance.closure.revision_ref_count
+                || provenance.closure.cleanup_generic_index_count
+                    != provenance.closure.generic_index_count
                 || provenance.closure.cleanup_member_count != provenance.closure.member_count
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreCommitCleanupKind {
+    Revisions,
+    GenericIndexes,
+    Members,
 }
 
 fn cleanup_restore_commit_scaffolding_batch(
@@ -2890,51 +3523,64 @@ fn cleanup_restore_commit_scaffolding_batch(
     loaded: Loaded<RestoreOperationRecord>,
     input_digest: [u8; SHA256_BYTES],
 ) -> Result<CopyRestoreBatchOutcome, RestoreError> {
-    let (destination_commit_id, cleanup_revisions, remaining) =
-        match &loaded.record.commit_provenance {
-            RestoreCommitProvenance::V5(provenance) => {
-                let binding = provenance.destination_binding.as_ref().ok_or(
-                    RestoreError::DestinationBindingMismatch {
-                        operation_id: request.operation_id,
-                    },
-                )?;
-                if provenance.closure.cleanup_revision_count < provenance.closure.revision_ref_count
-                {
-                    (
-                        binding.destination_commit_id,
-                        true,
-                        provenance
-                            .closure
-                            .revision_ref_count
-                            .checked_sub(provenance.closure.cleanup_revision_count)
-                            .expect("validated cleanup cursor"),
-                    )
-                } else {
-                    (
-                        binding.destination_commit_id,
-                        false,
-                        provenance
-                            .closure
-                            .member_count
-                            .checked_sub(provenance.closure.cleanup_member_count)
-                            .expect("validated cleanup cursor"),
-                    )
-                }
+    let (destination_commit_id, cleanup_kind, remaining) = match &loaded.record.commit_provenance {
+        RestoreCommitProvenance::V5(provenance) => {
+            let binding = provenance.destination_binding.as_ref().ok_or(
+                RestoreError::DestinationBindingMismatch {
+                    operation_id: request.operation_id,
+                },
+            )?;
+            if provenance.closure.cleanup_revision_count < provenance.closure.revision_ref_count {
+                (
+                    binding.destination_commit_id,
+                    RestoreCommitCleanupKind::Revisions,
+                    provenance
+                        .closure
+                        .revision_ref_count
+                        .checked_sub(provenance.closure.cleanup_revision_count)
+                        .expect("validated cleanup cursor"),
+                )
+            } else if provenance.closure.cleanup_generic_index_count
+                < provenance.closure.generic_index_count
+            {
+                (
+                    binding.destination_commit_id,
+                    RestoreCommitCleanupKind::GenericIndexes,
+                    provenance
+                        .closure
+                        .generic_index_count
+                        .checked_sub(provenance.closure.cleanup_generic_index_count)
+                        .expect("validated cleanup cursor"),
+                )
+            } else {
+                (
+                    binding.destination_commit_id,
+                    RestoreCommitCleanupKind::Members,
+                    provenance
+                        .closure
+                        .member_count
+                        .checked_sub(provenance.closure.cleanup_member_count)
+                        .expect("validated cleanup cursor"),
+                )
             }
-            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
-        };
+        }
+        RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+    };
     let limit = usize::try_from(remaining.min(request.limit as u64))
         .expect("bounded cleanup count fits usize");
-    let (family, prefix) = if cleanup_revisions {
-        (
+    let (family, prefix) = match cleanup_kind {
+        RestoreCommitCleanupKind::Revisions => (
             MetadataFamily::RevisionRef,
             commit_revision_ref_prefix(context.root_id, destination_commit_id),
-        )
-    } else {
-        (
+        ),
+        RestoreCommitCleanupKind::GenericIndexes => (
+            MetadataFamily::CommitGenericIndexMember,
+            commit_generic_index_member_prefix(context.root_id, destination_commit_id),
+        ),
+        RestoreCommitCleanupKind::Members => (
             MetadataFamily::CommitMember,
             commit_member_prefix(context.root_id, destination_commit_id),
-        )
+        ),
     };
     let rows = store.scan_prefix_at(
         context.root_id,
@@ -2948,16 +3594,24 @@ fn cleanup_restore_commit_scaffolding_batch(
     )?;
     if rows.is_empty() {
         return Err(RestoreError::SourceClosureMismatch {
-            reason: if cleanup_revisions {
-                "destination commit revision refs are missing before cleanup completed".to_owned()
-            } else {
-                "destination commit members are missing before cleanup completed".to_owned()
+            reason: match cleanup_kind {
+                RestoreCommitCleanupKind::Revisions => {
+                    "destination commit revision refs are missing before cleanup completed"
+                        .to_owned()
+                }
+                RestoreCommitCleanupKind::GenericIndexes => {
+                    "destination commit Generic index members are missing before cleanup completed"
+                        .to_owned()
+                }
+                RestoreCommitCleanupKind::Members => {
+                    "destination commit members are missing before cleanup completed".to_owned()
+                }
             },
         });
     }
     let mut next = loaded.record.clone();
     let mut plan = CommandPlan::default();
-    if cleanup_revisions {
+    if cleanup_kind == RestoreCommitCleanupKind::Revisions {
         for row in &rows {
             let revision_id = decode_restore_commit_revision_ref_key(&prefix, &row.key)?;
             let reference = RevisionRefRecord::decode(&row.value)?;
@@ -3013,6 +3667,47 @@ fn cleanup_restore_commit_scaffolding_batch(
             .checked_add(u64::try_from(rows.len()).expect("bounded batch fits u64"))
             .ok_or_else(|| RestoreError::SourceClosureMismatch {
                 reason: "destination revision cleanup cursor overflow".to_owned(),
+            })?;
+    } else if cleanup_kind == RestoreCommitCleanupKind::GenericIndexes {
+        for row in &rows {
+            decode_commit_generic_index_member_key(
+                context.root_id,
+                destination_commit_id,
+                &row.key,
+            )
+            .ok_or(RestoreError::CorruptKey {
+                family: "CommitGenericIndexMember(destination)",
+            })?;
+            let member = CommitGenericIndexMemberRecord::decode(&row.value)
+                .map_err(GenericIndexError::from)?;
+            let delta = plan_remove_generic_index_reference(
+                store,
+                context,
+                GenericIndexGenerationSeal {
+                    generation_id: member.generation_id,
+                    capability_digest: member.capability_digest,
+                    row_count: member.row_count,
+                    row_digest: member.row_digest,
+                },
+                GenericIndexReferenceKind::Commit,
+                generic_index_commit_owner_digest(destination_commit_id),
+            )?;
+            plan.merge_generic_index_reference_delta(delta)?;
+            plan.delete(
+                MetadataFamily::CommitGenericIndexMember,
+                row.key.clone(),
+                row.value.clone(),
+            )?;
+        }
+        let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+            unreachable!();
+        };
+        provenance.closure.cleanup_generic_index_count = provenance
+            .closure
+            .cleanup_generic_index_count
+            .checked_add(u64::try_from(rows.len()).expect("bounded batch fits u64"))
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "destination Generic index cleanup cursor overflow".to_owned(),
             })?;
     } else {
         for row in &rows {
@@ -3070,6 +3765,8 @@ fn cleanup_restore_commit_scaffolding_batch(
     Ok(CopyRestoreBatchOutcome {
         copied_members: rows.len(),
         source_eof: !restore_commit_cleanup_pending(&command.operation)
+            && command.operation.cleanup_generic_index_cursor
+                == command.operation.source_generic_index_count
             && command.operation.cleanup_member_cursor == command.operation.next_member_sequence,
         command,
     })
@@ -3299,6 +3996,11 @@ pub fn finish_restore_cleanup(
             reason: "cleanup cursor has not consumed the full member closure".to_owned(),
         });
     }
+    if loaded.record.cleanup_generic_index_cursor != loaded.record.source_generic_index_count {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "cleanup cursor has not consumed the full Generic index closure".to_owned(),
+        });
+    }
     let publications = inspect_restore_cleanup_publications(store, context, &loaded.record)?;
     match publications.disposition {
         RestoreCleanupPublicationDisposition::Ready => {}
@@ -3370,6 +4072,10 @@ pub fn finish_restore_cleanup(
         MetadataFamily::RestoreMember,
         restore_member_prefix(context.root_id, request.operation_id),
     );
+    plan.prefix_empty(
+        MetadataFamily::GenericIndexCurrent,
+        generic_index_current_prefix(context.root_id, next.destination_workspace_incarnation_id),
+    );
     let destination_commit_id = match &loaded.record.commit_provenance {
         RestoreCommitProvenance::V5(provenance) => provenance
             .destination_binding
@@ -3385,6 +4091,10 @@ pub fn finish_restore_cleanup(
         plan.prefix_empty(
             MetadataFamily::RevisionRef,
             commit_revision_ref_prefix(context.root_id, destination_commit_id),
+        );
+        plan.prefix_empty(
+            MetadataFamily::CommitGenericIndexMember,
+            commit_generic_index_member_prefix(context.root_id, destination_commit_id),
         );
         plan.assert_value(
             MetadataFamily::Commit,
@@ -3508,6 +4218,110 @@ fn scan_source_page(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(SourcePage {
         members,
+        eof: !has_more,
+    })
+}
+
+fn scan_source_generic_index_page(
+    store: &MetaShard,
+    context: RootWriteContext,
+    operation: &RestoreOperationRecord,
+    limit: usize,
+) -> Result<SourceGenericIndexPage, RestoreError> {
+    validate_source_retention(store, context, operation)?;
+    let (family, prefix, marker, read_version) = match operation.source {
+        RestoreSource::Snapshot { read_version, .. } => {
+            let marker = (operation.source_generic_index_count > 0).then(|| {
+                generic_index_current_key(
+                    context.root_id,
+                    operation.source_workspace_incarnation_id,
+                    operation.source_generic_index_cursor.as_ref(),
+                )
+            });
+            (
+                MetadataFamily::GenericIndexCurrent,
+                generic_index_current_prefix(
+                    context.root_id,
+                    operation.source_workspace_incarnation_id,
+                ),
+                marker,
+                read_version,
+            )
+        }
+        RestoreSource::Commit { commit_id } => {
+            let marker = (operation.source_generic_index_count > 0).then(|| {
+                commit_generic_index_member_key(
+                    context.root_id,
+                    commit_id,
+                    operation.source_generic_index_cursor.as_ref(),
+                )
+            });
+            (
+                MetadataFamily::CommitGenericIndexMember,
+                commit_generic_index_member_prefix(context.root_id, commit_id),
+                marker,
+                context.read_version,
+            )
+        }
+    };
+    let mut rows = store.scan_prefix_at(
+        context.root_id,
+        context.placement_generation,
+        context.owner_epoch,
+        family,
+        &prefix,
+        read_version,
+        marker.as_deref(),
+        limit + 1,
+    )?;
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
+    }
+    let indexes = rows
+        .into_iter()
+        .map(|row| {
+            let (scope, member) = match operation.source {
+                RestoreSource::Snapshot { .. } => {
+                    let scope = decode_generic_index_current_key(
+                        context.root_id,
+                        operation.source_workspace_incarnation_id,
+                        &row.key,
+                    )
+                    .ok_or(RestoreError::CorruptKey {
+                        family: "GenericIndexCurrent(source)",
+                    })?;
+                    let current = GenericIndexCurrentRecord::decode(&row.value)
+                        .map_err(GenericIndexError::from)?;
+                    (
+                        scope,
+                        CommitGenericIndexMemberRecord {
+                            generation_id: current.generation_id,
+                            capability_digest: current.capability_digest,
+                            row_count: current.row_count,
+                            row_digest: current.row_digest,
+                        },
+                    )
+                }
+                RestoreSource::Commit { commit_id } => {
+                    let scope = decode_commit_generic_index_member_key(
+                        context.root_id,
+                        commit_id,
+                        &row.key,
+                    )
+                    .ok_or(RestoreError::CorruptKey {
+                        family: "CommitGenericIndexMember(source)",
+                    })?;
+                    let member = CommitGenericIndexMemberRecord::decode(&row.value)
+                        .map_err(GenericIndexError::from)?;
+                    (scope, member)
+                }
+            };
+            Ok(SourceGenericIndex { scope, member })
+        })
+        .collect::<Result<Vec<_>, RestoreError>>()?;
+    Ok(SourceGenericIndexPage {
+        indexes,
         eof: !has_more,
     })
 }
@@ -3699,6 +4513,148 @@ fn verify_source_and_members(
             reason: "member ledger contains rows past the sealed source count".to_owned(),
         });
     }
+    verify_source_generic_indexes(store, context, operation)?;
+    Ok(())
+}
+
+fn verify_source_generic_indexes(
+    store: &MetaShard,
+    context: RootWriteContext,
+    operation: &RestoreOperationRecord,
+) -> Result<(), RestoreError> {
+    let mut scan = operation.clone();
+    scan.source_generic_index_cursor = None;
+    scan.source_generic_index_count = 0;
+    let mut rolling = [0; SHA256_BYTES];
+    loop {
+        let page = scan_source_generic_index_page(store, context, &scan, 255)?;
+        for index in page.indexes {
+            let current_key = generic_index_current_key(
+                context.root_id,
+                operation.destination_workspace_incarnation_id,
+                index.scope.as_ref(),
+            );
+            let current = read_record(
+                store,
+                context,
+                MetadataFamily::GenericIndexCurrent,
+                &current_key,
+                GenericIndexCurrentRecord::decode,
+            )?
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "hidden destination Generic index pointer is missing".to_owned(),
+            })?;
+            if current.record
+                != (GenericIndexCurrentRecord {
+                    generation_id: index.member.generation_id,
+                    pointer_generation: Generation::new(1).expect("one is non-zero"),
+                    capability_digest: index.member.capability_digest,
+                    row_count: index.member.row_count,
+                    row_digest: index.member.row_digest,
+                })
+            {
+                return Err(RestoreError::SourceClosureMismatch {
+                    reason: "hidden destination Generic index pointer changed before sealing"
+                        .to_owned(),
+                });
+            }
+            let generation = read_record(
+                store,
+                context,
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_key(context.root_id, index.member.generation_id),
+                GenericIndexGenerationRecord::decode,
+            )?
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "restored Generic index generation is missing".to_owned(),
+            })?;
+            verify_generic_index_generation_seal(
+                &generation.record,
+                index.member.capability_digest,
+                index.member.row_count,
+                index.member.row_digest,
+            )
+            .map_err(GenericIndexError::from)?;
+            let owner_digest = generic_index_current_owner_digest(
+                operation.destination_workspace_incarnation_id,
+                index.scope.as_ref(),
+            );
+            let reference = read_record(
+                store,
+                context,
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_ref_key(
+                    context.root_id,
+                    index.member.generation_id,
+                    GenericIndexReferenceKind::Current,
+                    owner_digest,
+                ),
+                GenericIndexGenerationRefRecord::decode,
+            )?
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "hidden destination Generic index reference is missing".to_owned(),
+            })?;
+            if reference.record.kind != GenericIndexReferenceKind::Current
+                || reference.record.owner_digest != owner_digest
+                || reference.record.reference_epoch_at_add > generation.record.reference_epoch
+            {
+                return Err(RestoreError::SourceClosureMismatch {
+                    reason: "hidden destination Generic index reference is inconsistent".to_owned(),
+                });
+            }
+            let member_digest =
+                commit_generic_index_member_row_digest(index.scope.as_ref(), &index.member)
+                    .map_err(GenericIndexError::from)?;
+            rolling = advance_commit_generic_index_member_rolling_digest(rolling, member_digest);
+            scan.source_generic_index_count = scan
+                .source_generic_index_count
+                .checked_add(1)
+                .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                    reason: "source Generic index count overflow".to_owned(),
+                })?;
+            scan.source_generic_index_cursor = index.scope;
+        }
+        if page.eof {
+            break;
+        }
+    }
+    if scan.source_generic_index_count != operation.source_generic_index_count
+        || scan.source_generic_index_cursor != operation.source_generic_index_cursor
+        || rolling != operation.source_generic_index_rolling_digest
+        || operation.source_generic_index_seal != Some(rolling)
+    {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "rescanned Generic index source does not match its persisted seal".to_owned(),
+        });
+    }
+    let destination_prefix = generic_index_current_prefix(
+        context.root_id,
+        operation.destination_workspace_incarnation_id,
+    );
+    let destination_marker = (scan.source_generic_index_count > 0).then(|| {
+        generic_index_current_key(
+            context.root_id,
+            operation.destination_workspace_incarnation_id,
+            scan.source_generic_index_cursor.as_ref(),
+        )
+    });
+    if !store
+        .scan_prefix_at(
+            context.root_id,
+            context.placement_generation,
+            context.owner_epoch,
+            MetadataFamily::GenericIndexCurrent,
+            &destination_prefix,
+            context.read_version,
+            destination_marker.as_deref(),
+            1,
+        )?
+        .is_empty()
+    {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "hidden destination contains a Generic index past its source seal".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -3806,6 +4762,8 @@ fn source_commit_matches_seal(commit: &CommitRecord, seal: &RestoreSourceCommitS
         && commit.unique_revision_count == seal.unique_revision_count
         && commit.revision_digest == seal.revision_digest
         && commit.parent_digest == seal.parent_digest
+        && commit.generic_index_count == seal.generic_index_count
+        && commit.generic_index_digest == seal.generic_index_digest
 }
 
 fn path_entry_from_commit_member(member: &CommitMemberRecord) -> PathEntry {
@@ -4657,17 +5615,41 @@ fn plan_restore_commit_member_batch(
     }
 
     if source_eof {
-        let (run, restore) = verify_destination_manifest_publications(store, context, &next)?;
-        run.add_predicates(&mut plan)?;
-        restore.add_predicates(&mut plan)?;
-        let member_seal = match &next.commit_provenance {
-            RestoreCommitProvenance::V5(provenance) => provenance.closure.member_digest,
-            RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+        let destination_has_generic_indexes = !store
+            .scan_prefix_at(
+                context.root_id,
+                context.placement_generation,
+                context.owner_epoch,
+                MetadataFamily::GenericIndexCurrent,
+                &generic_index_current_prefix(
+                    context.root_id,
+                    next.destination_workspace_incarnation_id,
+                ),
+                context.read_version,
+                None,
+                1,
+            )?
+            .is_empty();
+        let RestoreCommitProvenance::V5(provenance) = &mut next.commit_provenance else {
+            unreachable!();
         };
-        next = next.apply(
-            RestorePhase::DestinationBuilding,
-            RestoreTransition::BeginDestinationSealing { member_seal },
-        )?;
+        provenance.closure.path_members_complete = true;
+        if !destination_has_generic_indexes {
+            provenance.closure.generic_indexes_complete = true;
+            let (run, restore) = verify_destination_manifest_publications(store, context, &next)?;
+            run.add_predicates(&mut plan)?;
+            restore.add_predicates(&mut plan)?;
+            let member_seal = match &next.commit_provenance {
+                RestoreCommitProvenance::V5(provenance) => provenance.closure.member_digest,
+                RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
+            };
+            next = next.apply(
+                RestorePhase::DestinationBuilding,
+                RestoreTransition::BeginDestinationSealing { member_seal },
+            )?;
+        } else {
+            next.validate()?;
+        }
     } else {
         next.validate()?;
     }
@@ -4813,7 +5795,146 @@ fn verify_destination_commit_scaffolding(
             reason: "hidden destination contains a path past the commit member seal".to_owned(),
         });
     }
+    verify_destination_generic_index_commit_closure(
+        store,
+        context,
+        operation,
+        binding.destination_commit_id,
+        &provenance.closure,
+    )?;
     verify_destination_manifest_publications(store, context, operation)?;
+    Ok(())
+}
+
+fn verify_destination_generic_index_commit_closure(
+    store: &MetaShard,
+    context: RootWriteContext,
+    operation: &RestoreOperationRecord,
+    destination_commit_id: CommitId,
+    closure: &RestoreCommitClosureProgress,
+) -> Result<(), RestoreError> {
+    let prefix = commit_generic_index_member_prefix(context.root_id, destination_commit_id);
+    let mut count = 0_u64;
+    let mut cursor = None;
+    let mut digest = [0; SHA256_BYTES];
+    loop {
+        let marker = (count > 0).then(|| {
+            commit_generic_index_member_key(context.root_id, destination_commit_id, cursor.as_ref())
+        });
+        let rows = store.scan_prefix_at(
+            context.root_id,
+            context.placement_generation,
+            context.owner_epoch,
+            MetadataFamily::CommitGenericIndexMember,
+            &prefix,
+            context.read_version,
+            marker.as_deref(),
+            256,
+        )?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            let scope = decode_commit_generic_index_member_key(
+                context.root_id,
+                destination_commit_id,
+                &row.key,
+            )
+            .ok_or(RestoreError::CorruptKey {
+                family: "CommitGenericIndexMember(destination)",
+            })?;
+            let member = CommitGenericIndexMemberRecord::decode(&row.value)
+                .map_err(GenericIndexError::from)?;
+            let current = read_record(
+                store,
+                context,
+                MetadataFamily::GenericIndexCurrent,
+                &generic_index_current_key(
+                    context.root_id,
+                    operation.destination_workspace_incarnation_id,
+                    scope.as_ref(),
+                ),
+                GenericIndexCurrentRecord::decode,
+            )?
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "destination commit Generic index is missing its hidden pointer".to_owned(),
+            })?;
+            if current.record.generation_id != member.generation_id
+                || current.record.capability_digest != member.capability_digest
+                || current.record.row_count != member.row_count
+                || current.record.row_digest != member.row_digest
+            {
+                return Err(RestoreError::SourceClosureMismatch {
+                    reason: "destination commit Generic index differs from its hidden pointer"
+                        .to_owned(),
+                });
+            }
+            let owner_digest = generic_index_commit_owner_digest(destination_commit_id);
+            let reference = read_record(
+                store,
+                context,
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_ref_key(
+                    context.root_id,
+                    member.generation_id,
+                    GenericIndexReferenceKind::Commit,
+                    owner_digest,
+                ),
+                GenericIndexGenerationRefRecord::decode,
+            )?
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "destination commit Generic index reference is missing".to_owned(),
+            })?;
+            let generation = read_record(
+                store,
+                context,
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_key(context.root_id, member.generation_id),
+                GenericIndexGenerationRecord::decode,
+            )?
+            .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                reason: "destination commit Generic index generation is missing".to_owned(),
+            })?;
+            verify_generic_index_generation_seal(
+                &generation.record,
+                member.capability_digest,
+                member.row_count,
+                member.row_digest,
+            )
+            .map_err(GenericIndexError::from)?;
+            if reference.record.kind != GenericIndexReferenceKind::Commit
+                || reference.record.owner_digest != owner_digest
+                || reference.record.reference_epoch_at_add > generation.record.reference_epoch
+            {
+                return Err(RestoreError::SourceClosureMismatch {
+                    reason: "destination commit Generic index reference is inconsistent".to_owned(),
+                });
+            }
+            digest = advance_commit_generic_index_member_rolling_digest(
+                digest,
+                commit_generic_index_member_row_digest(scope.as_ref(), &member)
+                    .map_err(GenericIndexError::from)?,
+            );
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| RestoreError::SourceClosureMismatch {
+                    reason: "destination Generic index count overflow".to_owned(),
+                })?;
+            cursor = scope;
+        }
+        if rows.len() < 256 {
+            break;
+        }
+    }
+    if count != closure.generic_index_count
+        || cursor != closure.generic_index_cursor
+        || digest != closure.generic_index_digest
+    {
+        return Err(RestoreError::SourceClosureMismatch {
+            reason: "destination commit Generic index closure does not match its durable seal"
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -5447,12 +6568,24 @@ mod tests {
     use tempfile::tempdir;
 
     use nokv_types::{
-        Generation, LogicalShardId, OwnerEpoch, PlacementGeneration, RequestId,
-        RootActivationState, RootId, FIXED_ID_BYTES,
+        Generation, GenericIndexGenerationId, LogicalShardId, OwnerEpoch, PlacementGeneration,
+        RequestId, RootActivationState, RootId, FIXED_ID_BYTES,
     };
 
+    use super::super::generic_index::{
+        AppendGenericIndexRowsRequest, BeginGenericIndexRegistrationRequest,
+        FinalizeGenericIndexRegistrationRequest, GenericIndexRegistrationService,
+        GenericIndexRowInput,
+    };
+    use super::super::generic_index_records::{
+        GenericIndexFieldCapability, GenericIndexFieldValues, GenericIndexOperator,
+    };
     use super::super::namespace::{
         create_visible_workspace, get_visible_path_at, get_visible_workspace_at, RootReadContext,
+    };
+    use super::super::query::{
+        search_paths_at, PresentationPathRoot, QueryOperand, QueryOperator, QueryPredicate,
+        QueryProfile, QueryScope, SearchRequest, MAX_QUERY_PAGE_SIZE,
     };
     use super::super::remove::{remove_path, RemovePathRequest};
     use super::super::snapshot::{
@@ -5897,6 +7030,193 @@ mod tests {
             },
             paths,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_test_generic_index(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        target_workbench: &WorkbenchId,
+        target_incarnation: WorkspaceIncarnationId,
+        operation_fill: u8,
+        generation_fill: u8,
+        index_path: Option<&str>,
+        row_relative_path: Option<&str>,
+        expected_current_generation: Option<Generation>,
+        label: &str,
+    ) -> GenericIndexCurrentRecord {
+        let index_path = index_path.map(|path| NormalizedRelativePath::new(path).unwrap());
+        let row_relative_path =
+            row_relative_path.map(|path| NormalizedRelativePath::new(path).unwrap());
+        let operation_id = operation(operation_fill);
+        let generation_id = GenericIndexGenerationId::from_bytes([generation_fill; FIXED_ID_BYTES]);
+        let service = GenericIndexRegistrationService::new(store);
+        service
+            .begin(BeginGenericIndexRegistrationRequest {
+                context: write_context(store, counter, owner_epoch),
+                operation_id,
+                generation_id,
+                workbench_id: target_workbench.clone(),
+                expected_workspace_incarnation_id: target_incarnation,
+                index_path: index_path.clone(),
+                expected_current_generation,
+                capabilities: vec![GenericIndexFieldCapability {
+                    field: QueryFieldId::new("custom.label").unwrap(),
+                    operators: vec![GenericIndexOperator::Equal],
+                    sortable: false,
+                    facetable: false,
+                }],
+                declared_row_count: 1,
+            })
+            .unwrap();
+        service
+            .append(AppendGenericIndexRowsRequest {
+                context: write_context(store, counter, owner_epoch),
+                operation_id,
+                first_sequence: 0,
+                rows: vec![GenericIndexRowInput {
+                    relative_path: row_relative_path,
+                    values: vec![GenericIndexFieldValues {
+                        field: QueryFieldId::new("custom.label").unwrap(),
+                        values: vec![QueryScalar::String(label.to_owned())],
+                    }],
+                }],
+            })
+            .unwrap();
+        service
+            .finalize(FinalizeGenericIndexRegistrationRequest {
+                context: write_context(store, counter, owner_epoch),
+                operation_id,
+            })
+            .unwrap();
+
+        read_record(
+            store,
+            write_context(store, counter, owner_epoch),
+            MetadataFamily::GenericIndexCurrent,
+            &generic_index_current_key(root(), target_incarnation, index_path.as_ref()),
+            GenericIndexCurrentRecord::decode,
+        )
+        .unwrap()
+        .expect("finalized Generic index publishes one exact current pointer")
+        .record
+    }
+
+    fn assert_generic_label(
+        store: &MetaShard,
+        owner_epoch: OwnerEpoch,
+        target_workbench: &WorkbenchId,
+        expected_relative_path: &str,
+        label: &str,
+    ) {
+        let field = QueryFieldId::new("custom.label").unwrap();
+        let page = search_paths_at(
+            store,
+            read_context(store, owner_epoch),
+            &SearchRequest {
+                profile: QueryProfile::GenericNamespaceV1 {
+                    presentation_path_root: PresentationPathRoot::new("/agents").unwrap(),
+                },
+                scope: QueryScope::Workspace(target_workbench.clone()),
+                path_prefix: None,
+                predicates: vec![QueryPredicate {
+                    field_id: field.clone(),
+                    operator: QueryOperator::Equal,
+                    operand: QueryOperand::Scalar(QueryScalar::String(label.to_owned())),
+                }],
+                projection: vec![field.clone()],
+                sort: Vec::new(),
+                facets: Vec::new(),
+                cursor: None,
+                limit: MAX_QUERY_PAGE_SIZE,
+            },
+        )
+        .unwrap();
+        assert_eq!(page.match_count, 1);
+        assert_eq!(page.namespace_hits.len(), 1);
+        let hit = &page.namespace_hits[0];
+        assert_eq!(
+            hit.relative_path
+                .as_ref()
+                .map(NormalizedRelativePath::as_str),
+            Some(expected_relative_path)
+        );
+        assert_eq!(
+            hit.indexed_values.get(&field),
+            Some(&vec![QueryScalar::String(label.to_owned())])
+        );
+    }
+
+    fn remove_test_generic_index_current(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        workspace_incarnation_id: WorkspaceIncarnationId,
+        index_path: Option<&NormalizedRelativePath>,
+    ) -> GenericIndexCurrentRecord {
+        let context = write_context(store, counter, owner_epoch);
+        let current_key = generic_index_current_key(root(), workspace_incarnation_id, index_path);
+        let current_payload = read_payload(
+            store,
+            context,
+            MetadataFamily::GenericIndexCurrent,
+            &current_key,
+        )
+        .unwrap()
+        .expect("test current pointer exists");
+        let current = GenericIndexCurrentRecord::decode(&current_payload).unwrap();
+        let mut delta = plan_remove_generic_index_reference(
+            store,
+            context,
+            GenericIndexGenerationSeal {
+                generation_id: current.generation_id,
+                capability_digest: current.capability_digest,
+                row_count: current.row_count,
+                row_digest: current.row_digest,
+            },
+            GenericIndexReferenceKind::Current,
+            generic_index_current_owner_digest(workspace_incarnation_id, index_path),
+        )
+        .unwrap();
+        delta.predicates.push(CommandPredicate::Value {
+            family: MetadataFamily::GenericIndexCurrent,
+            key: current_key.clone(),
+            expected: Some(current_payload),
+        });
+        delta.mutations.push(CommandMutation::Delete {
+            family: MetadataFamily::GenericIndexCurrent,
+            key: current_key.clone(),
+        });
+        delta.history.push(HistoryProjection {
+            family: MetadataFamily::GenericIndexCurrent,
+            key: current_key,
+        });
+        store
+            .execute(
+                &MetadataCommand {
+                    schema_id: SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    object_namespace_id: Some(nokv_types::ObjectNamespaceId::from_bytes(
+                        [10; FIXED_ID_BYTES],
+                    )),
+                    placement_generation: placement(),
+                    owner_epoch,
+                    request_id: context.request_id,
+                    command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                    read_version: context.read_version,
+                    root_fence_action: RootFenceAction::RequireActive,
+                    predicates: delta.predicates,
+                    mutations: delta.mutations,
+                    history_projection: delta.history,
+                    event_projection: Vec::new(),
+                    deterministic_result: Vec::new(),
+                }
+                .seal(),
+            )
+            .unwrap();
+        current
     }
 
     fn mint_source_snapshot(
@@ -6368,6 +7688,63 @@ mod tests {
             .unwrap();
     }
 
+    fn retire_commit_for_test(
+        store: &MetaShard,
+        counter: &mut u128,
+        owner_epoch: OwnerEpoch,
+        workspace_incarnation_id: WorkspaceIncarnationId,
+        commit_id: CommitId,
+        retirement_operation_id: OperationId,
+    ) {
+        detach_commit_head_for_retirement_test(
+            store,
+            counter,
+            owner_epoch,
+            workspace_incarnation_id,
+            commit_id,
+        );
+        let commit = read_record(
+            store,
+            write_context(store, counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .expect("commit remains as a zero-consumer retirement candidate")
+        .record;
+        assert_eq!(commit.consumer_count, 0);
+        let service = CommitService::new(store);
+        let mut outcome = service
+            .begin_retirement(BeginCommitRetirementRequest {
+                context: write_context(store, counter, owner_epoch),
+                operation_id: retirement_operation_id,
+                commit_id,
+                expected_consumer_epoch: commit.consumer_epoch,
+            })
+            .unwrap();
+        while outcome.operation.phase != CommitRetirePhase::Complete {
+            outcome = service
+                .release_retired_commit(BuildCommitStepRequest {
+                    context: write_context(store, counter, owner_epoch),
+                    operation_id: retirement_operation_id,
+                    limit: MAX_COMMIT_MEMBER_BATCH_ROWS,
+                })
+                .unwrap();
+        }
+        let retired = read_record(
+            store,
+            write_context(store, counter, owner_epoch),
+            MetadataFamily::Commit,
+            &commit_key(root(), commit_id),
+            CommitRecord::decode,
+        )
+        .unwrap()
+        .expect("retired commit preserves its tombstone")
+        .record;
+        assert_eq!(retired.state, CommitState::Retired);
+    }
+
     fn copy_all(
         store: &MetaShard,
         counter: &mut u128,
@@ -6757,7 +8134,34 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.operation, bound.operation);
 
-        let mut different = bind_request;
+        publish_destination_manifests_for_test(
+            &store,
+            &mut counter,
+            owner_epoch,
+            begun.operation.operation_id,
+        );
+        let initialized = apply_restore_initialization(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: begun.operation.operation_id,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            initialized.operation.phase,
+            RestorePhase::DestinationBuilding
+        );
+        let late_replay = bind_restore_destination(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &bind_request,
+        )
+        .expect("DestinationBuilding must accept the exact durable bind replay");
+        assert!(late_replay.replayed);
+        assert_eq!(late_replay.operation, initialized.operation);
+
+        let mut different = bind_request.clone();
         different.binding.destination_projection_input_digest = [0x76; SHA256_BYTES];
         assert_ne!(
             bind_destination_input_digest(&different),
@@ -6774,6 +8178,143 @@ mod tests {
             ),
             Err(RestoreError::DestinationBindingMismatch {
                 operation_id: begun.operation.operation_id,
+            })
+        );
+    }
+
+    #[test]
+    fn destination_bind_replay_is_rejected_after_abort_and_complete() {
+        let owner_epoch = owner(1);
+
+        let mut abort_counter = 0_u128;
+        let abort_store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&abort_store, &mut abort_counter, owner_epoch);
+        let abort_source = seed_source(&abort_store, &mut abort_counter, owner_epoch, 1);
+        let abort_snapshot =
+            mint_source_snapshot(&abort_store, &mut abort_counter, owner_epoch, &abort_source);
+        let abort_operation = begin_snapshot_restore(
+            &abort_store,
+            &mut abort_counter,
+            owner_epoch,
+            &abort_source,
+            abort_snapshot,
+            "bind-aborted",
+            incarnation(41),
+        );
+        start_restore_copy(
+            &abort_store,
+            write_context(&abort_store, &mut abort_counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: abort_operation.operation.operation_id,
+            },
+        )
+        .unwrap();
+        copy_all(
+            &abort_store,
+            &mut abort_counter,
+            owner_epoch,
+            abort_operation.operation.operation_id,
+        );
+        let abort_sealed = seal_restore_source(
+            &abort_store,
+            write_context(&abort_store, &mut abort_counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: abort_operation.operation.operation_id,
+            },
+        )
+        .unwrap();
+        let abort_bind = BindRestoreDestinationRequest {
+            operation_id: abort_operation.operation.operation_id,
+            binding: destination_binding_for_test(&abort_sealed.operation, 0xd8),
+        };
+        bind_restore_destination(
+            &abort_store,
+            write_context(&abort_store, &mut abort_counter, owner_epoch),
+            &abort_bind,
+        )
+        .unwrap();
+        abort_restore(
+            &abort_store,
+            write_context(&abort_store, &mut abort_counter, owner_epoch),
+            &AbortRestoreRequest {
+                operation_id: abort_bind.operation_id,
+                terminal_error: RestoreTerminalError {
+                    kind: RestoreTerminalErrorKind::AbortedByCaller,
+                    message: "bind replay boundary".to_owned(),
+                    evidence_digest: None,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            bind_restore_destination(
+                &abort_store,
+                write_context(&abort_store, &mut abort_counter, owner_epoch),
+                &abort_bind,
+            ),
+            Err(RestoreError::InvalidPhase {
+                expected: "SourceSealed, DestinationBuilding, DestinationSealing, or Ready",
+                actual: RestorePhase::Aborting,
+            })
+        );
+
+        let mut complete_counter = 0_u128;
+        let complete_store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&complete_store, &mut complete_counter, owner_epoch);
+        let complete_source = seed_source(&complete_store, &mut complete_counter, owner_epoch, 1);
+        let complete_snapshot = mint_source_snapshot(
+            &complete_store,
+            &mut complete_counter,
+            owner_epoch,
+            &complete_source,
+        );
+        let complete_operation = begin_snapshot_restore(
+            &complete_store,
+            &mut complete_counter,
+            owner_epoch,
+            &complete_source,
+            complete_snapshot,
+            "bind-complete",
+            incarnation(42),
+        );
+        drive_to_ready(
+            &complete_store,
+            &mut complete_counter,
+            owner_epoch,
+            complete_operation.operation.operation_id,
+            &complete_source.initialization,
+        );
+        let ready = get_restore(
+            &complete_store,
+            write_context(&complete_store, &mut complete_counter, owner_epoch),
+            complete_operation.operation.operation_id,
+        )
+        .unwrap()
+        .unwrap();
+        let RestoreCommitProvenance::V5(provenance) = &ready.commit_provenance else {
+            unreachable!();
+        };
+        let complete_bind = BindRestoreDestinationRequest {
+            operation_id: ready.operation_id,
+            binding: provenance.destination_binding.clone().unwrap(),
+        };
+        complete_restore(
+            &complete_store,
+            write_context(&complete_store, &mut complete_counter, owner_epoch),
+            RestoreOperationRequest {
+                operation_id: ready.operation_id,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            bind_restore_destination(
+                &complete_store,
+                write_context(&complete_store, &mut complete_counter, owner_epoch),
+                &complete_bind,
+            ),
+            Err(RestoreError::InvalidPhase {
+                expected: "SourceSealed, DestinationBuilding, DestinationSealing, or Ready",
+                actual: RestorePhase::Complete,
             })
         );
     }
@@ -7634,6 +9175,256 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn abort_partial_generic_index_build_cleans_hidden_pointers_and_references_exactly() {
+        let mut counter = 1_900_u128;
+        let owner_epoch = owner(1);
+        let store = crate::workspace::test_support::memory(shard()).unwrap();
+        activate_root(&store, &mut counter, owner_epoch);
+        let source = seed_source(&store, &mut counter, owner_epoch, 1);
+        let root_index = register_test_generic_index(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source.source_workbench,
+            source.source_incarnation,
+            0xa1,
+            0xb1,
+            None,
+            Some("outputs/item-0000"),
+            None,
+            "root-index",
+        );
+        let output_scope = NormalizedRelativePath::new("outputs").unwrap();
+        let scoped_index = register_test_generic_index(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source.source_workbench,
+            source.source_incarnation,
+            0xa2,
+            0xb2,
+            Some(output_scope.as_str()),
+            Some("item-0000"),
+            None,
+            "scoped-index",
+        );
+        let snapshot_id = mint_source_snapshot(&store, &mut counter, owner_epoch, &source);
+        let begun = begin_snapshot_restore(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source,
+            snapshot_id,
+            "generic-partial-abort",
+            incarnation(38),
+        );
+        let operation_id = begun.operation.operation_id;
+        start_restore_copy(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        copy_all(&store, &mut counter, owner_epoch, operation_id);
+        let sealed = seal_restore_source(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert_eq!(sealed.operation.source_generic_index_count, 2);
+        let binding = destination_binding_for_test(&sealed.operation, 0xd8);
+        let destination_commit_id = binding.destination_commit_id;
+        bind_restore_destination(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &BindRestoreDestinationRequest {
+                operation_id,
+                binding,
+            },
+        )
+        .unwrap();
+        publish_destination_manifests_for_test(&store, &mut counter, owner_epoch, operation_id);
+        apply_restore_initialization(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+
+        let paths_complete = build_restore_commit_members(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreClosureBatchRequest {
+                operation_id,
+                limit: MAX_RESTORE_BATCH_MEMBERS,
+            },
+        )
+        .unwrap();
+        assert!(!paths_complete.members_complete);
+        let RestoreCommitProvenance::V5(paths_provenance) =
+            &paths_complete.command.operation.commit_provenance
+        else {
+            unreachable!();
+        };
+        assert!(paths_provenance.closure.path_members_complete);
+        assert_eq!(paths_provenance.closure.generic_index_count, 0);
+
+        let one_index = build_restore_commit_members(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreClosureBatchRequest {
+                operation_id,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(one_index.built_members, 1);
+        assert!(!one_index.members_complete);
+        let RestoreCommitProvenance::V5(partial_provenance) =
+            &one_index.command.operation.commit_provenance
+        else {
+            unreachable!();
+        };
+        assert_eq!(partial_provenance.closure.generic_index_count, 1);
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitGenericIndexMember,
+            &commit_generic_index_member_key(root(), destination_commit_id, None),
+        )
+        .unwrap()
+        .is_some());
+
+        let abort_context = write_context(&store, &mut counter, owner_epoch);
+        let abort_request = AbortRestoreRequest {
+            operation_id,
+            terminal_error: RestoreTerminalError {
+                kind: RestoreTerminalErrorKind::AbortedByCaller,
+                message: "cancelled after a partial Generic index commit build".to_owned(),
+                evidence_digest: None,
+            },
+        };
+        let aborted = abort_restore(&store, abort_context, &abort_request).unwrap();
+        let abort_replay = abort_restore(&store, abort_context, &abort_request).unwrap();
+        assert!(!aborted.replayed);
+        assert!(abort_replay.replayed);
+        assert_eq!(abort_replay.operation, aborted.operation);
+        start_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        let mut cleanup_calls = 0_usize;
+        loop {
+            cleanup_calls += 1;
+            let cleanup = cleanup_restore_batch(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                CopyRestoreBatchRequest {
+                    operation_id,
+                    limit: 1,
+                },
+            )
+            .unwrap();
+            if cleanup.source_eof {
+                break;
+            }
+        }
+        assert!(
+            cleanup_calls > 2,
+            "cleanup must advance through bounded closure pages"
+        );
+        let cleaned = finish_restore_cleanup(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            RestoreOperationRequest { operation_id },
+        )
+        .unwrap();
+        assert_eq!(cleaned.operation.phase, RestorePhase::Cleaned);
+
+        let read_version = store.current_read_version().unwrap();
+        assert!(store
+            .scan_prefix_at(
+                root(),
+                placement(),
+                owner_epoch,
+                MetadataFamily::GenericIndexCurrent,
+                &generic_index_current_prefix(root(), incarnation(38)),
+                read_version,
+                None,
+                1,
+            )
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .scan_prefix_at(
+                root(),
+                placement(),
+                owner_epoch,
+                MetadataFamily::CommitGenericIndexMember,
+                &commit_generic_index_member_prefix(root(), destination_commit_id),
+                read_version,
+                None,
+                1,
+            )
+            .unwrap()
+            .is_empty());
+        for (scope, current) in [(None, root_index), (Some(&output_scope), scoped_index)] {
+            assert!(read_payload(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_ref_key(
+                    root(),
+                    current.generation_id,
+                    GenericIndexReferenceKind::Current,
+                    generic_index_current_owner_digest(incarnation(38), scope),
+                ),
+            )
+            .unwrap()
+            .is_none());
+            assert!(read_payload(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_ref_key(
+                    root(),
+                    current.generation_id,
+                    GenericIndexReferenceKind::Commit,
+                    generic_index_commit_owner_digest(destination_commit_id),
+                ),
+            )
+            .unwrap()
+            .is_none());
+            assert!(read_payload(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_ref_key(
+                    root(),
+                    current.generation_id,
+                    GenericIndexReferenceKind::Current,
+                    generic_index_current_owner_digest(source.source_incarnation, scope),
+                ),
+            )
+            .unwrap()
+            .is_some());
+            let generation = read_record(
+                &store,
+                write_context(&store, &mut counter, owner_epoch),
+                MetadataFamily::GenericIndexGeneration,
+                &generic_index_generation_key(root(), current.generation_id),
+                GenericIndexGenerationRecord::decode,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(generation.record.reference_count, 1);
+        }
     }
 
     #[test]
@@ -8868,6 +10659,19 @@ mod tests {
             revision(0x12),
             run_manifest_body,
         );
+        let frozen_index = register_test_generic_index(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            0x33,
+            0x34,
+            None,
+            Some("input/note.txt"),
+            None,
+            "snapshot-alpha",
+        );
 
         // workbench_snapshot: alias "frozen", one-day lease.
         let snapshot_id = SnapshotId::new(429);
@@ -8883,6 +10687,20 @@ mod tests {
             },
         )
         .unwrap();
+        let live_index = register_test_generic_index(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            0x35,
+            0x36,
+            None,
+            Some("input/note.txt"),
+            Some(frozen_index.pointer_generation),
+            "snapshot-beta",
+        );
+        assert_ne!(frozen_index.generation_id, live_index.generation_id);
 
         // workbench_restore into destination "minimal-restored".
         let destination_workbench = workbench("minimal-restored");
@@ -8941,6 +10759,27 @@ mod tests {
         };
         let binding = provenance.destination_binding.as_ref().unwrap();
         let manifests = binding.manifests.as_ref().unwrap();
+        assert_eq!(
+            completed
+                .command
+                .operation
+                .source_generic_indexes_match_base_commit,
+            Some(false),
+            "the snapshot must carry its dirty @V Generic pointer without a recommit",
+        );
+        let restored_index = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::GenericIndexCurrent,
+            &generic_index_current_key(root(), destination_incarnation, None),
+            GenericIndexCurrentRecord::decode,
+        )
+        .unwrap()
+        .expect("snapshot restore publishes the frozen Generic pointer");
+        assert_eq!(
+            restored_index.record.generation_id,
+            frozen_index.generation_id
+        );
         assert_eq!(
             destination_commit.record.content_digest_uri,
             binding.effective_content_digest_uri
@@ -9019,6 +10858,62 @@ mod tests {
         )
         .unwrap()
         .is_some());
+        assert_generic_label(
+            &store,
+            owner_epoch,
+            &destination_workbench,
+            "input/note.txt",
+            "snapshot-alpha",
+        );
+
+        retire_snapshot(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            &RetireSnapshotRequest {
+                workbench_id: source_workbench.clone(),
+                selector: SnapshotSelector::Id(snapshot_id),
+                retire_annotation: None,
+            },
+        )
+        .unwrap();
+        let removed_live = remove_test_generic_index_current(
+            &store,
+            &mut counter,
+            owner_epoch,
+            source_incarnation,
+            None,
+        );
+        assert_eq!(removed_live.generation_id, live_index.generation_id);
+        delete_present(
+            &store,
+            &mut counter,
+            owner_epoch,
+            MetadataFamily::WorkspaceCurrent,
+            workspace_current_key(root(), &source_workbench),
+        );
+        retire_commit_for_test(
+            &store,
+            &mut counter,
+            owner_epoch,
+            destination_incarnation,
+            receipt.destination_commit_id,
+            operation(0x70),
+        );
+        retire_commit_for_test(
+            &store,
+            &mut counter,
+            owner_epoch,
+            source_incarnation,
+            source_commit_id,
+            operation(0x71),
+        );
+        assert_generic_label(
+            &store,
+            owner_epoch,
+            &destination_workbench,
+            "input/note.txt",
+            "snapshot-alpha",
+        );
     }
 
     /// The run-manifest row sorts between input/ and output/, so a one-row
@@ -9174,6 +11069,19 @@ mod tests {
             revision(0x12),
             br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/note.txt"]}"#,
         );
+        let first_index = register_test_generic_index(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &first,
+            first_incarnation,
+            0x33,
+            0x34,
+            None,
+            Some("input/note.txt"),
+            None,
+            "chain-alpha",
+        );
         let first_snapshot = SnapshotId::new(432);
         mint_snapshot(
             &store,
@@ -9210,6 +11118,17 @@ mod tests {
             .destination_commit_receipt()
             .unwrap()
             .destination_commit_id;
+        let second_base_index = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::GenericIndexCurrent,
+            &generic_index_current_key(root(), second_incarnation, None),
+            GenericIndexCurrentRecord::decode,
+        )
+        .unwrap()
+        .expect("A to B restore publishes the frozen Generic pointer")
+        .record;
+        assert_eq!(second_base_index.generation_id, first_index.generation_id);
 
         // Mutate the restored workbench without recommitting: publish the
         // renamed destination and another dirty path, then remove the old
@@ -9250,6 +11169,19 @@ mod tests {
             },
         )
         .unwrap();
+        let dirty_second_index = register_test_generic_index(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &second,
+            second_incarnation,
+            0x53,
+            0x54,
+            None,
+            Some("output/dirty.txt"),
+            Some(second_base_index.pointer_generation),
+            "chain-beta",
+        );
         let second_snapshot = SnapshotId::new(433);
         mint_snapshot(
             &store,
@@ -9282,6 +11214,31 @@ mod tests {
         assert_eq!(
             completed.command.operation.source_matches_base_commit,
             Some(false)
+        );
+        assert_eq!(
+            completed
+                .command
+                .operation
+                .source_generic_indexes_match_base_commit,
+            Some(false)
+        );
+        let third_index = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::GenericIndexCurrent,
+            &generic_index_current_key(root(), third_incarnation, None),
+            GenericIndexCurrentRecord::decode,
+        )
+        .unwrap()
+        .expect("B to C snapshot restore copies the dirty Generic pointer")
+        .record;
+        assert_eq!(third_index.generation_id, dirty_second_index.generation_id);
+        assert_generic_label(
+            &store,
+            owner_epoch,
+            &third,
+            "output/dirty.txt",
+            "chain-beta",
         );
         assert_eq!(completed.result.member_count, 2);
         let restored_note = get_visible_path_at(
@@ -9654,6 +11611,19 @@ mod tests {
             revision(0x11),
             operation(0x21),
         );
+        let source_index = register_test_generic_index(
+            &store,
+            &mut counter,
+            owner_epoch,
+            &source_workbench,
+            source_incarnation,
+            0x22,
+            0x23,
+            None,
+            Some("input/note.txt"),
+            None,
+            "commit-alpha",
+        );
         let commit_id = CommitId::from_bytes([0x44; SHA256_BYTES]);
         drive_commit_wire_calls(
             &store,
@@ -9667,6 +11637,9 @@ mod tests {
             revision(0x12),
             br#"{"schema":"nokv.workbench.run_manifest.v1","paths":["input/note.txt"]}"#,
         );
+        let restore_manifest_body: &[u8] = br#"{"schema":"nokv.workbench.restore_manifest.v1"}"#;
+        let destination_workbench = workbench("commit-restored");
+        let destination_incarnation = incarnation(30);
 
         let begun = begin_restore(
             &store,
@@ -9676,16 +11649,16 @@ mod tests {
                 source_workbench_id: source_workbench.clone(),
                 expected_source_workspace_incarnation_id: source_incarnation,
                 source: RestoreSourceSelector::Commit(commit_id),
-                destination_workbench_id: workbench("commit-restored"),
-                destination_workspace_incarnation_id: incarnation(30),
+                destination_workbench_id: destination_workbench.clone(),
+                destination_workspace_incarnation_id: destination_incarnation,
                 destination_restore_manifest_identity: RestoreManifestIdentity {
                     publication_operation_id: operation(0x15),
                     artifact_revision_id: revision(0x14),
                 },
                 destination_committed_at_unix_seconds: 1,
                 restore_manifest: RestoreManifestDescriptor {
-                    body_digest_uri: format!("sha256:{:064x}", 0xcafe),
-                    logical_size: 2,
+                    body_digest_uri: body_digest_uri(restore_manifest_body),
+                    logical_size: restore_manifest_body.len() as u64,
                     content_type: "application/json".to_owned(),
                 },
             }),
@@ -9699,6 +11672,17 @@ mod tests {
             },
         )
         .unwrap();
+        let copied_paths = copy_restore_batch(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            CopyRestoreBatchRequest {
+                operation_id: begun.operation.operation_id,
+                limit: MAX_RESTORE_BATCH_MEMBERS,
+            },
+        )
+        .unwrap();
+        assert!(!copied_paths.source_eof);
+        assert_eq!(copied_paths.copied_members, 1);
         let copied = copy_restore_batch(
             &store,
             write_context(&store, &mut counter, owner_epoch),
@@ -9747,6 +11731,16 @@ mod tests {
             sealed.operation.source_member_seal,
             Some(source_commit.record.member_digest)
         );
+        assert_eq!(source_commit.record.generic_index_count, 1);
+        assert_eq!(sealed.operation.source_generic_index_count, 1);
+        assert_eq!(
+            sealed.operation.source_generic_index_seal,
+            Some(source_commit.record.generic_index_digest)
+        );
+        assert_eq!(
+            sealed.operation.source_generic_indexes_match_base_commit,
+            Some(true)
+        );
         let materialized = read_record(
             &store,
             write_context(&store, &mut counter, owner_epoch),
@@ -9768,5 +11762,87 @@ mod tests {
         )
         .unwrap()
         .is_none());
+
+        drive_sealed_to_ready(
+            &store,
+            &mut counter,
+            owner_epoch,
+            begun.operation.operation_id,
+            &RestoreInitialization {
+                restore_manifest: PathEntry {
+                    generation: Generation::new(1).unwrap(),
+                    artifact_revision_id: revision(0x14),
+                    body_digest_uri: body_digest_uri(restore_manifest_body),
+                    manifest_digest_uri: "sha256:manifest".to_owned(),
+                    logical_size: restore_manifest_body.len() as u64,
+                    dependency_count: 0,
+                    dependency_depth: 0,
+                    content_type: "application/json".to_owned(),
+                    producer: Some("restore".to_owned()),
+                    manifest_id: None,
+                    typed_index_projection: TypedProjection::empty().encode().unwrap(),
+                },
+            },
+        );
+        assert!(get_visible_workspace_at(
+            &store,
+            read_context(&store, owner_epoch),
+            &destination_workbench,
+        )
+        .unwrap()
+        .is_none());
+        let hidden_current = read_record(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::GenericIndexCurrent,
+            &generic_index_current_key(root(), destination_incarnation, None),
+            GenericIndexCurrentRecord::decode,
+        )
+        .unwrap()
+        .expect("Ready keeps the destination Generic pointer hidden behind WorkspaceCurrent");
+        assert_eq!(
+            hidden_current.record.generation_id,
+            source_index.generation_id
+        );
+        let ready = get_restore(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            begun.operation.operation_id,
+        )
+        .unwrap()
+        .unwrap();
+        let RestoreCommitProvenance::V5(ready_provenance) = &ready.commit_provenance else {
+            unreachable!();
+        };
+        let destination_commit_id = ready_provenance
+            .destination_binding
+            .as_ref()
+            .unwrap()
+            .destination_commit_id;
+        assert!(read_payload(
+            &store,
+            write_context(&store, &mut counter, owner_epoch),
+            MetadataFamily::CommitGenericIndexMember,
+            &commit_generic_index_member_key(root(), destination_commit_id, None),
+        )
+        .unwrap()
+        .is_some());
+
+        let complete_context = write_context(&store, &mut counter, owner_epoch);
+        let complete_request = RestoreOperationRequest {
+            operation_id: begun.operation.operation_id,
+        };
+        let completed = complete_restore(&store, complete_context, complete_request).unwrap();
+        let replay = complete_restore(&store, complete_context, complete_request).unwrap();
+        assert!(!completed.command.replayed);
+        assert!(replay.command.replayed);
+        assert_eq!(replay.result, completed.result);
+        assert_generic_label(
+            &store,
+            owner_epoch,
+            &destination_workbench,
+            "input/note.txt",
+            "commit-alpha",
+        );
     }
 }

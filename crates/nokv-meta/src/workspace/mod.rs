@@ -11,6 +11,8 @@ mod engine;
 mod event_projection;
 mod gc;
 mod gc_records;
+mod generic_index;
+mod generic_index_records;
 mod keyspace;
 mod namespace;
 mod publication;
@@ -35,24 +37,32 @@ pub(crate) mod test_support;
 pub use build_commit_records::{
     BuildCommitOperationRecord, BuildCommitResult, CommitManifestBinding, CommitManifestCondition,
     CommitOperationErrorKind, CommitOperationRecordError, CommitOperationTerminalError,
-    CommitRetireOperationRecord, COMMIT_OPERATION_VALUE_FORMAT_VERSION,
-    MAX_COMMIT_OPERATION_ERROR_BYTES,
+    CommitRetireOperationRecord, BUILD_COMMIT_OPERATION_VALUE_FORMAT_VERSION,
+    COMMIT_RETIRE_OPERATION_VALUE_FORMAT_VERSION, MAX_COMMIT_OPERATION_ERROR_BYTES,
 };
 pub use codec::{
     artifact_manifest_key, artifact_manifest_prefix, artifact_revision_claim_key,
-    artifact_revision_key, build_commit_history_hold_key, child_commit_consumer_key, commit_key,
+    artifact_revision_key, build_commit_history_hold_key, child_commit_consumer_key,
+    commit_generic_index_member_key, commit_generic_index_member_prefix, commit_key,
     commit_member_key, commit_member_prefix, commit_prefix, commit_revision_ref_key,
-    commit_revision_ref_prefix, decode_artifact_manifest_key, decode_commit_key,
-    decode_commit_member_key, decode_gc_candidate_key, decode_operation_key,
+    commit_revision_ref_prefix, decode_artifact_manifest_key,
+    decode_commit_generic_index_member_key, decode_commit_key, decode_commit_member_key,
+    decode_gc_candidate_key, decode_generic_index_append_receipt_key,
+    decode_generic_index_current_key, decode_generic_index_generation_key,
+    decode_generic_index_generation_ref_key, decode_generic_index_row_key, decode_operation_key,
     decode_path_current_key, decode_revision_dependency_ref_key, decode_snapshot_ref_key,
     decode_workspace_current_key, gc_candidate_key, gc_candidate_prefix, gc_history_barrier_key,
+    generic_index_append_receipt_key, generic_index_append_receipt_prefix,
+    generic_index_current_key, generic_index_current_prefix, generic_index_generation_key,
+    generic_index_generation_prefix, generic_index_generation_ref_key,
+    generic_index_generation_ref_prefix, generic_index_row_key, generic_index_row_prefix,
     history_hold_prefix, lease_commit_consumer_key, object_block_key, operation_key,
     operation_prefix, path_child_prefix, path_current_key, path_revision_ref_key,
-    restore_history_hold_key, restore_member_key, restore_member_prefix,
-    revision_dependency_ref_key, revision_dependency_ref_prefix, snapshot_alias_key,
-    snapshot_commit_consumer_key, snapshot_history_hold_key, snapshot_id_claim_key,
-    snapshot_ref_key, snapshot_ref_prefix, staged_object_key, staged_object_prefix,
-    tag_commit_consumer_key, tag_key, workbench_commit_head_key,
+    register_generic_index_history_hold_key, restore_history_hold_key, restore_member_key,
+    restore_member_prefix, revision_dependency_ref_key, revision_dependency_ref_prefix,
+    snapshot_alias_key, snapshot_commit_consumer_key, snapshot_history_hold_key,
+    snapshot_id_claim_key, snapshot_ref_key, snapshot_ref_prefix, staged_object_key,
+    staged_object_prefix, tag_commit_consumer_key, tag_key, workbench_commit_head_key,
     workbench_head_commit_consumer_key, workspace_current_key, workspace_current_prefix,
     PATH_COMPONENT_DELIMITER, PATH_EXACT_TERMINATOR, SCHEMA_ID, VALUE_FORMAT_VERSION,
 };
@@ -72,8 +82,9 @@ pub use commit_closure::{
 pub use commit_records::{
     advance_commit_member_rolling_digest, commit_member_row_digest, CommitConsumerRecord,
     CommitMemberRecord, CommitRecord, CommitRecordError, TagRecord, WorkbenchCommitHeadRecord,
-    COMMIT_VALUE_FORMAT_VERSION, MAX_COMMIT_DIGEST_URI_BYTES, MAX_COMMIT_LINEAGE_BYTES,
-    MAX_COMMIT_MEMBER_PROJECTION_BYTES, MAX_COMMIT_PRODUCER_BYTES, MAX_PARENT_COMMITS,
+    COMMIT_AUXILIARY_VALUE_FORMAT_VERSION, COMMIT_RECORD_VALUE_FORMAT_VERSION,
+    MAX_COMMIT_DIGEST_URI_BYTES, MAX_COMMIT_LINEAGE_BYTES, MAX_COMMIT_MEMBER_PROJECTION_BYTES,
+    MAX_COMMIT_PRODUCER_BYTES, MAX_PARENT_COMMITS,
 };
 #[cfg(feature = "metadata-read-stats")]
 pub use engine::MetadataReadStatsSession;
@@ -83,15 +94,44 @@ pub use engine::{
     RootFenceAction,
 };
 pub use gc::{
-    gc_operation_id, AdvanceGcDeletionBatchRequest, BeginGcDeletionRequest, ClaimGcRequest,
-    ClearStaleGcCandidateRequest, CompleteGcRequest, GcCandidateClearOutcome, GcCandidateCursor,
-    GcCandidateEntry, GcCandidatePage, GcCommandOutcome, GcError, GcHistoryBarrierOutcome,
-    GcManifestBatch, GcManifestEntry, GcObjectAbsence, GcService, QuarantineGcRequest,
-    MAX_GC_BATCH_ROWS, MAX_GC_CANDIDATE_PAGE_SIZE,
+    gc_operation_id, generic_index_gc_operation_id, AdvanceGcDeletionBatchRequest,
+    BeginGcDeletionRequest, ClaimGcRequest, ClaimGenericIndexGenerationGcRequest,
+    ClearStaleGcCandidateRequest, CollectGenericIndexGenerationGcBatchRequest, CompleteGcRequest,
+    GcCandidateClearOutcome, GcCandidateCursor, GcCandidateEntry, GcCandidatePage,
+    GcCommandOutcome, GcError, GcHistoryBarrierOutcome, GcManifestBatch, GcManifestEntry,
+    GcObjectAbsence, GcService, GenericIndexGenerationGcCandidate,
+    GenericIndexGenerationGcCandidateCursor, GenericIndexGenerationGcCandidatePage,
+    GenericIndexGenerationGcOutcome, QuarantineGcRequest, MAX_GC_BATCH_ROWS,
+    MAX_GC_CANDIDATE_PAGE_SIZE, MAX_GENERIC_INDEX_GC_BATCH_ROWS,
 };
 pub use gc_records::{
     GcHistoryBarrierRecord, GcOperationRecord, GcRecordError, GcTransition,
-    GC_VALUE_FORMAT_VERSION, MAX_GC_EVIDENCE_BYTES,
+    GenericIndexGcOperationRecord, GenericIndexGcPhase, GC_VALUE_FORMAT_VERSION,
+    MAX_GC_EVIDENCE_BYTES,
+};
+pub use generic_index::{
+    AbortGenericIndexRegistrationOutcome, AbortGenericIndexRegistrationRequest,
+    AppendGenericIndexRowsOutcome, AppendGenericIndexRowsRequest,
+    BeginGenericIndexRegistrationRequest, FinalizeGenericIndexRegistrationRequest,
+    GenericIndexError, GenericIndexRegistrationOutcome, GenericIndexRegistrationService,
+    GenericIndexRowInput, MAX_GENERIC_INDEX_APPEND_BATCH_ROWS,
+    MAX_GENERIC_INDEX_CLEANUP_BATCH_ROWS,
+};
+pub use generic_index_records::{
+    advance_commit_generic_index_member_rolling_digest, advance_generic_index_row_rolling_digest,
+    commit_generic_index_member_row_digest, empty_generic_index_row_digest,
+    generic_index_append_batch_digest, generic_index_append_input_digest,
+    generic_index_build_commit_owner_digest, generic_index_capability_digest,
+    generic_index_commit_owner_digest, generic_index_current_owner_digest,
+    generic_index_registration_owner_digest, generic_index_restore_owner_digest,
+    generic_index_row_digest, verify_generic_index_generation_seal, CommitGenericIndexMemberRecord,
+    GenericIndexAppendReceiptRecord, GenericIndexArtifactBinding, GenericIndexCurrentRecord,
+    GenericIndexFieldCapability, GenericIndexFieldValues, GenericIndexGenerationRecord,
+    GenericIndexGenerationRefRecord, GenericIndexOperator, GenericIndexRecordError,
+    GenericIndexRegistrationOperationRecord, GenericIndexRowBinding, GenericIndexRowRecord,
+    GENERIC_INDEX_VALUE_FORMAT_VERSION, MAX_GENERIC_INDEX_APPEND_ROWS, MAX_GENERIC_INDEX_FIELDS,
+    MAX_GENERIC_INDEX_ROW_BYTES, MAX_GENERIC_INDEX_ROW_FIELDS,
+    MAX_GENERIC_INDEX_TERMINAL_ERROR_BYTES, MAX_GENERIC_INDEX_VALUES_PER_FIELD,
 };
 pub use keyspace::{keyspaces, KeyspaceDef, MetadataFamily};
 pub use namespace::{
@@ -130,11 +170,12 @@ pub use publish_operation_records::{
 pub use query::{
     aggregate_paths_at, catalog_fields_at, find_workspaces_at, get_workspace_at, read_changes_at,
     search_paths_at, AggregateFunction, AggregateGroup, AggregatePage, AggregateRequest,
-    AggregateSpec, CatalogField, CatalogPage, CatalogRequest, ChangeEvent, ChangePage,
-    ChangePageRequest, CommittedFilter, FacetBucket, FacetResult, FindWorkspacesPage,
-    FindWorkspacesRequest, QueryError, QueryOperand, QueryOperator, QueryPredicate, QueryScope,
-    QuerySort, QuerySortDirection, SearchHit, SearchPage, SearchRequest, WorkspaceDiscovery,
-    MAX_FACET_BUCKETS_PER_FIELD, MAX_QUERY_AGGREGATES, MAX_QUERY_CURSOR_BYTES,
+    AggregateSpec, CatalogField, CatalogPage, CatalogPathMatch, CatalogRequest, ChangeEvent,
+    ChangePage, ChangePageRequest, CommittedFilter, FacetBucket, FacetResult, FindWorkspacesPage,
+    FindWorkspacesRequest, GenericArtifactMetadata, GenericNamespaceHit, GenericNamespaceKind,
+    PresentationPathRoot, QueryError, QueryOperand, QueryOperator, QueryPredicate, QueryProfile,
+    QueryScope, QuerySort, QuerySortDirection, SearchHit, SearchPage, SearchRequest,
+    WorkspaceDiscovery, MAX_FACET_BUCKETS_PER_FIELD, MAX_QUERY_AGGREGATES, MAX_QUERY_CURSOR_BYTES,
     MAX_QUERY_FACET_FIELDS, MAX_QUERY_GROUP_FIELDS, MAX_QUERY_IN_VALUES, MAX_QUERY_PAGE_SIZE,
     MAX_QUERY_PREDICATES, MAX_QUERY_PROJECTION_FIELDS, MAX_QUERY_SORT_FIELDS,
 };

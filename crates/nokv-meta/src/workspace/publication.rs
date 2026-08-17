@@ -1594,9 +1594,24 @@ impl PublicationService<'_> {
         {
             let operation = PublishOperationRecord::decode(&payload)?;
             validate_operation_seals(&operation)?;
-            if operation.operation_id != request.operation.operation_id
-                || operation.identity_digest != request.operation.identity_digest
-                || operation.initialization_digest != request.operation.initialization_digest
+            let mut replay_candidate = request.operation.clone();
+            if matches!(operation.authority, PublishAuthority::RestoreStaging { .. })
+                && operation.phase == PublishPhase::Published
+            {
+                // The owner epoch is server-derived admission state, not a
+                // caller-selected part of a restore manifest identity. A
+                // successor may borrow only the stored epoch of an already
+                // terminal RestoreStaging row, then must still match every
+                // other sealed input and pass the live restore/path checks
+                // below. Visible and CommitStaging receipts deliberately
+                // remain epoch-bound because they lack equivalent live
+                // replay authority validation.
+                replay_candidate.initiating_owner_epoch = operation.initiating_owner_epoch;
+                seal_publish_operation(&mut replay_candidate);
+            }
+            if operation.operation_id != replay_candidate.operation_id
+                || operation.identity_digest != replay_candidate.identity_digest
+                || operation.initialization_digest != replay_candidate.initialization_digest
             {
                 return Err(PublicationError::OperationInputMismatch);
             }
@@ -2958,14 +2973,21 @@ impl PublicationService<'_> {
             return Err(PublicationError::WorkspaceIncarnationMismatch);
         }
         Self::validate_restore_workspace_state(&workspace.record, &restore)?;
-        let replay = if operation.phase == PublishPhase::Published {
-            self.validate_restore_terminal_publication_replay(context, operation, &restore, kind)
-        } else if restore.phase == RestorePhase::SourceSealed
-            && restore_destination_binding(&restore)?.manifests.is_none()
-        {
-            Ok(())
-        } else {
-            Err(PublicationError::RestoreAuthorityMismatch)
+        let replay = match operation.phase {
+            PublishPhase::Published => self
+                .validate_restore_terminal_publication_replay(context, operation, &restore, kind),
+            PublishPhase::Uploading | PublishPhase::Finalizing
+                if restore.phase == RestorePhase::SourceSealed
+                    && restore_destination_binding(&restore)?.manifests.is_none() =>
+            {
+                Ok(())
+            }
+            PublishPhase::Uploading
+            | PublishPhase::Finalizing
+            | PublishPhase::Aborting
+            | PublishPhase::Cleaning
+            | PublishPhase::Cleaned
+            | PublishPhase::Quarantined => Err(PublicationError::RestoreAuthorityMismatch),
         };
         replay?;
         // This read-only replay path has no MetadataCommand CAS. Re-read the
@@ -4554,6 +4576,8 @@ mod tests {
                     unique_revision_count: 0,
                     revision_digest: [0; SHA256_BYTES],
                     parent_digest: [0; SHA256_BYTES],
+                    generic_index_count: 0,
+                    generic_index_digest: [0; SHA256_BYTES],
                 },
                 destination_committed_at_unix_seconds: 1,
                 destination_binding: Some(binding),
@@ -4561,6 +4585,11 @@ mod tests {
                     member_cursor: None,
                     member_count: 0,
                     member_digest: [0; SHA256_BYTES],
+                    path_members_complete: false,
+                    generic_index_cursor: None,
+                    generic_index_count: 0,
+                    generic_index_digest: [0; SHA256_BYTES],
+                    generic_indexes_complete: false,
                     member_seal: None,
                     revision_ref_count: 0,
                     revision_cursor: None,
@@ -4574,12 +4603,19 @@ mod tests {
                     ),
                     parent_seal: None,
                     cleanup_member_count: 0,
+                    cleanup_generic_index_count: 0,
                     cleanup_revision_count: 0,
                 },
                 destination_head_generation: None,
             })),
             phase: RestorePhase::SourceSealed,
             source_cursor: None,
+            source_paths_eof: true,
+            source_generic_index_cursor: None,
+            source_generic_index_count: 0,
+            source_generic_index_rolling_digest: [0; SHA256_BYTES],
+            source_generic_index_seal: Some([0; SHA256_BYTES]),
+            source_generic_indexes_match_base_commit: Some(true),
             source_eof: true,
             source_member_count: 0,
             source_member_rolling_digest: [0; SHA256_BYTES],
@@ -4589,6 +4625,7 @@ mod tests {
             member_rolling_digest: [0; SHA256_BYTES],
             member_seal: Some([0; SHA256_BYTES]),
             cleanup_member_cursor: 0,
+            cleanup_generic_index_cursor: 0,
             result: None,
             terminal_error: None,
         };
@@ -4663,6 +4700,80 @@ mod tests {
     ) {
         let context = publication_context(store, counter);
         let key = operation_key(root(), OperationKind::Restore, expected.operation_id);
+        let mut plan = CommandPlan::default();
+        plan.replace(
+            MetadataFamily::Operation,
+            key,
+            expected.encode().unwrap(),
+            next.encode().unwrap(),
+        )
+        .unwrap();
+        store
+            .execute(
+                &MetadataCommand {
+                    schema_id: SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    object_namespace_id: Some(context.object_namespace_id),
+                    placement_generation: placement(),
+                    owner_epoch: owner(),
+                    request_id: context.request_id,
+                    command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                    read_version: context.read_version,
+                    root_fence_action: RootFenceAction::RequireActive,
+                    predicates: plan.predicates,
+                    mutations: plan.mutations,
+                    history_projection: plan.history,
+                    event_projection: plan.events,
+                    deterministic_result: next.encode().unwrap(),
+                }
+                .seal(),
+            )
+            .unwrap();
+    }
+
+    fn install_publish_operation_for_test(
+        store: &MetaShard,
+        counter: &mut u128,
+        operation: &PublishOperationRecord,
+    ) {
+        let context = publication_context(store, counter);
+        let key = operation_key(root(), OperationKind::Publish, operation.operation_id);
+        let mut plan = CommandPlan::default();
+        plan.put_absent(MetadataFamily::Operation, key, operation.encode().unwrap())
+            .unwrap();
+        store
+            .execute(
+                &MetadataCommand {
+                    schema_id: SCHEMA_ID.to_owned(),
+                    root_id: root(),
+                    logical_shard_id: shard(),
+                    object_namespace_id: Some(context.object_namespace_id),
+                    placement_generation: placement(),
+                    owner_epoch: owner(),
+                    request_id: context.request_id,
+                    command_digest: CommandDigest::from_bytes([0; SHA256_BYTES]),
+                    read_version: context.read_version,
+                    root_fence_action: RootFenceAction::RequireActive,
+                    predicates: plan.predicates,
+                    mutations: plan.mutations,
+                    history_projection: plan.history,
+                    event_projection: plan.events,
+                    deterministic_result: operation.encode().unwrap(),
+                }
+                .seal(),
+            )
+            .unwrap();
+    }
+
+    fn replace_publish_operation_for_test(
+        store: &MetaShard,
+        counter: &mut u128,
+        expected: &PublishOperationRecord,
+        next: &PublishOperationRecord,
+    ) {
+        let context = publication_context(store, counter);
+        let key = operation_key(root(), OperationKind::Publish, expected.operation_id);
         let mut plan = CommandPlan::default();
         plan.replace(
             MetadataFamily::Operation,
@@ -5240,6 +5351,85 @@ mod tests {
                 operation: mismatched,
             }),
             Err(PublicationError::OperationInputMismatch)
+        );
+    }
+
+    #[test]
+    fn successor_epoch_cannot_borrow_visible_or_commit_staging_operation_identity() {
+        for (index, authority) in [
+            PublishAuthority::Visible,
+            PublishAuthority::CommitStaging {
+                commit_operation_id: operation_id(91_100),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let revision_id = revision(91_101 + u128::try_from(index).unwrap());
+            let staged = staged_rows(revision_id, 1);
+            let manifest = manifest_rows(&staged);
+            let mut durable = publish_operation(
+                operation_id(91_101 + u128::try_from(index).unwrap()),
+                revision_id,
+                path("outputs/epoch-bound.bin"),
+                PublishClaim::CreateOnly,
+                &staged,
+                &manifest,
+            );
+            durable.authority = authority;
+            seal_publish_operation(&mut durable);
+            install_publish_operation_for_test(&store, &mut counter, &durable);
+
+            store
+                .advance_owner_epoch(Some(owner()), successor_owner())
+                .unwrap();
+            let mut successor_candidate = durable.clone();
+            successor_candidate.initiating_owner_epoch = successor_owner();
+            seal_publish_operation(&mut successor_candidate);
+            assert_eq!(
+                PublicationService::new(&store).begin_publish(BeginPublishRequest {
+                    context: publication_context_for_owner(
+                        &store,
+                        &mut counter,
+                        successor_owner(),
+                    ),
+                    operation: successor_candidate,
+                }),
+                Err(PublicationError::OperationInputMismatch),
+                "only a restore-staging terminal receipt may cross an owner epoch",
+            );
+        }
+    }
+
+    #[test]
+    fn absent_publish_operation_never_accepts_an_old_initiating_owner() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        store
+            .advance_owner_epoch(Some(owner()), successor_owner())
+            .unwrap();
+        let revision_id = revision(91_110);
+        let staged = staged_rows(revision_id, 1);
+        let manifest = manifest_rows(&staged);
+        let operation = publish_operation(
+            operation_id(91_110),
+            revision_id,
+            path("outputs/absent-old-owner.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        assert_eq!(
+            PublicationService::new(&store).begin_publish(BeginPublishRequest {
+                context: publication_context_for_owner(&store, &mut counter, successor_owner(),),
+                operation,
+            }),
+            Err(PublicationError::InitiatingOwnerEpochMismatch {
+                expected: successor_owner(),
+                actual: owner(),
+            }),
         );
     }
 
@@ -8876,6 +9066,201 @@ mod tests {
                 }),
                 Err(PublicationError::RestoreAuthorityMismatch),
                 "an old terminal publication receipt must not survive restore cleanup authority",
+            );
+        }
+    }
+
+    #[test]
+    fn successor_replays_only_the_exact_terminal_restore_staging_identity() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let restore = sealed_bound_restore_operation();
+        let RestoreCommitProvenance::V5(provenance) = &restore.commit_provenance else {
+            unreachable!("test fixture uses v5 provenance")
+        };
+        let binding = provenance.destination_binding.as_ref().unwrap().clone();
+        install_restore_publication_authority(&store, &mut counter, &restore);
+
+        let (run_initial, run_outcome) = {
+            let (operation, staged, manifest) = restore_staging_publish_operation(
+                binding.run_manifest_identity,
+                RUN_MANIFEST_PATH,
+                canonical_digest_uri(0x41),
+                127,
+            );
+            drive_restore_staging_publish(
+                &service,
+                &store,
+                &mut counter,
+                operation,
+                &staged,
+                &manifest,
+                RESTORE_MANIFEST_CONTENT_TYPE,
+            )
+        };
+        let restore_outcome = {
+            let (operation, staged, manifest) = restore_staging_publish_operation(
+                binding.restore_manifest_identity,
+                RESTORE_MANIFEST_PATH,
+                restore.restore_manifest.body_digest_uri.clone(),
+                restore.restore_manifest.logical_size,
+            );
+            drive_restore_staging_publish(
+                &service,
+                &store,
+                &mut counter,
+                operation,
+                &staged,
+                &manifest,
+                RESTORE_MANIFEST_CONTENT_TYPE,
+            )
+            .1
+        };
+        let manifests = RestoreDestinationManifests {
+            run_manifest: RestoreManifestPublication {
+                publication_operation_id: run_outcome.operation.operation_id,
+                workspace_incarnation_id: incarnation(9),
+                artifact_revision_id: run_outcome.operation.artifact_revision_id,
+                body_digest_uri: run_outcome.result.body_digest_uri.clone(),
+                manifest_digest_uri: sha256_digest_uri(run_outcome.operation.manifest_seal),
+                logical_size: run_outcome.result.logical_size,
+                content_type: RESTORE_MANIFEST_CONTENT_TYPE.to_owned(),
+            },
+            restore_manifest: RestoreManifestPublication {
+                publication_operation_id: restore_outcome.operation.operation_id,
+                workspace_incarnation_id: incarnation(9),
+                artifact_revision_id: restore_outcome.operation.artifact_revision_id,
+                body_digest_uri: restore_outcome.result.body_digest_uri.clone(),
+                manifest_digest_uri: sha256_digest_uri(restore_outcome.operation.manifest_seal),
+                logical_size: restore_outcome.result.logical_size,
+                content_type: RESTORE_MANIFEST_CONTENT_TYPE.to_owned(),
+            },
+        };
+        let building = restore
+            .apply(
+                RestorePhase::SourceSealed,
+                RestoreTransition::BeginDestinationBuilding {
+                    initialization_digest: [0x51; SHA256_BYTES],
+                    manifests,
+                },
+            )
+            .unwrap();
+        replace_restore_operation(&store, &mut counter, &restore, &building);
+        store
+            .advance_owner_epoch(Some(owner()), successor_owner())
+            .unwrap();
+
+        let mut successor_candidate = run_initial.clone();
+        successor_candidate.initiating_owner_epoch = successor_owner();
+        seal_publish_operation(&mut successor_candidate);
+        let replay = service
+            .begin_publish(BeginPublishRequest {
+                context: publication_context_for_owner(&store, &mut counter, successor_owner()),
+                operation: successor_candidate.clone(),
+            })
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.operation, run_outcome.operation);
+
+        let mut wrong_staged_row_seal = successor_candidate.clone();
+        wrong_staged_row_seal.staged_object_seal[0] ^= 0xff;
+        seal_publish_operation(&mut wrong_staged_row_seal);
+        let mut wrong_manifest_row_seal = successor_candidate.clone();
+        wrong_manifest_row_seal.manifest_seal[0] ^= 0xff;
+        seal_publish_operation(&mut wrong_manifest_row_seal);
+        let mut wrong_revision = successor_candidate.clone();
+        wrong_revision.artifact_revision_id = revision(91_200);
+        seal_publish_operation(&mut wrong_revision);
+        let mut wrong_restore = successor_candidate;
+        wrong_restore.authority = PublishAuthority::RestoreStaging {
+            restore_operation_id: operation_id(91_201),
+        };
+        seal_publish_operation(&mut wrong_restore);
+
+        for mismatch in [
+            wrong_staged_row_seal,
+            wrong_manifest_row_seal,
+            wrong_revision,
+            wrong_restore,
+        ] {
+            assert_eq!(
+                service.begin_publish(BeginPublishRequest {
+                    context: publication_context_for_owner(
+                        &store,
+                        &mut counter,
+                        successor_owner(),
+                    ),
+                    operation: mismatch,
+                }),
+                Err(PublicationError::OperationInputMismatch),
+                "successor replay must compare every immutable publish input",
+            );
+        }
+    }
+
+    #[test]
+    fn failed_restore_staging_publish_phases_never_replay_as_success() {
+        for phase in [
+            PublishPhase::Aborting,
+            PublishPhase::Cleaning,
+            PublishPhase::Cleaned,
+            PublishPhase::Quarantined,
+        ] {
+            let mut counter = 1;
+            let store = ready_store(&mut counter);
+            let service = PublicationService::new(&store);
+            let restore = sealed_bound_restore_operation();
+            let RestoreCommitProvenance::V5(provenance) = &restore.commit_provenance else {
+                unreachable!("test fixture uses v5 provenance")
+            };
+            let identity = provenance
+                .destination_binding
+                .as_ref()
+                .unwrap()
+                .run_manifest_identity;
+            install_restore_publication_authority(&store, &mut counter, &restore);
+            let (initial, published) = {
+                let (operation, staged, manifest) = restore_staging_publish_operation(
+                    identity,
+                    RUN_MANIFEST_PATH,
+                    canonical_digest_uri(0x41),
+                    127,
+                );
+                drive_restore_staging_publish(
+                    &service,
+                    &store,
+                    &mut counter,
+                    operation,
+                    &staged,
+                    &manifest,
+                    RESTORE_MANIFEST_CONTENT_TYPE,
+                )
+            };
+            let mut failed = published.operation.clone();
+            failed.phase = phase;
+            failed.result = None;
+            failed.terminal_error = Some(PublishTerminalError {
+                kind: PublishTerminalErrorKind::InvariantViolation,
+                message: "terminal failure must not replay as success".to_owned(),
+                evidence_digest: (phase == PublishPhase::Quarantined)
+                    .then_some([0x91; SHA256_BYTES]),
+            });
+            if phase == PublishPhase::Cleaned {
+                failed.cleanup_staged_object_cursor = failed.staged_object_cursor;
+                failed.cleanup_manifest_cursor = failed.manifest_cursor;
+            }
+            seal_publish_operation(&mut failed);
+            failed.validate().unwrap();
+            replace_publish_operation_for_test(&store, &mut counter, &published.operation, &failed);
+
+            assert_eq!(
+                service.begin_publish(BeginPublishRequest {
+                    context: publication_context(&store, &mut counter),
+                    operation: initial,
+                }),
+                Err(PublicationError::RestoreAuthorityMismatch),
+                "{phase:?} must fail closed instead of borrowing a stale receipt",
             );
         }
     }

@@ -16,10 +16,11 @@ use nokv_types::{
 use super::commit_closure::advance_commit_parent_rolling_digest;
 use super::commit_records::MAX_COMMIT_DIGEST_URI_BYTES;
 
-/// Only supported value format for restore-operation payloads.
-pub const RESTORE_OPERATION_VALUE_FORMAT_VERSION: u8 = 5;
-/// Restore-member rows retain their v4 layout; operation v5 owns the new
-/// destination-commit recovery state.
+/// Current value format for restore-operation payloads.
+pub const RESTORE_OPERATION_VALUE_FORMAT_VERSION: u8 = 6;
+const LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION: u8 = 5;
+/// Restore-member rows retain their v4 layout; operation v6 owns the Generic
+/// index closure while operation v5 remains dual-decodable.
 pub const RESTORE_MEMBER_VALUE_FORMAT_VERSION: u8 = 4;
 
 /// Maximum reconciliation text retained by a failed restore.
@@ -62,6 +63,8 @@ pub struct RestoreSourceCommitSeal {
     pub unique_revision_count: u64,
     pub revision_digest: [u8; SHA256_BYTES],
     pub parent_digest: [u8; SHA256_BYTES],
+    pub generic_index_count: u64,
+    pub generic_index_digest: [u8; SHA256_BYTES],
 }
 
 /// Exact object-first publication identity for a destination-owned manifest.
@@ -106,6 +109,11 @@ pub struct RestoreCommitClosureProgress {
     /// Canonical `CommitMember` rolling digest, never the `RestoreMember`
     /// rolling digest.
     pub member_digest: [u8; SHA256_BYTES],
+    pub path_members_complete: bool,
+    pub generic_index_cursor: Option<NormalizedRelativePath>,
+    pub generic_index_count: u64,
+    pub generic_index_digest: [u8; SHA256_BYTES],
+    pub generic_indexes_complete: bool,
     pub member_seal: Option<[u8; SHA256_BYTES]>,
     /// Number of unique revision refs materialized while members are built.
     pub revision_ref_count: u64,
@@ -119,6 +127,7 @@ pub struct RestoreCommitClosureProgress {
     pub parent_seal: Option<[u8; SHA256_BYTES]>,
     /// Reverse cleanup cursors for rows created before visibility publication.
     pub cleanup_member_count: u64,
+    pub cleanup_generic_index_count: u64,
     pub cleanup_revision_count: u64,
 }
 
@@ -178,8 +187,13 @@ impl RestoreSourceCommitSeal {
             "source_commit.unique_revision_count",
             self.unique_revision_count,
         )?;
+        validate_bounded_count(
+            "source_commit.generic_index_count",
+            self.generic_index_count,
+        )?;
         if (self.member_count == 0) != (self.member_digest == [0; SHA256_BYTES])
             || (self.unique_revision_count == 0) != (self.revision_digest == [0; SHA256_BYTES])
+            || (self.generic_index_count == 0) != (self.generic_index_digest == [0; SHA256_BYTES])
         {
             return Err(RestoreRecordError::InvalidPhasePayload {
                 phase,
@@ -290,6 +304,26 @@ impl RestoreCommitClosureProgress {
                 reason: "commit member count and rolling digest are inconsistent",
             });
         }
+        if self.generic_index_count == 0 && self.generic_index_cursor.is_some() {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit Generic index cursor requires non-empty progress",
+            });
+        }
+        if (self.generic_index_count == 0) != (self.generic_index_digest == [0; SHA256_BYTES]) {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit Generic index count and digest are inconsistent",
+            });
+        }
+        if (self.generic_index_count > 0 || self.generic_indexes_complete)
+            && !self.path_members_complete
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit Generic index build requires path EOF",
+            });
+        }
         if self
             .member_seal
             .is_some_and(|seal| seal != self.member_digest)
@@ -297,6 +331,14 @@ impl RestoreCommitClosureProgress {
             return Err(RestoreRecordError::InvalidPhasePayload {
                 phase,
                 reason: "commit member seal must equal the rolling digest",
+            });
+        }
+        if self.member_seal.is_some()
+            && (!self.path_members_complete || !self.generic_indexes_complete)
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase,
+                reason: "commit member seal requires both destination member closures",
             });
         }
         if self.revision_cursor.is_some() != (self.revision_seal_count > 0) {
@@ -340,6 +382,13 @@ impl RestoreCommitClosureProgress {
                 field: "commit member cleanup",
                 cursor: self.cleanup_member_count,
                 member_count: self.member_count,
+            });
+        }
+        if self.cleanup_generic_index_count > self.generic_index_count {
+            return Err(RestoreRecordError::CursorOutOfRange {
+                field: "commit Generic index cleanup",
+                cursor: self.cleanup_generic_index_count,
+                member_count: self.generic_index_count,
             });
         }
         if self.cleanup_revision_count > self.revision_ref_count {
@@ -459,6 +508,13 @@ pub struct RestoreOperationRecord {
     pub phase: RestorePhase,
     /// Last raw source path folded into the complete frozen source scan.
     pub source_cursor: Option<NormalizedRelativePath>,
+    /// The raw path scan reaches EOF before Generic index pointers are copied.
+    pub source_paths_eof: bool,
+    pub source_generic_index_cursor: Option<NormalizedRelativePath>,
+    pub source_generic_index_count: u64,
+    pub source_generic_index_rolling_digest: [u8; SHA256_BYTES],
+    pub source_generic_index_seal: Option<[u8; SHA256_BYTES]>,
+    pub source_generic_indexes_match_base_commit: Option<bool>,
     pub source_eof: bool,
     pub source_member_count: u64,
     pub source_member_rolling_digest: [u8; SHA256_BYTES],
@@ -474,6 +530,7 @@ pub struct RestoreOperationRecord {
     pub member_seal: Option<[u8; SHA256_BYTES]>,
     /// Number of contiguous members removed by abort cleanup.
     pub cleanup_member_cursor: u64,
+    pub cleanup_generic_index_cursor: u64,
     pub result: Option<RestoreResult>,
     pub terminal_error: Option<RestoreTerminalError>,
 }
@@ -681,12 +738,23 @@ impl RestoreOperationRecord {
             });
         }
         validate_bounded_count("source_member_count", self.source_member_count)?;
+        validate_bounded_count(
+            "source_generic_index_count",
+            self.source_generic_index_count,
+        )?;
         validate_bounded_count("next_member_sequence", self.next_member_sequence)?;
         if self.cleanup_member_cursor > self.next_member_sequence {
             return Err(RestoreRecordError::CursorOutOfRange {
                 field: "materialized member cleanup",
                 cursor: self.cleanup_member_cursor,
                 member_count: self.next_member_sequence,
+            });
+        }
+        if self.cleanup_generic_index_cursor > self.source_generic_index_count {
+            return Err(RestoreRecordError::CursorOutOfRange {
+                field: "materialized Generic index cleanup",
+                cursor: self.cleanup_generic_index_cursor,
+                member_count: self.source_generic_index_count,
             });
         }
         self.restore_manifest.validate()?;
@@ -700,6 +768,43 @@ impl RestoreOperationRecord {
             return Err(RestoreRecordError::InvalidPhasePayload {
                 phase: self.phase,
                 reason: "source cursor presence must match non-empty raw source progress",
+            });
+        }
+        if self.source_generic_index_count == 0 && self.source_generic_index_cursor.is_some() {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "source Generic index cursor requires non-empty progress",
+            });
+        }
+        if (self.source_generic_index_count == 0)
+            != (self.source_generic_index_rolling_digest == [0; SHA256_BYTES])
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "source Generic index count and digest are inconsistent",
+            });
+        }
+        if (self.source_generic_index_count > 0 || self.source_generic_index_seal.is_some())
+            && !self.source_paths_eof
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "source Generic index copying requires path EOF",
+            });
+        }
+        if self
+            .source_generic_index_seal
+            .is_some_and(|seal| seal != self.source_generic_index_rolling_digest)
+        {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "source Generic index seal must equal its rolling digest",
+            });
+        }
+        if self.source_eof != (self.source_paths_eof && self.source_generic_index_seal.is_some()) {
+            return Err(RestoreRecordError::InvalidPhasePayload {
+                phase: self.phase,
+                reason: "source EOF requires both path and Generic index closures",
             });
         }
         if self.next_member_sequence > self.source_member_count {
@@ -799,6 +904,31 @@ impl RestoreOperationRecord {
                         phase: self.phase,
                         reason:
                             "commit-source restore must exactly match its immutable commit closure",
+                    });
+                }
+                let source_generic_indexes_match_base_commit = self.source_generic_index_count
+                    == source_commit.generic_index_count
+                    && self.source_generic_index_rolling_digest
+                        == source_commit.generic_index_digest;
+                if self.source_generic_index_seal.is_some()
+                    != self.source_generic_indexes_match_base_commit.is_some()
+                    || self
+                        .source_generic_indexes_match_base_commit
+                        .is_some_and(|matches| matches != source_generic_indexes_match_base_commit)
+                {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: self.phase,
+                        reason:
+                            "source/base-commit Generic index match must equal the sealed closure",
+                    });
+                }
+                if matches!(self.source, RestoreSource::Commit { .. })
+                    && self.source_generic_indexes_match_base_commit == Some(false)
+                {
+                    return Err(RestoreRecordError::InvalidPhasePayload {
+                        phase: self.phase,
+                        reason:
+                            "commit-source restore must exactly match its Generic index closure",
                     });
                 }
                 if *destination_committed_at_unix_seconds == 0 {
@@ -920,6 +1050,12 @@ impl RestoreOperationRecord {
         put_commit_provenance(&mut encoded, &self.commit_provenance)?;
         encoded.push(self.phase.into());
         put_optional_path(&mut encoded, self.source_cursor.as_ref());
+        encoded.push(u8::from(self.source_paths_eof));
+        put_optional_path(&mut encoded, self.source_generic_index_cursor.as_ref());
+        encoded.extend_from_slice(&self.source_generic_index_count.to_be_bytes());
+        encoded.extend_from_slice(&self.source_generic_index_rolling_digest);
+        put_optional_fixed(&mut encoded, self.source_generic_index_seal.as_ref());
+        put_optional_boolean(&mut encoded, self.source_generic_indexes_match_base_commit);
         encoded.push(u8::from(self.source_eof));
         encoded.extend_from_slice(&self.source_member_count.to_be_bytes());
         encoded.extend_from_slice(&self.source_member_rolling_digest);
@@ -929,6 +1065,7 @@ impl RestoreOperationRecord {
         encoded.extend_from_slice(&self.member_rolling_digest);
         put_optional_fixed(&mut encoded, self.member_seal.as_ref());
         encoded.extend_from_slice(&self.cleanup_member_cursor.to_be_bytes());
+        encoded.extend_from_slice(&self.cleanup_generic_index_cursor.to_be_bytes());
         put_optional_result(&mut encoded, self.result.as_ref());
         put_optional_terminal_error(&mut encoded, self.terminal_error.as_ref())?;
         Ok(encoded)
@@ -968,7 +1105,12 @@ impl RestoreOperationRecord {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, RestoreRecordError> {
         match encoded.first().copied() {
-            Some(RESTORE_OPERATION_VALUE_FORMAT_VERSION) => Self::decode_v5(encoded),
+            Some(RESTORE_OPERATION_VALUE_FORMAT_VERSION) => {
+                Self::decode_versioned(encoded, RESTORE_OPERATION_VALUE_FORMAT_VERSION)
+            }
+            Some(LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION) => {
+                Self::decode_versioned(encoded, LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION)
+            }
             Some(RESTORE_MEMBER_VALUE_FORMAT_VERSION) => decode_legacy_v4_operation(encoded),
             Some(actual) => Err(RestoreRecordError::UnsupportedValueVersion {
                 actual,
@@ -982,9 +1124,9 @@ impl RestoreOperationRecord {
         }
     }
 
-    fn decode_v5(encoded: &[u8]) -> Result<Self, RestoreRecordError> {
+    fn decode_versioned(encoded: &[u8], value_version: u8) -> Result<Self, RestoreRecordError> {
         let mut decoder = Decoder::new(encoded);
-        decoder.require_value_version(RESTORE_OPERATION_VALUE_FORMAT_VERSION)?;
+        decoder.require_value_version(value_version)?;
         let operation_id = OperationId::from_bytes(decoder.fixed("operation_id")?);
         let identity_digest = decoder.fixed("identity_digest")?;
         let initialization_digest = decoder.optional_fixed("initialization_digest")?;
@@ -1003,10 +1145,43 @@ impl RestoreOperationRecord {
             logical_size: decoder.u64("restore_manifest.logical_size")?,
             content_type: decoder.string("restore_manifest.content_type")?,
         };
-        let commit_provenance = decoder.commit_provenance()?;
+        let commit_provenance = decoder.commit_provenance(value_version)?;
         let phase = decode_durable_enum(decoder.u8("phase")?)?;
         let source_cursor = decoder.optional_path("source_cursor")?;
+        let (
+            source_paths_eof,
+            source_generic_index_cursor,
+            source_generic_index_count,
+            source_generic_index_rolling_digest,
+            source_generic_index_seal,
+            source_generic_indexes_match_base_commit,
+        ) = if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+            (
+                decoder.boolean("source_paths_eof")?,
+                decoder.optional_path("source_generic_index_cursor")?,
+                decoder.u64("source_generic_index_count")?,
+                decoder.fixed("source_generic_index_rolling_digest")?,
+                decoder.optional_fixed("source_generic_index_seal")?,
+                decoder.optional_boolean("source_generic_indexes_match_base_commit")?,
+            )
+        } else {
+            (false, None, 0, [0; SHA256_BYTES], None, None)
+        };
         let source_eof = decoder.boolean("source_eof")?;
+        let (source_paths_eof, source_generic_index_seal, source_generic_indexes_match_base_commit) =
+            if value_version == LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+                (
+                    source_eof,
+                    source_eof.then_some([0; SHA256_BYTES]),
+                    source_eof.then_some(true),
+                )
+            } else {
+                (
+                    source_paths_eof,
+                    source_generic_index_seal,
+                    source_generic_indexes_match_base_commit,
+                )
+            };
         let source_member_count = decoder.u64("source_member_count")?;
         let source_member_rolling_digest = decoder.fixed("source_member_rolling_digest")?;
         let source_member_seal = decoder.optional_fixed("source_member_seal")?;
@@ -1015,6 +1190,12 @@ impl RestoreOperationRecord {
         let member_rolling_digest = decoder.fixed("member_rolling_digest")?;
         let member_seal = decoder.optional_fixed("member_seal")?;
         let cleanup_member_cursor = decoder.u64("cleanup_member_cursor")?;
+        let cleanup_generic_index_cursor =
+            if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+                decoder.u64("cleanup_generic_index_cursor")?
+            } else {
+                0
+            };
         let result = decoder.optional_result("result")?;
         let terminal_error = decoder.optional_terminal_error("terminal_error")?;
         decoder.finish()?;
@@ -1032,6 +1213,12 @@ impl RestoreOperationRecord {
             commit_provenance,
             phase,
             source_cursor,
+            source_paths_eof,
+            source_generic_index_cursor,
+            source_generic_index_count,
+            source_generic_index_rolling_digest,
+            source_generic_index_seal,
+            source_generic_indexes_match_base_commit,
             source_eof,
             source_member_count,
             source_member_rolling_digest,
@@ -1041,6 +1228,7 @@ impl RestoreOperationRecord {
             member_rolling_digest,
             member_seal,
             cleanup_member_cursor,
+            cleanup_generic_index_cursor,
             result,
             terminal_error,
         };
@@ -1288,6 +1476,12 @@ fn validate_restore_phase(
         RestorePhase::Preparing => {
             if record.initialization_digest.is_some()
                 || record.source_eof
+                || record.source_paths_eof
+                || record.source_generic_index_cursor.is_some()
+                || record.source_generic_index_count != 0
+                || record.source_generic_index_rolling_digest != [0; SHA256_BYTES]
+                || record.source_generic_index_seal.is_some()
+                || record.source_generic_indexes_match_base_commit.is_some()
                 || record.source_member_count != 0
                 || record.source_member_rolling_digest != [0; SHA256_BYTES]
                 || record.source_member_seal.is_some()
@@ -1297,6 +1491,7 @@ fn validate_restore_phase(
                 || destination_binding.is_some()
                 || !commit_closure_is_pristine(closure)
                 || record.cleanup_member_cursor != 0
+                || record.cleanup_generic_index_cursor != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
             {
@@ -1311,6 +1506,7 @@ fn validate_restore_phase(
                 || destination_binding.is_some()
                 || !commit_closure_is_pristine(closure)
                 || record.cleanup_member_cursor != 0
+                || record.cleanup_generic_index_cursor != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
             {
@@ -1322,10 +1518,14 @@ fn validate_restore_phase(
                 || !record.source_eof
                 || record.source_member_seal != Some(record.source_member_rolling_digest)
                 || record.source_matches_base_commit.is_none()
+                || record.source_generic_index_seal
+                    != Some(record.source_generic_index_rolling_digest)
+                || record.source_generic_indexes_match_base_commit.is_none()
                 || record.member_seal != Some(record.member_rolling_digest)
                 || destination_manifests.is_some()
                 || !commit_closure_is_pristine(closure)
                 || record.cleanup_member_cursor != 0
+                || record.cleanup_generic_index_cursor != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
             {
@@ -1339,6 +1539,9 @@ fn validate_restore_phase(
                 || !record.source_eof
                 || record.source_member_seal != Some(record.source_member_rolling_digest)
                 || record.source_matches_base_commit.is_none()
+                || record.source_generic_index_seal
+                    != Some(record.source_generic_index_rolling_digest)
+                || record.source_generic_indexes_match_base_commit.is_none()
                 || record.member_seal != Some(record.member_rolling_digest)
                 || destination_binding.is_none()
                 || destination_manifests.is_none()
@@ -1348,7 +1551,9 @@ fn validate_restore_phase(
                 || closure.revision_seal.is_some()
                 || closure.parent_seal.is_some()
                 || record.cleanup_member_cursor != 0
+                || record.cleanup_generic_index_cursor != 0
                 || closure.cleanup_member_count != 0
+                || closure.cleanup_generic_index_count != 0
                 || closure.cleanup_revision_count != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
@@ -1363,6 +1568,9 @@ fn validate_restore_phase(
                 || !record.source_eof
                 || record.source_member_seal != Some(record.source_member_rolling_digest)
                 || record.source_matches_base_commit.is_none()
+                || record.source_generic_index_seal
+                    != Some(record.source_generic_index_rolling_digest)
+                || record.source_generic_indexes_match_base_commit.is_none()
                 || record.member_seal != Some(record.member_rolling_digest)
                 || destination_binding.is_none()
                 || destination_manifests.is_none()
@@ -1371,7 +1579,9 @@ fn validate_restore_phase(
                 || closure.parent_seal.is_some()
                 || !commit_closure_matches_materialized(record, closure)
                 || record.cleanup_member_cursor != 0
+                || record.cleanup_generic_index_cursor != 0
                 || closure.cleanup_member_count != 0
+                || closure.cleanup_generic_index_count != 0
                 || closure.cleanup_revision_count != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
@@ -1384,12 +1594,16 @@ fn validate_restore_phase(
                 || !record.source_eof
                 || record.source_member_seal != Some(record.source_member_rolling_digest)
                 || record.source_matches_base_commit.is_none()
+                || record.source_generic_index_seal
+                    != Some(record.source_generic_index_rolling_digest)
+                || record.source_generic_indexes_match_base_commit.is_none()
                 || record.member_seal != Some(record.member_rolling_digest)
                 || destination_binding.is_none()
                 || destination_manifests.is_none()
                 || !commit_closure_is_sealed(closure)
                 || !commit_closure_matches_materialized(record, closure)
                 || record.cleanup_member_cursor != 0
+                || record.cleanup_generic_index_cursor != 0
                 || record.result.is_some()
                 || record.terminal_error.is_some()
             {
@@ -1401,12 +1615,16 @@ fn validate_restore_phase(
                 || !record.source_eof
                 || record.source_member_seal != Some(record.source_member_rolling_digest)
                 || record.source_matches_base_commit.is_none()
+                || record.source_generic_index_seal
+                    != Some(record.source_generic_index_rolling_digest)
+                || record.source_generic_indexes_match_base_commit.is_none()
                 || record.member_seal != Some(record.member_rolling_digest)
                 || destination_binding.is_none()
                 || destination_manifests.is_none()
                 || !commit_closure_is_sealed(closure)
                 || !commit_closure_matches_materialized(record, closure)
                 || record.cleanup_member_cursor != 0
+                || record.cleanup_generic_index_cursor != 0
                 || record.result.is_none()
                 || record.terminal_error.is_some()
             {
@@ -1415,7 +1633,9 @@ fn validate_restore_phase(
         }
         RestorePhase::Aborting => {
             if record.cleanup_member_cursor != 0
+                || record.cleanup_generic_index_cursor != 0
                 || closure.cleanup_member_count != 0
+                || closure.cleanup_generic_index_count != 0
                 || closure.cleanup_revision_count != 0
                 || record.result.is_some()
                 || record.terminal_error.is_none()
@@ -1430,6 +1650,7 @@ fn validate_restore_phase(
         }
         RestorePhase::Cleaned => {
             if record.cleanup_member_cursor != record.next_member_sequence
+                || record.cleanup_generic_index_cursor != record.source_generic_index_count
                 || !commit_cleanup_complete(&record.commit_provenance)
                 || record.result.is_some()
                 || record.terminal_error.is_none()
@@ -1494,6 +1715,11 @@ fn commit_closure_is_pristine(closure: &RestoreCommitClosureProgress) -> bool {
     closure.member_cursor.is_none()
         && closure.member_count == 0
         && closure.member_digest == [0; SHA256_BYTES]
+        && !closure.path_members_complete
+        && closure.generic_index_cursor.is_none()
+        && closure.generic_index_count == 0
+        && closure.generic_index_digest == [0; SHA256_BYTES]
+        && !closure.generic_indexes_complete
         && closure.member_seal.is_none()
         && closure.revision_ref_count == 0
         && closure.revision_cursor.is_none()
@@ -1502,11 +1728,14 @@ fn commit_closure_is_pristine(closure: &RestoreCommitClosureProgress) -> bool {
         && closure.revision_seal.is_none()
         && closure.parent_seal.is_none()
         && closure.cleanup_member_count == 0
+        && closure.cleanup_generic_index_count == 0
         && closure.cleanup_revision_count == 0
 }
 
 fn commit_closure_is_sealed(closure: &RestoreCommitClosureProgress) -> bool {
-    closure.member_seal == Some(closure.member_digest)
+    closure.path_members_complete
+        && closure.generic_indexes_complete
+        && closure.member_seal == Some(closure.member_digest)
         && closure.revision_seal_count == closure.revision_ref_count
         && closure.revision_seal == Some(closure.revision_digest)
         && closure.parent_seal == Some(closure.parent_digest)
@@ -1522,6 +1751,8 @@ fn commit_closure_matches_materialized(
         .is_some_and(|final_count| closure.member_count == final_count)
         && closure.revision_ref_count >= 2
         && closure.revision_ref_count <= closure.member_count
+        && closure.generic_index_count == record.source_generic_index_count
+        && closure.generic_index_digest == record.source_generic_index_rolling_digest
 }
 
 fn commit_cleanup_complete(provenance: &RestoreCommitProvenance) -> bool {
@@ -1529,6 +1760,8 @@ fn commit_cleanup_complete(provenance: &RestoreCommitProvenance) -> bool {
         RestoreCommitProvenance::MissingLegacyV4 => true,
         RestoreCommitProvenance::V5(provenance) => {
             provenance.closure.cleanup_member_count == provenance.closure.member_count
+                && provenance.closure.cleanup_generic_index_count
+                    == provenance.closure.generic_index_count
                 && provenance.closure.cleanup_revision_count
                     == provenance.closure.revision_ref_count
         }
@@ -1641,6 +1874,8 @@ fn put_commit_provenance(
     encoded.extend_from_slice(&source_commit.unique_revision_count.to_be_bytes());
     encoded.extend_from_slice(&source_commit.revision_digest);
     encoded.extend_from_slice(&source_commit.parent_digest);
+    encoded.extend_from_slice(&source_commit.generic_index_count.to_be_bytes());
+    encoded.extend_from_slice(&source_commit.generic_index_digest);
     encoded.extend_from_slice(&destination_committed_at_unix_seconds.to_be_bytes());
     match destination_binding {
         None => encoded.push(0),
@@ -1664,6 +1899,11 @@ fn put_commit_provenance(
     put_optional_path(encoded, closure.member_cursor.as_ref());
     encoded.extend_from_slice(&closure.member_count.to_be_bytes());
     encoded.extend_from_slice(&closure.member_digest);
+    encoded.push(u8::from(closure.path_members_complete));
+    put_optional_path(encoded, closure.generic_index_cursor.as_ref());
+    encoded.extend_from_slice(&closure.generic_index_count.to_be_bytes());
+    encoded.extend_from_slice(&closure.generic_index_digest);
+    encoded.push(u8::from(closure.generic_indexes_complete));
     put_optional_fixed(encoded, closure.member_seal.as_ref());
     encoded.extend_from_slice(&closure.revision_ref_count.to_be_bytes());
     put_optional_fixed(
@@ -1679,6 +1919,7 @@ fn put_commit_provenance(
     encoded.extend_from_slice(&closure.parent_digest);
     put_optional_fixed(encoded, closure.parent_seal.as_ref());
     encoded.extend_from_slice(&closure.cleanup_member_count.to_be_bytes());
+    encoded.extend_from_slice(&closure.cleanup_generic_index_count.to_be_bytes());
     encoded.extend_from_slice(&closure.cleanup_revision_count.to_be_bytes());
     match destination_head_generation {
         None => encoded.push(0),
@@ -1829,6 +2070,12 @@ fn decode_legacy_v4_operation(
         commit_provenance: RestoreCommitProvenance::MissingLegacyV4,
         phase,
         source_cursor,
+        source_paths_eof: source_eof,
+        source_generic_index_cursor: None,
+        source_generic_index_count: 0,
+        source_generic_index_rolling_digest: [0; SHA256_BYTES],
+        source_generic_index_seal: source_eof.then_some([0; SHA256_BYTES]),
+        source_generic_indexes_match_base_commit: None,
         source_eof,
         source_member_count: next_member_sequence,
         source_member_rolling_digest: member_rolling_digest,
@@ -1838,6 +2085,7 @@ fn decode_legacy_v4_operation(
         member_rolling_digest,
         member_seal,
         cleanup_member_cursor,
+        cleanup_generic_index_cursor: 0,
         result,
         terminal_error,
     };
@@ -1928,7 +2176,10 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn commit_provenance(&mut self) -> Result<RestoreCommitProvenance, RestoreRecordError> {
+    fn commit_provenance(
+        &mut self,
+        value_version: u8,
+    ) -> Result<RestoreCommitProvenance, RestoreRecordError> {
         let source_commit = RestoreSourceCommitSeal {
             commit_id: CommitId::from_bytes(self.fixed("source_commit.commit_id")?),
             content_digest_uri: self.string("source_commit.content_digest_uri")?,
@@ -1941,6 +2192,16 @@ impl<'a> Decoder<'a> {
             unique_revision_count: self.u64("source_commit.unique_revision_count")?,
             revision_digest: self.fixed("source_commit.revision_digest")?,
             parent_digest: self.fixed("source_commit.parent_digest")?,
+            generic_index_count: if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+                self.u64("source_commit.generic_index_count")?
+            } else {
+                0
+            },
+            generic_index_digest: if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+                self.fixed("source_commit.generic_index_digest")?
+            } else {
+                [0; SHA256_BYTES]
+            },
         };
         let destination_committed_at_unix_seconds =
             self.u64("destination_committed_at_unix_seconds")?;
@@ -1982,7 +2243,30 @@ impl<'a> Decoder<'a> {
         let member_cursor = self.optional_path("commit_closure.member_cursor")?;
         let member_count = self.u64("commit_closure.member_count")?;
         let member_digest = self.fixed("commit_closure.member_digest")?;
+        let (
+            path_members_complete,
+            generic_index_cursor,
+            generic_index_count,
+            generic_index_digest,
+            generic_indexes_complete,
+        ) = if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+            (
+                self.boolean("commit_closure.path_members_complete")?,
+                self.optional_path("commit_closure.generic_index_cursor")?,
+                self.u64("commit_closure.generic_index_count")?,
+                self.fixed("commit_closure.generic_index_digest")?,
+                self.boolean("commit_closure.generic_indexes_complete")?,
+            )
+        } else {
+            (false, None, 0, [0; SHA256_BYTES], false)
+        };
         let member_seal = self.optional_fixed("commit_closure.member_seal")?;
+        let (path_members_complete, generic_indexes_complete) =
+            if value_version == LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION {
+                (member_seal.is_some(), member_seal.is_some())
+            } else {
+                (path_members_complete, generic_indexes_complete)
+            };
         let revision_ref_count = self.u64("commit_closure.revision_ref_count")?;
         let revision_cursor = self
             .optional_fixed("commit_closure.revision_cursor")?
@@ -1993,6 +2277,12 @@ impl<'a> Decoder<'a> {
         let parent_digest = self.fixed("commit_closure.parent_digest")?;
         let parent_seal = self.optional_fixed("commit_closure.parent_seal")?;
         let cleanup_member_count = self.u64("commit_closure.cleanup_member_count")?;
+        let cleanup_generic_index_count = if value_version == RESTORE_OPERATION_VALUE_FORMAT_VERSION
+        {
+            self.u64("commit_closure.cleanup_generic_index_count")?
+        } else {
+            0
+        };
         let cleanup_revision_count = self.u64("commit_closure.cleanup_revision_count")?;
         let destination_head_generation = match self.u8("destination_head_generation")? {
             0 => None,
@@ -2013,6 +2303,11 @@ impl<'a> Decoder<'a> {
                     member_cursor,
                     member_count,
                     member_digest,
+                    path_members_complete,
+                    generic_index_cursor,
+                    generic_index_count,
+                    generic_index_digest,
+                    generic_indexes_complete,
                     member_seal,
                     revision_ref_count,
                     revision_cursor,
@@ -2022,6 +2317,7 @@ impl<'a> Decoder<'a> {
                     parent_digest,
                     parent_seal,
                     cleanup_member_count,
+                    cleanup_generic_index_count,
                     cleanup_revision_count,
                 },
                 destination_head_generation,
@@ -2267,6 +2563,8 @@ mod tests {
                     unique_revision_count: 1,
                     revision_digest: [0x23; SHA256_BYTES],
                     parent_digest: [0; SHA256_BYTES],
+                    generic_index_count: 0,
+                    generic_index_digest: [0; SHA256_BYTES],
                 },
                 destination_committed_at_unix_seconds: 7,
                 destination_binding: None,
@@ -2274,6 +2572,11 @@ mod tests {
                     member_cursor: None,
                     member_count: 0,
                     member_digest: [0; SHA256_BYTES],
+                    path_members_complete: false,
+                    generic_index_cursor: None,
+                    generic_index_count: 0,
+                    generic_index_digest: [0; SHA256_BYTES],
+                    generic_indexes_complete: false,
                     member_seal: None,
                     revision_ref_count: 0,
                     revision_cursor: None,
@@ -2287,12 +2590,19 @@ mod tests {
                     ),
                     parent_seal: None,
                     cleanup_member_count: 0,
+                    cleanup_generic_index_count: 0,
                     cleanup_revision_count: 0,
                 },
                 destination_head_generation: None,
             })),
             phase,
             source_cursor: None,
+            source_paths_eof: false,
+            source_generic_index_cursor: None,
+            source_generic_index_count: 0,
+            source_generic_index_rolling_digest: [0; SHA256_BYTES],
+            source_generic_index_seal: None,
+            source_generic_indexes_match_base_commit: None,
             source_eof: false,
             source_member_count: 0,
             source_member_rolling_digest: [0; SHA256_BYTES],
@@ -2302,9 +2612,17 @@ mod tests {
             member_rolling_digest: [0; SHA256_BYTES],
             member_seal: None,
             cleanup_member_cursor: 0,
+            cleanup_generic_index_cursor: 0,
             result: None,
             terminal_error: None,
         }
+    }
+
+    fn seal_empty_generic_index_source(record: &mut RestoreOperationRecord) {
+        record.source_paths_eof = true;
+        record.source_generic_index_seal = Some([0; SHA256_BYTES]);
+        record.source_generic_indexes_match_base_commit = Some(true);
+        record.source_eof = true;
     }
 
     fn bound_source_operation() -> RestoreOperationRecord {
@@ -2312,7 +2630,7 @@ mod tests {
             .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
             .unwrap();
         record.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
-        record.source_eof = true;
+        seal_empty_generic_index_source(&mut record);
         record.source_member_count = 1;
         record.source_member_rolling_digest = [7; SHA256_BYTES];
         record.next_member_sequence = 1;
@@ -2420,6 +2738,90 @@ mod tests {
         encoded
     }
 
+    fn legacy_v5_preparing_operation() -> Vec<u8> {
+        let record = operation(RestorePhase::Preparing);
+        let RestoreCommitProvenance::V5(provenance) = &record.commit_provenance else {
+            unreachable!();
+        };
+        let source_commit = &provenance.source_commit;
+        let closure = &provenance.closure;
+        let mut encoded = Vec::new();
+        encoded.push(LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION);
+        encoded.extend_from_slice(record.operation_id.as_bytes());
+        encoded.extend_from_slice(&record.identity_digest);
+        put_optional_fixed(&mut encoded, record.initialization_digest.as_ref());
+        put_bytes(&mut encoded, record.source_workbench_id.as_bytes());
+        encoded.extend_from_slice(record.source_workspace_incarnation_id.as_bytes());
+        put_source(&mut encoded, record.source);
+        put_bytes(&mut encoded, record.destination_workbench_id.as_bytes());
+        encoded.extend_from_slice(record.destination_workspace_incarnation_id.as_bytes());
+        put_manifest_identity(
+            &mut encoded,
+            record
+                .destination_restore_manifest_identity
+                .as_ref()
+                .unwrap(),
+        );
+        put_bytes(
+            &mut encoded,
+            record.restore_manifest.body_digest_uri.as_bytes(),
+        );
+        encoded.extend_from_slice(&record.restore_manifest.logical_size.to_be_bytes());
+        put_bytes(
+            &mut encoded,
+            record.restore_manifest.content_type.as_bytes(),
+        );
+        encoded.extend_from_slice(source_commit.commit_id.as_bytes());
+        put_bytes(&mut encoded, source_commit.content_digest_uri.as_bytes());
+        put_bytes(&mut encoded, source_commit.manifest_digest_uri.as_bytes());
+        encoded.extend_from_slice(source_commit.tree_manifest_revision_id.as_bytes());
+        encoded.extend_from_slice(&source_commit.member_count.to_be_bytes());
+        encoded.extend_from_slice(&source_commit.member_digest);
+        encoded.extend_from_slice(&source_commit.unique_revision_count.to_be_bytes());
+        encoded.extend_from_slice(&source_commit.revision_digest);
+        encoded.extend_from_slice(&source_commit.parent_digest);
+        encoded.extend_from_slice(
+            &provenance
+                .destination_committed_at_unix_seconds
+                .to_be_bytes(),
+        );
+        encoded.push(0); // destination binding
+        put_optional_path(&mut encoded, closure.member_cursor.as_ref());
+        encoded.extend_from_slice(&closure.member_count.to_be_bytes());
+        encoded.extend_from_slice(&closure.member_digest);
+        put_optional_fixed(&mut encoded, closure.member_seal.as_ref());
+        encoded.extend_from_slice(&closure.revision_ref_count.to_be_bytes());
+        put_optional_fixed(
+            &mut encoded,
+            closure
+                .revision_cursor
+                .as_ref()
+                .map(ArtifactRevisionId::as_bytes),
+        );
+        encoded.extend_from_slice(&closure.revision_seal_count.to_be_bytes());
+        encoded.extend_from_slice(&closure.revision_digest);
+        put_optional_fixed(&mut encoded, closure.revision_seal.as_ref());
+        encoded.extend_from_slice(&closure.parent_digest);
+        put_optional_fixed(&mut encoded, closure.parent_seal.as_ref());
+        encoded.extend_from_slice(&closure.cleanup_member_count.to_be_bytes());
+        encoded.extend_from_slice(&closure.cleanup_revision_count.to_be_bytes());
+        encoded.push(0); // destination head generation
+        encoded.push(record.phase.into());
+        put_optional_path(&mut encoded, record.source_cursor.as_ref());
+        encoded.push(u8::from(record.source_eof));
+        encoded.extend_from_slice(&record.source_member_count.to_be_bytes());
+        encoded.extend_from_slice(&record.source_member_rolling_digest);
+        put_optional_fixed(&mut encoded, record.source_member_seal.as_ref());
+        put_optional_boolean(&mut encoded, record.source_matches_base_commit);
+        encoded.extend_from_slice(&record.next_member_sequence.to_be_bytes());
+        encoded.extend_from_slice(&record.member_rolling_digest);
+        put_optional_fixed(&mut encoded, record.member_seal.as_ref());
+        encoded.extend_from_slice(&record.cleanup_member_cursor.to_be_bytes());
+        put_optional_result(&mut encoded, record.result.as_ref());
+        put_optional_terminal_error(&mut encoded, record.terminal_error.as_ref()).unwrap();
+        encoded
+    }
+
     fn v5_phase_offset(encoded: &[u8]) -> usize {
         let mut decoder = Decoder::new(encoded);
         decoder
@@ -2443,21 +2845,23 @@ mod tests {
         decoder.string("restore_manifest.body_digest_uri").unwrap();
         decoder.u64("restore_manifest.logical_size").unwrap();
         decoder.string("restore_manifest.content_type").unwrap();
-        decoder.commit_provenance().unwrap();
+        decoder
+            .commit_provenance(RESTORE_OPERATION_VALUE_FORMAT_VERSION)
+            .unwrap();
         decoder.offset
     }
 
     #[test]
-    fn restore_operation_v5_has_frozen_golden_digest_and_strict_envelope() {
+    fn restore_operation_v6_has_frozen_golden_digest_and_strict_envelope() {
         let record = operation(RestorePhase::Preparing);
         let encoded = record.encode().unwrap();
         assert_eq!(encoded[0], RESTORE_OPERATION_VALUE_FORMAT_VERSION);
-        assert_eq!(encoded.len(), 809);
+        assert_eq!(encoded.len(), 952);
         assert_eq!(
             <[u8; SHA256_BYTES]>::from(Sha256::digest(&encoded)),
             [
-                187, 141, 176, 65, 197, 79, 149, 230, 56, 116, 177, 115, 83, 238, 179, 92, 61, 20,
-                150, 171, 221, 149, 103, 217, 151, 30, 200, 95, 251, 50, 104, 20,
+                226, 8, 70, 170, 145, 81, 148, 158, 122, 225, 7, 132, 154, 68, 14, 27, 180, 242,
+                123, 163, 69, 205, 160, 15, 163, 103, 182, 254, 215, 125, 78, 92,
             ]
         );
         assert_eq!(RestoreOperationRecord::decode(&encoded).unwrap(), record);
@@ -2473,6 +2877,27 @@ mod tests {
         assert_eq!(
             RestoreOperationRecord::decode(&trailing),
             Err(RestoreRecordError::TrailingBytes { count: 1 })
+        );
+    }
+
+    #[test]
+    fn restore_operation_v5_dual_decode_does_not_claim_a_generic_index_closure() {
+        let encoded = legacy_v5_preparing_operation();
+        assert_eq!(encoded[0], LEGACY_RESTORE_OPERATION_VALUE_FORMAT_VERSION);
+        let decoded = RestoreOperationRecord::decode(&encoded).unwrap();
+        assert_eq!(decoded, operation(RestorePhase::Preparing));
+        assert_eq!(decoded.source_generic_index_count, 0);
+        assert!(decoded.source_generic_index_seal.is_none());
+        let RestoreCommitProvenance::V5(provenance) = &decoded.commit_provenance else {
+            unreachable!();
+        };
+        assert_eq!(provenance.source_commit.generic_index_count, 0);
+        assert_eq!(provenance.closure.generic_index_count, 0);
+        assert!(!provenance.closure.path_members_complete);
+        assert!(!provenance.closure.generic_indexes_complete);
+        assert_eq!(
+            decoded.encode().unwrap()[0],
+            RESTORE_OPERATION_VALUE_FORMAT_VERSION
         );
     }
 
@@ -2542,7 +2967,7 @@ mod tests {
             .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
             .unwrap();
         sealed.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
-        sealed.source_eof = true;
+        seal_empty_generic_index_source(&mut sealed);
         sealed.source_member_count = 1;
         sealed.source_member_rolling_digest = [7; SHA256_BYTES];
         sealed.next_member_sequence = 1;
@@ -2644,7 +3069,7 @@ mod tests {
             .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
             .unwrap();
         snapshot.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
-        snapshot.source_eof = true;
+        seal_empty_generic_index_source(&mut snapshot);
         snapshot.source_member_count = 1;
         snapshot.source_member_rolling_digest = [7; SHA256_BYTES];
         snapshot.next_member_sequence = 1;
@@ -2680,7 +3105,7 @@ mod tests {
             .apply(RestorePhase::Preparing, RestoreTransition::BeginCopying)
             .unwrap();
         clean.source_cursor = Some(NormalizedRelativePath::new("outputs/result").unwrap());
-        clean.source_eof = true;
+        seal_empty_generic_index_source(&mut clean);
         clean.source_member_count = 1;
         clean.source_member_rolling_digest = [0x22; SHA256_BYTES];
         clean.next_member_sequence = 1;
@@ -2850,7 +3275,7 @@ mod tests {
             prematurely_sealed.encode(),
             Err(RestoreRecordError::InvalidPhasePayload {
                 phase: RestorePhase::DestinationBuilding,
-                reason: "destination build requires staged manifests and unsealed commit progress",
+                reason: "commit member seal requires both destination member closures",
             })
         ));
 
@@ -2863,6 +3288,8 @@ mod tests {
                 closure.member_count = 3;
                 closure.member_digest = [9; SHA256_BYTES];
                 closure.revision_ref_count = 2;
+                closure.path_members_complete = true;
+                closure.generic_indexes_complete = true;
                 closure.parent_digest
             }
             RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),
@@ -3006,7 +3433,7 @@ mod tests {
             .unwrap();
         record.source_cursor =
             Some(NormalizedRelativePath::new("metadata/run_manifest.json").unwrap());
-        record.source_eof = true;
+        seal_empty_generic_index_source(&mut record);
         record.source_member_count = 1;
         record.source_member_rolling_digest = [7; SHA256_BYTES];
         record = record
@@ -3040,6 +3467,8 @@ mod tests {
         provenance.closure.member_count = 2;
         provenance.closure.member_digest = [9; SHA256_BYTES];
         provenance.closure.revision_ref_count = 2;
+        provenance.closure.path_members_complete = true;
+        provenance.closure.generic_indexes_complete = true;
         assert!(record
             .apply(
                 RestorePhase::DestinationBuilding,
@@ -3080,6 +3509,8 @@ mod tests {
         provenance.closure.member_count = 3;
         provenance.closure.member_digest = canonical_commit_digest;
         provenance.closure.revision_ref_count = 2;
+        provenance.closure.path_members_complete = true;
+        provenance.closure.generic_indexes_complete = true;
 
         let sealing = building
             .apply(
@@ -3116,6 +3547,8 @@ mod tests {
                 closure.member_count = 3;
                 closure.member_digest = [9; SHA256_BYTES];
                 closure.revision_ref_count = 2;
+                closure.path_members_complete = true;
+                closure.generic_indexes_complete = true;
                 closure.parent_digest
             }
             RestoreCommitProvenance::MissingLegacyV4 => unreachable!(),

@@ -380,6 +380,8 @@ mod tests {
             revision_digest: [7; SHA256_BYTES],
             parent_commits: Vec::new(),
             parent_digest: [0; SHA256_BYTES],
+            generic_index_count: 0,
+            generic_index_digest: [0; SHA256_BYTES],
             producer: Some("snapshot-query-test".to_owned()),
             lineage_projection: Vec::new(),
             consumer_count: 1,

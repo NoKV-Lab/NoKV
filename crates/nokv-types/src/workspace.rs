@@ -109,6 +109,11 @@ fixed_bytes_type!(
     FIXED_ID_BYTES
 );
 fixed_bytes_type!(
+    /// Never-reused identity for one durable Generic namespace-index generation.
+    GenericIndexGenerationId,
+    FIXED_ID_BYTES
+);
+fixed_bytes_type!(
     /// Stable request identity used for exact command replay.
     RequestId,
     FIXED_ID_BYTES
@@ -593,6 +598,7 @@ durable_enum! {
         Snapshot = 1,
         BuildCommit = 2,
         Restore = 3,
+        RegisterGenericIndex = 4,
     }
 }
 
@@ -651,6 +657,43 @@ durable_enum! {
         Restore = 3,
         CommitRetire = 4,
         Gc = 5,
+        RegisterGenericIndex = 6,
+    }
+}
+
+durable_enum! {
+    /// Durable lifecycle of one immutable Generic namespace-index generation.
+    pub enum GenericIndexGenerationState {
+        Building = 1,
+        Sealed = 2,
+        Retiring = 3,
+        Retired = 4,
+    }
+}
+
+durable_enum! {
+    /// Durable phase of one Generic namespace-index registration.
+    pub enum GenericIndexRegistrationPhase {
+        Preparing = 1,
+        Appending = 2,
+        Sealing = 3,
+        Publishing = 4,
+        Complete = 5,
+        Aborting = 6,
+        Cleaning = 7,
+        Cleaned = 8,
+        Quarantined = 9,
+    }
+}
+
+durable_enum! {
+    /// Exact owner kind for one strong Generic index-generation reference.
+    pub enum GenericIndexReferenceKind {
+        Current = 1,
+        Commit = 2,
+        BuildCommit = 3,
+        Restore = 4,
+        Registration = 5,
     }
 }
 
@@ -926,6 +969,7 @@ mod tests {
         let workspace = WorkspaceIncarnationId::from_bytes(bytes);
         let revision = ArtifactRevisionId::from_bytes(bytes);
         let operation = OperationId::from_bytes(bytes);
+        let generic_index_generation = GenericIndexGenerationId::from_bytes(bytes);
         let request = RequestId::from_bytes(bytes);
         let commit = CommitId::from_bytes(digest_bytes);
         let command_digest = CommandDigest::from_bytes(digest_bytes);
@@ -938,6 +982,7 @@ mod tests {
         assert_eq!(workspace.as_bytes(), &bytes);
         assert_eq!(revision.as_bytes(), &bytes);
         assert_eq!(operation.as_bytes(), &bytes);
+        assert_eq!(generic_index_generation.as_bytes(), &bytes);
         assert_eq!(request.as_bytes(), &bytes);
         assert_eq!(commit.as_bytes(), &digest_bytes);
         assert_eq!(command_digest.as_bytes(), &digest_bytes);
@@ -953,6 +998,10 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<ArtifactRevisionId>(), FIXED_ID_BYTES);
         assert_eq!(std::mem::size_of::<OperationId>(), FIXED_ID_BYTES);
+        assert_eq!(
+            std::mem::size_of::<GenericIndexGenerationId>(),
+            FIXED_ID_BYTES
+        );
         assert_eq!(std::mem::size_of::<RequestId>(), FIXED_ID_BYTES);
         assert_eq!(std::mem::size_of::<CommitId>(), SHA256_BYTES);
         assert_eq!(std::mem::size_of::<CommandDigest>(), SHA256_BYTES);
@@ -1068,6 +1117,7 @@ mod tests {
             (HistoryHoldKind::Snapshot, 1),
             (HistoryHoldKind::BuildCommit, 2),
             (HistoryHoldKind::Restore, 3),
+            (HistoryHoldKind::RegisterGenericIndex, 4),
         ]);
         assert_durable_registry(&[
             (HistoryHoldState::Active, 1),
@@ -1102,6 +1152,31 @@ mod tests {
             (OperationKind::Restore, 3),
             (OperationKind::CommitRetire, 4),
             (OperationKind::Gc, 5),
+            (OperationKind::RegisterGenericIndex, 6),
+        ]);
+        assert_durable_registry(&[
+            (GenericIndexGenerationState::Building, 1),
+            (GenericIndexGenerationState::Sealed, 2),
+            (GenericIndexGenerationState::Retiring, 3),
+            (GenericIndexGenerationState::Retired, 4),
+        ]);
+        assert_durable_registry(&[
+            (GenericIndexRegistrationPhase::Preparing, 1),
+            (GenericIndexRegistrationPhase::Appending, 2),
+            (GenericIndexRegistrationPhase::Sealing, 3),
+            (GenericIndexRegistrationPhase::Publishing, 4),
+            (GenericIndexRegistrationPhase::Complete, 5),
+            (GenericIndexRegistrationPhase::Aborting, 6),
+            (GenericIndexRegistrationPhase::Cleaning, 7),
+            (GenericIndexRegistrationPhase::Cleaned, 8),
+            (GenericIndexRegistrationPhase::Quarantined, 9),
+        ]);
+        assert_durable_registry(&[
+            (GenericIndexReferenceKind::Current, 1),
+            (GenericIndexReferenceKind::Commit, 2),
+            (GenericIndexReferenceKind::BuildCommit, 3),
+            (GenericIndexReferenceKind::Restore, 4),
+            (GenericIndexReferenceKind::Registration, 5),
         ]);
         assert_durable_registry(&[
             (PublishPhase::Uploading, 1),

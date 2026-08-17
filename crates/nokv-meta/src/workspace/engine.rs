@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use super::codec::{
     change_event_key, classify_schema_marker_for_open, encode_schema_marker,
-    validate_schema_marker, SchemaMarkerVersion, SCHEMA_ID, SYSTEM_SCHEMA_KEY,
+    validate_schema_marker, SCHEMA_ID, SYSTEM_SCHEMA_KEY,
 };
 use super::keyspace::{
     keyspaces, MetadataFamily, CHANGE_EVENT, COMMAND_DEDUPE, HISTORY, RECOVERY_OUTBOX, ROOT_FENCE,
@@ -616,10 +616,9 @@ impl MetaShard {
 
     fn open_domain(self) -> Result<Self, MetaError> {
         let schema = self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-        let schema_version =
-            classify_schema_marker_for_open(&schema).map_err(|error| MetaError::SchemaGate {
-                reason: error.to_string(),
-            })?;
+        classify_schema_marker_for_open(&schema).map_err(|error| MetaError::SchemaGate {
+            reason: error.to_string(),
+        })?;
         let shard = self.required_value(
             SYSTEM.id,
             SYSTEM_SHARD_IDENTITY_KEY,
@@ -664,34 +663,7 @@ impl MetaShard {
             "System(lease_clock_high_water)",
         )?;
         self.verify_recovery_chain_unlocked()?;
-        if schema_version == SchemaMarkerVersion::Format8 {
-            self.upgrade_format8_schema_marker(&schema)?;
-        }
         Ok(self)
-    }
-
-    fn upgrade_format8_schema_marker(&self, previous: &[u8]) -> Result<(), MetaError> {
-        let current = encode_schema_marker();
-        let txn = WriteTxn {
-            checks: vec![value_check(SYSTEM.id, SYSTEM_SCHEMA_KEY, previous)],
-            mutations: vec![Mutation::Put {
-                key: Key::new(SYSTEM.id, SYSTEM_SCHEMA_KEY),
-                value: current,
-            }],
-        };
-        match self.commit("upgrade format-8 schema marker", txn)? {
-            Commit::Applied => Ok(()),
-            Commit::Conflict => {
-                let observed =
-                    self.required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")?;
-                match validate_schema_marker(&observed) {
-                    Ok(()) => Ok(()),
-                    Err(_) => Err(MetaError::SchemaGate {
-                        reason: "format-8 schema upgrade lost its compare-and-swap".to_owned(),
-                    }),
-                }
-            }
-        }
     }
 
     pub fn current_read_version(&self) -> Result<ReadVersion, MetaError> {
@@ -4605,7 +4577,7 @@ mod tests {
     #[test]
     fn fresh_store_freezes_schema_shard_and_bootstrap_version() {
         let store = crate::workspace::test_support::memory(shard(1)).unwrap();
-        assert_eq!(keyspaces().len(), 26);
+        assert_eq!(keyspaces().len(), 29);
         assert_eq!(store.current_read_version().unwrap().get(), 1);
         assert_eq!(
             store.advance_owner_epoch(Some(epoch(1)), epoch(2)),
@@ -6278,125 +6250,55 @@ mod tests {
     }
 
     #[test]
-    fn format8_store_upgrades_without_rewriting_legacy_recovery_rows() {
+    fn format9_store_is_rejected_without_rewriting_its_marker_or_recovery_tail() {
         let temporary = tempdir().unwrap();
         let database = temporary.path().join("metadata");
-        let expected;
+        let expected_recovery;
+        let format9_marker;
         {
             let store = ready_file_store(&database);
-            expected = store.verify_recovery_chain().unwrap();
-            assert_eq!(expected.applied_recovery_lsn, 3);
-
-            for recovery_lsn in 1..=expected.applied_recovery_lsn {
-                let current_header_key = recovery_outbox_key(recovery_lsn);
-                let header = store
-                    .required_value(
-                        RECOVERY_OUTBOX.id,
-                        &current_header_key,
-                        "RecoveryOutbox header",
-                    )
-                    .unwrap();
-                let chunk_count = recovery_storage_chunk_count(&header).unwrap();
-                raw_put(
-                    &store,
-                    RECOVERY_OUTBOX.id,
-                    &recovery_outbox_scan_start(RecoveryKeyLayout::Format8, recovery_lsn),
-                    &header,
-                );
-                raw_delete(&store, RECOVERY_OUTBOX.id, &current_header_key);
-
-                for index in 0..chunk_count {
-                    let current_chunk_key = recovery_chunk_key(recovery_lsn, index);
-                    let chunk = store
-                        .required_value(
-                            RECOVERY_OUTBOX.id,
-                            &current_chunk_key,
-                            "RecoveryOutbox chunk",
-                        )
-                        .unwrap();
-                    raw_put(
-                        &store,
-                        RECOVERY_OUTBOX.id,
-                        &recovery_chunk_key_for_layout(
-                            RecoveryKeyLayout::Format8,
-                            recovery_lsn,
-                            index,
-                        ),
-                        &chunk,
-                    );
-                    raw_delete(&store, RECOVERY_OUTBOX.id, &current_chunk_key);
-                }
-            }
-
-            let mut format8_marker = encode_schema_marker();
-            let version_start = format8_marker.len() - std::mem::size_of::<u32>();
-            format8_marker[version_start..].copy_from_slice(&8_u32.to_be_bytes());
-            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format8_marker);
+            expected_recovery = store.verify_recovery_chain().unwrap();
+            format9_marker = {
+                let mut marker = encode_schema_marker();
+                let version_start = marker.len() - std::mem::size_of::<u32>();
+                marker[version_start..].copy_from_slice(&9_u32.to_be_bytes());
+                marker
+            };
+            raw_put(&store, SYSTEM.id, SYSTEM_SCHEMA_KEY, &format9_marker);
         }
 
-        let reopened = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
-        assert_eq!(reopened.verify_recovery_chain().unwrap(), expected);
-        assert_eq!(
-            reopened
-                .required_value(SYSTEM.id, SYSTEM_SCHEMA_KEY, "System(schema)")
-                .unwrap(),
-            encode_schema_marker()
-        );
-        for recovery_lsn in 1..=expected.applied_recovery_lsn {
-            reopened
-                .required_value(
-                    RECOVERY_OUTBOX.id,
-                    &recovery_outbox_scan_start(RecoveryKeyLayout::Format8, recovery_lsn),
-                    "legacy RecoveryOutbox header",
-                )
-                .unwrap();
-        }
+        assert!(matches!(
+            crate::workspace::test_support::open_file(&database, shard(1)),
+            Err(MetaError::SchemaGate { .. })
+        ));
 
-        let command = create_command(
-            &reopened,
-            request(9),
-            scoped_key(root(2), b"after-format8-upgrade"),
-            b"value",
-        );
-        reopened.execute(&command).unwrap();
-        let rows = reopened.recovery_outbox_after(0, 10).unwrap();
-        assert_eq!(
-            rows.iter().map(|row| row.recovery_lsn).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
-        );
-        assert_eq!(
-            reopened
-                .recovery_outbox_after(2, 10)
-                .unwrap()
-                .iter()
-                .map(|row| row.recovery_lsn)
-                .collect::<Vec<_>>(),
-            vec![3, 4]
-        );
-        assert_eq!(
-            reopened
-                .verify_recovery_chain()
-                .unwrap()
-                .applied_recovery_lsn,
-            4
-        );
-        reopened
-            .required_value(
-                RECOVERY_OUTBOX.id,
-                &recovery_outbox_key(4),
-                "format-9 RecoveryOutbox header",
-            )
+        let raw = crate::workspace::test_support::open_file_txn_store(&database).unwrap();
+        let snapshot = raw
+            .read(ReadBatch {
+                ops: vec![
+                    ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_SCHEMA_KEY)),
+                    ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_APPLIED_RECOVERY_LSN_KEY)),
+                    ReadOp::Get(Key::new(SYSTEM.id, SYSTEM_RECOVERY_CHAIN_DIGEST_KEY)),
+                ],
+            })
             .unwrap();
-        drop(reopened);
-
-        let mixed = crate::workspace::test_support::open_file(&database, shard(1)).unwrap();
+        let ReadResult::Get(marker) = &snapshot.results[0] else {
+            panic!("schema marker read must return a point value");
+        };
+        assert_eq!(marker.as_deref(), Some(format9_marker.as_slice()));
+        let ReadResult::Get(lsn) = &snapshot.results[1] else {
+            panic!("recovery LSN read must return a point value");
+        };
         assert_eq!(
-            mixed.recovery_outbox_after(3, 10).unwrap()[0].recovery_lsn,
-            4
+            lsn.as_deref(),
+            Some(encode_system_u64(expected_recovery.applied_recovery_lsn).as_slice())
         );
+        let ReadResult::Get(digest) = &snapshot.results[2] else {
+            panic!("recovery digest read must return a point value");
+        };
         assert_eq!(
-            mixed.verify_recovery_chain().unwrap().applied_recovery_lsn,
-            4
+            digest.as_deref(),
+            Some(encode_system_digest(expected_recovery.chain_digest).as_slice())
         );
     }
 
