@@ -3,6 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -11,14 +15,19 @@ use std::thread;
 use holt::Durability;
 use nokv_meta_store::conformance;
 use nokv_meta_store::{
-    Check, Commit, Key, Keyspace, Mutation, ReadBatch, ReadOp, ReadResult, Scan, ScanItem,
-    StoreError, StoreLimits, TxnStore, UnknownCommit, WriteTxn,
+    Check, CheckpointCatalogCommitment, CheckpointError, CheckpointFormatId,
+    CheckpointInstallState, Commit, FreshStoreCheckpointInstaller, Key, Keyspace, Mutation,
+    ReadBatch, ReadOp, ReadResult, Scan, ScanItem, StoreCheckpointEnvelope, StoreError,
+    StoreLimits, TxnStore, UnknownCommit, WholeStoreCheckpointSource, WriteTxn,
 };
 use tempfile::tempdir;
 
 #[cfg(feature = "read-stats")]
 use crate::HoltReadStatsSessionError;
-use crate::{HoltOptions, HoltStore, TreeBinding};
+use crate::{
+    HoltFreshCheckpointInstaller, HoltOptions, HoltRecoveryStagingAdoptionAuthority,
+    HoltRecoveryStagingIdentity, HoltStore, TreeBinding,
+};
 
 const FIRST: Keyspace = Keyspace::new(1);
 const SECOND: Keyspace = Keyspace::new(2);
@@ -90,6 +99,612 @@ fn assert_invalid_options(options: HoltOptions) {
         options.validate(false),
         Err(StoreError::InvalidRequest(_))
     ));
+}
+
+fn persist_control_finalize_for_test(path: &Path, identity: &HoltRecoveryStagingIdentity) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create durable control finalize receipt");
+    file.write_all(&identity.encode())
+        .expect("write durable control finalize receipt");
+    file.sync_all()
+        .expect("sync durable control finalize receipt");
+    drop(file);
+    File::open(path.parent().expect("control receipt parent"))
+        .and_then(|directory| directory.sync_all())
+        .expect("sync control finalize directory");
+}
+
+#[test]
+fn whole_store_checkpoint_installs_into_one_fresh_target() {
+    let source = memory_store([FIRST, SECOND]);
+    assert_eq!(put(&source, FIRST, b"first", b"one"), Commit::Applied);
+    assert_eq!(put(&source, SECOND, b"second", b"two"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+
+    let directory = tempdir().expect("create checkpoint target parent");
+    let target = directory.path().join("restored");
+    let restored = HoltFreshCheckpointInstaller::new(HoltOptions::file(
+        &target,
+        catalog([FIRST, SECOND]),
+        limits(),
+    ))
+    .install(&checkpoint)
+    .expect("install checkpoint");
+    assert!(crate::checkpoint::complete_marker_path(&target).is_file());
+
+    assert_eq!(get(&restored, FIRST, b"first"), Some(b"one".to_vec()));
+    assert_eq!(get(&restored, SECOND, b"second"), Some(b"two".to_vec()));
+    let reexported = restored.export_checkpoint().expect("re-export checkpoint");
+    assert_eq!(reexported, checkpoint);
+}
+
+#[test]
+fn checkpoint_install_rejects_format_and_catalog_before_creating_target() {
+    let source = memory_store([FIRST]);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create target parent");
+
+    let wrong_format = StoreCheckpointEnvelope::new(
+        CheckpointFormatId::new("other.checkpoint.v1").unwrap(),
+        checkpoint.catalog_commitment(),
+        checkpoint.image().to_vec(),
+    )
+    .unwrap();
+    let format_target = directory.path().join("wrong-format");
+    let error = match HoltFreshCheckpointInstaller::new(HoltOptions::file(
+        &format_target,
+        catalog([FIRST]),
+        limits(),
+    ))
+    .install(&wrong_format)
+    {
+        Ok(_) => panic!("wrong format checkpoint installed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.state(), CheckpointInstallState::Unchanged);
+    assert!(!format_target.exists());
+
+    let wrong_catalog = StoreCheckpointEnvelope::new(
+        checkpoint.format_id().clone(),
+        CheckpointCatalogCommitment::from_bytes([0x55; 32]),
+        checkpoint.image().to_vec(),
+    )
+    .unwrap();
+    let catalog_target = directory.path().join("wrong-catalog");
+    let error = match HoltFreshCheckpointInstaller::new(HoltOptions::file(
+        &catalog_target,
+        catalog([FIRST]),
+        limits(),
+    ))
+    .install(&wrong_catalog)
+    {
+        Ok(_) => panic!("wrong catalog checkpoint installed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.state(), CheckpointInstallState::Unchanged);
+    assert!(!catalog_target.exists());
+}
+
+#[test]
+fn catalog_commitment_binds_keyspace_to_physical_tree_mapping() {
+    let first = BTreeMap::from([(FIRST, "tree-a".to_owned()), (SECOND, "tree-b".to_owned())]);
+    let swapped = BTreeMap::from([(FIRST, "tree-b".to_owned()), (SECOND, "tree-a".to_owned())]);
+
+    assert_ne!(
+        crate::checkpoint::catalog_commitment(&first),
+        crate::checkpoint::catalog_commitment(&swapped)
+    );
+}
+
+#[test]
+fn checkpoint_validation_enforces_the_holt_record_budget() {
+    let source = memory_store([FIRST]);
+    assert_eq!(put(&source, FIRST, b"a", b"one"), Commit::Applied);
+    assert_eq!(put(&source, FIRST, b"b", b"two"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let options = HoltOptions::file("unused", catalog([FIRST]), limits());
+    let trees = options.validate(false).expect("validate test catalog");
+
+    let error = crate::checkpoint::validate_holt_checkpoint_image_with_record_limit(
+        checkpoint.image(),
+        &trees,
+        &options.limits,
+        1,
+    )
+    .expect_err("second record must cross the Holt-aligned checkpoint budget");
+    assert!(error.contains("record"));
+}
+
+#[test]
+fn malformed_or_foreign_holt_image_is_rejected_before_target_creation() {
+    let source = memory_store([FIRST, SECOND]);
+    assert_eq!(put(&source, FIRST, b"key", b"value"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create target parent");
+
+    let mut wrong_count = checkpoint.image().to_vec();
+    wrong_count[8..12].copy_from_slice(&3_u32.to_le_bytes());
+    let wrong_count = StoreCheckpointEnvelope::new(
+        checkpoint.format_id().clone(),
+        checkpoint.catalog_commitment(),
+        wrong_count,
+    )
+    .unwrap();
+    let count_target = directory.path().join("wrong-count");
+    let count_error = match HoltFreshCheckpointInstaller::new(HoltOptions::file(
+        &count_target,
+        catalog([FIRST, SECOND]),
+        limits(),
+    ))
+    .install(&wrong_count)
+    {
+        Ok(_) => panic!("wrong family count installed"),
+        Err(error) => error,
+    };
+    assert_eq!(count_error.state(), CheckpointInstallState::Unchanged);
+    assert!(!count_target.exists());
+
+    let mut foreign_family = checkpoint.image().to_vec();
+    let name_len = u32::from_le_bytes(foreign_family[12..16].try_into().unwrap()) as usize;
+    let last_name_byte = 16 + name_len - 1;
+    foreign_family[last_name_byte] ^= 1;
+    let foreign_family = StoreCheckpointEnvelope::new(
+        checkpoint.format_id().clone(),
+        checkpoint.catalog_commitment(),
+        foreign_family,
+    )
+    .unwrap();
+    let family_target = directory.path().join("foreign-family");
+    let family_error = match HoltFreshCheckpointInstaller::new(HoltOptions::file(
+        &family_target,
+        catalog([FIRST, SECOND]),
+        limits(),
+    ))
+    .install(&foreign_family)
+    {
+        Ok(_) => panic!("foreign family installed"),
+        Err(error) => error,
+    };
+    assert_eq!(family_error.state(), CheckpointInstallState::Unchanged);
+    assert!(!family_target.exists());
+}
+
+#[test]
+fn partial_install_leaves_durable_sentinel_and_regular_open_refuses_full_catalog() {
+    let source = memory_store([FIRST, SECOND]);
+    assert_eq!(put(&source, FIRST, b"source", b"complete"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create target parent");
+    let target = directory.path().join("partial");
+    crate::checkpoint::fail_install_after_partial_apply_for_test(target.clone());
+
+    let error = match HoltFreshCheckpointInstaller::new(HoltOptions::file(
+        &target,
+        catalog([FIRST, SECOND]),
+        limits(),
+    ))
+    .install(&checkpoint)
+    {
+        Ok(_) => panic!("partial checkpoint install unexpectedly succeeded"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.state(), CheckpointInstallState::Poisoned);
+    assert!(crate::checkpoint::install_sentinel_path(&target).is_file());
+    assert!(matches!(
+        HoltStore::open(HoltOptions::file(
+            &target,
+            catalog([FIRST, SECOND]),
+            limits(),
+        )),
+        Err(StoreError::Corrupt(reason)) if reason.contains("incomplete checkpoint installation marker")
+    ));
+}
+
+#[test]
+fn finalize_unlink_sync_and_sentinel_restore_failure_remains_restart_visible() {
+    let source = memory_store([FIRST]);
+    assert_eq!(put(&source, FIRST, b"source", b"complete"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create target parent");
+    let target = directory.path().join("finalize-uncertain");
+    crate::checkpoint::fail_finalize_after_unlink_and_restore_for_test(target.clone());
+
+    let error = match HoltFreshCheckpointInstaller::new(HoltOptions::file(
+        &target,
+        catalog([FIRST]),
+        limits(),
+    ))
+    .install(&checkpoint)
+    {
+        Ok(_) => panic!("uncertain checkpoint finalize unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.state(), CheckpointInstallState::Poisoned);
+    assert!(
+        !crate::checkpoint::install_sentinel_path(&target).exists(),
+        "fault model removes the legacy installing sentinel"
+    );
+    assert!(
+        crate::checkpoint::complete_marker_path(&target).is_file(),
+        "verified checkpoint identity must remain durable before installing unlink"
+    );
+    assert!(matches!(
+        HoltStore::open(HoltOptions::file(&target, catalog([FIRST]), limits())),
+        Err(StoreError::Corrupt(reason)) if reason.contains("checkpoint")
+    ));
+    let reconciled =
+        HoltFreshCheckpointInstaller::new(HoltOptions::file(&target, catalog([FIRST]), limits()))
+            .install(&checkpoint)
+            .expect("reconcile exact completed checkpoint identity");
+    assert_eq!(
+        get(&reconciled, FIRST, b"source"),
+        Some(b"complete".to_vec())
+    );
+}
+
+#[test]
+fn ready_and_open_fail_closed_if_install_sentinel_appears() {
+    let directory = tempdir().expect("create HoltStore parent");
+    let target = directory.path().join("live");
+    let store = HoltStore::initialize(HoltOptions::file(&target, catalog([FIRST]), limits()))
+        .expect("initialize HoltStore");
+    let sentinel = crate::checkpoint::install_sentinel_path(&target);
+    std::fs::write(&sentinel, b"incomplete").expect("write sentinel");
+
+    assert!(matches!(store.ready(), Err(StoreError::Corrupt(_))));
+    assert!(matches!(
+        HoltStore::open(HoltOptions::file(&target, catalog([FIRST]), limits())),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn checkpoint_export_releases_state_lock_and_rechecks_poison() {
+    let store = Arc::new(memory_store([FIRST]));
+    assert_eq!(put(&store, FIRST, b"seed", b"value"), Commit::Applied);
+
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+    store.pause_next_checkpoint_export_after_clone(entered_tx, resume_rx);
+    let exporting_store = Arc::clone(&store);
+    let export = thread::spawn(move || exporting_store.export_checkpoint());
+    entered_rx
+        .recv()
+        .expect("checkpoint export did not release its state guard");
+    assert_eq!(
+        put(&store, FIRST, b"concurrent", b"commit"),
+        Commit::Applied
+    );
+    resume_tx.send(()).expect("resume checkpoint export");
+    assert!(export.join().expect("join checkpoint export").is_ok());
+
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+    store.pause_next_checkpoint_export_after_clone(entered_tx, resume_rx);
+    let exporting_store = Arc::clone(&store);
+    let export = thread::spawn(move || exporting_store.export_checkpoint());
+    entered_rx
+        .recv()
+        .expect("second checkpoint export did not release its state guard");
+    store.fail_next_atomic_after_apply();
+    assert!(matches!(
+        store.commit(WriteTxn {
+            checks: vec![],
+            mutations: vec![Mutation::Put {
+                key: Key::new(FIRST, b"poison"),
+                value: b"applied".to_vec(),
+            }],
+        }),
+        Err(StoreError::OutcomeUnknown {
+            state: UnknownCommit::Poisoned,
+            ..
+        })
+    ));
+    resume_tx.send(()).expect("resume poisoned export");
+    assert!(matches!(
+        export.join().expect("join poisoned export"),
+        Err(CheckpointError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn installed_checkpoint_target_only_reconciles_the_exact_completed_identity() {
+    let source = memory_store([FIRST]);
+    assert_eq!(put(&source, FIRST, b"identity", b"first"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create target parent");
+    let target = directory.path().join("single-use");
+    let restored =
+        HoltFreshCheckpointInstaller::new(HoltOptions::file(&target, catalog([FIRST]), limits()))
+            .install(&checkpoint)
+            .expect("first install");
+    drop(restored);
+
+    assert!(matches!(
+        HoltStore::open(HoltOptions::file(&target, catalog([FIRST]), limits())),
+        Err(StoreError::Corrupt(reason)) if reason.contains("checkpoint")
+    ));
+    let reconciled =
+        HoltFreshCheckpointInstaller::new(HoltOptions::file(&target, catalog([FIRST]), limits()))
+            .install(&checkpoint)
+            .expect("same durable install intent must reconcile after restart");
+    assert_eq!(
+        get(&reconciled, FIRST, b"identity"),
+        Some(b"first".to_vec())
+    );
+    drop(reconciled);
+
+    let foreign_source = memory_store([FIRST]);
+    assert_eq!(
+        put(&foreign_source, FIRST, b"identity", b"foreign"),
+        Commit::Applied
+    );
+    let foreign = foreign_source
+        .export_checkpoint()
+        .expect("export foreign checkpoint");
+    let error = match HoltFreshCheckpointInstaller::new(HoltOptions::file(
+        &target,
+        catalog([FIRST]),
+        limits(),
+    ))
+    .install(&foreign)
+    {
+        Ok(_) => panic!("foreign checkpoint identity claimed completed target"),
+        Err(error) => error,
+    };
+    assert_eq!(error.state(), CheckpointInstallState::Poisoned);
+}
+
+#[test]
+fn installed_store_fails_closed_if_its_completed_identity_marker_is_tampered() {
+    let source = memory_store([FIRST]);
+    assert_eq!(put(&source, FIRST, b"identity", b"value"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create checkpoint target parent");
+    let target = directory.path().join("tampered-complete-marker");
+    let restored =
+        HoltFreshCheckpointInstaller::new(HoltOptions::file(&target, catalog([FIRST]), limits()))
+            .install(&checkpoint)
+            .expect("install checkpoint");
+
+    std::fs::write(
+        crate::checkpoint::complete_marker_path(&target),
+        b"tampered",
+    )
+    .expect("tamper completed checkpoint marker");
+    assert!(matches!(restored.ready(), Err(StoreError::Corrupt(_))));
+}
+
+#[test]
+fn recovery_staging_reopens_after_pre_control_replay_without_the_checkpoint_image() {
+    let source = memory_store([FIRST]);
+    assert_eq!(put(&source, FIRST, b"base", b"checkpoint"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create recovery staging parent");
+    let target = directory.path().join("recovery-staging");
+    let options = HoltOptions::file(&target, catalog([FIRST]), limits());
+    let installer = HoltFreshCheckpointInstaller::new(options.clone());
+    let identity = installer
+        .recovery_staging_identity(&checkpoint)
+        .expect("derive exact staging identity before installation");
+    let persisted_identity = identity.encode();
+    let staging = installer.install(&checkpoint).expect("install checkpoint");
+    assert_eq!(
+        put(&staging, FIRST, b"pre-control-log", b"replayed"),
+        Commit::Applied
+    );
+    drop(staging);
+    drop(checkpoint);
+
+    assert!(matches!(
+        HoltStore::open(options.clone()),
+        Err(StoreError::Corrupt(reason)) if reason.contains("checkpoint")
+    ));
+
+    let foreign_source = memory_store([FIRST]);
+    assert_eq!(
+        put(&foreign_source, FIRST, b"base", b"foreign"),
+        Commit::Applied
+    );
+    let foreign_checkpoint = foreign_source
+        .export_checkpoint()
+        .expect("export foreign checkpoint");
+    let foreign_identity = HoltFreshCheckpointInstaller::new(options.clone())
+        .recovery_staging_identity(&foreign_checkpoint)
+        .expect("derive foreign staging identity");
+    assert!(matches!(
+        HoltStore::open_recovery_staging(options.clone(), &foreign_identity),
+        Err(StoreError::Corrupt(_))
+    ));
+
+    let identity = HoltRecoveryStagingIdentity::decode(&persisted_identity)
+        .expect("decode persisted staging identity");
+    let reopened = HoltStore::open_recovery_staging(options, &identity)
+        .expect("open exact recovery staging without original image");
+    assert_eq!(
+        get(&reopened, FIRST, b"pre-control-log"),
+        Some(b"replayed".to_vec())
+    );
+}
+
+#[test]
+fn recovery_staging_open_rejects_a_tampered_complete_identity_marker() {
+    let source = memory_store([FIRST]);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create staging parent");
+    let target = directory.path().join("tampered-staging");
+    let options = HoltOptions::file(&target, catalog([FIRST]), limits());
+    let installer = HoltFreshCheckpointInstaller::new(options.clone());
+    let identity = installer
+        .recovery_staging_identity(&checkpoint)
+        .expect("derive staging identity");
+    drop(installer.install(&checkpoint).expect("install checkpoint"));
+    std::fs::write(
+        crate::checkpoint::complete_marker_path(&target),
+        b"tampered",
+    )
+    .expect("tamper complete marker");
+
+    assert!(matches!(
+        HoltStore::open_recovery_staging(options, &identity),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn durable_control_finalize_precedes_staging_adoption_and_ordinary_reopen() {
+    let source = memory_store([FIRST]);
+    assert_eq!(put(&source, FIRST, b"base", b"checkpoint"), Commit::Applied);
+    let checkpoint = source.export_checkpoint().expect("export checkpoint");
+    let directory = tempdir().expect("create adoption parent");
+    let target = directory.path().join("adopt-staging");
+    let options = HoltOptions::file(&target, catalog([FIRST]), limits());
+    let installer = HoltFreshCheckpointInstaller::new(options.clone());
+    let identity = installer
+        .recovery_staging_identity(&checkpoint)
+        .expect("derive staging identity");
+    let persisted_identity = identity.encode();
+    let staging = installer.install(&checkpoint).expect("install checkpoint");
+    assert_eq!(
+        put(&staging, FIRST, b"pre-control-log", b"replayed"),
+        Commit::Applied
+    );
+    drop(staging);
+    drop(checkpoint);
+
+    assert!(matches!(
+        HoltStore::open(options.clone()),
+        Err(StoreError::Corrupt(_))
+    ));
+    let foreign_source = memory_store([FIRST]);
+    assert_eq!(
+        put(&foreign_source, FIRST, b"base", b"foreign"),
+        Commit::Applied
+    );
+    let foreign_checkpoint = foreign_source
+        .export_checkpoint()
+        .expect("export foreign checkpoint");
+    let foreign_identity = HoltFreshCheckpointInstaller::new(options.clone())
+        .recovery_staging_identity(&foreign_checkpoint)
+        .expect("derive foreign staging identity");
+    persist_control_finalize_for_test(
+        &directory.path().join("foreign-control-finalized"),
+        &foreign_identity,
+    );
+    assert!(matches!(
+        HoltStore::adopt_recovery_staging(
+            options.clone(),
+            HoltRecoveryStagingAdoptionAuthority::after_durable_control_finalize(foreign_identity,),
+        ),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(crate::checkpoint::complete_marker_path(&target).is_file());
+
+    let identity = HoltRecoveryStagingIdentity::decode(&persisted_identity)
+        .expect("decode persisted staging identity after simulated restart");
+    let control_receipt = directory.path().join("control-finalized");
+    persist_control_finalize_for_test(&control_receipt, &identity);
+    let authority =
+        HoltRecoveryStagingAdoptionAuthority::after_durable_control_finalize(identity.clone());
+    let adopted = HoltStore::adopt_recovery_staging(options.clone(), authority)
+        .expect("adopt only after durable control finalize");
+    assert_eq!(
+        get(&adopted, FIRST, b"pre-control-log"),
+        Some(b"replayed".to_vec())
+    );
+    assert_eq!(
+        put(&adopted, FIRST, b"post-adoption-log", b"applied"),
+        Commit::Applied
+    );
+    drop(adopted);
+
+    let ordinary = HoltStore::open(options).expect("ordinary open after durable adoption");
+    assert_eq!(
+        get(&ordinary, FIRST, b"pre-control-log"),
+        Some(b"replayed".to_vec())
+    );
+    assert_eq!(
+        get(&ordinary, FIRST, b"post-adoption-log"),
+        Some(b"applied".to_vec())
+    );
+}
+
+#[test]
+fn staging_adoption_rename_and_sync_failures_are_exactly_retryable() {
+    for fail_after_rename in [false, true] {
+        let source = memory_store([FIRST]);
+        let checkpoint = source.export_checkpoint().expect("export checkpoint");
+        let directory = tempdir().expect("create adoption failure parent");
+        let target = directory.path().join(if fail_after_rename {
+            "fail-after-rename"
+        } else {
+            "fail-before-rename"
+        });
+        let options = HoltOptions::file(&target, catalog([FIRST]), limits());
+        let installer = HoltFreshCheckpointInstaller::new(options.clone());
+        let identity = installer
+            .recovery_staging_identity(&checkpoint)
+            .expect("derive staging identity");
+        let staging = installer.install(&checkpoint).expect("install checkpoint");
+        assert_eq!(
+            put(&staging, FIRST, b"pre-control-log", b"replayed"),
+            Commit::Applied
+        );
+        drop(staging);
+        persist_control_finalize_for_test(&directory.path().join("control-finalized"), &identity);
+        if fail_after_rename {
+            crate::checkpoint::fail_next_adoption_after_rename_for_test(target.clone());
+        } else {
+            crate::checkpoint::fail_next_adoption_before_rename_for_test(target.clone());
+        }
+
+        let error = match HoltStore::adopt_recovery_staging(
+            options.clone(),
+            HoltRecoveryStagingAdoptionAuthority::after_durable_control_finalize(identity.clone()),
+        ) {
+            Ok(_) => panic!("injected adoption failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Unavailable(_)));
+        if !fail_after_rename {
+            assert!(matches!(
+                HoltStore::open(options.clone()),
+                Err(StoreError::Corrupt(_))
+            ));
+        }
+
+        let adopted = HoltStore::adopt_recovery_staging(
+            options.clone(),
+            HoltRecoveryStagingAdoptionAuthority::after_durable_control_finalize(identity),
+        )
+        .expect("retry exact adoption identity");
+        assert_eq!(
+            get(&adopted, FIRST, b"pre-control-log"),
+            Some(b"replayed".to_vec())
+        );
+        drop(adopted);
+        let reopened = HoltStore::open(options).expect("ordinary open after adoption retry");
+        assert_eq!(
+            get(&reopened, FIRST, b"pre-control-log"),
+            Some(b"replayed".to_vec())
+        );
+        drop(reopened);
+        if fail_after_rename {
+            let adopted_marker = crate::checkpoint::adopted_marker_path(&target);
+            let mut tampered = std::fs::read(&adopted_marker).expect("read adopted marker");
+            let last = tampered.last_mut().expect("nonempty adopted marker");
+            *last ^= 1;
+            std::fs::write(&adopted_marker, tampered).expect("tamper adopted marker");
+            assert!(matches!(
+                HoltStore::open(HoltOptions::file(&target, catalog([FIRST]), limits())),
+                Err(StoreError::Corrupt(_))
+            ));
+        }
+    }
 }
 
 #[test]

@@ -1352,6 +1352,7 @@ version = "0.1.0"
 dependencies = [
  "holt",
  "nokv-meta-store",
+ "sha2 0.10.9",
  "tempfile",
 ]
 

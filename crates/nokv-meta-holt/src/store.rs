@@ -4,6 +4,8 @@
  */
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(test)]
@@ -12,13 +14,15 @@ use std::sync::Mutex;
 use holt::{DBView, RangeEntry, RecordVersion, DB};
 use nokv_meta_store::{
     AckBoundary, Authority, Check, Commit, Keyspace, Mutation, ReadBatch, ReadOp, ReadResult,
-    ReadSnapshot, Scan, ScanItem, ScanPage, StoreError, StoreLimits, StoreProfile, TxnStore,
-    UnknownCommit, WriteTxn,
+    ReadSnapshot, Scan, ScanItem, ScanPage, StoreCheckpointEnvelope, StoreError, StoreLimits,
+    StoreProfile, TxnStore, UnknownCommit, WriteTxn,
 };
 
-use crate::HoltOptions;
 #[cfg(any(test, feature = "test-support"))]
 use crate::TreeBinding;
+use crate::{HoltOptions, HoltRecoveryStagingAdoptionAuthority, HoltRecoveryStagingIdentity};
+
+static STORE_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Embedded Holt transaction store for one local metadata authority.
 pub struct HoltStore {
@@ -35,6 +39,9 @@ struct State {
     db: DB,
     trees: BTreeMap<Keyspace, String>,
     poisoned: Option<String>,
+    location: Option<PathBuf>,
+    expected_recovery_staging_identity: Option<HoltRecoveryStagingIdentity>,
+    instance_id: u64,
 }
 
 struct ValueVersion {
@@ -51,6 +58,7 @@ struct TestHooks {
     pause_read_after_lock: Mutex<Option<PoisonPause>>,
     read_entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
     commit_entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    pause_export_after_clone: Mutex<Option<PoisonPause>>,
 }
 
 #[cfg(test)]
@@ -73,25 +81,124 @@ impl HoltStore {
         Self::open_inner(options, OpenAction::Existing, false)
     }
 
+    /// Reopen a pre-control recovery staging target by its exact persisted identity.
+    ///
+    /// This deliberately does not compare the current database to the original
+    /// checkpoint image: authoritative log replay may already have appended
+    /// committed rows. Ordinary [`Self::open`] remains blocked until a separate
+    /// durable control-finalize authority adopts this staging target.
+    pub fn open_recovery_staging(
+        options: HoltOptions,
+        expected: &HoltRecoveryStagingIdentity,
+    ) -> Result<Self, StoreError> {
+        let trees = options.validate(false)?;
+        let expected_catalog = crate::checkpoint::catalog_commitment(&trees);
+        if expected.catalog_commitment() != expected_catalog {
+            return Err(StoreError::Corrupt(
+                "recovery staging identity has a foreign physical catalog".to_owned(),
+            ));
+        }
+        let path = options.file_path()?.ok_or_else(|| {
+            StoreError::InvalidRequest(
+                "recovery staging reopen requires a file-backed Holt target".to_owned(),
+            )
+        })?;
+        crate::checkpoint::validate_install_markers(path, Some(expected), expected_catalog)?;
+        require_holt_location(path)?;
+        let location = Some(path.to_path_buf());
+        let profile = StoreProfile {
+            limits: options.limits,
+            ack: AckBoundary::LocalSync,
+            authority: Authority::Local,
+        };
+        let db = DB::open(options.config).map_err(map_open_error)?;
+        prepare_trees(&db, &trees, OpenAction::Existing)?;
+        crate::checkpoint::validate_install_markers(
+            location.as_deref().expect("file-backed staging location"),
+            Some(expected),
+            expected_catalog,
+        )?;
+        Ok(Self::from_parts(
+            profile,
+            db,
+            trees,
+            location,
+            Some(expected.clone()),
+        ))
+    }
+
+    /// Adopt recovery staging only after the caller durably finalizes control state.
+    ///
+    /// The authority token is consumed at this boundary. Marker conversion is
+    /// exact and retryable, but the adapter cannot create or infer that token.
+    pub fn adopt_recovery_staging(
+        options: HoltOptions,
+        authority: HoltRecoveryStagingAdoptionAuthority,
+    ) -> Result<Self, StoreError> {
+        let expected = authority.into_expected_identity();
+        let trees = options.validate(false)?;
+        let expected_catalog = crate::checkpoint::catalog_commitment(&trees);
+        if expected.catalog_commitment() != expected_catalog {
+            return Err(StoreError::Corrupt(
+                "recovery staging adoption identity has a foreign physical catalog".to_owned(),
+            ));
+        }
+        let path = options.file_path()?.ok_or_else(|| {
+            StoreError::InvalidRequest(
+                "recovery staging adoption requires a file-backed Holt target".to_owned(),
+            )
+        })?;
+        crate::checkpoint::validate_recovery_staging_adoption(path, &expected)?;
+        require_holt_location(path)?;
+        let location = Some(path.to_path_buf());
+        let profile = StoreProfile {
+            limits: options.limits,
+            ack: AckBoundary::LocalSync,
+            authority: Authority::Local,
+        };
+        let db = DB::open(options.config).map_err(map_open_error)?;
+        prepare_trees(&db, &trees, OpenAction::Existing)?;
+        crate::checkpoint::adopt_recovery_staging_marker(
+            location.as_deref().expect("file-backed adoption location"),
+            &expected,
+        )?;
+        Ok(Self::from_parts(profile, db, trees, location, None))
+    }
+
     fn open_inner(
         options: HoltOptions,
         action: OpenAction,
         allow_memory: bool,
     ) -> Result<Self, StoreError> {
         let trees = options.validate(allow_memory)?;
-        preflight_location(&options, action)?;
+        preflight_location(&options, action, &trees)?;
+        let location = options.file_path()?.map(std::path::Path::to_path_buf);
+        let profile = StoreProfile {
+            limits: options.limits,
+            ack: AckBoundary::LocalSync,
+            authority: Authority::Local,
+        };
         let db = DB::open(options.config).map_err(map_open_error)?;
         prepare_trees(&db, &trees, action)?;
-        Ok(Self {
-            profile: StoreProfile {
-                limits: options.limits,
-                ack: AckBoundary::LocalSync,
-                authority: Authority::Local,
-            },
+        Ok(Self::from_parts(profile, db, trees, location, None))
+    }
+
+    fn from_parts(
+        profile: StoreProfile,
+        db: DB,
+        trees: BTreeMap<Keyspace, String>,
+        location: Option<PathBuf>,
+        expected_recovery_staging_identity: Option<HoltRecoveryStagingIdentity>,
+    ) -> Self {
+        Self {
+            profile,
             state: RwLock::new(State {
                 db,
                 trees,
                 poisoned: None,
+                location,
+                expected_recovery_staging_identity,
+                instance_id: STORE_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             }),
             #[cfg(feature = "read-stats")]
             read_stats: crate::stats::ReadStatsState::default(),
@@ -103,8 +210,29 @@ impl HoltStore {
                 pause_read_after_lock: Mutex::new(None),
                 read_entered: Mutex::new(None),
                 commit_entered: Mutex::new(None),
+                pause_export_after_clone: Mutex::new(None),
             },
-        })
+        }
+    }
+
+    pub(crate) fn from_installed_checkpoint(
+        options: HoltOptions,
+        db: DB,
+        trees: BTreeMap<Keyspace, String>,
+        expected_recovery_staging_identity: HoltRecoveryStagingIdentity,
+    ) -> Result<Self, StoreError> {
+        let location = options.file_path()?.map(std::path::Path::to_path_buf);
+        Ok(Self::from_parts(
+            StoreProfile {
+                limits: options.limits,
+                ack: AckBoundary::LocalSync,
+                authority: Authority::Local,
+            },
+            db,
+            trees,
+            location,
+            Some(expected_recovery_staging_identity),
+        ))
     }
 
     /// Open an in-memory store for tests.
@@ -241,6 +369,19 @@ impl HoltStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn pause_next_checkpoint_export_after_clone(
+        &self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .test_hooks
+            .pause_export_after_clone
+            .lock()
+            .expect("lock checkpoint export pause") = Some(PoisonPause { entered, resume });
+    }
+
+    #[cfg(test)]
     fn signal_read_entry(&self) {
         if let Some(entered) = self
             .test_hooks
@@ -292,6 +433,59 @@ impl HoltStore {
             let _ = pause.entered.send(());
             let _ = pause.resume.recv();
         }
+    }
+
+    #[cfg(test)]
+    fn pause_checkpoint_export_after_clone(&self) {
+        let pause = self
+            .test_hooks
+            .pause_export_after_clone
+            .lock()
+            .expect("lock checkpoint export pause")
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause.resume.recv();
+        }
+    }
+
+    pub(crate) fn export_whole_store_checkpoint(
+        &self,
+    ) -> Result<StoreCheckpointEnvelope, nokv_meta_store::CheckpointError> {
+        let state = self.read_state().map_err(checkpoint_store_error)?;
+        ensure_ready(&state).map_err(checkpoint_store_error)?;
+        let db = state.db.clone();
+        let trees = state.trees.clone();
+        let instance_id = state.instance_id;
+        let catalog_commitment = crate::checkpoint::catalog_commitment(&trees);
+        drop(state);
+
+        #[cfg(test)]
+        self.pause_checkpoint_export_after_clone();
+        let image = db
+            .export_checkpoint()
+            .map_err(|error| checkpoint_store_error(map_holt_error(error)))?;
+        crate::checkpoint::validate_holt_checkpoint_image(
+            image.as_bytes(),
+            &trees,
+            &self.profile.limits,
+        )
+        .map_err(nokv_meta_store::CheckpointError::Corrupt)?;
+        let format_id =
+            nokv_meta_store::CheckpointFormatId::new(crate::checkpoint::HOLT_CHECKPOINT_FORMAT_ID)?;
+        let envelope =
+            StoreCheckpointEnvelope::new(format_id, catalog_commitment, image.into_bytes())?;
+
+        let state = self.read_state().map_err(checkpoint_store_error)?;
+        ensure_ready(&state).map_err(checkpoint_store_error)?;
+        if state.instance_id != instance_id
+            || crate::checkpoint::catalog_commitment(&state.trees) != catalog_commitment
+        {
+            return Err(nokv_meta_store::CheckpointError::Corrupt(
+                "HoltStore identity or catalog changed during checkpoint export".to_owned(),
+            ));
+        }
+        Ok(envelope)
     }
 }
 
@@ -465,10 +659,15 @@ fn prepare_trees(
     Ok(())
 }
 
-fn preflight_location(options: &HoltOptions, action: OpenAction) -> Result<(), StoreError> {
+fn preflight_location(
+    options: &HoltOptions,
+    action: OpenAction,
+    trees: &BTreeMap<Keyspace, String>,
+) -> Result<(), StoreError> {
     let Some(path) = options.file_path()? else {
         return Ok(());
     };
+    crate::checkpoint::reject_install_sentinel(path, crate::checkpoint::catalog_commitment(trees))?;
     match action {
         OpenAction::Initialize => require_empty_location(path),
         OpenAction::Existing => require_holt_location(path),
@@ -599,11 +798,25 @@ fn tree_name(state: &State, keyspace: Keyspace) -> &str {
 }
 
 fn ensure_ready(state: &State) -> Result<(), StoreError> {
-    match &state.poisoned {
-        Some(reason) => Err(StoreError::Unavailable(format!(
+    if let Some(reason) = &state.poisoned {
+        return Err(StoreError::Unavailable(format!(
             "HoltStore is poisoned and must be reopened: {reason}"
-        ))),
-        None => Ok(()),
+        )));
+    }
+    if let Some(path) = &state.location {
+        crate::checkpoint::validate_install_markers(
+            path,
+            state.expected_recovery_staging_identity.as_ref(),
+            crate::checkpoint::catalog_commitment(&state.trees),
+        )?;
+    }
+    Ok(())
+}
+
+fn checkpoint_store_error(error: StoreError) -> nokv_meta_store::CheckpointError {
+    match error {
+        StoreError::Corrupt(reason) => nokv_meta_store::CheckpointError::Corrupt(reason),
+        other => nokv_meta_store::CheckpointError::Unavailable(other.to_string()),
     }
 }
 
