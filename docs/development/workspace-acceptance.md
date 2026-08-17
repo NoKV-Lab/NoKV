@@ -135,6 +135,14 @@ It owns real etcd and digest-pinned RustFS, uses a feature-only bench owner for
 the exact fault boundary, and always reopens with an independently built
 default `nokv` binary.
 
+The path-native whole-Workbench fork runner is
+[`scripts/workbench/fork_restore_recovery_gate.py`](../../scripts/workbench/fork_restore_recovery_gate.py).
+It owns isolated real etcd and digest-pinned RustFS instances, injects
+post-commit response loss, reopens the same Holt directory at the next owner
+epoch, and retains object-inventory evidence. It does not qualify inode/dentry
+subtree restore or in-place rollback; neither operation is part of the
+supported namespace contract.
+
 Required evidence:
 
 - snapshot mint creates a leased history hold at one read version;
@@ -162,6 +170,17 @@ Required evidence:
   Succeeded through real operation reads before exact replay;
 - replay retains the restore operation and destination commit identities,
   changes no object inventory, and then completes the A-to-B-to-C composition;
+
+- every durable restore and restore-manifest publication phase is reentrant;
+  exact concurrent callers converge to one operation without aborting work
+  advanced by another caller;
+- a restored Workbench is independently writable, can be recommitted and used
+  as a later restore source, and preserves its original revision closure after
+  the source snapshot is retired and the source Workbench diverges;
+- object-provider inventory of the artifact keyspace proves restore copies zero
+  payload bytes, adds only the two destination-owned manifest objects (run
+  manifest and restore manifest), and never overwrites source payload objects,
+  including the exact 1 GiB qualification profile;
 - after A succeeds and B replaces it, exact retry of A returns A's original
   terminal result for both original `replace=false` and `replace=true`, without
   reading the current workspace head or run-manifest path;

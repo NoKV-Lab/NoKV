@@ -312,6 +312,7 @@ mod tests {
     #[test]
     fn parsed_static_route_requires_explicit_fences_before_connecting() {
         let root_id = identity(0x11);
+        let agent_id = identity(0x44);
         let logical_shard_id = identity(0x22);
         let object_namespace_id = identity(0x33);
         let parse = |extra: &[&str]| {
@@ -319,6 +320,10 @@ mod tests {
                 [
                     "--root-id",
                     root_id.as_str(),
+                    // Agent-facing commands parse only with a durable AgentId;
+                    // the static-route fence checks below happen at connect().
+                    "--agent-id",
+                    agent_id.as_str(),
                     "--metadata-address",
                     "127.0.0.1:17750",
                     "--logical-shard-id",

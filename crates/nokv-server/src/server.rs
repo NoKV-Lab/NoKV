@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use nokv_protocol::{
     decode_handshake_payload, decode_request, encode_handshake_frame, encode_response,
-    has_handshake_magic, HandshakeKind, WorkspaceHandshake, HANDSHAKE_PAYLOAD_BYTES,
-    MAX_FRAME_BYTES, WORKSPACE_PROTOCOL_SCHEMA,
+    has_handshake_magic, ErrorCode, HandshakeKind, ProtocolError, RpcFailure, WorkspaceHandshake,
+    WorkspaceRpcOutcome, WorkspaceRpcResponse, HANDSHAKE_PAYLOAD_BYTES, MAX_FRAME_BYTES,
+    WORKSPACE_PROTOCOL_SCHEMA,
 };
 
 use crate::legacy_rejection::{legacy_rejection_response, MAX_LEGACY_FIRST_FRAME_BYTES};
@@ -405,7 +406,7 @@ fn serve_connection(
     while let Some(request) = read_frame(&mut stream)? {
         let request = decode_request(&request)?;
         let response = registry.dispatch_guarded(request)?;
-        let encoded = encode_response(response.response())?;
+        let encoded = encode_response_or_internal_failure(response.response())?;
         write_frame(&mut stream, &encoded)?;
         drop(response);
         if registry.owner_loss_signal().is_lost() {
@@ -415,6 +416,43 @@ fn serve_connection(
         }
     }
     Ok(())
+}
+
+/// Encodes one response frame. A success projection that fails wire
+/// validation is a server-side defect, but the connection must not be dropped
+/// silently over it: the caller receives a typed, non-retryable `Internal`
+/// failure for the exact request instead of a truncated stream, and the defect
+/// is logged once here.
+fn encode_response_or_internal_failure(
+    response: &WorkspaceRpcResponse,
+) -> Result<Vec<u8>, ServerError> {
+    match encode_response(response) {
+        Ok(encoded) => Ok(encoded),
+        Err(ProtocolError::FrameTooLarge { bytes, max }) => {
+            Err(ServerError::FrameTooLarge { bytes, max })
+        }
+        Err(error) => {
+            eprintln!(
+                "nokv-server: response projection for request {:?} failed wire validation: {error}",
+                response.request_id
+            );
+            let failure = WorkspaceRpcResponse {
+                route: response.route,
+                request_id: response.request_id,
+                commit_version: None,
+                replayed: false,
+                outcome: WorkspaceRpcOutcome::Failure(RpcFailure {
+                    code: ErrorCode::Internal,
+                    message: format!("response projection failed wire validation: {error}"),
+                    retryable: false,
+                    conflict: None,
+                    current_generation: None,
+                    route_hint: None,
+                }),
+            };
+            Ok(encode_response(&failure)?)
+        }
+    }
 }
 
 fn admit_current_protocol(stream: &mut TcpStream, timeout: Duration) -> Result<bool, ServerError> {
@@ -657,6 +695,62 @@ mod tests {
                 workspace_incarnation_id: WorkspaceIdentity([5; 16]),
             }),
         }
+    }
+
+    #[test]
+    fn invalid_success_projection_becomes_a_typed_internal_failure_frame() {
+        // A success result whose projection violates the wire contract must
+        // reach the caller as an `Internal` failure for the exact request, not
+        // as a dropped connection.
+        let request = request();
+        let invalid = WorkspaceRpcResponse {
+            route: request.route,
+            request_id: request.request_id,
+            commit_version: Some(3),
+            replayed: false,
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Workspace(
+                WorkspaceSummary {
+                    workbench: WorkbenchName::new("run-42").unwrap(),
+                    workspace_incarnation_id: WorkspaceIdentity([5; 16]),
+                    workspace_revision: 1,
+                    commit_head: None,
+                    commit_head_generation: Some(1),
+                },
+            ))),
+        };
+        assert!(encode_response(&invalid).is_err());
+
+        let encoded = encode_response_or_internal_failure(&invalid).unwrap();
+        let decoded = decode_response(&encoded).unwrap();
+        assert_eq!(decoded.route, request.route);
+        assert_eq!(decoded.request_id, request.request_id);
+        assert_eq!(decoded.commit_version, None);
+        assert!(!decoded.replayed);
+        let WorkspaceRpcOutcome::Failure(failure) = decoded.outcome else {
+            panic!("invalid projection must surface as a failure envelope");
+        };
+        assert_eq!(failure.code, ErrorCode::Internal);
+        assert!(!failure.retryable);
+        assert!(failure
+            .message
+            .contains("response projection failed wire validation"));
+
+        let valid = WorkspaceRpcResponse {
+            outcome: WorkspaceRpcOutcome::Success(Box::new(WorkspaceResult::Workspace(
+                WorkspaceSummary {
+                    workbench: WorkbenchName::new("run-42").unwrap(),
+                    workspace_incarnation_id: WorkspaceIdentity([5; 16]),
+                    workspace_revision: 1,
+                    commit_head: None,
+                    commit_head_generation: None,
+                },
+            ))),
+            ..invalid
+        };
+        assert_eq!(
+            encode_response_or_internal_failure(&valid).unwrap(),
+            encode_response(&valid).unwrap()
+        );
     }
 
     fn streams() -> (TcpStream, TcpStream) {

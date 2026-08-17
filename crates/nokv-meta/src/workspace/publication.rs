@@ -267,6 +267,9 @@ pub enum PublicationError {
         expected: PublishPhase,
         actual: PublishPhase,
     },
+    /// The durable operation row no longer matches the caller's observed
+    /// predecessor. Re-observe it before diagnosing contextual authority.
+    ConcurrentMutation,
     InitiatingOwnerEpochMismatch {
         expected: OwnerEpoch,
         actual: OwnerEpoch,
@@ -445,6 +448,9 @@ impl fmt::Display for PublicationError {
                 formatter,
                 "publish operation phase must be {expected:?}, found {actual:?}"
             ),
+            Self::ConcurrentMutation => {
+                formatter.write_str("publication state changed concurrently")
+            }
             Self::InitiatingOwnerEpochMismatch { expected, actual } => write!(
                 formatter,
                 "publish initiating owner epoch must be {}, found {}",
@@ -1704,6 +1710,7 @@ impl PublicationService<'_> {
         request: StageObjectsBatchRequest,
     ) -> Result<PublishCommandOutcome, PublicationError> {
         validate_operation_seals(&request.expected_operation)?;
+        self.require_current_operation(request.context, &request.expected_operation)?;
         require_operation_phase(&request.expected_operation, PublishPhase::Uploading)?;
         validate_batch_size("stage objects", request.staged_objects.len())?;
         let next_cursor = checked_batch_cursor(
@@ -1801,6 +1808,7 @@ impl PublicationService<'_> {
         request: MarkObjectsUploadedBatchRequest,
     ) -> Result<PublishCommandOutcome, PublicationError> {
         validate_operation_seals(&request.expected_operation)?;
+        self.require_current_operation(request.context, &request.expected_operation)?;
         require_operation_phase(&request.expected_operation, PublishPhase::Uploading)?;
         validate_batch_size("mark objects uploaded", request.staged_object_updates.len())?;
         let next_cursor = checked_batch_cursor(
@@ -1884,6 +1892,7 @@ impl PublicationService<'_> {
         request: StageManifestBatchRequest,
     ) -> Result<PublishCommandOutcome, PublicationError> {
         validate_operation_seals(&request.expected_operation)?;
+        self.require_current_operation(request.context, &request.expected_operation)?;
         require_operation_phase(&request.expected_operation, PublishPhase::Uploading)?;
         validate_batch_size("stage manifest", request.manifest_rows.len())?;
         if request.expected_operation.staged_object_cursor
@@ -2163,6 +2172,7 @@ impl PublicationService<'_> {
             return Err(PublicationError::MetadataLastFinalizationRequired);
         }
         let authority_purpose = transition_authority_purpose(&request.transition);
+        self.require_current_operation(request.context, &request.expected_operation)?;
         let operation_key = operation_key(
             request.context.root_id,
             OperationKind::Publish,
@@ -2230,6 +2240,7 @@ impl PublicationService<'_> {
                 requested: request.activity_deadline_ms,
             });
         }
+        self.require_current_operation(request.context, &request.expected_operation)?;
         let lease_clock = self.store.lease_clock_high_water()?;
         if request.activity_deadline_ms <= lease_clock {
             return Err(PublicationError::ActivityDeadlineNotFuture {
@@ -2274,6 +2285,7 @@ impl PublicationService<'_> {
         request: TakeOverOrphanedPublishRequest,
     ) -> Result<PublishCommandOutcome, PublicationError> {
         validate_operation_seals(&request.expected_operation)?;
+        self.require_current_operation(request.context, &request.expected_operation)?;
         if !matches!(
             request.expected_operation.phase,
             PublishPhase::Uploading | PublishPhase::Finalizing
@@ -2353,6 +2365,7 @@ impl PublicationService<'_> {
         request: CleanupPublishBatchRequest,
     ) -> Result<PublishCommandOutcome, PublicationError> {
         validate_operation_seals(&request.expected_operation)?;
+        self.require_current_operation(request.context, &request.expected_operation)?;
         require_operation_phase(&request.expected_operation, PublishPhase::Cleaning)?;
 
         let mut next_operation = request.expected_operation.clone();
@@ -2502,6 +2515,7 @@ impl PublicationService<'_> {
         request: ReconcileQuarantinedPublishBatchRequest,
     ) -> Result<PublishCommandOutcome, PublicationError> {
         validate_operation_seals(&request.expected_operation)?;
+        self.require_current_operation(request.context, &request.expected_operation)?;
         require_operation_phase(&request.expected_operation, PublishPhase::Quarantined)?;
 
         let mut next_operation = request.expected_operation.clone();
@@ -2659,6 +2673,7 @@ impl PublicationService<'_> {
         request: FinishReconcileQuarantinedPublishRequest,
     ) -> Result<PublishCommandOutcome, PublicationError> {
         validate_operation_seals(&request.expected_operation)?;
+        self.require_current_operation(request.context, &request.expected_operation)?;
         require_operation_phase(&request.expected_operation, PublishPhase::Quarantined)?;
 
         let mut plan = CommandPlan::default();
@@ -3307,6 +3322,26 @@ impl PublicationService<'_> {
         .seal())
     }
 
+    /// Establish operation-state precedence over contextual authority and row
+    /// validation at one exact read version.
+    fn require_current_operation(
+        &self,
+        context: PublicationContext,
+        expected: &PublishOperationRecord,
+    ) -> Result<(), PublicationError> {
+        let key = operation_key(
+            context.root_id,
+            OperationKind::Publish,
+            expected.operation_id,
+        );
+        let current = self.read_payload(context, MetadataFamily::Operation, &key)?;
+        let expected_payload = expected.encode()?;
+        if current.as_deref() != Some(expected_payload.as_slice()) {
+            return Err(PublicationError::ConcurrentMutation);
+        }
+        Ok(())
+    }
+
     fn read_publication_record<T>(
         &self,
         context: PublicationContext,
@@ -3341,6 +3376,7 @@ impl PublicationService<'_> {
                 actual: request.expected_operation.phase,
             });
         }
+        self.require_current_operation(request.context, &request.expected_operation)?;
         let expected_commit_version = CommitVersion::new(
             request
                 .context
@@ -7312,7 +7348,7 @@ mod tests {
             });
             assert!(matches!(
                 takeover,
-                Err(PublicationError::Meta(MetaError::PredicateFailed))
+                Err(PublicationError::ConcurrentMutation)
             ));
             assert!(get_visible_path_at(
                 &store,
@@ -7418,6 +7454,140 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn stale_publication_driver_is_classified_as_concurrent_progress() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let staged = staged_rows(revision(402), 2);
+        let manifest = manifest_rows(&staged);
+        let operation = publish_operation(
+            operation_id(402),
+            revision(402),
+            path("outputs/concurrent-progress.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let stale = begin_operation(&service, &store, &mut counter, operation);
+        service
+            .stage_objects_batch(StageObjectsBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: stale.clone(),
+                staged_objects: staged[..1].to_vec(),
+            })
+            .unwrap();
+
+        let error = service
+            .stage_objects_batch(StageObjectsBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: stale,
+                staged_objects: staged[..1].to_vec(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "publication state changed concurrently",
+            "a stale driver must re-observe the durable operation before contextual authority"
+        );
+    }
+
+    #[test]
+    fn stale_upload_marker_is_classified_before_noop_transition_validation() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let staged = staged_rows(revision(404), 1);
+        let manifest = manifest_rows(&staged);
+        let operation = publish_operation(
+            operation_id(404),
+            revision(404),
+            path("outputs/concurrent-upload.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let stale = service
+            .stage_objects_batch(StageObjectsBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                staged_objects: staged.clone(),
+            })
+            .unwrap()
+            .operation;
+        let mut uploaded = staged[0].clone();
+        uploaded.provider_state = StagedProviderState::Uploaded;
+        service
+            .mark_objects_uploaded_batch(MarkObjectsUploadedBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: stale.clone(),
+                staged_object_updates: vec![StagedObjectUpdate {
+                    expected: staged[0].clone(),
+                    next: uploaded.clone(),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(
+            service.mark_objects_uploaded_batch(MarkObjectsUploadedBatchRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: stale,
+                staged_object_updates: vec![StagedObjectUpdate {
+                    expected: uploaded.clone(),
+                    next: uploaded,
+                }],
+            }),
+            Err(PublicationError::ConcurrentMutation)
+        );
+    }
+
+    #[test]
+    fn stale_publication_finalizer_joins_the_durable_winner() {
+        let mut counter = 1;
+        let store = ready_store(&mut counter);
+        let service = PublicationService::new(&store);
+        let staged = Vec::new();
+        let manifest = Vec::new();
+        let operation = publish_operation(
+            operation_id(403),
+            revision(403),
+            path("outputs/concurrent-finalize.bin"),
+            PublishClaim::CreateOnly,
+            &staged,
+            &manifest,
+        );
+        let operation = begin_operation(&service, &store, &mut counter, operation);
+        let finalizing = service
+            .transition_publish(TransitionPublishRequest {
+                context: publication_context(&store, &mut counter),
+                expected_operation: operation,
+                transition: PublishTransition::BeginFinalization,
+            })
+            .unwrap()
+            .operation;
+        let artifact = published_artifact(&finalizing);
+        let winner = service
+            .finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                artifact: artifact.clone(),
+                expected_operation: finalizing.clone(),
+                dependency_owner_revision_ids: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(winner.operation.phase, PublishPhase::Published);
+
+        assert_eq!(
+            service.finalize_publish(FinalizePublishRequest {
+                context: publication_context(&store, &mut counter),
+                artifact,
+                expected_operation: finalizing,
+                dependency_owner_revision_ids: Vec::new(),
+            }),
+            Err(PublicationError::ConcurrentMutation)
+        );
     }
 
     #[test]
@@ -9374,6 +9544,28 @@ mod tests {
                     .unwrap()
                     .operation;
             }
+            if partial_phase == 2 {
+                // With the publication still Cleaning and its expected record
+                // current, a restore that already reached Cleaned is past the
+                // automatic publisher-cleanup authority: the transition must
+                // fail closed without touching the store.
+                let restore_cleaned = restore_cleanup
+                    .apply(RestorePhase::Cleaning, RestoreTransition::FinishCleanup)
+                    .unwrap();
+                replace_restore_operation(&store, &mut counter, &restore_cleanup, &restore_cleaned);
+                let version_before = store.current_read_version().unwrap();
+                assert_eq!(
+                    service.transition_publish(TransitionPublishRequest {
+                        context: publication_context(&store, &mut counter),
+                        expected_operation: cleaning.clone(),
+                        transition: PublishTransition::FinishCleanup,
+                    }),
+                    Err(PublicationError::RestoreAuthorityMismatch),
+                    "restore Cleaned is past automatic publisher cleanup authority",
+                );
+                assert_eq!(store.current_read_version().unwrap(), version_before);
+                replace_restore_operation(&store, &mut counter, &restore_cleaned, &restore_cleanup);
+            }
             let finish_expected = cleaning.clone();
             let finish = TransitionPublishRequest {
                 context: publication_context(&store, &mut counter),
@@ -9391,6 +9583,10 @@ mod tests {
                     .apply(RestorePhase::Cleaning, RestoreTransition::FinishCleanup)
                     .unwrap();
                 replace_restore_operation(&store, &mut counter, &restore_cleanup, &restore_cleaned);
+                // A stale expected record is classified as concurrent progress
+                // before any contextual authority check runs; the caller must
+                // re-observe the durable row rather than reason about
+                // authority from an outdated receipt.
                 let version_before = store.current_read_version().unwrap();
                 assert_eq!(
                     service.transition_publish(TransitionPublishRequest {
@@ -9398,8 +9594,8 @@ mod tests {
                         expected_operation: finish_expected,
                         transition: PublishTransition::FinishCleanup,
                     }),
-                    Err(PublicationError::RestoreAuthorityMismatch),
-                    "restore Cleaned is past automatic publisher cleanup authority",
+                    Err(PublicationError::ConcurrentMutation),
+                    "a stale expected record must be re-observed before authority is judged",
                 );
                 assert_eq!(store.current_read_version().unwrap(), version_before);
             }
