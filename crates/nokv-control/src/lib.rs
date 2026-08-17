@@ -22,10 +22,13 @@ pub use errors::ControlError;
 #[cfg(feature = "etcd")]
 pub use etcd::EtcdControlStore;
 pub use options::EtcdControlStoreOptions;
-pub use store::{ControlStore, InMemoryControlStore};
+pub use store::{
+    ControlStore, InMemoryControlStore, MAX_LOGICAL_SHARD_RECORD_BYTES,
+    MAX_RECOVERY_LOG_RECEIPT_BYTES, MAX_RECOVERY_LOG_SEGMENTS,
+};
 pub use types::{
     AgentId, CheckpointRef, LogRef, LogSegmentRef, LogicalShardId, LogicalShardLease,
     LogicalShardRecord, LogicalShardState, NodeId, NodeIdError, ObjectNamespaceId, OwnerEpoch,
-    PlacementGeneration, RecoveryPublication, RootAgentBinding, RootId, RootObjectNamespaceBinding,
-    RootPlacement, RootPlacementLifecycle, UnknownLogicalShardState,
+    PlacementGeneration, RecoveryPublication, RecoveryUploadIntent, RootAgentBinding, RootId,
+    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle, UnknownLogicalShardState,
 };

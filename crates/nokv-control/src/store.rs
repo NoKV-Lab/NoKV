@@ -4,9 +4,27 @@ use std::sync::Mutex;
 use crate::types::endpoint_is_canonical;
 use crate::{
     CheckpointRef, ControlError, LogRef, LogicalShardId, LogicalShardLease, LogicalShardRecord,
-    LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication, RootAgentBinding, RootId,
-    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
+    LogicalShardState, NodeId, OwnerEpoch, RecoveryPublication, RecoveryUploadIntent,
+    RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
 };
+
+/// Maximum opaque object plan retained in one logical-shard control record.
+pub const MAX_RECOVERY_UPLOAD_PLAN_BYTES: usize = 64 * 1024;
+pub const MAX_RECOVERY_UPLOAD_RECEIPT_BYTES: usize = 64 * 1024;
+/// Maximum canonical JSON bytes for one logical-shard record.
+///
+/// Owner-fenced etcd mutations also carry the lease-attached owner session.
+/// Keeping each record below 448 KiB leaves more than 128 KiB of headroom
+/// beneath etcd's 1 MiB portable request floor after the record and maximum
+/// same-owner session are encoded in one transaction.
+pub const MAX_LOGICAL_SHARD_RECORD_BYTES: usize = 448 * 1024;
+/// Maximum aggregate opaque receipt bytes retained by one shared-log chain.
+/// The encoded-record limit may stop a chain before this secondary opaque-byte
+/// bound because JSON byte arrays expand on the wire.
+pub const MAX_RECOVERY_LOG_RECEIPT_BYTES: usize = 1024 * 1024;
+/// Hard bound for one control-plane log chain until checkpoint compaction is
+/// available. Publication fails before acknowledgement when this is reached.
+pub const MAX_RECOVERY_LOG_SEGMENTS: usize = 4_096;
 
 /// Durable control-plane operations, split between immutable root placement
 /// and physical logical-shard ownership.
@@ -92,6 +110,31 @@ pub trait ControlStore: Send + Sync {
         &self,
         lease: &LogicalShardLease,
         publication: RecoveryPublication,
+    ) -> Result<LogicalShardRecord, ControlError>;
+
+    /// Persist the complete immutable-object plan before its first create.
+    fn prepare_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        intent: RecoveryUploadIntent,
+    ) -> Result<LogicalShardRecord, ControlError>;
+
+    /// Publish the exact uploaded segment and clear its durable intent in one
+    /// owner-fenced mutation. Exact lost-ACK readback is idempotent.
+    fn finalize_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        expected_intent: &RecoveryUploadIntent,
+        publication: RecoveryPublication,
+    ) -> Result<LogicalShardRecord, ControlError>;
+
+    /// Abandon one exact incomplete immutable upload while retaining the last
+    /// fully published recovery frontier. Exact readback after a concurrent
+    /// finalization is idempotent.
+    fn abort_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        expected_intent: &RecoveryUploadIntent,
     ) -> Result<LogicalShardRecord, ControlError>;
 
     /// End the live session for a boot that has not reached `Serving`, while
@@ -425,6 +468,68 @@ impl ControlStore for InMemoryControlStore {
         Ok(next)
     }
 
+    fn abort_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        expected_intent: &RecoveryUploadIntent,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        let current = state
+            .logical_shards
+            .get(&lease.logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        validate_record_lease(&current, lease)?;
+        validate_in_memory_session(&state, lease)?;
+        let next = prepare_recovery_upload_abort(&current, lease, expected_intent)?;
+        state
+            .logical_shards
+            .insert(lease.logical_shard_id, next.clone());
+        Ok(next)
+    }
+
+    fn prepare_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        intent: RecoveryUploadIntent,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        let current = state
+            .logical_shards
+            .get(&lease.logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        validate_record_lease(&current, lease)?;
+        validate_in_memory_session(&state, lease)?;
+        let next = prepare_recovery_upload_intent(&current, lease, intent)?;
+        state
+            .logical_shards
+            .insert(lease.logical_shard_id, next.clone());
+        Ok(next)
+    }
+
+    fn finalize_recovery_upload(
+        &self,
+        lease: &LogicalShardLease,
+        expected_intent: &RecoveryUploadIntent,
+        publication: RecoveryPublication,
+    ) -> Result<LogicalShardRecord, ControlError> {
+        let mut state = self.state.lock().expect("control store mutex poisoned");
+        let current = state
+            .logical_shards
+            .get(&lease.logical_shard_id)
+            .cloned()
+            .ok_or(ControlError::LogicalShardNotFound(lease.logical_shard_id))?;
+        validate_record_lease(&current, lease)?;
+        validate_in_memory_session(&state, lease)?;
+        let next =
+            prepare_recovery_upload_finalization(&current, lease, expected_intent, publication)?;
+        state
+            .logical_shards
+            .insert(lease.logical_shard_id, next.clone());
+        Ok(next)
+    }
+
     fn suspend_recovery(
         &self,
         lease: &LogicalShardLease,
@@ -704,7 +809,151 @@ pub(crate) fn prepare_mark_serving(
     validate_record_lease(current, lease)?;
     let mut next = current.clone();
     apply_recovery_publication(&mut next, publication)?;
+    if next.pending_recovery_upload.is_some() {
+        return Err(ControlError::RecoveryUploadConflict {
+            logical_shard_id: current.logical_shard_id,
+            reason: "logical shard cannot become Serving with a pending recovery upload".to_owned(),
+        });
+    }
     next.state = LogicalShardState::Serving;
+    validate_logical_shard_record(&next)?;
+    Ok(next)
+}
+
+pub(crate) fn prepare_recovery_upload_intent(
+    current: &LogicalShardRecord,
+    lease: &LogicalShardLease,
+    intent: RecoveryUploadIntent,
+) -> Result<LogicalShardRecord, ControlError> {
+    validate_record_lease(current, lease)?;
+    validate_recovery_upload_intent(current, &intent)?;
+    if let Some(pending) = current.pending_recovery_upload.as_ref() {
+        if pending == &intent {
+            return Ok(current.clone());
+        }
+        return Err(ControlError::RecoveryUploadConflict {
+            logical_shard_id: current.logical_shard_id,
+            reason: "another recovery upload intent is already pending".to_owned(),
+        });
+    }
+    let mut next = current.clone();
+    next.pending_recovery_upload = Some(intent);
+    validate_logical_shard_record(&next)?;
+    Ok(next)
+}
+
+fn recovery_publication_after_intent(
+    current: &LogicalShardRecord,
+    intent: &RecoveryUploadIntent,
+) -> RecoveryPublication {
+    let mut segments = current
+        .log
+        .as_ref()
+        .map_or_else(Vec::new, |log| log.segments.clone());
+    segments.push(crate::LogSegmentRef {
+        segment_key: intent.manifest_key.clone(),
+        first_lsn: intent.first_lsn,
+        last_lsn: intent.last_lsn,
+        digest: intent.last_chain_digest.clone(),
+        receipt: intent.receipt.clone(),
+    });
+    RecoveryPublication {
+        checkpoint: None,
+        log: Some(crate::LogRef {
+            segments,
+            durable_lsn: intent.last_lsn,
+            digest: intent.last_chain_digest.clone(),
+        }),
+        durable_lsn: intent.last_lsn,
+    }
+}
+
+pub(crate) fn prepare_recovery_upload_finalization(
+    current: &LogicalShardRecord,
+    lease: &LogicalShardLease,
+    expected_intent: &RecoveryUploadIntent,
+    publication: RecoveryPublication,
+) -> Result<LogicalShardRecord, ControlError> {
+    validate_record_lease(current, lease)?;
+    validate_recovery_upload_intent_shape(expected_intent).map_err(|reason| {
+        ControlError::RecoveryUploadConflict {
+            logical_shard_id: current.logical_shard_id,
+            reason,
+        }
+    })?;
+    match current.pending_recovery_upload.as_ref() {
+        Some(actual) if actual == expected_intent => {}
+        Some(_) => {
+            return Err(ControlError::RecoveryUploadConflict {
+                logical_shard_id: current.logical_shard_id,
+                reason: "pending recovery upload does not match finalization intent".to_owned(),
+            });
+        }
+        None => {
+            let mut completed = current.clone();
+            apply_recovery_publication(&mut completed, publication)?;
+            if completed == *current && recovery_upload_is_published(current, expected_intent) {
+                return Ok(current.clone());
+            }
+            return Err(ControlError::RecoveryUploadConflict {
+                logical_shard_id: current.logical_shard_id,
+                reason: "recovery upload intent is not pending and its publication is not current"
+                    .to_owned(),
+            });
+        }
+    }
+    validate_upload_publication(expected_intent, &publication).map_err(|reason| {
+        ControlError::RecoveryUploadConflict {
+            logical_shard_id: current.logical_shard_id,
+            reason,
+        }
+    })?;
+    let mut next = current.clone();
+    apply_recovery_publication(&mut next, publication)?;
+    next.pending_recovery_upload = None;
+    validate_logical_shard_record(&next)?;
+    Ok(next)
+}
+
+pub(crate) fn prepare_recovery_upload_abort(
+    current: &LogicalShardRecord,
+    lease: &LogicalShardLease,
+    expected_intent: &RecoveryUploadIntent,
+) -> Result<LogicalShardRecord, ControlError> {
+    validate_record_lease(current, lease)?;
+    validate_recovery_upload_intent_shape(expected_intent).map_err(|reason| {
+        ControlError::RecoveryUploadConflict {
+            logical_shard_id: current.logical_shard_id,
+            reason,
+        }
+    })?;
+    match current.pending_recovery_upload.as_ref() {
+        Some(actual) if actual == expected_intent => {}
+        Some(_) => {
+            return Err(ControlError::RecoveryUploadConflict {
+                logical_shard_id: current.logical_shard_id,
+                reason: "pending recovery upload does not match abort intent".to_owned(),
+            });
+        }
+        None if recovery_upload_is_published(current, expected_intent) => {
+            return Ok(current.clone());
+        }
+        None => {
+            return Err(ControlError::RecoveryUploadConflict {
+                logical_shard_id: current.logical_shard_id,
+                reason: "recovery upload intent is neither pending nor exactly published"
+                    .to_owned(),
+            });
+        }
+    }
+    if current.state != LogicalShardState::Recovering {
+        return Err(ControlError::RecoveryStateConflict {
+            logical_shard_id: current.logical_shard_id,
+            actual: current.state,
+        });
+    }
+    let mut next = current.clone();
+    next.pending_recovery_upload = None;
     validate_logical_shard_record(&next)?;
     Ok(next)
 }
@@ -714,6 +963,12 @@ pub(crate) fn prepare_owner_release(
     lease: &LogicalShardLease,
 ) -> Result<LogicalShardRecord, ControlError> {
     validate_record_lease(current, lease)?;
+    if current.pending_recovery_upload.is_some() {
+        return Err(ControlError::RecoveryUploadConflict {
+            logical_shard_id: current.logical_shard_id,
+            reason: "owner cannot be released while a recovery upload is pending".to_owned(),
+        });
+    }
     if current.state == LogicalShardState::Recovering {
         return Err(ControlError::RecoveryAttemptPending {
             logical_shard_id: current.logical_shard_id,
@@ -761,11 +1016,168 @@ pub(crate) fn validate_record_lease(
     Ok(())
 }
 
+fn validate_recovery_upload_intent(
+    record: &LogicalShardRecord,
+    intent: &RecoveryUploadIntent,
+) -> Result<(), ControlError> {
+    let conflict = |reason: String| ControlError::RecoveryUploadConflict {
+        logical_shard_id: record.logical_shard_id,
+        reason,
+    };
+    if !matches!(
+        record.state,
+        LogicalShardState::Recovering | LogicalShardState::Serving
+    ) {
+        return Err(conflict(format!(
+            "recovery upload requires Recovering or Serving state, actual {:?}",
+            record.state
+        )));
+    }
+    validate_recovery_upload_intent_shape(intent).map_err(&conflict)?;
+    let retained_segments = record.log.as_ref().map_or(0, |log| log.segments.len());
+    if retained_segments >= MAX_RECOVERY_LOG_SEGMENTS {
+        return Err(conflict(format!(
+            "shared recovery log already retains {retained_segments} segments; publish a checkpoint before preparing another upload"
+        )));
+    }
+    let retained_receipt_bytes = record
+        .log
+        .as_ref()
+        .map(|log| {
+            log.segments.iter().try_fold(0_usize, |total, segment| {
+                total
+                    .checked_add(segment.receipt.len())
+                    .ok_or_else(|| conflict("log receipt byte total overflows".to_owned()))
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let prepared_receipt_bytes = retained_receipt_bytes
+        .checked_add(intent.receipt.len())
+        .ok_or_else(|| conflict("prepared log receipt byte total overflows".to_owned()))?;
+    if prepared_receipt_bytes > MAX_RECOVERY_LOG_RECEIPT_BYTES {
+        return Err(conflict(format!(
+            "prepared log receipt byte total {prepared_receipt_bytes} exceeds {MAX_RECOVERY_LOG_RECEIPT_BYTES}"
+        )));
+    }
+    let expected_first = record
+        .durable_lsn
+        .checked_add(1)
+        .ok_or_else(|| conflict("durable recovery LSN is exhausted".to_owned()))?;
+    if intent.first_lsn != expected_first {
+        return Err(conflict(format!(
+            "upload starts at LSN {}, expected {expected_first}",
+            intent.first_lsn
+        )));
+    }
+    if let Some(expected) = durable_tail_digest(record).map_err(&conflict)? {
+        if intent.previous_chain_digest != expected {
+            return Err(conflict(
+                "upload previous digest differs from the durable tail".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_upload_intent_shape(intent: &RecoveryUploadIntent) -> Result<(), String> {
+    if intent.first_lsn == 0 || intent.last_lsn < intent.first_lsn {
+        return Err("recovery upload has an invalid LSN range".to_owned());
+    }
+    for (name, digest) in [
+        ("previous chain", intent.previous_chain_digest.as_str()),
+        ("last chain", intent.last_chain_digest.as_str()),
+        ("segment", intent.segment_digest.as_str()),
+    ] {
+        if !canonical_sha256_hex(digest) {
+            return Err(format!(
+                "recovery upload {name} digest is not canonical SHA-256 hex"
+            ));
+        }
+    }
+    if intent.manifest_key.is_empty()
+        || intent.manifest_key.trim() != intent.manifest_key
+        || intent.manifest_key.chars().any(char::is_control)
+    {
+        return Err("recovery upload manifest key is empty or non-canonical".to_owned());
+    }
+    if intent.receipt.is_empty() || intent.receipt.len() > MAX_RECOVERY_UPLOAD_RECEIPT_BYTES {
+        return Err(format!(
+            "recovery upload receipt length {} is outside 1..={MAX_RECOVERY_UPLOAD_RECEIPT_BYTES}",
+            intent.receipt.len()
+        ));
+    }
+    if intent.plan.is_empty() || intent.plan.len() > MAX_RECOVERY_UPLOAD_PLAN_BYTES {
+        return Err(format!(
+            "recovery upload plan length {} is outside 1..={MAX_RECOVERY_UPLOAD_PLAN_BYTES}",
+            intent.plan.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_upload_publication(
+    intent: &RecoveryUploadIntent,
+    publication: &RecoveryPublication,
+) -> Result<(), String> {
+    if publication.durable_lsn != intent.last_lsn {
+        return Err("publication durable LSN does not match upload intent".to_owned());
+    }
+    let log = publication
+        .log
+        .as_ref()
+        .ok_or_else(|| "upload finalization requires a log publication".to_owned())?;
+    if log.durable_lsn != intent.last_lsn || log.digest != intent.last_chain_digest {
+        return Err("log tail does not match upload intent".to_owned());
+    }
+    let segment = log
+        .segments
+        .last()
+        .ok_or_else(|| "upload finalization log has no segment".to_owned())?;
+    if segment.segment_key != intent.manifest_key
+        || segment.first_lsn != intent.first_lsn
+        || segment.last_lsn != intent.last_lsn
+        || segment.digest != intent.last_chain_digest
+        || segment.receipt != intent.receipt
+    {
+        return Err("log segment does not match upload intent".to_owned());
+    }
+    Ok(())
+}
+
+fn recovery_upload_is_published(
+    record: &LogicalShardRecord,
+    intent: &RecoveryUploadIntent,
+) -> bool {
+    record.durable_lsn == intent.last_lsn
+        && record.log.as_ref().is_some_and(|log| {
+            log.durable_lsn == intent.last_lsn
+                && log.digest == intent.last_chain_digest
+                && log.segments.last().is_some_and(|segment| {
+                    segment.segment_key == intent.manifest_key
+                        && segment.first_lsn == intent.first_lsn
+                        && segment.last_lsn == intent.last_lsn
+                        && segment.digest == intent.last_chain_digest
+                        && segment.receipt == intent.receipt
+                })
+        })
+}
+
+fn canonical_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn validate_logical_shard_record(
     record: &LogicalShardRecord,
 ) -> Result<(), ControlError> {
     if record.owner_epoch.is_none()
-        && (record.checkpoint.is_some() || record.log.is_some() || record.durable_lsn != 0)
+        && (record.checkpoint.is_some()
+            || record.log.is_some()
+            || record.durable_lsn != 0
+            || record.pending_recovery_upload.is_some())
     {
         return Err(ControlError::InvalidRecord(
             "never-owned logical shard cannot have recovery state".to_owned(),
@@ -824,6 +1236,16 @@ pub(crate) fn validate_logical_shard_record(
     if let Some(log) = record.log.as_ref() {
         validate_log_ref(record, None, log).map_err(ControlError::InvalidRecord)?;
     }
+    if let Some(intent) = record.pending_recovery_upload.as_ref() {
+        validate_recovery_upload_intent(record, intent).map_err(|error| {
+            ControlError::InvalidRecord(format!("pending recovery upload is invalid: {error}"))
+        })?;
+        validate_pending_recovery_upload_final_record(record, intent).map_err(|error| {
+            ControlError::InvalidRecord(format!(
+                "pending recovery upload cannot produce a durable final record: {error}"
+            ))
+        })?;
+    }
     let reference_lsn = match (record.checkpoint.as_ref(), record.log.as_ref()) {
         (Some(checkpoint), Some(log)) => checkpoint.lsn.max(log.durable_lsn),
         (Some(checkpoint), None) => checkpoint.lsn,
@@ -837,7 +1259,21 @@ pub(crate) fn validate_logical_shard_record(
         )));
     }
     durable_tail_digest(record).map_err(ControlError::InvalidRecord)?;
+    crate::codec::validate_logical_shard_record_encoded_size(record)?;
     Ok(())
+}
+
+fn validate_pending_recovery_upload_final_record(
+    record: &LogicalShardRecord,
+    intent: &RecoveryUploadIntent,
+) -> Result<(), ControlError> {
+    let mut completed = record.clone();
+    apply_recovery_publication(
+        &mut completed,
+        recovery_publication_after_intent(record, intent),
+    )?;
+    completed.pending_recovery_upload = None;
+    validate_logical_shard_record(&completed)
 }
 
 fn validate_endpoint(endpoint: &str) -> Result<(), ControlError> {
@@ -860,6 +1296,13 @@ fn validate_checkpoint_ref(checkpoint: &CheckpointRef) -> Result<(), String> {
     }
     if checkpoint.digest.is_empty() {
         return Err("checkpoint state digest must not be empty".to_owned());
+    }
+    if checkpoint.receipt.is_empty() || checkpoint.receipt.len() > MAX_RECOVERY_UPLOAD_RECEIPT_BYTES
+    {
+        return Err(format!(
+            "checkpoint receipt length {} is outside 1..={MAX_RECOVERY_UPLOAD_RECEIPT_BYTES}",
+            checkpoint.receipt.len()
+        ));
     }
     Ok(())
 }
@@ -998,6 +1441,12 @@ fn validate_log_ref(
     if log.segments.is_empty() {
         return Err("log segment chain is empty".to_owned());
     }
+    if log.segments.len() > MAX_RECOVERY_LOG_SEGMENTS {
+        return Err(format!(
+            "log segment chain has {} rows; maximum is {MAX_RECOVERY_LOG_SEGMENTS}",
+            log.segments.len()
+        ));
+    }
     if log.digest.is_empty() {
         return Err("log tail digest must not be empty".to_owned());
     }
@@ -1012,12 +1461,27 @@ fn validate_log_ref(
         ));
     }
 
+    let mut aggregate_receipt_bytes = 0_usize;
     for (index, segment) in log.segments.iter().enumerate() {
         if segment.segment_key.is_empty() {
             return Err(format!("log segment {index} has an empty object key"));
         }
         if segment.digest.is_empty() {
             return Err(format!("log segment {index} has an empty digest"));
+        }
+        if segment.receipt.is_empty() || segment.receipt.len() > MAX_RECOVERY_UPLOAD_RECEIPT_BYTES {
+            return Err(format!(
+                "log segment {index} receipt length {} is outside 1..={MAX_RECOVERY_UPLOAD_RECEIPT_BYTES}",
+                segment.receipt.len()
+            ));
+        }
+        aggregate_receipt_bytes = aggregate_receipt_bytes
+            .checked_add(segment.receipt.len())
+            .ok_or_else(|| "log receipt byte total overflows".to_owned())?;
+        if aggregate_receipt_bytes > MAX_RECOVERY_LOG_RECEIPT_BYTES {
+            return Err(format!(
+                "log receipt byte total {aggregate_receipt_bytes} exceeds {MAX_RECOVERY_LOG_RECEIPT_BYTES}"
+            ));
         }
         if segment.first_lsn == 0 || segment.first_lsn > segment.last_lsn {
             return Err(format!(
@@ -1110,7 +1574,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
-    use crate::{AgentId, LogSegmentRef, PlacementGeneration};
+    use crate::{encode_logical_shard_record, AgentId, LogSegmentRef, PlacementGeneration};
 
     fn root_id(value: u8) -> RootId {
         RootId::from_bytes([value; 16])
@@ -1256,10 +1720,154 @@ mod tests {
                 first_lsn,
                 last_lsn,
                 digest: digest.to_owned(),
+                receipt: vec![4, 5, 6],
             }],
             durable_lsn: last_lsn,
             digest: digest.to_owned(),
         }
+    }
+
+    fn recovery_upload(first_lsn: u64, last_lsn: u64, digest: char) -> RecoveryUploadIntent {
+        let digest = std::iter::repeat_n(digest, 64).collect::<String>();
+        RecoveryUploadIntent {
+            object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([7; 16]),
+            first_lsn,
+            last_lsn,
+            previous_chain_digest: std::iter::repeat_n('0', 64).collect(),
+            last_chain_digest: digest.clone(),
+            segment_digest: std::iter::repeat_n('a', 64).collect(),
+            manifest_key: format!("nokv/recovery/log-segments/v1/{first_lsn}-{last_lsn}"),
+            receipt: vec![4, 5, 6],
+            plan: vec![1, 2, 3],
+        }
+    }
+
+    fn recovery_upload_publication(intent: &RecoveryUploadIntent) -> RecoveryPublication {
+        RecoveryPublication {
+            checkpoint: None,
+            log: Some(LogRef {
+                segments: vec![LogSegmentRef {
+                    segment_key: intent.manifest_key.clone(),
+                    first_lsn: intent.first_lsn,
+                    last_lsn: intent.last_lsn,
+                    digest: intent.last_chain_digest.clone(),
+                    receipt: intent.receipt.clone(),
+                }],
+                durable_lsn: intent.last_lsn,
+                digest: intent.last_chain_digest.clone(),
+            }),
+            durable_lsn: intent.last_lsn,
+        }
+    }
+
+    #[test]
+    fn recovery_upload_intent_is_durable_before_publication_and_lost_ack_is_exact() {
+        let store = InMemoryControlStore::new();
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let intent = recovery_upload(1, 3, 'b');
+
+        let prepared = store
+            .prepare_recovery_upload(&lease, intent.clone())
+            .unwrap();
+        assert_eq!(prepared.pending_recovery_upload.as_ref(), Some(&intent));
+        assert_eq!(prepared.durable_lsn, 0);
+        assert_eq!(
+            store
+                .prepare_recovery_upload(&lease, intent.clone())
+                .unwrap(),
+            prepared,
+            "exact intent replay is idempotent"
+        );
+
+        let publication = recovery_upload_publication(&intent);
+        let finalized = store
+            .finalize_recovery_upload(&lease, &intent, publication.clone())
+            .unwrap();
+        assert_eq!(finalized.durable_lsn, 3);
+        assert!(finalized.pending_recovery_upload.is_none());
+        assert_eq!(finalized.state, LogicalShardState::Recovering);
+        assert_eq!(
+            store
+                .finalize_recovery_upload(&lease, &intent, publication)
+                .unwrap(),
+            finalized,
+            "exact finalization readback accepts a lost response"
+        );
+    }
+
+    #[test]
+    fn recovery_upload_rejects_conflicting_intent_or_publication() {
+        let store = InMemoryControlStore::new();
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let intent = recovery_upload(1, 3, 'b');
+        store
+            .prepare_recovery_upload(&lease, intent.clone())
+            .unwrap();
+
+        let mut conflicting = intent.clone();
+        conflicting.plan.push(4);
+        assert!(matches!(
+            store.prepare_recovery_upload(&lease, conflicting),
+            Err(ControlError::RecoveryUploadConflict { .. })
+        ));
+
+        let mut publication = recovery_upload_publication(&intent);
+        publication.log.as_mut().unwrap().segments[0].segment_key = "foreign".to_owned();
+        assert!(matches!(
+            store.finalize_recovery_upload(&lease, &intent, publication),
+            Err(ControlError::RecoveryUploadConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .get_logical_shard(&lease.logical_shard_id)
+                .unwrap()
+                .unwrap()
+                .pending_recovery_upload,
+            Some(intent)
+        );
+    }
+
+    #[test]
+    fn recovery_upload_abort_is_exact_owner_fenced_and_finalization_aware() {
+        let store = InMemoryControlStore::new();
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let intent = recovery_upload(1, 3, 'b');
+        store
+            .prepare_recovery_upload(&lease, intent.clone())
+            .unwrap();
+
+        let mut foreign = intent.clone();
+        foreign.plan.push(4);
+        assert!(matches!(
+            store.abort_recovery_upload(&lease, &foreign),
+            Err(ControlError::RecoveryUploadConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .get_logical_shard(&lease.logical_shard_id)
+                .unwrap()
+                .unwrap()
+                .pending_recovery_upload,
+            Some(intent.clone())
+        );
+
+        let aborted = store.abort_recovery_upload(&lease, &intent).unwrap();
+        assert!(aborted.pending_recovery_upload.is_none());
+        assert_eq!(aborted.durable_lsn, 0);
+        assert_eq!(aborted.state, LogicalShardState::Recovering);
+
+        store
+            .prepare_recovery_upload(&lease, intent.clone())
+            .unwrap();
+        let publication = recovery_upload_publication(&intent);
+        let finalized = store
+            .finalize_recovery_upload(&lease, &intent, publication)
+            .unwrap();
+        assert_eq!(
+            store.abort_recovery_upload(&lease, &intent).unwrap(),
+            finalized,
+            "an abort replay must recognize an exact completed publication"
+        );
     }
 
     #[test]
@@ -1531,6 +2139,7 @@ mod tests {
             image_bytes: 4096,
             image_digest: "image-2".to_owned(),
             digest: "state-2".to_owned(),
+            receipt: vec![7, 8, 9],
         };
         let checkpointed = store
             .mark_serving(
@@ -1556,7 +2165,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(advanced.durable_lsn, 4);
-        assert_eq!(advanced.log.unwrap().durable_lsn, 4);
+        assert_eq!(advanced.log.as_ref().unwrap().durable_lsn, 4);
+
+        let first_segment = advanced
+            .log
+            .as_ref()
+            .expect("advanced log must remain present")
+            .segments[0]
+            .clone();
+        let second_segment = LogSegmentRef {
+            segment_key: "logs/5-6".to_owned(),
+            first_lsn: 5,
+            last_lsn: 6,
+            digest: "state-6".to_owned(),
+            receipt: vec![7, 8, 9],
+        };
+        let advanced = store
+            .mark_serving(
+                &lease,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: Some(LogRef {
+                        segments: vec![first_segment, second_segment],
+                        durable_lsn: 6,
+                        digest: "state-6".to_owned(),
+                    }),
+                    durable_lsn: 6,
+                },
+            )
+            .unwrap();
+        assert_eq!(advanced.checkpoint.as_ref().unwrap().lsn, 2);
+        assert_eq!(advanced.log.as_ref().unwrap().segments.len(), 2);
+
+        store.release_owner(&lease).unwrap();
+        let successor = store
+            .acquire_successor(
+                &shard_id(1),
+                lease.owner_epoch,
+                node("node-b"),
+                "node-b:7000".to_owned(),
+            )
+            .unwrap();
+        let serving = store
+            .mark_serving(
+                &successor,
+                RecoveryPublication {
+                    checkpoint: None,
+                    log: None,
+                    durable_lsn: 6,
+                },
+            )
+            .unwrap();
+        assert_eq!(serving.state, LogicalShardState::Serving);
+        assert_eq!(serving.checkpoint.as_ref().unwrap().lsn, 2);
+        assert_eq!(serving.log.as_ref().unwrap().durable_lsn, 6);
+    }
+
+    #[test]
+    fn checkpoint_publication_requires_a_bounded_recovery_receipt() {
+        let store = InMemoryControlStore::new();
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let checkpoint = |receipt: Vec<u8>| CheckpointRef {
+            object_key: "checkpoints/2".to_owned(),
+            lsn: 2,
+            image_bytes: 4096,
+            image_digest: "image-2".to_owned(),
+            digest: "state-2".to_owned(),
+            receipt,
+        };
+
+        for receipt in [Vec::new(), vec![0; MAX_RECOVERY_UPLOAD_RECEIPT_BYTES + 1]] {
+            assert!(matches!(
+                store.mark_serving(
+                    &lease,
+                    RecoveryPublication {
+                        checkpoint: Some(checkpoint(receipt)),
+                        log: None,
+                        durable_lsn: 2,
+                    },
+                ),
+                Err(ControlError::RecoveryPublicationConflict { .. })
+            ));
+        }
+        assert_eq!(
+            store
+                .get_logical_shard(&shard_id(1))
+                .unwrap()
+                .unwrap()
+                .durable_lsn,
+            0
+        );
     }
 
     #[test]
@@ -1668,6 +2366,178 @@ mod tests {
     }
 
     #[test]
+    fn log_chain_cap_fails_closed_before_publication() {
+        let record = LogicalShardRecord::unassigned(shard_id(1));
+        let segments = (1..=MAX_RECOVERY_LOG_SEGMENTS + 1)
+            .map(|lsn| LogSegmentRef {
+                segment_key: format!("logs/{lsn}-{lsn}"),
+                first_lsn: lsn as u64,
+                last_lsn: lsn as u64,
+                digest: format!("state-{lsn}"),
+                receipt: vec![1],
+            })
+            .collect::<Vec<_>>();
+        let log = LogRef {
+            durable_lsn: segments.last().unwrap().last_lsn,
+            digest: segments.last().unwrap().digest.clone(),
+            segments,
+        };
+
+        assert_eq!(
+            validate_log_ref(&record, None, &log).unwrap_err(),
+            format!(
+                "log segment chain has {} rows; maximum is {MAX_RECOVERY_LOG_SEGMENTS}",
+                MAX_RECOVERY_LOG_SEGMENTS + 1
+            )
+        );
+    }
+
+    #[test]
+    fn aggregate_log_receipt_bytes_fail_closed_before_publication() {
+        let record = LogicalShardRecord::unassigned(shard_id(1));
+        let segment_count = MAX_RECOVERY_LOG_RECEIPT_BYTES
+            .checked_div(MAX_RECOVERY_UPLOAD_RECEIPT_BYTES)
+            .unwrap()
+            + 1;
+        let segments = (1..=segment_count)
+            .map(|lsn| LogSegmentRef {
+                segment_key: format!("logs/{lsn}-{lsn}"),
+                first_lsn: lsn as u64,
+                last_lsn: lsn as u64,
+                digest: format!("state-{lsn}"),
+                receipt: vec![1; MAX_RECOVERY_UPLOAD_RECEIPT_BYTES],
+            })
+            .collect::<Vec<_>>();
+        let log = LogRef {
+            durable_lsn: segments.last().unwrap().last_lsn,
+            digest: segments.last().unwrap().digest.clone(),
+            segments,
+        };
+
+        assert_eq!(
+            validate_log_ref(&record, None, &log).unwrap_err(),
+            format!(
+                "log receipt byte total {} exceeds {MAX_RECOVERY_LOG_RECEIPT_BYTES}",
+                segment_count * MAX_RECOVERY_UPLOAD_RECEIPT_BYTES
+            )
+        );
+    }
+
+    #[test]
+    fn recovery_upload_prepare_rejects_a_chain_that_cannot_be_finalized() {
+        let store = InMemoryControlStore::new();
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let base = store.renew_owner(&lease).unwrap();
+        let intent_after = |record: &LogicalShardRecord| RecoveryUploadIntent {
+            object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([7; 16]),
+            first_lsn: record.durable_lsn + 1,
+            last_lsn: record.durable_lsn + 1,
+            previous_chain_digest: record.log.as_ref().unwrap().digest.clone(),
+            last_chain_digest: "b".repeat(64),
+            segment_digest: "a".repeat(64),
+            manifest_key: "nokv/recovery/log-segments/v1/next".to_owned(),
+            receipt: vec![1],
+            plan: vec![1],
+        };
+        let chain = |count: usize, receipt_len: usize| {
+            let segments = (1..=count)
+                .map(|lsn| LogSegmentRef {
+                    segment_key: format!("logs/{lsn}-{lsn}"),
+                    first_lsn: lsn as u64,
+                    last_lsn: lsn as u64,
+                    digest: format!("{:064x}", lsn),
+                    receipt: vec![1; receipt_len],
+                })
+                .collect::<Vec<_>>();
+            LogRef {
+                durable_lsn: count as u64,
+                digest: segments.last().unwrap().digest.clone(),
+                segments,
+            }
+        };
+
+        let mut full = base.clone();
+        full.log = Some(chain(MAX_RECOVERY_LOG_SEGMENTS, 1));
+        full.durable_lsn = MAX_RECOVERY_LOG_SEGMENTS as u64;
+        let error = prepare_recovery_upload_intent(&full, &lease, intent_after(&full))
+            .expect_err("a full log chain cannot accept an unfinishable upload intent");
+        assert!(error.to_string().contains("publish a checkpoint"));
+
+        let exact_receipt_segments =
+            MAX_RECOVERY_LOG_RECEIPT_BYTES / MAX_RECOVERY_UPLOAD_RECEIPT_BYTES;
+        let mut receipt_full = base;
+        receipt_full.log = Some(chain(
+            exact_receipt_segments,
+            MAX_RECOVERY_UPLOAD_RECEIPT_BYTES,
+        ));
+        receipt_full.durable_lsn = exact_receipt_segments as u64;
+        let error =
+            prepare_recovery_upload_intent(&receipt_full, &lease, intent_after(&receipt_full))
+                .expect_err("an aggregate-full receipt chain cannot accept another intent");
+        assert!(error
+            .to_string()
+            .contains("prepared log receipt byte total"));
+    }
+
+    #[test]
+    fn recovery_upload_prepare_rejects_an_unpersistable_final_record() {
+        let store = InMemoryControlStore::new();
+        let lease = acquire_placed_shard(&store, 1, 1);
+        let mut record = store.renew_owner(&lease).unwrap();
+        let mut segments = Vec::new();
+
+        loop {
+            let lsn = segments.len() as u64 + 1;
+            segments.push(LogSegmentRef {
+                segment_key: format!("nokv/recovery/log-segments/v1/{lsn:020}-{}", "k".repeat(96)),
+                first_lsn: lsn,
+                last_lsn: lsn,
+                digest: format!("{lsn:064x}"),
+                receipt: vec![255; 210],
+            });
+            record.log = Some(LogRef {
+                segments: segments.clone(),
+                durable_lsn: lsn,
+                digest: format!("{lsn:064x}"),
+            });
+            record.durable_lsn = lsn;
+            if encode_logical_shard_record(&record).is_err() {
+                segments.pop();
+                let tail = segments.last().expect("one segment fits the record budget");
+                record.log = Some(LogRef {
+                    segments: segments.clone(),
+                    durable_lsn: tail.last_lsn,
+                    digest: tail.digest.clone(),
+                });
+                record.durable_lsn = tail.last_lsn;
+                break;
+            }
+            assert!(segments.len() < MAX_RECOVERY_LOG_SEGMENTS);
+        }
+        assert!(encode_logical_shard_record(&record).is_ok());
+
+        let next_lsn = record.durable_lsn + 1;
+        let intent = RecoveryUploadIntent {
+            object_namespace_id: nokv_types::ObjectNamespaceId::from_bytes([7; 16]),
+            first_lsn: next_lsn,
+            last_lsn: next_lsn,
+            previous_chain_digest: record.log.as_ref().unwrap().digest.clone(),
+            last_chain_digest: "b".repeat(64),
+            segment_digest: "a".repeat(64),
+            manifest_key: format!(
+                "nokv/recovery/log-segments/v1/{next_lsn:020}-{}",
+                "k".repeat(96)
+            ),
+            receipt: vec![255; 210],
+            plan: vec![1],
+        };
+
+        let error = prepare_recovery_upload_intent(&record, &lease, intent)
+            .expect_err("prepare must reject a final record outside the persistence budget");
+        assert!(error.to_string().contains("encoded logical shard record"));
+    }
+
+    #[test]
     fn never_owned_record_cannot_claim_recovery_state() {
         let mut record = LogicalShardRecord::unassigned(shard_id(1));
         record.checkpoint = Some(CheckpointRef {
@@ -1676,6 +2546,7 @@ mod tests {
             image_bytes: 1,
             image_digest: "image-0".to_owned(),
             digest: "state-0".to_owned(),
+            receipt: vec![1],
         });
 
         assert!(matches!(

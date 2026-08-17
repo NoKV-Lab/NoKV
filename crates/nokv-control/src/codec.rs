@@ -1,19 +1,19 @@
 use serde::{Deserialize, Serialize};
 
-use crate::store::validate_logical_shard_record;
+use crate::store::{validate_logical_shard_record, MAX_LOGICAL_SHARD_RECORD_BYTES};
 #[cfg(any(feature = "etcd", test))]
 use crate::LogicalShardLease;
 use crate::{
     AgentId, CheckpointRef, ControlError, LogRef, LogSegmentRef, LogicalShardId,
     LogicalShardRecord, LogicalShardState, NodeId, ObjectNamespaceId, OwnerEpoch,
-    PlacementGeneration, RootAgentBinding, RootId, RootObjectNamespaceBinding, RootPlacement,
-    RootPlacementLifecycle,
+    PlacementGeneration, RecoveryUploadIntent, RootAgentBinding, RootId,
+    RootObjectNamespaceBinding, RootPlacement, RootPlacementLifecycle,
 };
 
 const ROOT_PLACEMENT_CODEC_VERSION: u8 = 1;
 const ROOT_AGENT_BINDING_CODEC_VERSION: u8 = 1;
 const ROOT_OBJECT_NAMESPACE_CODEC_VERSION: u8 = 1;
-const LOGICAL_SHARD_RECORD_CODEC_VERSION: u8 = 1;
+const LOGICAL_SHARD_RECORD_CODEC_VERSION: u8 = 3;
 #[cfg(any(feature = "etcd", test))]
 const OWNER_SESSION_CODEC_VERSION: u8 = 1;
 
@@ -45,7 +45,7 @@ struct RootObjectNamespaceBindingWire {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LogicalShardRecordWire {
+struct LogicalShardRecordWireV3 {
     version: u8,
     logical_shard_id: String,
     owner: Option<String>,
@@ -56,11 +56,73 @@ struct LogicalShardRecordWire {
     checkpoint: Option<CheckpointRefWire>,
     log: Option<LogRefWire>,
     durable_lsn: u64,
+    pending_recovery_upload: Option<RecoveryUploadIntentWire>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogicalShardRecordWireV2 {
+    version: u8,
+    logical_shard_id: String,
+    owner: Option<String>,
+    owner_epoch: Option<u64>,
+    lease_id: u64,
+    state: u8,
+    endpoint: Option<String>,
+    checkpoint: Option<CheckpointRefWireV2>,
+    log: Option<LogRefWire>,
+    durable_lsn: u64,
+    pending_recovery_upload: Option<RecoveryUploadIntentWire>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogicalShardRecordWireV1 {
+    version: u8,
+    logical_shard_id: String,
+    owner: Option<String>,
+    owner_epoch: Option<u64>,
+    lease_id: u64,
+    state: u8,
+    endpoint: Option<String>,
+    checkpoint: Option<CheckpointRefWireV2>,
+    log: Option<LogRefWireV1>,
+    durable_lsn: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryUploadIntentWire {
+    object_namespace_id: String,
+    first_lsn: u64,
+    last_lsn: u64,
+    previous_chain_digest: String,
+    last_chain_digest: String,
+    segment_digest: String,
+    manifest_key: String,
+    receipt: Vec<u8>,
+    plan: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct VersionWire {
+    version: u8,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointRefWire {
+    object_key: String,
+    lsn: u64,
+    image_bytes: u64,
+    image_digest: String,
+    digest: String,
+    receipt: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRefWireV2 {
     object_key: String,
     lsn: u64,
     image_bytes: u64,
@@ -75,12 +137,30 @@ struct LogSegmentRefWire {
     first_lsn: u64,
     last_lsn: u64,
     digest: String,
+    receipt: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LogRefWire {
     segments: Vec<LogSegmentRefWire>,
+    durable_lsn: u64,
+    digest: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogSegmentRefWireV1 {
+    segment_key: String,
+    first_lsn: u64,
+    last_lsn: u64,
+    digest: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogRefWireV1 {
+    segments: Vec<LogSegmentRefWireV1>,
     durable_lsn: u64,
     digest: String,
 }
@@ -197,7 +277,24 @@ pub fn decode_root_object_namespace_binding(
 
 pub fn encode_logical_shard_record(record: &LogicalShardRecord) -> Result<Vec<u8>, ControlError> {
     validate_logical_shard_record(record)?;
-    serde_json::to_vec(&LogicalShardRecordWire {
+    encode_logical_shard_record_wire(record)
+}
+
+pub(crate) fn validate_logical_shard_record_encoded_size(
+    record: &LogicalShardRecord,
+) -> Result<(), ControlError> {
+    let encoded = encode_logical_shard_record_wire(record)?;
+    if encoded.len() > MAX_LOGICAL_SHARD_RECORD_BYTES {
+        return Err(ControlError::InvalidRecord(format!(
+            "encoded logical shard record is {} bytes; maximum is {MAX_LOGICAL_SHARD_RECORD_BYTES}",
+            encoded.len()
+        )));
+    }
+    Ok(())
+}
+
+fn encode_logical_shard_record_wire(record: &LogicalShardRecord) -> Result<Vec<u8>, ControlError> {
+    serde_json::to_vec(&LogicalShardRecordWireV3 {
         version: LOGICAL_SHARD_RECORD_CODEC_VERSION,
         logical_shard_id: encode_fixed_id(record.logical_shard_id.as_bytes()),
         owner: record.owner.as_ref().map(|owner| owner.as_str().to_owned()),
@@ -208,46 +305,156 @@ pub fn encode_logical_shard_record(record: &LogicalShardRecord) -> Result<Vec<u8
         checkpoint: record.checkpoint.clone().map(Into::into),
         log: record.log.clone().map(Into::into),
         durable_lsn: record.durable_lsn,
+        pending_recovery_upload: record.pending_recovery_upload.clone().map(Into::into),
     })
     .map_err(codec_error)
 }
 
 pub fn decode_logical_shard_record(bytes: &[u8]) -> Result<LogicalShardRecord, ControlError> {
-    let wire: LogicalShardRecordWire = serde_json::from_slice(bytes).map_err(codec_error)?;
+    let version: VersionWire = serde_json::from_slice(bytes).map_err(codec_error)?;
+    let record = match version.version {
+        1 => decode_logical_shard_record_v1(bytes)?,
+        2 => decode_logical_shard_record_v2(bytes)?,
+        LOGICAL_SHARD_RECORD_CODEC_VERSION => decode_logical_shard_record_v3(bytes)?,
+        actual => {
+            require_version(
+                "logical shard record",
+                actual,
+                LOGICAL_SHARD_RECORD_CODEC_VERSION,
+            )?;
+            unreachable!("version validator returned Ok for an unsupported version")
+        }
+    };
+    validate_logical_shard_record(&record)?;
+    if version.version == LOGICAL_SHARD_RECORD_CODEC_VERSION
+        && encode_logical_shard_record(&record)?.as_slice() != bytes
+    {
+        return Err(ControlError::Codec(
+            "logical shard record input is not canonical".to_owned(),
+        ));
+    }
+    Ok(record)
+}
+
+fn decode_logical_shard_record_v3(bytes: &[u8]) -> Result<LogicalShardRecord, ControlError> {
+    let wire: LogicalShardRecordWireV3 = serde_json::from_slice(bytes).map_err(codec_error)?;
     require_version(
         "logical shard record",
         wire.version,
         LOGICAL_SHARD_RECORD_CODEC_VERSION,
     )?;
+    logical_shard_record_from_wire(
+        wire.logical_shard_id,
+        wire.owner,
+        wire.owner_epoch,
+        wire.lease_id,
+        wire.state,
+        wire.endpoint,
+        wire.checkpoint,
+        wire.log,
+        wire.durable_lsn,
+        wire.pending_recovery_upload
+            .map(RecoveryUploadIntent::try_from)
+            .transpose()?,
+    )
+}
+
+fn decode_logical_shard_record_v2(bytes: &[u8]) -> Result<LogicalShardRecord, ControlError> {
+    let wire: LogicalShardRecordWireV2 = serde_json::from_slice(bytes).map_err(codec_error)?;
+    require_version("logical shard record", wire.version, 2)?;
+    if serde_json::to_vec(&wire).map_err(codec_error)?.as_slice() != bytes {
+        return Err(ControlError::Codec(
+            "logical shard record v2 input is not canonical".to_owned(),
+        ));
+    }
+    if wire.checkpoint.is_some() {
+        return Err(ControlError::Codec(
+            "logical shard record v2 checkpoint lacks a recovery receipt".to_owned(),
+        ));
+    }
+    logical_shard_record_from_wire(
+        wire.logical_shard_id,
+        wire.owner,
+        wire.owner_epoch,
+        wire.lease_id,
+        wire.state,
+        wire.endpoint,
+        None,
+        wire.log,
+        wire.durable_lsn,
+        wire.pending_recovery_upload
+            .map(RecoveryUploadIntent::try_from)
+            .transpose()?,
+    )
+}
+
+fn decode_logical_shard_record_v1(bytes: &[u8]) -> Result<LogicalShardRecord, ControlError> {
+    let wire: LogicalShardRecordWireV1 = serde_json::from_slice(bytes).map_err(codec_error)?;
+    require_version("logical shard record", wire.version, 1)?;
+    if serde_json::to_vec(&wire).map_err(codec_error)?.as_slice() != bytes {
+        return Err(ControlError::Codec(
+            "logical shard record v1 input is not canonical".to_owned(),
+        ));
+    }
+    if wire.checkpoint.is_some() {
+        return Err(ControlError::Codec(
+            "logical shard record v1 checkpoint lacks a recovery receipt".to_owned(),
+        ));
+    }
+    if wire.log.is_some() {
+        return Err(ControlError::Codec(
+            "logical shard record v1 log lacks a recovery receipt".to_owned(),
+        ));
+    }
+    logical_shard_record_from_wire(
+        wire.logical_shard_id,
+        wire.owner,
+        wire.owner_epoch,
+        wire.lease_id,
+        wire.state,
+        wire.endpoint,
+        None,
+        None,
+        wire.durable_lsn,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn logical_shard_record_from_wire(
+    logical_shard_id: String,
+    owner: Option<String>,
+    owner_epoch: Option<u64>,
+    lease_id: u64,
+    state: u8,
+    endpoint: Option<String>,
+    checkpoint: Option<CheckpointRefWire>,
+    log: Option<LogRefWire>,
+    durable_lsn: u64,
+    pending_recovery_upload: Option<RecoveryUploadIntent>,
+) -> Result<LogicalShardRecord, ControlError> {
     let record = LogicalShardRecord {
         logical_shard_id: LogicalShardId::from_bytes(decode_fixed_id(
-            &wire.logical_shard_id,
+            &logical_shard_id,
             "logical shard id",
         )?),
-        owner: wire
-            .owner
+        owner: owner
             .map(NodeId::new)
             .transpose()
             .map_err(|err| ControlError::Codec(err.to_string()))?,
-        owner_epoch: wire
-            .owner_epoch
+        owner_epoch: owner_epoch
             .map(OwnerEpoch::new)
             .transpose()
             .map_err(|err| ControlError::Codec(err.to_string()))?,
-        lease_id: wire.lease_id,
-        state: LogicalShardState::try_from(wire.state)
+        lease_id,
+        state: LogicalShardState::try_from(state)
             .map_err(|err| ControlError::Codec(err.to_string()))?,
-        endpoint: wire.endpoint,
-        checkpoint: wire.checkpoint.map(Into::into),
-        log: wire.log.map(Into::into),
-        durable_lsn: wire.durable_lsn,
+        endpoint,
+        checkpoint: checkpoint.map(Into::into),
+        log: log.map(Into::into),
+        durable_lsn,
+        pending_recovery_upload,
     };
-    validate_logical_shard_record(&record)?;
-    if encode_logical_shard_record(&record)?.as_slice() != bytes {
-        return Err(ControlError::Codec(
-            "logical shard record input is not canonical".to_owned(),
-        ));
-    }
     Ok(record)
 }
 
@@ -376,6 +583,7 @@ impl From<CheckpointRef> for CheckpointRefWire {
             image_bytes: value.image_bytes,
             image_digest: value.image_digest,
             digest: value.digest,
+            receipt: value.receipt,
         }
     }
 }
@@ -388,6 +596,7 @@ impl From<CheckpointRefWire> for CheckpointRef {
             image_bytes: value.image_bytes,
             image_digest: value.image_digest,
             digest: value.digest,
+            receipt: value.receipt,
         }
     }
 }
@@ -419,6 +628,7 @@ impl From<LogSegmentRef> for LogSegmentRefWire {
             first_lsn: value.first_lsn,
             last_lsn: value.last_lsn,
             digest: value.digest,
+            receipt: value.receipt,
         }
     }
 }
@@ -430,7 +640,45 @@ impl From<LogSegmentRefWire> for LogSegmentRef {
             first_lsn: value.first_lsn,
             last_lsn: value.last_lsn,
             digest: value.digest,
+            receipt: value.receipt,
         }
+    }
+}
+
+impl From<RecoveryUploadIntent> for RecoveryUploadIntentWire {
+    fn from(intent: RecoveryUploadIntent) -> Self {
+        Self {
+            object_namespace_id: encode_fixed_id(intent.object_namespace_id.as_bytes()),
+            first_lsn: intent.first_lsn,
+            last_lsn: intent.last_lsn,
+            previous_chain_digest: intent.previous_chain_digest,
+            last_chain_digest: intent.last_chain_digest,
+            segment_digest: intent.segment_digest,
+            manifest_key: intent.manifest_key,
+            receipt: intent.receipt,
+            plan: intent.plan,
+        }
+    }
+}
+
+impl TryFrom<RecoveryUploadIntentWire> for RecoveryUploadIntent {
+    type Error = ControlError;
+
+    fn try_from(intent: RecoveryUploadIntentWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            object_namespace_id: ObjectNamespaceId::from_bytes(decode_fixed_id(
+                &intent.object_namespace_id,
+                "object namespace id",
+            )?),
+            first_lsn: intent.first_lsn,
+            last_lsn: intent.last_lsn,
+            previous_chain_digest: intent.previous_chain_digest,
+            last_chain_digest: intent.last_chain_digest,
+            segment_digest: intent.segment_digest,
+            manifest_key: intent.manifest_key,
+            receipt: intent.receipt,
+            plan: intent.plan,
+        })
     }
 }
 
@@ -484,6 +732,7 @@ mod tests {
                 image_bytes: 4096,
                 image_digest: "sha256:image".to_owned(),
                 digest: "state-128".to_owned(),
+                receipt: vec![1, 2, 3],
             }),
             log: Some(LogRef {
                 segments: vec![LogSegmentRef {
@@ -491,11 +740,38 @@ mod tests {
                     first_lsn: 129,
                     last_lsn: 144,
                     digest: "state-144".to_owned(),
+                    receipt: vec![4, 5, 6],
                 }],
                 durable_lsn: 144,
                 digest: "state-144".to_owned(),
             }),
             durable_lsn: 144,
+            pending_recovery_upload: None,
+        }
+    }
+
+    fn recovering_record_with_upload() -> LogicalShardRecord {
+        LogicalShardRecord {
+            logical_shard_id: shard_id(2),
+            owner: Some(NodeId::new("node-a").unwrap()),
+            owner_epoch: Some(OwnerEpoch::new(7).unwrap()),
+            lease_id: 42,
+            state: LogicalShardState::Recovering,
+            endpoint: Some("10.0.0.1:7000".to_owned()),
+            checkpoint: None,
+            log: None,
+            durable_lsn: 0,
+            pending_recovery_upload: Some(RecoveryUploadIntent {
+                object_namespace_id: ObjectNamespaceId::from_bytes([3; 16]),
+                first_lsn: 1,
+                last_lsn: 2,
+                previous_chain_digest: "0".repeat(64),
+                last_chain_digest: "1".repeat(64),
+                segment_digest: "2".repeat(64),
+                manifest_key: "nokv/recovery/log-segments/v1/manifest".to_owned(),
+                receipt: vec![4, 5, 6],
+                plan: vec![1, 2, 3],
+            }),
         }
     }
 
@@ -525,6 +801,11 @@ mod tests {
             decode_logical_shard_record(&encode_logical_shard_record(&record).unwrap()).unwrap(),
             record
         );
+        let record = recovering_record_with_upload();
+        assert_eq!(
+            decode_logical_shard_record(&encode_logical_shard_record(&record).unwrap()).unwrap(),
+            record
+        );
     }
 
     #[test]
@@ -543,8 +824,36 @@ mod tests {
         );
         assert_eq!(
             encode_logical_shard_record(&LogicalShardRecord::unassigned(shard_id(2))).unwrap(),
-            br#"{"version":1,"logical_shard_id":"02020202020202020202020202020202","owner":null,"owner_epoch":null,"lease_id":0,"state":1,"endpoint":null,"checkpoint":null,"log":null,"durable_lsn":0}"#
+            br#"{"version":3,"logical_shard_id":"02020202020202020202020202020202","owner":null,"owner_epoch":null,"lease_id":0,"state":1,"endpoint":null,"checkpoint":null,"log":null,"durable_lsn":0,"pending_recovery_upload":null}"#
         );
+        assert_eq!(
+            decode_logical_shard_record(
+                br#"{"version":1,"logical_shard_id":"02020202020202020202020202020202","owner":null,"owner_epoch":null,"lease_id":0,"state":1,"endpoint":null,"checkpoint":null,"log":null,"durable_lsn":0}"#
+            )
+            .unwrap(),
+            LogicalShardRecord::unassigned(shard_id(2)),
+            "the explicit v1 decoder installs no pending upload"
+        );
+        assert_eq!(
+            decode_logical_shard_record(
+                br#"{"version":2,"logical_shard_id":"02020202020202020202020202020202","owner":null,"owner_epoch":null,"lease_id":0,"state":1,"endpoint":null,"checkpoint":null,"log":null,"durable_lsn":0,"pending_recovery_upload":null}"#
+            )
+            .unwrap(),
+            LogicalShardRecord::unassigned(shard_id(2)),
+            "the explicit v2 decoder remains readable when no legacy checkpoint exists"
+        );
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_receipt_fails_closed() {
+        for encoded in [
+            br#"{"version":1,"logical_shard_id":"02020202020202020202020202020202","owner":"node-a","owner_epoch":7,"lease_id":42,"state":3,"endpoint":"10.0.0.1:7000","checkpoint":{"object_key":"checkpoints/7","lsn":128,"image_bytes":4096,"image_digest":"sha256:image","digest":"state-128"},"log":null,"durable_lsn":128}"#.as_slice(),
+            br#"{"version":2,"logical_shard_id":"02020202020202020202020202020202","owner":"node-a","owner_epoch":7,"lease_id":42,"state":3,"endpoint":"10.0.0.1:7000","checkpoint":{"object_key":"checkpoints/7","lsn":128,"image_bytes":4096,"image_digest":"sha256:image","digest":"state-128"},"log":null,"durable_lsn":128,"pending_recovery_upload":null}"#.as_slice(),
+        ] {
+            let error = decode_logical_shard_record(encoded)
+                .expect_err("a checkpoint without a receipt cannot be located after restart");
+            assert!(error.to_string().contains("checkpoint lacks a recovery receipt"));
+        }
     }
 
     #[test]
