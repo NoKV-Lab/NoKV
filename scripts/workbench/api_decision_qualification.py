@@ -41,6 +41,27 @@ WORKSPACE_CLIENT = _source(
     required=("pub use sdk::{ClientCall, ClientOptions, WorkspaceClient};",),
     forbidden=("NoKvFsClient", "Inode", "Dentry"),
 )
+GENERIC_AGENT_CONTRACT = _source(
+    "l01-generic-agent-contract-is-checked-in",
+    "crates/nokv-agent/src/lib.rs",
+    required=(
+        'pub const GENERIC_AGENT_CONTRACT_SCHEMA: &str = "nokv.agent.generic.mcp_input_schemas.v1";',
+        "pub const GENERIC_AGENT_TOOL_COUNT: usize = 7;",
+        "const GENERIC_AGENT_TOOL_DESCRIPTIONS: [(&str, &str); GENERIC_AGENT_TOOL_COUNT]",
+        'include_str!("../generic_agent_contract_schema.json")',
+        '"checked-in generic Agent contract tool set differs"',
+    ),
+)
+GENERIC_AGENT_CLI_PROFILE = _source(
+    "l01-generic-agent-profile-is-explicitly-selectable",
+    "crates/nokv/src/cli.rs",
+    required=(
+        "pub enum McpProfile {",
+        '"agent" => McpProfile::Agent,',
+        '"workbench" => McpProfile::Workbench,',
+        "profile: profile.unwrap_or_default(),",
+    ),
+)
 PYTHON_REPLACEMENT_DECISIONS = _source(
     "python-l03-l06-behaviors-must-be-replaced",
     "docs/development/pre423-contract-ledger.md",
@@ -106,7 +127,8 @@ SCENARIOS = {
     ),
     "l01.generic-profile-restoration-contract": _scenario(
         "L01",
-        nq="the reviewed policy requires an explicit seven-tool generic Agent MCP profile, but the CLI and nokv-agent schema do not implement it yet",
+        GENERIC_AGENT_CONTRACT,
+        GENERIC_AGENT_CLI_PROFILE,
     ),
     "l02.workspace-client-replacement-decision": _scenario("L02", WORKSPACE_CLIENT),
     "l03.path-native-python-compatibility-contract": _scenario(

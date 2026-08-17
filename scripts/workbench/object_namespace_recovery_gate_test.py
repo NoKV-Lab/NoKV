@@ -27,7 +27,10 @@ from object_namespace_recovery_gate import (
     server_command,
     validate_gate_evidence,
     wait_rustfs,
+    TYPED_SCENARIOS,
+    TYPED_SUPPORTED_SCENARIOS,
 )
+import pre423_contract_ledger
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -75,6 +78,28 @@ def valid_evidence() -> dict[str, object]:
 
 
 class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
+    def test_typed_scenarios_cover_the_provider_recovery_profile_without_overclaiming(
+        self,
+    ) -> None:
+        ledger = pre423_contract_ledger.load_ledger()
+        expected = {
+            scenario
+            for item in ledger["items"]
+            for gate in item["required_gates"]
+            for expectation in (
+                pre423_contract_ledger.resolve_gate_expectation(
+                    ledger, item["id"], gate
+                ),
+            )
+            if "object-namespace-recovery" in expectation["allowed_producers"]
+            for scenario in expectation["scenarios"]
+        }
+        self.assertEqual(set(TYPED_SCENARIOS), expected)
+        self.assertEqual(
+            TYPED_SUPPORTED_SCENARIOS,
+            {"c06.root-binding-survives-provider-restart"},
+        )
+
     def test_wrong_root_has_its_own_canonical_agent_fixture(self) -> None:
         seed = "agent-admission-contract"
         root_agent = fixed_id(seed, "agent")
@@ -158,9 +183,7 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
             process = mock.Mock()
             process.poll.return_value = None
             with (
-                mock.patch(
-                    "object_namespace_recovery_gate.run", side_effect=fake_run
-                ),
+                mock.patch("object_namespace_recovery_gate.run", side_effect=fake_run),
                 mock.patch(
                     "object_namespace_recovery_gate.start_process",
                     return_value=process,
@@ -236,7 +259,9 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
     def test_live_gate_bounds_each_aws_readiness_attempt(self) -> None:
         environment = aws_environment("access", "secret")
         self.assertEqual(environment["AWS_MAX_ATTEMPTS"], "1")
-        command = aws_command(Path("/usr/bin/aws"), "http://127.0.0.1:9000", "s3api", "list-buckets")
+        command = aws_command(
+            Path("/usr/bin/aws"), "http://127.0.0.1:9000", "s3api", "list-buckets"
+        )
         self.assertIn("--cli-connect-timeout", command)
         self.assertEqual(command[command.index("--cli-connect-timeout") + 1], "1")
         self.assertIn("--cli-read-timeout", command)
@@ -249,7 +274,7 @@ class ObjectNamespaceRecoveryGateTest(unittest.TestCase):
             "id: object_namespace_recovery",
             "python3 scripts/workbench/object_namespace_recovery_gate.py",
             "python3 scripts/workbench/object_namespace_recovery_gate_test.py",
-            "--evidence-dir \"$OBJECT_RECOVERY_EVIDENCE_DIR\"",
+            '--evidence-dir "$OBJECT_RECOVERY_EVIDENCE_DIR"',
             "object-namespace-recovery-${{ github.sha }}",
             "if-no-files-found: error",
         ):

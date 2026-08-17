@@ -24,7 +24,9 @@ from typing import Callable, Mapping, Sequence
 
 PRODUCER_RESULT_SCHEMA = "nokv.pre423.producer_result.v1"
 EVIDENCE_SCHEMA = "nokv.pre423.producer_evidence.v1"
+RUST_QUALIFICATION_SCHEMA = "nokv.pre423.rust_qualification.v1"
 RESULT_ROLES = ("producer-result",)
+RUST_EVIDENCE_ROLES = frozenset({"producer-result", "qualification"})
 OUTCOME_EXIT_CODES = {"PASS": 0, "NQ": 3, "FAIL": 2}
 SUMMARY_CHARACTERS = 2_048
 HEX_32 = re.compile(r"^[0-9a-f]{32}$")
@@ -428,6 +430,9 @@ def load_context(
     evidence_kind: str | Sequence[str],
     scenarios: Mapping[str, object],
     require_rust_toolchain: bool = False,
+    require_product_binary: bool = False,
+    expected_dependencies: Sequence[str] = (),
+    required_evidence_roles: Sequence[str] = RESULT_ROLES,
 ) -> QualificationContext:
     """Load and exact-bind the runner context for a known producer mapping."""
 
@@ -464,16 +469,49 @@ def load_context(
     if not isinstance(subjects_value, dict):
         raise ProducerError("runner subjects must be an object")
     subjects: dict[str, object] = subjects_value
-    expected_subject_keys = (
-        {"dependencies", "rust_toolchain"}
-        if require_rust_toolchain
-        else {"dependencies"}
-    )
-    if set(subjects) != expected_subject_keys or subjects.get("dependencies") != []:
-        boundary = "Rust toolchain" if require_rust_toolchain else "subject-free"
-        raise ProducerError(f"runner subjects do not match this {boundary} boundary")
+    expected_subject_keys = {"dependencies"}
+    if require_rust_toolchain:
+        expected_subject_keys.add("rust_toolchain")
+    if require_product_binary:
+        expected_subject_keys.add("product_binary")
+    if set(subjects) != expected_subject_keys:
+        raise ProducerError("runner subjects do not match this producer boundary")
+    dependencies = subjects.get("dependencies")
+    if not isinstance(dependencies, list):
+        raise ProducerError("runner dependency subjects must be an array")
+    dependency_names: list[str] = []
+    for dependency in dependencies:
+        if (
+            not isinstance(dependency, dict)
+            or set(dependency) != {"name", "identity"}
+            or any(not isinstance(dependency[field], str) for field in dependency)
+        ):
+            raise ProducerError("runner dependency subjects use an invalid schema")
+        dependency_names.append(dependency["name"])
+    if dependency_names != sorted(expected_dependencies):
+        raise ProducerError(
+            "runner dependency subjects do not match this producer boundary"
+        )
     if require_rust_toolchain:
         _validate_rust_toolchain_shape(subjects.get("rust_toolchain"))
+    if require_product_binary:
+        product_binary = subjects.get("product_binary")
+        if (
+            not isinstance(product_binary, dict)
+            or set(product_binary) != {"path", "sha256"}
+            or not isinstance(product_binary.get("path"), str)
+            or not isinstance(product_binary.get("sha256"), str)
+            or not HEX_64.fullmatch(product_binary["sha256"])
+        ):
+            raise ProducerError("runner product binary subject uses an invalid schema")
+        binary_path = Path(product_binary["path"])
+        if (
+            not binary_path.is_absolute()
+            or not binary_path.is_file()
+            or _regular_file_sha256(binary_path, "product_binary.path")
+            != product_binary["sha256"]
+        ):
+            raise ProducerError("runner product binary identity is not current")
     subjects_sha = _required_environment(environ, "NOKV_QUALIFICATION_SUBJECTS_SHA256")
     if subjects_sha != _json_sha256(subjects):
         raise ProducerError("runner subjects hash does not match canonical subjects")
@@ -483,10 +521,8 @@ def load_context(
         )
     except json.JSONDecodeError as error:
         raise ProducerError(f"invalid required evidence roles JSON: {error}") from error
-    if required_roles != list(RESULT_ROLES):
-        raise ProducerError(
-            "typed producer requires exactly the producer-result evidence role"
-        )
+    if required_roles != list(required_evidence_roles):
+        raise ProducerError("runner evidence roles do not match this producer boundary")
 
     try:
         claims = json.loads(_required_environment(environ, "NOKV_QUALIFICATION_CLAIMS"))
@@ -1058,41 +1094,19 @@ def qualify_static_scenarios(
     return _global_outcome(outcomes)
 
 
-def write_producer_result(
-    path: Path,
-    context: QualificationContext,
-    outcome: str,
+def write_create_new_evidence(
+    path: Path, payload: bytes, *, operation_id: str, label: str
 ) -> None:
-    """Atomically publish a create-new closed producer result."""
+    """Durably publish one create-new evidence file without replacing a peer."""
 
-    if outcome not in OUTCOME_EXIT_CODES:
-        raise ProducerError(f"invalid producer outcome {outcome!r}")
     if not path.is_absolute():
-        raise ProducerError("--qualification-result must be an absolute path")
+        raise ProducerError(f"{label} must be an absolute path")
     parent = path.parent
     if not parent.is_dir():
-        raise ProducerError("producer-result parent directory does not exist")
+        raise ProducerError(f"{label} parent directory does not exist")
     if path.exists() or path.is_symlink():
-        raise ProducerError("producer-result must be create-new")
-    value = {
-        "schema": PRODUCER_RESULT_SCHEMA,
-        "producer": context.producer,
-        "evidence_kind": context.evidence_kind,
-        "operation_id": context.operation_id,
-        "source_sha": context.source_sha,
-        "command_argv_sha256": context.command_argv_sha256,
-        "subjects": context.subjects,
-        "subjects_sha256": context.subjects_sha256,
-        "scenarios": {
-            scenario: {
-                "outcome": outcome,
-                "evidence_roles": list(RESULT_ROLES),
-            }
-            for scenario in sorted(context.scenarios)
-        },
-    }
-    payload = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    temporary = parent / f".{path.name}.{context.operation_id}.tmp"
+        raise ProducerError(f"{label} must be create-new")
+    temporary = parent / f".{path.name}.{operation_id}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     descriptor: int | None = None
     try:
@@ -1106,7 +1120,7 @@ def write_producer_result(
         try:
             os.link(temporary, path)
         except FileExistsError as error:
-            raise ProducerError("producer-result must be create-new") from error
+            raise ProducerError(f"{label} must be create-new") from error
         directory_descriptor = os.open(parent, os.O_RDONLY)
         try:
             os.fsync(directory_descriptor)
@@ -1119,6 +1133,74 @@ def write_producer_result(
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def write_producer_result(
+    path: Path,
+    context: QualificationContext,
+    outcome: str,
+    *,
+    evidence_roles: Sequence[str] = RESULT_ROLES,
+) -> None:
+    """Atomically publish a create-new closed producer result."""
+
+    if outcome not in OUTCOME_EXIT_CODES:
+        raise ProducerError(f"invalid producer outcome {outcome!r}")
+    value = {
+        "schema": PRODUCER_RESULT_SCHEMA,
+        "producer": context.producer,
+        "evidence_kind": context.evidence_kind,
+        "operation_id": context.operation_id,
+        "source_sha": context.source_sha,
+        "command_argv_sha256": context.command_argv_sha256,
+        "subjects": context.subjects,
+        "subjects_sha256": context.subjects_sha256,
+        "scenarios": {
+            scenario: {
+                "outcome": outcome,
+                "evidence_roles": list(evidence_roles),
+            }
+            for scenario in sorted(context.scenarios)
+        },
+    }
+    payload = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    write_create_new_evidence(
+        path,
+        payload,
+        operation_id=context.operation_id,
+        label="--qualification-result",
+    )
+
+
+def write_rust_qualification(
+    path: Path,
+    context: QualificationContext,
+    outcome: str,
+    scenarios: Mapping[str, RustScenario],
+) -> None:
+    """Publish the closed scenario summary required by integration producers."""
+
+    value = {
+        "schema": RUST_QUALIFICATION_SCHEMA,
+        "producer": context.producer,
+        "evidence_kind": context.evidence_kind,
+        "operation_id": context.operation_id,
+        "outcome": outcome,
+        "scenarios": {
+            scenario: {
+                "outcome": outcome,
+                "not_qualified_reason": scenarios[scenario].not_qualified_reason,
+            }
+            for scenario in sorted(context.scenarios)
+        },
+    }
+    payload = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    write_create_new_evidence(
+        path,
+        payload,
+        operation_id=context.operation_id,
+        label="Rust qualification evidence",
+    )
 
 
 def _rust_parser(description: str) -> argparse.ArgumentParser:
@@ -1144,6 +1226,7 @@ def rust_main(
     argv: Sequence[str] | None = None,
     environ: Mapping[str, str] | None = None,
     command_runner: CommandRunner = subprocess.run,
+    evidence_roles: Sequence[str] = RESULT_ROLES,
 ) -> int:
     args = _rust_parser(description).parse_args(argv)
     if not 1 <= args.timeout_seconds <= 1_200:
@@ -1151,12 +1234,24 @@ def rust_main(
         return 2
     environment = os.environ if environ is None else environ
     try:
+        roles = tuple(evidence_roles)
+        if (
+            not roles
+            or roles[0] != "producer-result"
+            or len(roles) != len(set(roles))
+            or not set(roles).issubset(RUST_EVIDENCE_ROLES)
+        ):
+            raise ProducerError(
+                "Rust evidence roles must be unique, supported, and start with "
+                "producer-result"
+            )
         context = load_context(
             environment,
             producer_id=producer_id,
             evidence_kind=evidence_kinds,
             scenarios=scenarios,
             require_rust_toolchain=True,
+            required_evidence_roles=roles,
         )
         repo = Path.cwd().resolve()
         toolchain = validate_rust_toolchain(
@@ -1196,7 +1291,19 @@ def rust_main(
                     environment=toolchain.child_environment,
                     command_runner=command_runner,
                 )
-        write_producer_result(args.qualification_result, context, outcome)
+        if "qualification" in roles:
+            write_rust_qualification(
+                args.qualification_result.parent / "qualification.json",
+                context,
+                outcome,
+                scenarios,
+            )
+        write_producer_result(
+            args.qualification_result,
+            context,
+            outcome,
+            evidence_roles=roles,
+        )
     except (OSError, ProducerError) as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 2

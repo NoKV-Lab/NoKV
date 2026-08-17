@@ -35,7 +35,7 @@ LIST_ROOT_SCOPE = _test(
 LIST_STALE = _test(
     "cli-list-staleness-fails-closed",
     "nokv",
-    "backend::tests::user_list_cursor_staleness_fails_without_an_automatic_restart",
+    "backend::tests::user_list_cursor_staleness_is_a_typed_fence_change_without_an_automatic_restart",
     "--bin",
     "nokv",
 )

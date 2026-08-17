@@ -10,6 +10,12 @@ import cursor_differential_qualification as qualification
 
 
 class CursorDifferentialQualificationTests(unittest.TestCase):
+    def test_list_staleness_oracle_is_the_current_typed_fence_test(self) -> None:
+        self.assertEqual(
+            qualification.LIST_STALE.test_name,
+            "backend::tests::user_list_cursor_staleness_is_a_typed_fence_change_without_an_automatic_restart",
+        )
+
     def test_scenario_inventory_is_frozen_and_read_scope_gap_is_visible(self) -> None:
         self.assertEqual(
             set(qualification.SCENARIOS),

@@ -34,6 +34,7 @@ def environment(
     producer_id: str,
     evidence_kind: str,
     claims: list[tuple[str, str, str]],
+    evidence_roles: tuple[str, ...] = ("producer-result",),
 ) -> dict[str, str]:
     subjects = {"dependencies": []}
     return {
@@ -50,7 +51,7 @@ def environment(
                 for stable_id, gate, scenario in claims
             ]
         ),
-        "NOKV_QUALIFICATION_REQUIRED_EVIDENCE_ROLES": json.dumps(["producer-result"]),
+        "NOKV_QUALIFICATION_REQUIRED_EVIDENCE_ROLES": json.dumps(evidence_roles),
     }
 
 
@@ -400,6 +401,7 @@ class SourceBoundProducerTests(unittest.TestCase):
                 producer_id="test-producer",
                 evidence_kind="unit",
                 claims=[("T01", "facade-contract", scenario)],
+                evidence_roles=("producer-result", "qualification"),
             )
             rust_environment.update(
                 {
@@ -452,6 +454,7 @@ class SourceBoundProducerTests(unittest.TestCase):
                 ],
                 environ=rust_environment,
                 command_runner=trusted_runner,
+                evidence_roles=("producer-result", "qualification"),
             )
 
             self.assertEqual(exit_code, 0)
@@ -480,6 +483,29 @@ class SourceBoundProducerTests(unittest.TestCase):
             )
             result = json.loads(result_path.read_text())
             self.assertEqual(result["subjects"], subjects)
+            self.assertEqual(
+                result["scenarios"][scenario]["evidence_roles"],
+                ["producer-result", "qualification"],
+            )
+            qualification = json.loads(
+                (result_path.parent / "qualification.json").read_text()
+            )
+            self.assertEqual(
+                qualification,
+                {
+                    "schema": "nokv.pre423.rust_qualification.v1",
+                    "producer": "test-producer",
+                    "evidence_kind": "unit",
+                    "operation_id": "a" * 32,
+                    "outcome": "PASS",
+                    "scenarios": {
+                        scenario: {
+                            "outcome": "PASS",
+                            "not_qualified_reason": None,
+                        }
+                    },
+                },
+            )
 
     def test_timeout_and_output_parse_errors_fail_closed(self) -> None:
         assertion = producer.RustTestAssertion(

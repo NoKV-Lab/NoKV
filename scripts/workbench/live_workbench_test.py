@@ -8,9 +8,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 
 import live_workbench as harness
+import pre423_contract_ledger
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -47,6 +50,40 @@ def config(evidence_dir: Path) -> harness.Config:
 
 
 class LiveWorkbenchTest(unittest.TestCase):
+    def test_typed_scenarios_cover_every_live_workbench_ledger_claim(self) -> None:
+        ledger = pre423_contract_ledger.load_ledger()
+        expected = {
+            scenario
+            for item in ledger["items"]
+            for gate in item["required_gates"]
+            for expectation in (
+                pre423_contract_ledger.resolve_gate_expectation(
+                    ledger, item["id"], gate
+                ),
+            )
+            if "live-workbench" in expectation["allowed_producers"]
+            for scenario in expectation["scenarios"]
+        }
+        self.assertEqual(set(harness.TYPED_SCENARIOS), expected)
+        self.assertEqual(
+            harness.TYPED_UNSUPPORTED_SCENARIOS,
+            {
+                "l01.generic-seven-tool-profile-live",
+                "l02.rootid-workspace-client-live",
+                "l08.current-workbench-cli-live",
+            },
+        )
+
+    def test_typed_mode_forbids_dry_run(self) -> None:
+        with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+            harness.parse_args(
+                [
+                    "--dry-run",
+                    "--qualification-result",
+                    "/tmp/producer-result.json",
+                ]
+            )
+
     def test_required_rust_job_runs_live_workbench_and_retains_evidence(self) -> None:
         workflow = (REPO / ".github/workflows/rust.yml").read_text(encoding="utf-8")
         for required in (
@@ -55,7 +92,7 @@ class LiveWorkbenchTest(unittest.TestCase):
             "--nokv-bin target/debug/nokv",
             "--agent-id 44444444444444444444444444444444",
             "jq -e '.workbench_workflow.status == \"PASS\"'",
-            "jq -e '.acceptance_gates[\"0\"].status == \"NOT QUALIFIED\"'",
+            'jq -e \'.acceptance_gates["0"].status == "NOT QUALIFIED"\'',
             "live-workbench-${{ github.sha }}",
             "if: ${{ always() && steps.live_workbench.outcome != 'skipped' }}",
             "if-no-files-found: error",
@@ -84,12 +121,21 @@ class LiveWorkbenchTest(unittest.TestCase):
 
         self.assertNotIn("lingtai", encoded)
 
-    def test_agent_identity_is_durable_and_distinct_from_presentation_name(self) -> None:
+    def test_agent_identity_is_durable_and_distinct_from_presentation_name(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            current = harness.parse_args([
-                "--dry-run", "--evidence-dir", str(Path(directory) / "evidence"),
-                "--agent-name", "display-only", "--agent-id", "aa" * 16,
-            ])
+            current = harness.parse_args(
+                [
+                    "--dry-run",
+                    "--evidence-dir",
+                    str(Path(directory) / "evidence"),
+                    "--agent-name",
+                    "display-only",
+                    "--agent-id",
+                    "aa" * 16,
+                ]
+            )
         self.assertEqual(current.agent_name, "display-only")
         self.assertEqual(current.agent_id, "aa" * 16)
         self.assertEqual(current.workbench_root, "/agents/display-only/wb")
@@ -109,10 +155,13 @@ class LiveWorkbenchTest(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaisesRegex(harness.NotQualified, "AgentId"):
                     harness.validate(
-                        harness.dataclasses.replace(current, agent_id=invalid), live=False
+                        harness.dataclasses.replace(current, agent_id=invalid),
+                        live=False,
                     )
 
-    def test_authority_probe_uses_distinct_durable_identities_on_one_shard(self) -> None:
+    def test_authority_probe_uses_distinct_durable_identities_on_one_shard(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             current = config(Path(directory) / "evidence")
         peer, mismatch = harness.authority_configs(current)
@@ -144,7 +193,9 @@ class LiveWorkbenchTest(unittest.TestCase):
         self.assertEqual(first_occurrences, REQUIRED_FIRST_OCCURRENCE_ORDER)
         self.assertEqual(len(first_occurrences), 18)
 
-    def test_phase_one_plan_restores_old_contracts_without_explicit_create(self) -> None:
+    def test_phase_one_plan_restores_old_contracts_without_explicit_create(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             current = config(Path(directory) / "evidence")
             steps = harness.tool_plan(current)
@@ -152,14 +203,14 @@ class LiveWorkbenchTest(unittest.TestCase):
         by_label = {step.label: step for step in steps}
         phase_one_ids = harness.phase_one_workbench_ids(current)
         self.assertEqual(len(set(phase_one_ids.values())), 3)
-        self.assertTrue(all(
-            harness.WORKBENCH_ID.fullmatch(workbench_id)
-            for workbench_id in phase_one_ids.values()
-        ))
+        self.assertTrue(
+            all(
+                harness.WORKBENCH_ID.fullmatch(workbench_id)
+                for workbench_id in phase_one_ids.values()
+            )
+        )
         created_ids = {
-            step.arguments["id"]
-            for step in steps
-            if step.name == "workbench_create"
+            step.arguments["id"] for step in steps if step.name == "workbench_create"
         }
         self.assertTrue(set(phase_one_ids.values()).isdisjoint(created_ids))
         self.assertEqual(by_label["implicit-put"].arguments["id"], phase_one_ids["put"])
@@ -170,9 +221,7 @@ class LiveWorkbenchTest(unittest.TestCase):
         self.assertEqual(
             by_label["implicit-commit"].arguments["id"], phase_one_ids["commit"]
         )
-        self.assertEqual(
-            by_label["find"].arguments["manifest_pattern"], "PtYcHoGrApHy"
-        )
+        self.assertEqual(by_label["find"].arguments["manifest_pattern"], "PtYcHoGrApHy")
 
         for omitted, explicit_empty in harness.OPTIONAL_SCOPE_RESULT_PAIRS:
             omitted_arguments = by_label[omitted].arguments
@@ -183,7 +232,12 @@ class LiveWorkbenchTest(unittest.TestCase):
         self.assertEqual(by_label["grep-phase1-page-1"].arguments["limit"], 1)
         self.assertEqual(
             plan["dynamic_tool_steps"],
-            [{"label": "grep-phase1-page-2", "cursor_from": "grep-phase1-page-1.next_cursor"}],
+            [
+                {
+                    "label": "grep-phase1-page-2",
+                    "cursor_from": "grep-phase1-page-1.next_cursor",
+                }
+            ],
         )
 
     def test_phase_one_fixture_ids_cannot_alias_configured_workbenches(self) -> None:
@@ -198,7 +252,8 @@ class LiveWorkbenchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             current = config(Path(directory) / "evidence")
             first = next(
-                step for step in harness.tool_plan(current)
+                step
+                for step in harness.tool_plan(current)
                 if step.label == "grep-phase1-page-1"
             )
         second = harness.grep_continuation_step(
@@ -220,7 +275,9 @@ class LiveWorkbenchTest(unittest.TestCase):
         )
         self.assertEqual(record["workbench_workflow"]["status"], "PASS")
         self.assertEqual(record["acceptance_gates"]["0"]["status"], "NOT QUALIFIED")
-        self.assertIn("one-day snapshot lease", record["acceptance_gates"]["0"]["reason"])
+        self.assertIn(
+            "one-day snapshot lease", record["acceptance_gates"]["0"]["reason"]
+        )
 
     def test_phase_one_assertions_emit_reviewable_ledger_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -229,9 +286,9 @@ class LiveWorkbenchTest(unittest.TestCase):
         evidence = harness.assert_phase_one_results(results, current)
         self.assertEqual(evidence["schema"], harness.SCHEMA)
         self.assertEqual(set(evidence["checks"]), {"C04", "C05", "C15", "T08"})
-        self.assertTrue(all(
-            check["status"] == "PASS" for check in evidence["checks"].values()
-        ))
+        self.assertTrue(
+            all(check["status"] == "PASS" for check in evidence["checks"].values())
+        )
         self.assertNotIn(
             results["grep-phase1-page-1"]["next_cursor"],
             harness.canonical_json(evidence),
@@ -247,32 +304,41 @@ class LiveWorkbenchTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.WorkflowFailure, "grep continuation"):
             harness.assert_phase_one_results(results, current)
 
-    def test_authority_assertions_require_isolation_reconnect_and_early_rejection(self) -> None:
+    def test_authority_assertions_require_isolation_reconnect_and_early_rejection(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             current = config(Path(directory) / "evidence")
         peer, _ = harness.authority_configs(current)
         results = {
             "peer-read-before-create": {"code": "NotFound"},
             "peer-put": {
-                "status": "success", "workbench_id": current.workbench,
-                "generation": 1, "replace": False,
+                "status": "success",
+                "workbench_id": current.workbench,
+                "generation": 1,
+                "replace": False,
             },
             "peer-read": {
-                "status": "success", "record_type": "json_object",
+                "status": "success",
+                "record_type": "json_object",
                 "items": [{"value": {"authority": "peer"}}],
             },
             "peer-reconnect-read": {
-                "status": "success", "record_type": "json_object",
+                "status": "success",
+                "record_type": "json_object",
                 "items": [{"value": {"authority": "peer"}}],
             },
             "primary-read-after-peer-write": {
-                "status": "success", "record_type": "json_object",
+                "status": "success",
+                "record_type": "json_object",
                 "items": [{"value": {"state": "post-snapshot"}}],
             },
         }
         mismatch = subprocess.CompletedProcess(
-            harness.mcp_command(harness.authority_configs(current)[1]), 1,
-            stdout="", stderr="root is already bound to another Agent\n",
+            harness.mcp_command(harness.authority_configs(current)[1]),
+            1,
+            stdout="",
+            stderr="root is already bound to another Agent\n",
         )
         evidence = harness.assert_authority_results(results, mismatch, current, peer)
         self.assertEqual(evidence["status"], "PASS")
@@ -314,7 +380,9 @@ class LiveWorkbenchTest(unittest.TestCase):
         )
         self.assertNotIn(secret, redacted)
         self.assertEqual(redacted[2], "<redacted>")
-        self.assertNotIn(harness.digest(secret.encode()), harness.canonical_json(redacted))
+        self.assertNotIn(
+            harness.digest(secret.encode()), harness.canonical_json(redacted)
+        )
 
     def test_early_process_exit_cannot_be_qualified_as_live(self) -> None:
         class Process:
@@ -359,9 +427,7 @@ class LiveWorkbenchTest(unittest.TestCase):
         self.assertEqual(plan["tool_coverage"]["count"], 18)
         self.assertTrue(plan["tool_coverage"]["complete"])
         self.assertEqual(qualification["overall_status"], "NOT QUALIFIED")
-        self.assertEqual(
-            qualification["workbench_workflow"]["status"], "NOT QUALIFIED"
-        )
+        self.assertEqual(qualification["workbench_workflow"]["status"], "NOT QUALIFIED")
 
     def test_missing_live_binary_is_not_qualified_not_pass(self) -> None:
         script = Path(__file__).with_name("live_workbench.py")
@@ -407,51 +473,71 @@ class LiveWorkbenchTest(unittest.TestCase):
         results.update(
             {
                 "implicit-put": {
-                    "status": "success", "workbench_id": phase_one_ids["put"],
-                    "generation": 1, "replace": False,
+                    "status": "success",
+                    "workbench_id": phase_one_ids["put"],
+                    "generation": 1,
+                    "replace": False,
                 },
                 "implicit-put-replay": {"code": "AlreadyExists"},
                 "implicit-put-second": {
-                    "status": "success", "workbench_id": phase_one_ids["put"],
-                    "generation": 1, "replace": False,
+                    "status": "success",
+                    "workbench_id": phase_one_ids["put"],
+                    "generation": 1,
+                    "replace": False,
                 },
                 "implicit-append": {
-                    "status": "success", "workbench_id": phase_one_ids["append"],
-                    "generation": 1, "created": True,
+                    "status": "success",
+                    "workbench_id": phase_one_ids["append"],
+                    "generation": 1,
+                    "created": True,
                 },
                 "implicit-commit": {
-                    "status": "success", "workbench_id": phase_one_ids["commit"],
-                    "commit_identity": "ab" * 32, "idempotent_replay": False,
+                    "status": "success",
+                    "workbench_id": phase_one_ids["commit"],
+                    "commit_identity": "ab" * 32,
+                    "idempotent_replay": False,
                 },
                 "implicit-commit-replay": {
-                    "status": "success", "workbench_id": phase_one_ids["commit"],
-                    "commit_identity": "ab" * 32, "idempotent_replay": True,
+                    "status": "success",
+                    "workbench_id": phase_one_ids["commit"],
+                    "commit_identity": "ab" * 32,
+                    "idempotent_replay": True,
                 },
                 "find": {
                     "status": "success",
-                    "matches": [{
-                        "workbench_id": current.workbench, "committed": True,
-                        "commit_identity_verified": True,
-                    }],
+                    "matches": [
+                        {
+                            "workbench_id": current.workbench,
+                            "committed": True,
+                            "commit_identity_verified": True,
+                        }
+                    ],
                 },
                 "grep-phase1-page-1": {
-                    "status": "success", "truncated": True,
+                    "status": "success",
+                    "truncated": True,
                     "next_cursor": "opaque-secret-cursor",
-                    "matches": [{
-                        "path": (
-                            f"{current.workbench_root}/{phase_one_ids['put']}"
-                            "/outputs/a.txt"
-                        )
-                    }],
+                    "matches": [
+                        {
+                            "path": (
+                                f"{current.workbench_root}/{phase_one_ids['put']}"
+                                "/outputs/a.txt"
+                            )
+                        }
+                    ],
                 },
                 "grep-phase1-page-2": {
-                    "status": "success", "truncated": False, "next_cursor": None,
-                    "matches": [{
-                        "path": (
-                            f"{current.workbench_root}/{phase_one_ids['put']}"
-                            "/outputs/b.txt"
-                        )
-                    }],
+                    "status": "success",
+                    "truncated": False,
+                    "next_cursor": None,
+                    "matches": [
+                        {
+                            "path": (
+                                f"{current.workbench_root}/{phase_one_ids['put']}"
+                                "/outputs/b.txt"
+                            )
+                        }
+                    ],
                 },
             }
         )

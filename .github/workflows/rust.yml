@@ -15,8 +15,20 @@ permissions:
 jobs:
   workbench-contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Rust for typed qualification
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler for typed qualification
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache typed qualification targets
+        uses: Swatinem/rust-cache@v2
 
       - name: Check Workbench contract and live workflow
         run: |
@@ -37,6 +49,264 @@ jobs:
           python3 scripts/workbench/restore_composition_gate_test.py
           bash -n scripts/workbench/start_rustfs.sh
 
+      - name: Check Phase 1 qualification framework
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/workbench/pre423_contract_ledger.py \
+            scripts/workbench/pre423_contract_ledger_test.py \
+            scripts/workbench/source_bound_producer.py \
+            scripts/workbench/source_bound_producer_test.py \
+            scripts/workbench/typed_live_qualification.py \
+            scripts/workbench/typed_live_qualification_test.py \
+            scripts/workbench/qualification_receipt.py \
+            scripts/workbench/qualification_receipt_test.py \
+            scripts/workbench/qualification_aggregate.py \
+            scripts/workbench/qualification_aggregate_test.py \
+            scripts/workbench/qualification_invocation_check.py \
+            scripts/workbench/qualification_invocation_check_test.py \
+            scripts/workbench/api_absence_qualification.py \
+            scripts/workbench/api_absence_qualification_test.py \
+            scripts/workbench/api_decision_qualification.py \
+            scripts/workbench/api_decision_qualification_test.py \
+            scripts/workbench/commit_replay_qualification.py \
+            scripts/workbench/commit_replay_qualification_test.py \
+            scripts/workbench/cursor_differential_qualification.py \
+            scripts/workbench/cursor_differential_qualification_test.py \
+            scripts/workbench/nokv_agent_qualification.py \
+            scripts/workbench/nokv_agent_qualification_test.py \
+            scripts/workbench/lingtai_mcp_qualification.py \
+            scripts/workbench/python_sdk_qualification.py \
+            scripts/workbench/live_gap_qualification_test.py \
+            scripts/workbench/snapshot_lifecycle_qualification.py \
+            scripts/workbench/snapshot_lifecycle_qualification_test.py \
+            scripts/workbench/qualification_invocation_manifest_test.py
+          PYTHONPATH=scripts/workbench python3 -m unittest \
+            scripts/workbench/pre423_contract_ledger_test.py \
+            scripts/workbench/source_bound_producer_test.py \
+            scripts/workbench/typed_live_qualification_test.py \
+            scripts/workbench/qualification_receipt_test.py \
+            scripts/workbench/qualification_aggregate_test.py \
+            scripts/workbench/qualification_invocation_check_test.py \
+            scripts/workbench/api_absence_qualification_test.py \
+            scripts/workbench/api_decision_qualification_test.py \
+            scripts/workbench/commit_replay_qualification_test.py \
+            scripts/workbench/cursor_differential_qualification_test.py \
+            scripts/workbench/nokv_agent_qualification_test.py \
+            scripts/workbench/live_gap_qualification_test.py \
+            scripts/workbench/snapshot_lifecycle_qualification_test.py \
+            scripts/workbench/qualification_invocation_manifest_test.py
+
+      - name: Build source-bound qualification product
+        run: cargo build --locked -p nokv --bin nokv --target-dir target/phase1-qualification
+
+      - name: Upload source-bound qualification product
+        id: qualification_product
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: phase1-product-${{ github.sha }}
+          path: target/phase1-qualification/debug/nokv
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Produce Phase 1 source-bound qualification receipts
+        id: qualification_receipts
+        shell: bash
+        env:
+          PHASE1_QUALIFICATION_ROOT: ${{ runner.temp }}/phase1-qualification
+        run: |
+          set -euo pipefail
+          manifest=scripts/workbench/qualification_invocation_manifest.json
+          bundle="$PHASE1_QUALIFICATION_ROOT/bundle"
+          target_dir=target/phase1-qualification
+          product_binary="$target_dir/debug/nokv"
+          runner_python=$(python3 -c 'import os,sys; print(os.path.realpath(sys.executable))')
+          [[ -x "$runner_python" && "$runner_python" = /* ]]
+          mkdir -p "$PHASE1_QUALIFICATION_ROOT"
+          [[ -x "$product_binary" ]]
+          python_sdk_sha256=$(git ls-files -s crates/nokv-python | sha256sum | cut -d' ' -f1)
+
+          while IFS= read -r invocation; do
+            invocation_id=$(jq -r '.id' <<<"$invocation")
+            producer=$(jq -r '.producer' <<<"$invocation")
+            evidence_kind=$(jq -r '.evidence_kind' <<<"$invocation")
+            script=$(jq -r '.script' <<<"$invocation")
+            expected_exit=$(jq -r '.expected_exit_code' <<<"$invocation")
+            evidence_root="$PHASE1_QUALIFICATION_ROOT/producer-evidence/$invocation_id"
+            producer_result="$evidence_root/producer-result.json"
+            mkdir -p "$evidence_root"
+
+            receipt_args=(
+              "$runner_python" scripts/workbench/qualification_receipt.py
+              --repo "$GITHUB_WORKSPACE"
+              --output-dir "$bundle"
+              --evidence-root "$evidence_root"
+              --producer "$producer"
+              --evidence-kind "$evidence_kind"
+              --evidence "producer-result=$producer_result"
+            )
+            mapfile -t claims < <(jq -r '.claims[]' <<<"$invocation")
+            for claim in "${claims[@]}"; do
+              receipt_args+=(--claim "$claim")
+            done
+
+            producer_args=(
+              "$runner_python" "$script"
+              --qualification-result "$producer_result"
+            )
+            case "$producer" in
+              lingtai-mcp)
+                receipt_args+=(
+                  --binary "$product_binary"
+                  --dependency "lingtai-kernel=git:834274df1304488d3e6b5b2cde4a3b481a81e38b"
+                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
+                  --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
+                  --evidence "qualification=$evidence_root/qualification.json"
+                  --evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"
+                )
+                producer_args+=(--nokv-bin "$product_binary")
+                ;;
+              live-workbench)
+                receipt_args+=(
+                  --binary "$product_binary"
+                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
+                  --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
+                  --evidence "qualification=$evidence_root/qualification.json"
+                  --evidence "mcp-transcript=$evidence_root/mcp-transcript.jsonl"
+                )
+                producer_args+=(
+                  --nokv-bin "$product_binary"
+                  --evidence-dir "$evidence_root/workflow"
+                )
+                ;;
+              object-namespace-recovery)
+                receipt_args+=(
+                  --binary "$product_binary"
+                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
+                  --dependency "rustfs=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
+                  --evidence "qualification=$evidence_root/qualification.json"
+                )
+                producer_args+=(
+                  --binary "$product_binary"
+                  --evidence-dir "$evidence_root/gate"
+                )
+                ;;
+              python-sdk)
+                receipt_args+=(
+                  --binary "$product_binary"
+                  --dependency "python-sdk=sha256:$python_sdk_sha256"
+                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
+                  --dependency "object-store=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
+                  --evidence "qualification=$evidence_root/qualification.json"
+                )
+                producer_args+=(--nokv-bin "$product_binary")
+                ;;
+              restore-composition)
+                receipt_args+=(
+                  --binary "$product_binary"
+                  --dependency "etcd=sha256:e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9"
+                  --dependency "rustfs=oci:rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab"
+                  --evidence "qualification=$evidence_root/qualification.json"
+                )
+                producer_args+=(
+                  --nokv-bin "$product_binary"
+                  --evidence-dir "$evidence_root/gate"
+                  --etcd-bin "$evidence_root/unavailable-etcd"
+                  --etcdctl-bin "$evidence_root/unavailable-etcdctl"
+                  --docker-bin "$evidence_root/unavailable-docker"
+                  --aws-bin "$evidence_root/unavailable-aws"
+                )
+                ;;
+              snapshot-lifecycle)
+                receipt_args+=(
+                  --evidence "qualification=$evidence_root/qualification.json"
+                )
+                ;;
+            esac
+            if [[ "$(jq -r '.uses_rust_target' <<<"$invocation")" == "true" ]]; then
+              producer_args+=(--target-dir "$target_dir")
+            fi
+
+            set +e
+            "${receipt_args[@]}" -- "${producer_args[@]}"
+            receipt_status=$?
+            set -e
+            if [[ "$receipt_status" -ne "$expected_exit" ]]; then
+              echo "unexpected receipt status for $invocation_id: expected=$expected_exit actual=$receipt_status" >&2
+              exit 1
+            fi
+          done < <(jq -c '.invocations[]' "$manifest")
+
+      - name: Aggregate Phase 1 receipts as explicitly not qualified
+        shell: bash
+        env:
+          PHASE1_QUALIFICATION_ROOT: ${{ runner.temp }}/phase1-qualification
+          QUALIFICATION_PRODUCT_ARTIFACT_ID: ${{ steps.qualification_product.outputs.artifact-id }}
+          QUALIFICATION_PRODUCT_ARTIFACT_DIGEST: ${{ steps.qualification_product.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          manifest=scripts/workbench/qualification_invocation_manifest.json
+          report="$PHASE1_QUALIFICATION_ROOT/aggregate.json"
+          product_manifest="$PHASE1_QUALIFICATION_ROOT/product-artifact-manifest.json"
+          product_binary=target/phase1-qualification/debug/nokv
+          artifact_digest="${QUALIFICATION_PRODUCT_ARTIFACT_DIGEST#sha256:}"
+          binary_digest=$(sha256sum "$product_binary" | cut -d' ' -f1)
+          [[ "$QUALIFICATION_PRODUCT_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$binary_digest" =~ ^[0-9a-f]{64}$ ]]
+          jq -n \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg head_sha "$GITHUB_SHA" \
+            --arg job "$GITHUB_JOB" \
+            --arg artifact_id "$QUALIFICATION_PRODUCT_ARTIFACT_ID" \
+            --arg artifact_digest "sha256:$artifact_digest" \
+            --arg binary_sha256 "sha256:$binary_digest" \
+            --argjson producers '["lingtai-mcp","live-workbench","object-namespace-recovery","python-sdk","restore-composition"]' \
+            '{
+              schema: "nokv.pre423.product_artifact_manifest.v1",
+              provider: "github-actions",
+              workflow_run_id: $run_id,
+              workflow_attempt: $attempt,
+              head_sha: $head_sha,
+              artifacts: [
+                $producers[] | {
+                  producer: ., job: $job, artifact_id: $artifact_id,
+                  artifact_digest: $artifact_digest, binary_path: "nokv",
+                  binary_sha256: $binary_sha256
+                }
+              ]
+            }' >"$product_manifest"
+          expected_exit=$(jq -r '.aggregate_expectation.expected_exit_code' "$manifest")
+          set +e
+          python3 scripts/workbench/qualification_aggregate.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --receipt-dir "$PHASE1_QUALIFICATION_ROOT/bundle/receipts" \
+            --product-artifact-manifest "$product_manifest" \
+            --output "$report"
+          aggregate_status=$?
+          set -e
+          [[ "$aggregate_status" -eq "$expected_exit" ]]
+          [[ "$aggregate_status" -eq 3 ]]
+          jq -e '.status == "NQ"' "$report"
+          expected_receipt_counts=$(jq -c \
+            '.aggregate_expectation.receipt_counts' "$manifest")
+          jq -e --argjson expected "$expected_receipt_counts" \
+            '.receipt_counts == $expected' "$report"
+          jq -e '.invalid_receipts == [] and .receipt_conflicts == []' "$report"
+          python3 scripts/workbench/qualification_invocation_check.py \
+            --manifest "$manifest" \
+            --report "$report"
+
+      - name: Upload Phase 1 qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: phase1-qualification-${{ github.sha }}
+          path: ${{ runner.temp }}/phase1-qualification
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Check Homebrew release safety
         run: python3 scripts/release/test_homebrew_source_release.py
 
@@ -51,7 +321,7 @@ jobs:
       ETCD_LINUX_AMD64_SHA256: e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9
       RUSTFS_IMAGE: rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -75,6 +345,11 @@ jobs:
           cargo clippy -p nokv-meta -p nokv-bench --all-targets --features metadata-read-stats -- -D warnings
           cargo clippy -p nokv-meta-holt --all-targets --features read-stats -- -D warnings
 
+      - name: Clippy restore crash support
+        run: |
+          cargo clippy -p nokv-server --all-targets --features restore-crash-test-support -- -D warnings
+          cargo clippy -p nokv-bench --all-targets --features restore-crash-test-support -- -D warnings
+
       - name: Test
         run: cargo test --workspace
 
@@ -83,6 +358,11 @@ jobs:
           cargo test -p nokv-meta --features metadata-read-stats
           cargo test -p nokv-meta-holt --features read-stats
           cargo test -p nokv-bench --features metadata-read-stats
+
+      - name: Test restore crash support
+        run: |
+          cargo test -p nokv-server --features restore-crash-test-support
+          cargo test -p nokv-bench --bin nokv-restore-crash-owner --features restore-crash-test-support
 
       - name: Install pinned etcd
         shell: bash
@@ -222,14 +502,18 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/workbench/restore_composition_gate.py \
+            --build \
             --nokv-bin target/debug/nokv \
             --target-dir target \
+            --fault-target-dir "${RUNNER_TEMP}/restore-composition-fault-target" \
             --evidence-dir "$RESTORE_COMPOSITION_EVIDENCE_DIR" \
             --seed "restore-composition-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --timeout 60
           jq -e '.restore_composition.status == "PASS"' \
             "$RESTORE_COMPOSITION_EVIDENCE_DIR/qualification.json"
-          jq -e '.partial_publication_recovery.status == "NOT QUALIFIED"' \
+          jq -e '.partial_publication_recovery.status == "PASS"' \
+            "$RESTORE_COMPOSITION_EVIDENCE_DIR/qualification.json"
+          jq -e '.overall_status == "PASS"' \
             "$RESTORE_COMPOSITION_EVIDENCE_DIR/qualification.json"
 
       - name: Upload restore composition evidence
@@ -237,7 +521,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: restore-composition-${{ github.sha }}
-          path: ${{ runner.temp }}/restore-composition
+          path: ${{ runner.temp }}/restore-composition/evidence
           if-no-files-found: error
           retention-days: 7
 
@@ -256,7 +540,7 @@ jobs:
       ETCD_LINUX_AMD64_SHA256: e8cd3fa8064c98137c5dbd78b76f969417ace84efb83c481041d7a52ffdd8fb9
       RUSTFS_IMAGE: rustfs/rustfs@sha256:e620d37756fff072b10bf648c7bb9d370d7e91a928b7e6a5e1ac85bdfb4e4dab
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable

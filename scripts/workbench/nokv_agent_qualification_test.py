@@ -73,7 +73,6 @@ class NokvAgentQualificationTests(unittest.TestCase):
                         {
                             "c04.implicit-workbench-create-contract",
                             "c07.payload-decode-content-type-size-contract",
-                            "c13.grep-literal-or-bounds-contract",
                         },
                     )
                     continue
@@ -85,6 +84,17 @@ class NokvAgentQualificationTests(unittest.TestCase):
                     ) if assertion.target_args == ("--lib",) else self.assertEqual(
                         assertion.target_args[:1], ("--test",)
                     )
+
+    def test_grep_bounds_contract_uses_the_exact_seventeen_pattern_oracle(self) -> None:
+        specification = qualification.SCENARIOS["c13.grep-literal-or-bounds-contract"]
+        self.assertIsNone(specification.not_qualified_reason)
+        self.assertEqual(
+            [assertion.test_name for assertion in specification.assertions],
+            [
+                "grep_treats_patterns_as_case_insensitive_literals_and_globs_as_basenames",
+                "workbench_grep_pipe_compatibility_is_not_enabled_for_generic_grep",
+            ],
+        )
 
     def test_generic_profile_schema_uses_the_exact_seven_tool_oracle(self) -> None:
         specification = qualification.SCENARIOS["l01.generic-seven-tool-profile-schema"]

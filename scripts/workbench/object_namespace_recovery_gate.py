@@ -26,6 +26,12 @@ import time
 from pathlib import Path
 from typing import Any, Sequence, TextIO
 
+from source_bound_producer import ProducerError, ScenarioContract
+from typed_live_qualification import (
+    gap_record,
+    load_live_context,
+    publish_live_result,
+)
 
 SCHEMA = "nokv.object_namespace_recovery_gate.v1"
 PROTOCOL_VERSION = "2025-11-25"
@@ -44,6 +50,60 @@ PHYSICAL_ERROR_TOKENS = (
     "object-root",
     "nokv/artifacts/",
 )
+TYPED_EVIDENCE_ROLES = ("producer-result", "qualification")
+TYPED_SCENARIOS = {
+    "t18.restore-two-manifest-publication": ScenarioContract(
+        "T18", "provider-recovery"
+    ),
+    "t18.restore-provider-restart": ScenarioContract("T18", "provider-recovery"),
+    "t18.restore-reference-fenced-gc": ScenarioContract("T18", "provider-recovery"),
+    "t18.restore-exact-bytes": ScenarioContract("T18", "provider-recovery"),
+    "c06.root-binding-survives-provider-restart": ScenarioContract(
+        "C06", "provider-recovery"
+    ),
+    "c08.conditional-put-provider": ScenarioContract("C08", "provider-recovery"),
+    "c08.conditional-put-response-loss-readback": ScenarioContract(
+        "C08", "provider-recovery"
+    ),
+    "c09.two-writer-no-lost-update": ScenarioContract("C09", "provider-recovery"),
+    "c09.same-operation-retry": ScenarioContract("C09", "provider-recovery"),
+    "c12.range-conditional-frozen-provider-restart": ScenarioContract(
+        "C12", "provider-recovery"
+    ),
+    "c12.provider-outage-read-failure": ScenarioContract("C12", "provider-recovery"),
+    "c16.commit-outcome-unknown-retry": ScenarioContract("C16", "provider-recovery"),
+    "c19.frozen-reference-retention-across-restart": ScenarioContract(
+        "C19", "provider-recovery"
+    ),
+    "c19.retire-reap-reference-release": ScenarioContract("C19", "provider-recovery"),
+    "c20.restore-cleanup-after-failure": ScenarioContract("C20", "provider-recovery"),
+    "c20.restore-reference-fenced-gc": ScenarioContract("C20", "provider-recovery"),
+    "c20.restore-exact-source-and-destination-bytes": ScenarioContract(
+        "C20", "provider-recovery"
+    ),
+    "l08.single-node-no-external-etcd-live": ScenarioContract(
+        "L08", "provider-recovery"
+    ),
+    "l08.http-health-readiness-stats-live": ScenarioContract(
+        "L08", "provider-recovery"
+    ),
+    "l08.metadata-backup-fresh-node-restore-live": ScenarioContract(
+        "L08", "provider-recovery"
+    ),
+    "l08.metadata-fsck-clean-and-corruption-detection-live": ScenarioContract(
+        "L08", "provider-recovery"
+    ),
+    "l08.manual-reconciliable-gc-live": ScenarioContract("L08", "provider-recovery"),
+    "l08.checkpoint-log-replay-live": ScenarioContract("L08", "provider-recovery"),
+    "l08.cross-owner-failover-live": ScenarioContract("L08", "provider-recovery"),
+    "l08.multishard-routing-failover-live": ScenarioContract(
+        "L08", "provider-recovery"
+    ),
+    "l08.v010-upgrade-recovery-matrix-live": ScenarioContract(
+        "L08", "provider-recovery"
+    ),
+}
+TYPED_SUPPORTED_SCENARIOS = frozenset({"c06.root-binding-survives-provider-restart"})
 
 
 class NotQualified(RuntimeError):
@@ -146,7 +206,9 @@ def validate_gate_evidence(evidence: dict[str, object]) -> None:
         raise WorkflowFailure("owner session remained live before restart retry")
     before, after = restart.get("before_owner_epoch"), restart.get("after_owner_epoch")
     if not isinstance(before, int) or after != before + 1:
-        raise WorkflowFailure("stable owner restart must advance the epoch exactly once")
+        raise WorkflowFailure(
+            "stable owner restart must advance the epoch exactly once"
+        )
 
     outage = _mapping(evidence, "outage")
     error = _mapping(outage, "error")
@@ -169,11 +231,19 @@ def validate_gate_evidence(evidence: dict[str, object]) -> None:
 
     phymat = _mapping(evidence, "phymat")
     expected_structure, expected_relaxation = phymat_documents()
-    if phymat.get("structure") != expected_structure or phymat.get("relaxation") != expected_relaxation:
-        raise WorkflowFailure("PhyMat source evidence differs from the deterministic fixture")
+    if (
+        phymat.get("structure") != expected_structure
+        or phymat.get("relaxation") != expected_relaxation
+    ):
+        raise WorkflowFailure(
+            "PhyMat source evidence differs from the deterministic fixture"
+        )
     if phymat.get("commit_replay_converged") is not True:
         raise WorkflowFailure("PhyMat commit replay did not converge")
-    if restart.get("structure") != expected_structure or restart.get("relaxation") != expected_relaxation:
+    if (
+        restart.get("structure") != expected_structure
+        or restart.get("relaxation") != expected_relaxation
+    ):
         raise WorkflowFailure("PhyMat evidence did not survive the owner restart")
     if outage.get("recovered") != expected_relaxation:
         raise WorkflowFailure("PhyMat evidence did not survive the RustFS outage")
@@ -277,7 +347,9 @@ def run(
         )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip() or "no output"
-        raise WorkflowFailure(f"{label or 'command'} failed ({result.returncode}): {detail}")
+        raise WorkflowFailure(
+            f"{label or 'command'} failed ({result.returncode}): {detail}"
+        )
     return result
 
 
@@ -315,7 +387,9 @@ def wait_tcp(process: subprocess.Popen[str], port: int, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise WorkflowFailure(f"process exited before listening ({process.returncode})")
+            raise WorkflowFailure(
+                f"process exited before listening ({process.returncode})"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return
@@ -334,7 +408,9 @@ def wait_etcd(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise WorkflowFailure(f"etcd exited before readiness ({process.returncode})")
+            raise WorkflowFailure(
+                f"etcd exited before readiness ({process.returncode})"
+            )
         result = run(
             [etcdctl, f"--endpoints={endpoint}", "endpoint", "health"],
             cwd=repo,
@@ -361,12 +437,17 @@ def aws_environment(access_key: str, secret_key: str) -> dict[str, str]:
     return environment
 
 
-def aws_command(aws: Path, endpoint: str, *arguments: os.PathLike[str] | str) -> list[str]:
+def aws_command(
+    aws: Path, endpoint: str, *arguments: os.PathLike[str] | str
+) -> list[str]:
     return [
         str(aws),
-        "--cli-connect-timeout", "1",
-        "--cli-read-timeout", "2",
-        "--endpoint-url", endpoint,
+        "--cli-connect-timeout",
+        "1",
+        "--cli-read-timeout",
+        "2",
+        "--endpoint-url",
+        endpoint,
         *(str(argument) for argument in arguments),
     ]
 
@@ -446,7 +527,9 @@ def wait_rustfs(
                 raise WorkflowFailure("RustFS container disappeared before readiness")
             status_and_code = state.stdout.strip().split()
             if status_and_code and status_and_code[0] in {"dead", "exited"}:
-                exit_code = status_and_code[1] if len(status_and_code) > 1 else "unknown"
+                exit_code = (
+                    status_and_code[1] if len(status_and_code) > 1 else "unknown"
+                )
                 raise WorkflowFailure(
                     f"RustFS container exited before readiness (exit code {exit_code})"
                 )
@@ -478,7 +561,9 @@ def capture_rustfs_log(
     evidence.text("rustfs.log", content or "RustFS produced no container log output")
 
 
-def etcd_value(etcdctl: Path, endpoint: str, key: str, repo: Path, timeout: float) -> str:
+def etcd_value(
+    etcdctl: Path, endpoint: str, key: str, repo: Path, timeout: float
+) -> str:
     return run(
         [etcdctl, f"--endpoints={endpoint}", "get", key, "--print-value-only"],
         cwd=repo,
@@ -608,7 +693,9 @@ class McpClient:
         self.next_id = 1
         self.last_call_digest: str | None = None
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def request(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         request_id = self.next_id
         self.next_id += 1
         request: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
@@ -628,7 +715,9 @@ class McpClient:
         finally:
             selector.close()
         if not received:
-            raise WorkflowFailure(f"MCP exited before responding ({self.process.poll()})")
+            raise WorkflowFailure(
+                f"MCP exited before responding ({self.process.poll()})"
+            )
         try:
             response = json.loads(received)
         except json.JSONDecodeError as error:
@@ -649,7 +738,9 @@ class McpClient:
     def notify(self, method: str) -> None:
         if self.process.stdin is None:
             raise WorkflowFailure("MCP stdin is unavailable")
-        self.process.stdin.write(canonical_json({"jsonrpc": "2.0", "method": method}) + "\n")
+        self.process.stdin.write(
+            canonical_json({"jsonrpc": "2.0", "method": method}) + "\n"
+        )
         self.process.stdin.flush()
 
     def initialize(self) -> None:
@@ -662,7 +753,10 @@ class McpClient:
             },
         )
         result = response.get("result")
-        if not isinstance(result, dict) or result.get("serverInfo", {}).get("name") != "nokv-mcp":
+        if (
+            not isinstance(result, dict)
+            or result.get("serverInfo", {}).get("name") != "nokv-mcp"
+        ):
             raise WorkflowFailure("unexpected MCP initialize result")
         self.notify("notifications/initialized")
 
@@ -671,7 +765,9 @@ class McpClient:
         self.last_call_digest = digest(canonical_json(params).encode())
         response = self.request("tools/call", params)
         result = response.get("result")
-        structured = result.get("structuredContent") if isinstance(result, dict) else None
+        structured = (
+            result.get("structuredContent") if isinstance(result, dict) else None
+        )
         if not isinstance(structured, dict):
             raise WorkflowFailure(f"{name} lacks structuredContent")
         content = result.get("content")
@@ -717,7 +813,9 @@ def build_binary(repo: Path, target: Path, timeout: float) -> Path:
         env=environment,
     )
     if result.returncode != 0:
-        raise WorkflowFailure(f"build failed: {(result.stderr or result.stdout).strip()}")
+        raise WorkflowFailure(
+            f"build failed: {(result.stderr or result.stdout).strip()}"
+        )
     return target / "debug" / "nokv"
 
 
@@ -845,7 +943,12 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         )
         run(
             aws_command(
-                Path(args.aws_bin), s3_endpoint, "s3api", "create-bucket", "--bucket", bucket
+                Path(args.aws_bin),
+                s3_endpoint,
+                "s3api",
+                "create-bucket",
+                "--bucket",
+                bucket,
             ),
             cwd=repo,
             timeout=args.timeout,
@@ -879,9 +982,13 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         first_control_raw = etcd_value(
             Path(args.etcdctl_bin), etcd_endpoint, owner_key, repo, args.timeout
         )
-        first_control = parse_control_record(first_control_raw, "first owner control record")
+        first_control = parse_control_record(
+            first_control_raw, "first owner control record"
+        )
         if first_control.get("owner_epoch") != 1 or first_control.get("state") != 3:
-            raise WorkflowFailure(f"first owner did not reach Serving(1): {first_control}")
+            raise WorkflowFailure(
+                f"first owner did not reach Serving(1): {first_control}"
+            )
 
         client = [
             *agent_common,
@@ -989,7 +1096,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         second_control_raw = etcd_value(
             Path(args.etcdctl_bin), etcd_endpoint, owner_key, repo, args.timeout
         )
-        second_control = parse_control_record(second_control_raw, "retry owner control record")
+        second_control = parse_control_record(
+            second_control_raw, "retry owner control record"
+        )
         structure_after = read_document(
             workbench_call(
                 client,
@@ -1177,7 +1286,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         recovered_result = mcp.call("workbench_read", read_arguments)
         recovered_request_digest = mcp.last_call_digest
         if recovered_result.get("status") != "success":
-            raise WorkflowFailure("same logical read did not recover after RustFS restart")
+            raise WorkflowFailure(
+                "same logical read did not recover after RustFS restart"
+            )
         recovered = read_document(recovered_result, "outage recovery read")
 
         binding_raw = etcd_value(
@@ -1220,7 +1331,9 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
                 "wrong_profile_objects": wrong_profile_objects,
             },
             "restart": {
-                "signal": "SIGKILL" if owner_exit == -signal.SIGKILL else str(owner_exit),
+                "signal": "SIGKILL"
+                if owner_exit == -signal.SIGKILL
+                else str(owner_exit),
                 "session_absent_before_retry": True,
                 "before_owner_epoch": first_control.get("owner_epoch"),
                 "after_owner_epoch": second_control.get("owner_epoch"),
@@ -1280,6 +1393,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--target-dir", type=Path)
     parser.add_argument("--binary", type=Path)
+    parser.add_argument("--qualification-result", type=Path)
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--etcd-bin", type=Path, default=shutil.which("etcd"))
     parser.add_argument("--etcdctl-bin", type=Path, default=shutil.which("etcdctl"))
@@ -1294,11 +1408,57 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     evidence = args.evidence_dir.resolve()
+    typed_context = None
+
+    def finish(code: int, record: dict[str, object]) -> int:
+        if typed_context is None or args.qualification_result is None:
+            return code
+        outcome = "PASS" if code == 0 else "NQ" if code == 3 else "FAIL"
+        try:
+            publish_live_result(
+                result_path=args.qualification_result.resolve(),
+                context=typed_context,
+                outcome=outcome,
+                qualification=record,
+                evidence_roles=TYPED_EVIDENCE_ROLES,
+            )
+        except (OSError, ProducerError) as error:
+            print(f"FAIL: {error}", file=sys.stderr)
+            return 2
+        return code
+
     try:
+        if args.qualification_result is not None:
+            if args.binary is None:
+                raise ProducerError("typed qualification requires --binary")
+            if evidence == args.qualification_result.resolve().parent:
+                raise ProducerError(
+                    "gate evidence must not overlap typed direct-child evidence"
+                )
+            typed_context = load_live_context(
+                producer_id="object-namespace-recovery",
+                scenarios=TYPED_SCENARIOS,
+                dependency_names=("etcd", "rustfs"),
+                product_binary=args.binary,
+                evidence_roles=TYPED_EVIDENCE_ROLES,
+            )
+            unsupported = sorted(
+                set(typed_context.scenarios) - TYPED_SUPPORTED_SCENARIOS
+            )
+            if unsupported:
+                reason = (
+                    "The namespace restart/outage gate does not execute the restore, "
+                    "conditional-write, concurrency, retention, backup, fsck, GC, "
+                    "checkpoint/log, cross-owner, multishard, or upgrade scenarios "
+                    f"required by {unsupported}."
+                )
+                record = gap_record(producer="object-namespace-recovery", reason=reason)
+                print(json.dumps(record, indent=2, sort_keys=True))
+                return finish(3, record)
         result = execute(args)
         Evidence(evidence).json("qualification.json", result)
         print(evidence / "qualification.json")
-        return 0
+        return finish(0, result)
     except NotQualified as error:
         status, code = "NOT QUALIFIED", 3
         failure = str(error)
@@ -1311,7 +1471,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         {"schema": SCHEMA, "status": status, "finished_at": now(), "error": failure},
     )
     print(f"{status}: {failure}", file=sys.stderr)
-    return code
+    return finish(
+        code,
+        {
+            "schema": SCHEMA,
+            "status": status,
+            "finished_at": now(),
+            "error": failure,
+        },
+    )
 
 
 if __name__ == "__main__":

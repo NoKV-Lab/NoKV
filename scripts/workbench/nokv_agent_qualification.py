@@ -89,6 +89,12 @@ GREP = _test(
     ("--test", "sdk_facade"),
     "grep_treats_patterns_as_case_insensitive_literals_and_globs_as_basenames",
 )
+WORKBENCH_GREP_PIPE_BOUNDS = _test(
+    "agent-workbench-grep-pipe-seventeen-pattern-bound",
+    "nokv-agent",
+    ("--test", "sdk_facade"),
+    "workbench_grep_pipe_compatibility_is_not_enabled_for_generic_grep",
+)
 COMMIT = _test(
     "agent-canonical-commit-identity",
     "nokv-agent",
@@ -245,7 +251,8 @@ SCENARIOS = {
     "c13.grep-literal-or-bounds-contract": _scenario(
         "C13",
         "facade-contract",
-        nq="the exact grep test proves literals and glob behavior but not the sixteen-pattern admission bound",
+        GREP,
+        WORKBENCH_GREP_PIPE_BOUNDS,
     ),
     "c14.query-scope-predicate-control-contract": _scenario(
         "C14", "facade-contract", AGENT_ALL, EMPTY_SCOPE

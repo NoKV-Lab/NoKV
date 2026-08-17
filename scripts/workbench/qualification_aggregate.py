@@ -1125,12 +1125,14 @@ def _scenario_status(
         grouped.setdefault(receipt.producer, []).append(receipt)
     selected_receipts: list[AcceptedReceipt] = []
     for producer, candidates in grouped.items():
-        fingerprints = {candidate.canonical_sha256 for candidate in candidates}
-        if len(fingerprints) != 1:
+        if len(candidates) != 1:
             conflicts.append(
-                f"producer {producer!r} equivocates across jobs for one scenario "
+                f"producer {producer!r} supplied {len(candidates)} receipts for one "
+                "scenario; exactly one is allowed "
                 f"at attempt {candidates[0].attempt}; "
-                f"jobs={sorted({candidate.job for candidate in candidates})}"
+                f"jobs={sorted({candidate.job for candidate in candidates})}; "
+                "operation_ids="
+                f"{sorted({candidate.operation_id for candidate in candidates})}"
             )
             continue
         selected_receipts.append(candidates[0])

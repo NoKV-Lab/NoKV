@@ -571,6 +571,18 @@ class QualificationAggregateTest(unittest.TestCase):
         self.assertEqual(result.status, "FAIL")
         self.assertTrue(result.report["receipt_conflicts"])
 
+    def test_same_job_same_producer_identical_duplicate_is_framework_fail(self) -> None:
+        paths = self._write_complete_receipts()
+        duplicate = json.loads(paths[0].read_text(encoding="utf-8"))
+        (self.receipt_dir / "identical-duplicate.json").write_text(
+            json.dumps(duplicate), encoding="utf-8"
+        )
+
+        result = self._aggregate()
+
+        self.assertEqual(result.status, "FAIL")
+        self.assertTrue(result.report["receipt_conflicts"])
+
     def test_runner_receipt_is_accepted_without_shape_translation(self) -> None:
         repo = Path(self.temporary.name) / "runner-source-repo"
         repo.mkdir()
