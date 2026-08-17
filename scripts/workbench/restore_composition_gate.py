@@ -1385,6 +1385,9 @@ def inventory(
     env: dict[str, str],
 ) -> dict[str, dict[str, Any]]:
     assert config.aws is not None
+    # The zero-copy assertions concern the artifact keyspace only. Recovery
+    # log segments and provider-admission probes live under sibling prefixes
+    # of the same object root and must not count as restore-published objects.
     result = run(
         aws_command(
             config.aws,
@@ -1393,6 +1396,8 @@ def inventory(
             "list-objects-v2",
             "--bucket",
             runtime.object_bucket,
+            "--prefix",
+            artifact_inventory_prefix(runtime),
             "--output",
             "json",
         ),
@@ -1415,6 +1420,10 @@ def inventory(
             "last_modified": item.get("LastModified"),
         }
     return output
+
+
+def artifact_inventory_prefix(runtime: Runtime) -> str:
+    return f"{runtime.object_root.strip('/')}/nokv/artifacts/"
 
 
 def changed_objects(

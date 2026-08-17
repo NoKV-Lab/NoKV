@@ -283,6 +283,12 @@ def proxy_server_command(
     command = server_command(common, objects, bind_port, node, metadata_option, metadata)
     index = command.index("--advertise-endpoint") + 1
     command[index] = f"127.0.0.1:{advertise_port}"
+    # This gate qualifies whole-Workbench fork restore plus exclusive local-WAL
+    # reopen after owner loss; shared-log succession is not its subject, and
+    # shared publication has no checkpoint compaction yet, so the owner keeps
+    # the local WAL as its only recovery authority.
+    serve = command.index("serve")
+    command[serve:serve] = ["--recovery-publication", "local-only"]
     return command
 
 

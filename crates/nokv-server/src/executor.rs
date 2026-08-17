@@ -352,25 +352,41 @@ impl MetadataWorkspaceRequestExecutor {
     ) -> Result<ExecutedRequest, protocol::RpcFailure> {
         let workbench = workbench_id(&request.target.workbench)?;
         let path = relative_path(&request.target.path)?;
-        let context = self.workspace_read_context(rpc.route, &workbench, &request.view)?;
-        if request
-            .expected_read_version
-            .is_some_and(|expected| expected != context.read_version.get())
-        {
-            return Err(failure(
-                protocol::ErrorCode::PreconditionFailed,
-                format!(
-                    "get_path expected read version {} does not match resolved read version {}",
-                    request.expected_read_version.expect("checked as present"),
-                    context.read_version.get()
-                ),
-                false,
-                Some(protocol::ConflictKind::ReadVersion),
-            ));
+        let resolved = match (&request.view, request.expected_read_version) {
+            // An unfenced live read resolves the workspace and path under one
+            // ownership/fence validation at the current version; it does not
+            // pay for a separate read-context sample it never compares.
+            (protocol::WorkspaceReadView::Live, None) => {
+                let route = route_parts(rpc.route)?;
+                meta::get_current_visible_workspace_path(
+                    &self.meta,
+                    route.root_id,
+                    route.placement_generation,
+                    route.owner_epoch,
+                    &workbench,
+                    &path,
+                )
+            }
+            (view, expected_read_version) => {
+                let context = self.workspace_read_context(rpc.route, &workbench, view)?;
+                if let Some(expected) = expected_read_version {
+                    if expected != context.read_version.get() {
+                        return Err(failure(
+                            protocol::ErrorCode::PreconditionFailed,
+                            format!(
+                                "get_path expected read version {expected} does not match resolved read version {}",
+                                context.read_version.get()
+                            ),
+                            false,
+                            Some(protocol::ConflictKind::ReadVersion),
+                        ));
+                    }
+                }
+                meta::get_visible_workspace_path_at(&self.meta, context, &workbench, &path)
+            }
         }
-        let resolved = meta::get_visible_workspace_path_at(&self.meta, context, &workbench, &path)
-            .map_err(namespace_failure)?
-            .ok_or_else(|| not_found("workbench does not exist"))?;
+        .map_err(namespace_failure)?
+        .ok_or_else(|| not_found("workbench does not exist"))?;
         let Some(entry) = resolved.entry else {
             return Err(not_found("path does not exist"));
         };

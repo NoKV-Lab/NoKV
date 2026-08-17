@@ -1430,6 +1430,10 @@ def start_mcp(
             ) != {"tools": {}}:
                 raise WorkflowFailure("unexpected MCP initialize result")
             session.notify("notifications/initialized")
+            # The short bound above only guards the startup probe against a
+            # not-yet-serving owner. Every tool call afterwards is bounded by
+            # the configured command timeout, exactly like the CLI steps.
+            session.timeout = config.timeout
             evidence.line(
                 "processes.jsonl",
                 {

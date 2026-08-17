@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from fork_restore_recovery_gate import (
+    proxy_server_command,
     BLOCK_BYTES,
     CONCURRENT_RESTORES,
     FULL_PROFILE_FILES,
@@ -332,6 +333,24 @@ class ForkRestoreRecoveryGateTest(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, workflow)
+
+
+
+class ProxyServerCommandTest(unittest.TestCase):
+    def test_proxied_owner_keeps_local_wal_as_recovery_authority(self) -> None:
+        command = proxy_server_command(
+            ["nokv", "--root-id", "11" * 16],
+            ["--object-bucket", "b"],
+            7801,
+            7802,
+            "fork-gate-e1",
+            "--metadata-reopen",
+            Path("/tmp/meta"),
+        )
+        serve = command.index("serve")
+        self.assertEqual(command[serve - 2 : serve], ["--recovery-publication", "local-only"])
+        self.assertEqual(command[command.index("--advertise-endpoint") + 1], "127.0.0.1:7802")
+        self.assertNotIn("--agent-id", command)
 
 
 if __name__ == "__main__":
